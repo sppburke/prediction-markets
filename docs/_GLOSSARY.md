@@ -133,6 +133,7 @@ pub struct Quantity(pub ContractQty);
 pub struct KalshiPriceCents(pub u8);          // 0..=100
 pub struct PolymarketPriceDecimal(pub rust_decimal::Decimal); // 0.0..=1.0, 4dp
 pub struct Price(pub rust_decimal::Decimal);  // 0.0..=1.0
+pub struct Probability(pub rust_decimal::Decimal); // 0.0..=1.0; model/strategy estimate, distinct from market price
 pub struct PriceDelta(pub rust_decimal::Decimal);
 pub struct ProbabilityPpm(pub u32);           // 0..=1_000_000
 pub struct BasisPoints(pub i32);

@@ -1,0 +1,9 @@
+---
+source: crates/core-types/tests/wire_format.rs
+assertion_line: 231
+expression: v
+---
+{
+  "market": "market-abc",
+  "outcome": 0
+}
