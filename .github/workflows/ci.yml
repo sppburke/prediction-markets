@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gate:
+    name: rustc 1.95.0 acceptance gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny,cargo-audit
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustc version contains 1.95.0
+        run: rustc --version | grep -F '1.95.0'
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - run: cargo test --workspace --all-features
+
+      - run: cargo nextest run --workspace --all-features
+
+      - run: cargo deny check
+
+      - run: cargo audit
+
+      - run: cargo metadata --locked --format-version 1 > /dev/null

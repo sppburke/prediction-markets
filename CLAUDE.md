@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-This repository is currently **specification-only**. It contains the design documents for `prediction-edge`, a Rust 1.95.0 / Rust 2024 trading and research system for Polymarket and Kalshi. There is no Rust code yet; `crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, and `.github/workflows/` will be created in Phase 0 of `docs/17-RUST-IMPLEMENTATION-ROADMAP.md`.
+`prediction-edge` is a Rust 1.95.0 / Rust 2024 trading and research system for Polymarket and Kalshi. Phase 0 (toolchain, workspace, CI, fake service binary) is in place: `crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, and `.github/workflows/ci.yml` exist and the full acceptance gate is green. Subsequent phases per `docs/17-RUST-IMPLEMENTATION-ROADMAP.md` add core types, event log, sources, venue adapters, and strategies.
 
 The root `AGENTS.md` is the human contributor guide; this `CLAUDE.md` is for coding-agent context. They are complementary — the contributor guide covers commit/PR conventions and dev workflow at a human level, while this file captures architecture, doc authority order, and the gotchas a fresh agent needs to avoid.
 
-When the Rust workspace is added, the CI gate is exactly:
+The CI gate is exactly:
 
 ```bash
 rustc --version              # must contain 1.95.0
