@@ -1,6 +1,7 @@
 # 02 — Phase Data Ingestion
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule, toolchain pin, and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for venue rate-limit defaults and source-freshness defaults.
 
 ## Objective
 
@@ -56,10 +57,21 @@ For serious deployment, monitor host clock offset with chrony/PTP. Do not compar
 
 Only bounded channels are allowed. Each connector declares a policy:
 
-- lossless critical: block and alert;
-- latest-wins state: drop older non-critical updates and count drops;
-- sampled telemetry: downsample explicitly;
-- circuit break: disable strategies on backlog.
+| Policy | Behavior | Example |
+|---|---|---|
+| `LosslessCritical` | Block and alert | Chainlink resolver-shadow, NWS final |
+| `LatestWinsState` | Drop older non-critical updates and count drops | Polymarket book WS |
+| `SampledTelemetry` | Downsample explicitly | Source health pings |
+| `CircuitBreak` | Disable strategies on backlog | Polygon RPC under reorg |
+
+## Rate limits
+
+Per-venue and per-source budgets, retry/backoff, and 429/5xx handling are first-class events. Authoritative defaults live in `_GLOSSARY.md` ("Venue rate limits"); any change requires updating that table and a research pass per `21-RESEARCH-AND-SOURCE-DISCOVERY.md`. Connectors must:
+
+1. enforce the production-budget column from `_GLOSSARY.md` as a token-bucket;
+2. emit a `RateLimitObserved` event on every 429/5xx, with retry-after headers normalized;
+3. halve the local budget on a sustained breach (≥ 3 events in 60 s) and recover linearly over 5 minutes;
+4. never silently swallow a 429 in retry logic.
 
 ## Connector families
 
@@ -85,7 +97,7 @@ Only bounded channels are allowed. Each connector declares a policy:
 - Polymarket proxy wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral-flow event logs where publicly derivable
 - wallet funding-path events for operator identity research
 - maintained exchange/bridge/hot-wallet boundary labels with config hashes
-- block-lag and reorg-aware health state
+- block-lag and reorg-aware health state, using `onchain_block_lag_warn` / `onchain_block_lag_block` from `_GLOSSARY.md`
 
 ### `source-sports`
 
@@ -133,24 +145,13 @@ pub struct SourceHealth {
 }
 ```
 
-Strategies may only trade if required sources are healthy or if a pre-approved degraded-source mode exists.
-
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
+Stale and block thresholds come from `_GLOSSARY.md` ("Source freshness defaults"). Strategies may only trade if required sources are healthy, or if a pre-approved degraded-source mode exists.
 
 ## Winner-Follow ingestion priority
 
-Before building specialized weather/crypto/sports/macro source gateways, build the trader-intelligence ingestion path.
+Before specialized weather/crypto/sports/macro source gateways, build the trader-intelligence ingestion path. The crate is `source-trader` (not `source-trader-polymarket`/`source-trader-kalshi`); venue-specific behavior lives in submodules `source_trader::polymarket` and `source_trader::kalshi`.
 
-### `source-trader-polymarket`
+### `source-trader::polymarket`
 
 - leaderboard snapshots by category, offset, and time window;
 - public user trades by wallet/profile address;
@@ -169,14 +170,14 @@ Responsibilities:
 
 - ingest normalized Polygon events such as `CollateralTransfer`, `UsdcTransfer`, `PusdMintOrWrap`, `ProxyWalletCreated`, `DepositAddressCreated`, and `BridgeDepositObserved` where supported by official/public contract evidence;
 - record transaction hash, block number, log index, contract address, event signature, parser version, raw payload hash, observed timestamp, and received timestamp;
-- maintain a first-funding index for each observed Polymarket wallet/proxy using the first public inbound collateral event, the first non-exchange direct funder where available, and an N-hop funding path with stop rules at exchanges, bridges, mixers, or unknown high-risk contracts;
+- maintain a first-funding index for each observed Polymarket wallet/proxy using the first public inbound collateral event, the first non-exchange direct funder where available, and an N-hop funding path (`funding_max_hops` in `_GLOSSARY.md`) with stop rules at exchanges, bridges, mixers, or unknown high-risk contracts;
 - preserve both strict single-root clusters and optional secondary transitive clusters; only strict clusters are eligible for sizing in v1;
 - keep a versioned CEX/bridge/hot-wallet boundary list in config so changes are replayable by config hash;
 - expose source health with RPC block lag, reorg depth, parse-error count, schema drift, and label-version state.
 
-Polymarket proxy-wallet reality is a research gate. The implementation must prove, with replay fixtures, how public `proxyWallet`/funder/collateral/deposit evidence maps to the economic actor for representative historical accounts. If this mapping is incomplete, inherited-prior and cluster-coordination signals remain shadow-only.
+Polymarket proxy-wallet reality is a research gate. The implementation must prove, with replay fixtures, how public `proxyWallet`/funder/collateral/deposit evidence maps to the economic actor for representative historical accounts (per `21-RESEARCH-AND-SOURCE-DISCOVERY.md`). If this mapping is incomplete, inherited-prior and cluster-coordination signals remain shadow-only.
 
-### `source-trader-kalshi`
+### `source-trader::kalshi`
 
 - public trade stream and historical trades for market-flow analysis;
 - leaderboard pages or official endpoints only where public/allowed;
@@ -185,8 +186,8 @@ Polymarket proxy-wallet reality is a research gate. The implementation must prov
 
 ### Polling and streaming discipline
 
-- Polymarket leader watchlist trade polling should use adaptive intervals: sub-second only for top active leaders and markets that have just printed; slower intervals for dormant leaders.
-- Every poll result is diffed against the last event hash; duplicate trade events are ignored by deterministic idempotency keys.
+- Polymarket leader watchlist trade polling uses adaptive intervals: sub-second only for top active leaders and markets that have just printed; slower intervals for dormant leaders. Concrete defaults: 500 ms for top-10 active leaders with markets traded in the last 60 s; 5 s for top-50; 30 s for tail watchlist.
+- Every poll result is diffed against the last event hash; duplicate trade events are ignored by the deterministic idempotency key in `_GLOSSARY.md` ("Idempotency").
 - WebSocket streams are used for market-state latency, but public trader identification is reconstructed from Data API/profile endpoints and public transaction metadata when needed.
-- All scanner loops must respect venue rate limits and ToS; rate-limit handling is a first-class event, not an exception swallowed by retry logic.
-- If `source-onchain-polygon` is unhealthy or lags beyond the configured block threshold, degrade gracefully: block fresh-wallet first-trade and cluster-coordination signals, but do not block ordinary leaderboard-based Winner-Follow when its required Polymarket sources are healthy.
+- All scanner loops respect the budgets in `_GLOSSARY.md` ("Venue rate limits"); rate-limit handling is a first-class event, not an exception swallowed by retry logic.
+- If `source-onchain-polygon` is unhealthy or lags beyond `onchain_block_lag_block`, degrade gracefully: block fresh-wallet first-trade and cluster-coordination signals, but do not block ordinary leaderboard-based Winner-Follow when its required Polymarket sources are healthy.

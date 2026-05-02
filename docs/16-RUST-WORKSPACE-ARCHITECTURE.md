@@ -1,6 +1,7 @@
 # 16 — Rust Workspace Architecture
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule, lints, and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for type aliases.
 
 ## Objective
 
@@ -14,7 +15,8 @@ core-types
       -> source-* and venue-*
       -> operator-graph
       -> model-core and model-*
-      -> strategy-core, trader-index, copy-signal-engine, kelly-sizer, strategy-winner-follow, execution-core, risk-engine
+      -> strategy-core, trader-index, copy-signal-engine, kelly-sizer,
+         strategy-winner-follow, execution-core, risk-engine
       -> replay, backtest, service, cli
 ```
 
@@ -31,7 +33,7 @@ Forbidden:
 
 ### `core-types`
 
-Newtypes for IDs, prices, ticks, quantities, probabilities, basis points, timestamps, hashes, source IDs, venue IDs, market families.
+Authoritative home for all newtypes listed in `_GLOSSARY.md` ("Type aliases"): IDs, prices, ticks, quantities, probabilities, basis points, timestamps, hashes, source IDs, venue IDs, market families, operator/funder identities.
 
 ### `event-log`
 
@@ -39,19 +41,19 @@ Append/read event envelopes; local framed log; BLAKE3 hash chain; zstd compressi
 
 ### `resolver-card`
 
-Resolver schema, parser/validator, JSON Schema, property tests for timing/rounding/tie/finality.
+Resolver schema, parser/validator, JSON Schema, property tests for timing/rounding/tie/finality. Sub-types defined in `_GLOSSARY.md` ("Resolver-card sub-types"); a fully populated example is in `_GLOSSARY.md` ("Example resolver card").
 
 ### `source-core`
 
-Connector trait, source health, source manifests, retry/backoff, source event envelope.
+Connector trait, source health, source manifests, retry/backoff, source event envelope. Source-freshness defaults are in `_GLOSSARY.md`.
 
 ### `source-onchain-polygon`
 
-Public Polygon event connector for Winner-Follow identity research. It ingests pUSD, USDC/USDC.e, proxy-wallet, deposit/onramp, and funding-path evidence where publicly derivable. It emits normalized source events with raw hashes and parser versions; it does not perform clustering or ranking.
+Public Polygon event connector for Winner-Follow identity research. Ingests pUSD, USDC/USDC.e, proxy-wallet, deposit/onramp, and funding-path evidence where publicly derivable. Emits normalized source events with raw hashes and parser versions; does not perform clustering or ranking.
 
 ### `operator-graph`
 
-Pure logic for wallet-to-operator clustering, funder-root identity, inherited priors, cluster-coordination features, and anti-gaming flags. It consumes event snapshots and config, emits deterministic `OperatorIdentity` and `OperatorTrackRecord` snapshots, and has no I/O.
+Pure logic for wallet-to-operator clustering, funder-root identity, inherited priors, cluster-coordination features, and anti-gaming flags (concrete thresholds in `_GLOSSARY.md`). Consumes event snapshots and config, emits deterministic `OperatorIdentity` and `OperatorTrackRecord` snapshots, has no I/O.
 
 ### `venue-core`
 
@@ -59,15 +61,15 @@ Venue adapter trait, book state, order intent, order lifecycle, venue health.
 
 ### `execution-core`
 
-Order journal, idempotency keys, order typestate, router abstractions.
+Order journal, idempotency keys (key definition in `_GLOSSARY.md`), order typestate, router abstractions.
 
 ### `risk-engine`
 
-Pure risk checks with typed inputs and deterministic decisions.
+Pure risk checks with typed inputs and deterministic decisions. The risk-block taxonomy and halt scope is canonical in `19-WINNER-FOLLOW-STRATEGY.md`.
 
 ## Internal APIs
 
-Use Axum for control endpoints:
+`axum` for control endpoints:
 
 - `/health/live`
 - `/health/ready`
@@ -95,17 +97,6 @@ strip = "symbols"
 ```
 
 Keep a profiling build with symbols for latency work.
-
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
 
 ## Winner-Follow crate boundaries
 

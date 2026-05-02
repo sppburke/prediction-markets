@@ -1,11 +1,13 @@
 # SKILLS.md — Project Skills and Quality Bars
 
+> See [`_BASELINE.md`](_BASELINE.md), [`_GLOSSARY.md`](_GLOSSARY.md), and [`AGENTS.md`](AGENTS.md) before any task.
+
 ## Skill: Rust 1.95.0 systems implementation
 
 - Use Rust 2024 Edition.
-- Pin `rust-toolchain.toml` to `1.95.0`.
+- Pin `rust-toolchain.toml` to `1.95.0` (per `_BASELINE.md`).
 - Use `tokio` for async services.
-- Use strong newtypes for domain values.
+- Use strong newtypes for domain values (canonical list in `_GLOSSARY.md` "Type aliases").
 - Use `rust_decimal`/integer ticks for financial math.
 - Use typed errors in libraries and contextual errors in binaries.
 - Use `tracing` for structured observability.
@@ -16,12 +18,12 @@ Build a public trader-intelligence pipeline:
 
 1. ingest public trader data;
 2. ingest public Polygon funding/collateral data where permitted;
-3. collapse wallets into operators only with replayable evidence;
+3. collapse wallets into operators only with replayable evidence (`funder_root_min_confidence_ppm` in `_GLOSSARY.md`);
 4. reconstruct ledgers;
-5. classify trades and signal kinds;
-6. rank operators/leaders by walk-forward lower-confidence daily log growth;
-7. detect new leader entries quickly;
-8. size using calibrated fractional Kelly;
+5. classify trades and signal kinds (rules in `19-`);
+6. rank operators/leaders by walk-forward LCB_5pct daily log growth;
+7. detect new leader entries quickly (latency budget in `_GLOSSARY.md`);
+8. size using calibrated fractional Kelly (fractions and caps in `19-`);
 9. emit risk-checked `OrderIntent`;
 10. record everything for replay.
 
@@ -29,16 +31,16 @@ Quality bar:
 
 - no future leakage;
 - conservative fill modeling;
-- robust sample-size shrinkage;
-- latency/edge decay measured;
-- Kalshi identity restrictions respected;
+- robust sample-size shrinkage (cap at `inherited_prior_max_effective_n`);
+- latency/edge decay measured against the production budget in `_GLOSSARY.md`;
+- Kalshi identity restrictions respected (`07-`);
 - CrowdIntel-style funding concepts reimplemented natively instead of scraped;
-- inherited-prior fresh-wallet signals kept paper/shadow until separately validated;
-- live-tiny only after paper-copy validation.
+- inherited-prior fresh-wallet signals kept paper/shadow until separately validated per `19-` "Promotion ladder";
+- live-tiny only after paper-copy validation per `_GLOSSARY.md` "Promotion criteria — quantified".
 
 ## Skill: Venue adapter implementation
 
-- Read latest official docs before coding.
+- Read latest official docs before coding (`21-`).
 - Encode venue-specific IDs and order lifecycle states.
 - Keep venue adapters separate from strategies.
 - Implement fake venue servers before live adapters.
@@ -57,7 +59,7 @@ Quality bar:
 - Use bootstrap confidence intervals.
 - Penalize profit concentration.
 - Include costs, slippage, missed fills, and copy delay.
-- Compare live paper-copy against backtest distributions.
+- Compare live paper-copy against backtest distributions using the "close to simulation" definition in `_GLOSSARY.md` (KS p-value ≥ 0.10, abs(z) ≤ 2.0).
 
 ## Skill: AWS and Git operations
 
@@ -65,13 +67,13 @@ Quality bar:
 - Use GitHub Actions OIDC for AWS access.
 - Build immutable Docker images.
 - Push to ECR.
-- Deploy to ECS/EKS with least-privilege IAM.
+- Deploy to ECS Fargate by default (migration trigger in `06-`).
 - Store secrets in Secrets Manager/KMS.
 - Emit OpenTelemetry metrics/logs/traces.
 
 ## Skill: Source research
 
 - Use official docs first.
-- Update `15-SOURCES.md` after each research pass.
-- Treat API behavior as stale unless recently verified.
+- Update `15-SOURCES.md` `Last checked` and `Re-verify by` after each research pass.
+- Treat API behavior as stale per the per-class TTLs in `15-SOURCES.md`.
 - Record checked date and endpoint status for production-critical assumptions.

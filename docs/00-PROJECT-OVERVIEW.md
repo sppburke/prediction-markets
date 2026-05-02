@@ -1,6 +1,8 @@
 # 00 — Project Overview
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule, toolchain pin, lints, and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for vocabulary, type aliases, latency budget, rate limits, and configuration defaults.
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, eligibility thresholds, and promotion ladders.
 
 ## Mission
 
@@ -34,56 +36,13 @@ All production decisions must be reproducible from:
 - model artifact version;
 - venue adapter version.
 
+## Strategy 0 — Winner-Follow Copy Engine (summary)
 
-## Strategy 0 — Winner-Follow Copy Engine
+Winner-Follow is the first deployable strategy. Full specification — including venue support, eligibility thresholds, ranking objective, Kelly sizing, anti-gaming flags, risk caps, and promotion ladders — lives in [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md). This file does not restate those values; if a number appears here that conflicts with `19`, `19` wins.
 
-The first production strategy is **Winner-Follow**: continuously discover, rank, watch, and selectively copy the fastest-compounding public traders before the broader market has fully incorporated their action. This is not treated as a risk-free or "edge-free" system. The edge is the combination of public trader intelligence, rigorous skill filtering, latency-optimized copy execution, fractional-Kelly sizing, portfolio-level drawdown control, and continuous decay monitoring.
+Strategy 0 starts here because it can be built using public venue/profile/trade data, deterministic analysis, and speed. Resolver-source strategies remain Strategy 1+ and are used later to validate whether copied trades have independent fundamental support.
 
-Winner-Follow ships before weather, crypto, macro, sports, and chart/source-arbitrage strategies because it can be built using public venue/profile/trade data, deterministic analysis, and speed. Resolver-source strategies remain Strategy 1+ and are used later to validate whether copied trades have independent fundamental support.
-
-Winner-Follow is **operator-aware**, not wallet-naive. A public wallet is an observable proxy for a possible economic actor. The system builds a native, replayable Polygon funding/collateral graph from public chain data and official/public Polymarket surfaces, collapses wallets into deterministic `OperatorId`s when confidence is high, and applies ranking, correlation, and risk caps at the operator/funder/cluster level. CrowdIntel-style funding clusters are useful research inspiration, but opaque third-party scores or UI-only data are not production dependencies unless an authorized, replayable export or API exists.
-
-Fresh-wallet "first trade" following is an incubator sub-mode, not the default live strategy. A new wallet can inherit a heavily shrunk prior from a known operator/funder only when funding/collateral linkage is public, replayable, recent enough, low-hop, and not flagged as gaming. These trades start in shadow or paper mode and use much smaller Kelly fractions than promoted leader-follow trades.
-
-### Venue support
-
-- **Polymarket:** first-class support. The public Data API exposes leaderboard, user trades, positions, activity, and related profile data, making trader-level reconstruction feasible. Polymarket also uses Polygon proxy wallets and pUSD collateral, so funding identity must be based on verified proxy/funder/collateral evidence rather than a simplistic first-USDC-sender rule.
-- **Kalshi:** limited trader-copy support. Kalshi exposes public trades and a leaderboard feature, but public trade messages do not identify the trader and leaderboard participation is opt-in. Kalshi is therefore used for copy-trading only when a lawful public identity-to-trade mapping exists, when a trader explicitly authorizes API/portfolio access, or when future official endpoints expose sufficient public trader-level data. Otherwise, Kalshi remains a venue for resolver-source strategies, market-flow analytics, and cross-venue checks.
-
-### Ranking objective
-
-Rank traders by **walk-forward lower-confidence expected log-growth per day** for a follower account after simulated latency, spread, slippage, fees, partial fills, and position caps. Raw PnL, win rate, and leaderboard rank are inputs, not the final ranking target.
-
-When operator identity is confident, rank the operator-level track record first and keep wallet-level ledgers as sub-aggregations. Penalize uncertain membership, abnormal wallet-seeding velocity, narrow market-family specialization, wash-like coordination, and any cluster whose funding path is unstable or not reproducible.
-
-### Default eligibility thresholds
-
-The user-proposed `average hold < 5 days` and `>= 15 trades` are too loose for production. Use adaptive thresholds instead:
-
-- at least **60 closed trades** or **30 resolved markets** in the rolling 180-day audit window;
-- at least **12 closed trades in the last 30 days** for active-copy eligibility;
-- median capital-weighted holding period **<= 72 hours**;
-- 75th percentile holding period **<= 7 days**;
-- minimum simulated follower turnover of **0.35 bankroll-equivalent per day** after caps;
-- positive lower 5% bootstrap estimate of daily log growth after copy delay and costs;
-- no single resolved market contributes more than **20%** of audited profit;
-- no more than **35%** of audited profit comes from positions too illiquid for the follower to enter within the latency/slippage budget.
-
-Fresh-wallet inherited-prior incubator requires a known operator with the active-leader sample threshold, a fresh wallet with no or minimal closed-trade history, a low-confidence-bounded inherited prior above baseline after shrinkage, funding hop count within the configured limit, sane cluster size, low seeding velocity, and no anti-gaming flags. It is paper-only until separately validated.
-
-### Default sizing
-
-For a binary contract with current entry price `c` and calibrated copied-trade win probability `p`, the full-Kelly bankroll allocation to stake cost is:
-
-```text
-f_full = max(0, (p - c) / (1 - c))
-f_live = kelly_fraction * f_full
-```
-
-Use **quarter Kelly** by default during live-tiny and scale to half Kelly only after a statistically meaningful live audit. `p` is not the trader's naive win rate. It is a calibrated, shrinkage-adjusted probability conditional on trader, market family, odds bucket, liquidity, holding-period bucket, side, recency, and observed copy latency.
-
-Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 1.00% after promotion, max 3.00% per trader/operator, max 8.00% per market family, max 25.00% total open copy exposure, and stop new entries after 2.00% intraday drawdown or 6.00% rolling 7-day drawdown until review. Inherited-prior trades have separate lower caps across all funders, per funder per day, per operator per market, and per cluster-coordination mode.
-
+Note: "Strategy 0" (strategy index) and "Phase 0" / "Phase 0A" (build phase) are different axes; see `_GLOSSARY.md`.
 
 ## Core trading thesis
 
@@ -94,25 +53,11 @@ For every market, answer:
 3. What orthogonal source can confirm or challenge the signal?
 4. How does Kalshi or Polymarket expose tradability, book state, fees, queue, and settlement?
 5. Does the edge survive latency, fees, slippage, and fill probability?
-6. Is there a related market on the other venue, and is it a real hedge or a fake hedge?
+6. Is there a related market on the other venue, and is it a real hedge or a fake hedge (see `09-CROSS-VENUE-MISMATCHES-AND-HEDGES.md`)?
 
 ## Why Rust
 
-Rust is used because this system needs low-latency networked services, strict type safety, high concurrency, no garbage collector pauses, reproducible binaries, and a testing ecosystem that can validate concurrent systems. Rust also lets the code encode the domain: prices, probabilities, order states, resolver states, time windows, finality, and market IDs should be distinct types, not loose strings/floats.
-
-
-## Rust baseline
-
-- **Edition/toolchain:** Rust 2024 Edition, stable Rust 1.95.0 toolchain, `Cargo.lock` committed, reproducible builds.
-- **Async:** `tokio`, `tokio-tungstenite`, `reqwest`/`hyper`, `tower`, `axum`.
-- **Serialization/parsing:** `serde`, `serde_json`, `simd-json` for benchmarked hot paths, `csv`, `quick-xml`, `scraper`, `schemars`.
-- **Numerics:** `rust_decimal` and integer ticks/cents/basis-points. No raw `f64` for venue prices, money, contract counts, or probabilities.
-- **Analytics:** Rust `polars`, Apache Arrow/Parquet, `datafusion`.
-- **ML/inference:** Rust `linfa`, `burn`, `candle`, and/or `ort` for ONNX inference. No production Python model server.
-- **Messaging/storage:** local append-only framed event log first; `async-nats` JetStream or Kafka/Redpanda-compatible streams later; Parquet lakehouse for replay.
-- **Observability:** `tracing`, `tracing-opentelemetry`, OpenTelemetry metrics/logs/traces.
-- **Testing:** `proptest`, `loom`, `shuttle`, `cargo-nextest`, `criterion`, `insta`, fake source/venue servers.
-
+Rust is used because this system needs low-latency networked services, strict type safety, high concurrency, no garbage collector pauses, reproducible binaries, and a testing ecosystem that can validate concurrent systems. Rust also lets the code encode the domain: prices, probabilities, order states, resolver states, time windows, finality, and market IDs are distinct types, not loose strings/floats. See `_GLOSSARY.md` for the canonical type aliases.
 
 ## Core event model
 
@@ -136,15 +81,15 @@ pub struct EventEnvelope<T> {
 
 ### Kalshi
 
-Kalshi is especially attractive for official-source markets: weather reports, benchmark crypto windows, government releases, official charts/rankings, and queue-aware passive strategies. Kalshi must have a dedicated Rust adapter that understands order books, queue position, order groups, combos, and exchange schedule.
+Kalshi is especially attractive for official-source markets: weather reports, benchmark crypto windows, government releases, official charts/rankings, and queue-aware passive strategies. Kalshi has a dedicated Rust adapter (`venue-kalshi`) that understands order books, queue position, order groups, combos, and exchange schedule.
 
 ### Polymarket
 
-Polymarket is especially attractive for broad coverage, short-horizon crypto, live sports, market/event structure, and rapid repricing gaps. Polymarket must have a dedicated Rust adapter that understands market/user/sports/RTDS sockets, signed orders, condition/token IDs, category costs, and market-specific resolution sources.
+Polymarket is especially attractive for broad coverage, short-horizon crypto, live sports, market/event structure, and rapid repricing gaps. Polymarket has a dedicated Rust adapter (`venue-polymarket`) that understands market/user/sports/RTDS sockets, signed orders, condition/token IDs, category costs, and market-specific resolution sources.
 
 ## ResolverCard requirement
 
-A market is not tradable until it compiles into a reviewed `ResolverCard`:
+A market is not tradable until it compiles into a reviewed `ResolverCard`. Sub-types (`MarketFamily`, `ResolverSource`, `OutputSpace`, `TimingRule`, `WindowSpec`, `SamplePolicy`, `RoundingRule`, `TieRule`, `FinalityRule`, `RevisionPolicy`) are defined in `_GLOSSARY.md`, with a fully populated example resolver card.
 
 ```rust
 pub struct ResolverCard {
@@ -164,18 +109,12 @@ pub struct ResolverCard {
 
 ## Edge taxonomy
 
-- **Exact reprice:** official source moved; venue lagged.
-- **Predictive upstream:** upstream source implies future resolver state.
-- **Cross-venue mismatch:** venues price related but non-identical outcomes incorrectly.
-- **Microstructure:** queue, fees, rebates, stale orders, or venue-specific mechanics create tradable edge.
-- **Finality:** market underprices certainty after a result is functionally finalized but before formal resolution.
+| Edge | Definition |
+|---|---|
+| **Exact reprice** | Official source moved; venue lagged. |
+| **Predictive upstream** | Upstream source implies future resolver state. |
+| **Cross-venue mismatch** | Venues price related but non-identical outcomes incorrectly. Refined by `CompatibilityClass` in `09-CROSS-VENUE-MISMATCHES-AND-HEDGES.md`. |
+| **Microstructure** | Queue, fees, rebates, stale orders, or venue-specific mechanics create tradable edge. |
+| **Finality** | Market underprices certainty after a result is functionally finalized but before formal resolution. |
 
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
+`09-CROSS-VENUE-MISMATCHES-AND-HEDGES.md` extends the cross-venue mismatch entry with the full `CompatibilityClass` enum.

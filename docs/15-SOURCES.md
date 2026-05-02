@@ -1,112 +1,131 @@
 # 15 — Sources and Implementation References
 
-Verify official venue docs again before live trading.
+> Re-verify per the staleness rule in [`21-RESEARCH-AND-SOURCE-DISCOVERY.md`](21-RESEARCH-AND-SOURCE-DISCOVERY.md).
+
+## Per-class re-verification TTL
+
+| Class | TTL | Notes |
+|---|---:|---|
+| Venue API reference (Polymarket / Kalshi) | 60 days | Official `docs.*` references |
+| Venue help-center market rules | 14 days | Help-center pages change without versioning |
+| Public source resolver pages | 60 days | NWS, BLS, Spotify chart pages |
+| Public chain provider docs | 90 days | Polygon RPC, archive provider |
+| Rust ecosystem docs | 180 days | tokio, axum, polars, etc. |
+| AWS service docs | 90 days | ECS, IAM, Secrets Manager |
+| Third-party research references | re-check before use | CrowdIntel, etc. |
+
+`Last checked` and `Re-verify by` columns are added per link below as research passes complete.
 
 ## Kalshi
 
-- API docs: https://docs.kalshi.com/welcome
-- WebSocket quick start: https://docs.kalshi.com/getting_started/quick_start_websockets
-- Market data quick start: https://docs.kalshi.com/getting_started/quick_start_market_data
-- Orderbook responses: https://docs.kalshi.com/getting_started/orderbook_responses
-- Queue position: https://docs.kalshi.com/api-reference/orders/get-order-queue-position
-- Order groups: https://docs.kalshi.com/api-reference/order-groups/create-order-group
-- Changelog: https://docs.kalshi.com/changelog
-- Weather markets: https://help.kalshi.com/en/articles/13823837-weather-markets
-- Crypto markets: https://help.kalshi.com/en/articles/13823838-crypto-markets
-- Spotify markets: https://help.kalshi.com/en/articles/13823839-spotify-markets
-- Netflix markets: https://help.kalshi.com/en/articles/13823840-netflix-markets
-- Top App markets: https://help.kalshi.com/en/articles/13823841-top-app-markets
-- Trading hours: https://help.kalshi.com/en/articles/13823807-what-are-trading-hours
-- Liquidity incentives: https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program
-- Combos: https://help.kalshi.com/en/articles/13823820-combos
+| Link | Last checked | Re-verify by |
+|---|---|---|
+| https://docs.kalshi.com/welcome | — | — |
+| https://docs.kalshi.com/getting_started/quick_start_websockets | — | — |
+| https://docs.kalshi.com/getting_started/quick_start_market_data | — | — |
+| https://docs.kalshi.com/getting_started/orderbook_responses | — | — |
+| https://docs.kalshi.com/api-reference/orders/get-order-queue-position | — | — |
+| https://docs.kalshi.com/api-reference/order-groups/create-order-group | — | — |
+| https://docs.kalshi.com/changelog | — | — |
+| https://help.kalshi.com/en/articles/13823837-weather-markets | — | — |
+| https://help.kalshi.com/en/articles/13823838-crypto-markets | — | — |
+| https://help.kalshi.com/en/articles/13823839-spotify-markets | — | — |
+| https://help.kalshi.com/en/articles/13823840-netflix-markets | — | — |
+| https://help.kalshi.com/en/articles/13823841-top-app-markets | — | — |
+| https://help.kalshi.com/en/articles/13823807-what-are-trading-hours | — | — |
+| https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program | — | — |
+| https://help.kalshi.com/en/articles/13823820-combos | — | — |
 
 ## Polymarket
 
-- Docs home: https://docs.polymarket.com/
-- Documentation index: https://docs.polymarket.com/llms.txt
-- WebSocket overview: https://docs.polymarket.com/market-data/websocket/overview
-- Market channel: https://docs.polymarket.com/market-data/websocket/market-channel
-- User channel: https://docs.polymarket.com/market-data/websocket/user-channel
-- Sports WebSocket: https://docs.polymarket.com/market-data/websocket/sports
-- RTDS: https://docs.polymarket.com/market-data/websocket/rtds
-- Trading overview: https://docs.polymarket.com/trading/overview
-- Create order: https://docs.polymarket.com/trading/orders/create
-- Order lifecycle: https://docs.polymarket.com/concepts/order-lifecycle
-- Authentication: https://docs.polymarket.com/api-reference/authentication
-- CLOB API introduction: https://docs.polymarket.com/api-reference/introduction
-- Polymarket 101 / proxy wallets: https://docs.polymarket.com/polymarket-101
-- Bridge deposit flow: https://docs.polymarket.com/trading/bridge/deposit
-- Supported bridge assets: https://docs.polymarket.com/trading/bridge/supported-assets
-- Bridge transaction status: https://docs.polymarket.com/trading/bridge/status
-- Contracts: https://docs.polymarket.com/developers/contracts
+| Link | Last checked | Re-verify by |
+|---|---|---|
+| https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/llms.txt | — | — |
+| https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/market-data/websocket/market-channel | — | — |
+| https://docs.polymarket.com/market-data/websocket/user-channel | — | — |
+| https://docs.polymarket.com/market-data/websocket/sports | — | — |
+| https://docs.polymarket.com/market-data/websocket/rtds | — | — |
+| https://docs.polymarket.com/trading/overview | — | — |
+| https://docs.polymarket.com/trading/orders/create | — | — |
+| https://docs.polymarket.com/concepts/order-lifecycle | — | — |
+| https://docs.polymarket.com/api-reference/authentication | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/api-reference/introduction | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/polymarket-101 | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/trading/bridge/deposit | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/trading/bridge/supported-assets | — | — |
+| https://docs.polymarket.com/trading/bridge/status | — | — |
+| https://docs.polymarket.com/developers/contracts | — | — |
+| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets | 2026-05-02 | 2026-07-01 |
 
 ## Public sources
 
-- Polygon: https://polygon.technology/
-- Polygon JSON-RPC / provider docs for archive access as selected by implementation.
-- NOAA/NWS: https://www.weather.gov/
-- Aviation Weather Center API: https://aviationweather.gov/data/api/
-- NOAA HRRR: https://rapidrefresh.noaa.gov/hrrr/
-- NOAA NBM: https://vlab.noaa.gov/web/mdl/nbm
-- USGS earthquake feeds: https://earthquake.usgs.gov/earthquakes/feed/
-- National Hurricane Center: https://www.nhc.noaa.gov/
-- NASA FIRMS: https://firms.modaps.eosdis.nasa.gov/
-- BLS: https://www.bls.gov/
-- BEA: https://www.bea.gov/
-- Census: https://www.census.gov/
-- Federal Reserve: https://www.federalreserve.gov/
-- Treasury: https://home.treasury.gov/
-- SEC EDGAR: https://www.sec.gov/edgar
+| Link | Last checked | Re-verify by |
+|---|---|---|
+| https://polygon.technology/ | — | — |
+| Polygon JSON-RPC / archive provider docs (selected by impl) | — | — |
+| https://www.weather.gov/ | — | — |
+| https://aviationweather.gov/data/api/ | — | — |
+| https://rapidrefresh.noaa.gov/hrrr/ | — | — |
+| https://vlab.noaa.gov/web/mdl/nbm | — | — |
+| https://earthquake.usgs.gov/earthquakes/feed/ | — | — |
+| https://www.nhc.noaa.gov/ | — | — |
+| https://firms.modaps.eosdis.nasa.gov/ | — | — |
+| https://www.bls.gov/ | — | — |
+| https://www.bea.gov/ | — | — |
+| https://www.census.gov/ | — | — |
+| https://www.federalreserve.gov/ | — | — |
+| https://home.treasury.gov/ | — | — |
+| https://www.sec.gov/edgar | — | — |
 
 ## Rust implementation references
 
-- Rust 2024 Edition Guide: https://doc.rust-lang.org/edition-guide/rust-2024/index.html
-- Rust 1.95.0 announcement: https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/
-- Tokio: https://tokio.rs/
-- Tokio crate: https://docs.rs/tokio
-- Axum: https://docs.rs/axum/latest/axum/
-- OpenTelemetry Rust: https://opentelemetry.io/docs/languages/rust/
-- tracing-opentelemetry: https://docs.rs/tracing-opentelemetry
-- Polars Rust: https://docs.pola.rs/api/rust/dev/polars/
-- Polars streaming: https://docs.pola.rs/user-guide/concepts/streaming/
-- DataFusion: https://datafusion.apache.org/
-- Candle: https://huggingface.github.io/candle/
-- Burn: https://burn.dev/
-- ONNX Runtime: https://onnxruntime.ai/docs/
-- ort: https://docs.rs/ort
-- Linfa: https://rust-ml.github.io/linfa/
-- Serde: https://docs.rs/serde
-- simd-json: https://docs.rs/simd-json
-- rust_decimal: https://docs.rs/rust_decimal/latest/rust_decimal/
-- async-nats JetStream: https://docs.rs/async-nats/latest/async_nats/jetstream/index.html
-- NATS JetStream: https://docs.nats.io/nats-concepts/jetstream
-- Loom: https://docs.rs/loom/latest/loom/
-- Shuttle: https://docs.rs/shuttle/latest/shuttle/
+| Link | Last checked | Re-verify by |
+|---|---|---|
+| https://doc.rust-lang.org/edition-guide/rust-2024/index.html | — | — |
+| https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/ | 2026-05-02 | 2026-11-02 |
+| https://tokio.rs/ | — | — |
+| https://docs.rs/tokio | — | — |
+| https://docs.rs/axum/latest/axum/ | — | — |
+| https://opentelemetry.io/docs/languages/rust/ | — | — |
+| https://docs.rs/tracing-opentelemetry | — | — |
+| https://docs.pola.rs/api/rust/dev/polars/ | — | — |
+| https://docs.pola.rs/user-guide/concepts/streaming/ | — | — |
+| https://datafusion.apache.org/ | — | — |
+| https://huggingface.github.io/candle/ | — | — |
+| https://burn.dev/ | — | — |
+| https://onnxruntime.ai/docs/ | — | — |
+| https://docs.rs/ort | — | — |
+| https://rust-ml.github.io/linfa/ | — | — |
+| https://docs.rs/serde | — | — |
+| https://docs.rs/simd-json | — | — |
+| https://docs.rs/rust_decimal/latest/rust_decimal/ | — | — |
+| https://docs.rs/async-nats/latest/async_nats/jetstream/index.html | — | — |
+| https://docs.nats.io/nats-concepts/jetstream | — | — |
+| https://docs.rs/loom/latest/loom/ | — | — |
+| https://docs.rs/shuttle/latest/shuttle/ | — | — |
 
+## AWS / CI references
 
-## Winner-Follow and current implementation references
+| Link | Last checked | Re-verify by |
+|---|---|---|
+| https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services | — | — |
+| https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html | — | — |
+| https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html | — | — |
+| https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html | — | — |
 
-- Polymarket API overview: https://docs.polymarket.com/api-reference/introduction
-- Polymarket leaderboard endpoint: https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings
-- Polymarket user trades endpoint: https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets
-- Polymarket profile/current positions/activity endpoints: https://docs.polymarket.com/api-reference/introduction
-- Polymarket authentication signature types and funder: https://docs.polymarket.com/api-reference/authentication
-- Polymarket proxy-wallet overview: https://docs.polymarket.com/polymarket-101
-- Polymarket deposit flow and pUSD collateral notes: https://docs.polymarket.com/trading/bridge/deposit
-- Polymarket WebSocket overview: https://docs.polymarket.com/market-data/websocket/overview
-- CrowdIntel network page, research only: https://crowdintel.xyz/network
-- CrowdIntel methodology, research only: https://crowdintel.xyz/methodology
-- CrowdIntel copy-trading guide, research only: https://crowdintel.xyz/docs/copy-trading-polymarket
-- CrowdIntel docs index, research only: https://crowdintel.xyz/docs
-- Kalshi API overview: https://docs.kalshi.com/welcome
-- Kalshi public trades websocket: https://docs.kalshi.com/websockets/public-trades
-- Kalshi historical trades: https://docs.kalshi.com/api-reference/historical/get-historical-trades
-- Kalshi leaderboard help: https://help.kalshi.com/en/articles/13823809-leaderboard
-- Rust 1.95.0 announcement: https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/
-- GitHub Actions OIDC with AWS: https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
-- AWS ECS: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html
-- AWS ECR: https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html
-- AWS Secrets Manager: https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html
+## Research-only references
+
+Treat as research inspiration; not a production decision input unless an authorized, replayable export/API is reviewed.
+
+| Link | Last checked | Re-verify by |
+|---|---|---|
+| https://crowdintel.xyz/network | 2026-05-02 | 2026-07-01 |
+| https://crowdintel.xyz/methodology | 2026-05-02 | 2026-07-01 |
+| https://crowdintel.xyz/docs/copy-trading-polymarket | 2026-05-02 | 2026-07-01 |
+| https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
 

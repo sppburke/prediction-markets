@@ -1,6 +1,9 @@
 # 06 — Phase Deployment
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for production latency budget and rate-limit defaults.
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps and promotion ladders.
+> See [`20-AWS-GIT-OPERATIONS.md`](20-AWS-GIT-OPERATIONS.md) for the canonical AWS deployment architecture (region, VPC, RDS engine).
 
 ## Objective
 
@@ -9,27 +12,28 @@ Deploy the Rust system as reliable, observable, replayable, low-latency services
 ## Service topology
 
 ```text
-source-gateway-trader       Rust binary
-source-gateway-onchain-polygon Rust binary
-operator-graph-worker        Rust binary
-leader-ranker               Rust binary
-copy-signal-engine          Rust binary
-source-gateway-weather       Rust binary
-source-gateway-crypto        Rust binary
-source-gateway-sports        Rust binary
-source-gateway-macro         Rust binary
-source-gateway-charts        Rust binary
-venue-gateway-kalshi         Rust binary
-venue-gateway-polymarket     Rust binary
-resolver-worker              Rust binary
-model-worker                 Rust binary
-strategy-winner-follow       Rust binary
-strategy-worker              Rust binary
-execution-router             Rust binary
-risk-supervisor              Rust binary
-operator-api                 Rust axum service
-operator-cli                 Rust CLI
-replay-cli                   Rust CLI
+source-gateway-trader              Rust binary
+source-gateway-onchain-polygon     Rust binary
+operator-graph-worker              Rust binary
+trader-ledger-builder              Rust binary
+leader-ranker                      Rust binary
+copy-signal-engine                 Rust binary
+source-gateway-weather             Rust binary
+source-gateway-crypto              Rust binary
+source-gateway-sports              Rust binary
+source-gateway-macro               Rust binary
+source-gateway-charts              Rust binary
+venue-gateway-kalshi               Rust binary
+venue-gateway-polymarket           Rust binary
+resolver-worker                    Rust binary
+model-worker                       Rust binary
+strategy-winner-follow             Rust binary
+strategy-worker                    Rust binary
+execution-router                   Rust binary
+risk-supervisor                    Rust binary
+operator-api                       Rust axum service
+operator-cli                       Rust CLI
+replay-cli                         Rust CLI
 ```
 
 ## Runtime model
@@ -47,12 +51,12 @@ replay-cli                   Rust CLI
 1. **record-only:** collect sources and venue data.
 2. **shadow:** run models/strategies without orders.
 3. **paper:** route intents to fake/sandbox venue.
-4. **live-tiny:** live orders with strict caps.
-5. **scaled-live:** only after metrics prove stability.
+4. **live-tiny:** live orders with strict caps from `19-`.
+5. **scaled-live:** only after metrics prove stability per the promotion criteria in `_GLOSSARY.md`.
 
 ## Health endpoints
 
-Use `axum` for:
+`axum`:
 
 - `/health/live`
 - `/health/ready`
@@ -60,17 +64,20 @@ Use `axum` for:
 - `/health/venues`
 - `/metrics`
 
-Readiness must block live trading if critical sources, venue sockets, account reconciliation, or risk state are unhealthy.
+Readiness blocks live trading if critical sources, venue sockets, account reconciliation, or risk state are unhealthy.
 
 ## Observability
 
 Every order must be trace-linked:
 
 ```text
-source event -> normalized event -> feature snapshot -> fair value -> strategy decision -> risk decision -> order submission -> venue ack -> fill -> settlement
+source event -> normalized event -> feature snapshot -> fair value -> strategy decision
+            -> risk decision -> order submission -> venue ack -> fill -> settlement
 ```
 
-Metrics: source staleness, source parse latency, schema drift, venue book age, delta gaps, order ack latency, cancel latency, model latency, risk block counts, replay/live mismatch count.
+Metrics: source staleness, source parse latency, schema drift, venue book age, delta gaps, order ack latency, cancel latency, model latency, risk block counts, replay/live mismatch count, p50/p95/p99 of the latency budget in `_GLOSSARY.md`.
+
+The **copy-latency kill switch** described in `19-` is wired to the p95 metric: when running p95 over the prior hour exceeds budget by 50 % for two consecutive 5-minute windows, `risk-supervisor` raises `CopyLatencyKillSwitch` and `execution-router` blocks new entries until p95 returns under budget.
 
 ## Reconciliation
 
@@ -85,22 +92,11 @@ On startup or reconnect:
 
 ## Containers
 
-Use multi-stage Rust builds, minimal runtime image, non-root user, read-only filesystem where possible, embedded git SHA, explicit health check.
+Multi-stage Rust builds, minimal runtime image, non-root user, read-only filesystem where possible, embedded git SHA, explicit health check.
 
+## AWS deployment
 
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
-
-## AWS + Git deployment standard
-
-The project is Git-hosted and deployed on AWS. The default production path is:
+The full architecture (region, VPC, IaC tool, RDS engine choice, secrets) is in `20-AWS-GIT-OPERATIONS.md`. Default summary:
 
 ```text
 GitHub/Git remote
@@ -110,10 +106,22 @@ GitHub/Git remote
   -> cargo test/clippy/audit/deny/nextest
   -> Docker build with rust:1.95.0 builder image
   -> ECR immutable image tag by git SHA
-  -> ECS service or EKS deployment
+  -> ECS Fargate (default; see migration trigger below)
   -> private subnets + Secrets Manager + CloudWatch/OpenTelemetry
-  -> S3/Parquet event archive + Postgres/Aurora metadata + optional NATS/Redpanda stream
+  -> S3/Parquet event archive + RDS Aurora-Postgres metadata + optional NATS/Redpanda stream
 ```
+
+### Compute placement
+
+**Default: ECS Fargate** for operational simplicity.
+
+**Migration trigger to ECS-on-EC2 or EKS:** any of these, sustained over 7 days, promotes a service:
+
+- p95 venue-ack latency exceeds the budget in `_GLOSSARY.md` by ≥ 50 %, AND latency-attribution-profiler attributes ≥ 100 ms median to Fargate scheduling jitter (verified by comparison run on EC2);
+- service requires features Fargate does not support (kernel module, host networking, GPU);
+- aggregate Fargate cost exceeds equivalent EC2 cost by ≥ 30 % at sustained throughput.
+
+Otherwise stay on Fargate. Use Graviton (`aarch64-unknown-linux-gnu`) where dependencies support it and benchmarks show no regression vs. x86.
 
 ### Winner-Follow deployment services
 
@@ -121,23 +129,19 @@ GitHub/Git remote
 - `source-gateway-onchain-polygon`: ingests public Polygon proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding/collateral events.
 - `operator-graph-worker`: builds deterministic operator identities, inherited priors, cluster-coordination features, and anti-gaming flags.
 - `trader-ledger-builder`: reconstructs per-trader positions.
-- `leader-ranker`: produces top-50 active operator/leader and incubator lists.
+- `leader-ranker`: produces top-`active_watchlist_size` lists.
 - `copy-signal-engine`: converts newly observed leader trades into classified actions and signal kinds.
 - `strategy-winner-follow`: emits risk-checked order intents.
 - `execution-router`: submits/cancels/reconciles venue orders.
-- `risk-supervisor`: enforces bankroll, exposure, drawdown, and kill-switch limits.
+- `risk-supervisor`: enforces bankroll, exposure, drawdown, kill-switch, and copy-latency limits.
 
-### AWS service placement
-
-Start on ECS Fargate for operational simplicity. Promote latency-sensitive services to ECS on EC2 or EKS only when measurements show Fargate jitter is hurting fills. Use Graviton instances where dependencies support `aarch64-unknown-linux-gnu` and benchmark against x86.
-
-Inherited-prior first-trade and cluster-coordination modes default to shadow/paper in deployed configs. Ordinary leader-follow may reach live-tiny before these modes, because their validation, risk caps, and source-health dependencies are separate.
+Inherited-prior first-trade and cluster-coordination modes default to shadow/paper in deployed configs. Ordinary leader-follow may reach live-tiny before these modes; their validation, risk caps, and source-health dependencies are separate.
 
 ### Secrets and keys
 
 - Store venue API keys, wallet keys, and signing material in AWS Secrets Manager or KMS-backed secure stores.
 - No secrets in Git, Docker images, task definitions, logs, traces, or panic messages.
-- Production signing should be isolated behind a minimal internal signing service with allowlisted order-intent schemas.
+- Production signing is isolated behind a minimal internal signing service with allowlisted order-intent schemas.
 
 ### Release gates
 
@@ -145,8 +149,9 @@ A deployment cannot reach live mode unless:
 
 1. `rustc --version` is 1.95.0;
 2. all tests pass under `cargo nextest`;
-3. `cargo clippy --all-targets --all-features -D warnings` passes;
-4. `cargo deny` and `cargo audit` pass or have explicit reviewed exceptions;
+3. `cargo clippy --all-targets --all-features -- -D warnings` passes;
+4. `cargo deny check` and `cargo audit` pass or have explicit reviewed exceptions;
 5. replay determinism hash matches between CI and staging;
-6. live-tiny bankroll caps are configured;
-7. kill switch has been manually tested in staging.
+6. live-tiny bankroll caps are configured per the canonical TOML in `19-`;
+7. kill switch has been manually tested in staging;
+8. `flip_human_approved` and `kelly_fraction_above_default_human_approved` flags (`_GLOSSARY.md`) are explicitly false unless a signed config change has set them.

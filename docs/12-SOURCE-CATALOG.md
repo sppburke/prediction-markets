@@ -1,6 +1,7 @@
 # 12 — Source Catalog
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for source-freshness defaults.
 
 ## Objective
 
@@ -56,15 +57,31 @@ pub struct SourceManifest {
     pub access_method: AccessMethod,
     pub license_notes: String,
     pub expected_cadence: Option<Duration>,
-    pub max_stale: Duration,
+    pub max_stale: Duration,                           // see _GLOSSARY.md "Source freshness defaults"
     pub parser_version: semver::Version,
     pub replay_fixture_path: String,
 }
 ```
 
+## Per-source SLA defaults
+
+These are starting defaults for `max_stale`. They are overridden by the `_GLOSSARY.md` defaults where applicable; venue WebSocket / on-chain values come from `_GLOSSARY.md`.
+
+| Source class | `max_stale` | Block threshold |
+|---|---:|---:|
+| NWS final climate report | publication cadence × 2 | publication cadence × 4 |
+| NWS observations / METAR | 90 min | 4 h |
+| Chainlink stream | 30 s | 2 min |
+| Exchange WS trades/books | 2 s | 6 s |
+| Polymarket Data API poll | 1.5× polling interval | 4× polling interval |
+| `source-onchain-polygon` | `onchain_block_lag_warn` blocks | `onchain_block_lag_block` blocks |
+| BLS/BEA/Census release watcher | 5 min after expected | 30 min after expected |
+| Spotify/Netflix/Apple chart page | publication cadence × 2 | publication cadence × 4 |
+| USGS/NHC event feed | 10 min | 60 min |
+
 ## Access policy
 
-Edge must come from legitimate faster engineering, not access abuse. Do not bypass controls, violate license terms, use non-public material, overwhelm public systems, or evade rate limits.
+Edge must come from legitimate faster engineering, not access abuse. Do not bypass controls, violate license terms, use non-public material, overwhelm public systems, or evade rate limits (production budgets in `_GLOSSARY.md`).
 
 ## Redundancy
 
@@ -78,17 +95,6 @@ pub enum SourceDisagreementPolicy {
     RequireManualReview,
 }
 ```
-
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
 
 ## Winner-Follow trader-intelligence sources
 
@@ -104,7 +110,7 @@ This file is complete only when the implementation:
 ### Polygon public chain sources
 
 - Polymarket proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral-flow event logs where publicly derivable.
-- Wallet funding path and funder-root events for operator identity.
+- Wallet funding path and funder-root events for operator identity (`funding_max_hops` in `_GLOSSARY.md`).
 - Publicly versioned exchange/bridge/hot-wallet boundary labels.
 - Polygon JSON-RPC/archive node or equivalent licensed public-chain provider.
 

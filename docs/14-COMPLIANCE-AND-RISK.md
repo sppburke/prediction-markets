@@ -1,6 +1,7 @@
 # 14 — Compliance and Risk
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for the canonical risk-block taxonomy with halt scope.
 
 ## Objective
 
@@ -17,7 +18,7 @@ Every live strategy requires:
 - source access review;
 - venue terms/API review;
 - data license notes;
-- rate-limit behavior;
+- rate-limit behavior matches budgets in `_GLOSSARY.md`;
 - market-family legal risk note;
 - non-public information exclusion;
 - manipulation avoidance;
@@ -31,13 +32,14 @@ Every live strategy requires:
 - venue-level exposure;
 - market-level exposure;
 - family-level exposure;
-- source-health gate;
+- source-health gate (using `_GLOSSARY.md` freshness defaults);
 - resolver-card tradability gate;
 - stale-model gate;
 - order-rate gate;
 - reject-rate gate;
 - venue-reconciliation gate;
-- cross-venue fake-hedge gate.
+- cross-venue fake-hedge gate (`09-`);
+- copy-latency kill switch (production budget in `_GLOSSARY.md`).
 
 ## False edge taxonomy
 
@@ -50,43 +52,31 @@ Every live strategy requires:
 
 ## Operational controls
 
-- idempotent submissions;
+- idempotent submissions (key in `_GLOSSARY.md`);
 - durable local order journal;
 - startup/reconnect reconciliation;
 - cancel-on-disconnect policy;
 - manual and automatic kill switches;
 - immutable audit log;
 - replayable decisions;
-- per-strategy capital caps.
+- per-strategy capital caps (canonical in `19-`).
 
 ## Security
 
 - no secrets in logs/traces;
 - separate paper/live keys;
 - secret redaction in config;
-- dependency audit;
+- dependency audit (`cargo deny`, `cargo audit`);
 - minimal containers;
 - non-root runtime;
-- signing modules isolated.
+- signing modules isolated;
+- `flip_human_approved` and `kelly_fraction_above_default_human_approved` (`_GLOSSARY.md`) require signed config changes; both are audit-logged on every change.
 
 ## Responsible scaling
 
-Scale only when backtest, shadow, paper, and live-tiny behavior agree.
-
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
+Scale only when backtest, shadow, paper, and live-tiny behavior agree per the "close to simulation" definition in `_GLOSSARY.md`.
 
 ## Winner-Follow compliance and risk
-
-Winner-Follow must be implemented as public-data analysis and user-authorized copying only.
 
 Rules:
 
@@ -98,27 +88,17 @@ Rules:
 - Do not infer Polymarket operator identity from a simplistic first-USDC-sender rule; account for proxy wallets, pUSD collateral, deposit addresses, bridge/onramp flows, and documented funder semantics.
 - Do not market the system as guaranteed returns.
 - Display drawdown, ruin, liquidity, and copy-delay risk in operator dashboards.
-- Require explicit human approval before increasing Kelly fraction, bankroll, or venue permissions.
+- Require explicit human approval before increasing Kelly fraction, bankroll, or venue permissions (via `kelly_fraction_above_default_human_approved`).
 
-Risk controls specific to Winner-Follow:
-
-- leader concentration caps;
-- market-family concentration caps;
-- crowding/correlation caps;
-- automatic demotion after live underperformance;
-- copy-latency kill switch;
-- no copy entries during venue/API incident states;
-- no copying if the leader's current position cannot be reconstructed confidently;
-- operator, funder, and cluster concentration caps;
-- inherited-prior exposure caps and lower Kelly fractions;
-- automatic block or demotion when funding/collateral source health is stale;
-- anti-gaming flags for suspicious fresh-wallet seeding, cluster dilution, laundered funders, wash-like cluster behavior, and over-narrow market-family history.
-
-Default operator-aware block reasons:
+Risk controls specific to Winner-Follow are enforced via the canonical TOML in `19-`. Risk-block taxonomy (with halt scope per variant) is also in `19-` ("Risk-block taxonomy and halt scope"); the enum is shared with `risk-engine`:
 
 ```rust
 pub enum WinnerFollowRiskBlock {
     OperatorConcentrationExceeded,
+    LeaderConcentrationExceeded,
+    MarketConcentrationExceeded,
+    FamilyConcentrationExceeded,
+    TotalCopyExposureExceeded,
     FunderInheritedExposureExceeded,
     FunderSeedingRateSuspicious,
     ClusterMembershipUnstable,
@@ -126,5 +106,11 @@ pub enum WinnerFollowRiskBlock {
     OnchainSourceUnhealthy,
     ProxyFunderMappingUnproven,
     AntiGamingFlagActive,
+    IntradayDrawdownStop,
+    Rolling7dDrawdownStop,
+    KillSwitchDrawdown,
+    CopyLatencyKillSwitch,
 }
 ```
+
+The halt scope for each variant (this trade, this funder for the day, mode-wide, strategy-wide) is documented canonically in `19-`. Manual review is required to clear any `KillSwitchDrawdown`.

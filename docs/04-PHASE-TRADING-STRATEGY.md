@@ -1,6 +1,8 @@
 # 04 — Phase Trading Strategy
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for type aliases, latency budget, and configuration defaults.
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, eligibility thresholds, mode definitions, and promotion ladders. **All Winner-Follow numeric values in this file are pointers to that file.**
 
 ## Objective
 
@@ -20,17 +22,15 @@ FairValueSnapshot
   -> execution router
 ```
 
-
-
 ## Strategy 0 — Winner-Follow comes first
 
-Winner-Follow is the first strategy implemented and the first strategy allowed into live-tiny mode. Resolver/source-arbitrage strategies are Strategy 1+.
+Winner-Follow is the first strategy implemented and the first allowed into live-tiny mode. Resolver/source-arbitrage strategies are Strategy 1+.
 
 ### Why it comes first
 
-The strategy does not require building a proprietary weather station network, crypto oracle predictor, sports feed parser, or macro-release parser before it can produce signals. It requires public-market research, trader-performance reconstruction, continuous monitoring, copy latency, and risk sizing. That makes it the fastest path to a deployable system while the deeper source-arbitrage stack is built.
+The strategy does not require building a proprietary weather station network, crypto oracle predictor, sports feed parser, or macro-release parser before producing signals. It requires public-market research, trader-performance reconstruction, continuous monitoring, copy latency, and risk sizing. That makes it the fastest path to a deployable system while the deeper source-arbitrage stack is built.
 
-It still has real risk. The strategy's edge is not "free money"; it is a measurable empirical claim that selected public traders' future entries contain signal that survives copy delay and costs.
+It still has real risk: the strategy's edge is not "free money"; it is a measurable empirical claim that selected public traders' future entries contain signal that survives copy delay and costs (see edge-claim inequality in `19-WINNER-FOLLOW-STRATEGY.md`).
 
 ### End-to-end pipeline
 
@@ -40,12 +40,12 @@ Candidate discovery
   -> operator identity collapse
   -> public trader ledger reconstruction
   -> walk-forward follower simulation
-  -> top-50 active operator/leader ranking
+  -> top-N active operator/leader ranking          (N = active_watchlist_size, _GLOSSARY.md)
   -> continuous leader watch
   -> trade and signal-kind classification
   -> copy eligibility check
-  -> calibrated p and fractional Kelly
-  -> risk-gated OrderIntent
+  -> calibrated p and fractional Kelly             (see 19-)
+  -> risk-gated OrderIntent                        (see 19-)
   -> execution router
   -> fill/reconcile
   -> live decay monitoring
@@ -53,56 +53,17 @@ Candidate discovery
 
 ### Trader universe
 
-Polymarket candidate discovery starts from:
+Polymarket candidate discovery starts from sources listed in `19-WINNER-FOLLOW-STRATEGY.md` ("Candidate discovery"). Wallets are collapsed into operators only when funding/collateral evidence is public, reproducible, and confidence-scored at `≥ funder_root_min_confidence_ppm` (`_GLOSSARY.md`).
 
-- leaderboard by category and offset;
-- top users by recent PnL and volume;
-- users repeatedly appearing in profitable short-duration markets;
-- users whose trades produce favorable post-entry drift;
-- users with public profiles and sufficient trade/position data.
-- fresh wallets funded by a known operator/funder with a strong, replayable track record;
-- same-operator clusters whose member wallets coordinate on the same market/outcome/side within a short window.
-
-Wallets are collapsed into operators only when funding/collateral evidence is public, reproducible, and confidence-scored. Polymarket proxy-wallet, pUSD, deposit, and bridge flows must be verified before using funding identity for sizing.
-
-Kalshi candidate discovery is not equivalent because public trades do not identify traders. Kalshi copy trading is enabled only for public/authorized trader data. Otherwise Kalshi signals remain market-flow and source/resolver signals.
+Kalshi candidate discovery is not equivalent because public trades do not identify traders. Kalshi copy trading is enabled only for public/authorized trader data; otherwise Kalshi signals remain market-flow and source/resolver signals.
 
 ### Eligibility thresholds
 
-Use these initial thresholds, then tune with walk-forward optimization:
-
-| Filter | Default |
-|---|---:|
-| Rolling audit window | 180 days |
-| Minimum closed trades | 60 |
-| Minimum resolved markets | 30 |
-| Minimum closed trades in last 30 days | 12 |
-| Median capital-weighted hold | <= 72 hours |
-| 75th percentile hold | <= 7 days |
-| Max profit from one market | <= 20% |
-| Max uncopiable profit contribution | <= 35% |
-| Minimum lower 5% daily log-growth | > 0 after costs |
-| Active watchlist size | top 50 leaders |
-| Incubator watchlist size | up to 250 candidates |
-| Inherited-prior first-trade mode | paper by default |
-| Cluster-coordination mode | shadow by default |
-
-These replace the arbitrary `average hold < 5 days` and `>= 15 trades` rule. Shorter holding periods are good only when the edge survives copy latency; more trades are useful only when they are independent and reproducible.
+See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibility thresholds"). Watchlist sizes are `active_watchlist_size = 50` and `incubator_watchlist_size = 250` (`_GLOSSARY.md`).
 
 ### Trade classification
 
-Each observed leader trade is classified as:
-
-- `Entry`: opens a new position or reopens a flat market.
-- `Add`: increases an existing position in the same direction.
-- `Trim`: reduces but does not close.
-- `Exit`: closes or near-closes.
-- `Flip`: changes net direction.
-- `Unknown`: insufficient state; never copy as an entry.
-
-Only `Entry` and high-confidence `Add` trades can initiate follower exposure. `Exit` and `Trim` events can reduce follower exposure if the follower has a mirrored position and liquidity is acceptable.
-
-Signal kind is separate from trade action:
+Each observed leader trade is classified as `Entry`, `Add`, `Trim`, `Exit`, `Flip`, or `Unknown`. Action eligibility (which actions can initiate, reduce, or are blocked) and the confidence thresholds (`add_high_confidence_threshold_ppm`, `exit_high_confidence_threshold_ppm`) are defined canonically in `19-WINNER-FOLLOW-STRATEGY.md` ("Signal classification").
 
 ```rust
 pub enum WinnerFollowSignalKind {
@@ -112,82 +73,41 @@ pub enum WinnerFollowSignalKind {
 }
 ```
 
-`FreshWalletFirstTrade` requires a fresh wallet, low prior trade count, known operator/funder track record, low funding hop count, sane cluster size, low seeding velocity, and no anti-gaming flags. `ClusterCoordination` requires at least `K` member wallets of the same operator entering the same market/outcome/side within window `W`; it is emitted once per `(operator, market, outcome, side, window)`.
+Signal-kind preconditions and `K`/`W` defaults (`cluster_coord_min_members_K = 3`, `cluster_coord_window_seconds_W = 300`) are in `_GLOSSARY.md`.
 
 ### Copy eligibility
 
-Do not copy unless all are true:
+Do not copy unless ALL are true:
 
-1. leader is active top-50 at decision time;
-2. the event is `Entry` or approved `Add`;
-3. current price is within the max slippage budget from leader's observed entry;
+1. leader is in active top-`active_watchlist_size` at decision time;
+2. the event is `Entry` or an `Add` meeting the high-confidence rule in `19-`;
+3. current price is within `max_slippage_from_leader_bps` of leader's observed entry;
 4. market liquidity can fill the follower order without exceeding adverse-selection limits;
-5. market is not in a blocked category, settlement dispute state, or stale metadata state;
+5. market is not in a blocked category, settlement dispute, or stale-metadata state;
 6. leader's family-specific model has positive lower-confidence expected log growth;
-7. portfolio risk caps permit new exposure;
-8. order can be represented as an idempotent `OrderIntent` and replayed.
+7. portfolio risk caps permit new exposure (caps in `19-`);
+8. order can be represented as an idempotent `OrderIntent` and replayed (key in `_GLOSSARY.md` "Idempotency").
 
 Additional gates for inherited-prior and cluster-coordination signals:
 
-1. operator identity confidence is above threshold;
-2. `source-onchain-polygon` is healthy and within block-lag limits;
-3. proxy-wallet/funder/collateral mapping is proven for the wallet class;
-4. inherited prior is shrinkage-adjusted with capped `effective_n`;
-5. anti-gaming flags are absent or configured to demote rather than block;
-6. mode-specific promotion state permits the order mode.
+1. operator identity confidence ≥ `funder_root_min_confidence_ppm`;
+2. `source-onchain-polygon` is healthy and within `onchain_block_lag_block`;
+3. proxy-wallet/funder/collateral mapping is proven for the wallet class (see `21-`);
+4. inherited prior is shrinkage-adjusted with `effective_n ≤ inherited_prior_max_effective_n`;
+5. anti-gaming flags absent or configured to demote rather than block;
+6. mode-specific promotion state permits the order mode (`19-` "Promotion ladder").
 
 ### Fractional Kelly sizing
 
-For a binary contract with current follower entry price `c` and calibrated follower win probability `p`:
-
-```text
-f_full = max(0, (p - c) / (1 - c))
-f_live = f_full * kelly_fraction
-stake_dollars = bankroll * f_live
-contracts = floor(stake_dollars / c)
-```
-
-Default `kelly_fraction`:
-
-- 0.10x in dry-run sanity checks;
-- 0.25x in live-tiny;
-- 0.50x only after live data proves stability;
-- never above 0.50x without explicit human approval.
-
-Mode-specific defaults:
-
-```toml
-[winner_follow.kelly]
-fraction_leader_promoted = 0.25
-fraction_leader_live_tiny = 0.10
-fraction_inherited_prior = 0.05
-fraction_cluster_coordination = 0.15
-```
-
-Use net `c` after fees, expected slippage, and adverse-selection buffer. Reject trades where `f_live` is positive only because of stale or uncalibrated `p`.
+Formula and Kelly fractions per mode are in `19-WINNER-FOLLOW-STRATEGY.md` ("Kelly sizing"). Use net `c` (after fees, expected slippage, adverse-selection buffer). Reject trades where `f_live > 0` only because `p` is stale or uncalibrated.
 
 ### Risk caps
 
-| Cap | Default |
-|---|---:|
-| Live-tiny max per copied trade | 0.25% bankroll |
-| Promoted max per copied trade | 1.00% bankroll |
-| Max per leader | 3.00% bankroll |
-| Max per operator | 3.00% bankroll |
-| Max per market | 2.00% bankroll |
-| Max per market family | 8.00% bankroll |
-| Max all copy exposure | 25.00% bankroll |
-| Max inherited-prior exposure | 1.00% bankroll |
-| Max cluster-coordination exposure | 2.00% bankroll |
-| Max per operator per market | 0.75% bankroll |
-| Max inherited-prior trades per funder per day | 3 |
-| Intraday new-entry stop | -2.00% bankroll |
-| Rolling 7-day new-entry stop | -6.00% bankroll |
-| Absolute kill-switch drawdown | -10.00% bankroll |
+The canonical cap TOML lives in `19-WINNER-FOLLOW-STRATEGY.md` ("Canonical risk caps"). This file does not restate the values.
 
 ### Strategy trait implementation
 
-`strategy-winner-follow` implements the same strategy trait as every other strategy but receives `LeaderSignal` and `TraderRankSnapshot` in context. It emits `OrderIntent` only; it never submits orders directly.
+`strategy-winner-follow` implements the same strategy trait as every other strategy but receives `LeaderSignal` and `TraderRankSnapshot` in context. It emits `OrderIntent` only.
 
 ```rust
 pub struct WinnerFollowStrategy {
@@ -195,27 +115,14 @@ pub struct WinnerFollowStrategy {
     pub min_rank: TraderRankCutoff,
     pub kelly_fraction: KellyFraction,
     pub max_copy_slippage: PriceDelta,
-    pub risk_caps: CopyRiskCaps,
+    pub risk_caps: CopyRiskCaps,                  // loaded from `19-` canonical TOML
     pub modes: WinnerFollowModes,
 }
 ```
 
-```toml
-[winner_follow.modes]
-leader_follow = "live_tiny"
-inherited_prior_first_trade = "paper"
-cluster_coordination = "shadow"
-```
-
 ### Promotion path
 
-1. Historical reconstruction.
-2. Walk-forward backtest.
-3. Paper-copy live signals.
-4. Live-tiny with 0.10x-0.25x Kelly and small bankroll.
-5. Promotion only after the realized follower distribution matches the simulated distribution.
-
-Inherited-prior first-trade and cluster-coordination modes have separate promotion ladders and cannot inherit validation from ordinary leader-follow. They share ingestion and execution infrastructure, not statistical approval.
+The full per-mode ladder, with quantified gates (KS p-value, mean-PnL z-score, observation length, fill-rate match, latency match, demotion-resets-clock rule), is in `19-WINNER-FOLLOW-STRATEGY.md` ("Promotion ladder", "Promotion and demotion criteria") and `_GLOSSARY.md` ("Promotion criteria — quantified", "Demotion criteria"). All "matches simulation" / "close to" / "stable" qualifiers in this file resolve through those tables.
 
 ## Strategy trait
 
@@ -247,7 +154,7 @@ pub struct Order<S> {
 }
 ```
 
-The execution router owns transitions. This prevents invalid state transitions from compiling.
+The execution router owns transitions. Invalid state transitions do not compile.
 
 ## Strategy classes
 
@@ -261,7 +168,7 @@ Trade when upstream data predicts resolver state before final publication. Best 
 
 ### Cross-venue mismatch
 
-Trade divergence only after compatibility classification. Do not call it a hedge unless resolver rules prove it.
+Trade divergence only after compatibility classification. Do not call it a hedge unless the resolver rules prove it (see `09-CROSS-VENUE-MISMATCHES-AND-HEDGES.md`).
 
 ### Passive microstructure
 
@@ -289,30 +196,22 @@ No strategy trades on gross edge.
 pub enum RiskDecision {
     Allow,
     Resize { new_qty: ContractQty, reason: String },
-    Block { reason: String },
-    KillSwitch { reason: String },
+    Block { reason: WinnerFollowRiskBlock },                  // taxonomy in 19-
+    KillSwitch { reason: WinnerFollowRiskBlock },
 }
 ```
 
-Risk checks are pure, deterministic Rust functions. Inputs are explicit snapshots: positions, orders, balances, source health, venue health, limits, and resolver confidence.
+Risk checks are pure, deterministic Rust functions. Inputs are explicit snapshots: positions, orders, balances, source health, venue health, limits, resolver confidence, and the approval flags `flip_human_approved` / `kelly_fraction_above_default_human_approved` (`_GLOSSARY.md`).
 
 ## Execution safety
 
-- idempotency key per submission;
+- idempotency key per submission (key in `_GLOSSARY.md`);
 - local journal before network call;
-- stale intent expiration;
+- stale intent expiration after `order_validity_seconds` (`19-`);
 - reconnect/reconcile before new orders;
 - cancel-on-disconnect policy;
 - venue maintenance awareness;
 - account/position reconciliation;
-- per-venue rate-limit handling.
+- per-venue rate-limit handling using `_GLOSSARY.md` budgets.
 
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
+Market vs limit: the engine submits limit orders by default. Market orders are only used when `prefer_market_order = true` AND the market passes the "very liquid" gate in `_GLOSSARY.md`.

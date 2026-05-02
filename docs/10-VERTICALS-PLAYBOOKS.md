@@ -1,6 +1,18 @@
 # 10 — Vertical Playbooks
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+
+## 0) Winner-Follow vertical — first implementation
+
+**Rust crates:** `source-onchain-polygon`, `operator-graph`, `trader-index`, `copy-signal-engine`, `kelly-sizer`, `strategy-winner-follow`, `venue-polymarket`, optional `venue-kalshi` for authorized trader data.
+
+**Goal:** compound bankroll by copying selected leaders whose public trades historically generate positive follower log-growth after copy delay and costs. Full spec in `19-WINNER-FOLLOW-STRATEGY.md`.
+
+**Primary source:** Polymarket public leader/profile/trade/position/activity data plus public Polygon proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding/collateral events where publicly derivable.
+
+**Secondary use:** resolver/source playbooks (1–7 below) validate or veto copied trades. Example: if a top leader buys a weather contract but the weather resolver engine strongly disagrees, reduce size or block.
+
+**Risk:** crowding, false skill, uncopiable speed, hidden exits, low liquidity, one-off luck, strategy drift, wallet/operator double-counting, fresh-wallet baiting, cluster dilution, and unproven proxy/funder mapping.
 
 ## 1) Short-horizon crypto
 
@@ -71,26 +83,3 @@
 **Models:** first-confirmation detector, geospatial filter, threshold evaluator, preliminary/final revision handler.
 
 **Trap:** preliminary data revisions.
-
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
-
-## 0) Winner-Follow vertical — first implementation
-
-**Rust crates:** `source-onchain-polygon`, `operator-graph`, `trader-index`, `copy-signal-engine`, `kelly-sizer`, `strategy-winner-follow`, `venue-polymarket`, optional `venue-kalshi` for authorized trader data.
-
-**Goal:** compound bankroll by copying selected leaders whose public trades historically generate positive follower log-growth after copy delay and costs.
-
-**Primary source:** Polymarket public leader/profile/trade/position/activity data plus public Polygon proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding/collateral events where publicly derivable.
-
-**Secondary use:** resolver/source playbooks validate or veto copied trades. Example: if a top leader buys a weather contract but the weather resolver engine strongly disagrees, reduce size or block.
-
-**Risk:** crowding, false skill, uncopiable speed, hidden exits, low liquidity, one-off luck, strategy drift, wallet/operator double-counting, fresh-wallet baiting, cluster dilution, and unproven proxy/funder mapping.

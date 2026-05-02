@@ -1,6 +1,7 @@
 # 07 — Venue Playbook: Kalshi
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for type aliases and Kalshi rate-limit defaults.
 
 ## Objective
 
@@ -27,12 +28,14 @@ Responsibilities:
 
 ## Types
 
+Authoritative in `core-types`; illustrative subset:
+
 ```rust
-pub struct KalshiMarketTicker(String);
-pub struct KalshiEventTicker(String);
-pub struct KalshiOrderId(String);
-pub struct KalshiPriceCents(u8);
-pub struct KalshiCountFp(Decimal);
+pub struct KalshiMarketTicker(pub String);
+pub struct KalshiEventTicker(pub String);
+pub struct KalshiOrderId(pub String);
+pub struct KalshiPriceCents(pub u8);
+pub struct KalshiCountFp(pub Decimal);
 pub enum KalshiSide { Yes, No }
 pub enum KalshiOrderStatus { Resting, PartiallyFilled, Filled, Cancelled, Rejected, Unknown }
 ```
@@ -42,7 +45,7 @@ pub enum KalshiOrderStatus { Resting, PartiallyFilled, Filled, Cancelled, Reject
 - Build book from snapshot then deltas.
 - Detect gaps and resubscribe.
 - Emit typed `VenueEvent`s.
-- Track heartbeat and staleness.
+- Track heartbeat and staleness against `_GLOSSARY.md` "Source freshness defaults" (Kalshi WS stale = 2 s, block = 6 s).
 - Reconcile after reconnect.
 - No strategy reads raw JSON.
 
@@ -52,7 +55,7 @@ Kalshi queue data is a strategy feature. Passive orders require fill probability
 
 ## Order groups and combos
 
-Order groups should be used for fast related orders once live size exceeds tiny mode. Combos are feature-gated until liquidity, fill, and unwind behavior are tested.
+Order groups are used for fast related orders once live size exceeds tiny mode. Combos are feature-gated until liquidity, fill, and unwind behavior are tested.
 
 ## Strong Kalshi verticals
 
@@ -63,20 +66,9 @@ Order groups should be used for fast related orders once live size exceeds tiny 
 - Sports: official status/result source with correction handling.
 - Official-stat pages: gas, fertilizer, rankings, other published benchmarks.
 
-
-## Common acceptance gate
-
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
-
-
 ## Winner-Follow implications for Kalshi
 
-Kalshi is not treated as equivalent to Polymarket for trader-level copy trading. The public trade feed gives market-level executions, not a public trader identity in each trade message. Kalshi's leaderboard is an opt-in performance feature, but leaderboard appearance alone is not enough to reconstruct live trades for copying.
+Kalshi is not equivalent to Polymarket for trader-level copy trading. The public trade feed gives market-level executions, not a public trader identity per trade message. Kalshi's leaderboard is opt-in, but leaderboard appearance alone is not enough to reconstruct live trades for copying.
 
 Therefore:
 
@@ -84,3 +76,5 @@ Therefore:
 - otherwise use Kalshi data for market-flow signals, liquidity/queue analytics, and resolver/source strategies;
 - never infer that a public Kalshi trade belongs to a leaderboard trader without evidence;
 - never attempt credential sharing, scraping private data, or bypassing platform privacy controls.
+
+`KalshiLeaderSignal::Authorized` and `KalshiMarketFlowSignal::Anonymous` are kept as separate types so the strategy cannot accidentally copy unidentified users.

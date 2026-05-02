@@ -1,6 +1,7 @@
 # 05 — Phase Backtesting
 
-> **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
+> See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for the "close to simulation" definition (KS p-value, mean-PnL z-score) and configuration defaults.
 
 ## Objective
 
@@ -30,7 +31,7 @@ pub enum ReplaySpeed {
 }
 ```
 
-Replay must rebuild source state, venue books, resolver state, model output, strategy decisions, risk decisions, order lifecycle, fills, and settlement.
+Replay rebuilds source state, venue books, resolver state, model output, strategy decisions, risk decisions, order lifecycle, fills, and settlement.
 
 ## Backtest modes
 
@@ -61,6 +62,8 @@ Use `loom` for hot shared state: order book deltas, order journal transitions, c
 
 ## Reports
 
+Base report:
+
 ```rust
 pub struct BacktestReport {
     pub run_id: uuid::Uuid,
@@ -77,28 +80,64 @@ pub struct BacktestReport {
 }
 ```
 
+Winner-Follow extension (emitted alongside the base report by `strategy-winner-follow` runs):
 
-## Common acceptance gate
+```rust
+pub struct WinnerFollowReport {
+    pub base: BacktestReport,
+    pub mode: WinnerFollowMode,                      // leader_follow | inherited_prior_first_trade | cluster_coordination
 
-This file is complete only when the implementation:
-1. compiles as Rust 2024;
-2. uses typed IDs, prices, probabilities, quantities, timestamps, and resolver states;
-3. writes replayable events with raw payload hashes;
-4. has fixture tests and deterministic replay;
-5. blocks live execution when source, resolver, venue, or risk state is invalid.
+    // Compounding and exposure
+    pub expected_log_growth_per_day: Decimal,
+    pub realized_log_growth_per_day: Decimal,
+    pub lcb_5pct_log_growth_per_day: Decimal,
+    pub turnover_bankroll_per_day: Decimal,
 
+    // Latency and fill
+    pub copy_delay_p50_ms: u32,
+    pub copy_delay_p95_ms: u32,
+    pub copy_delay_p99_ms: u32,
+    pub edge_decay_by_delay_bps: BTreeMap<DelayBucket, i32>,
+    pub fill_rate_simulated_vs_realized: (ProbabilityPpm, ProbabilityPpm),
+
+    // Hold and concentration
+    pub hold_p50_seconds: u32,
+    pub hold_p75_seconds: u32,
+    pub max_single_market_pnl_pct: Decimal,
+    pub uncopiable_pnl_pct: Decimal,
+
+    // Watchlist dynamics
+    pub leader_churn_rate_per_day: Decimal,
+    pub demotion_count_by_cause: BTreeMap<DemotionCause, u32>,
+
+    // Operator-aware
+    pub exposure_by_operator_bps: BTreeMap<OperatorId, i32>,
+    pub wallet_to_operator_confidence_p50: ProbabilityPpm,
+    pub inherited_prior_effective_n_p50: u32,
+    pub fresh_wallet_outcomes: ModeOutcomes,
+    pub cluster_coordination_outcomes: ModeOutcomes,
+    pub anti_gaming_flag_counts: BTreeMap<AntiGamingFlag, u32>,
+    pub onchain_source_lag_p95_blocks: u32,
+
+    // Promotion-relevant
+    pub paper_vs_backtest_ks_pvalue: Decimal,
+    pub paper_vs_backtest_mean_z: Decimal,
+}
+```
+
+`DelayBucket` matches the survivability buckets in `19-WINNER-FOLLOW-STRATEGY.md`.
 
 ## Winner-Follow backtesting and validation
 
-Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A historical leader trade is not copied at the leader's price unless the follower could actually have filled there after discovery delay, API delay, decision delay, order routing, queue position, and slippage.
+Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A historical leader trade is not copied at the leader's price unless the follower could have filled there after discovery delay, API delay, decision delay, order routing, queue position, and slippage.
 
 ### Required replay modes
 
 1. **Leader reconstruction replay:** rebuild each candidate's historical positions from public trades/activity/positions.
 2. **Ranking replay:** at each historical time `t`, rank candidates using only data available before `t`.
 3. **Follower replay:** copy eligible trades after simulated latency and with book-aware fill assumptions.
-4. **Portfolio replay:** apply Kelly sizing, caps, correlated exposure limits, exits, and drawdown stops.
-5. **Live-vs-backtest drift replay:** compare paper/live outcomes against simulated expectations.
+4. **Portfolio replay:** apply Kelly sizing, caps, correlated exposure limits, exits, and drawdown stops (caps in `19-`).
+5. **Live-vs-backtest drift replay:** compare paper/live outcomes against simulated expectations using the "close to simulation" definition in `_GLOSSARY.md`.
 6. **Operator graph replay:** rebuild funding/collateral graph state and operator identities exactly as known at historical time `t`.
 
 ### Bias controls
@@ -113,14 +152,6 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 - No using future funding edges, future cluster members, future labels, or future operator PnL to identify a funder as skilled at historical time `t`.
 - No treating CrowdIntel or other opaque third-party cluster scores as replayable production truth unless the exact input/export is logged and licensed.
 
-### Metrics
-
-Report expected and realized log-growth per day, CAGR-equivalent under daily compounding, max drawdown, turnover, average hold, copy delay distribution, edge decay by delay bucket, fill rate, slippage, fees, hit rate by price bucket, profit concentration, active exposure by leader/family/market, leader churn, and demotion causes.
-
-Operator-aware reports also include operator-level exposure, wallet-to-operator membership confidence, inherited-prior effective sample size, fresh-wallet first-trade outcomes, cluster-coordination outcomes, anti-gaming flags, funding/collateral source lag, and promotion status by mode.
-
 ### Acceptance gate
 
-Winner-Follow can enter live-tiny only if its walk-forward lower 5% expected daily log growth is positive after conservative costs and the simulated drawdown is acceptable under the configured bankroll cap.
-
-Inherited-prior first-trade and cluster-coordination modes require separate walk-forward acceptance reports. They cannot be promoted because ordinary leader-follow passed.
+Winner-Follow can enter live-tiny only if the gates in `19-WINNER-FOLLOW-STRATEGY.md` ("Promotion ladder") and `_GLOSSARY.md` ("Promotion criteria — quantified") all pass for ordinary leader-follow. `inherited_prior_first_trade` and `cluster_coordination` modes have separate walk-forward acceptance reports and are not promoted because ordinary leader-follow passed.
