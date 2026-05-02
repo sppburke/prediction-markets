@@ -18,6 +18,20 @@ All first-party production services, clients, parsers, models, replay tools, CLI
 - **Observability:** `tracing`, `tracing-opentelemetry`, OpenTelemetry metrics/logs/traces.
 - **Testing:** `proptest`, `loom`, `shuttle`, `cargo-nextest`, `criterion`, `insta`, fake source/venue servers.
 
+## Build profile
+
+Production-tier builds (`release`, `bench`, and the dedicated `profiling` profile) use thin LTO. Dev and test profiles keep Cargo defaults so incremental builds and the CI test gate stay fast.
+
+```toml
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+```
+
+`bench` inherits from `release`, so it is thin LTO automatically; do not override. The concrete TOML and the `[profile.profiling]` block live in `16-RUST-WORKSPACE-ARCHITECTURE.md`.
+
 ## Required workspace lints
 
 ```toml

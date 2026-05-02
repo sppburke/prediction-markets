@@ -88,15 +88,25 @@ Pure risk checks with typed inputs and deterministic decisions. The risk-block t
 
 ## Build profile
 
+Authoritative rule and rationale: see `_BASELINE.md` "Build profile". Thin LTO applies to every production-tier profile (`release`, `bench`, `profiling`); dev and test keep Cargo defaults.
+
 ```toml
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
 ```
 
-Keep a profiling build with symbols for latency work.
+`profiling` is the build used for flamegraphs and latency work — same codegen as `release` so numbers stay representative, but with symbols retained.
 
 ## Winner-Follow crate boundaries
 
