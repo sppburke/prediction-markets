@@ -2,13 +2,13 @@
 
 ## Project Structure & Module Organization
 
-This repo is specification-only for `prediction-edge`, a Rust 1.95.0 / Rust 2024 trading and research workspace for Polymarket and Kalshi. Root files: `README.md` overview, `CLAUDE.md` agent context, this file contributor guide.
+This repo hosts `prediction-edge`, a Rust 1.95.0 / Rust 2024 trading and research workspace for Polymarket and Kalshi. Root files: `README.md` overview, `CLAUDE.md` agent context, this file contributor guide. Phase 0 has shipped `crates/` (`pe-config`, `pe-service`), `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, and `.github/workflows/ci.yml`.
 
-Primary material lives in `docs/`. Start with `docs/_BASELINE.md`, `docs/_GLOSSARY.md`, `docs/19-WINNER-FOLLOW-STRATEGY.md`, `docs/AGENTS.md`, `docs/SKILLS.md`, then the relevant phase, venue, or source doc. Phase 0 will add `crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, and `.github/workflows/`.
+Primary material lives in `docs/`. Start with `docs/_BASELINE.md`, `docs/_GLOSSARY.md`, `docs/19-WINNER-FOLLOW-STRATEGY.md`, `docs/AGENTS.md`, `docs/SKILLS.md`, then the relevant phase, venue, or source doc.
 
 ## Build, Test, and Development Commands
 
-No active build exists until the Rust workspace is committed. For docs, validate links, examples, and canonical references manually. Once the workspace exists, run:
+The full acceptance gate (also run in CI):
 
 ```bash
 rustc --version              # must contain 1.95.0
