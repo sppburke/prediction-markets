@@ -60,3 +60,7 @@ Build a Rust system that measures how fast public leader trades lose edge after 
 ## 0.1) Leader-resolver hybrid veto engine
 
 Combine Winner-Follow with resolver-source engines. Copy a leader only when the independent resolver model is neutral or supportive; downsize or block when the resolver model contradicts the leader. This creates a hybrid strategy that starts from public skill but does not blindly follow it.
+
+## 0.2) Operator-aware first-trade incubator
+
+Build a replayable Polygon funding/collateral graph for Polymarket proxy wallets and use it to detect when a fresh wallet's first meaningful trade is linked to a known high-quality operator. The experiment is useful only if proxy/funder/collateral mapping is public and reproducible, inherited priors remain heavily shrunk, anti-gaming flags are effective, and paper-mode outcomes beat baseline after latency and costs.

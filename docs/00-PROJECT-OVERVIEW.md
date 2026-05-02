@@ -41,14 +41,20 @@ The first production strategy is **Winner-Follow**: continuously discover, rank,
 
 Winner-Follow ships before weather, crypto, macro, sports, and chart/source-arbitrage strategies because it can be built using public venue/profile/trade data, deterministic analysis, and speed. Resolver-source strategies remain Strategy 1+ and are used later to validate whether copied trades have independent fundamental support.
 
+Winner-Follow is **operator-aware**, not wallet-naive. A public wallet is an observable proxy for a possible economic actor. The system builds a native, replayable Polygon funding/collateral graph from public chain data and official/public Polymarket surfaces, collapses wallets into deterministic `OperatorId`s when confidence is high, and applies ranking, correlation, and risk caps at the operator/funder/cluster level. CrowdIntel-style funding clusters are useful research inspiration, but opaque third-party scores or UI-only data are not production dependencies unless an authorized, replayable export or API exists.
+
+Fresh-wallet "first trade" following is an incubator sub-mode, not the default live strategy. A new wallet can inherit a heavily shrunk prior from a known operator/funder only when funding/collateral linkage is public, replayable, recent enough, low-hop, and not flagged as gaming. These trades start in shadow or paper mode and use much smaller Kelly fractions than promoted leader-follow trades.
+
 ### Venue support
 
-- **Polymarket:** first-class support. The public Data API exposes leaderboard, user trades, positions, activity, and related profile data, making trader-level reconstruction feasible.
+- **Polymarket:** first-class support. The public Data API exposes leaderboard, user trades, positions, activity, and related profile data, making trader-level reconstruction feasible. Polymarket also uses Polygon proxy wallets and pUSD collateral, so funding identity must be based on verified proxy/funder/collateral evidence rather than a simplistic first-USDC-sender rule.
 - **Kalshi:** limited trader-copy support. Kalshi exposes public trades and a leaderboard feature, but public trade messages do not identify the trader and leaderboard participation is opt-in. Kalshi is therefore used for copy-trading only when a lawful public identity-to-trade mapping exists, when a trader explicitly authorizes API/portfolio access, or when future official endpoints expose sufficient public trader-level data. Otherwise, Kalshi remains a venue for resolver-source strategies, market-flow analytics, and cross-venue checks.
 
 ### Ranking objective
 
 Rank traders by **walk-forward lower-confidence expected log-growth per day** for a follower account after simulated latency, spread, slippage, fees, partial fills, and position caps. Raw PnL, win rate, and leaderboard rank are inputs, not the final ranking target.
+
+When operator identity is confident, rank the operator-level track record first and keep wallet-level ledgers as sub-aggregations. Penalize uncertain membership, abnormal wallet-seeding velocity, narrow market-family specialization, wash-like coordination, and any cluster whose funding path is unstable or not reproducible.
 
 ### Default eligibility thresholds
 
@@ -63,6 +69,8 @@ The user-proposed `average hold < 5 days` and `>= 15 trades` are too loose for p
 - no single resolved market contributes more than **20%** of audited profit;
 - no more than **35%** of audited profit comes from positions too illiquid for the follower to enter within the latency/slippage budget.
 
+Fresh-wallet inherited-prior incubator requires a known operator with the active-leader sample threshold, a fresh wallet with no or minimal closed-trade history, a low-confidence-bounded inherited prior above baseline after shrinkage, funding hop count within the configured limit, sane cluster size, low seeding velocity, and no anti-gaming flags. It is paper-only until separately validated.
+
 ### Default sizing
 
 For a binary contract with current entry price `c` and calibrated copied-trade win probability `p`, the full-Kelly bankroll allocation to stake cost is:
@@ -74,7 +82,7 @@ f_live = kelly_fraction * f_full
 
 Use **quarter Kelly** by default during live-tiny and scale to half Kelly only after a statistically meaningful live audit. `p` is not the trader's naive win rate. It is a calibrated, shrinkage-adjusted probability conditional on trader, market family, odds bucket, liquidity, holding-period bucket, side, recency, and observed copy latency.
 
-Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 1.00% after promotion, max 3.00% per trader, max 8.00% per market family, max 25.00% total open copy exposure, and stop new entries after 2.00% intraday drawdown or 6.00% rolling 7-day drawdown until review.
+Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 1.00% after promotion, max 3.00% per trader/operator, max 8.00% per market family, max 25.00% total open copy exposure, and stop new entries after 2.00% intraday drawdown or 6.00% rolling 7-day drawdown until review. Inherited-prior trades have separate lower caps across all funders, per funder per day, per operator per market, and per cluster-coordination mode.
 
 
 ## Core trading thesis

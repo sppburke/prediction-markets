@@ -114,6 +114,19 @@ For each candidate trader, estimate conditional copied-trade win probability and
 
 Use Bayesian shrinkage so a trader with 15 lucky trades cannot outrank a trader with hundreds of robust trades. The default is a hierarchical beta-binomial layer for win probability plus a payoff/edge model for realized log return. The output is a distribution, not a point estimate.
 
+### Operator identity model
+
+Wallets are not assumed independent. `operator-graph` produces deterministic identity snapshots that the model can use as features:
+
+- `operator_id` and identity confidence;
+- funder root, funding hop count, wallet age, cluster size, and cluster rule version;
+- operator-level track record by market family and odds bucket;
+- inherited-prior mean, standard error, effective sample size, and shrinkage source;
+- seeding velocity and cluster-membership instability;
+- same-cluster co-movement on the same market/outcome/side within a configured window.
+
+The model must keep wallet-level and operator-level evidence separate. An inherited funder prior is a prior over a fresh wallet's copied trade, not proof that the fresh wallet has the operator's posterior skill.
+
 ### Copy survivability model
 
 A leader can be profitable while uncopiable. For every leader and market family, estimate:
@@ -139,6 +152,10 @@ score = LCB_5pct(expected_log_growth_per_day)
 
 Penalties include profit concentration, low sample size, illiquidity, uncopyable entries, excessive drawdown, market-family crowding, and strategy drift.
 
+When operator identity is confident, ranking starts from the operator-level distribution and keeps wallet-level results as sub-aggregations. Add penalties for uncertain membership, abnormal seeding velocity, narrow market-family specialization, and unstable funding/collateral paths.
+
 ### Probability for Kelly sizing
 
 `p` for Kelly sizing is the calibrated probability that **the copied follower trade**, entered at the current follower price and latency, resolves profitably. It is never a naive leaderboard win rate.
+
+For `FreshWalletFirstTrade`, `p` is built from a heavily shrunk inherited prior toward the category baseline and must carry an explicit `effective_n` cap. For `ClusterCoordination`, `p` includes the coordination feature only after walk-forward evidence shows that same-cluster co-movement survives latency, fees, and adverse selection.

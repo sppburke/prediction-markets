@@ -99,6 +99,7 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 3. **Follower replay:** copy eligible trades after simulated latency and with book-aware fill assumptions.
 4. **Portfolio replay:** apply Kelly sizing, caps, correlated exposure limits, exits, and drawdown stops.
 5. **Live-vs-backtest drift replay:** compare paper/live outcomes against simulated expectations.
+6. **Operator graph replay:** rebuild funding/collateral graph state and operator identities exactly as known at historical time `t`.
 
 ### Bias controls
 
@@ -109,11 +110,17 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 - No ignoring missed exits.
 - No ignoring market delistings, disputes, or stale prices.
 - No treating Kalshi public market trades as trader-attributed signals unless identity is public/authorized.
+- No using future funding edges, future cluster members, future labels, or future operator PnL to identify a funder as skilled at historical time `t`.
+- No treating CrowdIntel or other opaque third-party cluster scores as replayable production truth unless the exact input/export is logged and licensed.
 
 ### Metrics
 
 Report expected and realized log-growth per day, CAGR-equivalent under daily compounding, max drawdown, turnover, average hold, copy delay distribution, edge decay by delay bucket, fill rate, slippage, fees, hit rate by price bucket, profit concentration, active exposure by leader/family/market, leader churn, and demotion causes.
 
+Operator-aware reports also include operator-level exposure, wallet-to-operator membership confidence, inherited-prior effective sample size, fresh-wallet first-trade outcomes, cluster-coordination outcomes, anti-gaming flags, funding/collateral source lag, and promotion status by mode.
+
 ### Acceptance gate
 
 Winner-Follow can enter live-tiny only if its walk-forward lower 5% expected daily log growth is positive after conservative costs and the simulated drawdown is acceptable under the configured bankroll cap.
+
+Inherited-prior first-trade and cluster-coordination modes require separate walk-forward acceptance reports. They cannot be promoted because ordinary leader-follow passed.

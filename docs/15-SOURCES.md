@@ -23,6 +23,7 @@ Verify official venue docs again before live trading.
 ## Polymarket
 
 - Docs home: https://docs.polymarket.com/
+- Documentation index: https://docs.polymarket.com/llms.txt
 - WebSocket overview: https://docs.polymarket.com/market-data/websocket/overview
 - Market channel: https://docs.polymarket.com/market-data/websocket/market-channel
 - User channel: https://docs.polymarket.com/market-data/websocket/user-channel
@@ -33,9 +34,16 @@ Verify official venue docs again before live trading.
 - Order lifecycle: https://docs.polymarket.com/concepts/order-lifecycle
 - Authentication: https://docs.polymarket.com/api-reference/authentication
 - CLOB API introduction: https://docs.polymarket.com/api-reference/introduction
+- Polymarket 101 / proxy wallets: https://docs.polymarket.com/polymarket-101
+- Bridge deposit flow: https://docs.polymarket.com/trading/bridge/deposit
+- Supported bridge assets: https://docs.polymarket.com/trading/bridge/supported-assets
+- Bridge transaction status: https://docs.polymarket.com/trading/bridge/status
+- Contracts: https://docs.polymarket.com/developers/contracts
 
 ## Public sources
 
+- Polygon: https://polygon.technology/
+- Polygon JSON-RPC / provider docs for archive access as selected by implementation.
 - NOAA/NWS: https://www.weather.gov/
 - Aviation Weather Center API: https://aviationweather.gov/data/api/
 - NOAA HRRR: https://rapidrefresh.noaa.gov/hrrr/
@@ -81,7 +89,15 @@ Verify official venue docs again before live trading.
 - Polymarket API overview: https://docs.polymarket.com/api-reference/introduction
 - Polymarket leaderboard endpoint: https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings
 - Polymarket user trades endpoint: https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets
+- Polymarket profile/current positions/activity endpoints: https://docs.polymarket.com/api-reference/introduction
+- Polymarket authentication signature types and funder: https://docs.polymarket.com/api-reference/authentication
+- Polymarket proxy-wallet overview: https://docs.polymarket.com/polymarket-101
+- Polymarket deposit flow and pUSD collateral notes: https://docs.polymarket.com/trading/bridge/deposit
 - Polymarket WebSocket overview: https://docs.polymarket.com/market-data/websocket/overview
+- CrowdIntel network page, research only: https://crowdintel.xyz/network
+- CrowdIntel methodology, research only: https://crowdintel.xyz/methodology
+- CrowdIntel copy-trading guide, research only: https://crowdintel.xyz/docs/copy-trading-polymarket
+- CrowdIntel docs index, research only: https://crowdintel.xyz/docs
 - Kalshi API overview: https://docs.kalshi.com/welcome
 - Kalshi public trades websocket: https://docs.kalshi.com/websockets/public-trades
 - Kalshi historical trades: https://docs.kalshi.com/api-reference/historical/get-historical-trades
@@ -91,3 +107,8 @@ Verify official venue docs again before live trading.
 - AWS ECS: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html
 - AWS ECR: https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html
 - AWS Secrets Manager: https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html
+
+## Last research pass
+
+- 2026-05-02: Checked Polymarket official docs for public Data/Gamma/CLOB read endpoints, proxy wallets, signature type/funder behavior, and bridge deposit/pUSD collateral flow.
+- 2026-05-02: Checked CrowdIntel public pages for funding-network methodology. Treat as research inspiration only unless an authorized replayable API/export exists.

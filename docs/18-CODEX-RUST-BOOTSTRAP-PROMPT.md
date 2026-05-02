@@ -21,7 +21,7 @@ Architecture:
 - shadow/paper/live-tiny modes before scaled trading.
 
 Create crates:
-core-types, config, event-log, resolver-card, source-core, source-trader, source-weather, source-crypto, source-sports, source-macro, source-charts, source-events, venue-core, venue-kalshi, venue-polymarket, model-core, trader-index, copy-signal-engine, kelly-sizer, strategy-core, strategy-winner-follow, execution-core, risk-engine, replay, backtest, observability, cli, service.
+core-types, config, event-log, resolver-card, source-core, source-trader, source-onchain-polygon, source-weather, source-crypto, source-sports, source-macro, source-charts, source-events, venue-core, venue-kalshi, venue-polymarket, model-core, operator-graph, trader-index, copy-signal-engine, kelly-sizer, strategy-core, strategy-winner-follow, execution-core, risk-engine, replay, backtest, observability, cli, service.
 
 Strict requirements:
 - Rust edition 2024.
@@ -51,9 +51,12 @@ First milestone:
 
 Winner-Follow requirements:
 - Implement Polymarket public trader ingestion first: leaderboard, user trades, user positions, user activity, market/orderbook data.
+- Implement native Polygon funding/collateral ingestion for operator identity: proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding-path evidence where publicly derivable.
+- Build `operator-graph` as pure deterministic logic for wallet-to-operator collapse, inherited priors, cluster-coordination features, and anti-gaming flags.
 - Implement Kalshi copy support only as authorized/public trader-level data; otherwise keep Kalshi public trades as anonymous market-flow data.
-- Rank traders by walk-forward lower-confidence expected follower log-growth per day, not raw PnL.
+- Rank operators/traders by walk-forward lower-confidence expected follower log-growth per day, not raw PnL.
 - Use adaptive thresholds: 60 closed trades or 30 resolved markets, 12 recent closed trades, median hold <=72h, p75 hold <=7d.
 - Copy only entry/add trades that survive liquidity, latency, slippage, cost, and portfolio risk checks.
 - Size with calibrated quarter-Kelly by default, hard capped by trade, trader, market, family, total exposure, and drawdown.
+- Fresh-wallet first-trade inherited-prior mode defaults to paper with much smaller Kelly; cluster-coordination defaults to shadow.
 - Produce deterministic replay showing why each copied trade was or was not taken.

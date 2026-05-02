@@ -101,6 +101,15 @@ This file is complete only when the implementation:
 - Market/orderbook websocket for followed markets.
 - Public transaction hashes for timing verification.
 
+### Polygon public chain sources
+
+- Polymarket proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral-flow event logs where publicly derivable.
+- Wallet funding path and funder-root events for operator identity.
+- Publicly versioned exchange/bridge/hot-wallet boundary labels.
+- Polygon JSON-RPC/archive node or equivalent licensed public-chain provider.
+
+These sources feed `source-onchain-polygon` and `operator-graph`. They are not venue execution APIs and must remain replayable from raw logs plus parser/config versions.
+
 ### Kalshi trader/flow sources
 
 - Public trades REST and websocket for market-flow only.
@@ -111,3 +120,5 @@ This file is complete only when the implementation:
 ### Data ethics
 
 Use public APIs, official exports, and user-authorized data. Do not scrape private pages, bypass access controls, impersonate users, or join data in a way that violates venue terms or privacy commitments.
+
+CrowdIntel and similar products may be used as research references for methodology and manual validation, but their UI-only data, opaque scores, and proprietary cluster labels are not production decision inputs unless an authorized, stable, replayable export/API is available and reviewed.

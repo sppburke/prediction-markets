@@ -74,14 +74,16 @@ Use Terraform, OpenTofu, Pulumi, or AWS CDK. Do not click-build production resou
 Winner-Follow MVP services:
 
 1. `source-gateway-trader`
-2. `trader-ledger-builder`
-3. `leader-ranker`
-4. `copy-signal-engine`
-5. `strategy-winner-follow`
-6. `risk-supervisor`
-7. `execution-router`
-8. `reconciler`
-9. `ops-api`
+2. `source-gateway-onchain-polygon`
+3. `operator-graph-worker`
+4. `trader-ledger-builder`
+5. `leader-ranker`
+6. `copy-signal-engine`
+7. `strategy-winner-follow`
+8. `risk-supervisor`
+9. `execution-router`
+10. `reconciler`
+11. `ops-api`
 
 Later resolver-source services add weather, crypto, sports, macro, charts, and event feeds.
 

@@ -94,6 +94,8 @@ Rules:
 - Respect venue terms, rate limits, API restrictions, and geographic/account restrictions.
 - Do not attempt to deanonymize Kalshi traders from anonymous public trades.
 - Do not use hacked, leaked, private, or access-controlled data.
+- Do not use CrowdIntel UI output, opaque proprietary scores, or non-replayable third-party cluster labels in live decisions unless a reviewed license and replayable export/API exist.
+- Do not infer Polymarket operator identity from a simplistic first-USDC-sender rule; account for proxy wallets, pUSD collateral, deposit addresses, bridge/onramp flows, and documented funder semantics.
 - Do not market the system as guaranteed returns.
 - Display drawdown, ruin, liquidity, and copy-delay risk in operator dashboards.
 - Require explicit human approval before increasing Kelly fraction, bankroll, or venue permissions.
@@ -106,4 +108,23 @@ Risk controls specific to Winner-Follow:
 - automatic demotion after live underperformance;
 - copy-latency kill switch;
 - no copy entries during venue/API incident states;
-- no copying if the leader's current position cannot be reconstructed confidently.
+- no copying if the leader's current position cannot be reconstructed confidently;
+- operator, funder, and cluster concentration caps;
+- inherited-prior exposure caps and lower Kelly fractions;
+- automatic block or demotion when funding/collateral source health is stale;
+- anti-gaming flags for suspicious fresh-wallet seeding, cluster dilution, laundered funders, wash-like cluster behavior, and over-narrow market-family history.
+
+Default operator-aware block reasons:
+
+```rust
+pub enum WinnerFollowRiskBlock {
+    OperatorConcentrationExceeded,
+    FunderInheritedExposureExceeded,
+    FunderSeedingRateSuspicious,
+    ClusterMembershipUnstable,
+    FunderHopCountExcessive,
+    OnchainSourceUnhealthy,
+    ProxyFunderMappingUnproven,
+    AntiGamingFlagActive,
+}
+```

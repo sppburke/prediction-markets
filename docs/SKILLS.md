@@ -15,13 +15,15 @@
 Build a public trader-intelligence pipeline:
 
 1. ingest public trader data;
-2. reconstruct ledgers;
-3. classify trades;
-4. rank leaders by walk-forward lower-confidence daily log growth;
-5. detect new leader entries quickly;
-6. size using calibrated fractional Kelly;
-7. emit risk-checked `OrderIntent`;
-8. record everything for replay.
+2. ingest public Polygon funding/collateral data where permitted;
+3. collapse wallets into operators only with replayable evidence;
+4. reconstruct ledgers;
+5. classify trades and signal kinds;
+6. rank operators/leaders by walk-forward lower-confidence daily log growth;
+7. detect new leader entries quickly;
+8. size using calibrated fractional Kelly;
+9. emit risk-checked `OrderIntent`;
+10. record everything for replay.
 
 Quality bar:
 
@@ -30,6 +32,8 @@ Quality bar:
 - robust sample-size shrinkage;
 - latency/edge decay measured;
 - Kalshi identity restrictions respected;
+- CrowdIntel-style funding concepts reimplemented natively instead of scraped;
+- inherited-prior fresh-wallet signals kept paper/shadow until separately validated;
 - live-tiny only after paper-copy validation.
 
 ## Skill: Venue adapter implementation

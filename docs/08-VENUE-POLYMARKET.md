@@ -24,6 +24,7 @@ Responsibilities:
 - cost model;
 - account/order reconciliation;
 - restart/maintenance awareness.
+- public proxy-wallet, signature/funder, bridge/deposit, and pUSD collateral documentation tracking for on-chain identity research.
 
 ## Types
 
@@ -39,6 +40,8 @@ pub enum PolymarketOrderType { Gtc, Gtd, Fok, Fak }
 ## Signing and auth
 
 The signing module is isolated. It must have golden tests, no secret logging, explicit L1/L2 authentication boundaries, and payload hashes. Strategies never call signing functions directly.
+
+Polymarket uses signature types and a funder address that can be an EOA, proxy wallet, or Gnosis Safe. Public profile/trade data can expose `proxyWallet`, while authenticated trading uses the configured funder. The venue adapter must keep these concepts typed and must not assume the displayed wallet is the same thing as the original funding EOA.
 
 ## Sports
 
@@ -88,8 +91,11 @@ The Rust adapter must implement:
 1. `LeaderboardSnapshot` ingestion across categories and pagination;
 2. `TraderTradeEvent` ingestion by watched user;
 3. `TraderPositionLedger` reconstruction from trades, activity, and positions;
-4. `LeaderSignal` generation for entry/add/trim/exit/flip;
-5. market websocket subscription management for every watched leader's active markets;
-6. copy-order idempotency keyed by `(leader, source_trade_id, market, outcome, side, observed_at_bucket)`.
+4. proxy-wallet/funder fields as typed optional identity evidence for `operator-graph`;
+5. `LeaderSignal` generation for entry/add/trim/exit/flip with separate signal-kind annotations;
+6. market websocket subscription management for every watched leader's active markets;
+7. copy-order idempotency keyed by `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` and operator-aware idempotency for cluster signals.
 
 Do not rely on UI scraping. Use official APIs first, then documented public chain data for timing validation where needed.
+
+Funding/collateral identity is not owned by `venue-polymarket`. It is produced by `source-onchain-polygon` and `operator-graph`; the venue adapter supplies typed public Polymarket fields and transaction references.

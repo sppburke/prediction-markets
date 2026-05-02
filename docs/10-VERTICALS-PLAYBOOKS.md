@@ -85,12 +85,12 @@ This file is complete only when the implementation:
 
 ## 0) Winner-Follow vertical — first implementation
 
-**Rust crates:** `trader-index`, `copy-signal-engine`, `kelly-sizer`, `strategy-winner-follow`, `venue-polymarket`, optional `venue-kalshi` for authorized trader data.
+**Rust crates:** `source-onchain-polygon`, `operator-graph`, `trader-index`, `copy-signal-engine`, `kelly-sizer`, `strategy-winner-follow`, `venue-polymarket`, optional `venue-kalshi` for authorized trader data.
 
 **Goal:** compound bankroll by copying selected leaders whose public trades historically generate positive follower log-growth after copy delay and costs.
 
-**Primary source:** Polymarket public leader/profile/trade/position/activity data.
+**Primary source:** Polymarket public leader/profile/trade/position/activity data plus public Polygon proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding/collateral events where publicly derivable.
 
 **Secondary use:** resolver/source playbooks validate or veto copied trades. Example: if a top leader buys a weather contract but the weather resolver engine strongly disagrees, reduce size or block.
 
-**Risk:** crowding, false skill, uncopiable speed, hidden exits, low liquidity, one-off luck, and strategy drift.
+**Risk:** crowding, false skill, uncopiable speed, hidden exits, low liquidity, one-off luck, strategy drift, wallet/operator double-counting, fresh-wallet baiting, cluster dilution, and unproven proxy/funder mapping.

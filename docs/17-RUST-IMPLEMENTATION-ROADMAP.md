@@ -48,7 +48,9 @@ Record-only, shadow, paper, live-tiny, scaling rules.
 
 ## Recommended first live candidate
 
-Start with **Winner-Follow in Polymarket paper mode**, then live-tiny. Do not start with weather/crypto live execution until the Winner-Follow scanner, ranker, Kelly sizing, event log, and risk gates are working end to end. Kalshi copy-trading remains disabled unless authorized trader-level data exists.
+Start with **Winner-Follow in Polymarket paper mode**, then live-tiny for ordinary leader-follow only. Do not start with weather/crypto live execution until the Winner-Follow scanner, operator-aware ranker, Kelly sizing, event log, and risk gates are working end to end. Kalshi copy-trading remains disabled unless authorized trader-level data exists.
+
+Fresh-wallet inherited-prior and cluster-coordination modes share the Winner-Follow infrastructure but remain shadow/paper until they have separate walk-forward validation.
 
 
 ## Common acceptance gate
@@ -63,13 +65,18 @@ This file is complete only when the implementation:
 
 ## Phase 0A — Winner-Follow first milestone
 
-1. Add `trader-index`, `copy-signal-engine`, `kelly-sizer`, and `strategy-winner-follow` crates.
+1. Add `source-onchain-polygon`, `operator-graph`, `trader-index`, `copy-signal-engine`, `kelly-sizer`, and `strategy-winner-follow` crates.
 2. Build Polymarket public trader ingestion.
-3. Build trader ledger reconstruction.
-4. Build walk-forward ranker.
-5. Build top-50 active watchlist.
-6. Build copy-signal classification.
-7. Build pure fractional-Kelly sizing with caps.
-8. Build paper-copy execution.
-9. Build live-tiny mode with hard-coded bankroll cap.
-10. Only then proceed to larger source/resolver strategies.
+3. Build `source-onchain-polygon` for public Polygon funding/collateral events and replay fixtures.
+4. Verify Polymarket proxy-wallet, funder, pUSD, deposit, and bridge/onramp mapping against official docs and historical chain fixtures.
+5. Build `operator-graph` for strict funder-root clustering, operator identities, inherited priors, and anti-gaming flags.
+6. Build trader ledger reconstruction with wallet-level facts and operator annotations.
+7. Build walk-forward operator-aware ranker.
+8. Build top-50 active operator/leader watchlist.
+9. Build copy-signal classification with separate action and signal-kind fields.
+10. Build pure fractional-Kelly sizing with normal, inherited-prior, and cluster-coordination fractions.
+11. Build risk gates with operator, funder, inherited-prior, and cluster caps.
+12. Build paper-copy execution.
+13. Build live-tiny mode for ordinary leader-follow with hard-coded bankroll cap.
+14. Keep inherited-prior first-trade in paper and cluster-coordination in shadow until separately validated.
+15. Only then proceed to larger source/resolver strategies.

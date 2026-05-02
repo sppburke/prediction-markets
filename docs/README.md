@@ -3,7 +3,7 @@
 
 > **Rust-only implementation rule:** all first-party production services, clients, parsers, models, replay tools, CLIs, and test harnesses are implemented in **Rust 2024 Edition pinned to stable Rust 1.95.0**. Non-Rust components are permitted only as external infrastructure daemons, vendor APIs, operating-system services, managed databases, or public data sources. No production hot-path Python, Node, or browser automation is allowed.
 
-This v5 package is a Rust 1.95.0 update that makes **Winner-Follow** the first deployable strategy while preserving the prior resolver-first Polymarket/Kalshi architecture. The system now starts by finding the fastest-compounding public traders, reconstructing their behavior, and copying only the subset of trades that survive empirical latency, liquidity, cost, and fractional-Kelly risk checks. Resolver/source-arbitrage strategies remain in the package as Strategy 1+, but the first build target is trader-intelligence plus speed.
+This v5 package is a Rust 1.95.0 update that makes **Winner-Follow** the first deployable strategy while preserving the prior resolver-first Polymarket/Kalshi architecture. The system now starts by finding the fastest-compounding public traders/operators, reconstructing their behavior, and copying only the subset of trades that survive empirical latency, liquidity, cost, and fractional-Kelly risk checks. Resolver/source-arbitrage strategies remain in the package as Strategy 1+, but the first build target is trader-intelligence plus speed.
 
 The core idea is still:
 
@@ -16,14 +16,18 @@ The first production strategy is **Winner-Follow**: continuously discover, rank,
 
 Winner-Follow ships before weather, crypto, macro, sports, and chart/source-arbitrage strategies because it can be built using public venue/profile/trade data, deterministic analysis, and speed. Resolver-source strategies remain Strategy 1+ and are used later to validate whether copied trades have independent fundamental support.
 
+Winner-Follow is operator-aware. A wallet is an observable proxy, not necessarily a distinct economic actor. The plan adds a native Polygon funding/collateral graph and pure `operator-graph` layer to collapse wallets into deterministic operators when public proxy-wallet, pUSD, deposit/onramp, and funder evidence supports it. CrowdIntel-style funding clusters are treated as research inspiration, not a production data dependency.
+
+Fresh-wallet first-trade following is a constrained incubator mode. A fresh wallet may inherit a heavily shrunk operator/funder prior only when the funding/collateral path is public, replayable, low-hop, and not flagged as gaming. This mode starts in paper; cluster-coordination starts in shadow.
+
 ### Venue support
 
-- **Polymarket:** first-class support. The public Data API exposes leaderboard, user trades, positions, activity, and related profile data, making trader-level reconstruction feasible.
+- **Polymarket:** first-class support. The public Data API exposes leaderboard, user trades, positions, activity, and related profile data, making trader-level reconstruction feasible. Proxy-wallet and pUSD collateral behavior means funding identity must be verified from official/public chain evidence.
 - **Kalshi:** limited trader-copy support. Kalshi exposes public trades and a leaderboard feature, but public trade messages do not identify the trader and leaderboard participation is opt-in. Kalshi is therefore used for copy-trading only when a lawful public identity-to-trade mapping exists, when a trader explicitly authorizes API/portfolio access, or when future official endpoints expose sufficient public trader-level data. Otherwise, Kalshi remains a venue for resolver-source strategies, market-flow analytics, and cross-venue checks.
 
 ### Ranking objective
 
-Rank traders by **walk-forward lower-confidence expected log-growth per day** for a follower account after simulated latency, spread, slippage, fees, partial fills, and position caps. Raw PnL, win rate, and leaderboard rank are inputs, not the final ranking target.
+Rank operators/traders by **walk-forward lower-confidence expected log-growth per day** for a follower account after simulated latency, spread, slippage, fees, partial fills, and position caps. Raw PnL, win rate, leaderboard rank, and cluster reputation are inputs, not the final ranking target.
 
 ### Default eligibility thresholds
 
@@ -49,7 +53,7 @@ f_live = kelly_fraction * f_full
 
 Use **quarter Kelly** by default during live-tiny and scale to half Kelly only after a statistically meaningful live audit. `p` is not the trader's naive win rate. It is a calibrated, shrinkage-adjusted probability conditional on trader, market family, odds bucket, liquidity, holding-period bucket, side, recency, and observed copy latency.
 
-Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 1.00% after promotion, max 3.00% per trader, max 8.00% per market family, max 25.00% total open copy exposure, and stop new entries after 2.00% intraday drawdown or 6.00% rolling 7-day drawdown until review.
+Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 1.00% after promotion, max 3.00% per trader/operator, max 8.00% per market family, max 25.00% total open copy exposure, and stop new entries after 2.00% intraday drawdown or 6.00% rolling 7-day drawdown until review. Inherited-prior and cluster-coordination modes have lower separate caps and separate promotion ladders.
 
 
 ## What changed in this pass
@@ -57,6 +61,7 @@ Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 
 - Every markdown file was rewritten or updated to specify Rust 2024 implementation requirements pinned to stable Rust 1.95.0.
 - The architecture is now **event-sourced**: every source update, market update, model output, risk decision, order attempt, fill, cancel, and settlement is recorded and replayable.
 - The system uses a **Rust workspace** with small crates, strict type boundaries, deterministic replay, and fake venues/sources before live trading.
+- Winner-Follow now includes `source-onchain-polygon` and `operator-graph` planning for native, replayable funding/collateral identity.
 - Kalshi and Polymarket are implemented as separate venue adapters. A common trait exists for orchestration, but venue-specific behavior is preserved.
 - All source connectors are Rust actors with bounded channels, parser versions, source health, raw payload hashes, and replay fixtures.
 - All modeling is Rust-native: rule engines, finite-state machines, benchmark-window accumulators, Polars/DataFusion analytics, and optional Rust ML/inference.
@@ -114,6 +119,8 @@ Hard caps override Kelly: max 0.25% bankroll per copied trade in live-tiny, max 
 - No direct strategy-to-venue order submission. Strategies emit `OrderIntent`; execution routers submit.
 - No live deployment before fake connector replay, historical replay, paper mode, and shadow mode.
 - No cross-venue “hedge” label until resolver compatibility proves it.
+- No CrowdIntel UI scraping or opaque third-party cluster scores in the production decision path.
+- No fresh-wallet inherited-prior live sizing until proxy/funder/collateral mapping and mode-specific backtests are proven.
 
 ## Coding-agent instructions
 

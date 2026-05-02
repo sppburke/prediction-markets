@@ -36,11 +36,13 @@ It still has real risk. The strategy's edge is not "free money"; it is a measura
 
 ```text
 Candidate discovery
+  -> public Polygon funding/collateral graph
+  -> operator identity collapse
   -> public trader ledger reconstruction
   -> walk-forward follower simulation
-  -> top-50 active leader ranking
+  -> top-50 active operator/leader ranking
   -> continuous leader watch
-  -> trade classification
+  -> trade and signal-kind classification
   -> copy eligibility check
   -> calibrated p and fractional Kelly
   -> risk-gated OrderIntent
@@ -58,6 +60,10 @@ Polymarket candidate discovery starts from:
 - users repeatedly appearing in profitable short-duration markets;
 - users whose trades produce favorable post-entry drift;
 - users with public profiles and sufficient trade/position data.
+- fresh wallets funded by a known operator/funder with a strong, replayable track record;
+- same-operator clusters whose member wallets coordinate on the same market/outcome/side within a short window.
+
+Wallets are collapsed into operators only when funding/collateral evidence is public, reproducible, and confidence-scored. Polymarket proxy-wallet, pUSD, deposit, and bridge flows must be verified before using funding identity for sizing.
 
 Kalshi candidate discovery is not equivalent because public trades do not identify traders. Kalshi copy trading is enabled only for public/authorized trader data. Otherwise Kalshi signals remain market-flow and source/resolver signals.
 
@@ -78,6 +84,8 @@ Use these initial thresholds, then tune with walk-forward optimization:
 | Minimum lower 5% daily log-growth | > 0 after costs |
 | Active watchlist size | top 50 leaders |
 | Incubator watchlist size | up to 250 candidates |
+| Inherited-prior first-trade mode | paper by default |
+| Cluster-coordination mode | shadow by default |
 
 These replace the arbitrary `average hold < 5 days` and `>= 15 trades` rule. Shorter holding periods are good only when the edge survives copy latency; more trades are useful only when they are independent and reproducible.
 
@@ -94,6 +102,18 @@ Each observed leader trade is classified as:
 
 Only `Entry` and high-confidence `Add` trades can initiate follower exposure. `Exit` and `Trim` events can reduce follower exposure if the follower has a mirrored position and liquidity is acceptable.
 
+Signal kind is separate from trade action:
+
+```rust
+pub enum WinnerFollowSignalKind {
+    NormalLeaderFollow,
+    FreshWalletFirstTrade,
+    ClusterCoordination,
+}
+```
+
+`FreshWalletFirstTrade` requires a fresh wallet, low prior trade count, known operator/funder track record, low funding hop count, sane cluster size, low seeding velocity, and no anti-gaming flags. `ClusterCoordination` requires at least `K` member wallets of the same operator entering the same market/outcome/side within window `W`; it is emitted once per `(operator, market, outcome, side, window)`.
+
 ### Copy eligibility
 
 Do not copy unless all are true:
@@ -106,6 +126,15 @@ Do not copy unless all are true:
 6. leader's family-specific model has positive lower-confidence expected log growth;
 7. portfolio risk caps permit new exposure;
 8. order can be represented as an idempotent `OrderIntent` and replayed.
+
+Additional gates for inherited-prior and cluster-coordination signals:
+
+1. operator identity confidence is above threshold;
+2. `source-onchain-polygon` is healthy and within block-lag limits;
+3. proxy-wallet/funder/collateral mapping is proven for the wallet class;
+4. inherited prior is shrinkage-adjusted with capped `effective_n`;
+5. anti-gaming flags are absent or configured to demote rather than block;
+6. mode-specific promotion state permits the order mode.
 
 ### Fractional Kelly sizing
 
@@ -125,6 +154,16 @@ Default `kelly_fraction`:
 - 0.50x only after live data proves stability;
 - never above 0.50x without explicit human approval.
 
+Mode-specific defaults:
+
+```toml
+[winner_follow.kelly]
+fraction_leader_promoted = 0.25
+fraction_leader_live_tiny = 0.10
+fraction_inherited_prior = 0.05
+fraction_cluster_coordination = 0.15
+```
+
 Use net `c` after fees, expected slippage, and adverse-selection buffer. Reject trades where `f_live` is positive only because of stale or uncalibrated `p`.
 
 ### Risk caps
@@ -134,9 +173,14 @@ Use net `c` after fees, expected slippage, and adverse-selection buffer. Reject 
 | Live-tiny max per copied trade | 0.25% bankroll |
 | Promoted max per copied trade | 1.00% bankroll |
 | Max per leader | 3.00% bankroll |
+| Max per operator | 3.00% bankroll |
 | Max per market | 2.00% bankroll |
 | Max per market family | 8.00% bankroll |
 | Max all copy exposure | 25.00% bankroll |
+| Max inherited-prior exposure | 1.00% bankroll |
+| Max cluster-coordination exposure | 2.00% bankroll |
+| Max per operator per market | 0.75% bankroll |
+| Max inherited-prior trades per funder per day | 3 |
 | Intraday new-entry stop | -2.00% bankroll |
 | Rolling 7-day new-entry stop | -6.00% bankroll |
 | Absolute kill-switch drawdown | -10.00% bankroll |
@@ -152,7 +196,15 @@ pub struct WinnerFollowStrategy {
     pub kelly_fraction: KellyFraction,
     pub max_copy_slippage: PriceDelta,
     pub risk_caps: CopyRiskCaps,
+    pub modes: WinnerFollowModes,
 }
+```
+
+```toml
+[winner_follow.modes]
+leader_follow = "live_tiny"
+inherited_prior_first_trade = "paper"
+cluster_coordination = "shadow"
 ```
 
 ### Promotion path
@@ -162,6 +214,8 @@ pub struct WinnerFollowStrategy {
 3. Paper-copy live signals.
 4. Live-tiny with 0.10x-0.25x Kelly and small bankroll.
 5. Promotion only after the realized follower distribution matches the simulated distribution.
+
+Inherited-prior first-trade and cluster-coordination modes have separate promotion ladders and cannot inherit validation from ordinary leader-follow. They share ingestion and execution infrastructure, not statistical approval.
 
 ## Strategy trait
 

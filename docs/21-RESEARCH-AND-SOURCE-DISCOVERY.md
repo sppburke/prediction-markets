@@ -25,6 +25,21 @@ Before coding trader-copy logic, verify:
 - rate limits and allowed uses;
 - fields available for trades, positions, activity, and settlement;
 - whether the endpoint is official, stable, beta, deprecated, or third-party.
+- for Polymarket, how `proxyWallet`, signature type, funder address, pUSD collateral, deposit addresses, and bridge/onramp flows map to public wallet identity;
+- whether the proxy/funder/collateral mapping is derivable from public chain data and official docs for representative historical examples;
+- whether any third-party data source has an authorized replayable API/export, or is only an opaque UI product.
+
+## Operator graph source checks
+
+Before coding `source-onchain-polygon` or `operator-graph`, verify:
+
+- official Polymarket contract addresses and deployment/factory docs;
+- public event signatures for proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral flows;
+- chain provider archive access, rate limits, reorg behavior, and allowed trading use;
+- exchange/bridge/hot-wallet label source and versioning policy;
+- strict versus transitive cluster rule version and replay determinism;
+- anti-gaming flags and whether each is computable from public data at time `t`;
+- degradation behavior when the on-chain source is stale or unavailable.
 
 ## Documentation output
 

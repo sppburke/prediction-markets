@@ -24,6 +24,8 @@ Build `prediction-edge`: a Rust 1.95.0, Rust 2024, event-sourced, replayable tra
 - Every external input is logged with raw hash, parser version, timestamps, and source ID.
 - Every live decision must be replayable.
 - Do not implement Kalshi trader-copy attribution unless the data is official/public or explicitly authorized.
+- Do not use CrowdIntel UI data or opaque third-party cluster scores in live decisions unless an authorized, replayable API/export is reviewed.
+- Do not size fresh-wallet first-trade signals until proxy-wallet/funder/collateral mapping is proven from public data and the mode has its own paper/backtest validation.
 
 ## Winner-Follow first milestone
 
@@ -33,13 +35,15 @@ Implement in this order:
 2. core types;
 3. event log;
 4. Polymarket public trader ingestion;
-5. trader ledger reconstruction;
-6. walk-forward ranker;
-7. copy-signal classifier;
-8. fractional-Kelly sizer;
-9. risk gates;
-10. paper-copy execution;
-11. live-tiny after approval.
+5. public Polygon funding/collateral ingestion;
+6. operator graph and identity collapse;
+7. trader ledger reconstruction;
+8. walk-forward operator-aware ranker;
+9. copy-signal classifier;
+10. fractional-Kelly sizer;
+11. risk gates;
+12. paper-copy execution;
+13. live-tiny after approval.
 
 ## Required quality gates
 
