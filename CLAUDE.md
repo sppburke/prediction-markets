@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository is currently **specification-only**. It contains the design documents for `prediction-edge`, a Rust 1.95.0 / Rust 2024 trading and research system for Polymarket and Kalshi. There is no Rust code yet; `crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`, and `.github/workflows/` will be created in Phase 0 of `docs/17-RUST-IMPLEMENTATION-ROADMAP.md`.
 
+The root `AGENTS.md` is the human contributor guide; this `CLAUDE.md` is for coding-agent context. They are complementary — the contributor guide covers commit/PR conventions and dev workflow at a human level, while this file captures architecture, doc authority order, and the gotchas a fresh agent needs to avoid.
+
 When the Rust workspace is added, the CI gate is exactly:
 
 ```bash
@@ -19,7 +21,17 @@ cargo audit
 cargo metadata --locked
 ```
 
-A single test runs as `cargo nextest run -p <crate> <test_name>` once `cargo-nextest` is present.
+A single test runs as `cargo nextest run -p <crate> <test_name>` once `cargo-nextest` is present. Document any gate that cannot be run.
+
+## Commit and PR conventions
+
+Commit messages: concise imperative summaries, optionally with a scoped prefix. Examples from history: `Restructure docs: canonical baseline...`, `Update Winner-Follow operator graph plans`, `Add repository contributor guide`.
+
+Pull requests must include: summary, files changed, tests run, replay impact, risk impact, API docs checked (with `Last checked` updates in `docs/15-SOURCES.md` when a venue/source doc was re-verified), deployment impact, and rollback plan. Link issues when available; add screenshots only for visual changes.
+
+## Doc naming and authoring
+
+Documentation files use numbered prefixes for sequence and scope (e.g. `docs/03-PHASE-MODEL-ENGINE.md`, `docs/07-VENUE-KALSHI.md`). Underscore-prefixed files (`_BASELINE.md`, `_GLOSSARY.md`) are canonical references that other docs link to. Keep new docs focused; cross-reference canonical values (Winner-Follow caps in `19-`, types and defaults in `_GLOSSARY.md`) instead of duplicating them.
 
 ## Mandatory reading before editing anything
 
