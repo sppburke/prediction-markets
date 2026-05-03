@@ -1070,6 +1070,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-copy-signal-engine"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pe-core-types",
+ "pe-trader-index",
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "time",
+]
+
+[[package]]
 name = "pe-core-types"
 version = "0.1.0"
 dependencies = [

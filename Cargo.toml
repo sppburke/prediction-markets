@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/config",
+    "crates/copy-signal-engine",
     "crates/core-types",
     "crates/event-log",
     "crates/kelly-sizer",
