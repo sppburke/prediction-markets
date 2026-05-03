@@ -6,6 +6,7 @@ members = [
     "crates/event-log",
     "crates/source-core",
     "crates/service",
+    "crates/venue-core",
 ]
 
 [workspace.package]
