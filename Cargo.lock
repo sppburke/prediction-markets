@@ -933,28 +933,29 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "pe-operator-graph"
-version = "0.1.0"
-dependencies = [
- "blake3",
-=======
 name = "pe-kelly-sizer"
 version = "0.1.0"
 dependencies = [
->>>>>>> origin/main
  "pe-core-types",
  "proptest",
  "rust_decimal",
  "rust_decimal_macros",
-<<<<<<< HEAD
+ "thiserror",
+]
+
+[[package]]
+name = "pe-operator-graph"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pe-core-types",
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
  "serde",
  "serde_json",
  "thiserror",
  "time",
-=======
- "thiserror",
->>>>>>> origin/main
 ]
 
 [[package]]
