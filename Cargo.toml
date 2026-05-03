@@ -8,6 +8,7 @@ members = [
     "crates/operator-graph",
     "crates/source-core",
     "crates/source-onchain-polygon",
+    "crates/source-polymarket-public",
     "crates/service",
     "crates/venue-core",
 ]
@@ -38,13 +39,14 @@ proptest = "1"
 rust_decimal = { version = "1", features = ["serde"] }
 rust_decimal_macros = "1"
 schemars = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "serde-well-known", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 toml = "0.8"
 tower = "0.5"
 tracing = "0.1"

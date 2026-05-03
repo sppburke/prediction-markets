@@ -1,0 +1,29 @@
+[package]
+name = "pe-source-polymarket-public"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pe_source_polymarket_public"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+scenario = []
+
+[dependencies]
+pe-core-types = { path = "../core-types", version = "0.1.0" }
+pe-source-core = { path = "../source-core", version = "0.1.0" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
