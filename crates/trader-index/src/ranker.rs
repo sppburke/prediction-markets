@@ -78,6 +78,9 @@ pub fn build_watchlist(
         }
 
         // Fall back to incubator tier.
+        // Intentionally no `lcb_5pct_bps > 0` check: incubator is an observation pool for
+        // research, not a copy-trading list. LCB sign is not an eligibility gate here per
+        // _GLOSSARY.md "Ranker eligibility thresholds" (active tier carries the LCB > 0 gate).
         if let Some(stats) = compute_stats(&owned, incubator_window_start, now_unix)
             && stats.closed_trades_in_window >= config.incubator_min_closed_trades
             && stats.distinct_markets_in_window >= config.incubator_min_distinct_markets
