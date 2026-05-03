@@ -35,4 +35,11 @@ pub enum LogError {
 
     #[error("zstd error: {0}")]
     Compress(String),
+
+    #[error("frame at byte offset {byte_offset} claims {len} bytes, exceeding {max}-byte limit")]
+    FrameTooLarge {
+        byte_offset: u64,
+        len: u32,
+        max: u32,
+    },
 }

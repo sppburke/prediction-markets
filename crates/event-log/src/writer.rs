@@ -11,7 +11,8 @@ use crate::envelope::{
     ChainError, EnvelopeIn, EventEnvelope, HashInput, compute_hashes, verify_chain,
 };
 use crate::frame::{
-    FrameReadError, HEADER_LEN, read_frame, verify_file_header, write_file_header, write_frame,
+    FrameReadError, HEADER_LEN, MAX_FRAME_BYTES, read_frame, verify_file_header, write_file_header,
+    write_frame,
 };
 
 /// Single-writer handle for an append-only event log file.
@@ -189,6 +190,16 @@ fn scan_existing(path: &Path, file: &File) -> Result<(u64, Hash), LogError> {
                 return Err(LogError::CrcMismatch {
                     at_seq: EventSeq(seq),
                     byte_offset: off,
+                });
+            }
+            Err(FrameReadError::FrameTooLarge {
+                byte_offset: off,
+                len,
+            }) => {
+                return Err(LogError::FrameTooLarge {
+                    byte_offset: off,
+                    len,
+                    max: MAX_FRAME_BYTES,
                 });
             }
             Err(FrameReadError::Decompress(msg)) => return Err(LogError::Compress(msg)),

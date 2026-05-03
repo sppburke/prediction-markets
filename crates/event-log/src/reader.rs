@@ -1,14 +1,17 @@
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use blake3::Hash;
 use pe_core_types::EventSeq;
 
 use crate::LogError;
 use crate::envelope::{ChainError, EventEnvelope, verify_chain};
-use crate::frame::{FrameReadError, HEADER_LEN, read_frame, verify_file_header};
+use crate::frame::{FrameReadError, HEADER_LEN, MAX_FRAME_BYTES, read_frame, verify_file_header};
+
+/// How long tail mode retries a partial frame before giving up.
+const TRUNCATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read-only access to an event log file.
 pub struct Reader;
@@ -43,6 +46,8 @@ struct ReplayIter {
     poll_interval: Option<Duration>,
     /// Set to true after a hard error; prevents further iteration.
     poisoned: bool,
+    /// Deadline for retrying a partial frame in tail mode; None when no retry is in progress.
+    truncation_deadline: Option<Instant>,
 }
 
 impl ReplayIter {
@@ -57,6 +62,7 @@ impl ReplayIter {
             byte_offset: HEADER_LEN,
             poll_interval,
             poisoned: false,
+            truncation_deadline: None,
         })
     }
 }
@@ -89,6 +95,7 @@ impl Iterator for ReplayIter {
                 }
 
                 Ok(Some(json)) => {
+                    self.truncation_deadline = None;
                     let frame_byte_offset = self.byte_offset;
 
                     let envelope: EventEnvelope = match serde_json::from_slice(&json) {
@@ -143,16 +150,31 @@ impl Iterator for ReplayIter {
                     if let Some(interval) = self.poll_interval {
                         // Partial frame is a normal transient condition: the writer has
                         // flushed the LEN but not yet the full zstd block + CRC.
-                        // Seek back to the frame start and retry after the poll interval.
-                        if self.reader.seek(SeekFrom::Start(frame_start)).is_ok() {
+                        // Retry for up to TRUNCATION_TIMEOUT before giving up.
+                        let deadline = self
+                            .truncation_deadline
+                            .get_or_insert_with(|| Instant::now() + TRUNCATION_TIMEOUT);
+                        if Instant::now() < *deadline
+                            && self.reader.seek(SeekFrom::Start(frame_start)).is_ok()
+                        {
                             std::thread::sleep(interval);
                             continue;
                         }
+                        self.truncation_deadline = None;
                     }
                     self.poisoned = true;
                     return Some(Err(LogError::Truncated {
                         at: EventSeq(self.next_seq),
                         byte_offset,
+                    }));
+                }
+
+                Err(FrameReadError::FrameTooLarge { byte_offset, len }) => {
+                    self.poisoned = true;
+                    return Some(Err(LogError::FrameTooLarge {
+                        byte_offset,
+                        len,
+                        max: MAX_FRAME_BYTES,
                     }));
                 }
 
