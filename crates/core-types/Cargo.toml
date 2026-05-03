@@ -1,0 +1,49 @@
+[package]
+name = "pe-core-types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pe_core_types"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+float_arithmetic = "deny"
+
+[features]
+default = ["serde"]
+serde = []
+schemars = ["dep:schemars"]
+arbitrary = ["dep:proptest"]
+
+[dependencies]
+blake3 = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dependencies.schemars]
+workspace = true
+optional = true
+
+[dependencies.proptest]
+workspace = true
+optional = true
+
+[dev-dependencies]
+insta = { workspace = true }
+proptest = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde_json = { workspace = true }
+trybuild = { workspace = true }
+uuid = { workspace = true }

@@ -22,3 +22,6 @@ target
 
 # Per-developer Claude Code project state
 .claude/
+
+# insta snapshot review state (developer-local)
+**/.*.pending-snap

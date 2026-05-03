@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/compile_fail/probability_rejects_f64.rs:5:27
+  |
+5 |     let _p: Probability = 0.5_f64;
+  |             -----------   ^^^^^^^ expected `Probability`, found `f64`
+  |             |
+  |             expected due to this
