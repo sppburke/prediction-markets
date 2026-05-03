@@ -1,0 +1,15 @@
+---
+source: crates/event-log/tests/log_tests.rs
+assertion_line: 458
+expression: json
+---
+{
+  "content_type": "json",
+  "parser_version": 2,
+  "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "raw_payload_hash": "de965c860e20e8a865295472b6100678254d9fd7c65ed2f3a9988cd79fab21a9",
+  "schema_version": 1,
+  "seq": 0,
+  "source_id": "snapshot-source",
+  "this_hash": "f62dcb18d7b4c8b4a91e7a3b08c27be78c1d8f23700e8989a7d6b015f72d4c42"
+}
