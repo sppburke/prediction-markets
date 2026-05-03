@@ -1,0 +1,35 @@
+[package]
+name = "pe-operator-graph"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pe_operator_graph"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+float_arithmetic = "deny"
+
+[features]
+scenario = []
+
+[dependencies]
+pe-core-types = { path = "../core-types", version = "0.1.0" }
+blake3 = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal_macros = { workspace = true }
