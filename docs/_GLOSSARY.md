@@ -334,6 +334,24 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `active_watchlist_size` | 50 | Top-N active leaders/operators |
 | `incubator_watchlist_size` | 250 | Candidates under research |
 
+### Ranker eligibility thresholds
+
+Active tier (LCB_5pct > 0 required in addition):
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `active_window_days` | 180 | Look-back window for active-tier scoring |
+| `active_min_closed_trades` | 60 | Minimum closed trades in window |
+| `active_min_distinct_markets` | 30 | Minimum distinct markets traded in window |
+
+Incubator tier:
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `incubator_window_days` | 90 | Look-back window for incubator-tier scoring |
+| `incubator_min_closed_trades` | 20 | Minimum closed trades in window |
+| `incubator_min_distinct_markets` | 10 | Minimum distinct markets traded in window |
+
 ### Idempotency
 
 `observed_at_bucket = floor(observed_at_ms / 1_000)` — 1-second buckets. The tuple `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` is the unique idempotency key. Two events with the same key are the same trade. Operator-aware idempotency adds `operator_id` for cluster-coordination signals.

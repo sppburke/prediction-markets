@@ -212,6 +212,7 @@ fn match_against_queue(
             .max(0) as u64;
 
         let entry_tid = entries[n_consumed].source_trade_id.clone();
+        let opened_at_unix = entries[n_consumed].timestamp_unix;
 
         closed.push(ClosedTrade {
             market_id: key.market_id.clone(),
@@ -222,6 +223,8 @@ fn match_against_queue(
             contracts: ContractQty(matched),
             hold_duration_seconds: hold_secs,
             realized_pnl_usd: pnl,
+            opened_at_unix,
+            closed_at_unix: closing.timestamp_unix,
             source_trade_ids: vec![entry_tid, closing.source_trade_id.clone()],
         });
 

@@ -22,6 +22,10 @@ pub struct ClosedTrade {
     pub contracts: ContractQty,
     pub hold_duration_seconds: u64,
     pub realized_pnl_usd: Decimal,
+    /// Unix timestamp of the entry fill (seconds since epoch, UTC).
+    pub opened_at_unix: i64,
+    /// Unix timestamp of the closing fill (seconds since epoch, UTC).
+    pub closed_at_unix: i64,
     /// Source trade IDs contributing to this closed trade (entry ids first, then exit ids).
     pub source_trade_ids: Vec<SourceTradeId>,
 }

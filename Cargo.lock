@@ -1200,6 +1200,7 @@ dependencies = [
 name = "pe-trader-index"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "pe-core-types",
  "pe-operator-graph",
  "rust_decimal",
