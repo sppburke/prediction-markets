@@ -6,6 +6,7 @@ members = [
     "crates/event-log",
     "crates/kelly-sizer",
     "crates/operator-graph",
+    "crates/risk-engine",
     "crates/source-core",
     "crates/source-onchain-polygon",
     "crates/source-polymarket-public",

@@ -394,6 +394,7 @@ intraday_stop_bps                    = -200  # halt new entries at -2.00 % intra
 rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
 inherited_prior_kill_if_drawdown_bps = -150  # -1.50 % inherited-prior PnL kills the mode
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
+copy_latency_kill_switch_ms          = 3000  # fire when p95 > 1.5× the 2000 ms p95 budget
 
 [winner_follow.copy]
 max_slippage_from_leader_bps         = 75    # 0.75 % from leader observed price
