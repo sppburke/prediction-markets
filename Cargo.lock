@@ -944,6 +944,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-operator-graph"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pe-core-types",
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "pe-service"
 version = "0.1.0"
 dependencies = [
