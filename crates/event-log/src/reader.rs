@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
@@ -70,6 +70,12 @@ impl Iterator for ReplayIter {
         }
 
         loop {
+            // Capture the exact logical read position before calling read_frame so that,
+            // in tail mode, a transient truncation can seek back to retry the same frame.
+            // self.byte_offset tracks decompressed size (error-reporting approximation only),
+            // so we ask the reader for the real position.
+            let frame_start = self.reader.stream_position().unwrap_or(self.byte_offset);
+
             match read_frame(&mut self.reader, self.byte_offset) {
                 Ok(None) => {
                     // EOF: stop (replay) or sleep and retry (tail).
@@ -134,6 +140,15 @@ impl Iterator for ReplayIter {
                 }
 
                 Err(FrameReadError::Truncated { byte_offset }) => {
+                    if let Some(interval) = self.poll_interval {
+                        // Partial frame is a normal transient condition: the writer has
+                        // flushed the LEN but not yet the full zstd block + CRC.
+                        // Seek back to the frame start and retry after the poll interval.
+                        if self.reader.seek(SeekFrom::Start(frame_start)).is_ok() {
+                            std::thread::sleep(interval);
+                            continue;
+                        }
+                    }
                     self.poisoned = true;
                     return Some(Err(LogError::Truncated {
                         at: EventSeq(self.next_seq),

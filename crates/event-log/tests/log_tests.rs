@@ -380,6 +380,52 @@ fn tail_receives_all_appended_envelopes() {
     }
 }
 
+// ── Tail transient-truncation test ───────────────────────────────────────────
+
+#[test]
+fn tail_recovers_from_transient_truncation() {
+    use std::thread;
+
+    let dir = tmp_dir();
+    let path = dir.path().join("tail_trunc.log");
+
+    // Write 2 events and flush.
+    {
+        let mut w = Writer::open(&path).unwrap();
+        w.append(make_envelope(b"first".to_vec())).unwrap();
+        w.append(make_envelope(b"second".to_vec())).unwrap();
+        w.sync().unwrap();
+    }
+
+    // Capture the complete file, then truncate by 1 byte (breaks the last CRC).
+    let complete = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &complete[..complete.len() - 1]).unwrap();
+
+    let path_clone = path.clone();
+    let reader_thread = thread::spawn(move || {
+        Reader::tail(&path_clone, Duration::from_millis(10))
+            .unwrap()
+            .take(2)
+            .collect::<Vec<_>>()
+    });
+
+    // After the reader has had time to hit the truncated frame, restore the missing byte.
+    thread::sleep(Duration::from_millis(60));
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&complete[complete.len() - 1..]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let results = reader_thread.join().unwrap();
+    assert_eq!(results.len(), 2, "tail reader must recover and yield both events");
+    assert!(results[0].is_ok());
+    assert!(results[1].is_ok());
+    assert_eq!(results[0].as_ref().unwrap().0, EventSeq(0));
+    assert_eq!(results[1].as_ref().unwrap().0, EventSeq(1));
+}
+
 // ── Round-trip property test ──────────────────────────────────────────────────
 
 #[test]
