@@ -981,6 +981,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-source-onchain-polygon"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "pe-source-core",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "pe-venue-core"
 version = "0.1.0"
 dependencies = [
