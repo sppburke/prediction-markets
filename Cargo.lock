@@ -959,6 +959,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-risk-engine"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "pe-operator-graph",
+ "pe-source-core",
+ "proptest",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "pe-service"
 version = "0.1.0"
 dependencies = [
