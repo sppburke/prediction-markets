@@ -262,8 +262,10 @@ impl BasisPoints {
     pub fn from_decimal(d: Decimal) -> Self {
         let bps = (d * Decimal::from(10_000i32))
             .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointNearestEven);
-        // clamp to i32 range; to_i32 returns None only for out-of-i32-range values
-        let n = bps.to_i32().unwrap_or(i32::MAX);
+        // saturate preserving sign: negative overflow → i32::MIN, positive → i32::MAX
+        let n = bps
+            .to_i32()
+            .unwrap_or_else(|| if bps.is_sign_negative() { i32::MIN } else { i32::MAX });
         Self(n)
     }
 
