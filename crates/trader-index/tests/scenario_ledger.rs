@@ -1,7 +1,12 @@
 // Scenario tests for ledger reconstruction.
 // Run with: cargo nextest run -p pe-trader-index --features scenario
 #![cfg(feature = "scenario")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::too_many_arguments)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_arguments
+)]
 
 use std::collections::HashMap;
 
