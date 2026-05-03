@@ -933,6 +933,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-kelly-sizer"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "thiserror",
+]
+
+[[package]]
 name = "pe-service"
 version = "0.1.0"
 dependencies = [

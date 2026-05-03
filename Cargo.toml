@@ -4,6 +4,7 @@ members = [
     "crates/config",
     "crates/core-types",
     "crates/event-log",
+    "crates/kelly-sizer",
     "crates/source-core",
     "crates/service",
     "crates/venue-core",
