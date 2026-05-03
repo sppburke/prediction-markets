@@ -413,13 +413,20 @@ fn tail_recovers_from_transient_truncation() {
     thread::sleep(Duration::from_millis(60));
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(&complete[complete.len() - 1..]).unwrap();
         f.sync_all().unwrap();
     }
 
     let results = reader_thread.join().unwrap();
-    assert_eq!(results.len(), 2, "tail reader must recover and yield both events");
+    assert_eq!(
+        results.len(),
+        2,
+        "tail reader must recover and yield both events"
+    );
     assert!(results[0].is_ok());
     assert!(results[1].is_ok());
     assert_eq!(results[0].as_ref().unwrap().0, EventSeq(0));
