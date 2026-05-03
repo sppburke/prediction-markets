@@ -1211,6 +1211,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-strategy-winner-follow"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pe-copy-signal-engine",
+ "pe-core-types",
+ "pe-kelly-sizer",
+ "pe-risk-engine",
+ "pe-source-core",
+ "pe-venue-core",
+ "proptest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "pe-trader-index"
 version = "0.1.0"
 dependencies = [
