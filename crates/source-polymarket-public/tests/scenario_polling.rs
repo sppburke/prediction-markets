@@ -59,7 +59,7 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
     let config = PollingConfig {
         base_url: BASE.into(),
         endpoint_configs: HashMap::new(),
-        default_interval_secs: 30,
+        default_interval_secs: 0,
     };
 
     PolymarketPublicConnector::new(

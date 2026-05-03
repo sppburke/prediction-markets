@@ -1,5 +1,7 @@
 //! [`PolymarketPublicConnector`] — round-robin polling connector.
 
+use std::time::Duration;
+
 use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
 use pe_source_core::{SourceConnector, SourceError, SourceEvent, SourceHealth, SourceStatus};
 
@@ -73,9 +75,14 @@ impl<F: PageFetcher> SourceConnector for PolymarketPublicConnector<F> {
 
         let endpoint = &self.endpoints[self.current_index];
         let url = endpoint.url(&self.config.base_url);
+        let interval = self.config.interval_secs(endpoint);
 
         // Advance round-robin BEFORE fetch so callers see a different endpoint on retry.
         self.current_index = (self.current_index + 1) % self.endpoints.len();
+
+        if interval > 0 {
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+        }
 
         let result = self.fetcher.fetch_page(&url).await;
         let payload = match result {
