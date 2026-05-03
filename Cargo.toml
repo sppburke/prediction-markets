@@ -11,6 +11,7 @@ members = [
     "crates/source-onchain-polygon",
     "crates/source-polymarket-public",
     "crates/service",
+    "crates/trader-index",
     "crates/venue-core",
 ]
 
