@@ -7,5 +7,5 @@ pub mod engine;
 pub mod snapshot;
 
 pub use block::RiskBlock;
-pub use engine::evaluate_risk;
+pub use engine::{RiskDecision, evaluate_risk};
 pub use snapshot::{RiskSnapshot, TradingMode};

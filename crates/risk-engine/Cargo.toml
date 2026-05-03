@@ -26,7 +26,6 @@ pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-source-core = { path = "../source-core", version = "0.1.0" }
 pe-operator-graph = { path = "../operator-graph", version = "0.1.0" }
 serde = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
