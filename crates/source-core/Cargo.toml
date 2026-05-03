@@ -1,0 +1,21 @@
+[package]
+name = "pe-source-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pe_source_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+pe-core-types = { path = "../core-types", version = "0.1.0" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

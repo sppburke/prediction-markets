@@ -945,6 +945,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-source-core"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
