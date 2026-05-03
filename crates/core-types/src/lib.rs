@@ -10,6 +10,7 @@ pub mod operator;
 pub mod price;
 pub mod quantity;
 pub mod side;
+pub mod signal;
 pub mod time;
 
 pub use error::Error;
@@ -20,9 +21,10 @@ pub use ids::{
 };
 pub use operator::{ClusterSize, FundingHopCount, ReconstructionQuality, WalletAgeSeconds};
 pub use price::{
-    BasisPoints, KalshiPriceCents, KellyFraction, PolymarketPriceDecimal, Price, PriceDelta,
-    Probability, ProbabilityPpm, RoundingPolicy,
+    BasisPoints, InheritedPriorPpm, KalshiPriceCents, KellyFraction, PolymarketPriceDecimal, Price,
+    PriceDelta, Probability, ProbabilityPpm, RoundingPolicy,
 };
 pub use quantity::{ContractQty, Quantity};
 pub use side::Side;
+pub use signal::{LeaderAction, WinnerFollowSignalKind};
 pub use time::{ObservedAtBucket, ReceivedAt, SourceTimestamp};
