@@ -8,6 +8,8 @@ pub const VERSION: u8 = 0x01;
 /// File header length: MAGIC (4 bytes) + VER (1 byte).
 pub const HEADER_LEN: u64 = 5;
 const ZSTD_LEVEL: i32 = 3;
+/// Maximum allowed compressed frame body size (64 MiB).
+pub const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 pub fn write_file_header(w: &mut impl Write) -> Result<(), LogError> {
     w.write_all(MAGIC)?;
@@ -64,7 +66,14 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
     r.read_exact(&mut len_rest)
         .map_err(|_| FrameReadError::Truncated { byte_offset })?;
 
-    let len = u32::from_le_bytes([first[0], len_rest[0], len_rest[1], len_rest[2]]) as usize;
+    let len_raw = u32::from_le_bytes([first[0], len_rest[0], len_rest[1], len_rest[2]]);
+    if len_raw > MAX_FRAME_BYTES {
+        return Err(FrameReadError::FrameTooLarge {
+            byte_offset,
+            len: len_raw,
+        });
+    }
+    let len = len_raw as usize;
 
     let mut compressed = vec![0u8; len];
     r.read_exact(&mut compressed)
@@ -90,6 +99,7 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
 pub enum FrameReadError {
     Truncated { byte_offset: u64 },
     CrcMismatch { byte_offset: u64 },
+    FrameTooLarge { byte_offset: u64, len: u32 },
     Decompress(String),
     Io(io::Error),
 }
