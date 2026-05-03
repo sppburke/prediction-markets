@@ -1,0 +1,1 @@
+{"data": [{"type": "TRADE", "market": "market_abc", "timestamp": 1704067200, "details": {"side": "BUY", "size": "100"}}], "next_cursor": ""}
