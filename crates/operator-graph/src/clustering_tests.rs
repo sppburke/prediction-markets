@@ -7,7 +7,7 @@ use pe_core_types::{SourceTimestamp, WalletAddress};
 use rust_decimal::Decimal;
 
 use crate::{
-    clustering::{build_operator_identities, ClusteringConfig},
+    clustering::{ClusteringConfig, build_operator_identities},
     funding::{AddressCategory, FundingEdge, FundingSnapshot},
     identity::AntiGamingFlag,
 };
