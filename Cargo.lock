@@ -1197,6 +1197,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-trader-index"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "pe-operator-graph",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "pe-venue-core"
 version = "0.1.0"
 dependencies = [
