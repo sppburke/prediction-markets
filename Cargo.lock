@@ -933,18 +933,28 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "pe-operator-graph"
 version = "0.1.0"
 dependencies = [
  "blake3",
+=======
+name = "pe-kelly-sizer"
+version = "0.1.0"
+dependencies = [
+>>>>>>> origin/main
  "pe-core-types",
  "proptest",
  "rust_decimal",
  "rust_decimal_macros",
+<<<<<<< HEAD
  "serde",
  "serde_json",
  "thiserror",
  "time",
+=======
+ "thiserror",
+>>>>>>> origin/main
 ]
 
 [[package]]
@@ -957,6 +967,28 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pe-source-core"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "pe-venue-core"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
