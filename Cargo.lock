@@ -945,6 +945,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-source-core"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "pe-venue-core"
 version = "0.1.0"
 dependencies = [
