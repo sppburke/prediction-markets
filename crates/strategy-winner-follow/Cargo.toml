@@ -17,11 +17,13 @@ float_arithmetic = "deny"
 [dependencies]
 pe-copy-signal-engine = { path = "../copy-signal-engine", version = "0.1.0" }
 pe-core-types = { path = "../core-types", version = "0.1.0" }
+pe-event-log = { path = "../event-log", version = "0.1.0" }
 pe-kelly-sizer = { path = "../kelly-sizer", version = "0.1.0" }
 pe-risk-engine = { path = "../risk-engine", version = "0.1.0" }
 pe-venue-core = { path = "../venue-core", version = "0.1.0" }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
@@ -29,4 +31,5 @@ blake3 = { workspace = true }
 pe-source-core = { path = "../source-core", version = "0.1.0" }
 proptest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tempfile = { workspace = true }
 time = { workspace = true }

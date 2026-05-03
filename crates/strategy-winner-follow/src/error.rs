@@ -1,5 +1,6 @@
-//! Error type for Winner-Follow strategy evaluation.
+//! Error types for Winner-Follow strategy evaluation and paper execution.
 
+use pe_event_log::LogError;
 use pe_kelly_sizer::KellyError;
 use pe_risk_engine::RiskBlock;
 
@@ -25,4 +26,16 @@ pub enum WinnerFollowError {
     /// Underlying Kelly sizing computation failed (invalid inputs).
     #[error("Kelly sizing error: {0}")]
     KellySizing(#[from] KellyError),
+}
+
+/// Reasons `PaperExecutor::execute` returns `Err`.
+#[derive(Debug, thiserror::Error)]
+pub enum PaperExecutionError {
+    /// Failed to serialise `PaperFill` to JSON before writing to the log.
+    #[error("serialisation error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// Event-log write or sync failed.
+    #[error("log write error: {0}")]
+    LogWrite(#[from] LogError),
 }
