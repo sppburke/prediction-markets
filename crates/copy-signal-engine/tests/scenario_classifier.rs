@@ -407,6 +407,81 @@ fn cluster_coordination_fires() {
     );
 }
 
+// ─── scenario 8 ──────────────────────────────────────────────────────────────
+
+/// Zero reconstruction quality with no position data → Unknown action → signal suppressed.
+///
+/// PASS: `classify_trade` returns `None`.
+#[test]
+fn unknown_action_suppressed() {
+    let w = wallet(0x08);
+    let mkt = market(8);
+    let trade = incoming(w, mkt.clone(), Side::Buy, 100);
+    let watchlist = active_watchlist(w, None);
+
+    let result = classify_trade(
+        &trade,
+        None,
+        &watchlist,
+        &stale_profile(w),
+        None,
+        None,
+        quality(0),
+        VenueId::polymarket(),
+        &SignalConfig::default(),
+    );
+
+    assert!(
+        result.is_none(),
+        "Unknown action must be suppressed; got {result:?}"
+    );
+}
+
+// ─── scenario 9 ──────────────────────────────────────────────────────────────
+
+/// Wallet adds to an existing long with reconstruction quality 60 (600_000 ppm < 700_000
+/// threshold) → signal suppressed despite valid signal kind.
+///
+/// PASS: `classify_trade` returns `None`.
+#[test]
+fn add_low_confidence_suppressed() {
+    let w = wallet(0x09);
+    let mkt = market(9);
+    let trade = incoming(w, mkt.clone(), Side::Buy, 50);
+    let watchlist = active_watchlist(w, None);
+
+    let mut positions = HashMap::new();
+    positions.insert(
+        MarketOutcomeId::new(mkt.clone(), OutcomeId(0)),
+        PositionState {
+            long_contracts: 200,
+            short_contracts: 0,
+        },
+    );
+    let position = PositionSnapshot {
+        wallet: w,
+        positions,
+    };
+
+    // quality 60 → confidence_ppm = 600_000 < add_high_confidence_threshold_ppm (700_000)
+    let result = classify_trade(
+        &trade,
+        Some(&position),
+        &watchlist,
+        &stale_profile(w),
+        None,
+        None,
+        quality(60),
+        VenueId::polymarket(),
+        &SignalConfig::default(),
+    );
+
+    assert!(
+        result.is_none(),
+        "Low-confidence Add must be suppressed; got {result:?}"
+    );
+}
+
 // ─── proptest ────────────────────────────────────────────────────────────────
 
 proptest::proptest! {

@@ -43,6 +43,10 @@ pub fn classify_trade(
     let action = classify_action(trade, position, reconstruction_quality, config);
     let action_confidence_ppm = confidence_from_quality(reconstruction_quality);
 
+    if !is_action_eligible(action, action_confidence_ppm, config) {
+        return None;
+    }
+
     // Placeholder: real shrinkage computed by model-calibrated weights per 03-PHASE-MODEL-ENGINE.md.
     let inherited_prior = (signal_kind == WinnerFollowSignalKind::FreshWalletFirstTrade)
         .then_some(InheritedPriorPpm(0));
@@ -224,6 +228,27 @@ fn is_on_active_watchlist(wallet: WalletAddress, watchlist: &Watchlist) -> bool 
 /// Returns 0 on overflow or if the conversion fails (price is guaranteed in [0,1]).
 fn price_times_contracts_usd(price: Decimal, contracts: u64) -> u64 {
     (price * Decimal::from(contracts)).to_u64().unwrap_or(0)
+}
+
+/// Gate on action type and confidence before emitting a signal.
+///
+/// - `Unknown` is always suppressed (no usable position information).
+/// - `Add` requires confidence ≥ `add_high_confidence_threshold_ppm`.
+/// - `Trim`/`Exit` require confidence ≥ `exit_high_confidence_threshold_ppm`.
+/// - `Entry` and `Flip` pass through unconditionally.
+fn is_action_eligible(
+    action: LeaderAction,
+    confidence_ppm: ProbabilityPpm,
+    config: &SignalConfig,
+) -> bool {
+    match action {
+        LeaderAction::Unknown => false,
+        LeaderAction::Add => confidence_ppm.0 >= config.add_high_confidence_threshold_ppm,
+        LeaderAction::Trim | LeaderAction::Exit => {
+            confidence_ppm.0 >= config.exit_high_confidence_threshold_ppm
+        }
+        LeaderAction::Entry | LeaderAction::Flip => true,
+    }
 }
 
 /// `quality ∈ [0, 100]` → `ppm ∈ [0, 1_000_000]`.
