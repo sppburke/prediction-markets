@@ -25,10 +25,12 @@ scenario = []
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-operator-graph = { path = "../operator-graph", version = "0.1.0" }
 rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
