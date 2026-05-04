@@ -27,14 +27,19 @@ impl OperatorGraphScheduler {
     ///
     /// The receiver's initial value is an empty `Vec` (no operators yet known).
     /// Call [`run`] to start the rebuild loop.
+    ///
+    /// Pass `ClusteringConfig::default()` for standard production behaviour.
+    /// Callers that need non-default thresholds (e.g. integration tests or
+    /// operator-specific tuning) can supply a custom config without recompiling.
     pub fn new(
         accumulator: Arc<Mutex<FundingGraphAccumulator>>,
+        clustering_config: ClusteringConfig,
         cadence_secs: u64,
     ) -> (Self, watch::Receiver<Vec<OperatorIdentity>>) {
         let (tx, rx) = watch::channel(Vec::new());
         let scheduler = Self {
             accumulator,
-            clustering_config: ClusteringConfig::default(),
+            clustering_config,
             cadence: Duration::from_secs(cadence_secs),
             tx,
         };

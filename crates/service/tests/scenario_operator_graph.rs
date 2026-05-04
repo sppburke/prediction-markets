@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use pe_core_types::{SourceTimestamp, WalletAddress};
 use pe_funding_graph::FundingGraphAccumulator;
+use pe_operator_graph::ClusteringConfig;
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_source_onchain_polygon::{PolygonEvent, event::TxHash};
 use rust_decimal_macros::dec;
@@ -99,7 +100,8 @@ async fn scenario_operator_ids_converge() {
     }
 
     // Use a 1-second cadence so the test completes quickly without real-time waiting.
-    let (scheduler, mut rx) = OperatorGraphScheduler::new(accumulator, 1);
+    let (scheduler, mut rx) =
+        OperatorGraphScheduler::new(accumulator, ClusteringConfig::default(), 1);
 
     // Drive the scheduler for just one tick by running it with a 1.5s timeout.
     tokio::select! {

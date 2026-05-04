@@ -11,6 +11,7 @@ use pe_config::ServiceConfig;
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
 use pe_funding_graph::FundingGraphAccumulator;
+use pe_operator_graph::ClusteringConfig;
 use pe_source_onchain_polygon::{LivePolygonConnector, PolygonConnectorConfig};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{
@@ -65,8 +66,11 @@ async fn main() -> Result<()> {
     let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
 
     // Operator-graph scheduler — rebuilds clusters every 60s and publishes via watch.
-    let (scheduler, operator_identities_rx) =
-        OperatorGraphScheduler::new(accumulator.clone(), cfg.operator_graph_rebuild_cadence_secs);
+    let (scheduler, operator_identities_rx) = OperatorGraphScheduler::new(
+        accumulator.clone(),
+        ClusteringConfig::default(),
+        cfg.operator_graph_rebuild_cadence_secs,
+    );
     let scheduler_task = tokio::spawn(scheduler.run());
 
     // Polygon source task.
