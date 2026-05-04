@@ -25,3 +25,7 @@ target
 
 # insta snapshot review state (developer-local)
 **/.*.pending-snap
+
+# Paper-mode runtime output — binary log and JSONL sidecar
+paper.log
+paper.jsonl

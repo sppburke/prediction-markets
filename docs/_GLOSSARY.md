@@ -287,6 +287,8 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_base_url` | `https://data-api.polymarket.com` | Base URL for all five public REST endpoints |
 | `polymarket_request_timeout_secs` | 10 | Per-request HTTP timeout before the request is abandoned |
 | `polymarket_max_retries` | 3 | Retries on network errors and 5xx (4 total attempts: initial + 3 retries) |
+| `polymarket_channel_capacity` | 256 | Bounded mpsc channel capacity between trade poller and orchestrator |
+| `trade_poll_interval_secs` | 30 | Seconds between Polymarket trade poll rounds (one round = all watchlisted wallets) |
 
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 
@@ -341,6 +343,31 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `near_close_remaining_pct` | 10 | Position fraction remaining after Trim that flips it to Exit |
 | `unknown_classification_blocks` | true | An `Unknown` action is never copied |
 | `flip_requires_human_approval` | true | Default-deny flip until `flip_human_approved = true` is set in config |
+
+### Service health (`HealthState`)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `source_freshness_window_seconds` | 60 | Seconds without an event before a source is considered stale in `/health/ready` |
+
+### JSONL observability sidecar schema
+
+Written to `jsonl_log_path` (default: `./paper.jsonl`). One JSON object per line.
+
+**Required fields on every line:**
+
+| Field | Type | Description |
+|---|---|---|
+| `ts` | RFC-3339 UTC string | When the event was emitted |
+| `level` | string | `INFO`, `WARN`, `ERROR`, `DEBUG` |
+| `message` | string | Human-readable description |
+
+**Per-kind structured fields** (present when `kind` is set via `tracing::info!(kind = "...", ...)`):
+
+| `kind` | Extra fields | Description |
+|---|---|---|
+| `paper_fill` | `idempotency_key`, `market`, `side`, `contracts`, `fill_price` | A paper-mode simulated fill |
+| `polygon_event` | _(implicit in body)_ | Decoded on-chain Polygon event |
 
 ### Watchlist auto-fetcher (`WatchlistFetchConfig`)
 
