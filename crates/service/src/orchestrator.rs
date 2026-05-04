@@ -176,21 +176,26 @@ impl Orchestrator {
             .find(|e| e.wallet == trade.wallet)
             .and_then(|e| e.operator_id);
 
-        // Update position ledger before classify so the snapshot is current.
-        self.position_ledger.ingest(&trade);
+        // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
+        // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
+        // classification, not before.
+        let position = self.position_ledger.position(&trade.wallet).cloned();
 
         // Record cluster entry when operator is known; prune stale entries.
+        // Ingest into tracker first so the current trade is included in cluster_obs_for.
         if let Some(op) = operator_id {
             self.cluster_tracker.ingest(&trade, op);
         }
 
-        let position = self.position_ledger.position(&trade.wallet);
         let cluster_obs =
             operator_id.and_then(|op| self.cluster_tracker.cluster_obs_for(&trade, op));
 
+        // Advance position ledger after classification inputs are captured.
+        self.position_ledger.ingest(&trade);
+
         let Some(signal) = classify_trade(
             &trade,
-            position,
+            position.as_ref(),
             &self.watchlist,
             &profile,
             cluster_obs.as_ref(),
