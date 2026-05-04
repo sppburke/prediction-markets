@@ -3067,6 +3067,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-position-ledger"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "pe-copy-signal-engine",
+ "pe-core-types",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "pe-risk-engine"
 version = "0.1.0"
 dependencies = [
@@ -3089,6 +3102,7 @@ dependencies = [
  "pe-event-log",
  "pe-funding-graph",
  "pe-operator-graph",
+ "pe-position-ledger",
  "pe-risk-engine",
  "pe-source-core",
  "pe-source-onchain-polygon",

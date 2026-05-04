@@ -8,6 +8,7 @@ members = [
     "crates/funding-graph",
     "crates/kelly-sizer",
     "crates/operator-graph",
+    "crates/position-ledger",
     "crates/risk-engine",
     "crates/source-core",
     "crates/source-onchain-polygon",
