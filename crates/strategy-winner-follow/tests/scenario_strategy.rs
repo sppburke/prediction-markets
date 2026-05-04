@@ -21,6 +21,7 @@ use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{
     ExecutionMode, WinnerFollowConfig, WinnerFollowError, WinnerFollowStrategy,
 };
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use time::macros::datetime;
 
@@ -96,15 +97,48 @@ fn clean_snapshot() -> RiskSnapshot {
 
 // ─── scenario 1 ──────────────────────────────────────────────────────────────
 
-/// With the current placeholder (`p = c = leader_price`), Kelly always returns
-/// zero contracts because edge = 0 when p == c. This is expected — the model
-/// engine (03-PHASE-MODEL-ENGINE.md) will supply calibrated `p`.
+/// With `leader_alpha = 0`, p == c and Kelly always returns zero contracts
+/// because edge = 0. Model-calibrated `p` (Phase 3) replaces the alpha.
 ///
 /// PASS: `Err(NoEdge)`.
 #[test]
-fn scenario_no_edge_with_placeholder_probability() {
+fn scenario_no_edge_with_zero_alpha() {
     let signal = make_signal(
         0x01,
+        WinnerFollowSignalKind::NormalLeaderFollow,
+        LeaderAction::Entry,
+        None,
+    );
+    let config = WinnerFollowConfig {
+        leader_alpha: Decimal::ZERO,
+        ..WinnerFollowConfig::default()
+    };
+    let strategy = WinnerFollowStrategy::new(config);
+
+    let result = strategy.evaluate(
+        &signal,
+        clean_snapshot(),
+        dec!(10_000),
+        ExecutionMode::LiveTiny,
+    );
+
+    assert!(
+        matches!(result, Err(WinnerFollowError::NoEdge)),
+        "zero alpha: p=c yields no edge; got {result:?}"
+    );
+}
+
+// ─── scenario 7 ──────────────────────────────────────────────────────────────
+
+/// With default `leader_alpha = 0.05`, p > c and Kelly finds a non-zero edge.
+/// The strategy returns something other than `NoEdge` (either an order or a
+/// risk block), confirming alpha breaks the p=c deadlock.
+///
+/// PASS: result is NOT `Err(NoEdge)`.
+#[test]
+fn scenario_positive_alpha_breaks_no_edge() {
+    let signal = make_signal(
+        0x07,
         WinnerFollowSignalKind::NormalLeaderFollow,
         LeaderAction::Entry,
         None,
@@ -119,8 +153,8 @@ fn scenario_no_edge_with_placeholder_probability() {
     );
 
     assert!(
-        matches!(result, Err(WinnerFollowError::NoEdge)),
-        "placeholder p=c yields no edge; got {result:?}"
+        !matches!(result, Err(WinnerFollowError::NoEdge)),
+        "default alpha 0.05 must break the p=c deadlock; got {result:?}"
     );
 }
 
@@ -233,8 +267,7 @@ fn scenario_flip_blocked_by_default() {
 
 // ─── scenario 6 ──────────────────────────────────────────────────────────────
 
-/// With `flip_human_approved = true`, Flip passes the gate (then hits NoEdge
-/// due to the probability placeholder).
+/// With `flip_human_approved = true`, Flip passes the gate.
 ///
 /// PASS: result is NOT `Err(FlipNotApproved)`.
 #[test]
