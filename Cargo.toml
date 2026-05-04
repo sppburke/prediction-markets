@@ -17,6 +17,7 @@ members = [
     "crates/strategy-winner-follow",
     "crates/trader-index",
     "crates/venue-core",
+    "crates/bootstrap",
 ]
 
 [workspace.package]

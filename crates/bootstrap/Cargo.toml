@@ -1,0 +1,40 @@
+[package]
+name = "pe-bootstrap"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pe-bootstrap"
+path = "src/main.rs"
+
+[lib]
+name = "pe_bootstrap"
+path = "src/lib.rs"
+
+[features]
+scenario = []
+
+[lints]
+workspace = true
+
+[dependencies]
+pe-core-types               = { path = "../core-types",                 version = "0.1.0" }
+pe-operator-graph           = { path = "../operator-graph",             version = "0.1.0" }
+pe-source-polymarket-public = { path = "../source-polymarket-public",   version = "0.1.0" }
+pe-trader-index             = { path = "../trader-index",               version = "0.1.0" }
+
+reqwest         = { workspace = true }
+rust_decimal    = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+thiserror       = { workspace = true }
+time            = { workspace = true }
+tokio           = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }
+tempfile            = { workspace = true }
