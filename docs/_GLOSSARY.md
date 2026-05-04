@@ -492,3 +492,15 @@ Otherwise the engine submits limit orders.
 - abs(z) ≤ 2.0 on mean-PnL difference, where the standard error is computed by stationary bootstrap with 1_000 resamples.
 
 This applies anywhere the docs say "matches", "close to", or "drift acceptable".
+
+### Bootstrap defaults (`pe-bootstrap`)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `bootstrap_min_closed_trades` | 10 | Minimum closed trades for a wallet to pass the bootstrap pre-filter (exclusive: must have > 10) |
+| `bootstrap_min_win_rate_pct` | 80 | Minimum win-rate (percent, integer) to pass the bootstrap pre-filter |
+| `bootstrap_wallet_cache_ttl_days` | 7 | Days before a cached wallet's trade history is considered stale and re-fetched |
+| `bootstrap_dune_wallet_limit` | 10000 | Maximum distinct wallets pulled from Dune per bootstrap run |
+| `bootstrap_polymarket_audit_window_days` | 90 | Trade lookback window (days) used when building ledgers from bootstrapped wallets |
+| `bootstrap_dune_poll_interval_secs` | 3 | Seconds between Dune execution result polling attempts |
+| `bootstrap_dune_max_wait_secs` | 300 | Maximum seconds to wait for a Dune query to complete before aborting |
