@@ -61,6 +61,11 @@ pub struct ServiceConfig {
     #[serde(default = "default_watchlist_size")]
     pub watchlist_size: usize,
 
+    /// Seconds between Polymarket trade poll rounds (one round = all wallets).
+    /// See `docs/_GLOSSARY.md`: `trade_poll_interval_secs`.
+    #[serde(default = "default_trade_poll_interval_secs")]
+    pub trade_poll_interval_secs: u64,
+
     // ── Logging / persistence ────────────────────────────────────────────────
     /// Path to the BLAKE3-chained binary event log.
     #[serde(default = "default_event_log_path")]
@@ -107,6 +112,10 @@ fn default_watchlist_size() -> usize {
     20
 }
 
+fn default_trade_poll_interval_secs() -> u64 {
+    30
+}
+
 fn default_event_log_path() -> PathBuf {
     PathBuf::from("./paper.log")
 }
@@ -137,6 +146,7 @@ impl Default for ServiceConfig {
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             watchlist_size: default_watchlist_size(),
+            trade_poll_interval_secs: default_trade_poll_interval_secs(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
             bankroll_usd: default_bankroll_usd(),
@@ -186,6 +196,7 @@ mod tests {
         assert_eq!(cfg.polygon_channel_capacity, 256);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
         assert_eq!(cfg.watchlist_size, 20);
+        assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
     }

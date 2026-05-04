@@ -48,8 +48,9 @@ pub struct Orchestrator {
     mode: ExecutionMode,
     bankroll: Decimal,
     health: SharedHealth,
-    // Cached fallback quality for watchlisted wallets whose entry has 100% quality.
-    max_quality: ReconstructionQuality,
+    // Sentinel quality (0) returned for any wallet not found in the watchlist.
+    // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
+    min_quality: ReconstructionQuality,
 }
 
 impl Orchestrator {
@@ -64,8 +65,8 @@ impl Orchestrator {
         paper_executor: PaperExecutor,
         health: SharedHealth,
     ) -> Result<Self, anyhow::Error> {
-        let max_quality = ReconstructionQuality::new(100)
-            .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(100) failed"))?;
+        let min_quality = ReconstructionQuality::new(0)
+            .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
         Ok(Self {
             polygon_rx,
             trade_rx,
@@ -77,7 +78,7 @@ impl Orchestrator {
             mode: config.mode,
             bankroll: config.bankroll,
             health,
-            max_quality,
+            min_quality,
         })
     }
 
@@ -204,7 +205,7 @@ impl Orchestrator {
             .iter()
             .find(|e| &e.wallet == wallet)
             .map(|e| e.reconstruction_quality)
-            .unwrap_or(self.max_quality)
+            .unwrap_or(self.min_quality)
     }
 }
 

@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         TradePoller::new(
             TradePollerConfig {
                 base_url: cfg.polymarket_base_url.clone(),
-                poll_interval_secs: 30,
+                poll_interval_secs: cfg.trade_poll_interval_secs,
             },
             wallets,
             ReqwestFetcher::new(reqwest::Client::new()),

@@ -115,13 +115,18 @@ fn convert_trade(
         .map_err(|_| TradeParseError::InvalidTimestamp(ts_secs))?;
 
     // Outcome: Polymarket YES token → 0, NO token → 1, unknown → 0.
+    // Phase 0B: asset_id is a Polymarket token ID (large decimal); full token→outcome
+    // mapping deferred. Non-parseable IDs default to outcome 0 (YES) with a warning.
     let outcome_id = if raw.asset_id.is_empty() {
         OutcomeId(0)
     } else {
-        raw.asset_id
-            .parse::<u8>()
-            .map(OutcomeId)
-            .unwrap_or(OutcomeId(0))
+        raw.asset_id.parse::<u8>().map(OutcomeId).unwrap_or_else(|_| {
+            tracing::warn!(
+                asset_id = %raw.asset_id,
+                "asset_id not a u8; defaulting to outcome 0 (YES) — token→outcome mapping deferred"
+            );
+            OutcomeId(0)
+        })
     };
 
     Ok(IncomingTrade {
