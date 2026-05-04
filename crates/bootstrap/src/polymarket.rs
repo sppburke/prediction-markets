@@ -137,8 +137,9 @@ fn convert_trade(raw: PolymarketTrade, wallet: WalletAddress) -> Result<RawTrade
         .size
         .floor()
         .to_u64()
+        .filter(|&n| n > 0)
         .map(ContractQty)
-        .ok_or_else(|| format!("size {} out of u64 range", raw.size))?;
+        .ok_or_else(|| format!("size {} floors to zero contracts", raw.size))?;
 
     let side = match raw.side.to_uppercase().as_str() {
         "BUY" => Side::Buy,
@@ -195,6 +196,14 @@ mod tests {
     #[test]
     fn parse_unknown_side_skipped() {
         let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"UNKNOWN","size":5,"price":0.40,"timestamp":1704067200}]"#;
+        let trades = parse_trades(json, wallet_a()).unwrap();
+        assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn parse_fractional_size_skipped() {
+        // 0.75 contracts floors to 0 — trade must be skipped with a warning.
+        let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"BUY","size":0.75,"price":0.40,"timestamp":1704067200}]"#;
         let trades = parse_trades(json, wallet_a()).unwrap();
         assert!(trades.is_empty());
     }

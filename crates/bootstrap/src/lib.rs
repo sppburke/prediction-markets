@@ -182,7 +182,7 @@ pub fn build_seed_watchlist(
             operator_id: None,
             tier: WatchlistTier::Active,
             leader_score_bps: score,
-            lcb_5pct_bps: score,
+            lcb_5pct_bps: BasisPoints(0),
             closed_trades_in_window: u32::try_from(total).unwrap_or(u32::MAX),
             reconstruction_quality: ledger.reconstruction_quality,
         });

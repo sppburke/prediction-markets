@@ -14,6 +14,7 @@ use crate::error::BootstrapError;
 const BASE_URL: &str = "https://api.dune.com/api/v1";
 const POLL_INTERVAL_SECS: u64 = 3;
 const MAX_WAIT_SECS: u64 = 300;
+const HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// SQL for wallet discovery: all distinct makers from Polymarket trade history.
 /// The `{limit}` placeholder is filled at runtime via format!.
@@ -112,6 +113,7 @@ impl DuneClient {
             .post(&url)
             .header("X-DUNE-API-KEY", &self.api_key)
             .json(&body)
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .send()
             .await
             .map_err(|e| BootstrapError::Dune {
@@ -147,6 +149,7 @@ impl DuneClient {
             .post(&url)
             .header("X-DUNE-API-KEY", &self.api_key)
             .header("Content-Length", "0")
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .send()
             .await
             .map_err(|e| BootstrapError::Dune {
@@ -194,6 +197,7 @@ impl DuneClient {
                 .client
                 .get(&url)
                 .header("X-DUNE-API-KEY", &self.api_key)
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
                 .send()
                 .await
                 .map_err(|e| BootstrapError::Dune {
