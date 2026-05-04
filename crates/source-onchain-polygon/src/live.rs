@@ -29,7 +29,7 @@ use alloy::{
     rpc::types::Filter,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast::error::RecvError as BroadcastRecvError, mpsc};
 use tracing::{debug, info, warn};
 
 use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
@@ -372,6 +372,11 @@ async fn connect_and_stream(
                         return StreamOutcome::ChannelClosed;
                     }
                 }
+                // Lag is recoverable: the channel is still alive; we lost `n` events
+                // from the broadcast buffer. Warn and continue rather than reconnect.
+                Err(BroadcastRecvError::Lagged(n)) => {
+                    warn!(dropped = n, sub = "usdc", "subscription lagged; events dropped");
+                }
                 Err(e) => return StreamOutcome::StreamEnded(format!("usdc: {e}")),
             },
             r = sub_other.recv() => match r {
@@ -381,6 +386,9 @@ async fn connect_and_stream(
                     {
                         return StreamOutcome::ChannelClosed;
                     }
+                }
+                Err(BroadcastRecvError::Lagged(n)) => {
+                    warn!(dropped = n, sub = "other", "subscription lagged; events dropped");
                 }
                 Err(e) => return StreamOutcome::StreamEnded(format!("other: {e}")),
             },
