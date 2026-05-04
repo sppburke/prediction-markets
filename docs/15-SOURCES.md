@@ -57,7 +57,7 @@
 | https://docs.polymarket.com/trading/bridge/supported-assets | — | — |
 | https://docs.polymarket.com/trading/bridge/status | — | — |
 | https://docs.polymarket.com/developers/contracts | — | — |
-| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
 | https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets | 2026-05-02 | 2026-07-01 |
 
 ## Public sources
