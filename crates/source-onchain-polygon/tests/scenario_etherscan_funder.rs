@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use pe_core_types::WalletAddress;
 use pe_source_onchain_polygon::EtherscanFunderLookup;
-use pe_source_onchain_polygon::etherscan::HttpFetcher;
+use pe_source_onchain_polygon::etherscan::{FetchError, HttpFetcher};
 use pe_source_onchain_polygon::funder_discovery::{BlockRange, FunderLookup};
 
 const WALLET_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -50,14 +50,14 @@ impl FixtureFetcher {
 }
 
 impl HttpFetcher for FixtureFetcher {
-    async fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
         self.calls.lock().unwrap().push(url.to_owned());
         for (substr, body) in &self.rules {
             if url.contains(substr) {
                 return Ok(body.clone());
             }
         }
-        Err(format!("no fixture matched url: {url}"))
+        Err(FetchError::Fatal(format!("no fixture matched url: {url}")))
     }
 }
 

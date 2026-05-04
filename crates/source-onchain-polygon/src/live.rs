@@ -120,6 +120,8 @@ pub enum LivePolygonError {
     WsConnect(String),
     #[error("funder discovery: {0}")]
     Discovery(String),
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 // ── Connector ─────────────────────────────────────────────────────────────────
@@ -141,6 +143,37 @@ impl LivePolygonConnector {
         source_id: SourceId,
         config: PolygonConnectorConfig,
     ) -> Result<Self, LivePolygonError> {
+        // Validate funder_source up-front: typo'd values (e.g. "Etherscan",
+        // "etherscan_v2", trailing whitespace) would otherwise silently fall
+        // through to eth_logs and re-burn the Alchemy CU budget that selecting
+        // "etherscan" was meant to save.
+        match config.funder_source.as_str() {
+            "eth_logs" => {}
+            "etherscan" => {
+                if config.etherscan_api_key.is_empty() {
+                    return Err(LivePolygonError::InvalidConfig(
+                        "funder_source = \"etherscan\" but etherscan_api_key is empty (set PE_ETHERSCAN_API_KEY)".to_owned(),
+                    ));
+                }
+                // Etherscan does not emit decoded events into the live event
+                // log; only the closure is computed. Operators promoting from
+                // a fresh deploy should bootstrap the event log under
+                // `funder_source = "eth_logs"` once before flipping. Tracked
+                // as a follow-up to issue #52.
+                warn!(
+                    "funder_source = \"etherscan\": historical USDC Transfer events are NOT \
+                     written to the event log during discovery. Only the funder closure is \
+                     populated. Replay reproducibility for the historical range will be \
+                     incomplete unless eth_logs has previously populated the log."
+                );
+            }
+            other => {
+                return Err(LivePolygonError::InvalidConfig(format!(
+                    "unknown funder_source '{other}'; expected 'eth_logs' or 'etherscan'"
+                )));
+            }
+        }
+
         let (event_tx, event_rx) = mpsc::channel(config.channel_capacity);
 
         // HTTP provider for backfill and current-block query.

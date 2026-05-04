@@ -32,6 +32,11 @@
 //! - `etherscan`: [`EtherscanFunderLookup`] — one tokentx query per
 //!   `(wallet, USDC contract)` pair against the Etherscan V2 free tier.
 //!   Spends 5 req/s; intended for the historical 21M-block discovery sweep.
+//!   **Caveat:** unlike the eth_logs backend, the Etherscan backend does NOT
+//!   forward decoded USDC Transfer events into `event_tx`; it only computes
+//!   the funder closure. Operators flipping a fresh deploy should bootstrap
+//!   the event log under `eth_logs` once before switching, otherwise replay
+//!   reproducibility for the historical range will be incomplete.
 
 pub mod connector;
 pub mod contracts;

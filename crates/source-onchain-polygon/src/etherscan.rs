@@ -54,33 +54,52 @@ const MAX_RESULTS_PER_PAGE: usize = 10_000;
 
 // ── HTTP abstraction ──────────────────────────────────────────────────────────
 
+/// Classified fetch error.
+///
+/// `Transient` (429, 5xx, network) is retryable; `Fatal` (4xx other than 429,
+/// or malformed responses) is not. The retry loop in
+/// [`EtherscanFunderLookup::fetch_with_backoff`] uses this to skip pointless
+/// retries on permanent errors like a bad API key.
+#[derive(Debug, Clone)]
+pub enum FetchError {
+    Transient(String),
+    Fatal(String),
+}
+
 /// HTTP fetcher used by [`EtherscanFunderLookup`].
 ///
 /// Production uses `reqwest::Client`; tests substitute a fixture-backed impl
 /// to avoid live network calls.
 pub trait HttpFetcher: Send + Sync {
-    fn fetch(&self, url: &str)
-    -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+    fn fetch(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, FetchError>> + Send;
 }
 
 impl HttpFetcher for reqwest::Client {
-    async fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
         let resp = self
             .get(url)
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| FetchError::Transient(e.to_string()))?;
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(format!(
-                "HTTP {}: {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            ));
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| FetchError::Transient(e.to_string()))?;
+        if status.is_success() {
+            return Ok(bytes.to_vec());
         }
-        Ok(bytes.to_vec())
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        // 429 + 5xx are retryable; other 4xx (auth, not-found, …) are permanent.
+        if status.as_u16() == 429 || status.is_server_error() {
+            Err(FetchError::Transient(format!("HTTP {status}: {body}")))
+        } else {
+            Err(FetchError::Fatal(format!("HTTP {status}: {body}")))
+        }
     }
 }
 
@@ -96,7 +115,7 @@ struct EtherscanResponse {
     result: serde_json::Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TokenTxEntry {
     from: String,
@@ -151,24 +170,41 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         )
     }
 
-    async fn fetch_with_backoff(&self, url: &str) -> Result<Vec<u8>, FunderDiscoveryError> {
+    /// Fetch and parse a single page, retrying on transient HTTP errors AND
+    /// on Etherscan's in-band rate-limit responses (HTTP 200 + status="0" +
+    /// body containing "Max rate limit reached"). A `Fatal` HTTP error or a
+    /// permanent API error returns immediately without retry.
+    async fn fetch_and_parse_with_backoff(
+        &self,
+        url: &str,
+    ) -> Result<Vec<TokenTxEntry>, FunderDiscoveryError> {
         let mut backoff_secs: u64 = 1;
         let mut last_err: Option<String> = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.fetcher.fetch(url).await {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => {
+            let outcome = match self.fetcher.fetch(url).await {
+                Ok(bytes) => parse_tokentx_response(&bytes),
+                Err(FetchError::Fatal(m)) => {
+                    return Err(FunderDiscoveryError::Etherscan(format!("fatal: {m}")));
+                }
+                Err(FetchError::Transient(m)) => Err(ParseOutcome::Transient(m)),
+            };
+            match outcome {
+                Ok(entries) => return Ok(entries),
+                Err(ParseOutcome::Transient(m)) => {
                     warn!(
                         attempt,
                         max = MAX_ATTEMPTS,
-                        error = %e,
+                        error = %m,
                         "etherscan: transient error, retrying"
                     );
-                    last_err = Some(e);
+                    last_err = Some(m);
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     }
+                }
+                Err(ParseOutcome::Fatal(m)) => {
+                    return Err(FunderDiscoveryError::Etherscan(format!("fatal: {m}")));
                 }
             }
         }
@@ -189,8 +225,7 @@ impl<F: HttpFetcher> FunderLookup for EtherscanFunderLookup<F> {
         for wallet in wallets {
             for contract in [USDC_NATIVE, USDC_BRIDGED] {
                 let url = self.build_url(wallet, contract, range);
-                let bytes = self.fetch_with_backoff(&url).await?;
-                let transfers = parse_tokentx_response(&bytes)?;
+                let transfers = self.fetch_and_parse_with_backoff(&url).await?;
                 if transfers.len() >= MAX_RESULTS_PER_PAGE {
                     warn!(
                         wallet = %wallet,
@@ -222,18 +257,45 @@ impl<F: HttpFetcher> FunderLookup for EtherscanFunderLookup<F> {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
-fn parse_tokentx_response(bytes: &[u8]) -> Result<Vec<TokenTxEntry>, FunderDiscoveryError> {
+/// Outcome of parsing one Etherscan response — distinguishes in-band errors
+/// that should trigger a retry (rate limit, transient API failure) from
+/// permanent API errors (malformed JSON, unexpected schema).
+#[derive(Debug)]
+enum ParseOutcome {
+    Transient(String),
+    Fatal(String),
+}
+
+fn parse_tokentx_response(bytes: &[u8]) -> Result<Vec<TokenTxEntry>, ParseOutcome> {
     let resp: EtherscanResponse = serde_json::from_slice(bytes)
-        .map_err(|e| FunderDiscoveryError::Etherscan(e.to_string()))?;
+        .map_err(|e| ParseOutcome::Fatal(format!("decode envelope: {e}")))?;
     match resp.status.as_str() {
         "1" => serde_json::from_value::<Vec<TokenTxEntry>>(resp.result)
-            .map_err(|e| FunderDiscoveryError::Etherscan(format!("decode result array: {e}"))),
+            .map_err(|e| ParseOutcome::Fatal(format!("decode result array: {e}"))),
         // "No transactions found" is reported as status="0" with an empty
         // result array — treat as success with zero transfers.
         "0" if resp.message.eq_ignore_ascii_case("No transactions found") => Ok(Vec::new()),
-        _ => Err(FunderDiscoveryError::Etherscan(format!(
-            "API status={}: {}",
-            resp.status, resp.message
+        // Etherscan reports rate-limit failures in-band with HTTP 200; treat
+        // them as transient so the retry loop kicks in.
+        "0" => {
+            let body = resp.result.to_string();
+            if resp.message.to_uppercase().contains("NOTOK")
+                || body.to_lowercase().contains("rate limit")
+            {
+                Err(ParseOutcome::Transient(format!(
+                    "API status=0 message={} body={body}",
+                    resp.message
+                )))
+            } else {
+                Err(ParseOutcome::Fatal(format!(
+                    "API status=0 message={}: {body}",
+                    resp.message
+                )))
+            }
+        }
+        other => Err(ParseOutcome::Fatal(format!(
+            "API status={other} message={}",
+            resp.message
         ))),
     }
 }
@@ -265,16 +327,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_rate_limited_response() {
+    fn rate_limited_response_is_transient() {
         let json = br#"{"status":"0","message":"NOTOK","result":"Max rate limit reached"}"#;
         let result = parse_tokentx_response(json);
-        assert!(matches!(result, Err(FunderDiscoveryError::Etherscan(_))));
+        assert!(
+            matches!(result, Err(ParseOutcome::Transient(_))),
+            "rate-limit must be classified Transient so the retry loop kicks in, got {result:?}"
+        );
     }
 
     #[test]
-    fn rejects_malformed_json() {
+    fn malformed_json_is_fatal() {
         let result = parse_tokentx_response(b"not json");
-        assert!(matches!(result, Err(FunderDiscoveryError::Etherscan(_))));
+        assert!(matches!(result, Err(ParseOutcome::Fatal(_))));
     }
 
     #[test]
