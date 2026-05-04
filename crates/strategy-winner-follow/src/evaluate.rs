@@ -45,8 +45,8 @@ impl WinnerFollowStrategy {
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
-    /// `p` placeholder: `signal.leader_price` is used as the estimated win probability.
-    /// Model-calibrated `p` is deferred to `03-PHASE-MODEL-ENGINE.md`.
+    /// `p` = `leader_price + leader_alpha` (capped at 1.0). Model-calibrated `p` deferred to
+    /// `03-PHASE-MODEL-ENGINE.md`.
     ///
     /// `c` placeholder: `signal.leader_price` is used as the net price (pre-fee/slippage).
     /// Cost-model adjustment is deferred to `05-PHASE-BACKTESTING.md`.
@@ -74,8 +74,8 @@ impl WinnerFollowStrategy {
         let kf = kelly_fraction(signal.signal_kind, effective_mode);
 
         // 5. Size contracts.
-        // Both `p` and `c` use leader_price as a placeholder until the model engine lands.
-        let p = Probability(signal.leader_price.0);
+        // p = leader_price + alpha, capped at 1.0. Model-calibrated p deferred to Phase 3.
+        let p = Probability((signal.leader_price.0 + self.config.leader_alpha).min(Decimal::ONE));
         let c = signal.leader_price;
 
         let kelly_input = KellyInput {

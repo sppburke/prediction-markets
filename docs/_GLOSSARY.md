@@ -347,6 +347,12 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `unknown_classification_blocks` | true | An `Unknown` action is never copied |
 | `flip_requires_human_approval` | true | Default-deny flip until `flip_human_approved = true` is set in config |
 
+### Winner-Follow evaluation (`WinnerFollowConfig`)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `winner_follow_leader_alpha` | 0.05 | Edge assumption: `p = leader_price + alpha`. Breaks the `p=c` deadlock until model-calibrated `p` lands in Phase 3. Set to 0 to disable. |
+
 ### Service health (`HealthState`)
 
 | Key | Default | Meaning |
