@@ -24,8 +24,12 @@ pub mod connector;
 pub mod contracts;
 pub mod decoder;
 pub mod event;
+pub mod funder_discovery;
 pub mod live;
 
 pub use connector::PolygonReplayConnector;
 pub use event::{ExternalAddressKind, PolygonEvent, PolygonEventError, TxHash};
+pub use funder_discovery::{
+    BlockRange, EthGetLogsLookup, FunderDiscoveryError, FunderLookup, discover_to_depth,
+};
 pub use live::{LivePolygonConnector, LivePolygonError, PolygonConnectorConfig};

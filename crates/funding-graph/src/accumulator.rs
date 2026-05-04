@@ -1,10 +1,10 @@
 //! Pure accumulator: `PolygonEvent`s → `FundingSnapshot`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pe_core_types::{SourceTimestamp, WalletAddress};
 use pe_operator_graph::{AddressCategory, FundingEdge, FundingSnapshot};
-use pe_source_onchain_polygon::{ExternalAddressKind, PolygonEvent};
+use pe_source_onchain_polygon::{ExternalAddressKind, PolygonEvent, TxHash};
 use time::macros::datetime;
 
 /// Accumulates decoded [`PolygonEvent`]s and produces [`FundingSnapshot`]s for
@@ -22,6 +22,11 @@ pub struct FundingGraphAccumulator {
     last_timestamp: SourceTimestamp,
     /// Highest block number seen across all ingested events.
     highest_block: u64,
+    /// `(tx_hash, from, to)` keys of edges already ingested. Multi-pass
+    /// backfill can return the same physical log when wallets appear in more
+    /// than one pass's `topic[2]` filter; without this guard we'd push
+    /// duplicate `FundingEdge`s and double-weight the funding graph.
+    seen_edge_keys: HashSet<(TxHash, WalletAddress, WalletAddress)>,
 }
 
 impl FundingGraphAccumulator {
@@ -34,6 +39,7 @@ impl FundingGraphAccumulator {
             // Sentinel: no events ingested yet.
             last_timestamp: SourceTimestamp(datetime!(1970-01-01 0:00 UTC)),
             highest_block: 0,
+            seen_edge_keys: HashSet::new(),
         }
     }
 
@@ -46,15 +52,18 @@ impl FundingGraphAccumulator {
                 amount_usd,
                 timestamp,
                 block_number,
+                tx_hash,
                 ..
             } => {
                 self.update_watermark(&timestamp, block_number);
-                self.edges.push(FundingEdge {
-                    funder: from,
-                    funded: to,
-                    amount_usd,
-                    timestamp,
-                });
+                if self.seen_edge_keys.insert((tx_hash, from, to)) {
+                    self.edges.push(FundingEdge {
+                        funder: from,
+                        funded: to,
+                        amount_usd,
+                        timestamp,
+                    });
+                }
             }
 
             PolygonEvent::ProxyWalletDeployed {
@@ -86,15 +95,18 @@ impl FundingGraphAccumulator {
                 amount_usd,
                 timestamp,
                 block_number,
+                tx_hash,
                 ..
             } => {
                 self.update_watermark(&timestamp, block_number);
-                self.edges.push(FundingEdge {
-                    funder: from,
-                    funded: deposit_address,
-                    amount_usd,
-                    timestamp: timestamp.clone(),
-                });
+                if self.seen_edge_keys.insert((tx_hash, from, deposit_address)) {
+                    self.edges.push(FundingEdge {
+                        funder: from,
+                        funded: deposit_address,
+                        amount_usd,
+                        timestamp: timestamp.clone(),
+                    });
+                }
                 // The deposit address is a CEX intermediary, not a Polymarket proxy.
                 self.known_external
                     .insert(deposit_address, AddressCategory::CexDeposit);
@@ -292,6 +304,59 @@ mod tests {
                 .get(&addr("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")),
             Some(&AddressCategory::CexDeposit)
         );
+    }
+
+    #[test]
+    fn duplicate_usdc_transfer_produces_one_edge() {
+        let mut acc = FundingGraphAccumulator::new();
+        let from = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let to = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let same_tx = pe_source_onchain_polygon::event::TxHash([7u8; 32]);
+        let event = || PolygonEvent::UsdcTransfer {
+            from,
+            to,
+            to_collateral_contract: false,
+            from_collateral_contract: false,
+            amount_usd: rust_decimal::Decimal::ONE,
+            block_number: 100,
+            tx_hash: same_tx,
+            timestamp: ts("2024-01-01T00:00:00Z"),
+        };
+        // Same physical log ingested twice (multi-pass backfill scenario).
+        acc.ingest(event());
+        acc.ingest(event());
+        let snap = acc.snapshot();
+        assert_eq!(snap.edges.len(), 1);
+    }
+
+    #[test]
+    fn distinct_transfers_in_same_tx_are_kept() {
+        // A single tx may emit multiple Transfer events (e.g. swap + fee).
+        // Dedup key is (tx_hash, from, to), so distinct edge endpoints are kept.
+        let mut acc = FundingGraphAccumulator::new();
+        let same_tx = pe_source_onchain_polygon::event::TxHash([9u8; 32]);
+        acc.ingest(PolygonEvent::UsdcTransfer {
+            from: addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            to: addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            to_collateral_contract: false,
+            from_collateral_contract: false,
+            amount_usd: rust_decimal::Decimal::ONE,
+            block_number: 100,
+            tx_hash: same_tx,
+            timestamp: ts("2024-01-01T00:00:00Z"),
+        });
+        acc.ingest(PolygonEvent::UsdcTransfer {
+            from: addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            to: addr("0xcccccccccccccccccccccccccccccccccccccccc"),
+            to_collateral_contract: false,
+            from_collateral_contract: false,
+            amount_usd: rust_decimal::Decimal::ONE,
+            block_number: 100,
+            tx_hash: same_tx,
+            timestamp: ts("2024-01-01T00:00:00Z"),
+        });
+        let snap = acc.snapshot();
+        assert_eq!(snap.edges.len(), 2);
     }
 
     #[test]

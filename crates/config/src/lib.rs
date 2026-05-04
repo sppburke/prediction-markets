@@ -45,6 +45,12 @@ pub struct ServiceConfig {
     #[serde(default = "default_channel_capacity")]
     pub polygon_channel_capacity: usize,
 
+    /// Max blocks per `eth_getLogs` page during backfill.
+    /// Alchemy free tier caps this at 10; paid tiers allow ~2_000+.
+    /// See `docs/_GLOSSARY.md`: `polygon_backfill_page_size`.
+    #[serde(default = "default_backfill_page_size")]
+    pub polygon_backfill_page_size: u64,
+
     // ── Polymarket public source ─────────────────────────────────────────────
     /// Base URL for the Polymarket Data API (no trailing slash).
     #[serde(default = "default_polymarket_base_url")]
@@ -110,6 +116,10 @@ fn default_channel_capacity() -> usize {
     256
 }
 
+fn default_backfill_page_size() -> u64 {
+    10
+}
+
 fn default_polymarket_base_url() -> String {
     "https://data-api.polymarket.com".to_string()
 }
@@ -153,6 +163,7 @@ impl Default for ServiceConfig {
             backfill_blocks: default_backfill_blocks(),
             polygon_checkpoint_path: default_checkpoint_path(),
             polygon_channel_capacity: default_channel_capacity(),
+            polygon_backfill_page_size: default_backfill_page_size(),
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             watchlist_size: default_watchlist_size(),
@@ -205,6 +216,7 @@ mod tests {
         assert_eq!(cfg.bind, "127.0.0.1:8080");
         assert_eq!(cfg.backfill_blocks, 21_000_000);
         assert_eq!(cfg.polygon_channel_capacity, 256);
+        assert_eq!(cfg.polygon_backfill_page_size, 10);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
         assert_eq!(cfg.watchlist_size, 20);
         assert_eq!(cfg.trade_poll_interval_secs, 30);
@@ -229,6 +241,15 @@ mode = "shadow"
         assert_eq!(cfg.bind, "0.0.0.0:9000");
         assert_eq!(cfg.bankroll_usd, "5000");
         assert_eq!(cfg.mode, "shadow");
+    }
+
+    #[test]
+    fn backfill_page_size_toml_override() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"polygon_backfill_page_size = 2000"#).unwrap();
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.polygon_backfill_page_size, 2000);
     }
 
     #[test]
