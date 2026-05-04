@@ -22,7 +22,7 @@ pub enum TradeParseError {
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
-// v1 /trades returns a JSON array directly (no wrapper object).
+// GET /trades?user=<wallet> returns a JSON array directly (no wrapper object).
 type TradeResponse = Vec<RawTrade>;
 
 // Field names match the camelCase keys returned by GET /trades?user=<wallet>.
