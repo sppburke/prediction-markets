@@ -196,12 +196,16 @@ fn scenario_proxy_creation_decoded() {
     match event {
         PolygonEvent::ProxyWalletDeployed {
             proxy: p,
-            owner: o,
+            singleton: s,
             block_number,
             ..
         } => {
             assert_eq!(p.0, *proxy.as_slice(), "proxy address");
-            assert_eq!(o.0, *singleton.as_slice(), "owner (singleton) address");
+            assert_eq!(
+                s.0,
+                *singleton.as_slice(),
+                "singleton (implementation) address"
+            );
             assert_eq!(block_number, BLOCK_NUMBER);
         }
         other => panic!("expected ProxyWalletDeployed, got {other:?}"),

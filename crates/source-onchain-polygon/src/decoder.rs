@@ -112,7 +112,7 @@ fn decode_proxy_creation(
     let decoded = ProxyCreation::decode_log(&log.inner).ok()?;
     Some(PolygonEvent::ProxyWalletDeployed {
         proxy: to_wallet_address(decoded.proxy),
-        owner: to_wallet_address(decoded.singleton),
+        singleton: to_wallet_address(decoded.singleton),
         block_number,
         tx_hash,
         timestamp,
@@ -135,6 +135,7 @@ fn block_timestamp(log: &Log) -> Option<SourceTimestamp> {
     // Alchemy nodes populate block_timestamp in eth_getLogs / subscription responses.
     // Standard Ethereum nodes may omit it; logs without a timestamp are skipped.
     let ts_secs = log.block_timestamp?;
-    let odt = OffsetDateTime::from_unix_timestamp(ts_secs as i64).ok()?;
+    let ts_i64 = i64::try_from(ts_secs).ok()?;
+    let odt = OffsetDateTime::from_unix_timestamp(ts_i64).ok()?;
     Some(SourceTimestamp(odt))
 }

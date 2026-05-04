@@ -12,7 +12,7 @@
   {
     "kind": "proxy_wallet_deployed",
     "proxy": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-    "owner": "0xcccccccccccccccccccccccccccccccccccccccc",
+    "singleton": "0xcccccccccccccccccccccccccccccccccccccccc",
     "block_number": 51000001,
     "tx_hash": "0x0000000000000000000000000000000000000000000000000000000000000011",
     "timestamp": "2024-02-01T09:01:00Z"

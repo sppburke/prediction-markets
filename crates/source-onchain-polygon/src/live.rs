@@ -296,10 +296,15 @@ async fn run_ws_subscription(tx: mpsc::Sender<PolygonEvent>, ws_url: String) {
 
         match connect_and_stream(&ws_url, &tx).await {
             StreamOutcome::ChannelClosed => return,
-            StreamOutcome::Reconnect(reason) => {
-                warn!(reason, backoff_secs, "WS disconnected; reconnecting");
+            StreamOutcome::ConnectFailed(reason) => {
+                warn!(reason, backoff_secs, "WS connect failed; retrying");
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                 backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            }
+            StreamOutcome::StreamEnded(reason) => {
+                // Stream was active; reset backoff so a brief reconnect isn't penalised.
+                warn!(reason, "WS stream ended; reconnecting");
+                backoff_secs = 1;
             }
         }
     }
@@ -308,20 +313,23 @@ async fn run_ws_subscription(tx: mpsc::Sender<PolygonEvent>, ws_url: String) {
 #[derive(Debug)]
 enum StreamOutcome {
     ChannelClosed,
-    Reconnect(String),
+    /// WS connection or subscription failed before streaming began; maintain backoff.
+    ConnectFailed(String),
+    /// WS stream was active and then disconnected; backoff should reset on next connect.
+    StreamEnded(String),
 }
 
 async fn connect_and_stream(ws_url: &str, tx: &mpsc::Sender<PolygonEvent>) -> StreamOutcome {
     let connect = WsConnect::new(ws_url);
     let provider = match ProviderBuilder::new().connect_ws(connect).await {
         Ok(p) => p,
-        Err(e) => return StreamOutcome::Reconnect(e.to_string()),
+        Err(e) => return StreamOutcome::ConnectFailed(e.to_string()),
     };
 
     let filter = make_subscription_filter();
     let mut sub = match provider.subscribe_logs(&filter).await {
         Ok(s) => s,
-        Err(e) => return StreamOutcome::Reconnect(e.to_string()),
+        Err(e) => return StreamOutcome::ConnectFailed(e.to_string()),
     };
 
     info!("WS subscription active");
@@ -335,7 +343,7 @@ async fn connect_and_stream(ws_url: &str, tx: &mpsc::Sender<PolygonEvent>) -> St
                     return StreamOutcome::ChannelClosed;
                 }
             }
-            Err(e) => return StreamOutcome::Reconnect(e.to_string()),
+            Err(e) => return StreamOutcome::StreamEnded(e.to_string()),
         }
     }
 }
@@ -372,5 +380,9 @@ fn load_checkpoint(path: &Path) -> Option<u64> {
 fn save_checkpoint(path: &Path, block: u64) -> Result<(), std::io::Error> {
     let cp = Checkpoint { last_block: block };
     let content = serde_json::to_string(&cp).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(path, content)
+    // Write to a sibling tmp file then rename for POSIX-atomic swap: a crash
+    // between write and rename leaves the previous checkpoint intact.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
 }
