@@ -1,12 +1,12 @@
 [package]
-name = "pe-trader-index"
+name = "pe-funding-graph"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [lib]
-name = "pe_trader_index"
+name = "pe_funding_graph"
 path = "src/lib.rs"
 
 [lints.rust]
@@ -24,15 +24,9 @@ scenario = []
 [dependencies]
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-operator-graph = { path = "../operator-graph", version = "0.1.0" }
-pe-source-polymarket-public = { path = "../source-polymarket-public", version = "0.1.0" }
+pe-source-onchain-polygon = { path = "../source-onchain-polygon", version = "0.1.0" }
 rust_decimal = { workspace = true }
-rust_decimal_macros = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true }
 
 [dev-dependencies]
-blake3 = { workspace = true }
 rust_decimal_macros = { workspace = true }
