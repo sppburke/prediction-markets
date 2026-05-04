@@ -342,6 +342,13 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `unknown_classification_blocks` | true | An `Unknown` action is never copied |
 | `flip_requires_human_approval` | true | Default-deny flip until `flip_human_approved = true` is set in config |
 
+### Watchlist auto-fetcher (`WatchlistFetchConfig`)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `watchlist_size` | 20 | Top-N leaderboard entries fetched by `WatchlistFetcher` |
+| `watchlist_lookback_window_days` | 7 | Days of leaderboard history considered when selecting candidates |
+
 ### Watchlist sizes
 
 | Key | Default | Meaning |

@@ -5,6 +5,7 @@ members = [
     "crates/copy-signal-engine",
     "crates/core-types",
     "crates/event-log",
+    "crates/funding-graph",
     "crates/kelly-sizer",
     "crates/operator-graph",
     "crates/risk-engine",

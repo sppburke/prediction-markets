@@ -2993,6 +2993,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-funding-graph"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "pe-operator-graph",
+ "pe-source-onchain-polygon",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "time",
+]
+
+[[package]]
 name = "pe-kelly-sizer"
 version = "0.1.0"
 dependencies = [
@@ -3113,12 +3125,14 @@ dependencies = [
  "blake3",
  "pe-core-types",
  "pe-operator-graph",
+ "pe-source-polymarket-public",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "thiserror",
  "time",
+ "tokio",
 ]
 
 [[package]]
