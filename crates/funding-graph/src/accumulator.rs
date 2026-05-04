@@ -120,6 +120,12 @@ impl FundingGraphAccumulator {
     ///
     /// `closed_trade_counts` and `realized_pnl_usd` are empty in Phase 0B;
     /// they require Polymarket trade data fed from a separate source.
+    ///
+    /// **Precondition**: at least one event must have been ingested before calling
+    /// this method. If called on an empty accumulator, `snapshot_at` will be the
+    /// Unix epoch sentinel (`1970-01-01T00:00:00Z`), causing wallet ages to be
+    /// computed as epoch-relative (very large values will silently overflow `u32`
+    /// and be dropped from `wallet_ages`).
     pub fn snapshot(&self) -> FundingSnapshot {
         let snapshot_at = self.last_timestamp.clone();
         let snapshot_unix = snapshot_at.0.unix_timestamp();

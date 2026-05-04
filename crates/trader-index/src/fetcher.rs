@@ -111,14 +111,20 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
                 }
             })?;
             // Rank-inverted basis-point score: rank 1 → n×100, rank n → 100.
-            let rank_score = BasisPoints(((n - idx) * 100) as i32);
+            // saturating_mul prevents usize overflow; try_into caps at i32::MAX for
+            // pathological watchlist_size values (safe at the default of 20).
+            let score_value = (n - idx).saturating_mul(100).try_into().unwrap_or(i32::MAX);
+            let rank_score = BasisPoints(score_value);
             entries.push(WatchlistEntry {
                 wallet,
                 operator_id: None,
                 tier: WatchlistTier::Active,
                 leader_score_bps: rank_score,
                 lcb_5pct_bps: rank_score,
-                closed_trades_in_window: 1,
+                // No trade data at fetch time — honest zero sentinel.
+                // The service layer merges this with ranker output before
+                // passing to copy-signal-engine.
+                closed_trades_in_window: 0,
                 reconstruction_quality: quality,
             });
         }
