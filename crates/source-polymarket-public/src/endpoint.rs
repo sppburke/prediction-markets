@@ -28,7 +28,7 @@ impl PolymarketEndpoint {
     /// Build the request URL given a base URL (no trailing slash).
     pub fn url(&self, base: &str) -> String {
         match self {
-            Self::Leaderboard => format!("{base}/leaderboard"),
+            Self::Leaderboard => format!("{base}/v1/leaderboard"),
             Self::UserTrades { user } => format!("{base}/data/trades?user={user}"),
             Self::CurrentPositions { user } => format!("{base}/positions?user={user}"),
             Self::ClosedPositions { user } => {
@@ -49,7 +49,7 @@ mod tests {
         assert_eq!(ep.key(), "leaderboard");
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/leaderboard"
+            "https://data-api.polymarket.com/v1/leaderboard"
         );
     }
 

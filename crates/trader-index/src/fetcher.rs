@@ -51,10 +51,8 @@ pub enum WatchlistFetchError {
 
 // ── Internal JSON DTOs ────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct LeaderboardResponse {
-    data: Vec<LeaderboardEntry>,
-}
+// v1 API returns a JSON array directly (no wrapper object).
+type LeaderboardResponse = Vec<LeaderboardEntry>;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,11 +98,11 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
                 message: e.to_string(),
             })?;
 
-        let n = response.data.len().min(self.config.watchlist_size);
+        let n = response.len().min(self.config.watchlist_size);
         let quality = ReconstructionQuality::new(100).map_err(|_| WatchlistFetchError::Internal)?;
 
         let mut entries = Vec::with_capacity(n);
-        for (idx, entry) in response.data.iter().take(n).enumerate() {
+        for (idx, entry) in response.iter().take(n).enumerate() {
             let wallet = WalletAddress::from_hex(&entry.proxy_wallet).map_err(|e| {
                 WatchlistFetchError::Parse {
                     message: format!("invalid proxyWallet: {e}"),
