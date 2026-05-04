@@ -65,7 +65,8 @@ url = "2"
 toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+figment = { version = "0.10", features = ["toml", "env"] }
 trybuild = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.13"

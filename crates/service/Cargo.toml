@@ -9,14 +9,42 @@ publish.workspace = true
 name = "pe-service"
 path = "src/main.rs"
 
+[lib]
+name = "pe_service"
+path = "src/lib.rs"
+
+[features]
+scenario = []
+
 [lints]
 workspace = true
 
 [dependencies]
-pe-config = { path = "../config", version = "0.1.0" }
+pe-config                   = { path = "../config",                     version = "0.1.0" }
+pe-core-types               = { path = "../core-types",                 version = "0.1.0" }
+pe-copy-signal-engine       = { path = "../copy-signal-engine",         version = "0.1.0" }
+pe-event-log                = { path = "../event-log",                  version = "0.1.0" }
+pe-funding-graph            = { path = "../funding-graph",              version = "0.1.0" }
+pe-risk-engine              = { path = "../risk-engine",                version = "0.1.0" }
+pe-source-core              = { path = "../source-core",                version = "0.1.0" }
+pe-source-onchain-polygon   = { path = "../source-onchain-polygon",     version = "0.1.0" }
+pe-source-polymarket-public = { path = "../source-polymarket-public",   version = "0.1.0" }
+pe-strategy-winner-follow   = { path = "../strategy-winner-follow",     version = "0.1.0" }
+pe-trader-index             = { path = "../trader-index",               version = "0.1.0" }
+pe-operator-graph           = { path = "../operator-graph",             version = "0.1.0" }
+pe-venue-core               = { path = "../venue-core",                 version = "0.1.0" }
 
-anyhow = { workspace = true }
-axum = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+anyhow          = { workspace = true }
+axum            = { workspace = true }
+reqwest         = { workspace = true }
+rust_decimal    = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+thiserror       = { workspace = true }
+time            = { workspace = true }
+tokio           = { workspace = true }
+tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
