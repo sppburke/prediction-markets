@@ -47,6 +47,12 @@ use crate::{
 /// Maximum WS reconnect delay in seconds.
 const MAX_BACKOFF_SECS: u64 = 60;
 
+/// A cached funder closure is reused (skipping discovery) only if the
+/// checkpoint's `last_block` is within this many blocks of current chain head.
+/// 50_000 ≈ 1 day on Polygon at ~2s/block. Beyond that we re-discover to catch
+/// new funders that appeared in the interim.
+const CACHED_CLOSURE_MAX_AGE_BLOCKS: u64 = 50_000;
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for [`LivePolygonConnector`].
@@ -139,8 +145,11 @@ impl LivePolygonConnector {
             .await
             .map_err(|e| LivePolygonError::BlockNumber(e.to_string()))?;
 
-        // Resume from checkpoint or default to (head - backfill_blocks).
-        let start_block = load_checkpoint(&config.checkpoint_path)
+        // Resume from checkpoint (or default to head - backfill_blocks).
+        let prev_checkpoint = load_checkpoint(&config.checkpoint_path);
+        let start_block = prev_checkpoint
+            .as_ref()
+            .map(|cp| cp.last_block + 1)
             .unwrap_or_else(|| current_block.saturating_sub(config.backfill_blocks));
 
         info!(
@@ -151,11 +160,40 @@ impl LivePolygonConnector {
             "LivePolygonConnector: starting"
         );
 
+        // If a recent checkpoint preserves a usable closure, skip discovery
+        // entirely — this is the fast restart path. We still re-discover when
+        // the chain has advanced beyond CACHED_CLOSURE_MAX_AGE_BLOCKS so new
+        // funders that appeared in the interim are picked up.
+        let cached_closure = prev_checkpoint.as_ref().and_then(|cp| {
+            if cp.closure.is_empty() {
+                return None;
+            }
+            let chain_advance = current_block.saturating_sub(cp.last_block);
+            if chain_advance <= CACHED_CLOSURE_MAX_AGE_BLOCKS {
+                Some(cp.closure.clone())
+            } else {
+                info!(
+                    chain_advance,
+                    threshold = CACHED_CLOSURE_MAX_AGE_BLOCKS,
+                    "cached closure too stale; re-running discovery"
+                );
+                None
+            }
+        });
+
         // Discovery + backfill: page eth_getLogs with topic[2] = seed_wallets,
         // recursing to funding_max_hops. Decoded events are forwarded via tx
         // as a side-effect, so the funding graph picks up historical USDC
-        // transfers without a separate broad backfill.
-        let ws_filter_wallets = if start_block >= current_block
+        // transfers without a separate broad backfill. The per-hop callback
+        // persists the closure so an interrupted run preserves completed-hop
+        // progress.
+        let ws_filter_wallets = if let Some(closure) = cached_closure {
+            info!(
+                closure_size = closure.len(),
+                "using cached funder closure (skipping discovery)"
+            );
+            closure
+        } else if start_block >= current_block
             || config.seed_wallets.is_empty()
             || config.funding_max_hops == 0
         {
@@ -175,14 +213,23 @@ impl LivePolygonConnector {
                 from: start_block,
                 to: current_block,
             };
-            let closure = discover_to_depth(&lookup, seeds, config.funding_max_hops, range)
-                .await
-                .map_err(|e| LivePolygonError::Discovery(e.to_string()))?;
-            // Persist checkpoint at end of discovery so a restart resumes
-            // from current head rather than re-running the full discovery.
-            if let Err(e) = save_checkpoint(&config.checkpoint_path, current_block) {
-                warn!(error = %e, "discovery: checkpoint save failed");
-            }
+            let checkpoint_path = config.checkpoint_path.clone();
+            let closure = discover_to_depth(
+                &lookup,
+                seeds,
+                config.funding_max_hops,
+                range,
+                |hop, closure_so_far| {
+                    let cl: Vec<WalletAddress> = closure_so_far.iter().copied().collect();
+                    if let Err(e) = save_checkpoint(&checkpoint_path, current_block, &cl) {
+                        warn!(error = %e, hop, "checkpoint save after hop failed");
+                    } else {
+                        debug!(hop, closure_size = cl.len(), "checkpoint saved after hop");
+                    }
+                },
+            )
+            .await
+            .map_err(|e| LivePolygonError::Discovery(e.to_string()))?;
             closure.into_iter().collect()
         };
 
@@ -373,19 +420,30 @@ fn make_other_subscription_filter() -> Filter {
 
 // ── Checkpoint ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+/// Persisted discovery state. `closure` is the union of seed wallets plus all
+/// funders discovered during the most recent successful (or partial) run.
+/// Empty `closure` means "no discovery has completed yet".
+#[derive(Serialize, Deserialize, Default)]
 struct Checkpoint {
     last_block: u64,
+    #[serde(default)]
+    closure: Vec<WalletAddress>,
 }
 
-fn load_checkpoint(path: &Path) -> Option<u64> {
+fn load_checkpoint(path: &Path) -> Option<Checkpoint> {
     let content = std::fs::read_to_string(path).ok()?;
-    let cp: Checkpoint = serde_json::from_str(&content).ok()?;
-    Some(cp.last_block + 1) // resume from the block after the last seen
+    serde_json::from_str(&content).ok()
 }
 
-fn save_checkpoint(path: &Path, block: u64) -> Result<(), std::io::Error> {
-    let cp = Checkpoint { last_block: block };
+fn save_checkpoint(
+    path: &Path,
+    last_block: u64,
+    closure: &[WalletAddress],
+) -> Result<(), std::io::Error> {
+    let cp = Checkpoint {
+        last_block,
+        closure: closure.to_vec(),
+    };
     let content = serde_json::to_string(&cp).map_err(|e| std::io::Error::other(e.to_string()))?;
     // Write to a sibling tmp file then rename for POSIX-atomic swap: a crash
     // between write and rename leaves the previous checkpoint intact.

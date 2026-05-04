@@ -87,6 +87,13 @@ pub struct ServiceConfig {
     #[serde(default = "default_operator_graph_rebuild_cadence_secs")]
     pub operator_graph_rebuild_cadence_secs: u64,
 
+    /// Maximum hops in the funding-path BFS. Surfaced here (rather than baked
+    /// into `ClusteringConfig::default()`) so the value participates in the
+    /// service config-hash for replay reproducibility.
+    /// See `docs/_GLOSSARY.md`: `funding_max_hops`.
+    #[serde(default = "default_funding_max_hops")]
+    pub funding_max_hops: u8,
+
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to
     /// `rust_decimal::Decimal` at startup — no f64.
@@ -148,6 +155,10 @@ fn default_operator_graph_rebuild_cadence_secs() -> u64 {
     60
 }
 
+fn default_funding_max_hops() -> u8 {
+    3
+}
+
 fn default_mode() -> String {
     "paper".to_string()
 }
@@ -171,6 +182,7 @@ impl Default for ServiceConfig {
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
             operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
+            funding_max_hops: default_funding_max_hops(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
         }
@@ -221,6 +233,7 @@ mod tests {
         assert_eq!(cfg.watchlist_size, 20);
         assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.operator_graph_rebuild_cadence_secs, 60);
+        assert_eq!(cfg.funding_max_hops, 3);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
     }

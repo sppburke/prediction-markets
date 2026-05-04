@@ -11,6 +11,7 @@
 //! it can be unit-tested without an RPC.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use alloy::primitives::B256;
 use alloy::providers::Provider;
@@ -23,11 +24,18 @@ use crate::contracts::{TOPIC_ERC20_TRANSFER, USDC};
 use crate::decoder;
 use crate::event::PolygonEvent;
 
+/// Cap on `eth_getLogs` retry backoff. Mirrors `live::MAX_BACKOFF_SECS`.
+const MAX_GET_LOGS_BACKOFF_SECS: u64 = 60;
+
 /// Errors produced by funder discovery.
 #[derive(Debug, thiserror::Error)]
 pub enum FunderDiscoveryError {
     #[error("eth_getLogs: {0}")]
     GetLogs(String),
+    #[error("receiver dropped during discovery")]
+    ReceiverDropped,
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Inclusive block range `[from, to]`.
@@ -56,12 +64,22 @@ pub trait FunderLookup {
 /// depth ≤ `max_hops`. The frontier shrinks each iteration as cycles and
 /// already-seen funders are skipped, so the BFS terminates even on circular
 /// funding graphs.
-pub async fn discover_to_depth<L: FunderLookup>(
+///
+/// `on_hop_complete` is invoked after each successful hop with the hop number
+/// (1-indexed) and the closure-so-far. Callers use it to persist partial
+/// progress (e.g. a checkpoint) so an interrupted discovery doesn't lose
+/// every completed hop's work.
+pub async fn discover_to_depth<L, F>(
     lookup: &L,
     seeds: HashSet<WalletAddress>,
     max_hops: u8,
     range: BlockRange,
-) -> Result<HashSet<WalletAddress>, FunderDiscoveryError> {
+    mut on_hop_complete: F,
+) -> Result<HashSet<WalletAddress>, FunderDiscoveryError>
+where
+    L: FunderLookup,
+    F: FnMut(u8, &HashSet<WalletAddress>),
+{
     let seed_count = seeds.len();
     info!(
         seed_count,
@@ -87,6 +105,7 @@ pub async fn discover_to_depth<L: FunderLookup>(
         );
         closure.extend(new_funders.iter().copied());
         frontier = new_funders;
+        on_hop_complete(hop, &closure);
     }
     info!(total = closure.len(), "funder discovery: complete");
     Ok(closure)
@@ -116,11 +135,15 @@ impl<P: Provider + Clone + Send + Sync> FunderLookup for EthGetLogsLookup<P> {
         if wallets.is_empty() {
             return Ok(HashSet::new());
         }
+        if self.page_size == 0 {
+            return Err(FunderDiscoveryError::InvalidConfig(
+                "page_size must be > 0".to_string(),
+            ));
+        }
         let topic2: Vec<B256> = wallets.iter().map(wallet_to_topic).collect();
         let mut funders: HashSet<WalletAddress> = HashSet::new();
         let mut block = range.from;
         let mut events_decoded: u64 = 0;
-        let mut events_forward_failed: u64 = 0;
         while block <= range.to {
             let to_block = (block + self.page_size - 1).min(range.to);
             let filter = Filter::new()
@@ -129,11 +152,30 @@ impl<P: Provider + Clone + Send + Sync> FunderLookup for EthGetLogsLookup<P> {
                 .topic2(topic2.clone())
                 .from_block(BlockNumberOrTag::Number(block))
                 .to_block(BlockNumberOrTag::Number(to_block));
-            let logs = self
-                .provider
-                .get_logs(&filter)
-                .await
-                .map_err(|e| FunderDiscoveryError::GetLogs(e.to_string()))?;
+            // Retry transient `eth_getLogs` failures with exponential backoff.
+            // Matches the resilience pattern from PR #40's `run_backfill`.
+            let logs = {
+                let mut backoff_secs: u64 = 1;
+                loop {
+                    if self.event_tx.is_closed() {
+                        return Err(FunderDiscoveryError::ReceiverDropped);
+                    }
+                    match self.provider.get_logs(&filter).await {
+                        Ok(logs) => break logs,
+                        Err(e) => {
+                            warn!(
+                                block,
+                                to_block,
+                                backoff_secs,
+                                error = %e,
+                                "eth_getLogs failed; retrying"
+                            );
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(MAX_GET_LOGS_BACKOFF_SECS);
+                        }
+                    }
+                }
+            };
             for log in logs {
                 if let Some(from) = topic_to_wallet(log.topics().get(1)) {
                     funders.insert(from);
@@ -141,17 +183,11 @@ impl<P: Provider + Clone + Send + Sync> FunderLookup for EthGetLogsLookup<P> {
                 if let Some(event) = decoder::decode_log(&log) {
                     events_decoded += 1;
                     if self.event_tx.send(event).await.is_err() {
-                        events_forward_failed += 1;
+                        return Err(FunderDiscoveryError::ReceiverDropped);
                     }
                 }
             }
             block = to_block + 1;
-        }
-        if events_forward_failed > 0 {
-            warn!(
-                events_forward_failed,
-                "funder discovery: receiver dropped during pass"
-            );
         }
         debug!(
             events_decoded,
@@ -241,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn empty_seeds_returns_empty() {
         let lookup = InMemoryLookup::new(HashMap::new());
-        let out = discover_to_depth(&lookup, HashSet::new(), 3, rng())
+        let out = discover_to_depth(&lookup, HashSet::new(), 3, rng(), |_, _| {})
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -253,7 +289,7 @@ mod tests {
     async fn depth_zero_returns_seeds_unchanged() {
         let lookup = InMemoryLookup::new(HashMap::new());
         let seeds: HashSet<_> = [w(0x01), w(0x02)].into_iter().collect();
-        let out = discover_to_depth(&lookup, seeds.clone(), 0, rng())
+        let out = discover_to_depth(&lookup, seeds.clone(), 0, rng(), |_, _| {})
             .await
             .unwrap();
         assert_eq!(out, seeds);
@@ -267,7 +303,7 @@ mod tests {
         let mut funders = HashMap::new();
         funders.insert(leader, [funder].into_iter().collect());
         let lookup = InMemoryLookup::new(funders);
-        let out = discover_to_depth(&lookup, [leader].into_iter().collect(), 1, rng())
+        let out = discover_to_depth(&lookup, [leader].into_iter().collect(), 1, rng(), |_, _| {})
             .await
             .unwrap();
         assert_eq!(out, [leader, funder].into_iter().collect());
@@ -286,7 +322,7 @@ mod tests {
         funders.insert(f1, [f2].into_iter().collect());
         funders.insert(f2, [f3].into_iter().collect());
         let lookup = InMemoryLookup::new(funders);
-        let out = discover_to_depth(&lookup, [l].into_iter().collect(), 3, rng())
+        let out = discover_to_depth(&lookup, [l].into_iter().collect(), 3, rng(), |_, _| {})
             .await
             .unwrap();
         assert_eq!(out, [l, f1, f2, f3].into_iter().collect());
@@ -304,7 +340,7 @@ mod tests {
         funders.insert(f1, [f2].into_iter().collect());
         funders.insert(f2, [f3].into_iter().collect());
         let lookup = InMemoryLookup::new(funders);
-        let out = discover_to_depth(&lookup, [l].into_iter().collect(), 2, rng())
+        let out = discover_to_depth(&lookup, [l].into_iter().collect(), 2, rng(), |_, _| {})
             .await
             .unwrap();
         // Depth-2 closure: leader, f1, f2 — but NOT f3.
@@ -320,7 +356,7 @@ mod tests {
         funders.insert(a, [b].into_iter().collect());
         funders.insert(b, [a].into_iter().collect());
         let lookup = InMemoryLookup::new(funders);
-        let out = discover_to_depth(&lookup, [a].into_iter().collect(), 5, rng())
+        let out = discover_to_depth(&lookup, [a].into_iter().collect(), 5, rng(), |_, _| {})
             .await
             .unwrap();
         // Closure contains both wallets and the BFS terminates.
@@ -341,7 +377,7 @@ mod tests {
         funders.insert(l1, [f].into_iter().collect());
         funders.insert(l2, [f].into_iter().collect());
         let lookup = InMemoryLookup::new(funders);
-        let out = discover_to_depth(&lookup, [l1, l2].into_iter().collect(), 3, rng())
+        let out = discover_to_depth(&lookup, [l1, l2].into_iter().collect(), 3, rng(), |_, _| {})
             .await
             .unwrap();
         assert_eq!(out, [l1, l2, f].into_iter().collect());

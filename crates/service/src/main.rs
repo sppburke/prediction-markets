@@ -68,7 +68,13 @@ async fn main() -> Result<()> {
     // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
     // and the Polymarket trade poller.
     let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
-    let clustering_config = ClusteringConfig::default();
+    // `funding_max_hops` is sourced from ServiceConfig so the value flows
+    // through the config-hash; other ClusteringConfig fields stay at default
+    // until they're surfaced in their own follow-up.
+    let clustering_config = ClusteringConfig {
+        funding_max_hops: cfg.funding_max_hops,
+        ..ClusteringConfig::default()
+    };
 
     // Operator-graph scheduler — rebuilds clusters every 60s and publishes via watch.
     let (scheduler, operator_identities_rx) = OperatorGraphScheduler::new(
