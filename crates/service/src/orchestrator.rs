@@ -18,6 +18,7 @@ use pe_copy_signal_engine::{IncomingTrade, SignalConfig, WalletProfile, classify
 use pe_core_types::{ReconstructionQuality, SourceTimestamp, VenueId, WalletAddress};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::AntiGamingFlag;
+use pe_position_ledger::{ClusterObservationTracker, PositionLedger};
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::{SourceEvent, SourceStatus};
 use pe_source_onchain_polygon::PolygonEvent;
@@ -35,12 +36,17 @@ pub struct OrchestratorConfig {
     pub bankroll: Decimal,
     pub mode: ExecutionMode,
     pub signal_config: SignalConfig,
+    /// How long [`ClusterObservationTracker`] retains entries in seconds.
+    /// Default from `_GLOSSARY.md`: `cluster_observation_window_secs = 300`.
+    pub cluster_observation_window_secs: u64,
 }
 
 pub struct Orchestrator {
     polygon_rx: mpsc::Receiver<SourceEvent>,
     trade_rx: mpsc::Receiver<IncomingTrade>,
     accumulator: FundingGraphAccumulator,
+    position_ledger: PositionLedger,
+    cluster_tracker: ClusterObservationTracker,
     watchlist: Watchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
@@ -71,6 +77,8 @@ impl Orchestrator {
             polygon_rx,
             trade_rx,
             accumulator,
+            position_ledger: PositionLedger::new(),
+            cluster_tracker: ClusterObservationTracker::new(config.cluster_observation_window_secs),
             watchlist,
             signal_config: config.signal_config,
             strategy,
@@ -160,13 +168,38 @@ impl Orchestrator {
             age_seconds: 0,        // honest sentinel; treated as "fresh" conservative stub
         };
 
+        // Operator identity is deferred to Phase 1 (operator-graph wiring).
+        let operator_id = self
+            .watchlist
+            .entries
+            .iter()
+            .find(|e| e.wallet == trade.wallet)
+            .and_then(|e| e.operator_id);
+
+        // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
+        // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
+        // classification, not before.
+        let position = self.position_ledger.position(&trade.wallet).cloned();
+
+        // Record cluster entry when operator is known; prune stale entries.
+        // Ingest into tracker first so the current trade is included in cluster_obs_for.
+        if let Some(op) = operator_id {
+            self.cluster_tracker.ingest(&trade, op);
+        }
+
+        let cluster_obs =
+            operator_id.and_then(|op| self.cluster_tracker.cluster_obs_for(&trade, op));
+
+        // Advance position ledger after classification inputs are captured.
+        self.position_ledger.ingest(&trade);
+
         let Some(signal) = classify_trade(
             &trade,
-            None, // position: stub None per issue spec
+            position.as_ref(),
             &self.watchlist,
             &profile,
-            None, // cluster_obs: stub None
-            None, // operator_id: stub None
+            cluster_obs.as_ref(),
+            operator_id,
             quality,
             VenueId::polymarket(),
             &self.signal_config,
@@ -214,7 +247,7 @@ impl Orchestrator {
 /// Build a zeroed [`RiskSnapshot`] with LiveTiny mode.
 ///
 /// All exposure and PnL fields are zero; no anti-gaming flags; source healthy.
-/// Phase 0B stub — real exposure tracking lands in #38.
+/// Phase 0B stub — real exposure tracking is a separate later issue.
 ///
 /// `evaluate()` overwrites `trading_mode` and `proposed_trade_bps` before calling
 /// the risk gate, so their initial values here are overridden.

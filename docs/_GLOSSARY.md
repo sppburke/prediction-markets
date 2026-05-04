@@ -333,6 +333,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `cluster_coord_window_seconds_W` | 300 | Window during which coordinating entries count |
 | `cluster_coord_min_aggregate_usd` | 1_000 | Minimum aggregate notional across members |
 | `cluster_coord_dedup_window_seconds` | 600 | Debounce duplicate signals per `(operator,market,outcome,side)` |
+| `cluster_observation_window_secs` | 300 | How long `ClusterObservationTracker` retains entries; must be ≥ `cluster_coord_window_seconds_W` |
 
 ### Trade classification
 

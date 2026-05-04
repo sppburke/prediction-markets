@@ -32,6 +32,7 @@ pe-source-polymarket-public = { path = "../source-polymarket-public",   version 
 pe-strategy-winner-follow   = { path = "../strategy-winner-follow",     version = "0.1.0" }
 pe-trader-index             = { path = "../trader-index",               version = "0.1.0" }
 pe-operator-graph           = { path = "../operator-graph",             version = "0.1.0" }
+pe-position-ledger          = { path = "../position-ledger",            version = "0.1.0" }
 pe-venue-core               = { path = "../venue-core",                 version = "0.1.0" }
 
 anyhow          = { workspace = true }

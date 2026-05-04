@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
             bankroll,
             mode,
             signal_config: Default::default(),
+            cluster_observation_window_secs: 300,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         paper_executor,
