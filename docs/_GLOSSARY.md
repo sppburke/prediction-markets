@@ -280,6 +280,14 @@ let card = ResolverCard {
 
 Where the docs use vague qualifiers, these are the canonical defaults. They live in code as `WinnerFollowConfig` and `OperatorGraphConfig` and are restated here for cross-reference.
 
+### Polymarket public source (`PollingConfig`)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `polymarket_base_url` | `https://data-api.polymarket.com` | Base URL for all five public REST endpoints |
+| `polymarket_request_timeout_secs` | 10 | Per-request HTTP timeout before the request is abandoned |
+| `polymarket_max_retries` | 3 | Retries on network errors and 5xx (4 total attempts: initial + 3 retries) |
+
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 
 | Key | Default | Meaning |

@@ -26,4 +26,6 @@ time = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
