@@ -3,6 +3,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr as _;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
@@ -21,6 +22,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use pe_service::health::{SharedHealth, new_shared_health};
+use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 
@@ -59,6 +61,14 @@ async fn main() -> Result<()> {
     let (polygon_tx, polygon_rx) = mpsc::channel(cfg.polygon_channel_capacity);
     let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
+    // Shared accumulator: orchestrator ingests polygon events; scheduler reads snapshots.
+    let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
+
+    // Operator-graph scheduler — rebuilds clusters every 60s and publishes via watch.
+    let (scheduler, operator_identities_rx) =
+        OperatorGraphScheduler::new(accumulator.clone(), cfg.operator_graph_rebuild_cadence_secs);
+    let scheduler_task = tokio::spawn(scheduler.run());
+
     // Polygon source task.
     let polygon_task = spawn_polygon_task(polygon_config_from(&cfg), polygon_tx, health.clone());
 
@@ -81,7 +91,8 @@ async fn main() -> Result<()> {
     let orch = Orchestrator::new(
         polygon_rx,
         trade_rx,
-        FundingGraphAccumulator::new(),
+        accumulator,
+        operator_identities_rx,
         watchlist,
         OrchestratorConfig {
             bankroll,
@@ -121,6 +132,7 @@ async fn main() -> Result<()> {
     polygon_task.abort();
     trade_task.abort();
     http_task.abort();
+    scheduler_task.abort();
     info!("pe-service stopped");
     Ok(())
 }

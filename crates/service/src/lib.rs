@@ -4,6 +4,7 @@
 
 pub mod health;
 pub mod logging;
+pub mod operator_graph_scheduler;
 pub mod orchestrator;
 pub mod trade_parser;
 pub mod trade_poller;

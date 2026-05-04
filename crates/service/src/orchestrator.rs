@@ -5,19 +5,22 @@
 //! # Architecture
 //!
 //! ```text
-//! polygon_rx (SourceEvent) ──► FundingGraphAccumulator
+//! polygon_rx (SourceEvent) ──► FundingGraphAccumulator (Arc<Mutex<...>>)
+//!                                   └──► OperatorGraphScheduler ──► watch::Sender
 //! trade_rx   (IncomingTrade) ──► classify_trade ──► WinnerFollowStrategy::evaluate
-//!                                                ──► PaperExecutor::execute
+//!                                  ▲                   ──► PaperExecutor::execute
+//!                           watch::Receiver (operator IDs, refreshed every 60s)
 //! ```
 //!
 //! The orchestrator is pure dispatch: it owns no I/O except through `PaperExecutor`.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, WalletProfile, classify_trade};
-use pe_core_types::{ReconstructionQuality, SourceTimestamp, VenueId, WalletAddress};
+use pe_core_types::{OperatorId, ReconstructionQuality, SourceTimestamp, VenueId, WalletAddress};
 use pe_funding_graph::FundingGraphAccumulator;
-use pe_operator_graph::AntiGamingFlag;
+use pe_operator_graph::{AntiGamingFlag, OperatorIdentity};
 use pe_position_ledger::{ClusterObservationTracker, PositionLedger};
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::{SourceEvent, SourceStatus};
@@ -26,7 +29,7 @@ use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrate
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::health::SharedHealth;
@@ -44,7 +47,8 @@ pub struct OrchestratorConfig {
 pub struct Orchestrator {
     polygon_rx: mpsc::Receiver<SourceEvent>,
     trade_rx: mpsc::Receiver<IncomingTrade>,
-    accumulator: FundingGraphAccumulator,
+    accumulator: Arc<Mutex<FundingGraphAccumulator>>,
+    operator_identities: watch::Receiver<Vec<OperatorIdentity>>,
     position_ledger: PositionLedger,
     cluster_tracker: ClusterObservationTracker,
     watchlist: Watchlist,
@@ -64,7 +68,8 @@ impl Orchestrator {
     pub fn new(
         polygon_rx: mpsc::Receiver<SourceEvent>,
         trade_rx: mpsc::Receiver<IncomingTrade>,
-        accumulator: FundingGraphAccumulator,
+        accumulator: Arc<Mutex<FundingGraphAccumulator>>,
+        operator_identities: watch::Receiver<Vec<OperatorIdentity>>,
         watchlist: Watchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
@@ -77,6 +82,7 @@ impl Orchestrator {
             polygon_rx,
             trade_rx,
             accumulator,
+            operator_identities,
             position_ledger: PositionLedger::new(),
             cluster_tracker: ClusterObservationTracker::new(config.cluster_observation_window_secs),
             watchlist,
@@ -140,7 +146,10 @@ impl Orchestrator {
         match serde_json::from_slice::<PolygonEvent>(&event.payload) {
             Err(e) => warn!(error = %e, "polygon payload decode failed"),
             Ok(pe) => {
-                self.accumulator.ingest(pe);
+                self.accumulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ingest(pe);
                 let mut h = self
                     .health
                     .lock()
@@ -168,13 +177,8 @@ impl Orchestrator {
             age_seconds: 0,        // honest sentinel; treated as "fresh" conservative stub
         };
 
-        // Operator identity is deferred to Phase 1 (operator-graph wiring).
-        let operator_id = self
-            .watchlist
-            .entries
-            .iter()
-            .find(|e| e.wallet == trade.wallet)
-            .and_then(|e| e.operator_id);
+        // Look up operator ID from the latest scheduler snapshot (non-blocking borrow).
+        let operator_id = self.operator_id_for(&trade.wallet);
 
         // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
         // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
@@ -239,6 +243,18 @@ impl Orchestrator {
             .find(|e| &e.wallet == wallet)
             .map(|e| e.reconstruction_quality)
             .unwrap_or(self.min_quality)
+    }
+
+    /// Look up the operator ID for `wallet` from the latest scheduler snapshot.
+    ///
+    /// Uses a non-blocking `borrow()` — always returns the most recently published
+    /// cluster list without any synchronization cost.
+    fn operator_id_for(&self, wallet: &WalletAddress) -> Option<OperatorId> {
+        self.operator_identities
+            .borrow()
+            .iter()
+            .find(|id| id.member_wallets.contains(wallet))
+            .map(|id| id.operator_id)
     }
 }
 

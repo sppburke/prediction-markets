@@ -19,6 +19,7 @@
 )]
 
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
@@ -27,6 +28,7 @@ use pe_core_types::{
 };
 use pe_event_log::Writer;
 use pe_funding_graph::FundingGraphAccumulator;
+use pe_operator_graph::OperatorIdentity;
 use pe_service::health::new_shared_health;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_core::SourceEvent;
@@ -37,7 +39,7 @@ use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -87,6 +89,14 @@ fn make_paper_executor(dir: &TempDir) -> PaperExecutor {
     PaperExecutor::new(writer, SourceId("test".into()))
 }
 
+fn make_accumulator() -> Arc<Mutex<FundingGraphAccumulator>> {
+    Arc::new(Mutex::new(FundingGraphAccumulator::new()))
+}
+
+fn empty_operator_rx() -> watch::Receiver<Vec<OperatorIdentity>> {
+    watch::channel(Vec::new()).1
+}
+
 // ── Scenario 1: e2e_clean_exit ────────────────────────────────────────────────
 //
 // PASS: one IncomingTrade from a watchlisted wallet is processed; orchestrator
@@ -110,7 +120,8 @@ async fn scenario_e2e_clean_exit() {
     let orch = Orchestrator::new(
         polygon_rx,
         trade_rx,
-        FundingGraphAccumulator::new(),
+        make_accumulator(),
+        empty_operator_rx(),
         make_watchlist(wallet),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
@@ -163,7 +174,8 @@ async fn scenario_graceful_shutdown() {
     let orch = Orchestrator::new(
         polygon_rx,
         trade_rx,
-        FundingGraphAccumulator::new(),
+        make_accumulator(),
+        empty_operator_rx(),
         make_watchlist(wallet),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
