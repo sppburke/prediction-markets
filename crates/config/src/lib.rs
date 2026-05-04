@@ -94,6 +94,17 @@ pub struct ServiceConfig {
     #[serde(default = "default_funding_max_hops")]
     pub funding_max_hops: u8,
 
+    /// Funder discovery backend: `"eth_logs"` (default) or `"etherscan"`.
+    /// See `docs/_GLOSSARY.md`: `funder_source`.
+    #[serde(default = "default_funder_source")]
+    pub funder_source: String,
+
+    /// Etherscan V2 API key (chain id 137). Required when
+    /// `funder_source = "etherscan"`. Set via `PE_ETHERSCAN_API_KEY`; never
+    /// committed.
+    #[serde(default)]
+    pub etherscan_api_key: String,
+
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to
     /// `rust_decimal::Decimal` at startup — no f64.
@@ -159,6 +170,10 @@ fn default_funding_max_hops() -> u8 {
     3
 }
 
+fn default_funder_source() -> String {
+    "eth_logs".to_string()
+}
+
 fn default_mode() -> String {
     "paper".to_string()
 }
@@ -183,6 +198,8 @@ impl Default for ServiceConfig {
             jsonl_log_path: default_jsonl_log_path(),
             operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
             funding_max_hops: default_funding_max_hops(),
+            funder_source: default_funder_source(),
+            etherscan_api_key: String::new(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
         }

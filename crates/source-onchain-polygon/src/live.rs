@@ -38,6 +38,7 @@ use pe_source_core::{SourceConnector, SourceError, SourceEvent, SourceHealth, So
 use crate::{
     contracts::{GNOSIS_SAFE_FACTORY, MONITORED_TOPICS, TOPIC_ERC20_TRANSFER, USDC, WCOL},
     decoder,
+    etherscan::EtherscanFunderLookup,
     event::PolygonEvent,
     funder_discovery::{BlockRange, EthGetLogsLookup, discover_to_depth, wallet_to_topic},
 };
@@ -81,6 +82,13 @@ pub struct PolygonConnectorConfig {
     /// subscription then uses `seed_wallets` as the topic[2] filter directly.
     /// See `docs/_GLOSSARY.md`: `funding_max_hops`.
     pub funding_max_hops: u8,
+    /// Funder discovery backend: `"eth_logs"` (default, Alchemy CU) or
+    /// `"etherscan"` (Etherscan V2 free tier).
+    /// See `docs/_GLOSSARY.md`: `funder_source`.
+    pub funder_source: String,
+    /// Etherscan V2 API key. Required when `funder_source = "etherscan"`;
+    /// ignored otherwise. Set via `PE_ETHERSCAN_API_KEY`; never committed.
+    pub etherscan_api_key: String,
 }
 
 impl Default for PolygonConnectorConfig {
@@ -94,6 +102,8 @@ impl Default for PolygonConnectorConfig {
             channel_capacity: 256,
             seed_wallets: Vec::new(),
             funding_max_hops: 3,
+            funder_source: "eth_logs".to_owned(),
+            etherscan_api_key: String::new(),
         }
     }
 }
@@ -203,32 +213,44 @@ impl LivePolygonConnector {
             );
             config.seed_wallets.clone()
         } else {
-            let lookup = EthGetLogsLookup {
-                provider: http_provider.clone(),
-                page_size: config.backfill_page_size,
-                event_tx: event_tx.clone(),
-            };
             let seeds: HashSet<WalletAddress> = config.seed_wallets.iter().copied().collect();
             let range = BlockRange {
                 from: start_block,
                 to: current_block,
             };
-            let checkpoint_path = config.checkpoint_path.clone();
-            let closure = discover_to_depth(
-                &lookup,
-                seeds,
-                config.funding_max_hops,
-                range,
-                |hop, closure_so_far| {
-                    let cl: Vec<WalletAddress> = closure_so_far.iter().copied().collect();
-                    if let Err(e) = save_checkpoint(&checkpoint_path, current_block, &cl) {
-                        warn!(error = %e, hop, "checkpoint save after hop failed");
-                    } else {
-                        debug!(hop, closure_size = cl.len(), "checkpoint saved after hop");
-                    }
-                },
-            )
-            .await
+            let closure = if config.funder_source == "etherscan" {
+                info!(
+                    funder_source = "etherscan",
+                    "funder discovery: using Etherscan V2 backend"
+                );
+                let lookup = EtherscanFunderLookup::new(config.etherscan_api_key.clone());
+                discover_to_depth(
+                    &lookup,
+                    seeds,
+                    config.funding_max_hops,
+                    range,
+                    make_hop_checkpoint(config.checkpoint_path.clone(), current_block),
+                )
+                .await
+            } else {
+                info!(
+                    funder_source = "eth_logs",
+                    "funder discovery: using eth_getLogs backend"
+                );
+                let lookup = EthGetLogsLookup {
+                    provider: http_provider.clone(),
+                    page_size: config.backfill_page_size,
+                    event_tx: event_tx.clone(),
+                };
+                discover_to_depth(
+                    &lookup,
+                    seeds,
+                    config.funding_max_hops,
+                    range,
+                    make_hop_checkpoint(config.checkpoint_path.clone(), current_block),
+                )
+                .await
+            }
             .map_err(|e| LivePolygonError::Discovery(e.to_string()))?;
             closure.into_iter().collect()
         };
@@ -458,4 +480,20 @@ fn save_checkpoint(
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Build the per-hop checkpoint callback used by `discover_to_depth`.
+/// Factored out so both funder backends share a single definition.
+fn make_hop_checkpoint(
+    checkpoint_path: PathBuf,
+    current_block: u64,
+) -> impl FnMut(u8, &HashSet<WalletAddress>) {
+    move |hop, closure_so_far| {
+        let cl: Vec<WalletAddress> = closure_so_far.iter().copied().collect();
+        if let Err(e) = save_checkpoint(&checkpoint_path, current_block, &cl) {
+            warn!(error = %e, hop, "checkpoint save after hop failed");
+        } else {
+            debug!(hop, closure_size = cl.len(), "checkpoint saved after hop");
+        }
+    }
 }

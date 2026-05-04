@@ -192,6 +192,8 @@ fn polygon_config_from(
         channel_capacity: cfg.polygon_channel_capacity,
         seed_wallets,
         funding_max_hops,
+        funder_source: cfg.funder_source.clone(),
+        etherscan_api_key: cfg.etherscan_api_key.clone(),
     }
 }
 
