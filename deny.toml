@@ -1,5 +1,10 @@
 [advisories]
 yanked = "deny"
+ignore = [
+    # paste is an indirect dep of alloy; the advisory is an unmaintained notice only.
+    # No vulnerability; no security risk. Will resolve when alloy drops paste.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 allow = [
@@ -14,6 +19,9 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    # Unlicense: public domain equivalent; used by async_io_stream, pharos,
+    # ws_stream_wasm (indirect deps pulled in by alloy's WS provider).
+    "Unlicense",
 ]
 confidence-threshold = 0.8
 unused-allowed-license = "allow"

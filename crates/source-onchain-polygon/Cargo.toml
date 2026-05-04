@@ -18,11 +18,16 @@ scenario = []
 [dependencies]
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-source-core = { path = "../source-core", version = "0.1.0" }
+alloy = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
+rust_decimal_macros = { workspace = true }
 tokio = { workspace = true }

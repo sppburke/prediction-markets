@@ -50,7 +50,17 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "serde-well-known", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+alloy = { version = "=1.0.9", default-features = false, features = [
+    "std",
+    "provider-http",
+    "provider-ws",
+    "pubsub",
+    "reqwest-rustls-tls",
+    "rpc-types",
+    "sol-types",
+] }
+url = "2"
 toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
