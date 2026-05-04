@@ -145,9 +145,14 @@ pub enum PolygonEvent {
         timestamp: SourceTimestamp,
     },
     /// A new Polymarket proxy wallet was deployed on-chain.
+    ///
+    /// `singleton` is the Gnosis Safe implementation/master-copy contract address
+    /// from the `ProxyCreation` event — **not** the user-facing wallet owner.
+    /// Actual ownership must be resolved via `getOwners()` or transaction-data
+    /// analysis in `operator-graph`.
     ProxyWalletDeployed {
         proxy: WalletAddress,
-        owner: WalletAddress,
+        singleton: WalletAddress,
         block_number: u64,
         tx_hash: TxHash,
         timestamp: SourceTimestamp,
@@ -263,7 +268,7 @@ mod tests {
                 "p_usd_mint",
             ),
             (
-                r#"{"kind":"proxy_wallet_deployed","proxy":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","owner":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_number":1,"tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"2024-01-01T00:00:00Z"}"#,
+                r#"{"kind":"proxy_wallet_deployed","proxy":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","singleton":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_number":1,"tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000001","timestamp":"2024-01-01T00:00:00Z"}"#,
                 "proxy_wallet_deployed",
             ),
         ];

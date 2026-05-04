@@ -280,6 +280,13 @@ let card = ResolverCard {
 
 Where the docs use vague qualifiers, these are the canonical defaults. They live in code as `WinnerFollowConfig` and `OperatorGraphConfig` and are restated here for cross-reference.
 
+### Polygon on-chain source (`PolygonConnectorConfig`)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `polygon_backfill_blocks` | 21_000_000 | Blocks to backfill from current head on first run (≈ 16 months at ~2 s/block) |
+| `polygon_channel_capacity` | 256 | Bounded mpsc channel capacity between backfill/WS workers and `next_event` consumer |
+
 ### Operator graph
 
 | Key | Default | Meaning |

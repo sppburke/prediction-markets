@@ -9,9 +9,23 @@
 //! provenance fields (`from`, `bridge`, `source_kind`, etc.) so that
 //! `operator-graph` can reconstruct multi-hop funding chains from the raw log
 //! without losing context.
+//!
+//! # Modules
+//!
+//! | Module | Purpose |
+//! |---|---|
+//! | [`contracts`] | Verified Polygon PoS contract addresses and topic0 hashes |
+//! | [`decoder`] | ABI decoders: alloy `Log` → [`PolygonEvent`] |
+//! | [`connector`] | [`PolygonReplayConnector`] for deterministic replay |
+//! | [`live`] | [`LivePolygonConnector`] for live data via HTTP backfill + WS |
+//! | [`event`] | [`PolygonEvent`] enum and supporting types |
 
 pub mod connector;
+pub mod contracts;
+pub mod decoder;
 pub mod event;
+pub mod live;
 
 pub use connector::PolygonReplayConnector;
 pub use event::{ExternalAddressKind, PolygonEvent, PolygonEventError, TxHash};
+pub use live::{LivePolygonConnector, LivePolygonError, PolygonConnectorConfig};
