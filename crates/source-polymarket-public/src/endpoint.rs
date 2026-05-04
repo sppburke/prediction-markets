@@ -29,10 +29,10 @@ impl PolymarketEndpoint {
     pub fn url(&self, base: &str) -> String {
         match self {
             Self::Leaderboard => format!("{base}/v1/leaderboard"),
-            Self::UserTrades { user } => format!("{base}/data/trades?user={user}"),
+            Self::UserTrades { user } => format!("{base}/trades?user={user}"),
             Self::CurrentPositions { user } => format!("{base}/positions?user={user}"),
             Self::ClosedPositions { user } => {
-                format!("{base}/data/positions?user={user}&sizeThreshold=.01")
+                format!("{base}/closed-positions?user={user}")
             }
             Self::UserActivity { user } => format!("{base}/activity?user={user}"),
         }
@@ -61,7 +61,7 @@ mod tests {
         assert_eq!(ep.key(), "user_trades");
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/data/trades?user=0xabc"
+            "https://data-api.polymarket.com/trades?user=0xabc"
         );
     }
 }

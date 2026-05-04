@@ -12,8 +12,6 @@ use time::OffsetDateTime;
 pub enum TradeParseError {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("invalid price '{value}': {reason}")]
-    InvalidPrice { value: String, reason: String },
     #[error("invalid size '{value}': {reason}")]
     InvalidSize { value: String, reason: String },
     #[error("invalid side '{0}'")]
@@ -24,33 +22,37 @@ pub enum TradeParseError {
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct TradeResponse {
-    data: Vec<RawTrade>,
-}
+// v1 /trades returns a JSON array directly (no wrapper object).
+type TradeResponse = Vec<RawTrade>;
 
+// Field names match the camelCase keys returned by GET /trades?user=<wallet>.
+// size and price arrive as JSON numbers; rust_decimal's serde feature handles
+// both number and string representations.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawTrade {
-    id: String,
-    market: String,
+    /// Unique trade identifier (on-chain tx hash).
+    transaction_hash: String,
+    /// Market condition ID (hex string).
+    condition_id: String,
     side: String,
-    /// Decimal string (e.g. `"100"`) — contracts/size.
-    size: String,
-    /// Decimal string in [0, 1] (e.g. `"0.65"`) — yes-outcome price.
-    price: String,
-    /// Unix timestamp in **milliseconds** if > 9_999_999_999, otherwise seconds.
+    /// Number of contracts (integral in practice; floored before use).
+    size: Decimal,
+    /// Yes-outcome price in [0, 1].
+    price: Decimal,
+    /// Unix timestamp in seconds or milliseconds — normalised below.
     timestamp: i64,
-    /// Polymarket token ID for the outcome; maps to OutcomeId 0 (YES) when absent.
+    /// Outcome index: 0 = YES, 1 = NO.  Absent on older records; defaults to 0.
     #[serde(default)]
-    asset_id: String,
+    outcome_index: Option<u8>,
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 /// Parse a raw `UserTrades` response for `wallet` into a vec of [`IncomingTrade`]s.
 ///
-/// Trades whose price or size cannot be parsed are skipped with a warning log; other
-/// parse errors return `Err`.
+/// Trades whose size cannot be converted to u64 are skipped with a warning log;
+/// other parse errors return `Err`.
 pub fn parse_trades(
     bytes: &[u8],
     wallet: pe_core_types::WalletAddress,
@@ -58,8 +60,8 @@ pub fn parse_trades(
     let response: TradeResponse = serde_json::from_slice(bytes)?;
     let now = OffsetDateTime::now_utc();
 
-    let mut out = Vec::with_capacity(response.data.len());
-    for raw in response.data {
+    let mut out = Vec::with_capacity(response.len());
+    for raw in response {
         match convert_trade(raw, wallet, now) {
             Ok(t) => out.push(t),
             Err(e) => tracing::warn!(error = %e, "skipping unparseable trade"),
@@ -73,31 +75,18 @@ fn convert_trade(
     wallet: pe_core_types::WalletAddress,
     received_at: OffsetDateTime,
 ) -> Result<IncomingTrade, TradeParseError> {
-    let price_decimal: Decimal =
-        raw.price
-            .parse()
-            .map_err(|e: rust_decimal::Error| TradeParseError::InvalidPrice {
-                value: raw.price.clone(),
-                reason: e.to_string(),
-            })?;
-    let price = Price(price_decimal);
+    let price = Price(raw.price);
 
-    let size_decimal: Decimal =
-        raw.size
-            .parse()
-            .map_err(|e: rust_decimal::Error| TradeParseError::InvalidSize {
-                value: raw.size.clone(),
-                reason: e.to_string(),
-            })?;
     // Floor to integer contracts (fractional contracts are not valid).
-    let contracts = size_decimal
-        .floor()
-        .to_u64()
-        .map(ContractQty)
-        .ok_or_else(|| TradeParseError::InvalidSize {
-            value: raw.size.clone(),
-            reason: "out of u64 range".to_owned(),
-        })?;
+    let contracts =
+        raw.size
+            .floor()
+            .to_u64()
+            .map(ContractQty)
+            .ok_or_else(|| TradeParseError::InvalidSize {
+                value: raw.size.to_string(),
+                reason: "out of u64 range".to_owned(),
+            })?;
 
     let side = match raw.side.to_uppercase().as_str() {
         "BUY" => Side::Buy,
@@ -114,31 +103,18 @@ fn convert_trade(
     let observed_at = OffsetDateTime::from_unix_timestamp(ts_secs)
         .map_err(|_| TradeParseError::InvalidTimestamp(ts_secs))?;
 
-    // Outcome: Polymarket YES token → 0, NO token → 1, unknown → 0.
-    // Phase 0B: asset_id is a Polymarket token ID (large decimal); full token→outcome
-    // mapping deferred. Non-parseable IDs default to outcome 0 (YES) with a warning.
-    let outcome_id = if raw.asset_id.is_empty() {
-        OutcomeId(0)
-    } else {
-        raw.asset_id.parse::<u8>().map(OutcomeId).unwrap_or_else(|_| {
-            tracing::warn!(
-                asset_id = %raw.asset_id,
-                "asset_id not a u8; defaulting to outcome 0 (YES) — token→outcome mapping deferred"
-            );
-            OutcomeId(0)
-        })
-    };
+    let outcome_id = OutcomeId(raw.outcome_index.unwrap_or(0));
 
     Ok(IncomingTrade {
         wallet,
-        market_id: MarketId(VenueMarketId(raw.market)),
+        market_id: MarketId(VenueMarketId(raw.condition_id)),
         outcome_id,
         side,
         price,
         contracts,
         observed_at,
         received_at,
-        source_trade_id: SourceTradeId(raw.id),
+        source_trade_id: SourceTradeId(raw.transaction_hash),
     })
 }
 
@@ -153,27 +129,41 @@ mod tests {
 
     #[test]
     fn parses_valid_trade() {
-        let json = br#"{"data":[{"id":"t1","market":"mkt_abc","side":"BUY","size":"50","price":"0.65","timestamp":1704067200}]}"#;
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":50,"price":0.65,"timestamp":1704067200}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].contracts.0, 50);
         assert_eq!(trades[0].side, Side::Buy);
-        assert_eq!(trades[0].market_id.0.0, "mkt_abc");
+        assert_eq!(trades[0].market_id.0.0, "0xcond");
+        assert_eq!(trades[0].source_trade_id.0, "0xabc");
     }
 
     #[test]
     fn millisecond_timestamp_normalised() {
-        let json = br#"{"data":[{"id":"t2","market":"m","side":"SELL","size":"10","price":"0.40","timestamp":1704067200000}]}"#;
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"SELL","size":10,"price":0.40,"timestamp":1704067200000}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades.len(), 1);
-        // timestamp normalised to seconds
         assert_eq!(trades[0].observed_at.unix_timestamp(), 1_704_067_200);
     }
 
     #[test]
     fn empty_response() {
-        let json = br#"{"data":[]}"#;
+        let json = br#"[]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn outcome_index_propagated() {
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":5,"price":0.55,"timestamp":1704067200,"outcomeIndex":1}]"#;
+        let trades = parse_trades(json, dummy_wallet()).unwrap();
+        assert_eq!(trades[0].outcome_id, OutcomeId(1));
+    }
+
+    #[test]
+    fn missing_outcome_index_defaults_to_yes() {
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":5,"price":0.55,"timestamp":1704067200}]"#;
+        let trades = parse_trades(json, dummy_wallet()).unwrap();
+        assert_eq!(trades[0].outcome_id, OutcomeId(0));
     }
 }
