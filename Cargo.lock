@@ -3073,6 +3073,7 @@ dependencies = [
 name = "pe-source-polymarket-public"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "pe-core-types",
  "pe-source-core",
  "reqwest 0.12.28",
