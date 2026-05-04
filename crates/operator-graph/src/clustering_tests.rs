@@ -320,3 +320,72 @@ fn bait_wallet_suspect_flag_fires() {
         id.anti_gaming_flags
     );
 }
+
+// ─── Cycle handling: each cycle member becomes its own root ─────────────────
+
+#[test]
+fn cycle_two_wallets_each_self_funded() {
+    let a = wallet(0xa1);
+    let b = wallet(0xb2);
+    let mut snapshot = empty_snapshot();
+    snapshot.edges.push(make_edge(a, b)); // A funds B
+    snapshot.edges.push(make_edge(b, a)); // B funds A
+    snapshot.wallet_ages.insert(a, 30 * 86_400);
+    snapshot.wallet_ages.insert(b, 30 * 86_400);
+
+    let config = ClusteringConfig::default();
+    let result = build_operator_identities(&snapshot, &config).unwrap();
+
+    // Each wallet is its own singleton root — no error, no aborted rebuild.
+    assert_eq!(result.len(), 2);
+    let mut roots: Vec<WalletAddress> = result.iter().map(|id| id.funder_root.0).collect();
+    roots.sort_by_key(|w| w.0);
+    assert_eq!(roots, vec![a, b]);
+}
+
+#[test]
+fn cycle_three_wallets_each_self_funded() {
+    let a = wallet(0xa1);
+    let b = wallet(0xb2);
+    let c = wallet(0xc3);
+    let mut snapshot = empty_snapshot();
+    snapshot.edges.push(make_edge(a, b)); // A → B
+    snapshot.edges.push(make_edge(b, c)); // B → C
+    snapshot.edges.push(make_edge(c, a)); // C → A
+    snapshot.wallet_ages.insert(a, 30 * 86_400);
+    snapshot.wallet_ages.insert(b, 30 * 86_400);
+    snapshot.wallet_ages.insert(c, 30 * 86_400);
+
+    let config = ClusteringConfig::default();
+    let result = build_operator_identities(&snapshot, &config).unwrap();
+
+    assert_eq!(result.len(), 3);
+}
+
+#[test]
+fn cycle_does_not_poison_acyclic_wallets() {
+    let a = wallet(0xa1);
+    let b = wallet(0xb2);
+    let funder = wallet(0x10);
+    let funded = wallet(0x20);
+    let mut snapshot = empty_snapshot();
+    // Cycle.
+    snapshot.edges.push(make_edge(a, b));
+    snapshot.edges.push(make_edge(b, a));
+    // Independent acyclic edge.
+    snapshot.edges.push(make_edge(funder, funded));
+    for w in [a, b, funder, funded] {
+        snapshot.wallet_ages.insert(w, 30 * 86_400);
+    }
+
+    let config = ClusteringConfig::default();
+    let result = build_operator_identities(&snapshot, &config).unwrap();
+
+    // a, b are singletons; funder is root of {funder, funded}.
+    assert_eq!(result.len(), 3);
+    let cluster_with_funded = result
+        .iter()
+        .find(|id| id.member_wallets.contains(&funded))
+        .expect("acyclic cluster present");
+    assert_eq!(cluster_with_funded.funder_root.0, funder);
+}

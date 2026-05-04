@@ -1,52 +1,57 @@
-//! Live Polygon connector: backfill via HTTP `eth_getLogs` + real-time via WebSocket.
+//! Live Polygon connector: tightly-filtered backfill via HTTP `eth_getLogs`
+//! plus real-time via WebSocket.
 //!
-//! On construction ([`LivePolygonConnector::connect`]) two background tokio tasks are spawned:
+//! Startup runs [`funder_discovery::discover_to_depth`] to (a) page through
+//! the historical block range with `topic[2] ∈ seed_wallets` to populate the
+//! funding graph, and (b) compute the closure of transitive funders. The WS
+//! subscription then uses that closure as its `topic[2]` filter — so live
+//! events are limited to USDC transfers that touch a wallet of interest.
 //!
-//! 1. **Backfill worker** — paginates `eth_getLogs` from the last checkpointed block (or
-//!    `current_block - backfill_blocks`) to the current head, 10 000 blocks per page.
-//! 2. **WS worker** — subscribes to `eth_subscribe(logs, filter)` and forwards live events.
-//!    Reconnects with exponential backoff (1 s → 2 s → … → 60 s) on disconnect.
+//! Two parallel WS subscriptions are merged via `tokio::select!`:
 //!
-//! Both workers push decoded [`PolygonEvent`]s into a bounded [`tokio::sync::mpsc`] channel.
-//! [`SourceConnector::next_event`] drains that channel.
+//! 1. **USDC** — `topic[0] = Transfer`, `topic[2] ∈ closure`. The CU saver.
+//! 2. **Other** — `address ∈ {WCOL, GnosisSafeFactory}`, no topic filter
+//!    beyond `topic[0]`. Volume is low enough on these contracts that an
+//!    address-level filter suffices.
 //!
-//! **Deferred (Phase 0B out-of-scope)**:
-//! - `DepositAddressFunding` — deposit-wallet factory event ABI not publicly available.
-//! - `BridgeOnrampReceipt` — requires a maintained, configurable bridge address list.
+//! WCOL Mint/Burn events and ProxyCreation events that occurred BEFORE
+//! service start are not backfilled; they are observed only from live WS.
+//! In Phase 0B these only feed `wallet_first_seen` for anti-gaming flags
+//! that require multi-week histories anyway.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy::{
+    primitives::B256,
     providers::{Provider, ProviderBuilder, WsConnect},
-    rpc::types::{BlockNumberOrTag, Filter},
+    rpc::types::Filter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
+use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
 use pe_source_core::{SourceConnector, SourceError, SourceEvent, SourceHealth, SourceStatus};
 
 use crate::{
-    contracts::{MONITORED_ADDRESSES, MONITORED_TOPICS},
+    contracts::{GNOSIS_SAFE_FACTORY, MONITORED_TOPICS, TOPIC_ERC20_TRANSFER, USDC, WCOL},
     decoder,
     event::PolygonEvent,
+    funder_discovery::{BlockRange, EthGetLogsLookup, discover_to_depth, wallet_to_topic},
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Maximum blocks per `eth_getLogs` page (Alchemy free-tier limit).
-const PAGE_SIZE: u64 = 10_000;
-
-/// Log backfill progress every N pages (≈ 100 × 10K = 1M blocks).
-const PROGRESS_LOG_INTERVAL: u64 = 100;
-
-/// Save the block checkpoint every N pages during backfill.
-const CHECKPOINT_SAVE_INTERVAL: u64 = 1_000;
-
 /// Maximum WS reconnect delay in seconds.
 const MAX_BACKOFF_SECS: u64 = 60;
+
+/// A cached funder closure is reused (skipping discovery) only if the
+/// checkpoint's `last_block` is within this many blocks of current chain head.
+/// 50_000 ≈ 1 day on Polygon at ~2s/block. Beyond that we re-discover to catch
+/// new funders that appeared in the interim.
+const CACHED_CLOSURE_MAX_AGE_BLOCKS: u64 = 50_000;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -60,10 +65,22 @@ pub struct PolygonConnectorConfig {
     /// Blocks to backfill from current head on first run (default ≈ 16 months).
     /// See `docs/_GLOSSARY.md`: `polygon_backfill_blocks`.
     pub backfill_blocks: u64,
+    /// Max blocks per `eth_getLogs` page during discovery/backfill.
+    /// Alchemy free tier caps this at 10; paid tiers allow ~2_000+.
+    /// See `docs/_GLOSSARY.md`: `polygon_backfill_page_size`.
+    pub backfill_page_size: u64,
     /// Path to the JSON block-checkpoint file. Resumes backfill from `last_block + 1`.
     pub checkpoint_path: PathBuf,
     /// Bounded channel capacity. See `docs/_GLOSSARY.md`: `polygon_channel_capacity`.
     pub channel_capacity: usize,
+    /// Seed wallets used as the initial `topic[2]` filter for discovery and
+    /// the WS subscription. Typically the leaderboard top-N.
+    /// Empty falls back to a global USDC firehose with a warning.
+    pub seed_wallets: Vec<WalletAddress>,
+    /// Recursion depth for funder discovery. `0` disables discovery; the WS
+    /// subscription then uses `seed_wallets` as the topic[2] filter directly.
+    /// See `docs/_GLOSSARY.md`: `funding_max_hops`.
+    pub funding_max_hops: u8,
 }
 
 impl Default for PolygonConnectorConfig {
@@ -72,8 +89,11 @@ impl Default for PolygonConnectorConfig {
             http_url: String::new(),
             ws_url: String::new(),
             backfill_blocks: 21_000_000,
+            backfill_page_size: 10,
             checkpoint_path: PathBuf::from("./polygon_checkpoint.json"),
             channel_capacity: 256,
+            seed_wallets: Vec::new(),
+            funding_max_hops: 3,
         }
     }
 }
@@ -88,6 +108,8 @@ pub enum LivePolygonError {
     BlockNumber(String),
     #[error("connect WS: {0}")]
     WsConnect(String),
+    #[error("funder discovery: {0}")]
+    Discovery(String),
 }
 
 // ── Connector ─────────────────────────────────────────────────────────────────
@@ -100,10 +122,11 @@ pub struct LivePolygonConnector {
 }
 
 impl LivePolygonConnector {
-    /// Connect to Polygon and start backfill + WS tasks.
+    /// Connect to Polygon and start discovery + WS tasks.
     ///
-    /// Returns once the providers are connected and both background tasks are
-    /// running. The caller drives event consumption via [`SourceConnector::next_event`].
+    /// Discovery runs synchronously (paging `eth_getLogs` to populate the
+    /// funding graph and compute the funder closure); the WS subscription is
+    /// then spawned with the closure as its `topic[2]` filter.
     pub async fn connect(
         source_id: SourceId,
         config: PolygonConnectorConfig,
@@ -117,41 +140,108 @@ impl LivePolygonConnector {
             .map_err(|e: url::ParseError| LivePolygonError::HttpUrl(e.to_string()))?;
         let http_provider = ProviderBuilder::new().connect_http(http_url);
 
-        // Current chain head.
         let current_block = http_provider
             .get_block_number()
             .await
             .map_err(|e| LivePolygonError::BlockNumber(e.to_string()))?;
 
-        // Resume from checkpoint or default to (head - backfill_blocks).
-        let start_block = load_checkpoint(&config.checkpoint_path)
+        // Resume from checkpoint (or default to head - backfill_blocks).
+        let prev_checkpoint = load_checkpoint(&config.checkpoint_path);
+        let start_block = prev_checkpoint
+            .as_ref()
+            .map(|cp| cp.last_block + 1)
             .unwrap_or_else(|| current_block.saturating_sub(config.backfill_blocks));
 
         info!(
             current_block,
             start_block,
-            pages = (current_block.saturating_sub(start_block)) / PAGE_SIZE + 1,
-            "LivePolygonConnector: starting backfill"
+            seed_wallet_count = config.seed_wallets.len(),
+            funding_max_hops = config.funding_max_hops,
+            "LivePolygonConnector: starting"
         );
 
-        // Spawn backfill task (HTTP).
-        let backfill_tx = event_tx.clone();
-        let checkpoint_path = config.checkpoint_path.clone();
-        tokio::spawn(async move {
-            run_backfill(
-                backfill_tx,
-                http_provider,
-                start_block,
-                current_block,
-                checkpoint_path,
-            )
-            .await;
+        // If a recent checkpoint preserves a usable closure, skip discovery
+        // entirely — this is the fast restart path. We still re-discover when
+        // the chain has advanced beyond CACHED_CLOSURE_MAX_AGE_BLOCKS so new
+        // funders that appeared in the interim are picked up.
+        let cached_closure = prev_checkpoint.as_ref().and_then(|cp| {
+            if cp.closure.is_empty() {
+                return None;
+            }
+            let chain_advance = current_block.saturating_sub(cp.last_block);
+            if chain_advance <= CACHED_CLOSURE_MAX_AGE_BLOCKS {
+                Some(cp.closure.clone())
+            } else {
+                info!(
+                    chain_advance,
+                    threshold = CACHED_CLOSURE_MAX_AGE_BLOCKS,
+                    "cached closure too stale; re-running discovery"
+                );
+                None
+            }
         });
 
-        // Spawn WS subscription task.
+        // Discovery + backfill: page eth_getLogs with topic[2] = seed_wallets,
+        // recursing to funding_max_hops. Decoded events are forwarded via tx
+        // as a side-effect, so the funding graph picks up historical USDC
+        // transfers without a separate broad backfill. The per-hop callback
+        // persists the closure so an interrupted run preserves completed-hop
+        // progress.
+        let ws_filter_wallets = if let Some(closure) = cached_closure {
+            info!(
+                closure_size = closure.len(),
+                "using cached funder closure (skipping discovery)"
+            );
+            closure
+        } else if start_block >= current_block
+            || config.seed_wallets.is_empty()
+            || config.funding_max_hops == 0
+        {
+            info!(
+                seed_wallets_in_filter = config.seed_wallets.len(),
+                "skipping funder discovery (range empty, no seeds, or max_hops=0)"
+            );
+            config.seed_wallets.clone()
+        } else {
+            let lookup = EthGetLogsLookup {
+                provider: http_provider.clone(),
+                page_size: config.backfill_page_size,
+                event_tx: event_tx.clone(),
+            };
+            let seeds: HashSet<WalletAddress> = config.seed_wallets.iter().copied().collect();
+            let range = BlockRange {
+                from: start_block,
+                to: current_block,
+            };
+            let checkpoint_path = config.checkpoint_path.clone();
+            let closure = discover_to_depth(
+                &lookup,
+                seeds,
+                config.funding_max_hops,
+                range,
+                |hop, closure_so_far| {
+                    let cl: Vec<WalletAddress> = closure_so_far.iter().copied().collect();
+                    if let Err(e) = save_checkpoint(&checkpoint_path, current_block, &cl) {
+                        warn!(error = %e, hop, "checkpoint save after hop failed");
+                    } else {
+                        debug!(hop, closure_size = cl.len(), "checkpoint saved after hop");
+                    }
+                },
+            )
+            .await
+            .map_err(|e| LivePolygonError::Discovery(e.to_string()))?;
+            closure.into_iter().collect()
+        };
+
+        info!(
+            ws_filter_address_count = ws_filter_wallets.len(),
+            "WS topic[2] filter populated"
+        );
+
+        // Spawn WS subscription task with the discovered wallet closure.
         let ws_url = config.ws_url.clone();
         tokio::spawn(async move {
-            run_ws_subscription(event_tx, ws_url).await;
+            run_ws_subscription(event_tx, ws_url, ws_filter_wallets).await;
         });
 
         Ok(Self {
@@ -204,88 +294,13 @@ impl SourceConnector for LivePolygonConnector {
     }
 }
 
-// ── Backfill worker ───────────────────────────────────────────────────────────
-
-async fn run_backfill<P: Provider + Clone>(
-    tx: mpsc::Sender<PolygonEvent>,
-    provider: P,
-    start_block: u64,
-    end_block: u64,
-    checkpoint_path: PathBuf,
-) {
-    let total_blocks = end_block.saturating_sub(start_block);
-    if total_blocks == 0 {
-        info!("Backfill: already at current head, skipping");
-        return;
-    }
-
-    let total_pages = total_blocks / PAGE_SIZE + 1;
-    let mut page: u64 = 0;
-    let mut block = start_block;
-
-    while block <= end_block {
-        if tx.is_closed() {
-            debug!("Backfill: channel closed, stopping");
-            return;
-        }
-
-        let to_block = (block + PAGE_SIZE - 1).min(end_block);
-        let filter = make_range_filter(block, to_block);
-
-        match provider.get_logs(&filter).await {
-            Ok(logs) => {
-                for log in &logs {
-                    if let Some(event) = decoder::decode_log(log)
-                        && tx.send(event).await.is_err()
-                    {
-                        debug!("Backfill: receiver dropped, stopping");
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(block, to_block, error = %e, "Backfill: get_logs failed; retrying page");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue; // retry same page
-            }
-        }
-
-        page += 1;
-
-        // Progress logging every PROGRESS_LOG_INTERVAL pages.
-        if page.is_multiple_of(PROGRESS_LOG_INTERVAL) {
-            let processed = block.saturating_sub(start_block);
-            let pct_x10 = (processed * 1000).checked_div(total_blocks).unwrap_or(1000);
-            info!(
-                block,
-                end_block,
-                page,
-                total_pages,
-                "Backfill progress: {}.{}% complete",
-                pct_x10 / 10,
-                pct_x10 % 10,
-            );
-        }
-
-        // Persist checkpoint periodically.
-        if page.is_multiple_of(CHECKPOINT_SAVE_INTERVAL)
-            && let Err(e) = save_checkpoint(&checkpoint_path, to_block)
-        {
-            warn!(error = %e, "Backfill: checkpoint save failed");
-        }
-
-        block = to_block + 1;
-    }
-
-    if let Err(e) = save_checkpoint(&checkpoint_path, end_block) {
-        warn!(error = %e, "Backfill: final checkpoint save failed");
-    }
-    info!(end_block, pages = page, "Backfill complete");
-}
-
 // ── WS subscription worker ────────────────────────────────────────────────────
 
-async fn run_ws_subscription(tx: mpsc::Sender<PolygonEvent>, ws_url: String) {
+async fn run_ws_subscription(
+    tx: mpsc::Sender<PolygonEvent>,
+    ws_url: String,
+    seed_wallets: Vec<WalletAddress>,
+) {
     let mut backoff_secs: u64 = 1;
 
     loop {
@@ -294,7 +309,7 @@ async fn run_ws_subscription(tx: mpsc::Sender<PolygonEvent>, ws_url: String) {
             return;
         }
 
-        match connect_and_stream(&ws_url, &tx).await {
+        match connect_and_stream(&ws_url, &tx, &seed_wallets).await {
             StreamOutcome::ChannelClosed => return,
             StreamOutcome::ConnectFailed(reason) => {
                 warn!(reason, backoff_secs, "WS connect failed; retrying");
@@ -319,66 +334,116 @@ enum StreamOutcome {
     StreamEnded(String),
 }
 
-async fn connect_and_stream(ws_url: &str, tx: &mpsc::Sender<PolygonEvent>) -> StreamOutcome {
+async fn connect_and_stream(
+    ws_url: &str,
+    tx: &mpsc::Sender<PolygonEvent>,
+    seed_wallets: &[WalletAddress],
+) -> StreamOutcome {
     let connect = WsConnect::new(ws_url);
     let provider = match ProviderBuilder::new().connect_ws(connect).await {
         Ok(p) => p,
         Err(e) => return StreamOutcome::ConnectFailed(e.to_string()),
     };
 
-    let filter = make_subscription_filter();
-    let mut sub = match provider.subscribe_logs(&filter).await {
+    let usdc_filter = make_usdc_subscription_filter(seed_wallets);
+    let other_filter = make_other_subscription_filter();
+
+    let mut sub_usdc = match provider.subscribe_logs(&usdc_filter).await {
         Ok(s) => s,
-        Err(e) => return StreamOutcome::ConnectFailed(e.to_string()),
+        Err(e) => return StreamOutcome::ConnectFailed(format!("usdc sub: {e}")),
+    };
+    let mut sub_other = match provider.subscribe_logs(&other_filter).await {
+        Ok(s) => s,
+        Err(e) => return StreamOutcome::ConnectFailed(format!("other sub: {e}")),
     };
 
-    info!("WS subscription active");
+    info!(
+        seed_wallet_count = seed_wallets.len(),
+        "WS subscriptions active (usdc filtered, wcol+factory unfiltered)"
+    );
 
     loop {
-        match sub.recv().await {
-            Ok(log) => {
-                if let Some(event) = decoder::decode_log(&log)
-                    && tx.send(event).await.is_err()
-                {
-                    return StreamOutcome::ChannelClosed;
+        tokio::select! {
+            r = sub_usdc.recv() => match r {
+                Ok(log) => {
+                    if let Some(event) = decoder::decode_log(&log)
+                        && tx.send(event).await.is_err()
+                    {
+                        return StreamOutcome::ChannelClosed;
+                    }
                 }
-            }
-            Err(e) => return StreamOutcome::StreamEnded(e.to_string()),
+                Err(e) => return StreamOutcome::StreamEnded(format!("usdc: {e}")),
+            },
+            r = sub_other.recv() => match r {
+                Ok(log) => {
+                    if let Some(event) = decoder::decode_log(&log)
+                        && tx.send(event).await.is_err()
+                    {
+                        return StreamOutcome::ChannelClosed;
+                    }
+                }
+                Err(e) => return StreamOutcome::StreamEnded(format!("other: {e}")),
+            },
         }
     }
 }
 
 // ── Filter construction ───────────────────────────────────────────────────────
 
-fn make_range_filter(from_block: u64, to_block: u64) -> Filter {
-    Filter::new()
-        .address(MONITORED_ADDRESSES.to_vec())
-        .event_signature(MONITORED_TOPICS.to_vec())
-        .from_block(BlockNumberOrTag::Number(from_block))
-        .to_block(BlockNumberOrTag::Number(to_block))
+/// USDC Transfer subscription. When `seed_wallets` is non-empty, restricts to
+/// transfers TO any of those wallets (`topic[2] = recipient`). Empty falls
+/// back to the full USDC firehose with a warning — the deployment should
+/// always populate `seed_wallets`.
+fn make_usdc_subscription_filter(seed_wallets: &[WalletAddress]) -> Filter {
+    let base = Filter::new()
+        .address(USDC)
+        .event_signature(TOPIC_ERC20_TRANSFER);
+    if seed_wallets.is_empty() {
+        warn!(
+            "WS USDC subscription has no topic[2] filter (empty seed_wallets); falling back to full firehose"
+        );
+        base
+    } else {
+        let topic2: Vec<B256> = seed_wallets.iter().map(wallet_to_topic).collect();
+        base.topic2(topic2)
+    }
 }
 
-fn make_subscription_filter() -> Filter {
+/// WCOL Mint/Burn (Transfer) and Gnosis Safe ProxyCreation events. Volume on
+/// these two contracts is low enough that a topic[2] filter is unnecessary
+/// and the OR-of-topics filter captures both event types in one subscription.
+fn make_other_subscription_filter() -> Filter {
     Filter::new()
-        .address(MONITORED_ADDRESSES.to_vec())
+        .address(vec![WCOL, GNOSIS_SAFE_FACTORY])
         .event_signature(MONITORED_TOPICS.to_vec())
 }
 
 // ── Checkpoint ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+/// Persisted discovery state. `closure` is the union of seed wallets plus all
+/// funders discovered during the most recent successful (or partial) run.
+/// Empty `closure` means "no discovery has completed yet".
+#[derive(Serialize, Deserialize, Default)]
 struct Checkpoint {
     last_block: u64,
+    #[serde(default)]
+    closure: Vec<WalletAddress>,
 }
 
-fn load_checkpoint(path: &Path) -> Option<u64> {
+fn load_checkpoint(path: &Path) -> Option<Checkpoint> {
     let content = std::fs::read_to_string(path).ok()?;
-    let cp: Checkpoint = serde_json::from_str(&content).ok()?;
-    Some(cp.last_block + 1) // resume from the block after the last seen
+    serde_json::from_str(&content).ok()
 }
 
-fn save_checkpoint(path: &Path, block: u64) -> Result<(), std::io::Error> {
-    let cp = Checkpoint { last_block: block };
+fn save_checkpoint(
+    path: &Path,
+    last_block: u64,
+    closure: &[WalletAddress],
+) -> Result<(), std::io::Error> {
+    let cp = Checkpoint {
+        last_block,
+        closure: closure.to_vec(),
+    };
     let content = serde_json::to_string(&cp).map_err(|e| std::io::Error::other(e.to_string()))?;
     // Write to a sibling tmp file then rename for POSIX-atomic swap: a crash
     // between write and rename leaves the previous checkpoint intact.

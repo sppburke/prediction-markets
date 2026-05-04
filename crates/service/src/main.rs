@@ -65,19 +65,33 @@ async fn main() -> Result<()> {
     // Shared accumulator: orchestrator ingests polygon events; scheduler reads snapshots.
     let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
 
+    // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
+    // and the Polymarket trade poller.
+    let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
+    // `funding_max_hops` is sourced from ServiceConfig so the value flows
+    // through the config-hash; other ClusteringConfig fields stay at default
+    // until they're surfaced in their own follow-up.
+    let clustering_config = ClusteringConfig {
+        funding_max_hops: cfg.funding_max_hops,
+        ..ClusteringConfig::default()
+    };
+
     // Operator-graph scheduler — rebuilds clusters every 60s and publishes via watch.
     let (scheduler, operator_identities_rx) = OperatorGraphScheduler::new(
         accumulator.clone(),
-        ClusteringConfig::default(),
+        clustering_config.clone(),
         cfg.operator_graph_rebuild_cadence_secs,
     );
     let scheduler_task = tokio::spawn(scheduler.run());
 
     // Polygon source task.
-    let polygon_task = spawn_polygon_task(polygon_config_from(&cfg), polygon_tx, health.clone());
+    let polygon_task = spawn_polygon_task(
+        polygon_config_from(&cfg, wallets.clone(), clustering_config.funding_max_hops),
+        polygon_tx,
+        health.clone(),
+    );
 
     // Polymarket trade poller task.
-    let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
     let trade_task = tokio::spawn(
         TradePoller::new(
             TradePollerConfig {
@@ -164,13 +178,20 @@ fn parse_mode(s: &str) -> Result<ExecutionMode> {
     }
 }
 
-fn polygon_config_from(cfg: &ServiceConfig) -> PolygonConnectorConfig {
+fn polygon_config_from(
+    cfg: &ServiceConfig,
+    seed_wallets: Vec<pe_core_types::WalletAddress>,
+    funding_max_hops: u8,
+) -> PolygonConnectorConfig {
     PolygonConnectorConfig {
         http_url: cfg.polygon_http_url.clone(),
         ws_url: cfg.polygon_ws_url.clone(),
         backfill_blocks: cfg.backfill_blocks,
+        backfill_page_size: cfg.polygon_backfill_page_size,
         checkpoint_path: cfg.polygon_checkpoint_path.clone(),
         channel_capacity: cfg.polygon_channel_capacity,
+        seed_wallets,
+        funding_max_hops,
     }
 }
 

@@ -295,13 +295,14 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | Key | Default | Meaning |
 |---|---:|---|
 | `polygon_backfill_blocks` | 21_000_000 | Blocks to backfill from current head on first run (≈ 16 months at ~2 s/block) |
+| `polygon_backfill_page_size` | 10 | Max blocks per `eth_getLogs` page during discovery/backfill. Alchemy free tier hard-caps this at 10; paid/dedicated tiers allow ~2_000+. |
 | `polygon_channel_capacity` | 256 | Bounded mpsc channel capacity between backfill/WS workers and `next_event` consumer |
 
 ### Operator graph
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `funding_max_hops` | 3 | Hops along funding path before traversal stops |
+| `funding_max_hops` | 3 | Hops along funding path before traversal stops. Surfaced in `ServiceConfig` so the value participates in the config-hash. |
 | `funder_root_min_confidence_ppm` | 850_000 | Minimum identity confidence (= 0.85) to attribute a funder root |
 | `cluster_min_size` | 1 | Minimum wallets in cluster |
 | `cluster_max_size` | 25 | Cluster sizes above this require manual review |

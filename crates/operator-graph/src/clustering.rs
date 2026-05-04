@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use pe_core_types::{ClusterSize, FunderRootId, FundingHopCount, OperatorId, WalletAddress};
 use rust_decimal::Decimal;
+use tracing::warn;
 
 use crate::{
     error::OperatorGraphError,
@@ -114,7 +115,11 @@ fn build_reverse_adj(snapshot: &FundingSnapshot) -> HashMap<WalletAddress, Vec<W
 /// found becomes the boundary root.
 ///
 /// Returns `(root, hops_from_start_to_root)`.
-/// Returns `Err(CycleDetected)` if all reachable ancestors form a cycle.
+///
+/// On a circular funding graph (every reachable ancestor was already visited
+/// before any true root or boundary was reached), `start` becomes its own root
+/// with hops=0 — the wallet is treated as self-funded. A `tracing::warn!` is
+/// emitted so the cycle is observable.
 fn find_root(
     start: WalletAddress,
     reverse_adj: &HashMap<WalletAddress, Vec<WalletAddress>>,
@@ -159,8 +164,11 @@ fn find_root(
     }
 
     if root_candidates.is_empty() {
-        // Every ancestor was already visited — indicates a cycle.
-        return Err(OperatorGraphError::CycleDetected);
+        // Cycle: every reachable ancestor was already visited. Treat `start`
+        // as self-funded so the wallet still appears as a singleton cluster
+        // downstream rather than poisoning the entire rebuild.
+        warn!(wallet = ?start, "cycle in funding graph; treating as self-funded");
+        return Ok((start, 0));
     }
 
     // Pick root with minimum hops; break ties by smallest wallet bytes (determinism).
