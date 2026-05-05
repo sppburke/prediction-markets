@@ -22,11 +22,15 @@ pub struct ServiceConfig {
 
     // ── Polygon on-chain source ──────────────────────────────────────────────
     /// Alchemy (or compatible) HTTPS endpoint for `eth_getLogs` backfill.
-    /// Set via `PE_POLYGON_HTTP_URL`; never committed.
+    /// Required when `funder_source = "eth_logs"` (default); ignored when
+    /// `funder_source = "etherscan"`. Set via `PE_POLYGON_HTTP_URL`; never committed.
     #[serde(default)]
     pub polygon_http_url: String,
 
     /// Alchemy (or compatible) WSS endpoint for `eth_subscribe` live logs.
+    /// Required when `funder_source = "eth_logs"` (default). When
+    /// `funder_source = "etherscan"`, leave empty to skip the live WS
+    /// subscription entirely — only funder discovery runs, no real-time events.
     /// Set via `PE_POLYGON_WS_URL`; never committed.
     #[serde(default)]
     pub polygon_ws_url: String,

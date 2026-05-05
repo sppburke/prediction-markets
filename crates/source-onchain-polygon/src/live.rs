@@ -122,6 +122,9 @@ pub enum LivePolygonError {
     Discovery(String),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    /// Invariant violated by a logic error — unreachable in correct code.
+    #[error("internal invariant violated: {0}")]
+    Internal(&'static str),
 }
 
 // ── Connector ─────────────────────────────────────────────────────────────────
@@ -130,6 +133,10 @@ pub enum LivePolygonError {
 pub struct LivePolygonConnector {
     source_id: SourceId,
     event_rx: mpsc::Receiver<PolygonEvent>,
+    /// Retained so the channel stays open when no background task holds a sender
+    /// (etherscan-only mode with empty ws_url). Without this, event_rx.recv()
+    /// returns None immediately on first call and the connector reports Fatal.
+    _event_tx: mpsc::Sender<PolygonEvent>,
     last_event_at: Option<SourceTimestamp>,
 }
 
@@ -148,7 +155,13 @@ impl LivePolygonConnector {
         // through to eth_logs and re-burn the Alchemy CU budget that selecting
         // "etherscan" was meant to save.
         match config.funder_source.as_str() {
-            "eth_logs" => {}
+            "eth_logs" => {
+                if config.http_url.is_empty() {
+                    return Err(LivePolygonError::InvalidConfig(
+                        "funder_source = \"eth_logs\" requires polygon_http_url (set PE_POLYGON_HTTP_URL)".to_owned(),
+                    ));
+                }
+            }
             "etherscan" => {
                 if config.etherscan_api_key.is_empty() {
                     return Err(LivePolygonError::InvalidConfig(
@@ -176,17 +189,27 @@ impl LivePolygonConnector {
 
         let (event_tx, event_rx) = mpsc::channel(config.channel_capacity);
 
-        // HTTP provider for backfill and current-block query.
-        let http_url: url::Url = config
-            .http_url
-            .parse()
-            .map_err(|e: url::ParseError| LivePolygonError::HttpUrl(e.to_string()))?;
-        let http_provider = ProviderBuilder::new().connect_http(http_url);
-
-        let current_block = http_provider
-            .get_block_number()
-            .await
-            .map_err(|e| LivePolygonError::BlockNumber(e.to_string()))?;
+        // Acquire current block number. For eth_logs we also construct the HTTP
+        // provider that will be reused during funder discovery. For etherscan
+        // we use the Etherscan proxy API so that no Alchemy URL is required.
+        let (current_block, http_provider_opt) = if config.funder_source == "etherscan" {
+            let block = EtherscanFunderLookup::new(config.etherscan_api_key.clone())
+                .current_block()
+                .await
+                .map_err(|e| LivePolygonError::BlockNumber(e.to_string()))?;
+            (block, None)
+        } else {
+            let http_url: url::Url = config
+                .http_url
+                .parse()
+                .map_err(|e: url::ParseError| LivePolygonError::HttpUrl(e.to_string()))?;
+            let provider = ProviderBuilder::new().connect_http(http_url);
+            let block = provider
+                .get_block_number()
+                .await
+                .map_err(|e| LivePolygonError::BlockNumber(e.to_string()))?;
+            (block, Some(provider))
+        };
 
         // Resume from checkpoint (or default to head - backfill_blocks).
         let prev_checkpoint = load_checkpoint(&config.checkpoint_path);
@@ -270,8 +293,13 @@ impl LivePolygonConnector {
                     funder_source = "eth_logs",
                     "funder discovery: using eth_getLogs backend"
                 );
+                // http_provider_opt is Some when funder_source = "eth_logs";
+                // the validation block at the top of connect() enforces this.
+                let provider = http_provider_opt.ok_or(LivePolygonError::Internal(
+                    "http_provider_opt is None in eth_logs discovery branch",
+                ))?;
                 let lookup = EthGetLogsLookup {
-                    provider: http_provider.clone(),
+                    provider,
                     page_size: config.backfill_page_size,
                     event_tx: event_tx.clone(),
                 };
@@ -294,14 +322,22 @@ impl LivePolygonConnector {
         );
 
         // Spawn WS subscription task with the discovered wallet closure.
+        // Skipped when ws_url is empty (etherscan-only mode): no live on-chain
+        // events flow through; trade data from the Polymarket poller is unaffected.
         let ws_url = config.ws_url.clone();
-        tokio::spawn(async move {
-            run_ws_subscription(event_tx, ws_url, ws_filter_wallets).await;
-        });
+        if ws_url.is_empty() {
+            info!("ws_url is empty; skipping live WS subscription (etherscan-only mode)");
+        } else {
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                run_ws_subscription(tx, ws_url, ws_filter_wallets).await;
+            });
+        }
 
         Ok(Self {
             source_id,
             event_rx,
+            _event_tx: event_tx,
             last_event_at: None,
         })
     }

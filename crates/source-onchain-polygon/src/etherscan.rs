@@ -122,6 +122,13 @@ struct TokenTxEntry {
     to: String,
 }
 
+/// JSON-RPC response from `eth_blockNumber` proxy endpoint.
+/// `result` is the current block number as a hex string (e.g. `"0x4d20d8"`).
+#[derive(Deserialize)]
+struct EthBlockNumberResponse {
+    result: String,
+}
+
 // ── Lookup ────────────────────────────────────────────────────────────────────
 
 /// [`FunderLookup`] backed by the Etherscan V2 tokentx API.
@@ -153,6 +160,15 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         }
     }
 
+    fn build_block_number_url(&self) -> String {
+        format!(
+            "{base}?chainid={chain}&module=proxy&action=eth_blockNumber&apikey={key}",
+            base = self.base_url,
+            chain = POLYGON_CHAIN_ID,
+            key = self.api_key,
+        )
+    }
+
     fn build_url(&self, wallet: &WalletAddress, contract: &str, range: BlockRange) -> String {
         format!(
             "{base}?chainid={chain}&module=account&action=tokentx\
@@ -170,26 +186,32 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         )
     }
 
-    /// Fetch and parse a single page, retrying on transient HTTP errors AND
-    /// on Etherscan's in-band rate-limit responses (HTTP 200 + status="0" +
-    /// body containing "Max rate limit reached"). A `Fatal` HTTP error or a
-    /// permanent API error returns immediately without retry.
-    async fn fetch_and_parse_with_backoff(
+    /// Generic fetch-and-parse loop with exponential backoff.
+    ///
+    /// Retries on transient HTTP errors and on Etherscan's in-band rate-limit
+    /// responses (HTTP 200 + status="0"). `parser` maps raw response bytes to
+    /// `Result<T, ParseOutcome>`; a `Fatal` HTTP error or `ParseOutcome::Fatal`
+    /// returns immediately without retry.
+    async fn fetch_with_backoff<T, P>(
         &self,
         url: &str,
-    ) -> Result<Vec<TokenTxEntry>, FunderDiscoveryError> {
+        parser: P,
+    ) -> Result<T, FunderDiscoveryError>
+    where
+        P: Fn(&[u8]) -> Result<T, ParseOutcome>,
+    {
         let mut backoff_secs: u64 = 1;
         let mut last_err: Option<String> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             let outcome = match self.fetcher.fetch(url).await {
-                Ok(bytes) => parse_tokentx_response(&bytes),
+                Ok(bytes) => parser(&bytes),
                 Err(FetchError::Fatal(m)) => {
                     return Err(FunderDiscoveryError::Etherscan(format!("fatal: {m}")));
                 }
                 Err(FetchError::Transient(m)) => Err(ParseOutcome::Transient(m)),
             };
             match outcome {
-                Ok(entries) => return Ok(entries),
+                Ok(value) => return Ok(value),
                 Err(ParseOutcome::Transient(m)) => {
                     warn!(
                         attempt,
@@ -212,6 +234,27 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
             "exhausted {MAX_ATTEMPTS} attempts: {}",
             last_err.unwrap_or_else(|| "no error captured".to_owned())
         )))
+    }
+
+    async fn fetch_and_parse_with_backoff(
+        &self,
+        url: &str,
+    ) -> Result<Vec<TokenTxEntry>, FunderDiscoveryError> {
+        self.fetch_with_backoff(url, parse_tokentx_response).await
+    }
+
+    /// Return the current Polygon block number via the Etherscan V2 proxy API.
+    ///
+    /// Calls `eth_blockNumber` on chain id 137. Retries with the same backoff
+    /// policy as funder discovery so the etherscan path needs no Alchemy URL.
+    ///
+    /// # Precondition
+    /// `api_key` must be non-empty; an empty key will return a rate-limit
+    /// or auth error from Etherscan on the first attempt.
+    pub async fn current_block(&self) -> Result<u64, FunderDiscoveryError> {
+        let url = self.build_block_number_url();
+        self.fetch_with_backoff(&url, parse_block_number_response)
+            .await
     }
 }
 
@@ -300,6 +343,25 @@ fn parse_tokentx_response(bytes: &[u8]) -> Result<Vec<TokenTxEntry>, ParseOutcom
     }
 }
 
+fn parse_block_number_response(bytes: &[u8]) -> Result<u64, ParseOutcome> {
+    let resp: EthBlockNumberResponse = serde_json::from_slice(bytes)
+        .map_err(|e| ParseOutcome::Fatal(format!("decode block number response: {e}")))?;
+    // Etherscan returns rate-limit failures in the result field as plain strings
+    // (e.g. "Max rate limit reached") even for the JSON-RPC proxy endpoint.
+    // Detect these before attempting hex parse so they are retried, not failed.
+    if resp.result.to_lowercase().contains("rate limit")
+        || resp.result.to_lowercase().contains("notok")
+    {
+        return Err(ParseOutcome::Transient(format!(
+            "eth_blockNumber API error: {}",
+            resp.result
+        )));
+    }
+    let hex = resp.result.trim_start_matches("0x");
+    u64::from_str_radix(hex, 16)
+        .map_err(|e| ParseOutcome::Fatal(format!("parse hex block number '{}': {e}", resp.result)))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -355,5 +417,51 @@ mod tests {
         assert!(url.contains("startblock=100"));
         assert!(url.contains("endblock=200"));
         assert!(url.contains("apikey=KEY"));
+    }
+
+    #[test]
+    fn parse_block_number_response_decodes_hex() {
+        // 0x4d20d8 == 5_054_680
+        let json = br#"{"jsonrpc":"2.0","id":1,"result":"0x4d20d8"}"#;
+        let block = parse_block_number_response(json).unwrap();
+        assert_eq!(block, 5_054_680u64);
+    }
+
+    #[test]
+    fn parse_block_number_response_bad_hex_is_fatal() {
+        let json = br#"{"jsonrpc":"2.0","id":1,"result":"0xnothex"}"#;
+        let result = parse_block_number_response(json);
+        assert!(
+            matches!(result, Err(ParseOutcome::Fatal(_))),
+            "invalid hex must be Fatal, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_block_number_response_malformed_json_is_fatal() {
+        let result = parse_block_number_response(b"not json at all");
+        assert!(matches!(result, Err(ParseOutcome::Fatal(_))));
+    }
+
+    #[test]
+    fn parse_block_number_response_rate_limit_is_transient() {
+        // Etherscan returns rate-limit errors in the result field as plain strings
+        // even for the JSON-RPC proxy endpoint. Must be Transient so fetch_with_backoff retries.
+        let json = br#"{"jsonrpc":"2.0","id":1,"result":"Max rate limit reached"}"#;
+        let result = parse_block_number_response(json);
+        assert!(
+            matches!(result, Err(ParseOutcome::Transient(_))),
+            "rate-limit result must be Transient so the retry loop kicks in, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_block_number_url_includes_required_params() {
+        let lookup = EtherscanFunderLookup::new("MYKEY".to_owned());
+        let url = lookup.build_block_number_url();
+        assert!(url.contains("chainid=137"));
+        assert!(url.contains("module=proxy"));
+        assert!(url.contains("action=eth_blockNumber"));
+        assert!(url.contains("apikey=MYKEY"));
     }
 }
