@@ -297,6 +297,12 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polygon_backfill_blocks` | 21_000_000 | Blocks to backfill from current head on first run (≈ 16 months at ~2 s/block) |
 | `polygon_backfill_page_size` | 10 | Max blocks per `eth_getLogs` page during discovery/backfill. Alchemy free tier hard-caps this at 10; paid/dedicated tiers allow ~2_000+. |
 | `polygon_channel_capacity` | 256 | Bounded mpsc channel capacity between backfill/WS workers and `next_event` consumer |
+| `funder_source` | `"eth_logs"` | Funder discovery backend: `"eth_logs"` (default, Alchemy CU) or `"etherscan"` (Etherscan V2 free tier). |
+| `etherscan_funder_rps` | 5 | Etherscan V2 free-tier rate limit: 5 requests per second. |
+| `etherscan_funder_request_delay_ms` | 200 | Delay between successive Etherscan calls to stay under `etherscan_funder_rps`. |
+| `etherscan_funder_max_backoff_secs` | 60 | Cap on retry backoff for transient Etherscan errors. |
+| `etherscan_funder_max_attempts` | 6 | Maximum retry attempts before failing the discovery hop. |
+| `etherscan_funder_http_timeout_secs` | 30 | Per-request HTTP timeout for Etherscan calls. |
 
 ### Operator graph
 

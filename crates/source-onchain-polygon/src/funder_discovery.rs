@@ -32,6 +32,8 @@ const MAX_GET_LOGS_BACKOFF_SECS: u64 = 60;
 pub enum FunderDiscoveryError {
     #[error("eth_getLogs: {0}")]
     GetLogs(String),
+    #[error("etherscan: {0}")]
+    Etherscan(String),
     #[error("receiver dropped during discovery")]
     ReceiverDropped,
     #[error("invalid config: {0}")]

@@ -66,6 +66,7 @@
 |---|---|---|
 | https://polygon.technology/ | — | — |
 | Polygon JSON-RPC / archive provider docs (selected by impl) | — | — |
+| https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts | 2026-05-04 | 2026-08-04 |
 | https://www.weather.gov/ | — | — |
 | https://aviationweather.gov/data/api/ | — | — |
 | https://rapidrefresh.noaa.gov/hrrr/ | — | — |
