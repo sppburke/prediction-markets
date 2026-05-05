@@ -66,17 +66,29 @@ async fn main() -> Result<()> {
     // Shared accumulator: orchestrator ingests polygon events; scheduler reads snapshots.
     let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
 
-    // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
-    // and the Polymarket trade poller. Merge leaderboard with optional seed.
+    // Merge leaderboard with optional bootstrap seed. The merged Watchlist
+    // carries full WatchlistEntry metadata for every wallet so the Orchestrator
+    // can look up tier and scores for seed-only wallets.
     let seed_wl = seed::load_seed_watchlist(&cfg.seed_watchlist_path)?;
-    if let Some(ref s) = seed_wl {
+    let watchlist = seed::merge_watchlist(&watchlist, seed_wl.as_ref());
+    if seed_wl.is_some() {
         info!(
-            leaderboard = watchlist.entries.len(),
-            seed = s.entries.len(),
-            "merging seed watchlist with leaderboard"
+            total = watchlist.entries.len(),
+            active = watchlist.active_count,
+            incubator = watchlist.incubator_count,
+            "seed watchlist merged with leaderboard"
         );
+        if watchlist.entries.len() > cfg.watchlist_size {
+            tracing::warn!(
+                merged = watchlist.entries.len(),
+                watchlist_size = cfg.watchlist_size,
+                "merged wallet count exceeds watchlist_size; trade poller rate-limit budget was sized for watchlist_size"
+            );
+        }
     }
-    let wallets = seed::merge_seed(&watchlist, seed_wl.as_ref());
+    // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
+    // and the Polymarket trade poller.
+    let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
     // `funding_max_hops` is sourced from ServiceConfig so the value flows
     // through the config-hash; other ClusteringConfig fields stay at default
     // until they're surfaced in their own follow-up.

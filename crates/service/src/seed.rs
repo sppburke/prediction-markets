@@ -5,8 +5,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::Context;
-use pe_core_types::WalletAddress;
-use pe_trader_index::Watchlist;
+use pe_trader_index::{Watchlist, WatchlistTier};
 use tracing::warn;
 
 /// Load a seed [`Watchlist`] from `path`.
@@ -35,30 +34,51 @@ pub fn load_seed_watchlist(path: &str) -> anyhow::Result<Option<Watchlist>> {
     }
 }
 
-/// Merge `leaderboard` and an optional `seed` watchlist into a deduplicated
-/// `Vec<WalletAddress>`. Leaderboard order is preserved; seed-only wallets
-/// are appended in their original order.
-pub fn merge_seed(leaderboard: &Watchlist, seed: Option<&Watchlist>) -> Vec<WalletAddress> {
+/// Merge `leaderboard` and an optional `seed` watchlist into a single
+/// [`Watchlist`]. Leaderboard entries appear first (order preserved);
+/// seed-only entries are appended in their original order. Duplicates
+/// (by wallet address) are dropped from the seed — the leaderboard entry wins.
+///
+/// The returned [`Watchlist`] carries full [`pe_trader_index::WatchlistEntry`]
+/// metadata for every wallet, so the Orchestrator can look up tier, scores,
+/// and operator identity for seed-only wallets.
+pub fn merge_watchlist(leaderboard: &Watchlist, seed: Option<&Watchlist>) -> Watchlist {
     let capacity = leaderboard.entries.len() + seed.map_or(0, |s| s.entries.len());
     let mut seen = HashSet::with_capacity(capacity);
-    let mut out = Vec::with_capacity(capacity);
+    let mut entries = Vec::with_capacity(capacity);
+
     for entry in leaderboard
         .entries
         .iter()
         .chain(seed.into_iter().flat_map(|s| s.entries.iter()))
     {
         if seen.insert(entry.wallet) {
-            out.push(entry.wallet);
+            entries.push(entry.clone());
         }
     }
-    out
+
+    let active_count = entries
+        .iter()
+        .filter(|e| e.tier == WatchlistTier::Active)
+        .count();
+    let incubator_count = entries
+        .iter()
+        .filter(|e| e.tier == WatchlistTier::Incubator)
+        .count();
+
+    Watchlist {
+        entries,
+        snapshot_at: leaderboard.snapshot_at.clone(),
+        active_count,
+        incubator_count,
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
+    use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 
     fn wallet(n: u8) -> WalletAddress {
@@ -93,23 +113,45 @@ mod tests {
     #[test]
     fn merge_no_seed() {
         let a = wallet(1);
-        let result = merge_seed(&wl(&[a]), None);
-        assert_eq!(result, vec![a]);
+        let result = merge_watchlist(&wl(&[a]), None);
+        assert_eq!(
+            result.entries.iter().map(|e| e.wallet).collect::<Vec<_>>(),
+            vec![a]
+        );
     }
 
     #[test]
     fn merge_disjoint() {
         let (a, b) = (wallet(1), wallet(2));
-        let result = merge_seed(&wl(&[a]), Some(&wl(&[b])));
-        assert_eq!(result, vec![a, b]);
+        let result = merge_watchlist(&wl(&[a]), Some(&wl(&[b])));
+        assert_eq!(
+            result.entries.iter().map(|e| e.wallet).collect::<Vec<_>>(),
+            vec![a, b]
+        );
     }
 
     #[test]
     fn merge_overlap_leaderboard_wins() {
         let (a, b) = (wallet(1), wallet(2));
-        // b appears in both; leaderboard slot wins (one occurrence only)
-        let result = merge_seed(&wl(&[a, b]), Some(&wl(&[b])));
-        assert_eq!(result, vec![a, b]);
+        // b in both — leaderboard slot wins; appears exactly once
+        let result = merge_watchlist(&wl(&[a, b]), Some(&wl(&[b])));
+        assert_eq!(
+            result.entries.iter().map(|e| e.wallet).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn merge_counts_recomputed() {
+        let (a, b) = (wallet(1), wallet(2));
+        let lb = wl(&[a]);
+        let mut seed_wl = wl(&[b]);
+        seed_wl.entries[0].tier = WatchlistTier::Incubator;
+        seed_wl.active_count = 0;
+        seed_wl.incubator_count = 1;
+        let result = merge_watchlist(&lb, Some(&seed_wl));
+        assert_eq!(result.active_count, 1);
+        assert_eq!(result.incubator_count, 1);
     }
 
     #[test]
