@@ -519,9 +519,9 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 |---|---:|---|
 | `bootstrap_min_closed_trades` | 10 | Minimum closed trades for a wallet to pass the bootstrap pre-filter (exclusive: must have > 10) |
 | `bootstrap_min_win_rate_pct` | 80 | Minimum win-rate (percent, integer) to pass the bootstrap pre-filter |
-| `bootstrap_wallet_cache_ttl_days` | 7 | Days before a cached wallet's trade history is considered stale and re-fetched |
 | `bootstrap_dune_wallet_limit` | 10000 | Maximum distinct wallets pulled from Dune per bootstrap run |
-| `bootstrap_polymarket_audit_window_days` | 90 | Trade lookback window (days) used when building ledgers from bootstrapped wallets |
+| `bootstrap_polymarket_audit_window_days` | `None` (unlimited) | Trade lookback window. `None` means all available history; set `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS` to an integer or `unlimited`/empty for no limit. Passed as `u32::MAX` to `TradeSnapshot` internally. |
+| `bootstrap_incremental_fetch_known_id_threshold` | 3 | Number of consecutive already-cached `source_trade_id`s that signals incremental fetch is complete for a wallet |
 | `bootstrap_dune_poll_interval_secs` | 3 | Seconds between Dune execution result polling attempts |
 | `bootstrap_dune_max_wait_secs` | 300 | Maximum seconds to wait for a Dune query to complete before aborting |
 | `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/trades` endpoint |
