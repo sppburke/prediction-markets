@@ -42,6 +42,12 @@ const LOGS_PAGE_CAP: usize = 1_000;
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
 const RATE_LIMIT_DELAY_MS: u64 = 200;
 
+/// Maximum block span for a single top-level Etherscan request before the
+/// bisection recurses. Keeping this small avoids "server too busy" errors
+/// that Etherscan returns when asked to scan very large ranges in one shot.
+/// Canonical value in `docs/_GLOSSARY.md` "Wallet enumeration defaults".
+const SCAN_CHUNK_BLOCKS: u64 = 500_000;
+
 /// Maximum retry backoff when Etherscan returns transient errors.
 const MAX_BACKOFF_SECS: u64 = 60;
 
@@ -167,20 +173,24 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
 
         // Each contract address is queried separately; Etherscan's `address` param
         // is a single address (not an array) for the free-tier `eth_getLogs` endpoint.
+        // Pre-chunk the full range into SCAN_CHUNK_BLOCKS windows so that the initial
+        // request per chunk is small enough for Etherscan to handle without timing out.
         for contract in &ALL_EXCHANGE_CONTRACTS {
             let contract_hex = format!("0x{contract:x}");
-            debug!(contract = %contract_hex, "wallet enumeration: scanning contract");
-
-            self.scan_range(
-                &contract_hex,
-                self.config.from_block,
-                self.config.to_block,
-                &operator_set,
-                &mut wallets,
-            )
-            .await?;
-
-            tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
+            let mut chunk_from = self.config.from_block;
+            while chunk_from <= self.config.to_block {
+                let chunk_to = (chunk_from + SCAN_CHUNK_BLOCKS - 1).min(self.config.to_block);
+                tracing::info!(
+                    contract = %contract_hex,
+                    chunk_from,
+                    chunk_to,
+                    "wallet enumeration: scanning chunk"
+                );
+                self.scan_range(&contract_hex, chunk_from, chunk_to, &operator_set, &mut wallets)
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
+                chunk_from = chunk_to + 1;
+            }
         }
 
         Ok(wallets)
