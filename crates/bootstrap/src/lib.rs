@@ -358,10 +358,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
         .build()
-        .map_err(|e| BootstrapError::Polymarket {
-            wallet: String::new(),
-            message: format!("build client: {e}"),
-        })?;
+        .map_err(|_| BootstrapError::Internal)?;
     let fetcher = PolymarketBulkFetcher::new(
         config.polymarket_base_url.clone(),
         ReqwestFetcher::new(client),
