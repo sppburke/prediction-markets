@@ -67,6 +67,14 @@ pub struct ServiceConfig {
     #[serde(default = "default_watchlist_size")]
     pub watchlist_size: usize,
 
+    /// Path to the pe-bootstrap-generated Watchlist JSON file.
+    /// Empty string means disabled. If set but the file is absent, startup
+    /// warns and proceeds with the leaderboard alone. If the file exists but
+    /// cannot be parsed, startup fails.
+    /// See `docs/_GLOSSARY.md`: `seed_watchlist_path`.
+    #[serde(default)]
+    pub seed_watchlist_path: String,
+
     /// Seconds between Polymarket trade poll rounds (one round = all wallets).
     /// See `docs/_GLOSSARY.md`: `trade_poll_interval_secs`.
     #[serde(default = "default_trade_poll_interval_secs")]
@@ -193,6 +201,7 @@ impl Default for ServiceConfig {
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             watchlist_size: default_watchlist_size(),
+            seed_watchlist_path: String::new(),
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),

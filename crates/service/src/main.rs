@@ -25,6 +25,7 @@ use tracing::info;
 use pe_service::health::{SharedHealth, new_shared_health};
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::seed;
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 
 #[tokio::main]
@@ -66,8 +67,16 @@ async fn main() -> Result<()> {
     let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
 
     // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
-    // and the Polymarket trade poller.
-    let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
+    // and the Polymarket trade poller. Merge leaderboard with optional seed.
+    let seed_wl = seed::load_seed_watchlist(&cfg.seed_watchlist_path)?;
+    if let Some(ref s) = seed_wl {
+        info!(
+            leaderboard = watchlist.entries.len(),
+            seed = s.entries.len(),
+            "merging seed watchlist with leaderboard"
+        );
+    }
+    let wallets = seed::merge_seed(&watchlist, seed_wl.as_ref());
     // `funding_max_hops` is sourced from ServiceConfig so the value flows
     // through the config-hash; other ClusteringConfig fields stay at default
     // until they're surfaced in their own follow-up.
