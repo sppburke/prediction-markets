@@ -2970,6 +2970,7 @@ version = "0.1.0"
 dependencies = [
  "pe-core-types",
  "pe-operator-graph",
+ "pe-source-onchain-polygon",
  "pe-source-polymarket-public",
  "pe-trader-index",
  "reqwest 0.12.28",

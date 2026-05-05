@@ -1,3 +1,4 @@
+use pe_source_onchain_polygon::EnumerationError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -8,6 +9,10 @@ pub enum BootstrapError {
     DuneExecutionFailed { state: String, message: String },
     #[error("dune timeout after {secs}s waiting for execution {execution_id}")]
     DuneTimeout { execution_id: String, secs: u64 },
+    #[error("etherscan: {message}")]
+    Etherscan { message: String },
+    #[error("wallet enumeration: {0}")]
+    Enumeration(#[from] EnumerationError),
     #[error("polymarket fetch for {wallet}: {message}")]
     Polymarket { wallet: String, message: String },
     #[error("trade parse for {wallet}: {message}")]
