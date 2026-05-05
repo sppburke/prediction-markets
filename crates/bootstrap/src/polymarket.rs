@@ -73,6 +73,9 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                 Ok(new_trades) => {
                     if !new_trades.is_empty() {
                         cache.insert_new(&wallet_hex, new_trades);
+                        if let Err(e) = cache.save() {
+                            tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: cache checkpoint write failed");
+                        }
                     }
                 }
                 Err(e) => {

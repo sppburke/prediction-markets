@@ -68,10 +68,15 @@ impl WalletCache {
             match serde_json::from_slice::<TradeCache>(&bytes) {
                 Ok(d) => d,
                 Err(e) => {
+                    let bak = path.with_extension("json.bak");
+                    if let Err(bak_err) = std::fs::rename(path, &bak) {
+                        tracing::warn!(error = %bak_err, "trade cache: could not back up corrupt file");
+                    }
                     tracing::warn!(
                         path = %path.display(),
+                        bak = %bak.display(),
                         error = %e,
-                        "trade cache: parse failed (legacy format?); starting with blank cache"
+                        "trade cache: parse failed; corrupt file renamed to .bak, starting blank"
                     );
                     TradeCache::default()
                 }
@@ -165,7 +170,10 @@ impl WalletCache {
             .by_wallet
             .entry(wallet_hex.to_owned())
             .or_default();
-        index.trade_ids.extend(new_ids);
+        // Prepend so newest trades remain at the front.
+        let old_ids = std::mem::take(&mut index.trade_ids);
+        index.trade_ids = new_ids;
+        index.trade_ids.extend(old_ids);
         index.newest_trade_at = newest_at;
         index.newest_trade_id = newest_id;
     }
@@ -307,8 +315,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_results_in_blank_cache() {
+    fn legacy_file_results_in_blank_cache_and_bak() {
         // Old CacheEntry format; cannot be parsed as TradeCache — must silently start blank.
+        // The corrupt file is renamed to .bak so it can be inspected.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("cache.json");
         let legacy = r#"{"entries":{"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"fetched_at_unix":1704067200,"trades":[]}}}"#;
@@ -316,6 +325,14 @@ mod tests {
 
         let cache = WalletCache::open(&path).unwrap();
         assert_eq!(cache.trade_count(), 0, "legacy file must yield blank cache");
+        assert!(
+            path.with_extension("json.bak").exists(),
+            "corrupt file must be renamed to .bak"
+        );
+        assert!(
+            !path.exists(),
+            "original must be moved to .bak, not left in place"
+        );
     }
 
     #[test]

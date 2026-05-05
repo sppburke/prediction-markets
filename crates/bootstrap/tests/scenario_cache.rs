@@ -215,6 +215,10 @@ async fn scenario_legacy_file_auto_wiped() {
         0,
         "legacy file must produce a blank cache — run proceeds as cold start"
     );
+    assert!(
+        path.with_extension("json.bak").exists(),
+        "legacy file must be renamed to .bak"
+    );
 
     // Fetch with fixture to confirm cold-start behaviour.
     let page = trades_page(WALLET_A_HEX, &[("0xhash1", 2_000_001)]);
