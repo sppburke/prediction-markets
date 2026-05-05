@@ -20,6 +20,7 @@
 //! | [`live`] | [`LivePolygonConnector`] for live data via HTTP backfill + WS |
 //! | [`event`] | [`PolygonEvent`] enum and supporting types |
 //! | [`etherscan`] | [`EtherscanFunderLookup`] — alternate funder backend (chain 137) |
+//! | [`wallet_enumeration`] | [`PolymarketTraderEnumeration`] — discover all wallets via `OrderFilled` events |
 //!
 //! # Funder discovery backends
 //!
@@ -45,6 +46,7 @@ pub mod etherscan;
 pub mod event;
 pub mod funder_discovery;
 pub mod live;
+pub mod wallet_enumeration;
 
 pub use connector::PolygonReplayConnector;
 pub use etherscan::{EtherscanFunderLookup, HttpFetcher};
@@ -53,3 +55,4 @@ pub use funder_discovery::{
     BlockRange, EthGetLogsLookup, FunderDiscoveryError, FunderLookup, discover_to_depth,
 };
 pub use live::{LivePolygonConnector, LivePolygonError, PolygonConnectorConfig};
+pub use wallet_enumeration::{EnumerationConfig, EnumerationError, PolymarketTraderEnumeration};

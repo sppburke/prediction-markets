@@ -307,6 +307,16 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `etherscan_funder_max_attempts` | 6 | Maximum retry attempts before failing the discovery hop. |
 | `etherscan_funder_http_timeout_secs` | 30 | Per-request HTTP timeout for Etherscan calls. |
 
+### Wallet enumeration defaults
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `wallet_enum_logs_page_cap` | 1_000 | Etherscan free-tier per-call `eth_getLogs` result cap. If a range returns exactly this many logs, the range is bisected and re-fetched. |
+| `wallet_enum_from_block` | 33_605_403 | Earliest block to scan — approximate CTFExchange V1 deployment on Polygon. |
+| `wallet_enum_rate_limit_delay_ms` | 200 | Delay between successive Etherscan calls for enumeration (shared 5 req/s budget). |
+| `wallet_enum_max_backoff_secs` | 60 | Cap on retry backoff for transient enumeration errors. |
+| `wallet_enum_max_attempts` | 6 | Maximum retry attempts per `eth_getLogs` call before failing. |
+
 ### Operator graph
 
 | Key | Default | Meaning |

@@ -27,6 +27,38 @@ pub const GNOSIS_SAFE_FACTORY: Address = address!("aacFeEa03eb1561C4e67d661e4068
 /// verified 2026-05-04 from github.com/Polymarket/py-clob-client config.py chain 137
 pub const CTF: Address = address!("4D97DCd97eC945f40cF65F87097ACe5EA0476045");
 
+/// Polymarket CTFExchange V1 (binary YES/NO markets).
+/// Deployed ~block 33_605_403 (Jan 2023).
+/// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
+pub const CTF_EXCHANGE_V1: Address = address!("4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
+
+/// Polymarket NegRiskCtfExchange V1 (multi-outcome / neg-risk markets).
+/// Deployed ~block 50_505_492 (Aug 2024).
+/// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
+pub const NEG_RISK_CTF_EXCHANGE_V1: Address = address!("C5d563A36AE78145C45a50134d48A1215220f80a");
+
+/// Polymarket CTFExchange V2 (binary YES/NO markets — current).
+/// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
+pub const CTF_EXCHANGE_V2: Address = address!("E111180000d2663C0091e4f400237545B87B996B");
+
+/// Polymarket NegRiskCtfExchange V2 (multi-outcome / neg-risk — current).
+/// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
+pub const NEG_RISK_CTF_EXCHANGE_V2: Address = address!("e2222d279d744050d28e00520010520000310F59");
+
+/// All Polymarket exchange contracts (V1 + V2). Used for wallet enumeration.
+/// Scanning all four covers the full history from block 33_605_403 onwards.
+pub const ALL_EXCHANGE_CONTRACTS: [Address; 4] = [
+    CTF_EXCHANGE_V1,
+    NEG_RISK_CTF_EXCHANGE_V1,
+    CTF_EXCHANGE_V2,
+    NEG_RISK_CTF_EXCHANGE_V2,
+];
+
+/// Earliest Polymarket exchange deployment block on Polygon — CTFExchange V1.
+/// Default `from_block` for wallet enumeration.
+/// Canonical value in `docs/_GLOSSARY.md` "Wallet enumeration defaults".
+pub const CTF_EXCHANGE_V1_DEPLOY_BLOCK: u64 = 33_605_403;
+
 // ── Event topic0 hashes ──────────────────────────────────────────────────────
 
 /// ERC-20 Transfer(address indexed from, address indexed to, uint256 value)
@@ -39,6 +71,13 @@ pub const TOPIC_ERC20_TRANSFER: B256 =
 /// verified 2026-05-04 via 4byte.directory
 pub const TOPIC_PROXY_CREATION: B256 =
     b256!("4f51faf6c4561ff95f067657e43439f0f856d97c04d9ec9070a6199ad418e235");
+
+/// OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker,
+///   uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled,
+///   uint256 takerAmountFilled, uint256 fee)
+/// verified 2026-05-05 via yzc.me/x01Crypto/decoding-polymarket + Etherscan OrderFilled logs
+pub const TOPIC_ORDER_FILLED: B256 =
+    b256!("d0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6");
 
 // ── Numeric constants ────────────────────────────────────────────────────────
 
