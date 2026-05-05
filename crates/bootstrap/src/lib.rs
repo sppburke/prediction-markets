@@ -112,6 +112,9 @@ pub struct BootstrapConfig {
     pub min_win_rate_pct: u8,
     /// Base URL for the Polymarket Data API.
     pub polymarket_base_url: String,
+    /// Concurrent wallet fetches against the Polymarket Data API
+    /// (default `bootstrap_polymarket_concurrency = 16`).
+    pub polymarket_concurrency: usize,
 }
 
 impl BootstrapConfig {
@@ -213,6 +216,10 @@ impl BootstrapConfig {
                 DEFAULT_MIN_WIN_RATE_PCT,
             ),
             polymarket_base_url: optional("PE_POLYMARKET_BASE_URL", DEFAULT_POLYMARKET_BASE_URL),
+            polymarket_concurrency: optional_parse(
+                "PE_BOOTSTRAP_POLYMARKET_CONCURRENCY",
+                polymarket::DEFAULT_CONCURRENCY,
+            ),
         })
     }
 }
@@ -347,10 +354,11 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     //    On subsequent runs fetches only trades newer than the newest cached id.
     let mut cache = WalletCache::open(&config.cache_path)?;
     let client = reqwest::Client::new();
-    let mut fetcher = PolymarketBulkFetcher::new(
+    let fetcher = PolymarketBulkFetcher::new(
         config.polymarket_base_url.clone(),
         ReqwestFetcher::new(client),
-    );
+    )
+    .with_concurrency(config.polymarket_concurrency);
     let all_trades = fetcher.fetch_all(&wallets, &mut cache).await;
     cache.save()?;
     tracing::info!(count = all_trades.len(), "bootstrap: fetched trades");

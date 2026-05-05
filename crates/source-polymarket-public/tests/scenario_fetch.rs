@@ -54,7 +54,7 @@ async fn scenario_happy_path() {
     let router = Router::new().route("/data", get(handler));
     let base = start_mock_server(router).await;
 
-    let mut fetcher = make_fetcher();
+    let fetcher = make_fetcher();
     let bytes = fetcher
         .fetch_page(&format!("{base}/data"))
         .await
@@ -93,7 +93,7 @@ async fn scenario_retry_on_5xx() {
         .with_state(state);
     let base = start_mock_server(router).await;
 
-    let mut fetcher = make_fetcher();
+    let fetcher = make_fetcher();
     let bytes = fetcher
         .fetch_page(&format!("{base}/flaky"))
         .await
@@ -123,7 +123,7 @@ async fn scenario_rate_limited_429() {
     let router = Router::new().route("/limited", get(handler));
     let base = start_mock_server(router).await;
 
-    let mut fetcher = make_fetcher();
+    let fetcher = make_fetcher();
     let err = fetcher
         .fetch_page(&format!("{base}/limited"))
         .await
@@ -151,7 +151,7 @@ async fn scenario_fatal_4xx() {
     let router = Router::new().route("/missing", get(handler));
     let base = start_mock_server(router).await;
 
-    let mut fetcher = make_fetcher();
+    let fetcher = make_fetcher();
     let err = fetcher
         .fetch_page(&format!("{base}/missing"))
         .await
@@ -190,7 +190,7 @@ async fn scenario_exhaust_retries() {
     let base = start_mock_server(router).await;
 
     // max_retries = 2 → 3 total attempts.
-    let mut fetcher = make_fetcher().with_max_retries(2);
+    let fetcher = make_fetcher().with_max_retries(2);
     let err = fetcher
         .fetch_page(&format!("{base}/error"))
         .await

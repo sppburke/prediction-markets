@@ -52,7 +52,7 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     ///
     /// Each round fetches trades for every wallet in sequence, then sleeps for
     /// `poll_interval_secs`. Returns when the downstream channel is closed.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         loop {
             for &wallet in &self.wallets {
                 let url = PolymarketEndpoint::UserTrades {

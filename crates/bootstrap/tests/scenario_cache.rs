@@ -79,8 +79,7 @@ async fn scenario_first_run_full_fetch() {
     let mut responses = HashMap::new();
     responses.insert(trade_url(wallet_a(), 0), page);
 
-    let mut fetcher =
-        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
     let trades = fetcher.fetch_all(&[wallet_a()], &mut cache).await;
 
     assert_eq!(trades.len(), 3, "all 3 trades must be returned");
@@ -427,4 +426,75 @@ async fn scenario_unlimited_window_includes_all_trades() {
         all_ids.iter().any(|id| id.0 == "0xancient"),
         "ancient trade must appear in the ledger — unlimited window must not exclude it"
     );
+}
+
+// ── Scenario 8 ────────────────────────────────────────────────────────────────
+//
+// PASS: parallel fetch across N wallets writes the same trade-set into the
+//       cache as sequential fetch (concurrency=1) given identical fixtures.
+// FAIL: trade count differs, any wallet's trades are dropped, or any trade
+//       appears under the wrong wallet.
+
+#[tokio::test]
+async fn scenario_parallel_fetch_matches_sequential() {
+    // 8 wallets, each with a distinct trade hash. Concurrent fetch must not
+    // race — every wallet's trade must land under that wallet only.
+    const N: usize = 8;
+    let wallets: Vec<WalletAddress> = (0..N)
+        .map(|i| {
+            // 40-char hex, padded with i.
+            let hex = format!("0x{:040x}", i + 1);
+            WalletAddress::from_hex(&hex).unwrap()
+        })
+        .collect();
+
+    let mut responses = HashMap::new();
+    for (i, w) in wallets.iter().enumerate() {
+        let hash = format!("0xhash{i:02}");
+        let page = trades_page(&w.to_string(), &[(&hash, 2_000_000 + i as i64)]);
+        responses.insert(trade_url(*w, 0), page);
+    }
+
+    // Parallel run.
+    let dir_par = TempDir::new().unwrap();
+    let mut cache_par = WalletCache::open(&dir_par.path().join("cache.json")).unwrap();
+    let par_fetcher =
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses.clone()))
+            .with_concurrency(N);
+    let par_trades = par_fetcher.fetch_all(&wallets, &mut cache_par).await;
+
+    // Sequential run.
+    let dir_seq = TempDir::new().unwrap();
+    let mut cache_seq = WalletCache::open(&dir_seq.path().join("cache.json")).unwrap();
+    let seq_fetcher =
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_concurrency(1);
+    let seq_trades = seq_fetcher.fetch_all(&wallets, &mut cache_seq).await;
+
+    assert_eq!(
+        par_trades.len(),
+        N,
+        "parallel must return one trade per wallet"
+    );
+    assert_eq!(
+        seq_trades.len(),
+        N,
+        "sequential must return one trade per wallet"
+    );
+    assert_eq!(cache_par.trade_count(), N);
+    assert_eq!(cache_seq.trade_count(), N);
+
+    // Each wallet must have exactly its own one trade in the cache, never another's.
+    for (i, w) in wallets.iter().enumerate() {
+        let hex = w.to_string();
+        let par_ids = cache_par.known_trade_ids(&hex);
+        let seq_ids = cache_seq.known_trade_ids(&hex);
+        let expected_hash = format!("0xhash{i:02}");
+        assert_eq!(par_ids.len(), 1);
+        assert_eq!(par_ids[0], SourceTradeId(expected_hash.clone()));
+        assert_eq!(
+            seq_ids, par_ids,
+            "parallel and sequential cache must be identical"
+        );
+    }
 }
