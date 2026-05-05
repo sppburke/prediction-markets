@@ -1,7 +1,9 @@
 //! `pe-bootstrap` — wallet discovery and seed watchlist generation.
 //!
 //! Pipeline:
-//! 1. Discover wallets via Dune Analytics or Etherscan (selected by `PE_WALLET_SOURCE`).
+//! 1. Discover wallets — load from per-contract checkpoint if available, else
+//!    enumerate via Dune Analytics or Etherscan (selected by `PE_WALLET_SOURCE`).
+//!    Etherscan: checkpoint saved after each contract; resume skips completed ones.
 //! 2. Fetch trade history per wallet from the Polymarket Data API (7-day JSON cache).
 //! 3. Reconstruct `TraderLedger`s via `pe-trader-index`.
 //! 4. Pre-filter: keep wallets with > 10 closed trades and > 80 % win rate.
@@ -22,7 +24,8 @@ use std::time::Duration;
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_onchain_polygon::{
-    EnumerationConfig, PolymarketTraderEnumeration, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+    EnumerationConfig, PolymarketTraderEnumeration,
+    contracts::{ALL_EXCHANGE_CONTRACTS, CTF_EXCHANGE_V1_DEPLOY_BLOCK},
 };
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_trader_index::{
@@ -196,17 +199,45 @@ impl BootstrapConfig {
 ///
 /// Writes the watchlist as pretty-printed JSON to `config.output_path`.
 pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> {
-    // 1. Discover wallets — load from cache if available, else enumerate and save.
-    let wallets: Vec<WalletAddress> =
-        if let Some(cached) = wallet_set::load(&config.wallet_set_path)? {
+    // 1. Discover wallets — load from checkpoint if available; enumerate per-contract
+    //    and checkpoint after each (Etherscan) or all-at-once (Dune).
+    //    Legacy bare-array files (pre-checkpoint format) are upgraded in-place.
+    let wallets: Vec<WalletAddress> = {
+        let mut state = match wallet_set::load_state(&config.wallet_set_path)? {
+            Some(s) => s,
+            None => {
+                // Try legacy bare-array format written by pre-checkpoint binary.
+                match wallet_set::load(&config.wallet_set_path)? {
+                    Some(legacy) => {
+                        tracing::info!(
+                            count = legacy.len(),
+                            path = %config.wallet_set_path.display(),
+                            "bootstrap: upgrading legacy wallet set to checkpoint format"
+                        );
+                        let upgraded = wallet_set::WalletSetState {
+                            completed_contracts: ALL_EXCHANGE_CONTRACTS
+                                .iter()
+                                .map(|c| format!("0x{c:x}"))
+                                .collect(),
+                            wallets: legacy.iter().map(|w| w.to_string()).collect(),
+                        };
+                        wallet_set::save_state(&config.wallet_set_path, &upgraded)?;
+                        upgraded
+                    }
+                    None => wallet_set::WalletSetState::default(),
+                }
+            }
+        };
+
+        let total_contracts = ALL_EXCHANGE_CONTRACTS.len();
+        if state.completed_contracts.len() >= total_contracts {
             tracing::info!(
-                count = cached.len(),
+                count = state.wallets.len(),
                 path = %config.wallet_set_path.display(),
-                "bootstrap: loaded wallet set from cache — skipping enumeration"
+                "bootstrap: all contracts enumerated — skipping wallet discovery"
             );
-            cached
         } else {
-            let enumerated = match &config.wallet_source {
+            match &config.wallet_source {
                 WalletSource::Dune => {
                     let api_key = config
                         .dune_api_key
@@ -217,9 +248,15 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         "bootstrap: querying dune for wallets"
                     );
                     let dune = DuneClient::new(api_key);
-                    let wallets = dune.discover_wallets(config.dune_wallet_limit).await?;
-                    tracing::info!(count = wallets.len(), "bootstrap: dune returned wallets");
-                    wallets
+                    let found = dune.discover_wallets(config.dune_wallet_limit).await?;
+                    tracing::info!(count = found.len(), "bootstrap: dune returned wallets");
+                    state.wallets = found.iter().map(|w| w.to_string()).collect();
+                    // Mark all contracts complete so subsequent runs skip Dune.
+                    state.completed_contracts = ALL_EXCHANGE_CONTRACTS
+                        .iter()
+                        .map(|c| format!("0x{c:x}"))
+                        .collect();
+                    wallet_set::save_state(&config.wallet_set_path, &state)?;
                 }
                 WalletSource::Etherscan => {
                     let api_key = config
@@ -234,6 +271,8 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         from_block = config.wallet_from_block,
                         to_block,
                         operators = config.operator_addresses.len(),
+                        contracts_done = state.completed_contracts.len(),
+                        contracts_total = total_contracts,
                         "bootstrap: enumerating wallets via etherscan"
                     );
                     let enum_config = EnumerationConfig {
@@ -242,23 +281,44 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         operator_addresses: config.operator_addresses.clone(),
                     };
                     let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
-                    let wallet_set = enumerator.enumerate().await?;
-                    let wallets: Vec<WalletAddress> = wallet_set.into_iter().collect();
-                    tracing::info!(
-                        count = wallets.len(),
-                        "bootstrap: etherscan enumeration complete"
-                    );
-                    wallets
+                    for contract in &ALL_EXCHANGE_CONTRACTS {
+                        let contract_hex = format!("0x{contract:x}");
+                        if state.completed_contracts.contains(&contract_hex) {
+                            tracing::info!(
+                                contract = %contract_hex,
+                                "bootstrap: contract already in checkpoint — skipping"
+                            );
+                            continue;
+                        }
+                        let found = enumerator.enumerate_one_contract(*contract).await?;
+                        tracing::info!(
+                            contract = %contract_hex,
+                            found = found.len(),
+                            "bootstrap: contract enumerated"
+                        );
+                        state.wallets.extend(found.iter().map(|w| w.to_string()));
+                        state.completed_contracts.push(contract_hex);
+                        wallet_set::save_state(&config.wallet_set_path, &state)?;
+                    }
                 }
-            };
-            wallet_set::save(&config.wallet_set_path, &enumerated)?;
-            tracing::info!(
-                count = enumerated.len(),
-                path = %config.wallet_set_path.display(),
-                "bootstrap: wallet set saved to cache"
-            );
-            enumerated
-        };
+            }
+        }
+
+        // Deduplicate (per-contract sets may overlap at wallet level) and parse.
+        let mut seen = std::collections::HashSet::new();
+        state
+            .wallets
+            .iter()
+            .filter(|h| seen.insert(h.as_str()))
+            .filter_map(|h| {
+                WalletAddress::from_hex(h)
+                    .map_err(|e| {
+                        tracing::warn!(address = %h, error = %e, "bootstrap: skipping unparseable wallet");
+                    })
+                    .ok()
+            })
+            .collect()
+    };
 
     // 2. Fetch trade history (cache-first).
     // Note: cache entries written by pre-pagination versions of this binary may contain
