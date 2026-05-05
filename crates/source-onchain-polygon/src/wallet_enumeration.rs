@@ -218,8 +218,10 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
                     extract_wallets(&logs, operator_set, wallets);
                     return Ok(());
                 }
-                // Bisect and recurse.
+                // Bisect and recurse. Sleep before each sub-fetch to honour the
+                // 5 req/s budget — the triggering fetch above already consumed one slot.
                 let mid = from + (to - from) / 2;
+                tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
                 self.scan_range(contract_hex, from, mid, operator_set, wallets)
                     .await?;
                 tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
@@ -233,7 +235,8 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
     }
 
     fn build_url(&self, contract_hex: &str, from: u64, to: u64) -> String {
-        let topic0 = format!("0x{TOPIC_ORDER_FILLED}");
+        // B256 Display already includes the "0x" prefix — do not add a second one.
+        let topic0 = format!("{TOPIC_ORDER_FILLED}");
         format!(
             "{base}?chainid={chain}&module=logs&action=getLogs\
              &address={contract}&topic0={topic0}\
@@ -396,7 +399,7 @@ mod tests {
     fn make_log(maker: WalletAddress, taker: WalletAddress) -> LogEntry {
         LogEntry {
             topics: vec![
-                format!("0x{TOPIC_ORDER_FILLED}"),
+                format!("{TOPIC_ORDER_FILLED}"),
                 "0x".to_owned() + &"0".repeat(64), // orderHash
                 topic_hex(maker),
                 topic_hex(taker),
@@ -532,7 +535,7 @@ mod tests {
     fn json_logs(n: usize) -> Vec<u8> {
         let maker = w(0xaa);
         let taker = w(0xbb);
-        let topic0_str = format!("0x{TOPIC_ORDER_FILLED}");
+        let topic0_str = format!("{TOPIC_ORDER_FILLED}"); // B256 Display already includes "0x"
         let zero_str = "0x".to_owned() + &"0".repeat(64);
         let maker_str = topic_hex(maker);
         let taker_str = topic_hex(taker);
@@ -566,10 +569,10 @@ mod tests {
         let chain_id = POLYGON_CHAIN_ID;
         let full_url = format!(
             "{base}?chainid={chain_id}&module=logs&action=getLogs\
-             &address={contract}&topic0=0x{topic0}\
+             &address={contract}&topic0={topic0}\
              &fromBlock=100&toBlock=101\
              &offset={cap}&page=1&apikey={api_key}",
-            topic0 = TOPIC_ORDER_FILLED,
+            topic0 = TOPIC_ORDER_FILLED, // B256 Display already includes "0x"
             cap = LOGS_PAGE_CAP,
         );
         let left_url = full_url.replace("fromBlock=100&toBlock=101", "fromBlock=100&toBlock=100");
@@ -590,10 +593,10 @@ mod tests {
             let chain_id = POLYGON_CHAIN_ID;
             let url = format!(
                 "{base}?chainid={chain_id}&module=logs&action=getLogs\
-                 &address=0x{contract_addr:x}&topic0=0x{topic0}\
+                 &address=0x{contract_addr:x}&topic0={topic0}\
                  &fromBlock=100&toBlock=101\
                  &offset={cap}&page=1&apikey={api_key}",
-                topic0 = TOPIC_ORDER_FILLED,
+                topic0 = TOPIC_ORDER_FILLED, // B256 Display already includes "0x"
                 cap = LOGS_PAGE_CAP,
             );
             responses.insert(url, json_empty());

@@ -66,8 +66,8 @@ fn topic_hex(addr: WalletAddress) -> String {
 
 fn log_entry_json(maker: WalletAddress, taker: WalletAddress) -> String {
     format!(
-        r#"{{"topics":["0x{topic0}","0x{zero}","{maker}","{taker}"]}}"#,
-        topic0 = TOPIC_ORDER_FILLED,
+        r#"{{"topics":["{topic0}","0x{zero}","{maker}","{taker}"]}}"#,
+        topic0 = TOPIC_ORDER_FILLED, // B256 Display already includes "0x"
         zero = "0".repeat(64),
         maker = topic_hex(maker),
         taker = topic_hex(taker),
@@ -110,10 +110,10 @@ async fn three_paginated_responses_produce_correct_wallet_set() {
     let build_url = |addr: &str| {
         format!(
             "{base}?chainid=137&module=logs&action=getLogs\
-             &address={addr}&topic0=0x{topic0}\
+             &address={addr}&topic0={topic0}\
              &fromBlock={from_block}&toBlock={to_block}\
              &offset=1000&page=1&apikey={api_key}",
-            topic0 = TOPIC_ORDER_FILLED,
+            topic0 = TOPIC_ORDER_FILLED, // B256 Display already includes "0x"
         )
     };
 
