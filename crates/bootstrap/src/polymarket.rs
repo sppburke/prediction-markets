@@ -66,6 +66,15 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             let wallet_hex = wallet.to_string();
 
             if let Some(cached) = cache.get(&wallet_hex) {
+                // Cache entries written before pagination was introduced may contain at
+                // most TRADE_FETCH_LIMIT trades. Warn so operators know to delete the
+                // cache file if they need complete history for high-volume wallets.
+                if cached.len() == TRADE_FETCH_LIMIT as usize {
+                    tracing::warn!(
+                        wallet = %wallet_hex,
+                        "cached trade count equals page limit — may be truncated from a pre-pagination run; delete the cache to force re-fetch"
+                    );
+                }
                 all_trades.extend_from_slice(cached);
                 continue;
             }

@@ -524,3 +524,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_polymarket_audit_window_days` | 90 | Trade lookback window (days) used when building ledgers from bootstrapped wallets |
 | `bootstrap_dune_poll_interval_secs` | 3 | Seconds between Dune execution result polling attempts |
 | `bootstrap_dune_max_wait_secs` | 300 | Maximum seconds to wait for a Dune query to complete before aborting |
+| `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/trades` endpoint |
+| `bootstrap_wallet_source` | `"etherscan"` | Wallet discovery backend (`"etherscan"` or `"dune"`); set via `PE_WALLET_SOURCE` |
+| `bootstrap_wallet_from_block` | `CTF_EXCHANGE_V1_DEPLOY_BLOCK` (33_605_403) | Start block for Etherscan wallet scan; set via `PE_WALLET_FROM_BLOCK` |
+| `bootstrap_wallet_to_block` | current chain head | End block for Etherscan wallet scan; set via `PE_WALLET_TO_BLOCK` (fetched from Etherscan if absent) |

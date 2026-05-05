@@ -16,6 +16,7 @@ pub mod filter;
 pub mod polymarket;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
@@ -41,6 +42,8 @@ const DEFAULT_DUNE_WALLET_LIMIT: u32 = 10_000;
 const DEFAULT_AUDIT_WINDOW_DAYS: u32 = 90;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
+// bootstrap_eth_block_timeout_secs = 30
+const ETH_BLOCK_TIMEOUT_SECS: u64 = 30;
 
 /// Wallet discovery backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +58,14 @@ impl WalletSource {
     fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "dune" => Self::Dune,
-            _ => Self::Etherscan,
+            "etherscan" => Self::Etherscan,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unrecognised PE_WALLET_SOURCE; defaulting to etherscan"
+                );
+                Self::Etherscan
+            }
         }
     }
 }
@@ -69,9 +79,14 @@ pub struct BootstrapConfig {
     /// `PE_ETHERSCAN_API_KEY` — required when `wallet_source = etherscan`.
     pub etherscan_api_key: Option<String>,
     /// `PE_WALLET_FROM_BLOCK` — start block for Etherscan scan (default: CTF V1 deploy block).
+    /// Ignored when `wallet_source = dune`.
     pub wallet_from_block: u64,
     /// `PE_WALLET_TO_BLOCK` — end block for Etherscan scan (default: current chain head).
+    /// Ignored when `wallet_source = dune`.
     pub wallet_to_block: Option<u64>,
+    /// `PE_POLYMARKET_OPERATOR_ADDRESSES` — comma-separated hex addresses to exclude from the
+    /// enumerated wallet set (e.g. Polymarket matching operators). Ignored when `wallet_source = dune`.
+    pub operator_addresses: Vec<WalletAddress>,
     /// `PE_BOOTSTRAP_OUTPUT` — path where the `Watchlist` JSON is written.
     pub output_path: PathBuf,
     /// `PE_BOOTSTRAP_CACHE_PATH` — path to the wallet trade cache JSON file.
@@ -111,14 +126,43 @@ impl BootstrapConfig {
             WalletSource::Etherscan => (None, Some(require("PE_ETHERSCAN_API_KEY")?)),
         };
 
+        // Parse optional wallet_to_block; warn if set but unparseable (so the operator
+        // knows their explicit value was ignored rather than silently falling back to
+        // fetching the current chain head).
+        let wallet_to_block = match std::env::var("PE_WALLET_TO_BLOCK") {
+            Err(_) => None,
+            Ok(v) => match v.parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(
+                        value = v,
+                        "PE_WALLET_TO_BLOCK is not a valid u64; falling back to current chain head"
+                    );
+                    None
+                }
+            },
+        };
+
+        let operator_addresses = std::env::var("PE_POLYMARKET_OPERATOR_ADDRESSES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|hex| {
+                WalletAddress::from_hex(hex.trim())
+                    .map_err(|e| {
+                        tracing::warn!(address = hex, error = %e, "skipping invalid operator address");
+                    })
+                    .ok()
+            })
+            .collect();
+
         Ok(Self {
             wallet_source,
             dune_api_key,
             etherscan_api_key,
             wallet_from_block: optional_parse("PE_WALLET_FROM_BLOCK", CTF_EXCHANGE_V1_DEPLOY_BLOCK),
-            wallet_to_block: std::env::var("PE_WALLET_TO_BLOCK")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            wallet_to_block,
+            operator_addresses,
             output_path: PathBuf::from(require("PE_BOOTSTRAP_OUTPUT")?),
             cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.json")),
             dune_wallet_limit: optional_parse("PE_BOOTSTRAP_DUNE_LIMIT", DEFAULT_DUNE_WALLET_LIMIT),
@@ -171,12 +215,13 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             tracing::info!(
                 from_block = config.wallet_from_block,
                 to_block,
+                operators = config.operator_addresses.len(),
                 "bootstrap: enumerating wallets via etherscan"
             );
             let enum_config = EnumerationConfig {
                 from_block: config.wallet_from_block,
                 to_block,
-                operator_addresses: Vec::new(),
+                operator_addresses: config.operator_addresses.clone(),
             };
             let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
             let wallet_set = enumerator.enumerate().await?;
@@ -190,6 +235,10 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     };
 
     // 2. Fetch trade history (cache-first).
+    // Note: cache entries written by pre-pagination versions of this binary may contain
+    // at most 500 trades per wallet. High-volume wallets cached before upgrading will be
+    // under-counted until the 7-day TTL expires. Delete the cache file after upgrading
+    // to force a full re-fetch with pagination.
     let mut cache = WalletCache::open(&config.cache_path)?;
     let client = reqwest::Client::new();
     let mut fetcher = PolymarketBulkFetcher::new(
@@ -236,7 +285,15 @@ async fn fetch_current_block(api_key: &str) -> Result<u64, BootstrapError> {
     let url = format!(
         "{DEFAULT_ETHERSCAN_BASE_URL}?chainid=137&module=proxy&action=eth_blockNumber&apikey={api_key}"
     );
-    let bytes = reqwest::get(url)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(ETH_BLOCK_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| BootstrapError::Etherscan {
+            message: format!("build client: {e}"),
+        })?;
+    let bytes = client
+        .get(url)
+        .send()
         .await
         .map_err(|e| BootstrapError::Etherscan {
             message: format!("eth_blockNumber GET: {e}"),
@@ -256,7 +313,10 @@ async fn fetch_current_block(api_key: &str) -> Result<u64, BootstrapError> {
     })?;
     u64::from_str_radix(parsed.result.trim_start_matches("0x"), 16).map_err(|e| {
         BootstrapError::Etherscan {
-            message: format!("eth_blockNumber hex parse: {e}"),
+            message: format!(
+                "eth_blockNumber hex parse '{result}': {e}",
+                result = parsed.result
+            ),
         }
     })
 }
