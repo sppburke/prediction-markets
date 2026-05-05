@@ -1,6 +1,8 @@
 //! Dune Analytics API client for wallet discovery.
 //!
-//! Workflow: create a query → execute it → poll until complete → parse wallet rows.
+//! Workflow: POST /api/v1/sql/execute → poll execution until complete → parse wallet rows.
+//! Uses the direct SQL execution endpoint — no stored query is created, so the
+//! per-account private-query quota is never touched.
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" table.
 
 use std::time::{Duration, Instant};
@@ -17,20 +19,19 @@ const MAX_WAIT_SECS: u64 = 300;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// SQL for wallet discovery: all distinct makers from Polymarket trade history.
+///
+/// DuneSQL (Trino): address columns are `varbinary`; use bytearray literals (no
+/// quotes) for comparisons and CAST to VARCHAR for the output so the JSON row
+/// value is a hex string consumable by `WalletAddress::from_hex`.
 /// The `{limit}` placeholder is filled at runtime via format!.
 const WALLET_DISCOVERY_SQL: &str = "\
-SELECT DISTINCT maker AS wallet \
+SELECT DISTINCT CAST(maker AS VARCHAR) AS wallet \
 FROM polymarket_polygon.market_trades \
 WHERE maker IS NOT NULL \
-  AND maker != '0x0000000000000000000000000000000000000000' \
+  AND maker != 0x0000000000000000000000000000000000000000 \
 LIMIT {limit}";
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct CreateQueryResponse {
-    query_id: u64,
-}
 
 #[derive(Deserialize)]
 struct ExecuteResponse {
@@ -87,25 +88,26 @@ impl DuneClient {
     /// Returns up to `limit` distinct wallet addresses.
     pub async fn discover_wallets(&self, limit: u32) -> Result<Vec<WalletAddress>, BootstrapError> {
         let sql = WALLET_DISCOVERY_SQL.replace("{limit}", &limit.to_string());
-        let query_id = self.create_query(&sql).await?;
-        let execution_id = self.execute_query(query_id).await?;
+        let execution_id = self.execute_sql(&sql).await?;
         let rows = self.wait_for_results(&execution_id).await?;
         parse_wallet_rows(rows)
     }
 
-    async fn create_query(&self, sql: &str) -> Result<u64, BootstrapError> {
+    /// Submit SQL for direct execution without creating a stored query.
+    ///
+    /// Uses POST /api/v1/sql/execute — no private query is created so the
+    /// per-account private-query quota is never consumed.
+    async fn execute_sql(&self, sql: &str) -> Result<String, BootstrapError> {
         #[derive(serde::Serialize)]
         struct Body<'a> {
-            name: &'a str,
-            query_sql: &'a str,
-            is_private: bool,
+            sql: &'a str,
+            performance: &'a str,
         }
 
-        let url = format!("{}/query", self.base_url);
+        let url = format!("{}/sql/execute", self.base_url);
         let body = Body {
-            name: "pe-bootstrap-wallet-discovery",
-            query_sql: sql,
-            is_private: true,
+            sql,
+            performance: "free",
         };
 
         let resp = self
@@ -117,54 +119,18 @@ impl DuneClient {
             .send()
             .await
             .map_err(|e| BootstrapError::Dune {
-                message: format!("create_query POST failed: {e}"),
+                message: format!("execute_sql POST failed: {e}"),
             })?;
 
         let status = resp.status().as_u16();
         let bytes = resp.bytes().await.map_err(|e| BootstrapError::Dune {
-            message: format!("create_query read body failed: {e}"),
+            message: format!("execute_sql read body failed: {e}"),
         })?;
 
         if status >= 400 {
             return Err(BootstrapError::Dune {
                 message: format!(
-                    "create_query HTTP {status}: {}",
-                    String::from_utf8_lossy(&bytes)
-                ),
-            });
-        }
-
-        let parsed: CreateQueryResponse =
-            serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Dune {
-                message: format!("create_query parse failed: {e}"),
-            })?;
-        Ok(parsed.query_id)
-    }
-
-    async fn execute_query(&self, query_id: u64) -> Result<String, BootstrapError> {
-        let url = format!("{}/query/{query_id}/execute", self.base_url);
-
-        let resp = self
-            .client
-            .post(&url)
-            .header("X-DUNE-API-KEY", &self.api_key)
-            .header("Content-Length", "0")
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .send()
-            .await
-            .map_err(|e| BootstrapError::Dune {
-                message: format!("execute_query POST failed: {e}"),
-            })?;
-
-        let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| BootstrapError::Dune {
-            message: format!("execute_query read body failed: {e}"),
-        })?;
-
-        if status >= 400 {
-            return Err(BootstrapError::Dune {
-                message: format!(
-                    "execute_query HTTP {status}: {}",
+                    "execute_sql HTTP {status}: {}",
                     String::from_utf8_lossy(&bytes)
                 ),
             });
@@ -172,7 +138,7 @@ impl DuneClient {
 
         let parsed: ExecuteResponse =
             serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Dune {
-                message: format!("execute_query parse failed: {e}"),
+                message: format!("execute_sql parse failed: {e}"),
             })?;
         Ok(parsed.execution_id)
     }
@@ -193,21 +159,33 @@ impl DuneClient {
                 });
             }
 
-            let resp = self
-                .client
-                .get(&url)
-                .header("X-DUNE-API-KEY", &self.api_key)
-                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-                .send()
-                .await
-                .map_err(|e| BootstrapError::Dune {
-                    message: format!("poll GET failed: {e}"),
-                })?;
+            let poll_result = async {
+                let resp = self
+                    .client
+                    .get(&url)
+                    .header("X-DUNE-API-KEY", &self.api_key)
+                    .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                    .send()
+                    .await
+                    .map_err(|e| format!("poll GET failed: {e}"))?;
+                let status = resp.status().as_u16();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("poll read body failed: {e}"))?;
+                Ok::<_, String>((status, bytes))
+            }
+            .await;
 
-            let status = resp.status().as_u16();
-            let bytes = resp.bytes().await.map_err(|e| BootstrapError::Dune {
-                message: format!("poll read body failed: {e}"),
-            })?;
+            let (status, bytes) = match poll_result {
+                Ok(v) => v,
+                Err(e) => {
+                    // Transient network error — log and retry after back-off.
+                    tracing::warn!(execution_id, error = %e, "dune: transient poll error, retrying");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+            };
 
             if status >= 400 {
                 return Err(BootstrapError::Dune {
