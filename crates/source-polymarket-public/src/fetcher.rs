@@ -36,8 +36,10 @@ pub trait PageFetcher {
 /// - Per-request timeout: `polymarket_request_timeout_secs = 10`.
 /// - Retry with exponential backoff for network errors and 5xx responses
 ///   (`polymarket_max_retries = 3` retries; 4 total attempts).
-/// - Rate limiting: enforces ≤ 5 req/s by sleeping before each call when
-///   less than 200 ms has elapsed since the previous one.
+/// - Rate limiting: enforces ≤ 1 / `MIN_INTERVAL_MS` req/ms (defaults to ≤ 20 req/s
+///   at 50 ms) by reserving a future slot before each call. The reservation is
+///   shared via `Mutex<Option<Instant>>` so concurrent callers all observe the
+///   serial gate (see `last_request_at` and the gate logic in `fetch_page`).
 /// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried).
 /// - HTTP 4xx (non-429) → [`SourceError::Fatal`].
 pub struct ReqwestFetcher {
@@ -84,9 +86,11 @@ impl ReqwestFetcher {
 
 impl PageFetcher for ReqwestFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
-        // Rate-limit gate: serialize the "claim a slot, stamp now()" critical section
-        // and only then release the lock to perform the HTTP request — keeps wall-clock
-        // throughput at ≤ 1 / MIN_INTERVAL_MS even when many tasks share this fetcher.
+        // Rate-limit gate: each call claims the next available slot,
+        // computed as max(now, last_slot + MIN_INTERVAL_MS), and stamps it
+        // before releasing the lock so concurrent callers observe the
+        // reservation rather than the pre-sleep `now`. Wall-clock throughput
+        // stays at ≤ 1 / MIN_INTERVAL_MS even when many tasks share this fetcher.
         let min_interval = Duration::from_millis(MIN_INTERVAL_MS);
         let sleep_for = {
             let mut guard = self
@@ -94,13 +98,12 @@ impl PageFetcher for ReqwestFetcher {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let now = Instant::now();
-            let needed = guard.and_then(|t| {
-                let elapsed = now.duration_since(t);
-                (elapsed < min_interval).then(|| min_interval - elapsed)
-            });
-            // Reserve our slot at (now + sleep) before releasing the lock.
-            *guard = Some(now + needed.unwrap_or(Duration::ZERO));
-            needed
+            let next_slot = match *guard {
+                None => now,
+                Some(last) => last.max(now) + min_interval,
+            };
+            *guard = Some(next_slot);
+            next_slot.checked_duration_since(now)
         };
         if let Some(d) = sleep_for {
             tokio::time::sleep(d).await;
