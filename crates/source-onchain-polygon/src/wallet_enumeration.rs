@@ -313,8 +313,13 @@ fn parse_logs_response(bytes: &[u8]) -> Result<Vec<LogEntry>, ParseOutcome> {
         "0" if resp.message.eq_ignore_ascii_case("No logs found") => Ok(Vec::new()),
         "0" => {
             let body = resp.result.to_string();
+            let msg_lc = resp.message.to_lowercase();
             if resp.message.to_uppercase().contains("NOTOK")
                 || body.to_lowercase().contains("rate limit")
+                || msg_lc.contains("too busy")
+                || msg_lc.contains("timeout")
+                || msg_lc.contains("try again")
+                || msg_lc.contains("server error")
             {
                 Err(ParseOutcome::Transient(format!(
                     "API status=0 message={} body={body}",
