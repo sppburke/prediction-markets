@@ -346,6 +346,17 @@ fn parse_tokentx_response(bytes: &[u8]) -> Result<Vec<TokenTxEntry>, ParseOutcom
 fn parse_block_number_response(bytes: &[u8]) -> Result<u64, ParseOutcome> {
     let resp: EthBlockNumberResponse = serde_json::from_slice(bytes)
         .map_err(|e| ParseOutcome::Fatal(format!("decode block number response: {e}")))?;
+    // Etherscan returns rate-limit failures in the result field as plain strings
+    // (e.g. "Max rate limit reached") even for the JSON-RPC proxy endpoint.
+    // Detect these before attempting hex parse so they are retried, not failed.
+    if resp.result.to_lowercase().contains("rate limit")
+        || resp.result.to_lowercase().contains("notok")
+    {
+        return Err(ParseOutcome::Transient(format!(
+            "eth_blockNumber API error: {}",
+            resp.result
+        )));
+    }
     let hex = resp.result.trim_start_matches("0x");
     u64::from_str_radix(hex, 16)
         .map_err(|e| ParseOutcome::Fatal(format!("parse hex block number '{}': {e}", resp.result)))
@@ -430,6 +441,18 @@ mod tests {
     fn parse_block_number_response_malformed_json_is_fatal() {
         let result = parse_block_number_response(b"not json at all");
         assert!(matches!(result, Err(ParseOutcome::Fatal(_))));
+    }
+
+    #[test]
+    fn parse_block_number_response_rate_limit_is_transient() {
+        // Etherscan returns rate-limit errors in the result field as plain strings
+        // even for the JSON-RPC proxy endpoint. Must be Transient so fetch_with_backoff retries.
+        let json = br#"{"jsonrpc":"2.0","id":1,"result":"Max rate limit reached"}"#;
+        let result = parse_block_number_response(json);
+        assert!(
+            matches!(result, Err(ParseOutcome::Transient(_))),
+            "rate-limit result must be Transient so the retry loop kicks in, got {result:?}"
+        );
     }
 
     #[test]

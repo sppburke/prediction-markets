@@ -133,6 +133,10 @@ pub enum LivePolygonError {
 pub struct LivePolygonConnector {
     source_id: SourceId,
     event_rx: mpsc::Receiver<PolygonEvent>,
+    /// Retained so the channel stays open when no background task holds a sender
+    /// (etherscan-only mode with empty ws_url). Without this, event_rx.recv()
+    /// returns None immediately on first call and the connector reports Fatal.
+    _event_tx: mpsc::Sender<PolygonEvent>,
     last_event_at: Option<SourceTimestamp>,
 }
 
@@ -324,14 +328,16 @@ impl LivePolygonConnector {
         if ws_url.is_empty() {
             info!("ws_url is empty; skipping live WS subscription (etherscan-only mode)");
         } else {
+            let tx = event_tx.clone();
             tokio::spawn(async move {
-                run_ws_subscription(event_tx, ws_url, ws_filter_wallets).await;
+                run_ws_subscription(tx, ws_url, ws_filter_wallets).await;
             });
         }
 
         Ok(Self {
             source_id,
             event_rx,
+            _event_tx: event_tx,
             last_event_at: None,
         })
     }
