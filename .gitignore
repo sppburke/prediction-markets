@@ -29,3 +29,7 @@ target
 # Paper-mode runtime output — binary log and JSONL sidecar
 paper.log
 paper.jsonl
+
+# Smoke-test runtime data and secrets — never commit
+.env
+smoke-test/
