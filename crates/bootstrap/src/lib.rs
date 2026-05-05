@@ -14,6 +14,7 @@ pub mod dune;
 pub mod error;
 pub mod filter;
 pub mod polymarket;
+pub mod wallet_set;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,6 +92,10 @@ pub struct BootstrapConfig {
     pub output_path: PathBuf,
     /// `PE_BOOTSTRAP_CACHE_PATH` — path to the wallet trade cache JSON file.
     pub cache_path: PathBuf,
+    /// `PE_BOOTSTRAP_WALLET_SET_PATH` — path to the enumerated wallet address list.
+    /// If the file exists, Etherscan/Dune enumeration is skipped entirely.
+    /// Delete the file to force a fresh scan. Default: `wallet_set.json`.
+    pub wallet_set_path: PathBuf,
     /// Maximum distinct wallets to pull from Dune (default `bootstrap_dune_wallet_limit = 10000`).
     pub dune_wallet_limit: u32,
     /// Trade lookback window for ledger reconstruction (default `bootstrap_polymarket_audit_window_days = 90`).
@@ -165,6 +170,10 @@ impl BootstrapConfig {
             operator_addresses,
             output_path: PathBuf::from(require("PE_BOOTSTRAP_OUTPUT")?),
             cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.json")),
+            wallet_set_path: PathBuf::from(optional(
+                "PE_BOOTSTRAP_WALLET_SET_PATH",
+                "wallet_set.json",
+            )),
             dune_wallet_limit: optional_parse("PE_BOOTSTRAP_DUNE_LIMIT", DEFAULT_DUNE_WALLET_LIMIT),
             audit_window_days: optional_parse(
                 "PE_BOOTSTRAP_AUDIT_WINDOW_DAYS",
@@ -187,52 +196,69 @@ impl BootstrapConfig {
 ///
 /// Writes the watchlist as pretty-printed JSON to `config.output_path`.
 pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> {
-    // 1. Discover wallets.
-    let wallets: Vec<WalletAddress> = match &config.wallet_source {
-        WalletSource::Dune => {
-            let api_key = config
-                .dune_api_key
-                .clone()
-                .ok_or(BootstrapError::Internal)?;
+    // 1. Discover wallets — load from cache if available, else enumerate and save.
+    let wallets: Vec<WalletAddress> =
+        if let Some(cached) = wallet_set::load(&config.wallet_set_path)? {
             tracing::info!(
-                limit = config.dune_wallet_limit,
-                "bootstrap: querying dune for wallets"
+                count = cached.len(),
+                path = %config.wallet_set_path.display(),
+                "bootstrap: loaded wallet set from cache — skipping enumeration"
             );
-            let dune = DuneClient::new(api_key);
-            let wallets = dune.discover_wallets(config.dune_wallet_limit).await?;
-            tracing::info!(count = wallets.len(), "bootstrap: dune returned wallets");
-            wallets
-        }
-        WalletSource::Etherscan => {
-            let api_key = config
-                .etherscan_api_key
-                .clone()
-                .ok_or(BootstrapError::Internal)?;
-            let to_block = match config.wallet_to_block {
-                Some(b) => b,
-                None => fetch_current_block(&api_key).await?,
+            cached
+        } else {
+            let enumerated = match &config.wallet_source {
+                WalletSource::Dune => {
+                    let api_key = config
+                        .dune_api_key
+                        .clone()
+                        .ok_or(BootstrapError::Internal)?;
+                    tracing::info!(
+                        limit = config.dune_wallet_limit,
+                        "bootstrap: querying dune for wallets"
+                    );
+                    let dune = DuneClient::new(api_key);
+                    let wallets = dune.discover_wallets(config.dune_wallet_limit).await?;
+                    tracing::info!(count = wallets.len(), "bootstrap: dune returned wallets");
+                    wallets
+                }
+                WalletSource::Etherscan => {
+                    let api_key = config
+                        .etherscan_api_key
+                        .clone()
+                        .ok_or(BootstrapError::Internal)?;
+                    let to_block = match config.wallet_to_block {
+                        Some(b) => b,
+                        None => fetch_current_block(&api_key).await?,
+                    };
+                    tracing::info!(
+                        from_block = config.wallet_from_block,
+                        to_block,
+                        operators = config.operator_addresses.len(),
+                        "bootstrap: enumerating wallets via etherscan"
+                    );
+                    let enum_config = EnumerationConfig {
+                        from_block: config.wallet_from_block,
+                        to_block,
+                        operator_addresses: config.operator_addresses.clone(),
+                    };
+                    let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
+                    let wallet_set = enumerator.enumerate().await?;
+                    let wallets: Vec<WalletAddress> = wallet_set.into_iter().collect();
+                    tracing::info!(
+                        count = wallets.len(),
+                        "bootstrap: etherscan enumeration complete"
+                    );
+                    wallets
+                }
             };
+            wallet_set::save(&config.wallet_set_path, &enumerated)?;
             tracing::info!(
-                from_block = config.wallet_from_block,
-                to_block,
-                operators = config.operator_addresses.len(),
-                "bootstrap: enumerating wallets via etherscan"
+                count = enumerated.len(),
+                path = %config.wallet_set_path.display(),
+                "bootstrap: wallet set saved to cache"
             );
-            let enum_config = EnumerationConfig {
-                from_block: config.wallet_from_block,
-                to_block,
-                operator_addresses: config.operator_addresses.clone(),
-            };
-            let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
-            let wallet_set = enumerator.enumerate().await?;
-            let wallets: Vec<WalletAddress> = wallet_set.into_iter().collect();
-            tracing::info!(
-                count = wallets.len(),
-                "bootstrap: etherscan enumeration complete"
-            );
-            wallets
-        }
-    };
+            enumerated
+        };
 
     // 2. Fetch trade history (cache-first).
     // Note: cache entries written by pre-pagination versions of this binary may contain
