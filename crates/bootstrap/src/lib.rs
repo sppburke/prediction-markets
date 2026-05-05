@@ -1,7 +1,7 @@
 //! `pe-bootstrap` — wallet discovery and seed watchlist generation.
 //!
 //! Pipeline:
-//! 1. Query Dune Analytics for all wallets that have ever traded on Polymarket.
+//! 1. Discover wallets via Dune Analytics or Etherscan (selected by `PE_WALLET_SOURCE`).
 //! 2. Fetch trade history per wallet from the Polymarket Data API (7-day JSON cache).
 //! 3. Reconstruct `TraderLedger`s via `pe-trader-index`.
 //! 4. Pre-filter: keep wallets with > 10 closed trades and > 80 % win rate.
@@ -16,9 +16,13 @@ pub mod filter;
 pub mod polymarket;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
+use pe_source_onchain_polygon::{
+    EnumerationConfig, PolymarketTraderEnumeration, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_trader_index::{
     LedgerConfig, TraderLedger, Watchlist, WatchlistEntry, WatchlistTier, build_trader_ledgers,
@@ -37,11 +41,52 @@ use rust_decimal::Decimal;
 const DEFAULT_DUNE_WALLET_LIMIT: u32 = 10_000;
 const DEFAULT_AUDIT_WINDOW_DAYS: u32 = 90;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
+const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
+// bootstrap_eth_block_timeout_secs = 30
+const ETH_BLOCK_TIMEOUT_SECS: u64 = 30;
+
+/// Wallet discovery backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletSource {
+    /// Use Dune Analytics (legacy path; requires `PE_DUNE_API_KEY`).
+    Dune,
+    /// Use Etherscan `eth_getLogs` on Polygon (requires `PE_ETHERSCAN_API_KEY`).
+    Etherscan,
+}
+
+impl WalletSource {
+    fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "dune" => Self::Dune,
+            "etherscan" => Self::Etherscan,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unrecognised PE_WALLET_SOURCE; defaulting to etherscan"
+                );
+                Self::Etherscan
+            }
+        }
+    }
+}
 
 /// Configuration for a bootstrap run, sourced from environment variables.
 pub struct BootstrapConfig {
-    /// `PE_DUNE_API_KEY` — required.
-    pub dune_api_key: String,
+    /// `PE_WALLET_SOURCE` — `"etherscan"` (default) or `"dune"`.
+    pub wallet_source: WalletSource,
+    /// `PE_DUNE_API_KEY` — required when `wallet_source = dune`.
+    pub dune_api_key: Option<String>,
+    /// `PE_ETHERSCAN_API_KEY` — required when `wallet_source = etherscan`.
+    pub etherscan_api_key: Option<String>,
+    /// `PE_WALLET_FROM_BLOCK` — start block for Etherscan scan (default: CTF V1 deploy block).
+    /// Ignored when `wallet_source = dune`.
+    pub wallet_from_block: u64,
+    /// `PE_WALLET_TO_BLOCK` — end block for Etherscan scan (default: current chain head).
+    /// Ignored when `wallet_source = dune`.
+    pub wallet_to_block: Option<u64>,
+    /// `PE_POLYMARKET_OPERATOR_ADDRESSES` — comma-separated hex addresses to exclude from the
+    /// enumerated wallet set (e.g. Polymarket matching operators). Ignored when `wallet_source = dune`.
+    pub operator_addresses: Vec<WalletAddress>,
     /// `PE_BOOTSTRAP_OUTPUT` — path where the `Watchlist` JSON is written.
     pub output_path: PathBuf,
     /// `PE_BOOTSTRAP_CACHE_PATH` — path to the wallet trade cache JSON file.
@@ -74,8 +119,50 @@ impl BootstrapConfig {
                 .unwrap_or(default)
         }
 
+        let wallet_source = WalletSource::from_str(&optional("PE_WALLET_SOURCE", "etherscan"));
+
+        let (dune_api_key, etherscan_api_key) = match &wallet_source {
+            WalletSource::Dune => (Some(require("PE_DUNE_API_KEY")?), None),
+            WalletSource::Etherscan => (None, Some(require("PE_ETHERSCAN_API_KEY")?)),
+        };
+
+        // Parse optional wallet_to_block; warn if set but unparseable (so the operator
+        // knows their explicit value was ignored rather than silently falling back to
+        // fetching the current chain head).
+        let wallet_to_block = match std::env::var("PE_WALLET_TO_BLOCK") {
+            Err(_) => None,
+            Ok(v) => match v.parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(
+                        value = v,
+                        "PE_WALLET_TO_BLOCK is not a valid u64; falling back to current chain head"
+                    );
+                    None
+                }
+            },
+        };
+
+        let operator_addresses = std::env::var("PE_POLYMARKET_OPERATOR_ADDRESSES")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|hex| {
+                WalletAddress::from_hex(hex.trim())
+                    .map_err(|e| {
+                        tracing::warn!(address = hex, error = %e, "skipping invalid operator address");
+                    })
+                    .ok()
+            })
+            .collect();
+
         Ok(Self {
-            dune_api_key: require("PE_DUNE_API_KEY")?,
+            wallet_source,
+            dune_api_key,
+            etherscan_api_key,
+            wallet_from_block: optional_parse("PE_WALLET_FROM_BLOCK", CTF_EXCHANGE_V1_DEPLOY_BLOCK),
+            wallet_to_block,
+            operator_addresses,
             output_path: PathBuf::from(require("PE_BOOTSTRAP_OUTPUT")?),
             cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.json")),
             dune_wallet_limit: optional_parse("PE_BOOTSTRAP_DUNE_LIMIT", DEFAULT_DUNE_WALLET_LIMIT),
@@ -100,16 +187,58 @@ impl BootstrapConfig {
 ///
 /// Writes the watchlist as pretty-printed JSON to `config.output_path`.
 pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> {
-    // 1. Discover wallets via Dune.
-    tracing::info!(
-        limit = config.dune_wallet_limit,
-        "bootstrap: querying dune for wallets"
-    );
-    let dune = DuneClient::new(config.dune_api_key.clone());
-    let wallets: Vec<WalletAddress> = dune.discover_wallets(config.dune_wallet_limit).await?;
-    tracing::info!(count = wallets.len(), "bootstrap: dune returned wallets");
+    // 1. Discover wallets.
+    let wallets: Vec<WalletAddress> = match &config.wallet_source {
+        WalletSource::Dune => {
+            let api_key = config
+                .dune_api_key
+                .clone()
+                .ok_or(BootstrapError::Internal)?;
+            tracing::info!(
+                limit = config.dune_wallet_limit,
+                "bootstrap: querying dune for wallets"
+            );
+            let dune = DuneClient::new(api_key);
+            let wallets = dune.discover_wallets(config.dune_wallet_limit).await?;
+            tracing::info!(count = wallets.len(), "bootstrap: dune returned wallets");
+            wallets
+        }
+        WalletSource::Etherscan => {
+            let api_key = config
+                .etherscan_api_key
+                .clone()
+                .ok_or(BootstrapError::Internal)?;
+            let to_block = match config.wallet_to_block {
+                Some(b) => b,
+                None => fetch_current_block(&api_key).await?,
+            };
+            tracing::info!(
+                from_block = config.wallet_from_block,
+                to_block,
+                operators = config.operator_addresses.len(),
+                "bootstrap: enumerating wallets via etherscan"
+            );
+            let enum_config = EnumerationConfig {
+                from_block: config.wallet_from_block,
+                to_block,
+                operator_addresses: config.operator_addresses.clone(),
+            };
+            let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
+            let wallet_set = enumerator.enumerate().await?;
+            let wallets: Vec<WalletAddress> = wallet_set.into_iter().collect();
+            tracing::info!(
+                count = wallets.len(),
+                "bootstrap: etherscan enumeration complete"
+            );
+            wallets
+        }
+    };
 
     // 2. Fetch trade history (cache-first).
+    // Note: cache entries written by pre-pagination versions of this binary may contain
+    // at most 500 trades per wallet. High-volume wallets cached before upgrading will be
+    // under-counted until the 7-day TTL expires. Delete the cache file after upgrading
+    // to force a full re-fetch with pagination.
     let mut cache = WalletCache::open(&config.cache_path)?;
     let client = reqwest::Client::new();
     let mut fetcher = PolymarketBulkFetcher::new(
@@ -149,6 +278,47 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     write_watchlist(&watchlist, &config.output_path)?;
 
     Ok(watchlist)
+}
+
+/// Fetch the current Polygon chain head block number from Etherscan.
+async fn fetch_current_block(api_key: &str) -> Result<u64, BootstrapError> {
+    let url = format!(
+        "{DEFAULT_ETHERSCAN_BASE_URL}?chainid=137&module=proxy&action=eth_blockNumber&apikey={api_key}"
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(ETH_BLOCK_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| BootstrapError::Etherscan {
+            message: format!("build client: {e}"),
+        })?;
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| BootstrapError::Etherscan {
+            message: format!("eth_blockNumber GET: {e}"),
+        })?
+        .bytes()
+        .await
+        .map_err(|e| BootstrapError::Etherscan {
+            message: format!("eth_blockNumber read body: {e}"),
+        })?;
+
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        result: String,
+    }
+    let parsed: Resp = serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Etherscan {
+        message: format!("eth_blockNumber parse: {e}"),
+    })?;
+    u64::from_str_radix(parsed.result.trim_start_matches("0x"), 16).map_err(|e| {
+        BootstrapError::Etherscan {
+            message: format!(
+                "eth_blockNumber hex parse '{result}': {e}",
+                result = parsed.result
+            ),
+        }
+    })
 }
 
 /// Build a seed [`Watchlist`] from reconstructed ledgers using the bootstrap pre-filter.
