@@ -225,7 +225,13 @@ fn spawn_polygon_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match LivePolygonConnector::connect(SourceId("polygon".into()), config).await {
-            Err(e) => tracing::error!(error = %e, "polygon connector failed to connect"),
+            Err(e) => {
+                tracing::error!(error = %e, "polygon connector failed to connect");
+                let mut h = health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                h.polygon_status = pe_source_core::SourceStatus::Dead;
+            }
             Ok(mut connector) => {
                 use pe_source_core::SourceConnector as _;
                 loop {

@@ -61,6 +61,35 @@ impl HttpFetcher for FixtureFetcher {
     }
 }
 
+/// Scenario: EtherscanFunderLookup::current_block() decodes the hex response
+/// from the Etherscan V2 proxy API into a `u64` block number.
+///
+/// PASS: block number == 5_054_680 (0x4d20d8) from fixture
+/// FAIL: wrong number, error returned, or panic
+#[tokio::test]
+async fn etherscan_current_block_returns_decoded_height() {
+    // Fixture contains: {"jsonrpc":"2.0","id":1,"result":"0x4d20d8"} — block 5_054_680
+    let rules = vec![(
+        "action=eth_blockNumber".to_owned(),
+        fixture("etherscan_eth_block_number.json"),
+    )];
+    let fetcher = FixtureFetcher::new(rules);
+    let lookup = EtherscanFunderLookup::with_fetcher(
+        fetcher,
+        "TESTKEY".to_owned(),
+        "https://example.invalid/v2/api".to_owned(),
+    );
+
+    let block = lookup
+        .current_block()
+        .await
+        .expect("current_block must succeed with fixture");
+    assert_eq!(
+        block, 5_054_680u64,
+        "current_block must decode 0x4d20d8 to 5_054_680"
+    );
+}
+
 #[tokio::test]
 async fn etherscan_funders_of_returns_incoming_senders() {
     let wallet_a = WalletAddress::from_hex(WALLET_A).unwrap();
