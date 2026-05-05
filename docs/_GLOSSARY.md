@@ -390,6 +390,7 @@ Written to `jsonl_log_path` (default: `./paper.jsonl`). One JSON object per line
 |---|---:|---|
 | `watchlist_size` | 20 | Top-N leaderboard entries fetched by `WatchlistFetcher` |
 | `watchlist_lookback_window_days` | 7 | Days of leaderboard history considered when selecting candidates |
+| `seed_watchlist_path` | `""` | Path to pe-bootstrap Watchlist JSON. Empty = disabled. Missing file warns and falls back to leaderboard. |
 
 ### Watchlist sizes
 

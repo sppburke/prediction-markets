@@ -25,6 +25,7 @@ use tracing::info;
 use pe_service::health::{SharedHealth, new_shared_health};
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::seed;
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 
 #[tokio::main]
@@ -65,6 +66,26 @@ async fn main() -> Result<()> {
     // Shared accumulator: orchestrator ingests polygon events; scheduler reads snapshots.
     let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
 
+    // Merge leaderboard with optional bootstrap seed. The merged Watchlist
+    // carries full WatchlistEntry metadata for every wallet so the Orchestrator
+    // can look up tier and scores for seed-only wallets.
+    let seed_wl = seed::load_seed_watchlist(&cfg.seed_watchlist_path)?;
+    let watchlist = seed::merge_watchlist(&watchlist, seed_wl.as_ref());
+    if seed_wl.is_some() {
+        info!(
+            total = watchlist.entries.len(),
+            active = watchlist.active_count,
+            incubator = watchlist.incubator_count,
+            "seed watchlist merged with leaderboard"
+        );
+        if watchlist.entries.len() > cfg.watchlist_size {
+            tracing::warn!(
+                merged = watchlist.entries.len(),
+                watchlist_size = cfg.watchlist_size,
+                "merged wallet count exceeds watchlist_size; trade poller rate-limit budget was sized for watchlist_size"
+            );
+        }
+    }
     // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
     // and the Polymarket trade poller.
     let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
