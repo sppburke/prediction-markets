@@ -4,6 +4,7 @@
 //! [`FixtureFetcher`] for hermetic tests.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use pe_source_core::SourceError;
@@ -11,10 +12,13 @@ use pe_source_core::SourceError;
 // Defaults — canonical values live in `docs/_GLOSSARY.md` "Polymarket public source" section.
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRIES: u32 = 3;
-/// Enforces ≤ 5 req/s per the Polymarket Data API production budget.
-const MIN_INTERVAL_MS: u64 = 200;
+/// Enforces ≤ 20 req/s per the Polymarket Data API documented limit (200 req/10s on `/trades`).
+const MIN_INTERVAL_MS: u64 = 50;
 
 /// Abstracts HTTP page fetching so production and test connectors share the same logic.
+///
+/// `&self` (not `&mut self`) so a single fetcher can be shared across concurrent tasks;
+/// implementations must use interior mutability for any per-call state.
 #[allow(async_fn_in_trait)]
 pub trait PageFetcher {
     /// Fetch a page from `url`. Returns raw response bytes.
@@ -22,7 +26,7 @@ pub trait PageFetcher {
     /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value.
     /// - Returns [`SourceError::Transient`] on 5xx or network errors (retried internally).
     /// - Returns [`SourceError::Fatal`] on 4xx (non-429) errors.
-    async fn fetch_page(&mut self, url: &str) -> Result<Vec<u8>, SourceError>;
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError>;
 }
 
 // ── Production fetcher ────────────────────────────────────────────────────────
@@ -32,8 +36,10 @@ pub trait PageFetcher {
 /// - Per-request timeout: `polymarket_request_timeout_secs = 10`.
 /// - Retry with exponential backoff for network errors and 5xx responses
 ///   (`polymarket_max_retries = 3` retries; 4 total attempts).
-/// - Rate limiting: enforces ≤ 5 req/s by sleeping before each call when
-///   less than 200 ms has elapsed since the previous one.
+/// - Rate limiting: enforces ≤ 1 / `MIN_INTERVAL_MS` req/ms (defaults to ≤ 20 req/s
+///   at 50 ms) by reserving a future slot before each call. The reservation is
+///   shared via `Mutex<Option<Instant>>` so concurrent callers all observe the
+///   serial gate (see `last_request_at` and the gate logic in `fetch_page`).
 /// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried).
 /// - HTTP 4xx (non-429) → [`SourceError::Fatal`].
 pub struct ReqwestFetcher {
@@ -41,7 +47,10 @@ pub struct ReqwestFetcher {
     timeout: Duration,
     max_retries: u32,
     initial_backoff_ms: u64,
-    last_request_at: Option<Instant>,
+    /// Shared rate-limit clock: serializes the gate across concurrent callers
+    /// so the global throughput stays under `MIN_INTERVAL_MS` even when a single
+    /// fetcher is shared by many tasks (e.g. via `Arc<ReqwestFetcher>`).
+    last_request_at: Mutex<Option<Instant>>,
 }
 
 impl ReqwestFetcher {
@@ -52,7 +61,7 @@ impl ReqwestFetcher {
             timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
             max_retries: MAX_RETRIES,
             initial_backoff_ms: 200,
-            last_request_at: None,
+            last_request_at: Mutex::new(None),
         }
     }
 
@@ -76,20 +85,32 @@ impl ReqwestFetcher {
 }
 
 impl PageFetcher for ReqwestFetcher {
-    async fn fetch_page(&mut self, url: &str) -> Result<Vec<u8>, SourceError> {
-        // Rate-limit enforcement: sleep if < MIN_INTERVAL_MS since the last request.
-        if let Some(last) = self.last_request_at {
-            let elapsed = last.elapsed();
-            let min_interval = Duration::from_millis(MIN_INTERVAL_MS);
-            if elapsed < min_interval {
-                tokio::time::sleep(min_interval - elapsed).await;
-            }
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        // Rate-limit gate: each call claims the next available slot,
+        // computed as max(now, last_slot + MIN_INTERVAL_MS), and stamps it
+        // before releasing the lock so concurrent callers observe the
+        // reservation rather than the pre-sleep `now`. Wall-clock throughput
+        // stays at ≤ 1 / MIN_INTERVAL_MS even when many tasks share this fetcher.
+        let min_interval = Duration::from_millis(MIN_INTERVAL_MS);
+        let sleep_for = {
+            let mut guard = self
+                .last_request_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            let next_slot = match *guard {
+                None => now,
+                Some(last) => last.max(now) + min_interval,
+            };
+            *guard = Some(next_slot);
+            next_slot.checked_duration_since(now)
+        };
+        if let Some(d) = sleep_for {
+            tokio::time::sleep(d).await;
         }
 
         let mut attempt = 0u32;
         loop {
-            self.last_request_at = Some(Instant::now());
-
             let send_result = self.client.get(url).timeout(self.timeout).send().await;
 
             match send_result {
@@ -174,7 +195,7 @@ impl FixtureFetcher {
 }
 
 impl PageFetcher for FixtureFetcher {
-    async fn fetch_page(&mut self, url: &str) -> Result<Vec<u8>, SourceError> {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
         self.responses
             .get(url)
             .cloned()

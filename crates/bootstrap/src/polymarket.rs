@@ -1,13 +1,19 @@
-//! Polymarket bulk trade fetcher — incremental, cache-first.
+//! Polymarket bulk trade fetcher — incremental, cache-first, concurrent.
 //!
 //! For each wallet: paginates from offset 0, stops when
 //! `INCREMENTAL_STOP_THRESHOLD` consecutive already-known `source_trade_id`s
 //! are encountered, then appends only the new trades to the cache.
 //! Each fetched page is sorted newest-first (defensive: API normally does this
 //! but the sort removes the silent-failure mode if ordering ever changes).
+//!
+//! `fetch_all` runs up to `concurrency` per-wallet fetches in parallel; the
+//! shared `PageFetcher` enforces the global rate-limit gate so the aggregate
+//! throughput stays inside the documented Polymarket Data API limit
+//! (200 req/10s on `/trades`, ≈ 20 req/s).
 
 use std::collections::HashSet;
 
+use futures::stream::{self, StreamExt};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -18,6 +24,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 
 use crate::cache::{INCREMENTAL_STOP_THRESHOLD, WalletCache};
 use crate::error::BootstrapError;
@@ -43,47 +50,76 @@ struct PolymarketTrade {
 
 // ── Fetcher ───────────────────────────────────────────────────────────────────
 
+/// Default per-run concurrency for `PolymarketBulkFetcher::fetch_all`.
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+pub const DEFAULT_CONCURRENCY: usize = 16;
+
 /// Incremental trade fetcher for Polymarket wallets.
 pub struct PolymarketBulkFetcher<F: PageFetcher> {
     base_url: String,
     fetcher: F,
+    concurrency: usize,
 }
 
 impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     pub fn new(base_url: String, fetcher: F) -> Self {
-        Self { base_url, fetcher }
+        Self {
+            base_url,
+            fetcher,
+            concurrency: DEFAULT_CONCURRENCY,
+        }
+    }
+
+    /// Override the wallet-fetch concurrency (clamped to `>= 1`).
+    pub fn with_concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n.max(1);
+        self
     }
 
     /// Fetch new trades for all `wallets`, updating `cache` incrementally.
     ///
+    /// Up to `self.concurrency` wallets are fetched in parallel; the underlying
+    /// `PageFetcher` enforces the global rate-limit gate. Wallets that produce
+    /// a network or parse error are skipped with a `tracing::warn!`.
+    ///
     /// Returns a flat `Vec<RawTrade>` of all trades (pre-existing + new) for
-    /// the given wallets. Wallets that produce a network or parse error are
-    /// skipped with a `tracing::warn!`.
+    /// the given wallets. Wallets are checkpointed to `cache.save()` after
+    /// each successful fetch.
     pub async fn fetch_all(
-        &mut self,
+        &self,
         wallets: &[WalletAddress],
         cache: &mut WalletCache,
     ) -> Vec<RawTrade> {
-        for wallet in wallets {
-            let wallet_hex = wallet.to_string();
-            let known_ids: HashSet<SourceTradeId> =
-                cache.known_trade_ids(&wallet_hex).iter().cloned().collect();
+        let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);
 
-            match self.fetch_wallet_incremental(*wallet, &known_ids).await {
-                Ok(new_trades) => {
-                    if !new_trades.is_empty() {
-                        cache.insert_new(&wallet_hex, new_trades);
-                        if let Err(e) = cache.save() {
-                            tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: cache checkpoint write failed");
+        stream::iter(wallets.iter().copied())
+            .for_each_concurrent(self.concurrency, |wallet| {
+                let cache_mutex = &cache_mutex;
+                async move {
+                    let wallet_hex = wallet.to_string();
+                    let known_ids: HashSet<SourceTradeId> = {
+                        let guard = cache_mutex.lock().await;
+                        guard.known_trade_ids(&wallet_hex).iter().cloned().collect()
+                    };
+
+                    match self.fetch_wallet_incremental(wallet, &known_ids).await {
+                        Ok(new_trades) if !new_trades.is_empty() => {
+                            let mut guard = cache_mutex.lock().await;
+                            guard.insert_new(&wallet_hex, new_trades);
+                            if let Err(e) = guard.save() {
+                                tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: cache checkpoint write failed");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: skipping wallet");
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: skipping wallet");
-                }
-            }
-        }
+            })
+            .await;
 
+        let cache = cache_mutex.into_inner();
         wallets
             .iter()
             .flat_map(|w| cache.trades_for(&w.to_string()))
@@ -96,7 +132,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// trades whose `source_trade_id` appears in `known_ids`. Each page is sorted
     /// newest-first before checking (defensive against API ordering changes).
     async fn fetch_wallet_incremental(
-        &mut self,
+        &self,
         wallet: WalletAddress,
         known_ids: &HashSet<SourceTradeId>,
     ) -> Result<Vec<RawTrade>, BootstrapError> {
@@ -344,7 +380,7 @@ mod tests {
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
-        let mut bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
         let trades = bulk.fetch_all(&[wallet], &mut cache).await;
 
         assert_eq!(trades.len(), 1000);
@@ -359,7 +395,7 @@ mod tests {
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
-        let mut bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
         let trades = bulk.fetch_all(&[wallet], &mut cache).await;
 
         assert_eq!(trades.len(), 499);
@@ -381,8 +417,7 @@ mod tests {
         ]);
         let mut r_cold = HashMap::new();
         r_cold.insert(trade_url(wallet, 0), old_page);
-        let mut b_cold =
-            PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold));
+        let b_cold = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold));
         b_cold.fetch_all(&[wallet], &mut cache).await;
         assert_eq!(cache.trade_count(), 5);
 
@@ -398,8 +433,7 @@ mod tests {
         ]);
         let mut r_incr = HashMap::new();
         r_incr.insert(trade_url(wallet, 0), incr_page);
-        let mut b_incr =
-            PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr));
+        let b_incr = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr));
         let all = b_incr.fetch_all(&[wallet], &mut cache).await;
 
         assert_eq!(cache.trade_count(), 7, "5 old + 2 new = 7");
@@ -414,8 +448,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
-        let mut bulk =
-            PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
         let trades = bulk.fetch_all(&[wallet], &mut cache).await;
 
         assert_eq!(trades.len(), 10);

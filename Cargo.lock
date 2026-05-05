@@ -2995,6 +2995,7 @@ dependencies = [
 name = "pe-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "pe-core-types",
  "pe-operator-graph",
  "pe-source-onchain-polygon",

@@ -69,7 +69,7 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
     // Fetch trades using fixture fetcher (no network).
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
-    let mut fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fixture_fetcher());
+    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fixture_fetcher());
     let all_trades = fetcher.fetch_all(&wallets, &mut cache).await;
 
     // Reconstruct ledgers (no operator attribution at bootstrap).

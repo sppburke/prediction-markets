@@ -26,6 +26,7 @@ pe-source-onchain-polygon     = { path = "../source-onchain-polygon",       vers
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",                 version = "0.1.0" }
 
+futures         = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }
 serde           = { workspace = true }

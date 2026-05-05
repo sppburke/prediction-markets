@@ -55,7 +55,7 @@ Production budgets are conservative; they reduce automatically on 429/5xx. The "
 
 | Venue / surface | Documented limit | Production budget | Burst |
 |---|---|---|---|
-| Polymarket Data API | verify in `21-...` | ≤ 5 req/s sustained | 20-req burst, 1/s refill |
+| Polymarket Data API | 200 req/10s on `/trades`, 100 req/s general (Cloudflare-queued, no 429) | ≤ 20 req/s sustained on `/trades` | n/a — bursts queued, not rejected |
 | Polymarket Gamma API | verify | ≤ 2 req/s sustained | 10-req burst |
 | Polymarket CLOB REST | verify | ≤ 5 req/s sustained | 10-req burst |
 | Polymarket WebSocket | per-account socket cap | ≤ 4 concurrent sockets | n/a |
@@ -525,6 +525,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_dune_poll_interval_secs` | 3 | Seconds between Dune execution result polling attempts |
 | `bootstrap_dune_max_wait_secs` | 300 | Maximum seconds to wait for a Dune query to complete before aborting |
 | `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/trades` endpoint |
+| `bootstrap_polymarket_concurrency` | 16 | Concurrent per-wallet trade fetches against the Polymarket Data API; the `ReqwestFetcher` rate-limit gate caps aggregate throughput at ≤ 20 req/s regardless. Set via `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY`. |
 | `bootstrap_wallet_source` | `"etherscan"` | Wallet discovery backend (`"etherscan"` or `"dune"`); set via `PE_WALLET_SOURCE` |
 | `bootstrap_wallet_from_block` | `CTF_EXCHANGE_V1_DEPLOY_BLOCK` (33_605_403) | Start block for Etherscan wallet scan; set via `PE_WALLET_FROM_BLOCK` |
 | `bootstrap_wallet_to_block` | current chain head | End block for Etherscan wallet scan; set via `PE_WALLET_TO_BLOCK` (fetched from Etherscan if absent) |
