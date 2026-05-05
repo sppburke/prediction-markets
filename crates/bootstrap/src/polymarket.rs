@@ -86,9 +86,13 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// `PageFetcher` enforces the global rate-limit gate. Wallets that produce
     /// a network or parse error are skipped with a `tracing::warn!`.
     ///
+    /// Checkpoints to disk every `CHECKPOINT_INTERVAL` successful inserts.
+    /// The mutex is released before the disk write so concurrent tasks are not
+    /// blocked during I/O. A final `save()` after the loop persists any
+    /// remaining inserts below the last checkpoint boundary.
+    ///
     /// Returns a flat `Vec<RawTrade>` of all trades (pre-existing + new) for
-    /// the given wallets. Wallets are checkpointed to `cache.save()` after
-    /// each successful fetch.
+    /// the given wallets.
     pub async fn fetch_all(
         &self,
         wallets: &[WalletAddress],
@@ -108,10 +112,48 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
 
                     match self.fetch_wallet_incremental(wallet, &known_ids).await {
                         Ok(new_trades) if !new_trades.is_empty() => {
-                            let mut guard = cache_mutex.lock().await;
-                            guard.insert_new(&wallet_hex, new_trades);
-                            if let Err(e) = guard.save() {
-                                tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: cache checkpoint write failed");
+                            // Serialize inside the lock for a consistent snapshot,
+                            // then release the lock before the slow disk write.
+                            let checkpoint = {
+                                let mut guard = cache_mutex.lock().await;
+                                guard.insert_new(&wallet_hex, new_trades);
+                                guard.checkpoint_seq().and_then(|seq| {
+                                    match guard.to_bytes() {
+                                        Ok(bytes) => Some((bytes, guard.path.clone(), seq)),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                wallet = %wallet_hex,
+                                                error = %e,
+                                                "polymarket: cache checkpoint serialization failed"
+                                            );
+                                            None
+                                        }
+                                    }
+                                })
+                            };
+                            // Lock released. Disk I/O on a blocking thread.
+                            if let Some((bytes, path, seq)) = checkpoint {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    WalletCache::atomic_write(&path, &bytes, seq)
+                                })
+                                .await;
+                                match result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(
+                                            wallet = %wallet_hex,
+                                            error = %e,
+                                            "polymarket: cache checkpoint write failed"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            wallet = %wallet_hex,
+                                            error = %e,
+                                            "polymarket: cache checkpoint task panicked"
+                                        );
+                                    }
+                                }
                             }
                         }
                         Ok(_) => {}
@@ -124,6 +166,10 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             .await;
 
         let cache = cache_mutex.into_inner();
+        // Final flush: persist any inserts since the last periodic checkpoint.
+        if let Err(e) = cache.save() {
+            tracing::warn!(error = %e, "polymarket: final cache save failed");
+        }
         wallets
             .iter()
             .flat_map(|w| cache.trades_for(&w.to_string()))
