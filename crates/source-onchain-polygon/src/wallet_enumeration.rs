@@ -166,39 +166,54 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
                 self.config.from_block, self.config.to_block
             )));
         }
+        let mut wallets = HashSet::new();
+        for contract in &ALL_EXCHANGE_CONTRACTS {
+            wallets.extend(self.enumerate_one_contract(*contract).await?);
+        }
+        Ok(wallets)
+    }
 
+    /// Enumerate every distinct trader wallet for a single exchange `contract`.
+    ///
+    /// Scans `[from_block, to_block]` in `SCAN_CHUNK_BLOCKS`-sized windows,
+    /// bisecting on page-cap responses.  Operator addresses are excluded.
+    /// Returns a deduplicated `HashSet<WalletAddress>`.
+    ///
+    /// # Precondition
+    /// `config.from_block <= config.to_block` — callers must validate the
+    /// range before calling (e.g. via [`enumerate`] which checks up front).
+    pub async fn enumerate_one_contract(
+        &self,
+        contract: alloy::primitives::Address,
+    ) -> Result<HashSet<WalletAddress>, EnumerationError> {
         let operator_set: HashSet<WalletAddress> =
             self.config.operator_addresses.iter().copied().collect();
         let mut wallets: HashSet<WalletAddress> = HashSet::new();
-
         // Each contract address is queried separately; Etherscan's `address` param
         // is a single address (not an array) for the free-tier `eth_getLogs` endpoint.
         // Pre-chunk the full range into SCAN_CHUNK_BLOCKS windows so that the initial
         // request per chunk is small enough for Etherscan to handle without timing out.
-        for contract in &ALL_EXCHANGE_CONTRACTS {
-            let contract_hex = format!("0x{contract:x}");
-            let mut chunk_from = self.config.from_block;
-            while chunk_from <= self.config.to_block {
-                let chunk_to = (chunk_from + SCAN_CHUNK_BLOCKS - 1).min(self.config.to_block);
-                tracing::info!(
-                    contract = %contract_hex,
-                    chunk_from,
-                    chunk_to,
-                    "wallet enumeration: scanning chunk"
-                );
-                self.scan_range(
-                    &contract_hex,
-                    chunk_from,
-                    chunk_to,
-                    &operator_set,
-                    &mut wallets,
-                )
-                .await?;
-                tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
-                chunk_from = chunk_to + 1;
-            }
+        let contract_hex = format!("0x{contract:x}");
+        let mut chunk_from = self.config.from_block;
+        while chunk_from <= self.config.to_block {
+            let chunk_to = (chunk_from + SCAN_CHUNK_BLOCKS - 1).min(self.config.to_block);
+            tracing::info!(
+                contract = %contract_hex,
+                chunk_from,
+                chunk_to,
+                "wallet enumeration: scanning chunk"
+            );
+            self.scan_range(
+                &contract_hex,
+                chunk_from,
+                chunk_to,
+                &operator_set,
+                &mut wallets,
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
+            chunk_from = chunk_to + 1;
         }
-
         Ok(wallets)
     }
 
