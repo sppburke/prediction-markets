@@ -186,8 +186,14 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
                     chunk_to,
                     "wallet enumeration: scanning chunk"
                 );
-                self.scan_range(&contract_hex, chunk_from, chunk_to, &operator_set, &mut wallets)
-                    .await?;
+                self.scan_range(
+                    &contract_hex,
+                    chunk_from,
+                    chunk_to,
+                    &operator_set,
+                    &mut wallets,
+                )
+                .await?;
                 tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
                 chunk_from = chunk_to + 1;
             }
