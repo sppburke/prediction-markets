@@ -159,12 +159,21 @@ impl PageFetcher for ReqwestFetcher {
                         });
                     }
 
-                    // 2xx / 3xx — success.
-                    return resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
-                        SourceError::Transient {
-                            message: e.to_string(),
+                    // 2xx / 3xx — read body. Retry on connection-reset
+                    // (server may close a pooled connection mid-transfer).
+                    match resp.bytes().await {
+                        Ok(b) => return Ok(b.to_vec()),
+                        Err(e) => {
+                            if attempt >= self.max_retries {
+                                return Err(SourceError::Transient {
+                                    message: e.to_string(),
+                                });
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
+                            // Fall through — loop resends the request on a fresh connection.
                         }
-                    });
+                    }
                 }
             }
         }

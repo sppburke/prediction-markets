@@ -353,7 +353,15 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     //    On first run (or after legacy-file auto-wipe) fetches full history.
     //    On subsequent runs fetches only trades newer than the newest cached id.
     let mut cache = WalletCache::open(&config.cache_path)?;
-    let client = reqwest::Client::new();
+    // Short pool_idle_timeout avoids reusing connections the server has silently
+    // closed (Polymarket servers enforce per-IP connection limits under load).
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| BootstrapError::Polymarket {
+            wallet: String::new(),
+            message: format!("build client: {e}"),
+        })?;
     let fetcher = PolymarketBulkFetcher::new(
         config.polymarket_base_url.clone(),
         ReqwestFetcher::new(client),
