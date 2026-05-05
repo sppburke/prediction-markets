@@ -30,6 +30,10 @@ use crate::cache::{INCREMENTAL_STOP_THRESHOLD, WalletCache};
 use crate::error::BootstrapError;
 
 const TRADE_FETCH_LIMIT: u32 = 500;
+/// Polymarket Data API rejects `/trades` requests with `offset >= 3000` (HTTP 400,
+/// "max historical activity offset of 3000 exceeded"). Stop paging before that limit.
+/// Canonical default: `docs/_GLOSSARY.md` `bootstrap_polymarket_max_offset`.
+const MAX_POLYMARKET_OFFSET: u32 = 3000;
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
@@ -146,6 +150,9 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         let mut offset: u32 = 0;
 
         'pages: loop {
+            if offset >= MAX_POLYMARKET_OFFSET {
+                break;
+            }
             let url = format!("{endpoint}&limit={TRADE_FETCH_LIMIT}&offset={offset}");
 
             let bytes =
