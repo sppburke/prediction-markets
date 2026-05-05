@@ -180,13 +180,19 @@ fn convert_trade(raw: PolymarketTrade, wallet: WalletAddress) -> Result<RawTrade
     let price_dec = raw.price;
     let price = Price::new(price_dec).map_err(|e| format!("invalid price {price_dec}: {e}"))?;
 
-    let contracts = raw
-        .size
-        .floor()
-        .to_u64()
-        .filter(|&n| n > 0)
-        .map(ContractQty)
-        .ok_or_else(|| format!("size {} floors to zero contracts", raw.size))?;
+    // Fractional fills (size < 1) count as 1 contract — win/loss signal matters,
+    // not exact size.
+    let contracts = if raw.size >= Decimal::ONE {
+        raw.size
+            .floor()
+            .to_u64()
+            .map(ContractQty)
+            .ok_or_else(|| format!("size {} overflows u64", raw.size))?
+    } else if raw.size > Decimal::ZERO {
+        ContractQty(1)
+    } else {
+        return Err(format!("size {} is zero or negative", raw.size));
+    };
 
     let side = match raw.side.to_uppercase().as_str() {
         "BUY" => Side::Buy,
@@ -288,8 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_fractional_size_skipped() {
+    fn parse_fractional_size_counts_as_one_contract() {
         let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"BUY","size":0.75,"price":0.40,"timestamp":1704067200}]"#;
+        let trades = parse(json);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].contracts, ContractQty(1));
+    }
+
+    #[test]
+    fn parse_zero_size_skipped() {
+        let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"BUY","size":0,"price":0.40,"timestamp":1704067200}]"#;
         let trades = parse(json);
         assert!(trades.is_empty());
     }
