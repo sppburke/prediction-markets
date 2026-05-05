@@ -1,18 +1,17 @@
 //! Permanent wallet trade-history cache — JSON file, no TTL.
 //!
-//! Atomic write: serialize to `<path>.tmp`, then `rename` to `<path>`.
+//! Atomic write: serialize to a uniquely-named `.tmp` file, then `rename` to
+//! the final path. Each checkpoint is assigned a monotonically increasing
+//! sequence number so concurrent in-flight writes (via `spawn_blocking`) use
+//! separate tmp paths and never collide.
+//!
 //! On parse failure (legacy format, truncated file) the file is treated as a
 //! blank cache and a `tracing::warn!` is emitted — no error propagated, no
 //! user action required.  Follows the `load_state` precedent in `wallet_set.rs`.
 //!
 //! File layout:
 //! ```json
-//! {
-//!   "trades": { "0xtxhash": { ... } },
-//!   "by_wallet": {
-//!     "0xaddr": { "newest_trade_id": "...", "newest_trade_at": 123, "trade_ids": [...] }
-//!   }
-//! }
+//! { "trades": { "0xtxhash": { ... } }, "by_wallet": { "0xaddr": { ... } } }
 //! ```
 
 use std::collections::HashMap;
@@ -27,6 +26,10 @@ use crate::error::BootstrapError;
 /// Number of consecutive known `source_trade_id`s that signals the incremental fetch is done.
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 pub(crate) const INCREMENTAL_STOP_THRESHOLD: usize = 3;
+
+/// How many successful wallet inserts between periodic disk checkpoints.
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+pub(crate) const CHECKPOINT_INTERVAL: usize = 50;
 
 // ── On-disk types ─────────────────────────────────────────────────────────────
 
@@ -53,8 +56,10 @@ struct TradeCache {
 
 /// Permanent wallet trade-history cache backed by a JSON file.
 pub struct WalletCache {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     data: TradeCache,
+    /// Counts successful `insert_new` calls; drives the checkpoint interval.
+    insert_count: usize,
 }
 
 impl WalletCache {
@@ -87,6 +92,7 @@ impl WalletCache {
         Ok(Self {
             path: path.to_owned(),
             data,
+            insert_count: 0,
         })
     }
 
@@ -176,15 +182,54 @@ impl WalletCache {
         index.trade_ids.extend(old_ids);
         index.newest_trade_at = newest_at;
         index.newest_trade_id = newest_id;
+
+        self.insert_count += 1;
     }
 
-    /// Atomically write the cache to disk.
-    pub fn save(&self) -> Result<(), BootstrapError> {
-        let tmp = self.path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(&self.data)?;
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)?;
+    /// Returns `Some(seq)` every `CHECKPOINT_INTERVAL` inserts, `None` otherwise.
+    ///
+    /// `seq` is a monotonically increasing sequence number used as a unique
+    /// suffix for the tmp file so concurrent in-flight writes don't collide.
+    /// Must be called while holding the cache mutex so the counter increments
+    /// are serialized and only one task gets `Some` per interval.
+    pub(crate) fn checkpoint_seq(&self) -> Option<usize> {
+        if self.insert_count.is_multiple_of(CHECKPOINT_INTERVAL) {
+            Some(self.insert_count)
+        } else {
+            None
+        }
+    }
+
+    /// Serialize the cache to compact JSON bytes.
+    ///
+    /// Call while holding the cache mutex to obtain a consistent snapshot.
+    /// The caller is responsible for writing the bytes to disk (outside the
+    /// mutex so disk I/O does not block concurrent inserts).
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, BootstrapError> {
+        Ok(serde_json::to_vec(&self.data)?)
+    }
+
+    /// Atomically write `bytes` to disk at `path` using a unique tmp name.
+    ///
+    /// `seq` is appended to the tmp filename so concurrent in-flight writes
+    /// (from different checkpoint intervals) use separate tmp paths.
+    /// On Linux, `rename` is atomic: the final path always holds a complete
+    /// consistent snapshot, never a partial write.
+    pub(crate) fn atomic_write(
+        path: &Path,
+        bytes: &[u8],
+        seq: usize,
+    ) -> Result<(), BootstrapError> {
+        let tmp = path.with_extension(format!("json.{seq}.tmp"));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Atomically write the full cache to disk (used for the final flush and tests).
+    pub fn save(&self) -> Result<(), BootstrapError> {
+        let bytes = self.to_bytes()?;
+        Self::atomic_write(&self.path, &bytes, 0)
     }
 
     /// Total number of unique trades stored across all wallets.
@@ -347,7 +392,38 @@ mod tests {
         );
         cache.save().unwrap();
         assert!(path.exists());
-        assert!(!path.with_extension("json.tmp").exists());
+        // save() uses seq=0 → tmp is "cache.json.0.tmp"
+        assert!(!path.with_extension("json.0.tmp").exists());
+    }
+
+    #[test]
+    fn checkpoint_seq_fires_at_interval() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let wallet = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let hex = wallet.to_string();
+
+        // First CHECKPOINT_INTERVAL - 1 inserts: no checkpoint.
+        for i in 0..CHECKPOINT_INTERVAL - 1 {
+            cache.insert_new(
+                &hex,
+                vec![make_trade(&format!("0xtx{i}"), wallet, i as i64)],
+            );
+            assert!(
+                cache.checkpoint_seq().is_none(),
+                "no checkpoint before interval"
+            );
+        }
+        // The CHECKPOINT_INTERVAL-th insert triggers.
+        cache.insert_new(
+            &hex,
+            vec![make_trade(
+                &format!("0xtx{}", CHECKPOINT_INTERVAL - 1),
+                wallet,
+                (CHECKPOINT_INTERVAL - 1) as i64,
+            )],
+        );
+        assert_eq!(cache.checkpoint_seq(), Some(CHECKPOINT_INTERVAL));
     }
 
     #[test]
