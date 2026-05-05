@@ -77,7 +77,7 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
     let snapshot = TradeSnapshot {
         trades: all_trades,
         snapshot_at: snapshot_at.clone(),
-        audit_window_days: 90,
+        audit_window_days: u32::MAX,
     };
     let empty: &[OperatorIdentity] = &[];
     let ledgers = build_trader_ledgers(&snapshot, empty, &LedgerConfig::default());

@@ -4,7 +4,8 @@
 //! 1. Discover wallets — load from per-contract checkpoint if available, else
 //!    enumerate via Dune Analytics or Etherscan (selected by `PE_WALLET_SOURCE`).
 //!    Etherscan: checkpoint saved after each contract; resume skips completed ones.
-//! 2. Fetch trade history per wallet from the Polymarket Data API (7-day JSON cache).
+//! 2. Fetch trade history per wallet from the Polymarket Data API (permanent JSON cache,
+//!    incremental per run).
 //! 3. Reconstruct `TraderLedger`s via `pe-trader-index`.
 //! 4. Pre-filter: keep wallets with > 10 closed trades and > 80 % win rate.
 //! 5. Build a seed `Watchlist` and write it to `output_path`.
@@ -43,7 +44,6 @@ use rust_decimal::Decimal;
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 const DEFAULT_DUNE_WALLET_LIMIT: u32 = 10_000;
-const DEFAULT_AUDIT_WINDOW_DAYS: u32 = 90;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
 // bootstrap_eth_block_timeout_secs = 30
@@ -101,8 +101,11 @@ pub struct BootstrapConfig {
     pub wallet_set_path: PathBuf,
     /// Maximum distinct wallets to pull from Dune (default `bootstrap_dune_wallet_limit = 10000`).
     pub dune_wallet_limit: u32,
-    /// Trade lookback window for ledger reconstruction (default `bootstrap_polymarket_audit_window_days = 90`).
-    pub audit_window_days: u32,
+    /// Trade lookback window for ledger reconstruction.
+    /// `None` = unlimited (default); `Some(n)` = at most n calendar days.
+    /// Env var `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS`: an integer, or empty / `"unlimited"` / `"none"` for unlimited.
+    /// Canonical default in `docs/_GLOSSARY.md`: `bootstrap_polymarket_audit_window_days = None (unlimited)`.
+    pub audit_window_days: Option<u32>,
     /// Minimum closed trades to pass the pre-filter (default `bootstrap_min_closed_trades = 10`).
     pub min_closed_trades: usize,
     /// Minimum win-rate percent to pass the pre-filter (default `bootstrap_min_win_rate_pct = 80`).
@@ -125,6 +128,28 @@ impl BootstrapConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
+        }
+        fn parse_audit_window(key: &str) -> Option<u32> {
+            match std::env::var(key) {
+                Err(_) => None,
+                Ok(v) => {
+                    let v = v.trim().to_lowercase();
+                    if v.is_empty() || v == "none" || v == "unlimited" {
+                        None
+                    } else {
+                        match v.parse::<u32>() {
+                            Ok(n) => Some(n),
+                            Err(_) => {
+                                tracing::warn!(
+                                    value = %v,
+                                    "PE_BOOTSTRAP_AUDIT_WINDOW_DAYS: not a valid u32 or 'unlimited'; using unlimited"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let wallet_source = WalletSource::from_str(&optional("PE_WALLET_SOURCE", "etherscan"));
@@ -178,10 +203,7 @@ impl BootstrapConfig {
                 "wallet_set.json",
             )),
             dune_wallet_limit: optional_parse("PE_BOOTSTRAP_DUNE_LIMIT", DEFAULT_DUNE_WALLET_LIMIT),
-            audit_window_days: optional_parse(
-                "PE_BOOTSTRAP_AUDIT_WINDOW_DAYS",
-                DEFAULT_AUDIT_WINDOW_DAYS,
-            ),
+            audit_window_days: parse_audit_window("PE_BOOTSTRAP_AUDIT_WINDOW_DAYS"),
             min_closed_trades: optional_parse(
                 "PE_BOOTSTRAP_MIN_CLOSED_TRADES",
                 DEFAULT_MIN_CLOSED_TRADES,
@@ -320,11 +342,9 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             .collect()
     };
 
-    // 2. Fetch trade history (cache-first).
-    // Note: cache entries written by pre-pagination versions of this binary may contain
-    // at most 500 trades per wallet. High-volume wallets cached before upgrading will be
-    // under-counted until the 7-day TTL expires. Delete the cache file after upgrading
-    // to force a full re-fetch with pagination.
+    // 2. Fetch trade history — permanent cache, incremental per run.
+    //    On first run (or after legacy-file auto-wipe) fetches full history.
+    //    On subsequent runs fetches only trades newer than the newest cached id.
     let mut cache = WalletCache::open(&config.cache_path)?;
     let client = reqwest::Client::new();
     let mut fetcher = PolymarketBulkFetcher::new(
@@ -336,11 +356,13 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     tracing::info!(count = all_trades.len(), "bootstrap: fetched trades");
 
     // 3. Reconstruct ledgers.
+    // audit_window_days=None → unlimited (u32::MAX sentinel passed downstream).
+    // Reserved for future per-snapshot windowing; currently unused by build_trader_ledgers.
     let snapshot_at = SourceTimestamp(OffsetDateTime::now_utc());
     let snapshot = TradeSnapshot {
         trades: all_trades,
         snapshot_at: snapshot_at.clone(),
-        audit_window_days: config.audit_window_days,
+        audit_window_days: config.audit_window_days.unwrap_or(u32::MAX),
     };
     let empty_operators: &[OperatorIdentity] = &[];
     let ledgers: Vec<TraderLedger> =
