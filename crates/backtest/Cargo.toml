@@ -1,0 +1,46 @@
+[package]
+name = "pe-backtest"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pe-backtest"
+path = "src/main.rs"
+
+[lib]
+name = "pe_backtest"
+path = "src/lib.rs"
+
+[features]
+scenario = []
+
+[lints]
+workspace = true
+
+[dependencies]
+pe-bootstrap                  = { path = "../bootstrap",               version = "0.1.0" }
+pe-core-types                 = { path = "../core-types",              version = "0.1.0" }
+pe-kelly-sizer                = { path = "../kelly-sizer",             version = "0.1.0" }
+pe-operator-graph             = { path = "../operator-graph",          version = "0.1.0" }
+pe-risk-engine                = { path = "../risk-engine",             version = "0.1.0" }
+pe-source-core                = { path = "../source-core",             version = "0.1.0" }
+pe-source-onchain-polygon     = { path = "../source-onchain-polygon",  version = "0.1.0" }
+pe-strategy-winner-follow     = { path = "../strategy-winner-follow",  version = "0.1.0" }
+pe-trader-index               = { path = "../trader-index",            version = "0.1.0" }
+
+reqwest         = { workspace = true }
+rust_decimal    = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+thiserror       = { workspace = true }
+time            = { workspace = true }
+tokio           = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+blake3              = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tempfile            = { workspace = true }

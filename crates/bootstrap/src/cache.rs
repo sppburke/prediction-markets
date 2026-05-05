@@ -67,6 +67,23 @@ impl WalletCache {
         }
     }
 
+    /// Returns all trades across all cache entries, ignoring TTL.
+    ///
+    /// Intended for the backtest binary, which wants all historical trade data
+    /// regardless of cache freshness.
+    pub fn all_trades_unchecked(&self) -> Vec<RawTrade> {
+        self.data
+            .entries
+            .values()
+            .flat_map(|e| e.trades.iter().cloned())
+            .collect()
+    }
+
+    /// Returns all wallet hex addresses in the cache, regardless of TTL.
+    pub fn all_wallet_addresses(&self) -> Vec<String> {
+        self.data.entries.keys().cloned().collect()
+    }
+
     /// Insert or overwrite a wallet's trade history, stamped with the current time.
     pub fn insert(&mut self, wallet_hex: String, trades: Vec<RawTrade>) {
         self.data.entries.insert(
