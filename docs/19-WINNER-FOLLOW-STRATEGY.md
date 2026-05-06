@@ -104,6 +104,23 @@ Discover candidates
 
 ## Candidate discovery
 
+### Bootstrap quality filters (also applied continuously in live stream)
+
+The `pe-bootstrap` Dune query seeds the initial watchlist using four quality filters. These same
+criteria **must be mirrored as continuous live eligibility gates** in `operator-graph` /
+`strategy-winner-follow` so that wallets that degrade after bootstrap are demoted or excluded:
+
+| Filter | Canonical default | Env override |
+|---|---|---|
+| Distinct resolved binary markets traded | `> bootstrap_dune_min_closed_markets` (15) | `PE_BOOTSTRAP_DUNE_MIN_MARKETS` |
+| Win rate on those markets | `> bootstrap_dune_min_win_rate_pct` (95%) | `PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT` |
+| At least one trade on a resolved market within recent window | within `bootstrap_dune_active_window_days` (30 days) | `PE_BOOTSTRAP_DUNE_ACTIVE_DAYS` |
+| Average hours from first entry to market resolution | `< bootstrap_dune_max_avg_hours_to_resolution` (72 h) | `PE_BOOTSTRAP_DUNE_MAX_AVG_HOURS` |
+
+Canonical default values are in `_GLOSSARY.md` "Bootstrap defaults" table. The live stream gate
+uses the same thresholds computed over rolling windows; a wallet falling below any threshold
+transitions to the incubator tier and stops receiving copy signals until it recovers.
+
 Discovery cadences:
 
 | Job | Interval |
