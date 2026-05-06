@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::LeaderboardSnapshots;
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex};
 use pe_core_types::{
     ClusterSize, ContractQty, FunderRootId, FundingHopCount, MarketId, OperatorId, OutcomeId,
     Price, ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
@@ -195,6 +195,7 @@ async fn wallet_outside_snapshot_emits_no_signals() {
             operator_for(bob, funder, b"bob-op"),
         ],
         &snapshots,
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -249,6 +250,7 @@ async fn weekly_pool_swap_changes_active_leaders() {
             operator_for(carol, funder, b"carol-op-2"),
         ],
         &snapshots,
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -287,6 +289,7 @@ async fn wallet_present_throughout_emits_throughout() {
         all_trades,
         vec![operator_for(alice, funder, b"alice-op-3")],
         &snapshots,
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -329,6 +332,7 @@ async fn position_opened_in_week1_persists_after_drop() {
         all_trades,
         vec![operator_for(alice, funder, b"alice-op-4")],
         &snapshots,
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -366,6 +370,7 @@ async fn empty_snapshots_falls_back_to_full_history() {
         all_trades,
         vec![operator_for(alice, funder, b"alice-op-5")],
         &snapshots,
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -407,6 +412,7 @@ async fn simulation_date_before_first_snapshot_emits_nothing() {
         all_trades,
         vec![operator_for(alice, funder, b"alice-op-6")],
         &snapshots,
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

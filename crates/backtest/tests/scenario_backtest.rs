@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::LeaderboardSnapshots;
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex};
 use pe_core_types::{
     ClusterSize, ContractQty, FunderRootId, FundingHopCount, MarketId, OperatorId, OutcomeId,
     Price, ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
@@ -145,6 +145,7 @@ async fn winner_wallet_produces_positive_pnl() {
         all_trades,
         operator_identities,
         &LeaderboardSnapshots::default(),
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -192,6 +193,7 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
         all_trades,
         operator_identities,
         &LeaderboardSnapshots::default(),
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -281,6 +283,7 @@ async fn per_trader_win_rate_used_as_probability() {
         all_trades,
         vec![op1, op2],
         &LeaderboardSnapshots::default(),
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -341,6 +344,7 @@ async fn fee_model_reduces_edge_at_high_prices() {
         all_trades,
         vec![winner_operator_identity(winner, funder)],
         &LeaderboardSnapshots::default(),
+        &ResolutionIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

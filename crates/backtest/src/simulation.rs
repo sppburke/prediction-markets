@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use pe_bootstrap::cache::LeaderboardSnapshots;
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, LeaderAction, MarketId, OperatorId, OutcomeId, Probability, ProbabilityPpm,
@@ -47,6 +47,9 @@ struct OpenPosition {
     contracts: u64,
     avg_fill_price: Decimal,
     operator_id: Option<OperatorId>,
+    /// Calendar date on which the copy was opened. Used by the resolution sweep to
+    /// guard against anomalies where a market's resolved_at precedes the bought_on date.
+    bought_on: Date,
 }
 
 /// Position key: (market, outcome, BUY side).
@@ -100,12 +103,18 @@ impl ExposureTracker {
 /// "all wallets present in the trade history" with a single warning log —
 /// preserves backwards compatibility with caches predating the snapshots feature.
 ///
+/// `resolutions` drives the per-day resolution sweep that closes open positions
+/// whose underlying market settled on-chain. Pass `&ResolutionIndex::new()` when
+/// no resolution data is available (sweep is a no-op; positions remain open at horizon).
+///
 /// Writes `report.json` and `trades.ndjson` to `config.output_dir`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_simulation(
     config: &BacktestConfig,
     mut all_trades: Vec<RawTrade>,
     operator_identities: Vec<OperatorIdentity>,
     snapshots: &LeaderboardSnapshots,
+    resolutions: &ResolutionIndex,
     ranker_config: &RankerConfig,
     ledger_config: &LedgerConfig,
     strategy: &WinnerFollowStrategy,
@@ -193,6 +202,61 @@ pub fn run_simulation(
             daily_bankroll.push(bankroll);
             intraday_realized_pnl = Decimal::ZERO;
             last_intraday_reset = Some(sim_date);
+        }
+
+        // Resolution sweep: close positions whose underlying market resolved on or before sim_date.
+        let sim_date_unix = sim_date.midnight().assume_utc().unix_timestamp();
+        let to_close: Vec<(WalletAddress, PosKey)> = open_positions
+            .iter()
+            .filter_map(|((leader, pos_key), open)| {
+                let res = resolutions.get(&pos_key.0)?;
+                let bought_unix = open.bought_on.midnight().assume_utc().unix_timestamp();
+                if res.resolved_at_unix > sim_date_unix {
+                    return None;
+                }
+                if res.resolved_at_unix < bought_unix {
+                    return None;
+                }
+                Some((*leader, pos_key.clone()))
+            })
+            .collect();
+
+        for (leader, pos_key) in to_close {
+            let Some(open) = open_positions.remove(&(leader, pos_key.clone())) else {
+                continue;
+            };
+            let Some(res) = resolutions.get(&pos_key.0) else {
+                continue;
+            };
+            let close_price = if res.winning_outcome_id == pos_key.1.0 {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            };
+
+            let revenue = Decimal::from(open.contracts) * close_price;
+            let cost = Decimal::from(open.contracts) * open.avg_fill_price;
+            let pnl = revenue - cost;
+            bankroll += revenue;
+            intraday_realized_pnl += pnl;
+
+            let bps_removed = proposed_trade_bps(open.contracts, open.avg_fill_price, bankroll);
+            exposure.remove(leader, open.operator_id.as_ref(), &pos_key.0, bps_removed);
+
+            pnl_accum.record(open.operator_id.as_ref(), pnl);
+
+            let fill = TradeFill {
+                simulated_at: sim_date.midnight().assume_utc(),
+                leader_wallet: leader.to_string(),
+                operator_id: open.operator_id.as_ref().map(|o| o.to_string()),
+                market_id: pos_key.0.0.0.clone(),
+                outcome_id: pos_key.1.0,
+                side: "resolution".to_owned(),
+                contracts: open.contracts,
+                signal_price: close_price,
+                fill_price: close_price,
+            };
+            write_fill(&mut fills_writer, &fill)?;
         }
 
         // Skip days that fall outside the step window.
@@ -365,6 +429,7 @@ pub fn run_simulation(
                             contracts: contracts_count,
                             avg_fill_price: fill_price,
                             operator_id: operator_id.cloned(),
+                            bought_on: sim_date,
                         },
                     );
 

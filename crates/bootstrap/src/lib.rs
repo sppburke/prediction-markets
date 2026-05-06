@@ -11,6 +11,7 @@
 //! 4. Post-filter: keep wallets passing all four quality conditions (trades, win rate, recency,
 //!    avg hold duration). Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 //! 5. Build a seed `Watchlist` and write it to `output_path`.
+//! 6. Optionally fetch market resolution data from the Gamma API (`PE_BOOTSTRAP_FETCH_RESOLUTIONS=1`).
 //!
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
@@ -18,6 +19,7 @@ pub mod cache;
 pub mod dune;
 pub mod error;
 pub mod filter;
+pub mod gamma;
 pub mod polymarket;
 pub mod wallet_set;
 
@@ -143,6 +145,12 @@ pub struct BootstrapConfig {
     /// Concurrent wallet fetches against the Polymarket Data API
     /// (default `bootstrap_polymarket_concurrency = 16`).
     pub polymarket_concurrency: usize,
+    /// `PE_BOOTSTRAP_FETCH_RESOLUTIONS` — when `"1"`, fetch market resolutions from the
+    /// Gamma API after the trade fetch. Default off; ~2.4 h one-time for ~85k markets.
+    /// Canonical default: `bootstrap_fetch_resolutions_default = false`.
+    pub fetch_resolutions: bool,
+    /// `PE_GAMMA_BASE_URL` — Gamma API base URL (default `bootstrap_gamma_base_url`).
+    pub gamma_base_url: String,
 }
 
 impl BootstrapConfig {
@@ -271,6 +279,8 @@ impl BootstrapConfig {
                 "PE_BOOTSTRAP_POLYMARKET_CONCURRENCY",
                 polymarket::DEFAULT_CONCURRENCY,
             ),
+            fetch_resolutions: optional("PE_BOOTSTRAP_FETCH_RESOLUTIONS", "0") == "1",
+            gamma_base_url: optional("PE_GAMMA_BASE_URL", gamma::DEFAULT_GAMMA_BASE_URL),
         })
     }
 }
@@ -489,6 +499,29 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         wallets = snapshot_wallets.len(),
         "bootstrap: leaderboard snapshot persisted"
     );
+
+    // 6. Optionally fetch market resolution data from the Gamma API.
+    //    Off by default (requires PE_BOOTSTRAP_FETCH_RESOLUTIONS=1); ~2.4 h one-time.
+    //    Incremental: already-resolved markets are skipped via INSERT OR IGNORE.
+    if config.fetch_resolutions {
+        let market_ids = cache.all_market_ids();
+        let gamma_client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| BootstrapError::Internal)?;
+        let gamma_fetcher = gamma::GammaFetcher::new(
+            config.gamma_base_url.clone(),
+            ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
+        );
+        let new_rows = gamma_fetcher
+            .fetch_resolutions(&market_ids, &mut cache)
+            .await?;
+        tracing::info!(
+            new_rows,
+            total_markets = market_ids.len(),
+            "bootstrap: gamma resolutions fetched"
+        );
+    }
 
     // Write output.
     write_watchlist(&watchlist, &config.output_path)?;

@@ -19,11 +19,13 @@ async fn main() -> Result<(), BacktestError> {
     let all_wallet_addresses = cache.all_wallet_addresses();
     let all_trades = cache.all_trades();
     let snapshots = cache.load_all_snapshots()?;
+    let resolutions = pe_bootstrap::gamma::load_resolutions(&cache)?;
 
     info!(
         wallets = all_wallet_addresses.len(),
         trades = all_trades.len(),
         snapshots = snapshots.len(),
+        resolutions = resolutions.len(),
         "cache loaded"
     );
 
@@ -49,6 +51,7 @@ async fn main() -> Result<(), BacktestError> {
         all_trades,
         operator_identities,
         &snapshots,
+        &resolutions,
         &RankerConfig::default(),
         &LedgerConfig::default(),
         &strategy,

@@ -36,10 +36,11 @@ pub trait PageFetcher {
 /// - Per-request timeout: `polymarket_request_timeout_secs = 10`.
 /// - Retry with exponential backoff for network errors and 5xx responses
 ///   (`polymarket_max_retries = 3` retries; 4 total attempts).
-/// - Rate limiting: enforces ≤ 1 / `MIN_INTERVAL_MS` req/ms (defaults to ≤ 20 req/s
+/// - Rate limiting: enforces ≤ 1 / `min_interval_ms` req/ms (defaults to ≤ 20 req/s
 ///   at 50 ms) by reserving a future slot before each call. The reservation is
 ///   shared via `Mutex<Option<Instant>>` so concurrent callers all observe the
 ///   serial gate (see `last_request_at` and the gate logic in `fetch_page`).
+///   Override via [`Self::with_min_interval_ms`] for APIs with different rate limits.
 /// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried).
 /// - HTTP 4xx (non-429) → [`SourceError::Fatal`].
 pub struct ReqwestFetcher {
@@ -47,8 +48,9 @@ pub struct ReqwestFetcher {
     timeout: Duration,
     max_retries: u32,
     initial_backoff_ms: u64,
+    min_interval_ms: u64,
     /// Shared rate-limit clock: serializes the gate across concurrent callers
-    /// so the global throughput stays under `MIN_INTERVAL_MS` even when a single
+    /// so the global throughput stays under `min_interval_ms` even when a single
     /// fetcher is shared by many tasks (e.g. via `Arc<ReqwestFetcher>`).
     last_request_at: Mutex<Option<Instant>>,
 }
@@ -61,6 +63,7 @@ impl ReqwestFetcher {
             timeout: Duration::from_secs(REQUEST_TIMEOUT_SECS),
             max_retries: MAX_RETRIES,
             initial_backoff_ms: 200,
+            min_interval_ms: MIN_INTERVAL_MS,
             last_request_at: Mutex::new(None),
         }
     }
@@ -82,16 +85,25 @@ impl ReqwestFetcher {
         self.initial_backoff_ms = ms;
         self
     }
+
+    /// Override the minimum interval between requests (default `polymarket_min_interval_ms = 50`).
+    ///
+    /// Use a higher value when calling APIs with stricter rate limits than the Polymarket
+    /// Data API. Example: `with_min_interval_ms(100)` for ≤ 10 req/s.
+    pub fn with_min_interval_ms(mut self, ms: u64) -> Self {
+        self.min_interval_ms = ms;
+        self
+    }
 }
 
 impl PageFetcher for ReqwestFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
         // Rate-limit gate: each call claims the next available slot,
-        // computed as max(now, last_slot + MIN_INTERVAL_MS), and stamps it
+        // computed as max(now, last_slot + min_interval_ms), and stamps it
         // before releasing the lock so concurrent callers observe the
         // reservation rather than the pre-sleep `now`. Wall-clock throughput
-        // stays at ≤ 1 / MIN_INTERVAL_MS even when many tasks share this fetcher.
-        let min_interval = Duration::from_millis(MIN_INTERVAL_MS);
+        // stays at ≤ 1 / min_interval_ms even when many tasks share this fetcher.
+        let min_interval = Duration::from_millis(self.min_interval_ms);
         let sleep_for = {
             let mut guard = self
                 .last_request_at
