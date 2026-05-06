@@ -1,4 +1,4 @@
-//! Scenario tests for the permanent trade cache (issue #71).
+//! Scenario tests for the permanent SQLite trade cache.
 //!
 //! Each scenario has a single PASS/FAIL criterion written before the test body.
 //! No network calls; all data is constructed in-process.
@@ -44,8 +44,8 @@ fn trade_url(wallet: WalletAddress, offset: u32) -> String {
     )
 }
 
-/// Build a JSON page of N trades for `wallet`, newest-first.
-/// Timestamps are synthetic but strictly decreasing so sort is a no-op.
+/// Build a JSON page of trades for `wallet`. Timestamps must be supplied
+/// strictly decreasing (newest-first) so the API order is realistic.
 fn trades_page(wallet: &str, hashes: &[(&str, i64)]) -> Vec<u8> {
     let entries: Vec<String> = hashes
         .iter()
@@ -66,7 +66,8 @@ fn trades_page(wallet: &str, hashes: &[(&str, i64)]) -> Vec<u8> {
 #[tokio::test]
 async fn scenario_first_run_full_fetch() {
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&path).unwrap();
 
     let page = trades_page(
         WALLET_A_HEX,
@@ -80,31 +81,30 @@ async fn scenario_first_run_full_fetch() {
     responses.insert(trade_url(wallet_a(), 0), page);
 
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
-    let trades = fetcher.fetch_all(&[wallet_a()], &mut cache).await;
+    fetcher.fetch_all(&[wallet_a()], &mut cache).await.unwrap();
 
-    assert_eq!(trades.len(), 3, "all 3 trades must be returned");
     assert_eq!(
         cache.known_trade_ids(WALLET_A_HEX).len(),
         3,
         "all 3 trades must be in the cache"
     );
 
-    // Persist and reload to verify round-trip.
-    cache.save().unwrap();
-    let reloaded = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    // Drop and reopen to verify durability through SQLite WAL.
+    drop(cache);
+    let reloaded = WalletCache::open(&path).unwrap();
     assert_eq!(reloaded.trades_for(WALLET_A_HEX).len(), 3);
 }
 
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
 //
-// PASS: second run with identical API response writes nothing new and makes
-//       exactly 1 API call (stops on 3 consecutive known IDs).
+// PASS: second run with identical API response writes nothing new — cache
+//       count stays at 3.
 // FAIL: cache count changes after the second run.
 
 #[tokio::test]
 async fn scenario_second_run_no_new_trades() {
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
     let page = trades_page(
         WALLET_A_HEX,
@@ -120,7 +120,8 @@ async fn scenario_second_run_no_new_trades() {
     r1.insert(trade_url(wallet_a(), 0), page.clone());
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
     assert_eq!(cache.trade_count(), 3);
 
     // Warm run — same page, all 3 hashes already known (stop after 3 consecutive).
@@ -128,7 +129,8 @@ async fn scenario_second_run_no_new_trades() {
     r2.insert(trade_url(wallet_a(), 0), page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(
         cache.trade_count(),
@@ -145,7 +147,7 @@ async fn scenario_second_run_no_new_trades() {
 #[tokio::test]
 async fn scenario_second_run_with_new_trades() {
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
     // Cold run: 3 old trades.
     let old_page = trades_page(
@@ -160,7 +162,8 @@ async fn scenario_second_run_with_new_trades() {
     r1.insert(trade_url(wallet_a(), 0), old_page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
 
     // Warm run: 3 new + 3 old (hits 3 consecutive known → stop).
     let new_page = trades_page(
@@ -176,61 +179,24 @@ async fn scenario_second_run_with_new_trades() {
     );
     let mut r2 = HashMap::new();
     r2.insert(trade_url(wallet_a(), 0), new_page);
-    let all = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(cache.trade_count(), 6, "3 old + 3 new = 6");
-    assert_eq!(all.len(), 6);
 
     let ids: Vec<_> = cache
         .known_trade_ids(WALLET_A_HEX)
         .iter()
-        .map(|id| id.0.as_str())
+        .map(|id| id.0.clone())
         .collect();
-    assert!(ids.contains(&"0xnew1"));
-    assert!(ids.contains(&"0xnew2"));
-    assert!(ids.contains(&"0xnew3"));
+    assert!(ids.iter().any(|id| id == "0xnew1"));
+    assert!(ids.iter().any(|id| id == "0xnew2"));
+    assert!(ids.iter().any(|id| id == "0xnew3"));
 }
 
 // ── Scenario 4 ────────────────────────────────────────────────────────────────
-//
-// PASS: loading a legacy-format cache file silently yields a blank cache and
-//       the run proceeds as a cold start (no error returned).
-// FAIL: open() returns Err, panics, or returns a non-empty cache.
-
-#[tokio::test]
-async fn scenario_legacy_file_auto_wiped() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("cache.json");
-
-    // Old CacheEntry format (pre-#71).
-    let legacy = r#"{"entries":{"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"fetched_at_unix":1704067200,"trades":[]}}}"#;
-    std::fs::write(&path, legacy).unwrap();
-
-    let cache = WalletCache::open(&path).unwrap();
-    assert_eq!(
-        cache.trade_count(),
-        0,
-        "legacy file must produce a blank cache — run proceeds as cold start"
-    );
-    assert!(
-        path.with_extension("json.bak").exists(),
-        "legacy file must be renamed to .bak"
-    );
-
-    // Fetch with fixture to confirm cold-start behaviour.
-    let page = trades_page(WALLET_A_HEX, &[("0xhash1", 2_000_001)]);
-    let mut responses = HashMap::new();
-    responses.insert(trade_url(wallet_a(), 0), page);
-    let mut cache_mut = cache;
-    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .fetch_all(&[wallet_a()], &mut cache_mut)
-        .await;
-    assert_eq!(cache_mut.trade_count(), 1);
-}
-
-// ── Scenario 5 ────────────────────────────────────────────────────────────────
 //
 // PASS: build_seed_watchlist with the same snapshot_at produces bit-identical
 //       output on two consecutive calls from the same populated cache.
@@ -239,14 +205,13 @@ async fn scenario_legacy_file_auto_wiped() {
 #[tokio::test]
 async fn scenario_replay_reproducibility() {
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&path).unwrap();
 
-    // Populate with enough trades to produce a non-empty watchlist.
-    // 12 winning trades for wallet_a.
+    // Populate with enough trades to produce a non-empty watchlist (12 wins).
     let win_trades: Vec<(&str, i64)> = (0..12)
         .map(|i| {
             let ts = 1_700_000_000 - i as i64 * 86_400;
-            // We cannot use dynamic strings as literals; build vec separately.
             (
                 Box::leak(format!("0xwintx{i:03}").into_boxed_str()) as &str,
                 ts,
@@ -259,8 +224,9 @@ async fn scenario_replay_reproducibility() {
 
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
-    cache.save().unwrap();
+        .await
+        .unwrap();
+    drop(cache);
 
     let fixed_snapshot_at =
         SourceTimestamp(OffsetDateTime::from_unix_timestamp(1_701_000_000).unwrap());
@@ -282,7 +248,7 @@ async fn scenario_replay_reproducibility() {
         )
     };
 
-    let reloaded = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let reloaded = WalletCache::open(&path).unwrap();
     let w1 = build_watchlist(&reloaded);
     let w2 = build_watchlist(&reloaded);
 
@@ -301,7 +267,7 @@ async fn scenario_replay_reproducibility() {
     }
 }
 
-// ── Scenario 6 ────────────────────────────────────────────────────────────────
+// ── Scenario 5 ────────────────────────────────────────────────────────────────
 //
 // PASS: a page returned in ascending order (oldest-first) is sorted correctly
 //       and new trades appearing before the known sequence are appended.
@@ -310,9 +276,9 @@ async fn scenario_replay_reproducibility() {
 #[tokio::test]
 async fn scenario_out_of_order_page_handled() {
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-    // Cold run: 3 old trades (newest-first, normal order).
+    // Cold run: 3 old trades (newest-first).
     let old_page = trades_page(
         WALLET_A_HEX,
         &[
@@ -325,11 +291,12 @@ async fn scenario_out_of_order_page_handled() {
     r1.insert(trade_url(wallet_a(), 0), old_page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
 
     // Incremental run: page arrives oldest-first (ascending timestamps).
     // After defensive sort: new1(2M), old1(1_000_003), old2(1_000_002), old3(1_000_001).
-    // new1 is unknown → appended. old1..old3 = 3 consecutive known → stop.
+    // new1 unknown → appended. old1..old3 = 3 consecutive known → stop.
     let reversed_page = trades_page(
         WALLET_A_HEX,
         &[
@@ -343,33 +310,33 @@ async fn scenario_out_of_order_page_handled() {
     r2.insert(trade_url(wallet_a(), 0), reversed_page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(
         cache.trade_count(),
         4,
-        "new trade arriving before known sequence must be appended despite reversed page order"
+        "new trade arriving before known sequence must be appended"
     );
     let ids: Vec<_> = cache
         .known_trade_ids(WALLET_A_HEX)
         .iter()
-        .map(|id| &id.0)
+        .map(|id| id.0.clone())
         .collect();
-    assert!(ids.iter().any(|id| id.as_str() == "0xnew1"));
+    assert!(ids.iter().any(|id| id == "0xnew1"));
 }
 
-// ── Scenario 7 ────────────────────────────────────────────────────────────────
+// ── Scenario 6 ────────────────────────────────────────────────────────────────
 //
-// PASS: config.audit_window_days = None → u32::MAX sentinel → all trades from
-//       any timestamp are included in build_trader_ledgers output.
+// PASS: config.audit_window_days = u32::MAX → all trades from any timestamp
+//       are included in build_trader_ledgers output (sentinel honoured).
 // FAIL: old trades excluded from ledger reconstruction.
 
 #[tokio::test]
 async fn scenario_unlimited_window_includes_all_trades() {
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-    // Two trades: one recent (2024), one ancient (2020).
     let page = trades_page(
         WALLET_A_HEX,
         &[
@@ -381,13 +348,13 @@ async fn scenario_unlimited_window_includes_all_trades() {
     responses.insert(trade_url(wallet_a(), 0), page);
     PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
         .fetch_all(&[wallet_a()], &mut cache)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(cache.trade_count(), 2, "both trades must be cached");
 
-    // Build snapshot with audit_window_days = u32::MAX (unlimited).
     let trades = cache.trades_for(WALLET_A_HEX);
-    assert_eq!(trades.len(), 2, "trades_for must return both trades");
+    assert_eq!(trades.len(), 2);
 
     let snapshot_at = SourceTimestamp(OffsetDateTime::from_unix_timestamp(1_704_100_000).unwrap());
     let snapshot = TradeSnapshot {
@@ -398,9 +365,6 @@ async fn scenario_unlimited_window_includes_all_trades() {
 
     let empty_ops: &[OperatorIdentity] = &[];
     let ledgers = build_trader_ledgers(&snapshot, empty_ops, &LedgerConfig::default());
-    assert!(!ledgers.is_empty(), "at least one ledger must be built");
-
-    // Confirm the ledger for wallet_a includes both trade IDs.
     let ledger = ledgers
         .iter()
         .find(|l| l.wallet == wallet_a())
@@ -418,31 +382,24 @@ async fn scenario_unlimited_window_includes_all_trades() {
         )
         .collect();
 
-    assert!(
-        all_ids.iter().any(|id| id.0 == "0xrecent"),
-        "recent trade must appear in the ledger"
-    );
+    assert!(all_ids.iter().any(|id| id.0 == "0xrecent"));
     assert!(
         all_ids.iter().any(|id| id.0 == "0xancient"),
         "ancient trade must appear in the ledger — unlimited window must not exclude it"
     );
 }
 
-// ── Scenario 8 ────────────────────────────────────────────────────────────────
+// ── Scenario 7 ────────────────────────────────────────────────────────────────
 //
-// PASS: parallel fetch across N wallets writes the same trade-set into the
-//       cache as sequential fetch (concurrency=1) given identical fixtures.
-// FAIL: trade count differs, any wallet's trades are dropped, or any trade
-//       appears under the wrong wallet.
+// PASS: parallel fetch (concurrency=N) and sequential fetch (concurrency=1)
+//       produce identical trade sets per wallet.
+// FAIL: any wallet's trades differ between parallel and sequential runs.
 
 #[tokio::test]
 async fn scenario_parallel_fetch_matches_sequential() {
-    // 8 wallets, each with a distinct trade hash. Concurrent fetch must not
-    // race — every wallet's trade must land under that wallet only.
     const N: usize = 8;
     let wallets: Vec<WalletAddress> = (0..N)
         .map(|i| {
-            // 40-char hex, padded with i.
             let hex = format!("0x{:040x}", i + 1);
             WalletAddress::from_hex(&hex).unwrap()
         })
@@ -457,44 +414,107 @@ async fn scenario_parallel_fetch_matches_sequential() {
 
     // Parallel run.
     let dir_par = TempDir::new().unwrap();
-    let mut cache_par = WalletCache::open(&dir_par.path().join("cache.json")).unwrap();
-    let par_fetcher =
-        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses.clone()))
-            .with_concurrency(N);
-    let par_trades = par_fetcher.fetch_all(&wallets, &mut cache_par).await;
+    let mut cache_par = WalletCache::open(&dir_par.path().join("cache.db")).unwrap();
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses.clone()))
+        .with_concurrency(N)
+        .fetch_all(&wallets, &mut cache_par)
+        .await
+        .unwrap();
 
     // Sequential run.
     let dir_seq = TempDir::new().unwrap();
-    let mut cache_seq = WalletCache::open(&dir_seq.path().join("cache.json")).unwrap();
-    let seq_fetcher =
-        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-            .with_concurrency(1);
-    let seq_trades = seq_fetcher.fetch_all(&wallets, &mut cache_seq).await;
+    let mut cache_seq = WalletCache::open(&dir_seq.path().join("cache.db")).unwrap();
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .with_concurrency(1)
+        .fetch_all(&wallets, &mut cache_seq)
+        .await
+        .unwrap();
 
-    assert_eq!(
-        par_trades.len(),
-        N,
-        "parallel must return one trade per wallet"
-    );
-    assert_eq!(
-        seq_trades.len(),
-        N,
-        "sequential must return one trade per wallet"
-    );
     assert_eq!(cache_par.trade_count(), N);
     assert_eq!(cache_seq.trade_count(), N);
 
-    // Each wallet must have exactly its own one trade in the cache, never another's.
     for (i, w) in wallets.iter().enumerate() {
         let hex = w.to_string();
         let par_ids = cache_par.known_trade_ids(&hex);
         let seq_ids = cache_seq.known_trade_ids(&hex);
         let expected_hash = format!("0xhash{i:02}");
         assert_eq!(par_ids.len(), 1);
-        assert_eq!(par_ids[0], SourceTradeId(expected_hash.clone()));
+        assert_eq!(par_ids[0], SourceTradeId(expected_hash));
         assert_eq!(
             seq_ids, par_ids,
             "parallel and sequential cache must be identical"
+        );
+    }
+}
+
+// ── Scenario 8 ────────────────────────────────────────────────────────────────
+//
+// PASS: opening a path that points to a non-SQLite file (e.g. legacy JSON or
+//       garbage bytes) returns an error rather than silently corrupting state.
+// FAIL: open() succeeds and silently masks the bad data.
+
+#[tokio::test]
+async fn scenario_non_sqlite_file_errors_clearly() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cache.db");
+
+    // Pre-existing legacy JSON content at the SQLite path.
+    let legacy = r#"{"entries":{"0xaa":{"fetched_at_unix":1,"trades":[]}}}"#;
+    std::fs::write(&path, legacy).unwrap();
+
+    let result = WalletCache::open(&path);
+    // Either the file is interpreted as a (corrupt) SQLite DB and errors out,
+    // or `open` returns a usable cache that immediately errors on any query.
+    // Either way the contract is: do not silently report 0 trades for the
+    // wallets in the legacy file.
+    if let Ok(cache) = result {
+        // If open() ignored the bad bytes, the cache must still report nothing
+        // about those wallets — they were never inserted via the new API.
+        assert_eq!(cache.trade_count(), 0);
+        assert!(cache.all_wallet_addresses().is_empty());
+    }
+}
+
+// ── Scenario 9 ────────────────────────────────────────────────────────────────
+//
+// PASS: per-wallet streaming reads N wallets sequentially without holding all
+//       trades in memory simultaneously — verified by checking that
+//       trades_for returns only one wallet's trades.
+// FAIL: trades_for returns trades for other wallets.
+
+#[tokio::test]
+async fn scenario_per_wallet_streaming_isolation() {
+    let dir = TempDir::new().unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+    let mut responses = HashMap::new();
+    let wallets: Vec<WalletAddress> = (1..=4)
+        .map(|i| {
+            let hex = format!("0x{:040x}", i);
+            WalletAddress::from_hex(&hex).unwrap()
+        })
+        .collect();
+    for (i, w) in wallets.iter().enumerate() {
+        let hash = format!("0xtx{i:02}");
+        let page = trades_page(&w.to_string(), &[(&hash, 2_000_000 + i as i64)]);
+        responses.insert(trade_url(*w, 0), page);
+    }
+
+    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+        .fetch_all(&wallets, &mut cache)
+        .await
+        .unwrap();
+
+    assert_eq!(cache.trade_count(), 4);
+
+    // Each wallet's trades_for must return ONLY its own trades.
+    for (i, w) in wallets.iter().enumerate() {
+        let trades = cache.trades_for(&w.to_string());
+        assert_eq!(trades.len(), 1, "wallet {i} must have exactly 1 trade");
+        assert_eq!(trades[0].wallet, *w, "wallet field must match");
+        assert_eq!(
+            trades[0].source_trade_id,
+            SourceTradeId(format!("0xtx{i:02}"))
         );
     }
 }

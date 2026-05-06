@@ -4,7 +4,7 @@
 //! 1. Discover wallets — load from per-contract checkpoint if available, else
 //!    enumerate via Dune Analytics or Etherscan (selected by `PE_WALLET_SOURCE`).
 //!    Etherscan: checkpoint saved after each contract; resume skips completed ones.
-//! 2. Fetch trade history per wallet from the Polymarket Data API (permanent JSON cache,
+//! 2. Fetch trade history per wallet from the Polymarket Data API (permanent SQLite cache,
 //!    incremental per run).
 //! 3. Reconstruct `TraderLedger`s via `pe-trader-index`.
 //! 4. Pre-filter: keep wallets with > 10 closed trades and > 80 % win rate.
@@ -93,7 +93,7 @@ pub struct BootstrapConfig {
     pub operator_addresses: Vec<WalletAddress>,
     /// `PE_BOOTSTRAP_OUTPUT` — path where the `Watchlist` JSON is written.
     pub output_path: PathBuf,
-    /// `PE_BOOTSTRAP_CACHE_PATH` — path to the wallet trade cache JSON file.
+    /// `PE_BOOTSTRAP_CACHE_PATH` — path to the wallet trade SQLite cache file.
     pub cache_path: PathBuf,
     /// `PE_BOOTSTRAP_WALLET_SET_PATH` — path to the enumerated wallet address list.
     /// If the file exists, Etherscan/Dune enumeration is skipped entirely.
@@ -200,7 +200,7 @@ impl BootstrapConfig {
             wallet_to_block,
             operator_addresses,
             output_path: PathBuf::from(require("PE_BOOTSTRAP_OUTPUT")?),
-            cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.json")),
+            cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.db")),
             wallet_set_path: PathBuf::from(optional(
                 "PE_BOOTSTRAP_WALLET_SET_PATH",
                 "wallet_set.json",
@@ -349,9 +349,9 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             .collect()
     };
 
-    // 2. Fetch trade history — permanent cache, incremental per run.
-    //    On first run (or after legacy-file auto-wipe) fetches full history.
-    //    On subsequent runs fetches only trades newer than the newest cached id.
+    // 2. Fetch trade history — permanent cache (SQLite, WAL), incremental per run.
+    //    On first run fetches full history. On subsequent runs fetches only trades
+    //    newer than the newest cached id per wallet.
     let mut cache = WalletCache::open(&config.cache_path)?;
     // Short pool_idle_timeout avoids reusing connections the server has silently
     // closed (Polymarket servers enforce per-IP connection limits under load).
@@ -364,23 +364,42 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         ReqwestFetcher::new(client),
     )
     .with_concurrency(config.polymarket_concurrency);
-    let all_trades = fetcher.fetch_all(&wallets, &mut cache).await;
-    cache.save()?;
-    tracing::info!(count = all_trades.len(), "bootstrap: fetched trades");
+    fetcher.fetch_all(&wallets, &mut cache).await?;
+    tracing::info!(wallets = wallets.len(), "bootstrap: trade fetch complete");
 
-    // 3. Reconstruct ledgers.
+    // 3. Reconstruct ledgers — per-wallet streaming from SQLite to keep peak
+    //    memory bounded. Each wallet's trades are loaded, reconstructed, and
+    //    dropped before the next wallet is processed.
     // audit_window_days=None → unlimited (u32::MAX sentinel passed downstream).
     // Reserved for future per-snapshot windowing; currently unused by build_trader_ledgers.
     let snapshot_at = SourceTimestamp(OffsetDateTime::now_utc());
-    let snapshot = TradeSnapshot {
-        trades: all_trades,
-        snapshot_at: snapshot_at.clone(),
-        audit_window_days: config.audit_window_days.unwrap_or(u32::MAX),
-    };
+    let audit_window_days = config.audit_window_days.unwrap_or(u32::MAX);
     let empty_operators: &[OperatorIdentity] = &[];
-    let ledgers: Vec<TraderLedger> =
-        build_trader_ledgers(&snapshot, empty_operators, &LedgerConfig::default());
-    tracing::info!(count = ledgers.len(), "bootstrap: reconstructed ledgers");
+    let ledger_config = LedgerConfig::default();
+    let mut ledgers: Vec<TraderLedger> = Vec::with_capacity(wallets.len());
+    let mut total_trades: usize = 0;
+    for wallet in &wallets {
+        let trades = cache.trades_for(&wallet.to_string());
+        if trades.is_empty() {
+            continue;
+        }
+        total_trades += trades.len();
+        let snapshot = TradeSnapshot {
+            trades,
+            snapshot_at: snapshot_at.clone(),
+            audit_window_days,
+        };
+        ledgers.extend(build_trader_ledgers(
+            &snapshot,
+            empty_operators,
+            &ledger_config,
+        ));
+    }
+    tracing::info!(
+        ledgers = ledgers.len(),
+        trades = total_trades,
+        "bootstrap: reconstructed ledgers"
+    );
 
     // 4. Pre-filter and 5. Build seed watchlist.
     let watchlist = build_seed_watchlist(

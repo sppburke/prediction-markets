@@ -84,20 +84,16 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     ///
     /// Up to `self.concurrency` wallets are fetched in parallel; the underlying
     /// `PageFetcher` enforces the global rate-limit gate. Wallets that produce
-    /// a network or parse error are skipped with a `tracing::warn!`.
+    /// a network, parse, or insert error are skipped with a `tracing::warn!`.
     ///
-    /// Checkpoints to disk every `CHECKPOINT_INTERVAL` successful inserts.
-    /// The mutex is released before the disk write so concurrent tasks are not
-    /// blocked during I/O. A final `save()` after the loop persists any
-    /// remaining inserts below the last checkpoint boundary.
-    ///
-    /// Returns a flat `Vec<RawTrade>` of all trades (pre-existing + new) for
-    /// the given wallets.
+    /// Trades are committed to SQLite per-wallet inside a single transaction.
+    /// SQLite WAL mode provides per-commit durability — no manual checkpointing
+    /// or final flush is needed.
     pub async fn fetch_all(
         &self,
         wallets: &[WalletAddress],
         cache: &mut WalletCache,
-    ) -> Vec<RawTrade> {
+    ) -> Result<(), BootstrapError> {
         let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);
 
         stream::iter(wallets.iter().copied())
@@ -107,53 +103,18 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                     let wallet_hex = wallet.to_string();
                     let known_ids: HashSet<SourceTradeId> = {
                         let guard = cache_mutex.lock().await;
-                        guard.known_trade_ids(&wallet_hex).iter().cloned().collect()
+                        guard.known_trade_ids(&wallet_hex).into_iter().collect()
                     };
 
                     match self.fetch_wallet_incremental(wallet, &known_ids).await {
                         Ok(new_trades) if !new_trades.is_empty() => {
-                            // Serialize inside the lock for a consistent snapshot,
-                            // then release the lock before the slow disk write.
-                            let checkpoint = {
-                                let mut guard = cache_mutex.lock().await;
-                                guard.insert_new(&wallet_hex, new_trades);
-                                guard.checkpoint_seq().and_then(|seq| {
-                                    match guard.to_bytes() {
-                                        Ok(bytes) => Some((bytes, guard.path.clone(), seq)),
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                wallet = %wallet_hex,
-                                                error = %e,
-                                                "polymarket: cache checkpoint serialization failed"
-                                            );
-                                            None
-                                        }
-                                    }
-                                })
-                            };
-                            // Lock released. Disk I/O on a blocking thread.
-                            if let Some((bytes, path, seq)) = checkpoint {
-                                let result = tokio::task::spawn_blocking(move || {
-                                    WalletCache::atomic_write(&path, &bytes, seq)
-                                })
-                                .await;
-                                match result {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => {
-                                        tracing::warn!(
-                                            wallet = %wallet_hex,
-                                            error = %e,
-                                            "polymarket: cache checkpoint write failed"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            wallet = %wallet_hex,
-                                            error = %e,
-                                            "polymarket: cache checkpoint task panicked"
-                                        );
-                                    }
-                                }
+                            let mut guard = cache_mutex.lock().await;
+                            if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
+                                tracing::warn!(
+                                    wallet = %wallet_hex,
+                                    error = %e,
+                                    "polymarket: cache insert failed"
+                                );
                             }
                         }
                         Ok(_) => {}
@@ -165,15 +126,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             })
             .await;
 
-        let cache = cache_mutex.into_inner();
-        // Final flush: persist any inserts since the last periodic checkpoint.
-        if let Err(e) = cache.save() {
-            tracing::warn!(error = %e, "polymarket: final cache save failed");
-        }
-        wallets
-            .iter()
-            .flat_map(|w| cache.trades_for(&w.to_string()))
-            .collect()
+        Ok(())
     }
 
     /// Fetch only trades not already in `known_ids` for a single wallet.
@@ -432,11 +385,11 @@ mod tests {
 
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
-        let trades = bulk.fetch_all(&[wallet], &mut cache).await;
+        bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
-        assert_eq!(trades.len(), 1000);
+        assert_eq!(cache.trade_count(), 1000);
     }
 
     #[tokio::test]
@@ -447,18 +400,18 @@ mod tests {
 
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
-        let trades = bulk.fetch_all(&[wallet], &mut cache).await;
+        bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
-        assert_eq!(trades.len(), 499);
+        assert_eq!(cache.trade_count(), 499);
     }
 
     #[tokio::test]
     async fn incremental_fetch_stops_after_k_consecutive_known_ids() {
         let wallet = wallet_a();
         let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
         // Cold run: populate cache with 5 old trades.
         let old_page = page_json_hashes(&[
@@ -471,7 +424,7 @@ mod tests {
         let mut r_cold = HashMap::new();
         r_cold.insert(trade_url(wallet, 0), old_page);
         let b_cold = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold));
-        b_cold.fetch_all(&[wallet], &mut cache).await;
+        b_cold.fetch_all(&[wallet], &mut cache).await.unwrap();
         assert_eq!(cache.trade_count(), 5);
 
         // Incremental run: 2 new trades, then old1..old5 (3 consecutive known → stop).
@@ -487,10 +440,9 @@ mod tests {
         let mut r_incr = HashMap::new();
         r_incr.insert(trade_url(wallet, 0), incr_page);
         let b_incr = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr));
-        let all = b_incr.fetch_all(&[wallet], &mut cache).await;
+        b_incr.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert_eq!(cache.trade_count(), 7, "5 old + 2 new = 7");
-        assert_eq!(all.len(), 7);
     }
 
     #[tokio::test]
@@ -500,11 +452,10 @@ mod tests {
         responses.insert(trade_url(wallet, 0), page_json_n(10, 0, 2_000_000));
 
         let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
-        let trades = bulk.fetch_all(&[wallet], &mut cache).await;
+        bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
-        assert_eq!(trades.len(), 10);
         assert_eq!(cache.trade_count(), 10);
     }
 
@@ -514,7 +465,7 @@ mod tests {
         // (newest-first), new trade appears before known trades → gets appended.
         let wallet = wallet_a();
         let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
         // Cold run: store 3 old trades.
         let old_page = page_json_hashes(&[
@@ -526,7 +477,8 @@ mod tests {
         r1.insert(trade_url(wallet, 0), old_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
             .fetch_all(&[wallet], &mut cache)
-            .await;
+            .await
+            .unwrap();
 
         // Incremental: page arrives oldest-first (ascending timestamps).
         // After sort → new1(2M), old1(1_000_003), old2(1_000_002), old3(1_000_001).
@@ -541,7 +493,8 @@ mod tests {
         r2.insert(trade_url(wallet, 0), reversed_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
             .fetch_all(&[wallet], &mut cache)
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             cache.trade_count(),

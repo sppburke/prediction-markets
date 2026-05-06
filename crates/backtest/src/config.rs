@@ -12,7 +12,7 @@ const DEFAULT_AUDIT_WINDOW_DAYS: u32 = 90;
 
 /// Backtest configuration sourced from environment variables.
 pub struct BacktestConfig {
-    /// `PE_BOOTSTRAP_CACHE_PATH` — path to bootstrap wallet trade cache JSON.
+    /// `PE_BOOTSTRAP_CACHE_PATH` — path to bootstrap wallet trade SQLite cache.
     pub cache_path: PathBuf,
     /// `PE_BACKTEST_OUTPUT_DIR` — directory where report.json and trades.ndjson are written.
     pub output_dir: PathBuf,
@@ -42,7 +42,7 @@ impl BacktestConfig {
         }
 
         Ok(Self {
-            cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.json")),
+            cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.db")),
             output_dir: PathBuf::from(require("PE_BACKTEST_OUTPUT_DIR")?),
             bankroll_usd: optional_parse("PE_BANKROLL_USD", Decimal::from(10_000u32)),
             step_days: optional_parse("PE_BACKTEST_STEP_DAYS", DEFAULT_STEP_DAYS),

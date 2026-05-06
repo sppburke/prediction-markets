@@ -23,6 +23,8 @@ pub enum BootstrapError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("missing required environment variable '{0}' — set it in .env or export it")]
     MissingEnv(String),
     #[error("internal error")]

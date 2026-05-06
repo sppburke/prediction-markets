@@ -68,19 +68,27 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
 
     // Fetch trades using fixture fetcher (no network).
     let dir = TempDir::new().unwrap();
-    let mut cache = WalletCache::open(&dir.path().join("cache.json")).unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
     let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fixture_fetcher());
-    let all_trades = fetcher.fetch_all(&wallets, &mut cache).await;
+    fetcher.fetch_all(&wallets, &mut cache).await.unwrap();
 
-    // Reconstruct ledgers (no operator attribution at bootstrap).
+    // Reconstruct ledgers per-wallet (mirrors production rank phase).
     let snapshot_at = SourceTimestamp(OffsetDateTime::from_unix_timestamp(SNAPSHOT_UNIX).unwrap());
-    let snapshot = TradeSnapshot {
-        trades: all_trades,
-        snapshot_at: snapshot_at.clone(),
-        audit_window_days: u32::MAX,
-    };
     let empty: &[OperatorIdentity] = &[];
-    let ledgers = build_trader_ledgers(&snapshot, empty, &LedgerConfig::default());
+    let ledger_config = LedgerConfig::default();
+    let mut ledgers = Vec::new();
+    for wallet in &wallets {
+        let trades = cache.trades_for(&wallet.to_string());
+        if trades.is_empty() {
+            continue;
+        }
+        let snapshot = TradeSnapshot {
+            trades,
+            snapshot_at: snapshot_at.clone(),
+            audit_window_days: u32::MAX,
+        };
+        ledgers.extend(build_trader_ledgers(&snapshot, empty, &ledger_config));
+    }
 
     // Build seed watchlist with default filter thresholds.
     let watchlist = build_seed_watchlist(
