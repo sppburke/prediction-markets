@@ -33,6 +33,8 @@ pub enum BootstrapError {
         "fetch incomplete: {failed_wallets} wallet(s) could not be fetched or cached; re-run to retry"
     )]
     PartialFetch { failed_wallets: usize },
+    #[error("gamma: {message}")]
+    Gamma { message: String },
     #[error("internal error")]
     Internal,
 }

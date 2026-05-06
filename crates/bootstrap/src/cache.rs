@@ -1,15 +1,17 @@
 //! Permanent wallet trade-history cache — SQLite (WAL mode), no TTL.
 //!
-//! Two tables:
+//! Three tables:
 //! - `trades` — append-only per-trade rows, indexed by `(wallet_hex, timestamp_unix)`.
 //! - `leaderboard_snapshots` — `(snapshot_at_unix, wallet_hex)` rows, one row-set per
 //!   `pe-bootstrap` run, written from the post-filtered watchlist. Read by
 //!   `pe-backtest` to constrain the candidate pool at each simulated week boundary.
+//! - `market_resolutions` — one row per resolved market from the Gamma API.
+//!   `winning_outcome_id NULL` means voided/non-binary — the backtest skips these.
 //!
 //! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
 //! is needed. Per-wallet streaming reads keep peak memory bounded.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -50,6 +52,15 @@ CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
     PRIMARY KEY (snapshot_at_unix, wallet_hex)
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_at ON leaderboard_snapshots(snapshot_at_unix);
+
+CREATE TABLE IF NOT EXISTS market_resolutions (
+    market_id           TEXT    PRIMARY KEY NOT NULL,
+    winning_outcome_id  INTEGER NULL,
+    resolved_at_unix    INTEGER NOT NULL,
+    fetched_at_unix     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resolutions_resolved_at
+    ON market_resolutions(resolved_at_unix);
 ";
 
 /// Permanent wallet trade-history cache backed by SQLite.
@@ -371,7 +382,118 @@ impl WalletCache {
         }
         Ok(LeaderboardSnapshots { entries })
     }
+
+    // ── market_resolutions ────────────────────────────────────────────────────
+
+    /// Insert a single market resolution. Idempotent: `INSERT OR IGNORE` silently
+    /// skips if `market_id` is already present (first fetch wins).
+    ///
+    /// `winning_outcome_id = None` means voided/non-binary — backtest will not
+    /// attempt to close positions on this market.
+    pub fn insert_resolution(
+        &mut self,
+        market_id: &str,
+        winning_outcome_id: Option<u8>,
+        resolved_at_unix: i64,
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        let winner_i64: Option<i64> = winning_outcome_id.map(i64::from);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO market_resolutions \
+             (market_id, winning_outcome_id, resolved_at_unix, fetched_at_unix) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![market_id, winner_i64, resolved_at_unix, fetched_at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Return the set of market IDs already present in `market_resolutions`.
+    ///
+    /// Used by [`GammaFetcher`] to skip markets that have already been fetched.
+    pub fn resolved_market_ids(&self) -> HashSet<String> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT market_id FROM market_resolutions")
+        {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Return all distinct `market_id` values present in the `trades` table, sorted.
+    ///
+    /// Used by the Gamma fetch step to enumerate the full set of markets to resolve.
+    pub fn all_market_ids(&self) -> Vec<String> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT DISTINCT market_id FROM trades ORDER BY market_id")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Load all resolved markets into a `ResolutionIndex` keyed by `MarketId`.
+    ///
+    /// Excludes rows where `winning_outcome_id IS NULL` (voided/non-binary markets).
+    /// Used by `pe-backtest` at startup for the per-day resolution sweep.
+    pub fn load_all_resolutions(&self) -> Result<ResolutionIndex, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT market_id, winning_outcome_id, resolved_at_unix \
+             FROM market_resolutions \
+             WHERE winning_outcome_id IS NOT NULL \
+             ORDER BY market_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let market_id: String = r.get(0)?;
+            let winner_i64: i64 = r.get(1)?;
+            let resolved_at: i64 = r.get(2)?;
+            Ok((market_id, winner_i64, resolved_at))
+        })?;
+        let mut index = ResolutionIndex::new();
+        for row in rows {
+            let (market_id, winner_i64, resolved_at_unix) = row?;
+            let Ok(winning_outcome_id) = u8::try_from(winner_i64) else {
+                continue; // out-of-range value; skip defensively
+            };
+            index.insert(
+                MarketId(VenueMarketId(market_id)),
+                MarketResolution {
+                    winning_outcome_id,
+                    resolved_at_unix,
+                },
+            );
+        }
+        Ok(index)
+    }
 }
+
+/// Resolved-market record loaded from the `market_resolutions` table.
+///
+/// Only rows with `winning_outcome_id IS NOT NULL` are materialised in the
+/// [`ResolutionIndex`]; voided markets are filtered at load time.
+#[derive(Debug, Clone)]
+pub struct MarketResolution {
+    /// 0-based index of the winning outcome (e.g. 0 = YES, 1 = NO).
+    pub winning_outcome_id: u8,
+    /// Unix seconds when the market was closed (from Gamma `closedTime`).
+    pub resolved_at_unix: i64,
+}
+
+/// In-memory map from [`MarketId`] to [`MarketResolution`].
+///
+/// Built once at backtest startup via [`WalletCache::load_all_resolutions`].
+pub type ResolutionIndex = HashMap<MarketId, MarketResolution>;
 
 /// In-memory index of every leaderboard snapshot in the cache, sorted ascending.
 ///
@@ -796,5 +918,119 @@ mod tests {
         assert_eq!(trades[0].outcome_id, OutcomeId(1));
         assert_eq!(trades[0].side, Side::Sell);
         assert_eq!(trades[0].contracts, ContractQty(7));
+    }
+
+    // ── market_resolutions tests ──────────────────────────────────────────────
+
+    #[test]
+    fn insert_resolution_round_trips_through_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            let mut cache = WalletCache::open(&path).unwrap();
+            cache
+                .insert_resolution("0xcond_yes", Some(0), 1_700_000_100, 1_700_000_200)
+                .unwrap();
+        }
+        let cache2 = WalletCache::open(&path).unwrap();
+        let idx = cache2.load_all_resolutions().unwrap();
+        assert_eq!(idx.len(), 1);
+        let m = idx
+            .get(&MarketId(VenueMarketId("0xcond_yes".to_owned())))
+            .unwrap();
+        assert_eq!(m.winning_outcome_id, 0);
+        assert_eq!(m.resolved_at_unix, 1_700_000_100);
+    }
+
+    #[test]
+    fn insert_resolution_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xcond", Some(1), 1_700_000_000, 1_700_000_001)
+            .unwrap();
+        // Second insert with different data — INSERT OR IGNORE should keep first.
+        cache
+            .insert_resolution("0xcond", Some(0), 1_700_000_999, 1_700_001_000)
+            .unwrap();
+        let idx = cache.load_all_resolutions().unwrap();
+        assert_eq!(idx.len(), 1);
+        let m = idx
+            .get(&MarketId(VenueMarketId("0xcond".to_owned())))
+            .unwrap();
+        assert_eq!(m.winning_outcome_id, 1, "first insert must win");
+    }
+
+    #[test]
+    fn load_all_resolutions_filters_null_winners() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xcond_voided", None, 1_700_000_000, 1_700_000_001)
+            .unwrap();
+        cache
+            .insert_resolution("0xcond_resolved", Some(0), 1_700_000_100, 1_700_000_101)
+            .unwrap();
+        let idx = cache.load_all_resolutions().unwrap();
+        assert_eq!(idx.len(), 1, "voided market must be excluded");
+        assert!(idx.contains_key(&MarketId(VenueMarketId("0xcond_resolved".to_owned()))));
+    }
+
+    #[test]
+    fn resolved_market_ids_returns_complete_set() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xa", Some(0), 1_700_000_000, 1_700_000_001)
+            .unwrap();
+        cache
+            .insert_resolution("0xb", None, 1_700_000_100, 1_700_000_101)
+            .unwrap();
+        let ids = cache.resolved_market_ids();
+        // Both resolved and voided rows count as "already fetched".
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("0xa"));
+        assert!(ids.contains("0xb"));
+    }
+
+    #[test]
+    fn all_market_ids_returns_distinct_from_trades() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let wallet = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut trade1 = make_trade("0xtx1", wallet, 1_000_000);
+        trade1.market_id = MarketId(VenueMarketId("0xmkt_a".to_owned()));
+        let mut trade2 = make_trade("0xtx2", wallet, 1_000_001);
+        trade2.market_id = MarketId(VenueMarketId("0xmkt_a".to_owned())); // duplicate market
+        let mut trade3 = make_trade("0xtx3", wallet, 1_000_002);
+        trade3.market_id = MarketId(VenueMarketId("0xmkt_b".to_owned()));
+        cache
+            .insert_new(&wallet.to_string(), vec![trade1, trade2, trade3])
+            .unwrap();
+        let ids = cache.all_market_ids();
+        assert_eq!(ids.len(), 2, "must deduplicate market_ids");
+        assert!(ids.contains(&"0xmkt_a".to_owned()));
+        assert!(ids.contains(&"0xmkt_b".to_owned()));
+    }
+
+    #[test]
+    fn resolution_table_independent_of_trades_and_snapshots() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let wallet = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        cache
+            .insert_new(
+                &wallet.to_string(),
+                vec![make_trade("0xtx1", wallet, 1_000_000)],
+            )
+            .unwrap();
+        cache.insert_snapshot(1_700_000_000, &[wallet]).unwrap();
+        cache
+            .insert_resolution("0xcond", Some(0), 1_700_000_000, 1_700_000_001)
+            .unwrap();
+        assert_eq!(cache.trade_count(), 1);
+        assert_eq!(cache.wallet_count(), 1);
+        assert_eq!(cache.all_snapshot_dates().unwrap().len(), 1);
+        assert_eq!(cache.load_all_resolutions().unwrap().len(), 1);
     }
 }
