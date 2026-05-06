@@ -27,6 +27,8 @@ pub enum BootstrapError {
     Sqlite(#[from] rusqlite::Error),
     #[error("missing required environment variable '{0}' — set it in .env or export it")]
     MissingEnv(String),
+    #[error("config parse: {message}")]
+    Config { message: String },
     #[error(
         "fetch incomplete: {failed_wallets} wallet(s) could not be fetched or cached; re-run to retry"
     )]

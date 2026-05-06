@@ -18,10 +18,12 @@ async fn main() -> Result<(), BacktestError> {
     let cache = WalletCache::open(&config.cache_path)?;
     let all_wallet_addresses = cache.all_wallet_addresses();
     let all_trades = cache.all_trades();
+    let snapshots = cache.load_all_snapshots()?;
 
     info!(
         wallets = all_wallet_addresses.len(),
         trades = all_trades.len(),
+        snapshots = snapshots.len(),
         "cache loaded"
     );
 
@@ -46,6 +48,7 @@ async fn main() -> Result<(), BacktestError> {
         &config,
         all_trades,
         operator_identities,
+        &snapshots,
         &RankerConfig::default(),
         &LedgerConfig::default(),
         &strategy,
