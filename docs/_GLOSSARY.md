@@ -571,3 +571,8 @@ CREATE TABLE leaderboard_snapshots (
 | `backtest_step_days` | 1 | Walk-forward simulation step in days; set via `PE_BACKTEST_STEP_DAYS` |
 | `backtest_bankroll_usd` | 10000 | Starting bankroll in USD; set via `PE_BANKROLL_USD` |
 | `backtest_audit_window_days` | 90 | Trade lookback window for ledger reconstruction during simulation; set via `PE_BACKTEST_AUDIT_WINDOW_DAYS` |
+| `backtest_min_reconstruction_quality` | 0 | Minimum reconstruction quality (0–100) for watchlist eligibility in backtest. Default 0 (not 60) because Polymarket's CLOB API omits market-resolution redemption events; most positions appear "open" even when settled. The leaderboard snapshot serves as the quality proxy instead. Set via `PE_BACKTEST_MIN_QUALITY`. |
+| `backtest_active_min_closed_trades` | 10 | Min closed trades in 180-day window for active tier. Relaxed from live-system default (60) due to missing resolution data. Set via `PE_BACKTEST_ACTIVE_MIN_CLOSED`. |
+| `backtest_active_min_distinct_markets` | 5 | Min distinct markets in 180-day window for active tier. Relaxed from live-system default (30). Set via `PE_BACKTEST_ACTIVE_MIN_MARKETS`. |
+| `backtest_incubator_min_closed_trades` | 3 | Min closed trades in 90-day window for incubator tier. Relaxed from live-system default (20). Set via `PE_BACKTEST_INCUBATOR_MIN_CLOSED`. |
+| `backtest_incubator_min_distinct_markets` | 2 | Min distinct markets in 90-day window for incubator tier. Relaxed from live-system default (10). Set via `PE_BACKTEST_INCUBATOR_MIN_MARKETS`. |

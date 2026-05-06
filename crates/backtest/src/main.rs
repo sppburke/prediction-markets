@@ -45,6 +45,23 @@ async fn main() -> Result<(), BacktestError> {
     // Phase 1: walk-forward simulation.
     std::fs::create_dir_all(&config.output_dir)?;
 
+    let ranker_config = RankerConfig {
+        min_reconstruction_quality: config.ranker_min_quality,
+        active_min_closed_trades: config.ranker_active_min_closed,
+        active_min_distinct_markets: config.ranker_active_min_markets,
+        incubator_min_closed_trades: config.ranker_incubator_min_closed,
+        incubator_min_distinct_markets: config.ranker_incubator_min_markets,
+        ..RankerConfig::default()
+    };
+    info!(
+        min_quality = ranker_config.min_reconstruction_quality,
+        active_min_closed = ranker_config.active_min_closed_trades,
+        active_min_markets = ranker_config.active_min_distinct_markets,
+        incubator_min_closed = ranker_config.incubator_min_closed_trades,
+        incubator_min_markets = ranker_config.incubator_min_distinct_markets,
+        "ranker config (backtest-adjusted)"
+    );
+
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
     let report = simulation::run_simulation(
         &config,
@@ -52,7 +69,7 @@ async fn main() -> Result<(), BacktestError> {
         operator_identities,
         &snapshots,
         &resolutions,
-        &RankerConfig::default(),
+        &ranker_config,
         &LedgerConfig::default(),
         &strategy,
     )?;

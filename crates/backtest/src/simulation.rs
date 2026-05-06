@@ -311,6 +311,17 @@ pub fn run_simulation(
             ranker_config,
         );
 
+        // Log watchlist sizes periodically (every 30th day) for diagnostic visibility.
+        if day_idx % 30 == 0 {
+            info!(
+                date = %sim_date,
+                filtered_ledgers = filtered_ledgers.len(),
+                active = watchlist.active_count,
+                incubator = watchlist.incubator_count,
+                "watchlist snapshot"
+            );
+        }
+
         // Build wallet → ledger map for O(1) win-rate lookup.
         let ledger_by_wallet: HashMap<WalletAddress, &TraderLedger> =
             filtered_ledgers.iter().map(|l| (l.wallet, l)).collect();
@@ -348,7 +359,11 @@ pub fn run_simulation(
             let leader = trade.wallet;
             let op_identity = wallet_to_operator.get(&leader).copied();
             let operator_id = op_identity.map(|op| &op.operator_id);
-            let has_funder = op_identity.is_some();
+            // When leaderboard snapshots are in use the snapshot membership serves
+            // as the funder/quality proxy — treat every snapshot wallet as having a
+            // proven funder mapping so the risk engine's funder-check doesn't block
+            // all signals in the absence of Etherscan data.
+            let has_funder = op_identity.is_some() || !snapshots.is_empty();
 
             let pos_key = (trade.market_id.clone(), trade.outcome_id);
             let wallet_pos_key = (leader, pos_key.clone());

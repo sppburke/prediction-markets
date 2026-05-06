@@ -10,6 +10,17 @@ use crate::error::BacktestError;
 const DEFAULT_STEP_DAYS: u32 = 1;
 const DEFAULT_AUDIT_WINDOW_DAYS: u32 = 90;
 
+// Backtest-specific ranker defaults (lower than live-system RankerConfig defaults).
+// Polymarket's trade API captures CLOB buys/sells only — market resolution redemptions
+// do not appear as sell trades, so most positions look "open" and reconstruction quality
+// is artificially low. The leaderboard snapshot already encodes quality; these thresholds
+// reflect what the data can actually support. See `docs/_GLOSSARY.md` "Backtest defaults".
+const DEFAULT_BT_MIN_QUALITY: u8 = 0;
+const DEFAULT_BT_ACTIVE_MIN_CLOSED: u32 = 10;
+const DEFAULT_BT_ACTIVE_MIN_MARKETS: u32 = 5;
+const DEFAULT_BT_INCUBATOR_MIN_CLOSED: u32 = 3;
+const DEFAULT_BT_INCUBATOR_MIN_MARKETS: u32 = 2;
+
 /// Backtest configuration sourced from environment variables.
 pub struct BacktestConfig {
     /// `PE_BOOTSTRAP_CACHE_PATH` — path to bootstrap wallet trade SQLite cache.
@@ -24,6 +35,19 @@ pub struct BacktestConfig {
     pub etherscan_api_key: Option<String>,
     /// Trade lookback window for ledger reconstruction (default: 90 days).
     pub audit_window_days: u32,
+    // ── Ranker eligibility overrides (backtest-specific defaults) ──────────────
+    /// `PE_BACKTEST_MIN_QUALITY` — min reconstruction quality for watchlist eligibility.
+    /// Default 0: leaderboard snapshot already encodes quality; CLOB-only data produces
+    /// artificially low quality scores because market resolutions are not captured as sells.
+    pub ranker_min_quality: u8,
+    /// `PE_BACKTEST_ACTIVE_MIN_CLOSED` — min closed trades in 180-day window for active tier.
+    pub ranker_active_min_closed: u32,
+    /// `PE_BACKTEST_ACTIVE_MIN_MARKETS` — min distinct markets in 180-day window for active tier.
+    pub ranker_active_min_markets: u32,
+    /// `PE_BACKTEST_INCUBATOR_MIN_CLOSED` — min closed trades in 90-day window for incubator tier.
+    pub ranker_incubator_min_closed: u32,
+    /// `PE_BACKTEST_INCUBATOR_MIN_MARKETS` — min distinct markets in 90-day window for incubator tier.
+    pub ranker_incubator_min_markets: u32,
 }
 
 impl BacktestConfig {
@@ -50,6 +74,26 @@ impl BacktestConfig {
             audit_window_days: optional_parse(
                 "PE_BACKTEST_AUDIT_WINDOW_DAYS",
                 DEFAULT_AUDIT_WINDOW_DAYS,
+            ),
+            ranker_min_quality: optional_parse(
+                "PE_BACKTEST_MIN_QUALITY",
+                DEFAULT_BT_MIN_QUALITY,
+            ),
+            ranker_active_min_closed: optional_parse(
+                "PE_BACKTEST_ACTIVE_MIN_CLOSED",
+                DEFAULT_BT_ACTIVE_MIN_CLOSED,
+            ),
+            ranker_active_min_markets: optional_parse(
+                "PE_BACKTEST_ACTIVE_MIN_MARKETS",
+                DEFAULT_BT_ACTIVE_MIN_MARKETS,
+            ),
+            ranker_incubator_min_closed: optional_parse(
+                "PE_BACKTEST_INCUBATOR_MIN_CLOSED",
+                DEFAULT_BT_INCUBATOR_MIN_CLOSED,
+            ),
+            ranker_incubator_min_markets: optional_parse(
+                "PE_BACKTEST_INCUBATOR_MIN_MARKETS",
+                DEFAULT_BT_INCUBATOR_MIN_MARKETS,
             ),
         })
     }
