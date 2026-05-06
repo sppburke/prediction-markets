@@ -121,6 +121,11 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         step_days: 1,
         etherscan_api_key: None,
         audit_window_days: 365,
+        ranker_min_quality: 0,
+        ranker_active_min_closed: 60,
+        ranker_active_min_markets: 30,
+        ranker_incubator_min_closed: 10,
+        ranker_incubator_min_markets: 5,
     }
 }
 
