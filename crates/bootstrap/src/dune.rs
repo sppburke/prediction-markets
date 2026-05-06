@@ -79,8 +79,8 @@ wallet_stats AS (\
 SELECT CAST(wallet AS VARCHAR) AS wallet \
 FROM wallet_stats \
 WHERE closed_markets > {min_closed_markets} \
+  AND winning_markets > 0 \
   AND (1.0 * winning_markets / closed_markets) > {min_win_rate} \
-  AND avg_hours_entry_to_resolution IS NOT NULL \
   AND avg_hours_entry_to_resolution < {max_avg_hours_to_resolution}";
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ impl DuneClient {
     /// Returns wallets satisfying all four quality filters:
     /// - more than `min_closed_markets` distinct resolved binary markets traded
     /// - win rate above `min_win_rate_pct` percent on those markets
-    /// - at least one trade on a resolved market within `active_window_days` days
+    /// - at least one trade (on any market) within `active_window_days` days
     /// - average hours from first entry to market resolution below `max_avg_hours_to_resolution`
     ///
     /// No hard limit on result count; all qualifying wallets are returned.
