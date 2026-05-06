@@ -5,6 +5,7 @@
 //! per-account private-query quota is never touched.
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" table.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use pe_core_types::WalletAddress;
@@ -97,6 +98,30 @@ WHERE closed_markets > {min_closed_markets} \
   AND winning_markets > 0 \
   AND (1.0 * winning_markets / closed_markets) > {min_win_rate} \
   AND avg_hours_entry_to_resolution < {max_avg_hours_to_resolution}";
+
+/// SQL for market resolution fetch: all binary-market resolutions settled after
+/// `{last_resolved_at}` Unix seconds. Timestamp-bounded for incremental runs.
+///
+/// Winner encoding matches Gamma convention:
+///   0 = YES (outcome index 0) won, 1 = NO (outcome index 1) won, NULL = voided.
+///
+/// `CAST(conditionid AS VARCHAR)` in DuneSQL returns a `\x`-prefixed lowercase hex string
+/// (e.g. `\x0aff…`). `parse_resolution_rows` normalises this to `0x`-prefixed for
+/// consistency with the trade cache.
+///
+/// Placeholder: `{last_resolved_at}` — Unix seconds (0 on first run).
+const RESOLUTION_SQL: &str = "\
+SELECT \
+  CAST(conditionid AS VARCHAR) AS condition_id, \
+  CASE \
+    WHEN payoutnumerators[1] > 0 THEN 0 \
+    WHEN payoutnumerators[2] > 0 THEN 1 \
+    ELSE NULL \
+  END AS winning_outcome_id, \
+  CAST(TO_UNIXTIME(evt_block_time) AS BIGINT) AS resolved_at_unix \
+FROM polymarket_polygon.ctf_evt_conditionresolution \
+WHERE outcomeslotcount = 2 \
+  AND evt_block_time > FROM_UNIXTIME({last_resolved_at})";
 
 /// Render `as_of` as a Trino-compatible `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` literal in UTC.
 ///
@@ -202,6 +227,28 @@ impl DuneClient {
         let execution_id = self.execute_sql(&sql).await?;
         let rows = self.wait_for_results(&execution_id).await?;
         parse_wallet_rows(rows)
+    }
+
+    /// Fetch binary-market resolutions settled after `last_resolved_at` (Unix seconds).
+    ///
+    /// Pass `0` on the first run to fetch the full on-chain history. Subsequent runs
+    /// pass `cache.max_resolved_at_unix()` to fetch only new settlements.
+    ///
+    /// Returns `(market_id, winner, resolved_at_unix)` filtered to markets present in
+    /// `wanted`. Winner: `Some(0)` = YES won, `Some(1)` = NO won, `None` = voided.
+    pub async fn fetch_resolutions(
+        &self,
+        wanted: &HashSet<String>,
+        last_resolved_at: i64,
+    ) -> Result<Vec<(String, Option<u8>, i64)>, BootstrapError> {
+        let sql = render_resolution_sql(last_resolved_at);
+        let execution_id = self.execute_sql(&sql).await?;
+        let rows = self.wait_for_results(&execution_id).await?;
+        let parsed = parse_resolution_rows(rows);
+        Ok(parsed
+            .into_iter()
+            .filter(|(id, _, _)| wanted.contains(id.as_str()))
+            .collect())
     }
 
     /// Submit SQL for direct execution without creating a stored query.
@@ -360,6 +407,11 @@ pub(crate) fn render_wallet_discovery_sql(
         )
 }
 
+/// Substitute `{last_resolved_at}` in [`RESOLUTION_SQL`] with the given Unix timestamp.
+pub(crate) fn render_resolution_sql(last_resolved_at: i64) -> String {
+    RESOLUTION_SQL.replace("{last_resolved_at}", &last_resolved_at.to_string())
+}
+
 // ── Row parsing ───────────────────────────────────────────────────────────────
 
 fn parse_wallet_rows(rows: Vec<serde_json::Value>) -> Result<Vec<WalletAddress>, BootstrapError> {
@@ -380,6 +432,70 @@ fn parse_wallet_rows(rows: Vec<serde_json::Value>) -> Result<Vec<WalletAddress>,
         }
     }
     Ok(wallets)
+}
+
+/// Normalise a `CAST(conditionid AS VARCHAR)` result to `0x`-prefixed lowercase hex.
+///
+/// DuneSQL returns varbinary casts with a `\x` prefix (e.g. `\x0aff…`). The cache
+/// uses `0x`-prefixed strings to match the Polymarket trade data format.
+fn normalise_condition_id(raw: &str) -> String {
+    if let Some(hex) = raw.strip_prefix("\\x") {
+        format!("0x{hex}")
+    } else {
+        raw.to_owned()
+    }
+}
+
+/// Parse raw Dune resolution rows into `(market_id, winner, resolved_at_unix)` tuples.
+///
+/// Missing or empty `condition_id` → warn and skip. `winning_outcome_id` absent →
+/// warn and skip. `winning_outcome_id` JSON null → `None` (voided, included).
+/// Out-of-range integer → warn and skip.
+fn parse_resolution_rows(rows: Vec<serde_json::Value>) -> Vec<(String, Option<u8>, i64)> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_id = match row.get("condition_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                tracing::warn!("dune: resolution row missing or empty condition_id, skipping");
+                continue;
+            }
+        };
+        let condition_id = normalise_condition_id(raw_id);
+        let ts = match row.get("resolved_at_unix").and_then(|v| v.as_i64()) {
+            Some(ts) => ts,
+            None => {
+                tracing::warn!(
+                    condition_id = %raw_id,
+                    "dune: resolution row missing resolved_at_unix, skipping"
+                );
+                continue;
+            }
+        };
+        let winner: Option<u8> = match row.get("winning_outcome_id") {
+            None => {
+                tracing::warn!(
+                    condition_id = %raw_id,
+                    "dune: resolution row missing winning_outcome_id key, skipping"
+                );
+                continue;
+            }
+            Some(v) if v.is_null() => None,
+            Some(v) => match v.as_u64().and_then(|n| u8::try_from(n).ok()) {
+                Some(w) => Some(w),
+                None => {
+                    tracing::warn!(
+                        condition_id = %raw_id,
+                        value = ?v,
+                        "dune: resolution row has out-of-range winning_outcome_id, skipping"
+                    );
+                    continue;
+                }
+            },
+        };
+        out.push((condition_id, winner, ts));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -490,6 +606,127 @@ mod tests {
         assert!(
             !s.contains('.'),
             "subsecond fragment leaked into literal: {s}"
+        );
+    }
+
+    // ── Resolution SQL rendering ─────────────────────────────────────────────
+
+    #[test]
+    fn render_resolution_sql_substitutes_zero() {
+        let sql = render_resolution_sql(0);
+        assert!(
+            sql.contains("FROM_UNIXTIME(0)"),
+            "first-run cold start must use FROM_UNIXTIME(0)"
+        );
+        assert!(
+            !sql.contains("{last_resolved_at}"),
+            "placeholder must be fully substituted"
+        );
+    }
+
+    #[test]
+    fn render_resolution_sql_substitutes_nonzero_timestamp() {
+        let sql = render_resolution_sql(1_700_000_000);
+        assert!(
+            sql.contains("FROM_UNIXTIME(1700000000)"),
+            "timestamp must appear verbatim in rendered SQL"
+        );
+    }
+
+    // ── Resolution row parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_resolution_rows_yes_win() {
+        let rows = vec![serde_json::json!({
+            "condition_id": "0xaabbcc",
+            "winning_outcome_id": 0,
+            "resolved_at_unix": 1_700_000_000i64,
+        })];
+        let parsed = parse_resolution_rows(rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "0xaabbcc");
+        assert_eq!(parsed[0].1, Some(0u8));
+        assert_eq!(parsed[0].2, 1_700_000_000i64);
+    }
+
+    #[test]
+    fn parse_resolution_rows_no_win() {
+        let rows = vec![serde_json::json!({
+            "condition_id": "0xaabbcc",
+            "winning_outcome_id": 1,
+            "resolved_at_unix": 1_700_000_000i64,
+        })];
+        let parsed = parse_resolution_rows(rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1, Some(1u8));
+    }
+
+    #[test]
+    fn parse_resolution_rows_voided_null_included() {
+        let rows = vec![serde_json::json!({
+            "condition_id": "0xaabbcc",
+            "winning_outcome_id": null,
+            "resolved_at_unix": 1_700_000_000i64,
+        })];
+        let parsed = parse_resolution_rows(rows);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "voided market must be included in parse output"
+        );
+        assert_eq!(parsed[0].1, None);
+    }
+
+    #[test]
+    fn parse_resolution_rows_skips_missing_condition_id() {
+        let rows = vec![
+            // Missing condition_id entirely.
+            serde_json::json!({"winning_outcome_id": 0, "resolved_at_unix": 1_700_000_000i64}),
+            // Valid row that must survive.
+            serde_json::json!({"condition_id": "0xgood", "winning_outcome_id": 0, "resolved_at_unix": 1_700_000_001i64}),
+        ];
+        let parsed = parse_resolution_rows(rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "0xgood");
+    }
+
+    #[test]
+    fn parse_resolution_rows_skips_missing_resolved_at() {
+        let rows = vec![serde_json::json!({
+            "condition_id": "0xaabbcc",
+            "winning_outcome_id": 0,
+        })];
+        let parsed = parse_resolution_rows(rows);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_resolution_rows_normalises_backslash_x_prefix() {
+        let rows = vec![serde_json::json!({
+            "condition_id": r"\xaabbcc1234",
+            "winning_outcome_id": 0,
+            "resolved_at_unix": 1_700_000_000i64,
+        })];
+        let parsed = parse_resolution_rows(rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].0, "0xaabbcc1234",
+            "\\x prefix must be normalised to 0x"
+        );
+    }
+
+    #[test]
+    fn parse_resolution_rows_passthrough_0x_prefix() {
+        let rows = vec![serde_json::json!({
+            "condition_id": "0xdeadbeef",
+            "winning_outcome_id": 1,
+            "resolved_at_unix": 1_700_000_000i64,
+        })];
+        let parsed = parse_resolution_rows(rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].0, "0xdeadbeef",
+            "0x prefix must pass through unchanged"
         );
     }
 }

@@ -11,7 +11,8 @@
 //! 4. Post-filter: keep wallets passing all four quality conditions (trades, win rate, recency,
 //!    avg hold duration). Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 //! 5. Build a seed `Watchlist` and write it to `output_path`.
-//! 6. Optionally fetch market resolution data from the Gamma API (`PE_BOOTSTRAP_FETCH_RESOLUTIONS=1`).
+//! 6. Optionally fetch market resolution data: Gamma API (classic markets, PE_BOOTSTRAP_FETCH_RESOLUTIONS=1)
+//!    + Dune on-chain `ctf_evt_conditionresolution` (all markets including financial, gated by PE_DUNE_API_KEY).
 //!
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
@@ -23,6 +24,7 @@ pub mod gamma;
 pub mod polymarket;
 pub mod wallet_set;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -500,9 +502,10 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         "bootstrap: leaderboard snapshot persisted"
     );
 
-    // 6. Optionally fetch market resolution data from the Gamma API.
-    //    Off by default (requires PE_BOOTSTRAP_FETCH_RESOLUTIONS=1); ~2.4 h one-time.
-    //    Incremental: already-resolved markets are skipped via INSERT OR IGNORE.
+    // 6. Fetch market resolution data.
+    //    a) Gamma API — covers ~2% of markets (classic prediction markets).
+    //       Off by default (PE_BOOTSTRAP_FETCH_RESOLUTIONS=1); ~2.4 h one-time.
+    //       Incremental: already-resolved markets skipped via INSERT OR IGNORE.
     if config.fetch_resolutions {
         let market_ids = cache.all_market_ids();
         let gamma_client = reqwest::Client::builder()
@@ -521,6 +524,37 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             total_markets = market_ids.len(),
             "bootstrap: gamma resolutions fetched"
         );
+    }
+
+    //    b) Dune on-chain (`ctf_evt_conditionresolution`) — covers all markets including
+    //       financial/quantitative markets absent from Gamma. Queries from epoch (cursor=0)
+    //       so newly-discovered wallets' markets that resolved before any prior run's cursor
+    //       are never silently skipped. Filtered client-side to unresolved markets only;
+    //       INSERT OR IGNORE makes repeated runs idempotent.
+    if let Some(api_key) = &config.dune_api_key {
+        let all_market_ids: HashSet<String> = cache.all_market_ids().into_iter().collect();
+        let already_resolved = cache.resolved_market_ids();
+        let unresolved: HashSet<String> = all_market_ids
+            .difference(&already_resolved)
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let dune_resolution_client = DuneClient::new(api_key.clone());
+            let rows = dune_resolution_client
+                .fetch_resolutions(&unresolved, 0)
+                .await?;
+            let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+            let mut inserted = 0usize;
+            for (market_id, winner, resolved_at_unix) in rows {
+                cache.insert_resolution(&market_id, winner, resolved_at_unix, fetched_at)?;
+                inserted += 1;
+            }
+            tracing::info!(
+                inserted,
+                unresolved = unresolved.len(),
+                "bootstrap: dune resolutions fetched"
+            );
+        }
     }
 
     // Write output.
