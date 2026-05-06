@@ -1,11 +1,15 @@
 //! `pe-backtest` binary entry point.
 
+use std::collections::HashSet;
+
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::error::BacktestError;
 use pe_backtest::{funder_graph, simulation};
 use pe_bootstrap::cache::WalletCache;
+use pe_bootstrap::dune::DuneClient;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::{LedgerConfig, RankerConfig};
+use time::OffsetDateTime;
 use tracing::info;
 
 #[tokio::main]
@@ -14,11 +18,67 @@ async fn main() -> Result<(), BacktestError> {
 
     let config = BacktestConfig::from_env()?;
 
-    // Load wallet trade cache.
-    let cache = WalletCache::open(&config.cache_path)?;
+    // Load wallet trade cache (mutable so Dune resolutions can be written).
+    let mut cache = WalletCache::open(&config.cache_path)?;
     let all_wallet_addresses = cache.all_wallet_addresses();
     let all_trades = cache.all_trades();
     let snapshots = cache.load_all_snapshots()?;
+
+    // Fetch on-chain resolutions via Dune before running the simulation so that
+    // financial/quantitative markets (absent from the Gamma API) are resolved.
+    if let Some(api_key) = &config.dune_api_key {
+        let all_market_ids: HashSet<String> = cache.all_market_ids().into_iter().collect();
+        let already_resolved = cache.resolved_market_ids();
+        let unresolved: HashSet<String> = all_market_ids
+            .difference(&already_resolved)
+            .cloned()
+            .collect();
+        if unresolved.is_empty() {
+            info!("backtest: all markets already resolved — skipping Dune fetch");
+        } else {
+            // Scope the Dune scan to our actual trade history window, not all of
+            // history from epoch 0. A 30-day buffer before the earliest trade
+            // captures resolutions for markets entered near our data horizon.
+            const THIRTY_DAYS_SECS: i64 = 30 * 86_400;
+            let min_trade_ts = cache.min_trade_unix()?.saturating_sub(THIRTY_DAYS_SECS);
+            info!(
+                unresolved = unresolved.len(),
+                from_unix = min_trade_ts,
+                "backtest: fetching Dune resolutions"
+            );
+            let dune = DuneClient::new(api_key.clone());
+            match dune
+                .fetch_resolutions(&unresolved, min_trade_ts, config.dune_namespace.as_deref())
+                .await
+            {
+                Ok(rows) => {
+                    let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+                    let mut inserted = 0usize;
+                    for (market_id, winner, resolved_at_unix) in rows {
+                        cache.insert_resolution(
+                            &market_id,
+                            winner,
+                            resolved_at_unix,
+                            fetched_at,
+                        )?;
+                        inserted += 1;
+                    }
+                    info!(
+                        inserted,
+                        unresolved = unresolved.len(),
+                        "backtest: Dune resolutions fetched"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "backtest: Dune resolution fetch failed — continuing without on-chain resolutions"
+                    );
+                }
+            }
+        }
+    }
+
     let resolutions = pe_bootstrap::gamma::load_resolutions(&cache)?;
 
     info!(

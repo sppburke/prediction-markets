@@ -443,6 +443,17 @@ impl WalletCache {
         }
     }
 
+    /// Minimum `timestamp_unix` across all rows in `trades`.
+    /// Returns 0 when the table is empty.
+    pub fn min_trade_unix(&self) -> Result<i64, BootstrapError> {
+        let ts: i64 = self.conn.query_row(
+            "SELECT COALESCE(MIN(timestamp_unix), 0) FROM trades",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(ts)
+    }
+
     /// Maximum `resolved_at_unix` across all rows in `market_resolutions`.
     /// Returns 0 when the table is empty — the first run then queries the full
     /// on-chain history by passing 0 to `FROM_UNIXTIME`.

@@ -92,6 +92,10 @@ pub struct BootstrapConfig {
     pub wallet_source: WalletSource,
     /// `PE_DUNE_API_KEY` — required when `wallet_source = dune`.
     pub dune_api_key: Option<String>,
+    /// `PE_DUNE_NAMESPACE` — Dune username (e.g. `apexurellc`). When set, the resolution
+    /// fetch uploads market IDs as a lookup table and uses a server-side JOIN so only
+    /// the caller's markets are returned, greatly reducing credit cost.
+    pub dune_namespace: Option<String>,
     /// `PE_ETHERSCAN_API_KEY` — required when `wallet_source = etherscan`.
     pub etherscan_api_key: Option<String>,
     /// `PE_WALLET_FROM_BLOCK` — start block for Etherscan scan (default: CTF V1 deploy block).
@@ -197,7 +201,13 @@ impl BootstrapConfig {
 
         let (dune_api_key, etherscan_api_key) = match &wallet_source {
             WalletSource::Dune => (Some(require("PE_DUNE_API_KEY")?), None),
-            WalletSource::Etherscan => (None, Some(require("PE_ETHERSCAN_API_KEY")?)),
+            // In Etherscan mode, PE_DUNE_API_KEY is optional — it enables the on-chain
+            // resolution sweep (ctf_evt_conditionresolution) without requiring Dune
+            // for wallet discovery.
+            WalletSource::Etherscan => (
+                std::env::var("PE_DUNE_API_KEY").ok(),
+                Some(require("PE_ETHERSCAN_API_KEY")?),
+            ),
         };
 
         // Parse optional wallet_to_block; warn if set but unparseable (so the operator
@@ -233,6 +243,7 @@ impl BootstrapConfig {
         Ok(Self {
             wallet_source,
             dune_api_key,
+            dune_namespace: std::env::var("PE_DUNE_NAMESPACE").ok(),
             etherscan_api_key,
             wallet_from_block: optional_parse("PE_WALLET_FROM_BLOCK", CTF_EXCHANGE_V1_DEPLOY_BLOCK),
             wallet_to_block,
@@ -541,7 +552,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         if !unresolved.is_empty() {
             let dune_resolution_client = DuneClient::new(api_key.clone());
             let rows = dune_resolution_client
-                .fetch_resolutions(&unresolved, 0)
+                .fetch_resolutions(&unresolved, 0, config.dune_namespace.as_deref())
                 .await?;
             let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
             let mut inserted = 0usize;

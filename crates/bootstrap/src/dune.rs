@@ -20,6 +20,10 @@ const BASE_URL: &str = "https://api.dune.com/api/v1";
 const POLL_INTERVAL_SECS: u64 = 3;
 const MAX_WAIT_SECS: u64 = 300;
 const HTTP_TIMEOUT_SECS: u64 = 30;
+const TABLE_UPLOAD_TIMEOUT_SECS: u64 = 120;
+
+/// Stable name for the per-namespace market-ID lookup table used by the JOIN resolution path.
+const RESOLUTION_TABLE: &str = "pe_resolution_lookup";
 
 /// SQL for wallet discovery: wallets with strong win rates on resolved binary markets,
 /// active within a configurable recent window, and entering close to resolution.
@@ -110,6 +114,7 @@ WHERE closed_markets > {min_closed_markets} \
 /// consistency with the trade cache.
 ///
 /// Placeholder: `{last_resolved_at}` — Unix seconds (0 on first run).
+/// Used as the fallback path when no namespace is configured.
 const RESOLUTION_SQL: &str = "\
 SELECT \
   CAST(conditionid AS VARCHAR) AS condition_id, \
@@ -122,6 +127,33 @@ SELECT \
 FROM polymarket_polygon.ctf_evt_conditionresolution \
 WHERE outcomeslotcount = 2 \
   AND evt_block_time > FROM_UNIXTIME({last_resolved_at})";
+
+/// Render the JOIN-based resolution SQL that queries only the caller's markets.
+///
+/// Before calling this, upload market IDs via [`DuneClient::upload_market_ids`] to
+/// create `dune.{namespace}.pe_resolution_lookup`. The INNER JOIN restricts Dune to
+/// returning only rows that match the uploaded condition IDs — dramatically reducing
+/// the result set compared to scanning all resolved binary markets.
+///
+/// `TO_HEX(conditionid)` returns lowercase hex without a prefix; prepending `'0x'`
+/// and lowercasing both sides produces a stable join key matching our `0x<hex>` cache format.
+pub(crate) fn render_resolution_sql_with_join(namespace: &str, last_resolved_at: i64) -> String {
+    format!(
+        "SELECT DISTINCT \
+           m.condition_id, \
+           CASE \
+             WHEN r.payoutnumerators[1] > 0 THEN 0 \
+             WHEN r.payoutnumerators[2] > 0 THEN 1 \
+             ELSE NULL \
+           END AS winning_outcome_id, \
+           CAST(TO_UNIXTIME(r.evt_block_time) AS BIGINT) AS resolved_at_unix \
+         FROM dune.{namespace}.{RESOLUTION_TABLE} m \
+         INNER JOIN polymarket_polygon.ctf_evt_conditionresolution r \
+           ON '0x' || LOWER(TO_HEX(r.conditionid)) = m.condition_id \
+         WHERE r.outcomeslotcount = 2 \
+           AND r.evt_block_time > FROM_UNIXTIME({last_resolved_at})"
+    )
+}
 
 /// Render `as_of` as a Trino-compatible `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` literal in UTC.
 ///
@@ -231,24 +263,146 @@ impl DuneClient {
 
     /// Fetch binary-market resolutions settled after `last_resolved_at` (Unix seconds).
     ///
-    /// Pass `0` on the first run to fetch the full on-chain history. Subsequent runs
-    /// pass `cache.max_resolved_at_unix()` to fetch only new settlements.
+    /// When `namespace` is `Some`, uploads `wanted` as a Dune lookup table and queries
+    /// with a server-side INNER JOIN so only the caller's markets are returned — avoiding
+    /// a full scan of all resolved binary markets. When `None`, falls back to a broad scan
+    /// with client-side filtering.
     ///
-    /// Returns `(market_id, winner, resolved_at_unix)` filtered to markets present in
-    /// `wanted`. Winner: `Some(0)` = YES won, `Some(1)` = NO won, `None` = voided.
+    /// Returns `(market_id, winner, resolved_at_unix)` for each resolved market in `wanted`.
+    /// Winner: `Some(0)` = YES won, `Some(1)` = NO won, `None` = voided.
     pub async fn fetch_resolutions(
         &self,
         wanted: &HashSet<String>,
         last_resolved_at: i64,
+        namespace: Option<&str>,
     ) -> Result<Vec<(String, Option<u8>, i64)>, BootstrapError> {
-        let sql = render_resolution_sql(last_resolved_at);
-        let execution_id = self.execute_sql(&sql).await?;
-        let rows = self.wait_for_results(&execution_id).await?;
-        let parsed = parse_resolution_rows(rows);
-        Ok(parsed
-            .into_iter()
-            .filter(|(id, _, _)| wanted.contains(id.as_str()))
-            .collect())
+        if let Some(ns) = namespace {
+            self.upload_market_ids(ns, wanted).await?;
+            let sql = render_resolution_sql_with_join(ns, last_resolved_at);
+            let execution_id = self.execute_sql(&sql).await?;
+            let rows = self.wait_for_results(&execution_id).await?;
+            Ok(parse_resolution_rows(rows))
+        } else {
+            let sql = render_resolution_sql(last_resolved_at);
+            let execution_id = self.execute_sql(&sql).await?;
+            let rows = self.wait_for_results(&execution_id).await?;
+            let parsed = parse_resolution_rows(rows);
+            Ok(parsed
+                .into_iter()
+                .filter(|(id, _, _)| wanted.contains(id.as_str()))
+                .collect())
+        }
+    }
+
+    /// Upload market condition IDs to a Dune user table for the JOIN resolution path.
+    ///
+    /// Flow: DELETE (ignore 404) → CREATE → INSERT CSV.
+    /// Dune requires an explicit CREATE before INSERT; DELETE + re-CREATE ensures
+    /// repeated runs replace stale rows rather than accumulating them.
+    async fn upload_market_ids(
+        &self,
+        namespace: &str,
+        ids: &HashSet<String>,
+    ) -> Result<(), BootstrapError> {
+        // 1. Delete any existing table (ignore errors — 404 on first run is expected).
+        let table_url = format!("{}/table/{namespace}/{RESOLUTION_TABLE}", self.base_url);
+        let _ = self
+            .client
+            .delete(&table_url)
+            .header("X-DUNE-API-KEY", &self.api_key)
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .send()
+            .await;
+
+        // 2. Create the table with a single varchar column.
+        #[derive(serde::Serialize)]
+        struct ColDef {
+            name: &'static str,
+            #[serde(rename = "type")]
+            ty: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct CreateBody {
+            namespace: String,
+            table_name: &'static str,
+            schema: Vec<ColDef>,
+            is_private: bool,
+        }
+        let create_body = CreateBody {
+            namespace: namespace.to_owned(),
+            table_name: RESOLUTION_TABLE,
+            schema: vec![ColDef {
+                name: "condition_id",
+                ty: "varchar",
+            }],
+            is_private: false,
+        };
+        let create_url = format!("{}/table/create", self.base_url);
+        let create_resp = self
+            .client
+            .post(&create_url)
+            .header("X-DUNE-API-KEY", &self.api_key)
+            .json(&create_body)
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(|e| BootstrapError::Dune {
+                message: format!("upload_market_ids CREATE failed: {e}"),
+            })?;
+        let create_status = create_resp.status().as_u16();
+        if create_status >= 400 {
+            let bytes = create_resp.bytes().await.unwrap_or_default();
+            return Err(BootstrapError::Dune {
+                message: format!(
+                    "upload_market_ids CREATE HTTP {create_status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                ),
+            });
+        }
+
+        // 3. Insert all rows as CSV.
+        let mut csv = String::with_capacity(ids.len() * 68);
+        csv.push_str("condition_id\n");
+        for id in ids {
+            csv.push_str(id);
+            csv.push('\n');
+        }
+
+        let insert_url = format!(
+            "{}/table/{namespace}/{RESOLUTION_TABLE}/insert",
+            self.base_url
+        );
+        let resp = self
+            .client
+            .post(&insert_url)
+            .header("X-DUNE-API-KEY", &self.api_key)
+            .header("Content-Type", "text/csv")
+            .body(csv)
+            .timeout(Duration::from_secs(TABLE_UPLOAD_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(|e| BootstrapError::Dune {
+                message: format!("upload_market_ids INSERT failed: {e}"),
+            })?;
+
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            return Err(BootstrapError::Dune {
+                message: format!(
+                    "upload_market_ids INSERT HTTP {status}: {}",
+                    String::from_utf8_lossy(&bytes)
+                ),
+            });
+        }
+
+        tracing::info!(
+            count = ids.len(),
+            namespace,
+            table = RESOLUTION_TABLE,
+            "dune: market ID lookup table uploaded"
+        );
+        Ok(())
     }
 
     /// Submit SQL for direct execution without creating a stored query.

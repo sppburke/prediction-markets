@@ -33,6 +33,13 @@ pub struct BacktestConfig {
     pub step_days: u32,
     /// `PE_ETHERSCAN_API_KEY` — required for Phase 0 funder discovery.
     pub etherscan_api_key: Option<String>,
+    /// `PE_DUNE_API_KEY` — when set, fetches on-chain market resolutions from
+    /// `ctf_evt_conditionresolution` before running the simulation.
+    pub dune_api_key: Option<String>,
+    /// `PE_DUNE_NAMESPACE` — Dune username (e.g. `apexurellc`). When set, the resolution
+    /// fetch uploads market IDs as a lookup table and uses a server-side JOIN so only
+    /// the caller's markets are returned, greatly reducing credit cost.
+    pub dune_namespace: Option<String>,
     /// Trade lookback window for ledger reconstruction (default: 90 days).
     pub audit_window_days: u32,
     // ── Ranker eligibility overrides (backtest-specific defaults) ──────────────
@@ -71,6 +78,8 @@ impl BacktestConfig {
             bankroll_usd: optional_parse("PE_BANKROLL_USD", Decimal::from(10_000u32)),
             step_days: optional_parse("PE_BACKTEST_STEP_DAYS", DEFAULT_STEP_DAYS),
             etherscan_api_key: std::env::var("PE_ETHERSCAN_API_KEY").ok(),
+            dune_api_key: std::env::var("PE_DUNE_API_KEY").ok(),
+            dune_namespace: std::env::var("PE_DUNE_NAMESPACE").ok(),
             audit_window_days: optional_parse(
                 "PE_BACKTEST_AUDIT_WINDOW_DAYS",
                 DEFAULT_AUDIT_WINDOW_DAYS,

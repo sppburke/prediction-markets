@@ -138,6 +138,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         bankroll_usd: Decimal::from(10_000u32),
         step_days: 1,
         etherscan_api_key: None,
+        dune_api_key: None,
+        dune_namespace: None,
         audit_window_days: 365,
         ranker_min_quality: 0,
         ranker_active_min_closed: 60,
