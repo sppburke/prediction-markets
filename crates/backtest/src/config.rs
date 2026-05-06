@@ -75,10 +75,7 @@ impl BacktestConfig {
                 "PE_BACKTEST_AUDIT_WINDOW_DAYS",
                 DEFAULT_AUDIT_WINDOW_DAYS,
             ),
-            ranker_min_quality: optional_parse(
-                "PE_BACKTEST_MIN_QUALITY",
-                DEFAULT_BT_MIN_QUALITY,
-            ),
+            ranker_min_quality: optional_parse("PE_BACKTEST_MIN_QUALITY", DEFAULT_BT_MIN_QUALITY),
             ranker_active_min_closed: optional_parse(
                 "PE_BACKTEST_ACTIVE_MIN_CLOSED",
                 DEFAULT_BT_ACTIVE_MIN_CLOSED,
