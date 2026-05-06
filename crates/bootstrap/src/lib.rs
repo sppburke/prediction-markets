@@ -527,22 +527,34 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     }
 
     //    b) Dune on-chain (`ctf_evt_conditionresolution`) — covers all markets including
-    //       financial/quantitative markets absent from Gamma. Single timestamp-bounded
-    //       query; results filtered client-side to known market IDs.
+    //       financial/quantitative markets absent from Gamma. Queries from epoch (cursor=0)
+    //       so newly-discovered wallets' markets that resolved before any prior run's cursor
+    //       are never silently skipped. Filtered client-side to unresolved markets only;
+    //       INSERT OR IGNORE makes repeated runs idempotent.
     if let Some(api_key) = &config.dune_api_key {
-        let last_resolved_at = cache.max_resolved_at_unix()?;
-        let dune_resolution_client = DuneClient::new(api_key.clone());
-        let wanted: HashSet<String> = cache.all_market_ids().into_iter().collect();
-        let rows = dune_resolution_client
-            .fetch_resolutions(&wanted, last_resolved_at)
-            .await?;
-        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-        let mut inserted = 0usize;
-        for (market_id, winner, resolved_at_unix) in rows {
-            cache.insert_resolution(&market_id, winner, resolved_at_unix, fetched_at)?;
-            inserted += 1;
+        let all_market_ids: HashSet<String> = cache.all_market_ids().into_iter().collect();
+        let already_resolved = cache.resolved_market_ids();
+        let unresolved: HashSet<String> = all_market_ids
+            .difference(&already_resolved)
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            let dune_resolution_client = DuneClient::new(api_key.clone());
+            let rows = dune_resolution_client
+                .fetch_resolutions(&unresolved, 0)
+                .await?;
+            let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+            let mut inserted = 0usize;
+            for (market_id, winner, resolved_at_unix) in rows {
+                cache.insert_resolution(&market_id, winner, resolved_at_unix, fetched_at)?;
+                inserted += 1;
+            }
+            tracing::info!(
+                inserted,
+                unresolved = unresolved.len(),
+                "bootstrap: dune resolutions fetched"
+            );
         }
-        tracing::info!(inserted, "bootstrap: dune resolutions fetched");
     }
 
     // Write output.

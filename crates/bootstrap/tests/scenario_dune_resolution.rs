@@ -237,3 +237,43 @@ fn normalised_condition_id_matches_trade_cache_format() {
         "0x-prefixed normalised condition ID must be retrievable from resolution index"
     );
 }
+
+// ── Scenario 9 ────────────────────────────────────────────────────────────────
+//
+// PASS: markets already present in `resolved_market_ids` are correctly identified
+//       as not needing re-fetch. The unresolved set (all_market_ids -
+//       resolved_market_ids) is empty when every known market has a resolution.
+//       This is the invariant the lib.rs wiring uses to skip the Dune query
+//       on subsequent runs when nothing is new.
+// FAIL: `resolved_market_ids` omits a previously-inserted market, causing a
+//       spurious re-fetch on the next run.
+
+#[test]
+fn resolved_market_ids_covers_all_inserted_markets() {
+    let dir = TempDir::new().unwrap();
+    let mut cache = tmp_cache(&dir);
+
+    let markets = ["0xcond_a", "0xcond_b", "0xcond_c"];
+    for m in markets {
+        cache
+            .insert_resolution(m, Some(0), 1_700_001_000, 1_700_002_000)
+            .unwrap();
+    }
+
+    let resolved = cache.resolved_market_ids();
+    for m in markets {
+        assert!(
+            resolved.contains(m),
+            "resolved_market_ids must contain {m} after insertion"
+        );
+    }
+
+    // Simulate the unresolved-set computation from lib.rs step 6b.
+    let all: std::collections::HashSet<&str> = markets.iter().copied().collect();
+    let unresolved: Vec<&&str> = all.iter().filter(|id| !resolved.contains(**id)).collect();
+    assert!(
+        unresolved.is_empty(),
+        "unresolved set must be empty when every known market has a resolution — \
+         would cause a spurious Dune query on the next run"
+    );
+}
