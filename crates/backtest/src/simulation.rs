@@ -380,9 +380,7 @@ pub fn run_simulation(
                     if let Some(max_hours) = config.max_hours_to_expiry {
                         let max_secs = i64::from(max_hours) * 3600;
                         match resolutions.get(&trade.market_id) {
-                            Some(res)
-                                if res.resolved_at_unix - sim_date_unix > max_secs =>
-                            {
+                            Some(res) if res.resolved_at_unix - sim_date_unix > max_secs => {
                                 continue;
                             }
                             None => continue, // Unknown resolution — can't confirm expiry window.
