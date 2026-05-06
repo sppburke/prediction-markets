@@ -1,9 +1,15 @@
 //! Permanent wallet trade-history cache — SQLite (WAL mode), no TTL.
 //!
-//! Single `trades` table with `(wallet_hex, timestamp_unix)` index. WAL mode
-//! provides per-commit durability — no atomic-rename or checkpoint batching is
-//! needed. Per-wallet streaming reads keep peak memory bounded.
+//! Two tables:
+//! - `trades` — append-only per-trade rows, indexed by `(wallet_hex, timestamp_unix)`.
+//! - `leaderboard_snapshots` — `(snapshot_at_unix, wallet_hex)` rows, one row-set per
+//!   `pe-bootstrap` run, written from the post-filtered watchlist. Read by
+//!   `pe-backtest` to constrain the candidate pool at each simulated week boundary.
+//!
+//! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
+//! is needed. Per-wallet streaming reads keep peak memory bounded.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -37,6 +43,13 @@ CREATE TABLE IF NOT EXISTS trades (
     timestamp_unix  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix);
+
+CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+    snapshot_at_unix INTEGER NOT NULL,
+    wallet_hex       TEXT    NOT NULL,
+    PRIMARY KEY (snapshot_at_unix, wallet_hex)
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_at ON leaderboard_snapshots(snapshot_at_unix);
 ";
 
 /// Permanent wallet trade-history cache backed by SQLite.
@@ -227,6 +240,179 @@ impl WalletCache {
             .ok()
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0)
+    }
+
+    /// Insert a leaderboard snapshot: for a given `snapshot_at_unix`, record every wallet
+    /// in `wallets`. Idempotent on `(snapshot_at_unix, wallet_hex)` — re-running with the
+    /// same inputs is a no-op via `INSERT OR IGNORE`.
+    pub fn insert_snapshot(
+        &mut self,
+        snapshot_at_unix: i64,
+        wallets: &[WalletAddress],
+    ) -> Result<(), BootstrapError> {
+        if wallets.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO leaderboard_snapshots \
+                 (snapshot_at_unix, wallet_hex) VALUES (?1, ?2)",
+            )?;
+            for wallet in wallets {
+                stmt.execute(params![snapshot_at_unix, wallet.to_string()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return the most-recent snapshot at or before `sim_date_unix`.
+    ///
+    /// Returns `Ok(None)` when no snapshot exists at or before that date (i.e. the
+    /// simulation date precedes the first seeded snapshot, or the table is empty).
+    /// Returns `Ok(Some((snapshot_at_unix, wallets)))` otherwise.
+    pub fn snapshot_for_date(
+        &self,
+        sim_date_unix: i64,
+    ) -> Result<Option<(i64, Vec<WalletAddress>)>, BootstrapError> {
+        // Resolve to the most-recent snapshot timestamp ≤ sim_date_unix.
+        let snapshot_at: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(snapshot_at_unix) FROM leaderboard_snapshots \
+                 WHERE snapshot_at_unix <= ?1",
+                params![sim_date_unix],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        let Some(at) = snapshot_at else {
+            return Ok(None);
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT wallet_hex FROM leaderboard_snapshots \
+             WHERE snapshot_at_unix = ?1 ORDER BY wallet_hex",
+        )?;
+        let mut wallets = Vec::new();
+        let rows = stmt.query_map(params![at], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let hex = row?;
+            // Skip unparseable rows defensively; insertion path validates, so this is
+            // only reachable through external DB tampering.
+            if let Ok(addr) = WalletAddress::from_hex(&hex) {
+                wallets.push(addr);
+            }
+        }
+        Ok(Some((at, wallets)))
+    }
+
+    /// Return every snapshot timestamp present in the cache, ascending.
+    /// Useful for diagnostics and for the historical seed driver to detect already-seeded dates.
+    pub fn all_snapshot_dates(&self) -> Result<Vec<i64>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT snapshot_at_unix FROM leaderboard_snapshots \
+             ORDER BY snapshot_at_unix ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Load every snapshot row in the cache into an in-memory [`LeaderboardSnapshots`].
+    ///
+    /// Used by `pe-backtest` at simulation startup so the per-day filter can be
+    /// applied without round-tripping to SQLite on every iteration. Returns an
+    /// empty index when the table has no rows.
+    pub fn load_all_snapshots(&self) -> Result<LeaderboardSnapshots, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT snapshot_at_unix, wallet_hex FROM leaderboard_snapshots \
+             ORDER BY snapshot_at_unix ASC, wallet_hex ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let at: i64 = r.get(0)?;
+            let hex: String = r.get(1)?;
+            Ok((at, hex))
+        })?;
+        let mut entries: Vec<(i64, HashSet<WalletAddress>)> = Vec::new();
+        for row in rows {
+            let (at, hex) = row?;
+            let Ok(addr) = WalletAddress::from_hex(&hex) else {
+                continue;
+            };
+            match entries.last_mut() {
+                Some((last_at, set)) if *last_at == at => {
+                    set.insert(addr);
+                }
+                _ => {
+                    let mut set = HashSet::new();
+                    set.insert(addr);
+                    entries.push((at, set));
+                }
+            }
+        }
+        Ok(LeaderboardSnapshots { entries })
+    }
+}
+
+/// In-memory index of every leaderboard snapshot in the cache, sorted ascending.
+///
+/// Built once via [`WalletCache::load_all_snapshots`]; the backtest then queries
+/// [`LeaderboardSnapshots::for_date`] per simulated day. The internal layout is a
+/// sorted `Vec` rather than a `BTreeMap` because lookups are sequential by date
+/// in the simulation and a binary search is sufficient at current snapshot counts
+/// (typically 8–52 per cache).
+#[derive(Debug, Default, Clone)]
+pub struct LeaderboardSnapshots {
+    /// `(snapshot_at_unix, wallet set)` ascending by `snapshot_at_unix`.
+    entries: Vec<(i64, HashSet<WalletAddress>)>,
+}
+
+impl LeaderboardSnapshots {
+    /// True when no snapshots exist (the backtest's fallback path applies).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Return the wallet set for the most-recent snapshot at or before `sim_date_unix`,
+    /// or `None` when the simulation date precedes the first seeded snapshot.
+    pub fn for_date(&self, sim_date_unix: i64) -> Option<&HashSet<WalletAddress>> {
+        // partition_point finds the index of the first entry strictly greater than
+        // sim_date_unix; the most-recent snapshot ≤ sim_date is at idx-1.
+        let idx = self.entries.partition_point(|(at, _)| *at <= sim_date_unix);
+        if idx == 0 {
+            None
+        } else {
+            self.entries.get(idx - 1).map(|(_, set)| set)
+        }
+    }
+
+    /// Number of snapshots in the index. For diagnostics and tests.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Construct from raw `(unix, wallets)` pairs. Used by tests and the backtest's
+    /// in-memory fallback paths so the filter can be exercised without a SQLite file.
+    /// Pairs are sorted internally and duplicate timestamps are merged.
+    pub fn from_pairs(mut pairs: Vec<(i64, Vec<WalletAddress>)>) -> Self {
+        pairs.sort_by_key(|(at, _)| *at);
+        let mut entries: Vec<(i64, HashSet<WalletAddress>)> = Vec::with_capacity(pairs.len());
+        for (at, wallets) in pairs {
+            match entries.last_mut() {
+                Some((last_at, set)) if *last_at == at => {
+                    set.extend(wallets);
+                }
+                _ => {
+                    entries.push((at, wallets.into_iter().collect()));
+                }
+            }
+        }
+        Self { entries }
     }
 }
 
@@ -420,6 +606,116 @@ mod tests {
         cache.insert_new(&wallet.to_string(), vec![]).unwrap();
         assert_eq!(cache.trade_count(), 0);
         assert_eq!(cache.wallet_count(), 0);
+    }
+
+    // ── leaderboard_snapshots tests ───────────────────────────────────────────
+
+    #[test]
+    fn fresh_cache_has_no_snapshots() {
+        let dir = TempDir::new().unwrap();
+        let cache = tmp_cache(&dir);
+        assert!(cache.all_snapshot_dates().unwrap().is_empty());
+        assert!(cache.snapshot_for_date(1_704_067_200).unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_snapshot_persists_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        cache.insert_snapshot(1_700_000_000, &[w1, w2]).unwrap();
+        let dates = cache.all_snapshot_dates().unwrap();
+        assert_eq!(dates, vec![1_700_000_000]);
+
+        let (at, wallets) = cache.snapshot_for_date(1_700_000_000).unwrap().unwrap();
+        assert_eq!(at, 1_700_000_000);
+        assert_eq!(wallets.len(), 2);
+        assert!(wallets.contains(&w1));
+        assert!(wallets.contains(&w2));
+    }
+
+    #[test]
+    fn insert_snapshot_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        cache.insert_snapshot(1_700_000_000, &[w1]).unwrap();
+        cache.insert_snapshot(1_700_000_000, &[w1]).unwrap();
+        let (_, wallets) = cache.snapshot_for_date(1_700_000_000).unwrap().unwrap();
+        assert_eq!(wallets.len(), 1, "duplicate insert must not double-count");
+    }
+
+    #[test]
+    fn snapshot_for_date_returns_most_recent_at_or_before() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let w3 = addr("0xcccccccccccccccccccccccccccccccccccccccc");
+
+        cache.insert_snapshot(1_700_000_000, &[w1]).unwrap(); // week 1
+        cache.insert_snapshot(1_700_604_800, &[w2]).unwrap(); // week 2 (+7 days)
+        cache.insert_snapshot(1_701_209_600, &[w3]).unwrap(); // week 3 (+14 days)
+
+        // Exactly on a boundary returns that snapshot.
+        let (at, w) = cache.snapshot_for_date(1_700_604_800).unwrap().unwrap();
+        assert_eq!(at, 1_700_604_800);
+        assert_eq!(w, vec![w2]);
+
+        // Between week 2 and week 3 returns week 2.
+        let mid = 1_700_604_800 + 86_400; // +1 day after week 2
+        let (at, w) = cache.snapshot_for_date(mid).unwrap().unwrap();
+        assert_eq!(at, 1_700_604_800);
+        assert_eq!(w, vec![w2]);
+
+        // After all snapshots returns the latest.
+        let after = 1_701_209_600 + 86_400 * 30;
+        let (at, w) = cache.snapshot_for_date(after).unwrap().unwrap();
+        assert_eq!(at, 1_701_209_600);
+        assert_eq!(w, vec![w3]);
+
+        // Before the first snapshot returns None.
+        let before = 1_700_000_000 - 1;
+        assert!(cache.snapshot_for_date(before).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        {
+            let mut cache = WalletCache::open(&path).unwrap();
+            cache.insert_snapshot(1_700_000_000, &[w1]).unwrap();
+        }
+        let cache2 = WalletCache::open(&path).unwrap();
+        assert_eq!(cache2.all_snapshot_dates().unwrap(), vec![1_700_000_000]);
+    }
+
+    #[test]
+    fn empty_snapshot_insert_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache.insert_snapshot(1_700_000_000, &[]).unwrap();
+        assert!(cache.all_snapshot_dates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_table_is_independent_of_trades() {
+        // Adding snapshots must not alter trade rows or wallet counts.
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        cache
+            .insert_new(&w1.to_string(), vec![make_trade("0xtx1", w1, 1_000_000)])
+            .unwrap();
+        cache.insert_snapshot(1_700_000_000, &[w1]).unwrap();
+        assert_eq!(cache.trade_count(), 1);
+        assert_eq!(cache.wallet_count(), 1);
+        assert_eq!(cache.all_snapshot_dates().unwrap().len(), 1);
     }
 
     #[test]

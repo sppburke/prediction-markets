@@ -333,6 +333,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     let dune = DuneClient::new(api_key);
                     let found = dune
                         .discover_wallets(
+                            OffsetDateTime::now_utc(),
                             config.dune_min_closed_markets,
                             config.dune_min_win_rate_pct,
                             config.dune_active_window_days,
@@ -469,6 +470,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         active_window_days: config.post_filter_active_window_days,
         max_avg_hours_to_resolution: config.post_filter_max_avg_hours_to_resolution,
     };
+    let snapshot_at_for_db = snapshot_at.clone();
     let watchlist = build_seed_watchlist(ledgers, snapshot_at, &filter);
     tracing::info!(
         active = watchlist.active_count,
@@ -476,10 +478,102 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         "bootstrap: watchlist built"
     );
 
+    // Persist a leaderboard snapshot row-set: (snapshot_at_unix, wallet) for every
+    // wallet that survived the post-filter. Read by the backtest's walk-forward
+    // simulation to constrain its candidate pool to wallets that *would have been*
+    // visible to the live system at this point in time.
+    let snapshot_wallets: Vec<WalletAddress> = watchlist.entries.iter().map(|e| e.wallet).collect();
+    cache.insert_snapshot(snapshot_at_for_db.0.unix_timestamp(), &snapshot_wallets)?;
+    tracing::info!(
+        snapshot_at = snapshot_at_for_db.0.unix_timestamp(),
+        wallets = snapshot_wallets.len(),
+        "bootstrap: leaderboard snapshot persisted"
+    );
+
     // Write output.
     write_watchlist(&watchlist, &config.output_path)?;
 
     Ok(watchlist)
+}
+
+/// Seed historical leaderboard snapshots for a list of past `as_of` UTC midnights.
+///
+/// Runs the parameterized Dune `discover_wallets` query once per date and inserts
+/// the resulting wallet set into `leaderboard_snapshots`. Idempotent: re-running
+/// with overlapping dates is safe (PRIMARY KEY collision = silent skip).
+///
+/// Requires `dune_api_key`. The other Dune filter parameters mirror the live path
+/// — they're sourced from the same config so historical snapshots use identical
+/// quality filters to what the live system would have used at that time.
+pub async fn seed_historical_snapshots(
+    config: &BootstrapConfig,
+    as_of_dates: &[OffsetDateTime],
+) -> Result<usize, BootstrapError> {
+    let api_key = config
+        .dune_api_key
+        .clone()
+        .ok_or_else(|| BootstrapError::MissingEnv("PE_DUNE_API_KEY".to_owned()))?;
+    let dune = DuneClient::new(api_key);
+    let mut cache = WalletCache::open(&config.cache_path)?;
+
+    let already_seeded: std::collections::HashSet<i64> =
+        cache.all_snapshot_dates()?.into_iter().collect();
+
+    let mut total_rows: usize = 0;
+    for as_of in as_of_dates {
+        let unix = as_of.unix_timestamp();
+        if already_seeded.contains(&unix) {
+            tracing::info!(
+                as_of_unix = unix,
+                as_of = %as_of,
+                "bootstrap: snapshot already present — skipping"
+            );
+            continue;
+        }
+        tracing::info!(
+            as_of_unix = unix,
+            as_of = %as_of,
+            "bootstrap: seeding historical snapshot via dune"
+        );
+        let wallets = dune
+            .discover_wallets(
+                *as_of,
+                config.dune_min_closed_markets,
+                config.dune_min_win_rate_pct,
+                config.dune_active_window_days,
+                config.dune_max_avg_hours_to_resolution,
+            )
+            .await?;
+        cache.insert_snapshot(unix, &wallets)?;
+        total_rows += wallets.len();
+        tracing::info!(
+            as_of_unix = unix,
+            wallets = wallets.len(),
+            "bootstrap: snapshot inserted"
+        );
+    }
+    Ok(total_rows)
+}
+
+/// Parse `PE_SEED_AS_OF_DATES`: comma-separated `YYYY-MM-DD` UTC dates.
+///
+/// Returns `Ok(Vec::new())` when the variable is unset or empty (caller treats this
+/// as "no seeding requested"). Whitespace around each entry is trimmed; empty
+/// entries (e.g. trailing comma) are skipped.
+pub fn parse_seed_as_of_env(value: &str) -> Result<Vec<OffsetDateTime>, BootstrapError> {
+    let mut out = Vec::new();
+    for raw in value.split(',') {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let date = time::Date::parse(s, &time::format_description::well_known::Iso8601::DATE)
+            .map_err(|e| BootstrapError::Config {
+                message: format!("PE_SEED_AS_OF_DATES `{s}`: {e}"),
+            })?;
+        out.push(date.midnight().assume_utc());
+    }
+    Ok(out)
 }
 
 /// Fetch the current Polygon chain head block number from Etherscan.

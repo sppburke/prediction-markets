@@ -541,6 +541,24 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_wallet_from_block` | `CTF_EXCHANGE_V1_DEPLOY_BLOCK` (33_605_403) | Start block for Etherscan wallet scan; set via `PE_WALLET_FROM_BLOCK` |
 | `bootstrap_wallet_to_block` | current chain head | End block for Etherscan wallet scan; set via `PE_WALLET_TO_BLOCK` (fetched from Etherscan if absent) |
 | `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to the enumerated wallet address list. If the file exists, Etherscan/Dune enumeration is skipped entirely. Delete the file to force a fresh scan; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
+| `bootstrap_seed_as_of_dates` | unset | Comma-separated `YYYY-MM-DD` UTC dates. When set, `pe-bootstrap` switches to historical-seed mode: runs the parameterized Dune query for each date and inserts the results into `leaderboard_snapshots`. Idempotent on `(snapshot_at_unix, wallet_hex)`. Mutually exclusive with the regular pipeline. Set via `PE_SEED_AS_OF_DATES`. |
+
+#### Leaderboard snapshots (`leaderboard_snapshots` table)
+
+Persists weekly leaderboard state in `wallet_cache.db`. One row-set per `pe-bootstrap` run (live path uses `as_of = NOW()`; historical seed path uses each date in `PE_SEED_AS_OF_DATES`). Read by `pe-backtest` at simulation startup to constrain the candidate-wallet pool at each weekly boundary.
+
+Schema:
+```sql
+CREATE TABLE leaderboard_snapshots (
+    snapshot_at_unix INTEGER NOT NULL,
+    wallet_hex       TEXT    NOT NULL,
+    PRIMARY KEY (snapshot_at_unix, wallet_hex)
+);
+```
+
+**Look-ahead invariant.** The Dune wallet-discovery SQL is parameterized with an `as_of` cutoff that fences three forward-looking surfaces: the `resolved` CTE (resolutions before `as_of` only), the `recently_active` CTE (trades in `[as_of - active_window, as_of)`), and the `wallet_condition` join (trades before `as_of` only). Without all three, a snapshot taken "as of" a past date would still leak future market outcomes through the win-rate computation. Verified by `tests::rendered_sql_fences_all_three_forward_surfaces` and `tests::rendered_sql_contains_no_now_call` in `crates/bootstrap/src/dune.rs`.
+
+**Backtest semantics.** At each simulated day `D`, the simulation looks up the most-recent snapshot ≤ `D` and filters reconstructed `TraderLedger`s to that wallet set BEFORE the ranker groups by operator. Strict (wallet-level) filter: even if wallet `X` shares an `operator_id` with `Y, Z` that are in the snapshot, `X`'s ledger does not contribute to the operator group's score because we wouldn't have known about `X` that week. When the table is empty the simulation falls back to "all wallets in trade history" with a single warning at start (legacy behavior; survivorship-biased).
 
 ### Backtest defaults (`pe-backtest`)
 

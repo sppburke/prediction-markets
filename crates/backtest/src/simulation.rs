@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
+use pe_bootstrap::cache::LeaderboardSnapshots;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, LeaderAction, MarketId, OperatorId, OutcomeId, Probability, ProbabilityPpm,
@@ -93,11 +94,18 @@ impl ExposureTracker {
 
 /// Run the walk-forward simulation and produce a `WinnerFollowReport`.
 ///
+/// `snapshots` constrains the candidate-wallet pool at each weekly boundary to
+/// match what the live system would have seen at that point in time. When
+/// [`LeaderboardSnapshots::is_empty`] is true the simulation falls back to
+/// "all wallets present in the trade history" with a single warning log —
+/// preserves backwards compatibility with caches predating the snapshots feature.
+///
 /// Writes `report.json` and `trades.ndjson` to `config.output_dir`.
 pub fn run_simulation(
     config: &BacktestConfig,
     mut all_trades: Vec<RawTrade>,
     operator_identities: Vec<OperatorIdentity>,
+    snapshots: &LeaderboardSnapshots,
     ranker_config: &RankerConfig,
     ledger_config: &LedgerConfig,
     strategy: &WinnerFollowStrategy,
@@ -113,6 +121,19 @@ pub fn run_simulation(
 
     if all_trades.is_empty() {
         return Err(BacktestError::Internal("no trades in cache".to_owned()));
+    }
+
+    // Backwards-compatibility fallback. Caches predating the snapshots feature
+    // (or fresh caches that have never been bootstrapped) have no leaderboard
+    // rows; in that mode the simulation runs with the full wallet history,
+    // which is survivorship-biased. Surfaced as a single warning so it isn't
+    // missed in long runs but doesn't spam per-day.
+    if snapshots.is_empty() {
+        tracing::warn!(
+            "no leaderboard snapshots available — running with full wallet history; \
+             results subject to survivorship bias. Run pe-bootstrap to populate \
+             leaderboard_snapshots."
+        );
     }
 
     // Collect unique simulation dates.
@@ -197,11 +218,38 @@ pub fn run_simulation(
             audit_window_days: config.audit_window_days,
         };
         let ledgers = build_trader_ledgers(&snapshot, &operator_identities, ledger_config);
-        let watchlist = build_watchlist(&ledgers, snapshot.snapshot_at.clone(), ranker_config);
+
+        // Constrain the candidate pool to wallets present in the most-recent
+        // leaderboard snapshot ≤ sim_date. Wallet-level filter applied BEFORE
+        // operator grouping inside build_watchlist — strict "we didn't know
+        // about this wallet at week T" semantics. When snapshots are absent
+        // the filter degrades to a no-op (warned at start).
+        let filtered_ledgers: Vec<TraderLedger> = if snapshots.is_empty() {
+            ledgers
+        } else {
+            match snapshots.for_date(ranker_cutoff_unix) {
+                Some(pool) => ledgers
+                    .into_iter()
+                    .filter(|l| pool.contains(&l.wallet))
+                    .collect(),
+                // Simulation date precedes the first seeded snapshot — no candidates yet.
+                None => Vec::new(),
+            }
+        };
+
+        if filtered_ledgers.is_empty() {
+            continue;
+        }
+
+        let watchlist = build_watchlist(
+            &filtered_ledgers,
+            snapshot.snapshot_at.clone(),
+            ranker_config,
+        );
 
         // Build wallet → ledger map for O(1) win-rate lookup.
         let ledger_by_wallet: HashMap<WalletAddress, &TraderLedger> =
-            ledgers.iter().map(|l| (l.wallet, l)).collect();
+            filtered_ledgers.iter().map(|l| (l.wallet, l)).collect();
 
         // Build wallet → reconstruction quality map from watchlist entries.
         let quality_by_wallet: HashMap<WalletAddress, ReconstructionQuality> = watchlist
