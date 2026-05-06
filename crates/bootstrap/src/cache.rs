@@ -242,25 +242,38 @@ impl WalletCache {
             .unwrap_or(0)
     }
 
+    /// Sentinel `wallet_hex` written when a snapshot is inserted with no qualifying wallets.
+    /// Reads filter it out via `WalletAddress::from_hex` parse failure (empty string is not
+    /// a valid hex address), so the date appears in `all_snapshot_dates` and `snapshot_for_date`
+    /// returns `Some((at, []))` rather than falling through to the prior week.
+    const EMPTY_SNAPSHOT_SENTINEL: &str = "";
+
     /// Insert a leaderboard snapshot: for a given `snapshot_at_unix`, record every wallet
     /// in `wallets`. Idempotent on `(snapshot_at_unix, wallet_hex)` — re-running with the
     /// same inputs is a no-op via `INSERT OR IGNORE`.
+    ///
+    /// When `wallets` is empty, a sentinel row with `wallet_hex = ""` is written so the
+    /// date is still recorded as "seeded but empty" — distinct from "never seeded". This
+    /// prevents the historical-seed driver from re-querying Dune for empty weeks on every
+    /// re-run, and lets the backtest distinguish "no wallets qualified that week" (apply
+    /// empty-pool semantics) from "no snapshot for this week" (fall back to prior).
     pub fn insert_snapshot(
         &mut self,
         snapshot_at_unix: i64,
         wallets: &[WalletAddress],
     ) -> Result<(), BootstrapError> {
-        if wallets.is_empty() {
-            return Ok(());
-        }
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO leaderboard_snapshots \
                  (snapshot_at_unix, wallet_hex) VALUES (?1, ?2)",
             )?;
-            for wallet in wallets {
-                stmt.execute(params![snapshot_at_unix, wallet.to_string()])?;
+            if wallets.is_empty() {
+                stmt.execute(params![snapshot_at_unix, Self::EMPTY_SNAPSHOT_SENTINEL])?;
+            } else {
+                for wallet in wallets {
+                    stmt.execute(params![snapshot_at_unix, wallet.to_string()])?;
+                }
             }
         }
         tx.commit()?;
@@ -328,6 +341,10 @@ impl WalletCache {
     /// Used by `pe-backtest` at simulation startup so the per-day filter can be
     /// applied without round-tripping to SQLite on every iteration. Returns an
     /// empty index when the table has no rows.
+    ///
+    /// Empty-week anchors (sentinel rows, see [`Self::EMPTY_SNAPSHOT_SENTINEL`])
+    /// produce an entry with an empty wallet set so the backtest can correctly
+    /// apply "no candidates this week" semantics rather than falling through.
     pub fn load_all_snapshots(&self) -> Result<LeaderboardSnapshots, BootstrapError> {
         let mut stmt = self.conn.prepare(
             "SELECT snapshot_at_unix, wallet_hex FROM leaderboard_snapshots \
@@ -341,18 +358,15 @@ impl WalletCache {
         let mut entries: Vec<(i64, HashSet<WalletAddress>)> = Vec::new();
         for row in rows {
             let (at, hex) = row?;
-            let Ok(addr) = WalletAddress::from_hex(&hex) else {
-                continue;
-            };
-            match entries.last_mut() {
-                Some((last_at, set)) if *last_at == at => {
-                    set.insert(addr);
-                }
-                _ => {
-                    let mut set = HashSet::new();
-                    set.insert(addr);
-                    entries.push((at, set));
-                }
+            // Ensure an entry exists for `at` even when the only row is the empty-week
+            // sentinel (or any unparseable hex, defensively).
+            if entries.last().is_none_or(|(last_at, _)| *last_at != at) {
+                entries.push((at, HashSet::new()));
+            }
+            if let Ok(addr) = WalletAddress::from_hex(&hex)
+                && let Some((_, set)) = entries.last_mut()
+            {
+                set.insert(addr);
             }
         }
         Ok(LeaderboardSnapshots { entries })
@@ -696,11 +710,52 @@ mod tests {
     }
 
     #[test]
-    fn empty_snapshot_insert_is_noop() {
+    fn empty_snapshot_insert_records_anchor_with_no_wallets() {
+        // Distinguishing "no qualifying wallets that week" from "never seeded" is
+        // load-bearing for the historical-seed driver and the backtest filter — see
+        // EMPTY_SNAPSHOT_SENTINEL doc above. An empty insert must persist the date.
         let dir = TempDir::new().unwrap();
         let mut cache = tmp_cache(&dir);
         cache.insert_snapshot(1_700_000_000, &[]).unwrap();
-        assert!(cache.all_snapshot_dates().unwrap().is_empty());
+        assert_eq!(
+            cache.all_snapshot_dates().unwrap(),
+            vec![1_700_000_000],
+            "empty-week anchor must appear in all_snapshot_dates"
+        );
+        let (at, wallets) = cache.snapshot_for_date(1_700_000_000).unwrap().unwrap();
+        assert_eq!(at, 1_700_000_000);
+        assert!(
+            wallets.is_empty(),
+            "empty-week wallet set must be empty (sentinel filtered out)"
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_anchor_blocks_fallthrough_to_prior_week() {
+        // Without the empty-anchor design, a Dune-empty week W2 would silently let
+        // for_date(W2) fall through to W1's pool. The sentinel row prevents that.
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        cache.insert_snapshot(1_700_000_000, &[w1]).unwrap();
+        cache.insert_snapshot(1_700_604_800, &[]).unwrap(); // empty week W2
+
+        let (at, wallets) = cache.snapshot_for_date(1_700_604_800).unwrap().unwrap();
+        assert_eq!(at, 1_700_604_800, "must return W2's anchor, not W1's");
+        assert!(wallets.is_empty(), "W2 was empty — must return empty set");
+    }
+
+    #[test]
+    fn empty_snapshot_load_all_includes_anchor() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache.insert_snapshot(1_700_000_000, &[]).unwrap();
+        let snaps = cache.load_all_snapshots().unwrap();
+        assert_eq!(snaps.len(), 1, "empty-week anchor must appear in index");
+        let pool = snaps.for_date(1_700_000_000);
+        assert!(pool.is_some(), "for_date must resolve the anchor");
+        assert!(pool.unwrap().is_empty(), "wallet set must be empty");
     }
 
     #[test]
