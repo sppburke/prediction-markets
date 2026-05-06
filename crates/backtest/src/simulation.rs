@@ -375,6 +375,21 @@ pub fn run_simulation(
                         continue; // Already tracking this leader's position.
                     }
 
+                    // Time-to-expiry filter: skip trades where the market resolves
+                    // more than max_hours_to_expiry hours after the trade date.
+                    if let Some(max_hours) = config.max_hours_to_expiry {
+                        let max_secs = i64::from(max_hours) * 3600;
+                        match resolutions.get(&trade.market_id) {
+                            Some(res)
+                                if res.resolved_at_unix - sim_date_unix > max_secs =>
+                            {
+                                continue;
+                            }
+                            None => continue, // Unknown resolution — can't confirm expiry window.
+                            _ => {}
+                        }
+                    }
+
                     let fill_price = {
                         let raw = trade.price.0 + slippage;
                         // Clamp to (0, 1).

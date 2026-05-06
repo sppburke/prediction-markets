@@ -122,6 +122,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         etherscan_api_key: None,
         dune_api_key: None,
         dune_namespace: None,
+        max_hours_to_expiry: None,
         audit_window_days: 365,
         ranker_min_quality: 0,
         ranker_active_min_closed: 60,

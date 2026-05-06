@@ -40,6 +40,9 @@ pub struct BacktestConfig {
     /// fetch uploads market IDs as a lookup table and uses a server-side JOIN so only
     /// the caller's markets are returned, greatly reducing credit cost.
     pub dune_namespace: Option<String>,
+    /// `PE_BACKTEST_MAX_HOURS_TO_EXPIRY` — only copy trades where the market resolves
+    /// within this many hours of the trade date. `None` = no filter (default).
+    pub max_hours_to_expiry: Option<u32>,
     /// Trade lookback window for ledger reconstruction (default: 90 days).
     pub audit_window_days: u32,
     // ── Ranker eligibility overrides (backtest-specific defaults) ──────────────
@@ -80,6 +83,9 @@ impl BacktestConfig {
             etherscan_api_key: std::env::var("PE_ETHERSCAN_API_KEY").ok(),
             dune_api_key: std::env::var("PE_DUNE_API_KEY").ok(),
             dune_namespace: std::env::var("PE_DUNE_NAMESPACE").ok(),
+            max_hours_to_expiry: std::env::var("PE_BACKTEST_MAX_HOURS_TO_EXPIRY")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             audit_window_days: optional_parse(
                 "PE_BACKTEST_AUDIT_WINDOW_DAYS",
                 DEFAULT_AUDIT_WINDOW_DAYS,
