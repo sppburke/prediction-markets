@@ -10,6 +10,7 @@ use axum::{Router, routing::get};
 use pe_config::ServiceConfig;
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
+use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::ClusteringConfig;
 use pe_source_onchain_polygon::{LivePolygonConnector, PolygonConnectorConfig};
@@ -18,6 +19,7 @@ use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::fetcher::{WatchlistFetchConfig, WatchlistFetcher};
+use pe_venue_polymarket::{PolymarketCredentials, PolymarketVenueAdapter, ReqwestCLOBClient};
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -52,10 +54,64 @@ async fn main() -> Result<()> {
         .context("bootstrap watchlist")?;
     info!(active = watchlist.active_count, "watchlist bootstrapped");
 
-    // Event-log writer for PaperExecutor.
-    let writer = Writer::open(&cfg.event_log_path)
+    // Paper event-log writer.
+    let paper_writer = Writer::open(&cfg.event_log_path)
         .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
-    let paper_executor = PaperExecutor::new(writer, SourceId("pe-service.paper".into()));
+    let paper_executor = PaperExecutor::new(paper_writer, SourceId("pe-service.paper".into()));
+
+    // Live event-log writer (separate file so paper and live fills are distinct streams).
+    let live_log_path = cfg.event_log_path.with_extension("live.log");
+    let live_writer = Writer::open(&live_log_path)
+        .with_context(|| format!("open live event log {}", live_log_path.display()))?;
+
+    // Fail fast: live modes require all five CLOB credential fields to be non-empty.
+    // Mirrors the parse_mode pattern of validating config eagerly before any I/O.
+    if matches!(mode, ExecutionMode::LiveTiny | ExecutionMode::Promoted) {
+        anyhow::ensure!(
+            !cfg.polymarket_funder_address.is_empty(),
+            "PE_POLYMARKET_FUNDER_ADDRESS is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_private_key.is_empty(),
+            "PE_POLYMARKET_PRIVATE_KEY is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_clob_api_key.is_empty(),
+            "PE_POLYMARKET_CLOB_API_KEY is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_clob_api_secret.is_empty(),
+            "PE_POLYMARKET_CLOB_API_SECRET is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_clob_api_passphrase.is_empty(),
+            "PE_POLYMARKET_CLOB_API_PASSPHRASE is required for mode '{}'",
+            cfg.mode
+        );
+    }
+
+    // Polymarket CLOB adapter.
+    let clob_creds = PolymarketCredentials::mainnet(
+        cfg.polymarket_funder_address.clone(),
+        cfg.polymarket_private_key.clone(),
+        cfg.polymarket_clob_api_key.clone(),
+        cfg.polymarket_clob_api_secret.clone(),
+        cfg.polymarket_clob_api_passphrase.clone(),
+    );
+    // Log funder address only when credentials are present (live mode only).
+    if !cfg.polymarket_funder_address.is_empty() {
+        info!(funder = %cfg.polymarket_funder_address, "polymarket clob credentials loaded");
+    }
+
+    let clob_client = ReqwestCLOBClient::new(reqwest::Client::new());
+    let adapter = PolymarketVenueAdapter::new(clob_client, clob_creds)
+        .with_base_url(&cfg.polymarket_clob_base_url);
+    let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("pe-service.live".into()));
+    let dispatcher = ExecutionDispatcher::new(paper_executor, live_executor);
 
     let health = new_shared_health();
 
@@ -140,7 +196,7 @@ async fn main() -> Result<()> {
             cluster_observation_window_secs: 300,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        paper_executor,
+        dispatcher,
         health.clone(),
     )
     .context("build orchestrator")?;

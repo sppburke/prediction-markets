@@ -289,6 +289,9 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_max_retries` | 3 | Retries on network errors and 5xx (4 total attempts: initial + 3 retries) |
 | `polymarket_channel_capacity` | 256 | Bounded mpsc channel capacity between trade poller and orchestrator |
 | `trade_poll_interval_secs` | 30 | Seconds between Polymarket trade poll rounds (one round = all watchlisted wallets) |
+| `polymarket_clob_base_url` | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL for order submission and status polling |
+| `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
+| `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
 
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 

@@ -57,6 +57,8 @@ dependencies = [
  "alloy-rpc-client",
  "alloy-rpc-types",
  "alloy-serde",
+ "alloy-signer",
+ "alloy-signer-local",
  "alloy-transport",
  "alloy-transport-http",
  "alloy-transport-ws",
@@ -526,6 +528,22 @@ dependencies = [
  "either",
  "elliptic-curve",
  "k256",
+ "thiserror",
+]
+
+[[package]]
+name = "alloy-signer-local"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f721f4bf2e4812e5505aaf5de16ef3065a8e26b9139ac885862d00b5a55a659a"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer",
+ "async-trait",
+ "k256",
+ "rand 0.8.6",
  "thiserror",
 ]
 
@@ -3128,6 +3146,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-execution-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "pe-core-types",
+ "pe-event-log",
+ "pe-strategy-winner-follow",
+ "pe-venue-core",
+ "pe-venue-polymarket",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pe-funding-graph"
 version = "0.1.0"
 dependencies = [
@@ -3196,10 +3235,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "pe-config",
  "pe-copy-signal-engine",
  "pe-core-types",
  "pe-event-log",
+ "pe-execution-core",
  "pe-funding-graph",
  "pe-operator-graph",
  "pe-position-ledger",
@@ -3210,6 +3251,7 @@ dependencies = [
  "pe-strategy-winner-follow",
  "pe-trader-index",
  "pe-venue-core",
+ "pe-venue-polymarket",
  "reqwest 0.12.28",
  "rust_decimal",
  "rust_decimal_macros",
@@ -3316,6 +3358,29 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "pe-venue-polymarket"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "base64",
+ "hmac",
+ "insta",
+ "pe-core-types",
+ "pe-event-log",
+ "pe-venue-core",
+ "reqwest 0.12.28",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

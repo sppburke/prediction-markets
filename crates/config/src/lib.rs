@@ -126,6 +126,37 @@ pub struct ServiceConfig {
     /// Execution mode: `shadow` | `paper` | `live_tiny` | `promoted`.
     #[serde(default = "default_mode")]
     pub mode: String,
+
+    // ── Polymarket CLOB (venue-polymarket) ────────────────────────────────────
+    /// Polymarket CLOB REST API base URL.
+    /// Set via `PE_POLYMARKET_CLOB_BASE_URL`. Default: `https://clob.polymarket.com`.
+    #[serde(default = "default_clob_base_url")]
+    pub polymarket_clob_base_url: String,
+
+    /// Funder (EOA) wallet address, hex checksummed.
+    /// Set via `PE_POLYMARKET_FUNDER_ADDRESS`; never committed.
+    #[serde(default)]
+    pub polymarket_funder_address: String,
+
+    /// Funder EOA private key, hex with or without "0x" prefix.
+    /// Set via `PE_POLYMARKET_PRIVATE_KEY`; never committed.
+    #[serde(default)]
+    pub polymarket_private_key: String,
+
+    /// Polymarket CLOB API key.
+    /// Set via `PE_POLYMARKET_CLOB_API_KEY`; never committed.
+    #[serde(default)]
+    pub polymarket_clob_api_key: String,
+
+    /// Polymarket CLOB API secret, base64-encoded.
+    /// Set via `PE_POLYMARKET_CLOB_API_SECRET`; never committed.
+    #[serde(default)]
+    pub polymarket_clob_api_secret: String,
+
+    /// Polymarket CLOB API passphrase.
+    /// Set via `PE_POLYMARKET_CLOB_API_PASSPHRASE`; never committed.
+    #[serde(default)]
+    pub polymarket_clob_api_passphrase: String,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -190,6 +221,10 @@ fn default_mode() -> String {
     "paper".to_string()
 }
 
+fn default_clob_base_url() -> String {
+    "https://clob.polymarket.com".to_string()
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for ServiceConfig {
@@ -215,6 +250,12 @@ impl Default for ServiceConfig {
             etherscan_api_key: String::new(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
+            polymarket_clob_base_url: default_clob_base_url(),
+            polymarket_funder_address: String::new(),
+            polymarket_private_key: String::new(),
+            polymarket_clob_api_key: String::new(),
+            polymarket_clob_api_secret: String::new(),
+            polymarket_clob_api_passphrase: String::new(),
         }
     }
 }

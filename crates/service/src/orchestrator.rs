@@ -1,6 +1,6 @@
 //! Event dispatch loop: routes decoded source events to the funding-graph accumulator
-//! and copy-signal-engine, then gates signals through strategy evaluation and paper
-//! execution.
+//! and copy-signal-engine, then gates signals through strategy evaluation and
+//! execution dispatch.
 //!
 //! # Architecture
 //!
@@ -8,25 +8,27 @@
 //! polygon_rx (SourceEvent) ──► FundingGraphAccumulator (Arc<Mutex<...>>)
 //!                                   └──► OperatorGraphScheduler ──► watch::Sender
 //! trade_rx   (IncomingTrade) ──► classify_trade ──► WinnerFollowStrategy::evaluate
-//!                                  ▲                   ──► PaperExecutor::execute
+//!                                  ▲                   ──► ExecutionDispatcher::execute
 //!                           watch::Receiver (operator IDs, refreshed every 60s)
 //! ```
 //!
-//! The orchestrator is pure dispatch: it owns no I/O except through `PaperExecutor`.
+//! The orchestrator is pure dispatch: it owns no I/O except through `ExecutionDispatcher`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, WalletProfile, classify_trade};
 use pe_core_types::{OperatorId, ReconstructionQuality, SourceTimestamp, VenueId, WalletAddress};
+use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::{AntiGamingFlag, OperatorIdentity};
 use pe_position_ledger::{ClusterObservationTracker, PositionLedger};
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::{SourceEvent, SourceStatus};
 use pe_source_onchain_polygon::PolygonEvent;
-use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
+use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
+use pe_venue_polymarket::CLOBClient;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch};
@@ -44,7 +46,7 @@ pub struct OrchestratorConfig {
     pub cluster_observation_window_secs: u64,
 }
 
-pub struct Orchestrator {
+pub struct Orchestrator<C: CLOBClient> {
     polygon_rx: mpsc::Receiver<SourceEvent>,
     trade_rx: mpsc::Receiver<IncomingTrade>,
     accumulator: Arc<Mutex<FundingGraphAccumulator>>,
@@ -54,7 +56,7 @@ pub struct Orchestrator {
     watchlist: Watchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
-    paper_executor: PaperExecutor,
+    dispatcher: ExecutionDispatcher<C>,
     mode: ExecutionMode,
     bankroll: Decimal,
     health: SharedHealth,
@@ -63,7 +65,7 @@ pub struct Orchestrator {
     min_quality: ReconstructionQuality,
 }
 
-impl Orchestrator {
+impl<C: CLOBClient> Orchestrator<C> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         polygon_rx: mpsc::Receiver<SourceEvent>,
@@ -73,7 +75,7 @@ impl Orchestrator {
         watchlist: Watchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_executor: PaperExecutor,
+        dispatcher: ExecutionDispatcher<C>,
         health: SharedHealth,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
@@ -88,7 +90,7 @@ impl Orchestrator {
             watchlist,
             signal_config: config.signal_config,
             strategy,
-            paper_executor,
+            dispatcher,
             mode: config.mode,
             bankroll: config.bankroll,
             health,
@@ -120,7 +122,7 @@ impl Orchestrator {
                         self.handle_polygon(event);
                     }
                     while let Ok(trade) = self.trade_rx.try_recv() {
-                        self.handle_trade(trade);
+                        self.handle_trade(trade).await;
                     }
                     break;
                 }
@@ -132,7 +134,7 @@ impl Orchestrator {
                 }
                 result = self.trade_rx.recv(), if !trades_done => {
                     match result {
-                        Some(trade) => self.handle_trade(trade),
+                        Some(trade) => self.handle_trade(trade).await,
                         None => trades_done = true,
                     }
                 }
@@ -159,7 +161,7 @@ impl Orchestrator {
         }
     }
 
-    fn handle_trade(&mut self, trade: IncomingTrade) {
+    async fn handle_trade(&mut self, trade: IncomingTrade) {
         // Mark polymarket freshness.
         {
             let mut h = self
@@ -219,9 +221,9 @@ impl Orchestrator {
             Err(e) => info!(reason = %e, "signal did not produce order"),
             Ok(intent) => {
                 let now = SourceTimestamp(OffsetDateTime::now_utc());
-                match self.paper_executor.execute(&intent, now) {
-                    Err(e) => error!(error = %e, "paper executor failed"),
-                    Ok(fill) => {
+                match self.dispatcher.execute(&intent, self.mode, now).await {
+                    Err(e) => error!(error = %e, "execution dispatcher failed"),
+                    Ok(DispatchResult::Paper(fill)) => {
                         info!(
                             kind = "paper_fill",
                             idempotency_key = %fill.intent.idempotency_key,
@@ -229,6 +231,14 @@ impl Orchestrator {
                             side = ?fill.intent.side,
                             contracts = fill.intent.contracts.0,
                             fill_price = %fill.simulated_fill_price.0,
+                        );
+                    }
+                    Ok(DispatchResult::Live(result)) => {
+                        info!(
+                            kind = "live_execution",
+                            idempotency_key = %intent.idempotency_key,
+                            market = %intent.market_id,
+                            outcome = ?result.outcome(),
                         );
                     }
                 }

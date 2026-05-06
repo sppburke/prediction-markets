@@ -34,6 +34,8 @@ pe-trader-index             = { path = "../trader-index",               version 
 pe-operator-graph           = { path = "../operator-graph",             version = "0.1.0" }
 pe-position-ledger          = { path = "../position-ledger",            version = "0.1.0" }
 pe-venue-core               = { path = "../venue-core",                 version = "0.1.0" }
+pe-venue-polymarket         = { path = "../venue-polymarket",           version = "0.1.0" }
+pe-execution-core           = { path = "../execution-core",             version = "0.1.0" }
 
 anyhow          = { workspace = true }
 axum            = { workspace = true }
@@ -48,5 +50,6 @@ tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+base64.workspace = true
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }

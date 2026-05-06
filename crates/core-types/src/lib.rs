@@ -7,6 +7,7 @@ pub mod error;
 pub mod identity;
 pub mod ids;
 pub mod operator;
+pub mod polymarket;
 pub mod price;
 pub mod quantity;
 pub mod side;
@@ -20,6 +21,9 @@ pub use ids::{
     SourceId, SourceTradeId, StrategyId, VenueId, VenueMarketId,
 };
 pub use operator::{ClusterSize, FundingHopCount, ReconstructionQuality, WalletAgeSeconds};
+pub use polymarket::{
+    PolymarketConditionId, PolymarketOrderId, PolymarketOrderType, PolymarketTokenId,
+};
 pub use price::{
     BasisPoints, InheritedPriorPpm, KalshiPriceCents, KellyFraction, PolymarketPriceDecimal, Price,
     PriceDelta, Probability, ProbabilityPpm, RoundingPolicy,

@@ -1,0 +1,6 @@
+---
+source: crates/venue-polymarket/src/signing.rs
+assertion_line: 223
+expression: h.poly_signature
+---
+fHSbeyXeu+daijdMcHgPGFG5eUTtlj4vcwZpmLha6uk=

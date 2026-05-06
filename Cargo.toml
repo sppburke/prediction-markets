@@ -19,6 +19,8 @@ members = [
     "crates/venue-core",
     "crates/bootstrap",
     "crates/backtest",
+    "crates/venue-polymarket",
+    "crates/execution-core",
 ]
 
 [workspace.package]
@@ -64,7 +66,11 @@ alloy = { version = "=1.0.9", default-features = false, features = [
     "reqwest-rustls-tls",
     "rpc-types",
     "sol-types",
+    "signer-local",
 ] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 url = "2"
 toml = "0.8"
 tower = "0.5"
