@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use pe_bootstrap::build_seed_watchlist;
 use pe_bootstrap::cache::WalletCache;
-use pe_bootstrap::filter::{DEFAULT_MIN_CLOSED_TRADES, DEFAULT_MIN_WIN_RATE_PCT};
+use pe_bootstrap::filter::FilterConfig;
 use pe_bootstrap::polymarket::PolymarketBulkFetcher;
 use pe_core_types::{SourceTimestamp, SourceTradeId, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
@@ -240,12 +240,7 @@ async fn scenario_replay_reproducibility() {
             audit_window_days: u32::MAX,
         };
         let ledgers = build_trader_ledgers(&snapshot, empty_ops, &LedgerConfig::default());
-        build_seed_watchlist(
-            ledgers,
-            fixed_snapshot_at.clone(),
-            DEFAULT_MIN_CLOSED_TRADES,
-            DEFAULT_MIN_WIN_RATE_PCT,
-        )
+        build_seed_watchlist(ledgers, fixed_snapshot_at.clone(), &FilterConfig::default())
     };
 
     let reloaded = WalletCache::open(&path).unwrap();

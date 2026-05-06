@@ -1,7 +1,8 @@
 //! Scenario: seed watchlist filter correctness.
 //!
-//! PASS: winner wallet (>10 closed trades, >90% win rate) appears in the watchlist.
-//!       loser wallet (>10 closed trades, <10% win rate) does NOT appear.
+//! PASS: winner wallet (>15 closed trades, >95% win rate, recently active, short avg hold)
+//!       appears in the watchlist.
+//!       loser wallet (<10% win rate) does NOT appear.
 //! FAIL: either condition is wrong, or the pipeline panics.
 //!
 //! No network calls — fixture JSON files under `tests/fixtures/` are loaded from disk.
@@ -12,7 +13,7 @@
 
 use pe_bootstrap::build_seed_watchlist;
 use pe_bootstrap::cache::WalletCache;
-use pe_bootstrap::filter::{DEFAULT_MIN_CLOSED_TRADES, DEFAULT_MIN_WIN_RATE_PCT};
+use pe_bootstrap::filter::FilterConfig;
 use pe_bootstrap::polymarket::PolymarketBulkFetcher;
 use pe_core_types::{SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
@@ -91,12 +92,7 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
     }
 
     // Build seed watchlist with default filter thresholds.
-    let watchlist = build_seed_watchlist(
-        ledgers,
-        snapshot_at,
-        DEFAULT_MIN_CLOSED_TRADES,
-        DEFAULT_MIN_WIN_RATE_PCT,
-    );
+    let watchlist = build_seed_watchlist(ledgers, snapshot_at, &FilterConfig::default());
 
     // Winner must be in the watchlist.
     let winner_in = watchlist.entries.iter().any(|e| e.wallet == winner);
