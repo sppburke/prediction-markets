@@ -18,18 +18,70 @@ const POLL_INTERVAL_SECS: u64 = 3;
 const MAX_WAIT_SECS: u64 = 300;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
-/// SQL for wallet discovery: all distinct makers from Polymarket trade history.
+/// SQL for wallet discovery: wallets with strong win rates on resolved binary markets,
+/// active within a configurable recent window, and entering close to resolution.
 ///
-/// DuneSQL (Trino): address columns are `varbinary`; use bytearray literals (no
-/// quotes) for comparisons and CAST to VARCHAR for the output so the JSON row
-/// value is a hex string consumable by `WalletAddress::from_hex`.
-/// The `{limit}` placeholder is filled at runtime via format!.
+/// DuneSQL (Trino) notes:
+/// - `condition_id` in `market_trades` and `conditionid` in `ctf_evt_conditionresolution`
+///   are both `varbinary` — compared directly, no casting needed.
+/// - `payoutnumerators[1] > 0` identifies the winning outcome for binary (2-slot) markets.
+/// - Counts unique resolved markets per wallet (not raw trade rows) so `closed_markets`
+///   is a cleaner "number of distinct bets" metric.
+/// - `avg_hours_entry_to_resolution` is the mean time (hours) from a wallet's first trade on
+///   a condition to when that condition resolved; only winning conditions with positive time
+///   deltas contribute.
+///
+/// Placeholders filled at runtime:
+///   `{min_closed_markets}`, `{min_win_rate}` (decimal, e.g. "0.95"),
+///   `{active_window_days}`, `{max_avg_hours_to_resolution}`.
 const WALLET_DISCOVERY_SQL: &str = "\
-SELECT DISTINCT CAST(maker AS VARCHAR) AS wallet \
-FROM polymarket_polygon.market_trades \
-WHERE maker IS NOT NULL \
-  AND maker != 0x0000000000000000000000000000000000000000 \
-LIMIT {limit}";
+WITH resolved AS (\
+  SELECT \
+    conditionid, \
+    CASE WHEN payoutnumerators[1] > 0 THEN 'Yes' ELSE 'No' END AS winning_outcome, \
+    evt_block_time AS resolved_at \
+  FROM polymarket_polygon.ctf_evt_conditionresolution \
+  WHERE outcomeslotcount = 2 \
+), \
+recently_active AS (\
+  SELECT DISTINCT maker \
+  FROM polymarket_polygon.market_trades \
+  WHERE block_time >= NOW() - INTERVAL '{active_window_days}' DAY \
+    AND maker IS NOT NULL \
+), \
+wallet_condition AS (\
+  SELECT \
+    t.maker AS wallet, \
+    r.conditionid, \
+    r.winning_outcome, \
+    r.resolved_at, \
+    MIN(t.block_time) AS first_trade_time, \
+    MAX(CASE WHEN t.token_outcome = r.winning_outcome THEN 1 ELSE 0 END) AS on_winning_side \
+  FROM polymarket_polygon.market_trades t \
+  JOIN resolved r ON t.condition_id = r.conditionid \
+  JOIN recently_active ra ON t.maker = ra.maker \
+  WHERE t.maker IS NOT NULL \
+  GROUP BY t.maker, r.conditionid, r.winning_outcome, r.resolved_at \
+), \
+wallet_stats AS (\
+  SELECT \
+    wallet, \
+    COUNT(*) AS closed_markets, \
+    SUM(on_winning_side) AS winning_markets, \
+    AVG(\
+      CASE WHEN on_winning_side = 1 AND resolved_at > first_trade_time \
+      THEN CAST(date_diff('minute', first_trade_time, resolved_at) AS DOUBLE) / 60.0 \
+      ELSE NULL END \
+    ) AS avg_hours_entry_to_resolution \
+  FROM wallet_condition \
+  GROUP BY wallet \
+) \
+SELECT CAST(wallet AS VARCHAR) AS wallet \
+FROM wallet_stats \
+WHERE closed_markets > {min_closed_markets} \
+  AND winning_markets > 0 \
+  AND (1.0 * winning_markets / closed_markets) > {min_win_rate} \
+  AND avg_hours_entry_to_resolution < {max_avg_hours_to_resolution}";
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
@@ -83,11 +135,31 @@ impl DuneClient {
         self
     }
 
-    /// Discover all unique wallet addresses from Polymarket trade history via Dune.
+    /// Discover wallet addresses from Polymarket trade history via Dune.
     ///
-    /// Returns up to `limit` distinct wallet addresses.
-    pub async fn discover_wallets(&self, limit: u32) -> Result<Vec<WalletAddress>, BootstrapError> {
-        let sql = WALLET_DISCOVERY_SQL.replace("{limit}", &limit.to_string());
+    /// Returns wallets satisfying all four quality filters:
+    /// - more than `min_closed_markets` distinct resolved binary markets traded
+    /// - win rate above `min_win_rate_pct` percent on those markets
+    /// - at least one trade (on any market) within `active_window_days` days
+    /// - average hours from first entry to market resolution below `max_avg_hours_to_resolution`
+    ///
+    /// No hard limit on result count; all qualifying wallets are returned.
+    pub async fn discover_wallets(
+        &self,
+        min_closed_markets: u32,
+        min_win_rate_pct: u32,
+        active_window_days: u32,
+        max_avg_hours_to_resolution: u32,
+    ) -> Result<Vec<WalletAddress>, BootstrapError> {
+        let win_rate_decimal = format!("{}.{:02}", min_win_rate_pct / 100, min_win_rate_pct % 100);
+        let sql = WALLET_DISCOVERY_SQL
+            .replace("{min_closed_markets}", &min_closed_markets.to_string())
+            .replace("{min_win_rate}", &win_rate_decimal)
+            .replace("{active_window_days}", &active_window_days.to_string())
+            .replace(
+                "{max_avg_hours_to_resolution}",
+                &max_avg_hours_to_resolution.to_string(),
+            );
         let execution_id = self.execute_sql(&sql).await?;
         let rows = self.wait_for_results(&execution_id).await?;
         parse_wallet_rows(rows)

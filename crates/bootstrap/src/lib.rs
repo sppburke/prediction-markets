@@ -3,11 +3,13 @@
 //! Pipeline:
 //! 1. Discover wallets — load from per-contract checkpoint if available, else
 //!    enumerate via Dune Analytics or Etherscan (selected by `PE_WALLET_SOURCE`).
+//!    Dune path applies four quality filters at query time (see `dune::WALLET_DISCOVERY_SQL`).
 //!    Etherscan: checkpoint saved after each contract; resume skips completed ones.
 //! 2. Fetch trade history per wallet from the Polymarket Data API (permanent SQLite cache,
 //!    incremental per run).
 //! 3. Reconstruct `TraderLedger`s via `pe-trader-index`.
-//! 4. Pre-filter: keep wallets with > 10 closed trades and > 80 % win rate.
+//! 4. Pre-filter: keep wallets with > `min_closed_trades` closed trades and > `min_win_rate_pct`
+//!    win rate. Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 //! 5. Build a seed `Watchlist` and write it to `output_path`.
 //!
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -43,7 +45,10 @@ use polymarket::PolymarketBulkFetcher;
 use rust_decimal::Decimal;
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-const DEFAULT_DUNE_WALLET_LIMIT: u32 = 10_000;
+const DEFAULT_DUNE_MIN_CLOSED_MARKETS: u32 = 15;
+const DEFAULT_DUNE_MIN_WIN_RATE_PCT: u32 = 95;
+const DEFAULT_DUNE_ACTIVE_WINDOW_DAYS: u32 = 30;
+const DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
 // bootstrap_eth_block_timeout_secs = 30
@@ -99,8 +104,20 @@ pub struct BootstrapConfig {
     /// If the file exists, Etherscan/Dune enumeration is skipped entirely.
     /// Delete the file to force a fresh scan. Default: `wallet_set.json`.
     pub wallet_set_path: PathBuf,
-    /// Maximum distinct wallets to pull from Dune (default `bootstrap_dune_wallet_limit = 10000`).
-    pub dune_wallet_limit: u32,
+    /// Minimum distinct resolved markets a wallet must have traded (Dune filter).
+    /// Default `bootstrap_dune_min_closed_markets = 15`. Env: `PE_BOOTSTRAP_DUNE_MIN_MARKETS`.
+    pub dune_min_closed_markets: u32,
+    /// Minimum win-rate percent for Dune wallet discovery (default `bootstrap_dune_min_win_rate_pct = 95`).
+    /// Env: `PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT`.
+    pub dune_min_win_rate_pct: u32,
+    /// Recency window for Dune wallet discovery: wallet must have a trade on a resolved market
+    /// within this many days (default `bootstrap_dune_active_window_days = 30`).
+    /// Env: `PE_BOOTSTRAP_DUNE_ACTIVE_DAYS`.
+    pub dune_active_window_days: u32,
+    /// Maximum average hours from first entry to market resolution for Dune wallets
+    /// (default `bootstrap_dune_max_avg_hours_to_resolution = 72`).
+    /// Env: `PE_BOOTSTRAP_DUNE_MAX_AVG_HOURS`.
+    pub dune_max_avg_hours_to_resolution: u32,
     /// Trade lookback window for ledger reconstruction.
     /// `None` = unlimited (default); `Some(n)` = at most n calendar days.
     /// Env var `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS`: an integer, or empty / `"unlimited"` / `"none"` for unlimited.
@@ -205,7 +222,22 @@ impl BootstrapConfig {
                 "PE_BOOTSTRAP_WALLET_SET_PATH",
                 "wallet_set.json",
             )),
-            dune_wallet_limit: optional_parse("PE_BOOTSTRAP_DUNE_LIMIT", DEFAULT_DUNE_WALLET_LIMIT),
+            dune_min_closed_markets: optional_parse(
+                "PE_BOOTSTRAP_DUNE_MIN_MARKETS",
+                DEFAULT_DUNE_MIN_CLOSED_MARKETS,
+            ),
+            dune_min_win_rate_pct: optional_parse(
+                "PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT",
+                DEFAULT_DUNE_MIN_WIN_RATE_PCT,
+            ),
+            dune_active_window_days: optional_parse(
+                "PE_BOOTSTRAP_DUNE_ACTIVE_DAYS",
+                DEFAULT_DUNE_ACTIVE_WINDOW_DAYS,
+            ),
+            dune_max_avg_hours_to_resolution: optional_parse(
+                "PE_BOOTSTRAP_DUNE_MAX_AVG_HOURS",
+                DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION,
+            ),
             audit_window_days: parse_audit_window("PE_BOOTSTRAP_AUDIT_WINDOW_DAYS"),
             min_closed_trades: optional_parse(
                 "PE_BOOTSTRAP_MIN_CLOSED_TRADES",
@@ -273,11 +305,21 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         .clone()
                         .ok_or(BootstrapError::Internal)?;
                     tracing::info!(
-                        limit = config.dune_wallet_limit,
+                        min_closed_markets = config.dune_min_closed_markets,
+                        min_win_rate_pct = config.dune_min_win_rate_pct,
+                        active_window_days = config.dune_active_window_days,
+                        max_avg_hours_to_resolution = config.dune_max_avg_hours_to_resolution,
                         "bootstrap: querying dune for wallets"
                     );
                     let dune = DuneClient::new(api_key);
-                    let found = dune.discover_wallets(config.dune_wallet_limit).await?;
+                    let found = dune
+                        .discover_wallets(
+                            config.dune_min_closed_markets,
+                            config.dune_min_win_rate_pct,
+                            config.dune_active_window_days,
+                            config.dune_max_avg_hours_to_resolution,
+                        )
+                        .await?;
                     tracing::info!(count = found.len(), "bootstrap: dune returned wallets");
                     state.wallets = found.iter().map(|w| w.to_string()).collect();
                     // Mark all contracts complete so subsequent runs skip Dune.
