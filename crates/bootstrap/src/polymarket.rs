@@ -12,6 +12,8 @@
 //! (200 req/10s on `/trades`, ≈ 20 req/s).
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -89,9 +91,10 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// retried indefinitely at the page level (sleeping `Retry-After` seconds)
     /// so no wallet is ever skipped due to rate limiting.
     ///
-    /// Wallets that fail with a non-recoverable error (network timeout after all
-    /// retries, unparseable response body) are skipped with a `tracing::error!`.
-    /// SQLite insert failures abort the run — they indicate disk or DB corruption.
+    /// Returns `Err(BootstrapError::PartialFetch)` if any wallet's trades could
+    /// not be fetched (non-recoverable network/parse error) or written to SQLite.
+    /// All wallets are attempted before the error is returned; re-running the
+    /// bootstrap will retry only the wallets that are missing from the cache.
     ///
     /// Trades are committed to SQLite per-wallet inside a single transaction.
     /// SQLite WAL mode provides per-commit durability — no manual checkpointing
@@ -102,10 +105,12 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         cache: &mut WalletCache,
     ) -> Result<(), BootstrapError> {
         let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);
+        let failed = Arc::new(AtomicUsize::new(0));
 
         stream::iter(wallets.iter().copied())
             .for_each_concurrent(self.concurrency, |wallet| {
                 let cache_mutex = &cache_mutex;
+                let failed = Arc::clone(&failed);
                 async move {
                     let wallet_hex = wallet.to_string();
                     let known_ids: HashSet<SourceTradeId> = {
@@ -117,30 +122,32 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                         Ok(new_trades) if !new_trades.is_empty() => {
                             let mut guard = cache_mutex.lock().await;
                             if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
-                                // SQLite write failure — data would be silently lost.
-                                // Treat as fatal: the run should be restarted.
                                 tracing::error!(
                                     wallet = %wallet_hex,
                                     error = %e,
-                                    "polymarket: cache insert failed — trades lost for this wallet"
+                                    "polymarket: cache insert failed — trades for this wallet will be missing"
                                 );
+                                failed.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            // Non-recoverable fetch error (network timeout after retries,
-                            // bad JSON). Wallet trades are missing from this run.
                             tracing::error!(
                                 wallet = %wallet_hex,
                                 error = %e,
-                                "polymarket: fetch failed — wallet trades missing from cache"
+                                "polymarket: fetch failed — trades for this wallet will be missing"
                             );
+                            failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             })
             .await;
 
+        let n = failed.load(Ordering::Relaxed);
+        if n > 0 {
+            return Err(BootstrapError::PartialFetch { failed_wallets: n });
+        }
         Ok(())
     }
 
@@ -544,6 +551,26 @@ mod tests {
             cache.trade_count(),
             5,
             "rate-limited pages must be retried — wallet trades must not be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_returns_partial_fetch_error_when_wallet_fails() {
+        // PASS: fetch_all returns Err(PartialFetch) when a wallet's page URL has no fixture
+        //       (simulates a network/API failure after all retries).
+        // FAIL: fetch_all returns Ok — data loss is silently swallowed.
+        let wallet = wallet_a();
+        let fetcher = FixtureFetcher::new(HashMap::new()); // no fixture → Fatal error
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        let result = bulk.fetch_all(&[wallet], &mut cache).await;
+        assert!(
+            matches!(
+                result,
+                Err(BootstrapError::PartialFetch { failed_wallets: 1 })
+            ),
+            "non-recoverable fetch error must surface as PartialFetch, got: {result:?}"
         );
     }
 
