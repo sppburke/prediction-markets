@@ -21,12 +21,14 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
     BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::Writer;
+use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::OperatorIdentity;
 use pe_service::health::new_shared_health;
@@ -36,6 +38,7 @@ use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -83,10 +86,24 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
     }
 }
 
-fn make_paper_executor(dir: &TempDir) -> PaperExecutor {
-    let path = dir.path().join("paper.log");
-    let writer = Writer::open(&path).unwrap();
-    PaperExecutor::new(writer, SourceId("test".into()))
+fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
+    let paper_path = dir.path().join("paper.log");
+    let paper_writer = Writer::open(&paper_path).unwrap();
+    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()));
+
+    let live_path = dir.path().join("live.log");
+    let live_writer = Writer::open(&live_path).unwrap();
+    let creds = PolymarketCredentials::mainnet(
+        "0x0000000000000000000000000000000000000001".into(),
+        "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+        "key".into(),
+        base64::engine::general_purpose::STANDARD.encode(b"secret"),
+        "pass".into(),
+    );
+    let adapter = PolymarketVenueAdapter::new(FixtureCLOBClient::new(vec![], vec![]), creds);
+    let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("test.live".into()));
+
+    ExecutionDispatcher::new(paper_executor, live_executor)
 }
 
 fn make_accumulator() -> Arc<Mutex<FundingGraphAccumulator>> {
@@ -130,7 +147,7 @@ async fn scenario_e2e_clean_exit() {
             cluster_observation_window_secs: 300,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_paper_executor(&dir),
+        make_dispatcher(&dir),
         new_shared_health(),
     )
     .unwrap();
@@ -184,7 +201,7 @@ async fn scenario_graceful_shutdown() {
             cluster_observation_window_secs: 300,
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-        make_paper_executor(&dir),
+        make_dispatcher(&dir),
         new_shared_health(),
     )
     .unwrap();

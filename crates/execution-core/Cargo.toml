@@ -1,0 +1,32 @@
+[package]
+name = "pe-execution-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+scenario = []
+
+[dependencies]
+pe-core-types               = { path = "../core-types",               version = "0.1.0" }
+pe-event-log                = { path = "../event-log",                version = "0.1.0" }
+pe-venue-core               = { path = "../venue-core",               version = "0.1.0" }
+pe-venue-polymarket         = { path = "../venue-polymarket",         version = "0.1.0" }
+pe-strategy-winner-follow   = { path = "../strategy-winner-follow",   version = "0.1.0" }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
+tempfile.workspace = true
