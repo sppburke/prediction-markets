@@ -1,35 +1,114 @@
-//! Bootstrap pre-filter: selects wallets with a strong win-rate signal.
+//! Bootstrap post-filter: selects wallets with strong win-rate, recency, and
+//! timing characteristics derived from the local `TraderLedger`.
 //!
-//! Canonical thresholds in `docs/_GLOSSARY.md` "Bootstrap defaults" section:
-//! `bootstrap_min_closed_trades = 10`, `bootstrap_min_win_rate_pct = 80`.
+//! The four conditions mirror the Dune SQL query applied at wallet-discovery
+//! time (see `dune::WALLET_DISCOVERY_SQL`). Applying them here provides a
+//! second, independent quality gate on local ledger data.
+//!
+//! Canonical thresholds in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
 use pe_trader_index::TraderLedger;
 use rust_decimal::Decimal;
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-pub const DEFAULT_MIN_CLOSED_TRADES: usize = 10;
-pub const DEFAULT_MIN_WIN_RATE_PCT: u8 = 80;
+pub const DEFAULT_MIN_CLOSED_TRADES: usize = 15;
+pub const DEFAULT_MIN_WIN_RATE_PCT: u8 = 95;
+pub const DEFAULT_ACTIVE_WINDOW_DAYS: u32 = 30;
+pub const DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
 
-/// Returns `true` when `ledger` passes the bootstrap pre-filter.
+/// Configuration for the bootstrap post-filter.
+///
+/// All fields correspond to canonical defaults in `docs/_GLOSSARY.md`
+/// "Bootstrap defaults" section.
+pub struct FilterConfig {
+    /// Minimum closed trades (exclusive: must have > this many).
+    pub min_closed_trades: usize,
+    /// Minimum win-rate percent (exclusive: must exceed this percentage).
+    pub min_win_rate_pct: u8,
+    /// Recency window in calendar days: at least one trade must have been
+    /// opened within this many days of `snapshot_at_unix`.
+    pub active_window_days: u32,
+    /// Maximum average hours from first entry on a market to that market's
+    /// resolution; filters out late entrants (exclusive: average must be < this).
+    pub max_avg_hours_to_resolution: u32,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            min_closed_trades: DEFAULT_MIN_CLOSED_TRADES,
+            min_win_rate_pct: DEFAULT_MIN_WIN_RATE_PCT,
+            active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
+            max_avg_hours_to_resolution: DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION,
+        }
+    }
+}
+
+/// Returns `true` when `ledger` passes all four bootstrap post-filter conditions.
+///
+/// Conditions:
+/// 1. `> min_closed_trades` distinct closed trades.
+/// 2. Win rate `> min_win_rate_pct` (integer arithmetic, no f64).
+/// 3. At least one trade opened within `active_window_days` calendar days before
+///    `snapshot_at_unix`.
+/// 4. Average hold duration on winning trades (opened_at → closed_at) is
+///    `< max_avg_hours_to_resolution` hours. Only winning trades where
+///    `closed_at_unix > opened_at_unix` contribute (mirrors Dune's
+///    `resolved_at > first_trade_time` guard).
 ///
 /// # Precondition
 /// `min_win_rate_pct` must be in 0–100; values above 100 always return `false`.
-pub fn passes_filter(
-    ledger: &TraderLedger,
-    min_closed_trades: usize,
-    min_win_rate_pct: u8,
-) -> bool {
+/// `snapshot_at_unix` should be a recent Unix timestamp; stale values relax condition 3.
+pub fn passes_filter(ledger: &TraderLedger, snapshot_at_unix: i64, config: &FilterConfig) -> bool {
     let total = ledger.closed_trades.len();
-    if total <= min_closed_trades {
+
+    // Condition 1: must have strictly more than min_closed_trades.
+    if total <= config.min_closed_trades {
         return false;
     }
+
+    // Condition 2: win rate > min_win_rate_pct (integer arithmetic, no f64).
     let wins = ledger
         .closed_trades
         .iter()
         .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
         .count();
-    // wins * 100 > total * min_win_rate_pct  (integer arithmetic, no f64)
-    wins.saturating_mul(100) > total.saturating_mul(min_win_rate_pct as usize)
+    if wins.saturating_mul(100) <= total.saturating_mul(usize::from(config.min_win_rate_pct)) {
+        return false;
+    }
+
+    // Condition 3: at least one trade opened within the active window.
+    let cutoff_unix = snapshot_at_unix
+        .saturating_sub(i64::from(config.active_window_days).saturating_mul(86_400));
+    if !ledger
+        .closed_trades
+        .iter()
+        .any(|t| t.opened_at_unix >= cutoff_unix)
+    {
+        return false;
+    }
+
+    // Condition 4: average hold on winning trades < max_avg_hours_to_resolution.
+    // Only count trades where closed_at_unix > opened_at_unix (guards against
+    // data artifacts where settlement and entry share the same timestamp).
+    let (winning_count, total_hold_secs) = ledger
+        .closed_trades
+        .iter()
+        .filter(|t| t.realized_pnl_usd > Decimal::ZERO && t.closed_at_unix > t.opened_at_unix)
+        .fold((0u64, 0u64), |(n, sum), t| {
+            let hold = u64::try_from(t.closed_at_unix - t.opened_at_unix).unwrap_or(0);
+            (n + 1, sum.saturating_add(hold))
+        });
+    if winning_count > 0 {
+        let max_secs = u64::from(config.max_avg_hours_to_resolution)
+            .saturating_mul(3_600)
+            .saturating_mul(winning_count);
+        if total_hold_secs >= max_secs {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Win rate expressed as basis points (0–10_000) for use as `leader_score_bps`.
@@ -55,7 +134,10 @@ mod tests {
     use pe_trader_index::ledger::{ClosedTrade, TraderLedger};
     use rust_decimal_macros::dec;
 
-    fn make_trade(pnl: rust_decimal::Decimal) -> ClosedTrade {
+    const BASE_TS: i64 = 1_700_000_000;
+    const SNAP: i64 = BASE_TS + 86_400; // 1 day after BASE_TS
+
+    fn make_trade(pnl: rust_decimal::Decimal, opened_at: i64, hold_secs: i64) -> ClosedTrade {
         ClosedTrade {
             market_id: MarketId(VenueMarketId("0xcond".to_owned())),
             outcome_id: OutcomeId(0),
@@ -63,74 +145,92 @@ mod tests {
             entry_price: Price::new(dec!(0.40)).unwrap(),
             exit_price: Price::new(dec!(0.60)).unwrap(),
             contracts: ContractQty(10),
-            hold_duration_seconds: 3600,
+            hold_duration_seconds: u64::try_from(hold_secs).unwrap_or(0),
             realized_pnl_usd: pnl,
-            opened_at_unix: 1_700_000_000,
-            closed_at_unix: 1_700_003_600,
+            opened_at_unix: opened_at,
+            closed_at_unix: opened_at + hold_secs,
             source_trade_ids: vec![SourceTradeId("0xtx".to_owned())],
         }
     }
 
-    fn make_ledger(wins: usize, losses: usize) -> TraderLedger {
-        let mut closed_trades = Vec::new();
-        for _ in 0..wins {
-            closed_trades.push(make_trade(dec!(2.00)));
-        }
-        for _ in 0..losses {
-            closed_trades.push(make_trade(dec!(-1.00)));
-        }
+    fn make_ledger(trades: Vec<ClosedTrade>) -> TraderLedger {
         TraderLedger {
             wallet: WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
             operator_id: None,
             reconstruction_quality: ReconstructionQuality::new(80).unwrap(),
-            closed_trades,
+            closed_trades: trades,
             open_positions: vec![],
             audit_window_days: 90,
         }
     }
 
+    /// 16 wins with recent activity and short avg hold — passes all 4 conditions.
     #[test]
-    fn passes_with_11_trades_and_90pct_win_rate() {
-        // 10 wins, 1 loss = 90.9% win rate; > 10 trades
-        let ledger = make_ledger(10, 1);
-        assert!(passes_filter(
-            &ledger,
-            DEFAULT_MIN_CLOSED_TRADES,
-            DEFAULT_MIN_WIN_RATE_PCT
-        ));
+    fn passes_all_four_conditions() {
+        let trades = (0..16)
+            .map(|_| make_trade(dec!(2.00), BASE_TS, 7_200)) // 2h hold, within SNAP's 30-day window
+            .collect();
+        let ledger = make_ledger(trades);
+        assert!(passes_filter(&ledger, SNAP, &FilterConfig::default()));
     }
 
+    /// Exactly 15 trades — not strictly more than 15 → fails condition 1.
     #[test]
     fn fails_insufficient_trades() {
-        // Exactly 10 trades; filter requires strictly MORE than 10
-        let ledger = make_ledger(9, 1);
-        assert!(!passes_filter(
-            &ledger,
-            DEFAULT_MIN_CLOSED_TRADES,
-            DEFAULT_MIN_WIN_RATE_PCT
-        ));
+        let trades = (0..15)
+            .map(|_| make_trade(dec!(2.00), BASE_TS, 7_200))
+            .collect();
+        let ledger = make_ledger(trades);
+        assert!(!passes_filter(&ledger, SNAP, &FilterConfig::default()));
     }
 
+    /// 16 trades, 14 wins = 87.5% < 95% → fails condition 2.
     #[test]
     fn fails_low_win_rate() {
-        // 11 trades but only 7/11 = 63.6% win rate
-        let ledger = make_ledger(7, 4);
-        assert!(!passes_filter(
-            &ledger,
-            DEFAULT_MIN_CLOSED_TRADES,
-            DEFAULT_MIN_WIN_RATE_PCT
-        ));
+        let mut trades: Vec<ClosedTrade> = (0..14)
+            .map(|_| make_trade(dec!(2.00), BASE_TS, 7_200))
+            .collect();
+        trades.extend((0..2).map(|_| make_trade(dec!(-1.00), BASE_TS, 7_200)));
+        let ledger = make_ledger(trades);
+        assert!(!passes_filter(&ledger, SNAP, &FilterConfig::default()));
+    }
+
+    /// 16 wins but last trade was 31 days before snapshot → fails condition 3.
+    #[test]
+    fn fails_not_recently_active() {
+        let stale = SNAP - 31 * 86_400;
+        let trades = (0..16)
+            .map(|_| make_trade(dec!(2.00), stale, 7_200))
+            .collect();
+        let ledger = make_ledger(trades);
+        assert!(!passes_filter(&ledger, SNAP, &FilterConfig::default()));
+    }
+
+    /// 16 wins each with 73h hold → avg = 73h ≥ 72h limit → fails condition 4.
+    #[test]
+    fn fails_avg_hold_too_long() {
+        let trades = (0..16)
+            .map(|_| make_trade(dec!(2.00), BASE_TS, 73 * 3_600))
+            .collect();
+        let ledger = make_ledger(trades);
+        assert!(!passes_filter(&ledger, SNAP, &FilterConfig::default()));
+    }
+
+    /// 71h59m59s avg hold — just under the 72h limit → passes condition 4.
+    #[test]
+    fn passes_exactly_at_avg_hold_boundary() {
+        let trades = (0..16)
+            .map(|_| make_trade(dec!(2.00), BASE_TS, 72 * 3_600 - 1))
+            .collect();
+        let ledger = make_ledger(trades);
+        assert!(passes_filter(&ledger, SNAP, &FilterConfig::default()));
     }
 
     #[test]
     fn win_rate_bps_computation() {
-        // 9 wins out of 10 = 90% = 9000 bps
         assert_eq!(win_rate_bps(9, 10), 9_000);
-        // 0 wins out of 10 = 0 bps
         assert_eq!(win_rate_bps(0, 10), 0);
-        // 10/10 = 100% = 10000 bps
         assert_eq!(win_rate_bps(10, 10), 10_000);
-        // Zero total: safe
         assert_eq!(win_rate_bps(0, 0), 0);
     }
 }

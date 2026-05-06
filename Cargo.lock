@@ -3045,6 +3045,7 @@ dependencies = [
  "futures",
  "pe-core-types",
  "pe-operator-graph",
+ "pe-source-core",
  "pe-source-onchain-polygon",
  "pe-source-polymarket-public",
  "pe-trader-index",

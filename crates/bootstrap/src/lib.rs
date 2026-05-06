@@ -8,8 +8,8 @@
 //! 2. Fetch trade history per wallet from the Polymarket Data API (permanent SQLite cache,
 //!    incremental per run).
 //! 3. Reconstruct `TraderLedger`s via `pe-trader-index`.
-//! 4. Pre-filter: keep wallets with > `min_closed_trades` closed trades and > `min_win_rate_pct`
-//!    win rate. Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+//! 4. Post-filter: keep wallets passing all four quality conditions (trades, win rate, recency,
+//!    avg hold duration). Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 //! 5. Build a seed `Watchlist` and write it to `output_path`.
 //!
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -40,7 +40,10 @@ use time::OffsetDateTime;
 use cache::WalletCache;
 use dune::DuneClient;
 use error::BootstrapError;
-use filter::{DEFAULT_MIN_CLOSED_TRADES, DEFAULT_MIN_WIN_RATE_PCT, passes_filter, win_rate_bps};
+use filter::{
+    DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION, DEFAULT_MIN_CLOSED_TRADES,
+    DEFAULT_MIN_WIN_RATE_PCT, FilterConfig, passes_filter, win_rate_bps,
+};
 use polymarket::PolymarketBulkFetcher;
 use rust_decimal::Decimal;
 
@@ -123,10 +126,18 @@ pub struct BootstrapConfig {
     /// Env var `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS`: an integer, or empty / `"unlimited"` / `"none"` for unlimited.
     /// Canonical default in `docs/_GLOSSARY.md`: `bootstrap_polymarket_audit_window_days = None (unlimited)`.
     pub audit_window_days: Option<u32>,
-    /// Minimum closed trades to pass the pre-filter (default `bootstrap_min_closed_trades = 10`).
+    /// Minimum closed trades to pass the post-filter (default `bootstrap_min_closed_trades = 15`).
     pub min_closed_trades: usize,
-    /// Minimum win-rate percent to pass the pre-filter (default `bootstrap_min_win_rate_pct = 80`).
+    /// Minimum win-rate percent to pass the post-filter (default `bootstrap_min_win_rate_pct = 95`).
     pub min_win_rate_pct: u8,
+    /// Recency window for post-filter: wallet must have a trade opened within this many days of
+    /// snapshot time (default `bootstrap_post_filter_active_window_days = 30`).
+    /// Env: `PE_BOOTSTRAP_POST_FILTER_ACTIVE_DAYS`.
+    pub post_filter_active_window_days: u32,
+    /// Maximum average hours from first entry to market resolution for post-filter
+    /// (default `bootstrap_post_filter_max_avg_hours_to_resolution = 72`).
+    /// Env: `PE_BOOTSTRAP_POST_FILTER_MAX_AVG_HOURS`.
+    pub post_filter_max_avg_hours_to_resolution: u32,
     /// Base URL for the Polymarket Data API.
     pub polymarket_base_url: String,
     /// Concurrent wallet fetches against the Polymarket Data API
@@ -246,6 +257,14 @@ impl BootstrapConfig {
             min_win_rate_pct: optional_parse(
                 "PE_BOOTSTRAP_MIN_WIN_RATE_PCT",
                 DEFAULT_MIN_WIN_RATE_PCT,
+            ),
+            post_filter_active_window_days: optional_parse(
+                "PE_BOOTSTRAP_POST_FILTER_ACTIVE_DAYS",
+                DEFAULT_ACTIVE_WINDOW_DAYS,
+            ),
+            post_filter_max_avg_hours_to_resolution: optional_parse(
+                "PE_BOOTSTRAP_POST_FILTER_MAX_AVG_HOURS",
+                DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION,
             ),
             polymarket_base_url: optional("PE_POLYMARKET_BASE_URL", DEFAULT_POLYMARKET_BASE_URL),
             polymarket_concurrency: optional_parse(
@@ -443,13 +462,14 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         "bootstrap: reconstructed ledgers"
     );
 
-    // 4. Pre-filter and 5. Build seed watchlist.
-    let watchlist = build_seed_watchlist(
-        ledgers,
-        snapshot_at,
-        config.min_closed_trades,
-        config.min_win_rate_pct,
-    );
+    // 4. Post-filter and 5. Build seed watchlist.
+    let filter = FilterConfig {
+        min_closed_trades: config.min_closed_trades,
+        min_win_rate_pct: config.min_win_rate_pct,
+        active_window_days: config.post_filter_active_window_days,
+        max_avg_hours_to_resolution: config.post_filter_max_avg_hours_to_resolution,
+    };
+    let watchlist = build_seed_watchlist(ledgers, snapshot_at, &filter);
     tracing::info!(
         active = watchlist.active_count,
         incubator = watchlist.incubator_count,
@@ -503,7 +523,7 @@ async fn fetch_current_block(api_key: &str) -> Result<u64, BootstrapError> {
     })
 }
 
-/// Build a seed [`Watchlist`] from reconstructed ledgers using the bootstrap pre-filter.
+/// Build a seed [`Watchlist`] from reconstructed ledgers using the bootstrap post-filter.
 ///
 /// Uses win-rate basis points as the score (no historical LCB_5pct available at bootstrap).
 /// All passing wallets are assigned `Active` tier; `operator_id` is always `None` since
@@ -511,13 +531,13 @@ async fn fetch_current_block(api_key: &str) -> Result<u64, BootstrapError> {
 pub fn build_seed_watchlist(
     ledgers: Vec<TraderLedger>,
     snapshot_at: SourceTimestamp,
-    min_closed_trades: usize,
-    min_win_rate_pct: u8,
+    filter: &FilterConfig,
 ) -> Watchlist {
+    let snapshot_at_unix = snapshot_at.0.unix_timestamp();
     let mut entries: Vec<WatchlistEntry> = Vec::new();
 
     for ledger in &ledgers {
-        if !passes_filter(ledger, min_closed_trades, min_win_rate_pct) {
+        if !passes_filter(ledger, snapshot_at_unix, filter) {
             continue;
         }
 

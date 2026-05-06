@@ -517,8 +517,10 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `bootstrap_min_closed_trades` | 10 | Minimum closed trades for a wallet to pass the bootstrap pre-filter (exclusive: must have > 10) |
-| `bootstrap_min_win_rate_pct` | 80 | Minimum win-rate (percent, integer) to pass the bootstrap pre-filter |
+| `bootstrap_min_closed_trades` | 15 | Minimum closed trades for a wallet to pass the bootstrap post-filter (exclusive: must have > 15) |
+| `bootstrap_min_win_rate_pct` | 95 | Minimum win-rate (percent, integer) to pass the bootstrap post-filter (exclusive: must exceed 95%) |
+| `bootstrap_post_filter_active_window_days` | 30 | Recency window: wallet must have at least one trade opened within this many days of snapshot time |
+| `bootstrap_post_filter_max_avg_hours_to_resolution` | 72 | Maximum average hours from first entry on a market to that market's resolution; filters out late entrants (exclusive: < 72 h) |
 | `bootstrap_dune_min_closed_markets` | 15 | Minimum distinct resolved binary markets a wallet must have traded (exclusive: > 15) for Dune discovery |
 | `bootstrap_dune_min_win_rate_pct` | 95 | Minimum win-rate (percent, integer) on those markets for Dune discovery (exclusive: > 95%) |
 | `bootstrap_dune_active_window_days` | 30 | Wallet must have at least one trade on a resolved market within this many calendar days for Dune discovery |
