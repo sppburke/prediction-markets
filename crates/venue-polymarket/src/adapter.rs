@@ -221,7 +221,9 @@ impl<C: CLOBClient> PolymarketVenueAdapter<C> {
                 signature: sig.to_owned(),
             },
             owner: self.creds.funder_address.clone(),
-            order_type: "GTC".into(),
+            // GTD: expiration is always set in the signed ClobOrder; REST layer must
+            // match so the server enforces server-side expiry (not just client-side polling).
+            order_type: "GTD".into(),
         }
     }
 
@@ -245,11 +247,10 @@ impl<C: CLOBClient> PolymarketVenueAdapter<C> {
         let deadline = Instant::now() + Duration::from_secs(u64::from(intent.validity_seconds));
         let poll_interval = Duration::from_millis(POLL_INTERVAL_MS);
 
+        // Always poll at least once before checking the deadline: a slow POST could
+        // exhaust validity_seconds before we even query the exchange, causing us to
+        // return Expired for an order that may already have filled.
         loop {
-            if Instant::now() > deadline {
-                return Ok(OrderOutcome::Expired);
-            }
-
             let l2_hdrs = compute_l2_headers(
                 &self.creds.l2,
                 "GET",
@@ -269,6 +270,10 @@ impl<C: CLOBClient> PolymarketVenueAdapter<C> {
 
             if status_resp.status.is_terminal() {
                 return map_terminal_status(status_resp, intent);
+            }
+
+            if Instant::now() > deadline {
+                return Ok(OrderOutcome::Expired);
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -330,9 +335,14 @@ fn map_terminal_status(
                         remaining_contracts: ContractQty(remaining.to_u64().unwrap_or(0)),
                     })
                 }
+                // Use exchange-confirmed fill qty when available; fall back to
+                // intent.contracts only if the response omits quantity_filled.
                 _ => Ok(OrderOutcome::Filled {
                     fill_price,
-                    contracts: intent.contracts,
+                    contracts: filled_qty
+                        .and_then(|d| d.to_u64())
+                        .map(ContractQty)
+                        .unwrap_or(intent.contracts),
                 }),
             }
         }

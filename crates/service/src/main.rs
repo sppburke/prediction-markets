@@ -64,6 +64,36 @@ async fn main() -> Result<()> {
     let live_writer = Writer::open(&live_log_path)
         .with_context(|| format!("open live event log {}", live_log_path.display()))?;
 
+    // Fail fast: live modes require all five CLOB credential fields to be non-empty.
+    // Mirrors the parse_mode pattern of validating config eagerly before any I/O.
+    if matches!(mode, ExecutionMode::LiveTiny | ExecutionMode::Promoted) {
+        anyhow::ensure!(
+            !cfg.polymarket_funder_address.is_empty(),
+            "PE_POLYMARKET_FUNDER_ADDRESS is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_private_key.is_empty(),
+            "PE_POLYMARKET_PRIVATE_KEY is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_clob_api_key.is_empty(),
+            "PE_POLYMARKET_CLOB_API_KEY is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_clob_api_secret.is_empty(),
+            "PE_POLYMARKET_CLOB_API_SECRET is required for mode '{}'",
+            cfg.mode
+        );
+        anyhow::ensure!(
+            !cfg.polymarket_clob_api_passphrase.is_empty(),
+            "PE_POLYMARKET_CLOB_API_PASSPHRASE is required for mode '{}'",
+            cfg.mode
+        );
+    }
+
     // Polymarket CLOB adapter.
     let clob_creds = PolymarketCredentials::mainnet(
         cfg.polymarket_funder_address.clone(),
@@ -72,8 +102,10 @@ async fn main() -> Result<()> {
         cfg.polymarket_clob_api_secret.clone(),
         cfg.polymarket_clob_api_passphrase.clone(),
     );
-    // Log funder address but never the key material.
-    info!(funder = %cfg.polymarket_funder_address, "polymarket clob credentials loaded");
+    // Log funder address only when credentials are present (live mode only).
+    if !cfg.polymarket_funder_address.is_empty() {
+        info!(funder = %cfg.polymarket_funder_address, "polymarket clob credentials loaded");
+    }
 
     let clob_client = ReqwestCLOBClient::new(reqwest::Client::new());
     let adapter = PolymarketVenueAdapter::new(clob_client, clob_creds)
