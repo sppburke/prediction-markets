@@ -548,13 +548,14 @@ pub fn build_seed_watchlist(
             .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
             .count();
 
-        let score = BasisPoints(win_rate_bps(wins, total));
+        let win_rate = BasisPoints(win_rate_bps(wins, total));
         entries.push(WatchlistEntry {
             wallet: ledger.wallet,
             operator_id: None,
             tier: WatchlistTier::Active,
-            leader_score_bps: score,
+            leader_score_bps: win_rate,
             lcb_5pct_bps: BasisPoints(0),
+            win_rate_bps: win_rate,
             closed_trades_in_window: u32::try_from(total).unwrap_or(u32::MAX),
             reconstruction_quality: ledger.reconstruction_quality,
         });

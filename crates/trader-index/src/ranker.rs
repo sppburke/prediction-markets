@@ -71,6 +71,7 @@ pub fn build_watchlist(
                 tier: WatchlistTier::Active,
                 leader_score_bps: stats.leader_score_bps,
                 lcb_5pct_bps: stats.lcb_5pct_bps,
+                win_rate_bps: stats.win_rate_bps,
                 closed_trades_in_window: stats.closed_trades_in_window,
                 reconstruction_quality,
             });
@@ -96,6 +97,7 @@ pub fn build_watchlist(
                 tier: WatchlistTier::Incubator,
                 leader_score_bps: stats.leader_score_bps,
                 lcb_5pct_bps: stats.lcb_5pct_bps,
+                win_rate_bps: stats.win_rate_bps,
                 closed_trades_in_window: stats.closed_trades_in_window,
                 reconstruction_quality,
             });

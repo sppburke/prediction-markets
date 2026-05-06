@@ -260,15 +260,15 @@ impl<C: CLOBClient> Orchestrator<C> {
     }
 
     /// Empirical win-rate probability for a leader, sourced from the watchlist's
-    /// `leader_score_bps`. Falls back to `Probability::ZERO` if the leader is
-    /// not in the watchlist (signal will produce no edge → NoEdge error from evaluate).
+    /// `win_rate_bps` (wins / closed_trades × 10 000). Falls back to `Probability::ZERO`
+    /// if the leader is not in the watchlist (signal will produce no edge → NoEdge error).
     fn win_rate_p_for(&self, leader: &TraderId) -> Probability {
         let bps = self
             .watchlist
             .entries
             .iter()
             .find(|e| e.wallet == leader.0)
-            .map(|e| e.leader_score_bps.0)
+            .map(|e| e.win_rate_bps.0)
             .unwrap_or(0)
             .clamp(0, 10_000);
         let p_raw = Decimal::from(bps) / Decimal::from(10_000i32);

@@ -94,6 +94,7 @@ mod tests {
             tier: WatchlistTier::Active,
             leader_score_bps: BasisPoints(0),
             lcb_5pct_bps: BasisPoints(0),
+            win_rate_bps: BasisPoints(0),
             closed_trades_in_window: 0,
             reconstruction_quality: ReconstructionQuality::new(0).unwrap(),
         }

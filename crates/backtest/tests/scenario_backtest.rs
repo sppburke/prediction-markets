@@ -300,12 +300,12 @@ async fn per_trader_win_rate_used_as_probability() {
 
 // ── Scenario 4 ────────────────────────────────────────────────────────────────
 
-/// PASS: the Polymarket fee model is applied to `c` so that at high prices near p,
-///       the Kelly fraction is reduced. The fee increases c, narrowing the p-c spread.
+/// PASS: the Polymarket fee model is applied to `c` so that Kelly is reduced.
+///       The fee increases c, narrowing the p-c spread.
 /// FAIL: fee is not applied (c = price only), which would give a falsely inflated edge.
 ///
-/// Design: verify fee is non-zero for a mid-probability trade (p=0.95, price=0.35).
-/// fee_per_share = price × fee_rate × p × (1-p) = 0.35 × 0.04 × 0.95 × 0.05 ≈ 0.000665.
+/// Design: verify fee is non-zero for a high-price trade (price=0.95).
+/// fee_per_share = price × fee_rate = 0.95 × 0.04 = 0.038.
 /// The test verifies the simulation runs without error — the fee is applied internally
 /// by WinnerFollowStrategy::evaluate() and the contracts produced reflect the fee-adjusted c.
 #[tokio::test]
@@ -314,8 +314,8 @@ async fn fee_model_reduces_edge_at_high_prices() {
     let funder = wallet(FUNDER_HEX);
 
     // 65 round trips qualifying the wallet. Then add trades at a high price (0.95)
-    // so that fee + slippage brings c very close to p (fee = 0.95 × 0.04 × 0.95 × 0.05 ≈ 0.0018).
-    // At p=1.0 (100% win rate) and price=0.95: c = 0.96 (with slippage) + ~0 fee → edge = 1.0 - 0.96 = 0.04.
+    // so that fee + slippage brings c close to p (fee = 0.95 × 0.04 = 0.038).
+    // At p=1.0 (100% win rate) and price=0.95: c = 0.95 + 0.038 = 0.988 → edge ≈ 0.012.
     // The test just checks the simulation completes and open_at_horizon is well-defined.
     let mut all_trades = generate_winner_trades(winner);
 

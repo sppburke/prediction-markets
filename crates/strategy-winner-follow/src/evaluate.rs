@@ -49,7 +49,7 @@ impl WinnerFollowStrategy {
     /// `p` — empirical win rate supplied by caller (e.g. from `TraderLedger.closed_trades`).
     ///
     /// `c` — computed internally as `leader_price + Polymarket BUY taker fee`. Fee formula:
-    /// `fee_per_share = price × fee_rate × p × (1 − p)`. SELL orders pay no taker fee.
+    /// `fee_per_share = price × fee_rate` (flat taker fee on notional). SELL orders pay no taker fee.
     /// See `_GLOSSARY.md` `polymarket_fee_rate`.
     pub fn evaluate(
         &self,
@@ -77,9 +77,9 @@ impl WinnerFollowStrategy {
 
         // 5. Size contracts.
         // c = leader_price + Polymarket BUY taker fee (SELL orders pay no taker fee).
-        // fee_per_share = price × fee_rate × p × (1 − p), peaks at p=0.5, drops to ~0 at extremes.
+        // fee_per_share = price × fee_rate (flat taker fee on notional).
         let fee_per_share = if signal.leader_side == Side::Buy {
-            signal.leader_price.0 * self.config.polymarket_fee_rate * p.0 * (Decimal::ONE - p.0)
+            signal.leader_price.0 * self.config.polymarket_fee_rate
         } else {
             Decimal::ZERO
         };

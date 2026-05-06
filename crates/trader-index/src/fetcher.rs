@@ -119,9 +119,10 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
                 tier: WatchlistTier::Active,
                 leader_score_bps: rank_score,
                 lcb_5pct_bps: rank_score,
-                // No trade data at fetch time — honest zero sentinel.
+                // No trade data at fetch time — honest zero sentinels.
                 // The service layer merges this with ranker output before
                 // passing to copy-signal-engine.
+                win_rate_bps: BasisPoints(0),
                 closed_trades_in_window: 0,
                 reconstruction_quality: quality,
             });

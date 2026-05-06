@@ -60,6 +60,7 @@ fn make_watchlist(wallet: WalletAddress) -> Watchlist {
             tier: WatchlistTier::Active,
             leader_score_bps: score,
             lcb_5pct_bps: score,
+            win_rate_bps: BasisPoints(7_000),
             closed_trades_in_window: 0,
             reconstruction_quality: quality,
         }],

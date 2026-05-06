@@ -373,7 +373,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `polymarket_fee_rate` | 0.04 | Polymarket BUY taker fee rate applied in the fee model: `fee_per_share = price × rate × p × (1-p)`. Added to `c` to obtain net cost. March 2026 schedule. |
+| `polymarket_fee_rate` | 0.04 | Polymarket BUY taker fee rate applied in the fee model: `fee_per_share = price × rate` (flat taker fee on notional). Added to `c` to obtain net cost. March 2026 schedule. |
 
 ### Service health (`HealthState`)
 
