@@ -26,6 +26,9 @@ pub struct WatchlistEntry {
     pub leader_score_bps: BasisPoints,
     /// Raw LCB at the 5th percentile of the daily-return distribution (basis points).
     pub lcb_5pct_bps: BasisPoints,
+    /// Empirical win rate: wins / closed_trades within the eligibility window (basis points, 0–10 000).
+    /// Used as Kelly input `p`. Honest zero sentinel when no trade data is available.
+    pub win_rate_bps: BasisPoints,
     /// Number of closed trades observed within the eligibility window.
     pub closed_trades_in_window: u32,
     /// Minimum reconstruction quality across all ledgers contributing to this entry.

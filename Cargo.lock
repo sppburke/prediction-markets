@@ -3035,6 +3035,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "pe-bootstrap",
+ "pe-copy-signal-engine",
  "pe-core-types",
  "pe-kelly-sizer",
  "pe-operator-graph",

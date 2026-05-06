@@ -373,7 +373,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `winner_follow_leader_alpha` | 0.05 | Edge assumption: `p = leader_price + alpha`. Breaks the `p=c` deadlock until model-calibrated `p` lands in Phase 3. Set to 0 to disable. |
+| `polymarket_fee_rate` | 0.04 | Polymarket BUY taker fee rate applied in the fee model: `fee_per_share = price × rate` (flat taker fee on notional). Added to `c` to obtain net cost. March 2026 schedule. |
 
 ### Service health (`HealthState`)
 

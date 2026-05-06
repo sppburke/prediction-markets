@@ -65,6 +65,7 @@ fn active_watchlist(w: WalletAddress, op: Option<OperatorId>) -> Watchlist {
             tier: WatchlistTier::Active,
             leader_score_bps: BasisPoints(500),
             lcb_5pct_bps: BasisPoints(200),
+            win_rate_bps: BasisPoints(9_500),
             closed_trades_in_window: 65,
             reconstruction_quality: quality(100),
         }],

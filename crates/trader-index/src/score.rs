@@ -17,6 +17,8 @@ pub(crate) struct CandidateStats {
     pub lcb_5pct_bps: BasisPoints,
     /// Composite ranking score: LCB_5pct + bonus/penalty terms (basis points).
     pub leader_score_bps: BasisPoints,
+    /// Empirical win rate: wins / closed_trades, expressed in basis points (0–10 000).
+    pub win_rate_bps: BasisPoints,
     /// Closed trades observed in the window.
     pub closed_trades_in_window: u32,
     /// Distinct markets traded in the window.
@@ -42,6 +44,15 @@ pub(crate) fn compute_stats(
     }
 
     let closed_trades_in_window = in_window.len() as u32;
+
+    // Empirical win rate: count trades where realized_pnl_usd > 0.
+    let wins = in_window
+        .iter()
+        .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
+        .count();
+    let win_rate_bps = BasisPoints::from_decimal(
+        Decimal::from(wins) / Decimal::from(in_window.len()) * dec!(10_000),
+    );
 
     let distinct_markets_in_window: u32 = in_window
         .iter()
@@ -72,6 +83,7 @@ pub(crate) fn compute_stats(
     Some(CandidateStats {
         lcb_5pct_bps,
         leader_score_bps,
+        win_rate_bps,
         closed_trades_in_window,
         distinct_markets_in_window,
     })

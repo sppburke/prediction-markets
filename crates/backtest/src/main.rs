@@ -4,7 +4,7 @@ use pe_backtest::config::BacktestConfig;
 use pe_backtest::error::BacktestError;
 use pe_backtest::{funder_graph, simulation};
 use pe_bootstrap::cache::WalletCache;
-use pe_strategy_winner_follow::WinnerFollowConfig;
+use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::{LedgerConfig, RankerConfig};
 use tracing::info;
 
@@ -41,13 +41,14 @@ async fn main() -> Result<(), BacktestError> {
     // Phase 1: walk-forward simulation.
     std::fs::create_dir_all(&config.output_dir)?;
 
+    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
     let report = simulation::run_simulation(
         &config,
         all_trades,
         operator_identities,
         &RankerConfig::default(),
         &LedgerConfig::default(),
-        &WinnerFollowConfig::default(),
+        &strategy,
     )?;
 
     info!(
