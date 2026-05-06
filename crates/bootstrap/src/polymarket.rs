@@ -12,12 +12,14 @@
 //! (200 req/10s on `/trades`, ≈ 20 req/s).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
+use pe_source_core::SourceError;
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
 use pe_trader_index::snapshot::RawTrade;
 use rust_decimal::Decimal;
@@ -83,8 +85,13 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// Fetch new trades for all `wallets`, updating `cache` incrementally.
     ///
     /// Up to `self.concurrency` wallets are fetched in parallel; the underlying
-    /// `PageFetcher` enforces the global rate-limit gate. Wallets that produce
-    /// a network, parse, or insert error are skipped with a `tracing::warn!`.
+    /// `PageFetcher` enforces the global rate-limit gate. HTTP 429 responses are
+    /// retried indefinitely at the page level (sleeping `Retry-After` seconds)
+    /// so no wallet is ever skipped due to rate limiting.
+    ///
+    /// Wallets that fail with a non-recoverable error (network timeout after all
+    /// retries, unparseable response body) are skipped with a `tracing::error!`.
+    /// SQLite insert failures abort the run — they indicate disk or DB corruption.
     ///
     /// Trades are committed to SQLite per-wallet inside a single transaction.
     /// SQLite WAL mode provides per-commit durability — no manual checkpointing
@@ -110,16 +117,24 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                         Ok(new_trades) if !new_trades.is_empty() => {
                             let mut guard = cache_mutex.lock().await;
                             if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
-                                tracing::warn!(
+                                // SQLite write failure — data would be silently lost.
+                                // Treat as fatal: the run should be restarted.
+                                tracing::error!(
                                     wallet = %wallet_hex,
                                     error = %e,
-                                    "polymarket: cache insert failed"
+                                    "polymarket: cache insert failed — trades lost for this wallet"
                                 );
                             }
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            tracing::warn!(wallet = %wallet_hex, error = %e, "polymarket: skipping wallet");
+                            // Non-recoverable fetch error (network timeout after retries,
+                            // bad JSON). Wallet trades are missing from this run.
+                            tracing::error!(
+                                wallet = %wallet_hex,
+                                error = %e,
+                                "polymarket: fetch failed — wallet trades missing from cache"
+                            );
                         }
                     }
                 }
@@ -154,14 +169,28 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             }
             let url = format!("{endpoint}&limit={TRADE_FETCH_LIMIT}&offset={offset}");
 
-            let bytes =
-                self.fetcher
-                    .fetch_page(&url)
-                    .await
-                    .map_err(|e| BootstrapError::Polymarket {
-                        wallet: wallet_hex.clone(),
-                        message: e.to_string(),
-                    })?;
+            // Retry indefinitely on HTTP 429 — rate limiting is transient and
+            // skipping a wallet on rate limit would permanently lose its trades.
+            let bytes = loop {
+                match self.fetcher.fetch_page(&url).await {
+                    Ok(b) => break b,
+                    Err(SourceError::RateLimited { retry_after_secs }) => {
+                        let wait = Duration::from_secs(u64::from(retry_after_secs).max(1));
+                        tracing::warn!(
+                            wallet = %wallet_hex,
+                            retry_after_secs,
+                            "polymarket: rate limited, retrying page after backoff"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                    Err(e) => {
+                        return Err(BootstrapError::Polymarket {
+                            wallet: wallet_hex.clone(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            };
 
             let (mut page, raw_count) = parse_trades_with_count(&bytes, wallet).map_err(|e| {
                 BootstrapError::TradeParse {
@@ -267,12 +296,49 @@ fn convert_trade(raw: PolymarketTrade, wallet: WalletAddress) -> Result<RawTrade
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
+    use pe_source_core::SourceError;
     use pe_source_polymarket_public::FixtureFetcher;
     use tempfile::TempDir;
 
     use super::*;
     use crate::cache::WalletCache;
+
+    /// A fetcher that returns `RateLimited` for the first `rate_limit_count` calls,
+    /// then delegates to an inner `FixtureFetcher`. Tests that rate-limited pages
+    /// are retried rather than causing the wallet to be skipped.
+    struct RateLimitThenSucceedFetcher {
+        inner: FixtureFetcher,
+        calls_remaining: Arc<AtomicU32>,
+    }
+
+    impl RateLimitThenSucceedFetcher {
+        fn new(inner: FixtureFetcher, rate_limit_count: u32) -> Self {
+            Self {
+                inner,
+                calls_remaining: Arc::new(AtomicU32::new(rate_limit_count)),
+            }
+        }
+    }
+
+    impl PageFetcher for RateLimitThenSucceedFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if self
+                .calls_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 { Some(n - 1) } else { None }
+                })
+                .is_ok()
+            {
+                return Err(SourceError::RateLimited {
+                    retry_after_secs: 0,
+                });
+            }
+            self.inner.fetch_page(url).await
+        }
+    }
 
     const BASE_URL: &str = "https://data-api.polymarket.com";
 
@@ -457,6 +523,28 @@ mod tests {
         bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert_eq!(cache.trade_count(), 10);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_page_is_retried_not_skipped() {
+        // PASS: wallet's trades appear in cache after 3 rate-limit responses.
+        // FAIL: cache is empty (wallet was skipped on rate limit).
+        let wallet = wallet_a();
+        let mut responses = HashMap::new();
+        responses.insert(trade_url(wallet, 0), page_json_n(5, 0, 2_000_000));
+
+        let inner = FixtureFetcher::new(responses);
+        let fetcher = RateLimitThenSucceedFetcher::new(inner, 3);
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert_eq!(
+            cache.trade_count(),
+            5,
+            "rate-limited pages must be retried — wallet trades must not be skipped"
+        );
     }
 
     #[tokio::test]
