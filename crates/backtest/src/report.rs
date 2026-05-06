@@ -28,6 +28,9 @@ pub struct WinnerFollowReport {
     /// Slippage applied to each fill, in basis points of the signal price.
     /// Canonical default: `backtest_slippage_bps = 100`.
     pub slippage_assumption_bps: u32,
+    /// Number of copy positions still open at the simulation horizon.
+    /// These are excluded from `total_pnl_usd` because their final PnL is unknown.
+    pub open_at_horizon: u64,
     /// True when the funder graph was built from today's Etherscan data, not from data
     /// as it existed at each simulated time T. Relationships established after T_past
     /// may appear in the graph — a known conservative approximation.

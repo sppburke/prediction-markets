@@ -18,7 +18,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, WalletProfile, classify_trade};
-use pe_core_types::{OperatorId, ReconstructionQuality, SourceTimestamp, VenueId, WalletAddress};
+use pe_core_types::{
+    OperatorId, Probability, ReconstructionQuality, SourceTimestamp, TraderId, VenueId,
+    WalletAddress,
+};
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::{AntiGamingFlag, OperatorIdentity};
@@ -213,10 +216,11 @@ impl<C: CLOBClient> Orchestrator<C> {
             return;
         };
 
+        let p = self.win_rate_p_for(&signal.leader);
         let snapshot = zeroed_risk_snapshot();
         match self
             .strategy
-            .evaluate(&signal, snapshot, self.bankroll, self.mode)
+            .evaluate(&signal, p, snapshot, self.bankroll, self.mode)
         {
             Err(e) => info!(reason = %e, "signal did not produce order"),
             Ok(intent) => {
@@ -253,6 +257,23 @@ impl<C: CLOBClient> Orchestrator<C> {
             .find(|e| &e.wallet == wallet)
             .map(|e| e.reconstruction_quality)
             .unwrap_or(self.min_quality)
+    }
+
+    /// Empirical win-rate probability for a leader, sourced from the watchlist's
+    /// `leader_score_bps`. Falls back to `Probability::ZERO` if the leader is
+    /// not in the watchlist (signal will produce no edge → NoEdge error from evaluate).
+    fn win_rate_p_for(&self, leader: &TraderId) -> Probability {
+        let bps = self
+            .watchlist
+            .entries
+            .iter()
+            .find(|e| e.wallet == leader.0)
+            .map(|e| e.leader_score_bps.0)
+            .unwrap_or(0)
+            .clamp(0, 10_000);
+        let p_raw = Decimal::from(bps) / Decimal::from(10_000i32);
+        // Infallible after clamping to [0, 10_000]: p_raw is in [0, 1].
+        Probability::new(p_raw).unwrap_or(Probability::ZERO)
     }
 
     /// Look up the operator ID for `wallet` from the latest scheduler snapshot.

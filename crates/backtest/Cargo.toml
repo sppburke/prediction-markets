@@ -21,6 +21,7 @@ workspace = true
 
 [dependencies]
 pe-bootstrap                  = { path = "../bootstrap",               version = "0.1.0" }
+pe-copy-signal-engine         = { path = "../copy-signal-engine",      version = "0.1.0" }
 pe-core-types                 = { path = "../core-types",              version = "0.1.0" }
 pe-kelly-sizer                = { path = "../kelly-sizer",             version = "0.1.0" }
 pe-operator-graph             = { path = "../operator-graph",          version = "0.1.0" }

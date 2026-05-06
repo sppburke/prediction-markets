@@ -5,7 +5,8 @@ use rust_decimal::prelude::ToPrimitive as _;
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, KellyFraction, LeaderAction, Probability, StrategyId, WinnerFollowSignalKind,
+    BasisPoints, KellyFraction, LeaderAction, Price, Probability, Side, StrategyId,
+    WinnerFollowSignalKind,
 };
 use pe_kelly_sizer::{
     KELLY_CLUSTER_COORDINATION, KELLY_INHERITED_PRIOR, KELLY_NORMAL, KELLY_PAPER_BACKTEST,
@@ -41,18 +42,19 @@ impl WinnerFollowStrategy {
     /// 2. Clamp `mode` to the ceiling imposed by `signal.signal_kind`.
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Select the Kelly fraction for this mode + signal kind.
-    /// 5. Size contracts using fractional Kelly.
+    /// 5. Size contracts using fractional Kelly with caller-provided `p` and fee-adjusted `c`.
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
-    /// `p` = `leader_price + leader_alpha` (capped at 1.0). Model-calibrated `p` deferred to
-    /// `03-PHASE-MODEL-ENGINE.md`.
+    /// `p` — empirical win rate supplied by caller (e.g. from `TraderLedger.closed_trades`).
     ///
-    /// `c` placeholder: `signal.leader_price` is used as the net price (pre-fee/slippage).
-    /// Cost-model adjustment is deferred to `05-PHASE-BACKTESTING.md`.
+    /// `c` — computed internally as `leader_price + Polymarket BUY taker fee`. Fee formula:
+    /// `fee_per_share = price × fee_rate × p × (1 − p)`. SELL orders pay no taker fee.
+    /// See `_GLOSSARY.md` `polymarket_fee_rate`.
     pub fn evaluate(
         &self,
         signal: &LeaderSignal,
+        p: Probability,
         mut snapshot: RiskSnapshot,
         bankroll: Decimal,
         mode: ExecutionMode,
@@ -74,9 +76,15 @@ impl WinnerFollowStrategy {
         let kf = kelly_fraction(signal.signal_kind, effective_mode);
 
         // 5. Size contracts.
-        // p = leader_price + alpha, capped at 1.0. Model-calibrated p deferred to Phase 3.
-        let p = Probability((signal.leader_price.0 + self.config.leader_alpha).min(Decimal::ONE));
-        let c = signal.leader_price;
+        // c = leader_price + Polymarket BUY taker fee (SELL orders pay no taker fee).
+        // fee_per_share = price × fee_rate × p × (1 − p), peaks at p=0.5, drops to ~0 at extremes.
+        let fee_per_share = if signal.leader_side == Side::Buy {
+            signal.leader_price.0 * self.config.polymarket_fee_rate * p.0 * (Decimal::ONE - p.0)
+        } else {
+            Decimal::ZERO
+        };
+        let c_raw = signal.leader_price.0 + fee_per_share;
+        let c = Price::new(c_raw).map_err(|_| WinnerFollowError::NoEdge)?;
 
         let kelly_input = KellyInput {
             p,

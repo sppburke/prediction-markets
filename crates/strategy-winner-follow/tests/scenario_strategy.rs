@@ -13,15 +13,14 @@ use std::collections::HashSet;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, FundingHopCount, InheritedPriorPpm, LeaderAction, MarketId,
-    OperatorId, OutcomeId, Price, ProbabilityPpm, Quantity, ReconstructionQuality, Side,
-    SourceTradeId, TraderId, VenueId, VenueMarketId, WalletAddress, WinnerFollowSignalKind,
+    OperatorId, OutcomeId, Price, Probability, ProbabilityPpm, Quantity, ReconstructionQuality,
+    Side, SourceTradeId, TraderId, VenueId, VenueMarketId, WalletAddress, WinnerFollowSignalKind,
 };
 use pe_risk_engine::{RiskBlock, RiskDecision, RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{
     ExecutionMode, WinnerFollowConfig, WinnerFollowError, WinnerFollowStrategy,
 };
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use time::macros::datetime;
 
@@ -45,6 +44,16 @@ fn price(d: rust_decimal::Decimal) -> Price {
 
 fn quality(q: u8) -> ReconstructionQuality {
     ReconstructionQuality::new(q).expect("quality in 0..=100")
+}
+
+/// Win rate identical to the signal price: fee model pushes c_net above p → NoEdge.
+fn p_at_market() -> Probability {
+    Probability::new(dec!(0.40)).expect("0.40 is valid")
+}
+
+/// Win rate well above the signal price: clear Kelly edge.
+fn p_high() -> Probability {
+    Probability::new(dec!(0.70)).expect("0.70 is valid")
 }
 
 fn make_signal(
@@ -97,26 +106,23 @@ fn clean_snapshot() -> RiskSnapshot {
 
 // ─── scenario 1 ──────────────────────────────────────────────────────────────
 
-/// With `leader_alpha = 0`, p == c and Kelly always returns zero contracts
-/// because edge = 0. Model-calibrated `p` (Phase 3) replaces the alpha.
+/// When p == leader_price, the fee model increases c_net above p, so Kelly edge
+/// is negative → NoEdge.
 ///
 /// PASS: `Err(NoEdge)`.
 #[test]
-fn scenario_no_edge_with_zero_alpha() {
+fn scenario_no_edge_when_p_equals_price() {
     let signal = make_signal(
         0x01,
         WinnerFollowSignalKind::NormalLeaderFollow,
         LeaderAction::Entry,
         None,
     );
-    let config = WinnerFollowConfig {
-        leader_alpha: Decimal::ZERO,
-        ..WinnerFollowConfig::default()
-    };
-    let strategy = WinnerFollowStrategy::new(config);
+    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
 
     let result = strategy.evaluate(
         &signal,
+        p_at_market(),
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,
@@ -124,19 +130,19 @@ fn scenario_no_edge_with_zero_alpha() {
 
     assert!(
         matches!(result, Err(WinnerFollowError::NoEdge)),
-        "zero alpha: p=c yields no edge; got {result:?}"
+        "p==price with fees: c_net > p yields no edge; got {result:?}"
     );
 }
 
 // ─── scenario 7 ──────────────────────────────────────────────────────────────
 
-/// With default `leader_alpha = 0.05`, p > c and Kelly finds a non-zero edge.
+/// With p=0.70 >> price=0.40, clear Kelly edge exists.
 /// The strategy returns something other than `NoEdge` (either an order or a
-/// risk block), confirming alpha breaks the p=c deadlock.
+/// risk block).
 ///
 /// PASS: result is NOT `Err(NoEdge)`.
 #[test]
-fn scenario_positive_alpha_breaks_no_edge() {
+fn scenario_positive_p_breaks_no_edge() {
     let signal = make_signal(
         0x07,
         WinnerFollowSignalKind::NormalLeaderFollow,
@@ -147,6 +153,7 @@ fn scenario_positive_alpha_breaks_no_edge() {
 
     let result = strategy.evaluate(
         &signal,
+        p_high(),
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,
@@ -154,7 +161,7 @@ fn scenario_positive_alpha_breaks_no_edge() {
 
     assert!(
         !matches!(result, Err(WinnerFollowError::NoEdge)),
-        "default alpha 0.05 must break the p=c deadlock; got {result:?}"
+        "p=0.70 >> price=0.40: must find edge; got {result:?}"
     );
 }
 
@@ -176,6 +183,7 @@ fn scenario_cluster_coordination_clamped_to_shadow() {
 
     let result = strategy.evaluate(
         &signal,
+        p_high(),
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,
@@ -206,6 +214,7 @@ fn scenario_fresh_wallet_clamped_to_paper_not_shadow() {
 
     let result = strategy.evaluate(
         &signal,
+        p_high(),
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,
@@ -254,6 +263,7 @@ fn scenario_flip_blocked_by_default() {
 
     let result = strategy.evaluate(
         &signal,
+        p_high(),
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,
@@ -286,6 +296,7 @@ fn scenario_flip_approved_passes_gate() {
 
     let result = strategy.evaluate(
         &signal,
+        p_high(),
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,
@@ -311,9 +322,10 @@ proptest::proptest! {
         );
         let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
         let bankroll = rust_decimal::Decimal::from(bankroll_raw);
+        let p = p_high();
 
-        let r1 = strategy.evaluate(&signal, clean_snapshot(), bankroll, ExecutionMode::LiveTiny);
-        let r2 = strategy.evaluate(&signal, clean_snapshot(), bankroll, ExecutionMode::LiveTiny);
+        let r1 = strategy.evaluate(&signal, p, clean_snapshot(), bankroll, ExecutionMode::LiveTiny);
+        let r2 = strategy.evaluate(&signal, p, clean_snapshot(), bankroll, ExecutionMode::LiveTiny);
 
         match (&r1, &r2) {
             (Ok(a), Ok(b)) => {

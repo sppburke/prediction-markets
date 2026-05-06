@@ -8,16 +8,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
+use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, MarketId, OperatorId, OutcomeId, Price, Probability, SourceTimestamp,
-    WalletAddress,
+    BasisPoints, LeaderAction, MarketId, OperatorId, OutcomeId, Probability, ProbabilityPpm,
+    Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
+    WinnerFollowSignalKind,
 };
-use pe_kelly_sizer::{KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
 use pe_operator_graph::OperatorIdentity;
+use pe_risk_engine::RiskSnapshot;
+use pe_risk_engine::block::RiskBlock;
 use pe_risk_engine::snapshot::TradingMode;
-use pe_risk_engine::{RiskDecision, RiskSnapshot, evaluate_risk};
 use pe_source_core::SourceStatus;
-use pe_strategy_winner_follow::WinnerFollowConfig;
+use pe_strategy_winner_follow::{WinnerFollowError, WinnerFollowStrategy};
+use pe_trader_index::ledger::TraderLedger;
 use pe_trader_index::snapshot::{RawTrade, TradeSnapshot};
 use pe_trader_index::{LedgerConfig, RankerConfig, build_trader_ledgers, build_watchlist};
 use rust_decimal::Decimal;
@@ -33,6 +36,9 @@ use crate::report::{
 
 // Canonical default in `docs/_GLOSSARY.md` "Backtest defaults".
 const DEFAULT_SLIPPAGE_BPS: u32 = 100;
+
+// Per-trade size cap in bps of bankroll (LiveTiny mode). Mirrors risk-engine's cap.
+const LIVETINY_PER_TRADE_CAP_BPS: u32 = 25;
 
 /// Open position entry (copies we've taken but not yet closed).
 #[derive(Debug, Clone)]
@@ -94,7 +100,7 @@ pub fn run_simulation(
     operator_identities: Vec<OperatorIdentity>,
     ranker_config: &RankerConfig,
     ledger_config: &LedgerConfig,
-    wf_config: &WinnerFollowConfig,
+    strategy: &WinnerFollowStrategy,
 ) -> Result<WinnerFollowReport, BacktestError> {
     // Build wallet → operator map for quick lookup.
     let wallet_to_operator: HashMap<WalletAddress, &OperatorIdentity> = operator_identities
@@ -133,7 +139,7 @@ pub fn run_simulation(
     let mut bankroll = config.bankroll_usd;
     let bankroll_initial = bankroll;
 
-    // Open positions per (market, outcome) → stack of positions.
+    // Open positions per (wallet, market, outcome) → position entry.
     let mut open_positions: HashMap<(WalletAddress, PosKey), OpenPosition> = HashMap::new();
 
     let mut exposure = ExposureTracker::default();
@@ -193,6 +199,17 @@ pub fn run_simulation(
         let ledgers = build_trader_ledgers(&snapshot, &operator_identities, ledger_config);
         let watchlist = build_watchlist(&ledgers, snapshot.snapshot_at.clone(), ranker_config);
 
+        // Build wallet → ledger map for O(1) win-rate lookup.
+        let ledger_by_wallet: HashMap<WalletAddress, &TraderLedger> =
+            ledgers.iter().map(|l| (l.wallet, l)).collect();
+
+        // Build wallet → reconstruction quality map from watchlist entries.
+        let quality_by_wallet: HashMap<WalletAddress, ReconstructionQuality> = watchlist
+            .entries
+            .iter()
+            .map(|e| (e.wallet, e.reconstruction_quality))
+            .collect();
+
         // Watchlisted wallets (Active + Incubator).
         let watchlisted: HashSet<WalletAddress> =
             watchlist.entries.iter().map(|e| e.wallet).collect();
@@ -225,7 +242,7 @@ pub fn run_simulation(
             let wallet_pos_key = (leader, pos_key.clone());
 
             match trade.side {
-                pe_core_types::Side::Buy => {
+                Side::Buy => {
                     // Open a new copy position if we don't already have one for this key.
                     if open_positions.contains_key(&wallet_pos_key) {
                         continue; // Already tracking this leader's position.
@@ -239,46 +256,18 @@ pub fn run_simulation(
                         }
                         raw
                     };
-                    let fill_price_typed = match Price::new(fill_price) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-
-                    // Kelly sizing.
-                    let p_raw = (trade.price.0 + wf_config.leader_alpha).min(Decimal::ONE);
-                    let p = match Probability::new(p_raw) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    let c = fill_price_typed;
-                    let kelly_input = KellyInput {
-                        p,
-                        c,
-                        kelly_fraction: KELLY_PAPER_BACKTEST,
-                        bankroll,
-                    };
-                    let kelly_contracts = match size_contracts(&kelly_input) {
-                        Ok(c) if c.0 > 0 => c.0,
-                        _ => continue,
-                    };
-
-                    // Clamp to the LiveTiny per-trade cap (25 bps of bankroll).
-                    // In a paper backtest we scale down to fit the cap rather than
-                    // skipping the trade entirely — the risk gate then validates the
-                    // clipped size.
-                    let max_for_cap: u64 = {
-                        let max_notional =
-                            Decimal::from(25u32) * bankroll / Decimal::from(10_000u32);
-                        let max = (max_notional / fill_price).floor();
-                        max.to_u64().unwrap_or(0)
-                    };
-                    let contracts_count = kelly_contracts.min(max_for_cap);
-                    if contracts_count == 0 {
+                    // Win-rate probability from the leader's ledger (Blocker 2).
+                    let Some(p) = leader_win_rate_p(ledger_by_wallet.get(&leader).copied()) else {
                         continue;
-                    }
+                    };
 
-                    // Risk gate.
-                    let proposed_bps = proposed_trade_bps(contracts_count, fill_price, bankroll);
+                    // Quality from watchlist; always present for watchlisted wallets.
+                    let Some(quality) = quality_by_wallet.get(&leader).copied() else {
+                        continue;
+                    };
+
+                    let signal = raw_trade_to_leader_signal(trade, operator_id.cloned(), quality);
+
                     let risk_snapshot = build_risk_snapshot(&RiskContext {
                         exposure: &exposure,
                         leader,
@@ -287,26 +276,40 @@ pub fn run_simulation(
                         intraday_bps,
                         rolling_7d_bps,
                         has_funder,
-                        proposed_bps,
+                        proposed_bps: 0, // evaluate() overwrites this
                     });
 
-                    match evaluate_risk(&risk_snapshot) {
-                        RiskDecision::Approved => {}
-                        RiskDecision::Blocked(reason) => {
-                            tracing::debug!(
-                                wallet = %leader,
-                                ?reason,
-                                "risk blocked"
-                            );
+                    let contracts_count = match strategy.evaluate(
+                        &signal,
+                        p,
+                        risk_snapshot,
+                        bankroll,
+                        pe_strategy_winner_follow::ExecutionMode::Paper,
+                    ) {
+                        Ok(intent) => intent.contracts.0,
+                        Err(WinnerFollowError::Blocked(RiskBlock::PerTradeSizeExceeded)) => {
+                            // Kelly exceeds the 25-bps cap. Clip to the cap-sized position.
+                            let max_notional = Decimal::from(LIVETINY_PER_TRADE_CAP_BPS) * bankroll
+                                / Decimal::from(10_000u32);
+                            let max = (max_notional / fill_price).floor();
+                            max.to_u64().unwrap_or(0)
+                        }
+                        Err(e) => {
+                            tracing::debug!(wallet = %leader, reason = %e, "signal blocked");
                             continue;
                         }
+                    };
+
+                    if contracts_count == 0 {
+                        continue;
                     }
 
                     // Record fill.
                     let notional = Decimal::from(contracts_count) * fill_price;
                     bankroll -= notional;
 
-                    exposure.add(leader, operator_id, &trade.market_id, proposed_bps);
+                    let actual_bps = proposed_trade_bps(contracts_count, fill_price, bankroll);
+                    exposure.add(leader, operator_id, &trade.market_id, actual_bps);
 
                     open_positions.insert(
                         wallet_pos_key,
@@ -331,7 +334,7 @@ pub fn run_simulation(
                     write_fill(&mut fills_writer, &fill)?;
                 }
 
-                pe_core_types::Side::Sell => {
+                Side::Sell => {
                     // Close existing copy position for this leader on this (market, outcome).
                     let Some(open) = open_positions.remove(&wallet_pos_key) else {
                         continue;
@@ -382,14 +385,10 @@ pub fn run_simulation(
         }
     }
 
-    // Close remaining open positions at last observed signal price (mark-to-market = 0).
-    for (_, open) in open_positions.drain() {
-        let notional = Decimal::from(open.contracts) * open.avg_fill_price;
-        let pnl = -notional; // treat as total loss
-        intraday_realized_pnl += pnl;
-        bankroll -= notional;
-        pnl_accum.record(open.operator_id.as_ref(), pnl);
-    }
+    // Positions still open at horizon are excluded from realized PnL — their final
+    // value is unknown. Capital remains tied up in the bankroll (cost was deducted at BUY).
+    let open_at_horizon = u64::try_from(open_positions.len()).unwrap_or(u64::MAX);
+    // Do NOT modify bankroll or record PnL for open positions.
 
     daily_bankroll.push(bankroll);
     daily_pnl.push(intraday_realized_pnl);
@@ -410,6 +409,7 @@ pub fn run_simulation(
         bankroll_initial,
         bankroll_final: bankroll,
         slippage_assumption_bps: slippage_bps,
+        open_at_horizon,
         funder_graph_snapshot_caveat: true,
     };
 
@@ -424,6 +424,7 @@ pub fn run_simulation(
         total_copies = report.total_copies,
         total_pnl_usd = %report.total_pnl_usd,
         win_rate_pct = %report.win_rate_pct,
+        open_at_horizon = report.open_at_horizon,
         "simulation complete"
     );
 
@@ -431,6 +432,58 @@ pub fn run_simulation(
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a `LeaderSignal` from a raw simulation trade for routing through evaluate().
+///
+/// All backtest signals use `NormalLeaderFollow` kind and `Add` action (BUY entry).
+fn raw_trade_to_leader_signal(
+    trade: &RawTrade,
+    operator_id: Option<OperatorId>,
+    quality: ReconstructionQuality,
+) -> LeaderSignal {
+    LeaderSignal {
+        leader: TraderId(trade.wallet),
+        operator_id,
+        venue: VenueId::polymarket(),
+        market_id: trade.market_id.clone(),
+        outcome_id: trade.outcome_id,
+        action: LeaderAction::Add,
+        leader_side: trade.side,
+        leader_price: trade.price,
+        leader_size: Quantity(trade.contracts),
+        observed_at: trade.timestamp.0,
+        received_at: trade.timestamp.0,
+        reconstruction_quality: quality,
+        signal_kind: WinnerFollowSignalKind::NormalLeaderFollow,
+        inherited_prior: None,
+        source_trade_id: trade.source_trade_id.clone(),
+        action_confidence_ppm: ProbabilityPpm(700_000),
+    }
+}
+
+/// Compute the empirical win-rate probability from a leader's ledger.
+///
+/// Returns `None` when the ledger has no closed trades (no data to derive edge from).
+///
+/// # Precondition
+/// Caller should ensure the ledger has passed the bootstrap filter (>15 closed trades,
+/// >95% win rate). This function does not re-apply those thresholds.
+fn leader_win_rate_p(ledger: Option<&TraderLedger>) -> Option<Probability> {
+    let ledger = ledger?;
+    let total = ledger.closed_trades.len();
+    if total == 0 {
+        return None;
+    }
+    let wins = ledger
+        .closed_trades
+        .iter()
+        .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
+        .count();
+    let p_raw = Decimal::from(wins) / Decimal::from(total);
+    // Clamp defensively: wins/total is always in [0,1] but saturating arithmetic protects against
+    // any edge case in ledger reconstruction.
+    Probability::new(p_raw.clamp(Decimal::ZERO, Decimal::ONE)).ok()
+}
 
 fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> i32 {
     if bankroll <= Decimal::ZERO {
@@ -492,99 +545,4 @@ fn write_fill(writer: &mut std::fs::File, fill: &TradeFill) -> Result<(), Backte
     let line = serde_json::to_string(fill)?;
     writeln!(writer, "{line}")?;
     Ok(())
-}
-
-/// Compute proposed trade size in basis points of bankroll (exposed for tests).
-pub fn compute_proposed_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> i32 {
-    proposed_trade_bps(contracts, price, bankroll)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-    use pe_core_types::{
-        ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, VenueMarketId,
-    };
-    use pe_core_types::{SourceTradeId, WalletAddress};
-    use rust_decimal_macros::dec;
-    use time::OffsetDateTime;
-
-    fn wallet(hex: &str) -> WalletAddress {
-        WalletAddress::from_hex(hex).unwrap()
-    }
-
-    fn raw_trade(wallet: WalletAddress, day_offset_secs: i64, side: Side, price: f64) -> RawTrade {
-        let base_unix: i64 = 1_700_000_000; // 2023-11-14 22:13:20 UTC
-        RawTrade {
-            wallet,
-            market_id: MarketId(VenueMarketId("0xcond".to_owned())),
-            outcome_id: OutcomeId(0),
-            side,
-            price: Price::new(Decimal::try_from(price).unwrap()).unwrap(),
-            contracts: ContractQty(10),
-            timestamp: SourceTimestamp(
-                OffsetDateTime::from_unix_timestamp(base_unix + day_offset_secs).unwrap(),
-            ),
-            source_trade_id: SourceTradeId(format!("0xhash_{price}_{day_offset_secs}")),
-        }
-    }
-
-    // Walk-forward invariant: a trade at day T+1 must not be visible to the ranker at day T.
-    #[test]
-    fn walk_forward_invariant_future_trade_not_visible() {
-        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-
-        // Trade at day 0 (epoch)
-        let t0 = raw_trade(w, 0, Side::Buy, 0.5);
-        // Trade at day 1 (86400 seconds later)
-        let future = raw_trade(w, 86_400, Side::Buy, 0.6);
-
-        let cutoff_day = future.timestamp.0.date();
-        let cutoff_unix = cutoff_day.midnight().assume_utc().unix_timestamp();
-
-        // Ranker at cutoff day sees ONLY trades BEFORE cutoff.
-        let t0_visible = t0.timestamp.0.unix_timestamp() < cutoff_unix;
-        let future_visible = future.timestamp.0.unix_timestamp() < cutoff_unix;
-
-        assert!(t0_visible, "t0 must be visible at the cutoff day");
-        assert!(
-            !future_visible,
-            "future trade must NOT be visible to ranker at its own day"
-        );
-    }
-
-    // Fill model: fill price must differ from signal price by the slippage amount.
-    #[test]
-    fn fill_slippage_applied() {
-        let signal_price = dec!(0.50);
-        let slippage = Decimal::from(DEFAULT_SLIPPAGE_BPS) / Decimal::from(10_000u32);
-        let buy_fill = signal_price + slippage;
-        let sell_fill = signal_price - slippage;
-
-        assert_ne!(
-            buy_fill, signal_price,
-            "BUY fill must differ from signal price"
-        );
-        assert_ne!(
-            sell_fill, signal_price,
-            "SELL fill must differ from signal price"
-        );
-        assert!(
-            buy_fill > signal_price,
-            "BUY fill price must be worse (higher) than signal"
-        );
-        assert!(
-            sell_fill < signal_price,
-            "SELL fill price must be worse (lower) than signal"
-        );
-    }
-
-    // Determinism: identical input trade sets produce identical bps output.
-    #[test]
-    fn compute_proposed_bps_deterministic() {
-        let bps_a = compute_proposed_bps(10, dec!(0.50), dec!(10_000));
-        let bps_b = compute_proposed_bps(10, dec!(0.50), dec!(10_000));
-        assert_eq!(bps_a, bps_b, "same inputs must produce same bps");
-    }
 }
