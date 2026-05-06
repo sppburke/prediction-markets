@@ -106,7 +106,7 @@ async fn winner_wallet_produces_positive_pnl() {
 
     let dir = TempDir::new().unwrap();
     let config = BacktestConfig {
-        cache_path: dir.path().join("cache.json"),
+        cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
         step_days: 1,

@@ -527,7 +527,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/trades` endpoint |
 | `bootstrap_polymarket_max_offset` | 3000 | Maximum `/trades` pagination offset; Polymarket Data API returns HTTP 400 for `offset >= 3000`. The fetcher breaks before issuing the over-limit request, so each wallet gets at most 3000 trades (its most-recent history). |
 | `bootstrap_polymarket_concurrency` | 16 | Concurrent per-wallet trade fetches against the Polymarket Data API; the `ReqwestFetcher` rate-limit gate caps aggregate throughput at ≤ 20 req/s regardless. Set via `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY`. |
-| `bootstrap_polymarket_checkpoint_interval` | 50 | Successful wallet inserts between periodic disk checkpoints. Serialization happens inside the cache mutex (consistent snapshot); the disk write happens outside via `spawn_blocking`. At most 50 wallets are re-fetched on crash recovery; each costs 1–6 API calls with incremental fetch. |
+| `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |
 | `bootstrap_wallet_source` | `"etherscan"` | Wallet discovery backend (`"etherscan"` or `"dune"`); set via `PE_WALLET_SOURCE` |
 | `bootstrap_wallet_from_block` | `CTF_EXCHANGE_V1_DEPLOY_BLOCK` (33_605_403) | Start block for Etherscan wallet scan; set via `PE_WALLET_FROM_BLOCK` |
 | `bootstrap_wallet_to_block` | current chain head | End block for Etherscan wallet scan; set via `PE_WALLET_TO_BLOCK` (fetched from Etherscan if absent) |

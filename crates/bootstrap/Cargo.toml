@@ -28,6 +28,7 @@ pe-trader-index               = { path = "../trader-index",                 vers
 
 futures         = { workspace = true }
 reqwest         = { workspace = true }
+rusqlite        = { version = "0.32", features = ["bundled"] }
 rust_decimal    = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }

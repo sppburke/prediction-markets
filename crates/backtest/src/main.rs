@@ -17,7 +17,7 @@ async fn main() -> Result<(), BacktestError> {
     // Load wallet trade cache.
     let cache = WalletCache::open(&config.cache_path)?;
     let all_wallet_addresses = cache.all_wallet_addresses();
-    let all_trades = cache.all_trades_unchecked();
+    let all_trades = cache.all_trades();
 
     info!(
         wallets = all_wallet_addresses.len(),
