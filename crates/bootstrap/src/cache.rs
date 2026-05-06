@@ -443,6 +443,18 @@ impl WalletCache {
         }
     }
 
+    /// Maximum `resolved_at_unix` across all rows in `market_resolutions`.
+    /// Returns 0 when the table is empty — the first run then queries the full
+    /// on-chain history by passing 0 to `FROM_UNIXTIME`.
+    pub fn max_resolved_at_unix(&self) -> Result<i64, BootstrapError> {
+        let ts: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(resolved_at_unix), 0) FROM market_resolutions",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(ts)
+    }
+
     /// Load all resolved markets into a `ResolutionIndex` keyed by `MarketId`.
     ///
     /// Excludes rows where `winning_outcome_id IS NULL` (voided/non-binary markets).
@@ -1011,6 +1023,29 @@ mod tests {
         assert_eq!(ids.len(), 2, "must deduplicate market_ids");
         assert!(ids.contains(&"0xmkt_a".to_owned()));
         assert!(ids.contains(&"0xmkt_b".to_owned()));
+    }
+
+    #[test]
+    fn max_resolved_at_unix_empty_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let cache = tmp_cache(&dir);
+        assert_eq!(cache.max_resolved_at_unix().unwrap(), 0);
+    }
+
+    #[test]
+    fn max_resolved_at_unix_returns_maximum() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xa", Some(0), 1_700_000_100, 1_700_000_200)
+            .unwrap();
+        cache
+            .insert_resolution("0xb", Some(1), 1_700_000_500, 1_700_000_600)
+            .unwrap();
+        cache
+            .insert_resolution("0xc", None, 1_700_000_300, 1_700_000_400)
+            .unwrap();
+        assert_eq!(cache.max_resolved_at_unix().unwrap(), 1_700_000_500);
     }
 
     #[test]
