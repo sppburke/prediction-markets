@@ -10,7 +10,7 @@
 //! Compared to [`crate::funder_discovery::EthGetLogsLookup`], which batches
 //! multiple recipients into a single `topic[2]` filter per call, this lookup
 //! issues one HTTP request per wallet per contract. That trades request
-//! volume for staying inside Etherscan's free 5 req/s budget instead of
+//! volume for staying inside Etherscan's free 3 req/s budget instead of
 //! consuming Alchemy compute units. For seed sets of ~10–100 wallets and
 //! `funding_max_hops = 3`, total wall time is bounded at a few minutes.
 //!
@@ -36,9 +36,12 @@ const POLYGON_CHAIN_ID: u32 = 137;
 const USDC_NATIVE: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 /// Bridged USDC.e on Polygon (legacy bridged from Ethereum).
 const USDC_BRIDGED: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-/// Free-tier rate limit is 5 req/s. Sleep between sequential calls to stay under it.
+/// Free-tier rate limit is 3 req/s (verified via in-band rate-limit responses;
+/// the historical "5 req/s" doc was optimistic). Sleep 350 ms ≈ 2.85 req/s
+/// between sequential calls — under the cap with margin, eliminating the
+/// in-band-retry loop that previously dragged effective throughput to 0.5 req/s.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
-const RATE_LIMIT_DELAY_MS: u64 = 200;
+const RATE_LIMIT_DELAY_MS: u64 = 350;
 /// Cap on retry backoff when transient errors occur.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
 const MAX_BACKOFF_SECS: u64 = 60;
