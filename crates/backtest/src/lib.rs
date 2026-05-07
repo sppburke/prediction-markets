@@ -5,3 +5,5 @@ pub mod error;
 pub mod funder_graph;
 pub mod report;
 pub mod simulation;
+
+pub use funder_graph::FunderGraphTimeline;

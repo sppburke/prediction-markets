@@ -1,12 +1,10 @@
-//! Build operator identities from cached Etherscan funder edges.
+//! Temporal funder/operator graph for walk-forward backtests.
 //!
-//! Reads pre-populated `funder_edges` from the bootstrap SQLite cache instead of calling
-//! Etherscan at backtest time. The cache is populated by `pe-bootstrap` when
-//! `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
-//!
-//! Known approximation: funder relationships are discovered at run time, not at each
-//! simulated time T. For Polymarket proxy wallets the funder relationship is established
-//! at deposit time, so the bias is small. Documented in `WinnerFollowReport.funder_graph_snapshot_caveat`.
+//! `FunderGraphTimeline` owns the full funder-edge list pre-sorted by
+//! `fetched_at_unix` and exposes a `view_at(t)` binary-search slice.
+//! `build_operator_identities_at` runs the existing clustering logic on that
+//! time-bounded slice, eliminating the look-forward bias of the old
+//! build-once-at-startup approach.
 
 use std::collections::HashMap;
 
@@ -22,41 +20,94 @@ use tracing::{info, warn};
 
 use crate::error::BacktestError;
 
-/// Build operator identities from cached funder edges.
+/// Funder-edge list sorted ascending by `fetched_at_unix`.
 ///
-/// Returns an empty `Vec` with a warning when the cache has no funder edges — run
-/// `pe-bootstrap` with `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1` to populate the cache.
-///
-/// # Precondition
-/// `cache` must have been populated by a prior bootstrap run with
-/// `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`. Empty cache is handled gracefully.
-pub fn build_funder_graph(
-    cache: &WalletCache,
-    all_trades: &[RawTrade],
-) -> Result<Vec<OperatorIdentity>, BacktestError> {
-    let edge_pairs = cache.load_funder_edges().map_err(BacktestError::Cache)?;
+/// Tuple layout: `(fetched_at_unix, funder, funded)` — timestamp first so
+/// `partition_point` uses natural ordering without a field-accessor closure.
+pub struct FunderGraphTimeline {
+    /// `(fetched_at_unix, funder, funded)` sorted ascending by `fetched_at_unix`.
+    edges: Vec<(i64, WalletAddress, WalletAddress)>,
+}
 
-    if edge_pairs.is_empty() {
-        warn!(
-            "funder edge cache is empty — run pe-bootstrap with \
-             PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 to populate; operator clustering disabled"
-        );
+impl FunderGraphTimeline {
+    /// Load all funder edges from the cache, sorted by discovery timestamp.
+    pub fn from_cache(cache: &WalletCache) -> Result<Self, BacktestError> {
+        let raw = cache
+            .load_funder_edges_with_timestamp()
+            .map_err(BacktestError::Cache)?;
+
+        if raw.is_empty() {
+            warn!(
+                "funder edge cache is empty — run pe-bootstrap with \
+                 PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1; operator clustering disabled"
+            );
+            return Ok(Self { edges: Vec::new() });
+        }
+
+        let mut edges: Vec<(i64, WalletAddress, WalletAddress)> = raw
+            .into_iter()
+            .map(|(funder, funded, ts)| (ts, funder, funded))
+            .collect();
+        // Guarantee ascending order (SQL ORDER BY should already ensure this,
+        // but be defensive against out-of-order rows).
+        edges.sort_unstable_by_key(|(ts, _, _)| *ts);
+
+        info!(edges = edges.len(), "funder timeline loaded from cache");
+        Ok(Self { edges })
+    }
+
+    /// Empty timeline — no edges visible at any time. Used in tests that do not
+    /// exercise operator clustering and in the empty-cache fast path.
+    pub fn empty() -> Self {
+        Self { edges: Vec::new() }
+    }
+
+    /// Return all edges whose `fetched_at_unix <= t`.
+    ///
+    /// Uses `partition_point` (O(log N)). Calling with the same `t` twice
+    /// returns the same slice.
+    pub fn view_at(&self, t: i64) -> &[(i64, WalletAddress, WalletAddress)] {
+        let count = self.edges.partition_point(|(ts, _, _)| *ts <= t);
+        &self.edges[..count]
+    }
+
+    pub fn total_edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+}
+
+/// Build operator identities using only the funder edges visible at time `t`.
+///
+/// Calls `view_at(t)` for the temporal slice, then runs the same
+/// `build_operator_identities` clustering logic. No look-forward bias.
+pub fn build_operator_identities_at(
+    timeline: &FunderGraphTimeline,
+    all_trades: &[RawTrade],
+    t: i64,
+) -> Result<Vec<OperatorIdentity>, BacktestError> {
+    let visible = timeline.view_at(t);
+
+    if visible.is_empty() {
         return Ok(Vec::new());
     }
 
-    let snapshot_ts = SourceTimestamp(OffsetDateTime::now_utc());
+    let snapshot_ts = SourceTimestamp(
+        OffsetDateTime::from_unix_timestamp(t).unwrap_or(OffsetDateTime::UNIX_EPOCH),
+    );
 
-    let edges: Vec<FundingEdge> = edge_pairs
-        .into_iter()
-        .map(|(funder, funded)| FundingEdge {
-            funder,
-            funded,
+    let edges: Vec<FundingEdge> = visible
+        .iter()
+        .map(|(_, funder, funded)| FundingEdge {
+            funder: *funder,
+            funded: *funded,
             amount_usd: Decimal::ZERO,
             timestamp: snapshot_ts.clone(),
         })
         .collect();
-
-    info!(edges = edges.len(), "funder edges loaded from cache");
 
     let mut closed_trades_per_wallet: HashMap<WalletAddress, u32> = HashMap::new();
     for trade in all_trades {
@@ -72,12 +123,6 @@ pub fn build_funder_graph(
         snapshot_at: snapshot_ts,
     };
 
-    let identities = build_operator_identities(&funding_snapshot, &ClusteringConfig::default())
-        .map_err(BacktestError::OperatorGraph)?;
-
-    info!(
-        operators = identities.len(),
-        "operator graph built from cache"
-    );
-    Ok(identities)
+    build_operator_identities(&funding_snapshot, &ClusteringConfig::default())
+        .map_err(BacktestError::OperatorGraph)
 }
