@@ -19,14 +19,21 @@ const DEFAULT_AUDIT_WINDOW_DAYS: u32 = 90;
 // reflect what the data can actually support. See `docs/_GLOSSARY.md` "Backtest defaults".
 const DEFAULT_BT_MIN_QUALITY: u8 = 0;
 const DEFAULT_BT_ACTIVE_MIN_CLOSED: u32 = 10;
-const DEFAULT_BT_ACTIVE_MIN_MARKETS: u32 = 5;
+// N_eff shrinkage now handles the statistical-rigor job that the distinct-markets filter
+// previously did. Lowered to 1 so specialists are not excluded before shrinkage can price them.
+// See `docs/_GLOSSARY.md` `backtest_active_min_distinct_markets`.
+const DEFAULT_BT_ACTIVE_MIN_MARKETS: u32 = 1;
 const DEFAULT_BT_INCUBATOR_MIN_CLOSED: u32 = 3;
-const DEFAULT_BT_INCUBATOR_MIN_MARKETS: u32 = 2;
+const DEFAULT_BT_INCUBATOR_MIN_MARKETS: u32 = 1;
 
 // Beta prior on leader win-rate. See `docs/_GLOSSARY.md` `kelly_p_prior_alpha_default` /
 // `kelly_p_prior_beta_default`. Set both to 0 to reproduce the raw-rate path.
 const DEFAULT_BT_KELLY_P_PRIOR_ALPHA: u32 = 10;
 const DEFAULT_BT_KELLY_P_PRIOR_BETA: u32 = 10;
+
+// Effective-sample-size scaling. See `docs/_GLOSSARY.md` `kelly_p_k_per_market_default`.
+// k=0 bypasses N_eff and uses total trades directly (pre-#107 path).
+const DEFAULT_BT_KELLY_P_K_PER_MARKET: u32 = 6;
 
 /// Backtest configuration sourced from environment variables.
 pub struct BacktestConfig {
@@ -81,6 +88,10 @@ pub struct BacktestConfig {
     /// `PE_BACKTEST_KELLY_P_PRIOR_BETA` — β of the Beta prior on leader win-rate.
     /// Default: see `docs/_GLOSSARY.md` `kelly_p_prior_beta_default`.
     pub kelly_p_prior_beta: u32,
+    /// `PE_BACKTEST_KELLY_P_K_PER_MARKET` — effective-sample-size scaling factor.
+    /// `N_eff = min(total, distinct_markets × k)`. `k=0` bypasses N_eff (uses total directly).
+    /// Default: see `docs/_GLOSSARY.md` `kelly_p_k_per_market_default`.
+    pub kelly_p_k_per_market: u32,
 }
 
 impl BacktestConfig {
@@ -141,6 +152,10 @@ impl BacktestConfig {
             kelly_p_prior_beta: optional_parse(
                 "PE_BACKTEST_KELLY_P_PRIOR_BETA",
                 DEFAULT_BT_KELLY_P_PRIOR_BETA,
+            ),
+            kelly_p_k_per_market: optional_parse(
+                "PE_BACKTEST_KELLY_P_K_PER_MARKET",
+                DEFAULT_BT_KELLY_P_K_PER_MARKET,
             ),
         })
     }

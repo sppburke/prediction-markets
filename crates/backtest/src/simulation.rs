@@ -507,6 +507,7 @@ pub fn run_simulation(
                         ledger_by_wallet.get(&leader).copied(),
                         config.kelly_p_prior_alpha,
                         config.kelly_p_prior_beta,
+                        config.kelly_p_k_per_market,
                     ) else {
                         continue;
                     };
@@ -714,16 +715,21 @@ fn raw_trade_to_leader_signal(
     }
 }
 
-/// Bayesian shrinkage estimate of leader win-rate probability.
+/// Bayesian shrinkage estimate of leader win-rate probability with effective-sample-size scaling.
 ///
-/// Applies a Beta(α, β) prior: `p_shrunk = (wins + α) / (total + α + β)`.
-/// `(α=0, β=0)` reduces to the raw empirical rate (backwards-compatible path).
-/// The default `(α=10, β=10)` has prior strength 20 trades centred at 0.5, pulling
-/// small-sample extremes (e.g. 11/12 → 0.91) toward the population mean.
+/// Applies a Beta(α, β) prior with optional N_eff correction for market concentration:
+///
+/// When `k_per_market > 0`:
+///   `N_eff = min(total, distinct_markets × k)`
+///   `scaled_wins = wins × N_eff / total` (Decimal division — no integer truncation)
+///   `p_shrunk = (scaled_wins + α) / (N_eff + α + β)`
+///
+/// When `k_per_market == 0` (bypass): uses `total` directly as `N_eff`, reproducing
+/// the #106 formula: `p_shrunk = (wins + α) / (total + α + β)`.
+///
+/// `(α=0, β=0, k=0)` reduces to the raw empirical rate.
 ///
 /// Returns `None` only when `total == 0` and the prior carries no weight (`α + β == 0`).
-/// When the prior has weight and `total == 0`, returns the prior mean α/(α+β) — at
-/// `p = 0.5` the Kelly fraction is effectively zero at market prices, so no trades are made.
 ///
 /// # Precondition
 /// Caller should ensure the ledger has passed the bootstrap filter (>15 closed trades,
@@ -732,6 +738,7 @@ fn leader_win_rate_p_shrunk(
     ledger: Option<&TraderLedger>,
     alpha: u32,
     beta: u32,
+    k_per_market: u32,
 ) -> Option<Probability> {
     let ledger = ledger?;
     let wins = ledger
@@ -743,8 +750,21 @@ fn leader_win_rate_p_shrunk(
     if total == 0 && (alpha + beta) == 0 {
         return None;
     }
-    let num = Decimal::from(wins + alpha);
-    let den = Decimal::from(total + alpha + beta);
+    let (scaled_wins, effective_n) = if k_per_market == 0 || total == 0 {
+        (Decimal::from(wins), total)
+    } else {
+        let distinct = ledger
+            .closed_trades
+            .iter()
+            .map(|t| &t.market_id)
+            .collect::<HashSet<_>>()
+            .len() as u32;
+        let n_eff = total.min(distinct.saturating_mul(k_per_market));
+        let sw = Decimal::from(wins) * Decimal::from(n_eff) / Decimal::from(total);
+        (sw, n_eff)
+    };
+    let num = scaled_wins + Decimal::from(alpha);
+    let den = Decimal::from(effective_n + alpha + beta);
     Probability::new((num / den).clamp(Decimal::ZERO, Decimal::ONE)).ok()
 }
 
@@ -984,7 +1004,7 @@ mod tests {
     #[test]
     fn shrinkage_with_zero_priors_matches_raw() {
         let ledger = make_ledger(11, 1);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 0, 0).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0).unwrap();
         // 11/12 = 0.91666...
         let expected = Decimal::from(11u32) / Decimal::from(12u32);
         assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
@@ -994,14 +1014,14 @@ mod tests {
     #[test]
     fn no_trades_zero_prior_returns_none() {
         let ledger = make_ledger(0, 0);
-        assert!(leader_win_rate_p_shrunk(Some(&ledger), 0, 0).is_none());
+        assert!(leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0).is_none());
     }
 
     // No trades + non-zero prior → prior mean (0.5 for symmetric Beta(10,10)).
     #[test]
     fn shrinkage_with_no_trades_returns_prior_mean() {
         let ledger = make_ledger(0, 0);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
         // (0+10)/(0+20) = 0.5
         assert_eq!(p.0, dec!(0.5));
     }
@@ -1010,7 +1030,7 @@ mod tests {
     #[test]
     fn shrinkage_dominates_at_low_n() {
         let ledger = make_ledger(11, 1);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
         let expected = Decimal::from(21u32) / Decimal::from(32u32); // 0.65625
         assert_eq!(p.0, expected);
     }
@@ -1021,7 +1041,7 @@ mod tests {
     #[test]
     fn shrinkage_negligible_at_high_n() {
         let ledger = make_ledger(1100, 100);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
         let raw = Decimal::from(1100u32) / Decimal::from(1200u32);
         let diff = (p.0 - raw).abs();
         assert!(
@@ -1036,14 +1056,14 @@ mod tests {
     // None ledger → None regardless of prior.
     #[test]
     fn no_ledger_returns_none() {
-        assert!(leader_win_rate_p_shrunk(None, 10, 10).is_none());
+        assert!(leader_win_rate_p_shrunk(None, 10, 10, 0).is_none());
     }
 
     // Asymmetric prior skews estimate toward 0 when β is large.
     #[test]
     fn asymmetric_prior_skews_estimate() {
         let ledger = make_ledger(5, 5); // raw p = 0.5
-        let p_low = leader_win_rate_p_shrunk(Some(&ledger), 1, 99).unwrap();
+        let p_low = leader_win_rate_p_shrunk(Some(&ledger), 1, 99, 0).unwrap();
         // (5+1)/(10+100) = 6/110 ≈ 0.0545 — prior pulls strongly toward 0
         assert!(p_low.0 < dec!(0.10));
     }
@@ -1052,8 +1072,106 @@ mod tests {
     #[test]
     fn all_wins_prior_pulls_toward_half() {
         let ledger = make_ledger(12, 0); // raw p = 1.0
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
         // (12+10)/(12+20) = 22/32 = 0.6875 — well below raw 1.0
         assert_eq!(p.0, Decimal::from(22u32) / Decimal::from(32u32));
+    }
+
+    // ── k_per_market / N_eff tests ────────────────────────────────────────────
+
+    /// Build a ledger where `wins` winning and `losses` losing trades are distributed
+    /// round-robin across `markets` distinct market IDs.
+    fn make_ledger_multi_market(wins: usize, losses: usize, markets: usize) -> TraderLedger {
+        let mut closed = Vec::with_capacity(wins + losses);
+        for i in 0..wins {
+            let mkt = format!("mkt-{}", i % markets.max(1));
+            closed.push(ClosedTrade {
+                market_id: market(&mkt),
+                outcome_id: OutcomeId(0),
+                side: Side::Buy,
+                entry_price: Price(dec!(0.50)),
+                exit_price: Price(dec!(1.00)),
+                contracts: ContractQty(1),
+                hold_duration_seconds: 86_400,
+                realized_pnl_usd: dec!(0.50),
+                opened_at_unix: 0,
+                closed_at_unix: 86_400,
+                source_trade_ids: vec![],
+            });
+        }
+        for i in 0..losses {
+            let mkt = format!("mkt-{}", (wins + i) % markets.max(1));
+            closed.push(ClosedTrade {
+                market_id: market(&mkt),
+                outcome_id: OutcomeId(0),
+                side: Side::Buy,
+                entry_price: Price(dec!(0.50)),
+                exit_price: Price(dec!(0.00)),
+                contracts: ContractQty(1),
+                hold_duration_seconds: 86_400,
+                realized_pnl_usd: dec!(-0.50),
+                opened_at_unix: 0,
+                closed_at_unix: 86_400,
+                source_trade_ids: vec![],
+            });
+        }
+        TraderLedger {
+            wallet: wallet(0),
+            operator_id: None,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            closed_trades: closed,
+            open_positions: vec![],
+            audit_window_days: 90,
+        }
+    }
+
+    // 60 trades on 1 market, k=6 → N_eff = min(60, 1×6) = 6.
+    // scaled_wins = 57 × 6/60 = 5.7; shrunk_p = (5.7+10)/(6+20) ≈ 0.604.
+    #[test]
+    fn n_eff_caps_at_distinct_markets_times_k() {
+        let ledger = make_ledger_multi_market(57, 3, 1); // 57 wins, 3 losses, 1 market
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6).unwrap();
+        let expected = (dec!(57) * dec!(6) / dec!(60) + dec!(10)) / (dec!(6) + dec!(10) + dec!(10));
+        assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
+    }
+
+    // 60 trades on 60 markets, k=6 → N_eff = min(60, 60×6) = 60 (not capped).
+    // scaled_wins = 57 × 60/60 = 57; shrunk_p = (57+10)/(60+20) ≈ 0.838.
+    #[test]
+    fn n_eff_uses_total_when_markets_are_diverse() {
+        let ledger = make_ledger_multi_market(57, 3, 60); // 1 trade per market
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6).unwrap();
+        let expected = (dec!(57) + dec!(10)) / (dec!(60) + dec!(10) + dec!(10));
+        assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
+    }
+
+    // k=0 bypasses N_eff entirely — same result as pre-#107 formula.
+    #[test]
+    fn k_zero_bypasses_n_eff() {
+        let ledger = make_ledger_multi_market(57, 3, 1);
+        let p_k0 = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        let p_bypass = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        // Both should give (57+10)/(60+20) = 67/80
+        let expected = (dec!(57) + dec!(10)) / (dec!(60) + dec!(10) + dec!(10));
+        assert_eq!(p_k0.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
+        assert_eq!(p_bypass.0, p_k0.0);
+    }
+
+    // scaled_wins uses Decimal division: 57 × 6/60 = 5.7, not integer 5.
+    // Verify p differs from the integer-truncated formula.
+    #[test]
+    fn scaled_wins_uses_decimal_not_integer_arithmetic() {
+        let ledger = make_ledger_multi_market(57, 3, 1);
+        let p_decimal = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6).unwrap();
+        // integer truncation would give 5; Decimal gives 5.7
+        let p_integer_trunc =
+            Probability::new((dec!(5) + dec!(10)) / (dec!(6) + dec!(10) + dec!(10))).unwrap();
+        let p_decimal_calc =
+            Probability::new((dec!(5.7) + dec!(10)) / (dec!(6) + dec!(10) + dec!(10))).unwrap();
+        assert_ne!(
+            p_decimal.0, p_integer_trunc.0,
+            "must use Decimal division, not integer truncation"
+        );
+        assert_eq!(p_decimal.0, p_decimal_calc.0);
     }
 }

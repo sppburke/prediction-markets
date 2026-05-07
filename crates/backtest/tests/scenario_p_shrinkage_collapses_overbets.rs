@@ -118,6 +118,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         per_trade_cap_override: Some(PerTradeCap::Unlimited),
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
+        kelly_p_k_per_market: 0,
     }
 }
 
