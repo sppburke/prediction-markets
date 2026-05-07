@@ -79,7 +79,7 @@ fn edge_visible_at_and_after_fetch_timestamp() {
     let funded = addr(FUNDED_1);
 
     cache
-        .insert_funder_edges(funded, &[funder], BASE_UNIX)
+        .insert_funder_edges(funded, &[(funder, BASE_UNIX)], BASE_UNIX)
         .unwrap();
     let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
 
@@ -115,10 +115,10 @@ fn multiple_edges_filtered_by_timestamp() {
     let funded_2 = addr(FUNDED_2);
 
     cache
-        .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX)
+        .insert_funder_edges(funded_1, &[(funder_a, BASE_UNIX)], BASE_UNIX)
         .unwrap();
     cache
-        .insert_funder_edges(funded_2, &[funder_b], BASE_UNIX + 100)
+        .insert_funder_edges(funded_2, &[(funder_b, BASE_UNIX + 100)], BASE_UNIX + 100)
         .unwrap();
 
     let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
@@ -151,10 +151,10 @@ fn from_cache_loads_edges_in_timestamp_order() {
 
     // Insert later edge first.
     cache
-        .insert_funder_edges(funded_2, &[funder_b], BASE_UNIX + 200)
+        .insert_funder_edges(funded_2, &[(funder_b, BASE_UNIX + 200)], BASE_UNIX + 200)
         .unwrap();
     cache
-        .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX + 100)
+        .insert_funder_edges(funded_1, &[(funder_a, BASE_UNIX + 100)], BASE_UNIX + 100)
         .unwrap();
 
     let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
@@ -189,10 +189,10 @@ fn build_operator_identities_at_excludes_future_edges() {
     let funded_2 = addr(FUNDED_2);
 
     cache
-        .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX + 100)
+        .insert_funder_edges(funded_1, &[(funder_a, BASE_UNIX + 100)], BASE_UNIX + 100)
         .unwrap();
     cache
-        .insert_funder_edges(funded_2, &[funder_b], BASE_UNIX + 200)
+        .insert_funder_edges(funded_2, &[(funder_b, BASE_UNIX + 200)], BASE_UNIX + 200)
         .unwrap();
 
     let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();

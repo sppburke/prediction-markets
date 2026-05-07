@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS funder_edges (
     funder_hex      TEXT    NOT NULL,
     funded_hex      TEXT    NOT NULL,
     fetched_at_unix INTEGER NOT NULL,
+    event_at_unix   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (funder_hex, funded_hex)
 );
 CREATE INDEX IF NOT EXISTS idx_funder_edges_funded ON funder_edges(funded_hex);
@@ -94,6 +95,21 @@ impl WalletCache {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         conn.execute_batch(SCHEMA)?;
+        // Migration: add event_at_unix if absent (DBs created before this change keep
+        // the default 0, which makes existing edges always visible in walk-forward sims).
+        let col_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('funder_edges') WHERE name='event_at_unix'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !col_exists {
+            conn.execute_batch(
+                "ALTER TABLE funder_edges ADD COLUMN event_at_unix INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -542,6 +558,12 @@ impl WalletCache {
 
     /// Record funder edges for `wallet` and mark it as done.
     ///
+    /// `funders` is a slice of `(funder_address, event_at_unix)` pairs where
+    /// `event_at_unix` is the Polygon block timestamp of the earliest funding
+    /// transaction. Use `0` as the sentinel for edges without a known on-chain
+    /// timestamp — `0` is treated as epoch (Jan 1 1970) by `FunderGraphTimeline`,
+    /// making those edges always visible in walk-forward simulations.
+    ///
     /// Atomic per-wallet commit: N edge inserts + 1 done-mark in a single transaction.
     /// Idempotent: repeated calls for the same `(funder, funded)` pair are safe.
     /// A wallet with zero funders is still written to `funder_lookup_done` so it is
@@ -549,7 +571,7 @@ impl WalletCache {
     pub fn insert_funder_edges(
         &mut self,
         wallet: WalletAddress,
-        funders: &[WalletAddress],
+        funders: &[(WalletAddress, i64)],
         fetched_at_unix: i64,
     ) -> Result<(), BootstrapError> {
         let wallet_hex = wallet.to_string();
@@ -557,10 +579,16 @@ impl WalletCache {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO funder_edges \
-                 (funder_hex, funded_hex, fetched_at_unix) VALUES (?1, ?2, ?3)",
+                 (funder_hex, funded_hex, fetched_at_unix, event_at_unix) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for funder in funders {
-                stmt.execute(params![funder.to_string(), wallet_hex, fetched_at_unix])?;
+            for (funder, event_at) in funders {
+                stmt.execute(params![
+                    funder.to_string(),
+                    wallet_hex,
+                    fetched_at_unix,
+                    event_at
+                ])?;
             }
             tx.execute(
                 "INSERT OR REPLACE INTO funder_lookup_done \
@@ -584,14 +612,17 @@ impl WalletCache {
             .collect())
     }
 
-    /// Load all funder edges with their discovery timestamp, sorted ascending by
-    /// `fetched_at_unix`. Used by `FunderGraphTimeline` to filter edges by sim time.
+    /// Load all funder edges with their on-chain event timestamp, sorted ascending.
+    ///
+    /// Returns `(funder, funded, event_at_unix)` triples. Rows migrated from older
+    /// DB versions have `event_at_unix = 0` (epoch sentinel — always visible in
+    /// walk-forward simulations). Used by `FunderGraphTimeline`.
     pub fn load_funder_edges_with_timestamp(
         &self,
     ) -> Result<Vec<(WalletAddress, WalletAddress, i64)>, BootstrapError> {
         let mut stmt = self.conn.prepare(
-            "SELECT funder_hex, funded_hex, fetched_at_unix \
-             FROM funder_edges ORDER BY fetched_at_unix ASC",
+            "SELECT funder_hex, funded_hex, event_at_unix \
+             FROM funder_edges ORDER BY event_at_unix ASC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -602,12 +633,12 @@ impl WalletCache {
         })?;
         let mut result = Vec::new();
         for row in rows {
-            let (funder_hex, funded_hex, fetched_at) = row?;
+            let (funder_hex, funded_hex, event_at) = row?;
             if let (Ok(funder), Ok(funded)) = (
                 WalletAddress::from_hex(&funder_hex),
                 WalletAddress::from_hex(&funded_hex),
             ) {
-                result.push((funder, funded, fetched_at));
+                result.push((funder, funded, event_at));
             }
         }
         Ok(result)
@@ -1240,7 +1271,7 @@ mod tests {
             .unwrap();
 
         // Mark w1 as done.
-        cache.insert_funder_edges(w1, &[], 1_700_000_000).unwrap();
+        cache.insert_funder_edges(w1, &[], 1_700_000_000).unwrap(); // zero funders
 
         let pending = cache.wallets_needing_funder_lookup().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1257,7 +1288,15 @@ mod tests {
         let funder3 = addr("0x3333333333333333333333333333333333333333");
 
         cache
-            .insert_funder_edges(funded, &[funder1, funder2, funder3], 1_700_000_000)
+            .insert_funder_edges(
+                funded,
+                &[
+                    (funder1, 1_600_000_000),
+                    (funder2, 1_600_000_001),
+                    (funder3, 1_600_000_002),
+                ],
+                1_700_000_000,
+            )
             .unwrap();
 
         let edges = cache.load_funder_edges().unwrap();
@@ -1280,7 +1319,7 @@ mod tests {
             .unwrap();
 
         // Zero funders — wallet is still marked done.
-        cache.insert_funder_edges(w, &[], 1_700_000_000).unwrap();
+        cache.insert_funder_edges(w, &[], 1_700_000_000).unwrap(); // no funder tuples
 
         let pending = cache.wallets_needing_funder_lookup().unwrap();
         assert!(
@@ -1300,10 +1339,10 @@ mod tests {
         let funder = addr("0x1111111111111111111111111111111111111111");
 
         cache
-            .insert_funder_edges(funded, &[funder], 1_700_000_000)
+            .insert_funder_edges(funded, &[(funder, 1_600_000_000)], 1_700_000_000)
             .unwrap();
         cache
-            .insert_funder_edges(funded, &[funder], 1_700_000_001)
+            .insert_funder_edges(funded, &[(funder, 1_600_000_001)], 1_700_000_001)
             .unwrap();
 
         let edges = cache.load_funder_edges().unwrap();
@@ -1326,9 +1365,15 @@ mod tests {
 
         // w1 has 2 funders, w2 has 1.
         cache
-            .insert_funder_edges(w1, &[f1, f2], 1_700_000_000)
+            .insert_funder_edges(
+                w1,
+                &[(f1, 1_600_000_000), (f2, 1_600_000_001)],
+                1_700_000_000,
+            )
             .unwrap();
-        cache.insert_funder_edges(w2, &[f3], 1_700_000_001).unwrap();
+        cache
+            .insert_funder_edges(w2, &[(f3, 1_600_000_002)], 1_700_000_001)
+            .unwrap();
 
         let edges = cache.load_funder_edges().unwrap();
         assert_eq!(edges.len(), 3);
@@ -1344,7 +1389,7 @@ mod tests {
         {
             let mut cache = WalletCache::open(&path).unwrap();
             cache
-                .insert_funder_edges(funded, &[funder], 1_700_000_000)
+                .insert_funder_edges(funded, &[(funder, 1_600_000_000)], 1_700_000_000)
                 .unwrap();
         }
         {

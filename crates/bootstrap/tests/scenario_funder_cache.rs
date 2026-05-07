@@ -93,7 +93,9 @@ fn partial_lookup_returns_remaining() {
     insert_trade(&mut cache, "t2", wb, 1);
     insert_trade(&mut cache, "t3", wc, 2);
 
-    cache.insert_funder_edges(wa, &[f1], BASE_UNIX).unwrap();
+    cache
+        .insert_funder_edges(wa, &[(f1, BASE_UNIX)], BASE_UNIX)
+        .unwrap();
 
     let pending = cache.wallets_needing_funder_lookup().unwrap();
     assert_eq!(pending.len(), 2);
@@ -141,9 +143,15 @@ fn funder_edges_persist_and_load() {
     let (wa, wb, wc) = (addr(WALLET_A), addr(WALLET_B), addr(WALLET_C));
     let (f1, f2) = (addr(FUNDER_1), addr(FUNDER_2));
 
-    cache.insert_funder_edges(wa, &[f1, f2], BASE_UNIX).unwrap();
-    cache.insert_funder_edges(wb, &[f1, f2], BASE_UNIX).unwrap();
-    cache.insert_funder_edges(wc, &[f1, f2], BASE_UNIX).unwrap();
+    cache
+        .insert_funder_edges(wa, &[(f1, BASE_UNIX), (f2, BASE_UNIX)], BASE_UNIX)
+        .unwrap();
+    cache
+        .insert_funder_edges(wb, &[(f1, BASE_UNIX), (f2, BASE_UNIX)], BASE_UNIX)
+        .unwrap();
+    cache
+        .insert_funder_edges(wc, &[(f1, BASE_UNIX), (f2, BASE_UNIX)], BASE_UNIX)
+        .unwrap();
 
     let edges = cache.load_funder_edges().unwrap();
     assert_eq!(edges.len(), 6);
@@ -195,10 +203,10 @@ fn idempotent_insert_no_duplicates() {
     let funder = addr(FUNDER_1);
 
     cache
-        .insert_funder_edges(funded, &[funder], BASE_UNIX)
+        .insert_funder_edges(funded, &[(funder, BASE_UNIX)], BASE_UNIX)
         .unwrap();
     cache
-        .insert_funder_edges(funded, &[funder], BASE_UNIX + 1)
+        .insert_funder_edges(funded, &[(funder, BASE_UNIX + 1)], BASE_UNIX + 1)
         .unwrap();
 
     let edges = cache.load_funder_edges().unwrap();
@@ -223,7 +231,7 @@ fn edges_survive_cache_reopen() {
     {
         let mut cache = WalletCache::open(&path).unwrap();
         cache
-            .insert_funder_edges(funded, &[funder], BASE_UNIX)
+            .insert_funder_edges(funded, &[(funder, BASE_UNIX)], BASE_UNIX)
             .unwrap();
     }
     {
@@ -257,8 +265,12 @@ fn end_to_end_bootstrap_flow() {
 
     // Step 3: insert edges (simulates the Etherscan loop in pe-bootstrap).
     // wa has 2 funders, wb has 1, wc has none.
-    cache.insert_funder_edges(wa, &[f1, f2], BASE_UNIX).unwrap();
-    cache.insert_funder_edges(wb, &[f1], BASE_UNIX).unwrap();
+    cache
+        .insert_funder_edges(wa, &[(f1, BASE_UNIX), (f2, BASE_UNIX)], BASE_UNIX)
+        .unwrap();
+    cache
+        .insert_funder_edges(wb, &[(f1, BASE_UNIX)], BASE_UNIX)
+        .unwrap();
     cache.insert_funder_edges(wc, &[], BASE_UNIX).unwrap();
 
     // Step 4: pending list must now be empty.

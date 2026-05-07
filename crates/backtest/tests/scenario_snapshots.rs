@@ -107,7 +107,9 @@ fn winner_book(w: WalletAddress, start_day: u32, mkt_base: u32) -> Vec<RawTrade>
 fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
     for &(funded, funder) in pairs {
-        cache.insert_funder_edges(funded, &[funder], 0).unwrap();
+        cache
+            .insert_funder_edges(funded, &[(funder, 0)], 0)
+            .unwrap();
     }
     FunderGraphTimeline::from_cache(&cache).unwrap()
 }

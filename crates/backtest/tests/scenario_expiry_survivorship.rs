@@ -85,7 +85,7 @@ fn make_timeline(dir: &TempDir) -> FunderGraphTimeline {
     let alice = wallet(ALICE_HEX);
     let funder = wallet(FUNDER_HEX);
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    cache.insert_funder_edges(alice, &[funder], 0).unwrap();
+    cache.insert_funder_edges(alice, &[(funder, 0)], 0).unwrap();
     FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
