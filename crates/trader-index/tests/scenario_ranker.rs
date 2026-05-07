@@ -113,19 +113,19 @@ fn fully_eligible_active_leader() {
 
 // ─── scenario 2 ──────────────────────────────────────────────────────────────
 
-/// Single wallet: 25 trades across 12 markets — passes incubator thresholds
-/// (≥ 20 trades, ≥ 10 markets) but not active (needs ≥ 60 trades, ≥ 30 markets).
+/// Single wallet: 8 trades across 3 markets — passes incubator thresholds
+/// (≥ 5 trades, ≥ 1 market) but not active (needs ≥ 15 trades).
 ///
 /// PASS: wallet appears with `tier == WatchlistTier::Incubator`.
 #[test]
 fn incubator_only_insufficient_trades() {
     let w = wallet(0x02);
 
-    // 25 trades across 12 markets within 80 days (inside both 90-d and 180-d windows).
-    let trades: Vec<ClosedTrade> = (0u32..25)
+    // 8 trades across 3 markets within 22 days (inside both 60-d incubator and 90-d active windows).
+    let trades: Vec<ClosedTrade> = (0u32..8)
         .map(|i| {
-            let market_n = (i % 12) as u8;
-            let day_offset = 1 + i * 3; // days 1, 4, 7, … (all within 80 d)
+            let market_n = (i % 3) as u8;
+            let day_offset = 1 + i * 3; // days 1, 4, 7, … (all within 22 d)
             closed_trade(market_n, day_offset, i * 2)
         })
         .collect();
@@ -150,9 +150,9 @@ fn incubator_only_insufficient_trades() {
 
 // ─── scenario 3 ──────────────────────────────────────────────────────────────
 
-/// Two wallets share one operator_id. Each has 35 trades (below the 60-trade active
-/// threshold individually). Combined they have 70 trades across 32 distinct markets,
-/// which crosses the active threshold.
+/// Two wallets share one operator_id. Each has 35 trades (above the 15-trade active
+/// threshold individually, but treated as a single operator entry). Combined they have
+/// 70 trades across 32 distinct markets.
 ///
 /// PASS: the operator group appears once with `tier == WatchlistTier::Active`.
 #[test]

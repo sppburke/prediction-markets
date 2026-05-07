@@ -40,19 +40,23 @@ pub struct RankerConfig {
     /// Default: 180 (`active_window_days` in `_GLOSSARY.md`).
     pub active_window_days: u32,
     /// Minimum closed trades in window for active-tier eligibility.
-    /// Default: 60 (`active_min_closed_trades` in `_GLOSSARY.md`).
+    /// Default: 15 (`active_min_closed_trades` in `_GLOSSARY.md`).
+    /// Lowered from 60: N_eff shrinkage now handles the statistical-rigor job.
     pub active_min_closed_trades: u32,
     /// Minimum distinct markets traded for active-tier eligibility.
-    /// Default: 30 (`active_min_distinct_markets` in `_GLOSSARY.md`).
+    /// Default: 1 (`active_min_distinct_markets` in `_GLOSSARY.md`).
+    /// Lowered from 30: N_eff replaces the hard filter; specialists are priced correctly.
     pub active_min_distinct_markets: u32,
     /// Number of calendar days in the incubator-tier look-back window.
     /// Default: 90 (`incubator_window_days` in `_GLOSSARY.md`).
     pub incubator_window_days: u32,
     /// Minimum closed trades in window for incubator-tier eligibility.
-    /// Default: 20 (`incubator_min_closed_trades` in `_GLOSSARY.md`).
+    /// Default: 5 (`incubator_min_closed_trades` in `_GLOSSARY.md`).
+    /// Lowered from 20: N_eff handles quality.
     pub incubator_min_closed_trades: u32,
     /// Minimum distinct markets traded for incubator-tier eligibility.
-    /// Default: 10 (`incubator_min_distinct_markets` in `_GLOSSARY.md`).
+    /// Default: 1 (`incubator_min_distinct_markets` in `_GLOSSARY.md`).
+    /// Lowered from 10: N_eff replaces the hard filter.
     pub incubator_min_distinct_markets: u32,
     /// Maximum active leaders/operators in the watchlist.
     /// Default: 50 (`active_watchlist_size` in `_GLOSSARY.md`).
@@ -70,11 +74,11 @@ impl Default for RankerConfig {
     fn default() -> Self {
         Self {
             active_window_days: 180,
-            active_min_closed_trades: 60,
-            active_min_distinct_markets: 30,
+            active_min_closed_trades: 15,
+            active_min_distinct_markets: 1,
             incubator_window_days: 90,
-            incubator_min_closed_trades: 20,
-            incubator_min_distinct_markets: 10,
+            incubator_min_closed_trades: 5,
+            incubator_min_distinct_markets: 1,
             active_watchlist_size: 50,
             incubator_watchlist_size: 250,
             min_reconstruction_quality: 60,

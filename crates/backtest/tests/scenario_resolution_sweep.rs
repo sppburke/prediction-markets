@@ -96,12 +96,12 @@ fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> Fun
 
 fn relaxed_ranker() -> RankerConfig {
     RankerConfig {
-        active_min_closed_trades: 60,
-        active_min_distinct_markets: 30,
+        active_min_closed_trades: 15,
+        active_min_distinct_markets: 1,
         active_window_days: 365,
         active_watchlist_size: 50,
-        incubator_min_closed_trades: 10,
-        incubator_min_distinct_markets: 5,
+        incubator_min_closed_trades: 5,
+        incubator_min_distinct_markets: 1,
         incubator_window_days: 365,
         incubator_watchlist_size: 250,
         min_reconstruction_quality: 0,
@@ -119,14 +119,15 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         max_hours_to_expiry: None,
         audit_window_days: 365,
         ranker_min_quality: 0,
-        ranker_active_min_closed: 60,
-        ranker_active_min_markets: 30,
-        ranker_incubator_min_closed: 10,
-        ranker_incubator_min_markets: 5,
+        ranker_active_min_closed: 15,
+        ranker_active_min_markets: 1,
+        ranker_incubator_min_closed: 5,
+        ranker_incubator_min_markets: 1,
         kelly_sweep_fractions: None,
         per_trade_cap_override: None,
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
+        kelly_p_k_per_market: 0,
     }
 }
 
