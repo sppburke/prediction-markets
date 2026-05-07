@@ -1,6 +1,6 @@
 //! `WinnerFollowReport` — output of the walk-forward backtest.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use pe_core_types::{KellyFraction, OperatorId};
@@ -32,10 +32,19 @@ pub struct WinnerFollowReport {
     /// Number of copy positions still open at the simulation horizon.
     /// These are excluded from `total_pnl_usd` because their final PnL is unknown.
     pub open_at_horizon: u64,
-    /// True when the funder graph was built from today's Etherscan data, not from data
-    /// as it existed at each simulated time T. Relationships established after T_past
-    /// may appear in the graph — a known conservative approximation.
+    /// False once the temporal funder-graph filter (`FunderGraphTimeline`) is active.
+    /// Kept for JSON backwards-compatibility; always `false` in current runs.
+    #[serde(default)]
     pub funder_graph_snapshot_caveat: bool,
+    /// Fraction (0–1) of buy signals suppressed by `max_hours_to_expiry` because
+    /// the market's resolution was too far out or unknown pre-fix. Zero when
+    /// `max_hours_to_expiry` is not configured.
+    #[serde(default)]
+    pub expiry_filter_suppression_pct: Decimal,
+    /// Per-calendar-quarter suppression fraction (key: `"YYYY-Qn"`). Empty when
+    /// `max_hours_to_expiry` is not configured.
+    #[serde(default)]
+    pub expiry_suppression_by_quarter: BTreeMap<String, Decimal>,
 }
 
 /// One run within a Kelly-fraction sweep.

@@ -577,18 +577,37 @@ impl WalletCache {
     /// # Precondition
     /// Returns an empty `Vec` if no funder discovery has been run yet.
     pub fn load_funder_edges(&self) -> Result<Vec<(WalletAddress, WalletAddress)>, BootstrapError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT funder_hex, funded_hex FROM funder_edges")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(self
+            .load_funder_edges_with_timestamp()?
+            .into_iter()
+            .map(|(funder, funded, _)| (funder, funded))
+            .collect())
+    }
+
+    /// Load all funder edges with their discovery timestamp, sorted ascending by
+    /// `fetched_at_unix`. Used by `FunderGraphTimeline` to filter edges by sim time.
+    pub fn load_funder_edges_with_timestamp(
+        &self,
+    ) -> Result<Vec<(WalletAddress, WalletAddress, i64)>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT funder_hex, funded_hex, fetched_at_unix \
+             FROM funder_edges ORDER BY fetched_at_unix ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
         let mut result = Vec::new();
         for row in rows {
-            let (funder_hex, funded_hex) = row?;
+            let (funder_hex, funded_hex, fetched_at) = row?;
             if let (Ok(funder), Ok(funded)) = (
                 WalletAddress::from_hex(&funder_hex),
                 WalletAddress::from_hex(&funded_hex),
             ) {
-                result.push((funder, funded));
+                result.push((funder, funded, fetched_at));
             }
         }
         Ok(result)
@@ -641,6 +660,18 @@ impl LeaderboardSnapshots {
             None
         } else {
             self.entries.get(idx - 1).map(|(_, set)| set)
+        }
+    }
+
+    /// Return the `snapshot_at_unix` of the most-recent leaderboard snapshot
+    /// at-or-before `sim_date_unix`. Used by the simulation to detect pool
+    /// transitions for the log-gate.
+    pub fn snapshot_at_for_date(&self, sim_date_unix: i64) -> Option<i64> {
+        let idx = self.entries.partition_point(|(at, _)| *at <= sim_date_unix);
+        if idx == 0 {
+            None
+        } else {
+            self.entries.get(idx - 1).map(|(at, _)| *at)
         }
     }
 

@@ -30,9 +30,82 @@ use tracing::info;
 
 use crate::config::BacktestConfig;
 use crate::error::BacktestError;
+use crate::funder_graph::{FunderGraphTimeline, build_operator_identities_at};
 use crate::report::{
     PnlAccumulator, TradeFill, WinnerFollowReport, max_drawdown_pct, sharpe_ratio,
 };
+
+// Warn threshold for expiry-filter suppression per quarter.
+// Canonical default: `expiry_filter_suppression_warn_threshold = 30%` in `docs/_GLOSSARY.md`.
+const SUPPRESSION_WARN_THRESHOLD: u32 = 30;
+
+/// Per-quarter statistics for the `max_hours_to_expiry` suppression diagnostic.
+#[derive(Debug, Default)]
+struct QuarterStats {
+    total: u64,
+    suppressed: u64,
+}
+
+/// Tracks how many buy signals are suppressed by the `max_hours_to_expiry` filter,
+/// broken down by calendar quarter. Emits a warning when any quarter exceeds the
+/// canonical 30% threshold.
+#[derive(Debug, Default)]
+struct SuppressionTracker {
+    by_quarter: BTreeMap<(i32, u8), QuarterStats>,
+}
+
+impl SuppressionTracker {
+    fn record(&mut self, date: Date, suppressed: bool) {
+        let quarter = (date.month() as u8 - 1) / 3 + 1;
+        let stats = self.by_quarter.entry((date.year(), quarter)).or_default();
+        stats.total += 1;
+        if suppressed {
+            stats.suppressed += 1;
+        }
+    }
+
+    fn suppression_pct_global(&self) -> Decimal {
+        let total: u64 = self.by_quarter.values().map(|s| s.total).sum();
+        let suppressed: u64 = self.by_quarter.values().map(|s| s.suppressed).sum();
+        if total == 0 {
+            return Decimal::ZERO;
+        }
+        Decimal::from(suppressed * 100) / Decimal::from(total)
+    }
+
+    fn per_quarter_suppression(&self) -> std::collections::BTreeMap<String, Decimal> {
+        self.by_quarter
+            .iter()
+            .map(|((year, q), stats)| {
+                let key = format!("{year}-Q{q}");
+                let pct = if stats.total == 0 {
+                    Decimal::ZERO
+                } else {
+                    Decimal::from(stats.suppressed * 100) / Decimal::from(stats.total)
+                };
+                (key, pct)
+            })
+            .collect()
+    }
+
+    fn warn_high_quarters(&self, threshold_pct: u32) {
+        let threshold = Decimal::from(threshold_pct);
+        for ((year, q), stats) in &self.by_quarter {
+            if stats.total == 0 {
+                continue;
+            }
+            let pct = Decimal::from(stats.suppressed * 100) / Decimal::from(stats.total);
+            if pct > threshold {
+                tracing::warn!(
+                    quarter = %format!("{year}-Q{q}"),
+                    suppression_pct = %pct,
+                    "expiry filter suppression exceeds {threshold_pct}% — \
+                     consider disabling max_hours_to_expiry for this data range"
+                );
+            }
+        }
+    }
+}
 
 // Canonical default in `docs/_GLOSSARY.md` "Backtest defaults".
 const DEFAULT_SLIPPAGE_BPS: u32 = 100;
@@ -111,7 +184,7 @@ impl ExposureTracker {
 pub fn run_simulation(
     config: &BacktestConfig,
     mut all_trades: Vec<RawTrade>,
-    operator_identities: Vec<OperatorIdentity>,
+    funder_timeline: &FunderGraphTimeline,
     snapshots: &LeaderboardSnapshots,
     resolutions: &ResolutionIndex,
     ranker_config: &RankerConfig,
@@ -119,12 +192,6 @@ pub fn run_simulation(
     strategy: &WinnerFollowStrategy,
     write_output: bool,
 ) -> Result<WinnerFollowReport, BacktestError> {
-    // Build wallet → operator map for quick lookup.
-    let wallet_to_operator: HashMap<WalletAddress, &OperatorIdentity> = operator_identities
-        .iter()
-        .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op)))
-        .collect();
-
     // Sort all trades ascending by timestamp for walk-forward processing.
     all_trades.sort_by_key(|t| t.timestamp.0);
 
@@ -182,6 +249,25 @@ pub fn run_simulation(
     let mut last_intraday_reset: Option<Date> = None;
 
     let mut fills_writer = maybe_open_trades_ndjson(&config.output_dir, write_output)?;
+
+    // Emit funder graph temporal filter diagnostic once before the main loop.
+    if !funder_timeline.is_empty() {
+        let first_day_unix = all_dates
+            .first()
+            .map_or(0, |d| d.midnight().assume_utc().unix_timestamp());
+        info!(
+            edges_visible_at_sim_start = funder_timeline.view_at(first_day_unix).len(),
+            total_edges = funder_timeline.total_edge_count(),
+            "funder graph temporal filter active"
+        );
+    }
+
+    // Tracks leaderboard snapshot transitions for the log gate (replaces the
+    // misleading `day_idx % 30` gate that fired every 30 array indices, not days).
+    let mut last_logged_snapshot_unix: Option<i64> = None;
+
+    // Tracks buy-signal suppression from the max_hours_to_expiry filter.
+    let mut suppression_tracker = SuppressionTracker::default();
 
     // Group trades by date for efficient walk-forward lookup.
     let mut trades_by_date: BTreeMap<Date, Vec<&RawTrade>> = BTreeMap::new();
@@ -276,6 +362,14 @@ pub fn run_simulation(
             continue;
         }
 
+        // Build operator identities using only edges visible at this sim date.
+        let operator_identities =
+            build_operator_identities_at(funder_timeline, &all_trades, sim_date_unix)?;
+        let wallet_to_operator: HashMap<WalletAddress, &OperatorIdentity> = operator_identities
+            .iter()
+            .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op)))
+            .collect();
+
         let snapshot = TradeSnapshot {
             trades: ranker_trades,
             snapshot_at: SourceTimestamp(sim_date.midnight().assume_utc()),
@@ -311,15 +405,18 @@ pub fn run_simulation(
             ranker_config,
         );
 
-        // Log watchlist sizes periodically (every 30th day) for diagnostic visibility.
-        if day_idx % 30 == 0 {
+        // Log on leaderboard snapshot transitions (replaces misleading day_idx % 30 gate).
+        let snapshot_unix = snapshots.snapshot_at_for_date(ranker_cutoff_unix);
+        if snapshot_unix != last_logged_snapshot_unix {
             info!(
                 date = %sim_date,
+                snapshot_unix,
                 filtered_ledgers = filtered_ledgers.len(),
                 active = watchlist.active_count,
                 incubator = watchlist.incubator_count,
-                "watchlist snapshot"
+                "watchlist snapshot transition"
             );
+            last_logged_snapshot_unix = snapshot_unix;
         }
 
         // Build wallet → ledger map for O(1) win-rate lookup.
@@ -377,14 +474,18 @@ pub fn run_simulation(
 
                     // Time-to-expiry filter: skip trades where the market resolves
                     // more than max_hours_to_expiry hours after the trade date.
+                    // Markets with unknown resolution (None) are allowed — at sim time
+                    // we could not have known the market was unresolved, so skipping
+                    // them would be survivorship-biased.
                     if let Some(max_hours) = config.max_hours_to_expiry {
                         let max_secs = i64::from(max_hours) * 3600;
-                        match resolutions.get(&trade.market_id) {
-                            Some(res) if res.resolved_at_unix - sim_date_unix > max_secs => {
-                                continue;
-                            }
-                            None => continue, // Unknown resolution — can't confirm expiry window.
-                            _ => {}
+                        let suppressed = matches!(
+                            resolutions.get(&trade.market_id),
+                            Some(res) if res.resolved_at_unix - sim_date_unix > max_secs
+                        );
+                        suppression_tracker.record(sim_date, suppressed);
+                        if suppressed {
+                            continue;
                         }
                     }
 
@@ -531,6 +632,8 @@ pub fn run_simulation(
     let sharpe = sharpe_ratio(&daily_pnl);
     let max_dd = max_drawdown_pct(&daily_bankroll);
 
+    suppression_tracker.warn_high_quarters(SUPPRESSION_WARN_THRESHOLD);
+
     let report = WinnerFollowReport {
         total_pnl_usd,
         sharpe_ratio: sharpe,
@@ -544,7 +647,9 @@ pub fn run_simulation(
         bankroll_final: bankroll,
         slippage_assumption_bps: slippage_bps,
         open_at_horizon,
-        funder_graph_snapshot_caveat: true,
+        funder_graph_snapshot_caveat: false,
+        expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
+        expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
     };
 
     if write_output {

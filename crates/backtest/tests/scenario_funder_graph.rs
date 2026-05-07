@@ -1,19 +1,20 @@
-//! Scenario tests for the `build_funder_graph` cache-read path.
-//!
-//! These tests verify the end-to-end wiring: funder edges in `WalletCache` →
-//! `build_funder_graph` → `Vec<OperatorIdentity>`.
+//! Scenario tests for `FunderGraphTimeline` and `build_operator_identities_at`.
 //!
 //! Scenarios:
-//! 1. `empty_cache_returns_empty_identities` — no edges in cache → empty vec (no panic).
-//! 2. `populated_cache_builds_correct_identities` — one funder with two funded wallets →
-//!    exactly one `OperatorIdentity` containing all three wallets.
-//! 3. `two_independent_operators_produce_two_identities` — two separate funder→funded pairs
-//!    with different funders → two distinct identities.
+//! 1. `empty_timeline_view_at_returns_empty` — empty timeline; view_at any t is empty.
+//! 2. `edge_visible_at_and_after_fetch_timestamp` — one edge at t=100; view_at(99)=[], view_at(100)=[1].
+//! 3. `multiple_edges_filtered_by_timestamp` — edges at t=100 and t=200; view_at(150) sees only the first.
+//! 4. `from_cache_loads_edges_in_timestamp_order` — insert edges with different timestamps; timeline
+//!    returns them sorted ascending.
+//! 5. `build_operator_identities_at_excludes_future_edges` — insert edges at t=100 and t=200; build at
+//!    t=150 produces one identity (first edge only); build at t=200 produces two.
+//! 6. `empty_cache_yields_empty_timeline` — `from_cache` on a zero-edge cache returns `is_empty()`.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pe_backtest::funder_graph::build_funder_graph;
+use pe_backtest::FunderGraphTimeline;
+use pe_backtest::funder_graph::build_operator_identities_at;
 use pe_bootstrap::cache::WalletCache;
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
@@ -25,11 +26,11 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 
 const FUNDER_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FUNDER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FUNDED_1: &str = "0x1111111111111111111111111111111111111111";
 const FUNDED_2: &str = "0x2222222222222222222222222222222222222222";
-const FUNDER_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const FUNDED_3: &str = "0x3333333333333333333333333333333333333333";
-// Fixed timestamp: 2023-11-01 00:00:00 UTC.
+
+// Fixed base timestamp: 2023-11-01 00:00:00 UTC.
 const BASE_UNIX: i64 = 1_698_796_800;
 
 fn addr(hex: &str) -> WalletAddress {
@@ -55,122 +56,180 @@ fn dummy_trade(wallet: WalletAddress, id: &str) -> RawTrade {
 
 // ── Scenario 1 ────────────────────────────────────────────────────────────────
 
-/// PASS: `build_funder_graph` on an empty cache returns an empty `Vec<OperatorIdentity>`
-///       without panicking or returning an error.
-/// FAIL: error returned, panic, or non-empty result.
+/// PASS: `FunderGraphTimeline::empty().view_at(t)` returns an empty slice for any `t`.
+/// FAIL: any non-empty slice returned, or panic.
 #[test]
-fn empty_cache_returns_empty_identities() {
-    let dir = TempDir::new().unwrap();
-    let cache = tmp_cache(&dir);
-    let trades: Vec<RawTrade> = Vec::new();
-
-    let identities = build_funder_graph(&cache, &trades).unwrap();
-
-    assert!(
-        identities.is_empty(),
-        "empty funder cache must produce empty identities, got {}",
-        identities.len()
-    );
+fn empty_timeline_view_at_returns_empty() {
+    let timeline = FunderGraphTimeline::empty();
+    assert!(timeline.is_empty());
+    assert_eq!(timeline.view_at(i64::MIN).len(), 0);
+    assert_eq!(timeline.view_at(0).len(), 0);
+    assert_eq!(timeline.view_at(i64::MAX).len(), 0);
 }
 
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
 
-/// PASS: one funder (A) with two funded wallets (1, 2) → exactly one `OperatorIdentity`
-///       containing all three wallets as members.
-/// FAIL: zero identities, or identity does not include all three wallets.
+/// PASS: one edge at t=BASE_UNIX; view_at(t-1) is empty; view_at(t) has 1 edge.
+/// FAIL: edge visible before its fetch timestamp, or absent at the exact timestamp.
 #[test]
-fn populated_cache_builds_correct_identities() {
+fn edge_visible_at_and_after_fetch_timestamp() {
     let dir = TempDir::new().unwrap();
     let mut cache = tmp_cache(&dir);
+    let funder = addr(FUNDER_A);
+    let funded = addr(FUNDED_1);
 
-    let funder_a = addr(FUNDER_A);
-    let funded_1 = addr(FUNDED_1);
-    let funded_2 = addr(FUNDED_2);
-
-    // Populate funder edges: A funds 1 and 2.
     cache
-        .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX)
+        .insert_funder_edges(funded, &[funder], BASE_UNIX)
         .unwrap();
-    cache
-        .insert_funder_edges(funded_2, &[funder_a], BASE_UNIX)
-        .unwrap();
+    let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
 
-    let trades = vec![dummy_trade(funded_1, "t1"), dummy_trade(funded_2, "t2")];
-
-    let identities = build_funder_graph(&cache, &trades).unwrap();
-
-    // Exactly one operator identity (one funder root → one cluster).
     assert_eq!(
-        identities.len(),
+        timeline.view_at(BASE_UNIX - 1).len(),
+        0,
+        "edge must not be visible one second before its fetch timestamp"
+    );
+    assert_eq!(
+        timeline.view_at(BASE_UNIX).len(),
         1,
-        "one funder with two funded wallets must produce exactly one identity"
-    );
-
-    let identity = &identities[0];
-    // All three wallets (funder + 2 funded) must be in the cluster.
-    assert!(
-        identity.member_wallets.contains(&funder_a),
-        "funder A must be a member"
-    );
-    assert!(
-        identity.member_wallets.contains(&funded_1),
-        "funded_1 must be a member"
-    );
-    assert!(
-        identity.member_wallets.contains(&funded_2),
-        "funded_2 must be a member"
+        "edge must be visible at exactly its fetch timestamp"
     );
     assert_eq!(
-        identity.member_wallets.len(),
-        3,
-        "cluster must have exactly 3 members"
+        timeline.view_at(BASE_UNIX + 86_400).len(),
+        1,
+        "edge must remain visible after its fetch timestamp"
     );
 }
 
 // ── Scenario 3 ────────────────────────────────────────────────────────────────
 
-/// PASS: two independent funder→funded pairs (A→1 and B→3) produce two distinct identities.
-/// FAIL: fewer than 2 identities, or both wallets end up in the same cluster.
+/// PASS: two edges at t=BASE_UNIX and t=BASE_UNIX+100; view_at(BASE_UNIX+50) sees 1 edge;
+///       view_at(BASE_UNIX+100) sees 2.
+/// FAIL: wrong count at either checkpoint.
 #[test]
-fn two_independent_operators_produce_two_identities() {
+fn multiple_edges_filtered_by_timestamp() {
     let dir = TempDir::new().unwrap();
     let mut cache = tmp_cache(&dir);
-
     let funder_a = addr(FUNDER_A);
-    let funded_1 = addr(FUNDED_1);
     let funder_b = addr(FUNDER_B);
-    let funded_3 = addr(FUNDED_3);
+    let funded_1 = addr(FUNDED_1);
+    let funded_2 = addr(FUNDED_2);
 
-    // Operator A: funder_a → funded_1
     cache
         .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX)
         .unwrap();
-    // Operator B: funder_b → funded_3 (no shared funder)
     cache
-        .insert_funder_edges(funded_3, &[funder_b], BASE_UNIX)
+        .insert_funder_edges(funded_2, &[funder_b], BASE_UNIX + 100)
         .unwrap();
 
-    let trades = vec![dummy_trade(funded_1, "t1"), dummy_trade(funded_3, "t3")];
-
-    let identities = build_funder_graph(&cache, &trades).unwrap();
+    let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
 
     assert_eq!(
-        identities.len(),
+        timeline.view_at(BASE_UNIX + 50).len(),
+        1,
+        "only the first edge should be visible at t = BASE+50"
+    );
+    assert_eq!(
+        timeline.view_at(BASE_UNIX + 100).len(),
         2,
-        "two independent operators must produce two identities, got {}",
-        identities.len()
+        "both edges should be visible at t = BASE+100"
+    );
+}
+
+// ── Scenario 4 ────────────────────────────────────────────────────────────────
+
+/// PASS: `from_cache` returns edges sorted ascending by `fetched_at_unix`, regardless
+///       of insertion order.
+/// FAIL: edges are unsorted, or `total_edge_count` is wrong.
+#[test]
+fn from_cache_loads_edges_in_timestamp_order() {
+    let dir = TempDir::new().unwrap();
+    let mut cache = tmp_cache(&dir);
+    let funder_a = addr(FUNDER_A);
+    let funder_b = addr(FUNDER_B);
+    let funded_1 = addr(FUNDED_1);
+    let funded_2 = addr(FUNDED_2);
+
+    // Insert later edge first.
+    cache
+        .insert_funder_edges(funded_2, &[funder_b], BASE_UNIX + 200)
+        .unwrap();
+    cache
+        .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX + 100)
+        .unwrap();
+
+    let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
+    assert_eq!(timeline.total_edge_count(), 2, "expected 2 edges total");
+
+    // The first edge visible at BASE+150 (where only the t=BASE+100 edge is included)
+    // must be the one inserted with the earlier timestamp.
+    let slice = timeline.view_at(BASE_UNIX + 150);
+    assert_eq!(slice.len(), 1, "only 1 edge visible at BASE+150");
+    // The visible edge is (ts=BASE+100, funder_a, funded_1).
+    let (ts, _funder, funded) = slice[0];
+    assert_eq!(
+        ts,
+        BASE_UNIX + 100,
+        "visible edge must have the earlier timestamp"
+    );
+    assert_eq!(funded, funded_1, "visible edge's funded wallet must match");
+}
+
+// ── Scenario 5 ────────────────────────────────────────────────────────────────
+
+/// PASS: `build_operator_identities_at` at t=BASE+150 uses only the edge at BASE+100,
+///       producing 1 identity; at t=BASE+200 it uses both edges, producing 2 identities.
+/// FAIL: wrong identity count at either checkpoint.
+#[test]
+fn build_operator_identities_at_excludes_future_edges() {
+    let dir = TempDir::new().unwrap();
+    let mut cache = tmp_cache(&dir);
+    let funder_a = addr(FUNDER_A);
+    let funder_b = addr(FUNDER_B);
+    let funded_1 = addr(FUNDED_1);
+    let funded_2 = addr(FUNDED_2);
+
+    cache
+        .insert_funder_edges(funded_1, &[funder_a], BASE_UNIX + 100)
+        .unwrap();
+    cache
+        .insert_funder_edges(funded_2, &[funder_b], BASE_UNIX + 200)
+        .unwrap();
+
+    let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
+
+    // Pass only a trade for funded_1. funded_2 has no closed trades, so it only
+    // becomes discoverable when the funder_b→funded_2 edge appears at BASE+200.
+    let trades = vec![dummy_trade(funded_1, "t1")];
+
+    let ids_at_150 = build_operator_identities_at(&timeline, &trades, BASE_UNIX + 150).unwrap();
+    assert_eq!(
+        ids_at_150.len(),
+        1,
+        "at t=BASE+150 only the first edge is visible → 1 identity, got {}",
+        ids_at_150.len()
     );
 
-    // Verify the two clusters don't share wallets.
-    let all_members: Vec<_> = identities
-        .iter()
-        .flat_map(|id| &id.member_wallets)
-        .collect();
-    let total_members = all_members.len();
-    let unique_members: std::collections::HashSet<_> = all_members.into_iter().collect();
+    let ids_at_200 = build_operator_identities_at(&timeline, &trades, BASE_UNIX + 200).unwrap();
     assert_eq!(
-        total_members,
-        unique_members.len(),
-        "no wallet should appear in two different operator identities"
+        ids_at_200.len(),
+        2,
+        "at t=BASE+200 both edges are visible → 2 identities, got {}",
+        ids_at_200.len()
     );
+}
+
+// ── Scenario 6 ────────────────────────────────────────────────────────────────
+
+/// PASS: `FunderGraphTimeline::from_cache` on a zero-edge cache returns `is_empty() = true`.
+/// FAIL: error, panic, or `is_empty() = false`.
+#[test]
+fn empty_cache_yields_empty_timeline() {
+    let dir = TempDir::new().unwrap();
+    let cache = tmp_cache(&dir);
+    let timeline = FunderGraphTimeline::from_cache(&cache).unwrap();
+    assert!(
+        timeline.is_empty(),
+        "timeline from empty cache must report is_empty()"
+    );
+    assert_eq!(timeline.total_edge_count(), 0);
 }

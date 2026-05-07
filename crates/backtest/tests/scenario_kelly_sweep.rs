@@ -14,20 +14,19 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::{KellySweepReport, KellySweepRun, WinnerFollowReport};
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, WalletCache};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, ClusterSize, ContractQty, FunderRootId, FundingHopCount, KellyFraction,
-    LeaderAction, MarketId, OperatorId, OutcomeId, Price, Probability, ProbabilityPpm, Quantity,
-    ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId, VenueMarketId,
-    WalletAddress, WinnerFollowSignalKind,
+    BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId, Price, Probability,
+    ProbabilityPpm, Quantity, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
+    VenueMarketId, WalletAddress, WinnerFollowSignalKind,
 };
-use pe_operator_graph::OperatorIdentity;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
@@ -76,19 +75,13 @@ fn make_trade(
     }
 }
 
-fn winner_operator_identity(winner: WalletAddress, funder: WalletAddress) -> OperatorIdentity {
-    let operator_id = OperatorId(blake3::hash(b"sweep-test-operator"));
-    let funder_root = FunderRootId(funder);
-    OperatorIdentity {
-        operator_id,
-        funder_root,
-        member_wallets: vec![winner],
-        hop_counts: HashMap::from([(winner, FundingHopCount(1))]),
-        confidence_ppm: 900_000,
-        reconstruction_quality: ReconstructionQuality::new(80).unwrap(),
-        cluster_size: ClusterSize(1),
-        anti_gaming_flags: HashSet::new(),
+/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs at Unix 0.
+fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+    for &(funded, funder) in pairs {
+        cache.insert_funder_edges(funded, &[funder], 0).unwrap();
     }
+    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -140,10 +133,6 @@ fn kf(d: Decimal) -> KellyFraction {
 }
 
 /// Build a NormalLeaderFollow BUY signal at price 0.40.
-///
-/// Price and fee-rate are chosen so that p=0.417 gives a thin but positive edge
-/// (c = 0.40 + 0.40×0.04 = 0.416; f_full ≈ 0.0017) that keeps Kelly-sized positions
-/// well under the 25 bps LiveTiny per-trade cap even at full Kelly with a $10,000 bankroll.
 fn thin_edge_signal() -> LeaderSignal {
     let leader = TraderId(wallet(WINNER_HEX));
     LeaderSignal {
@@ -158,7 +147,7 @@ fn thin_edge_signal() -> LeaderSignal {
         leader_size: Quantity(ContractQty(100)),
         observed_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
         received_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
-        reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
         signal_kind: WinnerFollowSignalKind::NormalLeaderFollow,
         inherited_prior: None,
         source_trade_id: SourceTradeId("sweep-tid-001".to_string()),
@@ -182,7 +171,7 @@ fn clean_risk_snapshot() -> RiskSnapshot {
         proxy_funder_mapping_proven: true,
         funder_seeding_rate_suspicious: false,
         cluster_membership_stable: true,
-        funding_hop_count: Some(FundingHopCount(1)),
+        funding_hop_count: Some(pe_core_types::FundingHopCount(1)),
         copy_latency_p95_ms: 500,
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(0),
@@ -195,14 +184,9 @@ fn clean_risk_snapshot() -> RiskSnapshot {
 /// PASS: `kelly_fraction_override: Some(1.0)` causes `evaluate()` to size more contracts
 ///       than the default `KELLY_PAPER_BACKTEST = 0.10` on an identical signal.
 /// FAIL: both strategies return the same contract count.
-///
-/// Tested at the evaluate() layer because the simulation's 25 bps per-trade risk cap
-/// clips all sufficiently large Kelly positions to the same fill, making PnL-level
-/// simulation comparison uninformative.
 #[test]
 fn override_changes_sizing_vs_default() {
     let signal = thin_edge_signal();
-    // p = 0.417 > c = 0.416 — thin positive edge; all fractions produce < 25 bps at $10k.
     let p = Probability::new(dec!(0.417)).unwrap();
     let bankroll = Decimal::from(10_000u32);
 
@@ -250,7 +234,6 @@ async fn sweep_produces_correct_run_count() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
     let trades = generate_winner_trades(winner);
-    let ops = vec![winner_operator_identity(winner, funder)];
 
     let fractions = vec![kf(dec!(0.10)), kf(dec!(0.50)), kf(dec!(1.0))];
     let dir = TempDir::new().unwrap();
@@ -258,6 +241,7 @@ async fn sweep_produces_correct_run_count() {
         kelly_sweep_fractions: Some(fractions.clone()),
         ..base_config(&dir)
     };
+    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
@@ -271,7 +255,7 @@ async fn sweep_produces_correct_run_count() {
         let report = run_simulation(
             &config,
             trades.clone(),
-            ops.clone(),
+            &timeline,
             &snapshots,
             &resolutions,
             &ranker,
@@ -297,10 +281,6 @@ async fn sweep_produces_correct_run_count() {
 /// PASS: across fractions [0.10, 0.25, 0.50, 0.75, 1.0], the contract count returned
 ///       by `evaluate()` increases strictly monotonically.
 /// FAIL: any adjacent pair has equal or decreasing contracts.
-///
-/// Uses the thin-edge signal (p=0.417, c=0.416) so all positions stay under the
-/// 25 bps per-trade cap, letting each fraction produce a distinct contract count.
-/// Expected counts at $10k bankroll: [4, 10, 20, 30, 41].
 #[test]
 fn higher_fraction_yields_more_contracts() {
     let signal = thin_edge_signal();
@@ -360,7 +340,9 @@ fn to_markdown_table_covers_all_runs() {
             bankroll_final: dec!(10_100),
             slippage_assumption_bps: 100,
             open_at_horizon: 0,
-            funder_graph_snapshot_caveat: true,
+            funder_graph_snapshot_caveat: false,
+            expiry_filter_suppression_pct: dec!(0),
+            expiry_suppression_by_quarter: BTreeMap::new(),
         },
     };
 
@@ -376,14 +358,12 @@ fn to_markdown_table_covers_all_runs() {
 
     let table = sweep.to_markdown_table();
     let lines: Vec<&str> = table.lines().collect();
-    // 2 header rows + 3 data rows = 5
     assert_eq!(
         lines.len(),
         5,
         "expected 5 lines (2 header + 3 data), got {}: {table}",
         lines.len()
     );
-    // Each data row contains the fraction value.
     assert!(lines[2].contains("0.10"), "row 0 should have 0.10");
     assert!(lines[3].contains("0.50"), "row 1 should have 0.50");
     assert!(lines[4].contains("1.00"), "row 2 should have 1.00");
@@ -398,11 +378,11 @@ async fn sweep_suppresses_per_run_output() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
     let trades = generate_winner_trades(winner);
-    let ops = vec![winner_operator_identity(winner, funder)];
 
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
     let config = base_config(&dir);
+    let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
         kelly_fraction_override: Some(KellyFraction::ONE),
@@ -411,7 +391,7 @@ async fn sweep_suppresses_per_run_output() {
     run_simulation(
         &config,
         trades,
-        ops,
+        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &relaxed_ranker(),

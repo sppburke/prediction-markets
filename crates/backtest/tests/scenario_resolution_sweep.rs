@@ -14,17 +14,14 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::{HashMap, HashSet};
-
+use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, MarketResolution, ResolutionIndex};
+use pe_bootstrap::cache::{LeaderboardSnapshots, MarketResolution, ResolutionIndex, WalletCache};
 use pe_core_types::{
-    ClusterSize, ContractQty, FunderRootId, FundingHopCount, MarketId, OperatorId, OutcomeId,
-    Price, ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
+    ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
-use pe_operator_graph::OperatorIdentity;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
@@ -86,17 +83,13 @@ fn winner_book(w: WalletAddress) -> Vec<RawTrade> {
     t
 }
 
-fn operator_for(w: WalletAddress, funder: WalletAddress, seed: &[u8]) -> OperatorIdentity {
-    OperatorIdentity {
-        operator_id: OperatorId(blake3::hash(seed)),
-        funder_root: FunderRootId(funder),
-        member_wallets: vec![w],
-        hop_counts: HashMap::from([(w, FundingHopCount(1))]),
-        confidence_ppm: 900_000,
-        reconstruction_quality: ReconstructionQuality::new(80).unwrap(),
-        cluster_size: ClusterSize(1),
-        anti_gaming_flags: HashSet::new(),
+/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs at Unix 0.
+fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+    for &(funded, funder) in pairs {
+        cache.insert_funder_edges(funded, &[funder], 0).unwrap();
     }
+    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -140,13 +133,13 @@ fn default_strategy() -> WinnerFollowStrategy {
 fn run_sim(
     dir: &TempDir,
     trades: Vec<RawTrade>,
-    ops: Vec<OperatorIdentity>,
+    timeline: &FunderGraphTimeline,
     resolutions: &ResolutionIndex,
 ) -> pe_backtest::report::WinnerFollowReport {
     run_simulation(
         &base_config(dir),
         trades,
-        ops,
+        timeline,
         &LeaderboardSnapshots::default(),
         resolutions,
         &relaxed_ranker(),
@@ -159,19 +152,18 @@ fn run_sim(
 
 fn res_yes(resolved_day: u32) -> MarketResolution {
     MarketResolution {
-        winning_outcome_id: 0, // outcome 0; all test positions are on outcome 0
+        winning_outcome_id: 0,
         resolved_at_unix: day_unix(resolved_day),
     }
 }
 
 fn res_no(resolved_day: u32) -> MarketResolution {
     MarketResolution {
-        winning_outcome_id: 1, // outcome 1 wins; our outcome-0 position loses
+        winning_outcome_id: 1,
         resolved_at_unix: day_unix(resolved_day),
     }
 }
 
-/// Returns fills from trades.ndjson whose `side` field equals `side`.
 fn fills_by_side(output_dir: &std::path::Path, side: &str) -> Vec<serde_json::Value> {
     let path = output_dir.join("trades.ndjson");
     let Ok(bytes) = std::fs::read(&path) else {
@@ -196,19 +188,14 @@ async fn resolved_yes_closes_position_at_full_price() {
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
-    // Keepalive at day 72 so the sweep fires. Position already closed by sweep → SELL skipped.
     trades.push(make_trade(alice, 9999, 72, Side::Sell, dec!(0.75), 1));
 
     let mut resolutions = ResolutionIndex::new();
     resolutions.insert(mkt(9999), res_yes(71));
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-yes")],
-        &resolutions,
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
@@ -244,12 +231,8 @@ async fn resolved_no_closes_position_at_zero() {
     resolutions.insert(mkt(9999), res_no(71));
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-no")],
-        &resolutions,
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
@@ -261,7 +244,6 @@ async fn resolved_no_closes_position_at_zero() {
         !fills.is_empty(),
         "expected a resolution fill in trades.ndjson"
     );
-    // fill_price must be 0 — losing side receives nothing.
     for fill in &fills {
         let fp = match &fill["fill_price"] {
             serde_json::Value::Number(n) => n.as_f64().unwrap_or(1.0),
@@ -292,12 +274,8 @@ async fn future_resolution_leaves_position_open_at_horizon() {
     resolutions.insert(mkt(9999), res_yes(200)); // far future
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-future")],
-        &resolutions,
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &resolutions);
 
     assert!(
         report.open_at_horizon > 0,
@@ -322,9 +300,7 @@ async fn anomaly_guard_preserves_position_with_early_resolution() {
     let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
-    // BUY at day 70 → bought_on = day_unix(70).
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
-    // Keepalive BUY on a different market so day 72 is in all_dates without closing market 9999.
     trades.push(make_trade(alice, 9998, 72, Side::Buy, dec!(0.35), 0));
 
     let mut resolutions = ResolutionIndex::new();
@@ -332,12 +308,8 @@ async fn anomaly_guard_preserves_position_with_early_resolution() {
     resolutions.insert(mkt(9999), res_yes(69));
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-anomaly")],
-        &resolutions,
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &resolutions);
 
     assert!(
         report.open_at_horizon > 0,
@@ -364,12 +336,8 @@ async fn empty_resolution_index_leaves_all_positions_open() {
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-empty")],
-        &ResolutionIndex::new(),
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &ResolutionIndex::new());
 
     assert!(
         report.open_at_horizon > 0,
@@ -395,8 +363,6 @@ async fn resolution_data_reduces_open_at_horizon() {
     let build_trades = || {
         let mut t = winner_book(alice);
         t.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
-        // Keepalive BUY on a different market: ensures day 72 is in all_dates without
-        // triggering a normal-path close of the market-9999 position.
         t.push(make_trade(alice, 9998, 72, Side::Buy, dec!(0.35), 0));
         t
     };
@@ -405,18 +371,15 @@ async fn resolution_data_reduces_open_at_horizon() {
     resolutions.insert(mkt(9999), res_yes(71));
 
     let dir_with = TempDir::new().unwrap();
-    let with_res = run_sim(
-        &dir_with,
-        build_trades(),
-        vec![operator_for(alice, funder, b"cmp-with")],
-        &resolutions,
-    );
+    let timeline_with = make_timeline(&dir_with, &[(alice, funder)]);
+    let with_res = run_sim(&dir_with, build_trades(), &timeline_with, &resolutions);
 
     let dir_without = TempDir::new().unwrap();
+    let timeline_without = make_timeline(&dir_without, &[(alice, funder)]);
     let without_res = run_sim(
         &dir_without,
         build_trades(),
-        vec![operator_for(alice, funder, b"cmp-without")],
+        &timeline_without,
         &ResolutionIndex::new(),
     );
 
@@ -439,10 +402,8 @@ async fn sequential_markets_each_swept_independently() {
     let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
-    // Two signal BUYs on different markets after qualification.
     trades.push(make_trade(alice, 9998, 70, Side::Buy, dec!(0.35), 0));
     trades.push(make_trade(alice, 9999, 72, Side::Buy, dec!(0.35), 0));
-    // Keepalive to run the sweep past both resolution dates.
     trades.push(make_trade(alice, 9998, 76, Side::Sell, dec!(0.75), 1));
 
     let mut resolutions = ResolutionIndex::new();
@@ -450,12 +411,8 @@ async fn sequential_markets_each_swept_independently() {
     resolutions.insert(mkt(9999), res_yes(75));
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-multi")],
-        &resolutions,
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
@@ -485,25 +442,19 @@ async fn sweep_and_leader_sell_same_day_no_double_close() {
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
-    // Leader sells same market on same day as the sweep — must not double-close.
     trades.push(make_trade(alice, 9999, 72, Side::Sell, dec!(0.75), 1));
 
     let mut resolutions = ResolutionIndex::new();
     resolutions.insert(mkt(9999), res_yes(71));
 
     let dir = TempDir::new().unwrap();
-    let report = run_sim(
-        &dir,
-        trades,
-        vec![operator_for(alice, funder, b"res-double")],
-        &resolutions,
-    );
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+    let report = run_sim(&dir, trades, &timeline, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
         "position must be closed exactly once"
     );
-    // Double-close would credit contracts twice. Use 2× initial as a generous upper bound.
     assert!(
         report.bankroll_final <= initial_bankroll * Decimal::from(2u32),
         "bankroll suspiciously large — possible double-close: {}",

@@ -21,17 +21,16 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, WalletCache};
 use pe_core_types::{
-    ClusterSize, ContractQty, FunderRootId, FundingHopCount, MarketId, OperatorId, OutcomeId,
-    Price, ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
+    ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
-use pe_operator_graph::OperatorIdentity;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
@@ -53,9 +52,6 @@ fn wallet(hex: &str) -> WalletAddress {
     WalletAddress::from_hex(hex).unwrap()
 }
 
-/// Build a single trade. `seq` makes the source_trade_id unique per call so
-/// multiple trades on the same (market, day, side) for the same wallet don't
-/// collide on idempotency.
 fn make_trade(
     w: WalletAddress,
     market_idx: u32,
@@ -86,7 +82,6 @@ fn make_trade(
 }
 
 /// Generate a 100%-win-rate book of 65 buy/sell pairs starting at `start_day`.
-/// Markets indices `mkt_base..mkt_base+65`. Buys at 0.35; sells at 0.75 two days later.
 fn winner_book(w: WalletAddress, start_day: u32, mkt_base: u32) -> Vec<RawTrade> {
     let mut trades = Vec::new();
     for i in 0u32..65 {
@@ -104,17 +99,17 @@ fn winner_book(w: WalletAddress, start_day: u32, mkt_base: u32) -> Vec<RawTrade>
     trades
 }
 
-fn operator_for(w: WalletAddress, funder: WalletAddress, seed: &[u8]) -> OperatorIdentity {
-    OperatorIdentity {
-        operator_id: OperatorId(blake3::hash(seed)),
-        funder_root: FunderRootId(funder),
-        member_wallets: vec![w],
-        hop_counts: HashMap::from([(w, FundingHopCount(1))]),
-        confidence_ppm: 900_000,
-        reconstruction_quality: ReconstructionQuality::new(80).unwrap(),
-        cluster_size: ClusterSize(1),
-        anti_gaming_flags: HashSet::new(),
+/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs at Unix 0.
+///
+/// Tests with populated `LeaderboardSnapshots` can use `FunderGraphTimeline::empty()`
+/// instead (has_funder = !snapshots.is_empty() = true). Tests with empty snapshots
+/// must provide actual funder edges so that the operator identity is resolved.
+fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
+    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+    for &(funded, funder) in pairs {
+        cache.insert_funder_edges(funded, &[funder], 0).unwrap();
     }
+    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -155,8 +150,6 @@ fn default_strategy() -> WinnerFollowStrategy {
     WinnerFollowStrategy::new(WinnerFollowConfig::default())
 }
 
-/// Read the trades.ndjson written by the simulation and return the leader_wallet
-/// of every TradeFill record. We use this to assert which leaders were copied.
 fn copied_leaders(output_dir: &std::path::Path) -> Vec<String> {
     let path = output_dir.join("trades.ndjson");
     let Ok(bytes) = std::fs::read(&path) else {
@@ -172,7 +165,6 @@ fn copied_leaders(output_dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Day offset to a unix timestamp at UTC midnight.
 fn day_unix(day: u32) -> i64 {
     BASE_UNIX + i64::from(day) * DAY
 }
@@ -183,26 +175,23 @@ fn day_unix(day: u32) -> i64 {
 /// FAIL: any TradeFill has the absent wallet's address as leader_wallet.
 #[tokio::test]
 async fn wallet_outside_snapshot_emits_no_signals() {
-    let alice = wallet(ALICE_HEX); // in snapshot
-    let bob = wallet(BOB_HEX); // NOT in snapshot
-    let funder = wallet(FUNDER_HEX);
+    let alice = wallet(ALICE_HEX);
+    let bob = wallet(BOB_HEX);
 
-    // Both wallets have the same winning book.
     let mut all_trades = winner_book(alice, 0, 0);
     all_trades.extend(winner_book(bob, 0, 200));
 
-    // Snapshot anchored 1 day before the simulation starts; contains alice only.
     let snap_pairs = vec![(day_unix(0) - DAY, vec![alice])];
     let snapshots = LeaderboardSnapshots::from_pairs(snap_pairs);
 
     let dir = TempDir::new().unwrap();
+    // Populated snapshots → has_funder = !snapshots.is_empty() = true for all wallets.
+    let timeline = FunderGraphTimeline::empty();
+
     let report = run_simulation(
         &base_config(&dir),
         all_trades,
-        vec![
-            operator_for(alice, funder, b"alice-op"),
-            operator_for(bob, funder, b"bob-op"),
-        ],
+        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &relaxed_ranker(),
@@ -225,23 +214,12 @@ async fn wallet_outside_snapshot_emits_no_signals() {
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
 
 /// PASS: alice is in week-1 snapshot only; carol is in week-2 snapshot only.
-///       Carol must be copied at least once after the week-2 boundary
-///       (proves the new pool became effective). Alice must never be copied
-///       after the week-2 boundary (proves the old pool stopped being effective).
+///       Carol must be copied at least once after the week-2 boundary.
 /// FAIL: carol absent from copied_leaders, or alice copied at/after week 2.
-///
-/// Timing notes:
-/// - Alice book: days 0..66 (buys 0..64, sells 2..66). Qualifies by day 65 with
-///   ≥60 closed trades.
-/// - Carol book: days 70..136 (buys 70..134, sells 72..136). Qualifies by day 134.
-/// - Week-2 anchor day_unix(134): carol's last BUY (day 134) lands during week 2
-///   so a copy is possible. Alice's last trade (day 66) is before week 2, so any
-///   alice copy must come from week 1.
 #[tokio::test]
 async fn weekly_pool_swap_changes_active_leaders() {
     let alice = wallet(ALICE_HEX);
     let carol = wallet(CAROL_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut all_trades = winner_book(alice, 0, 0);
     all_trades.extend(winner_book(carol, 70, 200));
@@ -252,13 +230,12 @@ async fn weekly_pool_swap_changes_active_leaders() {
     ]);
 
     let dir = TempDir::new().unwrap();
+    let timeline = FunderGraphTimeline::empty();
+
     let _ = run_simulation(
         &base_config(&dir),
         all_trades,
-        vec![
-            operator_for(alice, funder, b"alice-op-2"),
-            operator_for(carol, funder, b"carol-op-2"),
-        ],
+        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &relaxed_ranker(),
@@ -284,21 +261,21 @@ async fn weekly_pool_swap_changes_active_leaders() {
 #[tokio::test]
 async fn wallet_present_throughout_emits_throughout() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let all_trades = winner_book(alice, 0, 0);
 
-    // Two snapshots a week apart, alice in both.
     let snapshots = LeaderboardSnapshots::from_pairs(vec![
         (day_unix(0) - DAY, vec![alice]),
         (day_unix(7), vec![alice]),
     ]);
 
     let dir = TempDir::new().unwrap();
+    let timeline = FunderGraphTimeline::empty();
+
     let report = run_simulation(
         &base_config(&dir),
         all_trades,
-        vec![operator_for(alice, funder, b"alice-op-3")],
+        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &relaxed_ranker(),
@@ -319,30 +296,25 @@ async fn wallet_present_throughout_emits_throughout() {
 /// PASS: a position opened during week 1 (when alice is in the snapshot) is NOT
 ///       force-closed when alice falls off in week 2; it remains open until the
 ///       leader sells (or stays open at horizon).
-/// FAIL: open_at_horizon == 0 AND no exit fill exists (i.e. the simulation
-///       silently dropped the position state).
+/// FAIL: open_at_horizon == 0 AND no exit fill exists.
 #[tokio::test]
 async fn position_opened_in_week1_persists_after_drop() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
-    // Alice qualifies and buys at day 64. Sells matching come at day 66 — within
-    // her 65-day book. After day 66 she goes quiet. We then drop her from the
-    // snapshot at day 70.
     let all_trades = winner_book(alice, 0, 0);
 
     let snapshots = LeaderboardSnapshots::from_pairs(vec![
         (day_unix(0) - DAY, vec![alice]),
-        // Week 2 (day 70): alice is no longer in any snapshot. She has no
-        // wallets in this snapshot at all — pool is effectively empty.
         (day_unix(70), vec![]),
     ]);
 
     let dir = TempDir::new().unwrap();
+    let timeline = FunderGraphTimeline::empty();
+
     let report = run_simulation(
         &base_config(&dir),
         all_trades,
-        vec![operator_for(alice, funder, b"alice-op-4")],
+        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &relaxed_ranker(),
@@ -352,10 +324,6 @@ async fn position_opened_in_week1_persists_after_drop() {
     )
     .unwrap();
 
-    // The simulation must complete without panicking. Whether copies happened
-    // (in week 1 while alice was still in the pool) plus any open_at_horizon
-    // positions left over after she dropped out — the simulation must finish
-    // cleanly with bankroll non-negative.
     assert!(
         report.bankroll_final >= Decimal::ZERO,
         "bankroll must remain non-negative; got {}",
@@ -368,6 +336,9 @@ async fn position_opened_in_week1_persists_after_drop() {
 /// PASS: an empty snapshot index degrades to legacy "all wallets" behavior. A
 ///       100%-winner produces ≥1 copy and positive PnL.
 /// FAIL: snapshot filter blocks all signals despite there being no snapshots.
+///
+/// Note: empty snapshots means `has_funder` depends on `op_identity.is_some()`, so
+/// the timeline must contain actual funder edges for the winner wallet.
 #[tokio::test]
 async fn empty_snapshots_falls_back_to_full_history() {
     let alice = wallet(ALICE_HEX);
@@ -378,10 +349,13 @@ async fn empty_snapshots_falls_back_to_full_history() {
     assert!(snapshots.is_empty(), "fixture sanity");
 
     let dir = TempDir::new().unwrap();
+    // Empty snapshots → has_funder depends on op_identity. Must provide funder edges.
+    let timeline = make_timeline(&dir, &[(alice, funder)]);
+
     let report = run_simulation(
         &base_config(&dir),
         all_trades,
-        vec![operator_for(alice, funder, b"alice-op-5")],
+        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &relaxed_ranker(),
@@ -411,20 +385,19 @@ async fn empty_snapshots_falls_back_to_full_history() {
 #[tokio::test]
 async fn simulation_date_before_first_snapshot_emits_nothing() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
-    // Alice book covers days 0..66.
     let all_trades = winner_book(alice, 0, 0);
 
-    // Anchor the first snapshot AFTER alice's last sell — by then there are
-    // no more trade days, so no copies can happen.
+    // Anchor the first snapshot AFTER alice's last sell — no copies can happen.
     let snapshots = LeaderboardSnapshots::from_pairs(vec![(day_unix(100), vec![alice])]);
 
     let dir = TempDir::new().unwrap();
+    let timeline = FunderGraphTimeline::empty();
+
     let report = run_simulation(
         &base_config(&dir),
         all_trades,
-        vec![operator_for(alice, funder, b"alice-op-6")],
+        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &relaxed_ranker(),

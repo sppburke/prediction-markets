@@ -2,10 +2,11 @@
 
 use std::collections::HashSet;
 
+use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::error::BacktestError;
 use pe_backtest::report::{KellySweepReport, KellySweepRun};
-use pe_backtest::{funder_graph, simulation};
+use pe_backtest::simulation;
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::dune::DuneClient;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
@@ -99,8 +100,8 @@ async fn main() -> Result<(), BacktestError> {
         return Ok(());
     }
 
-    // Phase 0: build funder graph from cached edges (populated by pe-bootstrap).
-    let operator_identities = funder_graph::build_funder_graph(&cache, &all_trades)?;
+    // Phase 0: build temporal funder graph from cached edges (populated by pe-bootstrap).
+    let funder_timeline = FunderGraphTimeline::from_cache(&cache)?;
 
     // Phase 1: walk-forward simulation.
     std::fs::create_dir_all(&config.output_dir)?;
@@ -141,7 +142,7 @@ async fn main() -> Result<(), BacktestError> {
             let report = simulation::run_simulation(
                 &config,
                 all_trades.clone(),
-                operator_identities.clone(),
+                &funder_timeline,
                 &snapshots,
                 &resolutions,
                 &ranker_config,
@@ -189,7 +190,7 @@ async fn main() -> Result<(), BacktestError> {
         let report = simulation::run_simulation(
             &config,
             all_trades,
-            operator_identities,
+            &funder_timeline,
             &snapshots,
             &resolutions,
             &ranker_config,
