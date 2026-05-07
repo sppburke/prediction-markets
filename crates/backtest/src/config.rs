@@ -23,6 +23,11 @@ const DEFAULT_BT_ACTIVE_MIN_MARKETS: u32 = 5;
 const DEFAULT_BT_INCUBATOR_MIN_CLOSED: u32 = 3;
 const DEFAULT_BT_INCUBATOR_MIN_MARKETS: u32 = 2;
 
+// Beta prior on leader win-rate. See `docs/_GLOSSARY.md` `kelly_p_prior_alpha_default` /
+// `kelly_p_prior_beta_default`. Set both to 0 to reproduce the raw-rate path.
+const DEFAULT_BT_KELLY_P_PRIOR_ALPHA: u32 = 10;
+const DEFAULT_BT_KELLY_P_PRIOR_BETA: u32 = 10;
+
 /// Backtest configuration sourced from environment variables.
 pub struct BacktestConfig {
     /// `PE_BOOTSTRAP_CACHE_PATH` — path to bootstrap wallet trade SQLite cache.
@@ -69,6 +74,13 @@ pub struct BacktestConfig {
     /// Set `unlimited` to remove the cap and observe true Kelly-fraction effects.
     /// Canonical docs: `docs/_GLOSSARY.md` `per_trade_cap_default`.
     pub per_trade_cap_override: Option<PerTradeCap>,
+    /// `PE_BACKTEST_KELLY_P_PRIOR_ALPHA` — α of the Beta prior on leader win-rate.
+    /// `(alpha=0, beta=0)` reproduces the raw empirical-rate path. Default: see
+    /// `docs/_GLOSSARY.md` `kelly_p_prior_alpha_default`.
+    pub kelly_p_prior_alpha: u32,
+    /// `PE_BACKTEST_KELLY_P_PRIOR_BETA` — β of the Beta prior on leader win-rate.
+    /// Default: see `docs/_GLOSSARY.md` `kelly_p_prior_beta_default`.
+    pub kelly_p_prior_beta: u32,
 }
 
 impl BacktestConfig {
@@ -122,6 +134,14 @@ impl BacktestConfig {
             ),
             kelly_sweep_fractions,
             per_trade_cap_override,
+            kelly_p_prior_alpha: optional_parse(
+                "PE_BACKTEST_KELLY_P_PRIOR_ALPHA",
+                DEFAULT_BT_KELLY_P_PRIOR_ALPHA,
+            ),
+            kelly_p_prior_beta: optional_parse(
+                "PE_BACKTEST_KELLY_P_PRIOR_BETA",
+                DEFAULT_BT_KELLY_P_PRIOR_BETA,
+            ),
         })
     }
 }
