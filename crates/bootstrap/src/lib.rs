@@ -165,6 +165,11 @@ pub struct BootstrapConfig {
     /// are resumable after failure. Default off; ~2 h one-time for ~15k wallets.
     /// Canonical default: `bootstrap_fetch_funder_graph_default = false`.
     pub fetch_funder_graph: bool,
+    /// `PE_BOOTSTRAP_SKIP_TRADE_FETCH` — when `"1"`, skip the Polymarket trade-fetch
+    /// step entirely. Safe when the trade cache is already populated and only
+    /// subsequent steps (funder graph, resolutions, filters) need to run.
+    /// Canonical default: `bootstrap_skip_trade_fetch_default = false`.
+    pub skip_trade_fetch: bool,
 }
 
 impl BootstrapConfig {
@@ -303,6 +308,7 @@ impl BootstrapConfig {
             fetch_resolutions: optional("PE_BOOTSTRAP_FETCH_RESOLUTIONS", "0") == "1",
             gamma_base_url: optional("PE_GAMMA_BASE_URL", gamma::DEFAULT_GAMMA_BASE_URL),
             fetch_funder_graph: optional("PE_BOOTSTRAP_FETCH_FUNDER_GRAPH", "0") == "1",
+            skip_trade_fetch: optional("PE_BOOTSTRAP_SKIP_TRADE_FETCH", "0") == "1",
         })
     }
 }
@@ -458,8 +464,16 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         ReqwestFetcher::new(client),
     )
     .with_concurrency(config.polymarket_concurrency);
-    fetcher.fetch_all(&wallets, &mut cache).await?;
-    tracing::info!(wallets = wallets.len(), "bootstrap: trade fetch complete");
+    if config.skip_trade_fetch {
+        tracing::warn!(
+            wallets = wallets.len(),
+            "bootstrap: PE_BOOTSTRAP_SKIP_TRADE_FETCH=1 — skipping Polymarket fetch; \
+             cache may not reflect trades after the last full run"
+        );
+    } else {
+        fetcher.fetch_all(&wallets, &mut cache).await?;
+        tracing::info!(wallets = wallets.len(), "bootstrap: trade fetch complete");
+    }
 
     // 2b. Fetch funder edges via Etherscan — time-invariant once block range is finalized.
     //     Per-wallet atomic commit enables resume after failure.
