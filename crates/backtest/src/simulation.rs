@@ -17,10 +17,9 @@ use pe_core_types::{
 };
 use pe_operator_graph::OperatorIdentity;
 use pe_risk_engine::RiskSnapshot;
-use pe_risk_engine::block::RiskBlock;
 use pe_risk_engine::snapshot::TradingMode;
 use pe_source_core::SourceStatus;
-use pe_strategy_winner_follow::{WinnerFollowError, WinnerFollowStrategy};
+use pe_strategy_winner_follow::WinnerFollowStrategy;
 use pe_trader_index::ledger::TraderLedger;
 use pe_trader_index::snapshot::{RawTrade, TradeSnapshot};
 use pe_trader_index::{LedgerConfig, RankerConfig, build_trader_ledgers, build_watchlist};
@@ -37,9 +36,6 @@ use crate::report::{
 
 // Canonical default in `docs/_GLOSSARY.md` "Backtest defaults".
 const DEFAULT_SLIPPAGE_BPS: u32 = 100;
-
-// Per-trade size cap in bps of bankroll (LiveTiny mode). Mirrors risk-engine's cap.
-const LIVETINY_PER_TRADE_CAP_BPS: u32 = 25;
 
 /// Open position entry (copies we've taken but not yet closed).
 #[derive(Debug, Clone)]
@@ -431,13 +427,6 @@ pub fn run_simulation(
                         pe_strategy_winner_follow::ExecutionMode::Paper,
                     ) {
                         Ok(intent) => intent.contracts.0,
-                        Err(WinnerFollowError::Blocked(RiskBlock::PerTradeSizeExceeded)) => {
-                            // Kelly exceeds the 25-bps cap. Clip to the cap-sized position.
-                            let max_notional = Decimal::from(LIVETINY_PER_TRADE_CAP_BPS) * bankroll
-                                / Decimal::from(10_000u32);
-                            let max = (max_notional / fill_price).floor();
-                            max.to_u64().unwrap_or(0)
-                        }
                         Err(e) => {
                             tracing::debug!(wallet = %leader, reason = %e, "signal blocked");
                             continue;
@@ -678,6 +667,7 @@ fn build_risk_snapshot(ctx: &RiskContext<'_>) -> RiskSnapshot {
         copy_latency_p95_ms: 0,
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(ctx.proposed_bps),
+        per_trade_cap_bps: 0, // evaluate() overwrites with resolved cap from WinnerFollowConfig
     }
 }
 

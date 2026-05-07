@@ -25,6 +25,7 @@ float_arithmetic = "deny"
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-source-core = { path = "../source-core", version = "0.1.0" }
 pe-operator-graph = { path = "../operator-graph", version = "0.1.0" }
+rust_decimal = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

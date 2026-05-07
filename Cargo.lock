@@ -3227,6 +3227,7 @@ dependencies = [
  "pe-operator-graph",
  "pe-source-core",
  "proptest",
+ "rust_decimal",
  "serde",
 ]
 

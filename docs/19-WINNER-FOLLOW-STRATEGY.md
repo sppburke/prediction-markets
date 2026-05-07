@@ -355,6 +355,24 @@ p_effective = shrink(
 
 This is a prior over the copied follower trade, not a posterior on the new wallet.
 
+## Per-trade cap configuration
+
+After Kelly sizing, the strategy clamps the contract count to a per-trade size cap before the risk gate. This keeps single-trade notional within a configurable fraction of bankroll regardless of Kelly fraction.
+
+`PerTradeCap` variants (set in `WinnerFollowConfig.per_trade_cap`):
+
+| Variant | Resolved cap | Use |
+|---|---|---|
+| `ModeDefault` (default) | 25 bps LiveTiny / 100 bps Promoted | Production |
+| `Bps(n)` | `n` bps of bankroll | Research / tuning |
+| `Unlimited` | 10 000 bps (full bankroll) | Backtest Kelly-fraction study |
+
+Clamp formula: `max_contracts = floor(bankroll × cap_bps / 10_000 / price)`. When `max_contracts == 0` (bankroll < price), the strategy returns `NoEdge`.
+
+The risk engine retains `PerTradeSizeExceeded` as a defense-in-depth gate. Under normal flow the clamp prevents it from firing; it fires only on a programming error (e.g. `clamp_contracts_to_cap` bypassed).
+
+Backtest override: `PE_BACKTEST_PER_TRADE_CAP=unlimited` (or `bps:N` / `mode_default`). Canonical defaults: `per_trade_cap_default` and `per_trade_cap_unlimited_resolved_bps` in `_GLOSSARY.md`.
+
 ## Anti-gaming flags
 
 `operator-graph` computes deterministic flags from public funding/collateral and trading history. Concrete thresholds are in `_GLOSSARY.md`.

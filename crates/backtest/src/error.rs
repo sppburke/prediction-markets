@@ -33,4 +33,7 @@ pub enum BacktestError {
 
     #[error("invalid kelly sweep fraction: {0}")]
     InvalidKellySweep(String),
+
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }

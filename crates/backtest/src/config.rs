@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use pe_core_types::KellyFraction;
+use pe_strategy_winner_follow::PerTradeCap;
 use rust_decimal::Decimal;
 
 use crate::error::BacktestError;
@@ -63,6 +64,11 @@ pub struct BacktestConfig {
     /// Default fractions when the env var is present but empty: see
     /// `docs/_GLOSSARY.md` `backtest_kelly_sweep_fractions_default`.
     pub kelly_sweep_fractions: Option<Vec<KellyFraction>>,
+    /// `PE_BACKTEST_PER_TRADE_CAP` — per-trade size cap override for backtest/sweep runs.
+    /// Accepts: `mode_default` | `bps:N` | `unlimited`. Default: `None` (uses `ModeDefault`).
+    /// Set `unlimited` to remove the cap and observe true Kelly-fraction effects.
+    /// Canonical docs: `docs/_GLOSSARY.md` `per_trade_cap_default`.
+    pub per_trade_cap_override: Option<PerTradeCap>,
 }
 
 impl BacktestConfig {
@@ -81,6 +87,7 @@ impl BacktestConfig {
         }
 
         let kelly_sweep_fractions = parse_kelly_sweep()?;
+        let per_trade_cap_override = parse_per_trade_cap()?;
 
         Ok(Self {
             cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.db")),
@@ -114,7 +121,40 @@ impl BacktestConfig {
                 DEFAULT_BT_INCUBATOR_MIN_MARKETS,
             ),
             kelly_sweep_fractions,
+            per_trade_cap_override,
         })
+    }
+}
+
+/// Parse `PE_BACKTEST_PER_TRADE_CAP` into a `PerTradeCap`.
+///
+/// Returns `None` when the env var is absent (caller uses `ModeDefault`).
+/// Accepts: `mode_default` | `bps:N` (N is i32) | `unlimited`.
+fn parse_per_trade_cap() -> Result<Option<PerTradeCap>, BacktestError> {
+    let raw = match std::env::var("PE_BACKTEST_PER_TRADE_CAP") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    match raw.trim() {
+        "mode_default" => Ok(Some(PerTradeCap::ModeDefault)),
+        "unlimited" => Ok(Some(PerTradeCap::Unlimited)),
+        s if s.starts_with("bps:") => {
+            let n_str = &s["bps:".len()..];
+            let n: i32 = n_str.parse().map_err(|_| {
+                BacktestError::InvalidConfig(format!(
+                    "PE_BACKTEST_PER_TRADE_CAP 'bps:{n_str}': not a valid i32"
+                ))
+            })?;
+            if n <= 0 {
+                return Err(BacktestError::InvalidConfig(format!(
+                    "PE_BACKTEST_PER_TRADE_CAP 'bps:{n}': must be > 0"
+                )));
+            }
+            Ok(Some(PerTradeCap::Bps(n)))
+        }
+        other => Err(BacktestError::InvalidConfig(format!(
+            "PE_BACKTEST_PER_TRADE_CAP '{other}': expected 'mode_default', 'bps:N', or 'unlimited'"
+        ))),
     }
 }
 
