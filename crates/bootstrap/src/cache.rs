@@ -1,12 +1,17 @@
 //! Permanent wallet trade-history cache — SQLite (WAL mode), no TTL.
 //!
-//! Three tables:
+//! Five tables:
 //! - `trades` — append-only per-trade rows, indexed by `(wallet_hex, timestamp_unix)`.
 //! - `leaderboard_snapshots` — `(snapshot_at_unix, wallet_hex)` rows, one row-set per
 //!   `pe-bootstrap` run, written from the post-filtered watchlist. Read by
 //!   `pe-backtest` to constrain the candidate pool at each simulated week boundary.
 //! - `market_resolutions` — one row per resolved market from the Gamma API.
 //!   `winning_outcome_id NULL` means voided/non-binary — the backtest skips these.
+//! - `funder_edges` — one row per `(funder, funded)` pair discovered via Etherscan.
+//!   Time-invariant once the block range is finalized; populated by `pe-bootstrap`
+//!   when `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
+//! - `funder_lookup_done` — one row per wallet that has been queried for funders.
+//!   Distinguishes "queried and found zero funders" from "not yet queried".
 //!
 //! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
 //! is needed. Per-wallet streaming reads keep peak memory bounded.
@@ -61,6 +66,19 @@ CREATE TABLE IF NOT EXISTS market_resolutions (
 );
 CREATE INDEX IF NOT EXISTS idx_resolutions_resolved_at
     ON market_resolutions(resolved_at_unix);
+
+CREATE TABLE IF NOT EXISTS funder_edges (
+    funder_hex      TEXT    NOT NULL,
+    funded_hex      TEXT    NOT NULL,
+    fetched_at_unix INTEGER NOT NULL,
+    PRIMARY KEY (funder_hex, funded_hex)
+);
+CREATE INDEX IF NOT EXISTS idx_funder_edges_funded ON funder_edges(funded_hex);
+
+CREATE TABLE IF NOT EXISTS funder_lookup_done (
+    wallet_hex      TEXT    PRIMARY KEY NOT NULL,
+    fetched_at_unix INTEGER NOT NULL
+);
 ";
 
 /// Permanent wallet trade-history cache backed by SQLite.
@@ -498,6 +516,82 @@ impl WalletCache {
             );
         }
         Ok(index)
+    }
+
+    // ── funder_edges / funder_lookup_done ─────────────────────────────────────
+
+    /// Return wallets that appear in `trades` but have not yet been queried for funders.
+    ///
+    /// # Precondition
+    /// Returns all distinct trade wallets when no funder discovery has been run.
+    pub fn wallets_needing_funder_lookup(&self) -> Result<Vec<WalletAddress>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT wallet_hex FROM trades \
+             WHERE wallet_hex NOT IN (SELECT wallet_hex FROM funder_lookup_done)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let hex = row?;
+            if let Ok(addr) = WalletAddress::from_hex(&hex) {
+                result.push(addr);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Record funder edges for `wallet` and mark it as done.
+    ///
+    /// Atomic per-wallet commit: N edge inserts + 1 done-mark in a single transaction.
+    /// Idempotent: repeated calls for the same `(funder, funded)` pair are safe.
+    /// A wallet with zero funders is still written to `funder_lookup_done` so it is
+    /// not re-queried on subsequent runs.
+    pub fn insert_funder_edges(
+        &mut self,
+        wallet: WalletAddress,
+        funders: &[WalletAddress],
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        let wallet_hex = wallet.to_string();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO funder_edges \
+                 (funder_hex, funded_hex, fetched_at_unix) VALUES (?1, ?2, ?3)",
+            )?;
+            for funder in funders {
+                stmt.execute(params![funder.to_string(), wallet_hex, fetched_at_unix])?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO funder_lookup_done \
+                 (wallet_hex, fetched_at_unix) VALUES (?1, ?2)",
+                params![wallet_hex, fetched_at_unix],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load all funder edges as `(funder, funded)` address pairs.
+    ///
+    /// # Precondition
+    /// Returns an empty `Vec` if no funder discovery has been run yet.
+    pub fn load_funder_edges(&self) -> Result<Vec<(WalletAddress, WalletAddress)>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT funder_hex, funded_hex FROM funder_edges")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (funder_hex, funded_hex) = row?;
+            if let (Ok(funder), Ok(funded)) = (
+                WalletAddress::from_hex(&funder_hex),
+                WalletAddress::from_hex(&funded_hex),
+            ) {
+                result.push((funder, funded));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -1078,5 +1172,155 @@ mod tests {
         assert_eq!(cache.wallet_count(), 1);
         assert_eq!(cache.all_snapshot_dates().unwrap().len(), 1);
         assert_eq!(cache.load_all_resolutions().unwrap().len(), 1);
+    }
+
+    // ── funder_edges / funder_lookup_done unit tests ──────────────────────────
+
+    #[test]
+    fn wallets_needing_lookup_returns_all_when_none_done() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        cache
+            .insert_new(&w1.to_string(), vec![make_trade("t1", w1, 1_000)])
+            .unwrap();
+        cache
+            .insert_new(&w2.to_string(), vec![make_trade("t2", w2, 2_000)])
+            .unwrap();
+
+        let pending = cache.wallets_needing_funder_lookup().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&w1));
+        assert!(pending.contains(&w2));
+    }
+
+    #[test]
+    fn wallets_needing_lookup_returns_only_pending() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        cache
+            .insert_new(&w1.to_string(), vec![make_trade("t1", w1, 1_000)])
+            .unwrap();
+        cache
+            .insert_new(&w2.to_string(), vec![make_trade("t2", w2, 2_000)])
+            .unwrap();
+
+        // Mark w1 as done.
+        cache.insert_funder_edges(w1, &[], 1_700_000_000).unwrap();
+
+        let pending = cache.wallets_needing_funder_lookup().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], w2);
+    }
+
+    #[test]
+    fn insert_funder_edges_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let funded = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let funder1 = addr("0x1111111111111111111111111111111111111111");
+        let funder2 = addr("0x2222222222222222222222222222222222222222");
+        let funder3 = addr("0x3333333333333333333333333333333333333333");
+
+        cache
+            .insert_funder_edges(funded, &[funder1, funder2, funder3], 1_700_000_000)
+            .unwrap();
+
+        let edges = cache.load_funder_edges().unwrap();
+        assert_eq!(edges.len(), 3);
+        let funded_addrs: Vec<_> = edges.iter().map(|(_, f)| *f).collect();
+        assert!(funded_addrs.iter().all(|f| *f == funded));
+        let funder_addrs: Vec<_> = edges.iter().map(|(f, _)| *f).collect();
+        assert!(funder_addrs.contains(&funder1));
+        assert!(funder_addrs.contains(&funder2));
+        assert!(funder_addrs.contains(&funder3));
+    }
+
+    #[test]
+    fn insert_funder_edges_zero_funders_marks_done() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        cache
+            .insert_new(&w.to_string(), vec![make_trade("t1", w, 1_000)])
+            .unwrap();
+
+        // Zero funders — wallet is still marked done.
+        cache.insert_funder_edges(w, &[], 1_700_000_000).unwrap();
+
+        let pending = cache.wallets_needing_funder_lookup().unwrap();
+        assert!(
+            pending.is_empty(),
+            "wallet with zero funders must still be marked done"
+        );
+
+        let edges = cache.load_funder_edges().unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn insert_funder_edges_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let funded = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let funder = addr("0x1111111111111111111111111111111111111111");
+
+        cache
+            .insert_funder_edges(funded, &[funder], 1_700_000_000)
+            .unwrap();
+        cache
+            .insert_funder_edges(funded, &[funder], 1_700_000_001)
+            .unwrap();
+
+        let edges = cache.load_funder_edges().unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "duplicate (funder, funded) must not double-insert"
+        );
+    }
+
+    #[test]
+    fn load_funder_edges_full_table() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let f1 = addr("0x1111111111111111111111111111111111111111");
+        let f2 = addr("0x2222222222222222222222222222222222222222");
+        let f3 = addr("0x3333333333333333333333333333333333333333");
+
+        // w1 has 2 funders, w2 has 1.
+        cache
+            .insert_funder_edges(w1, &[f1, f2], 1_700_000_000)
+            .unwrap();
+        cache.insert_funder_edges(w2, &[f3], 1_700_000_001).unwrap();
+
+        let edges = cache.load_funder_edges().unwrap();
+        assert_eq!(edges.len(), 3);
+    }
+
+    #[test]
+    fn funder_edges_round_trip_through_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let funded = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let funder = addr("0x1111111111111111111111111111111111111111");
+
+        {
+            let mut cache = WalletCache::open(&path).unwrap();
+            cache
+                .insert_funder_edges(funded, &[funder], 1_700_000_000)
+                .unwrap();
+        }
+        {
+            let cache = WalletCache::open(&path).unwrap();
+            let edges = cache.load_funder_edges().unwrap();
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0], (funder, funded));
+        }
     }
 }

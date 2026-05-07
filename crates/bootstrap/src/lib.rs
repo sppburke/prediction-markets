@@ -31,7 +31,8 @@ use std::time::Duration;
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_onchain_polygon::{
-    EnumerationConfig, PolymarketTraderEnumeration,
+    BlockRange, EnumerationConfig, EtherscanFunderLookup, FunderLookup,
+    PolymarketTraderEnumeration,
     contracts::{ALL_EXCHANGE_CONTRACTS, CTF_EXCHANGE_V1_DEPLOY_BLOCK},
 };
 use pe_source_polymarket_public::ReqwestFetcher;
@@ -60,6 +61,8 @@ const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
 // bootstrap_eth_block_timeout_secs = 30
 const ETH_BLOCK_TIMEOUT_SECS: u64 = 30;
+// Upper-bound block for funder discovery — both endpoints finalized, result is time-invariant.
+const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 
 /// Wallet discovery backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,11 @@ pub struct BootstrapConfig {
     pub fetch_resolutions: bool,
     /// `PE_GAMMA_BASE_URL` — Gamma API base URL (default `bootstrap_gamma_base_url`).
     pub gamma_base_url: String,
+    /// `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH` — when `"1"`, query Etherscan for funder edges
+    /// for every wallet not yet in `funder_lookup_done`. Per-wallet commit means runs
+    /// are resumable after failure. Default off; ~2 h one-time for ~15k wallets.
+    /// Canonical default: `bootstrap_fetch_funder_graph_default = false`.
+    pub fetch_funder_graph: bool,
 }
 
 impl BootstrapConfig {
@@ -294,6 +302,7 @@ impl BootstrapConfig {
             ),
             fetch_resolutions: optional("PE_BOOTSTRAP_FETCH_RESOLUTIONS", "0") == "1",
             gamma_base_url: optional("PE_GAMMA_BASE_URL", gamma::DEFAULT_GAMMA_BASE_URL),
+            fetch_funder_graph: optional("PE_BOOTSTRAP_FETCH_FUNDER_GRAPH", "0") == "1",
         })
     }
 }
@@ -451,6 +460,60 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     .with_concurrency(config.polymarket_concurrency);
     fetcher.fetch_all(&wallets, &mut cache).await?;
     tracing::info!(wallets = wallets.len(), "bootstrap: trade fetch complete");
+
+    // 2b. Fetch funder edges via Etherscan — time-invariant once block range is finalized.
+    //     Per-wallet atomic commit enables resume after failure.
+    //     Gated by flag + API key so the slow path is opt-in.
+    if config.fetch_funder_graph {
+        if let Some(api_key) = &config.etherscan_api_key {
+            let pending = cache.wallets_needing_funder_lookup()?;
+            let total_pending = pending.len();
+            let total_cached = wallets.len().saturating_sub(total_pending);
+            tracing::info!(
+                cached = total_cached,
+                pending = total_pending,
+                "bootstrap: funder discovery starting"
+            );
+            let block_range = BlockRange {
+                from: CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+                to: FUNDER_DISCOVERY_TO_BLOCK,
+            };
+            let lookup = EtherscanFunderLookup::new(api_key.clone());
+            let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+            for (i, wallet) in pending.iter().enumerate() {
+                if (i + 1) % 500 == 0 || i + 1 == total_pending {
+                    tracing::info!(
+                        progress = i + 1,
+                        total = total_pending,
+                        "bootstrap: funder discovery {}/{}",
+                        i + 1,
+                        total_pending
+                    );
+                }
+                let wallet_set: std::collections::HashSet<WalletAddress> =
+                    std::iter::once(*wallet).collect();
+                let funders = lookup
+                    .funders_of(&wallet_set, block_range)
+                    .await
+                    .map_err(|e| BootstrapError::Etherscan {
+                        message: e.to_string(),
+                    })?;
+                let funders_vec: Vec<WalletAddress> = funders.into_iter().collect();
+                cache.insert_funder_edges(*wallet, &funders_vec, fetched_at)?;
+            }
+            let total_edges = cache.load_funder_edges()?.len();
+            tracing::info!(
+                cached = total_cached,
+                queried = total_pending,
+                edges_total = total_edges,
+                "bootstrap: funder discovery complete"
+            );
+        } else {
+            tracing::warn!(
+                "PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 but PE_ETHERSCAN_API_KEY not set — skipping"
+            );
+        }
+    }
 
     // 3. Reconstruct ledgers — per-wallet streaming from SQLite to keep peak
     //    memory bounded. Each wallet's trades are loaded, reconstructed, and
