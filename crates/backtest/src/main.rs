@@ -94,13 +94,8 @@ async fn main() -> Result<(), BacktestError> {
         return Ok(());
     }
 
-    // Phase 0: build funder graph.
-    let operator_identities = funder_graph::build_funder_graph(
-        config.etherscan_api_key.as_deref(),
-        &all_wallet_addresses,
-        &all_trades,
-    )
-    .await?;
+    // Phase 0: build funder graph from cached edges (populated by pe-bootstrap).
+    let operator_identities = funder_graph::build_funder_graph(&cache, &all_trades)?;
 
     // Phase 1: walk-forward simulation.
     std::fs::create_dir_all(&config.output_dir)?;

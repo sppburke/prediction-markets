@@ -31,8 +31,6 @@ pub struct BacktestConfig {
     pub bankroll_usd: Decimal,
     /// `PE_BACKTEST_STEP_DAYS` — walk-forward step in days (default: 1).
     pub step_days: u32,
-    /// `PE_ETHERSCAN_API_KEY` — required for Phase 0 funder discovery.
-    pub etherscan_api_key: Option<String>,
     /// `PE_DUNE_API_KEY` — when set, fetches on-chain market resolutions from
     /// `ctf_evt_conditionresolution` before running the simulation.
     pub dune_api_key: Option<String>,
@@ -80,7 +78,6 @@ impl BacktestConfig {
             output_dir: PathBuf::from(require("PE_BACKTEST_OUTPUT_DIR")?),
             bankroll_usd: optional_parse("PE_BANKROLL_USD", Decimal::from(10_000u32)),
             step_days: optional_parse("PE_BACKTEST_STEP_DAYS", DEFAULT_STEP_DAYS),
-            etherscan_api_key: std::env::var("PE_ETHERSCAN_API_KEY").ok(),
             dune_api_key: std::env::var("PE_DUNE_API_KEY").ok(),
             dune_namespace: std::env::var("PE_DUNE_NAMESPACE").ok(),
             max_hours_to_expiry: std::env::var("PE_BACKTEST_MAX_HOURS_TO_EXPIRY")
