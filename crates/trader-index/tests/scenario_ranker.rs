@@ -150,9 +150,9 @@ fn incubator_only_insufficient_trades() {
 
 // ─── scenario 3 ──────────────────────────────────────────────────────────────
 
-/// Two wallets share one operator_id. Each has 35 trades (below the 60-trade active
-/// threshold individually). Combined they have 70 trades across 32 distinct markets,
-/// which crosses the active threshold.
+/// Two wallets share one operator_id. Each has 35 trades (above the 15-trade active
+/// threshold individually, but treated as a single operator entry). Combined they have
+/// 70 trades across 32 distinct markets.
 ///
 /// PASS: the operator group appears once with `tier == WatchlistTier::Active`.
 #[test]
