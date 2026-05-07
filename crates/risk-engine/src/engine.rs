@@ -1,9 +1,6 @@
 use pe_source_core::SourceStatus;
 
-use crate::{
-    block::RiskBlock,
-    snapshot::{RiskSnapshot, TradingMode},
-};
+use crate::{block::RiskBlock, snapshot::RiskSnapshot};
 
 /// Result of evaluating a risk snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,12 +66,8 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
         return RiskDecision::Blocked(RiskBlock::FunderHopCountExcessive);
     }
 
-    // 11. Per-trade size cap
-    let trade_cap = match s.trading_mode {
-        TradingMode::LiveTiny => 25_i32,
-        TradingMode::Promoted => 100_i32,
-    };
-    if s.proposed_trade_bps.0 > trade_cap {
+    // 11. Per-trade size cap (defense-in-depth; clamp_contracts_to_cap normally prevents this)
+    if s.proposed_trade_bps.0 > s.per_trade_cap_bps {
         return RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded);
     }
 
@@ -133,6 +126,7 @@ mod tests {
             copy_latency_p95_ms: 100,
             trading_mode: TradingMode::LiveTiny,
             proposed_trade_bps: BasisPoints(10),
+            per_trade_cap_bps: 25,
         }
     }
 

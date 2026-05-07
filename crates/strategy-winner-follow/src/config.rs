@@ -6,8 +6,40 @@
 //! constant used to compute net cost `c` in Kelly sizing.
 
 use pe_core_types::KellyFraction;
+use pe_risk_engine::snapshot::TradingMode;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+/// Per-trade size cap configuration.
+///
+/// Canonical defaults in `docs/_GLOSSARY.md` (`per_trade_cap_default`, `per_trade_cap_unlimited_resolved_bps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum PerTradeCap {
+    /// Use the mode-keyed defaults: 25 bps for LiveTiny, 100 bps for Promoted.
+    #[default]
+    ModeDefault,
+    /// Explicit cap in basis points of bankroll.
+    Bps(i32),
+    /// No per-trade cap — effective cap is 10_000 bps (= full bankroll).
+    Unlimited,
+}
+
+impl PerTradeCap {
+    /// Resolve to a concrete cap in basis points.
+    ///
+    /// `ModeDefault` maps 25 / 100 by mode; `Unlimited` resolves to 10_000 bps (full bankroll).
+    pub fn resolve_bps(self, mode: TradingMode) -> i32 {
+        match self {
+            PerTradeCap::ModeDefault => match mode {
+                TradingMode::LiveTiny => 25,
+                TradingMode::Promoted => 100,
+            },
+            PerTradeCap::Bps(n) => n,
+            PerTradeCap::Unlimited => 10_000,
+        }
+    }
+}
 
 /// Configuration for the Winner-Follow strategy.
 ///
@@ -27,6 +59,12 @@ pub struct WinnerFollowConfig {
     /// in `evaluate::kelly_fraction()`. Must be `None` in all production code paths.
     #[serde(default)]
     pub kelly_fraction_override: Option<KellyFraction>,
+    /// Per-trade size cap. Default: `ModeDefault` (25 bps LiveTiny / 100 bps Promoted).
+    ///
+    /// In backtest, override with `PE_BACKTEST_PER_TRADE_CAP=unlimited` to remove the cap
+    /// and observe true Kelly-fraction effects. See `docs/_GLOSSARY.md`.
+    #[serde(default)]
+    pub per_trade_cap: PerTradeCap,
 }
 
 fn default_polymarket_fee_rate() -> Decimal {
@@ -40,6 +78,7 @@ impl Default for WinnerFollowConfig {
             kelly_fraction_above_default_human_approved: false,
             polymarket_fee_rate: default_polymarket_fee_rate(),
             kelly_fraction_override: None,
+            per_trade_cap: PerTradeCap::default(),
         }
     }
 }

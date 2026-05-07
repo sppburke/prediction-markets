@@ -121,6 +121,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         ranker_incubator_min_closed: 10,
         ranker_incubator_min_markets: 5,
         kelly_sweep_fractions: None,
+        per_trade_cap_override: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn clean_risk_snapshot() -> RiskSnapshot {
         copy_latency_p95_ms: 500,
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(0),
+        per_trade_cap_bps: 25,
     }
 }
 

@@ -130,6 +130,7 @@ async fn main() -> Result<(), BacktestError> {
         for &kf in fractions {
             let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
                 kelly_fraction_override: Some(kf),
+                per_trade_cap: config.per_trade_cap_override.unwrap_or_default(),
                 ..WinnerFollowConfig::default()
             });
             info!(kelly_fraction = %kf.0, "backtest: sweep run starting");
@@ -177,7 +178,10 @@ async fn main() -> Result<(), BacktestError> {
         print!("{}", sweep_report.to_markdown_table());
     } else {
         // ── Single-run mode (default) ────────────────────────────────────────
-        let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
+        let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
+            per_trade_cap: config.per_trade_cap_override.unwrap_or_default(),
+            ..WinnerFollowConfig::default()
+        });
         let report = simulation::run_simulation(
             &config,
             all_trades,

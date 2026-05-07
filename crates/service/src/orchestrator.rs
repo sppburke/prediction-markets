@@ -318,5 +318,6 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         copy_latency_p95_ms: 0,
         trading_mode: TradingMode::LiveTiny, // overridden by evaluate()
         proposed_trade_bps: BasisPoints(0),  // overridden by evaluate()
+        per_trade_cap_bps: 0,                // overridden by evaluate()
     }
 }

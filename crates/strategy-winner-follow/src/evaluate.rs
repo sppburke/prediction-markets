@@ -5,14 +5,14 @@ use rust_decimal::prelude::ToPrimitive as _;
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, KellyFraction, LeaderAction, Price, Probability, Side, StrategyId,
+    BasisPoints, ContractQty, KellyFraction, LeaderAction, Price, Probability, Side, StrategyId,
     WinnerFollowSignalKind,
 };
 use pe_kelly_sizer::{
     KELLY_CLUSTER_COORDINATION, KELLY_INHERITED_PRIOR, KELLY_NORMAL, KELLY_PAPER_BACKTEST,
     KellyInput, size_contracts,
 };
-use pe_risk_engine::{RiskDecision, RiskSnapshot, evaluate_risk};
+use pe_risk_engine::{RiskDecision, RiskSnapshot, clamp_contracts_to_cap, evaluate_risk};
 use pe_venue_core::OrderIntent;
 
 use crate::{
@@ -43,7 +43,8 @@ impl WinnerFollowStrategy {
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Select the Kelly fraction for this mode + signal kind.
     /// 5. Size contracts using fractional Kelly with caller-provided `p` and fee-adjusted `c`.
-    /// 6. Gate on risk snapshot.
+    ///    5b. Clamp contracts to `per_trade_cap`; return `NoEdge` if clamped to 0 (bankroll < price).
+    /// 6. Gate on risk snapshot (per-trade-cap check is defense-in-depth under normal flow).
     /// 7. Build and return `OrderIntent`.
     ///
     /// `p` — empirical win rate supplied by caller (e.g. from `TraderLedger.closed_trades`).
@@ -102,10 +103,19 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::NoEdge);
         }
 
+        // 5b. Clamp to per-trade cap.
+        let trading_mode = to_risk_trading_mode(effective_mode);
+        let cap_bps = self.config.per_trade_cap.resolve_bps(trading_mode);
+        let clamped = clamp_contracts_to_cap(contracts.0, signal.leader_price.0, bankroll, cap_bps);
+        // Guard: clamp returns 0 when available_bankroll < price (no fractional contracts).
+        if clamped == 0 {
+            return Err(WinnerFollowError::NoEdge);
+        }
+
         // 6. Risk gate.
-        snapshot.trading_mode = to_risk_trading_mode(effective_mode);
-        snapshot.proposed_trade_bps =
-            proposed_trade_bps(contracts.0, signal.leader_price.0, bankroll);
+        snapshot.trading_mode = trading_mode;
+        snapshot.proposed_trade_bps = proposed_trade_bps(clamped, signal.leader_price.0, bankroll);
+        snapshot.per_trade_cap_bps = cap_bps;
 
         match evaluate_risk(&snapshot) {
             RiskDecision::Approved => {}
@@ -120,7 +130,7 @@ impl WinnerFollowStrategy {
             market_id: signal.market_id.clone(),
             outcome_id: signal.outcome_id,
             side: signal.leader_side,
-            contracts,
+            contracts: ContractQty(clamped),
             limit_price: signal.leader_price,
             validity_seconds: ORDER_VALIDITY_SECONDS,
             idempotency_key,

@@ -129,6 +129,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         ranker_incubator_min_closed: 10,
         ranker_incubator_min_markets: 5,
         kelly_sweep_fractions: None,
+        per_trade_cap_override: None,
     }
 }
 

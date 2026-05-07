@@ -6,12 +6,16 @@ use pe_source_core::SourceStatus;
 use serde::{Deserialize, Serialize};
 
 /// Whether the trade is in live-tiny or promoted mode.
+///
+/// After the configurable-cap change (`PerTradeCap`), `trading_mode` is no longer used by any
+/// gate check in `evaluate_risk` — the cap is carried in `per_trade_cap_bps`. The field is
+/// retained in `RiskSnapshot` for logging and tracing only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingMode {
-    /// First live stage: max_trade = 25 bps, kelly = 0.25
+    /// First live stage; default cap = 25 bps when `PerTradeCap::ModeDefault`.
     LiveTiny,
-    /// After passing promotion gates: max_trade = 100 bps, kelly = 0.25
+    /// After passing promotion gates; default cap = 100 bps when `PerTradeCap::ModeDefault`.
     Promoted,
 }
 
@@ -60,8 +64,23 @@ pub struct RiskSnapshot {
     pub copy_latency_p95_ms: u64,
 
     // ── Proposed trade ──────────────────────────────────────────────────────
-    /// Whether this trade is in live-tiny or promoted mode.
+    /// Whether this trade is in live-tiny or promoted mode. Retained for logging only;
+    /// not read by any gate check in `evaluate_risk` after the configurable-cap change.
     pub trading_mode: TradingMode,
     /// Size of the proposed trade as basis points of bankroll.
+    /// Populated by `WinnerFollowStrategy::evaluate` after clamping to `per_trade_cap_bps`.
     pub proposed_trade_bps: BasisPoints,
+    /// Per-trade size cap in basis points of bankroll.
+    ///
+    /// Populated by `WinnerFollowStrategy::evaluate` from the resolved `PerTradeCap` config.
+    /// The risk gate fires `PerTradeSizeExceeded` if `proposed_trade_bps > per_trade_cap_bps`.
+    /// Under normal flow this never triggers because the strategy already clamped the contracts.
+    ///
+    /// Default 25 for serde backwards compatibility with snapshots written before this field existed.
+    #[serde(default = "default_per_trade_cap_bps")]
+    pub per_trade_cap_bps: i32,
+}
+
+fn default_per_trade_cap_bps() -> i32 {
+    25
 }
