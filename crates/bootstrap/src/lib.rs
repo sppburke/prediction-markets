@@ -31,8 +31,7 @@ use std::time::Duration;
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_onchain_polygon::{
-    BlockRange, EnumerationConfig, EtherscanFunderLookup, FunderLookup,
-    PolymarketTraderEnumeration,
+    BlockRange, EnumerationConfig, EtherscanFunderLookup, PolymarketTraderEnumeration,
     contracts::{ALL_EXCHANGE_CONTRACTS, CTF_EXCHANGE_V1_DEPLOY_BLOCK},
 };
 use pe_source_polymarket_public::ReqwestFetcher;
@@ -513,12 +512,12 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                 let wallet_set: std::collections::HashSet<WalletAddress> =
                     std::iter::once(*wallet).collect();
                 let funders = lookup
-                    .funders_of(&wallet_set, block_range)
+                    .funders_of_with_timestamps(&wallet_set, block_range)
                     .await
                     .map_err(|e| BootstrapError::Etherscan {
                         message: e.to_string(),
                     })?;
-                let funders_vec: Vec<WalletAddress> = funders.into_iter().collect();
+                let funders_vec: Vec<(WalletAddress, i64)> = funders.into_iter().collect();
                 cache.insert_funder_edges(*wallet, &funders_vec, fetched_at)?;
             }
             let total_edges = cache.load_funder_edges()?.len();

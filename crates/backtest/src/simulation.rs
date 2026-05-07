@@ -130,7 +130,7 @@ struct ExposureTracker {
     /// Open exposure in bps of bankroll per leader.
     by_leader: HashMap<WalletAddress, i32>,
     /// Open exposure in bps of bankroll per operator.
-    by_operator: HashMap<String, i32>,
+    by_operator: HashMap<OperatorId, i32>,
     /// Open exposure in bps of bankroll per market.
     by_market: HashMap<MarketId, i32>,
     /// Total copy exposure across all positions.
@@ -142,9 +142,13 @@ impl ExposureTracker {
         self.by_leader.get(&w).copied().unwrap_or(0)
     }
 
+    /// Returns 0 when `op` is `None` — unclustered wallets bypass operator concentration.
+    ///
+    /// The operator concentration cap prevents overexposure to a single multi-wallet operator.
+    /// A wallet with no known operator is standalone and is instead governed by the per-leader cap.
     fn operator_bps(&self, op: Option<&OperatorId>) -> i32 {
-        let key = op.map_or_else(|| "unknown".to_owned(), |o| o.to_string());
-        self.by_operator.get(&key).copied().unwrap_or(0)
+        let Some(op) = op else { return 0 };
+        self.by_operator.get(op).copied().unwrap_or(0)
     }
 
     fn market_bps(&self, m: &MarketId) -> i32 {
@@ -153,8 +157,9 @@ impl ExposureTracker {
 
     fn add(&mut self, w: WalletAddress, op: Option<&OperatorId>, m: &MarketId, bps: i32) {
         *self.by_leader.entry(w).or_default() += bps;
-        let key = op.map_or_else(|| "unknown".to_owned(), |o| o.to_string());
-        *self.by_operator.entry(key).or_default() += bps;
+        if let Some(op) = op {
+            *self.by_operator.entry(*op).or_default() += bps;
+        }
         *self.by_market.entry(m.clone()).or_default() += bps;
         self.total += bps;
     }
@@ -795,4 +800,125 @@ fn write_fill(writer: Option<&mut std::fs::File>, fill: &TradeFill) -> Result<()
     let line = serde_json::to_string(fill)?;
     writeln!(w, "{line}")?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn market(s: &str) -> MarketId {
+        use pe_core_types::VenueMarketId;
+        MarketId(VenueMarketId(s.to_owned()))
+    }
+
+    fn op(s: &str) -> OperatorId {
+        OperatorId(blake3::hash(s.as_bytes()))
+    }
+
+    fn wallet(b: u8) -> WalletAddress {
+        WalletAddress::from_hex(&format!("0x{:040x}", b)).unwrap()
+    }
+
+    // ── ExposureTracker: operator_bps with None ────────────────────────────────
+
+    #[test]
+    fn operator_bps_none_returns_zero_initially() {
+        let tracker = ExposureTracker::default();
+        assert_eq!(tracker.operator_bps(None), 0);
+    }
+
+    #[test]
+    fn operator_bps_none_stays_zero_after_none_adds() {
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-a");
+        // Add 3 different wallets all with op=None — must not accumulate in any shared bucket.
+        for i in 0u8..3 {
+            tracker.add(wallet(i), None, &m, 25);
+        }
+        assert_eq!(
+            tracker.operator_bps(None),
+            0,
+            "None operator must never accumulate exposure"
+        );
+    }
+
+    #[test]
+    fn operator_bps_none_does_not_affect_named_operator() {
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-b");
+        let known_op = op("op-alpha");
+        tracker.add(wallet(1), Some(&known_op), &m, 50);
+        tracker.add(wallet(2), None, &m, 100);
+        // The known operator's bps is 50, None's is still 0.
+        assert_eq!(tracker.operator_bps(Some(&known_op)), 50);
+        assert_eq!(tracker.operator_bps(None), 0);
+    }
+
+    #[test]
+    fn operator_bps_named_operator_accumulates_correctly() {
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-c");
+        let op_a = op("op-a");
+        let op_b = op("op-b");
+        // Two wallets in op-a each contribute 25 bps.
+        tracker.add(wallet(1), Some(&op_a), &m, 25);
+        tracker.add(wallet(2), Some(&op_a), &m, 25);
+        tracker.add(wallet(3), Some(&op_b), &m, 30);
+        assert_eq!(tracker.operator_bps(Some(&op_a)), 50);
+        assert_eq!(tracker.operator_bps(Some(&op_b)), 30);
+        assert_eq!(tracker.operator_bps(None), 0);
+    }
+
+    #[test]
+    fn remove_none_operator_does_not_panic_or_corrupt_state() {
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-d");
+        tracker.add(wallet(1), None, &m, 25);
+        // Remove should mirror add — must not panic and must leave leader/market correct.
+        tracker.remove(wallet(1), None, &m, 25);
+        assert_eq!(tracker.leader_bps(wallet(1)), 0);
+        assert_eq!(tracker.market_bps(&m), 0);
+        assert_eq!(tracker.total, 0);
+        assert_eq!(tracker.operator_bps(None), 0);
+    }
+
+    #[test]
+    fn operator_concentration_cap_does_not_block_unrelated_none_wallets() {
+        // Verifies the original bug is fixed: N wallets with None operator must not
+        // hit the 300 bps concentration cap from each other's exposure.
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-e");
+        // Add 20 different wallets each at 25 bps — total 500 bps through None path.
+        // operator_bps(None) must stay 0 throughout so the risk gate never fires.
+        for i in 0u8..20 {
+            tracker.add(wallet(i), None, &m, 25);
+            assert_eq!(
+                tracker.operator_bps(None),
+                0,
+                "operator_bps(None) must be 0 after {} adds",
+                i + 1
+            );
+        }
+        // per-leader and total are still tracked correctly.
+        assert_eq!(tracker.leader_bps(wallet(5)), 25);
+        assert_eq!(tracker.total, 500);
+    }
+
+    // ── ExposureTracker: leader and market caps still apply for None-operator wallets ──
+
+    #[test]
+    fn leader_bps_and_market_bps_track_none_operator_wallets() {
+        let mut tracker = ExposureTracker::default();
+        let m1 = market("mkt-f");
+        let m2 = market("mkt-g");
+        tracker.add(wallet(1), None, &m1, 25);
+        tracker.add(wallet(1), None, &m2, 25);
+        tracker.add(wallet(2), None, &m1, 30);
+        assert_eq!(tracker.leader_bps(wallet(1)), 50);
+        assert_eq!(tracker.leader_bps(wallet(2)), 30);
+        assert_eq!(tracker.market_bps(&m1), 55);
+        assert_eq!(tracker.market_bps(&m2), 25);
+        assert_eq!(tracker.total, 80);
+    }
 }

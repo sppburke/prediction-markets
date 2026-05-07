@@ -21,7 +21,7 @@
 //!
 //! [1]: https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts#get-a-list-of-erc20-token-transfer-events-by-address
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
@@ -123,6 +123,10 @@ struct EtherscanResponse {
 struct TokenTxEntry {
     from: String,
     to: String,
+    /// Block timestamp as a Unix-seconds string. Etherscan always populates this
+    /// in `tokentx` results; `default` guards against fixture JSON that omits it.
+    #[serde(rename = "timeStamp", default)]
+    timestamp_str: String,
 }
 
 /// JSON-RPC response from `eth_blockNumber` proxy endpoint.
@@ -258,6 +262,54 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         let url = self.build_block_number_url();
         self.fetch_with_backoff(&url, parse_block_number_response)
             .await
+    }
+}
+
+impl<F: HttpFetcher> EtherscanFunderLookup<F> {
+    /// Return the earliest Polygon block timestamp (Unix seconds) per unique funder address
+    /// for every incoming USDC transfer to `wallets` within `range`.
+    ///
+    /// Queries both native USDC and bridged USDC.e. When the same funder address appears in
+    /// multiple transfers the minimum `timeStamp` is kept (earliest known funding event).
+    /// Entries with an unparseable or absent `timeStamp` are stored with sentinel `0`
+    /// (epoch — always visible in walk-forward simulations).
+    pub async fn funders_of_with_timestamps(
+        &self,
+        wallets: &HashSet<WalletAddress>,
+        range: BlockRange,
+    ) -> Result<HashMap<WalletAddress, i64>, FunderDiscoveryError> {
+        let mut result: HashMap<WalletAddress, i64> = HashMap::new();
+        for wallet in wallets {
+            for contract in [USDC_NATIVE, USDC_BRIDGED] {
+                let url = self.build_url(wallet, contract, range);
+                let transfers = self.fetch_and_parse_with_backoff(&url).await?;
+                if transfers.len() >= MAX_RESULTS_PER_PAGE {
+                    warn!(
+                        wallet = %wallet,
+                        contract,
+                        result_count = transfers.len(),
+                        "etherscan: response hit per-page cap; some funders may be missing"
+                    );
+                }
+                let wallet_hex = wallet.to_string();
+                for entry in transfers {
+                    if !entry.to.eq_ignore_ascii_case(&wallet_hex) {
+                        continue;
+                    }
+                    let Ok(addr) = WalletAddress::from_hex(&entry.from) else {
+                        debug!(from = %entry.from, "etherscan: skipping unparseable from address");
+                        continue;
+                    };
+                    let ts: i64 = entry.timestamp_str.parse().unwrap_or(0);
+                    result
+                        .entry(addr)
+                        .and_modify(|existing| *existing = (*existing).min(ts))
+                        .or_insert(ts);
+                }
+                tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
+            }
+        }
+        Ok(result)
     }
 }
 

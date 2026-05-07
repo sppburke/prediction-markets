@@ -62,10 +62,12 @@ impl FunderGraphTimeline {
         Self { edges: Vec::new() }
     }
 
-    /// Return all edges whose `fetched_at_unix <= t`.
+    /// Return all edges whose `event_at_unix <= t`.
     ///
-    /// Uses `partition_point` (O(log N)). Calling with the same `t` twice
-    /// returns the same slice.
+    /// Edges with `event_at_unix = 0` (epoch sentinel, written by the pre-`event_at_unix`
+    /// schema migration) are always included because `0 <= t` for any positive simulation date.
+    ///
+    /// Uses `partition_point` (O(log N)). Calling with the same `t` twice returns the same slice.
     pub fn view_at(&self, t: i64) -> &[(i64, WalletAddress, WalletAddress)] {
         let count = self.edges.partition_point(|(ts, _, _)| *ts <= t);
         &self.edges[..count]
@@ -125,4 +127,103 @@ pub fn build_operator_identities_at(
 
     build_operator_identities(&funding_snapshot, &ClusteringConfig::default())
         .map_err(BacktestError::OperatorGraph)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn addr(b: u8) -> WalletAddress {
+        WalletAddress::from_hex(&format!("0x{:040x}", b)).unwrap()
+    }
+
+    fn timeline(edges: &[(i64, u8, u8)]) -> FunderGraphTimeline {
+        // Build from raw (event_at_unix, funder_byte, funded_byte) triples.
+        let mut sorted: Vec<(i64, WalletAddress, WalletAddress)> = edges
+            .iter()
+            .map(|(ts, funder, funded)| (*ts, addr(*funder), addr(*funded)))
+            .collect();
+        sorted.sort_unstable_by_key(|(ts, _, _)| *ts);
+        FunderGraphTimeline { edges: sorted }
+    }
+
+    // ── Sentinel (event_at_unix = 0) is always visible ────────────────────────
+
+    #[test]
+    fn sentinel_edge_visible_at_any_positive_timestamp() {
+        let tl = timeline(&[(0, 1, 2)]);
+        // epoch 0 is always ≤ any positive sim date.
+        assert_eq!(tl.view_at(1).len(), 1);
+        assert_eq!(tl.view_at(1_700_000_000).len(), 1);
+        assert_eq!(tl.view_at(i64::MAX).len(), 1);
+    }
+
+    #[test]
+    fn future_edge_not_visible_before_its_timestamp() {
+        let future_ts = 1_800_000_000_i64;
+        let tl = timeline(&[(future_ts, 1, 2)]);
+        assert_eq!(tl.view_at(future_ts - 1).len(), 0);
+    }
+
+    #[test]
+    fn future_edge_visible_at_and_after_its_timestamp() {
+        let future_ts = 1_800_000_000_i64;
+        let tl = timeline(&[(future_ts, 1, 2)]);
+        assert_eq!(tl.view_at(future_ts).len(), 1);
+        assert_eq!(tl.view_at(future_ts + 1).len(), 1);
+    }
+
+    #[test]
+    fn sentinel_always_visible_future_edge_gated() {
+        // Simulate the migration scenario: some edges have timestamp=0 (migrated
+        // from old schema), some have real timestamps from new bootstrap runs.
+        let real_ts = 1_760_000_000_i64; // a 2025-ish timestamp
+        let tl = timeline(&[(0, 1, 2), (real_ts, 3, 4)]);
+
+        // Before real_ts: only the sentinel edge is visible.
+        assert_eq!(tl.view_at(real_ts - 1).len(), 1);
+        // At and after real_ts: both visible.
+        assert_eq!(tl.view_at(real_ts).len(), 2);
+        assert_eq!(tl.view_at(real_ts + 86_400).len(), 2);
+    }
+
+    #[test]
+    fn multiple_sentinels_all_visible_at_any_time() {
+        let tl = timeline(&[(0, 1, 2), (0, 3, 4), (0, 5, 6)]);
+        assert_eq!(tl.view_at(1).len(), 3);
+    }
+
+    #[test]
+    fn empty_timeline_returns_empty_slice() {
+        let tl = FunderGraphTimeline::empty();
+        assert_eq!(tl.view_at(1_700_000_000).len(), 0);
+        assert!(tl.is_empty());
+    }
+
+    // ── view_at boundary semantics (inclusive) ────────────────────────────────
+
+    #[test]
+    fn view_at_is_inclusive_of_exact_timestamp() {
+        let ts = 1_700_000_000_i64;
+        let tl = timeline(&[(ts, 1, 2)]);
+        assert_eq!(
+            tl.view_at(ts).len(),
+            1,
+            "view_at must include edges at exactly t"
+        );
+        assert_eq!(tl.view_at(ts - 1).len(), 0);
+    }
+
+    #[test]
+    fn view_at_multiple_edges_different_timestamps() {
+        let tl = timeline(&[
+            (0, 1, 2), // sentinel
+            (1_700_000_000, 3, 4),
+            (1_750_000_000, 5, 6),
+        ]);
+        assert_eq!(tl.view_at(1_699_999_999).len(), 1); // only sentinel
+        assert_eq!(tl.view_at(1_700_000_000).len(), 2);
+        assert_eq!(tl.view_at(1_750_000_000).len(), 3);
+    }
 }
