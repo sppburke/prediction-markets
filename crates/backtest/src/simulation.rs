@@ -107,7 +107,10 @@ impl ExposureTracker {
 /// whose underlying market settled on-chain. Pass `&ResolutionIndex::new()` when
 /// no resolution data is available (sweep is a no-op; positions remain open at horizon).
 ///
-/// Writes `report.json` and `trades.ndjson` to `config.output_dir`.
+/// Writes `report.json` and `trades.ndjson` to `config.output_dir` when `write_output` is true.
+///
+/// Pass `write_output = false` from sweep mode — per-run files are suppressed and only
+/// the sweep-level JSON is written by the caller.
 #[allow(clippy::too_many_arguments)]
 pub fn run_simulation(
     config: &BacktestConfig,
@@ -118,6 +121,7 @@ pub fn run_simulation(
     ranker_config: &RankerConfig,
     ledger_config: &LedgerConfig,
     strategy: &WinnerFollowStrategy,
+    write_output: bool,
 ) -> Result<WinnerFollowReport, BacktestError> {
     // Build wallet → operator map for quick lookup.
     let wallet_to_operator: HashMap<WalletAddress, &OperatorIdentity> = operator_identities
@@ -181,7 +185,7 @@ pub fn run_simulation(
     let mut intraday_realized_pnl = Decimal::ZERO;
     let mut last_intraday_reset: Option<Date> = None;
 
-    let mut fills_writer = open_trades_ndjson(&config.output_dir)?;
+    let mut fills_writer = maybe_open_trades_ndjson(&config.output_dir, write_output)?;
 
     // Group trades by date for efficient walk-forward lookup.
     let mut trades_by_date: BTreeMap<Date, Vec<&RawTrade>> = BTreeMap::new();
@@ -256,7 +260,7 @@ pub fn run_simulation(
                 signal_price: close_price,
                 fill_price: close_price,
             };
-            write_fill(&mut fills_writer, &fill)?;
+            write_fill(fills_writer.as_mut(), &fill)?;
         }
 
         // Skip days that fall outside the step window.
@@ -472,7 +476,7 @@ pub fn run_simulation(
                         signal_price: trade.price.0,
                         fill_price,
                     };
-                    write_fill(&mut fills_writer, &fill)?;
+                    write_fill(fills_writer.as_mut(), &fill)?;
                 }
 
                 Side::Sell => {
@@ -520,7 +524,7 @@ pub fn run_simulation(
                         signal_price: trade.price.0,
                         fill_price,
                     };
-                    write_fill(&mut fills_writer, &fill)?;
+                    write_fill(fills_writer.as_mut(), &fill)?;
                 }
             }
         }
@@ -554,12 +558,13 @@ pub fn run_simulation(
         funder_graph_snapshot_caveat: true,
     };
 
-    // Write report.json.
-    let report_path = config.output_dir.join("report.json");
-    let json = serde_json::to_vec_pretty(&report)?;
-    let tmp = report_path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, &report_path)?;
+    if write_output {
+        let report_path = config.output_dir.join("report.json");
+        let json = serde_json::to_vec_pretty(&report)?;
+        let tmp = report_path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &report_path)?;
+    }
 
     info!(
         total_copies = report.total_copies,
@@ -676,14 +681,23 @@ fn build_risk_snapshot(ctx: &RiskContext<'_>) -> RiskSnapshot {
     }
 }
 
-fn open_trades_ndjson(output_dir: &Path) -> Result<std::fs::File, BacktestError> {
+fn maybe_open_trades_ndjson(
+    output_dir: &Path,
+    write_output: bool,
+) -> Result<Option<std::fs::File>, BacktestError> {
+    if !write_output {
+        return Ok(None);
+    }
     std::fs::create_dir_all(output_dir)?;
     let path = output_dir.join("trades.ndjson");
-    Ok(std::fs::File::create(path)?)
+    Ok(Some(std::fs::File::create(path)?))
 }
 
-fn write_fill(writer: &mut std::fs::File, fill: &TradeFill) -> Result<(), BacktestError> {
+fn write_fill(writer: Option<&mut std::fs::File>, fill: &TradeFill) -> Result<(), BacktestError> {
+    let Some(w) = writer else {
+        return Ok(());
+    };
     let line = serde_json::to_string(fill)?;
-    writeln!(writer, "{line}")?;
+    writeln!(w, "{line}")?;
     Ok(())
 }

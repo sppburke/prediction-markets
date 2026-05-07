@@ -73,7 +73,11 @@ impl WinnerFollowStrategy {
         }
 
         // 4. Kelly fraction.
-        let kf = kelly_fraction(signal.signal_kind, effective_mode);
+        let kf = kelly_fraction(
+            signal.signal_kind,
+            effective_mode,
+            self.config.kelly_fraction_override,
+        );
 
         // 5. Size contracts.
         // c = leader_price + Polymarket BUY taker fee (SELL orders pay no taker fee).
@@ -125,10 +129,17 @@ impl WinnerFollowStrategy {
 }
 
 /// Select the Kelly fraction for this signal kind and effective mode.
+///
+/// When `override_` is `Some`, it is returned for all signal kinds and modes.
+/// The override is research/backtest only; production always passes `None`.
 fn kelly_fraction(
     signal_kind: WinnerFollowSignalKind,
     effective_mode: ExecutionMode,
+    override_: Option<KellyFraction>,
 ) -> KellyFraction {
+    if let Some(kf) = override_ {
+        return kf;
+    }
     match signal_kind {
         WinnerFollowSignalKind::FreshWalletFirstTrade => KELLY_INHERITED_PRIOR,
         WinnerFollowSignalKind::ClusterCoordination => KELLY_CLUSTER_COORDINATION,

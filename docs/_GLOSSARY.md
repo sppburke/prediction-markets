@@ -578,3 +578,4 @@ CREATE TABLE leaderboard_snapshots (
 | `backtest_active_min_distinct_markets` | 5 | Min distinct markets in 180-day window for active tier. Relaxed from live-system default (30). Set via `PE_BACKTEST_ACTIVE_MIN_MARKETS`. |
 | `backtest_incubator_min_closed_trades` | 3 | Min closed trades in 90-day window for incubator tier. Relaxed from live-system default (20). Set via `PE_BACKTEST_INCUBATOR_MIN_CLOSED`. |
 | `backtest_incubator_min_distinct_markets` | 2 | Min distinct markets in 90-day window for incubator tier. Relaxed from live-system default (10). Set via `PE_BACKTEST_INCUBATOR_MIN_MARKETS`. |
+| `backtest_kelly_sweep_fractions_default` | `"0.10,0.25,0.50,0.75,1.0"` | Default sweep fractions when `PE_BACKTEST_KELLY_SWEEP` is set but empty. Each value must be in `(0.0, 1.0]`; 1.0 = full Kelly. Research only — production never sets this env var. |

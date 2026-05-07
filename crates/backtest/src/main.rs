@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::error::BacktestError;
+use pe_backtest::report::{KellySweepReport, KellySweepRun};
 use pe_backtest::{funder_graph, simulation};
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::dune::DuneClient;
@@ -117,27 +118,88 @@ async fn main() -> Result<(), BacktestError> {
         "ranker config (backtest-adjusted)"
     );
 
-    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
-    let report = simulation::run_simulation(
-        &config,
-        all_trades,
-        operator_identities,
-        &snapshots,
-        &resolutions,
-        &ranker_config,
-        &LedgerConfig::default(),
-        &strategy,
-    )?;
+    if let Some(fractions) = &config.kelly_sweep_fractions {
+        // ── Sweep mode ──────────────────────────────────────────────────────────
+        // Run N sequential backtests, one per fraction. Per-run report.json and
+        // trades.ndjson are suppressed; only the sweep-level JSON is written.
+        info!(
+            fractions = fractions.len(),
+            "backtest: Kelly sweep mode — starting sequential runs"
+        );
+        let mut runs: Vec<KellySweepRun> = Vec::with_capacity(fractions.len());
+        for &kf in fractions {
+            let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
+                kelly_fraction_override: Some(kf),
+                ..WinnerFollowConfig::default()
+            });
+            info!(kelly_fraction = %kf.0, "backtest: sweep run starting");
+            let report = simulation::run_simulation(
+                &config,
+                all_trades.clone(),
+                operator_identities.clone(),
+                &snapshots,
+                &resolutions,
+                &ranker_config,
+                &LedgerConfig::default(),
+                &strategy,
+                false, // suppress per-run output
+            )?;
+            info!(
+                kelly_fraction = %kf.0,
+                total_pnl_usd = %report.total_pnl_usd,
+                sharpe_ratio = %report.sharpe_ratio,
+                max_drawdown_pct = %report.max_drawdown_pct,
+                "backtest: sweep run complete"
+            );
+            runs.push(KellySweepRun {
+                kelly_fraction: kf,
+                report,
+            });
+        }
+        let sweep_report = KellySweepReport {
+            runs,
+            cache_path: config.cache_path.clone(),
+            executed_at: OffsetDateTime::now_utc(),
+        };
 
-    info!(
-        total_pnl_usd = %report.total_pnl_usd,
-        sharpe_ratio = %report.sharpe_ratio,
-        max_drawdown_pct = %report.max_drawdown_pct,
-        total_copies = report.total_copies,
-        win_rate_pct = %report.win_rate_pct,
-        "backtest complete — results in {:?}",
-        config.output_dir,
-    );
+        // Write kelly-sweep-{ISO8601}.json.
+        let ts = sweep_report
+            .executed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| BacktestError::Internal(format!("timestamp format: {e}")))?
+            .replace(':', "-");
+        let sweep_path = config.output_dir.join(format!("kelly-sweep-{ts}.json"));
+        let json = serde_json::to_vec_pretty(&sweep_report)?;
+        std::fs::write(&sweep_path, &json)?;
+        info!(path = ?sweep_path, "backtest: Kelly sweep report written");
+
+        // Print markdown table to stdout.
+        print!("{}", sweep_report.to_markdown_table());
+    } else {
+        // ── Single-run mode (default) ────────────────────────────────────────
+        let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
+        let report = simulation::run_simulation(
+            &config,
+            all_trades,
+            operator_identities,
+            &snapshots,
+            &resolutions,
+            &ranker_config,
+            &LedgerConfig::default(),
+            &strategy,
+            true, // write report.json + trades.ndjson
+        )?;
+
+        info!(
+            total_pnl_usd = %report.total_pnl_usd,
+            sharpe_ratio = %report.sharpe_ratio,
+            max_drawdown_pct = %report.max_drawdown_pct,
+            total_copies = report.total_copies,
+            win_rate_pct = %report.win_rate_pct,
+            "backtest complete — results in {:?}",
+            config.output_dir,
+        );
+    }
 
     Ok(())
 }
