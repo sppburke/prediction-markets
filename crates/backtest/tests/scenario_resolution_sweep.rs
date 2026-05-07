@@ -128,6 +128,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         ranker_active_min_markets: 30,
         ranker_incubator_min_closed: 10,
         ranker_incubator_min_markets: 5,
+        kelly_sweep_fractions: None,
     }
 }
 
@@ -150,6 +151,7 @@ fn run_sim(
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap()
 }

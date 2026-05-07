@@ -146,6 +146,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         ranker_active_min_markets: 30,
         ranker_incubator_min_closed: 10,
         ranker_incubator_min_markets: 5,
+        kelly_sweep_fractions: None,
     }
 }
 
@@ -206,6 +207,7 @@ async fn wallet_outside_snapshot_emits_no_signals() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -261,6 +263,7 @@ async fn weekly_pool_swap_changes_active_leaders() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -300,6 +303,7 @@ async fn wallet_present_throughout_emits_throughout() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -343,6 +347,7 @@ async fn position_opened_in_week1_persists_after_drop() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -381,6 +386,7 @@ async fn empty_snapshots_falls_back_to_full_history() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -423,6 +429,7 @@ async fn simulation_date_before_first_snapshot_emits_nothing() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use pe_core_types::KellyFraction;
 use rust_decimal::Decimal;
 
 use crate::error::BacktestError;
@@ -56,6 +57,12 @@ pub struct BacktestConfig {
     pub ranker_incubator_min_closed: u32,
     /// `PE_BACKTEST_INCUBATOR_MIN_MARKETS` — min distinct markets in 90-day window for incubator tier.
     pub ranker_incubator_min_markets: u32,
+    /// `PE_BACKTEST_KELLY_SWEEP` — comma-separated list of Kelly fractions to sweep.
+    /// When `Some`, triggers sweep mode: N sequential backtests, one per fraction.
+    /// Each fraction must be in `(0.0, 1.0]` (strictly positive, at most full Kelly).
+    /// Default fractions when the env var is present but empty: see
+    /// `docs/_GLOSSARY.md` `backtest_kelly_sweep_fractions_default`.
+    pub kelly_sweep_fractions: Option<Vec<KellyFraction>>,
 }
 
 impl BacktestConfig {
@@ -72,6 +79,8 @@ impl BacktestConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
         }
+
+        let kelly_sweep_fractions = parse_kelly_sweep()?;
 
         Ok(Self {
             cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.db")),
@@ -104,6 +113,46 @@ impl BacktestConfig {
                 "PE_BACKTEST_INCUBATOR_MIN_MARKETS",
                 DEFAULT_BT_INCUBATOR_MIN_MARKETS,
             ),
+            kelly_sweep_fractions,
         })
     }
+}
+
+// Canonical default fractions — see `docs/_GLOSSARY.md` `backtest_kelly_sweep_fractions_default`.
+const SWEEP_DEFAULTS: &str = "0.10,0.25,0.50,0.75,1.0";
+
+/// Parse `PE_BACKTEST_KELLY_SWEEP` into validated fractions.
+///
+/// Returns `None` when the env var is absent (single-run mode).
+/// Returns `Some(fractions)` when present; uses `SWEEP_DEFAULTS` when the value is empty.
+/// Each fraction must be in `(0.0, 1.0]`.
+fn parse_kelly_sweep() -> Result<Option<Vec<KellyFraction>>, BacktestError> {
+    let raw = match std::env::var("PE_BACKTEST_KELLY_SWEEP") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let src = if raw.trim().is_empty() {
+        SWEEP_DEFAULTS
+    } else {
+        raw.trim()
+    };
+    let mut fractions = Vec::new();
+    for part in src.split(',') {
+        let trimmed = part.trim();
+        let d: Decimal = trimmed.parse().map_err(|_| {
+            BacktestError::InvalidKellySweep(format!("'{trimmed}' is not a valid decimal"))
+        })?;
+        if d <= Decimal::ZERO || d > Decimal::ONE {
+            return Err(BacktestError::InvalidKellySweep(format!(
+                "{d} is not in (0.0, 1.0] — fractions must be strictly positive and at most 1.0 (full Kelly)"
+            )));
+        }
+        fractions.push(KellyFraction(d));
+    }
+    if fractions.is_empty() {
+        return Err(BacktestError::InvalidKellySweep(
+            "PE_BACKTEST_KELLY_SWEEP produced no fractions".to_owned(),
+        ));
+    }
+    Ok(Some(fractions))
 }

@@ -114,6 +114,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         ranker_active_min_markets: 30,
         ranker_incubator_min_closed: 10,
         ranker_incubator_min_markets: 5,
+        kelly_sweep_fractions: None,
     }
 }
 
@@ -156,6 +157,7 @@ async fn winner_wallet_produces_positive_pnl() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -204,6 +206,7 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -294,6 +297,7 @@ async fn per_trader_win_rate_used_as_probability() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 
@@ -355,6 +359,7 @@ async fn fee_model_reduces_edge_at_high_prices() {
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
+        true,
     )
     .unwrap();
 

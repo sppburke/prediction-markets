@@ -30,4 +30,7 @@ pub enum BacktestError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("invalid kelly sweep fraction: {0}")]
+    InvalidKellySweep(String),
 }

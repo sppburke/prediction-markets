@@ -1,8 +1,9 @@
 //! `WinnerFollowReport` — output of the walk-forward backtest.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use pe_core_types::OperatorId;
+use pe_core_types::{KellyFraction, OperatorId};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -35,6 +36,48 @@ pub struct WinnerFollowReport {
     /// as it existed at each simulated time T. Relationships established after T_past
     /// may appear in the graph — a known conservative approximation.
     pub funder_graph_snapshot_caveat: bool,
+}
+
+/// One run within a Kelly-fraction sweep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KellySweepRun {
+    pub kelly_fraction: KellyFraction,
+    pub report: WinnerFollowReport,
+}
+
+/// Output of a Kelly-fraction sweep — N sequential backtests on identical data.
+///
+/// Written to `${PE_BACKTEST_OUTPUT_DIR}/kelly-sweep-{ISO8601}.json`.
+/// Per-run `report.json` / `trades.ndjson` are suppressed in sweep mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KellySweepReport {
+    pub runs: Vec<KellySweepRun>,
+    pub cache_path: PathBuf,
+    #[serde(with = "time::serde::rfc3339")]
+    pub executed_at: OffsetDateTime,
+}
+
+impl KellySweepReport {
+    /// Render a markdown comparison table to stdout.
+    pub fn to_markdown_table(&self) -> String {
+        let mut out = String::new();
+        out.push_str("| Kelly fraction | Total PnL (USD) | Sharpe | Max DD % | Win rate % | Copies | Open at horizon |\n");
+        out.push_str("|---:|---:|---:|---:|---:|---:|---:|\n");
+        for run in &self.runs {
+            let r = &run.report;
+            out.push_str(&format!(
+                "| {:.2} | {:.2} | {:.3} | {:.1} | {:.1} | {} | {} |\n",
+                run.kelly_fraction.0,
+                r.total_pnl_usd,
+                r.sharpe_ratio,
+                r.max_drawdown_pct,
+                r.win_rate_pct,
+                r.total_copies,
+                r.open_at_horizon,
+            ));
+        }
+        out
+    }
 }
 
 /// A single paper-fill record written to trades.ndjson.

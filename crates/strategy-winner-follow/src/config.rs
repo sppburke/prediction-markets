@@ -5,6 +5,7 @@
 //! approval flags that require a signed config change to flip, plus the fee-rate
 //! constant used to compute net cost `c` in Kelly sizing.
 
+use pe_core_types::KellyFraction;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,10 @@ pub struct WinnerFollowConfig {
     /// See `_GLOSSARY.md` `polymarket_fee_rate`. Default: 0.04 (March 2026 model).
     #[serde(default = "default_polymarket_fee_rate")]
     pub polymarket_fee_rate: Decimal,
+    /// Research/backtest only. When `Some`, replaces all per-mode Kelly fractions
+    /// in `evaluate::kelly_fraction()`. Must be `None` in all production code paths.
+    #[serde(default)]
+    pub kelly_fraction_override: Option<KellyFraction>,
 }
 
 fn default_polymarket_fee_rate() -> Decimal {
@@ -34,6 +39,7 @@ impl Default for WinnerFollowConfig {
             flip_human_approved: false,
             kelly_fraction_above_default_human_approved: false,
             polymarket_fee_rate: default_polymarket_fee_rate(),
+            kelly_fraction_override: None,
         }
     }
 }
