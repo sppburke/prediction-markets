@@ -99,7 +99,8 @@ pub struct BootstrapConfig {
     /// fetch uploads market IDs as a lookup table and uses a server-side JOIN so only
     /// the caller's markets are returned, greatly reducing credit cost.
     pub dune_namespace: Option<String>,
-    /// `PE_ETHERSCAN_API_KEY` — required when `wallet_source = etherscan`.
+    /// `PE_ETHERSCAN_API_KEY` — required when `wallet_source = etherscan`; optional
+    /// when `wallet_source = dune` but needed for `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
     pub etherscan_api_key: Option<String>,
     /// `PE_WALLET_FROM_BLOCK` — start block for Etherscan scan (default: CTF V1 deploy block).
     /// Ignored when `wallet_source = dune`.
@@ -213,7 +214,12 @@ impl BootstrapConfig {
         let wallet_source = WalletSource::from_str(&optional("PE_WALLET_SOURCE", "etherscan"));
 
         let (dune_api_key, etherscan_api_key) = match &wallet_source {
-            WalletSource::Dune => (Some(require("PE_DUNE_API_KEY")?), None),
+            // In Dune mode, PE_ETHERSCAN_API_KEY is optional — it's needed only for
+            // PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 and is independent of wallet discovery.
+            WalletSource::Dune => (
+                Some(require("PE_DUNE_API_KEY")?),
+                std::env::var("PE_ETHERSCAN_API_KEY").ok(),
+            ),
             // In Etherscan mode, PE_DUNE_API_KEY is optional — it enables the on-chain
             // resolution sweep (ctf_evt_conditionresolution) without requiring Dune
             // for wallet discovery.
