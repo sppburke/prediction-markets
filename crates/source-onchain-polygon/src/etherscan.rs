@@ -10,7 +10,7 @@
 //! Compared to [`crate::funder_discovery::EthGetLogsLookup`], which batches
 //! multiple recipients into a single `topic[2]` filter per call, this lookup
 //! issues one HTTP request per wallet per contract. That trades request
-//! volume for staying inside Etherscan's free 5 req/s budget instead of
+//! volume for staying inside Etherscan's free 3 req/s budget instead of
 //! consuming Alchemy compute units. For seed sets of ~10–100 wallets and
 //! `funding_max_hops = 3`, total wall time is bounded at a few minutes.
 //!
