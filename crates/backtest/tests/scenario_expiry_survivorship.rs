@@ -120,6 +120,8 @@ fn base_config(dir: &TempDir, max_hours_to_expiry: Option<u32>) -> BacktestConfi
         ranker_incubator_min_markets: 5,
         kelly_sweep_fractions: None,
         per_trade_cap_override: None,
+        kelly_p_prior_alpha: 0,
+        kelly_p_prior_beta: 0,
     }
 }
 

@@ -579,6 +579,8 @@ CREATE TABLE leaderboard_snapshots (
 | `backtest_incubator_min_closed_trades` | 3 | Min closed trades in 90-day window for incubator tier. Relaxed from live-system default (20). Set via `PE_BACKTEST_INCUBATOR_MIN_CLOSED`. |
 | `backtest_incubator_min_distinct_markets` | 2 | Min distinct markets in 90-day window for incubator tier. Relaxed from live-system default (10). Set via `PE_BACKTEST_INCUBATOR_MIN_MARKETS`. |
 | `backtest_kelly_sweep_fractions_default` | `"0.10,0.25,0.50,0.75,1.0"` | Default sweep fractions when `PE_BACKTEST_KELLY_SWEEP` is set but empty. Each value must be in `(0.0, 1.0]`; 1.0 = full Kelly. Research only — production never sets this env var. |
+| `kelly_p_prior_alpha_default` | 10 | α of the Beta(α,β) prior on leader win-rate `p`. Prior strength = α+β = 20 trades centred at 0.5. `(α=0, β=0)` reproduces the raw empirical-rate path. Set via `PE_BACKTEST_KELLY_P_PRIOR_ALPHA`. |
+| `kelly_p_prior_beta_default` | 10 | β of the Beta(α,β) prior on leader win-rate `p`. See `kelly_p_prior_alpha_default`. Set via `PE_BACKTEST_KELLY_P_PRIOR_BETA`. |
 | `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. |
 | `per_trade_cap_unlimited_resolved_bps` | 10 000 | Effective cap in basis points when `PerTradeCap::Unlimited` is selected. Full bankroll — Kelly fraction is the only size constraint. |
 | `expiry_filter_suppression_warn_threshold` | 30 | Warn threshold for `expiry_filter_suppression_pct` (percent of buy signals suppressed by `max_hours_to_expiry`). Logged as a warning when exceeded. |

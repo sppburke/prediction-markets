@@ -1,7 +1,7 @@
 # 05 — Phase Backtesting
 
 > See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
-> See [`_GLOSSARY.md`](_GLOSSARY.md) for the "close to simulation" definition (KS p-value, mean-PnL z-score) and configuration defaults.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for the "close to simulation" definition (KS p-value, mean-PnL z-score) and configuration defaults, including `kelly_p_prior_alpha_default` and `kelly_p_prior_beta_default` (Bayesian shrinkage on leader win-rate `p`; set via `PE_BACKTEST_KELLY_P_PRIOR_ALPHA` / `PE_BACKTEST_KELLY_P_PRIOR_BETA`).
 
 ## Objective
 

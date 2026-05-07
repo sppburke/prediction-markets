@@ -503,7 +503,11 @@ pub fn run_simulation(
                         raw
                     };
                     // Win-rate probability from the leader's ledger (Blocker 2).
-                    let Some(p) = leader_win_rate_p(ledger_by_wallet.get(&leader).copied()) else {
+                    let Some(p) = leader_win_rate_p_shrunk(
+                        ledger_by_wallet.get(&leader).copied(),
+                        config.kelly_p_prior_alpha,
+                        config.kelly_p_prior_beta,
+                    ) else {
                         continue;
                     };
 
@@ -589,7 +593,11 @@ pub fn run_simulation(
                         }
                     };
 
-                    let closed_contracts = open.contracts.min(trade.contracts.0);
+                    // Use our full position size: the position is already removed from
+                    // open_positions above, and the leader's sell quantity is their sizing,
+                    // not ours. Partial-close accounting would require updating the position
+                    // in-place; since we remove it, we must realize the full copy position.
+                    let closed_contracts = open.contracts;
                     let revenue = Decimal::from(closed_contracts) * fill_price;
                     let cost = Decimal::from(closed_contracts) * open.avg_fill_price;
                     let pnl = revenue - cost;
@@ -706,28 +714,38 @@ fn raw_trade_to_leader_signal(
     }
 }
 
-/// Compute the empirical win-rate probability from a leader's ledger.
+/// Bayesian shrinkage estimate of leader win-rate probability.
 ///
-/// Returns `None` when the ledger has no closed trades (no data to derive edge from).
+/// Applies a Beta(α, β) prior: `p_shrunk = (wins + α) / (total + α + β)`.
+/// `(α=0, β=0)` reduces to the raw empirical rate (backwards-compatible path).
+/// The default `(α=10, β=10)` has prior strength 20 trades centred at 0.5, pulling
+/// small-sample extremes (e.g. 11/12 → 0.91) toward the population mean.
+///
+/// Returns `None` only when `total == 0` and the prior carries no weight (`α + β == 0`).
+/// When the prior has weight and `total == 0`, returns the prior mean α/(α+β) — at
+/// `p = 0.5` the Kelly fraction is effectively zero at market prices, so no trades are made.
 ///
 /// # Precondition
 /// Caller should ensure the ledger has passed the bootstrap filter (>15 closed trades,
 /// >95% win rate). This function does not re-apply those thresholds.
-fn leader_win_rate_p(ledger: Option<&TraderLedger>) -> Option<Probability> {
+fn leader_win_rate_p_shrunk(
+    ledger: Option<&TraderLedger>,
+    alpha: u32,
+    beta: u32,
+) -> Option<Probability> {
     let ledger = ledger?;
-    let total = ledger.closed_trades.len();
-    if total == 0 {
-        return None;
-    }
     let wins = ledger
         .closed_trades
         .iter()
         .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
-        .count();
-    let p_raw = Decimal::from(wins) / Decimal::from(total);
-    // Clamp defensively: wins/total is always in [0,1] but saturating arithmetic protects against
-    // any edge case in ledger reconstruction.
-    Probability::new(p_raw.clamp(Decimal::ZERO, Decimal::ONE)).ok()
+        .count() as u32;
+    let total = ledger.closed_trades.len() as u32;
+    if total == 0 && (alpha + beta) == 0 {
+        return None;
+    }
+    let num = Decimal::from(wins + alpha);
+    let den = Decimal::from(total + alpha + beta);
+    Probability::new((num / den).clamp(Decimal::ZERO, Decimal::ONE)).ok()
 }
 
 fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> i32 {
@@ -920,5 +938,122 @@ mod tests {
         assert_eq!(tracker.market_bps(&m1), 55);
         assert_eq!(tracker.market_bps(&m2), 25);
         assert_eq!(tracker.total, 80);
+    }
+
+    // ── leader_win_rate_p_shrunk ───────────────────────────────────────────────
+
+    use pe_core_types::{ContractQty, OutcomeId, Price};
+    use pe_trader_index::ledger::ClosedTrade;
+    use rust_decimal_macros::dec;
+
+    fn closed_trade(pnl_usd: Decimal) -> ClosedTrade {
+        ClosedTrade {
+            market_id: market("mkt-0"),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            entry_price: Price(dec!(0.50)),
+            exit_price: Price(dec!(1.00)),
+            contracts: ContractQty(1),
+            hold_duration_seconds: 86_400,
+            realized_pnl_usd: pnl_usd,
+            opened_at_unix: 0,
+            closed_at_unix: 86_400,
+            source_trade_ids: vec![],
+        }
+    }
+
+    fn make_ledger(wins: usize, losses: usize) -> TraderLedger {
+        let mut closed = Vec::with_capacity(wins + losses);
+        for _ in 0..wins {
+            closed.push(closed_trade(dec!(0.50)));
+        }
+        for _ in 0..losses {
+            closed.push(closed_trade(dec!(-0.50)));
+        }
+        TraderLedger {
+            wallet: wallet(0),
+            operator_id: None,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            closed_trades: closed,
+            open_positions: vec![],
+            audit_window_days: 90,
+        }
+    }
+
+    // (0,0) prior → raw rate, identical to old leader_win_rate_p behaviour.
+    #[test]
+    fn shrinkage_with_zero_priors_matches_raw() {
+        let ledger = make_ledger(11, 1);
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 0, 0).unwrap();
+        // 11/12 = 0.91666...
+        let expected = Decimal::from(11u32) / Decimal::from(12u32);
+        assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
+    }
+
+    // No trades + zero prior → None (no data at all).
+    #[test]
+    fn no_trades_zero_prior_returns_none() {
+        let ledger = make_ledger(0, 0);
+        assert!(leader_win_rate_p_shrunk(Some(&ledger), 0, 0).is_none());
+    }
+
+    // No trades + non-zero prior → prior mean (0.5 for symmetric Beta(10,10)).
+    #[test]
+    fn shrinkage_with_no_trades_returns_prior_mean() {
+        let ledger = make_ledger(0, 0);
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        // (0+10)/(0+20) = 0.5
+        assert_eq!(p.0, dec!(0.5));
+    }
+
+    // Small sample: prior dominates.  11/12 with (10,10) → (21/32) = 0.65625.
+    #[test]
+    fn shrinkage_dominates_at_low_n() {
+        let ledger = make_ledger(11, 1);
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        let expected = Decimal::from(21u32) / Decimal::from(32u32); // 0.65625
+        assert_eq!(p.0, expected);
+    }
+
+    // Large sample: prior is negligible.  1100/1200 with (10,10) → within 0.01 of raw.
+    // (1110/1220 - 1100/1200) ≈ 0.0068, well under 1% — prior strength of 20 is
+    // negligible against 1200 observations.
+    #[test]
+    fn shrinkage_negligible_at_high_n() {
+        let ledger = make_ledger(1100, 100);
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        let raw = Decimal::from(1100u32) / Decimal::from(1200u32);
+        let diff = (p.0 - raw).abs();
+        assert!(
+            diff < dec!(0.01),
+            "shrunk p = {}, raw = {}, diff = {} >= 0.01",
+            p.0,
+            raw,
+            diff
+        );
+    }
+
+    // None ledger → None regardless of prior.
+    #[test]
+    fn no_ledger_returns_none() {
+        assert!(leader_win_rate_p_shrunk(None, 10, 10).is_none());
+    }
+
+    // Asymmetric prior skews estimate toward 0 when β is large.
+    #[test]
+    fn asymmetric_prior_skews_estimate() {
+        let ledger = make_ledger(5, 5); // raw p = 0.5
+        let p_low = leader_win_rate_p_shrunk(Some(&ledger), 1, 99).unwrap();
+        // (5+1)/(10+100) = 6/110 ≈ 0.0545 — prior pulls strongly toward 0
+        assert!(p_low.0 < dec!(0.10));
+    }
+
+    // All wins with symmetric prior → result is above raw/(prior pulls down).
+    #[test]
+    fn all_wins_prior_pulls_toward_half() {
+        let ledger = make_ledger(12, 0); // raw p = 1.0
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10).unwrap();
+        // (12+10)/(12+20) = 22/32 = 0.6875 — well below raw 1.0
+        assert_eq!(p.0, Decimal::from(22u32) / Decimal::from(32u32));
     }
 }
