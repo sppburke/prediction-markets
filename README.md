@@ -11,6 +11,29 @@ See [`docs/`](docs/) for the full specification:
 - [`docs/AGENTS.md`](docs/AGENTS.md) — coding-agent operating instructions
 - [`docs/SKILLS.md`](docs/SKILLS.md) — project skill definitions and quality gates
 
+## Quick start
+
+```bash
+# 1. Install toolchain and cargo tools
+rustup toolchain install 1.95.0
+cargo install cargo-nextest cargo-deny cargo-audit
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env and fill in required values (Polygon RPC, Dune API key, Etherscan API key, output paths)
+
+# 3. Run bootstrap (builds the wallet cache and trade history, ~2-4 hours first run)
+cargo run --release --bin pe-bootstrap
+
+# 4a. Run backtest (requires completed bootstrap)
+cargo run --release --bin pe-backtest
+
+# 4b. Or run the acceptance gate
+cargo nextest run --workspace --all-features
+```
+
+See [`docs/22-ONBOARDING.md`](docs/22-ONBOARDING.md) for the full environment-variable catalogue, startup sequence, and first-run recipes (backtest-only, paper trading, live-tiny).
+
 ## Toolchain
 
 Rust 2024 Edition pinned to stable Rust 1.95.0. See `_BASELINE.md`.

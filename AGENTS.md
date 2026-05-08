@@ -14,7 +14,7 @@ The full acceptance gate (also run in CI):
 rustc --version              # must contain 1.95.0
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo test --doc --workspace --all-features
 cargo nextest run --workspace --all-features
 cargo deny check
 cargo audit

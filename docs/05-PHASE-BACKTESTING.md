@@ -127,6 +127,21 @@ pub struct WinnerFollowReport {
 
 `DelayBucket` matches the survivability buckets in `19-WINNER-FOLLOW-STRATEGY.md`.
 
+## Simulation-level trade filters
+
+These six gates live in `crates/backtest/src/simulation.rs` and fire in the backtest harness only. They do **not** exist in production and do not contribute to `false_edge_count` in `BacktestReport`. Each entry skips the trade via `continue` and moves on to the next signal.
+
+| # | Gate | Condition | Source | Rationale |
+|---|---|---|---|---|
+| 1 | Not on watchlist | `!watchlisted.contains(&trade.wallet)` | `simulation.rs:457` | Restricts copies to active or incubator wallets at that historical timestamp. Without this, any trader in the raw dataset would be copied, including wallets that were never ranked — survivorship and look-forward bias. |
+| 2 | Duplicate open position | `open_positions.contains_key(&wallet_pos_key)` (Buy only) | `simulation.rs:476` | Each leader's position in a `(wallet, market, outcome)` triple is tracked once. Copying a second buy while one is already open would double-enter the same thesis. Prevents position doubling that real risk caps would block in production. |
+| 3 | Expiry filter | `resolved_at_unix − sim_date_unix > max_hours` (only when `max_hours_to_expiry` is set) | `simulation.rs:485–495` | Skips trades in markets resolving too far out. Markets with unknown resolution (`None`) are **always allowed** — at simulation time the future resolution date was unknown, so excluding them would be survivorship bias. |
+| 4 | Slippage ceiling | `fill_price = leader_price + slippage; if fill_price >= 1.0 { continue }` | `simulation.rs:497–504` | A Buy at `price + slippage ≥ 1.00¢` has no remaining upside even if the outcome resolves YES. Simulating a fill at a price ≥ $1.00 is nonsensical for a binary outcome. |
+| 5 | No shrunk-p | `leader_win_rate_p_shrunk(...) == None` | `simulation.rs:506–513` | The Bayesian-shrunk win-rate `p` is `None` when the leader has zero trades — no prior evidence, no size. Copying without a `p` estimate would require Kelly to assert a probability with no data. |
+| 6 | No quality score | `quality_by_wallet.get(&leader) == None` | `simulation.rs:516–518` | Every watchlisted wallet must have a quality score from the ranker. A missing score means the watchlist and ledger data are inconsistent — a data integrity guard, not a real eligibility criterion. |
+
+Gates 1–6 are evaluated sequentially inside the trade loop (not as part of any `Err` variant). After them, the signal proceeds to `strategy.evaluate()`, which applies the five strategy-level gates documented in `docs/19-WINNER-FOLLOW-STRATEGY.md`.
+
 ## Winner-Follow backtesting and validation
 
 Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A historical leader trade is not copied at the leader's price unless the follower could have filled there after discovery delay, API delay, decision delay, order routing, queue position, and slippage.

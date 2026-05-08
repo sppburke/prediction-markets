@@ -20,13 +20,13 @@
 
 | Link | Last checked | Re-verify by |
 |---|---|---|
-| https://docs.kalshi.com/welcome | — | — |
-| https://docs.kalshi.com/getting_started/quick_start_websockets | — | — |
-| https://docs.kalshi.com/getting_started/quick_start_market_data | — | — |
-| https://docs.kalshi.com/getting_started/orderbook_responses | — | — |
-| https://docs.kalshi.com/api-reference/orders/get-order-queue-position | — | — |
-| https://docs.kalshi.com/api-reference/order-groups/create-order-group | — | — |
-| https://docs.kalshi.com/changelog | — | — |
+| https://docs.kalshi.com/welcome | 2026-05-07 | 2026-07-06 |
+| https://docs.kalshi.com/getting_started/quick_start_websockets | 2026-05-07 | 2026-07-06 |
+| https://docs.kalshi.com/getting_started/quick_start_market_data | 2026-05-07 | 2026-07-06 |
+| https://docs.kalshi.com/getting_started/orderbook_responses | 2026-05-07 | 2026-07-06 |
+| https://docs.kalshi.com/api-reference/orders/get-order-queue-position | 2026-05-07 | 2026-07-06 |
+| https://docs.kalshi.com/api-reference/order-groups/create-order-group | 2026-05-07 | 2026-07-06 |
+| https://docs.kalshi.com/changelog | 2026-05-07 | 2026-07-06 |
 | https://help.kalshi.com/en/articles/13823837-weather-markets | — | — |
 | https://help.kalshi.com/en/articles/13823838-crypto-markets | — | — |
 | https://help.kalshi.com/en/articles/13823839-spotify-markets | — | — |
@@ -64,8 +64,8 @@
 
 | Link | Last checked | Re-verify by |
 |---|---|---|
-| https://polygon.technology/ | — | — |
-| Polygon JSON-RPC / archive provider docs (selected by impl) | — | — |
+| https://polygon.technology/ | 2026-05-07 | 2026-08-05 |
+| Polygon JSON-RPC / archive provider docs (selected by impl) | 2026-05-07 | 2026-08-05 |
 | https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts | 2026-05-04 | 2026-08-04 |
 | https://www.weather.gov/ | — | — |
 | https://aviationweather.gov/data/api/ | — | — |
@@ -113,9 +113,9 @@
 | Link | Last checked | Re-verify by |
 |---|---|---|
 | https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services | — | — |
-| https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html | — | — |
-| https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html | — | — |
-| https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html | — | — |
+| https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html | 2026-05-07 | 2026-08-05 |
+| https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html | 2026-05-07 | 2026-08-05 |
+| https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html | 2026-05-07 | 2026-08-05 |
 
 ## Research-only references
 
@@ -130,5 +130,7 @@ Treat as research inspiration; not a production decision input unless an authori
 
 ## Last research pass
 
+- 2026-05-07: Checked Kalshi REST/WS API reference, changelog, and core market spec pages. No breaking changes relative to prior implementation assumptions.
+- 2026-05-07: Checked Polygon RPC docs and AWS ECS/ECR/Secrets Manager welcome pages for structural changes. No breaking changes noted.
 - 2026-05-02: Checked Polymarket official docs for public Data/Gamma/CLOB read endpoints, proxy wallets, signature type/funder behavior, and bridge deposit/pUSD collateral flow.
 - 2026-05-02: Checked CrowdIntel public pages for funding-network methodology. Treat as research inspiration only unless an authorized replayable API/export exists.

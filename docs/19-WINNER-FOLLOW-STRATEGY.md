@@ -441,6 +441,28 @@ prefer_market_order                  = false # only true when "very liquid" gate
 
 The TOML above is the only authoritative copy. README, `04-PHASE-TRADING-STRATEGY.md`, and `14-COMPLIANCE-AND-RISK.md` reference this block by file path.
 
+## Strategy-level trade gates
+
+These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fire in both backtest and production. They are checked before the risk engine is called. A gate returning `Err(WinnerFollowError::*)` means `evaluate_risk()` is never reached for that signal.
+
+| # | Gate | Condition | Source | `WinnerFollowError` | Rationale |
+|---|---|---|---|---|---|
+| 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:64–66` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and require a manual signed config change. The flag prevents automated flip copying until an operator explicitly approves it. |
+| 2 | Shadow mode | `effective_mode == Shadow` | `evaluate.rs:72–74` | `ShadowMode` | Shadow is record-only; no order is emitted. Returned as `Err` (not a hard failure) so callers can distinguish "intentionally suppressed" from "legitimately blocked". |
+| 3 | Price invalid after fee | `Price::new(leader_price + fee_per_share)` fails | `evaluate.rs:92` | `NoEdge` | `c` (cost = leader price + taker fee) must be a valid `Price` in `(0, 1)`. If the leader traded at a price that after fees would round to ≥ $1.00 there is no upside — the trade has no edge. |
+| 4 | Kelly sizes to zero | `size_contracts(kelly_input) == 0` | `evaluate.rs:102–104` | `NoEdge` | Kelly sizing returned zero contracts — the bankroll is too small to buy even one contract at this price with the configured fraction. Not an error; the signal is valid but unsizeable. |
+| 5 | Cap-clamp to zero | `clamp_contracts_to_cap(...) == 0` | `evaluate.rs:111–113` | `NoEdge` | After applying the per-trade cap (basis points of bankroll), available bankroll is smaller than the price of a single contract. Fractional contracts are not supported; skip this trade. |
+
+Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the 16 risk-engine block reasons.
+
+**Relationship between layers:**
+
+```
+simulation.rs gates (backtest only, lines 457-518)
+  → strategy-level gates 1-5 (evaluate.rs, both backtest and production)
+      → risk-engine evaluate_risk() → 16 RiskBlock variants (production and backtest)
+```
+
 ## Risk-block taxonomy and halt scope
 
 `risk-engine` returns one of these block reasons; halt scope is recorded inline:
