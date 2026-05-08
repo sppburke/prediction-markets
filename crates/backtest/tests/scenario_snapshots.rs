@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, WalletCache};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -199,6 +199,7 @@ async fn wallet_outside_snapshot_emits_no_signals() {
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -243,6 +244,7 @@ async fn weekly_pool_swap_changes_active_leaders() {
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -283,6 +285,7 @@ async fn wallet_present_throughout_emits_throughout() {
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -322,6 +325,7 @@ async fn position_opened_in_week1_persists_after_drop() {
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -363,6 +367,7 @@ async fn empty_snapshots_falls_back_to_full_history() {
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -405,6 +410,7 @@ async fn simulation_date_before_first_snapshot_emits_nothing() {
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

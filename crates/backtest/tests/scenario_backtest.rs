@@ -16,7 +16,7 @@
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, WalletCache};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -154,6 +154,7 @@ async fn winner_wallet_produces_positive_pnl() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -196,6 +197,7 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -258,6 +260,7 @@ async fn per_trader_win_rate_used_as_probability() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -309,6 +312,7 @@ async fn fee_model_reduces_edge_at_high_prices() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

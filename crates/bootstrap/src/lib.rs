@@ -346,10 +346,12 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         "bootstrap: leaderboard snapshot persisted"
     );
 
-    // 6. Fetch market resolution data.
-    //    a) Gamma API — covers ~2% of markets (classic prediction markets).
-    //       Off by default (PE_BOOTSTRAP_FETCH_RESOLUTIONS=1); ~2.4 h one-time.
-    //       Incremental: already-resolved markets skipped via INSERT OR IGNORE.
+    // 6. Fetch market resolution data and scheduled endDates.
+    //    Both are gated by the same flag (PE_BOOTSTRAP_FETCH_RESOLUTIONS=1) since
+    //    they use the same Gamma endpoint and the schedule data is needed to fix
+    //    max_hours_to_expiry survivorship bias in the backtest.
+    //    Off by default; ~2× one-time request cost vs. resolutions alone.
+    //    Incremental: already-fetched markets skipped via INSERT OR IGNORE.
     if config.fetch_resolutions {
         let market_ids = cache.all_market_ids();
         let gamma_client = reqwest::Client::builder()
@@ -367,6 +369,14 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             new_rows,
             total_markets = market_ids.len(),
             "bootstrap: gamma resolutions fetched"
+        );
+        let schedule_rows = gamma_fetcher
+            .fetch_schedules(&market_ids, &mut cache)
+            .await?;
+        tracing::info!(
+            schedule_rows,
+            total_markets = market_ids.len(),
+            "bootstrap: gamma schedules fetched"
         );
     }
 

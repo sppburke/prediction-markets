@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, LeaderAction, MarketId, OperatorId, OutcomeId, Probability, ProbabilityPpm,
@@ -178,6 +178,12 @@ impl ExposureTracker {
 /// whose underlying market settled on-chain. Pass `&ResolutionIndex::new()` when
 /// no resolution data is available (sweep is a no-op; positions remain open at horizon).
 ///
+/// `schedules` provides scheduled `endDate` values for the `max_hours_to_expiry` buy
+/// filter. When a market is present in `schedules`, its `end_date_unix` is used (fixing
+/// the survivorship bias introduced by using `resolved_at_unix` as a proxy). When absent,
+/// the filter falls back to `resolved_at_unix`. Pass `&ScheduleIndex::new()` to use the
+/// legacy resolution-only path.
+///
 /// Writes `report.json` and `trades.ndjson` to `config.output_dir` when `write_output` is true.
 ///
 /// Pass `write_output = false` from sweep mode — per-run files are suppressed and only
@@ -189,6 +195,7 @@ pub fn run_simulation(
     funder_timeline: &FunderGraphTimeline,
     snapshots: &LeaderboardSnapshots,
     resolutions: &ResolutionIndex,
+    schedules: &ScheduleIndex,
     ranker_config: &RankerConfig,
     ledger_config: &LedgerConfig,
     strategy: &WinnerFollowStrategy,
@@ -479,17 +486,28 @@ pub fn run_simulation(
                         continue; // Already tracking this leader's position.
                     }
 
-                    // Time-to-expiry filter: skip trades where the market resolves
-                    // more than max_hours_to_expiry hours after the trade date.
-                    // Markets with unknown resolution (None) are allowed — at sim time
-                    // we could not have known the market was unresolved, so skipping
-                    // them would be survivorship-biased.
+                    // Time-to-expiry filter: skip trades where the market's scheduled
+                    // close is more than max_hours_to_expiry hours after the trade date.
+                    //
+                    // Preference order:
+                    // 1. `schedules` has an entry → use `end_date_unix` (the date the
+                    //    live trader would have seen). `None` end_date means Gamma had no
+                    //    scheduled date — allow through rather than leak future state.
+                    // 2. Market absent from `schedules` → fall back to `resolved_at_unix`
+                    //    for backward compat with caches pre-dating this feature.
+                    // 3. Both absent → allow through (no future-state leak possible).
                     if let Some(max_hours) = config.max_hours_to_expiry {
                         let max_secs = i64::from(max_hours) * 3600;
-                        let suppressed = matches!(
-                            resolutions.get(&trade.market_id),
-                            Some(res) if res.resolved_at_unix - sim_date_unix > max_secs
-                        );
+                        let suppressed = match schedules.get(&trade.market_id) {
+                            Some(sched) => match sched.end_date_unix {
+                                Some(end_unix) => end_unix - sim_date_unix > max_secs,
+                                None => false,
+                            },
+                            None => matches!(
+                                resolutions.get(&trade.market_id),
+                                Some(res) if res.resolved_at_unix - sim_date_unix > max_secs
+                            ),
+                        };
                         suppression_tracker.record(sim_date, suppressed);
                         if suppressed {
                             continue;

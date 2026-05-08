@@ -15,7 +15,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::info;
 
-use crate::cache::{ResolutionIndex, WalletCache};
+use crate::cache::{ResolutionIndex, ScheduleIndex, WalletCache};
 use crate::error::BootstrapError;
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -107,11 +107,81 @@ impl<F: PageFetcher> GammaFetcher<F> {
         info!(inserted, total, "gamma: resolution fetch complete");
         Ok(inserted)
     }
+
+    /// Fetch scheduled `endDate` for every market ID not already present in `cache`.
+    ///
+    /// Calls [`WalletCache::scheduled_market_ids`] once up front to build the skip set.
+    /// Unlike [`Self::fetch_resolutions`], this method fetches endDates regardless of
+    /// whether the market is closed — a live trader sees `endDate` at trade time.
+    ///
+    /// Each market ID is inserted via `INSERT OR IGNORE` whether or not `end_date_unix`
+    /// is `Some`, so it enters the skip-set and will not be re-fetched on the next run.
+    ///
+    /// Returns the count of newly inserted rows.
+    pub async fn fetch_schedules(
+        &self,
+        market_ids: &[String],
+        cache: &mut WalletCache,
+    ) -> Result<usize, BootstrapError> {
+        let already_scheduled = cache.scheduled_market_ids();
+        let to_fetch: Vec<&String> = market_ids
+            .iter()
+            .filter(|id| !already_scheduled.contains(*id))
+            .collect();
+
+        let total = to_fetch.len();
+        info!(
+            total,
+            already_cached = already_scheduled.len(),
+            "gamma: starting schedule fetch"
+        );
+
+        let mut inserted = 0usize;
+        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+
+        for (i, market_id) in to_fetch.iter().enumerate() {
+            if i > 0 && i % 1_000 == 0 {
+                info!(
+                    progress = i,
+                    total, inserted, "gamma: schedule fetch progress"
+                );
+            }
+
+            let url = format!("{}/markets?condition_ids={}", self.base_url, market_id);
+            let bytes = match self.fetcher.fetch_page(&url).await {
+                Ok(b) => b,
+                Err(SourceError::Fatal { message }) => {
+                    tracing::warn!(%market_id, %message, "gamma: schedule fetch error, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(BootstrapError::Gamma {
+                        message: format!("fetch schedule {market_id}: {e}"),
+                    });
+                }
+            };
+
+            let end_date_unix = match parse_gamma_schedule(&bytes) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    tracing::warn!(%market_id, %e, "gamma: schedule parse error, inserting NULL");
+                    None
+                }
+            };
+
+            cache.insert_schedule(market_id, end_date_unix, fetched_at)?;
+            inserted += 1;
+        }
+
+        info!(inserted, total, "gamma: schedule fetch complete");
+        Ok(inserted)
+    }
 }
 
 /// Serde DTO for a single element of the `/markets` response array.
 ///
-/// Only the fields needed for resolution detection are mapped; extra fields ignored.
+/// Only the fields needed for resolution and schedule detection are mapped; extra
+/// fields are ignored by serde.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarketRaw {
@@ -120,6 +190,9 @@ struct GammaMarketRaw {
     closed: bool,
     closed_time: Option<String>,
     outcome_prices: Option<String>,
+    /// Scheduled close date in RFC 3339 format, e.g. `"2024-11-04T00:00:00Z"`.
+    /// Present on open and closed markets. `None` only when Gamma omits the field.
+    end_date: Option<String>,
 }
 
 /// Parse a single-element Gamma `/markets` response.
@@ -174,6 +247,40 @@ pub fn parse_gamma_response(bytes: &[u8]) -> Result<Option<(Option<u8>, i64)>, S
     Ok(Some((winner, resolved_at_unix)))
 }
 
+/// Parse a single-element Gamma `/markets` response and extract the scheduled `endDate`.
+///
+/// Returns:
+/// - `Some(unix)` — the market has a parseable `endDate` field.
+/// - `None` — the market was not found (empty array) or has no `endDate`.
+///
+/// This function does not require the market to be closed; it extracts the
+/// scheduled end time regardless of `closed` status so that the backtest can
+/// gate on the date the trader would have seen, not the eventual resolution time.
+pub fn parse_gamma_schedule(bytes: &[u8]) -> Result<Option<i64>, String> {
+    let markets: Vec<GammaMarketRaw> =
+        serde_json::from_slice(bytes).map_err(|e| format!("JSON parse: {e}"))?;
+
+    let Some(m) = markets.into_iter().next() else {
+        return Ok(None); // empty array — market not found on Gamma
+    };
+
+    let Some(end_date_str) = m.end_date else {
+        return Ok(None);
+    };
+
+    parse_end_date(&end_date_str).map(Some)
+}
+
+/// Parse Gamma's `endDate` RFC 3339 format: `"YYYY-MM-DDTHH:MM:SSZ"`.
+///
+/// Logs a warning and returns an error string if parsing fails so the caller can
+/// insert a NULL row rather than aborting the bootstrap run.
+fn parse_end_date(s: &str) -> Result<i64, String> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map(|dt| dt.unix_timestamp())
+        .map_err(|e| format!("parse endDate {s:?}: {e}"))
+}
+
 /// Parse Gamma's `closedTime` format: `"YYYY-MM-DD HH:MM:SS+00"`.
 ///
 /// The offset is always `+00` (UTC), so we truncate to the 19-char datetime
@@ -197,6 +304,14 @@ fn parse_closed_time(s: &str) -> Result<i64, String> {
 /// here so callers don't need to import both `gamma` and `cache`.
 pub fn load_resolutions(cache: &WalletCache) -> Result<ResolutionIndex, BootstrapError> {
     cache.load_all_resolutions()
+}
+
+/// Load all schedule rows from `cache` into a [`ScheduleIndex`].
+///
+/// Thin wrapper that delegates to [`WalletCache::load_all_schedules`]; provided
+/// here so callers don't need to import both `gamma` and `cache`.
+pub fn load_schedules(cache: &WalletCache) -> Result<ScheduleIndex, BootstrapError> {
+    cache.load_all_schedules()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -368,5 +483,124 @@ mod tests {
             cache.load_all_resolutions().unwrap().is_empty(),
             "voided row must be excluded from ResolutionIndex (NULL winner filtered)"
         );
+    }
+
+    // ── schedule-specific tests ───────────────────────────────────────────────
+
+    fn open_with_end_date_fixture() -> Vec<u8> {
+        fixture_bytes(
+            r#"[{"conditionId":"0xcond","closed":false,"closedTime":null,"outcomePrices":null,"endDate":"2026-07-31T12:00:00Z","outcomes":"[\"Yes\",\"No\"]"}]"#,
+        )
+    }
+
+    fn open_no_end_date_fixture() -> Vec<u8> {
+        fixture_bytes(
+            r#"[{"conditionId":"0xcond","closed":false,"closedTime":null,"outcomePrices":null,"outcomes":"[\"Yes\",\"No\"]"}]"#,
+        )
+    }
+
+    fn closed_with_end_date_fixture() -> Vec<u8> {
+        fixture_bytes(
+            r#"[{"conditionId":"0xcond","closed":true,"closedTime":"2024-01-15 12:00:00+00","outcomePrices":"[\"1\",\"0\"]","endDate":"2024-01-15T00:00:00Z","outcomes":"[\"Yes\",\"No\"]"}]"#,
+        )
+    }
+
+    #[test]
+    fn parse_gamma_schedule_open_market_with_end_date() {
+        // 2026-07-31T12:00:00Z = 1785499200
+        let ts = parse_gamma_schedule(&open_with_end_date_fixture())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ts, 1_785_499_200,
+            "RFC 3339 endDate must parse to correct unix seconds"
+        );
+    }
+
+    #[test]
+    fn parse_gamma_schedule_missing_end_date_returns_none() {
+        let result = parse_gamma_schedule(&open_no_end_date_fixture()).unwrap();
+        assert!(result.is_none(), "missing endDate field must return None");
+    }
+
+    #[test]
+    fn parse_gamma_schedule_closed_market_returns_end_date() {
+        // 2024-01-15T00:00:00Z = 1705276800
+        let ts = parse_gamma_schedule(&closed_with_end_date_fixture())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ts, 1_705_276_800,
+            "closed market endDate must parse correctly"
+        );
+    }
+
+    #[test]
+    fn parse_gamma_schedule_empty_array_returns_none() {
+        let result = parse_gamma_schedule(&empty_array_fixture()).unwrap();
+        assert!(result.is_none(), "empty array must return None");
+    }
+
+    #[test]
+    fn parse_end_date_rfc3339() {
+        // Verify the RFC 3339 format parses correctly.
+        // 2020-11-04T00:00:00Z = 1604448000
+        let ts = parse_end_date("2020-11-04T00:00:00Z").unwrap();
+        assert_eq!(ts, 1_604_448_000, "endDate must round-trip to unix seconds");
+    }
+
+    #[test]
+    fn fetch_schedules_skips_already_cached_ids() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        // Pre-insert one market as already-scheduled.
+        cache
+            .insert_schedule("0xa", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+
+        // Fixture only handles "0xb"; if "0xa" were fetched it would return Fatal.
+        let url_b = "https://gamma-api.polymarket.com/markets?condition_ids=0xb";
+        let mut responses = HashMap::new();
+        responses.insert(url_b.to_owned(), open_with_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let inserted = rt
+            .block_on(gamma.fetch_schedules(&["0xa".to_owned(), "0xb".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(inserted, 1, "only 0xb must be fetched (0xa was cached)");
+        assert_eq!(cache.load_all_schedules().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fetch_schedules_inserts_null_for_missing_end_date() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        let url = "https://gamma-api.polymarket.com/markets?condition_ids=0xcond";
+        let mut responses = HashMap::new();
+        responses.insert(url.to_owned(), open_no_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let inserted = rt
+            .block_on(gamma.fetch_schedules(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(inserted, 1, "missing endDate must still insert a row");
+        let idx = cache.load_all_schedules().unwrap();
+        assert_eq!(idx.len(), 1, "NULL row must be present in index");
+        let sched = idx.values().next().unwrap();
+        assert_eq!(sched.end_date_unix, None, "end_date_unix must be NULL");
+        // NULL row must also be in the skip-set.
+        assert_eq!(cache.scheduled_market_ids().len(), 1);
     }
 }

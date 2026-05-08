@@ -98,12 +98,14 @@ async fn main() -> Result<(), BacktestError> {
     }
 
     let resolutions = pe_bootstrap::gamma::load_resolutions(&cache)?;
+    let schedules = pe_bootstrap::gamma::load_schedules(&cache)?;
 
     info!(
         wallets = all_wallet_addresses.len(),
         trades = all_trades.len(),
         snapshots = snapshots.len(),
         resolutions = resolutions.len(),
+        schedules = schedules.len(),
         "cache loaded"
     );
 
@@ -161,6 +163,7 @@ async fn main() -> Result<(), BacktestError> {
                 &funder_timeline,
                 &snapshots,
                 &resolutions,
+                &schedules,
                 &ranker_config,
                 &LedgerConfig::default(),
                 &strategy,
@@ -212,6 +215,7 @@ async fn main() -> Result<(), BacktestError> {
             &funder_timeline,
             &snapshots,
             &resolutions,
+            &schedules,
             &ranker_config,
             &LedgerConfig::default(),
             &strategy,

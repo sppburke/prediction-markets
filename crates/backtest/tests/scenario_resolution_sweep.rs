@@ -17,7 +17,9 @@
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, MarketResolution, ResolutionIndex, WalletCache};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, MarketResolution, ResolutionIndex, ScheduleIndex, WalletCache,
+};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -147,6 +149,7 @@ fn run_sim(
         timeline,
         &LeaderboardSnapshots::default(),
         resolutions,
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

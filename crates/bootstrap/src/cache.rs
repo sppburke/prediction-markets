@@ -1,12 +1,15 @@
 //! Permanent wallet trade-history cache — SQLite (WAL mode), no TTL.
 //!
-//! Five tables:
+//! Six tables:
 //! - `trades` — append-only per-trade rows, indexed by `(wallet_hex, timestamp_unix)`.
 //! - `leaderboard_snapshots` — `(snapshot_at_unix, wallet_hex)` rows, one row-set per
 //!   `pe-bootstrap` run, written from the post-filtered watchlist. Read by
 //!   `pe-backtest` to constrain the candidate pool at each simulated week boundary.
 //! - `market_resolutions` — one row per resolved market from the Gamma API.
 //!   `winning_outcome_id NULL` means voided/non-binary — the backtest skips these.
+//! - `market_schedules` — one row per market whose scheduled `endDate` has been
+//!   fetched from Gamma. `end_date_unix NULL` means Gamma had no `endDate` for this
+//!   market (it is still in the skip-set to avoid re-fetching).
 //! - `funder_edges` — one row per `(funder, funded)` pair discovered via Etherscan.
 //!   Time-invariant once the block range is finalized; populated by `pe-bootstrap`
 //!   when `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
@@ -66,6 +69,12 @@ CREATE TABLE IF NOT EXISTS market_resolutions (
 );
 CREATE INDEX IF NOT EXISTS idx_resolutions_resolved_at
     ON market_resolutions(resolved_at_unix);
+
+CREATE TABLE IF NOT EXISTS market_schedules (
+    market_id       TEXT    PRIMARY KEY NOT NULL,
+    end_date_unix   INTEGER NULL,
+    fetched_at_unix INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS funder_edges (
     funder_hex      TEXT    NOT NULL,
@@ -459,6 +468,75 @@ impl WalletCache {
         }
     }
 
+    // ── market_schedules ──────────────────────────────────────────────────────
+
+    /// Insert a scheduled endDate for a market. Idempotent: `INSERT OR IGNORE` silently
+    /// skips if `market_id` is already present (first fetch wins).
+    ///
+    /// `end_date_unix = None` means Gamma returned no `endDate` for this market — the
+    /// market still enters the skip-set so it is not re-fetched on subsequent runs.
+    pub fn insert_schedule(
+        &mut self,
+        market_id: &str,
+        end_date_unix: Option<i64>,
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO market_schedules \
+             (market_id, end_date_unix, fetched_at_unix) \
+             VALUES (?1, ?2, ?3)",
+            params![market_id, end_date_unix, fetched_at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Return the set of market IDs already present in `market_schedules`.
+    ///
+    /// Includes markets where `end_date_unix IS NULL` — a NULL row means "we checked
+    /// Gamma and it had no endDate" and should not be re-fetched.
+    ///
+    /// # Precondition
+    /// Returns an empty set when no schedules have been fetched.
+    pub fn scheduled_market_ids(&self) -> HashSet<String> {
+        let mut stmt = match self.conn.prepare("SELECT market_id FROM market_schedules") {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Load all schedule rows into a [`ScheduleIndex`] keyed by [`MarketId`].
+    ///
+    /// Includes rows where `end_date_unix IS NULL` (Gamma had no `endDate`). The
+    /// backtest uses presence in the index to distinguish "checked, no date → allow"
+    /// from "never fetched → fall back to `resolved_at_unix`".
+    ///
+    /// # Precondition
+    /// Returns an empty index when no schedules have been fetched.
+    pub fn load_all_schedules(&self) -> Result<ScheduleIndex, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT market_id, end_date_unix FROM market_schedules ORDER BY market_id")?;
+        let rows = stmt.query_map([], |r| {
+            let market_id: String = r.get(0)?;
+            let end_date_unix: Option<i64> = r.get(1)?;
+            Ok((market_id, end_date_unix))
+        })?;
+        let mut index = ScheduleIndex::new();
+        for row in rows {
+            let (market_id, end_date_unix) = row?;
+            index.insert(
+                MarketId(VenueMarketId(market_id)),
+                MarketSchedule { end_date_unix },
+            );
+        }
+        Ok(index)
+    }
+
     /// Return all distinct `market_id` values present in the `trades` table, sorted.
     ///
     /// Used by the Gamma fetch step to enumerate the full set of markets to resolve.
@@ -661,6 +739,24 @@ pub struct MarketResolution {
 ///
 /// Built once at backtest startup via [`WalletCache::load_all_resolutions`].
 pub type ResolutionIndex = HashMap<MarketId, MarketResolution>;
+
+/// Scheduled-endDate record loaded from the `market_schedules` table.
+///
+/// `end_date_unix = None` means Gamma had no `endDate` for this market — the backtest
+/// treats this as "allow through" (no suppression) rather than falling back to
+/// `resolved_at_unix`, which would leak future state.
+#[derive(Debug, Clone)]
+pub struct MarketSchedule {
+    /// Unix seconds of the market's scheduled `endDate`, or `None` if Gamma had none.
+    pub end_date_unix: Option<i64>,
+}
+
+/// In-memory map from [`MarketId`] to [`MarketSchedule`].
+///
+/// Built once at backtest startup via [`WalletCache::load_all_schedules`].
+/// Presence in this index means the market has been queried; absence means it has
+/// not yet been fetched and the buy-filter falls back to [`ResolutionIndex`].
+pub type ScheduleIndex = HashMap<MarketId, MarketSchedule>;
 
 /// In-memory index of every leaderboard snapshot in the cache, sorted ascending.
 ///
@@ -1234,6 +1330,101 @@ mod tests {
         assert_eq!(cache.wallet_count(), 1);
         assert_eq!(cache.all_snapshot_dates().unwrap().len(), 1);
         assert_eq!(cache.load_all_resolutions().unwrap().len(), 1);
+    }
+
+    // ── market_schedules unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn insert_schedule_round_trips_through_disk() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xcond", Some(1_700_000_100), 1_700_000_200)
+            .unwrap();
+        let idx = cache.load_all_schedules().unwrap();
+        assert_eq!(idx.len(), 1);
+        let s = idx
+            .get(&MarketId(VenueMarketId("0xcond".to_owned())))
+            .unwrap();
+        assert_eq!(s.end_date_unix, Some(1_700_000_100));
+    }
+
+    #[test]
+    fn insert_schedule_null_end_date_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xcond", None, 1_700_000_200)
+            .unwrap();
+        let idx = cache.load_all_schedules().unwrap();
+        assert_eq!(idx.len(), 1, "NULL end_date must still appear in the index");
+        let s = idx
+            .get(&MarketId(VenueMarketId("0xcond".to_owned())))
+            .unwrap();
+        assert_eq!(s.end_date_unix, None);
+    }
+
+    #[test]
+    fn insert_schedule_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xcond", Some(1_700_000_100), 1_700_000_200)
+            .unwrap();
+        // Second insert with different data — INSERT OR IGNORE keeps the first.
+        cache
+            .insert_schedule("0xcond", Some(9_999_999_999), 9_999_999_999)
+            .unwrap();
+        let idx = cache.load_all_schedules().unwrap();
+        assert_eq!(idx.len(), 1);
+        let s = idx
+            .get(&MarketId(VenueMarketId("0xcond".to_owned())))
+            .unwrap();
+        assert_eq!(
+            s.end_date_unix,
+            Some(1_700_000_100),
+            "first insert must win"
+        );
+    }
+
+    #[test]
+    fn scheduled_market_ids_returns_complete_set() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xa", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+        cache.insert_schedule("0xb", None, 1_700_000_100).unwrap();
+        let ids = cache.scheduled_market_ids();
+        assert_eq!(
+            ids.len(),
+            2,
+            "both NULL and non-NULL rows must be in the skip-set"
+        );
+        assert!(ids.contains("0xa"));
+        assert!(ids.contains("0xb"));
+    }
+
+    #[test]
+    fn schedule_table_independent_of_resolutions() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xcond", Some(0), 1_700_000_000, 1_700_000_001)
+            .unwrap();
+        cache
+            .insert_schedule("0xcond", Some(1_699_999_000), 1_700_000_001)
+            .unwrap();
+        // Both tables can have the same market_id independently.
+        assert_eq!(cache.load_all_resolutions().unwrap().len(), 1);
+        assert_eq!(cache.load_all_schedules().unwrap().len(), 1);
+        // The schedule value (1_699_999_000) is preserved independent of the resolution.
+        let sched = cache
+            .load_all_schedules()
+            .unwrap()
+            .remove(&MarketId(VenueMarketId("0xcond".to_owned())))
+            .unwrap();
+        assert_eq!(sched.end_date_unix, Some(1_699_999_000));
     }
 
     // ── funder_edges / funder_lookup_done unit tests ──────────────────────────

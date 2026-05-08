@@ -19,7 +19,10 @@
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, MarketResolution, ResolutionIndex, WalletCache};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, MarketResolution, MarketSchedule, ResolutionIndex, ScheduleIndex,
+    WalletCache,
+};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -157,6 +160,7 @@ async fn unknown_expiry_market_allowed_through() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -203,6 +207,7 @@ async fn known_far_expiry_is_suppressed() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -236,6 +241,7 @@ async fn suppression_pct_zero_without_filter() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -252,5 +258,173 @@ async fn suppression_pct_zero_without_filter() {
     assert!(
         report.expiry_suppression_by_quarter.is_empty(),
         "by_quarter map must be empty when filter is disabled"
+    );
+}
+
+// ── Scenario 4 ────────────────────────────────────────────────────────────────
+
+/// PASS: when a market is in ScheduleIndex with a far-future endDate, it is
+///       suppressed even if ResolutionIndex has a near resolved_at_unix.
+/// FAIL: the schedule is ignored and the (near) resolved_at_unix allows the trade.
+#[tokio::test]
+async fn expiry_filter_uses_schedule_over_resolution() {
+    let alice = wallet(ALICE_HEX);
+
+    let mut trades = winner_book(alice);
+    // Signal on market 9999 at day 70; endDate is 200 days out.
+    trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
+    trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
+
+    // ResolutionIndex says it resolved quickly (day 71) — would allow if used.
+    let mut resolutions = ResolutionIndex::new();
+    resolutions.insert(
+        mkt(9999),
+        MarketResolution {
+            winning_outcome_id: 0,
+            resolved_at_unix: BASE_UNIX + 71 * DAY,
+        },
+    );
+
+    // ScheduleIndex says scheduled endDate is 200 days out — should suppress.
+    let mut schedules = ScheduleIndex::new();
+    schedules.insert(
+        mkt(9999),
+        MarketSchedule {
+            end_date_unix: Some(BASE_UNIX + 270 * DAY),
+        },
+    );
+
+    let dir = TempDir::new().unwrap();
+    let timeline = make_timeline(&dir);
+
+    let report = run_simulation(
+        &base_config(&dir, Some(48)),
+        trades,
+        &timeline,
+        &LeaderboardSnapshots::default(),
+        &resolutions,
+        &schedules,
+        &relaxed_ranker(),
+        &LedgerConfig::default(),
+        &default_strategy(),
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.expiry_filter_suppression_pct > Decimal::ZERO,
+        "schedule endDate must take priority over resolution timestamp; \
+         suppression_pct must be > 0, got {}",
+        report.expiry_filter_suppression_pct
+    );
+}
+
+// ── Scenario 5 ────────────────────────────────────────────────────────────────
+
+/// PASS: when a market is in ScheduleIndex with a NULL endDate (Gamma had none),
+///       the trade is allowed through (not suppressed), even though the resolved_at_unix
+///       would suppress it. NULL endDate → allow, per Decision 2.
+/// FAIL: NULL endDate falls back to resolved_at_unix and the trade is suppressed.
+#[tokio::test]
+async fn expiry_filter_null_end_date_allows_through() {
+    let alice = wallet(ALICE_HEX);
+
+    let mut trades = winner_book(alice);
+    // Signal on market 9999; schedule has NULL endDate.
+    trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
+    trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
+
+    // ResolutionIndex says it resolves 200 days out — would suppress if used.
+    let mut resolutions = ResolutionIndex::new();
+    resolutions.insert(
+        mkt(9999),
+        MarketResolution {
+            winning_outcome_id: 0,
+            resolved_at_unix: BASE_UNIX + 270 * DAY,
+        },
+    );
+
+    // ScheduleIndex has the market but with NULL endDate — must allow through.
+    let mut schedules = ScheduleIndex::new();
+    schedules.insert(
+        mkt(9999),
+        MarketSchedule {
+            end_date_unix: None,
+        },
+    );
+
+    let dir = TempDir::new().unwrap();
+    let timeline = make_timeline(&dir);
+
+    let report = run_simulation(
+        &base_config(&dir, Some(48)),
+        trades,
+        &timeline,
+        &LeaderboardSnapshots::default(),
+        &resolutions,
+        &schedules,
+        &relaxed_ranker(),
+        &LedgerConfig::default(),
+        &default_strategy(),
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.total_copies > 0,
+        "NULL endDate must allow trade through (not fall back to resolved_at_unix); \
+         got 0 copies"
+    );
+}
+
+// ── Scenario 6 ────────────────────────────────────────────────────────────────
+
+/// PASS: when a market is absent from ScheduleIndex but present in ResolutionIndex
+///       with a far resolved_at_unix, it IS suppressed (fallback path is active).
+/// FAIL: absence from ScheduleIndex causes no suppression (fallback not working).
+#[tokio::test]
+async fn expiry_filter_falls_back_to_resolution_when_no_schedule() {
+    let alice = wallet(ALICE_HEX);
+
+    let mut trades = winner_book(alice);
+    // Signal on market 9999; not in ScheduleIndex.
+    trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
+    trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
+
+    // ResolutionIndex says it resolves 200 days out — should suppress via fallback.
+    let mut resolutions = ResolutionIndex::new();
+    resolutions.insert(
+        mkt(9999),
+        MarketResolution {
+            winning_outcome_id: 0,
+            resolved_at_unix: BASE_UNIX + 270 * DAY,
+        },
+    );
+
+    // Empty ScheduleIndex — fallback to ResolutionIndex must apply.
+    let schedules = ScheduleIndex::new();
+
+    let dir = TempDir::new().unwrap();
+    let timeline = make_timeline(&dir);
+
+    let report = run_simulation(
+        &base_config(&dir, Some(48)),
+        trades,
+        &timeline,
+        &LeaderboardSnapshots::default(),
+        &resolutions,
+        &schedules,
+        &relaxed_ranker(),
+        &LedgerConfig::default(),
+        &default_strategy(),
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.expiry_filter_suppression_pct > Decimal::ZERO,
+        "absent-from-schedule market must fall back to resolved_at_unix suppression; \
+         suppression_pct must be > 0, got {}",
+        report.expiry_filter_suppression_pct
     );
 }
