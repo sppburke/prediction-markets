@@ -39,6 +39,24 @@ async fn main() -> Result<()> {
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
     let mode = parse_mode(&cfg.mode)?;
 
+    // Fail fast: a kelly_fraction_override above the mode default requires the approval flag.
+    if let Some(kf) = &cfg.strategy.kelly_fraction_override {
+        let mode_default = match mode {
+            ExecutionMode::Shadow | ExecutionMode::Paper | ExecutionMode::LiveTiny => {
+                Decimal::new(25, 2)
+            }
+            ExecutionMode::Promoted => Decimal::new(50, 2),
+        };
+        anyhow::ensure!(
+            kf.0 <= mode_default || cfg.strategy.kelly_fraction_above_default_human_approved,
+            "kelly_fraction_override ({}) exceeds mode '{}' default ({}); \
+             set kelly_fraction_above_default_human_approved = true to allow this",
+            kf.0,
+            cfg.mode,
+            mode_default
+        );
+    }
+
     // Bootstrap watchlist from live Polymarket leaderboard.
     let fetch_config = WatchlistFetchConfig {
         base_url: cfg.polymarket_base_url.clone(),

@@ -147,7 +147,8 @@ impl WinnerFollowStrategy {
 /// Select the Kelly fraction for this signal kind and effective mode.
 ///
 /// When `override_` is `Some`, it is returned for all signal kinds and modes.
-/// The override is research/backtest only; production always passes `None`.
+/// In production, `pe-service` validates at startup that any override does not exceed
+/// the mode default without `kelly_fraction_above_default_human_approved = true`.
 fn kelly_fraction(
     signal_kind: WinnerFollowSignalKind,
     effective_mode: ExecutionMode,
