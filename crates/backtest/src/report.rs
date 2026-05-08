@@ -8,6 +8,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::config::BacktestConfig;
+
 /// Summary report for a walk-forward Winner-Follow backtest run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinnerFollowReport {
@@ -45,6 +47,10 @@ pub struct WinnerFollowReport {
     /// `max_hours_to_expiry` is not configured.
     #[serde(default)]
     pub expiry_suppression_by_quarter: BTreeMap<String, Decimal>,
+    /// Full resolved configuration used for this run — embedded so the output file
+    /// is self-describing even when the config file changes between runs.
+    #[serde(default)]
+    pub resolved_config: Option<BacktestConfig>,
 }
 
 /// One run within a Kelly-fraction sweep.
@@ -56,7 +62,7 @@ pub struct KellySweepRun {
 
 /// Output of a Kelly-fraction sweep — N sequential backtests on identical data.
 ///
-/// Written to `${PE_BACKTEST_OUTPUT_DIR}/kelly-sweep-{ISO8601}.json`.
+/// Written to `${output_dir}/{stem-}kelly-sweep-{ISO8601}.json`.
 /// Per-run `report.json` / `trades.ndjson` are suppressed in sweep mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KellySweepReport {
@@ -64,6 +70,9 @@ pub struct KellySweepReport {
     pub cache_path: PathBuf,
     #[serde(with = "time::serde::rfc3339")]
     pub executed_at: OffsetDateTime,
+    /// Full resolved configuration — embedded for self-documenting output.
+    #[serde(default)]
+    pub resolved_config: Option<BacktestConfig>,
 }
 
 impl KellySweepReport {

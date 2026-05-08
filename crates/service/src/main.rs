@@ -7,17 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
-use pe_config::ServiceConfig;
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::ClusteringConfig;
+use pe_service::config::{self as service_config, ServiceConfig};
 use pe_source_onchain_polygon::{LivePolygonConnector, PolygonConnectorConfig};
 use pe_source_polymarket_public::ReqwestFetcher;
-use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
-};
+use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::fetcher::{WatchlistFetchConfig, WatchlistFetcher};
 use pe_venue_polymarket::{PolymarketCredentials, PolymarketVenueAdapter, ReqwestCLOBClient};
 use rust_decimal::Decimal;
@@ -40,6 +38,24 @@ async fn main() -> Result<()> {
     let bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
     let mode = parse_mode(&cfg.mode)?;
+
+    // Fail fast: a kelly_fraction_override above the mode default requires the approval flag.
+    if let Some(kf) = &cfg.strategy.kelly_fraction_override {
+        let mode_default = match mode {
+            ExecutionMode::Shadow | ExecutionMode::Paper | ExecutionMode::LiveTiny => {
+                Decimal::new(25, 2)
+            }
+            ExecutionMode::Promoted => Decimal::new(50, 2),
+        };
+        anyhow::ensure!(
+            kf.0 <= mode_default || cfg.strategy.kelly_fraction_above_default_human_approved,
+            "kelly_fraction_override ({}) exceeds mode '{}' default ({}); \
+             set kelly_fraction_above_default_human_approved = true to allow this",
+            kf.0,
+            cfg.mode,
+            mode_default
+        );
+    }
 
     // Bootstrap watchlist from live Polymarket leaderboard.
     let fetch_config = WatchlistFetchConfig {
@@ -195,7 +211,7 @@ async fn main() -> Result<()> {
             signal_config: Default::default(),
             cluster_observation_window_secs: 300,
         },
-        WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+        WinnerFollowStrategy::new(cfg.strategy.clone()),
         dispatcher,
         health.clone(),
     )
@@ -235,11 +251,21 @@ async fn main() -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn load_config() -> Result<ServiceConfig> {
-    match env::args().nth(1).map(PathBuf::from) {
-        Some(path) => pe_config::load(&path)
-            .with_context(|| format!("loading config from {}", path.display())),
-        None => Ok(ServiceConfig::default()),
+    let first_arg = env::args().nth(1);
+    if first_arg.as_deref() == Some("--print-config") {
+        match toml::to_string_pretty(&ServiceConfig::default()) {
+            Ok(s) => {
+                print!("{s}");
+                std::process::exit(0);
+            }
+            Err(e) => anyhow::bail!("--print-config failed: {e}"),
+        }
     }
+    let config_path = first_arg.map(PathBuf::from);
+    service_config::load(config_path.as_deref()).with_context(|| match &config_path {
+        Some(p) => format!("loading config from {}", p.display()),
+        None => "loading config from environment".to_owned(),
+    })
 }
 
 fn parse_mode(s: &str) -> Result<ExecutionMode> {

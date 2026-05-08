@@ -48,15 +48,17 @@ impl PerTradeCap {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinnerFollowConfig {
     /// Allow `LeaderAction::Flip` trades. Default: false.
+    #[serde(default)]
     pub flip_human_approved: bool,
     /// Allow Kelly fractions above the mode default (> 0.25). Default: false.
+    #[serde(default)]
     pub kelly_fraction_above_default_human_approved: bool,
     /// Polymarket BUY taker fee rate used to compute net cost `c` in Kelly sizing.
     /// See `_GLOSSARY.md` `polymarket_fee_rate`. Default: 0.04 (March 2026 model).
     #[serde(default = "default_polymarket_fee_rate")]
     pub polymarket_fee_rate: Decimal,
-    /// Research/backtest only. When `Some`, replaces all per-mode Kelly fractions
-    /// in `evaluate::kelly_fraction()`. Must be `None` in all production code paths.
+    /// When set, overrides all mode-based Kelly fractions in all contexts (including
+    /// production). Defaults to `None` (mode-based selection applies).
     #[serde(default)]
     pub kelly_fraction_override: Option<KellyFraction>,
     /// Per-trade size cap. Default: `ModeDefault` (25 bps LiveTiny / 100 bps Promoted).

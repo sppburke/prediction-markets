@@ -17,6 +17,7 @@
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
 pub mod cache;
+pub mod config;
 pub mod dune;
 pub mod error;
 pub mod filter;
@@ -24,8 +25,10 @@ pub mod gamma;
 pub mod polymarket;
 pub mod wallet_set;
 
+pub use config::BootstrapConfig;
+
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
@@ -39,24 +42,16 @@ use pe_trader_index::{
     LedgerConfig, TraderLedger, Watchlist, WatchlistEntry, WatchlistTier, build_trader_ledgers,
     snapshot::TradeSnapshot,
 };
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use cache::WalletCache;
 use dune::DuneClient;
 use error::BootstrapError;
-use filter::{
-    DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION, DEFAULT_MIN_CLOSED_TRADES,
-    DEFAULT_MIN_WIN_RATE_PCT, FilterConfig, passes_filter, win_rate_bps,
-};
+use filter::{FilterConfig, passes_filter, win_rate_bps};
 use polymarket::PolymarketBulkFetcher;
 use rust_decimal::Decimal;
 
-// Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-const DEFAULT_DUNE_MIN_CLOSED_MARKETS: u32 = 15;
-const DEFAULT_DUNE_MIN_WIN_RATE_PCT: u32 = 95;
-const DEFAULT_DUNE_ACTIVE_WINDOW_DAYS: u32 = 30;
-const DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
-const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
 // bootstrap_eth_block_timeout_secs = 30
 const ETH_BLOCK_TIMEOUT_SECS: u64 = 30;
@@ -64,258 +59,14 @@ const ETH_BLOCK_TIMEOUT_SECS: u64 = 30;
 const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 
 /// Wallet discovery backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum WalletSource {
     /// Use Dune Analytics (legacy path; requires `PE_DUNE_API_KEY`).
     Dune,
     /// Use Etherscan `eth_getLogs` on Polygon (requires `PE_ETHERSCAN_API_KEY`).
+    #[default]
     Etherscan,
-}
-
-impl WalletSource {
-    fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "dune" => Self::Dune,
-            "etherscan" => Self::Etherscan,
-            other => {
-                tracing::warn!(
-                    value = other,
-                    "unrecognised PE_WALLET_SOURCE; defaulting to etherscan"
-                );
-                Self::Etherscan
-            }
-        }
-    }
-}
-
-/// Configuration for a bootstrap run, sourced from environment variables.
-pub struct BootstrapConfig {
-    /// `PE_WALLET_SOURCE` — `"etherscan"` (default) or `"dune"`.
-    pub wallet_source: WalletSource,
-    /// `PE_DUNE_API_KEY` — required when `wallet_source = dune`.
-    pub dune_api_key: Option<String>,
-    /// `PE_DUNE_NAMESPACE` — Dune username (e.g. `apexurellc`). When set, the resolution
-    /// fetch uploads market IDs as a lookup table and uses a server-side JOIN so only
-    /// the caller's markets are returned, greatly reducing credit cost.
-    pub dune_namespace: Option<String>,
-    /// `PE_ETHERSCAN_API_KEY` — required when `wallet_source = etherscan`; optional
-    /// when `wallet_source = dune` but needed for `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
-    pub etherscan_api_key: Option<String>,
-    /// `PE_WALLET_FROM_BLOCK` — start block for Etherscan scan (default: CTF V1 deploy block).
-    /// Ignored when `wallet_source = dune`.
-    pub wallet_from_block: u64,
-    /// `PE_WALLET_TO_BLOCK` — end block for Etherscan scan (default: current chain head).
-    /// Ignored when `wallet_source = dune`.
-    pub wallet_to_block: Option<u64>,
-    /// `PE_POLYMARKET_OPERATOR_ADDRESSES` — comma-separated hex addresses to exclude from the
-    /// enumerated wallet set (e.g. Polymarket matching operators). Ignored when `wallet_source = dune`.
-    pub operator_addresses: Vec<WalletAddress>,
-    /// `PE_BOOTSTRAP_OUTPUT` — path where the `Watchlist` JSON is written.
-    pub output_path: PathBuf,
-    /// `PE_BOOTSTRAP_CACHE_PATH` — path to the wallet trade SQLite cache file.
-    pub cache_path: PathBuf,
-    /// `PE_BOOTSTRAP_WALLET_SET_PATH` — path to the enumerated wallet address list.
-    /// If the file exists, Etherscan/Dune enumeration is skipped entirely.
-    /// Delete the file to force a fresh scan. Default: `wallet_set.json`.
-    pub wallet_set_path: PathBuf,
-    /// Minimum distinct resolved markets a wallet must have traded (Dune filter).
-    /// Default `bootstrap_dune_min_closed_markets = 15`. Env: `PE_BOOTSTRAP_DUNE_MIN_MARKETS`.
-    pub dune_min_closed_markets: u32,
-    /// Minimum win-rate percent for Dune wallet discovery (default `bootstrap_dune_min_win_rate_pct = 95`).
-    /// Env: `PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT`.
-    pub dune_min_win_rate_pct: u32,
-    /// Recency window for Dune wallet discovery: wallet must have a trade on a resolved market
-    /// within this many days (default `bootstrap_dune_active_window_days = 30`).
-    /// Env: `PE_BOOTSTRAP_DUNE_ACTIVE_DAYS`.
-    pub dune_active_window_days: u32,
-    /// Maximum average hours from first entry to market resolution for Dune wallets
-    /// (default `bootstrap_dune_max_avg_hours_to_resolution = 72`).
-    /// Env: `PE_BOOTSTRAP_DUNE_MAX_AVG_HOURS`.
-    pub dune_max_avg_hours_to_resolution: u32,
-    /// Trade lookback window for ledger reconstruction.
-    /// `None` = unlimited (default); `Some(n)` = at most n calendar days.
-    /// Env var `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS`: an integer, or empty / `"unlimited"` / `"none"` for unlimited.
-    /// Canonical default in `docs/_GLOSSARY.md`: `bootstrap_polymarket_audit_window_days = None (unlimited)`.
-    pub audit_window_days: Option<u32>,
-    /// Minimum closed trades to pass the post-filter (default `bootstrap_min_closed_trades = 15`).
-    pub min_closed_trades: usize,
-    /// Minimum win-rate percent to pass the post-filter (default `bootstrap_min_win_rate_pct = 95`).
-    pub min_win_rate_pct: u8,
-    /// Recency window for post-filter: wallet must have a trade opened within this many days of
-    /// snapshot time (default `bootstrap_post_filter_active_window_days = 30`).
-    /// Env: `PE_BOOTSTRAP_POST_FILTER_ACTIVE_DAYS`.
-    pub post_filter_active_window_days: u32,
-    /// Maximum average hours from first entry to market resolution for post-filter
-    /// (default `bootstrap_post_filter_max_avg_hours_to_resolution = 72`).
-    /// Env: `PE_BOOTSTRAP_POST_FILTER_MAX_AVG_HOURS`.
-    pub post_filter_max_avg_hours_to_resolution: u32,
-    /// Base URL for the Polymarket Data API.
-    pub polymarket_base_url: String,
-    /// Concurrent wallet fetches against the Polymarket Data API
-    /// (default `bootstrap_polymarket_concurrency = 16`).
-    pub polymarket_concurrency: usize,
-    /// `PE_BOOTSTRAP_FETCH_RESOLUTIONS` — when `"1"`, fetch market resolutions from the
-    /// Gamma API after the trade fetch. Default off; ~2.4 h one-time for ~85k markets.
-    /// Canonical default: `bootstrap_fetch_resolutions_default = false`.
-    pub fetch_resolutions: bool,
-    /// `PE_GAMMA_BASE_URL` — Gamma API base URL (default `bootstrap_gamma_base_url`).
-    pub gamma_base_url: String,
-    /// `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH` — when `"1"`, query Etherscan for funder edges
-    /// for every wallet not yet in `funder_lookup_done`. Per-wallet commit means runs
-    /// are resumable after failure. Default off; ~2 h one-time for ~15k wallets.
-    /// Canonical default: `bootstrap_fetch_funder_graph_default = false`.
-    pub fetch_funder_graph: bool,
-    /// `PE_BOOTSTRAP_SKIP_TRADE_FETCH` — when `"1"`, skip the Polymarket trade-fetch
-    /// step entirely. Safe when the trade cache is already populated and only
-    /// subsequent steps (funder graph, resolutions, filters) need to run.
-    /// Canonical default: `bootstrap_skip_trade_fetch_default = false`.
-    pub skip_trade_fetch: bool,
-}
-
-impl BootstrapConfig {
-    /// Build from environment variables. Returns an error for missing required vars.
-    pub fn from_env() -> Result<Self, BootstrapError> {
-        fn require(key: &str) -> Result<String, BootstrapError> {
-            std::env::var(key).map_err(|_| BootstrapError::MissingEnv(key.to_owned()))
-        }
-        fn optional(key: &str, default: &str) -> String {
-            std::env::var(key).unwrap_or_else(|_| default.to_owned())
-        }
-        fn optional_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        }
-        fn parse_audit_window(key: &str) -> Option<u32> {
-            match std::env::var(key) {
-                Err(_) => None,
-                Ok(v) => {
-                    let v = v.trim().to_lowercase();
-                    if v.is_empty() || v == "none" || v == "unlimited" {
-                        None
-                    } else {
-                        match v.parse::<u32>() {
-                            Ok(n) => Some(n),
-                            Err(_) => {
-                                tracing::warn!(
-                                    value = %v,
-                                    "PE_BOOTSTRAP_AUDIT_WINDOW_DAYS: not a valid u32 or 'unlimited'; using unlimited"
-                                );
-                                None
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let wallet_source = WalletSource::from_str(&optional("PE_WALLET_SOURCE", "etherscan"));
-
-        let (dune_api_key, etherscan_api_key) = match &wallet_source {
-            // In Dune mode, PE_ETHERSCAN_API_KEY is optional — it's needed only for
-            // PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 and is independent of wallet discovery.
-            WalletSource::Dune => (
-                Some(require("PE_DUNE_API_KEY")?),
-                std::env::var("PE_ETHERSCAN_API_KEY").ok(),
-            ),
-            // In Etherscan mode, PE_DUNE_API_KEY is optional — it enables the on-chain
-            // resolution sweep (ctf_evt_conditionresolution) without requiring Dune
-            // for wallet discovery.
-            WalletSource::Etherscan => (
-                std::env::var("PE_DUNE_API_KEY").ok(),
-                Some(require("PE_ETHERSCAN_API_KEY")?),
-            ),
-        };
-
-        // Parse optional wallet_to_block; warn if set but unparseable (so the operator
-        // knows their explicit value was ignored rather than silently falling back to
-        // fetching the current chain head).
-        let wallet_to_block = match std::env::var("PE_WALLET_TO_BLOCK") {
-            Err(_) => None,
-            Ok(v) => match v.parse::<u64>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    tracing::warn!(
-                        value = v,
-                        "PE_WALLET_TO_BLOCK is not a valid u64; falling back to current chain head"
-                    );
-                    None
-                }
-            },
-        };
-
-        let operator_addresses = std::env::var("PE_POLYMARKET_OPERATOR_ADDRESSES")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .filter_map(|hex| {
-                WalletAddress::from_hex(hex.trim())
-                    .map_err(|e| {
-                        tracing::warn!(address = hex, error = %e, "skipping invalid operator address");
-                    })
-                    .ok()
-            })
-            .collect();
-
-        Ok(Self {
-            wallet_source,
-            dune_api_key,
-            dune_namespace: std::env::var("PE_DUNE_NAMESPACE").ok(),
-            etherscan_api_key,
-            wallet_from_block: optional_parse("PE_WALLET_FROM_BLOCK", CTF_EXCHANGE_V1_DEPLOY_BLOCK),
-            wallet_to_block,
-            operator_addresses,
-            output_path: PathBuf::from(require("PE_BOOTSTRAP_OUTPUT")?),
-            cache_path: PathBuf::from(optional("PE_BOOTSTRAP_CACHE_PATH", "wallet_cache.db")),
-            wallet_set_path: PathBuf::from(optional(
-                "PE_BOOTSTRAP_WALLET_SET_PATH",
-                "wallet_set.json",
-            )),
-            dune_min_closed_markets: optional_parse(
-                "PE_BOOTSTRAP_DUNE_MIN_MARKETS",
-                DEFAULT_DUNE_MIN_CLOSED_MARKETS,
-            ),
-            dune_min_win_rate_pct: optional_parse(
-                "PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT",
-                DEFAULT_DUNE_MIN_WIN_RATE_PCT,
-            ),
-            dune_active_window_days: optional_parse(
-                "PE_BOOTSTRAP_DUNE_ACTIVE_DAYS",
-                DEFAULT_DUNE_ACTIVE_WINDOW_DAYS,
-            ),
-            dune_max_avg_hours_to_resolution: optional_parse(
-                "PE_BOOTSTRAP_DUNE_MAX_AVG_HOURS",
-                DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION,
-            ),
-            audit_window_days: parse_audit_window("PE_BOOTSTRAP_AUDIT_WINDOW_DAYS"),
-            min_closed_trades: optional_parse(
-                "PE_BOOTSTRAP_MIN_CLOSED_TRADES",
-                DEFAULT_MIN_CLOSED_TRADES,
-            ),
-            min_win_rate_pct: optional_parse(
-                "PE_BOOTSTRAP_MIN_WIN_RATE_PCT",
-                DEFAULT_MIN_WIN_RATE_PCT,
-            ),
-            post_filter_active_window_days: optional_parse(
-                "PE_BOOTSTRAP_POST_FILTER_ACTIVE_DAYS",
-                DEFAULT_ACTIVE_WINDOW_DAYS,
-            ),
-            post_filter_max_avg_hours_to_resolution: optional_parse(
-                "PE_BOOTSTRAP_POST_FILTER_MAX_AVG_HOURS",
-                DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION,
-            ),
-            polymarket_base_url: optional("PE_POLYMARKET_BASE_URL", DEFAULT_POLYMARKET_BASE_URL),
-            polymarket_concurrency: optional_parse(
-                "PE_BOOTSTRAP_POLYMARKET_CONCURRENCY",
-                polymarket::DEFAULT_CONCURRENCY,
-            ),
-            fetch_resolutions: optional("PE_BOOTSTRAP_FETCH_RESOLUTIONS", "0") == "1",
-            gamma_base_url: optional("PE_GAMMA_BASE_URL", gamma::DEFAULT_GAMMA_BASE_URL),
-            fetch_funder_graph: optional("PE_BOOTSTRAP_FETCH_FUNDER_GRAPH", "0") == "1",
-            skip_trade_fetch: optional("PE_BOOTSTRAP_SKIP_TRADE_FETCH", "0") == "1",
-        })
-    }
 }
 
 /// Run the full bootstrap pipeline and return the seed [`Watchlist`].
@@ -728,7 +479,7 @@ pub fn parse_seed_as_of_env(value: &str) -> Result<Vec<OffsetDateTime>, Bootstra
             continue;
         }
         let date = time::Date::parse(s, &time::format_description::well_known::Iso8601::DATE)
-            .map_err(|e| BootstrapError::Config {
+            .map_err(|e| BootstrapError::Parse {
                 message: format!("PE_SEED_AS_OF_DATES `{s}`: {e}"),
             })?;
         out.push(date.midnight().assume_utc());

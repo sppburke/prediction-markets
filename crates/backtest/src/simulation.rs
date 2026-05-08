@@ -107,9 +107,6 @@ impl SuppressionTracker {
     }
 }
 
-// Canonical default in `docs/_GLOSSARY.md` "Backtest defaults".
-const DEFAULT_SLIPPAGE_BPS: u32 = 100;
-
 /// Open position entry (copies we've taken but not yet closed).
 #[derive(Debug, Clone)]
 struct OpenPosition {
@@ -235,8 +232,13 @@ pub fn run_simulation(
         .map(|t| t.timestamp.0)
         .unwrap_or(simulation_start);
 
-    let slippage_bps = DEFAULT_SLIPPAGE_BPS;
-    let slippage_rate = Decimal::from(slippage_bps) / Decimal::from(10_000u32);
+    let slippage_rate = config.strategy.slippage_rate;
+    let slippage_assumption_bps = (slippage_rate * Decimal::from(10_000u32))
+        .round()
+        .to_u32()
+        .ok_or_else(|| {
+            BacktestError::Internal(format!("slippage_rate {slippage_rate} out of u32 range"))
+        })?;
 
     let mut bankroll = config.bankroll_usd;
     let bankroll_initial = bankroll;
@@ -659,11 +661,12 @@ pub fn run_simulation(
         simulation_end,
         bankroll_initial,
         bankroll_final: bankroll,
-        slippage_assumption_bps: slippage_bps,
+        slippage_assumption_bps,
         open_at_horizon,
         funder_graph_snapshot_caveat: false,
         expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
+        resolved_config: None,
     };
 
     if write_output {

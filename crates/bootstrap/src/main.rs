@@ -1,4 +1,4 @@
-use pe_bootstrap::{BootstrapConfig, parse_seed_as_of_env, run, seed_historical_snapshots};
+use pe_bootstrap::{BootstrapConfig, config, parse_seed_as_of_env, run, seed_historical_snapshots};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -8,7 +8,23 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = match BootstrapConfig::from_env() {
+    let first_arg = std::env::args().nth(1);
+
+    if first_arg.as_deref() == Some("--print-config") {
+        match toml::to_string_pretty(&BootstrapConfig::default()) {
+            Ok(s) => {
+                print!("{s}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("bootstrap: --print-config failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let config_path = first_arg.map(std::path::PathBuf::from);
+    let bootstrap_config = match config::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("bootstrap: config error: {e}");
@@ -28,7 +44,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        match seed_historical_snapshots(&config, &dates).await {
+        match seed_historical_snapshots(&bootstrap_config, &dates).await {
             Ok(rows) => {
                 tracing::info!(
                     snapshots = dates.len(),
@@ -44,11 +60,11 @@ async fn main() {
         }
     }
 
-    match run(&config).await {
+    match run(&bootstrap_config).await {
         Ok(watchlist) => {
             tracing::info!(
                 active = watchlist.active_count,
-                output = %config.output_path.display(),
+                output = %bootstrap_config.output_path.display(),
                 "bootstrap: complete"
             );
         }

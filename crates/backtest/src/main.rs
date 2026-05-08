@@ -1,9 +1,10 @@
 //! `pe-backtest` binary entry point.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use pe_backtest::FunderGraphTimeline;
-use pe_backtest::config::BacktestConfig;
+use pe_backtest::config::{BacktestConfig, load};
 use pe_backtest::error::BacktestError;
 use pe_backtest::report::{KellySweepReport, KellySweepRun};
 use pe_backtest::simulation;
@@ -22,10 +23,21 @@ async fn main() -> Result<(), BacktestError> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = BacktestConfig::from_env()?;
+    // First argument: optional TOML config path, or `--print-config`.
+    let first_arg = std::env::args().nth(1);
+
+    if first_arg.as_deref() == Some("--print-config") {
+        let default_toml = toml::to_string_pretty(&BacktestConfig::default())
+            .map_err(|e| BacktestError::Internal(format!("serialize default config: {e}")))?;
+        print!("{default_toml}");
+        return Ok(());
+    }
+
+    let config_path = first_arg.map(PathBuf::from);
+    let config = load(config_path.as_deref())?;
 
     // Load wallet trade cache (mutable so Dune resolutions can be written).
-    let mut cache = WalletCache::open(&config.cache_path)?;
+    let mut cache = WalletCache::open(&config.bootstrap_cache_path)?;
     let all_wallet_addresses = cache.all_wallet_addresses();
     let all_trades = cache.all_trades();
     let snapshots = cache.load_all_snapshots()?;
@@ -123,10 +135,15 @@ async fn main() -> Result<(), BacktestError> {
         "ranker config (backtest-adjusted)"
     );
 
+    // Derive output filename prefix from config file stem (when provided).
+    let file_stem = config_path
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
+
     if let Some(fractions) = &config.kelly_sweep_fractions {
         // ── Sweep mode ──────────────────────────────────────────────────────────
-        // Run N sequential backtests, one per fraction. Per-run report.json and
-        // trades.ndjson are suppressed; only the sweep-level JSON is written.
         info!(
             fractions = fractions.len(),
             "backtest: Kelly sweep mode — starting sequential runs"
@@ -135,8 +152,7 @@ async fn main() -> Result<(), BacktestError> {
         for &kf in fractions {
             let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
                 kelly_fraction_override: Some(kf),
-                per_trade_cap: config.per_trade_cap_override.unwrap_or_default(),
-                ..WinnerFollowConfig::default()
+                ..config.strategy.clone()
             });
             info!(kelly_fraction = %kf.0, "backtest: sweep run starting");
             let report = simulation::run_simulation(
@@ -162,19 +178,25 @@ async fn main() -> Result<(), BacktestError> {
                 report,
             });
         }
-        let sweep_report = KellySweepReport {
+        let mut sweep_report = KellySweepReport {
             runs,
-            cache_path: config.cache_path.clone(),
+            cache_path: config.bootstrap_cache_path.clone(),
             executed_at: OffsetDateTime::now_utc(),
+            resolved_config: None,
         };
+        sweep_report.resolved_config = Some(config.clone());
 
-        // Write kelly-sweep-{ISO8601}.json.
+        // Write {stem-}kelly-sweep-{ISO8601}.json.
         let ts = sweep_report
             .executed_at
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| BacktestError::Internal(format!("timestamp format: {e}")))?
             .replace(':', "-");
-        let sweep_path = config.output_dir.join(format!("kelly-sweep-{ts}.json"));
+        let filename = match &file_stem {
+            Some(stem) => format!("{stem}-kelly-sweep-{ts}.json"),
+            None => format!("kelly-sweep-{ts}.json"),
+        };
+        let sweep_path = config.output_dir.join(filename);
         let json = serde_json::to_vec_pretty(&sweep_report)?;
         std::fs::write(&sweep_path, &json)?;
         info!(path = ?sweep_path, "backtest: Kelly sweep report written");
@@ -183,11 +205,8 @@ async fn main() -> Result<(), BacktestError> {
         print!("{}", sweep_report.to_markdown_table());
     } else {
         // ── Single-run mode (default) ────────────────────────────────────────
-        let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
-            per_trade_cap: config.per_trade_cap_override.unwrap_or_default(),
-            ..WinnerFollowConfig::default()
-        });
-        let report = simulation::run_simulation(
+        let strategy = WinnerFollowStrategy::new(config.strategy.clone());
+        let mut report = simulation::run_simulation(
             &config,
             all_trades,
             &funder_timeline,
@@ -198,6 +217,12 @@ async fn main() -> Result<(), BacktestError> {
             &strategy,
             true, // write report.json + trades.ndjson
         )?;
+        report.resolved_config = Some(config.clone());
+
+        // Re-write report.json with the resolved_config embedded.
+        let report_path = config.output_dir.join("report.json");
+        let json = serde_json::to_vec_pretty(&report)?;
+        std::fs::write(&report_path, &json)?;
 
         info!(
             total_pnl_usd = %report.total_pnl_usd,

@@ -3034,6 +3034,7 @@ name = "pe-backtest"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "figment",
  "pe-bootstrap",
  "pe-copy-signal-engine",
  "pe-core-types",
@@ -3053,6 +3054,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3061,6 +3063,7 @@ dependencies = [
 name = "pe-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "figment",
  "futures",
  "pe-core-types",
  "pe-operator-graph",
@@ -3078,6 +3081,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3085,12 +3089,6 @@ dependencies = [
 [[package]]
 name = "pe-config"
 version = "0.1.0"
-dependencies = [
- "figment",
- "serde",
- "tempfile",
- "thiserror",
-]
 
 [[package]]
 name = "pe-copy-signal-engine"
@@ -3238,7 +3236,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
- "pe-config",
+ "figment",
  "pe-copy-signal-engine",
  "pe-core-types",
  "pe-event-log",
@@ -3263,6 +3261,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
 ]

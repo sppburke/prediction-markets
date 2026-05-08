@@ -105,7 +105,7 @@ fn relaxed_ranker() -> RankerConfig {
 
 fn base_config(dir: &TempDir, max_hours_to_expiry: Option<u32>) -> BacktestConfig {
     BacktestConfig {
-        cache_path: dir.path().join("cache.db"),
+        bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
         step_days: 1,
@@ -119,10 +119,10 @@ fn base_config(dir: &TempDir, max_hours_to_expiry: Option<u32>) -> BacktestConfi
         ranker_incubator_min_closed: 5,
         ranker_incubator_min_markets: 1,
         kelly_sweep_fractions: None,
-        per_trade_cap_override: None,
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        strategy: WinnerFollowConfig::default(),
     }
 }
 
