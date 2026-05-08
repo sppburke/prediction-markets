@@ -20,7 +20,7 @@ use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::{KellySweepReport, KellySweepRun, WinnerFollowReport};
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, WalletCache};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId, Price, Probability,
@@ -263,6 +263,7 @@ async fn sweep_produces_correct_run_count() {
             &timeline,
             &snapshots,
             &resolutions,
+            &ScheduleIndex::new(),
             &ranker,
             &LedgerConfig::default(),
             &strategy,
@@ -401,6 +402,7 @@ async fn sweep_suppresses_per_run_output() {
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
+        &ScheduleIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &strategy,

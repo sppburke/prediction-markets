@@ -27,7 +27,7 @@
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, WalletCache};
+use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
 use pe_core_types::{
     ContractQty, KellyFraction, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
     VenueMarketId, WalletAddress,
@@ -190,6 +190,7 @@ async fn run_with_prior(alpha: u32, beta: u32) -> Decimal {
         &timeline,
         &snapshots,
         &resolutions,
+        &ScheduleIndex::new(),
         &ranker_config,
         &ledger_config,
         &strategy,
