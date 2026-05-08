@@ -7,8 +7,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BacktestError {
-    #[error("missing required env var: {0}")]
-    MissingEnv(String),
+    #[error("config: {0}")]
+    Config(Box<figment::Error>),
 
     #[error("funder discovery: {0}")]
     FunderDiscovery(#[from] FunderDiscoveryError),
@@ -30,10 +30,10 @@ pub enum BacktestError {
 
     #[error("internal: {0}")]
     Internal(String),
+}
 
-    #[error("invalid kelly sweep fraction: {0}")]
-    InvalidKellySweep(String),
-
-    #[error("invalid config: {0}")]
-    InvalidConfig(String),
+impl From<figment::Error> for BacktestError {
+    fn from(e: figment::Error) -> Self {
+        BacktestError::Config(Box::new(e))
+    }
 }

@@ -16,8 +16,17 @@ path = "src/lib.rs"
 [features]
 scenario = []
 
-[lints]
-workspace = true
+# Lints are specified manually (not via workspace = true) so we can downgrade
+# unsafe_code from workspace `forbid` to `deny`, allowing scenario tests to use
+# #[allow(unsafe_code)] for env-var manipulation. nextest process-per-test makes it safe.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used    = "deny"
+expect_used    = "deny"
+panic          = "deny"
+float_arithmetic = "warn"
 
 [dependencies]
 pe-bootstrap                  = { path = "../bootstrap",               version = "0.1.0" }
@@ -31,6 +40,7 @@ pe-source-onchain-polygon     = { path = "../source-onchain-polygon",  version =
 pe-strategy-winner-follow     = { path = "../strategy-winner-follow",  version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",            version = "0.1.0" }
 
+figment         = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }
 serde           = { workspace = true }
@@ -38,6 +48,7 @@ serde_json      = { workspace = true }
 thiserror       = { workspace = true }
 time            = { workspace = true }
 tokio           = { workspace = true }
+toml            = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 

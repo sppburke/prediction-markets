@@ -2,6 +2,7 @@
 //! Library target for `pe-service` — exposes internal modules for scenario tests.
 //! Production code lives in `main.rs`.
 
+pub mod config;
 pub mod health;
 pub mod logging;
 pub mod operator_graph_scheduler;

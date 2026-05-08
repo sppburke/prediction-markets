@@ -11,11 +11,3 @@ path = "src/lib.rs"
 
 [lints]
 workspace = true
-
-[dependencies]
-figment = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

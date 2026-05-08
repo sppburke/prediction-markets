@@ -102,7 +102,7 @@ fn relaxed_ranker() -> RankerConfig {
 
 fn base_config(dir: &TempDir) -> BacktestConfig {
     BacktestConfig {
-        cache_path: dir.path().join("cache.db"),
+        bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
         step_days: 1,
@@ -116,10 +116,10 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         ranker_incubator_min_closed: 5,
         ranker_incubator_min_markets: 1,
         kelly_sweep_fractions: None,
-        per_trade_cap_override: None,
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        strategy: WinnerFollowConfig::default(),
     }
 }
 
@@ -348,6 +348,7 @@ fn to_markdown_table_covers_all_runs() {
             funder_graph_snapshot_caveat: false,
             expiry_filter_suppression_pct: dec!(0),
             expiry_suppression_by_quarter: BTreeMap::new(),
+            resolved_config: None,
         },
     };
 
@@ -359,6 +360,7 @@ fn to_markdown_table_covers_all_runs() {
         ],
         cache_path: std::path::PathBuf::from("/tmp/cache.db"),
         executed_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
+        resolved_config: None,
     };
 
     let table = sweep.to_markdown_table();

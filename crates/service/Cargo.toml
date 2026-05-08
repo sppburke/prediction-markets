@@ -20,7 +20,6 @@ scenario = []
 workspace = true
 
 [dependencies]
-pe-config                   = { path = "../config",                     version = "0.1.0" }
 pe-core-types               = { path = "../core-types",                 version = "0.1.0" }
 pe-copy-signal-engine       = { path = "../copy-signal-engine",         version = "0.1.0" }
 pe-event-log                = { path = "../event-log",                  version = "0.1.0" }
@@ -39,6 +38,8 @@ pe-execution-core           = { path = "../execution-core",             version 
 
 anyhow          = { workspace = true }
 axum            = { workspace = true }
+figment         = { workspace = true }
+toml            = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }
 serde           = { workspace = true }

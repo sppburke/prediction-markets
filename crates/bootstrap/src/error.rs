@@ -27,8 +27,10 @@ pub enum BootstrapError {
     Sqlite(#[from] rusqlite::Error),
     #[error("missing required environment variable '{0}' — set it in .env or export it")]
     MissingEnv(String),
-    #[error("config parse: {message}")]
-    Config { message: String },
+    #[error("config: {0}")]
+    Config(Box<figment::Error>),
+    #[error("parse: {message}")]
+    Parse { message: String },
     #[error(
         "fetch incomplete: {failed_wallets} wallet(s) could not be fetched or cached; re-run to retry"
     )]
@@ -37,4 +39,10 @@ pub enum BootstrapError {
     Gamma { message: String },
     #[error("internal error")]
     Internal,
+}
+
+impl From<figment::Error> for BootstrapError {
+    fn from(e: figment::Error) -> Self {
+        BootstrapError::Config(Box::new(e))
+    }
 }
