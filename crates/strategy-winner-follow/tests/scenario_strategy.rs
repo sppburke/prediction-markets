@@ -56,9 +56,10 @@ fn p_high() -> Probability {
     Probability::new(dec!(0.70)).expect("0.70 is valid")
 }
 
-/// Moderate win rate yielding ~246 Kelly contracts on $10k (98 bps notional) — strong edge
+/// Moderate win rate yielding ~205 Kelly contracts on $10k (82 bps notional) — strong edge
 /// but stays under all concentration caps (funder-inherited 100, market 200, operator 300 bps)
 /// so Unlimited-cap scenarios don't hit risk-gate blocks.
+/// c = price × (1 + fee_rate + slippage_rate) = 0.40 × 1.05 = 0.42.
 fn p_moderate() -> Probability {
     Probability::new(dec!(0.44)).expect("0.44 is valid")
 }
@@ -321,9 +322,9 @@ fn scenario_flip_approved_passes_gate() {
 /// With a 25-bps cap and bankroll=$10_000:
 /// cap_usd = $10_000 × 25/10_000 = $25.00 (25 bps = 0.25% of bankroll);
 /// max_contracts = floor($25.00 / $0.40) = floor(62.5) = 62.
-/// Kelly at p=0.44 gives ~246 contracts → clamped to 62.
+/// Kelly at p=0.44 gives ~205 contracts → clamped to 62.
 ///
-/// PASS: `intent.contracts.0 == 62` (Kelly would have sized ~246 without cap).
+/// PASS: `intent.contracts.0 == 62` (Kelly would have sized ~205 without cap).
 #[test]
 fn scenario_clamp_bps_cap_limits_contracts() {
     let signal = make_signal(
@@ -340,7 +341,7 @@ fn scenario_clamp_bps_cap_limits_contracts() {
 
     let result = strategy.evaluate(
         &signal,
-        p_moderate(), // p=0.44: Kelly ~246 contracts, clamped to 62 at 25 bps
+        p_moderate(), // p=0.44: Kelly ~205 contracts, clamped to 62 at 25 bps
         clean_snapshot(),
         dec!(10_000),
         ExecutionMode::LiveTiny,

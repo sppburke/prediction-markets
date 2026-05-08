@@ -192,7 +192,7 @@ fn clean_risk_snapshot() -> RiskSnapshot {
 #[test]
 fn override_changes_sizing_vs_default() {
     let signal = thin_edge_signal();
-    let p = Probability::new(dec!(0.417)).unwrap();
+    let p = Probability::new(dec!(0.421)).unwrap();
     let bankroll = Decimal::from(10_000u32);
 
     let default_strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
@@ -289,7 +289,7 @@ async fn sweep_produces_correct_run_count() {
 #[test]
 fn higher_fraction_yields_more_contracts() {
     let signal = thin_edge_signal();
-    let p = Probability::new(dec!(0.417)).unwrap();
+    let p = Probability::new(dec!(0.421)).unwrap();
     let bankroll = Decimal::from(10_000u32);
     let fractions = [dec!(0.10), dec!(0.25), dec!(0.50), dec!(0.75), dec!(1.0)];
 

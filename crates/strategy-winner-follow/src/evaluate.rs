@@ -42,16 +42,16 @@ impl WinnerFollowStrategy {
     /// 2. Clamp `mode` to the ceiling imposed by `signal.signal_kind`.
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Select the Kelly fraction for this mode + signal kind.
-    /// 5. Size contracts using fractional Kelly with caller-provided `p` and fee-adjusted `c`.
+    /// 5. Size contracts using fractional Kelly with caller-provided `p` and cost-adjusted `c`.
     ///    5b. Clamp contracts to `per_trade_cap`; return `NoEdge` if clamped to 0 (bankroll < price).
     /// 6. Gate on risk snapshot (per-trade-cap check is defense-in-depth under normal flow).
     /// 7. Build and return `OrderIntent`.
     ///
     /// `p` — empirical win rate supplied by caller (e.g. from `TraderLedger.closed_trades`).
     ///
-    /// `c` — computed internally as `leader_price + Polymarket BUY taker fee`. Fee formula:
-    /// `fee_per_share = price × fee_rate` (flat taker fee on notional). SELL orders pay no taker fee.
-    /// See `_GLOSSARY.md` `polymarket_fee_rate`.
+    /// `c` — computed internally as `leader_price + taker fee + slippage` for BUY orders.
+    /// `fee_per_share = price × fee_rate`; `slippage_per_share = price × slippage_rate`.
+    /// SELL orders pay neither. See `_GLOSSARY.md` `polymarket_fee_rate`, `slippage_rate`.
     pub fn evaluate(
         &self,
         signal: &LeaderSignal,
@@ -81,14 +81,20 @@ impl WinnerFollowStrategy {
         );
 
         // 5. Size contracts.
-        // c = leader_price + Polymarket BUY taker fee (SELL orders pay no taker fee).
+        // c = leader_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
         // fee_per_share = price × fee_rate (flat taker fee on notional).
+        // slippage_per_share = price × slippage_rate (proportional fill impact on BUY).
         let fee_per_share = if signal.leader_side == Side::Buy {
             signal.leader_price.0 * self.config.polymarket_fee_rate
         } else {
             Decimal::ZERO
         };
-        let c_raw = signal.leader_price.0 + fee_per_share;
+        let slippage_per_share = if signal.leader_side == Side::Buy {
+            signal.leader_price.0 * self.config.slippage_rate
+        } else {
+            Decimal::ZERO
+        };
+        let c_raw = signal.leader_price.0 + fee_per_share + slippage_per_share;
         let c = Price::new(c_raw).map_err(|_| WinnerFollowError::NoEdge)?;
 
         let kelly_input = KellyInput {

@@ -236,7 +236,7 @@ pub fn run_simulation(
         .unwrap_or(simulation_start);
 
     let slippage_bps = DEFAULT_SLIPPAGE_BPS;
-    let slippage = Decimal::from(slippage_bps) / Decimal::from(10_000u32);
+    let slippage_rate = Decimal::from(slippage_bps) / Decimal::from(10_000u32);
 
     let mut bankroll = config.bankroll_usd;
     let bankroll_initial = bankroll;
@@ -495,7 +495,7 @@ pub fn run_simulation(
                     }
 
                     let fill_price = {
-                        let raw = trade.price.0 + slippage;
+                        let raw = trade.price.0 * (Decimal::ONE + slippage_rate);
                         // Clamp to (0, 1).
                         if raw >= Decimal::ONE {
                             continue;
@@ -586,7 +586,7 @@ pub fn run_simulation(
                     };
 
                     let fill_price = {
-                        let raw = trade.price.0 - slippage;
+                        let raw = trade.price.0 * (Decimal::ONE - slippage_rate);
                         if raw <= Decimal::ZERO {
                             Decimal::new(1, 4)
                         } else {
