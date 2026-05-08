@@ -374,6 +374,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | Key | Default | Meaning |
 |---|---:|---|
 | `polymarket_fee_rate` | 0.04 | Polymarket BUY taker fee rate applied in the fee model: `fee_per_share = price × rate` (flat taker fee on notional). Added to `c` to obtain net cost. March 2026 schedule. |
+| `slippage_rate` | 0.01 | Expected proportional fill slippage for BUY orders; `slippage_per_share = price × rate`. Added to `c` alongside the taker fee. Backtest fill is `price × (1 + rate)`; SELL fill is `price × (1 − rate)`. Canonical default: 100 bps. |
 
 ### Service health (`HealthState`)
 
@@ -569,7 +570,7 @@ CREATE TABLE leaderboard_snapshots (
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `backtest_slippage_bps` | 100 | Conservative fill-cost assumption per trade in basis points of the signal price; applied as +bps on BUY and −bps on SELL |
+| `backtest_slippage_bps` | 100 | Conservative fill-cost assumption per trade; converted to a rate (`bps / 10_000`) and applied proportionally: BUY fill = `price × (1 + rate)`, SELL fill = `price × (1 − rate)`. The same rate feeds `WinnerFollowConfig.slippage_rate` so Kelly sizing and fill accounting are consistent. |
 | `backtest_step_days` | 1 | Walk-forward simulation step in days; set via `PE_BACKTEST_STEP_DAYS` |
 | `backtest_bankroll_usd` | 10000 | Starting bankroll in USD; set via `PE_BANKROLL_USD` |
 | `backtest_audit_window_days` | 90 | Trade lookback window for ledger reconstruction during simulation; set via `PE_BACKTEST_AUDIT_WINDOW_DAYS` |

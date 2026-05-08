@@ -3,7 +3,7 @@
 //! Numeric thresholds live in `_GLOSSARY.md` and `19-WINNER-FOLLOW-STRATEGY.md`;
 //! they are stored in the downstream risk/sizing crates. This config holds the
 //! approval flags that require a signed config change to flip, plus the fee-rate
-//! constant used to compute net cost `c` in Kelly sizing.
+//! and slippage-rate constants used to compute net cost `c` in Kelly sizing.
 
 use pe_core_types::KellyFraction;
 use pe_risk_engine::snapshot::TradingMode;
@@ -65,10 +65,18 @@ pub struct WinnerFollowConfig {
     /// and observe true Kelly-fraction effects. See `docs/_GLOSSARY.md`.
     #[serde(default)]
     pub per_trade_cap: PerTradeCap,
+    /// Expected fill slippage rate added to `c` for BUY orders, as a fraction.
+    /// Canonical default: `slippage_rate = 0.01` (100 bps). See `docs/_GLOSSARY.md`.
+    #[serde(default = "default_slippage_rate")]
+    pub slippage_rate: Decimal,
 }
 
 fn default_polymarket_fee_rate() -> Decimal {
     Decimal::new(4, 2)
+}
+
+fn default_slippage_rate() -> Decimal {
+    Decimal::new(1, 2)
 }
 
 impl Default for WinnerFollowConfig {
@@ -79,6 +87,7 @@ impl Default for WinnerFollowConfig {
             polymarket_fee_rate: default_polymarket_fee_rate(),
             kelly_fraction_override: None,
             per_trade_cap: PerTradeCap::default(),
+            slippage_rate: default_slippage_rate(),
         }
     }
 }
