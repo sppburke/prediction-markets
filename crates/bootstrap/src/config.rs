@@ -346,7 +346,11 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
         fig = fig.merge(Toml::file(p));
     }
     let cfg: BootstrapConfig = fig
-        .merge(Env::prefixed("PE_").lowercase(true))
+        .merge(
+            Env::prefixed("PE_")
+                .lowercase(true)
+                .filter(|k| !k.starts_with("BOOTSTRAP_")),
+        )
         .merge(Env::prefixed("PE_BOOTSTRAP_").lowercase(true))
         .extract()?;
     cfg.validate()?;
@@ -372,6 +376,26 @@ where
 
         fn visit_bool<E: de::Error>(self, v: bool) -> Result<bool, E> {
             Ok(v)
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<bool, E> {
+            match v {
+                1 => Ok(true),
+                0 => Ok(false),
+                other => Err(de::Error::custom(format!(
+                    "expected 0 or 1 for bool; got {other}"
+                ))),
+            }
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<bool, E> {
+            match v {
+                1 => Ok(true),
+                0 => Ok(false),
+                other => Err(de::Error::custom(format!(
+                    "expected 0 or 1 for bool; got {other}"
+                ))),
+            }
         }
 
         fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {

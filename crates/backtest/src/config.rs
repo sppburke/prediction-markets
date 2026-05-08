@@ -238,7 +238,11 @@ pub fn load(path: Option<&Path>) -> Result<BacktestConfig, BacktestError> {
         fig = fig.merge(Toml::file(p));
     }
     let cfg = fig
-        .merge(Env::prefixed("PE_").lowercase(true))
+        .merge(
+            Env::prefixed("PE_")
+                .lowercase(true)
+                .filter(|k| !k.starts_with("BACKTEST_")),
+        )
         .merge(Env::prefixed("PE_BACKTEST_").lowercase(true))
         .extract()?;
     Ok(cfg)
