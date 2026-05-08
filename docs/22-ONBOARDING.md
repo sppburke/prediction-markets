@@ -157,18 +157,18 @@ cargo run --release --bin pe-backtest
 
 ### Recipe B — Paper trading (backtest + live paper mode)
 
-Paper mode runs the strategy logic end-to-end against live Polymarket data but emits no real orders.
+Paper mode runs the strategy logic end-to-end against live Polymarket data but emits no real orders. `leader_follow` defaults to paper after fresh bootstrap — no config change required.
 
 ```bash
 # Complete recipe A first (bootstrap + historical backtest for calibration).
 
-# Then start the service in paper mode:
-PE_WINNER_FOLLOW_MODE=paper cargo run --release --bin pe-service
+# Then start the service (paper is the default mode for leader_follow):
+cargo run --release --bin pe-service
 
 # Monitor: RUST_LOG=info logs every signal and its paper outcome.
 ```
 
-Paper mode is the default for `leader_follow` after fresh bootstrap (see `docs/19-WINNER-FOLLOW-STRATEGY.md` "Promotion ladder").
+Paper mode is the default for `leader_follow` after fresh bootstrap (see `docs/19-WINNER-FOLLOW-STRATEGY.md` "Promotion ladder"). Promotion to live-tiny requires a manual review and passing the walk-forward gate.
 
 ### Recipe C — Live-tiny (first real capital)
 
@@ -193,8 +193,8 @@ Run this before pushing to confirm nothing is broken:
 rustc --version | grep -F '1.95.0'
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --doc --workspace --all-features
-cargo nextest run --workspace --all-features
+cargo test --doc --workspace --all-features   # doctests only
+cargo nextest run --workspace --all-features   # unit + integration + scenario
 cargo deny check
 cargo audit
 cargo metadata --locked --format-version 1 > /dev/null
