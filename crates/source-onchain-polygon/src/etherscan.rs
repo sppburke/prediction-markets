@@ -57,8 +57,7 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 const MAX_RESULTS_PER_PAGE: usize = 10_000;
 /// Safety cap on paginated cursor iterations per (wallet, contract) pair. Keeps
 /// the loop bounded for pathological hub wallets; 100 iterations × 10k results =
-/// 1M transfers max. At Etherscan's 3 req/s rate limit and concurrency=2, the
-/// worst-case wall time per capped contract is ~33s.
+/// 1M transfers max.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
 /// Public so integration tests can reference the cap symbolically.
 pub const MAX_PAGES: u32 = 100;
