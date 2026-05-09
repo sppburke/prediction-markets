@@ -2,15 +2,27 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The five Polymarket public REST API endpoints polled by this source.
+/// The four Polymarket public REST API endpoints polled by this source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketEndpoint {
     Leaderboard,
-    UserTrades { user: String },
-    CurrentPositions { user: String },
-    ClosedPositions { user: String },
-    UserActivity { user: String },
+    /// Cursor-based trade history for a single wallet via `/activity?type=TRADE`.
+    ///
+    /// `end` (inclusive): return trades with `timestamp <= end`. `None` = no upper bound.
+    /// `start` (exclusive): return trades with `timestamp > start`. `None` = no lower bound.
+    /// Cursor boundary semantics empirically verified: `end` inclusive, `start` exclusive.
+    UserTradeActivity {
+        user: String,
+        end: Option<i64>,
+        start: Option<i64>,
+    },
+    CurrentPositions {
+        user: String,
+    },
+    ClosedPositions {
+        user: String,
+    },
 }
 
 impl PolymarketEndpoint {
@@ -18,10 +30,9 @@ impl PolymarketEndpoint {
     pub fn key(&self) -> &'static str {
         match self {
             Self::Leaderboard => "leaderboard",
-            Self::UserTrades { .. } => "user_trades",
+            Self::UserTradeActivity { .. } => "user_trade_activity",
             Self::CurrentPositions { .. } => "current_positions",
             Self::ClosedPositions { .. } => "closed_positions",
-            Self::UserActivity { .. } => "user_activity",
         }
     }
 
@@ -29,12 +40,20 @@ impl PolymarketEndpoint {
     pub fn url(&self, base: &str) -> String {
         match self {
             Self::Leaderboard => format!("{base}/v1/leaderboard"),
-            Self::UserTrades { user } => format!("{base}/trades?user={user}"),
+            Self::UserTradeActivity { user, end, start } => {
+                let mut url = format!("{base}/activity?user={user}&type=TRADE&limit=500&offset=0");
+                if let Some(e) = end {
+                    url.push_str(&format!("&end={e}"));
+                }
+                if let Some(s) = start {
+                    url.push_str(&format!("&start={s}"));
+                }
+                url
+            }
             Self::CurrentPositions { user } => format!("{base}/positions?user={user}"),
             Self::ClosedPositions { user } => {
                 format!("{base}/closed-positions?user={user}")
             }
-            Self::UserActivity { user } => format!("{base}/activity?user={user}"),
         }
     }
 }
@@ -54,14 +73,42 @@ mod tests {
     }
 
     #[test]
-    fn user_trades_key_and_url() {
-        let ep = PolymarketEndpoint::UserTrades {
+    fn user_trade_activity_no_cursor() {
+        let ep = PolymarketEndpoint::UserTradeActivity {
             user: "0xabc".into(),
+            end: None,
+            start: None,
         };
-        assert_eq!(ep.key(), "user_trades");
+        assert_eq!(ep.key(), "user_trade_activity");
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/trades?user=0xabc"
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE&limit=500&offset=0"
+        );
+    }
+
+    #[test]
+    fn user_trade_activity_with_end_cursor() {
+        let ep = PolymarketEndpoint::UserTradeActivity {
+            user: "0xabc".into(),
+            end: Some(1_700_000_000),
+            start: None,
+        };
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE&limit=500&offset=0&end=1700000000"
+        );
+    }
+
+    #[test]
+    fn user_trade_activity_with_start_cursor() {
+        let ep = PolymarketEndpoint::UserTradeActivity {
+            user: "0xabc".into(),
+            end: None,
+            start: Some(1_700_000_000),
+        };
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE&limit=500&offset=0&start=1700000000"
         );
     }
 }

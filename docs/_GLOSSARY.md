@@ -55,7 +55,7 @@ Production budgets are conservative; they reduce automatically on 429/5xx. The "
 
 | Venue / surface | Documented limit | Production budget | Burst |
 |---|---|---|---|
-| Polymarket Data API | 200 req/10s on `/trades`, 100 req/s general (Cloudflare-queued, no 429) | ≤ 20 req/s sustained on `/trades` | n/a — bursts queued, not rejected |
+| Polymarket Data API | 200 req/10s on `/activity`, 100 req/s general (Cloudflare-queued, no 429) | ≤ 20 req/s sustained on `/activity` | n/a — bursts queued, not rejected |
 | Polymarket Gamma API | verify | ≤ 2 req/s sustained | 10-req burst |
 | Polymarket CLOB REST | verify | ≤ 5 req/s sustained | 10-req burst |
 | Polymarket WebSocket | per-account socket cap | ≤ 4 concurrent sockets | n/a |
@@ -533,8 +533,8 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_incremental_fetch_known_id_threshold` | 3 | Number of consecutive already-cached `source_trade_id`s that signals incremental fetch is complete for a wallet |
 | `bootstrap_dune_poll_interval_secs` | 3 | Seconds between Dune execution result polling attempts |
 | `bootstrap_dune_max_wait_secs` | 300 | Maximum seconds to wait for a Dune query to complete before aborting |
-| `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/trades` endpoint |
-| `bootstrap_polymarket_max_offset` | 3000 | Maximum `/trades` pagination offset; Polymarket Data API returns HTTP 400 for `offset >= 3000`. The fetcher breaks before issuing the over-limit request, so each wallet gets at most 3000 trades (its most-recent history). |
+| `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/activity?type=TRADE` endpoint |
+| `bootstrap_polymarket_pagination` | `"end-cursor"` | Pagination strategy for per-wallet trade fetch. Uses `end=<ts>` and `start=<ts>` cursor parameters on `/activity?type=TRADE`; no hard cap on history depth. |
 | `bootstrap_polymarket_min_retry_after_secs` | 1 | Minimum sleep duration (seconds) when the Polymarket Data API returns HTTP 429. Floors the `Retry-After` header value so a zero or absent header does not cause a tight retry loop. |
 | `bootstrap_polymarket_concurrency` | 16 | Concurrent per-wallet trade fetches against the Polymarket Data API; the `ReqwestFetcher` rate-limit gate caps aggregate throughput at ≤ 20 req/s regardless. Set via `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY`. |
 | `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |

@@ -40,20 +40,18 @@ fn fixture_fetcher() -> FixtureFetcher {
     let winner = WalletAddress::from_hex(WINNER_HEX).unwrap();
     let loser = WalletAddress::from_hex(LOSER_HEX).unwrap();
 
-    let winner_url = format!(
-        "{}&limit=500&offset=0",
-        PolymarketEndpoint::UserTrades {
-            user: winner.to_string(),
-        }
-        .url(BASE_URL)
-    );
-    let loser_url = format!(
-        "{}&limit=500&offset=0",
-        PolymarketEndpoint::UserTrades {
-            user: loser.to_string(),
-        }
-        .url(BASE_URL)
-    );
+    let winner_url = PolymarketEndpoint::UserTradeActivity {
+        user: winner.to_string(),
+        end: None,
+        start: None,
+    }
+    .url(BASE_URL);
+    let loser_url = PolymarketEndpoint::UserTradeActivity {
+        user: loser.to_string(),
+        end: None,
+        start: None,
+    }
+    .url(BASE_URL);
 
     let mut responses = HashMap::new();
     responses.insert(winner_url, fixture("polymarket_trades_winner.json"));

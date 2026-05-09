@@ -1,6 +1,6 @@
-//! Scenario test: FixtureFetcher drives all 5 endpoint shapes.
+//! Scenario test: FixtureFetcher drives all 4 endpoint shapes.
 //!
-//! PASS: connector emits exactly 5 `SourceEvent`s (one per endpoint, one rotation),
+//! PASS: connector emits exactly 4 `SourceEvent`s (one per endpoint, one rotation),
 //!       each with non-empty payload matching the fixture bytes.
 //! FAIL: wrong count, empty payload, or payload mismatch.
 
@@ -26,10 +26,13 @@ fn fixture(name: &str) -> Vec<u8> {
 fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
     let endpoints = vec![
         PolymarketEndpoint::Leaderboard,
-        PolymarketEndpoint::UserTrades { user: USER.into() },
+        PolymarketEndpoint::UserTradeActivity {
+            user: USER.into(),
+            end: None,
+            start: None,
+        },
         PolymarketEndpoint::CurrentPositions { user: USER.into() },
         PolymarketEndpoint::ClosedPositions { user: USER.into() },
-        PolymarketEndpoint::UserActivity { user: USER.into() },
     ];
 
     let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
@@ -38,8 +41,13 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
         fixture("leaderboard.json"),
     );
     responses.insert(
-        PolymarketEndpoint::UserTrades { user: USER.into() }.url(BASE),
-        fixture("user_trades.json"),
+        PolymarketEndpoint::UserTradeActivity {
+            user: USER.into(),
+            end: None,
+            start: None,
+        }
+        .url(BASE),
+        fixture("user_trade_activity.json"),
     );
     responses.insert(
         PolymarketEndpoint::CurrentPositions { user: USER.into() }.url(BASE),
@@ -48,10 +56,6 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
     responses.insert(
         PolymarketEndpoint::ClosedPositions { user: USER.into() }.url(BASE),
         fixture("closed_positions.json"),
-    );
-    responses.insert(
-        PolymarketEndpoint::UserActivity { user: USER.into() }.url(BASE),
-        fixture("user_activity.json"),
     );
 
     let fetcher = FixtureFetcher::new(responses);
@@ -71,15 +75,14 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
 }
 
 #[tokio::test]
-async fn all_five_endpoints_emit_non_empty_events() {
+async fn all_four_endpoints_emit_non_empty_events() {
     let mut connector = build_connector();
 
     let fixture_bytes = [
         fixture("leaderboard.json"),
-        fixture("user_trades.json"),
+        fixture("user_trade_activity.json"),
         fixture("current_positions.json"),
         fixture("closed_positions.json"),
-        fixture("user_activity.json"),
     ];
 
     for (i, expected_bytes) in fixture_bytes.iter().enumerate() {
