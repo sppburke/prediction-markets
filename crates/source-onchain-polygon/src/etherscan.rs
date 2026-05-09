@@ -14,10 +14,12 @@
 //! consuming Alchemy compute units. For seed sets of ~10–100 wallets and
 //! `funding_max_hops = 3`, total wall time is bounded at a few minutes.
 //!
-//! Each `(wallet, contract)` pair is fetched across up to `MAX_PAGES = 10` pages
-//! of `MAX_RESULTS_PER_PAGE = 10_000` entries each (100k transfers total). A
-//! `tracing::warn!` is emitted if the page cap is reached so hub-like wallets
-//! with extreme transfer volumes are visible in logs for manual review.
+//! Each `(wallet, contract)` pair is fetched via a block-range cursor: the first
+//! query uses `page=1&offset=10000&startblock=range.from`; on a full page the
+//! cursor advances to the highest `blockNumber` in that batch and the next query
+//! uses that block as `startblock`. Up to `MAX_PAGES = 10` cursor iterations
+//! (≤ 100k transfers) are attempted. A `tracing::warn!` is emitted at the cap
+//! so hub-like wallets with extreme transfer volumes are visible in logs.
 //!
 //! [1]: https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts#get-a-list-of-erc20-token-transfer-events-by-address
 
@@ -130,6 +132,11 @@ struct TokenTxEntry {
     /// in `tokentx` results; `default` guards against fixture JSON that omits it.
     #[serde(rename = "timeStamp", default)]
     timestamp_str: String,
+    /// Block number as a decimal string (e.g. `"12345678"`). Used by the
+    /// block-range cursor in `fetch_all_tokentx_pages` to advance `startblock`
+    /// after a full page. `default` keeps old fixture JSON compatible.
+    #[serde(default)]
+    block_number: String,
 }
 
 /// JSON-RPC response from `eth_blockNumber` proxy endpoint.
@@ -187,35 +194,40 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         )
     }
 
+    /// Build a `tokentx` URL. Always uses `page=1&offset=MAX_RESULTS_PER_PAGE`;
+    /// callers advance the block-range cursor between calls instead of incrementing
+    /// the page number (Etherscan enforces `page × offset ≤ 10_000`).
     fn build_url(
         &self,
         wallet: &WalletAddress,
         contract: &str,
-        range: BlockRange,
-        page: u32,
+        startblock: u64,
+        endblock: u64,
     ) -> String {
         format!(
             "{base}?chainid={chain}&module=account&action=tokentx\
              &contractaddress={contract}&address={wallet}\
-             &startblock={start}&endblock={end}\
-             &page={page}&offset={offset}&sort=asc&apikey={key}",
+             &startblock={startblock}&endblock={endblock}\
+             &page=1&offset={offset}&sort=asc&apikey={key}",
             base = self.base_url,
             chain = POLYGON_CHAIN_ID,
             contract = contract,
             wallet = wallet,
-            start = range.from,
-            end = range.to,
-            page = page,
+            startblock = startblock,
+            endblock = endblock,
             offset = MAX_RESULTS_PER_PAGE,
             key = self.api_key,
         )
     }
 
-    /// Fetch all pages of `tokentx` results for a single `(wallet, contract, range)` triple.
+    /// Fetch all `tokentx` results for a single `(wallet, contract, range)` triple
+    /// using a block-range cursor.
     ///
-    /// Pages until a short page signals history is exhausted, up to `MAX_PAGES`. Emits a
-    /// `warn!` if `MAX_PAGES` is hit without a terminating short page so hub-like wallets
-    /// with extreme transfer volumes are visible in logs.
+    /// After each full page (10k entries) the cursor advances to the highest
+    /// `blockNumber` in that batch and the next request uses it as `startblock`.
+    /// Entries near the cursor boundary may appear in two consecutive batches; the
+    /// `HashMap` in callers deduplicates them by `from` address. Up to `MAX_PAGES`
+    /// iterations are attempted; a `warn!` is emitted if the cap is hit.
     async fn fetch_all_tokentx_pages(
         &self,
         wallet: &WalletAddress,
@@ -223,15 +235,41 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         range: BlockRange,
     ) -> Result<Vec<TokenTxEntry>, FunderDiscoveryError> {
         let mut all_entries: Vec<TokenTxEntry> = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let url = self.build_url(wallet, contract, range, page);
+        let mut startblock = range.from;
+
+        for _iter in 1..=MAX_PAGES {
+            let url = self.build_url(wallet, contract, startblock, range.to);
             let entries = self.fetch_and_parse_with_backoff(&url).await?;
             let count = entries.len();
-            all_entries.extend(entries);
+
             if count < MAX_RESULTS_PER_PAGE {
+                all_entries.extend(entries);
                 return Ok(all_entries);
             }
+
+            // Full page: advance cursor to the max block seen so the next query
+            // starts there. If block_number is absent or unparseable (old fixture
+            // format), bail out with the guard below to avoid an infinite loop.
+            let next_start = entries
+                .iter()
+                .filter_map(|e| e.block_number.parse::<u64>().ok())
+                .max()
+                .unwrap_or(startblock);
+
+            all_entries.extend(entries);
+
+            if next_start <= startblock {
+                warn!(
+                    wallet = %wallet,
+                    contract,
+                    startblock,
+                    "etherscan: cursor did not advance (missing blockNumber?); stopping early"
+                );
+                return Ok(all_entries);
+            }
+            startblock = next_start;
         }
+
         warn!(
             wallet = %wallet,
             contract,
@@ -496,7 +534,7 @@ mod tests {
     fn build_url_includes_required_params() {
         let lookup = EtherscanFunderLookup::new("KEY".to_owned());
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let url = lookup.build_url(&wallet, USDC_NATIVE, BlockRange { from: 100, to: 200 }, 1);
+        let url = lookup.build_url(&wallet, USDC_NATIVE, 100, 200);
         assert!(url.contains("chainid=137"));
         assert!(url.contains("module=account"));
         assert!(url.contains("action=tokentx"));
@@ -509,15 +547,23 @@ mod tests {
     }
 
     #[test]
-    fn build_url_page_param_varies() {
+    fn build_url_startblock_cursor_advances() {
         let lookup = EtherscanFunderLookup::new("KEY".to_owned());
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let range = BlockRange { from: 1, to: 999 };
-        let url1 = lookup.build_url(&wallet, USDC_NATIVE, range, 1);
-        let url2 = lookup.build_url(&wallet, USDC_NATIVE, range, 2);
-        assert!(url1.contains("page=1"), "page=1 must appear in first URL");
-        assert!(url2.contains("page=2"), "page=2 must appear in second URL");
-        assert_ne!(url1, url2, "page-1 and page-2 URLs must differ");
+        let url1 = lookup.build_url(&wallet, USDC_NATIVE, 1, 100_000_000);
+        let url2 = lookup.build_url(&wallet, USDC_NATIVE, 50_000, 100_000_000);
+        assert!(
+            url1.contains("startblock=1"),
+            "first cursor url must have startblock=1"
+        );
+        assert!(
+            url2.contains("startblock=50000"),
+            "advanced cursor must appear in url"
+        );
+        assert_ne!(
+            url1, url2,
+            "different startblocks must produce different URLs"
+        );
     }
 
     #[test]

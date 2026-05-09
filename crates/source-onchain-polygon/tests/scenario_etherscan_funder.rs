@@ -242,22 +242,27 @@ async fn concurrent_funders_of_with_timestamps_matches_sequential() {
 
 /// Build a synthetic Etherscan `tokentx` response JSON with `count` entries.
 ///
-/// `from` addresses run `start..start+count` (formatted as `0x000...{n:040x}`),
-/// so callers can generate non-overlapping address ranges across pages.
-/// `to` = wallet, `timeStamp` is fixed. Built in-process; no large committed fixtures.
-fn synthetic_page(wallet: &str, start: usize, count: usize) -> Vec<u8> {
+/// `from` addresses run `start..start+count` (as `0x000...{n:040x}`).
+/// Every entry carries `blockNumber = block_number` — needed by the block-range
+/// cursor in `fetch_all_tokentx_pages` to advance `startblock` between batches.
+/// Built in-process; no large committed fixture files.
+fn synthetic_page(wallet: &str, start: usize, count: usize, block_number: u64) -> Vec<u8> {
     let entries: Vec<String> = (start..start + count)
-        .map(|n| format!(r#"{{"from":"0x{n:040x}","to":"{wallet}","timeStamp":"1700000000"}}"#))
+        .map(|n| {
+            format!(
+                r#"{{"from":"0x{n:040x}","to":"{wallet}","timeStamp":"1700000000","blockNumber":"{block_number}"}}"#
+            )
+        })
         .collect();
     let body = entries.join(",");
     format!(r#"{{"status":"1","message":"OK","result":[{body}]}}"#).into_bytes()
 }
 
-/// Scenario: when page 1 returns a full page (10k entries) and page 2 returns a
-/// partial page (500 entries), both pages are fetched and all entries returned.
+/// Scenario: when the first batch returns a full page (10k entries) the cursor
+/// advances via `blockNumber` and a second request fetches the remaining 500.
 ///
-/// PASS: 10,500 unique funders returned, exactly 2 HTTP calls for the pair
-/// FAIL: missing entries, wrong count, or fewer/more calls than expected
+/// PASS: 10,500 unique funders, exactly 2 HTTP calls for USDC_NATIVE
+/// FAIL: missing entries, wrong count, or wrong call count
 #[tokio::test]
 async fn two_page_fetch_returns_all_entries() {
     let wallet = WalletAddress::from_hex(WALLET_A).unwrap();
@@ -266,24 +271,24 @@ async fn two_page_fetch_returns_all_entries() {
         to: 100_000_000,
     };
 
-    // Build page responses: page 1 = 10k entries (full), page 2 = 500 entries (short).
-    // Pages use non-overlapping address ranges so dedup yields 10,500 unique funders.
-    let page1 = synthetic_page(WALLET_A, 0, 10_000);
-    let page2 = synthetic_page(WALLET_A, 10_000, 500);
+    // Batch 1: 10k entries, all at blockNumber=9999 → cursor advances to 9999.
+    // Batch 2: triggered by startblock=9999; 500 entries at blockNumber=10499.
+    // Non-overlapping `from` addresses → 10,500 unique funders after HashMap dedup.
+    let batch1 = synthetic_page(WALLET_A, 0, 10_000, 9_999);
+    let batch2 = synthetic_page(WALLET_A, 10_000, 500, 10_499);
     let bridged_empty: Vec<u8> =
         br#"{"status":"0","message":"No transactions found","result":[]}"#.to_vec();
 
-    // More-specific page=2 rule must appear BEFORE generic contractaddress rule.
+    // The startblock=9999 rule must appear BEFORE the generic contractaddress rule
+    // so FixtureFetcher matches it first on the second request.
     let rules = vec![
         (
-            format!(
-                "contractaddress={USDC_NATIVE}&address={WALLET_A}&startblock=1&endblock=100000000&page=2"
-            ),
-            page2,
+            format!("contractaddress={USDC_NATIVE}&address={WALLET_A}&startblock=9999&"),
+            batch2,
         ),
         (
             format!("contractaddress={USDC_NATIVE}&address={WALLET_A}"),
-            page1,
+            batch1,
         ),
         (
             format!("contractaddress={USDC_BRIDGED}&address={WALLET_A}"),
@@ -308,7 +313,7 @@ async fn two_page_fetch_returns_all_entries() {
     assert_eq!(
         funders.len(),
         10_500,
-        "must return all 10,500 entries across both pages"
+        "must return all 10,500 entries across both cursor iterations"
     );
 
     let calls = call_log.lock().unwrap();
@@ -323,10 +328,10 @@ async fn two_page_fetch_returns_all_entries() {
     );
 }
 
-/// Scenario: when every page returns a full page (10k entries), the loop stops
-/// after MAX_PAGES iterations rather than running forever.
+/// Scenario: when every cursor iteration returns a full page (10k entries), the
+/// loop terminates after MAX_PAGES iterations rather than running forever.
 ///
-/// PASS: exactly 10 HTTP calls for the pair; 100,000 entries returned
+/// PASS: exactly 10 HTTP calls for USDC_NATIVE; 100,000 unique funders returned
 /// FAIL: loop does not terminate, wrong call count, or wrong entry count
 #[tokio::test]
 async fn max_pages_exhaustion_terminates_loop() {
@@ -336,19 +341,24 @@ async fn max_pages_exhaustion_terminates_loop() {
         to: 100_000_000,
     };
 
-    // Each page gets a unique 10k-address slice so dedup yields 100,000 unique funders.
-    // Rule substr `&page=N&` matches exactly page N: `page=10&` ≠ substring of `page=1&`
-    // and vice versa, so ordering within the rules vec does not affect correctness.
+    // Iteration k uses startblock = (k-1)*10_000 (1 for the first iteration).
+    // Entries carry blockNumber = k*10_000 so the cursor advances to k*10_000 and
+    // the next request has startblock=k*10_000. Unique `from` addresses give
+    // 100,000 distinct funders after 10 iterations.
+    //
+    // Rule discriminator `startblock=S&` matches exactly: `startblock=1&` is not
+    // a substring of `startblock=10000&` because `1` is followed by `&` vs `0`.
     let empty: Vec<u8> =
         br#"{"status":"0","message":"No transactions found","result":[]}"#.to_vec();
     let mut rules: Vec<(String, Vec<u8>)> = (1u32..=10)
-        .map(|p| {
+        .map(|k| {
+            let startblock = if k == 1 { 1 } else { (k as u64 - 1) * 10_000 };
+            let block_number = k as u64 * 10_000;
             (
                 format!(
-                    "contractaddress={USDC_NATIVE}&address={WALLET_A}\
-                     &startblock=1&endblock=100000000&page={p}&"
+                    "contractaddress={USDC_NATIVE}&address={WALLET_A}&startblock={startblock}&"
                 ),
-                synthetic_page(WALLET_A, (p as usize - 1) * 10_000, 10_000),
+                synthetic_page(WALLET_A, (k as usize - 1) * 10_000, 10_000, block_number),
             )
         })
         .collect();
@@ -384,6 +394,6 @@ async fn max_pages_exhaustion_terminates_loop() {
     assert_eq!(
         funders.len(),
         100_000,
-        "must return 10 pages × 10,000 entries = 100,000 funders"
+        "must return 10 cursor iterations × 10,000 entries = 100,000 funders"
     );
 }
