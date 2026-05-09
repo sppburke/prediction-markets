@@ -26,6 +26,7 @@ const DEFAULT_DUNE_ACTIVE_WINDOW_DAYS: u32 = 30;
 const DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_POLYMARKET_CONCURRENCY: usize = 16;
+const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -218,6 +219,14 @@ pub struct BootstrapConfig {
         deserialize_with = "deserialize_bool_or_01"
     )]
     pub skip_trade_fetch: bool,
+
+    /// Concurrent per-wallet funder-discovery fetches against the Etherscan API.
+    /// `PE_BOOTSTRAP_FUNDER_CONCURRENCY` overrides.
+    #[serde(
+        default = "default_funder_concurrency",
+        alias = "bootstrap_funder_concurrency"
+    )]
+    pub funder_concurrency: usize,
 }
 
 impl BootstrapConfig {
@@ -292,6 +301,10 @@ const fn default_polymarket_concurrency() -> usize {
     DEFAULT_POLYMARKET_CONCURRENCY
 }
 
+const fn default_funder_concurrency() -> usize {
+    DEFAULT_FUNDER_CONCURRENCY
+}
+
 fn default_gamma_base_url() -> String {
     crate::gamma::DEFAULT_GAMMA_BASE_URL.to_owned()
 }
@@ -326,6 +339,7 @@ impl Default for BootstrapConfig {
             gamma_base_url: default_gamma_base_url(),
             fetch_funder_graph: false,
             skip_trade_fetch: false,
+            funder_concurrency: default_funder_concurrency(),
         }
     }
 }

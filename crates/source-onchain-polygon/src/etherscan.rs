@@ -22,8 +22,10 @@
 //! [1]: https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts#get-a-list-of-erc20-token-transfer-events-by-address
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::time::Duration;
 
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use pe_core_types::WalletAddress;
 use serde::Deserialize;
 use tracing::{debug, warn};
@@ -36,12 +38,10 @@ const POLYGON_CHAIN_ID: u32 = 137;
 const USDC_NATIVE: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 /// Bridged USDC.e on Polygon (legacy bridged from Ethereum).
 const USDC_BRIDGED: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-/// Free-tier rate limit is 3 req/s (verified via in-band rate-limit responses;
-/// the historical "5 req/s" doc was optimistic). Sleep 350 ms ≈ 2.85 req/s
-/// between sequential calls — under the cap with margin, eliminating the
-/// in-band-retry loop that previously dragged effective throughput to 0.5 req/s.
+/// Free-tier rate limit is 3 req/s. Every HTTP call acquires a token from this
+/// bucket; retries also acquire tokens so backoff windows don't bypass the cap.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
-const RATE_LIMIT_DELAY_MS: u64 = 350;
+const FUNDER_RATE_LIMIT_RPS: NonZeroU32 = NonZeroU32::MIN.saturating_add(2); // = 3
 /// Cap on retry backoff when transient errors occur.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
 const MAX_BACKOFF_SECS: u64 = 60;
@@ -143,6 +143,12 @@ pub struct EtherscanFunderLookup<F: HttpFetcher> {
     fetcher: F,
     api_key: String,
     base_url: String,
+    limiter: DefaultDirectRateLimiter,
+}
+
+fn build_limiter() -> DefaultDirectRateLimiter {
+    let quota = Quota::per_second(FUNDER_RATE_LIMIT_RPS).allow_burst(FUNDER_RATE_LIMIT_RPS);
+    RateLimiter::direct(quota)
 }
 
 impl EtherscanFunderLookup<reqwest::Client> {
@@ -152,6 +158,7 @@ impl EtherscanFunderLookup<reqwest::Client> {
             fetcher: reqwest::Client::new(),
             api_key,
             base_url: ETHERSCAN_BASE_URL.to_owned(),
+            limiter: build_limiter(),
         }
     }
 }
@@ -164,6 +171,7 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
             fetcher,
             api_key,
             base_url,
+            limiter: build_limiter(),
         }
     }
 
@@ -210,6 +218,7 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         let mut backoff_secs: u64 = 1;
         let mut last_err: Option<String> = None;
         for attempt in 1..=MAX_ATTEMPTS {
+            self.limiter.until_ready().await;
             let outcome = match self.fetcher.fetch(url).await {
                 Ok(bytes) => parser(&bytes),
                 Err(FetchError::Fatal(m)) => {
@@ -306,7 +315,6 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
                         .and_modify(|existing| *existing = (*existing).min(ts))
                         .or_insert(ts);
                 }
-                tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
             }
         }
         Ok(result)
@@ -346,7 +354,6 @@ impl<F: HttpFetcher> FunderLookup for EtherscanFunderLookup<F> {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
             }
         }
         Ok(funders)

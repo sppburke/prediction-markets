@@ -45,6 +45,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 crc32fast = "1"
 fs2 = "0.4"
 futures = "0.3"
+governor = "0.7"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 rust_decimal = { version = "1", features = ["serde", "maths"] }

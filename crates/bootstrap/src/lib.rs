@@ -29,8 +29,11 @@ pub use config::BootstrapConfig;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_onchain_polygon::{
@@ -51,6 +54,7 @@ use error::BootstrapError;
 use filter::{FilterConfig, passes_filter, win_rate_bps};
 use polymarket::PolymarketBulkFetcher;
 use rust_decimal::Decimal;
+use tokio::sync::Mutex;
 
 const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
 // bootstrap_eth_block_timeout_secs = 30
@@ -250,27 +254,72 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             };
             let lookup = EtherscanFunderLookup::new(api_key.clone());
             let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-            for (i, wallet) in pending.iter().enumerate() {
-                if (i + 1) % 500 == 0 || i + 1 == total_pending {
-                    tracing::info!(
-                        progress = i + 1,
-                        total = total_pending,
-                        "bootstrap: funder discovery {}/{}",
-                        i + 1,
-                        total_pending
-                    );
-                }
-                let wallet_set: std::collections::HashSet<WalletAddress> =
-                    std::iter::once(*wallet).collect();
-                let funders = lookup
-                    .funders_of_with_timestamps(&wallet_set, block_range)
-                    .await
-                    .map_err(|e| BootstrapError::Etherscan {
-                        message: e.to_string(),
-                    })?;
-                let funders_vec: Vec<(WalletAddress, i64)> = funders.into_iter().collect();
-                cache.insert_funder_edges(*wallet, &funders_vec, fetched_at)?;
+            let failed = {
+                let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(&mut cache);
+                let failed = Arc::new(AtomicUsize::new(0));
+                let progress = Arc::new(AtomicUsize::new(0));
+
+                stream::iter(pending.iter().copied())
+                    .for_each_concurrent(config.funder_concurrency, |wallet| {
+                        let cache_mutex = &cache_mutex;
+                        let lookup = &lookup;
+                        let failed = Arc::clone(&failed);
+                        let progress = Arc::clone(&progress);
+                        async move {
+                            let wallet_set: HashSet<WalletAddress> =
+                                std::iter::once(wallet).collect();
+                            match lookup
+                                .funders_of_with_timestamps(&wallet_set, block_range)
+                                .await
+                            {
+                                Ok(funders) => {
+                                    let funders_vec: Vec<(WalletAddress, i64)> =
+                                        funders.into_iter().collect();
+                                    let mut guard = cache_mutex.lock().await;
+                                    if let Err(e) = guard
+                                        .insert_funder_edges(wallet, &funders_vec, fetched_at)
+                                    {
+                                        tracing::error!(
+                                            wallet = %wallet,
+                                            error = %e,
+                                            "funder discovery: cache insert failed"
+                                        );
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        wallet = %wallet,
+                                        error = %e,
+                                        "funder discovery: fetch failed"
+                                    );
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            let n = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(500) || n == total_pending {
+                                tracing::info!(
+                                    progress = n,
+                                    total = total_pending,
+                                    "bootstrap: funder discovery {}/{}",
+                                    n,
+                                    total_pending
+                                );
+                            }
+                        }
+                    })
+                    .await;
+
+                // `cache_mutex` drops here, releasing &mut cache before the
+                // total_edges query below.
+                failed
+            };
+
+            let n = failed.load(Ordering::Relaxed);
+            if n > 0 {
+                return Err(BootstrapError::PartialFunderFetch { failed_wallets: n });
             }
+
             let total_edges = cache.load_funder_edges()?.len();
             tracing::info!(
                 cached = total_cached,
