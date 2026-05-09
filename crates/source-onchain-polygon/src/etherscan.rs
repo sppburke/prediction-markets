@@ -14,10 +14,10 @@
 //! consuming Alchemy compute units. For seed sets of ~10–100 wallets and
 //! `funding_max_hops = 3`, total wall time is bounded at a few minutes.
 //!
-//! Pagination is intentionally not implemented: Etherscan caps results at
-//! `MAX_RESULTS_PER_PAGE = 10_000` and a wallet with more than ~10k incoming
-//! USDC transfers in the discovery range is exceptional. A `tracing::warn!`
-//! is emitted at the cap so silent truncation is visible.
+//! Each `(wallet, contract)` pair is fetched across up to `MAX_PAGES = 10` pages
+//! of `MAX_RESULTS_PER_PAGE = 10_000` entries each (100k transfers total). A
+//! `tracing::warn!` is emitted if the page cap is reached so hub-like wallets
+//! with extreme transfer volumes are visible in logs for manual review.
 //!
 //! [1]: https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts#get-a-list-of-erc20-token-transfer-events-by-address
 
@@ -51,9 +51,12 @@ const MAX_ATTEMPTS: u32 = 6;
 /// Per-request HTTP timeout.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
 const HTTP_TIMEOUT_SECS: u64 = 30;
-/// Etherscan's per-page result cap. Hitting this is a signal that pagination
-/// is missing for the wallet, not that the wallet has exactly 10k transfers.
+/// Etherscan's per-page result cap.
 const MAX_RESULTS_PER_PAGE: usize = 10_000;
+/// Safety cap on paginated pages per (wallet, contract) pair. Keeps the loop
+/// bounded for pathological hub wallets; 10 pages × 10k = 100k transfers max.
+/// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
+const MAX_PAGES: u32 = 10;
 
 // ── HTTP abstraction ──────────────────────────────────────────────────────────
 
@@ -184,21 +187,58 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         )
     }
 
-    fn build_url(&self, wallet: &WalletAddress, contract: &str, range: BlockRange) -> String {
+    fn build_url(
+        &self,
+        wallet: &WalletAddress,
+        contract: &str,
+        range: BlockRange,
+        page: u32,
+    ) -> String {
         format!(
             "{base}?chainid={chain}&module=account&action=tokentx\
              &contractaddress={contract}&address={wallet}\
              &startblock={start}&endblock={end}\
-             &page=1&offset={offset}&sort=asc&apikey={key}",
+             &page={page}&offset={offset}&sort=asc&apikey={key}",
             base = self.base_url,
             chain = POLYGON_CHAIN_ID,
             contract = contract,
             wallet = wallet,
             start = range.from,
             end = range.to,
+            page = page,
             offset = MAX_RESULTS_PER_PAGE,
             key = self.api_key,
         )
+    }
+
+    /// Fetch all pages of `tokentx` results for a single `(wallet, contract, range)` triple.
+    ///
+    /// Pages until a short page signals history is exhausted, up to `MAX_PAGES`. Emits a
+    /// `warn!` if `MAX_PAGES` is hit without a terminating short page so hub-like wallets
+    /// with extreme transfer volumes are visible in logs.
+    async fn fetch_all_tokentx_pages(
+        &self,
+        wallet: &WalletAddress,
+        contract: &str,
+        range: BlockRange,
+    ) -> Result<Vec<TokenTxEntry>, FunderDiscoveryError> {
+        let mut all_entries: Vec<TokenTxEntry> = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let url = self.build_url(wallet, contract, range, page);
+            let entries = self.fetch_and_parse_with_backoff(&url).await?;
+            let count = entries.len();
+            all_entries.extend(entries);
+            if count < MAX_RESULTS_PER_PAGE {
+                return Ok(all_entries);
+            }
+        }
+        warn!(
+            wallet = %wallet,
+            contract,
+            max_pages = MAX_PAGES,
+            "etherscan: hit max page limit; some funders may be missing for this wallet"
+        );
+        Ok(all_entries)
     }
 
     /// Generic fetch-and-parse loop with exponential backoff.
@@ -290,16 +330,9 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         let mut result: HashMap<WalletAddress, i64> = HashMap::new();
         for wallet in wallets {
             for contract in [USDC_NATIVE, USDC_BRIDGED] {
-                let url = self.build_url(wallet, contract, range);
-                let transfers = self.fetch_and_parse_with_backoff(&url).await?;
-                if transfers.len() >= MAX_RESULTS_PER_PAGE {
-                    warn!(
-                        wallet = %wallet,
-                        contract,
-                        result_count = transfers.len(),
-                        "etherscan: response hit per-page cap; some funders may be missing"
-                    );
-                }
+                let transfers = self
+                    .fetch_all_tokentx_pages(wallet, contract, range)
+                    .await?;
                 let wallet_hex = wallet.to_string();
                 for entry in transfers {
                     if !entry.to.eq_ignore_ascii_case(&wallet_hex) {
@@ -330,16 +363,9 @@ impl<F: HttpFetcher> FunderLookup for EtherscanFunderLookup<F> {
         let mut funders: HashSet<WalletAddress> = HashSet::new();
         for wallet in wallets {
             for contract in [USDC_NATIVE, USDC_BRIDGED] {
-                let url = self.build_url(wallet, contract, range);
-                let transfers = self.fetch_and_parse_with_backoff(&url).await?;
-                if transfers.len() >= MAX_RESULTS_PER_PAGE {
-                    warn!(
-                        wallet = %wallet,
-                        contract,
-                        result_count = transfers.len(),
-                        "etherscan: response hit per-page cap; some funders may be missing"
-                    );
-                }
+                let transfers = self
+                    .fetch_all_tokentx_pages(wallet, contract, range)
+                    .await?;
                 let wallet_hex = wallet.to_string();
                 for entry in transfers {
                     if !entry.to.eq_ignore_ascii_case(&wallet_hex) {
@@ -470,7 +496,7 @@ mod tests {
     fn build_url_includes_required_params() {
         let lookup = EtherscanFunderLookup::new("KEY".to_owned());
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let url = lookup.build_url(&wallet, USDC_NATIVE, BlockRange { from: 100, to: 200 });
+        let url = lookup.build_url(&wallet, USDC_NATIVE, BlockRange { from: 100, to: 200 }, 1);
         assert!(url.contains("chainid=137"));
         assert!(url.contains("module=account"));
         assert!(url.contains("action=tokentx"));
@@ -478,7 +504,20 @@ mod tests {
         assert!(url.contains(&format!("address={wallet}")));
         assert!(url.contains("startblock=100"));
         assert!(url.contains("endblock=200"));
+        assert!(url.contains("page=1"));
         assert!(url.contains("apikey=KEY"));
+    }
+
+    #[test]
+    fn build_url_page_param_varies() {
+        let lookup = EtherscanFunderLookup::new("KEY".to_owned());
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let range = BlockRange { from: 1, to: 999 };
+        let url1 = lookup.build_url(&wallet, USDC_NATIVE, range, 1);
+        let url2 = lookup.build_url(&wallet, USDC_NATIVE, range, 2);
+        assert!(url1.contains("page=1"), "page=1 must appear in first URL");
+        assert!(url2.contains("page=2"), "page=2 must appear in second URL");
+        assert_ne!(url1, url2, "page-1 and page-2 URLs must differ");
     }
 
     #[test]

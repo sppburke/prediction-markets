@@ -306,6 +306,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `funder_source` | `"eth_logs"` | Funder discovery backend: `"eth_logs"` (default, Alchemy CU) or `"etherscan"` (Etherscan V2 free tier). With `"etherscan"` + empty Polygon URLs, funder discovery runs via Etherscan and no live WS subscription is started. |
 | `etherscan_funder_rps` | 3 | Etherscan V2 free-tier rate limit: 3 requests per second. Verified via in-band `Max calls per sec rate limit reached (3/sec)` responses; the historical doc value of 5 was optimistic. |
 | `etherscan_funder_concurrency` | 4 | Concurrent per-wallet funder-discovery tasks (`PE_BOOTSTRAP_FUNDER_CONCURRENCY`). Rate is enforced by the token-bucket limiter (`etherscan_funder_rps`), not by concurrency, so both can be tuned independently. N=4 covers HTTP RTT variance and 429 backoff windows at the 3 req/s free-tier ceiling. |
+| `etherscan_funder_max_pages` | 10 | Safety cap on paginated pages per (wallet, contract) pair. Stops the page loop after 10 × 10,000 = 100,000 transfers; emits `warn!` if hit so hub-like wallets are visible in logs. Wallets exceeding the cap get partial coverage until block-range bisection is implemented. |
 | `etherscan_funder_max_backoff_secs` | 60 | Cap on retry backoff for transient Etherscan errors. |
 | `etherscan_funder_max_attempts` | 6 | Maximum retry attempts before failing the discovery hop. |
 | `etherscan_funder_http_timeout_secs` | 30 | Per-request HTTP timeout for Etherscan calls. |

@@ -13,7 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pe_core_types::WalletAddress;
 use pe_source_onchain_polygon::EtherscanFunderLookup;
@@ -37,15 +37,21 @@ fn fixture(name: &str) -> Vec<u8> {
 /// have to reproduce the exact query-string ordering.
 struct FixtureFetcher {
     rules: Vec<(String, Vec<u8>)>,
-    calls: Mutex<Vec<String>>,
+    calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl FixtureFetcher {
     fn new(rules: Vec<(String, Vec<u8>)>) -> Self {
         Self {
             rules,
-            calls: Mutex::new(Vec::new()),
+            calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Returns a shared handle to the call log so tests can inspect it after
+    /// the fetcher has been moved into an `EtherscanFunderLookup`.
+    fn call_log(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.calls)
     }
 }
 
@@ -154,8 +160,6 @@ async fn etherscan_funders_of_returns_incoming_senders() {
 /// FAIL: missing funders or extra entries in either direction
 #[tokio::test]
 async fn concurrent_funders_of_with_timestamps_matches_sequential() {
-    use std::sync::Arc;
-
     let wallet_a = WalletAddress::from_hex(WALLET_A).unwrap();
     let wallet_b = WalletAddress::from_hex(WALLET_B).unwrap();
 
@@ -231,5 +235,155 @@ async fn concurrent_funders_of_with_timestamps_matches_sequential() {
             .keys()
             .collect::<std::collections::HashSet<_>>(),
         "concurrent and sequential runs must return the same funder set"
+    );
+}
+
+// ── Helpers for pagination scenarios ─────────────────────────────────────────
+
+/// Build a synthetic Etherscan `tokentx` response JSON with `count` entries.
+///
+/// `from` addresses run `start..start+count` (formatted as `0x000...{n:040x}`),
+/// so callers can generate non-overlapping address ranges across pages.
+/// `to` = wallet, `timeStamp` is fixed. Built in-process; no large committed fixtures.
+fn synthetic_page(wallet: &str, start: usize, count: usize) -> Vec<u8> {
+    let entries: Vec<String> = (start..start + count)
+        .map(|n| format!(r#"{{"from":"0x{n:040x}","to":"{wallet}","timeStamp":"1700000000"}}"#))
+        .collect();
+    let body = entries.join(",");
+    format!(r#"{{"status":"1","message":"OK","result":[{body}]}}"#).into_bytes()
+}
+
+/// Scenario: when page 1 returns a full page (10k entries) and page 2 returns a
+/// partial page (500 entries), both pages are fetched and all entries returned.
+///
+/// PASS: 10,500 unique funders returned, exactly 2 HTTP calls for the pair
+/// FAIL: missing entries, wrong count, or fewer/more calls than expected
+#[tokio::test]
+async fn two_page_fetch_returns_all_entries() {
+    let wallet = WalletAddress::from_hex(WALLET_A).unwrap();
+    let range = BlockRange {
+        from: 1,
+        to: 100_000_000,
+    };
+
+    // Build page responses: page 1 = 10k entries (full), page 2 = 500 entries (short).
+    // Pages use non-overlapping address ranges so dedup yields 10,500 unique funders.
+    let page1 = synthetic_page(WALLET_A, 0, 10_000);
+    let page2 = synthetic_page(WALLET_A, 10_000, 500);
+    let bridged_empty: Vec<u8> =
+        br#"{"status":"0","message":"No transactions found","result":[]}"#.to_vec();
+
+    // More-specific page=2 rule must appear BEFORE generic contractaddress rule.
+    let rules = vec![
+        (
+            format!(
+                "contractaddress={USDC_NATIVE}&address={WALLET_A}&startblock=1&endblock=100000000&page=2"
+            ),
+            page2,
+        ),
+        (
+            format!("contractaddress={USDC_NATIVE}&address={WALLET_A}"),
+            page1,
+        ),
+        (
+            format!("contractaddress={USDC_BRIDGED}&address={WALLET_A}"),
+            bridged_empty,
+        ),
+    ];
+
+    let fetcher = FixtureFetcher::new(rules);
+    let call_log = fetcher.call_log();
+    let lookup = EtherscanFunderLookup::with_fetcher(
+        fetcher,
+        "TESTKEY".to_owned(),
+        "https://example.invalid/v2/api".to_owned(),
+    );
+
+    let wallet_set = std::iter::once(wallet).collect();
+    let funders = lookup
+        .funders_of_with_timestamps(&wallet_set, range)
+        .await
+        .expect("two-page fetch must succeed");
+
+    assert_eq!(
+        funders.len(),
+        10_500,
+        "must return all 10,500 entries across both pages"
+    );
+
+    let calls = call_log.lock().unwrap();
+    let native_calls: Vec<_> = calls
+        .iter()
+        .filter(|u| u.contains(&format!("contractaddress={USDC_NATIVE}")))
+        .collect();
+    assert_eq!(
+        native_calls.len(),
+        2,
+        "must make exactly 2 HTTP calls for the USDC_NATIVE contract"
+    );
+}
+
+/// Scenario: when every page returns a full page (10k entries), the loop stops
+/// after MAX_PAGES iterations rather than running forever.
+///
+/// PASS: exactly 10 HTTP calls for the pair; 100,000 entries returned
+/// FAIL: loop does not terminate, wrong call count, or wrong entry count
+#[tokio::test]
+async fn max_pages_exhaustion_terminates_loop() {
+    let wallet = WalletAddress::from_hex(WALLET_A).unwrap();
+    let range = BlockRange {
+        from: 1,
+        to: 100_000_000,
+    };
+
+    // Each page gets a unique 10k-address slice so dedup yields 100,000 unique funders.
+    // Rule substr `&page=N&` matches exactly page N: `page=10&` ≠ substring of `page=1&`
+    // and vice versa, so ordering within the rules vec does not affect correctness.
+    let empty: Vec<u8> =
+        br#"{"status":"0","message":"No transactions found","result":[]}"#.to_vec();
+    let mut rules: Vec<(String, Vec<u8>)> = (1u32..=10)
+        .map(|p| {
+            (
+                format!(
+                    "contractaddress={USDC_NATIVE}&address={WALLET_A}\
+                     &startblock=1&endblock=100000000&page={p}&"
+                ),
+                synthetic_page(WALLET_A, (p as usize - 1) * 10_000, 10_000),
+            )
+        })
+        .collect();
+    rules.push((
+        format!("contractaddress={USDC_BRIDGED}&address={WALLET_A}"),
+        empty,
+    ));
+
+    let fetcher = FixtureFetcher::new(rules);
+    let call_log = fetcher.call_log();
+    let lookup = EtherscanFunderLookup::with_fetcher(
+        fetcher,
+        "TESTKEY".to_owned(),
+        "https://example.invalid/v2/api".to_owned(),
+    );
+
+    let wallet_set = std::iter::once(wallet).collect();
+    let funders = lookup
+        .funders_of_with_timestamps(&wallet_set, range)
+        .await
+        .expect("max-pages exhaustion must return Ok (with warn)");
+
+    let calls = call_log.lock().unwrap();
+    let native_calls: Vec<_> = calls
+        .iter()
+        .filter(|u| u.contains(&format!("contractaddress={USDC_NATIVE}")))
+        .collect();
+    assert_eq!(
+        native_calls.len(),
+        10,
+        "must stop after exactly MAX_PAGES=10 HTTP calls for USDC_NATIVE"
+    );
+    assert_eq!(
+        funders.len(),
+        100_000,
+        "must return 10 pages × 10,000 entries = 100,000 funders"
     );
 }
