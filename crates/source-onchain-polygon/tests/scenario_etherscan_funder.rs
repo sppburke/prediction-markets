@@ -146,3 +146,90 @@ async fn etherscan_funders_of_returns_incoming_senders() {
         "etherscan funders_of must return exactly the incoming-transfer senders"
     );
 }
+
+/// Scenario: N=4 concurrent calls to funders_of_with_timestamps produce the
+/// same funder set as a sequential run on the same fixtures.
+///
+/// PASS: concurrent result equals sequential result (set equality)
+/// FAIL: missing funders or extra entries in either direction
+#[tokio::test]
+async fn concurrent_funders_of_with_timestamps_matches_sequential() {
+    use std::sync::Arc;
+
+    let wallet_a = WalletAddress::from_hex(WALLET_A).unwrap();
+    let wallet_b = WalletAddress::from_hex(WALLET_B).unwrap();
+
+    let rules = vec![
+        (
+            format!("contractaddress={USDC_NATIVE}&address={WALLET_A}"),
+            fixture("etherscan_native_usdc_wallet_a.json"),
+        ),
+        (
+            format!("contractaddress={USDC_BRIDGED}&address={WALLET_A}"),
+            fixture("etherscan_bridged_usdc_wallet_a.json"),
+        ),
+        (
+            format!("contractaddress={USDC_NATIVE}&address={WALLET_B}"),
+            fixture("etherscan_native_usdc_wallet_b.json"),
+        ),
+        (
+            format!("contractaddress={USDC_BRIDGED}&address={WALLET_B}"),
+            fixture("etherscan_bridged_usdc_wallet_b.json"),
+        ),
+    ];
+
+    let range = BlockRange {
+        from: 1,
+        to: 100_000_000,
+    };
+
+    // Sequential reference run.
+    let seq_lookup = EtherscanFunderLookup::with_fetcher(
+        FixtureFetcher::new(rules.clone()),
+        "TESTKEY".to_owned(),
+        "https://example.invalid/v2/api".to_owned(),
+    );
+    let mut seq_result = std::collections::HashMap::new();
+    for wallet in [wallet_a, wallet_b] {
+        let wallet_set = std::iter::once(wallet).collect();
+        let funders = seq_lookup
+            .funders_of_with_timestamps(&wallet_set, range)
+            .await
+            .expect("sequential run must succeed");
+        seq_result.extend(funders);
+    }
+
+    // Concurrent run (N=4, fixture fetcher is Arc-shared so concurrent access is safe).
+    let lookup = Arc::new(EtherscanFunderLookup::with_fetcher(
+        FixtureFetcher::new(rules),
+        "TESTKEY".to_owned(),
+        "https://example.invalid/v2/api".to_owned(),
+    ));
+    let wallets = [wallet_a, wallet_b];
+    let handles: Vec<_> = wallets
+        .iter()
+        .map(|&wallet| {
+            let lookup = Arc::clone(&lookup);
+            tokio::spawn(async move {
+                let wallet_set = std::iter::once(wallet).collect();
+                lookup
+                    .funders_of_with_timestamps(&wallet_set, range)
+                    .await
+                    .expect("concurrent task must succeed")
+            })
+        })
+        .collect();
+
+    let mut concurrent_result = std::collections::HashMap::new();
+    for handle in handles {
+        concurrent_result.extend(handle.await.expect("task must not panic"));
+    }
+
+    assert_eq!(
+        seq_result.keys().collect::<std::collections::HashSet<_>>(),
+        concurrent_result
+            .keys()
+            .collect::<std::collections::HashSet<_>>(),
+        "concurrent and sequential runs must return the same funder set"
+    );
+}
