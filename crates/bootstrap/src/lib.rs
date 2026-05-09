@@ -276,8 +276,8 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                     let funders_vec: Vec<(WalletAddress, i64)> =
                                         funders.into_iter().collect();
                                     let mut guard = cache_mutex.lock().await;
-                                    if let Err(e) = guard
-                                        .insert_funder_edges(wallet, &funders_vec, fetched_at)
+                                    if let Err(e) =
+                                        guard.insert_funder_edges(wallet, &funders_vec, fetched_at)
                                     {
                                         tracing::error!(
                                             wallet = %wallet,
