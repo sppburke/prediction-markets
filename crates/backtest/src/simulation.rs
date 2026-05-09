@@ -364,6 +364,14 @@ pub fn run_simulation(
             continue;
         }
 
+        // Skip days before the first leaderboard snapshot — filtered_ledgers
+        // would be empty regardless and the trade-filter / operator-graph /
+        // ledger build below are pure CPU waste on those days. The full-history
+        // fallback (snapshots.is_empty()) keeps its prior behaviour.
+        if !snapshots.is_empty() && snapshots.for_date(sim_date_unix).is_none() {
+            continue;
+        }
+
         // Ranker state: all trades strictly BEFORE today.
         let ranker_cutoff_unix = sim_date.midnight().assume_utc().unix_timestamp();
         let ranker_trades: Vec<RawTrade> = all_trades
