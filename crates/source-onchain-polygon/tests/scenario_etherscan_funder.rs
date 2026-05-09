@@ -13,11 +13,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use pe_core_types::WalletAddress;
 use pe_source_onchain_polygon::EtherscanFunderLookup;
-use pe_source_onchain_polygon::etherscan::{FetchError, HttpFetcher};
+use pe_source_onchain_polygon::etherscan::{FetchError, HttpFetcher, MAX_PAGES};
 use pe_source_onchain_polygon::funder_discovery::{BlockRange, FunderLookup};
 
 const WALLET_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -328,10 +329,55 @@ async fn two_page_fetch_returns_all_entries() {
     );
 }
 
+/// Stateful fetcher that returns a fresh full page on every USDC_NATIVE call,
+/// with non-overlapping `from` addresses and a strictly-increasing `blockNumber`
+/// per call so the cursor advances. USDC_BRIDGED returns the empty body.
+///
+/// Avoids generating MAX_PAGES × 10k fixture entries upfront; the test scales
+/// with the MAX_PAGES constant without code changes.
+struct StatefulPageFetcher {
+    wallet: String,
+    page_size: usize,
+    native_call_count: Arc<Mutex<u32>>,
+}
+
+impl StatefulPageFetcher {
+    fn new(wallet: String, page_size: usize) -> Self {
+        Self {
+            wallet,
+            page_size,
+            native_call_count: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn native_call_count(&self) -> Arc<Mutex<u32>> {
+        Arc::clone(&self.native_call_count)
+    }
+}
+
+impl HttpFetcher for StatefulPageFetcher {
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        if url.contains(&format!("contractaddress={USDC_BRIDGED}")) {
+            return Ok(br#"{"status":"0","message":"No transactions found","result":[]}"#.to_vec());
+        }
+        let mut counter = self.native_call_count.lock().unwrap();
+        *counter += 1;
+        let n = *counter as usize;
+        // Iteration n: addresses (n-1)*page_size..n*page_size, blockNumber = n*10_000.
+        Ok(synthetic_page(
+            &self.wallet,
+            (n - 1) * self.page_size,
+            self.page_size,
+            n as u64 * 10_000,
+        ))
+    }
+}
+
 /// Scenario: when every cursor iteration returns a full page (10k entries), the
 /// loop terminates after MAX_PAGES iterations rather than running forever.
 ///
-/// PASS: exactly 10 HTTP calls for USDC_NATIVE; 100,000 unique funders returned
+/// PASS: exactly MAX_PAGES HTTP calls for USDC_NATIVE; MAX_PAGES × 10,000 unique
+///       funders returned
 /// FAIL: loop does not terminate, wrong call count, or wrong entry count
 #[tokio::test]
 async fn max_pages_exhaustion_terminates_loop() {
@@ -341,38 +387,17 @@ async fn max_pages_exhaustion_terminates_loop() {
         to: 100_000_000,
     };
 
-    // Iteration k uses startblock = (k-1)*10_000 (1 for the first iteration).
-    // Entries carry blockNumber = k*10_000 so the cursor advances to k*10_000 and
-    // the next request has startblock=k*10_000. Unique `from` addresses give
-    // 100,000 distinct funders after 10 iterations.
-    //
-    // Rule discriminator `startblock=S&` matches exactly: `startblock=1&` is not
-    // a substring of `startblock=10000&` because `1` is followed by `&` vs `0`.
-    let empty: Vec<u8> =
-        br#"{"status":"0","message":"No transactions found","result":[]}"#.to_vec();
-    let mut rules: Vec<(String, Vec<u8>)> = (1u32..=10)
-        .map(|k| {
-            let startblock = if k == 1 { 1 } else { (k as u64 - 1) * 10_000 };
-            let block_number = k as u64 * 10_000;
-            (
-                format!(
-                    "contractaddress={USDC_NATIVE}&address={WALLET_A}&startblock={startblock}&"
-                ),
-                synthetic_page(WALLET_A, (k as usize - 1) * 10_000, 10_000, block_number),
-            )
-        })
-        .collect();
-    rules.push((
-        format!("contractaddress={USDC_BRIDGED}&address={WALLET_A}"),
-        empty,
-    ));
+    let fetcher = StatefulPageFetcher::new(WALLET_A.to_owned(), 10_000);
+    let native_call_count = fetcher.native_call_count();
 
-    let fetcher = FixtureFetcher::new(rules);
-    let call_log = fetcher.call_log();
-    let lookup = EtherscanFunderLookup::with_fetcher(
+    // Test-only rate limit: 1000 req/s lets MAX_PAGES iterations finish in ms
+    // rather than 33s+ at the production 3 req/s ceiling.
+    let test_rps = NonZeroU32::new(1000).unwrap();
+    let lookup = EtherscanFunderLookup::with_fetcher_and_rps(
         fetcher,
         "TESTKEY".to_owned(),
         "https://example.invalid/v2/api".to_owned(),
+        test_rps,
     );
 
     let wallet_set = std::iter::once(wallet).collect();
@@ -381,19 +406,14 @@ async fn max_pages_exhaustion_terminates_loop() {
         .await
         .expect("max-pages exhaustion must return Ok (with warn)");
 
-    let calls = call_log.lock().unwrap();
-    let native_calls: Vec<_> = calls
-        .iter()
-        .filter(|u| u.contains(&format!("contractaddress={USDC_NATIVE}")))
-        .collect();
+    let actual_calls = *native_call_count.lock().unwrap();
     assert_eq!(
-        native_calls.len(),
-        10,
-        "must stop after exactly MAX_PAGES=10 HTTP calls for USDC_NATIVE"
+        actual_calls, MAX_PAGES,
+        "must stop after exactly MAX_PAGES HTTP calls for USDC_NATIVE"
     );
     assert_eq!(
         funders.len(),
-        100_000,
-        "must return 10 cursor iterations × 10,000 entries = 100,000 funders"
+        MAX_PAGES as usize * 10_000,
+        "must return MAX_PAGES cursor iterations × 10,000 entries unique funders"
     );
 }

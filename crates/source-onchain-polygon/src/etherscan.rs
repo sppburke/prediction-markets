@@ -17,9 +17,9 @@
 //! Each `(wallet, contract)` pair is fetched via a block-range cursor: the first
 //! query uses `page=1&offset=10000&startblock=range.from`; on a full page the
 //! cursor advances to the highest `blockNumber` in that batch and the next query
-//! uses that block as `startblock`. Up to `MAX_PAGES = 10` cursor iterations
-//! (≤ 100k transfers) are attempted. A `tracing::warn!` is emitted at the cap
-//! so hub-like wallets with extreme transfer volumes are visible in logs.
+//! uses that block as `startblock`. Up to `MAX_PAGES = 100` cursor iterations
+//! (≤ 1M transfers) are attempted. A `tracing::warn!` is emitted at the cap so
+//! hub-like wallets with extreme transfer volumes are visible in logs.
 //!
 //! [1]: https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts#get-a-list-of-erc20-token-transfer-events-by-address
 
@@ -55,10 +55,12 @@ const MAX_ATTEMPTS: u32 = 6;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 /// Etherscan's per-page result cap.
 const MAX_RESULTS_PER_PAGE: usize = 10_000;
-/// Safety cap on paginated pages per (wallet, contract) pair. Keeps the loop
-/// bounded for pathological hub wallets; 10 pages × 10k = 100k transfers max.
+/// Safety cap on paginated cursor iterations per (wallet, contract) pair. Keeps
+/// the loop bounded for pathological hub wallets; 100 iterations × 10k results =
+/// 1M transfers max.
 /// Canonical value in `docs/_GLOSSARY.md` "Etherscan funder defaults".
-const MAX_PAGES: u32 = 10;
+/// Public so integration tests can reference the cap symbolically.
+pub const MAX_PAGES: u32 = 100;
 
 // ── HTTP abstraction ──────────────────────────────────────────────────────────
 
@@ -182,6 +184,25 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
             api_key,
             base_url,
             limiter: build_limiter(),
+        }
+    }
+
+    /// Test-only constructor that overrides the rate limit. Production code uses
+    /// [`Self::with_fetcher`] (3 req/s); the cap-exhaustion scenario test bumps
+    /// this so its `MAX_PAGES` cursor iterations don't take 33+ seconds at 3 rps.
+    #[doc(hidden)]
+    pub fn with_fetcher_and_rps(
+        fetcher: F,
+        api_key: String,
+        base_url: String,
+        rps: NonZeroU32,
+    ) -> Self {
+        let quota = Quota::per_second(rps).allow_burst(rps);
+        Self {
+            fetcher,
+            api_key,
+            base_url,
+            limiter: RateLimiter::direct(quota),
         }
     }
 
