@@ -1,15 +1,20 @@
 //! Polymarket bulk trade fetcher — incremental, cache-first, concurrent.
 //!
-//! For each wallet: paginates from offset 0, stops when
-//! `INCREMENTAL_STOP_THRESHOLD` consecutive already-known `source_trade_id`s
-//! are encountered, then appends only the new trades to the cache.
+//! For each wallet: performs a two-phase cursor walk against
+//! `/activity?type=TRADE`:
+//!   - **Phase 1 (backward fill)** — walks from the oldest cached timestamp
+//!     backward, filling any historical gap. Cold-start wallets use an
+//!     unbounded initial request and walk until an empty or partial page.
+//!   - **Phase 2 (forward fill)** — walks forward from the newest cached
+//!     timestamp, collecting new trades. `INCREMENTAL_STOP_THRESHOLD`
+//!     consecutive already-known IDs act as an overlap safety net.
+//!
 //! Each fetched page is sorted newest-first (defensive: API normally does this
-//! but the sort removes the silent-failure mode if ordering ever changes).
+//! but the sort removes the silent-failure mode if ordering changes).
 //!
 //! `fetch_all` runs up to `concurrency` per-wallet fetches in parallel; the
-//! shared `PageFetcher` enforces the global rate-limit gate so the aggregate
-//! throughput stays inside the documented Polymarket Data API limit
-//! (200 req/10s on `/trades`, ≈ 20 req/s).
+//! shared `PageFetcher` enforces the global rate-limit gate so aggregate
+//! throughput stays inside the Polymarket Data API limit (200 req/10s, ≈ 20 req/s).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -34,10 +39,6 @@ use crate::cache::{INCREMENTAL_STOP_THRESHOLD, WalletCache};
 use crate::error::BootstrapError;
 
 const TRADE_FETCH_LIMIT: u32 = 500;
-/// Polymarket Data API rejects `/trades` requests with `offset >= 3000` (HTTP 400,
-/// "max historical activity offset of 3000 exceeded"). Stop paging before that limit.
-/// Canonical default: `docs/_GLOSSARY.md` `bootstrap_polymarket_max_offset`.
-const MAX_POLYMARKET_OFFSET: u32 = 3000;
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
@@ -113,12 +114,18 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                 let failed = Arc::clone(&failed);
                 async move {
                     let wallet_hex = wallet.to_string();
-                    let known_ids: HashSet<SourceTradeId> = {
+                    let (known_ids, ts_bounds) = {
                         let guard = cache_mutex.lock().await;
-                        guard.known_trade_ids(&wallet_hex).into_iter().collect()
+                        let ids: HashSet<SourceTradeId> =
+                            guard.known_trade_ids(&wallet_hex).into_iter().collect();
+                        let bounds = guard.trade_ts_bounds(&wallet_hex).ok().flatten();
+                        (ids, bounds)
                     };
 
-                    match self.fetch_wallet_incremental(wallet, &known_ids).await {
+                    match self
+                        .fetch_wallet_incremental(wallet, &known_ids, ts_bounds)
+                        .await
+                    {
                         Ok(new_trades) if !new_trades.is_empty() => {
                             let mut guard = cache_mutex.lock().await;
                             if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
@@ -151,30 +158,38 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         Ok(())
     }
 
-    /// Fetch only trades not already in `known_ids` for a single wallet.
+    /// Fetch trades not already in `known_ids` for a single wallet via two-phase cursor walk.
     ///
-    /// Pages from offset 0; stops after `INCREMENTAL_STOP_THRESHOLD` consecutive
-    /// trades whose `source_trade_id` appears in `known_ids`. Each page is sorted
-    /// newest-first before checking (defensive against API ordering changes).
+    /// Phase 1 (backward fill): walks backward from `oldest_cached_ts - 1` (or unbounded for
+    /// cold-start) until an empty or partial page signals no more history.
+    /// Phase 2 (forward fill): walks forward from `newest_cached_ts` (incremental only) until
+    /// empty or partial page; `INCREMENTAL_STOP_THRESHOLD` consecutive known IDs act as an
+    /// overlap safety net.
+    ///
+    /// Cursor semantics (empirically verified): `end` is inclusive (trade at `end` returned);
+    /// `start` is exclusive (trade at `start` not returned).
     async fn fetch_wallet_incremental(
         &self,
         wallet: WalletAddress,
         known_ids: &HashSet<SourceTradeId>,
+        ts_bounds: Option<(i64, i64)>,
     ) -> Result<Vec<RawTrade>, BootstrapError> {
         let wallet_hex = wallet.to_string();
-        let endpoint = PolymarketEndpoint::UserTrades {
-            user: wallet_hex.clone(),
-        }
-        .url(&self.base_url);
-
         let mut new_trades: Vec<RawTrade> = Vec::new();
-        let mut offset: u32 = 0;
 
-        'pages: loop {
-            if offset >= MAX_POLYMARKET_OFFSET {
-                break;
+        // ── Phase 1: Backward fill ────────────────────────────────────────────
+        // Cold start: no initial end cursor (fetch from present backward).
+        // Incremental: begin at oldest_cached_ts - 1 to fill any gap below cache floor.
+        // end is inclusive: advance cursor to min(page_timestamps) - 1 each page.
+        let mut end_cursor: Option<i64> = ts_bounds.map(|(oldest, _)| oldest - 1);
+
+        'backward: loop {
+            let url = PolymarketEndpoint::UserTradeActivity {
+                user: wallet_hex.clone(),
+                end: end_cursor,
+                start: None,
             }
-            let url = format!("{endpoint}&limit={TRADE_FETCH_LIMIT}&offset={offset}");
+            .url(&self.base_url);
 
             // Retry indefinitely on HTTP 429 — rate limiting is transient and
             // skipping a wallet on rate limit would permanently lose its trades.
@@ -206,26 +221,110 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                 }
             })?;
 
+            if page.is_empty() {
+                break 'backward;
+            }
+
             // Sort newest-first (defensive; API normally returns this order).
             page.sort_by_key(|t| std::cmp::Reverse(t.timestamp.0));
 
-            let mut consecutive_known: usize = 0;
+            let min_ts = page
+                .iter()
+                .map(|t| t.timestamp.0.unix_timestamp())
+                .min()
+                .unwrap_or(0);
+
             for trade in page {
-                if known_ids.contains(&trade.source_trade_id) {
-                    consecutive_known += 1;
-                    if consecutive_known >= INCREMENTAL_STOP_THRESHOLD {
-                        break 'pages;
-                    }
-                } else {
-                    consecutive_known = 0;
+                if !known_ids.contains(&trade.source_trade_id) {
                     new_trades.push(trade);
                 }
             }
 
             if raw_count < TRADE_FETCH_LIMIT as usize {
-                break;
+                break 'backward;
             }
-            offset += TRADE_FETCH_LIMIT;
+
+            // Advance cursor: end is inclusive, subtract 1 to exclude current minimum.
+            end_cursor = Some(min_ts - 1);
+        }
+
+        // ── Phase 2: Forward fill (incremental only) ──────────────────────────
+        // Walk forward from newest cached trade to pick up new trades.
+        // start is exclusive: advance to max(page_timestamps) each page so the next
+        // request returns only trades strictly newer than those already seen.
+        if let Some((_, newest_ts)) = ts_bounds {
+            let mut start_cursor = newest_ts;
+            let mut consecutive_known: usize = 0;
+
+            'forward: loop {
+                let url = PolymarketEndpoint::UserTradeActivity {
+                    user: wallet_hex.clone(),
+                    end: None,
+                    start: Some(start_cursor),
+                }
+                .url(&self.base_url);
+
+                let bytes = loop {
+                    match self.fetcher.fetch_page(&url).await {
+                        Ok(b) => break b,
+                        Err(SourceError::RateLimited { retry_after_secs }) => {
+                            let wait = Duration::from_secs(u64::from(retry_after_secs).max(1));
+                            tracing::warn!(
+                                wallet = %wallet_hex,
+                                retry_after_secs,
+                                "polymarket: rate limited, retrying page after backoff"
+                            );
+                            tokio::time::sleep(wait).await;
+                        }
+                        Err(e) => {
+                            return Err(BootstrapError::Polymarket {
+                                wallet: wallet_hex.clone(),
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                };
+
+                let (mut page, raw_count) =
+                    parse_trades_with_count(&bytes, wallet).map_err(|e| {
+                        BootstrapError::TradeParse {
+                            wallet: wallet_hex.clone(),
+                            message: e,
+                        }
+                    })?;
+
+                if page.is_empty() {
+                    break 'forward;
+                }
+
+                // Sort newest-first (defensive).
+                page.sort_by_key(|t| std::cmp::Reverse(t.timestamp.0));
+
+                let max_ts = page
+                    .iter()
+                    .map(|t| t.timestamp.0.unix_timestamp())
+                    .max()
+                    .unwrap_or(0);
+
+                for trade in page {
+                    if known_ids.contains(&trade.source_trade_id) {
+                        consecutive_known += 1;
+                        if consecutive_known >= INCREMENTAL_STOP_THRESHOLD {
+                            break 'forward;
+                        }
+                    } else {
+                        consecutive_known = 0;
+                        new_trades.push(trade);
+                    }
+                }
+
+                if raw_count < TRADE_FETCH_LIMIT as usize {
+                    break;
+                }
+
+                // Advance cursor: start is exclusive, so max_ts excludes the current page max.
+                start_cursor = max_ts;
+            }
         }
 
         Ok(new_trades)
@@ -371,14 +470,34 @@ mod tests {
         format!("[{}]", entries.join(",")).into_bytes()
     }
 
-    fn trade_url(wallet: WalletAddress, offset: u32) -> String {
-        format!(
-            "{}&limit={TRADE_FETCH_LIMIT}&offset={offset}",
-            PolymarketEndpoint::UserTrades {
-                user: wallet.to_string()
-            }
-            .url(BASE_URL)
-        )
+    /// Cold-start URL: no end/start cursor.
+    fn trade_url_cold(wallet: WalletAddress) -> String {
+        PolymarketEndpoint::UserTradeActivity {
+            user: wallet.to_string(),
+            end: None,
+            start: None,
+        }
+        .url(BASE_URL)
+    }
+
+    /// Backward-fill URL with an inclusive `end` timestamp cursor.
+    fn trade_url_end(wallet: WalletAddress, end: i64) -> String {
+        PolymarketEndpoint::UserTradeActivity {
+            user: wallet.to_string(),
+            end: Some(end),
+            start: None,
+        }
+        .url(BASE_URL)
+    }
+
+    /// Forward-fill URL with an exclusive `start` timestamp cursor.
+    fn trade_url_start(wallet: WalletAddress, start: i64) -> String {
+        PolymarketEndpoint::UserTradeActivity {
+            user: wallet.to_string(),
+            end: None,
+            start: Some(start),
+        }
+        .url(BASE_URL)
     }
 
     fn parse(bytes: &[u8]) -> Vec<RawTrade> {
@@ -447,14 +566,21 @@ mod tests {
         assert_eq!(trades.len(), 1);
     }
 
+    // ── Pagination: cold start ────────────────────────────────────────────────
+
     #[tokio::test]
     async fn pagination_concatenates_two_full_pages() {
+        // PASS: two full pages fetched via backward cursor walk → 1000 trades in cache.
+        // page_json_n(500, i, ts_base): hash_offset i, ts decreasing from ts_base.
+        // min_ts of page N = ts_base - 499 → next end = ts_base - 500.
         let wallet = wallet_a();
         let mut responses = HashMap::new();
-        // Each page uses a distinct hash range to avoid dedup across pages.
-        responses.insert(trade_url(wallet, 0), page_json_n(500, 0, 2_000_000));
-        responses.insert(trade_url(wallet, 500), page_json_n(500, 500, 1_500_000));
-        responses.insert(trade_url(wallet, 1000), page_json_n(0, 1000, 0));
+        // Page 1: ts 3500..3001, min=3001, next end=3000
+        responses.insert(trade_url_cold(wallet), page_json_n(500, 0, 3500));
+        // Page 2: ts 3000..2501, min=2501, next end=2500
+        responses.insert(trade_url_end(wallet, 3000), page_json_n(500, 500, 3000));
+        // Page 3: empty → stop
+        responses.insert(trade_url_end(wallet, 2500), page_json_n(0, 1000, 0));
 
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
@@ -469,7 +595,7 @@ mod tests {
     async fn pagination_stops_on_partial_page() {
         let wallet = wallet_a();
         let mut responses = HashMap::new();
-        responses.insert(trade_url(wallet, 0), page_json_n(499, 0, 2_000_000));
+        responses.insert(trade_url_cold(wallet), page_json_n(499, 0, 2_000_000));
 
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
@@ -481,12 +607,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_fetch_cold_start_fetches_everything() {
+        let wallet = wallet_a();
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(wallet), page_json_n(10, 0, 2_000_000));
+
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert_eq!(cache.trade_count(), 10);
+    }
+
+    // ── Pagination: incremental / forward fill ────────────────────────────────
+
+    #[tokio::test]
     async fn incremental_fetch_stops_after_k_consecutive_known_ids() {
+        // PASS: forward fill appends 2 new trades then stops on 3 consecutive known IDs.
         let wallet = wallet_a();
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-        // Cold run: populate cache with 5 old trades.
+        // Cold run: 5 old trades (partial page → stops, no further backward cursor).
         let old_page = page_json_hashes(&[
             ("0xold1", 1_000_005),
             ("0xold2", 1_000_004),
@@ -494,13 +637,18 @@ mod tests {
             ("0xold4", 1_000_002),
             ("0xold5", 1_000_001),
         ]);
+        // oldest=1_000_001, newest=1_000_005
         let mut r_cold = HashMap::new();
-        r_cold.insert(trade_url(wallet, 0), old_page);
-        let b_cold = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold));
-        b_cold.fetch_all(&[wallet], &mut cache).await.unwrap();
+        r_cold.insert(trade_url_cold(wallet), old_page);
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold))
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .unwrap();
         assert_eq!(cache.trade_count(), 5);
 
-        // Incremental run: 2 new trades, then old1..old5 (3 consecutive known → stop).
+        // Incremental run:
+        //   Phase 1 backward (end = 1_000_001 - 1 = 1_000_000) → empty → stop.
+        //   Phase 2 forward (start = 1_000_005): page with 2 new then 3 consecutive known.
         let incr_page = page_json_hashes(&[
             ("0xnew1", 2_000_002),
             ("0xnew2", 2_000_001),
@@ -511,26 +659,87 @@ mod tests {
             ("0xold5", 1_000_001), // not reached
         ]);
         let mut r_incr = HashMap::new();
-        r_incr.insert(trade_url(wallet, 0), incr_page);
-        let b_incr = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr));
-        b_incr.fetch_all(&[wallet], &mut cache).await.unwrap();
+        r_incr.insert(trade_url_end(wallet, 1_000_000), page_json_n(0, 0, 0));
+        r_incr.insert(trade_url_start(wallet, 1_000_005), incr_page);
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr))
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .unwrap();
 
         assert_eq!(cache.trade_count(), 7, "5 old + 2 new = 7");
     }
 
-    #[tokio::test]
-    async fn incremental_fetch_cold_start_fetches_everything() {
-        let wallet = wallet_a();
-        let mut responses = HashMap::new();
-        responses.insert(trade_url(wallet, 0), page_json_n(10, 0, 2_000_000));
+    // ── Pagination: backward fill fills history below cache floor ─────────────
 
+    #[tokio::test]
+    async fn incremental_backward_fill_fetches_history_below_cache_floor() {
+        // PASS: second run's backward phase appends 3 historical trades older than the cache
+        //       floor while the forward phase finds no new trades.
+        let wallet = wallet_a();
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
-        bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
-        assert_eq!(cache.trade_count(), 10);
+        // Cold run: 3 trades (partial page). oldest=998, newest=1000.
+        let cold_page =
+            page_json_hashes(&[("0xrecent1", 1000), ("0xrecent2", 999), ("0xrecent3", 998)]);
+        let mut r_cold = HashMap::new();
+        r_cold.insert(trade_url_cold(wallet), cold_page);
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_cold))
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .unwrap();
+        assert_eq!(cache.trade_count(), 3);
+
+        // Incremental run:
+        //   Phase 1 backward (end = 998 - 1 = 997) → 3 historical trades (partial) → stop.
+        //   Phase 2 forward (start = 1000) → empty → stop.
+        let hist_page = page_json_hashes(&[("0xhist1", 500), ("0xhist2", 499), ("0xhist3", 498)]);
+        let mut r_incr = HashMap::new();
+        r_incr.insert(trade_url_end(wallet, 997), hist_page);
+        r_incr.insert(trade_url_start(wallet, 1000), page_json_n(0, 0, 0));
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r_incr))
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .unwrap();
+
+        assert_eq!(cache.trade_count(), 6, "3 recent + 3 historical = 6");
     }
+
+    // ── Pagination: beyond old offset-3000 cap ────────────────────────────────
+
+    #[tokio::test]
+    async fn incremental_walk_walks_past_offset_3000_equivalent() {
+        // PASS: cursor walk fetches 3500 trades — 500 more than the old offset=3000 hard cap.
+        // page_json_n(500, hash_off, ts_base): min_ts = ts_base - 499, next end = ts_base - 500.
+        let wallet = wallet_a();
+        let mut responses = HashMap::new();
+        // 7 full pages + 1 terminating empty page.
+        responses.insert(trade_url_cold(wallet), page_json_n(500, 0, 3500));
+        responses.insert(trade_url_end(wallet, 3000), page_json_n(500, 500, 3000));
+        responses.insert(trade_url_end(wallet, 2500), page_json_n(500, 1000, 2500));
+        responses.insert(trade_url_end(wallet, 2000), page_json_n(500, 1500, 2000));
+        responses.insert(trade_url_end(wallet, 1500), page_json_n(500, 2000, 1500));
+        responses.insert(trade_url_end(wallet, 1000), page_json_n(500, 2500, 1000));
+        responses.insert(trade_url_end(wallet, 500), page_json_n(500, 3000, 500));
+        // min_ts of last page = 500 - 499 = 1, next end = 0
+        responses.insert(trade_url_end(wallet, 0), page_json_n(0, 3500, 0));
+
+        let fetcher = FixtureFetcher::new(responses);
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.trade_count(),
+            3500,
+            "all 3500 trades must be fetched without offset cap"
+        );
+    }
+
+    // ── Rate limiting ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn rate_limited_page_is_retried_not_skipped() {
@@ -538,7 +747,7 @@ mod tests {
         // FAIL: cache is empty (wallet was skipped on rate limit).
         let wallet = wallet_a();
         let mut responses = HashMap::new();
-        responses.insert(trade_url(wallet, 0), page_json_n(5, 0, 2_000_000));
+        responses.insert(trade_url_cold(wallet), page_json_n(5, 0, 2_000_000));
 
         let inner = FixtureFetcher::new(responses);
         let fetcher = RateLimitThenSucceedFetcher::new(inner, 3);
@@ -574,30 +783,35 @@ mod tests {
         );
     }
 
+    // ── Defensive sort ────────────────────────────────────────────────────────
+
     #[tokio::test]
     async fn page_sort_handles_out_of_order_api_response() {
-        // API returns page in ascending order (oldest-first). After defensive sort
-        // (newest-first), new trade appears before known trades → gets appended.
+        // Forward-fill page arrives oldest-first (ascending). After defensive sort
+        // (newest-first): new1 appears before known trades → appended; then 3
+        // consecutive known IDs trigger the stop threshold.
         let wallet = wallet_a();
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-        // Cold run: store 3 old trades.
+        // Cold run: 3 old trades (partial). oldest=1_000_001, newest=1_000_003.
         let old_page = page_json_hashes(&[
             ("0xold1", 1_000_003),
             ("0xold2", 1_000_002),
             ("0xold3", 1_000_001),
         ]);
         let mut r1 = HashMap::new();
-        r1.insert(trade_url(wallet, 0), old_page);
+        r1.insert(trade_url_cold(wallet), old_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r1))
             .fetch_all(&[wallet], &mut cache)
             .await
             .unwrap();
 
-        // Incremental: page arrives oldest-first (ascending timestamps).
-        // After sort → new1(2M), old1(1_000_003), old2(1_000_002), old3(1_000_001).
-        // new1 unknown → append; old1 known(1), old2 known(2), old3 known(3) → stop.
+        // Incremental run:
+        //   Phase 1 backward (end = 1_000_001 - 1 = 1_000_000) → empty.
+        //   Phase 2 forward (start = 1_000_003): page arrives ascending (oldest-first).
+        //   After sort → [new1(2M), old1(1M+3), old2(1M+2), old3(1M+1)] → append new1,
+        //   then 3 consecutive known → stop.
         let reversed_page = page_json_hashes(&[
             ("0xold3", 1_000_001),
             ("0xold2", 1_000_002),
@@ -605,7 +819,8 @@ mod tests {
             ("0xnew1", 2_000_000),
         ]);
         let mut r2 = HashMap::new();
-        r2.insert(trade_url(wallet, 0), reversed_page);
+        r2.insert(trade_url_end(wallet, 1_000_000), page_json_n(0, 0, 0));
+        r2.insert(trade_url_start(wallet, 1_000_003), reversed_page);
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(r2))
             .fetch_all(&[wallet], &mut cache)
             .await

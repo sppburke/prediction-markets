@@ -1,0 +1,4 @@
+[
+  {"transactionHash":"0xtx1","conditionId":"0xcond1","side":"BUY","size":50,"price":0.65,"timestamp":1700100000,"outcomeIndex":0},
+  {"transactionHash":"0xtx2","conditionId":"0xcond1","side":"SELL","size":20,"price":0.70,"timestamp":1700100060,"outcomeIndex":0}
+]

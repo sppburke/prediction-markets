@@ -1,6 +1,6 @@
 //! Per-wallet Polymarket trade poller.
 //!
-//! Polls `UserTrades` for every watchlisted wallet on a fixed interval and pushes
+//! Polls `UserTradeActivity` for every watchlisted wallet on a fixed interval and pushes
 //! parsed [`IncomingTrade`]s into a bounded mpsc channel for the orchestrator.
 //! This module contains all the I/O for Polymarket trade ingestion; the orchestrator
 //! itself is pure dispatch logic.
@@ -55,8 +55,12 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     pub async fn run(self) {
         loop {
             for &wallet in &self.wallets {
-                let url = PolymarketEndpoint::UserTrades {
+                // Stateless single-page poll; no cursor needed — downstream dedup by
+                // source_trade_id handles any overlap between rounds.
+                let url = PolymarketEndpoint::UserTradeActivity {
                     user: format!("{wallet}"),
+                    end: None,
+                    start: None,
                 }
                 .url(&self.config.base_url);
 

@@ -1,4 +1,4 @@
-//! Parse Polymarket `UserTrades` API responses into typed [`IncomingTrade`]s.
+//! Parse Polymarket `UserTradeActivity` API responses into typed [`IncomingTrade`]s.
 
 use pe_copy_signal_engine::IncomingTrade;
 use pe_core_types::{ContractQty, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
@@ -22,10 +22,10 @@ pub enum TradeParseError {
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
-// GET /trades?user=<wallet> returns a JSON array directly (no wrapper object).
+// GET /activity?user=<wallet>&type=TRADE returns a JSON array directly (no wrapper object).
 type TradeResponse = Vec<RawTrade>;
 
-// Field names match the camelCase keys returned by GET /trades?user=<wallet>.
+// Field names match the camelCase keys returned by GET /activity?type=TRADE.
 // size and price arrive as JSON numbers; rust_decimal's serde feature handles
 // both number and string representations.
 #[derive(Deserialize)]
@@ -49,7 +49,7 @@ struct RawTrade {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
-/// Parse a raw `UserTrades` response for `wallet` into a vec of [`IncomingTrade`]s.
+/// Parse a raw `UserTradeActivity` response for `wallet` into a vec of [`IncomingTrade`]s.
 ///
 /// Trades whose size cannot be converted to u64 are skipped with a warning log;
 /// other parse errors return `Err`.

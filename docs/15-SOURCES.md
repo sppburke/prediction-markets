@@ -58,7 +58,7 @@
 | https://docs.polymarket.com/trading/bridge/status | — | — |
 | https://docs.polymarket.com/developers/contracts | — | — |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets | 2026-05-05 | 2026-07-04 |
+| https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-05-09 | 2026-07-08 |
 
 ## Public sources
 

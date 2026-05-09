@@ -555,6 +555,22 @@ impl WalletCache {
         }
     }
 
+    /// Returns `(oldest_ts, newest_ts)` for `wallet_hex`, or `None` if no trades cached.
+    ///
+    /// # Precondition
+    /// Returns `None` when called before any trades have been ingested for this wallet.
+    pub fn trade_ts_bounds(&self, wallet_hex: &str) -> Result<Option<(i64, i64)>, BootstrapError> {
+        let result: (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT MIN(timestamp_unix), MAX(timestamp_unix) FROM trades WHERE wallet_hex = ?1",
+            params![wallet_hex],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )?;
+        match result {
+            (Some(min), Some(max)) => Ok(Some((min, max))),
+            _ => Ok(None),
+        }
+    }
+
     /// Minimum `timestamp_unix` across all rows in `trades`.
     /// Returns 0 when the table is empty.
     pub fn min_trade_unix(&self) -> Result<i64, BootstrapError> {
