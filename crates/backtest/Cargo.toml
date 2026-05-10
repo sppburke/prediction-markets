@@ -41,6 +41,7 @@ pe-strategy-winner-follow     = { path = "../strategy-winner-follow",  version =
 pe-trader-index               = { path = "../trader-index",            version = "0.1.0" }
 
 figment         = { workspace = true }
+rayon           = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }
 serde           = { workspace = true }

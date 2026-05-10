@@ -10,8 +10,9 @@ use pe_backtest::report::{KellySweepReport, KellySweepRun};
 use pe_backtest::simulation;
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::dune::DuneClient;
-use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
+use pe_strategy_winner_follow::WinnerFollowStrategy;
 use pe_trader_index::{LedgerConfig, RankerConfig};
+use rayon::prelude::*;
 use time::OffsetDateTime;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -146,41 +147,36 @@ async fn main() -> Result<(), BacktestError> {
 
     if let Some(fractions) = &config.kelly_sweep_fractions {
         // ── Sweep mode ──────────────────────────────────────────────────────────
+        //
+        // All fractions execute in parallel via rayon. The simulation kernel is pure
+        // and per-fraction state is stack-local, so each run is fully independent.
+        // Cap thread count via `RAYON_NUM_THREADS` env var (no plumbing in TOML).
+        // Log lines from concurrent threads interleave by arrival order — query by
+        // structured `kelly_fraction` and `thread` fields, not line position.
         info!(
             fractions = fractions.len(),
-            "backtest: Kelly sweep mode — starting sequential runs"
+            "backtest: Kelly sweep mode — starting parallel runs"
         );
-        let mut runs: Vec<KellySweepRun> = Vec::with_capacity(fractions.len());
-        for &kf in fractions {
-            let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
-                kelly_fraction_override: Some(kf),
-                ..config.strategy.clone()
-            });
-            info!(kelly_fraction = %kf.0, "backtest: sweep run starting");
-            let report = simulation::run_simulation(
-                &config,
-                all_trades.clone(),
-                &funder_timeline,
-                &snapshots,
-                &resolutions,
-                &schedules,
-                &ranker_config,
-                &LedgerConfig::default(),
-                &strategy,
-                false, // suppress per-run output
-            )?;
-            info!(
-                kelly_fraction = %kf.0,
-                total_pnl_usd = %report.total_pnl_usd,
-                sharpe_ratio = %report.sharpe_ratio,
-                max_drawdown_pct = %report.max_drawdown_pct,
-                "backtest: sweep run complete"
-            );
-            runs.push(KellySweepRun {
-                kelly_fraction: kf,
-                report,
-            });
-        }
+        let ledger_config = LedgerConfig::default();
+        let ctx = simulation::SweepContext {
+            config: &config,
+            all_trades: &all_trades,
+            funder_timeline: &funder_timeline,
+            snapshots: &snapshots,
+            resolutions: &resolutions,
+            schedules: &schedules,
+            ranker_config: &ranker_config,
+            ledger_config: &ledger_config,
+        };
+        let mut runs: Vec<KellySweepRun> = fractions
+            .par_iter()
+            .map(|&kf| simulation::run_one_kelly_fraction(kf, &ctx))
+            .collect::<Result<Vec<_>, BacktestError>>()?;
+        // Sort by kelly_fraction so output is field-equal across runs regardless
+        // of rayon scheduling. KellyFraction derives Ord (Decimal is Ord; the
+        // [0, 1] constructor invariant rules out any NaN-equivalent), so a
+        // total-order sort is well-defined.
+        runs.sort_unstable_by_key(|run| run.kelly_fraction);
         let mut sweep_report = KellySweepReport {
             runs,
             cache_path: config.bootstrap_cache_path.clone(),

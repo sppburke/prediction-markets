@@ -48,6 +48,7 @@ futures = "0.3"
 governor = "0.7"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
+rayon = "1"
 rust_decimal = { version = "1", features = ["serde", "maths"] }
 rust_decimal_macros = "1"
 schemars = "0.8"
@@ -87,6 +88,10 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
 
 [profile.bench]
 inherits = "release"
