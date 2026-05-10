@@ -4,12 +4,17 @@
 //! 1. `override_changes_sizing_vs_default` — `kelly_fraction_override: Some(kf)` causes
 //!    `WinnerFollowStrategy::evaluate()` to produce more contracts than the default fraction.
 //!    Tested at the evaluate() layer to avoid the simulation's per-trade risk cap.
-//! 2. `sweep_produces_correct_run_count` — a 3-fraction sweep produces exactly 3 runs in
-//!    `KellySweepReport`.
+//! 2. `sweep_produces_correct_run_count` — a 3-fraction sweep via `run_one_kelly_fraction`
+//!    produces exactly 3 runs in `KellySweepReport`.
 //! 3. `higher_fraction_yields_more_contracts` — across [0.10, 0.25, 0.50, 0.75, 1.0],
 //!    contract count from evaluate() increases monotonically with the Kelly fraction.
 //! 4. `to_markdown_table_covers_all_runs` — the markdown table contains one row per run.
 //! 5. `sweep_suppresses_per_run_output` — per-run report.json is NOT written in sweep mode.
+//! 6. `parallel_sweep_matches_sequential` — equivalence: rayon `par_iter` sweep produces
+//!    identical results (per-fraction PnL, copy count) to a sequential reference run on the
+//!    same fixture, after sorting by `kelly_fraction`.
+//! 7. `parallel_sweep_is_deterministic` — parallel sweep run twice on identical inputs
+//!    yields field-equal results (no floating-point reordering, no race-induced state).
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -19,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::{KellySweepReport, KellySweepRun, WinnerFollowReport};
-use pe_backtest::simulation::run_simulation;
+use pe_backtest::simulation::{SweepContext, run_one_kelly_fraction, run_simulation};
 use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
@@ -31,6 +36,7 @@ use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use rayon::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -231,8 +237,8 @@ fn override_changes_sizing_vs_default() {
 
 // ── Scenario 2 ─────────────────────────────────────────────────────────────────
 
-/// PASS: a 3-fraction sweep produces a `KellySweepReport` with exactly 3 runs,
-///       each tagged with its own fraction.
+/// PASS: a 3-fraction sweep via `run_one_kelly_fraction` produces a `KellySweepReport`
+///       with exactly 3 runs, each tagged with its own fraction.
 /// FAIL: run count ≠ 3, or fractions are mistagged.
 #[tokio::test]
 async fn sweep_produces_correct_run_count() {
@@ -250,30 +256,22 @@ async fn sweep_produces_correct_run_count() {
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
+    let ledger_config = LedgerConfig::default();
+
+    let ctx = SweepContext {
+        config: &config,
+        all_trades: &trades,
+        funder_timeline: &timeline,
+        snapshots: &snapshots,
+        resolutions: &resolutions,
+        schedules: &ScheduleIndex::new(),
+        ranker_config: &ranker,
+        ledger_config: &ledger_config,
+    };
 
     let mut runs: Vec<KellySweepRun> = Vec::new();
     for &kf in &fractions {
-        let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
-            kelly_fraction_override: Some(kf),
-            ..WinnerFollowConfig::default()
-        });
-        let report = run_simulation(
-            &config,
-            trades.clone(),
-            &timeline,
-            &snapshots,
-            &resolutions,
-            &ScheduleIndex::new(),
-            &ranker,
-            &LedgerConfig::default(),
-            &strategy,
-            false,
-        )
-        .unwrap();
-        runs.push(KellySweepRun {
-            kelly_fraction: kf,
-            report,
-        });
+        runs.push(run_one_kelly_fraction(kf, &ctx).unwrap());
     }
 
     assert_eq!(runs.len(), 3, "expected 3 sweep runs");
@@ -415,4 +413,334 @@ async fn sweep_suppresses_per_run_output() {
         !report_path.exists(),
         "report.json must not be written when write_output=false (sweep mode)"
     );
+}
+
+// ── Scenario 6 ─────────────────────────────────────────────────────────────────
+
+/// Equivalence: rayon `par_iter` sweep produces identical per-fraction results
+/// to a sequential reference run on the same fixture.
+///
+/// PASS: after sort by `kelly_fraction`, each `(kelly_fraction, total_pnl_usd, total_copies)`
+///       triple is identical between sequential and parallel result vectors.
+/// FAIL: any field differs — implies parallelism introduced shared mutable state,
+///       FP non-associativity in a sum reduction, or an order-dependent code path.
+#[tokio::test]
+async fn parallel_sweep_matches_sequential() {
+    let winner = wallet(WINNER_HEX);
+    let funder = wallet(FUNDER_HEX);
+    let trades = generate_winner_trades(winner);
+    let fractions = vec![kf(dec!(0.10)), kf(dec!(0.50)), kf(dec!(1.0))];
+    let dir = TempDir::new().unwrap();
+    let config = BacktestConfig {
+        kelly_sweep_fractions: Some(fractions.clone()),
+        ..base_config(&dir)
+    };
+    let timeline = make_timeline(&dir, &[(winner, funder)]);
+    let resolutions = ResolutionIndex::new();
+    let snapshots = LeaderboardSnapshots::default();
+    let ranker = relaxed_ranker();
+    let ledger_config = LedgerConfig::default();
+    let schedules = ScheduleIndex::new();
+
+    let ctx = SweepContext {
+        config: &config,
+        all_trades: &trades,
+        funder_timeline: &timeline,
+        snapshots: &snapshots,
+        resolutions: &resolutions,
+        schedules: &schedules,
+        ranker_config: &ranker,
+        ledger_config: &ledger_config,
+    };
+
+    // Sequential reference.
+    let mut sequential: Vec<KellySweepRun> = Vec::new();
+    for &kf in &fractions {
+        sequential.push(run_one_kelly_fraction(kf, &ctx).unwrap());
+    }
+    sequential.sort_unstable_by_key(|r| r.kelly_fraction);
+
+    // Parallel under test.
+    let mut parallel: Vec<KellySweepRun> = fractions
+        .par_iter()
+        .map(|&kf| run_one_kelly_fraction(kf, &ctx))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    parallel.sort_unstable_by_key(|r| r.kelly_fraction);
+
+    assert_eq!(
+        sequential.len(),
+        parallel.len(),
+        "run count differs: sequential={}, parallel={}",
+        sequential.len(),
+        parallel.len()
+    );
+    for (seq, par) in sequential.iter().zip(parallel.iter()) {
+        assert_eq!(
+            seq.kelly_fraction, par.kelly_fraction,
+            "kelly_fraction differs at sorted position"
+        );
+        assert_eq!(
+            seq.report.total_pnl_usd, par.report.total_pnl_usd,
+            "total_pnl_usd differs at kf={}: seq={}, par={}",
+            seq.kelly_fraction.0, seq.report.total_pnl_usd, par.report.total_pnl_usd
+        );
+        assert_eq!(
+            seq.report.total_copies, par.report.total_copies,
+            "total_copies differs at kf={}: seq={}, par={}",
+            seq.kelly_fraction.0, seq.report.total_copies, par.report.total_copies
+        );
+        assert_eq!(
+            seq.report.win_rate_pct, par.report.win_rate_pct,
+            "win_rate_pct differs at kf={}",
+            seq.kelly_fraction.0
+        );
+        assert_eq!(
+            seq.report.bankroll_final, par.report.bankroll_final,
+            "bankroll_final differs at kf={}",
+            seq.kelly_fraction.0
+        );
+        assert_eq!(
+            seq.report.open_at_horizon, par.report.open_at_horizon,
+            "open_at_horizon differs at kf={}",
+            seq.kelly_fraction.0
+        );
+    }
+}
+
+// ── Scenario 7 ─────────────────────────────────────────────────────────────────
+
+/// Determinism: parallel sweep run twice on identical inputs yields field-equal
+/// results. Catches FP reordering and any race-induced state.
+///
+/// PASS: both runs produce the same `(kelly_fraction, total_pnl_usd, total_copies,
+///       sharpe_ratio, max_drawdown_pct, bankroll_final)` after sorting by fraction.
+/// FAIL: any field differs across the two runs.
+///
+/// Note: does NOT compare serialized JSON bytes — `WinnerFollowReport.per_operator_pnl`
+/// is a `HashMap<String, Decimal>` which iterates in `RandomState`-driven order, making
+/// byte-identical serialization impossible without a `BTreeMap` migration (out of scope).
+#[tokio::test]
+async fn parallel_sweep_is_deterministic() {
+    let winner = wallet(WINNER_HEX);
+    let funder = wallet(FUNDER_HEX);
+    let trades = generate_winner_trades(winner);
+    let fractions = vec![
+        kf(dec!(0.10)),
+        kf(dec!(0.25)),
+        kf(dec!(0.50)),
+        kf(dec!(0.75)),
+        kf(dec!(1.0)),
+    ];
+    let dir = TempDir::new().unwrap();
+    let config = BacktestConfig {
+        kelly_sweep_fractions: Some(fractions.clone()),
+        ..base_config(&dir)
+    };
+    let timeline = make_timeline(&dir, &[(winner, funder)]);
+    let resolutions = ResolutionIndex::new();
+    let snapshots = LeaderboardSnapshots::default();
+    let ranker = relaxed_ranker();
+    let ledger_config = LedgerConfig::default();
+    let schedules = ScheduleIndex::new();
+
+    let ctx = SweepContext {
+        config: &config,
+        all_trades: &trades,
+        funder_timeline: &timeline,
+        snapshots: &snapshots,
+        resolutions: &resolutions,
+        schedules: &schedules,
+        ranker_config: &ranker,
+        ledger_config: &ledger_config,
+    };
+
+    let run_parallel = || -> Vec<KellySweepRun> {
+        let mut v: Vec<KellySweepRun> = fractions
+            .par_iter()
+            .map(|&kf| run_one_kelly_fraction(kf, &ctx))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        v.sort_unstable_by_key(|r| r.kelly_fraction);
+        v
+    };
+
+    let first = run_parallel();
+    let second = run_parallel();
+
+    assert_eq!(first.len(), 5);
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.kelly_fraction, b.kelly_fraction);
+        assert_eq!(
+            a.report.total_pnl_usd, b.report.total_pnl_usd,
+            "total_pnl_usd not deterministic at kf={}: first={}, second={}",
+            a.kelly_fraction.0, a.report.total_pnl_usd, b.report.total_pnl_usd
+        );
+        assert_eq!(
+            a.report.total_copies, b.report.total_copies,
+            "total_copies not deterministic at kf={}",
+            a.kelly_fraction.0
+        );
+        assert_eq!(
+            a.report.sharpe_ratio, b.report.sharpe_ratio,
+            "sharpe_ratio not deterministic at kf={}",
+            a.kelly_fraction.0
+        );
+        assert_eq!(
+            a.report.max_drawdown_pct, b.report.max_drawdown_pct,
+            "max_drawdown_pct not deterministic at kf={}",
+            a.kelly_fraction.0
+        );
+        assert_eq!(
+            a.report.bankroll_final, b.report.bankroll_final,
+            "bankroll_final not deterministic at kf={}",
+            a.kelly_fraction.0
+        );
+        assert_eq!(
+            a.report.win_rate_pct, b.report.win_rate_pct,
+            "win_rate_pct not deterministic at kf={}",
+            a.kelly_fraction.0
+        );
+    }
+}
+
+// ── Scenario 8 ─────────────────────────────────────────────────────────────────
+
+/// Output ordering: regardless of the input fraction order or rayon completion order,
+/// the post-sort output `runs` vector is in ascending `kelly_fraction` order.
+///
+/// PASS: `runs[i].kelly_fraction < runs[i+1].kelly_fraction` for all adjacent pairs.
+/// FAIL: any pair is out of order — `sort_unstable_by_key` is not being applied,
+///       or `KellyFraction`'s `Ord` impl is broken.
+#[tokio::test]
+async fn parallel_sweep_output_sorted_by_fraction() {
+    let winner = wallet(WINNER_HEX);
+    let funder = wallet(FUNDER_HEX);
+    let trades = generate_winner_trades(winner);
+    // Deliberately scrambled input order — output must be sorted regardless.
+    let fractions = vec![
+        kf(dec!(0.75)),
+        kf(dec!(0.10)),
+        kf(dec!(1.0)),
+        kf(dec!(0.25)),
+        kf(dec!(0.50)),
+    ];
+    let dir = TempDir::new().unwrap();
+    let config = BacktestConfig {
+        kelly_sweep_fractions: Some(fractions.clone()),
+        ..base_config(&dir)
+    };
+    let timeline = make_timeline(&dir, &[(winner, funder)]);
+    let resolutions = ResolutionIndex::new();
+    let snapshots = LeaderboardSnapshots::default();
+    let ranker = relaxed_ranker();
+    let ledger_config = LedgerConfig::default();
+    let schedules = ScheduleIndex::new();
+
+    let ctx = SweepContext {
+        config: &config,
+        all_trades: &trades,
+        funder_timeline: &timeline,
+        snapshots: &snapshots,
+        resolutions: &resolutions,
+        schedules: &schedules,
+        ranker_config: &ranker,
+        ledger_config: &ledger_config,
+    };
+
+    let mut runs: Vec<KellySweepRun> = fractions
+        .par_iter()
+        .map(|&kf| run_one_kelly_fraction(kf, &ctx))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    runs.sort_unstable_by_key(|r| r.kelly_fraction);
+
+    let expected = [
+        kf(dec!(0.10)),
+        kf(dec!(0.25)),
+        kf(dec!(0.50)),
+        kf(dec!(0.75)),
+        kf(dec!(1.0)),
+    ];
+    assert_eq!(runs.len(), expected.len());
+    for (run, exp) in runs.iter().zip(expected.iter()) {
+        assert_eq!(run.kelly_fraction, *exp);
+    }
+    // Strictly increasing.
+    for i in 1..runs.len() {
+        assert!(
+            runs[i - 1].kelly_fraction < runs[i].kelly_fraction,
+            "runs out of order: runs[{}].kf={} >= runs[{}].kf={}",
+            i - 1,
+            runs[i - 1].kelly_fraction.0,
+            i,
+            runs[i].kelly_fraction.0,
+        );
+    }
+}
+
+// ── Scenario 9 ─────────────────────────────────────────────────────────────────
+
+/// Single-fraction edge case: a sweep with exactly one fraction must produce
+/// exactly one run; rayon par_iter over a 1-element slice degenerates to a single
+/// task on the calling thread.
+///
+/// PASS: a 1-fraction sweep produces 1 run with the expected fraction.
+/// FAIL: any other run count, or fraction mismatch.
+#[tokio::test]
+async fn parallel_sweep_single_fraction() {
+    let winner = wallet(WINNER_HEX);
+    let funder = wallet(FUNDER_HEX);
+    let trades = generate_winner_trades(winner);
+    let fractions = vec![kf(dec!(0.50))];
+    let dir = TempDir::new().unwrap();
+    let config = BacktestConfig {
+        kelly_sweep_fractions: Some(fractions.clone()),
+        ..base_config(&dir)
+    };
+    let timeline = make_timeline(&dir, &[(winner, funder)]);
+    let resolutions = ResolutionIndex::new();
+    let snapshots = LeaderboardSnapshots::default();
+    let ranker = relaxed_ranker();
+    let ledger_config = LedgerConfig::default();
+    let schedules = ScheduleIndex::new();
+
+    let ctx = SweepContext {
+        config: &config,
+        all_trades: &trades,
+        funder_timeline: &timeline,
+        snapshots: &snapshots,
+        resolutions: &resolutions,
+        schedules: &schedules,
+        ranker_config: &ranker,
+        ledger_config: &ledger_config,
+    };
+
+    let runs: Vec<KellySweepRun> = fractions
+        .par_iter()
+        .map(|&kf| run_one_kelly_fraction(kf, &ctx))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].kelly_fraction, kf(dec!(0.50)));
+}
+
+// ── Scenario 10 ────────────────────────────────────────────────────────────────
+
+/// Compile-time assertion that `SweepContext<'a>` is `Send + Sync`. This is what
+/// makes `par_iter().map(|kf| run_one_kelly_fraction(kf, &ctx))` legal — without it,
+/// rayon would refuse to share the borrow across worker threads.
+///
+/// The function never runs (it's `#[allow(dead_code)]`). If the type ever loses
+/// `Send` or `Sync` (e.g. by adding a `Cell`, `RefCell`, `Rc`, or non-`Sync`
+/// embedded handle), this won't compile — a louder, earlier failure than waiting
+/// for the par_iter call site to break.
+#[allow(dead_code)]
+fn sweep_context_is_send_and_sync() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<SweepContext<'_>>();
+    assert_sync::<SweepContext<'_>>();
 }

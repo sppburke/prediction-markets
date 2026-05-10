@@ -3084,6 +3084,7 @@ dependencies = [
  "pe-source-onchain-polygon",
  "pe-strategy-winner-follow",
  "pe-trader-index",
+ "rayon",
  "reqwest 0.12.28",
  "rust_decimal",
  "rust_decimal_macros",

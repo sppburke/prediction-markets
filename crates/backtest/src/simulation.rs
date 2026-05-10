@@ -11,15 +11,15 @@ use std::path::Path;
 use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, LeaderAction, MarketId, OperatorId, OutcomeId, Probability, ProbabilityPpm,
-    Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
-    WinnerFollowSignalKind,
+    BasisPoints, KellyFraction, LeaderAction, MarketId, OperatorId, OutcomeId, Probability,
+    ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId,
+    WalletAddress, WinnerFollowSignalKind,
 };
 use pe_operator_graph::OperatorIdentity;
 use pe_risk_engine::RiskSnapshot;
 use pe_risk_engine::snapshot::TradingMode;
 use pe_source_core::SourceStatus;
-use pe_strategy_winner_follow::WinnerFollowStrategy;
+use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
 use pe_trader_index::snapshot::{RawTrade, TradeSnapshot};
 use pe_trader_index::{LedgerConfig, RankerConfig, build_trader_ledgers, build_watchlist};
@@ -32,7 +32,7 @@ use crate::config::BacktestConfig;
 use crate::error::BacktestError;
 use crate::funder_graph::{FunderGraphTimeline, build_operator_identities_at};
 use crate::report::{
-    PnlAccumulator, TradeFill, WinnerFollowReport, max_drawdown_pct, sharpe_ratio,
+    KellySweepRun, PnlAccumulator, TradeFill, WinnerFollowReport, max_drawdown_pct, sharpe_ratio,
 };
 
 // Warn threshold for expiry-filter suppression per quarter.
@@ -712,6 +712,91 @@ pub fn run_simulation(
     );
 
     Ok(report)
+}
+
+// ── Kelly-fraction sweep parallelism ──────────────────────────────────────────
+//
+// The sweep harness runs N independent simulations that differ only in the Kelly
+// sizing constant. `SweepContext<'a>` bundles the read-only inputs once so each
+// fraction's simulation can borrow them concurrently via rayon.
+//
+// Send + Sync rationale:
+// - All bundled fields are immutable shared borrows (`&T` where T: Send + Sync).
+// - `run_simulation` is a pure function over typed snapshots: zero global state,
+//   zero RNG, all per-fraction mutable state is stack-local (`bankroll`,
+//   `open_positions`, `exposure`, `pnl_accum`, accumulators, `suppression_tracker`).
+// - `WalletCache` (which wraps a non-`Sync` `rusqlite::Connection`) is deliberately
+//   excluded — by the time the sweep loop runs, all data has been moved out of the
+//   cache into the owned vectors and indices held by `main`.
+// - `fills_writer` is `None` in sweep mode (`write_output = false`), so no
+//   file-handle is shared across fraction threads.
+
+/// Read-only inputs shared by all Kelly-fraction sweep runs.
+///
+/// Constructed once in `main`, borrowed by `par_iter` across rayon threads.
+/// The struct itself contains only shared references — `Send + Sync` are
+/// derived automatically from the field types.
+pub struct SweepContext<'a> {
+    pub config: &'a BacktestConfig,
+    pub all_trades: &'a Vec<RawTrade>,
+    pub funder_timeline: &'a FunderGraphTimeline,
+    pub snapshots: &'a LeaderboardSnapshots,
+    pub resolutions: &'a ResolutionIndex,
+    pub schedules: &'a ScheduleIndex,
+    pub ranker_config: &'a RankerConfig,
+    pub ledger_config: &'a LedgerConfig,
+}
+
+/// Run a single Kelly-fraction iteration of the sweep against `ctx`.
+///
+/// Clones the input trade vector per call (matches the existing sequential loop
+/// — `run_simulation` takes ownership and sorts in place). Constructs a
+/// `WinnerFollowStrategy` whose `kelly_fraction_override = Some(kf)` and forwards
+/// to `run_simulation` with `write_output = false`. Per-fraction file outputs
+/// are suppressed; the caller serializes the combined `KellySweepReport`.
+///
+/// Logging: emits a structured `tracing::info!` at start and completion of each
+/// run with `kelly_fraction` and `thread` fields. Under rayon, lines from
+/// different threads will interleave in stdout — query by field, not by line
+/// position.
+pub fn run_one_kelly_fraction(
+    kf: KellyFraction,
+    ctx: &SweepContext<'_>,
+) -> Result<KellySweepRun, BacktestError> {
+    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
+        kelly_fraction_override: Some(kf),
+        ..ctx.config.strategy.clone()
+    });
+    let thread_id = format!("{:?}", std::thread::current().id());
+    info!(
+        kelly_fraction = %kf.0,
+        thread = %thread_id,
+        "backtest: sweep run starting"
+    );
+    let report = run_simulation(
+        ctx.config,
+        ctx.all_trades.clone(),
+        ctx.funder_timeline,
+        ctx.snapshots,
+        ctx.resolutions,
+        ctx.schedules,
+        ctx.ranker_config,
+        ctx.ledger_config,
+        &strategy,
+        false,
+    )?;
+    info!(
+        kelly_fraction = %kf.0,
+        thread = %thread_id,
+        total_pnl_usd = %report.total_pnl_usd,
+        sharpe_ratio = %report.sharpe_ratio,
+        max_drawdown_pct = %report.max_drawdown_pct,
+        "backtest: sweep run complete"
+    );
+    Ok(KellySweepRun {
+        kelly_fraction: kf,
+        report,
+    })
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
