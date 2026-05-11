@@ -475,11 +475,13 @@ pub fn run_simulation(
         // Build wallet → snapshot-appearance count for the snapshot-aware prior
         // (issue #129). Pre-built per snapshot transition so the O(S) scan in
         // `snapshot_appearances_up_to` amortises across all signals in this
-        // window. Skipped when snapshots are empty — `extra` will be 0
-        // everywhere via `unwrap_or(0)` + saturating-sub.
-        let snapshot_counts: HashMap<WalletAddress, u32> = if snapshots.is_empty() {
-            HashMap::new()
-        } else {
+        // window. When snapshots are empty (test fixtures or pre-snapshots
+        // caches) we have no visibility data, so the prior is disabled via the
+        // `snapshots_have_data` gate at the call site — otherwise `unwrap_or(0)`
+        // would feed `n_snaps = 0` to `saturating_sub`, producing the maximum
+        // `extra` for every signal (the opposite of "no data → no penalty").
+        let snapshots_have_data = !snapshots.is_empty();
+        let snapshot_counts: HashMap<WalletAddress, u32> = if snapshots_have_data {
             filtered_ledgers
                 .iter()
                 .map(|l| {
@@ -489,6 +491,8 @@ pub fn run_simulation(
                     )
                 })
                 .collect()
+        } else {
+            HashMap::new()
         };
 
         // Watchlisted wallets (Active + Incubator).
@@ -573,11 +577,18 @@ pub fn run_simulation(
                     // the candidate pool get symmetric extra pseudo-observations
                     // added to the Beta prior, weakening their thin empirical
                     // win-rate evidence. `unwrap_or(0)` is the defensive
-                    // max-penalty fallback — not reachable for leaders currently
-                    // on the leaderboard, since `filtered_ledgers` is built from
-                    // the current snapshot.
+                    // max-penalty fallback for leaders surprisingly missing from
+                    // `snapshot_counts` (should not reach this path in steady
+                    // state since `filtered_ledgers` is built from the current
+                    // snapshot). When `!snapshots_have_data` we have no
+                    // visibility signal at all — the prior is disabled.
                     total_signals_evaluated = total_signals_evaluated.saturating_add(1);
-                    let n_snaps = snapshot_counts.get(&leader).copied().unwrap_or(0);
+                    let n_snaps = if snapshots_have_data {
+                        snapshot_counts.get(&leader).copied().unwrap_or(0)
+                    } else {
+                        // Sentinel = `min_snapshots` so `saturating_sub` yields 0 → extra disabled.
+                        config.kelly_p_min_snapshots
+                    };
                     let extra = config
                         .kelly_p_min_snapshots
                         .saturating_sub(n_snaps)

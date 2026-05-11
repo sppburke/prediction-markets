@@ -312,17 +312,26 @@ async fn total_signals_evaluated_is_denominator() {
 
 // ── Scenario 5 ────────────────────────────────────────────────────────────────
 
-/// PASS: empty snapshots → simulation runs to completion; counters consistent.
-///       `unwrap_or(0)` fallback gives every leader n_snaps=0 → max extra.
-/// FAIL: panic on empty-snapshots path, or counters inconsistent.
+/// PASS: empty snapshots → prior is **disabled** (no visibility data → no
+///       strengthening). Counters consistent. This is the regression test for
+///       the call-site fix: without the `snapshots_have_data` gate,
+///       `unwrap_or(0)` would feed `n_snaps = 0` to `saturating_sub`,
+///       producing the *maximum* `extra` for every signal — the opposite of
+///       the intended "no data → no penalty" semantics.
+/// FAIL: panic on empty-snapshots path, OR `snapshot_prior_signals > 0`
+///       (strengthening happened despite no visibility data).
 #[tokio::test]
-async fn empty_snapshots_run_to_completion() {
-    // Empty snapshots — the simulation's fallback path applies; no per-snapshot
-    // filtering and `snapshot_counts` is built as an empty map.
+async fn empty_snapshots_disable_prior_no_max_penalty_silent_strengthening() {
     let snapshots = LeaderboardSnapshots::default();
     let report = run_scenario(snapshots, 4, 5);
-    // The simulation must complete successfully — assertion is non-panic.
-    // Counters may be 0 (if the empty-snapshots fallback path bypasses the
-    // win-rate code) or positive; what matters is the partition still holds.
-    assert!(report.snapshot_prior_signals <= report.total_signals_evaluated);
+    assert!(
+        report.total_signals_evaluated > 0,
+        "expected ≥1 signal; got 0"
+    );
+    assert_eq!(
+        report.snapshot_prior_signals, 0,
+        "empty snapshots → prior must be disabled; got {} strengthenings (the call-site gate is broken)",
+        report.snapshot_prior_signals
+    );
+    assert_eq!(report.snapshot_prior_extra_sum, 0);
 }
