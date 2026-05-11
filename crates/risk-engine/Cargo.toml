@@ -30,3 +30,4 @@ serde = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rust_decimal_macros = { workspace = true }

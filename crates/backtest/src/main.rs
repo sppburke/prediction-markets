@@ -100,6 +100,7 @@ async fn main() -> Result<(), BacktestError> {
 
     let resolutions = pe_bootstrap::gamma::load_resolutions(&cache)?;
     let schedules = pe_bootstrap::gamma::load_schedules(&cache)?;
+    let liq_index = pe_bootstrap::gamma::load_liquidity(&cache)?;
 
     info!(
         wallets = all_wallet_addresses.len(),
@@ -107,6 +108,7 @@ async fn main() -> Result<(), BacktestError> {
         snapshots = snapshots.len(),
         resolutions = resolutions.len(),
         schedules = schedules.len(),
+        liquidity = liq_index.len(),
         "cache loaded"
     );
 
@@ -165,6 +167,7 @@ async fn main() -> Result<(), BacktestError> {
             snapshots: &snapshots,
             resolutions: &resolutions,
             schedules: &schedules,
+            liq_index: &liq_index,
             ranker_config: &ranker_config,
             ledger_config: &ledger_config,
         };
@@ -212,6 +215,7 @@ async fn main() -> Result<(), BacktestError> {
             &snapshots,
             &resolutions,
             &schedules,
+            &liq_index,
             &ranker_config,
             &LedgerConfig::default(),
             &strategy,

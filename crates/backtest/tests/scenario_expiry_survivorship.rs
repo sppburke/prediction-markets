@@ -20,8 +20,8 @@ use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
 use pe_bootstrap::cache::{
-    LeaderboardSnapshots, MarketResolution, MarketSchedule, ResolutionIndex, ScheduleIndex,
-    WalletCache,
+    LeaderboardSnapshots, LiquidityIndex, MarketResolution, MarketSchedule, ResolutionIndex,
+    ScheduleIndex, WalletCache,
 };
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
@@ -125,6 +125,8 @@ fn base_config(dir: &TempDir, max_hours_to_expiry: Option<u32>) -> BacktestConfi
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
+        liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -161,6 +163,7 @@ async fn unknown_expiry_market_allowed_through() {
         &LeaderboardSnapshots::default(),
         &resolutions,
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -208,6 +211,7 @@ async fn known_far_expiry_is_suppressed() {
         &LeaderboardSnapshots::default(),
         &resolutions,
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -242,6 +246,7 @@ async fn suppression_pct_zero_without_filter() {
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -304,6 +309,7 @@ async fn expiry_filter_uses_schedule_over_resolution() {
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -363,6 +369,7 @@ async fn expiry_filter_null_end_date_allows_through() {
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -414,6 +421,7 @@ async fn expiry_filter_falls_back_to_resolution_when_no_schedule() {
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

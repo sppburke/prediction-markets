@@ -23,7 +23,9 @@
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
+};
 use pe_core_types::{
     ContractQty, KellyFraction, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
     VenueMarketId, WalletAddress,
@@ -115,6 +117,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_prior_beta: 10,
         kelly_p_k_per_market: 6,
         // Unlimited cap: Kelly fraction (not bps cap) drives position size.
+        liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
+        liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         strategy: WinnerFollowConfig {
             per_trade_cap: PerTradeCap::Unlimited,
             ..WinnerFollowConfig::default()
@@ -195,6 +199,7 @@ async fn run_leader(
         &snapshots,
         &resolutions,
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &strategy,

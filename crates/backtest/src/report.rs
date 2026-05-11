@@ -47,10 +47,53 @@ pub struct WinnerFollowReport {
     /// `max_hours_to_expiry` is not configured.
     #[serde(default)]
     pub expiry_suppression_by_quarter: BTreeMap<String, Decimal>,
+    /// Count of BUY trades where the liquidity clamp reduced `contracts_count`
+    /// (known market, gate enabled, depth above floor, clamp was binding).
+    #[serde(default)]
+    pub liquidity_clamps_fired: u64,
+    /// Sum of contracts removed by the clamp across all firings (i.e.,
+    /// `original - clamped` summed when `clamped < original`). Mean reduction
+    /// per firing = `liquidity_clamp_contracts_reduced / liquidity_clamps_fired`.
+    #[serde(default)]
+    pub liquidity_clamp_contracts_reduced: u64,
+    /// Count of BUY trades where Gamma `liquidity` was present but below
+    /// `liquidity_min_required_usd` (clamp bypassed; passthrough with warn).
+    /// Distinguishes "low-quality data" from "clamp inactive due to depth ok".
+    #[serde(default)]
+    pub liquidity_below_floor_bypasses: u64,
+    /// Count of BUY trades where the market_id was absent from `LiquidityIndex`
+    /// entirely (no Gamma row in cache; clamp bypassed). Large vs
+    /// `liquidity_clamps_fired` indicates cache coverage gaps rather than clamp
+    /// inactivity.
+    #[serde(default)]
+    pub liquidity_unknown_markets: u64,
     /// Full resolved configuration used for this run — embedded so the output file
     /// is self-describing even when the config file changes between runs.
     #[serde(default)]
     pub resolved_config: Option<BacktestConfig>,
+}
+
+impl WinnerFollowReport {
+    /// Record a liquidity-clamp firing — incremented when `clamped < contracts_count`
+    /// for a known market with the gate enabled and depth above floor.
+    pub fn record_liquidity_clamp(&mut self, reduced: u64) {
+        self.liquidity_clamps_fired += 1;
+        self.liquidity_clamp_contracts_reduced = self
+            .liquidity_clamp_contracts_reduced
+            .saturating_add(reduced);
+    }
+
+    /// Record a below-floor bypass — known market, gate enabled,
+    /// `0 < liquidity_usd < min_required_usd`.
+    pub fn record_liquidity_below_floor(&mut self) {
+        self.liquidity_below_floor_bypasses += 1;
+    }
+
+    /// Record an unknown-market bypass — gate enabled, market absent from
+    /// `LiquidityIndex`.
+    pub fn record_liquidity_unknown_market(&mut self) {
+        self.liquidity_unknown_markets += 1;
+    }
 }
 
 /// One run within a Kelly-fraction sweep.
