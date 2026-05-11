@@ -67,6 +67,24 @@ pub struct WinnerFollowReport {
     /// inactivity.
     #[serde(default)]
     pub liquidity_unknown_markets: u64,
+    /// Count of times `leader_win_rate_p_shrunk` was called during this run.
+    /// Denominator for the snapshot-aware-prior activation rate:
+    /// `snapshot_prior_signals / total_signals_evaluated`. In the current flow
+    /// this equals the count of `strategy.evaluate()` invocations because the
+    /// win-rate calc precedes every evaluate; if a future refactor moves
+    /// it behind an earlier filter, this counter's name will drift from its
+    /// semantics — rename or move accordingly at that point. See issue #129.
+    #[serde(default)]
+    pub total_signals_evaluated: u64,
+    /// Count of signals where the snapshot-aware prior strengthened the
+    /// Beta(α, β) prior (`extra > 0`). Activation rate = this / `total_signals_evaluated`.
+    #[serde(default)]
+    pub snapshot_prior_signals: u64,
+    /// Sum of `extra` values across all strengthening events. Mean per
+    /// strengthened signal = `snapshot_prior_extra_sum / snapshot_prior_signals`.
+    /// Tracks "on average, how much weight did the snapshot prior add?"
+    #[serde(default)]
+    pub snapshot_prior_extra_sum: u64,
     /// Full resolved configuration used for this run — embedded so the output file
     /// is self-describing even when the config file changes between runs.
     #[serde(default)]

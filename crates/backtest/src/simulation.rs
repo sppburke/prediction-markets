@@ -294,6 +294,15 @@ pub fn run_simulation(
     let mut liquidity_below_floor_bypasses: u64 = 0;
     let mut liquidity_unknown_markets: u64 = 0;
 
+    // Snapshot-aware prior counters (see report.rs `snapshot_prior_*` and
+    // `total_signals_evaluated` fields). Denominator and numerator for the
+    // activation rate `snapshot_prior_signals / total_signals_evaluated`. The
+    // counter fires once per call to `leader_win_rate_p_shrunk`; in the
+    // current flow that's once per `strategy.evaluate()` call. See issue #129.
+    let mut total_signals_evaluated: u64 = 0;
+    let mut snapshot_prior_signals: u64 = 0;
+    let mut snapshot_prior_extra_sum: u64 = 0;
+
     // Group trades by date for efficient walk-forward lookup.
     let mut trades_by_date: BTreeMap<Date, Vec<&RawTrade>> = BTreeMap::new();
     for trade in &all_trades {
@@ -463,6 +472,25 @@ pub fn run_simulation(
             .map(|e| (e.wallet, e.reconstruction_quality))
             .collect();
 
+        // Build wallet → snapshot-appearance count for the snapshot-aware prior
+        // (issue #129). Pre-built per snapshot transition so the O(S) scan in
+        // `snapshot_appearances_up_to` amortises across all signals in this
+        // window. Skipped when snapshots are empty — `extra` will be 0
+        // everywhere via `unwrap_or(0)` + saturating-sub.
+        let snapshot_counts: HashMap<WalletAddress, u32> = if snapshots.is_empty() {
+            HashMap::new()
+        } else {
+            filtered_ledgers
+                .iter()
+                .map(|l| {
+                    (
+                        l.wallet,
+                        snapshots.snapshot_appearances_up_to(l.wallet, sim_date_unix),
+                    )
+                })
+                .collect()
+        };
+
         // Watchlisted wallets (Active + Incubator).
         let watchlisted: HashSet<WalletAddress> =
             watchlist.entries.iter().map(|e| e.wallet).collect();
@@ -541,12 +569,38 @@ pub fn run_simulation(
                         }
                         raw
                     };
+                    // Snapshot-aware prior (issue #129): leaders newly entering
+                    // the candidate pool get symmetric extra pseudo-observations
+                    // added to the Beta prior, weakening their thin empirical
+                    // win-rate evidence. `unwrap_or(0)` is the defensive
+                    // max-penalty fallback — not reachable for leaders currently
+                    // on the leaderboard, since `filtered_ledgers` is built from
+                    // the current snapshot.
+                    total_signals_evaluated = total_signals_evaluated.saturating_add(1);
+                    let n_snaps = snapshot_counts.get(&leader).copied().unwrap_or(0);
+                    let extra = config
+                        .kelly_p_min_snapshots
+                        .saturating_sub(n_snaps)
+                        .saturating_mul(config.kelly_p_extra_per_missing_snapshot);
+                    if extra > 0 {
+                        tracing::debug!(
+                            target: "snapshot_prior",
+                            leader = %leader,
+                            n_snaps,
+                            extra,
+                            "snapshot-aware prior strengthened"
+                        );
+                        snapshot_prior_signals = snapshot_prior_signals.saturating_add(1);
+                        snapshot_prior_extra_sum =
+                            snapshot_prior_extra_sum.saturating_add(u64::from(extra));
+                    }
                     // Win-rate probability from the leader's ledger (Blocker 2).
                     let Some(p) = leader_win_rate_p_shrunk(
                         ledger_by_wallet.get(&leader).copied(),
                         config.kelly_p_prior_alpha,
                         config.kelly_p_prior_beta,
                         config.kelly_p_k_per_market,
+                        extra,
                     ) else {
                         continue;
                     };
@@ -753,6 +807,9 @@ pub fn run_simulation(
         funder_graph_snapshot_caveat: false,
         expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
+        total_signals_evaluated,
+        snapshot_prior_signals,
+        snapshot_prior_extra_sum,
         liquidity_clamps_fired,
         liquidity_clamp_contracts_reduced,
         liquidity_below_floor_bypasses,
@@ -896,21 +953,34 @@ fn raw_trade_to_leader_signal(
     }
 }
 
-/// Bayesian shrinkage estimate of leader win-rate probability with effective-sample-size scaling.
+/// Bayesian shrinkage estimate of leader win-rate probability with two additive priors.
 ///
-/// Applies a Beta(α, β) prior with optional N_eff correction for market concentration:
+/// Beta-Binomial formula:
 ///
-/// When `k_per_market > 0`:
-///   `N_eff = min(total, distinct_markets × k)`
-///   `scaled_wins = wins × N_eff / total` (Decimal division — no integer truncation)
-///   `p_shrunk = (scaled_wins + α) / (N_eff + α + β)`
+/// ```text
+///   N_eff       = min(total, distinct_markets × k)    (when k > 0; else N_eff = total)
+///   scaled_wins = wins × N_eff / total                (Decimal — no integer truncation)
+///   p_shrunk    = (scaled_wins + α + extra) / (N_eff + α + β + 2·extra)
+/// ```
 ///
-/// When `k_per_market == 0` (bypass): uses `total` directly as `N_eff`, reproducing
-/// the #106 formula: `p_shrunk = (wins + α) / (total + α + β)`.
+/// `(α, β, k)` are the baseline Beta(α, β) shrinkage knobs:
+///   - `(α=0, β=0, k=0)` reduces to the raw empirical rate.
+///   - `(α=10, β=10, k=6)` is the default: shrinks small-sample extremes toward 0.5 and
+///     down-weights specialists with narrow market breadth.
 ///
-/// `(α=0, β=0, k=0)` reduces to the raw empirical rate.
+/// `extra` is the snapshot-aware additive prior (issue #129): the caller computes
+/// `extra = min_snapshots.saturating_sub(n_snapshots) × extra_per_missing` so a leader
+/// that has been on fewer than `min_snapshots` leaderboards gets symmetric pseudo-
+/// observations added to both numerator and denominator. As `extra` grows, the
+/// effective prior point migrates from `α/(α+β)` toward 0.5 (least-informative).
 ///
-/// Returns `None` only when `total == 0` and the prior carries no weight (`α + β == 0`).
+/// Returns `None` only when `total == 0` and the combined prior carries no weight
+/// (`α + β + extra == 0`).
+///
+/// Formula canonical reference: `docs/_GLOSSARY.md`
+/// (`kelly_p_prior_alpha_default`, `kelly_p_prior_beta_default`,
+/// `kelly_p_k_per_market_default`, `kelly_p_min_snapshots_default`,
+/// `kelly_p_extra_per_missing_snapshot_default`).
 ///
 /// # Precondition
 /// Caller should ensure the ledger has passed the bootstrap filter (>15 closed trades,
@@ -920,6 +990,7 @@ fn leader_win_rate_p_shrunk(
     alpha: u32,
     beta: u32,
     k_per_market: u32,
+    extra: u32,
 ) -> Option<Probability> {
     let ledger = ledger?;
     let wins = ledger
@@ -928,7 +999,7 @@ fn leader_win_rate_p_shrunk(
         .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
         .count() as u32;
     let total = ledger.closed_trades.len() as u32;
-    if total == 0 && (alpha + beta) == 0 {
+    if total == 0 && (alpha + beta + extra) == 0 {
         return None;
     }
     let (scaled_wins, effective_n) = if k_per_market == 0 || total == 0 {
@@ -944,8 +1015,16 @@ fn leader_win_rate_p_shrunk(
         let sw = Decimal::from(wins) * Decimal::from(n_eff) / Decimal::from(total);
         (sw, n_eff)
     };
-    let num = scaled_wins + Decimal::from(alpha);
-    let den = Decimal::from(effective_n + alpha + beta);
+    // Symmetric snapshot-aware prior: numerator gains `extra`, denominator
+    // gains `2 * extra`. As `extra` grows the effective prior point migrates
+    // from α/(α+β) toward 0.5 — by design, the snapshot-aware prior pulls
+    // toward least-informative when data is thin.
+    let num = scaled_wins + Decimal::from(alpha) + Decimal::from(extra);
+    let den_u = effective_n
+        .saturating_add(alpha)
+        .saturating_add(beta)
+        .saturating_add(extra.saturating_mul(2));
+    let den = Decimal::from(den_u);
     Probability::new((num / den).clamp(Decimal::ZERO, Decimal::ONE)).ok()
 }
 
@@ -1185,7 +1264,7 @@ mod tests {
     #[test]
     fn shrinkage_with_zero_priors_matches_raw() {
         let ledger = make_ledger(11, 1);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0, 0).unwrap();
         // 11/12 = 0.91666...
         let expected = Decimal::from(11u32) / Decimal::from(12u32);
         assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
@@ -1195,14 +1274,14 @@ mod tests {
     #[test]
     fn no_trades_zero_prior_returns_none() {
         let ledger = make_ledger(0, 0);
-        assert!(leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0).is_none());
+        assert!(leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0, 0).is_none());
     }
 
     // No trades + non-zero prior → prior mean (0.5 for symmetric Beta(10,10)).
     #[test]
     fn shrinkage_with_no_trades_returns_prior_mean() {
         let ledger = make_ledger(0, 0);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0, 0).unwrap();
         // (0+10)/(0+20) = 0.5
         assert_eq!(p.0, dec!(0.5));
     }
@@ -1211,7 +1290,7 @@ mod tests {
     #[test]
     fn shrinkage_dominates_at_low_n() {
         let ledger = make_ledger(11, 1);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0, 0).unwrap();
         let expected = Decimal::from(21u32) / Decimal::from(32u32); // 0.65625
         assert_eq!(p.0, expected);
     }
@@ -1222,7 +1301,7 @@ mod tests {
     #[test]
     fn shrinkage_negligible_at_high_n() {
         let ledger = make_ledger(1100, 100);
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0, 0).unwrap();
         let raw = Decimal::from(1100u32) / Decimal::from(1200u32);
         let diff = (p.0 - raw).abs();
         assert!(
@@ -1237,14 +1316,14 @@ mod tests {
     // None ledger → None regardless of prior.
     #[test]
     fn no_ledger_returns_none() {
-        assert!(leader_win_rate_p_shrunk(None, 10, 10, 0).is_none());
+        assert!(leader_win_rate_p_shrunk(None, 10, 10, 0, 0).is_none());
     }
 
     // Asymmetric prior skews estimate toward 0 when β is large.
     #[test]
     fn asymmetric_prior_skews_estimate() {
         let ledger = make_ledger(5, 5); // raw p = 0.5
-        let p_low = leader_win_rate_p_shrunk(Some(&ledger), 1, 99, 0).unwrap();
+        let p_low = leader_win_rate_p_shrunk(Some(&ledger), 1, 99, 0, 0).unwrap();
         // (5+1)/(10+100) = 6/110 ≈ 0.0545 — prior pulls strongly toward 0
         assert!(p_low.0 < dec!(0.10));
     }
@@ -1253,7 +1332,7 @@ mod tests {
     #[test]
     fn all_wins_prior_pulls_toward_half() {
         let ledger = make_ledger(12, 0); // raw p = 1.0
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0, 0).unwrap();
         // (12+10)/(12+20) = 22/32 = 0.6875 — well below raw 1.0
         assert_eq!(p.0, Decimal::from(22u32) / Decimal::from(32u32));
     }
@@ -1311,7 +1390,7 @@ mod tests {
     #[test]
     fn n_eff_caps_at_distinct_markets_times_k() {
         let ledger = make_ledger_multi_market(57, 3, 1); // 57 wins, 3 losses, 1 market
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6, 0).unwrap();
         let expected = (dec!(57) * dec!(6) / dec!(60) + dec!(10)) / (dec!(6) + dec!(10) + dec!(10));
         assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
     }
@@ -1321,7 +1400,7 @@ mod tests {
     #[test]
     fn n_eff_uses_total_when_markets_are_diverse() {
         let ledger = make_ledger_multi_market(57, 3, 60); // 1 trade per market
-        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6).unwrap();
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6, 0).unwrap();
         let expected = (dec!(57) + dec!(10)) / (dec!(60) + dec!(10) + dec!(10));
         assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
     }
@@ -1330,8 +1409,8 @@ mod tests {
     #[test]
     fn k_zero_bypasses_n_eff() {
         let ledger = make_ledger_multi_market(57, 3, 1);
-        let p_k0 = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
-        let p_bypass = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0).unwrap();
+        let p_k0 = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0, 0).unwrap();
+        let p_bypass = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 0, 0).unwrap();
         // Both should give (57+10)/(60+20) = 67/80
         let expected = (dec!(57) + dec!(10)) / (dec!(60) + dec!(10) + dec!(10));
         assert_eq!(p_k0.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
@@ -1343,7 +1422,7 @@ mod tests {
     #[test]
     fn scaled_wins_uses_decimal_not_integer_arithmetic() {
         let ledger = make_ledger_multi_market(57, 3, 1);
-        let p_decimal = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6).unwrap();
+        let p_decimal = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6, 0).unwrap();
         // integer truncation would give 5; Decimal gives 5.7
         let p_integer_trunc =
             Probability::new((dec!(5) + dec!(10)) / (dec!(6) + dec!(10) + dec!(10))).unwrap();
@@ -1354,5 +1433,57 @@ mod tests {
             "must use Decimal division, not integer truncation"
         );
         assert_eq!(p_decimal.0, p_decimal_calc.0);
+    }
+
+    // ── snapshot-aware prior (issue #129) ──────────────────────────────────
+
+    // `extra = 0` is the no-op case — must produce the identical result as
+    // the pre-#129 formula. Locks in the backwards-compat guarantee.
+    #[test]
+    fn snapshot_aware_prior_disabled_when_extra_zero() {
+        let ledger = make_ledger_multi_market(11, 1, 5);
+        // 11/12 wins, α=β=10, k=6, extra=0.
+        let p_no_extra = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6, 0).unwrap();
+        // N_eff = min(12, 5×6) = 12. scaled_wins = 11×12/12 = 11. p = 21/32 ≈ 0.656.
+        let expected = (dec!(11) + dec!(10)) / (dec!(12) + dec!(10) + dec!(10));
+        assert_eq!(p_no_extra.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
+    }
+
+    // Worked example from issue #129: extra=20 pulls 21/32 down to 41/72 ≈ 0.569.
+    #[test]
+    fn snapshot_aware_prior_pulls_toward_half_for_new_entrant() {
+        let ledger = make_ledger_multi_market(11, 1, 5);
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 10, 10, 6, 20).unwrap();
+        // num = 11 + 10 + 20 = 41; den = 12 + 10 + 10 + 40 = 72.
+        let expected = dec!(41) / dec!(72);
+        assert_eq!(p.0, expected.clamp(Decimal::ZERO, Decimal::ONE));
+    }
+
+    // With asymmetric prior (α=20, β=5 → prior point 0.8), extra=20 pulls the
+    // effective prior point toward 0.5. Documented behavior in issue #129.
+    #[test]
+    fn snapshot_aware_prior_shifts_effective_prior_point_with_asymmetric_alpha_beta() {
+        // Empty ledger so the result is the pure prior point.
+        let empty_ledger = make_ledger_multi_market(0, 0, 0);
+        // Without extra: 20/(20+5) = 0.8.
+        let p_no_extra = leader_win_rate_p_shrunk(Some(&empty_ledger), 20, 5, 0, 0).unwrap();
+        assert_eq!(p_no_extra.0, dec!(20) / dec!(25));
+        // With extra=20: (0+20+20)/(0+20+5+40) = 40/65 ≈ 0.615 — shifted toward 0.5.
+        let p_with_extra = leader_win_rate_p_shrunk(Some(&empty_ledger), 20, 5, 0, 20).unwrap();
+        assert_eq!(p_with_extra.0, dec!(40) / dec!(65));
+        // Must be strictly less than the no-extra value (moving toward 0.5 from 0.8).
+        assert!(p_with_extra.0 < p_no_extra.0);
+        // And strictly greater than 0.5 (asymmetric prior not fully collapsed).
+        assert!(p_with_extra.0 > dec!(0.5));
+    }
+
+    // No-ledger + non-zero extra → still returns the pure-prior probability.
+    // Guards against a regression where extra was ignored when ledger is None.
+    #[test]
+    fn snapshot_aware_prior_with_extra_only_returns_pure_prior() {
+        let ledger = make_ledger_multi_market(0, 0, 0);
+        let p = leader_win_rate_p_shrunk(Some(&ledger), 0, 0, 0, 10).unwrap();
+        // num = 0+0+10 = 10; den = 0+0+0+20 = 20. p = 0.5.
+        assert_eq!(p.0, dec!(0.5));
     }
 }

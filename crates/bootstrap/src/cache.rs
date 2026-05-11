@@ -904,6 +904,30 @@ impl LeaderboardSnapshots {
         }
     }
 
+    /// Count of snapshots up to and including `sim_date_unix` in which `wallet`
+    /// was a leaderboard member.
+    ///
+    /// Used by the backtest's snapshot-aware win-rate prior to measure how long
+    /// a leader has been on the candidate pool: more appearances → more
+    /// evidence → weaker added shrinkage. Inclusive upper-bound semantics match
+    /// [`Self::for_date`] (`*at <= sim_date_unix`) — a wallet present on the
+    /// snapshot whose timestamp exactly equals `sim_date_unix` counts as 1.
+    ///
+    /// O(S) linear scan from the start, capped at the inclusive upper bound via
+    /// `partition_point`. At realistic snapshot counts (≤ 200) this is
+    /// negligible — see issue #129 for the amortisation analysis.
+    ///
+    /// # Precondition
+    /// Returns 0 when `sim_date_unix` precedes the first snapshot.
+    pub fn snapshot_appearances_up_to(&self, wallet: WalletAddress, sim_date_unix: i64) -> u32 {
+        let idx = self.entries.partition_point(|(at, _)| *at <= sim_date_unix);
+        let count = self.entries[..idx]
+            .iter()
+            .filter(|(_, set)| set.contains(&wallet))
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
     /// Number of snapshots in the index. For diagnostics and tests.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -1691,5 +1715,72 @@ mod tests {
             assert_eq!(edges.len(), 1);
             assert_eq!(edges[0], (funder, funded));
         }
+    }
+
+    // ── snapshot_appearances_up_to ───────────────────────────────────────────
+
+    fn snap_fixture() -> LeaderboardSnapshots {
+        let alice = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let bob = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let carol = addr("0xcccccccccccccccccccccccccccccccccccccccc");
+        // Three snapshots at unix 100, 200, 300:
+        //   t=100 : { alice }                    — alice's first appearance
+        //   t=200 : { alice, bob }               — bob joins
+        //   t=300 : { alice, bob, carol }        — carol joins
+        // alice is in every snapshot; bob in the last two; carol only in the last.
+        LeaderboardSnapshots::from_pairs(vec![
+            (100, vec![alice]),
+            (200, vec![alice, bob]),
+            (300, vec![alice, bob, carol]),
+        ])
+    }
+
+    #[test]
+    fn snapshot_appearances_zero_before_first_snapshot() {
+        let snaps = snap_fixture();
+        let alice = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, 50), 0);
+        // Boundary just below first snapshot.
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, 99), 0);
+    }
+
+    #[test]
+    fn snapshot_appearances_zero_when_wallet_never_present() {
+        let snaps = snap_fixture();
+        let dave = addr("0xdddddddddddddddddddddddddddddddddddddddd");
+        assert_eq!(snaps.snapshot_appearances_up_to(dave, 1_000), 0);
+    }
+
+    #[test]
+    fn snapshot_appearances_inclusive_cutoff_matches_for_date() {
+        let snaps = snap_fixture();
+        let alice = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        // `sim_date_unix == 100` — the timestamp of the first snapshot — must be
+        // counted (inclusive). Matches `for_date(100)` returning `Some(...)`.
+        assert!(snaps.for_date(100).is_some());
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, 100), 1);
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, 200), 2);
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, 300), 3);
+        // Past the last snapshot — full count.
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, 10_000), 3);
+    }
+
+    #[test]
+    fn snapshot_appearances_partial_subset() {
+        let snaps = snap_fixture();
+        let bob = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        // Bob's first appearance is t=200. At t=100 → 0; at t=200 → 1; at t=300 → 2.
+        assert_eq!(snaps.snapshot_appearances_up_to(bob, 100), 0);
+        assert_eq!(snaps.snapshot_appearances_up_to(bob, 199), 0);
+        assert_eq!(snaps.snapshot_appearances_up_to(bob, 200), 1);
+        assert_eq!(snaps.snapshot_appearances_up_to(bob, 299), 1);
+        assert_eq!(snaps.snapshot_appearances_up_to(bob, 300), 2);
+    }
+
+    #[test]
+    fn snapshot_appearances_full_count_when_present_in_every_snapshot() {
+        let snaps = snap_fixture();
+        let alice = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(snaps.snapshot_appearances_up_to(alice, i64::MAX), 3);
     }
 }

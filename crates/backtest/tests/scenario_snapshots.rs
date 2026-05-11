@@ -151,6 +151,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_k_per_market: 0,
         liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
         liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
+        kelly_p_min_snapshots: 0,
+        kelly_p_extra_per_missing_snapshot: 0,
         strategy: WinnerFollowConfig::default(),
     }
 }
