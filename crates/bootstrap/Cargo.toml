@@ -9,6 +9,10 @@ publish.workspace = true
 name = "pe-bootstrap"
 path = "src/main.rs"
 
+[[bin]]
+name = "pe-operator-audit"
+path = "src/bin/operator-audit.rs"
+
 [lib]
 name = "pe_bootstrap"
 path = "src/lib.rs"
@@ -27,6 +31,7 @@ pe-source-onchain-polygon     = { path = "../source-onchain-polygon",       vers
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",                 version = "0.1.0" }
 
+anyhow          = { workspace = true }
 figment         = { workspace = true }
 futures         = { workspace = true }
 reqwest         = { workspace = true }
@@ -42,5 +47,6 @@ tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+blake3              = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile            = { workspace = true }

@@ -22,6 +22,7 @@ pub mod dune;
 pub mod error;
 pub mod filter;
 pub mod gamma;
+pub mod operator_audit;
 pub mod polymarket;
 pub mod wallet_set;
 
