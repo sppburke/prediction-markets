@@ -20,12 +20,12 @@ use tracing::{info, warn};
 
 use crate::error::BacktestError;
 
-/// Funder-edge list sorted ascending by `fetched_at_unix`.
+/// Funder-edge list sorted ascending by `event_at_unix`.
 ///
-/// Tuple layout: `(fetched_at_unix, funder, funded)` — timestamp first so
+/// Tuple layout: `(event_at_unix, funder, funded)` — timestamp first so
 /// `partition_point` uses natural ordering without a field-accessor closure.
 pub struct FunderGraphTimeline {
-    /// `(fetched_at_unix, funder, funded)` sorted ascending by `fetched_at_unix`.
+    /// `(event_at_unix, funder, funded)` sorted ascending by `event_at_unix`.
     edges: Vec<(i64, WalletAddress, WalletAddress)>,
 }
 

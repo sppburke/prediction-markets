@@ -3103,6 +3103,8 @@ dependencies = [
 name = "pe-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "blake3",
  "figment",
  "futures",
  "pe-core-types",
