@@ -241,6 +241,13 @@ pub fn run_simulation(
         .map(|t| t.timestamp.0)
         .unwrap_or(simulation_start);
 
+    // Horizon cooldown — suppress new BUY opens within N days of the
+    // simulation end so existing positions can close before the report writes.
+    // Computed once; SELL path is always unaffected.
+    let no_buy_cutoff_unix: Option<i64> = config
+        .no_buy_within_horizon_days
+        .map(|d| simulation_end.unix_timestamp() - i64::from(d) * 86_400);
+
     let slippage_rate = config.strategy.slippage_rate;
     let slippage_assumption_bps = (slippage_rate * Decimal::from(10_000u32))
         .round()
@@ -535,6 +542,12 @@ pub fn run_simulation(
                     // Open a new copy position if we don't already have one for this key.
                     if open_positions.contains_key(&wallet_pos_key) {
                         continue; // Already tracking this leader's position.
+                    }
+
+                    // Horizon cooldown — suppress new opens when within
+                    // `no_buy_within_horizon_days` of `simulation_end`.
+                    if no_buy_cutoff_unix.is_some_and(|c| sim_date_unix >= c) {
+                        continue;
                     }
 
                     // Time-to-expiry filter: skip trades where the market's scheduled
