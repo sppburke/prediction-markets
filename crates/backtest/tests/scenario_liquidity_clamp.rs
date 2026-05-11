@@ -147,6 +147,7 @@ fn base_config(dir: &TempDir, take_fraction: Decimal, min_required_usd: Decimal)
         liquidity_min_required_usd: min_required_usd,
         kelly_p_min_snapshots: 0,
         kelly_p_extra_per_missing_snapshot: 0,
+        flat_usd: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

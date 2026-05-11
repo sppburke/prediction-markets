@@ -119,6 +119,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         kelly_p_min_snapshots: 0,
         kelly_p_extra_per_missing_snapshot: 0,
+        flat_usd: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

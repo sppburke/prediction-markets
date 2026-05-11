@@ -147,7 +147,19 @@ async fn main() -> Result<(), BacktestError> {
         .and_then(|s| s.to_str())
         .map(str::to_owned);
 
-    if let Some(fractions) = &config.kelly_sweep_fractions {
+    // Flat-USD sizing (issue #134) bypasses Kelly entirely, so sweeping
+    // Kelly fractions while the flag is set would produce N identical
+    // reports. Suppress the sweep with one warning when both are set.
+    let sweep = config.kelly_sweep_fractions.as_ref().filter(|_| {
+        if config.flat_usd.is_some() {
+            tracing::warn!("PE_BACKTEST_FLAT_USD set; ignoring kelly_sweep_fractions");
+            false
+        } else {
+            true
+        }
+    });
+
+    if let Some(fractions) = sweep {
         // ── Sweep mode ──────────────────────────────────────────────────────────
         //
         // All fractions execute in parallel via rayon. The simulation kernel is pure
