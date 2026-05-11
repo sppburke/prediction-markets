@@ -142,6 +142,21 @@ These six gates live in `crates/backtest/src/simulation.rs` and fire in the back
 
 Gates 1–6 are evaluated sequentially inside the trade loop (not as part of any `Err` variant). After them, the signal proceeds to `strategy.evaluate()`, which applies the five strategy-level gates documented in `docs/19-WINNER-FOLLOW-STRATEGY.md`.
 
+### Flat-stake mode (`PE_BACKTEST_FLAT_USD`)
+
+A research lever (issue #134) that short-circuits the entire sizing pipeline. Setting `BacktestConfig::flat_usd = Some(stake)` (env: `PE_BACKTEST_FLAT_USD=<decimal>`) opens each copy at `floor(stake / fill_price).max(1)` contracts and skips Kelly, the per-trade cap, mode clamping, `risk-engine`, and the liquidity clamp. The all-or-nothing bankroll guard (`bankroll < notional → continue`) is the only remaining filter on the size path.
+
+| Aspect | Behaviour with `flat_usd = Some(stake)` |
+|---|---|
+| Sizing | `contracts = floor(stake / fill_price).max(1)`; degenerate `fill_price > stake` opens 1 contract (best-effort, notional > stake) |
+| Skipped pipeline | Kelly, per-trade cap, mode clamp, `risk-engine`, liquidity clamp, snapshot-aware prior |
+| Bankroll floor | `bankroll < notional → continue` (all-or-nothing) |
+| Preserved | Gates 1–6 (watchlist, duplicate-open, expiry, slippage ceiling, p, quality); sell path |
+| `total_signals_evaluated`, `snapshot_prior_*`, `liquidity_*` counters | Stay at 0 (those code paths never execute) |
+| `kelly_sweep_fractions` interaction | Sweep is suppressed in `main.rs`; one `tracing::warn!` is emitted and a single run executes |
+
+`BacktestConfig` is not imported by the live service crate — the flag cannot leak into production by construction. Operator-level scenario coverage lives in `crates/backtest/tests/scenario_flat_usd.rs`.
+
 ## Winner-Follow backtesting and validation
 
 Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A historical leader trade is not copied at the leader's price unless the follower could have filled there after discovery delay, API delay, decision delay, order routing, queue position, and slippage.

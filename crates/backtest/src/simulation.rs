@@ -573,6 +573,52 @@ pub fn run_simulation(
                         }
                         raw
                     };
+
+                    // Flat-USD short-circuit (issue #134): backtest-only research
+                    // lever that bypasses Kelly, per-trade cap, mode clamp,
+                    // `risk-engine`, and the liquidity clamp. `floor(flat /
+                    // fill_price).max(1)` — degenerate `fill_price > flat` opens
+                    // at 1 contract (best-effort). Skip when bankroll cannot
+                    // cover the full notional (all-or-nothing semantics). The
+                    // Kelly-path counters (`total_signals_evaluated`,
+                    // `snapshot_prior_*`, `liquidity_*`) stay zero because the
+                    // corresponding code paths never execute.
+                    if let Some(flat) = config.flat_usd {
+                        let contracts = ((flat / fill_price).floor().to_u64().unwrap_or(1)).max(1);
+                        let notional = Decimal::from(contracts) * fill_price;
+                        if bankroll < notional {
+                            continue;
+                        }
+                        bankroll -= notional;
+
+                        let actual_bps = proposed_trade_bps(contracts, fill_price, bankroll);
+                        exposure.add(leader, operator_id, &trade.market_id, actual_bps);
+
+                        open_positions.insert(
+                            wallet_pos_key,
+                            OpenPosition {
+                                contracts,
+                                avg_fill_price: fill_price,
+                                operator_id: operator_id.cloned(),
+                                bought_on: sim_date,
+                            },
+                        );
+
+                        let fill = TradeFill {
+                            simulated_at: sim_date.midnight().assume_utc(),
+                            leader_wallet: leader.to_string(),
+                            operator_id: operator_id.map(|o| o.to_string()),
+                            market_id: trade.market_id.0.0.clone(),
+                            outcome_id: trade.outcome_id.0,
+                            side: "buy".to_owned(),
+                            contracts,
+                            signal_price: trade.price.0,
+                            fill_price,
+                        };
+                        write_fill(fills_writer.as_mut(), &fill)?;
+                        continue;
+                    }
+
                     // Snapshot-aware prior (issue #129): leaders newly entering
                     // the candidate pool get symmetric extra pseudo-observations
                     // added to the Beta prior, weakening their thin empirical

@@ -179,6 +179,18 @@ pub struct BacktestConfig {
     #[serde(default = "default_liquidity_min_required_usd")]
     pub liquidity_min_required_usd: Decimal,
 
+    /// Backtest-only flat USD stake per BUY (issue #134). `Some(flat)` short-
+    /// circuits the entire sizing pipeline (Kelly, per-trade cap, mode clamp,
+    /// `risk-engine`, liquidity clamp) and opens at `floor(flat / fill_price)`
+    /// contracts (minimum 1). `None` keeps the standard Kelly path.
+    ///
+    /// Research lever only — `BacktestConfig` is never imported by the live
+    /// service, so this field cannot leak into production. When set,
+    /// `kelly_sweep_fractions` is ignored (single run only).
+    /// `PE_BACKTEST_FLAT_USD` overrides.
+    #[serde(default)]
+    pub flat_usd: Option<Decimal>,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -277,6 +289,7 @@ impl Default for BacktestConfig {
             kelly_p_extra_per_missing_snapshot: default_kelly_p_extra_per_missing_snapshot(),
             liquidity_take_fraction: default_liquidity_take_fraction(),
             liquidity_min_required_usd: default_liquidity_min_required_usd(),
+            flat_usd: None,
             strategy: WinnerFollowConfig::default(),
         }
     }

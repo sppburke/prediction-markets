@@ -149,6 +149,7 @@ fn base_config(dir: &TempDir, min_snapshots: u32, extra_per_missing: u32) -> Bac
         kelly_p_extra_per_missing_snapshot: extra_per_missing,
         liquidity_take_fraction: Decimal::new(5, 2),
         liquidity_min_required_usd: Decimal::new(200, 0),
+        flat_usd: None,
         strategy: WinnerFollowConfig::default(),
     }
 }
