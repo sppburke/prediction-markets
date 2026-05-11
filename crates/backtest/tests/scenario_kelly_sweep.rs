@@ -129,6 +129,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_k_per_market: 0,
         liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
         liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
+        kelly_p_min_snapshots: 0,
+        kelly_p_extra_per_missing_snapshot: 0,
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -356,6 +358,9 @@ fn to_markdown_table_covers_all_runs() {
             liquidity_clamp_contracts_reduced: 0,
             liquidity_below_floor_bypasses: 0,
             liquidity_unknown_markets: 0,
+            total_signals_evaluated: 0,
+            snapshot_prior_signals: 0,
+            snapshot_prior_extra_sum: 0,
             resolved_config: None,
         },
     };

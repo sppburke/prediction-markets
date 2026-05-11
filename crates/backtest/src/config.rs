@@ -22,6 +22,8 @@ const DEFAULT_BT_INCUBATOR_MIN_CLOSED: u32 = 3;
 const DEFAULT_BT_KELLY_P_PRIOR_ALPHA: u32 = 10;
 const DEFAULT_BT_KELLY_P_PRIOR_BETA: u32 = 10;
 const DEFAULT_BT_KELLY_P_K_PER_MARKET: u32 = 6;
+const DEFAULT_BT_KELLY_P_MIN_SNAPSHOTS: u32 = 4;
+const DEFAULT_BT_KELLY_P_EXTRA_PER_MISSING_SNAPSHOT: u32 = 5;
 
 // Default fractions for sweep mode when env var is set but empty.
 // Canonical: `docs/_GLOSSARY.md` `backtest_kelly_sweep_fractions_default`.
@@ -142,6 +144,25 @@ pub struct BacktestConfig {
     #[serde(default = "default_kelly_p_k_per_market")]
     pub kelly_p_k_per_market: u32,
 
+    /// Threshold for the snapshot-aware Beta prior (issue #129). Leaders that
+    /// appear in fewer than `kelly_p_min_snapshots` historical leaderboards
+    /// receive extra symmetric pseudo-observations: `extra = (min_snapshots -
+    /// n_snapshots) × extra_per_missing_snapshot`, applied to numerator and
+    /// `2 × extra` to the denominator of `leader_win_rate_p_shrunk`. Setting
+    /// to `0` disables the prior entirely. Default: 4 (≈ 1 month at weekly
+    /// snapshot cadence). `PE_BACKTEST_KELLY_P_MIN_SNAPSHOTS` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `kelly_p_min_snapshots_default`.
+    #[serde(default = "default_kelly_p_min_snapshots")]
+    pub kelly_p_min_snapshots: u32,
+
+    /// Pseudo-observations added per missing snapshot (default: 5).
+    /// See `kelly_p_min_snapshots` for the full formula. Both ops use
+    /// saturating arithmetic. `PE_BACKTEST_KELLY_P_EXTRA_PER_MISSING_SNAPSHOT`
+    /// overrides. Canonical: `docs/_GLOSSARY.md`
+    /// `kelly_p_extra_per_missing_snapshot_default`.
+    #[serde(default = "default_kelly_p_extra_per_missing_snapshot")]
+    pub kelly_p_extra_per_missing_snapshot: u32,
+
     /// Fraction of Gamma `liquidity` (current order-book depth) the sizer is
     /// allowed to take per BUY (default: 0.05 = 5%).
     ///
@@ -212,6 +233,14 @@ const fn default_kelly_p_k_per_market() -> u32 {
     DEFAULT_BT_KELLY_P_K_PER_MARKET
 }
 
+const fn default_kelly_p_min_snapshots() -> u32 {
+    DEFAULT_BT_KELLY_P_MIN_SNAPSHOTS
+}
+
+const fn default_kelly_p_extra_per_missing_snapshot() -> u32 {
+    DEFAULT_BT_KELLY_P_EXTRA_PER_MISSING_SNAPSHOT
+}
+
 fn default_liquidity_take_fraction() -> Decimal {
     // 0.05 = 5%. Canonical: docs/_GLOSSARY.md `liquidity_take_fraction_default`.
     Decimal::new(5, 2)
@@ -244,6 +273,8 @@ impl Default for BacktestConfig {
             kelly_p_prior_alpha: default_kelly_p_prior_alpha(),
             kelly_p_prior_beta: default_kelly_p_prior_beta(),
             kelly_p_k_per_market: default_kelly_p_k_per_market(),
+            kelly_p_min_snapshots: default_kelly_p_min_snapshots(),
+            kelly_p_extra_per_missing_snapshot: default_kelly_p_extra_per_missing_snapshot(),
             liquidity_take_fraction: default_liquidity_take_fraction(),
             liquidity_min_required_usd: default_liquidity_min_required_usd(),
             strategy: WinnerFollowConfig::default(),

@@ -324,7 +324,7 @@ Kelly fractions:
 
 Above 0.50 requires a separate, signed config change.
 
-`p` estimation: the backtest uses a Bayesian Beta(α, β) shrinkage prior on the leader's empirical win-rate with N_eff (effective sample size) scaling — see `_GLOSSARY.md` `kelly_p_prior_alpha_default` / `kelly_p_prior_beta_default` / `kelly_p_k_per_market_default`. `(α=0, β=0, k=0)` reproduces raw empirical rate; the default `(α=10, β=10, k=6)` shrinks small-sample extremes toward 0.5 and down-weights specialists with narrow market breadth. N_eff = min(total_trades, distinct_markets × k); scaled_wins = wins × N_eff / total; shrunk_p = (scaled_wins + α) / (N_eff + α + β).
+`p` estimation: the backtest uses a Bayesian Beta(α, β) shrinkage prior on the leader's empirical win-rate with N_eff (effective sample size) scaling — see `_GLOSSARY.md` `kelly_p_prior_alpha_default` / `kelly_p_prior_beta_default` / `kelly_p_k_per_market_default`. `(α=0, β=0, k=0)` reproduces raw empirical rate; the default `(α=10, β=10, k=6)` shrinks small-sample extremes toward 0.5 and down-weights specialists with narrow market breadth. N_eff = min(total_trades, distinct_markets × k); scaled_wins = wins × N_eff / total; shrunk_p = (scaled_wins + α + extra) / (N_eff + α + β + 2·extra), where `extra` is the snapshot-aware additive prior (issue #129) — see `_GLOSSARY.md` `kelly_p_min_snapshots_default` / `kelly_p_extra_per_missing_snapshot_default`. Defaults `min=4, extra_per_missing=5`. As `extra` grows, the effective prior point migrates from `α/(α+β)` toward 0.5 (least-informative) — newly-entering leaders with thin visible history are shrunk harder than long-history leaders with the same observed win-rate.
 
 `p` source (live system):
 
