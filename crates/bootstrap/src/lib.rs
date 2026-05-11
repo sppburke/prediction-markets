@@ -427,6 +427,14 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             total_markets = market_ids.len(),
             "bootstrap: gamma schedules fetched"
         );
+        let liquidity_rows = gamma_fetcher
+            .fetch_market_liquidity(&market_ids, &mut cache)
+            .await?;
+        tracing::info!(
+            liquidity_rows,
+            total_markets = market_ids.len(),
+            "bootstrap: gamma liquidity fetched"
+        );
     }
 
     //    b) Dune on-chain (`ctf_evt_conditionresolution`) — covers all markets including

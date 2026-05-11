@@ -142,6 +142,22 @@ pub struct BacktestConfig {
     #[serde(default = "default_kelly_p_k_per_market")]
     pub kelly_p_k_per_market: u32,
 
+    /// Fraction of Gamma `liquidity` (current order-book depth) the sizer is
+    /// allowed to take per BUY (default: 0.05 = 5%).
+    ///
+    /// Set to `0` to disable the liquidity clamp entirely (passthrough — no
+    /// sizing change). `PE_BACKTEST_LIQUIDITY_TAKE_FRACTION` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `liquidity_take_fraction_default`.
+    #[serde(default = "default_liquidity_take_fraction")]
+    pub liquidity_take_fraction: Decimal,
+
+    /// Minimum Gamma `liquidity` USD required to apply the clamp (default: 200).
+    /// Below this floor, depth data is too noisy to act on and the clamp is
+    /// bypassed (passthrough). `PE_BACKTEST_LIQUIDITY_MIN_REQUIRED_USD` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `liquidity_min_required_usd_default`.
+    #[serde(default = "default_liquidity_min_required_usd")]
+    pub liquidity_min_required_usd: Decimal,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -196,6 +212,16 @@ const fn default_kelly_p_k_per_market() -> u32 {
     DEFAULT_BT_KELLY_P_K_PER_MARKET
 }
 
+fn default_liquidity_take_fraction() -> Decimal {
+    // 0.05 = 5%. Canonical: docs/_GLOSSARY.md `liquidity_take_fraction_default`.
+    Decimal::new(5, 2)
+}
+
+fn default_liquidity_min_required_usd() -> Decimal {
+    // 200 USD. Canonical: docs/_GLOSSARY.md `liquidity_min_required_usd_default`.
+    Decimal::new(200, 0)
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BacktestConfig {
@@ -218,6 +244,8 @@ impl Default for BacktestConfig {
             kelly_p_prior_alpha: default_kelly_p_prior_alpha(),
             kelly_p_prior_beta: default_kelly_p_prior_beta(),
             kelly_p_k_per_market: default_kelly_p_k_per_market(),
+            liquidity_take_fraction: default_liquidity_take_fraction(),
+            liquidity_min_required_usd: default_liquidity_min_required_usd(),
             strategy: WinnerFollowConfig::default(),
         }
     }

@@ -89,6 +89,12 @@ CREATE TABLE IF NOT EXISTS funder_lookup_done (
     wallet_hex      TEXT    PRIMARY KEY NOT NULL,
     fetched_at_unix INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS market_liquidity (
+    market_id        TEXT    PRIMARY KEY NOT NULL,
+    liquidity_usd_str TEXT   NOT NULL,
+    fetched_at_unix  INTEGER NOT NULL
+);
 ";
 
 /// Permanent wallet trade-history cache backed by SQLite.
@@ -537,6 +543,76 @@ impl WalletCache {
         Ok(index)
     }
 
+    // ── market_liquidity ───────────────────────────────────────────────────────
+
+    /// Upsert the Gamma `liquidity` value for `market_id`.
+    ///
+    /// `liquidity_usd` is the current order-book depth indicator reported by
+    /// Gamma's `/markets` endpoint. Stored as TEXT to preserve `Decimal`
+    /// precision (no `f64` round-trip). Idempotent via `INSERT OR REPLACE` —
+    /// later refreshes overwrite earlier values since depth changes over time.
+    pub fn upsert_market_liquidity(
+        &mut self,
+        market_id: &str,
+        liquidity_usd: Decimal,
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO market_liquidity \
+             (market_id, liquidity_usd_str, fetched_at_unix) \
+             VALUES (?1, ?2, ?3)",
+            params![market_id, liquidity_usd.to_string(), fetched_at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Return the set of market IDs that already have a cached liquidity row.
+    ///
+    /// Used by the bootstrap walk to skip already-fetched markets.
+    ///
+    /// # Precondition
+    /// Returns an empty set when no liquidity values have been fetched.
+    pub fn liquid_market_ids(&self) -> HashSet<String> {
+        let mut stmt = match self.conn.prepare("SELECT market_id FROM market_liquidity") {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Load all liquidity rows into a [`LiquidityIndex`] keyed by [`MarketId`].
+    ///
+    /// Rows where the stored decimal fails to parse are skipped defensively (this is
+    /// theoretically unreachable since the only writer goes through
+    /// [`Decimal::to_string`], but we don't want a single corrupt row to fail the
+    /// whole load).
+    ///
+    /// # Precondition
+    /// Returns an empty index when no liquidity values have been fetched.
+    pub fn load_all_liquidity(&self) -> Result<LiquidityIndex, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT market_id, liquidity_usd_str FROM market_liquidity ORDER BY market_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let market_id: String = r.get(0)?;
+            let liquidity_str: String = r.get(1)?;
+            Ok((market_id, liquidity_str))
+        })?;
+        let mut index = LiquidityIndex::new();
+        for row in rows {
+            let (market_id, liquidity_str) = row?;
+            let Ok(liquidity_usd) = liquidity_str.parse::<Decimal>() else {
+                continue; // corrupt row; skip defensively
+            };
+            index.insert(MarketId(VenueMarketId(market_id)), liquidity_usd);
+        }
+        Ok(index)
+    }
+
     /// Return all distinct `market_id` values present in the `trades` table, sorted.
     ///
     /// Used by the Gamma fetch step to enumerate the full set of markets to resolve.
@@ -773,6 +849,16 @@ pub struct MarketSchedule {
 /// Presence in this index means the market has been queried; absence means it has
 /// not yet been fetched and the buy-filter falls back to [`ResolutionIndex`].
 pub type ScheduleIndex = HashMap<MarketId, MarketSchedule>;
+
+/// In-memory map from [`MarketId`] to its Gamma `liquidity` USD value (current
+/// order-book depth indicator).
+///
+/// Built once at backtest startup via [`WalletCache::load_all_liquidity`]. Used by
+/// the simulation's liquidity-aware sizing clamp ([`pe_risk_engine::clamp_contracts_to_liquidity`]).
+/// Absence of a market from this index means "no data" — the caller supplies
+/// `Decimal::ZERO` to the clamp, which falls below the `min_required_usd` floor
+/// and passes through.
+pub type LiquidityIndex = HashMap<MarketId, Decimal>;
 
 /// In-memory index of every leaderboard snapshot in the cache, sorted ascending.
 ///

@@ -18,7 +18,8 @@ use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
 use pe_bootstrap::cache::{
-    LeaderboardSnapshots, MarketResolution, ResolutionIndex, ScheduleIndex, WalletCache,
+    LeaderboardSnapshots, LiquidityIndex, MarketResolution, ResolutionIndex, ScheduleIndex,
+    WalletCache,
 };
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
@@ -129,6 +130,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
+        liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -150,6 +153,7 @@ fn run_sim(
         &LeaderboardSnapshots::default(),
         resolutions,
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

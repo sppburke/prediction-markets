@@ -15,7 +15,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::info;
 
-use crate::cache::{ResolutionIndex, ScheduleIndex, WalletCache};
+use crate::cache::{LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache};
 use crate::error::BootstrapError;
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -176,12 +176,84 @@ impl<F: PageFetcher> GammaFetcher<F> {
         info!(inserted, total, "gamma: schedule fetch complete");
         Ok(inserted)
     }
+
+    /// Fetch Gamma `liquidity` (current order-book depth indicator) for every market ID
+    /// not already present in `cache`.
+    ///
+    /// Calls [`WalletCache::liquid_market_ids`] once up front to build the skip set.
+    /// Unlike resolution/schedule fetches, the `liquidity` value changes over time —
+    /// re-fetches use `INSERT OR REPLACE`, but the skip-set still suppresses re-fetch
+    /// within a single bootstrap run.
+    ///
+    /// Markets where Gamma returns no `liquidity` field, or a non-numeric value, are
+    /// silently skipped (no row inserted; market will be re-attempted on the next run).
+    ///
+    /// Returns the count of newly inserted rows.
+    pub async fn fetch_market_liquidity(
+        &self,
+        market_ids: &[String],
+        cache: &mut WalletCache,
+    ) -> Result<usize, BootstrapError> {
+        let already_fetched = cache.liquid_market_ids();
+        let to_fetch: Vec<&String> = market_ids
+            .iter()
+            .filter(|id| !already_fetched.contains(*id))
+            .collect();
+
+        let total = to_fetch.len();
+        info!(
+            total,
+            already_cached = already_fetched.len(),
+            "gamma: starting liquidity fetch"
+        );
+
+        let mut inserted = 0usize;
+        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+
+        for (i, market_id) in to_fetch.iter().enumerate() {
+            if i > 0 && i % 1_000 == 0 {
+                info!(
+                    progress = i,
+                    total, inserted, "gamma: liquidity fetch progress"
+                );
+            }
+
+            let url = format!("{}/markets?condition_ids={}", self.base_url, market_id);
+            let bytes = match self.fetcher.fetch_page(&url).await {
+                Ok(b) => b,
+                Err(SourceError::Fatal { message }) => {
+                    tracing::warn!(%market_id, %message, "gamma: liquidity fetch error, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(BootstrapError::Gamma {
+                        message: format!("fetch liquidity {market_id}: {e}"),
+                    });
+                }
+            };
+
+            let liquidity_usd = match parse_gamma_liquidity(&bytes) {
+                Ok(Some(v)) => v,
+                Ok(None) => continue, // no liquidity field — skip; retry next run
+                Err(e) => {
+                    tracing::warn!(%market_id, %e, "gamma: liquidity parse error, skipping");
+                    continue;
+                }
+            };
+
+            cache.upsert_market_liquidity(market_id, liquidity_usd, fetched_at)?;
+            inserted += 1;
+        }
+
+        info!(inserted, total, "gamma: liquidity fetch complete");
+        Ok(inserted)
+    }
 }
 
 /// Serde DTO for a single element of the `/markets` response array.
 ///
-/// Only the fields needed for resolution and schedule detection are mapped; extra
-/// fields are ignored by serde.
+/// Only the fields needed for resolution, schedule, and liquidity detection are mapped;
+/// extra fields are ignored by serde.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarketRaw {
@@ -193,6 +265,44 @@ struct GammaMarketRaw {
     /// Scheduled close date in RFC 3339 format, e.g. `"2024-11-04T00:00:00Z"`.
     /// Present on open and closed markets. `None` only when Gamma omits the field.
     end_date: Option<String>,
+    /// Current order-book depth indicator (USD). Gamma returns this as a JSON
+    /// number; the custom deserializer accepts integers, floats, and decimal
+    /// strings so callers can write fixtures in either form. `None` when Gamma
+    /// omits the field entirely.
+    #[serde(default, deserialize_with = "deserialize_decimal_flexible")]
+    liquidity: Option<Decimal>,
+}
+
+/// Deserialize a JSON value (number or string) into `Option<Decimal>`.
+///
+/// Gamma returns `liquidity` as a JSON number, but fixtures and other API surfaces
+/// sometimes serialize Decimal as a string. Accepting both keeps the DTO robust to
+/// upstream format changes without losing precision.
+fn deserialize_decimal_flexible<'de, D>(d: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use rust_decimal::prelude::FromPrimitive;
+    use serde::de::Error as DeError;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flex {
+        Str(String),
+        Float(f64),
+        Int(i64),
+    }
+
+    let Some(v) = Option::<Flex>::deserialize(d)? else {
+        return Ok(None);
+    };
+    match v {
+        Flex::Str(s) => s.parse::<Decimal>().map(Some).map_err(DeError::custom),
+        Flex::Float(f) => Decimal::from_f64(f)
+            .map(Some)
+            .ok_or_else(|| DeError::custom(format!("liquidity f64 {f} → Decimal failed"))),
+        Flex::Int(i) => Ok(Some(Decimal::from(i))),
+    }
 }
 
 /// Parse a single-element Gamma `/markets` response.
@@ -245,6 +355,25 @@ pub fn parse_gamma_response(bytes: &[u8]) -> Result<Option<(Option<u8>, i64)>, S
     });
 
     Ok(Some((winner, resolved_at_unix)))
+}
+
+/// Parse a single-element Gamma `/markets` response and extract the `liquidity` field.
+///
+/// Returns:
+/// - `Some(decimal)` — the market has a parseable `liquidity` value.
+/// - `None` — the market was not found (empty array) or Gamma omitted the field.
+///
+/// Does not require the market to be closed; depth is meaningful only on open markets,
+/// but we don't filter at parse time — caller decides whether to use stale closed-market
+/// values.
+pub fn parse_gamma_liquidity(bytes: &[u8]) -> Result<Option<Decimal>, String> {
+    let markets: Vec<GammaMarketRaw> =
+        serde_json::from_slice(bytes).map_err(|e| format!("JSON parse: {e}"))?;
+
+    let Some(m) = markets.into_iter().next() else {
+        return Ok(None);
+    };
+    Ok(m.liquidity)
 }
 
 /// Parse a single-element Gamma `/markets` response and extract the scheduled `endDate`.
@@ -312,6 +441,14 @@ pub fn load_resolutions(cache: &WalletCache) -> Result<ResolutionIndex, Bootstra
 /// here so callers don't need to import both `gamma` and `cache`.
 pub fn load_schedules(cache: &WalletCache) -> Result<ScheduleIndex, BootstrapError> {
     cache.load_all_schedules()
+}
+
+/// Load all liquidity rows from `cache` into a [`LiquidityIndex`].
+///
+/// Thin wrapper that delegates to [`WalletCache::load_all_liquidity`]; provided
+/// here so callers don't need to import both `gamma` and `cache`.
+pub fn load_liquidity(cache: &WalletCache) -> Result<LiquidityIndex, BootstrapError> {
+    cache.load_all_liquidity()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

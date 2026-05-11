@@ -16,7 +16,9 @@
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
+};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -113,6 +115,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
+        liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -155,6 +159,7 @@ async fn winner_wallet_produces_positive_pnl() {
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -198,6 +203,7 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -261,6 +267,7 @@ async fn per_trader_win_rate_used_as_probability() {
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -313,6 +320,7 @@ async fn fee_model_reduces_edge_at_high_prices() {
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

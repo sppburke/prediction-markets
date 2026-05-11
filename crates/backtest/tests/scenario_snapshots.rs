@@ -26,7 +26,9 @@ use std::collections::HashSet;
 use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
+};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -147,6 +149,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
+        liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -200,6 +204,7 @@ async fn wallet_outside_snapshot_emits_no_signals() {
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -245,6 +250,7 @@ async fn weekly_pool_swap_changes_active_leaders() {
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -286,6 +292,7 @@ async fn wallet_present_throughout_emits_throughout() {
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -326,6 +333,7 @@ async fn position_opened_in_week1_persists_after_drop() {
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -368,6 +376,7 @@ async fn empty_snapshots_falls_back_to_full_history() {
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),
@@ -411,6 +420,7 @@ async fn simulation_date_before_first_snapshot_emits_nothing() {
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &default_strategy(),

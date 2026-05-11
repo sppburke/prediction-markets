@@ -25,7 +25,9 @@ use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::{KellySweepReport, KellySweepRun, WinnerFollowReport};
 use pe_backtest::simulation::{SweepContext, run_one_kelly_fraction, run_simulation};
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex, WalletCache};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
+};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId, Price, Probability,
@@ -125,6 +127,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_prior_alpha: 0,
         kelly_p_prior_beta: 0,
         kelly_p_k_per_market: 0,
+        liquidity_take_fraction: rust_decimal::Decimal::new(5, 2),
+        liquidity_min_required_usd: rust_decimal::Decimal::new(200, 0),
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -265,6 +269,7 @@ async fn sweep_produces_correct_run_count() {
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &ScheduleIndex::new(),
+        liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
         ledger_config: &ledger_config,
     };
@@ -347,6 +352,10 @@ fn to_markdown_table_covers_all_runs() {
             funder_graph_snapshot_caveat: false,
             expiry_filter_suppression_pct: dec!(0),
             expiry_suppression_by_quarter: BTreeMap::new(),
+            liquidity_clamps_fired: 0,
+            liquidity_clamp_contracts_reduced: 0,
+            liquidity_below_floor_bypasses: 0,
+            liquidity_unknown_markets: 0,
             resolved_config: None,
         },
     };
@@ -401,6 +410,7 @@ async fn sweep_suppresses_per_run_output() {
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
+        &LiquidityIndex::new(),
         &relaxed_ranker(),
         &LedgerConfig::default(),
         &strategy,
@@ -449,6 +459,7 @@ async fn parallel_sweep_matches_sequential() {
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
+        liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
         ledger_config: &ledger_config,
     };
@@ -551,6 +562,7 @@ async fn parallel_sweep_is_deterministic() {
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
+        liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
         ledger_config: &ledger_config,
     };
@@ -645,6 +657,7 @@ async fn parallel_sweep_output_sorted_by_fraction() {
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
+        liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
         ledger_config: &ledger_config,
     };
@@ -713,6 +726,7 @@ async fn parallel_sweep_single_fraction() {
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
+        liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
         ledger_config: &ledger_config,
     };

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use pe_bootstrap::cache::{LeaderboardSnapshots, ResolutionIndex, ScheduleIndex};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, KellyFraction, LeaderAction, MarketId, OperatorId, OutcomeId, Probability,
@@ -17,6 +17,7 @@ use pe_core_types::{
 };
 use pe_operator_graph::OperatorIdentity;
 use pe_risk_engine::RiskSnapshot;
+use pe_risk_engine::clamp_contracts_to_liquidity;
 use pe_risk_engine::snapshot::TradingMode;
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
@@ -196,6 +197,7 @@ pub fn run_simulation(
     snapshots: &LeaderboardSnapshots,
     resolutions: &ResolutionIndex,
     schedules: &ScheduleIndex,
+    liq_index: &LiquidityIndex,
     ranker_config: &RankerConfig,
     ledger_config: &LedgerConfig,
     strategy: &WinnerFollowStrategy,
@@ -282,6 +284,15 @@ pub fn run_simulation(
 
     // Tracks buy-signal suppression from the max_hours_to_expiry filter.
     let mut suppression_tracker = SuppressionTracker::default();
+
+    // Liquidity-clamp partition counters (see report.rs `liquidity_*` fields).
+    // Every BUY trade reaching the clamp site increments at most one counter;
+    // "data-ok passthrough" is the silent no-counter case, derivable as
+    // `total_copies - fired - below_floor - unknown`.
+    let mut liquidity_clamps_fired: u64 = 0;
+    let mut liquidity_clamp_contracts_reduced: u64 = 0;
+    let mut liquidity_below_floor_bypasses: u64 = 0;
+    let mut liquidity_unknown_markets: u64 = 0;
 
     // Group trades by date for efficient walk-forward lookup.
     let mut trades_by_date: BTreeMap<Date, Vec<&RawTrade>> = BTreeMap::new();
@@ -572,6 +583,56 @@ pub fn run_simulation(
                         }
                     };
 
+                    // Liquidity-aware clamp — applied after evaluate() returns so
+                    // the strategy contract stays pure. Partition: gate disabled
+                    // → unknown market → clamp fired → below floor → data-ok
+                    // (silent). See docs/_GLOSSARY.md `liquidity_take_fraction`.
+                    let (liquidity_usd, market_known) = match liq_index.get(&trade.market_id) {
+                        Some(&v) => (v, true),
+                        None => (Decimal::ZERO, false),
+                    };
+                    let clamped = clamp_contracts_to_liquidity(
+                        contracts_count,
+                        liquidity_usd,
+                        config.liquidity_take_fraction,
+                        config.liquidity_min_required_usd,
+                        fill_price,
+                    );
+                    if config.liquidity_take_fraction <= Decimal::ZERO {
+                        // gate disabled — silent passthrough (data-ok bucket)
+                    } else if !market_known {
+                        tracing::debug!(
+                            target: "liquidity_clamp",
+                            market_id = %trade.market_id,
+                            "no liquidity data; clamp bypassed"
+                        );
+                        liquidity_unknown_markets = liquidity_unknown_markets.saturating_add(1);
+                    } else if clamped < contracts_count {
+                        tracing::info!(
+                            target: "liquidity_clamp",
+                            market_id = %trade.market_id,
+                            original = contracts_count,
+                            clamped,
+                            liquidity_usd = %liquidity_usd,
+                            "liquidity clamp fired"
+                        );
+                        liquidity_clamps_fired = liquidity_clamps_fired.saturating_add(1);
+                        liquidity_clamp_contracts_reduced = liquidity_clamp_contracts_reduced
+                            .saturating_add(contracts_count - clamped);
+                    } else if liquidity_usd > Decimal::ZERO
+                        && liquidity_usd < config.liquidity_min_required_usd
+                    {
+                        tracing::warn!(
+                            target: "liquidity_clamp",
+                            market_id = %trade.market_id,
+                            liquidity_usd = %liquidity_usd,
+                            "liquidity below min_required_usd; clamp bypassed"
+                        );
+                        liquidity_below_floor_bypasses =
+                            liquidity_below_floor_bypasses.saturating_add(1);
+                    }
+                    let contracts_count = clamped;
+
                     if contracts_count == 0 {
                         continue;
                     }
@@ -692,6 +753,10 @@ pub fn run_simulation(
         funder_graph_snapshot_caveat: false,
         expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
+        liquidity_clamps_fired,
+        liquidity_clamp_contracts_reduced,
+        liquidity_below_floor_bypasses,
+        liquidity_unknown_markets,
         resolved_config: None,
     };
 
@@ -743,6 +808,7 @@ pub struct SweepContext<'a> {
     pub snapshots: &'a LeaderboardSnapshots,
     pub resolutions: &'a ResolutionIndex,
     pub schedules: &'a ScheduleIndex,
+    pub liq_index: &'a LiquidityIndex,
     pub ranker_config: &'a RankerConfig,
     pub ledger_config: &'a LedgerConfig,
 }
@@ -780,6 +846,7 @@ pub fn run_one_kelly_fraction(
         ctx.snapshots,
         ctx.resolutions,
         ctx.schedules,
+        ctx.liq_index,
         ctx.ranker_config,
         ctx.ledger_config,
         &strategy,
