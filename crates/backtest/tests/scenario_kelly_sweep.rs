@@ -135,6 +135,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
+        skip_unknown_operator: false,
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -358,6 +359,8 @@ fn to_markdown_table_covers_all_runs() {
             funder_graph_snapshot_caveat: false,
             expiry_filter_suppression_pct: dec!(0),
             expiry_suppression_by_quarter: BTreeMap::new(),
+            unknown_operator_suppression_pct: dec!(0),
+            unknown_operator_suppression_by_quarter: BTreeMap::new(),
             liquidity_clamps_fired: 0,
             liquidity_clamp_contracts_reduced: 0,
             liquidity_below_floor_bypasses: 0,

@@ -123,6 +123,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
+        skip_unknown_operator: false,
         strategy: WinnerFollowConfig::default(),
     }
 }

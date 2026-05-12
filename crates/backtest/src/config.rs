@@ -236,6 +236,28 @@ pub struct BacktestConfig {
     #[serde(default = "default_max_positions_per_market")]
     pub max_positions_per_market: Option<NonZeroU32>,
 
+    /// Suppress BUY signals from wallets whose `op_identity` is unresolved in
+    /// the funder-graph (issue #141).
+    ///
+    /// Watchlisted leaders whose wallet does not appear in `wallet_to_operator`
+    /// — i.e. the funder-graph clustering has not attached them to any operator
+    /// at any confidence level — are treated as untrusted: the BUY arm of the
+    /// simulation `continue`s before sizing. The SELL arm is unaffected, so
+    /// already-open positions still close normally.
+    ///
+    /// Discriminator is `op_identity.is_none()` (no new graph traversal). The
+    /// gate sits inside the per-leader loop after the per-market cap and before
+    /// the horizon-cooldown filter, so both flat-USD and Kelly sizing honor it.
+    /// Suppression rate per quarter is reported in
+    /// `unknown_operator_suppression_by_quarter`.
+    ///
+    /// Default is `true` (production-correct). Existing scenarios opt out via
+    /// `skip_unknown_operator: false`, matching the `require_known_expiry`
+    /// precedent. `PE_BACKTEST_SKIP_UNKNOWN_OPERATOR` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `backtest_skip_unknown_operator_default`.
+    #[serde(default = "default_skip_unknown_operator")]
+    pub skip_unknown_operator: bool,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -316,6 +338,14 @@ const fn default_max_positions_per_market() -> Option<NonZeroU32> {
     Some(NonZeroU32::MIN)
 }
 
+const fn default_skip_unknown_operator() -> bool {
+    // Issue #141. Production-correct: wallets with no funder-graph operator
+    // identity are an oversized share of negative PnL per the A1 oracle-lift
+    // analysis. Scenarios opt out via `skip_unknown_operator: false`.
+    // Canonical: docs/_GLOSSARY.md `backtest_skip_unknown_operator_default`.
+    true
+}
+
 fn default_liquidity_min_required_usd() -> Decimal {
     // 200 USD. Canonical: docs/_GLOSSARY.md `liquidity_min_required_usd_default`.
     Decimal::new(200, 0)
@@ -351,6 +381,7 @@ impl Default for BacktestConfig {
             no_buy_within_horizon_days: None,
             require_known_expiry: default_require_known_expiry(),
             max_positions_per_market: default_max_positions_per_market(),
+            skip_unknown_operator: default_skip_unknown_operator(),
             strategy: WinnerFollowConfig::default(),
         }
     }

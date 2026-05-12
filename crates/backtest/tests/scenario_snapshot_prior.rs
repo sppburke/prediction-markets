@@ -153,6 +153,7 @@ fn base_config(dir: &TempDir, min_snapshots: u32, extra_per_missing: u32) -> Bac
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
+        skip_unknown_operator: false,
         strategy: WinnerFollowConfig::default(),
     }
 }
