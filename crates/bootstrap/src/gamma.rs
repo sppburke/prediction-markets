@@ -3,11 +3,17 @@
 //! Endpoint: `GET https://gamma-api.polymarket.com/markets?condition_ids={ID}`
 //!
 //! Multi-ID batching is not supported (comma-separated, bracket, and repeat-key
-//! strategies all fail silently). Per-ID sequential fetch is required.
+//! strategies all fail silently). Per-ID requests are required, but the client
+//! fires `GAMMA_CONCURRENCY` of them in parallel via `buffer_unordered` to
+//! amortise the per-request RTT (~250–300 ms each).
 //!
-//! Rate limit: live-tested at ≥27 req/s; we gate at 10 req/s (100ms) to stay
-//! conservative. See `bootstrap_gamma_min_interval_ms` in `docs/_GLOSSARY.md`.
+//! Rate limit: live-tested at ≥27 req/s; we gate at 20 req/s (50 ms) to stay
+//! conservative. The cap is enforced globally by [`ReqwestFetcher`]'s shared
+//! mutex regardless of caller concurrency. See
+//! `bootstrap_gamma_min_interval_ms` and `bootstrap_gamma_concurrency` in
+//! `docs/_GLOSSARY.md`.
 
+use futures::stream::{self, StreamExt};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
 use rust_decimal::Decimal;
@@ -20,7 +26,12 @@ use crate::error::BootstrapError;
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 pub(crate) const DEFAULT_GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
-pub(crate) const GAMMA_MIN_INTERVAL_MS: u64 = 100; // 10 req/s; live-tested limit ≥27 req/s
+pub(crate) const GAMMA_MIN_INTERVAL_MS: u64 = 50; // 20 req/s; live-tested limit ≥27 req/s
+/// Number of in-flight Gamma requests issued concurrently per fetch loop.
+/// With ~300 ms per-request RTT, ~6 in-flight saturates the 20 req/s rate
+/// limit; 10 leaves headroom for latency spikes without burning CPU on idle
+/// tasks.
+pub(crate) const GAMMA_CONCURRENCY: usize = 10;
 
 /// Fetches market resolution data from the Polymarket Gamma API.
 ///
@@ -31,7 +42,7 @@ pub struct GammaFetcher<F: PageFetcher> {
     fetcher: F,
 }
 
-impl<F: PageFetcher> GammaFetcher<F> {
+impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
     pub fn new(base_url: String, fetcher: F) -> Self {
         Self { base_url, fetcher }
     }
@@ -42,6 +53,12 @@ impl<F: PageFetcher> GammaFetcher<F> {
     /// markets already in `market_resolutions` are not re-fetched. Each successful
     /// resolution is inserted immediately via `INSERT OR IGNORE` (WAL durability).
     ///
+    /// Requests are issued with `buffer_unordered(GAMMA_CONCURRENCY)`. The shared
+    /// rate-limit mutex inside [`ReqwestFetcher`] enforces the global throughput
+    /// cap (`GAMMA_MIN_INTERVAL_MS`) regardless of concurrency. Results are
+    /// inserted serially as they arrive, so `cache` is never accessed from
+    /// multiple tasks.
+    ///
     /// Returns the count of newly inserted rows. Markets not yet closed, or markets
     /// where the Gamma API returns no result, are silently skipped and will be retried
     /// on the next run.
@@ -51,31 +68,44 @@ impl<F: PageFetcher> GammaFetcher<F> {
         cache: &mut WalletCache,
     ) -> Result<usize, BootstrapError> {
         let already_resolved = cache.resolved_market_ids();
-        let to_fetch: Vec<&String> = market_ids
+        let to_fetch: Vec<String> = market_ids
             .iter()
             .filter(|id| !already_resolved.contains(*id))
+            .cloned()
             .collect();
 
         let total = to_fetch.len();
         info!(
             total,
             already_cached = already_resolved.len(),
+            concurrency = GAMMA_CONCURRENCY,
             "gamma: starting resolution fetch"
         );
 
-        let mut inserted = 0usize;
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let fetcher = &self.fetcher;
+        let base_url = self.base_url.as_str();
 
-        for (i, market_id) in to_fetch.iter().enumerate() {
-            if i > 0 && i % 1_000 == 0 {
+        let mut stream = stream::iter(to_fetch)
+            .map(|market_id| async move {
+                let url = format!("{base_url}/markets?condition_ids={market_id}");
+                let result = fetcher.fetch_page(&url).await;
+                (market_id, result)
+            })
+            .buffer_unordered(GAMMA_CONCURRENCY);
+
+        let mut inserted = 0usize;
+        let mut processed = 0usize;
+        while let Some((market_id, result)) = stream.next().await {
+            processed += 1;
+            if processed.is_multiple_of(1_000) {
                 info!(
-                    progress = i,
+                    processed,
                     total, inserted, "gamma: resolution fetch progress"
                 );
             }
 
-            let url = format!("{}/markets?condition_ids={}", self.base_url, market_id);
-            let bytes = match self.fetcher.fetch_page(&url).await {
+            let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
                     tracing::warn!(%market_id, %message, "gamma: fetch error, skipping");
@@ -100,7 +130,7 @@ impl<F: PageFetcher> GammaFetcher<F> {
                 continue; // market not yet closed — skip silently
             };
 
-            cache.insert_resolution(market_id, winner, resolved_at_unix, fetched_at)?;
+            cache.insert_resolution(&market_id, winner, resolved_at_unix, fetched_at)?;
             inserted += 1;
         }
 
@@ -124,31 +154,41 @@ impl<F: PageFetcher> GammaFetcher<F> {
         cache: &mut WalletCache,
     ) -> Result<usize, BootstrapError> {
         let already_scheduled = cache.scheduled_market_ids();
-        let to_fetch: Vec<&String> = market_ids
+        let to_fetch: Vec<String> = market_ids
             .iter()
             .filter(|id| !already_scheduled.contains(*id))
+            .cloned()
             .collect();
 
         let total = to_fetch.len();
         info!(
             total,
             already_cached = already_scheduled.len(),
+            concurrency = GAMMA_CONCURRENCY,
             "gamma: starting schedule fetch"
         );
 
-        let mut inserted = 0usize;
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let fetcher = &self.fetcher;
+        let base_url = self.base_url.as_str();
 
-        for (i, market_id) in to_fetch.iter().enumerate() {
-            if i > 0 && i % 1_000 == 0 {
-                info!(
-                    progress = i,
-                    total, inserted, "gamma: schedule fetch progress"
-                );
+        let mut stream = stream::iter(to_fetch)
+            .map(|market_id| async move {
+                let url = format!("{base_url}/markets?condition_ids={market_id}");
+                let result = fetcher.fetch_page(&url).await;
+                (market_id, result)
+            })
+            .buffer_unordered(GAMMA_CONCURRENCY);
+
+        let mut inserted = 0usize;
+        let mut processed = 0usize;
+        while let Some((market_id, result)) = stream.next().await {
+            processed += 1;
+            if processed.is_multiple_of(1_000) {
+                info!(processed, total, inserted, "gamma: schedule fetch progress");
             }
 
-            let url = format!("{}/markets?condition_ids={}", self.base_url, market_id);
-            let bytes = match self.fetcher.fetch_page(&url).await {
+            let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
                     tracing::warn!(%market_id, %message, "gamma: schedule fetch error, skipping");
@@ -169,7 +209,7 @@ impl<F: PageFetcher> GammaFetcher<F> {
                 }
             };
 
-            cache.insert_schedule(market_id, end_date_unix, fetched_at)?;
+            cache.insert_schedule(&market_id, end_date_unix, fetched_at)?;
             inserted += 1;
         }
 
@@ -195,31 +235,44 @@ impl<F: PageFetcher> GammaFetcher<F> {
         cache: &mut WalletCache,
     ) -> Result<usize, BootstrapError> {
         let already_fetched = cache.liquid_market_ids();
-        let to_fetch: Vec<&String> = market_ids
+        let to_fetch: Vec<String> = market_ids
             .iter()
             .filter(|id| !already_fetched.contains(*id))
+            .cloned()
             .collect();
 
         let total = to_fetch.len();
         info!(
             total,
             already_cached = already_fetched.len(),
+            concurrency = GAMMA_CONCURRENCY,
             "gamma: starting liquidity fetch"
         );
 
-        let mut inserted = 0usize;
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let fetcher = &self.fetcher;
+        let base_url = self.base_url.as_str();
 
-        for (i, market_id) in to_fetch.iter().enumerate() {
-            if i > 0 && i % 1_000 == 0 {
+        let mut stream = stream::iter(to_fetch)
+            .map(|market_id| async move {
+                let url = format!("{base_url}/markets?condition_ids={market_id}");
+                let result = fetcher.fetch_page(&url).await;
+                (market_id, result)
+            })
+            .buffer_unordered(GAMMA_CONCURRENCY);
+
+        let mut inserted = 0usize;
+        let mut processed = 0usize;
+        while let Some((market_id, result)) = stream.next().await {
+            processed += 1;
+            if processed.is_multiple_of(1_000) {
                 info!(
-                    progress = i,
+                    processed,
                     total, inserted, "gamma: liquidity fetch progress"
                 );
             }
 
-            let url = format!("{}/markets?condition_ids={}", self.base_url, market_id);
-            let bytes = match self.fetcher.fetch_page(&url).await {
+            let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
                     tracing::warn!(%market_id, %message, "gamma: liquidity fetch error, skipping");
@@ -241,7 +294,7 @@ impl<F: PageFetcher> GammaFetcher<F> {
                 }
             };
 
-            cache.upsert_market_liquidity(market_id, liquidity_usd, fetched_at)?;
+            cache.upsert_market_liquidity(&market_id, liquidity_usd, fetched_at)?;
             inserted += 1;
         }
 

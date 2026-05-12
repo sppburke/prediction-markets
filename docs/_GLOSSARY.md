@@ -548,7 +548,8 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_fetch_funder_graph` | `false` | When `true`, `pe-bootstrap` queries Etherscan for funder edges for every wallet not yet in `funder_lookup_done` and persists them in `funder_edges`. Per-wallet atomic commit enables resume after failure. One-time ~4–5 h for ~23k wallets (concurrent N=4, token-bucket 3 req/s); all subsequent runs are near-instant. Requires `PE_ETHERSCAN_API_KEY`. Set `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1` to enable. |
 | `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (funder graph, resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
 | `bootstrap_gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API. Override via `PE_GAMMA_BASE_URL` (useful for testing against a stub). |
-| `bootstrap_gamma_min_interval_ms` | 100 | Minimum milliseconds between sequential Gamma API requests (10 req/s). Live-tested ceiling is ≥ 27 req/s; 100 ms is a conservative gate. |
+| `bootstrap_gamma_min_interval_ms` | 50 | Minimum milliseconds between Gamma API requests (20 req/s). Live-tested ceiling is ≥ 27 req/s; 50 ms keeps ~25% margin. Enforced globally by `ReqwestFetcher`'s shared mutex regardless of caller concurrency. |
+| `bootstrap_gamma_concurrency` | 10 | Number of in-flight Gamma requests issued concurrently per fetch loop (`buffer_unordered`). With ~300 ms per-request RTT, ~6 in-flight saturates the 20 req/s rate limit; 10 leaves headroom for latency spikes. The global rate cap is still enforced by `bootstrap_gamma_min_interval_ms`. |
 
 #### Leaderboard snapshots (`leaderboard_snapshots` table)
 
