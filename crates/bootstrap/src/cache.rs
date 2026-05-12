@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS market_resolutions (
     market_id           TEXT    PRIMARY KEY NOT NULL,
     winning_outcome_id  INTEGER NULL,
     resolved_at_unix    INTEGER NOT NULL,
-    fetched_at_unix     INTEGER NOT NULL
+    fetched_at_unix     INTEGER NOT NULL,
+    source              TEXT    NOT NULL DEFAULT 'gamma'
 );
 CREATE INDEX IF NOT EXISTS idx_resolutions_resolved_at
     ON market_resolutions(resolved_at_unix);
@@ -73,7 +74,8 @@ CREATE INDEX IF NOT EXISTS idx_resolutions_resolved_at
 CREATE TABLE IF NOT EXISTS market_schedules (
     market_id       TEXT    PRIMARY KEY NOT NULL,
     end_date_unix   INTEGER NULL,
-    fetched_at_unix INTEGER NOT NULL
+    fetched_at_unix INTEGER NOT NULL,
+    source          TEXT    NOT NULL DEFAULT 'gamma'
 );
 
 CREATE TABLE IF NOT EXISTS funder_edges (
@@ -94,6 +96,12 @@ CREATE TABLE IF NOT EXISTS market_liquidity (
     market_id        TEXT    PRIMARY KEY NOT NULL,
     liquidity_usd_str TEXT   NOT NULL,
     fetched_at_unix  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_cursor (
+    key        TEXT    PRIMARY KEY NOT NULL,
+    value      TEXT    NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 ";
 
@@ -125,6 +133,11 @@ impl WalletCache {
                 "ALTER TABLE funder_edges ADD COLUMN event_at_unix INTEGER NOT NULL DEFAULT 0",
             )?;
         }
+        // Migration: add `source` column to market_resolutions / market_schedules. DBs
+        // created before this change keep `DEFAULT 'gamma'` — correct since every
+        // pre-migration row was inserted by the Gamma fetcher.
+        add_source_column_if_missing(&conn, "market_resolutions")?;
+        add_source_column_if_missing(&conn, "market_schedules")?;
         Ok(Self { conn })
     }
 
@@ -456,6 +469,39 @@ impl WalletCache {
         Ok(())
     }
 
+    /// Insert a single market resolution, explicitly tagged with `source`.
+    ///
+    /// Same idempotency contract as [`Self::insert_resolution`] (`INSERT OR IGNORE` on
+    /// `market_id`). The `source` column was added in the multi-source pipeline migration
+    /// (issue #149) and lets the cache distinguish rows by their origin:
+    /// `"polygon"` (on-chain `eth_getLogs`), `"clob"` (Polymarket CLOB), `"dune"`
+    /// (Dune Analytics fallback). Gamma-sourced rows continue to flow through the
+    /// existing [`Self::insert_resolution`] method, which omits `source` from the
+    /// INSERT and lets the schema-level `DEFAULT 'gamma'` tag the row.
+    pub fn insert_resolution_with_source(
+        &mut self,
+        market_id: &str,
+        winning_outcome_id: Option<u8>,
+        resolved_at_unix: i64,
+        fetched_at_unix: i64,
+        source: &str,
+    ) -> Result<(), BootstrapError> {
+        let winner_i64: Option<i64> = winning_outcome_id.map(i64::from);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO market_resolutions \
+             (market_id, winning_outcome_id, resolved_at_unix, fetched_at_unix, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                market_id,
+                winner_i64,
+                resolved_at_unix,
+                fetched_at_unix,
+                source,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Return the set of market IDs already present in `market_resolutions`.
     ///
     /// Used by [`GammaFetcher`] to skip markets that have already been fetched.
@@ -492,6 +538,31 @@ impl WalletCache {
              (market_id, end_date_unix, fetched_at_unix) \
              VALUES (?1, ?2, ?3)",
             params![market_id, end_date_unix, fetched_at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a scheduled endDate for a market, explicitly tagged with `source`.
+    ///
+    /// Same idempotency contract as [`Self::insert_schedule`] (`INSERT OR IGNORE` on
+    /// `market_id`). The `source` column was added in the multi-source pipeline migration
+    /// (issue #149) and lets the cache distinguish rows by their origin:
+    /// `"clob"` (Polymarket CLOB closed-market listing) is the only non-Gamma writer
+    /// today; future sources slot in here. Gamma-sourced rows continue to flow through
+    /// the existing [`Self::insert_schedule`] method, which omits `source` from the
+    /// INSERT and lets the schema-level `DEFAULT 'gamma'` tag the row.
+    pub fn insert_schedule_with_source(
+        &mut self,
+        market_id: &str,
+        end_date_unix: Option<i64>,
+        fetched_at_unix: i64,
+        source: &str,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO market_schedules \
+             (market_id, end_date_unix, fetched_at_unix, source) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![market_id, end_date_unix, fetched_at_unix, source],
         )?;
         Ok(())
     }
@@ -813,6 +884,44 @@ impl WalletCache {
         }
         Ok(result)
     }
+
+    // ── source_cursor ─────────────────────────────────────────────────────────
+
+    /// Read a checkpoint value previously written by [`Self::set_source_cursor`].
+    ///
+    /// Returns `None` when the key has never been written. The `source_cursor`
+    /// table holds opaque string values keyed by `key` so different daily-run
+    /// resumes (CLOB pagination, Polygon block-scan checkpoint, …) can share
+    /// a single table without colliding. Callers parse the returned string as
+    /// needed (e.g. `s.parse::<u64>().ok()` for a block number).
+    ///
+    /// # Precondition
+    /// Returns `None` if no row exists for `key` or if the underlying query
+    /// fails — callers should treat absent-or-broken identically (start fresh).
+    pub fn get_source_cursor(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM source_cursor WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    /// Write or replace the checkpoint value for `key`.
+    ///
+    /// Uses `INSERT OR REPLACE` so subsequent calls overwrite the prior value;
+    /// `updated_at` is set to the current UTC unix timestamp on every write so
+    /// operators can audit how recently each cursor advanced.
+    pub fn set_source_cursor(&mut self, key: &str, value: &str) -> Result<(), BootstrapError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO source_cursor (key, value, updated_at) \
+             VALUES (?1, ?2, ?3)",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
 }
 
 /// Resolved-market record loaded from the `market_resolutions` table.
@@ -980,6 +1089,30 @@ fn row_to_trade(
         timestamp: SourceTimestamp(dt),
         source_trade_id: SourceTradeId(id),
     })
+}
+
+/// Add a `source TEXT NOT NULL DEFAULT 'gamma'` column to `table` if it doesn't
+/// already exist. Idempotent: safe to call on every `WalletCache::open`.
+///
+/// Used for the issue #149 multi-source-pipeline migration. SQLite ALTER TABLE
+/// ADD COLUMN with a constant DEFAULT is supported and back-fills the column
+/// for existing rows — every pre-migration `market_resolutions` /
+/// `market_schedules` row was written by Gamma, so `'gamma'` is the correct
+/// retroactive tag.
+fn add_source_column_if_missing(conn: &Connection, table: &str) -> Result<(), BootstrapError> {
+    let col_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='source'",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !col_exists {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'gamma'");
+        conn.execute_batch(&sql)?;
+    }
+    Ok(())
 }
 
 fn side_to_str(s: &Side) -> &'static str {
@@ -1551,6 +1684,285 @@ mod tests {
             .remove(&MarketId(VenueMarketId("0xcond".to_owned())))
             .unwrap();
         assert_eq!(sched.end_date_unix, Some(1_699_999_000));
+    }
+
+    // ── source-column migration + source_cursor unit tests ───────────────────
+
+    #[test]
+    fn fresh_cache_resolution_default_source_is_gamma() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xcond", Some(0), 1_700_000_000, 1_700_000_001)
+            .unwrap();
+        let source: String = cache
+            .conn
+            .query_row(
+                "SELECT source FROM market_resolutions WHERE market_id = ?1",
+                params!["0xcond"],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            source, "gamma",
+            "insert_resolution without explicit source must use DEFAULT 'gamma'"
+        );
+    }
+
+    #[test]
+    fn fresh_cache_schedule_default_source_is_gamma() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xcond", Some(1_699_999_000), 1_700_000_001)
+            .unwrap();
+        let source: String = cache
+            .conn
+            .query_row(
+                "SELECT source FROM market_schedules WHERE market_id = ?1",
+                params!["0xcond"],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            source, "gamma",
+            "insert_schedule without explicit source must use DEFAULT 'gamma'"
+        );
+    }
+
+    #[test]
+    fn insert_resolution_with_source_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution_with_source(
+                "0xpoly",
+                Some(0),
+                1_700_000_000,
+                1_700_000_001,
+                "polygon",
+            )
+            .unwrap();
+        cache
+            .insert_resolution_with_source("0xclob", Some(1), 1_700_000_010, 1_700_000_011, "clob")
+            .unwrap();
+        cache
+            .insert_resolution_with_source("0xdune", None, 1_700_000_020, 1_700_000_021, "dune")
+            .unwrap();
+        let mut stmt = cache
+            .conn
+            .prepare("SELECT market_id, source FROM market_resolutions ORDER BY market_id")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("0xclob".to_owned(), "clob".to_owned()),
+                ("0xdune".to_owned(), "dune".to_owned()),
+                ("0xpoly".to_owned(), "polygon".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_schedule_with_source_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule_with_source("0xclob", Some(1_700_000_000), 1_700_000_001, "clob")
+            .unwrap();
+        let source: String = cache
+            .conn
+            .query_row(
+                "SELECT source FROM market_schedules WHERE market_id = ?1",
+                params!["0xclob"],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(source, "clob");
+    }
+
+    #[test]
+    fn insert_with_source_is_idempotent_first_writer_wins() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        // First write: polygon claims the row.
+        cache
+            .insert_resolution_with_source(
+                "0xcond",
+                Some(0),
+                1_700_000_000,
+                1_700_000_001,
+                "polygon",
+            )
+            .unwrap();
+        // Second write: clob tries to overwrite — INSERT OR IGNORE swallows it.
+        cache
+            .insert_resolution_with_source("0xcond", Some(1), 1_700_000_010, 1_700_000_011, "clob")
+            .unwrap();
+        let (winner, source): (i64, String) = cache
+            .conn
+            .query_row(
+                "SELECT winning_outcome_id, source FROM market_resolutions WHERE market_id = ?1",
+                params!["0xcond"],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(winner, 0, "first writer's winner must survive");
+        assert_eq!(source, "polygon", "first writer's source must survive");
+    }
+
+    #[test]
+    fn source_column_migration_back_fills_legacy_rows() {
+        // Simulate a pre-migration DB by opening on a file path, dropping the
+        // `source` column, inserting raw rows, then re-opening — the migration
+        // must add the column with DEFAULT 'gamma' for the legacy rows.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            // Step 1: open normally, then DROP the source columns we just added
+            // to mimic a DB that pre-dates this migration.
+            let cache = WalletCache::open(&path).unwrap();
+            cache
+                .conn
+                .execute_batch(
+                    "CREATE TABLE legacy_res AS SELECT market_id, winning_outcome_id, \
+                     resolved_at_unix, fetched_at_unix FROM market_resolutions; \
+                     DROP TABLE market_resolutions; \
+                     ALTER TABLE legacy_res RENAME TO market_resolutions; \
+                     CREATE TABLE legacy_sch AS SELECT market_id, end_date_unix, \
+                     fetched_at_unix FROM market_schedules; \
+                     DROP TABLE market_schedules; \
+                     ALTER TABLE legacy_sch RENAME TO market_schedules;",
+                )
+                .unwrap();
+            cache
+                .conn
+                .execute(
+                    "INSERT INTO market_resolutions (market_id, winning_outcome_id, \
+                     resolved_at_unix, fetched_at_unix) VALUES (?1, ?2, ?3, ?4)",
+                    params!["0xlegacy", 0_i64, 1_700_000_000_i64, 1_700_000_001_i64],
+                )
+                .unwrap();
+            cache
+                .conn
+                .execute(
+                    "INSERT INTO market_schedules (market_id, end_date_unix, fetched_at_unix) \
+                     VALUES (?1, ?2, ?3)",
+                    params!["0xlegacy", 1_699_999_000_i64, 1_700_000_001_i64],
+                )
+                .unwrap();
+        }
+        // Step 2: re-open — migration must add `source` columns with DEFAULT 'gamma'.
+        let cache = WalletCache::open(&path).unwrap();
+        let res_source: String = cache
+            .conn
+            .query_row(
+                "SELECT source FROM market_resolutions WHERE market_id = ?1",
+                params!["0xlegacy"],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        let sch_source: String = cache
+            .conn
+            .query_row(
+                "SELECT source FROM market_schedules WHERE market_id = ?1",
+                params!["0xlegacy"],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            res_source, "gamma",
+            "legacy resolution must be tagged gamma"
+        );
+        assert_eq!(sch_source, "gamma", "legacy schedule must be tagged gamma");
+    }
+
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let _ = WalletCache::open(&path).unwrap();
+        // Re-opening repeatedly must not error or duplicate columns.
+        let _ = WalletCache::open(&path).unwrap();
+        let cache = WalletCache::open(&path).unwrap();
+        // pragma_table_info should show exactly one `source` column.
+        let count: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('market_resolutions') WHERE name='source'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "source column must exist exactly once");
+    }
+
+    #[test]
+    fn source_cursor_get_returns_none_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let cache = tmp_cache(&dir);
+        assert!(cache.get_source_cursor("clob_closed").is_none());
+        assert!(cache.get_source_cursor("polygon_ctf_last_block").is_none());
+    }
+
+    #[test]
+    fn source_cursor_set_then_get_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache.set_source_cursor("clob_closed", "LTE=").unwrap();
+        cache
+            .set_source_cursor("polygon_ctf_last_block", "55000000")
+            .unwrap();
+        assert_eq!(
+            cache.get_source_cursor("clob_closed").as_deref(),
+            Some("LTE=")
+        );
+        assert_eq!(
+            cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
+            Some("55000000")
+        );
+    }
+
+    #[test]
+    fn source_cursor_set_overwrites_prior_value() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .set_source_cursor("polygon_ctf_last_block", "33605403")
+            .unwrap();
+        cache
+            .set_source_cursor("polygon_ctf_last_block", "33615403")
+            .unwrap();
+        assert_eq!(
+            cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
+            Some("33615403"),
+            "later set must replace earlier value"
+        );
+    }
+
+    #[test]
+    fn source_cursor_keys_are_independent() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache.set_source_cursor("clob_closed", "abc").unwrap();
+        cache
+            .set_source_cursor("polygon_ctf_last_block", "1")
+            .unwrap();
+        // Updating one key must not affect the other.
+        cache.set_source_cursor("clob_closed", "def").unwrap();
+        assert_eq!(
+            cache.get_source_cursor("clob_closed").as_deref(),
+            Some("def")
+        );
+        assert_eq!(
+            cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
+            Some("1")
+        );
     }
 
     // ── funder_edges / funder_lookup_done unit tests ──────────────────────────

@@ -27,6 +27,9 @@ const DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_POLYMARKET_CONCURRENCY: usize = 16;
 const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
+const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
+const DEFAULT_CLOB_CONCURRENCY: usize = 8;
+const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -202,6 +205,37 @@ pub struct BootstrapConfig {
     #[serde(default = "default_gamma_base_url")]
     pub gamma_base_url: String,
 
+    /// Polygon JSON-RPC URL for the CTF `eth_getLogs` resolution scan
+    /// (issue #149). `None` skips the Polygon stage entirely — daily backfills
+    /// then rely on CLOB + Dune for resolutions. Set via
+    /// `PE_BOOTSTRAP_POLYGON_RPC_URL`.
+    #[serde(default, alias = "bootstrap_polygon_rpc_url")]
+    pub polygon_rpc_url: Option<String>,
+
+    /// Block-range chunk size for the Polygon CTF scan. Larger chunks issue
+    /// fewer RPC calls but are more likely to hit provider response-size caps
+    /// and trigger the bisect-on-cap fallback. Set via
+    /// `PE_BOOTSTRAP_POLYGON_CTF_CHUNK_BLOCKS`.
+    #[serde(
+        default = "default_polygon_ctf_chunk_blocks",
+        alias = "bootstrap_polygon_ctf_chunk_blocks"
+    )]
+    pub polygon_ctf_chunk_blocks: u64,
+
+    /// Polymarket CLOB API base URL. Override via `PE_CLOB_BASE_URL` (useful
+    /// for testing against a stub).
+    #[serde(default = "default_clob_base_url")]
+    pub clob_base_url: String,
+
+    /// Number of in-flight CLOB requests issued concurrently per fetch loop.
+    /// Mirrors the Gamma fetcher's `buffer_unordered` pattern. Set via
+    /// `PE_BOOTSTRAP_CLOB_CONCURRENCY`.
+    #[serde(
+        default = "default_clob_concurrency",
+        alias = "bootstrap_clob_concurrency"
+    )]
+    pub clob_concurrency: usize,
+
     /// Fetch funder edges via Etherscan after trade fetch (off by default).
     /// Env `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH`: `"1"` or `"true"` to enable.
     #[serde(
@@ -309,6 +343,18 @@ fn default_gamma_base_url() -> String {
     crate::gamma::DEFAULT_GAMMA_BASE_URL.to_owned()
 }
 
+const fn default_polygon_ctf_chunk_blocks() -> u64 {
+    DEFAULT_POLYGON_CTF_CHUNK_BLOCKS
+}
+
+fn default_clob_base_url() -> String {
+    DEFAULT_CLOB_BASE_URL.to_owned()
+}
+
+const fn default_clob_concurrency() -> usize {
+    DEFAULT_CLOB_CONCURRENCY
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BootstrapConfig {
@@ -337,6 +383,10 @@ impl Default for BootstrapConfig {
             polymarket_concurrency: default_polymarket_concurrency(),
             fetch_resolutions: false,
             gamma_base_url: default_gamma_base_url(),
+            polygon_rpc_url: None,
+            polygon_ctf_chunk_blocks: default_polygon_ctf_chunk_blocks(),
+            clob_base_url: default_clob_base_url(),
+            clob_concurrency: default_clob_concurrency(),
             fetch_funder_graph: false,
             skip_trade_fetch: false,
             funder_concurrency: default_funder_concurrency(),
