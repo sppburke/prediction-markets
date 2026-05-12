@@ -152,6 +152,7 @@ fn base_config(dir: &TempDir, take_fraction: Decimal, min_required_usd: Decimal)
         require_known_expiry: false,
         max_positions_per_market: None,
         skip_unknown_operator: false,
+        max_signal_price: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

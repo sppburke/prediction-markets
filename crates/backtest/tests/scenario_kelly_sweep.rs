@@ -136,6 +136,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         require_known_expiry: false,
         max_positions_per_market: None,
         skip_unknown_operator: false,
+        max_signal_price: None,
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -361,6 +362,8 @@ fn to_markdown_table_covers_all_runs() {
             expiry_suppression_by_quarter: BTreeMap::new(),
             unknown_operator_suppression_pct: dec!(0),
             unknown_operator_suppression_by_quarter: BTreeMap::new(),
+            high_price_suppression_pct: dec!(0),
+            high_price_suppression_by_quarter: BTreeMap::new(),
             liquidity_clamps_fired: 0,
             liquidity_clamp_contracts_reduced: 0,
             liquidity_below_floor_bypasses: 0,

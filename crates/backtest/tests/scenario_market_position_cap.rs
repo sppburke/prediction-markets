@@ -163,6 +163,7 @@ fn base_config(dir: &TempDir, cap: Option<NonZeroU32>) -> BacktestConfig {
         require_known_expiry: false,
         max_positions_per_market: cap,
         skip_unknown_operator: false,
+        max_signal_price: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

@@ -36,26 +36,36 @@ use crate::report::{
     KellySweepRun, PnlAccumulator, TradeFill, WinnerFollowReport, max_drawdown_pct, sharpe_ratio,
 };
 
-// Warn threshold for expiry-filter suppression per quarter.
-// Canonical default: `expiry_filter_suppression_warn_threshold = 30%` in `docs/_GLOSSARY.md`.
+// Warn threshold for per-quarter BUY-signal suppression — shared by every
+// labeled `SuppressionTracker` instance (expiry filter, high-price cap, …).
+// Canonical: `backtest_suppression_warn_threshold_pct = 30` in `docs/_GLOSSARY.md`.
 const SUPPRESSION_WARN_THRESHOLD: u32 = 30;
 
-/// Per-quarter statistics for the `max_hours_to_expiry` suppression diagnostic.
+/// Per-quarter statistics for a BUY-signal suppression diagnostic.
 #[derive(Debug, Default)]
 struct QuarterStats {
     total: u64,
     suppressed: u64,
 }
 
-/// Tracks how many buy signals are suppressed by the `max_hours_to_expiry` filter,
-/// broken down by calendar quarter. Emits a warning when any quarter exceeds the
-/// canonical 30% threshold.
-#[derive(Debug, Default)]
+/// Tracks how many BUY signals a gate suppresses, broken down by calendar
+/// quarter. Emits a warning when any quarter exceeds the canonical threshold.
+/// The `label` distinguishes diagnostics in the warning stream (e.g. an
+/// `"expiry filter"` instance vs a `"high-price cap"` instance).
+#[derive(Debug)]
 struct SuppressionTracker {
+    label: &'static str,
     by_quarter: BTreeMap<(i32, u8), QuarterStats>,
 }
 
 impl SuppressionTracker {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            by_quarter: BTreeMap::new(),
+        }
+    }
+
     fn record(&mut self, date: Date, suppressed: bool) {
         let quarter = (date.month() as u8 - 1) / 3 + 1;
         let stats = self.by_quarter.entry((date.year(), quarter)).or_default();
@@ -100,8 +110,9 @@ impl SuppressionTracker {
                 tracing::warn!(
                     quarter = %format!("{year}-Q{q}"),
                     suppression_pct = %pct,
-                    "expiry filter suppression exceeds {threshold_pct}% — \
-                     consider disabling max_hours_to_expiry for this data range"
+                    label = self.label,
+                    "{} suppression exceeds {threshold_pct}%",
+                    self.label,
                 );
             }
         }
@@ -320,15 +331,17 @@ pub fn run_simulation(
     // misleading `day_idx % 30` gate that fired every 30 array indices, not days).
     let mut last_logged_snapshot_unix: Option<i64> = None;
 
-    // Tracks buy-signal suppression from the max_hours_to_expiry filter.
-    let mut suppression_tracker = SuppressionTracker::default();
-    // Tracks buy-signal suppression from the `skip_unknown_operator` gate
+    // Tracks BUY-signal suppression from the max_hours_to_expiry filter.
+    let mut suppression_tracker = SuppressionTracker::new("expiry filter");
+    // Tracks BUY-signal suppression from the `skip_unknown_operator` gate
     // (issue #141). A second `SuppressionTracker` instance — the struct's
     // shape (per-quarter `record(date, suppressed)`) already fits this filter;
     // a separate struct would be pure duplication. `warn_high_quarters` is
     // intentionally not called on this tracker: operator suppression is
     // intentional, not a safety check.
-    let mut unknown_op_tracker = SuppressionTracker::default();
+    let mut unknown_op_tracker = SuppressionTracker::new("unknown operator");
+    // Tracks BUY-signal suppression from the `max_signal_price` cap (issue #142).
+    let mut high_price_tracker = SuppressionTracker::new("high-price cap");
 
     // Liquidity-clamp partition counters (see report.rs `liquidity_*` fields).
     // Every BUY trade reaching the clamp site increments at most one counter;
@@ -662,6 +675,21 @@ pub fn run_simulation(
                         raw
                     };
 
+                    // High-price cap (issue #142): skip BUYs whose
+                    // slippage-adjusted `fill_price` is ≥ `max_signal_price`.
+                    // Gating on `fill_price` (not the leader's signal price)
+                    // captures the cost we'd actually pay and prevents a
+                    // signal at 0.849 + 1% slippage = 0.857 from squeaking
+                    // past a signal-price cap. Fires before flat-USD and
+                    // Kelly so every sizing branch honors it.
+                    if let Some(cap) = config.max_signal_price {
+                        if fill_price >= cap {
+                            high_price_tracker.record(sim_date, true);
+                            continue;
+                        }
+                        high_price_tracker.record(sim_date, false);
+                    }
+
                     // Flat-USD short-circuit (issue #134): backtest-only research
                     // lever that bypasses Kelly, per-trade cap, mode clamp,
                     // `risk-engine`, and the liquidity clamp. `floor(flat /
@@ -935,6 +963,7 @@ pub fn run_simulation(
     let max_dd = max_drawdown_pct(&daily_bankroll);
 
     suppression_tracker.warn_high_quarters(SUPPRESSION_WARN_THRESHOLD);
+    high_price_tracker.warn_high_quarters(SUPPRESSION_WARN_THRESHOLD);
 
     let report = WinnerFollowReport {
         total_pnl_usd,
@@ -954,6 +983,8 @@ pub fn run_simulation(
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
         unknown_operator_suppression_pct: unknown_op_tracker.suppression_pct_global(),
         unknown_operator_suppression_by_quarter: unknown_op_tracker.per_quarter_suppression(),
+        high_price_suppression_pct: high_price_tracker.suppression_pct_global(),
+        high_price_suppression_by_quarter: high_price_tracker.per_quarter_suppression(),
         total_signals_evaluated,
         snapshot_prior_signals,
         snapshot_prior_extra_sum,

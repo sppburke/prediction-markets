@@ -165,6 +165,7 @@ fn base_config_with(
         require_known_expiry,
         max_positions_per_market: None,
         skip_unknown_operator: false,
+        max_signal_price: None,
         strategy: WinnerFollowConfig::default(),
     }
 }
