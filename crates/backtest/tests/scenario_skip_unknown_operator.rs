@@ -183,6 +183,7 @@ fn base_config(dir: &TempDir, skip_unknown_operator: bool) -> BacktestConfig {
         // Disable the per-market cap so it never masks the gate under test.
         max_positions_per_market: None,
         skip_unknown_operator,
+        max_signal_price: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

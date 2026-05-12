@@ -59,6 +59,17 @@ pub struct WinnerFollowReport {
     /// `skip_unknown_operator` gate. Empty when `skip_unknown_operator = false`.
     #[serde(default)]
     pub unknown_operator_suppression_by_quarter: BTreeMap<String, Decimal>,
+    /// Fraction (0–100, percentage) of BUY signals suppressed by the
+    /// `max_signal_price` cap (issue #142) — i.e. signals whose
+    /// slippage-adjusted `fill_price` was ≥ the cap. Zero when
+    /// `max_signal_price = None`. Denominator is BUY signals that reached the
+    /// gate (after slippage clamp, before flat-USD and Kelly).
+    #[serde(default)]
+    pub high_price_suppression_pct: Decimal,
+    /// Per-calendar-quarter suppression fraction (key: `"YYYY-Qn"`) for the
+    /// `max_signal_price` cap. Empty when `max_signal_price = None`.
+    #[serde(default)]
+    pub high_price_suppression_by_quarter: BTreeMap<String, Decimal>,
     /// Count of BUY trades where the liquidity clamp reduced `contracts_count`
     /// (known market, gate enabled, depth above floor, clamp was binding).
     #[serde(default)]

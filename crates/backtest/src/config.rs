@@ -258,6 +258,29 @@ pub struct BacktestConfig {
     #[serde(default = "default_skip_unknown_operator")]
     pub skip_unknown_operator: bool,
 
+    /// Upper-bound cap on slippage-adjusted `fill_price` for BUY copies (issue #142).
+    ///
+    /// `None` disables the cap entirely. `Some(cap)` skips any BUY where
+    /// `fill_price >= cap` (note: `>=` not `>` — a fill at exactly `cap` is
+    /// suppressed; strictly conservative). The cap is compared against the
+    /// slippage-adjusted `fill_price`, not the leader's signal price, so a
+    /// signal at `0.849` plus 1% slippage = `0.857` cannot squeak past a
+    /// signal-price cap.
+    ///
+    /// High-price contracts have catastrophic payoff geometry — 100 bps
+    /// slippage on a $0.99 contract burns nearly all upside, and the binary
+    /// $0/$1 payoff means any miss is total loss. A3 analysis showed +$20.60
+    /// oracle lift in-sample from skipping BUYs at signal price ≥ $0.85.
+    ///
+    /// The gate fires before the flat-USD short-circuit and the Kelly path,
+    /// so every sizing branch honors it. Per-quarter suppression telemetry
+    /// is in `high_price_suppression_pct` and `high_price_suppression_by_quarter`.
+    ///
+    /// Default is `Some(0.85)`. `PE_BACKTEST_MAX_SIGNAL_PRICE` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `backtest_max_signal_price_default`.
+    #[serde(default = "default_max_signal_price")]
+    pub max_signal_price: Option<Decimal>,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -346,6 +369,12 @@ const fn default_skip_unknown_operator() -> bool {
     true
 }
 
+fn default_max_signal_price() -> Option<Decimal> {
+    // Issue #142. 0.85 = `Decimal::new(85, 2)`. A3 oracle-analysis threshold.
+    // Canonical: docs/_GLOSSARY.md `backtest_max_signal_price_default`.
+    Some(Decimal::new(85, 2))
+}
+
 fn default_liquidity_min_required_usd() -> Decimal {
     // 200 USD. Canonical: docs/_GLOSSARY.md `liquidity_min_required_usd_default`.
     Decimal::new(200, 0)
@@ -382,6 +411,7 @@ impl Default for BacktestConfig {
             require_known_expiry: default_require_known_expiry(),
             max_positions_per_market: default_max_positions_per_market(),
             skip_unknown_operator: default_skip_unknown_operator(),
+            max_signal_price: default_max_signal_price(),
             strategy: WinnerFollowConfig::default(),
         }
     }

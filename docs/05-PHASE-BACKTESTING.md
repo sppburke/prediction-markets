@@ -173,9 +173,19 @@ Motivation: A1 oracle-lift analysis on the 2026-05-09 sweep attributed +$23.99 t
 
 Operator-level scenario coverage lives in `crates/backtest/tests/scenario_skip_unknown_operator.rs`.
 
+### High-price BUY cap (`PE_BACKTEST_MAX_SIGNAL_PRICE`)
+
+A structural gate (issue #142) that skips BUYs whose slippage-adjusted `fill_price` is `>=` a configured cap. `BacktestConfig::max_signal_price = Some(cap)` rejects BUY signals when `trade.price.0 × (1 + slippage_rate) >= cap`; the comparison is `>=` (not `>`) so a fill landing exactly at `cap` is suppressed — strictly conservative.
+
+Gating on `fill_price` rather than the leader's signal price is the load-bearing design choice: a signal at 0.849 + 1% slippage = 0.857 would squeak past a signal-price cap but is correctly captured by the fill-price cap. High-price contracts have catastrophic payoff geometry — 100 bps slippage on a $0.99 contract burns nearly all upside, and the binary $0/$1 payoff means any miss is total loss. A3 oracle analysis showed +$20.60 in-sample lift at this threshold.
+
+Default `Some(0.85)`; `None` disables. The gate fires *before* the flat-USD short-circuit and Kelly path, so every sizing branch honors it. Per-quarter suppression telemetry is emitted via `WinnerFollowReport::high_price_suppression_pct` and `high_price_suppression_by_quarter`; warns at the canonical `backtest_suppression_warn_threshold_pct = 30` (shared with `expiry_filter_suppression_pct` via a labeled `SuppressionTracker` instance).
+
+Operator-level scenario coverage lives in `crates/backtest/tests/scenario_max_signal_price.rs`.
+
 ### Scenario-test contributor note
 
-`BacktestConfig` has three fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3), `max_positions_per_market: Some(1)`, and `skip_unknown_operator: true`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false`, `max_positions_per_market: None`, and `skip_unknown_operator: false`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting any of these in a new scenario will produce confusing fewer-than-expected BUY fills (cap), fewer-than-expected through-fills (require_known_expiry), or no fills at all on fixtures that don't supply funder edges (skip_unknown_operator).
+`BacktestConfig` has four fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3), `max_positions_per_market: Some(1)`, `skip_unknown_operator: true`, and `max_signal_price: Some(0.85)`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false`, `max_positions_per_market: None`, `skip_unknown_operator: false`, and `max_signal_price: None`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting any of these in a new scenario will produce confusing fewer-than-expected BUY fills (cap), fewer-than-expected through-fills (require_known_expiry), no fills at all on fixtures that don't supply funder edges (skip_unknown_operator), or no fills on fixtures with prices ≥ 0.85 (max_signal_price).
 
 ## Ranker-level presets
 
