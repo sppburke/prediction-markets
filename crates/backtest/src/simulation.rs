@@ -131,6 +131,10 @@ struct ExposureTracker {
     by_operator: HashMap<OperatorId, i32>,
     /// Open exposure in bps of bankroll per market.
     by_market: HashMap<MarketId, i32>,
+    /// Count of concurrent open positions per market (issue #138). Used by the
+    /// per-market position cap gate in the BUY arm. Incremented once per `add`
+    /// regardless of bps, decremented once per `remove` (saturating at 0).
+    by_market_count: HashMap<MarketId, u32>,
     /// Total copy exposure across all positions.
     total: i32,
 }
@@ -153,17 +157,44 @@ impl ExposureTracker {
         self.by_market.get(m).copied().unwrap_or(0)
     }
 
+    /// Concurrent open-position count for a market (issue #138).
+    ///
+    /// Returns 0 when the market has never been opened or all positions have closed.
+    /// Used by the per-market position cap gate before any sizing branch.
+    fn market_position_count(&self, m: &MarketId) -> u32 {
+        self.by_market_count.get(m).copied().unwrap_or(0)
+    }
+
+    /// Increment exposure counters when a new position opens.
+    ///
+    /// Split from `remove` because `by_market_count` is non-linear (each open
+    /// adds 1 regardless of `bps`); a `remove → add(-bps)` delegation would
+    /// incorrectly increment the counter on close.
     fn add(&mut self, w: WalletAddress, op: Option<&OperatorId>, m: &MarketId, bps: i32) {
         *self.by_leader.entry(w).or_default() += bps;
         if let Some(op) = op {
             *self.by_operator.entry(*op).or_default() += bps;
         }
         *self.by_market.entry(m.clone()).or_default() += bps;
+        *self.by_market_count.entry(m.clone()).or_default() += 1;
         self.total += bps;
     }
 
+    /// Decrement exposure counters when an existing position closes.
+    ///
+    /// Mirror of `add`. `by_market_count` decrements with saturation at 0 to
+    /// guard against a hypothetical double-close that callers should never
+    /// trigger but which a panic would convert into a fatal error.
     fn remove(&mut self, w: WalletAddress, op: Option<&OperatorId>, m: &MarketId, bps: i32) {
-        self.add(w, op, m, -bps);
+        *self.by_leader.entry(w).or_default() -= bps;
+        if let Some(op) = op {
+            *self.by_operator.entry(*op).or_default() -= bps;
+        }
+        *self.by_market.entry(m.clone()).or_default() -= bps;
+        if let Some(n) = self.by_market_count.get_mut(m) {
+            *n = n.saturating_sub(1);
+        }
+        self.total -= bps;
     }
 }
 
@@ -542,6 +573,18 @@ pub fn run_simulation(
                     // Open a new copy position if we don't already have one for this key.
                     if open_positions.contains_key(&wallet_pos_key) {
                         continue; // Already tracking this leader's position.
+                    }
+
+                    // Per-market position cap (issue #138). Default is `Some(1)` — once
+                    // any leader holds an open position on `market_id`, all subsequent
+                    // BUY signals on that `market_id` (any outcome, any leader) are
+                    // suppressed until the existing position closes via SELL or
+                    // resolution sweep. Runs before sizing branches so flat-USD and
+                    // Kelly paths honor it uniformly.
+                    if let Some(cap) = config.max_positions_per_market
+                        && exposure.market_position_count(&trade.market_id) >= cap.get()
+                    {
+                        continue;
                     }
 
                     // Horizon cooldown — suppress new opens when within
@@ -1294,6 +1337,73 @@ mod tests {
         assert_eq!(tracker.market_bps(&m1), 55);
         assert_eq!(tracker.market_bps(&m2), 25);
         assert_eq!(tracker.total, 80);
+    }
+
+    // ── ExposureTracker: market_position_count (issue #138) ────────────────────
+
+    #[test]
+    fn market_position_count_starts_at_zero() {
+        let tracker = ExposureTracker::default();
+        let m = market("mkt-h");
+        assert_eq!(tracker.market_position_count(&m), 0);
+    }
+
+    #[test]
+    fn add_increments_count_independent_of_bps() {
+        // The position counter must increment once per `add` regardless of bps.
+        // This is the invariant that prevents `remove → add(-bps)` delegation.
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-i");
+        tracker.add(wallet(1), None, &m, 250);
+        tracker.add(wallet(2), None, &m, 1);
+        tracker.add(wallet(3), None, &m, 5_000);
+        assert_eq!(tracker.market_position_count(&m), 3);
+        // bps still accumulates linearly.
+        assert_eq!(tracker.market_bps(&m), 5_251);
+    }
+
+    #[test]
+    fn add_then_remove_returns_count_to_zero() {
+        // Critical symmetry guard: after every `add` has a matching `remove`,
+        // both the count and the bps must return to 0. A future refactor that
+        // drifts `add` and `remove` apart will trip this test.
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-j");
+        let op_a = op("op-symm");
+        tracker.add(wallet(1), Some(&op_a), &m, 100);
+        tracker.add(wallet(2), Some(&op_a), &m, 200);
+        tracker.remove(wallet(1), Some(&op_a), &m, 100);
+        tracker.remove(wallet(2), Some(&op_a), &m, 200);
+        assert_eq!(tracker.market_position_count(&m), 0);
+        assert_eq!(tracker.market_bps(&m), 0);
+        assert_eq!(tracker.operator_bps(Some(&op_a)), 0);
+        assert_eq!(tracker.total, 0);
+    }
+
+    #[test]
+    fn remove_on_empty_count_saturates_at_zero() {
+        // Defensive guard for double-close — a panic here would convert a
+        // recoverable caller bug into a fatal simulation error.
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-k");
+        tracker.remove(wallet(1), None, &m, 10);
+        assert_eq!(tracker.market_position_count(&m), 0);
+    }
+
+    #[test]
+    fn remove_does_not_increment_count() {
+        // Locks in the split-method invariant: `remove` must NEVER increment
+        // the position counter. A regression where `remove` delegates back to
+        // `add(-bps)` would trip this test (count would tick to 1 on remove).
+        let mut tracker = ExposureTracker::default();
+        let m = market("mkt-l");
+        tracker.add(wallet(1), None, &m, 50);
+        assert_eq!(tracker.market_position_count(&m), 1);
+        tracker.remove(wallet(1), None, &m, 50);
+        assert_eq!(tracker.market_position_count(&m), 0);
+        // A second remove must not increment.
+        tracker.remove(wallet(2), None, &m, 25);
+        assert_eq!(tracker.market_position_count(&m), 0);
     }
 
     // ── leader_win_rate_p_shrunk ───────────────────────────────────────────────

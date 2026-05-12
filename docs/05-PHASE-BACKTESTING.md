@@ -157,6 +157,16 @@ A research lever (issue #134) that short-circuits the entire sizing pipeline. Se
 
 `BacktestConfig` is not imported by the live service crate — the flag cannot leak into production by construction. Operator-level scenario coverage lives in `crates/backtest/tests/scenario_flat_usd.rs`.
 
+### Per-market position cap (`PE_BACKTEST_MAX_POSITIONS_PER_MARKET`)
+
+A structural gate (issue #138) that caps concurrent open positions on any `market_id`. `BacktestConfig::max_positions_per_market = Some(n)` blocks new BUY signals once `n` positions are open on that market across every leader and outcome; the slot reopens when positions close via SELL or resolution sweep. The cap is keyed strictly on `market_id` — leader A on outcome 0 and leader B on outcome 1 of the same binary market count against the same slot, preventing simultaneous exposure to both sides of one contract. Default `Some(1)`; `None` disables. `NonZeroU32` rejects `0` at deserialize time so a typo cannot silently block every BUY.
+
+Operator-level scenario coverage lives in `crates/backtest/tests/scenario_market_position_cap.rs`.
+
+### Scenario-test contributor note
+
+`BacktestConfig` has two fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3) and `max_positions_per_market: Some(1)`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false` and `max_positions_per_market: None`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting either field in a new scenario will produce confusing fewer-than-expected BUY fills (cap) or fewer-than-expected through-fills (require_known_expiry).
+
 ## Winner-Follow backtesting and validation
 
 Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A historical leader trade is not copied at the leader's price unless the follower could have filled there after discovery delay, API delay, decision delay, order routing, queue position, and slippage.
