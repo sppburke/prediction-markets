@@ -134,6 +134,7 @@ fn base_config(dir: &TempDir, cooldown_days: Option<u32>) -> BacktestConfig {
         liquidity_min_required_usd: dec!(200),
         flat_usd: Some(dec!(1)),
         no_buy_within_horizon_days: cooldown_days,
+        require_known_expiry: false,
         strategy: WinnerFollowConfig::default(),
     }
 }

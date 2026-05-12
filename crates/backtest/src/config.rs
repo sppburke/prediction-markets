@@ -200,6 +200,22 @@ pub struct BacktestConfig {
     #[serde(default)]
     pub no_buy_within_horizon_days: Option<u32>,
 
+    /// Strict-mode flag for the `max_hours_to_expiry` filter (issue #137, sub-PR 1).
+    ///
+    /// When `max_hours_to_expiry` is set, the filter consults the schedule index
+    /// first, then falls through to the resolution index. If BOTH are absent or
+    /// carry no usable timestamp, the trade is allowed when this flag is `false`
+    /// (default, preserves anti-survivorship semantics) and suppressed when
+    /// `true` (fail-closed on unknown expiry).
+    ///
+    /// Default is `false` so this sub-PR ships zero behavioural change — sub-PR
+    /// 3 of issue #137 flips it to `true` once the CLOB-sourced schedule
+    /// coverage report confirms ≥95% non-NULL rows.
+    /// `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `backtest_require_known_expiry_default`.
+    #[serde(default = "default_require_known_expiry")]
+    pub require_known_expiry: bool,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -267,6 +283,12 @@ fn default_liquidity_take_fraction() -> Decimal {
     Decimal::new(5, 2)
 }
 
+const fn default_require_known_expiry() -> bool {
+    // Sub-PR 1 of #137 ships behavioural-no-op default. Sub-PR 3 flips to `true`.
+    // Canonical: docs/_GLOSSARY.md `backtest_require_known_expiry_default`.
+    false
+}
+
 fn default_liquidity_min_required_usd() -> Decimal {
     // 200 USD. Canonical: docs/_GLOSSARY.md `liquidity_min_required_usd_default`.
     Decimal::new(200, 0)
@@ -300,6 +322,7 @@ impl Default for BacktestConfig {
             liquidity_min_required_usd: default_liquidity_min_required_usd(),
             flat_usd: None,
             no_buy_within_horizon_days: None,
+            require_known_expiry: default_require_known_expiry(),
             strategy: WinnerFollowConfig::default(),
         }
     }

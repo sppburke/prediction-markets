@@ -553,24 +553,30 @@ pub fn run_simulation(
                     // Time-to-expiry filter: skip trades where the market's scheduled
                     // close is more than max_hours_to_expiry hours after the trade date.
                     //
-                    // Preference order:
-                    // 1. `schedules` has an entry → use `end_date_unix` (the date the
-                    //    live trader would have seen). `None` end_date means Gamma had no
-                    //    scheduled date — allow through rather than leak future state.
-                    // 2. Market absent from `schedules` → fall back to `resolved_at_unix`
-                    //    for backward compat with caches pre-dating this feature.
-                    // 3. Both absent → allow through (no future-state leak possible).
+                    // Fallback chain (issue #137, sub-PR 1):
+                    // 1. `schedules` row with `Some(end_date_unix)` → use that timestamp
+                    //    (the date the live trader would have seen).
+                    // 2. `schedules` row with `None` end_date OR market absent from
+                    //    schedules → fall through to `resolutions.resolved_at_unix`.
+                    //    Pre-fix, the `None` case allowed every trade through; that was
+                    //    an inconsistency vs. the missing-row case and the source of the
+                    //    97.89% NULL coverage gap.
+                    // 3. Both absent → fail-closed iff `require_known_expiry`; otherwise
+                    //    allow through (preserves anti-survivorship semantics for tests
+                    //    and pre-CLOB data caches).
                     if let Some(max_hours) = config.max_hours_to_expiry {
                         let max_secs = i64::from(max_hours) * 3600;
-                        let suppressed = match schedules.get(&trade.market_id) {
-                            Some(sched) => match sched.end_date_unix {
-                                Some(end_unix) => end_unix - sim_date_unix > max_secs,
-                                None => false,
-                            },
-                            None => matches!(
-                                resolutions.get(&trade.market_id),
-                                Some(res) if res.resolved_at_unix - sim_date_unix > max_secs
-                            ),
+                        let end_unix = schedules
+                            .get(&trade.market_id)
+                            .and_then(|s| s.end_date_unix)
+                            .or_else(|| {
+                                resolutions
+                                    .get(&trade.market_id)
+                                    .map(|r| r.resolved_at_unix)
+                            });
+                        let suppressed = match end_unix {
+                            Some(ts) => ts - sim_date_unix > max_secs,
+                            None => config.require_known_expiry,
                         };
                         suppression_tracker.record(sim_date, suppressed);
                         if suppressed {
