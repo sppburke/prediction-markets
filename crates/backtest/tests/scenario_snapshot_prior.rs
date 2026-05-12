@@ -151,6 +151,7 @@ fn base_config(dir: &TempDir, min_snapshots: u32, extra_per_missing: u32) -> Bac
         liquidity_min_required_usd: Decimal::new(200, 0),
         flat_usd: None,
         no_buy_within_horizon_days: None,
+        require_known_expiry: false,
         strategy: WinnerFollowConfig::default(),
     }
 }

@@ -123,6 +123,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         kelly_p_extra_per_missing_snapshot: 0,
         flat_usd: None,
         no_buy_within_horizon_days: None,
+        require_known_expiry: false,
         strategy: WinnerFollowConfig {
             per_trade_cap: PerTradeCap::Unlimited,
             ..WinnerFollowConfig::default()

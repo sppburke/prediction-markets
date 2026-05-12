@@ -1,17 +1,40 @@
-//! Scenario tests for the expiry-filter survivorship bias fix (issue #102).
+//! Scenario tests for the expiry-filter survivorship bias fix (issue #102) and
+//! the `require_known_expiry` strict-mode flag (issue #137, sub-PR 1).
 //!
-//! Pre-fix: when `max_hours_to_expiry` was configured and a market had no resolution
+//! Pre-#102: when `max_hours_to_expiry` was configured and a market had no resolution
 //! entry, the signal was silently skipped (survivorship bias — only markets we
-//! "know" were short-lived would be traded). Post-fix: `None` resolution means
+//! "know" were short-lived would be traded). Post-#102: `None` resolution means
 //! "allow" (unknown expiry → don't suppress).
+//!
+//! Pre-#137: a schedule row with `end_date_unix = None` returned `allow` regardless
+//! of the resolution index — an inconsistency vs. the "row absent" path, which was
+//! consulting the resolution. Post-#137: NULL `end_date_unix` falls through to the
+//! resolution lookup; only when BOTH are absent does the `require_known_expiry` flag
+//! decide (false → allow, true → suppress).
 //!
 //! Scenarios:
 //! 1. `unknown_expiry_market_allowed_through` — market has no resolution entry and
-//!    `max_hours_to_expiry` is set; signal must be copied (not suppressed).
+//!    `max_hours_to_expiry` is set; signal must be copied (not suppressed) under
+//!    default `require_known_expiry: false`.
 //! 2. `known_far_expiry_is_suppressed` — market with a resolution time beyond the
 //!    configured window IS suppressed; total_copies == 0 for that market.
 //! 3. `suppression_pct_zero_without_filter` — `max_hours_to_expiry = None` yields
 //!    `expiry_filter_suppression_pct == 0`.
+//! 4. `expiry_filter_uses_schedule_over_resolution` — Some(end_date) wins over a
+//!    contradicting resolution timestamp.
+//! 5. `null_schedule_falls_through_to_resolution` — NULL `end_date_unix` is treated
+//!    identically to "row absent" — both consult the resolution index. (Replaces
+//!    the pre-#137 `expiry_filter_null_end_date_allows_through` test which asserted
+//!    the buggy behaviour.)
+//! 6. `expiry_filter_falls_back_to_resolution_when_no_schedule` — row absent +
+//!    far resolution → suppressed.
+//! 7. `require_known_expiry_suppresses_null_schedule_no_resolution` — strict mode:
+//!    NULL end_date + no resolution → suppressed.
+//! 8. `require_known_expiry_off_allows_null_schedule_no_resolution` — default mode:
+//!    NULL end_date + no resolution → allowed (regression guard for the
+//!    behavioural-no-op default).
+//! 9. `require_known_expiry_suppresses_missing_market` — strict mode: row absent +
+//!    no resolution → suppressed.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -107,6 +130,14 @@ fn relaxed_ranker() -> RankerConfig {
 }
 
 fn base_config(dir: &TempDir, max_hours_to_expiry: Option<u32>) -> BacktestConfig {
+    base_config_with(dir, max_hours_to_expiry, false)
+}
+
+fn base_config_with(
+    dir: &TempDir,
+    max_hours_to_expiry: Option<u32>,
+    require_known_expiry: bool,
+) -> BacktestConfig {
     BacktestConfig {
         bootstrap_cache_path: dir.path().join("cache.db"),
         output_dir: dir.path().join("output"),
@@ -131,6 +162,7 @@ fn base_config(dir: &TempDir, max_hours_to_expiry: Option<u32>) -> BacktestConfi
         kelly_p_extra_per_missing_snapshot: 0,
         flat_usd: None,
         no_buy_within_horizon_days: None,
+        require_known_expiry,
         strategy: WinnerFollowConfig::default(),
     }
 }
@@ -331,12 +363,15 @@ async fn expiry_filter_uses_schedule_over_resolution() {
 
 // ── Scenario 5 ────────────────────────────────────────────────────────────────
 
-/// PASS: when a market is in ScheduleIndex with a NULL endDate (Gamma had none),
-///       the trade is allowed through (not suppressed), even though the resolved_at_unix
-///       would suppress it. NULL endDate → allow, per Decision 2.
-/// FAIL: NULL endDate falls back to resolved_at_unix and the trade is suppressed.
+/// PASS: when a market is in ScheduleIndex with a NULL `end_date_unix` AND the
+///       resolution index has a far-future timestamp, the trade is suppressed
+///       via the fallback chain. This is the issue #137 sub-PR 1 fix — NULL
+///       end_date now behaves identically to "row absent" (both consult
+///       resolution), eliminating the pre-fix asymmetry where a NULL row
+///       allowed every trade through regardless of resolution data.
+/// FAIL: NULL end_date short-circuits to allow (the pre-fix bug).
 #[tokio::test]
-async fn expiry_filter_null_end_date_allows_through() {
+async fn null_schedule_falls_through_to_resolution() {
     let alice = wallet(ALICE_HEX);
 
     let mut trades = winner_book(alice);
@@ -344,7 +379,7 @@ async fn expiry_filter_null_end_date_allows_through() {
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
     trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
 
-    // ResolutionIndex says it resolves 200 days out — would suppress if used.
+    // ResolutionIndex says it resolves 200 days out — fallback must suppress.
     let mut resolutions = ResolutionIndex::new();
     resolutions.insert(
         mkt(9999),
@@ -354,7 +389,7 @@ async fn expiry_filter_null_end_date_allows_through() {
         },
     );
 
-    // ScheduleIndex has the market but with NULL endDate — must allow through.
+    // ScheduleIndex has the market with NULL endDate — fallback to resolution.
     let mut schedules = ScheduleIndex::new();
     schedules.insert(
         mkt(9999),
@@ -382,9 +417,10 @@ async fn expiry_filter_null_end_date_allows_through() {
     .unwrap();
 
     assert!(
-        report.total_copies > 0,
-        "NULL endDate must allow trade through (not fall back to resolved_at_unix); \
-         got 0 copies"
+        report.expiry_filter_suppression_pct > Decimal::ZERO,
+        "NULL end_date_unix must fall through to resolution; far resolution must \
+         suppress. expiry_filter_suppression_pct must be > 0, got {}",
+        report.expiry_filter_suppression_pct
     );
 }
 
@@ -437,6 +473,153 @@ async fn expiry_filter_falls_back_to_resolution_when_no_schedule() {
         report.expiry_filter_suppression_pct > Decimal::ZERO,
         "absent-from-schedule market must fall back to resolved_at_unix suppression; \
          suppression_pct must be > 0, got {}",
+        report.expiry_filter_suppression_pct
+    );
+}
+
+// ── Scenario 7 ────────────────────────────────────────────────────────────────
+
+/// PASS: strict mode (`require_known_expiry: true`) + NULL `end_date_unix` + no
+///       resolution → trade is suppressed. Tests the fail-closed path for the
+///       genuinely-unknown case.
+/// FAIL: trade is allowed through despite strict mode (flag not consulted).
+#[tokio::test]
+async fn require_known_expiry_suppresses_null_schedule_no_resolution() {
+    let alice = wallet(ALICE_HEX);
+
+    let mut trades = winner_book(alice);
+    trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
+    trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
+
+    // No resolution data — both lookups will miss.
+    let resolutions = ResolutionIndex::new();
+
+    // Schedule row present with NULL endDate.
+    let mut schedules = ScheduleIndex::new();
+    schedules.insert(
+        mkt(9999),
+        MarketSchedule {
+            end_date_unix: None,
+        },
+    );
+
+    let dir = TempDir::new().unwrap();
+    let timeline = make_timeline(&dir);
+
+    let report = run_simulation(
+        &base_config_with(&dir, Some(48), true),
+        trades,
+        &timeline,
+        &LeaderboardSnapshots::default(),
+        &resolutions,
+        &schedules,
+        &LiquidityIndex::new(),
+        &relaxed_ranker(),
+        &LedgerConfig::default(),
+        &default_strategy(),
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.expiry_filter_suppression_pct > Decimal::ZERO,
+        "require_known_expiry=true + unknown expiry must suppress; \
+         expiry_filter_suppression_pct must be > 0, got {}",
+        report.expiry_filter_suppression_pct
+    );
+}
+
+// ── Scenario 8 ────────────────────────────────────────────────────────────────
+
+/// PASS: default mode (`require_known_expiry: false`) + NULL `end_date_unix` + no
+///       resolution → trade is allowed through. Regression guard ensuring Sub-PR
+///       1 ships as a behavioural no-op for tests/data that lack schedule data.
+/// FAIL: trade is suppressed despite the default-false flag (would break the
+///       behavioural-no-op contract for Sub-PR 1).
+#[tokio::test]
+async fn require_known_expiry_off_allows_null_schedule_no_resolution() {
+    let alice = wallet(ALICE_HEX);
+
+    let mut trades = winner_book(alice);
+    trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
+    trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
+
+    let resolutions = ResolutionIndex::new();
+
+    let mut schedules = ScheduleIndex::new();
+    schedules.insert(
+        mkt(9999),
+        MarketSchedule {
+            end_date_unix: None,
+        },
+    );
+
+    let dir = TempDir::new().unwrap();
+    let timeline = make_timeline(&dir);
+
+    let report = run_simulation(
+        &base_config_with(&dir, Some(48), false),
+        trades,
+        &timeline,
+        &LeaderboardSnapshots::default(),
+        &resolutions,
+        &schedules,
+        &LiquidityIndex::new(),
+        &relaxed_ranker(),
+        &LedgerConfig::default(),
+        &default_strategy(),
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.total_copies > 0,
+        "require_known_expiry=false + unknown expiry must allow; got 0 copies"
+    );
+}
+
+// ── Scenario 9 ────────────────────────────────────────────────────────────────
+
+/// PASS: strict mode (`require_known_expiry: true`) + market absent from both
+///       schedule and resolution indices → trade is suppressed. Symmetric guard
+///       for Scenario 7: confirms the strict-mode fail-closed semantics apply
+///       to the "no row at all" path identically to the "NULL row" path.
+/// FAIL: trade is allowed through despite strict mode (asymmetry would mean
+///       the fallback chain isn't unified between NULL-row and missing-row).
+#[tokio::test]
+async fn require_known_expiry_suppresses_missing_market() {
+    let alice = wallet(ALICE_HEX);
+
+    let mut trades = winner_book(alice);
+    trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
+    trades.push(make_trade(alice, 9999, 75, Side::Sell, dec!(0.75), 1));
+
+    // Neither schedule nor resolution has any entry for market 9999.
+    let resolutions = ResolutionIndex::new();
+    let schedules = ScheduleIndex::new();
+
+    let dir = TempDir::new().unwrap();
+    let timeline = make_timeline(&dir);
+
+    let report = run_simulation(
+        &base_config_with(&dir, Some(48), true),
+        trades,
+        &timeline,
+        &LeaderboardSnapshots::default(),
+        &resolutions,
+        &schedules,
+        &LiquidityIndex::new(),
+        &relaxed_ranker(),
+        &LedgerConfig::default(),
+        &default_strategy(),
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        report.expiry_filter_suppression_pct > Decimal::ZERO,
+        "require_known_expiry=true + missing market must suppress; \
+         expiry_filter_suppression_pct must be > 0, got {}",
         report.expiry_filter_suppression_pct
     );
 }
