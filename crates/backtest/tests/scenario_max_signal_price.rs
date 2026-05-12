@@ -458,8 +458,12 @@ async fn suppression_counter_matches_ratio() {
         dec!(0.65),
         "allowed",
     ));
-    let (_, report) =
-        run_with_ranker(Some(dec!(0.85)), dec!(0), strict_post_training_ranker(), trades);
+    let (_, report) = run_with_ranker(
+        Some(dec!(0.85)),
+        dec!(0),
+        strict_post_training_ranker(),
+        trades,
+    );
     assert_eq!(
         report.high_price_suppression_pct,
         dec!(50),
