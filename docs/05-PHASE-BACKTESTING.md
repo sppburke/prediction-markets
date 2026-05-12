@@ -163,9 +163,19 @@ A structural gate (issue #138) that caps concurrent open positions on any `marke
 
 Operator-level scenario coverage lives in `crates/backtest/tests/scenario_market_position_cap.rs`.
 
+### Skip unknown-operator gate (`PE_BACKTEST_SKIP_UNKNOWN_OPERATOR`)
+
+A signal-time gate (issue #141) that suppresses BUY signals from watchlisted leaders whose wallet has no resolved operator identity in the funder graph. `BacktestConfig::skip_unknown_operator = true` causes the BUY arm to `continue` whenever `op_identity.is_none()`; the SELL arm is unaffected. The discriminator is the already-computed `wallet_to_operator.get(&leader)`, so the gate adds no new graph traversal. Placement: after the per-market cap and before the horizon-cooldown filter, so both flat-USD and Kelly sizing paths honor it.
+
+Suppression rate is reported as `unknown_operator_suppression_pct` (global, percent of BUY signals reaching the gate that were suppressed) and `unknown_operator_suppression_by_quarter` (per-calendar-quarter map). Per the `max_hours_to_expiry` tracker idiom the suppression counters only record while the gate is active; with `skip_unknown_operator = false` the report fields stay at `0` / empty.
+
+Motivation: A1 oracle-lift analysis on the 2026-05-09 sweep attributed +$23.99 to skipping unmapped wallets — they are an oversized share of negative PnL. Default `true`; the gate fires uniformly when the funder-edge cache is empty/stale (the "no Etherscan data" case) and for individual wallets the clustering does not attach to any operator.
+
+Operator-level scenario coverage lives in `crates/backtest/tests/scenario_skip_unknown_operator.rs`.
+
 ### Scenario-test contributor note
 
-`BacktestConfig` has two fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3) and `max_positions_per_market: Some(1)`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false` and `max_positions_per_market: None`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting either field in a new scenario will produce confusing fewer-than-expected BUY fills (cap) or fewer-than-expected through-fills (require_known_expiry).
+`BacktestConfig` has three fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3), `max_positions_per_market: Some(1)`, and `skip_unknown_operator: true`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false`, `max_positions_per_market: None`, and `skip_unknown_operator: false`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting any of these in a new scenario will produce confusing fewer-than-expected BUY fills (cap), fewer-than-expected through-fills (require_known_expiry), or no fills at all on fixtures that don't supply funder edges (skip_unknown_operator).
 
 ## Ranker-level presets
 

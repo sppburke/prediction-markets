@@ -47,6 +47,18 @@ pub struct WinnerFollowReport {
     /// `max_hours_to_expiry` is not configured.
     #[serde(default)]
     pub expiry_suppression_by_quarter: BTreeMap<String, Decimal>,
+    /// Fraction (0–100, percentage) of BUY signals suppressed by the
+    /// `skip_unknown_operator` gate (issue #141) — i.e. watchlisted leaders
+    /// whose wallet has no resolved operator identity in the funder graph.
+    /// Zero when `skip_unknown_operator = false`. Denominator is BUY signals
+    /// that reached the gate (after duplicate-open and per-market-cap, before
+    /// horizon-cooldown), not all signals.
+    #[serde(default)]
+    pub unknown_operator_suppression_pct: Decimal,
+    /// Per-calendar-quarter suppression fraction (key: `"YYYY-Qn"`) for the
+    /// `skip_unknown_operator` gate. Empty when `skip_unknown_operator = false`.
+    #[serde(default)]
+    pub unknown_operator_suppression_by_quarter: BTreeMap<String, Decimal>,
     /// Count of BUY trades where the liquidity clamp reduced `contracts_count`
     /// (known market, gate enabled, depth above floor, clamp was binding).
     #[serde(default)]

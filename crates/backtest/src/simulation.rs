@@ -322,6 +322,13 @@ pub fn run_simulation(
 
     // Tracks buy-signal suppression from the max_hours_to_expiry filter.
     let mut suppression_tracker = SuppressionTracker::default();
+    // Tracks buy-signal suppression from the `skip_unknown_operator` gate
+    // (issue #141). A second `SuppressionTracker` instance — the struct's
+    // shape (per-quarter `record(date, suppressed)`) already fits this filter;
+    // a separate struct would be pure duplication. `warn_high_quarters` is
+    // intentionally not called on this tracker: operator suppression is
+    // intentional, not a safety check.
+    let mut unknown_op_tracker = SuppressionTracker::default();
 
     // Liquidity-clamp partition counters (see report.rs `liquidity_*` fields).
     // Every BUY trade reaching the clamp site increments at most one counter;
@@ -585,6 +592,25 @@ pub fn run_simulation(
                         && exposure.market_position_count(&trade.market_id) >= cap.get()
                     {
                         continue;
+                    }
+
+                    // Skip-unknown-operator gate (issue #141). Wallets that the
+                    // funder-graph clustering has not attached to any operator
+                    // are an oversized share of negative PnL per the A1 oracle-
+                    // lift analysis. Default-on; scenarios opt out via
+                    // `skip_unknown_operator: false`. Placed after the
+                    // per-market cap so both flat-USD and Kelly paths honor it.
+                    //
+                    // Mirrors the `max_hours_to_expiry` idiom: the tracker only
+                    // records when the gate is active, so the suppression-pct
+                    // denominator is "signals that reached an enabled gate" —
+                    // not "all BUY signals." Disabled → tracker empty.
+                    if config.skip_unknown_operator {
+                        let suppressed = op_identity.is_none();
+                        unknown_op_tracker.record(sim_date, suppressed);
+                        if suppressed {
+                            continue;
+                        }
                     }
 
                     // Horizon cooldown — suppress new opens when within
@@ -926,6 +952,8 @@ pub fn run_simulation(
         funder_graph_snapshot_caveat: false,
         expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
+        unknown_operator_suppression_pct: unknown_op_tracker.suppression_pct_global(),
+        unknown_operator_suppression_by_quarter: unknown_op_tracker.per_quarter_suppression(),
         total_signals_evaluated,
         snapshot_prior_signals,
         snapshot_prior_extra_sum,

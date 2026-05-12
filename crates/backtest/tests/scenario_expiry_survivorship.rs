@@ -164,6 +164,7 @@ fn base_config_with(
         no_buy_within_horizon_days: None,
         require_known_expiry,
         max_positions_per_market: None,
+        skip_unknown_operator: false,
         strategy: WinnerFollowConfig::default(),
     }
 }
