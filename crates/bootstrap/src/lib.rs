@@ -399,25 +399,38 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     );
 
     // 6. Multi-source historical-data pipeline (issue #149).
-    //    Stage ordering enforces source priority via INSERT OR IGNORE:
-    //      6a. Polygon RPC CTF scan → source='polygon' (block-timestamp resolution time)
-    //      6b. CLOB closed-market pagination → source='clob' (gap-fill resolutions + schedules)
-    //      6c. Gamma schedules → source='gamma' (open markets only — Gamma retains active markets)
-    //      6d. Gamma liquidity → only Gamma exposes liquidity (open markets)
-    //      6e. Dune → source='dune' (last-resort for whatever remains unresolved)
+    //    Stage ordering puts precision sources first so INSERT OR IGNORE keeps
+    //    the most accurate `resolved_at_unix`:
+    //      6a. Polygon RPC CTF scan → source='polygon' (block timestamp)
+    //      6b. Dune `ctf_evt_conditionresolution` → source='dune' (block timestamp)
+    //      6c. CLOB closed-market pagination → source='clob' (end_date_iso approx)
+    //      6d. Gamma schedules → source='gamma' (open markets only)
+    //      6e. Gamma liquidity → only Gamma exposes liquidity (open markets)
     //
-    //    `open_ids` = markets not yet resolved by stages 6a/6b. Gamma never sees
-    //    closed-market work because they are filtered out before stage 6c.
+    //    `open_ids` is computed AFTER stages 6a/6b/6c so Gamma only fetches
+    //    truly-still-open markets.
+    //
+    //    `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` drops every imprecise-source row
+    //    (`'gamma'`, `'clob'`) up front so the precision stages can re-populate
+    //    them with block-timestamp accuracy. Idempotent — safe on every run.
     //
     //    Off by default; gated on `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1`.
     //    Incremental: already-fetched markets skipped via INSERT OR IGNORE and
     //    per-source cursors (`source_cursor.polygon_ctf_last_block`,
     //    `source_cursor.clob_closed`).
     if config.fetch_resolutions {
+        if config.rebuild_resolutions {
+            let deleted = cache.delete_resolutions_by_sources(&["gamma", "clob"])?;
+            tracing::info!(
+                deleted,
+                "bootstrap: rebuild_resolutions=1 — deleted imprecise-source rows so precision stages repopulate"
+            );
+        }
+
         let all_market_ids = cache.all_market_ids();
 
         // 6a. Polygon RPC scan — gated on rpc_url; cursor resume avoids walking
-        //     the entire chain on daily re-runs.
+        //     the entire chain on daily re-runs. Authoritative block timestamps.
         if let Some(rpc_url) = config.polygon_rpc_url.as_deref() {
             let from_block = cache
                 .get_source_cursor(polygon_ctf::POLYGON_CTF_CURSOR_KEY)
@@ -438,53 +451,10 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             );
         }
 
-        // 6b. CLOB closed-market pagination — gap-fill for resolutions Polygon
-        //     missed (multi-outcome / oracle quirks) and the schedule source for
-        //     closed markets.
-        let clob_client = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|_| BootstrapError::Internal)?;
-        let clob_fetcher = clob::ClobFetcher::new(
-            config.clob_base_url.clone(),
-            ReqwestFetcher::new(clob_client),
-        );
-        let (clob_schedules, clob_resolutions) =
-            clob_fetcher.fetch_closed_markets(&mut cache).await?;
-        tracing::info!(
-            clob_schedules,
-            clob_resolutions,
-            "bootstrap: clob closed markets fetched"
-        );
-
-        // 6c/d. Gamma schedules + liquidity — open markets only.
-        let open_ids: Vec<String> =
-            unresolved_market_ids(&all_market_ids, &cache.resolved_market_ids());
-        let gamma_client = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|_| BootstrapError::Internal)?;
-        let gamma_fetcher = gamma::GammaFetcher::new(
-            config.gamma_base_url.clone(),
-            ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
-        );
-        let schedule_rows = gamma_fetcher.fetch_schedules(&open_ids, &mut cache).await?;
-        tracing::info!(
-            schedule_rows,
-            open_markets = open_ids.len(),
-            "bootstrap: gamma schedules fetched (open markets only)"
-        );
-        let liquidity_rows = gamma_fetcher
-            .fetch_market_liquidity(&open_ids, &mut cache)
-            .await?;
-        tracing::info!(
-            liquidity_rows,
-            open_markets = open_ids.len(),
-            "bootstrap: gamma liquidity fetched (open markets only)"
-        );
-
-        // 6e. Dune last-resort fallback — only for markets still unresolved after
-        //     Polygon and CLOB. INSERT OR IGNORE keeps repeated runs idempotent.
+        // 6b. Dune `ctf_evt_conditionresolution` — primary precision source
+        //     when no Polygon RPC is configured (and gap-fill when it is).
+        //     `evt_block_time` is the same block-timestamp precision as 6a.
+        //     Binary markets only; multi-outcome handled by CLOB / Dune separately.
         if let Some(api_key) = &config.dune_api_key {
             let unresolved = unresolved_market_ids(&all_market_ids, &cache.resolved_market_ids());
             if !unresolved.is_empty() {
@@ -512,6 +482,54 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                 );
             }
         }
+
+        // 6c. CLOB closed-market pagination — covers schedules for every closed
+        //     market plus resolutions for any market neither Polygon nor Dune
+        //     caught (oracle quirks, multi-outcome surfaces). CLOB's
+        //     `end_date_iso` approximation only sticks when no precision source
+        //     ran first.
+        let clob_client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| BootstrapError::Internal)?;
+        let clob_fetcher = clob::ClobFetcher::new(
+            config.clob_base_url.clone(),
+            ReqwestFetcher::new(clob_client),
+        );
+        let (clob_schedules, clob_resolutions) =
+            clob_fetcher.fetch_closed_markets(&mut cache).await?;
+        tracing::info!(
+            clob_schedules,
+            clob_resolutions,
+            "bootstrap: clob closed markets fetched"
+        );
+
+        // 6d/e. Gamma schedules + liquidity — open markets only. Computed AFTER
+        //     6a/6b/6c so Gamma never sees markets the precision stages resolved.
+        let open_ids: Vec<String> =
+            unresolved_market_ids(&all_market_ids, &cache.resolved_market_ids());
+        let gamma_client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| BootstrapError::Internal)?;
+        let gamma_fetcher = gamma::GammaFetcher::new(
+            config.gamma_base_url.clone(),
+            ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
+        );
+        let schedule_rows = gamma_fetcher.fetch_schedules(&open_ids, &mut cache).await?;
+        tracing::info!(
+            schedule_rows,
+            open_markets = open_ids.len(),
+            "bootstrap: gamma schedules fetched (open markets only)"
+        );
+        let liquidity_rows = gamma_fetcher
+            .fetch_market_liquidity(&open_ids, &mut cache)
+            .await?;
+        tracing::info!(
+            liquidity_rows,
+            open_markets = open_ids.len(),
+            "bootstrap: gamma liquidity fetched (open markets only)"
+        );
     }
 
     // Write output.
@@ -702,13 +720,13 @@ fn write_watchlist(watchlist: &Watchlist, path: &Path) -> Result<(), BootstrapEr
 
 /// Return every market in `all` that is not present in `resolved`.
 ///
-/// Issue #149 helper used twice in the run() pipeline: once to compute
-/// `open_ids` for stage 6c/d (Gamma scope-tightening), and once at the
-/// Dune gate to short-circuit when stages 6a/6b already covered everything.
+/// Issue #149 helper used twice in the run() pipeline: at the Dune-gate
+/// (stage 6b) to short-circuit when stage 6a already resolved everything,
+/// and again to compute `open_ids` for Gamma's open-market scope (stage 6d/e).
 ///
 /// Pure data manipulation — no I/O — so the unit test below proves the
-/// "Dune skipped when nothing left to resolve" contract without spinning
-/// up a real DuneClient.
+/// "skipped when nothing left to resolve" contract without spinning up a
+/// real DuneClient.
 pub(crate) fn unresolved_market_ids(all: &[String], resolved: &HashSet<String>) -> Vec<String> {
     all.iter()
         .filter(|id| !resolved.contains(*id))
