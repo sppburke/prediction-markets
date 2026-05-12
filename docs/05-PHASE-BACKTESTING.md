@@ -167,6 +167,39 @@ Operator-level scenario coverage lives in `crates/backtest/tests/scenario_market
 
 `BacktestConfig` has two fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3) and `max_positions_per_market: Some(1)`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false` and `max_positions_per_market: None`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting either field in a new scenario will produce confusing fewer-than-expected BUY fills (cap) or fewer-than-expected through-fills (require_known_expiry).
 
+## Ranker-level presets
+
+These presets operate at the **trader-index layer** during watchlist construction, before any simulation-level filter runs. They tune the set of candidate leaders the simulation sees, not the per-signal copy decisions. Use them when the simulation-level gates are insufficient to suppress copies from statistically underpowered leaders.
+
+### Tightened-ranker preset (`ACTIVE_MIN_CLOSED=30`, `INCUBATOR_MIN_CLOSED=10`)
+
+A runbook preset (issue #143) that tightens two ranker thresholds to filter thin-history leaders — wallets with too few closed trades to be statistically credible. The preset is **opt-in** and **does not change the canonical backtest defaults** (`_GLOSSARY.md` `backtest_active_min_closed_trades=10`, `backtest_incubator_min_closed_trades=3`).
+
+**Invocation:**
+
+```
+PE_BACKTEST_ACTIVE_MIN_CLOSED=30 PE_BACKTEST_INCUBATOR_MIN_CLOSED=10 pe-backtest <toml>
+```
+
+**Hypothesis:** thin-history leaders are statistically underpowered and are expected to contribute disproportionately to negative PnL in the unknown-operator bucket. The preset's lift is **not yet empirically confirmed**; a post-merge sweep against the current cache is the confirmation step. Run the sweep after the cap-the-bleed simulation-level gates land (issues #141 `skip_unknown_operator`, #142 `max_signal_price`) so the baseline reflects the final filtered behaviour. If the sweep refutes the hypothesis, update this section to flag the preset as "don't use" — do not remove it, the negative result is itself valuable.
+
+**Values are starting points subject to empirical tuning.** 3× the current backtest defaults (`ACTIVE_MIN_CLOSED`: 10 → 30; `INCUBATOR_MIN_CLOSED`: 3 → 10) is a reasonable opening bid: stricter than the current live default of 15 (`_GLOSSARY.md` `active_min_closed_trades`) and well short of the historical pre-N_eff live default of 60. If the sweep shows the optimum lies elsewhere, update the values in this section directly rather than opening a new issue.
+
+**Deliberate exclusions:**
+
+| Env var | Why excluded |
+|---|---|
+| `PE_BACKTEST_MIN_QUALITY` | `reconstruction_quality` is closed contracts as a fraction of total contracts (`crates/trader-index/src/reconstruction.rs:290`). The Polymarket CLOB API does not return market-resolution redemption events, so buy-and-hold-to-resolution traders score quality=0 regardless of actual performance. Tightening `MIN_QUALITY` would filter conviction operators for structural data reasons unrelated to history depth — the wrong lever. |
+| `PE_BACKTEST_ACTIVE_MIN_MARKETS` / `PE_BACKTEST_INCUBATOR_MIN_MARKETS` | The min-markets filter is a hard gate in the ranker (`crates/trader-index/src/ranker.rs:60,87`). N_eff shrinkage in Kelly sizing (`docs/19-WINNER-FOLLOW-STRATEGY.md` § p estimation, `kelly_p_k_per_market`) prices specialists with narrow market breadth correctly via shrinkage. The current design deliberately lowered the hard filter to 1 *because* N_eff downstream does that work. Tightening here would re-introduce the hard cliff that the N_eff design explicitly chose to avoid — it excludes specialists rather than down-weights them. |
+
+**Expected effect** (to be confirmed by post-merge sweep):
+
+- Drops thin-history leaders from the watchlist before they enter the simulation.
+- Reduces `total_copies`.
+- Expected improvement in per-copy PnL.
+
+The ranker thresholds operate at the trader-index layer (watchlist construction), structurally distinct from the BUY-arm per-signal suppression in `simulation.rs`. The two layers compose: tightening the ranker shrinks the candidate pool; the simulation-level gates suppress per-signal copies within that pool.
+
 ## Winner-Follow backtesting and validation
 
 Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A historical leader trade is not copied at the leader's price unless the follower could have filled there after discovery delay, API delay, decision delay, order routing, queue position, and slippage.
