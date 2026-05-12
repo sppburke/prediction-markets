@@ -135,6 +135,7 @@ fn base_config(dir: &TempDir, cooldown_days: Option<u32>) -> BacktestConfig {
         flat_usd: Some(dec!(1)),
         no_buy_within_horizon_days: cooldown_days,
         require_known_expiry: false,
+        max_positions_per_market: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

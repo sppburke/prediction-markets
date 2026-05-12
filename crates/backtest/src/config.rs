@@ -1,5 +1,6 @@
 //! `BacktestConfig` — loaded from an optional TOML file with `PE_*` env var overlay.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use figment::{
@@ -216,6 +217,25 @@ pub struct BacktestConfig {
     #[serde(default = "default_require_known_expiry")]
     pub require_known_expiry: bool,
 
+    /// Cap on concurrent open positions per `market_id` (issue #138).
+    ///
+    /// `None` disables the cap entirely (no per-market gating). `Some(n)` blocks
+    /// new BUY signals on any market that already has ≥ `n` open positions
+    /// across all leaders and outcomes. The slot reopens when positions close
+    /// via SELL or resolution sweep.
+    ///
+    /// The cap is keyed strictly on `market_id` — leader A on outcome 0 and
+    /// leader B on outcome 1 of the same binary market count against the same
+    /// slot, preventing simultaneous exposure to both sides of one contract.
+    ///
+    /// Default is `Some(1)` — strictest setting. `NonZeroU32` rejects `0` at
+    /// deserialize-time so `PE_BACKTEST_MAX_POSITIONS_PER_MARKET=0` is an
+    /// explicit error rather than a silent "block everything" behaviour.
+    /// `PE_BACKTEST_MAX_POSITIONS_PER_MARKET` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `backtest_max_positions_per_market_default`.
+    #[serde(default = "default_max_positions_per_market")]
+    pub max_positions_per_market: Option<NonZeroU32>,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -289,6 +309,13 @@ const fn default_require_known_expiry() -> bool {
     false
 }
 
+const fn default_max_positions_per_market() -> Option<NonZeroU32> {
+    // Issue #138. `NonZeroU32::MIN` is `const`-evaluable at 1 with no `Option`
+    // intermediate — cleaner than `NonZeroU32::new(1)`. Canonical:
+    // docs/_GLOSSARY.md `backtest_max_positions_per_market_default`.
+    Some(NonZeroU32::MIN)
+}
+
 fn default_liquidity_min_required_usd() -> Decimal {
     // 200 USD. Canonical: docs/_GLOSSARY.md `liquidity_min_required_usd_default`.
     Decimal::new(200, 0)
@@ -323,6 +350,7 @@ impl Default for BacktestConfig {
             flat_usd: None,
             no_buy_within_horizon_days: None,
             require_known_expiry: default_require_known_expiry(),
+            max_positions_per_market: default_max_positions_per_market(),
             strategy: WinnerFollowConfig::default(),
         }
     }

@@ -153,6 +153,7 @@ fn base_config(dir: &TempDir, flat_usd: Option<Decimal>, bankroll: Decimal) -> B
         flat_usd,
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
+        max_positions_per_market: None,
         strategy: WinnerFollowConfig::default(),
     }
 }
