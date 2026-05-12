@@ -78,6 +78,22 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
         cache: &mut WalletCache,
     ) -> Result<(usize, usize), BootstrapError> {
         let mut cursor: Option<String> = cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY);
+
+        // Early-out when the stored cursor is already the terminator: a prior
+        // run reached end-of-pages, or an operator manually advanced past a
+        // broken page. Without this check the loop would feed the terminator
+        // into [`build_page_url`], which deliberately treats it like "no
+        // cursor" (first page), causing a full re-walk. To force a re-walk
+        // intentionally, clear the cursor row:
+        // `cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")`.
+        if cursor.as_deref() == Some(CLOB_END_CURSOR) {
+            info!(
+                "clob: stored cursor is at terminator — skipping closed-market fetch \
+                 (clear source_cursor.clob_closed to re-walk)"
+            );
+            return Ok((0, 0));
+        }
+
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
         let mut schedules = 0usize;
         let mut resolutions = 0usize;
@@ -244,6 +260,7 @@ struct ClobToken {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn winner_index_yes_picks_zero() {
@@ -303,5 +320,33 @@ mod tests {
         // it (the API would return an empty page).
         let url = build_page_url("https://clob.example", Some(CLOB_END_CURSOR));
         assert_eq!(url, "https://clob.example/markets?closed=true&limit=1000");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_closed_markets_early_returns_when_cursor_is_terminator() {
+        // Regression guard for the finish run of issue #149: the stored
+        // terminator must short-circuit the loop so a previous run's
+        // end-of-pages signal (or operator-set skip past a broken page) does
+        // not trigger a full re-walk on the next invocation.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = crate::cache::WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        cache
+            .set_source_cursor(CLOB_CLOSED_CURSOR_KEY, CLOB_END_CURSOR)
+            .unwrap();
+
+        // Empty fixture: any URL request would Fatal-error. If the early-out
+        // were missing, the loop would try to fetch page 1 here and the test
+        // would fail with a Fatal-fetch BootstrapError.
+        let fetcher = pe_source_polymarket_public::FixtureFetcher::new(HashMap::new());
+        let clob = ClobFetcher::new("https://clob.example".to_owned(), fetcher);
+
+        let (schedules, resolutions) = clob.fetch_closed_markets(&mut cache).await.unwrap();
+        assert_eq!(schedules, 0);
+        assert_eq!(resolutions, 0);
+        // Cursor stays at the terminator — caller controls re-walk by clearing it.
+        assert_eq!(
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
+            Some(CLOB_END_CURSOR)
+        );
     }
 }

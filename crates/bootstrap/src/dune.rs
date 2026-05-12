@@ -115,18 +115,26 @@ WHERE closed_markets > {min_closed_markets} \
 ///
 /// Placeholder: `{last_resolved_at}` — Unix seconds (0 on first run).
 /// Used as the fallback path when no namespace is configured.
+/// Multi-outcome markets surface as rows with `winning_outcome_id = NULL` so the
+/// `evt_block_time` (precise resolution timestamp) lands in the cache and the
+/// backtest's NULL-winner filter then excludes them from `ResolutionIndex`.
+/// Tied binary payouts (`[1, 1]`) also resolve to NULL — mirrors the
+/// unique-non-zero rule in `polygon_ctf::decode_resolution_log`.
 const RESOLUTION_SQL: &str = "\
 SELECT \
   CAST(conditionid AS VARCHAR) AS condition_id, \
   CASE \
-    WHEN payoutnumerators[1] > 0 THEN 0 \
-    WHEN payoutnumerators[2] > 0 THEN 1 \
+    WHEN outcomeslotcount = 2 \
+      AND payoutnumerators[1] > 0 \
+      AND payoutnumerators[2] = 0 THEN 0 \
+    WHEN outcomeslotcount = 2 \
+      AND payoutnumerators[1] = 0 \
+      AND payoutnumerators[2] > 0 THEN 1 \
     ELSE NULL \
   END AS winning_outcome_id, \
   CAST(TO_UNIXTIME(evt_block_time) AS BIGINT) AS resolved_at_unix \
 FROM polymarket_polygon.ctf_evt_conditionresolution \
-WHERE outcomeslotcount = 2 \
-  AND evt_block_time > FROM_UNIXTIME({last_resolved_at})";
+WHERE evt_block_time > FROM_UNIXTIME({last_resolved_at})";
 
 /// Render the JOIN-based resolution SQL that queries only the caller's markets.
 ///
@@ -138,20 +146,27 @@ WHERE outcomeslotcount = 2 \
 /// `TO_HEX(conditionid)` returns lowercase hex without a prefix; prepending `'0x'`
 /// and lowercasing both sides produces a stable join key matching our `0x<hex>` cache format.
 pub(crate) fn render_resolution_sql_with_join(namespace: &str, last_resolved_at: i64) -> String {
+    // Winner extraction mirrors [`RESOLUTION_SQL`]: binary unique-non-zero only;
+    // multi-outcome and tied-payout rows return `winning_outcome_id = NULL` so
+    // their precise `evt_block_time` lands in the cache while the backtest's
+    // NULL-winner filter excludes them from `ResolutionIndex`.
     format!(
         "SELECT DISTINCT \
            m.condition_id, \
            CASE \
-             WHEN r.payoutnumerators[1] > 0 THEN 0 \
-             WHEN r.payoutnumerators[2] > 0 THEN 1 \
+             WHEN r.outcomeslotcount = 2 \
+               AND r.payoutnumerators[1] > 0 \
+               AND r.payoutnumerators[2] = 0 THEN 0 \
+             WHEN r.outcomeslotcount = 2 \
+               AND r.payoutnumerators[1] = 0 \
+               AND r.payoutnumerators[2] > 0 THEN 1 \
              ELSE NULL \
            END AS winning_outcome_id, \
            CAST(TO_UNIXTIME(r.evt_block_time) AS BIGINT) AS resolved_at_unix \
          FROM dune.{namespace}.{RESOLUTION_TABLE} m \
          INNER JOIN polymarket_polygon.ctf_evt_conditionresolution r \
            ON '0x' || LOWER(TO_HEX(r.conditionid)) = m.condition_id \
-         WHERE r.outcomeslotcount = 2 \
-           AND r.evt_block_time > FROM_UNIXTIME({last_resolved_at})"
+         WHERE r.evt_block_time > FROM_UNIXTIME({last_resolved_at})"
     )
 }
 
@@ -784,6 +799,52 @@ mod tests {
         assert!(
             sql.contains("FROM_UNIXTIME(1700000000)"),
             "timestamp must appear verbatim in rendered SQL"
+        );
+    }
+
+    #[test]
+    fn render_resolution_sql_omits_outcomeslotcount_filter() {
+        // Multi-outcome markets must surface so their evt_block_time lands in
+        // the cache; the binary-vs-multi distinction lives in winner extraction.
+        let sql = render_resolution_sql(0);
+        assert!(
+            !sql.contains("outcomeslotcount = 2 \n") && !sql.contains("WHERE outcomeslotcount = 2"),
+            "WHERE-clause outcomeslotcount filter must be removed; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_resolution_sql_winner_extraction_gates_on_slotcount() {
+        let sql = render_resolution_sql(0);
+        // Winner extraction now requires slotcount=2 inside the CASE so
+        // multi-outcome rows return NULL instead of mis-attributing index 0/1.
+        assert!(
+            sql.contains("outcomeslotcount = 2"),
+            "winner CASE must still check outcomeslotcount=2; got: {sql}"
+        );
+        // Unique-non-zero contract: tied [1,1] returns NULL.
+        assert!(
+            sql.contains("payoutnumerators[2] = 0") && sql.contains("payoutnumerators[1] = 0"),
+            "winner CASE must require the other slot to be 0 to avoid tied-payout mis-tagging; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_resolution_sql_with_join_omits_outcomeslotcount_filter() {
+        let sql = render_resolution_sql_with_join("apexurellc", 0);
+        assert!(
+            !sql.contains("WHERE r.outcomeslotcount = 2"),
+            "JOIN path WHERE-clause filter must be removed; got: {sql}"
+        );
+        // Winner extraction still constrained to binary.
+        assert!(
+            sql.contains("r.outcomeslotcount = 2"),
+            "JOIN path winner CASE must still gate on r.outcomeslotcount=2; got: {sql}"
+        );
+        // Tied-payout disambiguation present in JOIN path too.
+        assert!(
+            sql.contains("r.payoutnumerators[2] = 0") && sql.contains("r.payoutnumerators[1] = 0"),
+            "JOIN path must apply unique-non-zero rule; got: {sql}"
         );
     }
 
