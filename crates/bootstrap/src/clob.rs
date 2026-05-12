@@ -128,10 +128,17 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 )?;
                 schedules += 1;
 
-                // Resolution: only when at least one token has winner=true.
+                // Resolution: only when the market is closed AND `end_date_iso`
+                // parsed cleanly. CLOB's `end_date_iso` is the best timestamp we
+                // have (the API does not expose a block-timestamp resolution
+                // time), so a malformed value would otherwise stamp the row
+                // with `resolved_at = now()`, lying about when the market
+                // actually settled. Skipping leaves the market unresolved so
+                // Polygon RPC or Dune can fill in an accurate timestamp later.
                 let winner = winner_index(&market.tokens);
-                let resolved_at = end_date_unix.unwrap_or(fetched_at);
-                if winner.is_some() || market.closed {
+                if market.closed
+                    && let Some(resolved_at) = end_date_unix
+                {
                     cache.insert_resolution_with_source(
                         &condition_id,
                         winner,

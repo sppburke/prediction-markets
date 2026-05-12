@@ -195,15 +195,21 @@ async fn get_logs_with_bisect<P: Provider>(
 
 /// Decode a `ConditionResolution` log into `(condition_id_hex, winner)`.
 ///
-/// Returns `None` when the log is malformed or the market is non-binary
-/// (`outcomeSlotCount != 2`); the caller silently skips these — Dune
-/// covers multi-outcome markets as a fallback.
+/// Returns `None` when the log is malformed OR the market is non-binary
+/// (`outcomeSlotCount != 2`) OR `payoutNumerators` length disagrees with
+/// `outcomeSlotCount`. The caller silently skips these — Dune covers
+/// multi-outcome markets as a fallback. Returning `None` (rather than
+/// `Some((id, None))`) is load-bearing: a row with `winner=None` would
+/// still occupy the `market_resolutions` table and short-circuit the
+/// `unresolved_market_ids` filter at the Dune gate, leaving multi-outcome
+/// markets permanently unresolved (issue #149 PR #151 code-review fix).
 ///
-/// **Winner rule (issue #149 design):** count the non-zero entries in
-/// `payoutNumerators`. Exactly one non-zero → `Some(index)` (YES at 0,
-/// NO at 1). Zero or two non-zero → `None` (voided or tied 50/50).
-/// Mirrors `gamma.rs`'s "price > 0.5" tie-handling so a `[1, 1]` payout
-/// is treated as ambiguous rather than silently labelled YES.
+/// **Winner rule (issue #149 design) for binary markets:** count the
+/// non-zero entries in `payoutNumerators`. Exactly one non-zero →
+/// `Some(index)` (YES at 0, NO at 1). Zero or two non-zero →
+/// `Some((id, None))` (voided or tied 50/50). Mirrors `gamma.rs`'s
+/// "price > 0.5" tie-handling so a `[1, 1]` payout is treated as
+/// ambiguous rather than silently labelled YES.
 pub fn decode_resolution_log(log: &Log) -> Option<(String, Option<u8>)> {
     let topics = log.topics();
     // topic[0] = event signature, topic[1] = conditionId (the only one we read).
@@ -212,10 +218,12 @@ pub fn decode_resolution_log(log: &Log) -> Option<(String, Option<u8>)> {
 
     let (slot_count, numerators) = decode_payout_numerators(&log.data().data)?;
     if slot_count != U256::from(2u64) {
-        return Some((condition_id_hex, None)); // non-binary: voided from our POV
+        // Non-binary: skip entirely so Dune can resolve it later.
+        return None;
     }
     if numerators.len() != 2 {
-        return Some((condition_id_hex, None));
+        // Malformed binary log (slot count and array length disagree); skip.
+        return None;
     }
     let nonzero: Vec<usize> = numerators
         .iter()
@@ -306,14 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_multi_outcome_is_none() {
+    fn decode_multi_outcome_returns_none_to_skip_entirely() {
+        // Multi-outcome (slot_count != 2) must return `None` (not
+        // `Some((id, None))`) so the row never enters `market_resolutions`
+        // and Dune's `unresolved_market_ids` filter still picks it up.
+        // Issue #149 PR #151 code-review fix.
         let cond = B256::repeat_byte(0xee);
-        // 3-outcome with winner at index 1.
         let data = encode_payout(3, &[0, 1, 0]);
-        let (_, winner) = decode_resolution_log(&make_log(cond, data)).unwrap();
         assert!(
-            winner.is_none(),
-            "non-binary markets must be skipped (Dune covers these)"
+            decode_resolution_log(&make_log(cond, data)).is_none(),
+            "non-binary markets must be skipped entirely; Dune covers them as fallback"
         );
     }
 
