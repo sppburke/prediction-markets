@@ -502,6 +502,41 @@ impl WalletCache {
         Ok(())
     }
 
+    /// Delete every `market_resolutions` row whose `source` matches one of
+    /// the supplied tags. Returns the count of deleted rows.
+    ///
+    /// Designed for the `PE_BOOTSTRAP_REBUILD_RESOLUTIONS` rebuild flow: the
+    /// pre-issue-#149 Gamma path wrote rows with `closedTime`
+    /// (oracle-settlement-time approximation), and Cycle 2's CLOB path
+    /// writes rows with `end_date_iso` (scheduled-close-time approximation).
+    /// Both are imprecise relative to Dune's `evt_block_time` /
+    /// Polygon RPC's block timestamp. Deleting them lets the precision
+    /// sources (Dune, Polygon) re-populate on the next stage-6 pass.
+    ///
+    /// # Precondition
+    /// Returns `Ok(0)` when `sources` is empty — caller-provided empty input
+    /// must not produce a no-WHERE DELETE that wipes the entire table.
+    pub fn delete_resolutions_by_sources(
+        &mut self,
+        sources: &[&str],
+    ) -> Result<usize, BootstrapError> {
+        if sources.is_empty() {
+            return Ok(0);
+        }
+        // SQLite requires explicit placeholders; build "?1, ?2, ..." for the
+        // IN clause. Source strings travel through bound params, so callers
+        // passing user-tainted tags here still cannot inject SQL.
+        let placeholders = (1..=sources.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM market_resolutions WHERE source IN ({placeholders})");
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            sources.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let affected = self.conn.execute(&sql, &params_vec[..])?;
+        Ok(affected)
+    }
+
     /// Return the set of market IDs already present in `market_resolutions`.
     ///
     /// Used by [`GammaFetcher`] to skip markets that have already been fetched.
@@ -2003,6 +2038,74 @@ mod tests {
             cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
             Some("1")
         );
+    }
+
+    // ── delete_resolutions_by_sources unit tests ──────────────────────────────
+
+    #[test]
+    fn delete_resolutions_by_sources_keeps_non_matching_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        // Mix of imprecise and precise sources.
+        cache
+            .insert_resolution_with_source("0xpoly", Some(0), 1_700_000_000, 1, "polygon")
+            .unwrap();
+        cache
+            .insert_resolution_with_source("0xdune", Some(1), 1_700_000_001, 2, "dune")
+            .unwrap();
+        cache
+            .insert_resolution("0xgamma", Some(0), 1_700_000_002, 3)
+            .unwrap(); // DEFAULT 'gamma'
+        cache
+            .insert_resolution_with_source("0xclob", Some(1), 1_700_000_003, 4, "clob")
+            .unwrap();
+        assert_eq!(cache.resolved_market_ids().len(), 4);
+
+        let deleted = cache
+            .delete_resolutions_by_sources(&["gamma", "clob"])
+            .unwrap();
+        assert_eq!(deleted, 2, "exactly 2 imprecise rows must be deleted");
+
+        let remaining = cache.resolved_market_ids();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains("0xpoly"));
+        assert!(remaining.contains("0xdune"));
+        assert!(!remaining.contains("0xgamma"));
+        assert!(!remaining.contains("0xclob"));
+    }
+
+    #[test]
+    fn delete_resolutions_by_sources_empty_input_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xa", Some(0), 1_700_000_000, 1)
+            .unwrap();
+        // Empty `sources` must NOT execute "DELETE FROM market_resolutions"
+        // (which would wipe everything). Defensive against accidental call sites.
+        let deleted = cache.delete_resolutions_by_sources(&[]).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            cache.resolved_market_ids().len(),
+            1,
+            "row must survive empty-sources delete"
+        );
+    }
+
+    #[test]
+    fn delete_resolutions_by_sources_no_matches_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution_with_source("0xpoly", Some(0), 1_700_000_000, 1, "polygon")
+            .unwrap();
+        // Asking to delete a source tag that doesn't exist in the cache must
+        // succeed silently with zero affected rows.
+        let deleted = cache
+            .delete_resolutions_by_sources(&["gamma", "clob", "dune"])
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(cache.resolved_market_ids().len(), 1);
     }
 
     // ── funder_edges / funder_lookup_done unit tests ──────────────────────────

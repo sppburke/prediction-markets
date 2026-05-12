@@ -201,6 +201,19 @@ pub struct BootstrapConfig {
     )]
     pub fetch_resolutions: bool,
 
+    /// One-shot retroactive rebuild of `market_resolutions` rows tagged with
+    /// imprecise sources (`'gamma'`, `'clob'`). When `true`, the stage-6
+    /// pipeline deletes those rows before any fetcher runs so the precision
+    /// sources (Polygon RPC, Dune) re-populate with block-timestamp
+    /// `resolved_at_unix` values. Idempotent — safe to set on every run.
+    /// Env `PE_BOOTSTRAP_REBUILD_RESOLUTIONS`: `"1"` or `"true"` to enable.
+    #[serde(
+        default,
+        alias = "bootstrap_rebuild_resolutions",
+        deserialize_with = "deserialize_bool_or_01"
+    )]
+    pub rebuild_resolutions: bool,
+
     /// Gamma API base URL. `PE_GAMMA_BASE_URL` overrides.
     #[serde(default = "default_gamma_base_url")]
     pub gamma_base_url: String,
@@ -382,6 +395,7 @@ impl Default for BootstrapConfig {
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_concurrency: default_polymarket_concurrency(),
             fetch_resolutions: false,
+            rebuild_resolutions: false,
             gamma_base_url: default_gamma_base_url(),
             polygon_rpc_url: None,
             polygon_ctf_chunk_blocks: default_polygon_ctf_chunk_blocks(),
