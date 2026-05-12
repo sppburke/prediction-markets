@@ -27,6 +27,14 @@ pub const GNOSIS_SAFE_FACTORY: Address = address!("aacFeEa03eb1561C4e67d661e4068
 /// verified 2026-05-04 from github.com/Polymarket/py-clob-client config.py chain 137
 pub const CTF: Address = address!("4D97DCd97eC945f40cF65F87097ACe5EA0476045");
 
+/// Polygon block of the CTF contract deployment. Used as the floor `from_block`
+/// for the multi-source pipeline's `eth_getLogs` resolution scan (issue #149)
+/// when no prior `polygon_ctf_last_block` cursor exists.
+/// verified 2026-05-12 from polygonscan.com/address/0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+/// (ContractCreator → tx 0xf822536aff16fdb8df59bc9c0b5854c5bec4b9a76484ea9d6944908ced563389
+/// at block 4_023_686, Sep-03-2020 18:07:23 UTC)
+pub const CTF_DEPLOY_BLOCK: u64 = 4_023_686;
+
 /// Polymarket CTFExchange V1 (binary YES/NO markets).
 /// Deployed ~block 33_605_403 (Jan 2023).
 /// verified 2026-05-05 from docs.polymarket.com/resources/contract-addresses
@@ -79,6 +87,14 @@ pub const TOPIC_PROXY_CREATION: B256 =
 pub const TOPIC_ORDER_FILLED: B256 =
     b256!("d0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6");
 
+/// CTF ConditionResolution(bytes32 indexed conditionId, address indexed oracle,
+///   bytes32 indexed questionId, uint outcomeSlotCount, uint[] payoutNumerators).
+/// Used by the multi-source pipeline (issue #149) to scan settled markets via
+/// Polygon `eth_getLogs`. Self-validated by [`tests::topic_condition_resolution_matches_signature`].
+/// verified 2026-05-12 via `alloy::primitives::keccak256` of the canonical signature
+pub const TOPIC_CONDITION_RESOLUTION: B256 =
+    b256!("b44d84d3289691f71497564b85d4233648d9dbae8cbdbb4329f301c3a0185894");
+
 // ── Numeric constants ────────────────────────────────────────────────────────
 
 /// Decimal places for USDC and WCOL (both 6-decimal ERC-20 tokens).
@@ -89,3 +105,31 @@ pub const MONITORED_ADDRESSES: [Address; 3] = [USDC, WCOL, GNOSIS_SAFE_FACTORY];
 
 /// Topic0 hashes used as the OR filter for `eth_getLogs`.
 pub const MONITORED_TOPICS: [B256; 2] = [TOPIC_ERC20_TRANSFER, TOPIC_PROXY_CREATION];
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use alloy::primitives::keccak256;
+
+    /// Self-validating proof that [`TOPIC_CONDITION_RESOLUTION`] matches the
+    /// canonical Gnosis-CTF event signature. A future signature change (e.g.
+    /// renaming a parameter type) would surface here as a hash mismatch
+    /// before silently breaking the resolution scan.
+    #[test]
+    fn topic_condition_resolution_matches_signature() {
+        let computed = keccak256(b"ConditionResolution(bytes32,address,bytes32,uint256,uint256[])");
+        assert_eq!(
+            computed, TOPIC_CONDITION_RESOLUTION,
+            "TOPIC_CONDITION_RESOLUTION drifted from the canonical signature"
+        );
+    }
+
+    /// Companion self-check for the ERC-20 Transfer topic so that the same
+    /// guard applies to every event topic in this module.
+    #[test]
+    fn topic_erc20_transfer_matches_signature() {
+        let computed = keccak256(b"Transfer(address,address,uint256)");
+        assert_eq!(computed, TOPIC_ERC20_TRANSFER);
+    }
+}
