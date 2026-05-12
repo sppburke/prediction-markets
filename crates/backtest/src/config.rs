@@ -191,6 +191,15 @@ pub struct BacktestConfig {
     #[serde(default)]
     pub flat_usd: Option<Decimal>,
 
+    /// Suppress new BUY opens when within `N` days of the simulation horizon —
+    /// gives existing positions time to close (leader sell or market resolution)
+    /// before the simulation ends, reducing `open_at_horizon` capital lock-up
+    /// and the "unrealised tail" that distorts PnL/Sharpe interpretation.
+    /// `None` disables the gate; sell path is always unaffected.
+    /// `PE_BACKTEST_NO_BUY_WITHIN_HORIZON_DAYS` overrides.
+    #[serde(default)]
+    pub no_buy_within_horizon_days: Option<u32>,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -290,6 +299,7 @@ impl Default for BacktestConfig {
             liquidity_take_fraction: default_liquidity_take_fraction(),
             liquidity_min_required_usd: default_liquidity_min_required_usd(),
             flat_usd: None,
+            no_buy_within_horizon_days: None,
             strategy: WinnerFollowConfig::default(),
         }
     }

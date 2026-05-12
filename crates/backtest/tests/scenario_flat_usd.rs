@@ -151,6 +151,7 @@ fn base_config(dir: &TempDir, flat_usd: Option<Decimal>, bankroll: Decimal) -> B
         liquidity_take_fraction: dec!(0),
         liquidity_min_required_usd: dec!(200),
         flat_usd,
+        no_buy_within_horizon_days: None,
         strategy: WinnerFollowConfig::default(),
     }
 }
