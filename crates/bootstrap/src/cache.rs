@@ -885,6 +885,46 @@ impl WalletCache {
         Ok(result)
     }
 
+    /// Return the full resolution record for `market_id` if present, including
+    /// the `source` tag. Intended for diagnostics and scenario tests; the
+    /// backtest reads via [`Self::load_all_resolutions`] which does not
+    /// surface the source column.
+    pub fn resolution_record(&self, market_id: &str) -> Option<(Option<u8>, i64, i64, String)> {
+        self.conn
+            .query_row(
+                "SELECT winning_outcome_id, resolved_at_unix, fetched_at_unix, source \
+                 FROM market_resolutions WHERE market_id = ?1",
+                params![market_id],
+                |r| {
+                    let winner_i64: Option<i64> = r.get(0)?;
+                    let resolved_at: i64 = r.get(1)?;
+                    let fetched_at: i64 = r.get(2)?;
+                    let source: String = r.get(3)?;
+                    let winner = winner_i64.and_then(|v| u8::try_from(v).ok());
+                    Ok((winner, resolved_at, fetched_at, source))
+                },
+            )
+            .ok()
+    }
+
+    /// Return the full schedule record for `market_id` if present, including
+    /// the `source` tag. Companion to [`Self::resolution_record`].
+    pub fn schedule_record(&self, market_id: &str) -> Option<(Option<i64>, i64, String)> {
+        self.conn
+            .query_row(
+                "SELECT end_date_unix, fetched_at_unix, source FROM market_schedules \
+                 WHERE market_id = ?1",
+                params![market_id],
+                |r| {
+                    let end_date: Option<i64> = r.get(0)?;
+                    let fetched_at: i64 = r.get(1)?;
+                    let source: String = r.get(2)?;
+                    Ok((end_date, fetched_at, source))
+                },
+            )
+            .ok()
+    }
+
     // ── source_cursor ─────────────────────────────────────────────────────────
 
     /// Read a checkpoint value previously written by [`Self::set_source_cursor`].

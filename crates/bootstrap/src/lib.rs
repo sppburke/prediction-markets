@@ -17,12 +17,14 @@
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
 pub mod cache;
+pub mod clob;
 pub mod config;
 pub mod dune;
 pub mod error;
 pub mod filter;
 pub mod gamma;
 pub mod operator_audit;
+pub mod polygon_ctf;
 pub mod polymarket;
 pub mod wallet_set;
 
@@ -396,14 +398,68 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         "bootstrap: leaderboard snapshot persisted"
     );
 
-    // 6. Fetch market resolution data and scheduled endDates.
-    //    Both are gated by the same flag (PE_BOOTSTRAP_FETCH_RESOLUTIONS=1) since
-    //    they use the same Gamma endpoint and the schedule data is needed to fix
-    //    max_hours_to_expiry survivorship bias in the backtest.
-    //    Off by default; ~2× one-time request cost vs. resolutions alone.
-    //    Incremental: already-fetched markets skipped via INSERT OR IGNORE.
+    // 6. Multi-source historical-data pipeline (issue #149).
+    //    Stage ordering enforces source priority via INSERT OR IGNORE:
+    //      6a. Polygon RPC CTF scan → source='polygon' (block-timestamp resolution time)
+    //      6b. CLOB closed-market pagination → source='clob' (gap-fill resolutions + schedules)
+    //      6c. Gamma schedules → source='gamma' (open markets only — Gamma retains active markets)
+    //      6d. Gamma liquidity → only Gamma exposes liquidity (open markets)
+    //      6e. Dune → source='dune' (last-resort for whatever remains unresolved)
+    //
+    //    `open_ids` = markets not yet resolved by stages 6a/6b. Gamma never sees
+    //    closed-market work because they are filtered out before stage 6c.
+    //
+    //    Off by default; gated on `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1`.
+    //    Incremental: already-fetched markets skipped via INSERT OR IGNORE and
+    //    per-source cursors (`source_cursor.polygon_ctf_last_block`,
+    //    `source_cursor.clob_closed`).
     if config.fetch_resolutions {
-        let market_ids = cache.all_market_ids();
+        let all_market_ids = cache.all_market_ids();
+
+        // 6a. Polygon RPC scan — gated on rpc_url; cursor resume avoids walking
+        //     the entire chain on daily re-runs.
+        if let Some(rpc_url) = config.polygon_rpc_url.as_deref() {
+            let from_block = cache
+                .get_source_cursor(polygon_ctf::POLYGON_CTF_CURSOR_KEY)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(pe_source_onchain_polygon::contracts::CTF_DEPLOY_BLOCK);
+            let inserted = polygon_ctf::scan_resolutions(
+                rpc_url,
+                from_block,
+                None,
+                config.polygon_ctf_chunk_blocks,
+                &mut cache,
+            )
+            .await?;
+            tracing::info!(
+                inserted,
+                from_block,
+                "bootstrap: polygon_ctf resolutions fetched"
+            );
+        }
+
+        // 6b. CLOB closed-market pagination — gap-fill for resolutions Polygon
+        //     missed (multi-outcome / oracle quirks) and the schedule source for
+        //     closed markets.
+        let clob_client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| BootstrapError::Internal)?;
+        let clob_fetcher = clob::ClobFetcher::new(
+            config.clob_base_url.clone(),
+            ReqwestFetcher::new(clob_client),
+        );
+        let (clob_schedules, clob_resolutions) =
+            clob_fetcher.fetch_closed_markets(&mut cache).await?;
+        tracing::info!(
+            clob_schedules,
+            clob_resolutions,
+            "bootstrap: clob closed markets fetched"
+        );
+
+        // 6c/d. Gamma schedules + liquidity — open markets only.
+        let open_ids: Vec<String> =
+            unresolved_market_ids(&all_market_ids, &cache.resolved_market_ids());
         let gamma_client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(15))
             .build()
@@ -412,60 +468,49 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             config.gamma_base_url.clone(),
             ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
         );
-        let new_rows = gamma_fetcher
-            .fetch_resolutions(&market_ids, &mut cache)
-            .await?;
-        tracing::info!(
-            new_rows,
-            total_markets = market_ids.len(),
-            "bootstrap: gamma resolutions fetched"
-        );
-        let schedule_rows = gamma_fetcher
-            .fetch_schedules(&market_ids, &mut cache)
-            .await?;
+        let schedule_rows = gamma_fetcher.fetch_schedules(&open_ids, &mut cache).await?;
         tracing::info!(
             schedule_rows,
-            total_markets = market_ids.len(),
-            "bootstrap: gamma schedules fetched"
+            open_markets = open_ids.len(),
+            "bootstrap: gamma schedules fetched (open markets only)"
         );
         let liquidity_rows = gamma_fetcher
-            .fetch_market_liquidity(&market_ids, &mut cache)
+            .fetch_market_liquidity(&open_ids, &mut cache)
             .await?;
         tracing::info!(
             liquidity_rows,
-            total_markets = market_ids.len(),
-            "bootstrap: gamma liquidity fetched"
+            open_markets = open_ids.len(),
+            "bootstrap: gamma liquidity fetched (open markets only)"
         );
-    }
 
-    //    b) Dune on-chain (`ctf_evt_conditionresolution`) — covers all markets including
-    //       financial/quantitative markets absent from Gamma. Queries from epoch (cursor=0)
-    //       so newly-discovered wallets' markets that resolved before any prior run's cursor
-    //       are never silently skipped. Filtered client-side to unresolved markets only;
-    //       INSERT OR IGNORE makes repeated runs idempotent.
-    if let Some(api_key) = &config.dune_api_key {
-        let all_market_ids: HashSet<String> = cache.all_market_ids().into_iter().collect();
-        let already_resolved = cache.resolved_market_ids();
-        let unresolved: HashSet<String> = all_market_ids
-            .difference(&already_resolved)
-            .cloned()
-            .collect();
-        if !unresolved.is_empty() {
-            let dune_resolution_client = DuneClient::new(api_key.clone());
-            let rows = dune_resolution_client
-                .fetch_resolutions(&unresolved, 0, config.dune_namespace.as_deref())
-                .await?;
-            let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-            let mut inserted = 0usize;
-            for (market_id, winner, resolved_at_unix) in rows {
-                cache.insert_resolution(&market_id, winner, resolved_at_unix, fetched_at)?;
-                inserted += 1;
+        // 6e. Dune last-resort fallback — only for markets still unresolved after
+        //     Polygon and CLOB. INSERT OR IGNORE keeps repeated runs idempotent.
+        if let Some(api_key) = &config.dune_api_key {
+            let unresolved = unresolved_market_ids(&all_market_ids, &cache.resolved_market_ids());
+            if !unresolved.is_empty() {
+                let dune_resolution_client = DuneClient::new(api_key.clone());
+                let unresolved_set: HashSet<String> = unresolved.into_iter().collect();
+                let rows = dune_resolution_client
+                    .fetch_resolutions(&unresolved_set, 0, config.dune_namespace.as_deref())
+                    .await?;
+                let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+                let mut inserted = 0usize;
+                for (market_id, winner, resolved_at_unix) in rows {
+                    cache.insert_resolution_with_source(
+                        &market_id,
+                        winner,
+                        resolved_at_unix,
+                        fetched_at,
+                        "dune",
+                    )?;
+                    inserted += 1;
+                }
+                tracing::info!(
+                    inserted,
+                    unresolved = unresolved_set.len(),
+                    "bootstrap: dune resolutions fetched"
+                );
             }
-            tracing::info!(
-                inserted,
-                unresolved = unresolved.len(),
-                "bootstrap: dune resolutions fetched"
-            );
         }
     }
 
@@ -653,4 +698,59 @@ fn write_watchlist(watchlist: &Watchlist, path: &Path) -> Result<(), BootstrapEr
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Return every market in `all` that is not present in `resolved`.
+///
+/// Issue #149 helper used twice in the run() pipeline: once to compute
+/// `open_ids` for stage 6c/d (Gamma scope-tightening), and once at the
+/// Dune gate to short-circuit when stages 6a/6b already covered everything.
+///
+/// Pure data manipulation — no I/O — so the unit test below proves the
+/// "Dune skipped when nothing left to resolve" contract without spinning
+/// up a real DuneClient.
+pub(crate) fn unresolved_market_ids(all: &[String], resolved: &HashSet<String>) -> Vec<String> {
+    all.iter()
+        .filter(|id| !resolved.contains(*id))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_market_ids_empty_when_all_resolved() {
+        // Replaces what would otherwise be a scenario_dune_only_for_gaps test;
+        // the Dune `if !unresolved.is_empty()` short-circuit is verified here
+        // without needing to inject a DuneClient.
+        let all = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let resolved: HashSet<String> = all.iter().cloned().collect();
+        assert!(unresolved_market_ids(&all, &resolved).is_empty());
+    }
+
+    #[test]
+    fn unresolved_market_ids_returns_complement_partial() {
+        let all = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let resolved: HashSet<String> = ["b".to_owned()].into_iter().collect();
+        let got = unresolved_market_ids(&all, &resolved);
+        // Iteration order preserves input ordering.
+        assert_eq!(got, vec!["a".to_owned(), "c".to_owned()]);
+    }
+
+    #[test]
+    fn unresolved_market_ids_all_when_none_resolved() {
+        let all = vec!["a".to_owned(), "b".to_owned()];
+        let resolved: HashSet<String> = HashSet::new();
+        assert_eq!(unresolved_market_ids(&all, &resolved), all);
+    }
+
+    #[test]
+    fn unresolved_market_ids_empty_input_is_empty_output() {
+        let all: Vec<String> = Vec::new();
+        let resolved: HashSet<String> = HashSet::new();
+        assert!(unresolved_market_ids(&all, &resolved).is_empty());
+    }
 }

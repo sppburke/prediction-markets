@@ -59,6 +59,8 @@
 | https://docs.polymarket.com/developers/contracts | — | — |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
 | https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-05-09 | 2026-07-08 |
+| https://clob.polymarket.com/markets?closed=true | 2026-05-12 | 2026-07-11 |
+| https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
 ## Public sources
 
@@ -66,6 +68,8 @@
 |---|---|---|
 | https://polygon.technology/ | 2026-05-07 | 2026-08-05 |
 | Polygon JSON-RPC / archive provider docs (selected by impl) | 2026-05-07 | 2026-08-05 |
+| Polygon JSON-RPC `eth_getLogs` for CTF `ConditionResolution` events (issue #149) | 2026-05-12 | 2026-08-10 |
+| https://polygonscan.com/address/0x4D97DCd97eC945f40cF65F87097ACe5EA0476045 (CTF contract page) | 2026-05-12 | 2026-08-10 |
 | https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts | 2026-05-04 | 2026-08-04 |
 | https://www.weather.gov/ | — | — |
 | https://aviationweather.gov/data/api/ | — | — |
@@ -134,3 +138,4 @@ Treat as research inspiration; not a production decision input unless an authori
 - 2026-05-07: Checked Polygon RPC docs and AWS ECS/ECR/Secrets Manager welcome pages for structural changes. No breaking changes noted.
 - 2026-05-02: Checked Polymarket official docs for public Data/Gamma/CLOB read endpoints, proxy wallets, signature type/funder behavior, and bridge deposit/pUSD collateral flow.
 - 2026-05-02: Checked CrowdIntel public pages for funding-network methodology. Treat as research inspiration only unless an authorized replayable API/export exists.
+- 2026-05-12: Verified CTF deploy block (4_023_686, Sep-03-2020) on PolygonScan and computed `TOPIC_CONDITION_RESOLUTION` keccak hash via `alloy::primitives::keccak256` of the canonical signature for issue #149 multi-source pipeline. Verified CLOB `/markets?closed=true` paginated listing endpoint exists; confirmed `next_cursor=LTE=` terminator convention from Polymarket CLOB documentation.

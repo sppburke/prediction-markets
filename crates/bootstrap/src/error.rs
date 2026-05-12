@@ -39,6 +39,10 @@ pub enum BootstrapError {
     PartialFunderFetch { failed_wallets: usize },
     #[error("gamma: {message}")]
     Gamma { message: String },
+    #[error("clob: {message}")]
+    Clob { message: String },
+    #[error("polygon_ctf: {message}")]
+    PolygonCtf { message: String },
     #[error("internal error")]
     Internal,
 }

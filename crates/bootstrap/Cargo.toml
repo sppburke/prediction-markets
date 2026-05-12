@@ -31,6 +31,7 @@ pe-source-onchain-polygon     = { path = "../source-onchain-polygon",       vers
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",                 version = "0.1.0" }
 
+alloy           = { workspace = true }
 anyhow          = { workspace = true }
 figment         = { workspace = true }
 futures         = { workspace = true }
