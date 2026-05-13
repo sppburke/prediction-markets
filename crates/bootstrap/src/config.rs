@@ -267,6 +267,34 @@ pub struct BootstrapConfig {
     )]
     pub skip_trade_fetch: bool,
 
+    /// Write a `leaderboard_snapshots` row at run time (off by default).
+    ///
+    /// When `false` (default), the main bootstrap pipeline still builds the
+    /// watchlist for the current run but does **not** persist a row keyed at
+    /// `now`. Keeps ad-hoc bootstrap runs (retries from the resolutions
+    /// watchdog, dev shells, funder-graph reruns) from polluting the snapshot
+    /// timeline with near-duplicate intra-day rows.
+    ///
+    /// Set to `true` only in the official weekly refresh path, where a single
+    /// canonical `(snapshot_at_unix, wallet)` row-set per Sunday is the
+    /// intent. Backwards-compatible callers that want the old behavior can
+    /// opt in.
+    ///
+    /// Env `PE_BOOTSTRAP_WRITE_SNAPSHOT`: `"1"` or `"true"` to enable.
+    /// (Field is named `write_snapshot` rather than `write_live_snapshot` so
+    /// the `PE_BOOTSTRAP_WRITE_SNAPSHOT` env var resolves to a key that
+    /// matches the field name after the loader strips its `PE_BOOTSTRAP_`
+    /// prefix — see `load()`.) Historical snapshot seeding via
+    /// `PE_SEED_AS_OF_DATES` is unaffected — `seed_historical_snapshots`
+    /// always writes its target rows independent of this flag.
+    #[serde(
+        default,
+        alias = "bootstrap_write_snapshot",
+        alias = "write_live_snapshot",
+        deserialize_with = "deserialize_bool_or_01"
+    )]
+    pub write_snapshot: bool,
+
     /// Concurrent per-wallet funder-discovery fetches against the Etherscan API.
     /// `PE_BOOTSTRAP_FUNDER_CONCURRENCY` overrides.
     #[serde(
@@ -403,6 +431,7 @@ impl Default for BootstrapConfig {
             clob_concurrency: default_clob_concurrency(),
             fetch_funder_graph: false,
             skip_trade_fetch: false,
+            write_snapshot: false,
             funder_concurrency: default_funder_concurrency(),
         }
     }
@@ -580,4 +609,105 @@ where
     }
 
     d.deserialize_any(V)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::result_large_err // figment::Error is ~208 bytes; only on test-only Jail closures.
+)]
+mod tests {
+    use super::*;
+
+    /// Default config has the snapshot write gate OFF — keeps ad-hoc bootstrap
+    /// runs from polluting `leaderboard_snapshots`. The Sunday weekly refresh
+    /// path must explicitly opt in.
+    #[test]
+    fn write_snapshot_defaults_false() {
+        let cfg = BootstrapConfig::default();
+        assert!(
+            !cfg.write_snapshot,
+            "write_snapshot must default to false to keep ad-hoc bootstrap runs \
+             from polluting leaderboard_snapshots"
+        );
+    }
+
+    /// TOML round-trip: `write_snapshot = true` flips the field.
+    #[test]
+    fn write_snapshot_parses_from_toml_true() {
+        let toml = r#"
+            output_path = "/tmp/watchlist.json"
+            write_snapshot = true
+        "#;
+        let cfg: BootstrapConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        assert!(cfg.write_snapshot);
+    }
+
+    /// TOML round-trip: `write_snapshot = false` is the explicit-opt-out path;
+    /// matches the implicit default but exercised here for symmetry.
+    #[test]
+    fn write_snapshot_parses_from_toml_false() {
+        let toml = r#"
+            output_path = "/tmp/watchlist.json"
+            write_snapshot = false
+        "#;
+        let cfg: BootstrapConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        assert!(!cfg.write_snapshot);
+    }
+
+    /// Backwards-compat alias `write_live_snapshot` (the field's pre-rename
+    /// name inside this PR) still parses. Guards against silently dropping
+    /// the alias on a future cleanup pass.
+    #[test]
+    fn write_snapshot_accepts_legacy_alias() {
+        let toml = r#"
+            output_path = "/tmp/watchlist.json"
+            write_live_snapshot = true
+        "#;
+        let cfg: BootstrapConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        assert!(cfg.write_snapshot);
+    }
+
+    /// **Env-var integration**: `PE_BOOTSTRAP_WRITE_SNAPSHOT=1` flips the field
+    /// through the same `load()` path production callers use. Guards against
+    /// the class of bug where the loader's `PE_BOOTSTRAP_`-prefix strip leaves
+    /// a key that does not match the field name (the prior `write_live_snapshot`
+    /// field name in this PR was a silent no-op under this env var — caught in
+    /// code review on PR #158). Uses `figment::Jail` for deterministic
+    /// env-var + cwd isolation.
+    #[test]
+    fn write_snapshot_set_via_env_var() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+            // `wallet_source` defaults to Etherscan, which needs a key to pass
+            // `validate()`. The value is opaque to this test.
+            jail.set_env("PE_ETHERSCAN_API_KEY", "test-key-unused");
+            jail.set_env("PE_BOOTSTRAP_WRITE_SNAPSHOT", "1");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert!(
+                cfg.write_snapshot,
+                "PE_BOOTSTRAP_WRITE_SNAPSHOT=1 must flip cfg.write_snapshot to true"
+            );
+            Ok(())
+        });
+    }
+
+    /// Env-var integration (off path): no `PE_BOOTSTRAP_WRITE_SNAPSHOT` set →
+    /// field stays false. Jail isolates env from the parent process.
+    #[test]
+    fn write_snapshot_unset_keeps_false() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+            jail.set_env("PE_ETHERSCAN_API_KEY", "test-key-unused");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert!(
+                !cfg.write_snapshot,
+                "no env var set → cfg.write_snapshot must remain false"
+            );
+            Ok(())
+        });
+    }
 }
