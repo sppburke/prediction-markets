@@ -349,9 +349,12 @@ fn default_liquidity_take_fraction() -> Decimal {
 }
 
 const fn default_require_known_expiry() -> bool {
-    // Sub-PR 1 of #137 ships behavioural-no-op default. Sub-PR 3 flips to `true`.
+    // Sub-PR 3 of #137. Flipped from `false` after PR #154 stage 6f populated
+    // trade-set schedules to 99.64% coverage (4,324 → 263,490 of 264,453 markets).
+    // Both-absent BUY signals (schedule + resolution missing) now fail closed.
     // Canonical: docs/_GLOSSARY.md `backtest_require_known_expiry_default`.
-    false
+    // Rollback: set `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY=false`.
+    true
 }
 
 const fn default_max_positions_per_market() -> Option<NonZeroU32> {
