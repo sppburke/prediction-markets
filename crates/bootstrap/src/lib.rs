@@ -391,7 +391,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     // walk-forward simulation to constrain its candidate pool to wallets that
     // *would have been* visible to the live system at this point in time.
     //
-    // Gated on `write_live_snapshot` (default: false). When false, the
+    // Gated on `write_snapshot` (default: false). When false, the
     // watchlist still builds and writes to the JSON output, but no row is
     // persisted to `leaderboard_snapshots` — this keeps ad-hoc retries
     // (resolutions watchdog, funder-graph reruns, dev shells) from polluting
@@ -401,7 +401,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     // (PE_SEED_AS_OF_DATES) is unaffected — that path has always written its
     // target rows and continues to do so.
     let snapshot_wallets: Vec<WalletAddress> = watchlist.entries.iter().map(|e| e.wallet).collect();
-    if config.write_live_snapshot {
+    if config.write_snapshot {
         cache.insert_snapshot(snapshot_at_for_db.0.unix_timestamp(), &snapshot_wallets)?;
         tracing::info!(
             snapshot_at = snapshot_at_for_db.0.unix_timestamp(),
