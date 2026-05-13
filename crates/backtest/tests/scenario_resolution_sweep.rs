@@ -150,13 +150,14 @@ fn default_strategy() -> WinnerFollowStrategy {
 
 fn run_sim(
     dir: &TempDir,
-    trades: Vec<RawTrade>,
+    mut trades: Vec<RawTrade>,
     timeline: &FunderGraphTimeline,
     resolutions: &ResolutionIndex,
 ) -> pe_backtest::report::WinnerFollowReport {
+    trades.sort_by_key(|t| t.timestamp.0);
     run_simulation(
         &base_config(dir),
-        trades,
+        &trades,
         timeline,
         &LeaderboardSnapshots::default(),
         resolutions,

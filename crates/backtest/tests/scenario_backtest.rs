@@ -155,14 +155,15 @@ async fn winner_wallet_produces_positive_pnl() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
 
-    let all_trades = generate_winner_trades(winner);
+    let mut all_trades = generate_winner_trades(winner);
+    all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
@@ -200,13 +201,14 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
     let mut all_trades = generate_winner_trades(winner);
     // Extra BUY on the last day with no corresponding SELL.
     all_trades.push(make_trade(winner, 99, 65, Side::Buy, dec!(0.35)));
+    all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
@@ -265,12 +267,14 @@ async fn per_trader_win_rate_used_as_probability() {
         ));
     }
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
+
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir, &[(high_winner, funder), (low_winner, funder2)]);
 
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
@@ -317,13 +321,14 @@ async fn fee_model_reduces_edge_at_high_prices() {
             dec!(0.98),
         ));
     }
+    all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),

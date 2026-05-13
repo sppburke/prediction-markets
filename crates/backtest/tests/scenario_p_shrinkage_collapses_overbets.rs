@@ -174,7 +174,8 @@ async fn run_with_prior(alpha: u32, beta: u32) -> Decimal {
 
     let leader = wallet(LEADER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_leader_trades(leader);
+    let mut trades = generate_leader_trades(leader);
+    trades.sort_by_key(|t| t.timestamp.0);
 
     let timeline = make_timeline(&dir, &[(leader, funder)]);
     let snapshots = LeaderboardSnapshots::default();
@@ -198,7 +199,7 @@ async fn run_with_prior(alpha: u32, beta: u32) -> Decimal {
 
     run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &resolutions,

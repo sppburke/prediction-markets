@@ -40,7 +40,7 @@ async fn main() -> Result<(), BacktestError> {
     // Load wallet trade cache (mutable so Dune resolutions can be written).
     let mut cache = WalletCache::open(&config.bootstrap_cache_path)?;
     let all_wallet_addresses = cache.all_wallet_addresses();
-    let all_trades = cache.all_trades();
+    let mut all_trades = cache.all_trades();
     let snapshots = cache.load_all_snapshots()?;
 
     // Fetch on-chain resolutions via Dune before running the simulation so that
@@ -116,6 +116,22 @@ async fn main() -> Result<(), BacktestError> {
         tracing::warn!("no trades in cache — populate with pe-bootstrap first");
         return Ok(());
     }
+
+    // Pre-sort trades once before the sweep/non-sweep branch. `run_simulation`
+    // documents this as a precondition (see simulation.rs) and guards it with a
+    // `debug_assert`. Single sort here covers both the parallel Kelly-fraction
+    // sweep (which shares the slice across rayon workers via SweepContext) and
+    // the single-config branch — avoids the previous per-thread `Vec` clone in
+    // `run_one_kelly_fraction` that drove the post-#137 memory regression
+    // (issue #156). Stable `sort_by_key` preserves byte-for-byte ordering for
+    // trades with identical `timestamp.0` (millisecond ties are real in
+    // batch/MEV-bundle fills) and matches the original in-place sort that lived
+    // inside `run_simulation`.
+    all_trades.sort_by_key(|t| t.timestamp.0);
+    info!(
+        count = all_trades.len(),
+        "backtest: trades pre-sorted for Kelly sweep"
+    );
 
     // Phase 0: build temporal funder graph from cached edges (populated by pe-bootstrap).
     let funder_timeline = FunderGraphTimeline::from_cache(&cache)?;
@@ -222,7 +238,7 @@ async fn main() -> Result<(), BacktestError> {
         let strategy = WinnerFollowStrategy::new(config.strategy.clone());
         let mut report = simulation::run_simulation(
             &config,
-            all_trades,
+            &all_trades,
             &funder_timeline,
             &snapshots,
             &resolutions,

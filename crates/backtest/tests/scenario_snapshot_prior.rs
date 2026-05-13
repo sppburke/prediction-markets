@@ -172,7 +172,8 @@ fn run_scenario(
 
     let leader = wallet(LEADER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = winner_book(leader);
+    let mut trades = winner_book(leader);
+    trades.sort_by_key(|t| t.timestamp.0);
 
     let timeline = make_timeline(&dir, &[(leader, funder)]);
     let resolutions = ResolutionIndex::new();
@@ -186,7 +187,7 @@ fn run_scenario(
 
     run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &resolutions,

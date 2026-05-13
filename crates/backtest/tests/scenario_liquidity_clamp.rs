@@ -189,9 +189,10 @@ fn run_with_liquidity(
     let config = base_config(&dir, take_fraction, min_required_usd);
     let strategy = WinnerFollowStrategy::new(config.strategy.clone());
 
+    trades.sort_by_key(|t| t.timestamp.0);
     run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &resolutions,

@@ -215,8 +215,9 @@ fn run_with_ranker(
     cap: Option<Decimal>,
     slippage_rate: Decimal,
     ranker_config: RankerConfig,
-    trades: Vec<RawTrade>,
+    mut trades: Vec<RawTrade>,
 ) -> (Vec<TradeFillJson>, WinnerFollowReport) {
+    trades.sort_by_key(|t| t.timestamp.0);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
@@ -233,7 +234,7 @@ fn run_with_ranker(
 
     let report = run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
