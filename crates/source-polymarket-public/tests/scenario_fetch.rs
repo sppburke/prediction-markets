@@ -1,11 +1,13 @@
 //! Scenario: ReqwestFetcher against an in-process axum mock server.
 //!
 //! Scenarios:
-//!   1. happy_path          — 200 OK → bytes returned.
-//!   2. retry_on_5xx        — 500×2 then 200 → success; 3 total requests.
-//!   3. rate_limited_429    — 429 with Retry-After:5 → RateLimited error.
-//!   4. fatal_4xx           — 404 → Fatal error.
-//!   5. exhaust_retries     — always 500, max_retries=2 → Transient; 3 total requests.
+//!   1. happy_path             — 200 OK → bytes returned.
+//!   2. retry_on_5xx           — 500×2 then 200 → success; 3 total requests.
+//!   3. rate_limited_429       — 429 with Retry-After:5 → RateLimited error.
+//!   4. fatal_4xx              — 404 → Fatal error.
+//!   5. exhaust_retries        — always 500, max_retries=2 → Transient; 3 total requests.
+//!   6. retry_on_408           — 408×2 then 200 → success; 3 total requests. (issue #159)
+//!   7. exhaust_retries_408    — always 408, max_retries=2 → Transient; 3 total requests. (issue #159)
 
 #![cfg(feature = "scenario")]
 #![allow(

@@ -202,7 +202,7 @@ fn backoff(initial_ms: u64, attempt: u32) -> Duration {
 /// HTTP status codes that should be retried with backoff. `408 Request Timeout`
 /// is added to the 5xx set (issue #159) — empirically transient on Polymarket's
 /// gamma-api edge. `429` is handled separately via [`SourceError::RateLimited`];
-/// `425 Too Early` and `502` (proxy edge cases) are deferred until observed.
+/// `425 Too Early` is deferred until observed in logs.
 fn is_retryable_status(status: u16) -> bool {
     status == 408 || status >= 500
 }
