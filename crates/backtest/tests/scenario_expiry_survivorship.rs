@@ -195,9 +195,10 @@ async fn unknown_expiry_market_allowed_through() {
     let timeline = make_timeline(&dir);
 
     // Configure a tight 48-hour window. Market 9999 has unknown expiry → allowed.
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -243,9 +244,10 @@ async fn known_far_expiry_is_suppressed() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -273,14 +275,15 @@ async fn known_far_expiry_is_suppressed() {
 #[tokio::test]
 async fn suppression_pct_zero_without_filter() {
     let alice = wallet(ALICE_HEX);
-    let trades = winner_book(alice);
+    let mut trades = winner_book(alice);
 
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, None), // no expiry filter
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
@@ -341,9 +344,10 @@ async fn expiry_filter_uses_schedule_over_resolution() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -404,9 +408,10 @@ async fn null_schedule_falls_through_to_resolution() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -457,9 +462,10 @@ async fn expiry_filter_falls_back_to_resolution_when_no_schedule() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -509,9 +515,10 @@ async fn require_known_expiry_suppresses_null_schedule_no_resolution() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config_with(&dir, Some(48), true),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -560,9 +567,10 @@ async fn require_known_expiry_off_allows_null_schedule_no_resolution() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config_with(&dir, Some(48), false),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
@@ -604,9 +612,10 @@ async fn require_known_expiry_suppresses_missing_market() {
     let dir = TempDir::new().unwrap();
     let timeline = make_timeline(&dir);
 
+    trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config_with(&dir, Some(48), true),
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,

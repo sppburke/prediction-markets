@@ -231,10 +231,20 @@ impl ExposureTracker {
 ///
 /// Pass `write_output = false` from sweep mode — per-run files are suppressed and only
 /// the sweep-level JSON is written by the caller.
+///
+/// # Precondition
+///
+/// `all_trades` must be sorted ascending by `t.timestamp.0`. The walk-forward
+/// loop and `simulation_start`/`simulation_end` derivation both assume this
+/// ordering. The caller is responsible for sorting once before invoking;
+/// `main.rs` does this above the sweep/non-sweep branch so a single sort
+/// covers both paths and the slice can be borrowed across rayon workers.
+/// Violating the precondition fires `debug_assert!` in debug builds; release
+/// builds will produce incorrect results without panicking.
 #[allow(clippy::too_many_arguments)]
 pub fn run_simulation(
     config: &BacktestConfig,
-    mut all_trades: Vec<RawTrade>,
+    all_trades: &[RawTrade],
     funder_timeline: &FunderGraphTimeline,
     snapshots: &LeaderboardSnapshots,
     resolutions: &ResolutionIndex,
@@ -245,8 +255,10 @@ pub fn run_simulation(
     strategy: &WinnerFollowStrategy,
     write_output: bool,
 ) -> Result<WinnerFollowReport, BacktestError> {
-    // Sort all trades ascending by timestamp for walk-forward processing.
-    all_trades.sort_by_key(|t| t.timestamp.0);
+    debug_assert!(
+        all_trades.is_sorted_by_key(|t| t.timestamp.0),
+        "run_simulation precondition violated: all_trades must be sorted by t.timestamp.0",
+    );
 
     if all_trades.is_empty() {
         return Err(BacktestError::Internal("no trades in cache".to_owned()));
@@ -363,7 +375,7 @@ pub fn run_simulation(
 
     // Group trades by date for efficient walk-forward lookup.
     let mut trades_by_date: BTreeMap<Date, Vec<&RawTrade>> = BTreeMap::new();
-    for trade in &all_trades {
+    for trade in all_trades {
         trades_by_date
             .entry(trade.timestamp.0.date())
             .or_default()
@@ -464,7 +476,7 @@ pub fn run_simulation(
 
         // Build operator identities using only edges visible at this sim date.
         let operator_identities =
-            build_operator_identities_at(funder_timeline, &all_trades, sim_date_unix)?;
+            build_operator_identities_at(funder_timeline, all_trades, sim_date_unix)?;
         let wallet_to_operator: HashMap<WalletAddress, &OperatorIdentity> = operator_identities
             .iter()
             .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op)))
@@ -1038,7 +1050,7 @@ pub fn run_simulation(
 /// derived automatically from the field types.
 pub struct SweepContext<'a> {
     pub config: &'a BacktestConfig,
-    pub all_trades: &'a Vec<RawTrade>,
+    pub all_trades: &'a [RawTrade],
     pub funder_timeline: &'a FunderGraphTimeline,
     pub snapshots: &'a LeaderboardSnapshots,
     pub resolutions: &'a ResolutionIndex,
@@ -1050,11 +1062,11 @@ pub struct SweepContext<'a> {
 
 /// Run a single Kelly-fraction iteration of the sweep against `ctx`.
 ///
-/// Clones the input trade vector per call (matches the existing sequential loop
-/// — `run_simulation` takes ownership and sorts in place). Constructs a
-/// `WinnerFollowStrategy` whose `kelly_fraction_override = Some(kf)` and forwards
-/// to `run_simulation` with `write_output = false`. Per-fraction file outputs
-/// are suppressed; the caller serializes the combined `KellySweepReport`.
+/// Forwards the pre-sorted trade slice borrowed from `SweepContext` into
+/// `run_simulation` together with a per-fraction `WinnerFollowStrategy` whose
+/// `kelly_fraction_override = Some(kf)`. `write_output = false` suppresses
+/// per-fraction file outputs; the caller serializes the combined
+/// `KellySweepReport`.
 ///
 /// Logging: emits a structured `tracing::info!` at start and completion of each
 /// run with `kelly_fraction` and `thread` fields. Under rayon, lines from
@@ -1076,7 +1088,7 @@ pub fn run_one_kelly_fraction(
     );
     let report = run_simulation(
         ctx.config,
-        ctx.all_trades.clone(),
+        ctx.all_trades,
         ctx.funder_timeline,
         ctx.snapshots,
         ctx.resolutions,
@@ -1282,6 +1294,18 @@ fn write_fill(writer: Option<&mut std::fs::File>, fill: &TradeFill) -> Result<()
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Compile-time regression guard for issue #156: `SweepContext::all_trades`
+    /// must remain a borrow, not an owned `Vec<RawTrade>`. The function below
+    /// only compiles if the field is `&[T]` or `&Vec<T>` (which deref-coerces
+    /// to `&[T]`); a regression to owned `Vec<RawTrade>` would fail to compile
+    /// because the inferred return type would require an unavailable copy or
+    /// move out of a shared reference. The function is intentionally never
+    /// called — its purpose is to be type-checked, not executed.
+    #[allow(dead_code)]
+    fn _assert_sweep_context_all_trades_is_borrowed<'a>(ctx: &SweepContext<'a>) -> &'a [RawTrade] {
+        ctx.all_trades
+    }
 
     fn market(s: &str) -> MarketId {
         use pe_core_types::VenueMarketId;

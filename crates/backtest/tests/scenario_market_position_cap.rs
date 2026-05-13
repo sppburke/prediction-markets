@@ -177,9 +177,10 @@ struct TradeFillJson {
 /// Drive `run_simulation` with a caller-supplied trade list and resolution index.
 fn run_with(
     cap: Option<NonZeroU32>,
-    trades: Vec<RawTrade>,
+    mut trades: Vec<RawTrade>,
     resolutions: ResolutionIndex,
 ) -> Vec<TradeFillJson> {
+    trades.sort_by_key(|t| t.timestamp.0);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
@@ -199,7 +200,7 @@ fn run_with(
 
     let _report = run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &resolutions,

@@ -184,10 +184,11 @@ fn generalist_trades(leader: WalletAddress) -> Vec<RawTrade> {
 /// concentration caps do not block either leader. PnL differences arise solely
 /// from the N_eff-derived shrunk_p.
 async fn run_leader(
-    trades: Vec<RawTrade>,
+    mut trades: Vec<RawTrade>,
     leader: WalletAddress,
     funder: WalletAddress,
 ) -> Decimal {
+    trades.sort_by_key(|t| t.timestamp.0);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
@@ -202,7 +203,7 @@ async fn run_leader(
 
     run_simulation(
         &base_config(&dir),
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &resolutions,

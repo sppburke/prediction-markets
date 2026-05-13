@@ -203,8 +203,9 @@ struct RunOutput {
 fn run_with(
     skip_unknown_operator: bool,
     funder_pairs: &[(WalletAddress, WalletAddress)],
-    trades: Vec<RawTrade>,
+    mut trades: Vec<RawTrade>,
 ) -> RunOutput {
+    trades.sort_by_key(|t| t.timestamp.0);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
@@ -220,7 +221,7 @@ fn run_with(
 
     let report = run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &snapshots,
         &resolutions,

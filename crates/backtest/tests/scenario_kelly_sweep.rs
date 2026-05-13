@@ -256,7 +256,8 @@ fn override_changes_sizing_vs_default() {
 async fn sweep_produces_correct_run_count() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_winner_trades(winner);
+    let mut trades = generate_winner_trades(winner);
+    trades.sort_by_key(|t| t.timestamp.0);
 
     let fractions = vec![kf(dec!(0.10)), kf(dec!(0.50)), kf(dec!(1.0))];
     let dir = TempDir::new().unwrap();
@@ -407,7 +408,8 @@ fn to_markdown_table_covers_all_runs() {
 async fn sweep_suppresses_per_run_output() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_winner_trades(winner);
+    let mut trades = generate_winner_trades(winner);
+    trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
@@ -420,7 +422,7 @@ async fn sweep_suppresses_per_run_output() {
     });
     run_simulation(
         &config,
-        trades,
+        &trades,
         &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
@@ -453,7 +455,8 @@ async fn sweep_suppresses_per_run_output() {
 async fn parallel_sweep_matches_sequential() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_winner_trades(winner);
+    let mut trades = generate_winner_trades(winner);
+    trades.sort_by_key(|t| t.timestamp.0);
     let fractions = vec![kf(dec!(0.10)), kf(dec!(0.50)), kf(dec!(1.0))];
     let dir = TempDir::new().unwrap();
     let config = BacktestConfig {
@@ -550,7 +553,8 @@ async fn parallel_sweep_matches_sequential() {
 async fn parallel_sweep_is_deterministic() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_winner_trades(winner);
+    let mut trades = generate_winner_trades(winner);
+    trades.sort_by_key(|t| t.timestamp.0);
     let fractions = vec![
         kf(dec!(0.10)),
         kf(dec!(0.25)),
@@ -644,7 +648,8 @@ async fn parallel_sweep_is_deterministic() {
 async fn parallel_sweep_output_sorted_by_fraction() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_winner_trades(winner);
+    let mut trades = generate_winner_trades(winner);
+    trades.sort_by_key(|t| t.timestamp.0);
     // Deliberately scrambled input order — output must be sorted regardless.
     let fractions = vec![
         kf(dec!(0.75)),
@@ -720,7 +725,8 @@ async fn parallel_sweep_output_sorted_by_fraction() {
 async fn parallel_sweep_single_fraction() {
     let winner = wallet(WINNER_HEX);
     let funder = wallet(FUNDER_HEX);
-    let trades = generate_winner_trades(winner);
+    let mut trades = generate_winner_trades(winner);
+    trades.sort_by_key(|t| t.timestamp.0);
     let fractions = vec![kf(dec!(0.50))];
     let dir = TempDir::new().unwrap();
     let config = BacktestConfig {

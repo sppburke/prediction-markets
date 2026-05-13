@@ -205,9 +205,10 @@ async fn wallet_outside_snapshot_emits_no_signals() {
     // Populated snapshots → has_funder = !snapshots.is_empty() = true for all wallets.
     let timeline = FunderGraphTimeline::empty();
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
@@ -251,9 +252,10 @@ async fn weekly_pool_swap_changes_active_leaders() {
     let dir = TempDir::new().unwrap();
     let timeline = FunderGraphTimeline::empty();
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
     let _ = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
@@ -283,7 +285,7 @@ async fn weekly_pool_swap_changes_active_leaders() {
 async fn wallet_present_throughout_emits_throughout() {
     let alice = wallet(ALICE_HEX);
 
-    let all_trades = winner_book(alice, 0, 0);
+    let mut all_trades = winner_book(alice, 0, 0);
 
     let snapshots = LeaderboardSnapshots::from_pairs(vec![
         (day_unix(0) - DAY, vec![alice]),
@@ -293,9 +295,10 @@ async fn wallet_present_throughout_emits_throughout() {
     let dir = TempDir::new().unwrap();
     let timeline = FunderGraphTimeline::empty();
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
@@ -324,7 +327,7 @@ async fn wallet_present_throughout_emits_throughout() {
 async fn position_opened_in_week1_persists_after_drop() {
     let alice = wallet(ALICE_HEX);
 
-    let all_trades = winner_book(alice, 0, 0);
+    let mut all_trades = winner_book(alice, 0, 0);
 
     let snapshots = LeaderboardSnapshots::from_pairs(vec![
         (day_unix(0) - DAY, vec![alice]),
@@ -334,9 +337,10 @@ async fn position_opened_in_week1_persists_after_drop() {
     let dir = TempDir::new().unwrap();
     let timeline = FunderGraphTimeline::empty();
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
@@ -369,7 +373,7 @@ async fn empty_snapshots_falls_back_to_full_history() {
     let alice = wallet(ALICE_HEX);
     let funder = wallet(FUNDER_HEX);
 
-    let all_trades = winner_book(alice, 0, 0);
+    let mut all_trades = winner_book(alice, 0, 0);
     let snapshots = LeaderboardSnapshots::default();
     assert!(snapshots.is_empty(), "fixture sanity");
 
@@ -377,9 +381,10 @@ async fn empty_snapshots_falls_back_to_full_history() {
     // Empty snapshots → has_funder depends on op_identity. Must provide funder edges.
     let timeline = make_timeline(&dir, &[(alice, funder)]);
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
@@ -413,7 +418,7 @@ async fn empty_snapshots_falls_back_to_full_history() {
 async fn simulation_date_before_first_snapshot_emits_nothing() {
     let alice = wallet(ALICE_HEX);
 
-    let all_trades = winner_book(alice, 0, 0);
+    let mut all_trades = winner_book(alice, 0, 0);
 
     // Anchor the first snapshot AFTER alice's last sell — no copies can happen.
     let snapshots = LeaderboardSnapshots::from_pairs(vec![(day_unix(100), vec![alice])]);
@@ -421,9 +426,10 @@ async fn simulation_date_before_first_snapshot_emits_nothing() {
     let dir = TempDir::new().unwrap();
     let timeline = FunderGraphTimeline::empty();
 
+    all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
-        all_trades,
+        &all_trades,
         &timeline,
         &snapshots,
         &ResolutionIndex::new(),
