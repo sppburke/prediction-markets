@@ -621,6 +621,56 @@ impl WalletCache {
         }
     }
 
+    /// Return market IDs in `market_schedules` whose `end_date_unix` is NULL.
+    ///
+    /// These are the candidate set for the null-rewrite pass (issue #137 Sub-PR 2):
+    /// rows where the initial Gamma fetch returned no `endDate`. Empirically, pre-PR
+    /// this was 98% of `source='gamma'` rows because the plain `?condition_ids=` URL
+    /// returns an empty list for closed markets; the `&closed=true` URL surfaces them.
+    ///
+    /// Caller is responsible for filtering this set to the trade-set scope before
+    /// issuing network requests.
+    ///
+    /// # Precondition
+    /// Returns an empty set when no schedules have been fetched.
+    pub fn null_schedule_market_ids(&self) -> HashSet<String> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT market_id FROM market_schedules WHERE end_date_unix IS NULL")
+        {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Rewrite the `end_date_unix` of an existing schedule row, only if it was NULL.
+    ///
+    /// The `WHERE end_date_unix IS NULL` clause is a hard guard against accidentally
+    /// overwriting good data: if a future caller passes a wrong value for a market
+    /// that already has a populated `end_date_unix`, this method is a no-op. Returns
+    /// `Ok(true)` when a row was updated, `Ok(false)` when no row matched (either the
+    /// market is absent from `market_schedules`, or its `end_date_unix` was already
+    /// populated by an earlier source).
+    pub fn update_schedule_end_date(
+        &mut self,
+        market_id: &str,
+        end_date_unix: i64,
+        fetched_at_unix: i64,
+    ) -> Result<bool, BootstrapError> {
+        let changes = self.conn.execute(
+            "UPDATE market_schedules \
+             SET end_date_unix = ?1, fetched_at_unix = ?2 \
+             WHERE market_id = ?3 AND end_date_unix IS NULL",
+            params![end_date_unix, fetched_at_unix, market_id],
+        )?;
+        Ok(changes > 0)
+    }
+
     /// Load all schedule rows into a [`ScheduleIndex`] keyed by [`MarketId`].
     ///
     /// Includes rows where `end_date_unix IS NULL` (Gamma had no `endDate`). The
@@ -1737,6 +1787,84 @@ mod tests {
         );
         assert!(ids.contains("0xa"));
         assert!(ids.contains("0xb"));
+    }
+
+    #[test]
+    fn null_schedule_market_ids_returns_only_null_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xpopulated", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+        cache
+            .insert_schedule("0xnull_a", None, 1_700_000_002)
+            .unwrap();
+        cache
+            .insert_schedule("0xnull_b", None, 1_700_000_003)
+            .unwrap();
+        let ids = cache.null_schedule_market_ids();
+        assert_eq!(
+            ids.len(),
+            2,
+            "only NULL rows belong in the null-rewrite candidate set"
+        );
+        assert!(ids.contains("0xnull_a"));
+        assert!(ids.contains("0xnull_b"));
+        assert!(
+            !ids.contains("0xpopulated"),
+            "populated rows must not appear"
+        );
+    }
+
+    #[test]
+    fn update_schedule_end_date_rewrites_null_row() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache.insert_schedule("0xa", None, 1_700_000_000).unwrap();
+        let changed = cache
+            .update_schedule_end_date("0xa", 1_700_500_000, 1_700_500_001)
+            .unwrap();
+        assert!(changed, "rewrite of a NULL row must return Ok(true)");
+        let mut sched = cache.load_all_schedules().unwrap();
+        let row = sched
+            .remove(&MarketId(VenueMarketId("0xa".to_owned())))
+            .unwrap();
+        assert_eq!(row.end_date_unix, Some(1_700_500_000));
+    }
+
+    #[test]
+    fn update_schedule_end_date_preserves_non_null_row() {
+        // Guards the `WHERE end_date_unix IS NULL` clause from being dropped in a
+        // future refactor; without it, a source returning a wrong value could
+        // silently corrupt good data.
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_schedule("0xa", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+        let changed = cache
+            .update_schedule_end_date("0xa", 1_700_999_999, 1_700_999_999)
+            .unwrap();
+        assert!(!changed, "rewrite of a populated row must return Ok(false)");
+        let mut sched = cache.load_all_schedules().unwrap();
+        let row = sched
+            .remove(&MarketId(VenueMarketId("0xa".to_owned())))
+            .unwrap();
+        assert_eq!(
+            row.end_date_unix,
+            Some(1_700_000_000),
+            "original populated value must be preserved"
+        );
+    }
+
+    #[test]
+    fn update_schedule_end_date_returns_false_for_missing_row() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let changed = cache
+            .update_schedule_end_date("0xnonexistent", 1_700_500_000, 1_700_500_001)
+            .unwrap();
+        assert!(!changed, "no row to update → Ok(false), not an error");
     }
 
     #[test]

@@ -139,6 +139,88 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         Ok(inserted)
     }
 
+    /// Rewrite NULL `end_date_unix` rows in `market_schedules` by re-fetching with
+    /// the `&closed=true` URL variant, then updating each row via
+    /// [`WalletCache::update_schedule_end_date`].
+    ///
+    /// Background: Gamma's plain `/markets?condition_ids={id}` endpoint silently
+    /// returns an empty list for closed markets, which is why pre-PR #137 ~98% of
+    /// `source='gamma'` rows had NULL `end_date_unix`. The `&closed=true` query
+    /// parameter surfaces closed markets with `endDate` populated. Empirical curl
+    /// against 100 random closed trade-set markets: plain URL 0/100 populated,
+    /// `&closed=true` 99/100 populated.
+    ///
+    /// Caller is responsible for filtering `market_ids` to the trade-set scope.
+    /// Returns the count of rows actually rewritten — markets where Gamma returns
+    /// `endDate=null` (the 1/100 case) leave the row at NULL and contribute 0.
+    /// Markets already populated by another source are likewise no-ops, guarded by
+    /// the cache method's `WHERE end_date_unix IS NULL` clause.
+    pub async fn rewrite_null_schedules(
+        &self,
+        market_ids: &[String],
+        cache: &mut WalletCache,
+    ) -> Result<usize, BootstrapError> {
+        let total = market_ids.len();
+        info!(
+            total,
+            concurrency = GAMMA_CONCURRENCY,
+            "gamma: starting null-schedule rewrite pass"
+        );
+
+        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let fetcher = &self.fetcher;
+        let base_url = self.base_url.as_str();
+
+        let mut stream = stream::iter(market_ids.iter().cloned())
+            .map(|market_id| async move {
+                let url = format!("{base_url}/markets?condition_ids={market_id}&closed=true");
+                let result = fetcher.fetch_page(&url).await;
+                (market_id, result)
+            })
+            .buffer_unordered(GAMMA_CONCURRENCY);
+
+        let mut rewritten = 0usize;
+        let mut processed = 0usize;
+        while let Some((market_id, result)) = stream.next().await {
+            processed += 1;
+            if processed.is_multiple_of(1_000) {
+                info!(
+                    processed,
+                    total, rewritten, "gamma: null-schedule rewrite progress"
+                );
+            }
+
+            let bytes = match result {
+                Ok(b) => b,
+                Err(SourceError::Fatal { message }) => {
+                    tracing::warn!(%market_id, %message, "gamma: rewrite fetch error, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(BootstrapError::Gamma {
+                        message: format!("rewrite schedule {market_id}: {e}"),
+                    });
+                }
+            };
+
+            let end_date_unix = match parse_gamma_schedule(&bytes) {
+                Ok(Some(ts)) => ts,
+                Ok(None) => continue, // closed market with no endDate; leave row NULL
+                Err(e) => {
+                    tracing::warn!(%market_id, %e, "gamma: rewrite parse error, leaving NULL");
+                    continue;
+                }
+            };
+
+            if cache.update_schedule_end_date(&market_id, end_date_unix, fetched_at)? {
+                rewritten += 1;
+            }
+        }
+
+        info!(rewritten, total, "gamma: null-schedule rewrite complete");
+        Ok(rewritten)
+    }
+
     /// Fetch Gamma `liquidity` (current order-book depth indicator) for every market ID
     /// not already present in `cache`.
     ///
@@ -473,6 +555,118 @@ mod tests {
             .unwrap();
         assert_eq!(inserted, 1, "only 0xb must be fetched (0xa was cached)");
         assert_eq!(cache.load_all_schedules().unwrap().len(), 2);
+    }
+
+    fn closed_no_end_date_fixture() -> Vec<u8> {
+        // Closed market that genuinely has endDate=null — the 1/100 case in the
+        // empirical probe. `rewrite_null_schedules` must leave the row at NULL.
+        fixture_bytes(
+            r#"[{"conditionId":"0xcond","closed":true,"closedTime":"2024-01-15 12:00:00+00","outcomes":"[\"Yes\",\"No\"]"}]"#,
+        )
+    }
+
+    #[test]
+    fn rewrite_null_schedules_populates_via_closed_endpoint() {
+        // End-to-end happy path: NULL row exists, &closed=true returns endDate,
+        // cache row is updated. Verifies the URL change + cache wiring.
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        cache
+            .insert_schedule("0xcond", None, 1_700_000_000)
+            .unwrap();
+
+        let closed_url =
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcond&closed=true";
+        let mut responses = HashMap::new();
+        responses.insert(closed_url.to_owned(), closed_with_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rewritten = rt
+            .block_on(gamma.rewrite_null_schedules(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(rewritten, 1, "single populated response must rewrite 1 row");
+
+        let idx = cache.load_all_schedules().unwrap();
+        let sched = idx.values().next().unwrap();
+        assert_eq!(
+            sched.end_date_unix,
+            Some(1_705_276_800),
+            "end_date must be the parsed closed-market value"
+        );
+        // No more NULL rows.
+        assert!(cache.null_schedule_market_ids().is_empty());
+    }
+
+    #[test]
+    fn rewrite_null_schedules_leaves_row_null_when_gamma_returns_no_enddate() {
+        // The 1/100 case: closed market that Gamma returns but with endDate=null.
+        // Row must stay NULL, rewritten counter must be 0.
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        cache
+            .insert_schedule("0xcond", None, 1_700_000_000)
+            .unwrap();
+
+        let closed_url =
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcond&closed=true";
+        let mut responses = HashMap::new();
+        responses.insert(closed_url.to_owned(), closed_no_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rewritten = rt
+            .block_on(gamma.rewrite_null_schedules(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(rewritten, 0, "no endDate in response → no row rewritten");
+
+        let idx = cache.load_all_schedules().unwrap();
+        let sched = idx.values().next().unwrap();
+        assert_eq!(sched.end_date_unix, None, "NULL must be preserved");
+    }
+
+    #[test]
+    fn rewrite_null_schedules_uses_closed_true_url_not_plain() {
+        // Regression guard: the URL MUST include &closed=true, otherwise Gamma
+        // returns empty list for closed markets and we silently get rewritten=0.
+        // We map only the &closed=true URL; a fetch against the plain URL would
+        // miss and return SourceError::Fatal (which the loop skips with a warn).
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        cache
+            .insert_schedule("0xcond", None, 1_700_000_000)
+            .unwrap();
+
+        let closed_url =
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcond&closed=true";
+        // NOTE: deliberately NOT mapping the plain URL — if the implementation
+        // regresses to that URL, the request 404s under FixtureFetcher and
+        // rewritten stays 0.
+        let mut responses = HashMap::new();
+        responses.insert(closed_url.to_owned(), closed_with_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rewritten = rt
+            .block_on(gamma.rewrite_null_schedules(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(
+            rewritten, 1,
+            "&closed=true URL must be used; rewritten=0 here would indicate the \
+             implementation regressed to the plain URL"
+        );
     }
 
     #[test]
