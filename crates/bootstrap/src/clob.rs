@@ -206,7 +206,7 @@ fn build_page_url(base_url: &str, cursor: Option<&str>) -> String {
 ///
 /// Index is taken positionally because CLOB returns tokens in YES/NO order
 /// for binary markets; multi-outcome markets follow the same convention.
-fn winner_index(tokens: &[ClobToken]) -> Option<u8> {
+fn winner_index(tokens: &[ClobToken]) -> Option<u16> {
     let winners: Vec<usize> = tokens
         .iter()
         .enumerate()
@@ -214,7 +214,7 @@ fn winner_index(tokens: &[ClobToken]) -> Option<u8> {
         .map(|(i, _)| i)
         .collect();
     if winners.len() == 1 {
-        u8::try_from(winners[0]).ok()
+        u16::try_from(winners[0]).ok()
     } else {
         None
     }

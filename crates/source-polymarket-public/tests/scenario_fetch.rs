@@ -206,3 +206,99 @@ async fn scenario_exhaust_retries() {
         "expected 3 total requests (initial + 2 retries)"
     );
 }
+
+// ── Scenario 6: retry_on_408 ─────────────────────────────────────────────────
+//
+// Issue #159: HTTP 408 Request Timeout was previously routed to Fatal by the
+// `>= 400 && != 429` branch. After widening `is_retryable_status` to include
+// 408, the fetcher must back off and succeed when the next attempt is 200.
+//
+// PASS: fetch_page returns Ok after two 408s, exactly 3 total requests.
+// FAIL: any error, or a request count other than 3.
+
+#[tokio::test]
+async fn scenario_retry_on_408() {
+    #[derive(Clone)]
+    struct S {
+        count: Arc<AtomicU32>,
+    }
+
+    async fn handler(State(s): State<S>) -> impl IntoResponse {
+        let prev = s.count.fetch_add(1, Ordering::SeqCst);
+        if prev < 2 {
+            StatusCode::REQUEST_TIMEOUT.into_response()
+        } else {
+            (StatusCode::OK, b"ok".to_vec()).into_response()
+        }
+    }
+
+    let state = S {
+        count: Arc::new(AtomicU32::new(0)),
+    };
+    let count_ref = state.count.clone();
+    let router = Router::new()
+        .route("/timeout", get(handler))
+        .with_state(state);
+    let base = start_mock_server(router).await;
+
+    let fetcher = make_fetcher();
+    let bytes = fetcher
+        .fetch_page(&format!("{base}/timeout"))
+        .await
+        .expect("408s must be retried until success");
+
+    assert_eq!(bytes, b"ok");
+    assert_eq!(
+        count_ref.load(Ordering::SeqCst),
+        3,
+        "expected 3 total requests (2x 408 + 1x 200)"
+    );
+}
+
+// ── Scenario 7: exhaust_retries_408 ──────────────────────────────────────────
+//
+// Issue #159: when 408 persists past max_retries, the fetcher must surface
+// Transient (not Fatal) so upstream BootstrapError treats the wallet as
+// retry-eligible rather than aborting the whole run.
+//
+// PASS: fetch_page returns Transient; exactly max_retries+1 requests made.
+// FAIL: any other error variant, Ok, or wrong request count.
+
+#[tokio::test]
+async fn scenario_exhaust_retries_408() {
+    #[derive(Clone)]
+    struct S {
+        count: Arc<AtomicU32>,
+    }
+
+    async fn handler(State(s): State<S>) -> impl IntoResponse {
+        s.count.fetch_add(1, Ordering::SeqCst);
+        StatusCode::REQUEST_TIMEOUT
+    }
+
+    let state = S {
+        count: Arc::new(AtomicU32::new(0)),
+    };
+    let count_ref = state.count.clone();
+    let router = Router::new()
+        .route("/timeout-forever", get(handler))
+        .with_state(state);
+    let base = start_mock_server(router).await;
+
+    // max_retries = 2 → 3 total attempts.
+    let fetcher = make_fetcher().with_max_retries(2);
+    let err = fetcher
+        .fetch_page(&format!("{base}/timeout-forever"))
+        .await
+        .expect_err("expected Err after exhausting retries");
+
+    assert!(
+        matches!(err, SourceError::Transient { .. }),
+        "408 exhaustion must surface Transient, got {err}"
+    );
+    assert_eq!(
+        count_ref.load(Ordering::SeqCst),
+        3,
+        "expected 3 total requests (initial + 2 retries)"
+    );
+}

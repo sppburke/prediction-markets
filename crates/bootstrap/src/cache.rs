@@ -167,7 +167,7 @@ impl WalletCache {
                     t.source_trade_id.0,
                     wallet_hex,
                     t.market_id.0.0,
-                    i64::from(t.outcome_id.0),
+                    i64::from(t.outcome_id),
                     side_to_str(&t.side),
                     t.price.0.to_string(),
                     contracts_i64,
@@ -455,7 +455,7 @@ impl WalletCache {
     pub fn insert_resolution(
         &mut self,
         market_id: &str,
-        winning_outcome_id: Option<u8>,
+        winning_outcome_id: Option<u16>,
         resolved_at_unix: i64,
         fetched_at_unix: i64,
     ) -> Result<(), BootstrapError> {
@@ -481,7 +481,7 @@ impl WalletCache {
     pub fn insert_resolution_with_source(
         &mut self,
         market_id: &str,
-        winning_outcome_id: Option<u8>,
+        winning_outcome_id: Option<u16>,
         resolved_at_unix: i64,
         fetched_at_unix: i64,
         source: &str,
@@ -846,7 +846,7 @@ impl WalletCache {
         let mut index = ResolutionIndex::new();
         for row in rows {
             let (market_id, winner_i64, resolved_at_unix) = row?;
-            let Ok(winning_outcome_id) = u8::try_from(winner_i64) else {
+            let Ok(winning_outcome_id) = OutcomeId::try_from(winner_i64) else {
                 continue; // out-of-range value; skip defensively
             };
             index.insert(
@@ -974,7 +974,7 @@ impl WalletCache {
     /// the `source` tag. Intended for diagnostics and scenario tests; the
     /// backtest reads via [`Self::load_all_resolutions`] which does not
     /// surface the source column.
-    pub fn resolution_record(&self, market_id: &str) -> Option<(Option<u8>, i64, i64, String)> {
+    pub fn resolution_record(&self, market_id: &str) -> Option<(Option<u16>, i64, i64, String)> {
         self.conn
             .query_row(
                 "SELECT winning_outcome_id, resolved_at_unix, fetched_at_unix, source \
@@ -985,7 +985,7 @@ impl WalletCache {
                     let resolved_at: i64 = r.get(1)?;
                     let fetched_at: i64 = r.get(2)?;
                     let source: String = r.get(3)?;
-                    let winner = winner_i64.and_then(|v| u8::try_from(v).ok());
+                    let winner = winner_i64.and_then(|v| u16::try_from(v).ok());
                     Ok((winner, resolved_at, fetched_at, source))
                 },
             )
@@ -1055,8 +1055,9 @@ impl WalletCache {
 /// [`ResolutionIndex`]; voided markets are filtered at load time.
 #[derive(Debug, Clone)]
 pub struct MarketResolution {
-    /// 0-based index of the winning outcome (e.g. 0 = YES, 1 = NO).
-    pub winning_outcome_id: u8,
+    /// 0-based index of the winning outcome (e.g. `OutcomeId(0)` = YES, `OutcomeId(1)` = NO).
+    /// Promoted from raw `u8` to `OutcomeId` (issue #159) to eliminate the `.0` deref footgun.
+    pub winning_outcome_id: OutcomeId,
     /// Unix seconds when the market was closed (from Gamma `closedTime`).
     pub resolved_at_unix: i64,
 }
@@ -1198,7 +1199,7 @@ fn row_to_trade(
     contracts: i64,
     ts: i64,
 ) -> Option<RawTrade> {
-    let outcome = u8::try_from(outcome_id).ok()?;
+    let outcome_id = OutcomeId::try_from(outcome_id).ok()?;
     let side = str_to_side(side)?;
     let price_dec = Decimal::from_str(price_str).ok()?;
     let price = Price::new(price_dec).ok()?;
@@ -1207,7 +1208,7 @@ fn row_to_trade(
     Some(RawTrade {
         wallet,
         market_id: MarketId(VenueMarketId(market_id)),
-        outcome_id: OutcomeId(outcome),
+        outcome_id,
         side,
         price,
         contracts: ContractQty(contracts_u64),
@@ -1597,7 +1598,7 @@ mod tests {
         let m = idx
             .get(&MarketId(VenueMarketId("0xcond_yes".to_owned())))
             .unwrap();
-        assert_eq!(m.winning_outcome_id, 0);
+        assert_eq!(m.winning_outcome_id, OutcomeId(0));
         assert_eq!(m.resolved_at_unix, 1_700_000_100);
     }
 
@@ -1617,7 +1618,38 @@ mod tests {
         let m = idx
             .get(&MarketId(VenueMarketId("0xcond".to_owned())))
             .unwrap();
-        assert_eq!(m.winning_outcome_id, 1, "first insert must win");
+        assert_eq!(m.winning_outcome_id, OutcomeId(1), "first insert must win");
+    }
+
+    // Issue #159: ensure a multi-outcome market with winner index > 255
+    // round-trips intact through SQLite, the OutcomeId::try_from path, and the
+    // ResolutionIndex. Pre-#159 this would have lost data at the load_all step.
+    #[test]
+    fn resolution_round_trips_large_outcome_id() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xcond_multi", Some(999), 1_700_000_100, 1_700_000_200)
+            .unwrap();
+        let idx = cache.load_all_resolutions().unwrap();
+        let m = idx
+            .get(&MarketId(VenueMarketId("0xcond_multi".to_owned())))
+            .expect("market with outcome 999 must be present in resolution index");
+        assert_eq!(m.winning_outcome_id, OutcomeId(999));
+    }
+
+    #[test]
+    fn resolution_round_trips_u16_max_outcome_id() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache
+            .insert_resolution("0xcond_max", Some(u16::MAX), 1_700_000_100, 1_700_000_200)
+            .unwrap();
+        let idx = cache.load_all_resolutions().unwrap();
+        let m = idx
+            .get(&MarketId(VenueMarketId("0xcond_max".to_owned())))
+            .expect("u16::MAX outcome must round-trip");
+        assert_eq!(m.winning_outcome_id, OutcomeId(u16::MAX));
     }
 
     #[test]

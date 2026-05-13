@@ -418,7 +418,7 @@ pub fn run_simulation(
             let Some(res) = resolutions.get(&pos_key.0) else {
                 continue;
             };
-            let close_price = if res.winning_outcome_id == pos_key.1.0 {
+            let close_price = if res.winning_outcome_id == pos_key.1 {
                 Decimal::ONE
             } else {
                 Decimal::ZERO

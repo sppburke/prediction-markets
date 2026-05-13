@@ -54,7 +54,7 @@ struct PolymarketTrade {
     price: Decimal,
     timestamp: i64,
     #[serde(default)]
-    outcome_index: Option<u8>,
+    outcome_index: Option<u16>,
 }
 
 // ── Fetcher ───────────────────────────────────────────────────────────────────
@@ -553,6 +553,23 @@ mod tests {
         let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"BUY","size":1,"price":0.50,"timestamp":1704067200,"outcomeIndex":1}]"#;
         let trades = parse(json);
         assert_eq!(trades[0].outcome_id, OutcomeId(1));
+    }
+
+    // Issue #159: Polymarket multi-outcome markets observed with outcomeIndex > 255.
+    // Pre-#159 this body would parse-fail with `invalid value: integer '999', expected u8`.
+    #[test]
+    fn parse_outcome_index_above_u8_max_propagated() {
+        let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"BUY","size":1,"price":0.50,"timestamp":1704067200,"outcomeIndex":999}]"#;
+        let trades = parse(json);
+        assert_eq!(trades.len(), 1, "multi-outcome trade must parse");
+        assert_eq!(trades[0].outcome_id, OutcomeId(999));
+    }
+
+    #[test]
+    fn parse_outcome_index_at_u16_max_propagated() {
+        let json = br#"[{"transactionHash":"0xhash","conditionId":"0xcond","side":"BUY","size":1,"price":0.50,"timestamp":1704067200,"outcomeIndex":65535}]"#;
+        let trades = parse(json);
+        assert_eq!(trades[0].outcome_id, OutcomeId(u16::MAX));
     }
 
     #[test]

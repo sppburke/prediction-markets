@@ -190,7 +190,7 @@ pub struct TradeFill {
     pub leader_wallet: String,
     pub operator_id: Option<String>,
     pub market_id: String,
-    pub outcome_id: u8,
+    pub outcome_id: u16,
     pub side: String,
     pub contracts: u64,
     pub signal_price: Decimal,

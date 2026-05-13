@@ -236,7 +236,7 @@ async fn known_far_expiry_is_suppressed() {
     resolutions.insert(
         mkt(9999),
         MarketResolution {
-            winning_outcome_id: 0,
+            winning_outcome_id: OutcomeId(0),
             resolved_at_unix: BASE_UNIX + 270 * DAY,
         },
     );
@@ -327,7 +327,7 @@ async fn expiry_filter_uses_schedule_over_resolution() {
     resolutions.insert(
         mkt(9999),
         MarketResolution {
-            winning_outcome_id: 0,
+            winning_outcome_id: OutcomeId(0),
             resolved_at_unix: BASE_UNIX + 71 * DAY,
         },
     );
@@ -391,7 +391,7 @@ async fn null_schedule_falls_through_to_resolution() {
     resolutions.insert(
         mkt(9999),
         MarketResolution {
-            winning_outcome_id: 0,
+            winning_outcome_id: OutcomeId(0),
             resolved_at_unix: BASE_UNIX + 270 * DAY,
         },
     );
@@ -451,7 +451,7 @@ async fn expiry_filter_falls_back_to_resolution_when_no_schedule() {
     resolutions.insert(
         mkt(9999),
         MarketResolution {
-            winning_outcome_id: 0,
+            winning_outcome_id: OutcomeId(0),
             resolved_at_unix: BASE_UNIX + 270 * DAY,
         },
     );

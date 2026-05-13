@@ -44,7 +44,7 @@ struct RawTrade {
     timestamp: i64,
     /// Outcome index: 0 = YES, 1 = NO.  Absent on older records; defaults to 0.
     #[serde(default)]
-    outcome_index: Option<u8>,
+    outcome_index: Option<u16>,
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -165,5 +165,13 @@ mod tests {
         let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":5,"price":0.55,"timestamp":1704067200}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades[0].outcome_id, OutcomeId(0));
+    }
+
+    // Issue #159: outcomeIndex > 255 must parse, matching the bootstrap-side DTO.
+    #[test]
+    fn outcome_index_above_u8_max_propagated() {
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":5,"price":0.55,"timestamp":1704067200,"outcomeIndex":999}]"#;
+        let trades = parse_trades(json, dummy_wallet()).unwrap();
+        assert_eq!(trades[0].outcome_id, OutcomeId(999));
     }
 }

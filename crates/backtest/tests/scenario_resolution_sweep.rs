@@ -173,14 +173,14 @@ fn run_sim(
 
 fn res_yes(resolved_day: u32) -> MarketResolution {
     MarketResolution {
-        winning_outcome_id: 0,
+        winning_outcome_id: OutcomeId(0),
         resolved_at_unix: day_unix(resolved_day),
     }
 }
 
 fn res_no(resolved_day: u32) -> MarketResolution {
     MarketResolution {
-        winning_outcome_id: 1,
+        winning_outcome_id: OutcomeId(1),
         resolved_at_unix: day_unix(resolved_day),
     }
 }

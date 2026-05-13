@@ -46,7 +46,7 @@ fn ts(offset_secs: i64) -> SourceTimestamp {
 fn raw_trade(
     wallet: WalletAddress,
     market_id: MarketId,
-    outcome: u8,
+    outcome: u16,
     side: Side,
     price_dec: rust_decimal::Decimal,
     contracts: u64,
