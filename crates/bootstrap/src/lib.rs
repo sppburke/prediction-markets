@@ -530,6 +530,26 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
             open_markets = open_ids.len(),
             "bootstrap: gamma liquidity fetched (open markets only)"
         );
+
+        // 6f. Null-schedule rewrite pass (issue #137 Sub-PR 2).
+        //     Markets whose schedule rows have NULL `end_date_unix` — overwhelmingly
+        //     closed markets that Gamma's plain `?condition_ids=` endpoint silently
+        //     dropped (empirical: 0/100 plain vs 99/100 with `&closed=true`).
+        //     Scope to trade-set ∩ null-schedule so we don't issue requests for
+        //     markets outside the wallet trade set.
+        let null_ids = cache.null_schedule_market_ids();
+        let trade_set: HashSet<String> = all_market_ids.iter().cloned().collect();
+        let rewrite_targets: Vec<String> = null_ids.intersection(&trade_set).cloned().collect();
+        if !rewrite_targets.is_empty() {
+            let rewritten = gamma_fetcher
+                .rewrite_null_schedules(&rewrite_targets, &mut cache)
+                .await?;
+            tracing::info!(
+                rewritten,
+                candidates = rewrite_targets.len(),
+                "bootstrap: gamma null-schedule rewrite complete"
+            );
+        }
     }
 
     // Write output.
