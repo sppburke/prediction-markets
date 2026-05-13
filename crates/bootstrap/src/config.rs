@@ -267,6 +267,30 @@ pub struct BootstrapConfig {
     )]
     pub skip_trade_fetch: bool,
 
+    /// Write a `leaderboard_snapshots` row at run time (off by default).
+    ///
+    /// When `false` (default), the main bootstrap pipeline still builds the
+    /// watchlist for the current run but does **not** persist a row keyed at
+    /// `now`. Keeps ad-hoc bootstrap runs (retries from the resolutions
+    /// watchdog, dev shells, funder-graph reruns) from polluting the snapshot
+    /// timeline with near-duplicate intra-day rows.
+    ///
+    /// Set to `true` only in the official weekly refresh path, where a single
+    /// canonical `(snapshot_at_unix, wallet)` row-set per Sunday is the
+    /// intent. Backwards-compatible callers that want the old behavior can
+    /// opt in.
+    ///
+    /// Env `PE_BOOTSTRAP_WRITE_SNAPSHOT`: `"1"` or `"true"` to enable.
+    /// Historical snapshot seeding via `PE_SEED_AS_OF_DATES` is unaffected —
+    /// `seed_historical_snapshots` always writes its target rows independent
+    /// of this flag.
+    #[serde(
+        default,
+        alias = "bootstrap_write_snapshot",
+        deserialize_with = "deserialize_bool_or_01"
+    )]
+    pub write_live_snapshot: bool,
+
     /// Concurrent per-wallet funder-discovery fetches against the Etherscan API.
     /// `PE_BOOTSTRAP_FUNDER_CONCURRENCY` overrides.
     #[serde(
@@ -403,6 +427,7 @@ impl Default for BootstrapConfig {
             clob_concurrency: default_clob_concurrency(),
             fetch_funder_graph: false,
             skip_trade_fetch: false,
+            write_live_snapshot: false,
             funder_concurrency: default_funder_concurrency(),
         }
     }
@@ -580,4 +605,46 @@ where
     }
 
     d.deserialize_any(V)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Default config has the snapshot write gate OFF — keeps ad-hoc bootstrap
+    /// runs from polluting `leaderboard_snapshots`. The Sunday weekly refresh
+    /// path must explicitly opt in.
+    #[test]
+    fn write_live_snapshot_defaults_false() {
+        let cfg = BootstrapConfig::default();
+        assert!(
+            !cfg.write_live_snapshot,
+            "write_live_snapshot must default to false to keep ad-hoc bootstrap runs \
+             from polluting leaderboard_snapshots"
+        );
+    }
+
+    /// TOML round-trip: `write_live_snapshot = true` flips the field.
+    #[test]
+    fn write_live_snapshot_parses_from_toml_true() {
+        let toml = r#"
+            output_path = "/tmp/watchlist.json"
+            write_live_snapshot = true
+        "#;
+        let cfg: BootstrapConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        assert!(cfg.write_live_snapshot);
+    }
+
+    /// TOML round-trip: `write_live_snapshot = false` is the explicit-opt-out
+    /// path; matches the implicit default but exercised here for symmetry.
+    #[test]
+    fn write_live_snapshot_parses_from_toml_false() {
+        let toml = r#"
+            output_path = "/tmp/watchlist.json"
+            write_live_snapshot = false
+        "#;
+        let cfg: BootstrapConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        assert!(!cfg.write_live_snapshot);
+    }
 }

@@ -386,17 +386,37 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         "bootstrap: watchlist built"
     );
 
-    // Persist a leaderboard snapshot row-set: (snapshot_at_unix, wallet) for every
-    // wallet that survived the post-filter. Read by the backtest's walk-forward
-    // simulation to constrain its candidate pool to wallets that *would have been*
-    // visible to the live system at this point in time.
+    // Persist a leaderboard snapshot row-set: (snapshot_at_unix, wallet) for
+    // every wallet that survived the post-filter. Read by the backtest's
+    // walk-forward simulation to constrain its candidate pool to wallets that
+    // *would have been* visible to the live system at this point in time.
+    //
+    // Gated on `write_live_snapshot` (default: false). When false, the
+    // watchlist still builds and writes to the JSON output, but no row is
+    // persisted to `leaderboard_snapshots` — this keeps ad-hoc retries
+    // (resolutions watchdog, funder-graph reruns, dev shells) from polluting
+    // the snapshot timeline with near-duplicate `now`-stamped rows. The
+    // official weekly refresh path is the intended sole writer; it opts in
+    // explicitly. Historical seeding via `seed_historical_snapshots`
+    // (PE_SEED_AS_OF_DATES) is unaffected — that path has always written its
+    // target rows and continues to do so.
     let snapshot_wallets: Vec<WalletAddress> = watchlist.entries.iter().map(|e| e.wallet).collect();
-    cache.insert_snapshot(snapshot_at_for_db.0.unix_timestamp(), &snapshot_wallets)?;
-    tracing::info!(
-        snapshot_at = snapshot_at_for_db.0.unix_timestamp(),
-        wallets = snapshot_wallets.len(),
-        "bootstrap: leaderboard snapshot persisted"
-    );
+    if config.write_live_snapshot {
+        cache.insert_snapshot(snapshot_at_for_db.0.unix_timestamp(), &snapshot_wallets)?;
+        tracing::info!(
+            snapshot_at = snapshot_at_for_db.0.unix_timestamp(),
+            wallets = snapshot_wallets.len(),
+            "bootstrap: leaderboard snapshot persisted"
+        );
+    } else {
+        tracing::info!(
+            snapshot_at = snapshot_at_for_db.0.unix_timestamp(),
+            wallets = snapshot_wallets.len(),
+            "bootstrap: leaderboard snapshot write skipped \
+             (set PE_BOOTSTRAP_WRITE_SNAPSHOT=true to enable; \
+             official weekly refresh is the intended writer)"
+        );
+    }
 
     // 6. Multi-source historical-data pipeline (issue #149).
     //    Stage ordering puts precision sources first so INSERT OR IGNORE keeps
