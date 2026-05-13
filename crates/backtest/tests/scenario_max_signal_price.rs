@@ -81,7 +81,7 @@ fn mkt(idx: u32) -> MarketId {
 fn raw_trade(
     w: WalletAddress,
     market_idx: u32,
-    outcome: u8,
+    outcome: u16,
     day_offset: u32,
     hour_offset: i64,
     side: Side,

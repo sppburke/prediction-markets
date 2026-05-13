@@ -74,7 +74,7 @@ fn mkt(idx: u32) -> MarketId {
 fn raw_trade(
     w: WalletAddress,
     market_idx: u32,
-    outcome: u8,
+    outcome: u16,
     day_offset: u32,
     hour_offset: i64,
     side: Side,
@@ -227,7 +227,7 @@ fn run_with(
 
 /// Convenience: both leaders trained, then both BUY the same `(market, outcome)`
 /// on the test day at distinct timestamps.
-fn both_buy_same_market_same_day(test_market: u32, outcome: u8) -> Vec<RawTrade> {
+fn both_buy_same_market_same_day(test_market: u32, outcome: u16) -> Vec<RawTrade> {
     let leader_a = wallet(LEADER_A_HEX);
     let leader_b = wallet(LEADER_B_HEX);
     let mut trades = Vec::new();
@@ -450,7 +450,7 @@ async fn cap_slot_reopens_after_resolution() {
         mkt(504),
         MarketResolution {
             resolved_at_unix: BASE_UNIX + 31 * 86_400,
-            winning_outcome_id: 0,
+            winning_outcome_id: OutcomeId(0),
         },
     );
 

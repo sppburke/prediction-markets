@@ -152,8 +152,8 @@ impl PageFetcher for ReqwestFetcher {
                         });
                     }
 
-                    if status >= 500 {
-                        // 5xx — retryable.
+                    if is_retryable_status(status) {
+                        // 5xx or 408 — retryable.
                         if attempt >= self.max_retries {
                             return Err(SourceError::Transient {
                                 message: format!("HTTP {status}"),
@@ -165,7 +165,7 @@ impl PageFetcher for ReqwestFetcher {
                     }
 
                     if status >= 400 {
-                        // 4xx (non-429) — unrecoverable.
+                        // 4xx (non-429, non-408) — unrecoverable.
                         return Err(SourceError::Fatal {
                             message: format!("HTTP {status}"),
                         });
@@ -199,6 +199,14 @@ fn backoff(initial_ms: u64, attempt: u32) -> Duration {
     Duration::from_millis(ms.min(30_000))
 }
 
+/// HTTP status codes that should be retried with backoff. `408 Request Timeout`
+/// is added to the 5xx set (issue #159) — empirically transient on Polymarket's
+/// gamma-api edge. `429` is handled separately via [`SourceError::RateLimited`];
+/// `425 Too Early` is deferred until observed in logs.
+fn is_retryable_status(status: u16) -> bool {
+    status == 408 || status >= 500
+}
+
 // ── Test fixture fetcher ──────────────────────────────────────────────────────
 
 /// A [`PageFetcher`] that returns pre-loaded fixture bytes keyed by URL.
@@ -223,5 +231,38 @@ impl PageFetcher for FixtureFetcher {
             .ok_or_else(|| SourceError::Fatal {
                 message: format!("no fixture for URL: {url}"),
             })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_status_includes_408_and_5xx() {
+        // Issue #159: 408 was previously fatal; now retried.
+        assert!(is_retryable_status(408));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+        assert!(is_retryable_status(599));
+    }
+
+    #[test]
+    fn retryable_status_excludes_429_and_unrelated_4xx() {
+        // 429 has its own RateLimited path; the rest of 4xx is fatal.
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(425));
+        assert!(!is_retryable_status(429));
+        // And the success / redirect ranges remain non-retryable.
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(204));
+        assert!(!is_retryable_status(301));
+        assert!(!is_retryable_status(304));
     }
 }

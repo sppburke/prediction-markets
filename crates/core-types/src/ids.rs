@@ -87,9 +87,15 @@ impl FromStr for MarketId {
     }
 }
 
+/// Zero-based outcome index within a market.
+///
+/// Widened to `u16` (issue #159) after Polymarket multi-outcome markets were
+/// observed emitting `outcomeIndex` > 255 (e.g. `999`). u16's 65,535 ceiling
+/// subsumes any realistic outcome cardinality; SQLite stores as `INTEGER`
+/// either way so the wire/storage cost is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct OutcomeId(pub u8);
+pub struct OutcomeId(pub u16);
 
 impl fmt::Display for OutcomeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -101,7 +107,25 @@ impl FromStr for OutcomeId {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse::<u8>()
+        s.parse::<u16>()
+            .map(OutcomeId)
+            .map_err(|e| Error::ParseError {
+                message: e.to_string(),
+            })
+    }
+}
+
+impl From<OutcomeId> for i64 {
+    fn from(id: OutcomeId) -> i64 {
+        i64::from(id.0)
+    }
+}
+
+impl TryFrom<i64> for OutcomeId {
+    type Error = Error;
+
+    fn try_from(v: i64) -> Result<Self, Self::Error> {
+        u16::try_from(v)
             .map(OutcomeId)
             .map_err(|e| Error::ParseError {
                 message: e.to_string(),
@@ -256,5 +280,69 @@ pub struct EventSeq(pub u64);
 impl fmt::Display for EventSeq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_id_round_trips_large_index_through_json() {
+        // Issue #159: Polymarket multi-outcome markets observed with outcomeIndex > 255.
+        let v = OutcomeId(999);
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, "999");
+        let back: OutcomeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, OutcomeId(999));
+    }
+
+    #[test]
+    fn outcome_id_round_trips_u16_max_through_json() {
+        let v = OutcomeId(u16::MAX);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: OutcomeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, OutcomeId(u16::MAX));
+    }
+
+    #[test]
+    fn outcome_id_try_from_i64_in_range() {
+        assert_eq!(OutcomeId::try_from(0_i64).unwrap(), OutcomeId(0));
+        assert_eq!(OutcomeId::try_from(1_i64).unwrap(), OutcomeId(1));
+        assert_eq!(OutcomeId::try_from(255_i64).unwrap(), OutcomeId(255));
+        assert_eq!(OutcomeId::try_from(999_i64).unwrap(), OutcomeId(999));
+        assert_eq!(
+            OutcomeId::try_from(i64::from(u16::MAX)).unwrap(),
+            OutcomeId(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn outcome_id_try_from_i64_out_of_range() {
+        assert!(OutcomeId::try_from(-1_i64).is_err());
+        assert!(OutcomeId::try_from(i64::from(u16::MAX) + 1).is_err());
+        assert!(OutcomeId::try_from(i64::MAX).is_err());
+        assert!(OutcomeId::try_from(i64::MIN).is_err());
+    }
+
+    #[test]
+    fn outcome_id_to_i64_round_trip() {
+        for raw in [0u16, 1, 999, u16::MAX] {
+            let id = OutcomeId(raw);
+            let as_i64: i64 = id.into();
+            assert_eq!(as_i64, i64::from(raw));
+            assert_eq!(OutcomeId::try_from(as_i64).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn outcome_id_from_str_accepts_widened_range() {
+        assert_eq!(OutcomeId::from_str("0").unwrap(), OutcomeId(0));
+        assert_eq!(OutcomeId::from_str("999").unwrap(), OutcomeId(999));
+        assert_eq!(OutcomeId::from_str("65535").unwrap(), OutcomeId(u16::MAX));
+        assert!(OutcomeId::from_str("65536").is_err());
+        assert!(OutcomeId::from_str("-1").is_err());
+        assert!(OutcomeId::from_str("not-a-number").is_err());
     }
 }

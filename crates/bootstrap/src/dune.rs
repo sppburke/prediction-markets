@@ -290,7 +290,7 @@ impl DuneClient {
         wanted: &HashSet<String>,
         last_resolved_at: i64,
         namespace: Option<&str>,
-    ) -> Result<Vec<(String, Option<u8>, i64)>, BootstrapError> {
+    ) -> Result<Vec<(String, Option<u16>, i64)>, BootstrapError> {
         if let Some(ns) = namespace {
             self.upload_market_ids(ns, wanted).await?;
             let sql = render_resolution_sql_with_join(ns, last_resolved_at);
@@ -620,7 +620,7 @@ fn normalise_condition_id(raw: &str) -> String {
 /// Missing or empty `condition_id` → warn and skip. `winning_outcome_id` absent →
 /// warn and skip. `winning_outcome_id` JSON null → `None` (voided, included).
 /// Out-of-range integer → warn and skip.
-fn parse_resolution_rows(rows: Vec<serde_json::Value>) -> Vec<(String, Option<u8>, i64)> {
+fn parse_resolution_rows(rows: Vec<serde_json::Value>) -> Vec<(String, Option<u16>, i64)> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let raw_id = match row.get("condition_id").and_then(|v| v.as_str()) {
@@ -641,7 +641,7 @@ fn parse_resolution_rows(rows: Vec<serde_json::Value>) -> Vec<(String, Option<u8
                 continue;
             }
         };
-        let winner: Option<u8> = match row.get("winning_outcome_id") {
+        let winner: Option<u16> = match row.get("winning_outcome_id") {
             None => {
                 tracing::warn!(
                     condition_id = %raw_id,
@@ -650,7 +650,7 @@ fn parse_resolution_rows(rows: Vec<serde_json::Value>) -> Vec<(String, Option<u8
                 continue;
             }
             Some(v) if v.is_null() => None,
-            Some(v) => match v.as_u64().and_then(|n| u8::try_from(n).ok()) {
+            Some(v) => match v.as_u64().and_then(|n| u16::try_from(n).ok()) {
                 Some(w) => Some(w),
                 None => {
                     tracing::warn!(
@@ -860,7 +860,7 @@ mod tests {
         let parsed = parse_resolution_rows(rows);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "0xaabbcc");
-        assert_eq!(parsed[0].1, Some(0u8));
+        assert_eq!(parsed[0].1, Some(0u16));
         assert_eq!(parsed[0].2, 1_700_000_000i64);
     }
 
@@ -873,7 +873,7 @@ mod tests {
         })];
         let parsed = parse_resolution_rows(rows);
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].1, Some(1u8));
+        assert_eq!(parsed[0].1, Some(1u16));
     }
 
     #[test]

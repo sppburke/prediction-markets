@@ -210,7 +210,7 @@ async fn get_logs_with_bisect<P: Provider>(
 /// `Some((id, None))` (voided or tied 50/50). Mirrors `gamma.rs`'s
 /// "price > 0.5" tie-handling so a `[1, 1]` payout is treated as
 /// ambiguous rather than silently labelled YES.
-pub fn decode_resolution_log(log: &Log) -> Option<(String, Option<u8>)> {
+pub fn decode_resolution_log(log: &Log) -> Option<(String, Option<u16>)> {
     let topics = log.topics();
     // topic[0] = event signature, topic[1] = conditionId (the only one we read).
     let condition_id: &B256 = topics.get(1)?;
@@ -232,7 +232,7 @@ pub fn decode_resolution_log(log: &Log) -> Option<(String, Option<u8>)> {
         .map(|(i, _)| i)
         .collect();
     let winner = if nonzero.len() == 1 {
-        u8::try_from(nonzero[0]).ok()
+        u16::try_from(nonzero[0]).ok()
     } else {
         None
     };

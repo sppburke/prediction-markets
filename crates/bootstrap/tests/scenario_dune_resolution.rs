@@ -10,7 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pe_bootstrap::cache::WalletCache;
-use pe_core_types::{MarketId, VenueMarketId};
+use pe_core_types::{MarketId, OutcomeId, VenueMarketId};
 use tempfile::TempDir;
 
 fn tmp_cache(dir: &TempDir) -> WalletCache {
@@ -70,7 +70,7 @@ fn yes_win_resolution_roundtrips_to_index() {
     let mut cache = tmp_cache(&dir);
 
     // Simulate what lib.rs step 6b would insert after fetch_resolutions returns.
-    let rows: Vec<(String, Option<u8>, i64)> =
+    let rows: Vec<(String, Option<u16>, i64)> =
         vec![("0xcond_yes_win".to_owned(), Some(0), 1_700_001_000)];
     let fetched_at = 1_700_002_000i64;
     for (market_id, winner, resolved_at_unix) in rows {
@@ -83,7 +83,11 @@ fn yes_win_resolution_roundtrips_to_index() {
     let market = idx
         .get(&MarketId(VenueMarketId("0xcond_yes_win".to_owned())))
         .expect("YES-win market must appear in resolution index");
-    assert_eq!(market.winning_outcome_id, 0, "YES win = outcome index 0");
+    assert_eq!(
+        market.winning_outcome_id,
+        OutcomeId(0),
+        "YES win = outcome index 0"
+    );
     assert_eq!(market.resolved_at_unix, 1_700_001_000);
 }
 
@@ -105,7 +109,11 @@ fn no_win_resolution_roundtrips_to_index() {
     let market = idx
         .get(&MarketId(VenueMarketId("0xcond_no_win".to_owned())))
         .expect("NO-win market must appear in resolution index");
-    assert_eq!(market.winning_outcome_id, 1, "NO win = outcome index 1");
+    assert_eq!(
+        market.winning_outcome_id,
+        OutcomeId(1),
+        "NO win = outcome index 1"
+    );
 }
 
 // ── Scenario 5 ────────────────────────────────────────────────────────────────
@@ -165,7 +173,8 @@ fn gamma_first_dune_second_first_insert_wins() {
         .get(&MarketId(VenueMarketId("0xcond_shared".to_owned())))
         .expect("market must be present");
     assert_eq!(
-        market.winning_outcome_id, 0,
+        market.winning_outcome_id,
+        OutcomeId(0),
         "first insert (Gamma, winner=0) must not be overwritten by second (Dune, winner=1)"
     );
 }
