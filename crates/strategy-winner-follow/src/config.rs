@@ -71,6 +71,16 @@ pub struct WinnerFollowConfig {
     /// Canonical default: `slippage_rate = 0.01` (100 bps). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_slippage_rate")]
     pub slippage_rate: Decimal,
+    /// When `Some(usd)`, bypasses Kelly sizing (steps 4–5 of `evaluate`) and sizes
+    /// each BUY as `max(1, floor(usd / leader_price))` contracts instead.
+    /// Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap,
+    /// risk gate) remain active in both paths.
+    ///
+    /// Canonical default: `None` (Kelly sizing). See `docs/_GLOSSARY.md`
+    /// `flat_usd_per_trade_default`. Use only when the Kelly `p` input is mis-specified
+    /// (issue #161).
+    #[serde(default)]
+    pub flat_usd_per_trade: Option<Decimal>,
 }
 
 fn default_polymarket_fee_rate() -> Decimal {
@@ -90,6 +100,7 @@ impl Default for WinnerFollowConfig {
             kelly_fraction_override: None,
             per_trade_cap: PerTradeCap::default(),
             slippage_rate: default_slippage_rate(),
+            flat_usd_per_trade: None,
         }
     }
 }
