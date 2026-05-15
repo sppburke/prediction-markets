@@ -40,14 +40,7 @@ use crate::error::BootstrapError;
 
 /// Row tuple for [`WalletCache::upsert_wallets_bulk`]:
 /// `(wallet_hex, source_bits, is_infra, dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps)`.
-pub type WalletUpsertRow = (
-    String,
-    i64,
-    bool,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-);
+pub type WalletUpsertRow = (String, i64, bool, Option<i64>, Option<i64>, Option<i64>);
 
 /// Number of consecutive known `source_trade_id`s that signals the incremental fetch is done.
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -1128,10 +1121,7 @@ impl WalletCache {
     }
 
     /// UPSERT many wallets in a single transaction. See [`Self::upsert_wallet`].
-    pub fn upsert_wallets_bulk(
-        &mut self,
-        rows: &[WalletUpsertRow],
-    ) -> Result<(), BootstrapError> {
+    pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
