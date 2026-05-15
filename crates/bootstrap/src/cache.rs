@@ -15,6 +15,10 @@
 //!   when `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
 //! - `funder_lookup_done` — one row per wallet that has been queried for funders.
 //!   Distinguishes "queried and found zero funders" from "not yet queried".
+//! - `wallets` — canonical wallet pile (issue #166). One row per known wallet across
+//!   every discovery source (`wallet_set.json`, `trades`, Dune CSV, Dune incremental,
+//!   Polymarket leaderboard, Radion, 502-gap). `is_active` is sticky (0→1 only) and
+//!   controls which wallets the `backfill`/`weekly` subcommands process.
 //!
 //! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
 //! is needed. Per-wallet streaming reads keep peak memory bounded.
@@ -33,6 +37,17 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::error::BootstrapError;
+
+/// Row tuple for [`WalletCache::upsert_wallets_bulk`]:
+/// `(wallet_hex, source_bits, is_infra, dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps)`.
+pub type WalletUpsertRow = (
+    String,
+    i64,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// Number of consecutive known `source_trade_id`s that signals the incremental fetch is done.
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -103,6 +118,30 @@ CREATE TABLE IF NOT EXISTS source_cursor (
     value      TEXT    NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
+-- `WalletAddress::Display`: `\"0x\" + 40 lowercase hex chars`.
+-- `source_bits`: bit0=wallet_set_json, bit1=trades, bit2=dune_csv,
+-- bit3=dune_incr, bit4=leaderboard, bit5=radion, bit6=gap502.
+-- `is_active` is sticky 0→1; `is_infra` is also sticky once set.
+CREATE TABLE IF NOT EXISTS wallets (
+    wallet_hex               TEXT    PRIMARY KEY NOT NULL,
+    is_active                INTEGER NOT NULL DEFAULT 0,
+    trade_count              INTEGER NOT NULL DEFAULT 0,
+    is_infra                 INTEGER NOT NULL DEFAULT 0,
+    source_bits              INTEGER NOT NULL DEFAULT 0,
+    last_polymarket_fetch_at INTEGER NULL,
+    last_funder_fetch_at     INTEGER NULL,
+    dune_first_seen_unix     INTEGER NULL,
+    dune_closed_markets      INTEGER NULL,
+    dune_win_rate_bps        INTEGER NULL,
+    discovered_at_unix       INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+CREATE INDEX IF NOT EXISTS idx_wallets_is_active ON wallets(is_active);
+CREATE INDEX IF NOT EXISTS idx_wallets_backfill
+    ON wallets(is_active, last_polymarket_fetch_at) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_wallets_weekly
+    ON wallets(is_active, last_funder_fetch_at) WHERE is_active = 1;
 ";
 
 /// Permanent wallet trade-history cache backed by SQLite.
@@ -1046,6 +1085,343 @@ impl WalletCache {
             params![key, value, now],
         )?;
         Ok(())
+    }
+
+    // ── wallets pile (issue #166) ─────────────────────────────────────────────
+
+    /// UPSERT a wallet row by `wallet_hex`, OR-ing `source_bits` into any existing row.
+    ///
+    /// Wallets present in multiple sources accumulate all their bits. New rows are
+    /// inserted with the provided fields; conflicting rows update `source_bits`,
+    /// `is_infra` (sticky 0→1), and Dune fields only when the new value is non-NULL.
+    pub fn upsert_wallet(
+        &mut self,
+        wallet_hex: &str,
+        source_bits: i64,
+        is_infra: bool,
+        dune_first_seen_unix: Option<i64>,
+        dune_closed_markets: Option<i64>,
+        dune_win_rate_bps: Option<i64>,
+    ) -> Result<(), BootstrapError> {
+        let is_infra_int: i64 = i64::from(is_infra);
+        self.conn.execute(
+            "INSERT INTO wallets (\
+                wallet_hex, source_bits, is_infra, \
+                dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(wallet_hex) DO UPDATE SET \
+                source_bits = source_bits | excluded.source_bits, \
+                is_infra = MAX(is_infra, excluded.is_infra), \
+                dune_first_seen_unix = COALESCE(excluded.dune_first_seen_unix, dune_first_seen_unix), \
+                dune_closed_markets = COALESCE(excluded.dune_closed_markets, dune_closed_markets), \
+                dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps)",
+            params![
+                wallet_hex,
+                source_bits,
+                is_infra_int,
+                dune_first_seen_unix,
+                dune_closed_markets,
+                dune_win_rate_bps,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// UPSERT many wallets in a single transaction. See [`Self::upsert_wallet`].
+    pub fn upsert_wallets_bulk(
+        &mut self,
+        rows: &[WalletUpsertRow],
+    ) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO wallets (\
+                    wallet_hex, source_bits, is_infra, \
+                    dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(wallet_hex) DO UPDATE SET \
+                    source_bits = source_bits | excluded.source_bits, \
+                    is_infra = MAX(is_infra, excluded.is_infra), \
+                    dune_first_seen_unix = COALESCE(excluded.dune_first_seen_unix, dune_first_seen_unix), \
+                    dune_closed_markets = COALESCE(excluded.dune_closed_markets, dune_closed_markets), \
+                    dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps)",
+            )?;
+            for (wallet, bits, infra, first_seen, closed, win_rate) in rows {
+                let is_infra_int: i64 = i64::from(*infra);
+                stmt.execute(params![
+                    wallet,
+                    bits,
+                    is_infra_int,
+                    first_seen,
+                    closed,
+                    win_rate,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Backfill `trade_count` for every wallet from the `trades` table.
+    ///
+    /// Idempotent. Run after migrate ingests trades and after each `run_backfill`
+    /// pass so the activation rule sees up-to-date counts.
+    pub fn refresh_trade_counts(&mut self) -> Result<usize, BootstrapError> {
+        let affected = self.conn.execute(
+            "UPDATE wallets SET trade_count = COALESCE((\
+                SELECT COUNT(*) FROM trades WHERE trades.wallet_hex = wallets.wallet_hex\
+             ), 0)",
+            [],
+        )?;
+        Ok(affected)
+    }
+
+    /// Refresh `trade_count` for a single wallet — used after a per-wallet backfill.
+    pub fn refresh_trade_count_for(&mut self, wallet_hex: &str) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "UPDATE wallets SET trade_count = COALESCE((\
+                SELECT COUNT(*) FROM trades WHERE trades.wallet_hex = wallets.wallet_hex\
+             ), 0) WHERE wallet_hex = ?1",
+            params![wallet_hex],
+        )?;
+        Ok(())
+    }
+
+    /// Seed `last_polymarket_fetch_at = MAX(trades.timestamp_unix)` for wallets with trades.
+    ///
+    /// Run during migrate so existing wallets don't enter the backfill queue
+    /// with NULL timestamps — that would trigger a redundant Polymarket re-fetch.
+    pub fn seed_last_polymarket_fetch_from_trades(&mut self) -> Result<usize, BootstrapError> {
+        let affected = self.conn.execute(
+            "UPDATE wallets SET last_polymarket_fetch_at = (\
+                SELECT MAX(timestamp_unix) FROM trades WHERE trades.wallet_hex = wallets.wallet_hex\
+             ) WHERE EXISTS (\
+                SELECT 1 FROM trades WHERE trades.wallet_hex = wallets.wallet_hex\
+             )",
+            [],
+        )?;
+        Ok(affected)
+    }
+
+    /// Seed `last_funder_fetch_at = funder_lookup_done.fetched_at_unix` for already-discovered wallets.
+    ///
+    /// Run during migrate so the first `run_weekly` doesn't redundantly re-fetch
+    /// funders for the existing wallet set via Etherscan.
+    pub fn seed_last_funder_fetch_from_done(&mut self) -> Result<usize, BootstrapError> {
+        let affected = self.conn.execute(
+            "UPDATE wallets SET last_funder_fetch_at = (\
+                SELECT fetched_at_unix FROM funder_lookup_done \
+                WHERE funder_lookup_done.wallet_hex = wallets.wallet_hex\
+             ) WHERE EXISTS (\
+                SELECT 1 FROM funder_lookup_done WHERE funder_lookup_done.wallet_hex = wallets.wallet_hex\
+             )",
+            [],
+        )?;
+        Ok(affected)
+    }
+
+    /// Set `last_polymarket_fetch_at = now_unix` for a single wallet.
+    pub fn update_last_polymarket_fetch(
+        &mut self,
+        wallet_hex: &str,
+        now_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "UPDATE wallets SET last_polymarket_fetch_at = ?2 WHERE wallet_hex = ?1",
+            params![wallet_hex, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Set `last_funder_fetch_at = now_unix` for a single wallet.
+    pub fn update_last_funder_fetch(
+        &mut self,
+        wallet_hex: &str,
+        now_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "UPDATE wallets SET last_funder_fetch_at = ?2 WHERE wallet_hex = ?1",
+            params![wallet_hex, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a wallet as infrastructure (sticky 0→1).
+    pub fn mark_infra(&mut self, wallet_hex: &str) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1",
+            params![wallet_hex],
+        )?;
+        Ok(())
+    }
+
+    /// Bulk-mark wallets as infrastructure (sticky). Idempotent.
+    pub fn mark_infra_bulk(&mut self, wallet_hexes: &[String]) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1")?;
+            for w in wallet_hexes {
+                stmt.execute(params![w])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Select active wallets due for Polymarket backfill.
+    ///
+    /// Filters `is_active = 1` AND (`last_polymarket_fetch_at IS NULL` OR
+    /// `last_polymarket_fetch_at < now_unix - staleness_secs`). Orders by
+    /// `last_polymarket_fetch_at ASC NULLS FIRST` then by Dune quality signals
+    /// (`dune_win_rate_bps DESC NULLS LAST, dune_closed_markets DESC NULLS LAST`).
+    /// `limit = 0` returns all due wallets (no LIMIT clause).
+    pub fn select_backfill_due(
+        &self,
+        now_unix: i64,
+        staleness_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, BootstrapError> {
+        let cutoff = now_unix - staleness_secs;
+        let base = "SELECT wallet_hex FROM wallets \
+                    WHERE is_active = 1 \
+                      AND (last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?1) \
+                    ORDER BY last_polymarket_fetch_at ASC NULLS FIRST, \
+                             dune_win_rate_bps DESC NULLS LAST, \
+                             dune_closed_markets DESC NULLS LAST";
+        let result = if limit == 0 {
+            let mut stmt = self.conn.prepare(base)?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let limited = format!("{base} LIMIT ?2");
+            let mut stmt = self.conn.prepare(&limited)?;
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+            let rows = stmt.query_map(params![cutoff, limit_i64], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(result)
+    }
+
+    /// Select active wallets due for weekly funder refresh.
+    ///
+    /// Same shape as [`Self::select_backfill_due`] but keyed on
+    /// `last_funder_fetch_at` with a 7-day staleness window by default.
+    pub fn select_weekly_due(
+        &self,
+        now_unix: i64,
+        staleness_secs: i64,
+        limit: usize,
+    ) -> Result<Vec<String>, BootstrapError> {
+        let cutoff = now_unix - staleness_secs;
+        let base = "SELECT wallet_hex FROM wallets \
+                    WHERE is_active = 1 \
+                      AND (last_funder_fetch_at IS NULL OR last_funder_fetch_at < ?1) \
+                    ORDER BY last_funder_fetch_at ASC NULLS FIRST, \
+                             dune_win_rate_bps DESC NULLS LAST, \
+                             dune_closed_markets DESC NULLS LAST";
+        let result = if limit == 0 {
+            let mut stmt = self.conn.prepare(base)?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let limited = format!("{base} LIMIT ?2");
+            let mut stmt = self.conn.prepare(&limited)?;
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+            let rows = stmt.query_map(params![cutoff, limit_i64], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(result)
+    }
+
+    /// Apply the activation rule. Returns the number of newly-activated wallets.
+    ///
+    /// Sticky semantics: only `is_active = 0` rows are considered. `is_infra = 0`
+    /// gates **every** activation branch — a wallet listed in both the infra CSV
+    /// and a curation list (leaderboard/radion/502-gap) stays inactive.
+    pub fn apply_activation_rules(&mut self, min_trades: i64) -> Result<usize, BootstrapError> {
+        let affected = self.conn.execute(
+            "UPDATE wallets SET is_active = 1 \
+             WHERE is_active = 0 AND is_infra = 0 AND (\
+                COALESCE(trade_count, 0) >= ?1 \
+             OR COALESCE(dune_closed_markets, 0) >= ?1 \
+             OR (source_bits & 16) != 0 \
+             OR (source_bits & 32) != 0 \
+             OR (source_bits & 64) != 0\
+             )",
+            params![min_trades],
+        )?;
+        Ok(affected)
+    }
+
+    /// Number of wallets currently in the pile (any status).
+    pub fn wallet_pile_size(&self) -> Result<usize, BootstrapError> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM wallets", [], |r| r.get(0))?;
+        usize::try_from(n).map_err(|_| BootstrapError::Internal)
+    }
+
+    /// Number of `is_active = 1` wallets in the pile.
+    pub fn active_wallet_count(&self) -> Result<usize, BootstrapError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM wallets WHERE is_active = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        usize::try_from(n).map_err(|_| BootstrapError::Internal)
+    }
+
+    /// Return every `wallet_hex` in the pile — used by `run_discovery` for the
+    /// Dune known-wallets upload (anti-join input).
+    pub fn all_pile_wallet_hexes(&self) -> Result<Vec<String>, BootstrapError> {
+        let mut stmt = self.conn.prepare("SELECT wallet_hex FROM wallets")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let out: Result<Vec<_>, _> = rows.collect();
+        Ok(out?)
+    }
+
+    // ── test-only escape hatches (issue #166 pile tests) ─────────────────────
+    //
+    // Gated on `cfg(test)` for unit tests and `feature = "scenario"` for
+    // integration tests under `tests/scenario_*.rs`. `expect` is allowed here
+    // because these helpers are only used in test fixtures with controlled
+    // inputs; a failure indicates a bug in the test itself.
+
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_set_trade_count(&mut self, wallet_hex: &str, count: i64) {
+        self.conn
+            .execute(
+                "UPDATE wallets SET trade_count = ?2 WHERE wallet_hex = ?1",
+                params![wallet_hex, count],
+            )
+            .expect("test-only direct SQL must succeed");
+    }
+
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_source_bits(&self, wallet_hex: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT source_bits FROM wallets WHERE wallet_hex = ?1",
+                params![wallet_hex],
+                |r| r.get(0),
+            )
+            .expect("test-only direct SQL must succeed")
+    }
+
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_is_infra(&self, wallet_hex: &str) -> bool {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT is_infra FROM wallets WHERE wallet_hex = ?1",
+                params![wallet_hex],
+                |r| r.get(0),
+            )
+            .expect("test-only direct SQL must succeed");
+        n != 0
     }
 }
 

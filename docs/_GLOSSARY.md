@@ -556,6 +556,47 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_polygon_ctf_chunk_blocks` | 10_000 | Block-range chunk size for the Polygon CTF scan. Larger chunks issue fewer RPC calls but are more likely to hit provider response-size caps and trigger the bisect-on-cap fallback. Set via `PE_BOOTSTRAP_POLYGON_CTF_CHUNK_BLOCKS`. |
 | `bootstrap_clob_base_url` | `https://clob.polymarket.com` | Base URL for the Polymarket CLOB API (`/markets?closed=true` paginated listing). Override via `PE_CLOB_BASE_URL` for testing against a stub. |
 | `bootstrap_clob_concurrency` | 8 | Number of in-flight CLOB requests issued concurrently per fetch loop, mirroring the Gamma `buffer_unordered` pattern. Set via `PE_BOOTSTRAP_CLOB_CONCURRENCY`. |
+| `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / Radion / 502-gap) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
+| `bootstrap_discovery_lookback_days` | 2 | Cold-start lookback (days) for `pe-bootstrap discovery` when the `source_cursor.dune_discovery_last_run` row is absent. Matches the 48h timer interval so warm restarts pick up where the previous run left off via the cursor. Set via `PE_BOOTSTRAP_DISCOVERY_LOOKBACK_DAYS`. |
+| `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. Initial deployment runs with `0` to drain the bulk catch-up queue; steady-state daily timers may set a positive value if daily run time grows unmanageable. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
+| `bootstrap_weekly_limit` | 200 | Per-run cap on `pe-bootstrap weekly`. `0` removes the cap. Weekly funder refresh runs against Etherscan; the cap throttles API budget on the Sunday timer. Set via `PE_BOOTSTRAP_WEEKLY_LIMIT`. |
+| `bootstrap_known_wallets_dune_table` | `"apexurellc.known_wallets"` | Dune user table (under `dune_namespace`) where `pe-bootstrap discovery` uploads the current pile for the anti-join. Replaced on every run (DELETE → CREATE → INSERT). Set via `PE_BOOTSTRAP_KNOWN_WALLETS_DUNE_TABLE`. |
+
+#### Wallet pile (`wallets` table, issue #166)
+
+Canonical wallet identity store maintained by the `migrate` / `discovery` /
+`backfill` / `weekly` subcommands. `wallet_hex` form is `"0x" + 40 lowercase
+hex chars` (matches `WalletAddress::Display` in `crates/core-types`).
+
+`source_bits` masks (defined in `crates/bootstrap/src/pile.rs`):
+
+| Bit | Mask | Source |
+|---:|---:|---|
+| 0 | 0b0000001 | `wallet_set.json` |
+| 1 | 0b0000010 | `trades` table (DB-resident) |
+| 2 | 0b0000100 | Dune CSV (generic) |
+| 3 | 0b0001000 | Dune incremental discovery |
+| 4 | 0b0010000 | Polymarket leaderboard |
+| 5 | 0b0100000 | Radion |
+| 6 | 0b1000000 | 502-gap |
+
+Activation rule (`is_infra = 0` gates every branch — a wallet listed in both
+the infra CSV and a curation list stays inactive):
+
+```sql
+UPDATE wallets SET is_active = 1
+WHERE is_active = 0 AND is_infra = 0 AND (
+    COALESCE(trade_count, 0) >= 100
+ OR COALESCE(dune_closed_markets, 0) >= 100
+ OR (source_bits & 16) != 0   -- in_leaderboard
+ OR (source_bits & 32) != 0   -- in_radion
+ OR (source_bits & 64) != 0   -- in_502_gap
+)
+```
+
+`is_active` and `is_infra` are sticky once set (never decay). Re-running
+`migrate` after edits to the input CSVs only adds source bits and infra flags;
+it never removes them. To "un-mark" a wallet, delete its row.
 
 #### Leaderboard snapshots (`leaderboard_snapshots` table)
 

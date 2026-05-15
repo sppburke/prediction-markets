@@ -311,16 +311,39 @@ impl DuneClient {
 
     /// Upload market condition IDs to a Dune user table for the JOIN resolution path.
     ///
-    /// Flow: DELETE (ignore 404) → CREATE → INSERT CSV.
-    /// Dune requires an explicit CREATE before INSERT; DELETE + re-CREATE ensures
-    /// repeated runs replace stale rows rather than accumulating them.
+    /// Thin wrapper over [`Self::upload_table`] preserving the call site signature.
     async fn upload_market_ids(
         &self,
         namespace: &str,
         ids: &HashSet<String>,
     ) -> Result<(), BootstrapError> {
+        let rows: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.upload_table(
+            namespace,
+            RESOLUTION_TABLE,
+            "condition_id",
+            rows.iter().copied(),
+        )
+        .await
+    }
+
+    /// Replace a single-VARCHAR-column Dune user table with the given rows.
+    ///
+    /// Flow: DELETE (ignore 404) → CREATE → INSERT CSV. Dune requires an explicit
+    /// CREATE before INSERT; DELETE + re-CREATE ensures repeated runs replace
+    /// stale rows rather than accumulating them.
+    pub async fn upload_table<'a, I>(
+        &self,
+        namespace: &str,
+        table_name: &str,
+        col_name: &str,
+        rows: I,
+    ) -> Result<(), BootstrapError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         // 1. Delete any existing table (ignore errors — 404 on first run is expected).
-        let table_url = format!("{}/table/{namespace}/{RESOLUTION_TABLE}", self.base_url);
+        let table_url = format!("{}/table/{namespace}/{table_name}", self.base_url);
         let _ = self
             .client
             .delete(&table_url)
@@ -331,23 +354,23 @@ impl DuneClient {
 
         // 2. Create the table with a single varchar column.
         #[derive(serde::Serialize)]
-        struct ColDef {
-            name: &'static str,
+        struct ColDef<'a> {
+            name: &'a str,
             #[serde(rename = "type")]
             ty: &'static str,
         }
         #[derive(serde::Serialize)]
-        struct CreateBody {
+        struct CreateBody<'a> {
             namespace: String,
-            table_name: &'static str,
-            schema: Vec<ColDef>,
+            table_name: &'a str,
+            schema: Vec<ColDef<'a>>,
             is_private: bool,
         }
         let create_body = CreateBody {
             namespace: namespace.to_owned(),
-            table_name: RESOLUTION_TABLE,
+            table_name,
             schema: vec![ColDef {
-                name: "condition_id",
+                name: col_name,
                 ty: "varchar",
             }],
             is_private: false,
@@ -362,31 +385,31 @@ impl DuneClient {
             .send()
             .await
             .map_err(|e| BootstrapError::Dune {
-                message: format!("upload_market_ids CREATE failed: {e}"),
+                message: format!("upload_table CREATE {table_name} failed: {e}"),
             })?;
         let create_status = create_resp.status().as_u16();
         if create_status >= 400 {
             let bytes = create_resp.bytes().await.unwrap_or_default();
             return Err(BootstrapError::Dune {
                 message: format!(
-                    "upload_market_ids CREATE HTTP {create_status}: {}",
+                    "upload_table CREATE {table_name} HTTP {create_status}: {}",
                     String::from_utf8_lossy(&bytes)
                 ),
             });
         }
 
         // 3. Insert all rows as CSV.
-        let mut csv = String::with_capacity(ids.len() * 68);
-        csv.push_str("condition_id\n");
-        for id in ids {
-            csv.push_str(id);
+        let mut csv = String::new();
+        csv.push_str(col_name);
+        csv.push('\n');
+        let mut count = 0usize;
+        for row in rows {
+            csv.push_str(row);
             csv.push('\n');
+            count += 1;
         }
 
-        let insert_url = format!(
-            "{}/table/{namespace}/{RESOLUTION_TABLE}/insert",
-            self.base_url
-        );
+        let insert_url = format!("{}/table/{namespace}/{table_name}/insert", self.base_url);
         let resp = self
             .client
             .post(&insert_url)
@@ -397,7 +420,7 @@ impl DuneClient {
             .send()
             .await
             .map_err(|e| BootstrapError::Dune {
-                message: format!("upload_market_ids INSERT failed: {e}"),
+                message: format!("upload_table INSERT {table_name} failed: {e}"),
             })?;
 
         let status = resp.status().as_u16();
@@ -405,19 +428,52 @@ impl DuneClient {
             let bytes = resp.bytes().await.unwrap_or_default();
             return Err(BootstrapError::Dune {
                 message: format!(
-                    "upload_market_ids INSERT HTTP {status}: {}",
+                    "upload_table INSERT {table_name} HTTP {status}: {}",
                     String::from_utf8_lossy(&bytes)
                 ),
             });
         }
 
         tracing::info!(
-            count = ids.len(),
+            count,
             namespace,
-            table = RESOLUTION_TABLE,
-            "dune: market ID lookup table uploaded"
+            table = table_name,
+            "dune: lookup table uploaded"
         );
         Ok(())
+    }
+
+    /// Run incremental wallet discovery against `polymarket_polygon.market_trades_raw`.
+    ///
+    /// Anti-joins against the user-uploaded `known_wallets` table in `namespace`;
+    /// returns only NEW makers active since `last_run_unix` that have at least
+    /// `min_trades_per_wallet` trades in `market_trades_raw`.
+    ///
+    /// Output rows: `(wallet_hex, first_seen_at_unix, dune_trade_count)`. The
+    /// `wallet_hex` is canonical: `"0x" + 40 lowercase hex chars`. The Dune SQL
+    /// uses `LOWER(CAST(maker AS VARCHAR))`; addresses on Polygon are
+    /// case-insensitive but Dune may store mixed-case so the cast is mandatory.
+    ///
+    /// # Precondition
+    /// The caller MUST have called [`Self::upload_table`] with the current pile's
+    /// wallet set into `<namespace>.<known_table_name>` before invoking this method —
+    /// otherwise the anti-join returns the full universe of makers.
+    pub async fn run_discovery(
+        &self,
+        namespace: &str,
+        known_table_name: &str,
+        last_run_unix: i64,
+        min_trades_per_wallet: i64,
+    ) -> Result<Vec<(String, i64, i64)>, BootstrapError> {
+        let sql = render_discovery_sql(
+            namespace,
+            known_table_name,
+            last_run_unix,
+            min_trades_per_wallet,
+        );
+        let execution_id = self.execute_sql(&sql).await?;
+        let rows = self.wait_for_results(&execution_id).await?;
+        Ok(parse_discovery_rows(rows))
     }
 
     /// Submit SQL for direct execution without creating a stored query.
@@ -612,6 +668,93 @@ fn normalise_condition_id(raw: &str) -> String {
         format!("0x{hex}")
     } else {
         raw.to_owned()
+    }
+}
+
+/// Render the incremental wallet-discovery SQL.
+///
+/// Anti-joins `polymarket_polygon.market_trades_raw` against the user-uploaded
+/// `<namespace>.<known_table_name>` table so only NEW makers active since
+/// `last_run_unix` come through. `HAVING COUNT(*) >= min_trades` prevents
+/// low-activity wallets from entering the pile (they'd never qualify for
+/// activation anyway and just bloat the daily Dune upload).
+pub(crate) fn render_discovery_sql(
+    namespace: &str,
+    known_table_name: &str,
+    last_run_unix: i64,
+    min_trades_per_wallet: i64,
+) -> String {
+    format!(
+        "WITH known AS (\
+            SELECT wallet_hex FROM dune.{namespace}.{known_table_name}\
+         ),\
+         new_makers AS (\
+            SELECT LOWER(CAST(maker AS VARCHAR)) AS wallet_hex,\
+                   CAST(TO_UNIXTIME(MIN(block_time)) AS BIGINT) AS first_seen_at_unix,\
+                   CAST(COUNT(*) AS BIGINT) AS dune_trade_count\
+            FROM polymarket_polygon.market_trades_raw\
+            WHERE block_time >= FROM_UNIXTIME({last_run_unix}) AND maker IS NOT NULL\
+            GROUP BY maker\
+            HAVING COUNT(*) >= {min_trades_per_wallet}\
+         )\
+         SELECT n.wallet_hex, n.first_seen_at_unix, n.dune_trade_count\
+         FROM new_makers n LEFT JOIN known k ON n.wallet_hex = k.wallet_hex\
+         WHERE k.wallet_hex IS NULL"
+    )
+}
+
+/// Parse raw Dune discovery rows into `(wallet_hex, first_seen_at_unix, dune_trade_count)`.
+///
+/// Normalises `wallet_hex` to the canonical form (`"0x" + 40 lowercase hex chars`).
+/// Missing or unparseable rows are warned and skipped.
+pub(crate) fn parse_discovery_rows(rows: Vec<serde_json::Value>) -> Vec<(String, i64, i64)> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw = match row.get("wallet_hex").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                tracing::warn!("dune: discovery row missing wallet_hex, skipping");
+                continue;
+            }
+        };
+        let normalised = normalise_wallet_hex(raw);
+        let first_seen = match row.get("first_seen_at_unix").and_then(|v| v.as_i64()) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    wallet = %raw,
+                    "dune: discovery row missing first_seen_at_unix, skipping"
+                );
+                continue;
+            }
+        };
+        let trade_count = match row.get("dune_trade_count").and_then(|v| v.as_i64()) {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    wallet = %raw,
+                    "dune: discovery row missing dune_trade_count, skipping"
+                );
+                continue;
+            }
+        };
+        out.push((normalised, first_seen, trade_count));
+    }
+    out
+}
+
+/// Normalise a wallet hex string to the canonical form: `"0x" + 40 lowercase hex chars`.
+///
+/// Accepts: bare 40-hex, 0x-prefixed 40-hex, mixed case. Returns the input
+/// unchanged if it doesn't look like a wallet address (caller decides what
+/// to do with garbage).
+pub(crate) fn normalise_wallet_hex(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if body.len() == 40 && body.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("0x{}", body.to_ascii_lowercase())
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -942,6 +1085,87 @@ mod tests {
         assert_eq!(
             parsed[0].0, "0xdeadbeef",
             "0x prefix must pass through unchanged"
+        );
+    }
+
+    // ── issue #166: discovery SQL + parser ───────────────────────────────────
+
+    #[test]
+    fn render_discovery_sql_substitutes_namespace_and_cursor() {
+        let sql = render_discovery_sql("apexurellc", "known_wallets", 1_700_000_000, 100);
+        assert!(
+            sql.contains("dune.apexurellc.known_wallets"),
+            "rendered SQL missing namespace/table: {sql}"
+        );
+        assert!(
+            sql.contains("FROM_UNIXTIME(1700000000)"),
+            "rendered SQL missing cursor: {sql}"
+        );
+        assert!(
+            sql.contains("HAVING COUNT(*) >= 100"),
+            "rendered SQL missing activation gate: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_discovery_sql_anti_joins_known_table() {
+        let sql = render_discovery_sql("ns", "known_wallets", 0, 100);
+        assert!(
+            sql.contains("LEFT JOIN known k") && sql.contains("k.wallet_hex IS NULL"),
+            "rendered SQL must anti-join: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_discovery_sql_selects_required_columns() {
+        let sql = render_discovery_sql("ns", "known_wallets", 0, 100);
+        for col in ["n.wallet_hex", "n.first_seen_at_unix", "n.dune_trade_count"] {
+            assert!(sql.contains(col), "missing column `{col}` in rendered SQL");
+        }
+    }
+
+    #[test]
+    fn parse_discovery_rows_normalises_canonical_form() {
+        let rows = vec![serde_json::json!({
+            "wallet_hex": "0xAAAaaaaAaAAAAAAaAaaaaAAaaaAaAAaAAAAaAAAA",
+            "first_seen_at_unix": 1_700_000_000i64,
+            "dune_trade_count": 150i64,
+        })];
+        let parsed = parse_discovery_rows(rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(parsed[0].1, 1_700_000_000);
+        assert_eq!(parsed[0].2, 150);
+    }
+
+    #[test]
+    fn parse_discovery_rows_adds_0x_when_missing() {
+        let rows = vec![serde_json::json!({
+            "wallet_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "first_seen_at_unix": 1i64,
+            "dune_trade_count": 100i64,
+        })];
+        let parsed = parse_discovery_rows(rows);
+        assert_eq!(parsed[0].0, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn parse_discovery_rows_skips_missing_columns() {
+        let rows = vec![
+            serde_json::json!({"wallet_hex": ""}),
+            serde_json::json!({"wallet_hex": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+            serde_json::json!({"wallet_hex": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "first_seen_at_unix": 1i64}),
+            serde_json::json!({"wallet_hex": "0xcccccccccccccccccccccccccccccccccccccccc", "first_seen_at_unix": 1i64, "dune_trade_count": 100i64}),
+        ];
+        let parsed = parse_discovery_rows(rows);
+        assert_eq!(parsed.len(), 1, "only the fully-populated row survives");
+    }
+
+    #[test]
+    fn normalise_wallet_hex_passes_through_canonical() {
+        assert_eq!(
+            normalise_wallet_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
     }
 }
