@@ -302,6 +302,36 @@ pub struct BootstrapConfig {
         alias = "bootstrap_funder_concurrency"
     )]
     pub funder_concurrency: usize,
+
+    // ── Wallet pile (issue #166) ─────────────────────────────────────────────
+    /// Cold-start lookback (days) for Dune incremental discovery when the
+    /// `source_cursor.dune_discovery_last_run` row is absent. Default 2 (= 48h
+    /// timer interval). `PE_BOOTSTRAP_DISCOVERY_LOOKBACK_DAYS` overrides.
+    #[serde(
+        default = "default_discovery_lookback_days",
+        alias = "bootstrap_discovery_lookback_days"
+    )]
+    pub discovery_lookback_days: u32,
+
+    /// Per-run cap on `pe-bootstrap backfill`. `0` = no limit (process every
+    /// due wallet in the queue). Initial deployment runs with `0`; steady-state
+    /// daily timers set a positive value. `PE_BOOTSTRAP_BACKFILL_LIMIT` overrides.
+    #[serde(default = "default_backfill_limit", alias = "bootstrap_backfill_limit")]
+    pub backfill_limit: usize,
+
+    /// Per-run cap on `pe-bootstrap weekly`. `0` = no limit.
+    /// `PE_BOOTSTRAP_WEEKLY_LIMIT` overrides.
+    #[serde(default = "default_weekly_limit", alias = "bootstrap_weekly_limit")]
+    pub weekly_limit: usize,
+
+    /// Dune user-table name (under `dune_namespace`) where `pe-bootstrap
+    /// discovery` uploads the current pile for the anti-join.
+    /// `PE_BOOTSTRAP_KNOWN_WALLETS_DUNE_TABLE` overrides.
+    #[serde(
+        default = "default_known_wallets_dune_table",
+        alias = "bootstrap_known_wallets_dune_table"
+    )]
+    pub known_wallets_dune_table: String,
 }
 
 impl BootstrapConfig {
@@ -388,6 +418,27 @@ const fn default_polygon_ctf_chunk_blocks() -> u64 {
     DEFAULT_POLYGON_CTF_CHUNK_BLOCKS
 }
 
+// ── Wallet pile (issue #166) ──────────────────────────────────────────────────
+
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+const fn default_discovery_lookback_days() -> u32 {
+    2
+}
+
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults". `0` = unlimited.
+const fn default_backfill_limit() -> usize {
+    0
+}
+
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+const fn default_weekly_limit() -> usize {
+    200
+}
+
+fn default_known_wallets_dune_table() -> String {
+    "apexurellc.known_wallets".to_owned()
+}
+
 fn default_clob_base_url() -> String {
     DEFAULT_CLOB_BASE_URL.to_owned()
 }
@@ -433,6 +484,10 @@ impl Default for BootstrapConfig {
             skip_trade_fetch: false,
             write_snapshot: false,
             funder_concurrency: default_funder_concurrency(),
+            discovery_lookback_days: default_discovery_lookback_days(),
+            backfill_limit: default_backfill_limit(),
+            weekly_limit: default_weekly_limit(),
+            known_wallets_dune_table: default_known_wallets_dune_table(),
         }
     }
 }

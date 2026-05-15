@@ -1,0 +1,12 @@
+[Unit]
+Description=Run pe-bootstrap backfill daily
+Documentation=https://github.com/sppburke/prediction-markets/issues/166
+
+[Timer]
+# Daily at 06:00 local. Staggered after discovery (02:00) and well before weekly (12:00 Sun).
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=pe-bootstrap-backfill.service
+
+[Install]
+WantedBy=timers.target

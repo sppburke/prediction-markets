@@ -1,0 +1,13 @@
+[Unit]
+Description=Run pe-bootstrap discovery every 48h
+Documentation=https://github.com/sppburke/prediction-markets/issues/166
+
+[Timer]
+# Stagger schedule to avoid SQLite WAL writer contention with backfill (06:00 daily)
+# and weekly (12:00 Sunday). Runs Mon/Wed/Fri/Sun at 02:00 local time.
+OnCalendar=Mon,Wed,Fri,Sun *-*-* 02:00:00
+Persistent=true
+Unit=pe-bootstrap-discovery.service
+
+[Install]
+WantedBy=timers.target

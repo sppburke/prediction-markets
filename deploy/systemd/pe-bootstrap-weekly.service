@@ -1,0 +1,14 @@
+[Unit]
+Description=pe-bootstrap weekly funder refresh (issue #166)
+Documentation=https://github.com/sppburke/prediction-markets/issues/166
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/prediction-markets
+EnvironmentFile=%h/prediction-markets/.env
+ExecStart=%h/.cargo/bin/pe-bootstrap weekly
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pe-bootstrap-weekly
