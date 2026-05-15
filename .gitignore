@@ -33,3 +33,7 @@ paper.jsonl
 # Smoke-test runtime data and secrets — never commit
 .env
 smoke-test/
+
+# Local data root (issue #166) — wallet_cache.db, wallet_set.json, Dune CSVs,
+# holdout-baseline output, backtest-output. Multi-GB, host-specific.
+/data/
