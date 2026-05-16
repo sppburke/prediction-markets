@@ -6,21 +6,19 @@
 //! 2. `PolymarketBulkFetcher::fetch_all` — incremental two-phase cursor walk
 //!    that appends only new trades for each wallet. Returns a [`FetchOutcome`]
 //!    with the failed-wallet list; per-wallet errors are **soft** — the rest
-//!    of the pipeline runs regardless.
+//!    of the pipeline runs regardless. With `with_stamp_on_success(true)`,
+//!    `last_polymarket_fetch_at` is written inline per-wallet under the same
+//!    `cache_mutex` guard that committed the trades, so SIGINT mid-run
+//!    preserves all completed work.
 //! 3. `fetch_resolutions_and_schedules` — multi-source pipeline (Polygon RPC →
 //!    Dune → CLOB → Gamma) on the full cache market set so newly-discovered
 //!    market_ids get their resolution / schedule rows.
 //! 4. `refresh_trade_counts` — recompute `wallets.trade_count` from the trades
 //!    table.
 //! 5. `apply_activation_rules` — newly-qualifying wallets flip to `is_active=1`.
-//! 6. Update `last_polymarket_fetch_at = now` for **successful** wallets only.
-//!    Failed wallets remain at their prior (typically NULL) value so the next
-//!    backfill picks them up immediately; the 3-known-IDs early-stop on the
-//!    second attempt makes the re-fetch cheap.
-//! 7. Return `Err(PartialFetch)` at the very end so `pe-bootstrap` exits non-zero
+//! 6. Return `Err(PartialFetch)` at the very end so `pe-bootstrap` exits non-zero
 //!    when any wallet failed, without aborting the pipeline.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
@@ -71,9 +69,13 @@ pub async fn run_backfill(
         ReqwestFetcher::new(client),
     )
     .with_concurrency(config.polymarket_concurrency)
-    .with_wallet_timeout(config.polymarket_wallet_timeout_secs);
+    .with_wallet_timeout(config.polymarket_wallet_timeout_secs)
+    // Per-wallet stamping: each succeeded wallet's `last_polymarket_fetch_at`
+    // is written inline under the same `cache_mutex` guard that commits its
+    // trades. SIGINT mid-run preserves all completed work — failed and
+    // in-flight wallets stay NULL and are re-queued by the next backfill.
+    .with_stamp_on_success(true);
     let outcome = fetcher.fetch_all(&wallets, cache).await?;
-    let failed_set: HashSet<WalletAddress> = outcome.failed.iter().copied().collect();
     let failed_count = outcome.failed.len();
     if failed_count > 0 {
         tracing::warn!(
@@ -94,24 +96,6 @@ pub async fn run_backfill(
     // just gained ≥ pile_activation_min_trades trades flip to active here.
     cache.refresh_trade_counts()?;
     let activated = pile::apply_activation_rules(cache)?;
-
-    // Stamp last_polymarket_fetch_at = now ONLY for successful wallets.
-    // Failed wallets keep their prior (typically NULL) value so select_backfill_due
-    // returns them again on the next run — the 3-known-IDs early-stop makes the
-    // re-fetch cheap when (most of) their trades are already cached.
-    let stamp_now = OffsetDateTime::now_utc().unix_timestamp();
-    for hex in &due_hexes {
-        let wallet = match WalletAddress::from_hex(hex) {
-            Ok(w) => w,
-            // Unparseable wallet_hex was already filtered out of `wallets` above
-            // (failed to enter PolymarketBulkFetcher); skip the stamp too.
-            Err(_) => continue,
-        };
-        if failed_set.contains(&wallet) {
-            continue;
-        }
-        cache.update_last_polymarket_fetch(hex, stamp_now)?;
-    }
 
     let fetched = wallets.len().saturating_sub(failed_count);
     tracing::info!(
