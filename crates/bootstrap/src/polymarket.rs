@@ -68,6 +68,7 @@ pub struct PolymarketBulkFetcher<F: PageFetcher> {
     fetcher: F,
     concurrency: usize,
     wallet_timeout_secs: u64,
+    stamp_on_success: bool,
 }
 
 /// Per-batch result of [`PolymarketBulkFetcher::fetch_all`].
@@ -104,6 +105,10 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             // `.with_wallet_timeout(config.polymarket_wallet_timeout_secs)` whose
             // canonical default is 300s (see `docs/_GLOSSARY.md`).
             wallet_timeout_secs: 0,
+            // `false` preserves the venue-agnostic posture — callers that want
+            // the pile's `last_polymarket_fetch_at` updated per-wallet opt in
+            // via `with_stamp_on_success(true)` (set by `backfill::run_backfill`).
+            stamp_on_success: false,
         }
     }
 
@@ -121,6 +126,27 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// `last_polymarket_fetch_at` not stamped → re-queued by the next backfill).
     pub fn with_wallet_timeout(mut self, secs: u64) -> Self {
         self.wallet_timeout_secs = secs;
+        self
+    }
+
+    /// Enable per-wallet incremental stamping of `last_polymarket_fetch_at`.
+    ///
+    /// When `true`, each wallet's successful fetch (including the empty-page
+    /// case where there are no new trades) immediately writes
+    /// `last_polymarket_fetch_at = now()` to the `wallets` table under the same
+    /// `cache_mutex` guard that committed its trades. Failures (fetch error,
+    /// timeout, or `insert_new` error) do **not** stamp the wallet.
+    ///
+    /// This makes SIGINT mid-run preserve all completed work — succeeded
+    /// wallets keep their stamps, in-flight ones stay NULL and are re-queued
+    /// by the next `select_backfill_due`. Without this flag, callers must
+    /// stamp in a post-fetch loop (the legacy `pe-bootstrap::run` path) which
+    /// loses the stamps if the process exits before `fetch_all` returns.
+    ///
+    /// Default `false` to preserve the venue-agnostic stance of `fetch_all`
+    /// for the legacy seed-bootstrap path; `backfill::run_backfill` opts in.
+    pub fn with_stamp_on_success(mut self, on: bool) -> Self {
+        self.stamp_on_success = on;
         self
     }
 
@@ -143,15 +169,20 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// - The legacy `lib.rs::run()` pipeline checks `outcome.failed.is_empty()` and
     ///   errors on partial fetch (preserving prior behaviour).
     /// - `backfill.rs::run_backfill` continues the post-fetch pipeline
-    ///   (resolutions + activation + per-wallet timestamp stamps for the *successful*
-    ///   wallets) and surfaces the partial-fetch error only at the very end.
+    ///   (resolutions + activation) and surfaces the partial-fetch error only at the
+    ///   very end. It also chains [`Self::with_stamp_on_success`] so per-wallet
+    ///   `last_polymarket_fetch_at` stamping happens inline as each wallet completes,
+    ///   making SIGINT-mid-run preserve all completed work.
     ///
     /// `Err` is reserved for catastrophic failures the caller cannot recover from
     /// (none are currently emitted from this method; future internal-bug surfaces).
     ///
     /// Trades are committed to SQLite per-wallet inside a single transaction.
     /// SQLite WAL mode provides per-commit durability — no manual checkpointing
-    /// or final flush is needed.
+    /// or final flush is needed. When [`Self::with_stamp_on_success`] is enabled,
+    /// the stamp write occurs under the same `cache_mutex` guard that committed
+    /// the trades so a successful wallet's `(trades, stamp)` pair is atomic from
+    /// the operator's point of view.
     pub async fn fetch_all(
         &self,
         wallets: &[WalletAddress],
@@ -199,18 +230,38 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                     };
 
                     match fetch_result {
-                        Ok(new_trades) if !new_trades.is_empty() => {
+                        Ok(new_trades) => {
                             let mut guard = cache_mutex.lock().await;
-                            if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
+                            // Empty pages still count as a successful fetch and
+                            // are stamped below; skip the no-op insert call.
+                            if !new_trades.is_empty()
+                                && let Err(e) = guard.insert_new(&wallet_hex, new_trades)
+                            {
                                 tracing::error!(
                                     wallet = %wallet_hex,
                                     error = %e,
                                     "polymarket: cache insert failed — trades for this wallet will be missing"
                                 );
                                 failed.lock().await.push(wallet);
+                                return;
+                            }
+                            if self.stamp_on_success {
+                                let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+                                if let Err(e) =
+                                    guard.update_last_polymarket_fetch(&wallet_hex, now_unix)
+                                {
+                                    // Trades are durable; missing stamp just means
+                                    // the next `select_backfill_due` will re-queue
+                                    // this wallet and the 3-known-IDs early-stop
+                                    // makes the re-fetch cheap. Not a hard failure.
+                                    tracing::warn!(
+                                        wallet = %wallet_hex,
+                                        error = %e,
+                                        "polymarket: stamp failed — wallet will be re-queued next backfill (trades are persisted)"
+                                    );
+                                }
                             }
                         }
-                        Ok(_) => {}
                         Err(e) => {
                             tracing::error!(
                                 wallet = %wallet_hex,
@@ -1147,5 +1198,135 @@ mod tests {
 
         assert!(outcome.failed.is_empty());
         assert_eq!(cache.trade_count(), 2);
+    }
+
+    // ── Incremental stamping (issue #175) ─────────────────────────────────────
+
+    /// Insert the wallet into the pile as an active leaderboard wallet so
+    /// `select_backfill_due` returns it (until stamped) and
+    /// `update_last_polymarket_fetch` has a row to update.
+    fn upsert_active_pile_row(cache: &mut WalletCache, wallet: WalletAddress) {
+        cache
+            .upsert_wallet(
+                &wallet.to_string(),
+                crate::pile::SRC_LEADERBOARD,
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        crate::pile::apply_activation_rules(cache).unwrap();
+    }
+
+    /// PASS: with `with_stamp_on_success(true)`, a successful fetch writes
+    ///       `last_polymarket_fetch_at` to the wallet's pile row inline.
+    /// FAIL: stamp column stays NULL after a successful fetch.
+    #[tokio::test]
+    async fn stamp_on_success_persists_timestamp_inline() {
+        let wallet = wallet_a();
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        upsert_active_pile_row(&mut cache, wallet);
+
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(wallet), page_json_n(3, 0, 1_700_000_000));
+
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_stamp_on_success(true);
+        let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert!(outcome.failed.is_empty());
+        assert_eq!(cache.trade_count(), 3);
+
+        let due = crate::pile::select_backfill_due(&cache, 1_700_000_001, 0).unwrap();
+        assert!(
+            due.is_empty(),
+            "stamped wallet must not be re-queued (stamp = now)"
+        );
+    }
+
+    /// PASS: with `with_stamp_on_success(true)`, an empty-page fetch (no new
+    ///       trades — e.g. cache already current) also stamps the wallet.
+    /// FAIL: empty-page success does not stamp (operator sees the wallet
+    ///       re-queued every run when nothing has changed).
+    #[tokio::test]
+    async fn stamp_on_success_persists_timestamp_on_empty_page() {
+        let wallet = wallet_a();
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        upsert_active_pile_row(&mut cache, wallet);
+
+        let mut responses = HashMap::new();
+        // Empty response on cold-start URL = "wallet has no Polymarket trades".
+        responses.insert(trade_url_cold(wallet), page_json_n(0, 0, 0));
+
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_stamp_on_success(true);
+        let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert!(outcome.failed.is_empty());
+        assert_eq!(cache.trade_count(), 0);
+
+        let due = crate::pile::select_backfill_due(&cache, 1_700_000_001, 0).unwrap();
+        assert!(
+            due.is_empty(),
+            "empty-page success must still stamp the wallet (otherwise zero-trade wallets are re-queued every run)"
+        );
+    }
+
+    /// PASS: a failed fetch with `with_stamp_on_success(true)` leaves the wallet
+    ///       NULL — next `select_backfill_due` re-queues it.
+    /// FAIL: failed wallet is stamped (false success), breaking the re-queue
+    ///       semantics that PR #171 + #173 established.
+    #[tokio::test]
+    async fn stamp_on_success_skips_failed_wallet() {
+        let wallet = wallet_a();
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        upsert_active_pile_row(&mut cache, wallet);
+
+        // No fixture → FixtureFetcher returns Fatal → wallet lands in `failed`.
+        let bulk =
+            PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(HashMap::new()))
+                .with_stamp_on_success(true);
+        let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert_eq!(outcome.failed, vec![wallet]);
+
+        let due = crate::pile::select_backfill_due(&cache, 1_700_000_001, 0).unwrap();
+        assert_eq!(
+            due,
+            vec![wallet.to_string()],
+            "failed wallet must remain NULL and re-queue on next backfill"
+        );
+    }
+
+    /// PASS: default `new()` does NOT stamp — preserves the venue-agnostic
+    ///       behaviour for the 29 existing fixture-based call sites + the
+    ///       legacy `lib.rs::run()` path.
+    /// FAIL: a non-opt-in fetcher silently writes to the pile table.
+    #[tokio::test]
+    async fn default_no_stamp_preserves_legacy_behavior() {
+        let wallet = wallet_a();
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        upsert_active_pile_row(&mut cache, wallet);
+
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(wallet), page_json_n(2, 0, 1_700_000_000));
+
+        // No `with_stamp_on_success` — matches existing scenario callers.
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert!(outcome.failed.is_empty());
+
+        let due = crate::pile::select_backfill_due(&cache, 1_700_000_001, 0).unwrap();
+        assert_eq!(
+            due,
+            vec![wallet.to_string()],
+            "without opt-in, wallet must remain NULL (caller is responsible for stamping)"
+        );
     }
 }
