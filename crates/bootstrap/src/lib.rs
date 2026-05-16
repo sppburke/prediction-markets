@@ -20,6 +20,7 @@ pub mod backfill;
 pub mod cache;
 pub mod clob;
 pub mod config;
+pub mod delta_audit;
 pub mod discovery;
 pub mod dune;
 pub mod error;
@@ -29,6 +30,7 @@ pub mod migrate;
 pub mod operator_audit;
 pub mod pile;
 pub mod polygon_ctf;
+pub mod polygon_ctf_delta;
 pub mod polymarket;
 pub mod wallet_set;
 pub mod weekly;
@@ -79,6 +81,40 @@ pub enum WalletSource {
     /// Use Etherscan `eth_getLogs` on Polygon (requires `PE_ETHERSCAN_API_KEY`).
     #[default]
     Etherscan,
+}
+
+/// Delta-backfill mode (issue #176).
+///
+/// Selects how `backfill::run_backfill` uses the Polygon CTF on-chain `eth_getLogs`
+/// scan to narrow the per-day Polymarket API surface.
+///
+/// - [`DeltaMode::Off`] — legacy behaviour. Every due wallet from
+///   `select_backfill_due` is fetched. No on-chain scan; no audit rows.
+/// - [`DeltaMode::Shadow`] — runs the on-chain scan AND the legacy full fetch on
+///   every backfill run; classifies each wallet that had new trades OR appeared
+///   in the delta set into `DELTA_HIT` / `DELTA_MISS` / `DELTA_EXTRA` rows in the
+///   `delta_audit` table. Operators flip to [`DeltaMode::Delta`] after the audit
+///   table is consistently empty of `DELTA_MISS` rows across multiple runs.
+/// - [`DeltaMode::Delta`] — the on-chain scan filters the fetch set down to
+///   `(full_due_set ∩ delta_set) ∪ paranoia_set`. Weekly paranoia
+///   (`select_full_fetch_due`) backstops any wallet whose `last_polymarket_full_at`
+///   exceeds the staleness window.
+///
+/// `Default` is [`DeltaMode::Shadow`] — safe-by-default for first release because
+/// shadow mode is functionally a no-op for the fetch path (legacy behaviour plus
+/// an audit table). Note: the delta scanner is only invoked inside
+/// `backfill::run_backfill`; `lib.rs::run()` never reads this field regardless of
+/// its value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeltaMode {
+    /// Disable the on-chain scan entirely; legacy fetch-all-due behaviour.
+    Off,
+    /// Run scan + full fetch; populate `delta_audit` but do not change the fetch set.
+    #[default]
+    Shadow,
+    /// Use the scan to filter the fetch set; weekly paranoia provides the backstop.
+    Delta,
 }
 
 /// Run the full bootstrap pipeline and return the seed [`Watchlist`].

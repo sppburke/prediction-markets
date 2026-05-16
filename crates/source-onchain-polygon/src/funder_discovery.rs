@@ -201,14 +201,18 @@ impl<P: Provider + Clone + Send + Sync> FunderLookup for EthGetLogsLookup<P> {
 }
 
 /// Left-pad a 20-byte address into a 32-byte topic value.
-pub(crate) fn wallet_to_topic(w: &WalletAddress) -> B256 {
+pub fn wallet_to_topic(w: &WalletAddress) -> B256 {
     let mut bytes = [0u8; 32];
     bytes[12..].copy_from_slice(&w.0);
     B256::from(bytes)
 }
 
 /// Read the lower 20 bytes of a 32-byte topic as a wallet address.
-fn topic_to_wallet(topic: Option<&B256>) -> Option<WalletAddress> {
+///
+/// Issue #176 promoted to `pub` for reuse in `pe_bootstrap::polygon_ctf_delta`,
+/// which extracts maker (`topic[2]`) and taker (`topic[3]`) addresses from
+/// `OrderFilled` log topics across the four exchange contracts.
+pub fn topic_to_wallet(topic: Option<&B256>) -> Option<WalletAddress> {
     let topic = topic?;
     let bytes = topic.as_slice();
     if bytes.len() != 32 {

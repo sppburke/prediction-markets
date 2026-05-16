@@ -65,6 +65,22 @@ pub fn select_weekly_due(
     cache.select_weekly_due(now_unix, WEEKLY_STALENESS_SECS, limit)
 }
 
+/// Select active wallets due for a Polymarket *full-fetch* (paranoia backstop
+/// for the delta-backfill flow, issue #176).
+///
+/// Unlike [`select_backfill_due`] (1-day staleness, every due wallet enters
+/// the fetch set), this picks wallets whose `last_polymarket_full_at` is NULL
+/// or older than `staleness_secs` ago. The canonical config window is 7 days
+/// so no wallet stays "delta-only" for more than a week even if the on-chain
+/// scanner misses it.
+pub fn select_full_fetch_due(
+    cache: &WalletCache,
+    now_unix: i64,
+    staleness_secs: i64,
+) -> Result<Vec<String>, BootstrapError> {
+    cache.wallets_due_for_full_fetch(now_unix, staleness_secs)
+}
+
 /// Update `last_polymarket_fetch_at` for a wallet.
 pub fn update_last_polymarket_fetch(
     cache: &mut WalletCache,

@@ -16,7 +16,7 @@
 //! shared `PageFetcher` enforces the global rate-limit gate so aggregate
 //! throughput stays inside the Polymarket Data API limit (200 req/10s, ≈ 20 req/s).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +83,12 @@ pub struct FetchOutcome {
     /// Wallets whose trades could not be fetched or written to SQLite. Their
     /// progress was rolled back per-wallet; the rest of the batch succeeded.
     pub failed: Vec<WalletAddress>,
+    /// Per-wallet count of newly inserted trade rows (issue #176). Contains
+    /// **only** wallets with `count > 0`; wallets that succeeded with zero
+    /// new trades are NOT inserted (saves ~95% of entries in shadow mode and
+    /// lets `delta_audit::classify_and_record` use `contains_key` as the
+    /// "had activity" predicate without a `> 0` guard).
+    pub new_trades: HashMap<WalletAddress, usize>,
 }
 
 impl FetchOutcome {
@@ -190,11 +196,14 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     ) -> Result<FetchOutcome, BootstrapError> {
         let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);
         let failed: Arc<Mutex<Vec<WalletAddress>>> = Arc::new(Mutex::new(Vec::new()));
+        let new_trades_map: Arc<Mutex<HashMap<WalletAddress, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         stream::iter(wallets.iter().copied())
             .for_each_concurrent(self.concurrency, |wallet| {
                 let cache_mutex = &cache_mutex;
                 let failed = Arc::clone(&failed);
+                let new_trades_map = Arc::clone(&new_trades_map);
                 async move {
                     let wallet_hex = wallet.to_string();
                     let (known_ids, ts_bounds) = {
@@ -232,18 +241,23 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                     match fetch_result {
                         Ok(new_trades) => {
                             let mut guard = cache_mutex.lock().await;
-                            // Empty pages still count as a successful fetch and
-                            // are stamped below; skip the no-op insert call.
-                            if !new_trades.is_empty()
-                                && let Err(e) = guard.insert_new(&wallet_hex, new_trades)
-                            {
-                                tracing::error!(
-                                    wallet = %wallet_hex,
-                                    error = %e,
-                                    "polymarket: cache insert failed — trades for this wallet will be missing"
-                                );
-                                failed.lock().await.push(wallet);
-                                return;
+                            let inserted = match guard.insert_new(&wallet_hex, new_trades) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    tracing::error!(
+                                        wallet = %wallet_hex,
+                                        error = %e,
+                                        "polymarket: cache insert failed — trades for this wallet will be missing"
+                                    );
+                                    failed.lock().await.push(wallet);
+                                    return;
+                                }
+                            };
+                            // Issue #176: only wallets with new trades enter
+                            // the map. `delta_audit::classify_and_record` uses
+                            // `contains_key` as the "had activity" predicate.
+                            if inserted > 0 {
+                                new_trades_map.lock().await.insert(wallet, inserted);
                             }
                             if self.stamp_on_success {
                                 let now_unix = OffsetDateTime::now_utc().unix_timestamp();
@@ -278,9 +292,13 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         let failed_vec = Arc::try_unwrap(failed)
             .map_err(|_| BootstrapError::Internal)?
             .into_inner();
+        let new_trades_inner = Arc::try_unwrap(new_trades_map)
+            .map_err(|_| BootstrapError::Internal)?
+            .into_inner();
         Ok(FetchOutcome {
             attempted: wallets.len(),
             failed: failed_vec,
+            new_trades: new_trades_inner,
         })
     }
 
