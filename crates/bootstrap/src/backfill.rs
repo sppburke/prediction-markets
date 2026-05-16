@@ -70,7 +70,8 @@ pub async fn run_backfill(
         config.polymarket_base_url.clone(),
         ReqwestFetcher::new(client),
     )
-    .with_concurrency(config.polymarket_concurrency);
+    .with_concurrency(config.polymarket_concurrency)
+    .with_wallet_timeout(config.polymarket_wallet_timeout_secs);
     let outcome = fetcher.fetch_all(&wallets, cache).await?;
     let failed_set: HashSet<WalletAddress> = outcome.failed.iter().copied().collect();
     let failed_count = outcome.failed.len();

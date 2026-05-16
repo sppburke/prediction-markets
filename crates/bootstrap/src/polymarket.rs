@@ -67,6 +67,7 @@ pub struct PolymarketBulkFetcher<F: PageFetcher> {
     base_url: String,
     fetcher: F,
     concurrency: usize,
+    wallet_timeout_secs: u64,
 }
 
 /// Per-batch result of [`PolymarketBulkFetcher::fetch_all`].
@@ -96,6 +97,13 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             base_url,
             fetcher,
             concurrency: DEFAULT_CONCURRENCY,
+            // `0` (disabled) is the test-friendly default — existing fixture-based
+            // tests (29 call sites of `new()` across this file and `tests/`) rely
+            // on no per-wallet timeout. Production callers in `lib.rs::run()` and
+            // `backfill::run_backfill` activate the timeout by chaining
+            // `.with_wallet_timeout(config.polymarket_wallet_timeout_secs)` whose
+            // canonical default is 300s (see `docs/_GLOSSARY.md`).
+            wallet_timeout_secs: 0,
         }
     }
 
@@ -105,16 +113,32 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         self
     }
 
+    /// Override the per-wallet wall-clock timeout (in seconds). `0` disables the
+    /// timeout entirely (the default in [`Self::new`]); any positive value wraps
+    /// each `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets
+    /// whose total fetch wall-clock exceeds the budget are added to
+    /// [`FetchOutcome::failed`] via the standard soft-fail path (no SQLite write,
+    /// `last_polymarket_fetch_at` not stamped → re-queued by the next backfill).
+    pub fn with_wallet_timeout(mut self, secs: u64) -> Self {
+        self.wallet_timeout_secs = secs;
+        self
+    }
+
     /// Fetch new trades for all `wallets`, updating `cache` incrementally.
     ///
     /// Up to `self.concurrency` wallets are fetched in parallel; the underlying
     /// `PageFetcher` enforces the global rate-limit gate. HTTP 429 responses are
-    /// retried indefinitely at the page level (sleeping `Retry-After` seconds)
-    /// so no wallet is ever skipped due to rate limiting.
+    /// retried indefinitely at the page level (sleeping `Retry-After` seconds);
+    /// the only mechanism that skips a wallet on rate limiting is the per-wallet
+    /// wall-clock budget set via [`Self::with_wallet_timeout`] — when configured,
+    /// a wallet whose total fetch time exceeds the budget is soft-failed via
+    /// [`FetchOutcome::failed`] (no SQLite write happens, `last_polymarket_fetch_at`
+    /// stays NULL → re-queued by the next backfill).
     ///
-    /// Per-wallet errors (non-recoverable network/parse error, SQLite insert failure)
-    /// are **not** returned as `Err` — they're captured in [`FetchOutcome::failed`].
-    /// This lets callers decide per-use-case how to handle partial success:
+    /// Per-wallet errors (non-recoverable network/parse error, SQLite insert failure,
+    /// or timeout-elapsed) are **not** returned as `Err` — they're captured in
+    /// [`FetchOutcome::failed`]. This lets callers decide per-use-case how to
+    /// handle partial success:
     ///
     /// - The legacy `lib.rs::run()` pipeline checks `outcome.failed.is_empty()` and
     ///   errors on partial fetch (preserving prior behaviour).
@@ -150,10 +174,31 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                         (ids, bounds)
                     };
 
-                    match self
-                        .fetch_wallet_incremental(wallet, &known_ids, ts_bounds)
+                    let fetch_future =
+                        self.fetch_wallet_incremental(wallet, &known_ids, ts_bounds);
+                    let fetch_result = if self.wallet_timeout_secs > 0 {
+                        match tokio::time::timeout(
+                            Duration::from_secs(self.wallet_timeout_secs),
+                            fetch_future,
+                        )
                         .await
-                    {
+                        {
+                            Ok(r) => r,
+                            Err(_elapsed) => {
+                                tracing::error!(
+                                    wallet = %wallet_hex,
+                                    timeout_secs = self.wallet_timeout_secs,
+                                    "polymarket: fetch timeout exceeded — trades for this wallet will be missing"
+                                );
+                                failed.lock().await.push(wallet);
+                                return;
+                            }
+                        }
+                    } else {
+                        fetch_future.await
+                    };
+
+                    match fetch_result {
                         Ok(new_trades) if !new_trades.is_empty() => {
                             let mut guard = cache_mutex.lock().await;
                             if let Err(e) = guard.insert_new(&wallet_hex, new_trades) {
@@ -473,6 +518,40 @@ mod tests {
                 });
             }
             self.inner.fetch_page(url).await
+        }
+    }
+
+    /// A `PageFetcher` that returns a pending future, simulating an infinitely
+    /// slow API (or one stuck in a sustained rate-limit episode). Used to
+    /// exercise the per-wallet timeout path without touching the network.
+    struct HangFetcher;
+
+    impl PageFetcher for HangFetcher {
+        async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, SourceError> {
+            std::future::pending::<Result<Vec<u8>, SourceError>>().await
+        }
+    }
+
+    /// A `PageFetcher` that delegates to a `FixtureFetcher` for some URLs and
+    /// hangs forever for others. Drives the mixed-wallet operator scenario:
+    /// fast wallets finish, slow ones time out, soft-fail bookkeeping survives.
+    struct PartialHangFetcher {
+        inner: FixtureFetcher,
+    }
+
+    impl PartialHangFetcher {
+        fn new(inner: FixtureFetcher) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl PageFetcher for PartialHangFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            match self.inner.fetch_page(url).await {
+                Ok(b) => Ok(b),
+                // No fixture → treat as "this wallet's API is hung indefinitely".
+                Err(_) => std::future::pending::<Result<Vec<u8>, SourceError>>().await,
+            }
         }
     }
 
@@ -930,5 +1009,143 @@ mod tests {
             4,
             "new trade before known sequence must be appended"
         );
+    }
+
+    // ── Per-wallet timeout (issue #173) ───────────────────────────────────────
+
+    /// PASS: a wallet whose fetcher never returns is soft-failed via
+    ///       `outcome.failed`, the cache stays empty (no partial write), and
+    ///       the timeout fires within ~1 s rather than hanging the test.
+    /// FAIL: `outcome.failed` is empty (wallet was treated as a success), OR
+    ///       the cache contains trades (cancellation-safety regression), OR
+    ///       elapsed wall-clock exceeds the 5 s upper bound.
+    #[tokio::test]
+    async fn wallet_timeout_soft_fails_hanging_wallet() {
+        let wallet = wallet_a();
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        let bulk =
+            PolymarketBulkFetcher::new(BASE_URL.to_owned(), HangFetcher).with_wallet_timeout(1);
+
+        let start = std::time::Instant::now();
+        let outcome = bulk
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .expect("Ok with FetchOutcome");
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(
+            outcome.failed,
+            vec![wallet],
+            "hanging wallet must be soft-failed"
+        );
+        assert_eq!(outcome.succeeded_count(), 0);
+        assert_eq!(
+            cache.trade_count(),
+            0,
+            "cancellation-safety regression: timeout-cancelled walk must not write to cache"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout must fire promptly; elapsed = {elapsed:?}"
+        );
+    }
+
+    /// PASS: with `with_wallet_timeout(0)` the timeout is disabled and a
+    ///       fixture-backed wallet completes normally — proves the
+    ///       config-disabled path doesn't break the success flow.
+    /// FAIL: timeout fires anyway, cache is empty, or `outcome.failed` is
+    ///       non-empty when the fixture returns a clean response.
+    #[tokio::test]
+    async fn wallet_timeout_disabled_passes_through_success() {
+        let wallet = wallet_a();
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(wallet), page_json_n(5, 0, 2_000_000));
+
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
+            .with_wallet_timeout(0);
+        let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert!(
+            outcome.failed.is_empty(),
+            "disabled timeout must not soft-fail"
+        );
+        assert_eq!(outcome.succeeded_count(), 1);
+        assert_eq!(cache.trade_count(), 5);
+    }
+
+    /// PASS: in a 2-wallet batch where the fast wallet has a fixture and the
+    ///       slow one hangs forever, the fast wallet is fully persisted, the
+    ///       slow one is soft-failed, and overall wall-clock is bounded by
+    ///       the timeout (not by the hanging fetcher).
+    /// FAIL: fast wallet's trades are missing, OR slow wallet is treated as
+    ///       success, OR test exceeds 5 s (queue tail not freed by timeout).
+    #[tokio::test]
+    async fn wallet_timeout_mixed_batch_isolates_stragglers() {
+        let fast = wallet_a();
+        let slow = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(fast), page_json_n(3, 0, 1_700_000_000));
+        // slow's URL has no fixture → PartialHangFetcher returns pending().
+
+        let fetcher = PartialHangFetcher::new(FixtureFetcher::new(responses));
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher).with_wallet_timeout(1);
+
+        let start = std::time::Instant::now();
+        let outcome = bulk.fetch_all(&[fast, slow], &mut cache).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(
+            outcome.failed,
+            vec![slow],
+            "only the hanging wallet must be soft-failed"
+        );
+        assert_eq!(outcome.succeeded_count(), 1);
+        assert_eq!(
+            cache.trade_count(),
+            3,
+            "fast wallet's trades must be persisted"
+        );
+        let slow_ids = cache.known_trade_ids(&slow.to_string());
+        assert!(
+            slow_ids.is_empty(),
+            "slow wallet must have no cached trades"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "queue tail freed promptly by timeout; elapsed = {elapsed:?}"
+        );
+    }
+
+    /// PASS: `new()` constructs a fetcher with timeout disabled by default —
+    ///       proves the 29 existing fixture-based tests continue to behave as
+    ///       before (the disabled-default protects them).
+    /// FAIL: a non-zero default leaks into `new()` and breaks unrelated tests.
+    #[tokio::test]
+    async fn new_constructor_disables_timeout_by_default() {
+        let wallet = wallet_a();
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(wallet), page_json_n(2, 0, 1_700_000_000));
+
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        // No `with_wallet_timeout(_)` chain — exactly the shape used by the
+        // 29 existing scenario and unit tests.
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
+        let outcome = bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
+
+        assert!(outcome.failed.is_empty());
+        assert_eq!(cache.trade_count(), 2);
     }
 }

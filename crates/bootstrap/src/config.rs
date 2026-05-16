@@ -26,6 +26,7 @@ const DEFAULT_DUNE_ACTIVE_WINDOW_DAYS: u32 = 30;
 const DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_POLYMARKET_CONCURRENCY: usize = 16;
+const DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
@@ -191,6 +192,20 @@ pub struct BootstrapConfig {
         alias = "bootstrap_polymarket_concurrency"
     )]
     pub polymarket_concurrency: usize,
+
+    /// Per-wallet wall-clock budget (seconds) for the Polymarket `fetch_all`
+    /// loop. `0` disables the timeout; positive values wrap each
+    /// `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets that
+    /// trip the timeout are soft-failed (added to `FetchOutcome::failed`) so
+    /// the post-fetch pipeline still runs and `last_polymarket_fetch_at`
+    /// remains NULL → next backfill re-queues them. Canonical default in
+    /// `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+    /// `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS` overrides.
+    #[serde(
+        default = "default_polymarket_wallet_timeout_secs",
+        alias = "bootstrap_polymarket_wallet_timeout_secs"
+    )]
+    pub polymarket_wallet_timeout_secs: u64,
 
     /// Fetch market resolutions from Gamma after trade fetch (off by default).
     /// Env `PE_BOOTSTRAP_FETCH_RESOLUTIONS`: `"1"` or `"true"` to enable.
@@ -406,6 +421,10 @@ const fn default_polymarket_concurrency() -> usize {
     DEFAULT_POLYMARKET_CONCURRENCY
 }
 
+const fn default_polymarket_wallet_timeout_secs() -> u64 {
+    DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS
+}
+
 const fn default_funder_concurrency() -> usize {
     DEFAULT_FUNDER_CONCURRENCY
 }
@@ -473,6 +492,7 @@ impl Default for BootstrapConfig {
             post_filter_max_avg_hours_to_resolution: default_post_filter_max_avg_hours(),
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_concurrency: default_polymarket_concurrency(),
+            polymarket_wallet_timeout_secs: default_polymarket_wallet_timeout_secs(),
             fetch_resolutions: false,
             rebuild_resolutions: false,
             gamma_base_url: default_gamma_base_url(),

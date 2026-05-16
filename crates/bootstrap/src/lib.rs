@@ -231,7 +231,8 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         config.polymarket_base_url.clone(),
         ReqwestFetcher::new(client),
     )
-    .with_concurrency(config.polymarket_concurrency);
+    .with_concurrency(config.polymarket_concurrency)
+    .with_wallet_timeout(config.polymarket_wallet_timeout_secs);
     if config.skip_trade_fetch {
         tracing::warn!(
             wallets = wallets.len(),
