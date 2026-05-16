@@ -14,8 +14,18 @@
 //! [`Provider`] in [`AlloyChainLogFetcher`]; tests substitute an in-memory
 //! impl so unit and scenario tests don't need a real Polygon RPC.
 
+use std::time::Duration;
+
 use alloy::providers::Provider;
 use alloy::rpc::types::{BlockNumberOrTag, Filter, Log};
+
+/// Maximum per-attempt backoff (seconds) when an `eth_getLogs` request hits
+/// HTTP 429 / rate-limit. Exponential backoff is `1 → 2 → 4 → 8 → 16 → 32`s
+/// before the retry loop gives up and propagates the error to the caller
+/// (which falls back to legacy full-fetch in `backfill::run_backfill`).
+///
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+const RATE_LIMIT_MAX_BACKOFF_SECS: u64 = 32;
 
 /// Errors emitted by the generic Polygon-RPC primitives in this module.
 ///
@@ -29,13 +39,25 @@ pub enum PolygonRpcError {
     GetBlockNumber(String),
 }
 
-/// Issue a single `eth_getLogs` request for `[from, to]`, bisecting on
-/// "response too large" errors. Cap-error detection is heuristic (substring
-/// match on the error string) because providers return non-standard JSON-RPC
-/// error codes; the fallback halves the range until one of:
-///   - the request succeeds,
-///   - the range reaches `min_chunk` blocks and still fails → propagate the
-///     error so the caller can lower `chunk_blocks` or switch RPC tiers.
+/// Issue an `eth_getLogs` request for `[from, to]` with exponential-backoff
+/// retry on HTTP 429 (rate limit) and bisect on "response too large".
+///
+/// Error handling, in order:
+///
+/// 1. **Rate-limit retry**: if the underlying error matches a 429 / "compute
+///    units" / "throttle" / "too many requests" heuristic, sleep
+///    exponentially (1, 2, 4, 8, 16, 32 s) and retry the same range. After
+///    backoff exceeds [`RATE_LIMIT_MAX_BACKOFF_SECS`], propagate to the
+///    caller (which falls back to legacy fetch in production). Mirrors the
+///    pattern from `funder_discovery.rs::EthGetLogsLookup` but bounded.
+///
+/// 2. **Cap-on-response-size**: heuristic substring match (providers return
+///    non-standard JSON-RPC error codes). Halves the range and retries until
+///    either it succeeds or the range reaches `min_chunk` blocks (then the
+///    error propagates so the caller can lower `chunk_blocks` or switch RPC
+///    tiers).
+///
+/// 3. **Other errors**: propagated unchanged.
 ///
 /// `filter` is supplied **without block range set** — the function clones it
 /// and injects `.from_block(...)` / `.to_block(...)` for each request,
@@ -53,50 +75,80 @@ pub async fn eth_get_logs_bisect<P: Provider>(
         .clone()
         .from_block(BlockNumberOrTag::Number(from))
         .to_block(BlockNumberOrTag::Number(to));
-    match provider.get_logs(&req_filter).await {
-        Ok(logs) => Ok(logs),
-        Err(e) => {
-            if span <= min_chunk {
-                return Err(PolygonRpcError::GetLogs {
-                    from,
-                    to,
-                    message: format!("min-chunk floor reached: {e}"),
-                });
+
+    // Step 1 — rate-limit retry. Bounded exponential backoff; the loop exits
+    // either via successful `Ok(logs)` (returned immediately) or by breaking
+    // out with the final error for the cap-vs-other classification below.
+    let mut backoff_secs: u64 = 1;
+    let final_err = loop {
+        match provider.get_logs(&req_filter).await {
+            Ok(logs) => return Ok(logs),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                let is_rate_limit = msg.contains("429")
+                    || msg.contains("compute units")
+                    || msg.contains("throttle")
+                    || msg.contains("too many requests")
+                    || msg.contains("rate limit");
+                if is_rate_limit && backoff_secs <= RATE_LIMIT_MAX_BACKOFF_SECS {
+                    tracing::warn!(
+                        from,
+                        to,
+                        backoff_secs,
+                        error = %e,
+                        "polygon eth_getLogs: rate-limited, retrying with backoff"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = backoff_secs.saturating_mul(2);
+                    continue;
+                }
+                break e;
             }
-            let msg = e.to_string().to_lowercase();
-            // Heuristic: response-too-large / range-too-wide / log-limit-exceeded.
-            let is_cap = msg.contains("too large")
-                || msg.contains("too many")
-                || msg.contains("response size")
-                || msg.contains("limit exceeded")
-                || msg.contains("range");
-            if !is_cap {
-                return Err(PolygonRpcError::GetLogs {
-                    from,
-                    to,
-                    message: e.to_string(),
-                });
-            }
-            tracing::warn!(
-                from,
-                to,
-                error = %e,
-                "polygon eth_getLogs: response cap hit, bisecting"
-            );
-            let mid = from.saturating_add(span / 2);
-            let mut left = Box::pin(eth_get_logs_bisect(
-                provider,
-                filter.clone(),
-                from,
-                mid.saturating_sub(1),
-                min_chunk,
-            ))
-            .await?;
-            let right = Box::pin(eth_get_logs_bisect(provider, filter, mid, to, min_chunk)).await?;
-            left.extend(right);
-            Ok(left)
         }
+    };
+
+    // Step 2 — cap detection: if span > min_chunk and the error looks like a
+    // response-size cap, recurse on halves; otherwise propagate.
+    let e = final_err;
+    if span <= min_chunk {
+        return Err(PolygonRpcError::GetLogs {
+            from,
+            to,
+            message: format!("min-chunk floor reached: {e}"),
+        });
     }
+    let msg = e.to_string().to_lowercase();
+    // Heuristic: response-too-large / range-too-wide / log-limit-exceeded.
+    let is_cap = msg.contains("too large")
+        || msg.contains("too many")
+        || msg.contains("response size")
+        || msg.contains("limit exceeded")
+        || msg.contains("range");
+    if !is_cap {
+        return Err(PolygonRpcError::GetLogs {
+            from,
+            to,
+            message: e.to_string(),
+        });
+    }
+    tracing::warn!(
+        from,
+        to,
+        error = %e,
+        "polygon eth_getLogs: response cap hit, bisecting"
+    );
+    let mid = from.saturating_add(span / 2);
+    let mut left = Box::pin(eth_get_logs_bisect(
+        provider,
+        filter.clone(),
+        from,
+        mid.saturating_sub(1),
+        min_chunk,
+    ))
+    .await?;
+    let right = Box::pin(eth_get_logs_bisect(provider, filter, mid, to, min_chunk)).await?;
+    left.extend(right);
+    Ok(left)
 }
 
 /// Testability seam for code that scans Polygon logs (issue #176).
