@@ -37,3 +37,16 @@ smoke-test/
 # Local data root (issue #166) — wallet_cache.db, wallet_set.json, Dune CSVs,
 # holdout-baseline output, backtest-output. Multi-GB, host-specific.
 /data/
+
+# Python tooling (analysis scripts under scripts/)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.venv-analysis/
+venv/
+
+# macOS
+.DS_Store
