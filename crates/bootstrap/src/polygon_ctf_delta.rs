@@ -33,11 +33,8 @@ pub const POLYGON_CTF_BACKFILL_CURSOR_KEY: &str = "polygon_ctf_backfill_last_blo
 /// Cold-start window (Polygon blocks ≈ 24 h at 2 s blocktime) used when no
 /// cursor is present in `source_cursor`. Keeps the first run from scanning
 /// the entire chain history.
-const COLD_START_LOOKBACK_BLOCKS: u64 = 43_200;
-
-/// Minimum chunk size below which [`pe_source_onchain_polygon::eth_get_logs_bisect`]
-/// propagates the underlying RPC error rather than bisecting further.
-const MIN_CHUNK_BLOCKS: u64 = 1;
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+pub const COLD_START_LOOKBACK_BLOCKS: u64 = 43_200;
 
 /// Result of a delta scan run.
 ///
@@ -176,7 +173,6 @@ pub async fn scan_active_wallets<F: ChainLogFetcher>(
     };
 
     let active = extract_active_wallets(&logs);
-    let _min_chunk_keepalive = MIN_CHUNK_BLOCKS; // documented bisect floor
     tracing::info!(
         from_block = resolved_from,
         to_block = resolved_to,
