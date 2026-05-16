@@ -4,15 +4,23 @@
 //!    NULL or stale (>1 day). `backfill_limit = 0` returns all due wallets;
 //!    a positive limit caps the per-run batch.
 //! 2. `PolymarketBulkFetcher::fetch_all` — incremental two-phase cursor walk
-//!    that appends only new trades for each wallet.
+//!    that appends only new trades for each wallet. Returns a [`FetchOutcome`]
+//!    with the failed-wallet list; per-wallet errors are **soft** — the rest
+//!    of the pipeline runs regardless.
 //! 3. `fetch_resolutions_and_schedules` — multi-source pipeline (Polygon RPC →
 //!    Dune → CLOB → Gamma) on the full cache market set so newly-discovered
 //!    market_ids get their resolution / schedule rows.
 //! 4. `refresh_trade_counts` — recompute `wallets.trade_count` from the trades
 //!    table.
 //! 5. `apply_activation_rules` — newly-qualifying wallets flip to `is_active=1`.
-//! 6. Update `last_polymarket_fetch_at = now` for every processed wallet.
+//! 6. Update `last_polymarket_fetch_at = now` for **successful** wallets only.
+//!    Failed wallets remain at their prior (typically NULL) value so the next
+//!    backfill picks them up immediately; the 3-known-IDs early-stop on the
+//!    second attempt makes the re-fetch cheap.
+//! 7. Return `Err(PartialFetch)` at the very end so `pe-bootstrap` exits non-zero
+//!    when any wallet failed, without aborting the pipeline.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
@@ -29,6 +37,7 @@ use crate::{fetch_resolutions_and_schedules, pile};
 pub struct BackfillReport {
     pub due: usize,
     pub fetched: usize,
+    pub failed: usize,
     pub activated: usize,
 }
 
@@ -62,7 +71,16 @@ pub async fn run_backfill(
         ReqwestFetcher::new(client),
     )
     .with_concurrency(config.polymarket_concurrency);
-    fetcher.fetch_all(&wallets, cache).await?;
+    let outcome = fetcher.fetch_all(&wallets, cache).await?;
+    let failed_set: HashSet<WalletAddress> = outcome.failed.iter().copied().collect();
+    let failed_count = outcome.failed.len();
+    if failed_count > 0 {
+        tracing::warn!(
+            attempted = outcome.attempted,
+            failed = failed_count,
+            "backfill: partial fetch — continuing pipeline; failed wallets will be retried on next run"
+        );
+    }
 
     // Resolutions + schedules for any newly-seen market_ids. Existing per-source
     // cursors (`polygon_ctf_last_block`, `clob_closed`) keep this incremental.
@@ -76,18 +94,45 @@ pub async fn run_backfill(
     cache.refresh_trade_counts()?;
     let activated = pile::apply_activation_rules(cache)?;
 
-    // Stamp last_polymarket_fetch_at = now for every wallet we attempted, even
-    // ones that errored — they're stale enough that re-tries in the next run
-    // would re-burn the same Polymarket request budget.
+    // Stamp last_polymarket_fetch_at = now ONLY for successful wallets.
+    // Failed wallets keep their prior (typically NULL) value so select_backfill_due
+    // returns them again on the next run — the 3-known-IDs early-stop makes the
+    // re-fetch cheap when (most of) their trades are already cached.
     let stamp_now = OffsetDateTime::now_utc().unix_timestamp();
     for hex in &due_hexes {
+        let wallet = match WalletAddress::from_hex(hex) {
+            Ok(w) => w,
+            // Unparseable wallet_hex was already filtered out of `wallets` above
+            // (failed to enter PolymarketBulkFetcher); skip the stamp too.
+            Err(_) => continue,
+        };
+        if failed_set.contains(&wallet) {
+            continue;
+        }
         cache.update_last_polymarket_fetch(hex, stamp_now)?;
     }
 
-    tracing::info!(due, activated, "backfill: complete");
+    let fetched = wallets.len().saturating_sub(failed_count);
+    tracing::info!(
+        due,
+        fetched,
+        failed = failed_count,
+        activated,
+        "backfill: complete"
+    );
+
+    // Soft-fail return: pipeline ran, successful wallets stamped, but exit code
+    // signals partial failure so operators / systemd notice.
+    if failed_count > 0 {
+        return Err(BootstrapError::PartialFetch {
+            failed_wallets: failed_count,
+        });
+    }
+
     Ok(BackfillReport {
         due,
-        fetched: wallets.len(),
+        fetched,
+        failed: failed_count,
         activated,
     })
 }

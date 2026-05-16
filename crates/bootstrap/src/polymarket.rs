@@ -18,7 +18,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -70,6 +69,27 @@ pub struct PolymarketBulkFetcher<F: PageFetcher> {
     concurrency: usize,
 }
 
+/// Per-batch result of [`PolymarketBulkFetcher::fetch_all`].
+///
+/// Per-wallet errors are in-band; the caller decides whether partial success is
+/// acceptable. Catastrophic errors (cache mutex poison, etc.) still propagate
+/// as `Err` on the outer `Result`.
+#[derive(Debug, Clone)]
+pub struct FetchOutcome {
+    /// Number of wallets in the input batch.
+    pub attempted: usize,
+    /// Wallets whose trades could not be fetched or written to SQLite. Their
+    /// progress was rolled back per-wallet; the rest of the batch succeeded.
+    pub failed: Vec<WalletAddress>,
+}
+
+impl FetchOutcome {
+    /// Number of wallets whose trades were successfully fetched and persisted.
+    pub fn succeeded_count(&self) -> usize {
+        self.attempted.saturating_sub(self.failed.len())
+    }
+}
+
 impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     pub fn new(base_url: String, fetcher: F) -> Self {
         Self {
@@ -92,10 +112,18 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// retried indefinitely at the page level (sleeping `Retry-After` seconds)
     /// so no wallet is ever skipped due to rate limiting.
     ///
-    /// Returns `Err(BootstrapError::PartialFetch)` if any wallet's trades could
-    /// not be fetched (non-recoverable network/parse error) or written to SQLite.
-    /// All wallets are attempted before the error is returned; re-running the
-    /// bootstrap will retry only the wallets that are missing from the cache.
+    /// Per-wallet errors (non-recoverable network/parse error, SQLite insert failure)
+    /// are **not** returned as `Err` — they're captured in [`FetchOutcome::failed`].
+    /// This lets callers decide per-use-case how to handle partial success:
+    ///
+    /// - The legacy `lib.rs::run()` pipeline checks `outcome.failed.is_empty()` and
+    ///   errors on partial fetch (preserving prior behaviour).
+    /// - `backfill.rs::run_backfill` continues the post-fetch pipeline
+    ///   (resolutions + activation + per-wallet timestamp stamps for the *successful*
+    ///   wallets) and surfaces the partial-fetch error only at the very end.
+    ///
+    /// `Err` is reserved for catastrophic failures the caller cannot recover from
+    /// (none are currently emitted from this method; future internal-bug surfaces).
     ///
     /// Trades are committed to SQLite per-wallet inside a single transaction.
     /// SQLite WAL mode provides per-commit durability — no manual checkpointing
@@ -104,9 +132,9 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         &self,
         wallets: &[WalletAddress],
         cache: &mut WalletCache,
-    ) -> Result<(), BootstrapError> {
+    ) -> Result<FetchOutcome, BootstrapError> {
         let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);
-        let failed = Arc::new(AtomicUsize::new(0));
+        let failed: Arc<Mutex<Vec<WalletAddress>>> = Arc::new(Mutex::new(Vec::new()));
 
         stream::iter(wallets.iter().copied())
             .for_each_concurrent(self.concurrency, |wallet| {
@@ -134,7 +162,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                                     error = %e,
                                     "polymarket: cache insert failed — trades for this wallet will be missing"
                                 );
-                                failed.fetch_add(1, Ordering::Relaxed);
+                                failed.lock().await.push(wallet);
                             }
                         }
                         Ok(_) => {}
@@ -144,18 +172,20 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                                 error = %e,
                                 "polymarket: fetch failed — trades for this wallet will be missing"
                             );
-                            failed.fetch_add(1, Ordering::Relaxed);
+                            failed.lock().await.push(wallet);
                         }
                     }
                 }
             })
             .await;
 
-        let n = failed.load(Ordering::Relaxed);
-        if n > 0 {
-            return Err(BootstrapError::PartialFetch { failed_wallets: n });
-        }
-        Ok(())
+        let failed_vec = Arc::try_unwrap(failed)
+            .map_err(|_| BootstrapError::Internal)?
+            .into_inner();
+        Ok(FetchOutcome {
+            attempted: wallets.len(),
+            failed: failed_vec,
+        })
     }
 
     /// Fetch trades not already in `known_ids` for a single wallet via two-phase cursor walk.
@@ -781,22 +811,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_all_returns_partial_fetch_error_when_wallet_fails() {
-        // PASS: fetch_all returns Err(PartialFetch) when a wallet's page URL has no fixture
-        //       (simulates a network/API failure after all retries).
-        // FAIL: fetch_all returns Ok — data loss is silently swallowed.
+    async fn fetch_all_returns_outcome_with_failed_wallet() {
+        // PASS: fetch_all returns Ok(FetchOutcome) listing the failed wallet by address.
+        //       Per-wallet failures are in-band so callers (run_backfill) can decide
+        //       whether to fail-soft or hard.
+        // FAIL: fetch_all returns Err on per-wallet failure (legacy behaviour) — would
+        //       abort callers that want to continue the pipeline.
         let wallet = wallet_a();
         let fetcher = FixtureFetcher::new(HashMap::new()); // no fixture → Fatal error
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
         let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
-        let result = bulk.fetch_all(&[wallet], &mut cache).await;
+        let outcome = bulk
+            .fetch_all(&[wallet], &mut cache)
+            .await
+            .expect("Ok with FetchOutcome");
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(
+            outcome.failed,
+            vec![wallet],
+            "failed wallet must be exposed"
+        );
+        assert_eq!(outcome.succeeded_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_all_mixed_success_returns_only_failed_wallet() {
+        // PASS: in a 2-wallet batch where one wallet has a fixture and one does not,
+        //       FetchOutcome.failed contains only the missing-fixture wallet, the
+        //       successful wallet's trades are persisted, succeeded_count == 1.
+        // FAIL: failed list contains the successful wallet, OR trades from the
+        //       successful wallet are missing from the cache.
+        let wallet_ok = wallet_a();
+        let wallet_fail =
+            WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+
+        // Cold-start URL only for wallet_ok with one tiny page (partial → stops).
+        let mut responses = HashMap::new();
+        responses.insert(trade_url_cold(wallet_ok), page_json_n(3, 0, 1_700_000_000));
+        // wallet_fail's URL has no fixture → FixtureFetcher returns Fatal.
+
+        let fetcher = FixtureFetcher::new(responses);
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+
+        let outcome = bulk
+            .fetch_all(&[wallet_ok, wallet_fail], &mut cache)
+            .await
+            .expect("Ok with FetchOutcome");
+
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(
+            outcome.failed,
+            vec![wallet_fail],
+            "only wallet_fail must fail"
+        );
+        assert_eq!(outcome.succeeded_count(), 1);
+        // Successful wallet's trades persisted.
+        assert_eq!(
+            cache.trade_count(),
+            3,
+            "wallet_ok's 3 trades must be cached"
+        );
+        // Failed wallet has no trades.
+        let fail_ids = cache.known_trade_ids(&wallet_fail.to_string());
         assert!(
-            matches!(
-                result,
-                Err(BootstrapError::PartialFetch { failed_wallets: 1 })
-            ),
-            "non-recoverable fetch error must surface as PartialFetch, got: {result:?}"
+            fail_ids.is_empty(),
+            "wallet_fail must have no cached trades"
         );
     }
 

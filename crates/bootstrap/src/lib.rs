@@ -239,8 +239,20 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
              cache may not reflect trades after the last full run"
         );
     } else {
-        fetcher.fetch_all(&wallets, &mut cache).await?;
-        tracing::info!(wallets = wallets.len(), "bootstrap: trade fetch complete");
+        let outcome = fetcher.fetch_all(&wallets, &mut cache).await?;
+        tracing::info!(
+            attempted = outcome.attempted,
+            failed = outcome.failed.len(),
+            "bootstrap: trade fetch complete"
+        );
+        // Preserve prior behaviour: legacy `run()` pipeline errors on any failure.
+        // The fail-soft semantics are scoped to `backfill::run_backfill` (issue #166
+        // post-mortem follow-up).
+        if !outcome.failed.is_empty() {
+            return Err(BootstrapError::PartialFetch {
+                failed_wallets: outcome.failed.len(),
+            });
+        }
     }
 
     // 2b. Fetch funder edges via Etherscan — time-invariant once block range is finalized.

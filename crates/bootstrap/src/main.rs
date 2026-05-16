@@ -76,10 +76,19 @@ async fn main() {
                     tracing::info!(
                         due = r.due,
                         fetched = r.fetched,
+                        failed = r.failed,
                         activated = r.activated,
                         "backfill: complete"
                     );
                     0
+                }
+                Err(e @ pe_bootstrap::error::BootstrapError::PartialFetch { .. }) => {
+                    // Soft-fail: pipeline ran, successful wallets stamped, post-fetch
+                    // steps (resolutions, refresh_trade_counts, apply_activation_rules)
+                    // completed. Failed wallets stayed NULL and will be retried by the
+                    // next backfill run. Non-zero exit so systemd / operators notice.
+                    eprintln!("backfill: partial: {e} — failed wallets will retry on next run");
+                    2
                 }
                 Err(e) => {
                     eprintln!("backfill: fatal: {e}");
