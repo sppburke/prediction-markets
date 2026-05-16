@@ -11,7 +11,7 @@ use pe_source_onchain_polygon::contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    WalletSource,
+    DeltaMode, WalletSource,
     error::BootstrapError,
     filter::{
         DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION, DEFAULT_MIN_CLOSED_TRADES,
@@ -31,6 +31,9 @@ const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
 const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
+// Issue #176: delta-backfill confirmations + paranoia staleness window.
+const DEFAULT_POLYGON_CTF_CONFIRMATIONS: u64 = 256;
+const DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS: i64 = 604_800;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -347,6 +350,40 @@ pub struct BootstrapConfig {
         alias = "bootstrap_known_wallets_dune_table"
     )]
     pub known_wallets_dune_table: String,
+
+    // ── Delta-backfill (issue #176) ──────────────────────────────────────────
+    /// Delta-backfill mode for `pe-bootstrap backfill`. Default `Shadow` runs
+    /// the on-chain scan alongside the legacy full fetch and writes a
+    /// `delta_audit` row for every wallet with new trades OR in the delta set
+    /// — operators flip to `Delta` after the audit table is empty of
+    /// `DELTA_MISS` rows. See [`DeltaMode`] for full semantics.
+    /// `PE_BOOTSTRAP_POLYMARKET_DELTA_MODE` overrides (`"off"`/`"shadow"`/`"delta"`).
+    #[serde(default, alias = "bootstrap_polymarket_delta_mode")]
+    pub polymarket_delta_mode: DeltaMode,
+
+    /// Polygon confirmation depth (blocks) the delta scanner subtracts from the
+    /// chain head to derive `to_block`. 256 blocks ≈ 8.5 min on Polygon's 2 s
+    /// blocktime — covers worst-case observed reorg depth. Canonical default
+    /// in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+    /// `PE_BOOTSTRAP_POLYGON_CTF_CONFIRMATIONS` overrides.
+    #[serde(
+        default = "default_polygon_ctf_confirmations",
+        alias = "bootstrap_polygon_ctf_confirmations"
+    )]
+    pub polygon_ctf_confirmations: u64,
+
+    /// Paranoia staleness window (seconds) for the weekly full-fetch backstop.
+    /// Each daily backfill auto-unions wallets where `last_polymarket_full_at`
+    /// is NULL or older than this many seconds into the fetch set, regardless
+    /// of `polymarket_delta_mode`. Default 604_800 (7 days) bounds the worst
+    /// case if the on-chain scanner ever misses a wallet.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+    /// `PE_BOOTSTRAP_POLYMARKET_FULL_FETCH_STALENESS_SECS` overrides.
+    #[serde(
+        default = "default_polymarket_full_fetch_staleness_secs",
+        alias = "bootstrap_polymarket_full_fetch_staleness_secs"
+    )]
+    pub polymarket_full_fetch_staleness_secs: i64,
 }
 
 impl BootstrapConfig {
@@ -437,6 +474,14 @@ const fn default_polygon_ctf_chunk_blocks() -> u64 {
     DEFAULT_POLYGON_CTF_CHUNK_BLOCKS
 }
 
+const fn default_polygon_ctf_confirmations() -> u64 {
+    DEFAULT_POLYGON_CTF_CONFIRMATIONS
+}
+
+const fn default_polymarket_full_fetch_staleness_secs() -> i64 {
+    DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS
+}
+
 // ── Wallet pile (issue #166) ──────────────────────────────────────────────────
 
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
@@ -508,6 +553,9 @@ impl Default for BootstrapConfig {
             backfill_limit: default_backfill_limit(),
             weekly_limit: default_weekly_limit(),
             known_wallets_dune_table: default_known_wallets_dune_table(),
+            polymarket_delta_mode: DeltaMode::default(),
+            polygon_ctf_confirmations: default_polygon_ctf_confirmations(),
+            polymarket_full_fetch_staleness_secs: default_polymarket_full_fetch_staleness_secs(),
         }
     }
 }

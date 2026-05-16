@@ -42,6 +42,7 @@
 pub mod connector;
 pub mod contracts;
 pub mod decoder;
+pub mod eth_logs;
 pub mod etherscan;
 pub mod event;
 pub mod funder_discovery;
@@ -49,10 +50,12 @@ pub mod live;
 pub mod wallet_enumeration;
 
 pub use connector::PolygonReplayConnector;
+pub use eth_logs::{AlloyChainLogFetcher, ChainLogFetcher, PolygonRpcError, eth_get_logs_bisect};
 pub use etherscan::{EtherscanFunderLookup, HttpFetcher};
 pub use event::{ExternalAddressKind, PolygonEvent, PolygonEventError, TxHash};
 pub use funder_discovery::{
     BlockRange, EthGetLogsLookup, FunderDiscoveryError, FunderLookup, discover_to_depth,
+    topic_to_wallet, wallet_to_topic,
 };
 pub use live::{LivePolygonConnector, LivePolygonError, PolygonConnectorConfig};
 pub use wallet_enumeration::{EnumerationConfig, EnumerationError, PolymarketTraderEnumeration};

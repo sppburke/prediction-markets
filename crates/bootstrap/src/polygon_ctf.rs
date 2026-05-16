@@ -15,11 +15,12 @@
 
 use alloy::primitives::{B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::{BlockNumberOrTag, Filter, Log};
+use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolValue;
 use pe_source_onchain_polygon::contracts::{CTF, TOPIC_CONDITION_RESOLUTION};
+use pe_source_onchain_polygon::eth_get_logs_bisect;
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cache::WalletCache;
 use crate::error::BootstrapError;
@@ -103,10 +104,23 @@ pub async fn scan_resolutions(
     let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
     let mut inserted = 0usize;
     let mut block = from_block;
+    let resolution_filter = Filter::new()
+        .address(CTF)
+        .event_signature(TOPIC_CONDITION_RESOLUTION);
     while block <= to {
         // Inclusive upper bound for this chunk.
         let chunk_to = block.saturating_add(chunk_blocks - 1).min(to);
-        let logs = get_logs_with_bisect(&provider, block, chunk_to, chunk_blocks).await?;
+        let logs = eth_get_logs_bisect(
+            &provider,
+            resolution_filter.clone(),
+            block,
+            chunk_to,
+            MIN_CHUNK_BLOCKS,
+        )
+        .await
+        .map_err(|e| BootstrapError::PolygonCtf {
+            message: e.to_string(),
+        })?;
 
         for log in &logs {
             let Some((condition_id_hex, winner)) = decode_resolution_log(log) else {
@@ -134,63 +148,6 @@ pub async fn scan_resolutions(
 
     info!(inserted, "polygon_ctf: scan complete");
     Ok(inserted)
-}
-
-/// Issue a single `eth_getLogs` request for `[from, to]`, bisecting on
-/// "response too large" errors. The cap-error detection is heuristic
-/// (substring match) because providers return non-standard JSON-RPC
-/// error codes; the fallback halves the range until one of:
-///   - the request succeeds,
-///   - the range reaches [`MIN_CHUNK_BLOCKS`] (1 block) and still fails →
-///     propagate the error so the caller can lower `chunk_blocks` or
-///     switch RPC tiers.
-async fn get_logs_with_bisect<P: Provider>(
-    provider: &P,
-    from: u64,
-    to: u64,
-    initial_chunk: u64,
-) -> Result<Vec<Log>, BootstrapError> {
-    let filter = Filter::new()
-        .address(CTF)
-        .event_signature(TOPIC_CONDITION_RESOLUTION)
-        .from_block(BlockNumberOrTag::Number(from))
-        .to_block(BlockNumberOrTag::Number(to));
-
-    match provider.get_logs(&filter).await {
-        Ok(logs) => Ok(logs),
-        Err(e) => {
-            let span = to.saturating_sub(from).saturating_add(1);
-            if span <= MIN_CHUNK_BLOCKS {
-                return Err(BootstrapError::PolygonCtf {
-                    message: format!("eth_getLogs failed at minimum range [{from}, {to}]: {e}"),
-                });
-            }
-            let msg = e.to_string().to_lowercase();
-            // Heuristic: response-too-large / range-too-wide / log-limit-exceeded.
-            let is_cap = msg.contains("too large")
-                || msg.contains("too many")
-                || msg.contains("response size")
-                || msg.contains("limit exceeded")
-                || msg.contains("range");
-            if !is_cap {
-                return Err(BootstrapError::PolygonCtf {
-                    message: format!("eth_getLogs [{from}, {to}]: {e}"),
-                });
-            }
-            warn!(
-                from,
-                to,
-                error = %e,
-                "polygon_ctf: response cap hit, bisecting"
-            );
-            let mid = from.saturating_add(span / 2);
-            let mut left =
-                Box::pin(get_logs_with_bisect(provider, from, mid - 1, initial_chunk)).await?;
-            let right = Box::pin(get_logs_with_bisect(provider, mid, to, initial_chunk)).await?;
-            left.extend(right);
-            Ok(left)
-        }
-    }
 }
 
 /// Decode a `ConditionResolution` log into `(condition_id_hex, winner)`.

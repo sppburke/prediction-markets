@@ -112,6 +112,21 @@ CREATE TABLE IF NOT EXISTS source_cursor (
     updated_at INTEGER NOT NULL
 );
 
+-- Delta-backfill audit table (issue #176). One row per (run, wallet) where
+-- the wallet had at least one new trade OR appeared in the on-chain scan's
+-- delta_set this run. True-negative wallets (no activity, not in delta_set)
+-- produce no row so the audit table grows ~5–10% of the daily backfill size
+-- instead of full ~105k/day.
+CREATE TABLE IF NOT EXISTS delta_audit (
+    run_at_unix        INTEGER NOT NULL,
+    wallet_hex         TEXT    NOT NULL,
+    classification     TEXT    NOT NULL,
+    new_trades_fetched INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_at_unix, wallet_hex)
+);
+CREATE INDEX IF NOT EXISTS idx_delta_audit_classification
+    ON delta_audit(classification, new_trades_fetched);
+
 -- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
 -- `WalletAddress::Display`: `\"0x\" + 40 lowercase hex chars`.
 -- `source_bits`: bit0=wallet_set_json, bit1=trades, bit2=dune_csv,
@@ -170,22 +185,48 @@ impl WalletCache {
         // pre-migration row was inserted by the Gamma fetcher.
         add_source_column_if_missing(&conn, "market_resolutions")?;
         add_source_column_if_missing(&conn, "market_schedules")?;
+        // Migration (issue #176): add `last_polymarket_full_at` if absent. DBs
+        // created before this change keep NULL — picked up by the weekly
+        // paranoia full-fetch on first delta-mode run, which then stamps each
+        // successfully-fetched wallet. Mirrors the `event_at_unix` migration
+        // pattern (no DEFAULT clause; NULL means "needs full fetch").
+        let last_polymarket_full_at_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wallets') WHERE name='last_polymarket_full_at'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !last_polymarket_full_at_exists {
+            conn.execute_batch(
+                "ALTER TABLE wallets ADD COLUMN last_polymarket_full_at INTEGER NULL",
+            )?;
+        }
         Ok(Self { conn })
     }
 
     /// Insert trades not already present for `wallet_hex`. Idempotent on `source_trade_id`.
     ///
-    /// `trades` ordering is unimportant — `INSERT OR IGNORE` rejects duplicates by primary key.
-    /// All inserts run in a single transaction for atomicity and write batching.
+    /// Returns the count of rows actually inserted — `INSERT OR IGNORE`
+    /// returns 0 for duplicates and 1 for new rows, so the sum across the
+    /// batch is exactly the number of new trades persisted. Issue #176 uses
+    /// this count to populate `FetchOutcome::new_trades` for the delta-audit
+    /// `new_trades_fetched` column without a pre/post `MAX(timestamp_unix)`
+    /// snapshot pass.
+    ///
+    /// `trades` ordering is unimportant. All inserts run in a single
+    /// transaction for atomicity and write batching.
     pub fn insert_new(
         &mut self,
         wallet_hex: &str,
         trades: Vec<RawTrade>,
-    ) -> Result<(), BootstrapError> {
+    ) -> Result<usize, BootstrapError> {
         if trades.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let tx = self.conn.transaction()?;
+        let mut inserted: usize = 0;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO trades \
@@ -195,7 +236,7 @@ impl WalletCache {
             for t in &trades {
                 let contracts_i64 =
                     i64::try_from(t.contracts.0).map_err(|_| BootstrapError::Internal)?;
-                stmt.execute(params![
+                let rows = stmt.execute(params![
                     t.source_trade_id.0,
                     wallet_hex,
                     t.market_id.0.0,
@@ -205,10 +246,11 @@ impl WalletCache {
                     contracts_i64,
                     t.timestamp.0.unix_timestamp(),
                 ])?;
+                inserted = inserted.saturating_add(rows);
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(inserted)
     }
 
     /// Return all `source_trade_id`s known for `wallet_hex`, newest-first.
@@ -1236,6 +1278,71 @@ impl WalletCache {
         Ok(())
     }
 
+    /// Set `last_polymarket_full_at = now_unix` for a single wallet.
+    ///
+    /// Written by `backfill::run_backfill` after a Polymarket full-fetch
+    /// succeeds (the wallet was in the legacy due set or paranoia set, not
+    /// only in `delta_set`). Resets the 7-day paranoia clock for the wallet.
+    pub fn update_last_polymarket_full_at(
+        &mut self,
+        wallet_hex: &str,
+        now_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "UPDATE wallets SET last_polymarket_full_at = ?2 WHERE wallet_hex = ?1",
+            params![wallet_hex, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Select active wallets due for a Polymarket full-fetch (issue #176
+    /// paranoia backstop). Filters `is_active = 1` AND
+    /// (`last_polymarket_full_at IS NULL` OR `< now_unix - staleness_secs`).
+    /// Same NULLS-FIRST ordering as [`Self::select_backfill_due`].
+    pub fn wallets_due_for_full_fetch(
+        &self,
+        now_unix: i64,
+        staleness_secs: i64,
+    ) -> Result<Vec<String>, BootstrapError> {
+        let cutoff = now_unix - staleness_secs;
+        let mut stmt = self.conn.prepare(
+            "SELECT wallet_hex FROM wallets \
+             WHERE is_active = 1 \
+               AND (last_polymarket_full_at IS NULL OR last_polymarket_full_at < ?1) \
+             ORDER BY last_polymarket_full_at ASC NULLS FIRST, \
+                      dune_win_rate_bps DESC NULLS LAST, \
+                      dune_closed_markets DESC NULLS LAST",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Bulk-insert classification rows into the `delta_audit` table.
+    ///
+    /// Idempotent on `(run_at_unix, wallet_hex)` PK — re-running the same
+    /// classification pass is a no-op. Issue #176.
+    pub fn insert_delta_audit_rows(
+        &mut self,
+        rows: &[(i64, String, &'static str, i64)],
+    ) -> Result<(), BootstrapError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO delta_audit \
+                 (run_at_unix, wallet_hex, classification, new_trades_fetched) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (run_at, hex, class, count) in rows {
+                stmt.execute(params![run_at, hex, class, count])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Mark a wallet as infrastructure (sticky 0→1).
     pub fn mark_infra(&mut self, wallet_hex: &str) -> Result<(), BootstrapError> {
         self.conn.execute(
@@ -1376,6 +1483,14 @@ impl WalletCache {
     // integration tests under `tests/scenario_*.rs`. `expect` is allowed here
     // because these helpers are only used in test fixtures with controlled
     // inputs; a failure indicates a bug in the test itself.
+
+    /// Test/scenario-only raw `Connection` accessor for ad-hoc queries
+    /// against the cache (e.g. delta-audit assertions). Hidden behind the
+    /// same feature gate as the other test helpers.
+    #[cfg(any(test, feature = "scenario"))]
+    pub fn raw_conn_for_test(&self) -> &Connection {
+        &self.conn
+    }
 
     #[cfg(any(test, feature = "scenario"))]
     #[allow(clippy::expect_used)]
