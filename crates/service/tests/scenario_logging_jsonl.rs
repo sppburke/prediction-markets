@@ -100,42 +100,55 @@ fn error_field_does_not_collide_with_message_field() {
 }
 
 // ── Scenario B (regression for pre-#184 bug) ─────────────────────────────────
-// This test demonstrates what the OLD pattern would produce, as a sanity check
-// that the new pattern is structurally different. We use `tracing::warn!(%message, "X")`
-// (the buggy shape) and verify the duplicate-key issue: serde_json's default
-// parser takes the LAST occurrence, so the log-message text is silently
-// overwritten by the error payload. This is exactly what AP-3 / the gamma.rs
-// fix is preventing in production.
+// Demonstrates the EXACT pre-#184 production bug: a local var literally named
+// `message` (matching the gamma.rs `Err(SourceError::Fatal { message })`
+// destructuring shape) passed as `%message` collides with tracing's implicit
+// `fields.message` (the log message string). serde_json's default parser
+// takes the LAST occurrence on duplicate keys, so the log-message text is
+// silently overwritten by the error payload.
+//
+// PASS: the parsed `message` field equals the error-payload value (NOT the
+//       static log message string), proving the bug. This is the regression
+//       guard that locks in the requirement to use `error = %message`.
+// FAIL: behavior changes such that `message` field carries the static string,
+//       making the production-code-fix unnecessary (would indicate a
+//       tracing-subscriber upgrade silently fixed the collision).
 
 #[test]
-fn duplicate_message_key_demonstrates_pre_184_bug() {
+fn pre_184_pct_message_collision_overwrites_log_message() {
     let buf = Arc::new(Mutex::new(Vec::new()));
-    let message_local = "this is the error text";
+    // Var literally named `message` — matches the gamma.rs pre-fix pattern
+    // `Err(SourceError::Fatal { message }) => { tracing::warn!(%message, "..."); }`.
+    let message = "this is the error text";
 
     with_default(json_subscriber(buf.clone()), || {
-        // The buggy pattern: a local var named `message` passed as `%message`
-        // produces a field named `message` that aliases the implicit log-message
-        // field. tracing-subscriber emits the JSON object with BOTH keys (it
-        // does not deduplicate); serde_json's default parser picks the last one.
-        tracing::warn!(%message_local, "gamma: schedule fetch error, skipping");
+        // The exact buggy shape — `%message` with a var named `message`.
+        tracing::warn!(%message, "gamma: schedule fetch error, skipping");
     });
 
     let lines = parse_jsonl(&buf);
-    assert_eq!(lines.len(), 1);
+    assert_eq!(lines.len(), 1, "expected one JSONL line");
     let line = &lines[0];
 
-    // Sanity: the message_local field IS present and IS preserved (because the
-    // field name `message_local` doesn't collide with `message`).
-    assert_eq!(
-        line.get("message_local").and_then(Value::as_str),
-        Some(message_local),
-        "non-colliding field name preserves value"
-    );
-    // The static log message text remains intact (no collision).
+    // THE BUG: the `message` JSON field carries the ERROR value, NOT the log
+    // message text. The static log-message string has been silently overwritten
+    // because tracing-subscriber emitted both keys and serde_json took the
+    // last-wins value during parse. This is exactly what every production user
+    // of gamma.rs and clob.rs would have seen pre-#184.
     assert_eq!(
         line.get("message").and_then(Value::as_str),
-        Some("gamma: schedule fetch error, skipping")
+        Some(message),
+        "pre-184 bug: %message overwrites the static log-message string in JSON output"
     );
+    // And the static log-message text is GONE — there is no other field carrying it.
+    let static_text = "gamma: schedule fetch error, skipping";
+    for (key, value) in line.as_object().expect("JSON object") {
+        assert_ne!(
+            value.as_str(),
+            Some(static_text),
+            "static log-message text MUST NOT appear in any field — it was overwritten ({key} would not be expected)"
+        );
+    }
 }
 
 // ── Scenario C ───────────────────────────────────────────────────────────────
