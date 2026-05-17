@@ -1,6 +1,6 @@
 use pe_bootstrap::{
-    BootstrapConfig, backfill, cache::WalletCache, config, discovery, migrate,
-    parse_seed_as_of_env, run, seed_historical_snapshots, weekly,
+    BootstrapConfig, backfill, cache::WalletCache, config, discovery, parse_seed_as_of_env, run,
+    seed_historical_snapshots, weekly,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -17,7 +17,7 @@ async fn main() {
     // positional TOML path so a subcommand always wins. Subcommands accept an
     // optional `[toml-path]` second positional arg.
     let subcommand = first_arg.as_deref().and_then(|s| match s {
-        "migrate" | "discovery" | "backfill" | "weekly" => Some(s),
+        "discovery" | "backfill" | "weekly" => Some(s),
         _ => None,
     });
     if let Some(sub) = subcommand {
@@ -37,25 +37,6 @@ async fn main() {
             }
         };
         let exit = match sub {
-            "migrate" => match migrate::run_migrate_from_config(&bootstrap_config, &mut cache) {
-                Ok(r) => {
-                    tracing::info!(
-                        wallet_set = r.wallet_set_rows,
-                        trades = r.trades_rows,
-                        dune_csv = r.dune_csv_rows,
-                        infra = r.infra_rows,
-                        seeded_polymarket = r.last_polymarket_fetch_seeded,
-                        seeded_funder = r.last_funder_fetch_seeded,
-                        activated = r.activated,
-                        "migrate: complete"
-                    );
-                    0
-                }
-                Err(e) => {
-                    eprintln!("migrate: fatal: {e}");
-                    1
-                }
-            },
             "discovery" => match discovery::run_discovery(&bootstrap_config, &mut cache).await {
                 Ok(r) => {
                     tracing::info!(
@@ -111,9 +92,7 @@ async fn main() {
                     1
                 }
             },
-            _ => unreachable!(
-                "subcommand filter restricts to migrate / discovery / backfill / weekly"
-            ),
+            _ => unreachable!("subcommand filter restricts to discovery / backfill / weekly"),
         };
         std::process::exit(exit);
     }

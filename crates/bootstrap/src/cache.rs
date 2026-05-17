@@ -1477,6 +1477,19 @@ impl WalletCache {
         Ok(out?)
     }
 
+    /// Return every `wallet_hex` whose `source_bits` has at least one bit in
+    /// common with `bit_mask`. Issue #181: used by `run()` to scope per-wallet
+    /// trade fetch to the discovered-wallet subset (typically `SRC_WALLET_SET_JSON`),
+    /// avoiding the ~2.7M-row blowup of [`Self::all_pile_wallet_hexes`].
+    pub fn wallets_with_source_bit(&self, bit_mask: i64) -> Result<Vec<String>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT wallet_hex FROM wallets WHERE (source_bits & ?1) != 0")?;
+        let rows = stmt.query_map(params![bit_mask], |r| r.get::<_, String>(0))?;
+        let out: Result<Vec<_>, _> = rows.collect();
+        Ok(out?)
+    }
+
     // ── test-only escape hatches (issue #166 pile tests) ─────────────────────
     //
     // Gated on `cfg(test)` for unit tests and `feature = "scenario"` for

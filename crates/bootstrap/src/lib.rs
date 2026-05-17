@@ -61,10 +61,11 @@ use pe_trader_index::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use cache::WalletCache;
+use cache::{WalletCache, WalletUpsertRow};
 use dune::DuneClient;
 use error::BootstrapError;
 use filter::{FilterConfig, passes_filter, win_rate_bps};
+use pile::SRC_WALLET_SET_JSON;
 use polymarket::PolymarketBulkFetcher;
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
@@ -124,56 +125,32 @@ pub enum DeltaMode {
 ///
 /// Writes the watchlist as pretty-printed JSON to `config.output_path`.
 pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> {
-    // 1. Discover wallets — load from checkpoint if available; enumerate per-contract
-    //    and checkpoint after each (Etherscan) or all-at-once (Dune).
-    //    Legacy bare-array files (pre-checkpoint format) are upgraded in-place.
+    // Open the canonical SQLite cache up front — needed by both
+    // `auto_migrate_legacy` (issue #181) and every later step.
+    let mut cache = WalletCache::open(&config.cache_path)?;
+
+    // Issue #181: one-shot consolidation of legacy on-disk artifacts into
+    // SQLite. Detects `wallet_set.json` + `data/dune_csvs/*.csv`, ingests
+    // them, persists enumeration-progress markers to `source_cursor`, then
+    // deletes / archives the originals. After first successful post-deploy
+    // run, this is a near-no-op (two `Path::exists()` syscalls).
+    migrate::auto_migrate_legacy(config, &mut cache)?;
+
+    // 1. Discover wallets — read enum progress from SQLite, run enumeration
+    //    (Etherscan/Dune) to fill in any missing (topic, contract) pairs,
+    //    then read the working wallet list back from the cache.
     let wallets: Vec<WalletAddress> = {
-        let mut state = match wallet_set::load_state(&config.wallet_set_path)? {
-            Some(s) => s,
-            None => {
-                // Try legacy bare-array format written by pre-checkpoint binary.
-                match wallet_set::load(&config.wallet_set_path)? {
-                    Some(legacy) => {
-                        tracing::info!(
-                            count = legacy.len(),
-                            path = %config.wallet_set_path.display(),
-                            "bootstrap: upgrading legacy wallet set to checkpoint format"
-                        );
-                        let upgraded = wallet_set::WalletSetState {
-                            completed_contracts: ALL_EXCHANGE_CONTRACTS
-                                .iter()
-                                .map(|c| format!("0x{c:x}"))
-                                .collect(),
-                            wallets: legacy.iter().map(|w| w.to_string()).collect(),
-                            // Pre-#179 bare-array files are V1-only by
-                            // construction. Mark V1 as enumerated and let
-                            // the per-topic loop pick up V2 additively.
-                            enumerated_topic_hashes: vec![format!("{TOPIC_ORDER_FILLED_V1}")],
-                        };
-                        wallet_set::save_state(&config.wallet_set_path, &upgraded)?;
-                        upgraded
-                    }
-                    None => wallet_set::WalletSetState::default(),
-                }
-            }
-        };
+        let (mut completed_contracts, mut enumerated_topic_hashes) =
+            migrate::load_enum_state(&cache)?;
 
         let total_contracts = ALL_EXCHANGE_CONTRACTS.len();
         // Issue #179: enumeration is complete only when every contract AND
-        // every known `OrderFilled` topic version has been swept. A
-        // pre-#179 checkpoint will have `enumerated_topic_hashes.is_empty()`
-        // and fall into the `else` branch where the per-topic loop runs an
-        // additive V2 sweep (V1 is marked done by the legacy-upgrade block
-        // inside the Etherscan arm).
+        // every known `OrderFilled` topic version has been swept.
         let all_topics_done = ALL_ORDER_FILLED_TOPICS
             .iter()
-            .all(|h| state.enumerated_topic_hashes.contains(&format!("{h}")));
-        if state.completed_contracts.len() >= total_contracts && all_topics_done {
-            tracing::info!(
-                count = state.wallets.len(),
-                path = %config.wallet_set_path.display(),
-                "bootstrap: wallet discovery complete — skipping"
-            );
+            .all(|h| enumerated_topic_hashes.contains(&format!("{h}")));
+        if completed_contracts.len() >= total_contracts && all_topics_done {
+            tracing::info!("bootstrap: wallet discovery complete — skipping");
         } else {
             match &config.wallet_source {
                 WalletSource::Dune => {
@@ -199,20 +176,28 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         )
                         .await?;
                     tracing::info!(count = found.len(), "bootstrap: dune returned wallets");
-                    state.wallets = found.iter().map(|w| w.to_string()).collect();
+                    let rows: Vec<WalletUpsertRow> = found
+                        .iter()
+                        .map(|w| (w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None))
+                        .collect();
+                    cache.upsert_wallets_bulk(&rows)?;
                     // Mark all contracts complete so subsequent runs skip Dune.
-                    state.completed_contracts = ALL_EXCHANGE_CONTRACTS
+                    completed_contracts = ALL_EXCHANGE_CONTRACTS
                         .iter()
                         .map(|c| format!("0x{c:x}"))
                         .collect();
                     // Dune SQL covers all OrderFilled events across V1 and V2
                     // implicitly; mark every known topic as enumerated so the
                     // guard short-circuits next run instead of re-querying Dune.
-                    state.enumerated_topic_hashes = ALL_ORDER_FILLED_TOPICS
+                    enumerated_topic_hashes = ALL_ORDER_FILLED_TOPICS
                         .iter()
                         .map(|h| format!("{h}"))
                         .collect();
-                    wallet_set::save_state(&config.wallet_set_path, &state)?;
+                    migrate::save_enum_state(
+                        &mut cache,
+                        &completed_contracts,
+                        &enumerated_topic_hashes,
+                    )?;
                 }
                 WalletSource::Etherscan => {
                     let api_key = config
@@ -227,9 +212,9 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         from_block = config.wallet_from_block,
                         to_block,
                         operators = config.operator_addresses.len(),
-                        contracts_done = state.completed_contracts.len(),
+                        contracts_done = completed_contracts.len(),
                         contracts_total = total_contracts,
-                        topics_done = state.enumerated_topic_hashes.len(),
+                        topics_done = enumerated_topic_hashes.len(),
                         topics_total = ALL_ORDER_FILLED_TOPICS.len(),
                         "bootstrap: enumerating wallets via etherscan"
                     );
@@ -248,18 +233,20 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     // Set-membership (not `len()`) so adding a future V3
                     // contract to ALL_EXCHANGE_CONTRACTS does not silently
                     // match a legacy 4-entry list.
-                    let legacy_v1_done = state.enumerated_topic_hashes.is_empty()
+                    let legacy_v1_done = enumerated_topic_hashes.is_empty()
                         && ALL_EXCHANGE_CONTRACTS
                             .iter()
-                            .all(|c| state.completed_contracts.contains(&format!("0x{c:x}")));
+                            .all(|c| completed_contracts.contains(&format!("0x{c:x}")));
                     if legacy_v1_done {
                         tracing::info!(
                             "bootstrap: legacy checkpoint upgraded; V1 marked complete, V2 pending"
                         );
-                        state
-                            .enumerated_topic_hashes
-                            .push(format!("{TOPIC_ORDER_FILLED_V1}"));
-                        wallet_set::save_state(&config.wallet_set_path, &state)?;
+                        enumerated_topic_hashes.push(format!("{TOPIC_ORDER_FILLED_V1}"));
+                        migrate::save_enum_state(
+                            &mut cache,
+                            &completed_contracts,
+                            &enumerated_topic_hashes,
+                        )?;
                     }
                     // Partial-legacy state (e.g., crashed mid-V1 sweep) does
                     // NOT match `legacy_v1_done` and therefore triggers a
@@ -274,7 +261,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     // a per-(contract,topic) skip predicate.
                     for topic in &ALL_ORDER_FILLED_TOPICS {
                         let topic_hex = format!("{topic}");
-                        if state.enumerated_topic_hashes.contains(&topic_hex) {
+                        if enumerated_topic_hashes.contains(&topic_hex) {
                             tracing::info!(
                                 topic = %topic_hex,
                                 "bootstrap: topic already enumerated — skipping"
@@ -292,22 +279,32 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                 found = found.len(),
                                 "bootstrap: contract enumerated for topic"
                             );
-                            state.wallets.extend(found.iter().map(|w| w.to_string()));
-                            wallet_set::save_state(&config.wallet_set_path, &state)?;
+                            let rows: Vec<WalletUpsertRow> = found
+                                .iter()
+                                .map(|w| {
+                                    (w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None)
+                                })
+                                .collect();
+                            cache.upsert_wallets_bulk(&rows)?;
                         }
-                        state.enumerated_topic_hashes.push(topic_hex);
-                        wallet_set::save_state(&config.wallet_set_path, &state)?;
+                        enumerated_topic_hashes.push(topic_hex);
+                        migrate::save_enum_state(
+                            &mut cache,
+                            &completed_contracts,
+                            &enumerated_topic_hashes,
+                        )?;
                     }
                 }
             }
         }
 
-        // Deduplicate (per-contract sets may overlap at wallet level) and parse.
-        let mut seen = std::collections::HashSet::new();
-        state
-            .wallets
+        // Working wallet set for trade fetch — narrowly scoped to the
+        // discovered-wallet subset via `SRC_WALLET_SET_JSON` bit. CRITICAL:
+        // do NOT use `all_pile_wallet_hexes` which would expand the scope
+        // to the full 2.7M-row cache (issue #181 trade-fetch scope rule).
+        let hexes = cache.wallets_with_source_bit(SRC_WALLET_SET_JSON)?;
+        hexes
             .iter()
-            .filter(|h| seen.insert(h.as_str()))
             .filter_map(|h| {
                 WalletAddress::from_hex(h)
                     .map_err(|e| {
@@ -321,7 +318,6 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
     // 2. Fetch trade history — permanent cache (SQLite, WAL), incremental per run.
     //    On first run fetches full history. On subsequent runs fetches only trades
     //    newer than the newest cached id per wallet.
-    let mut cache = WalletCache::open(&config.cache_path)?;
     // Short pool_idle_timeout avoids reusing connections the server has silently
     // closed (Polymarket servers enforce per-IP connection limits under load).
     let client = reqwest::Client::builder()

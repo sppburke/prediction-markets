@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use pe_core_types::WalletAddress;
+use pe_source_onchain_polygon::contracts::{ALL_EXCHANGE_CONTRACTS, TOPIC_ORDER_FILLED_V1};
 
 use crate::cache::{WalletCache, WalletUpsertRow};
 use crate::config::BootstrapConfig;
@@ -134,6 +135,170 @@ fn dune_csv_dir(config: &BootstrapConfig) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// `source_cursor` key for the enumeration-progress migration (issue #181).
+/// JSON-encoded `Vec<String>` of lowercase-hex contract addresses.
+pub const CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS: &str = "wallet_enum_completed_contracts";
+
+/// `source_cursor` key for the enumeration-progress migration (issue #181).
+/// JSON-encoded `Vec<String>` of B256-Display topic hashes (each prefixed `0x`).
+pub const CURSOR_WALLET_ENUM_TOPIC_HASHES: &str = "wallet_enum_topic_hashes";
+
+/// Read enumeration progress from the SQLite `source_cursor` table. Returns
+/// `(completed_contracts, enumerated_topic_hashes)` — empty `Vec`s on missing
+/// keys (fresh install). The `enumerated_topic_hashes.is_empty()` case
+/// combined with a full `completed_contracts` is the legacy-V1-done sentinel
+/// — see `lib.rs::run()` for the V2-only re-enumeration logic that triggers.
+pub fn load_enum_state(cache: &WalletCache) -> Result<(Vec<String>, Vec<String>), BootstrapError> {
+    let contracts = cache
+        .get_source_cursor(CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS)
+        .map(|s| serde_json::from_str::<Vec<String>>(&s))
+        .transpose()?
+        .unwrap_or_default();
+    let topics = cache
+        .get_source_cursor(CURSOR_WALLET_ENUM_TOPIC_HASHES)
+        .map(|s| serde_json::from_str::<Vec<String>>(&s))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((contracts, topics))
+}
+
+/// Persist enumeration progress to the SQLite `source_cursor` table. Both
+/// vecs are JSON-encoded and written under the [`CURSOR_WALLET_ENUM_*`] keys.
+pub fn save_enum_state(
+    cache: &mut WalletCache,
+    completed_contracts: &[String],
+    enumerated_topic_hashes: &[String],
+) -> Result<(), BootstrapError> {
+    let contracts_json = serde_json::to_string(completed_contracts)?;
+    let topics_json = serde_json::to_string(enumerated_topic_hashes)?;
+    cache.set_source_cursor(CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS, &contracts_json)?;
+    cache.set_source_cursor(CURSOR_WALLET_ENUM_TOPIC_HASHES, &topics_json)?;
+    Ok(())
+}
+
+/// One-shot consolidation of legacy on-disk artifacts into the SQLite cache.
+/// Issue #181 — called at the top of `lib.rs::run()` on every invocation.
+/// Idempotent: detects legacy files on disk, ingests them, persists
+/// enumeration-progress markers to `source_cursor`, and removes/archives the
+/// originals so subsequent runs see no legacy state.
+///
+/// After successful return from a first deploy that had legacy artifacts:
+/// - `data/wallet_set.json` is deleted
+/// - `data/dune_csvs/*.csv` files are renamed to `*.csv.imported`
+/// - `source_cursor` carries [`CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS`] and
+///   [`CURSOR_WALLET_ENUM_TOPIC_HASHES`] keys with JSON-encoded values
+/// - the `wallets` table contains every wallet hex from the legacy sources
+///   with the correct `source_bits` accumulated
+///
+/// On subsequent runs (no legacy files present) the function is a near-no-op:
+/// two `Path::exists()` syscalls and the post-ingest no-op-on-empty
+/// SQLite passes (`ingest_trades_wallets`, `refresh_trade_counts`, etc.).
+///
+/// # Precondition
+/// `config.wallet_set_path` is set; `cache` is already opened. The function
+/// is sync because every underlying operation (SQL, fs) is sync.
+pub fn auto_migrate_legacy(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+) -> Result<(), BootstrapError> {
+    let mut did_ingest = false;
+
+    // 1. wallet_set.json → SQLite + source_cursor + delete.
+    if config.wallet_set_path.exists() {
+        did_ingest = true;
+        // Detect file shape BEFORE ingest so we know what enum-state to persist.
+        let (contracts, topics) = match wallet_set::load_state(&config.wallet_set_path)? {
+            Some(state) => {
+                // Checkpoint format (pre-#179 with empty `enumerated_topic_hashes`
+                // via `#[serde(default)]`, OR post-#179 with both topics populated).
+                (state.completed_contracts, state.enumerated_topic_hashes)
+            }
+            None => {
+                // Bare-array legacy format (PR #68). V1-only by construction;
+                // synthesize the same V1-done state the prior `lib.rs:140-148`
+                // upgrade path encoded so downstream `legacy_v1_done` detection
+                // (now via the source_cursor read) stays identical.
+                let contracts = ALL_EXCHANGE_CONTRACTS
+                    .iter()
+                    .map(|c| format!("0x{c:x}"))
+                    .collect();
+                let topics = vec![format!("{TOPIC_ORDER_FILLED_V1}")];
+                (contracts, topics)
+            }
+        };
+        let rows = ingest_wallet_set(cache, &config.wallet_set_path)?;
+        tracing::info!(
+            rows,
+            path = %config.wallet_set_path.display(),
+            "auto_migrate_legacy: wallet_set.json ingested"
+        );
+        save_enum_state(cache, &contracts, &topics)?;
+        std::fs::remove_file(&config.wallet_set_path)?;
+        tracing::info!(
+            path = %config.wallet_set_path.display(),
+            "auto_migrate_legacy: wallet_set.json deleted; enum-progress persisted to source_cursor"
+        );
+    }
+
+    // 2. data/dune_csvs/*.csv → SQLite + rename to .csv.imported.
+    if let Some(dir) = dune_csv_dir(config) {
+        did_ingest = true;
+        let counts = ingest_dune_csvs(cache, &dir)?;
+        tracing::info!(
+            non_infra = counts.0,
+            infra = counts.1,
+            dir = %dir.display(),
+            "auto_migrate_legacy: dune CSVs ingested"
+        );
+        // Rename each ingested .csv to .csv.imported so the next run skips it
+        // (ingest_dune_csvs's extension filter `!= Some("csv")` excludes
+        // `.imported` automatically). Non-fatal on per-file rename failure so
+        // a single permissions edge case doesn't abort the migration.
+        let entries = std::fs::read_dir(&dir)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("csv") {
+                continue;
+            }
+            let archived = path.with_extension("csv.imported");
+            if let Err(e) = std::fs::rename(&path, &archived) {
+                tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "auto_migrate_legacy: rename to .imported failed; file will re-ingest on next run (idempotent)"
+                );
+            }
+        }
+    }
+
+    // 3. Post-ingest sequence — matches `run_migrate` exactly so the
+    //    consolidated path is functionally equivalent to invoking
+    //    `pe-bootstrap migrate` once. GATED on `did_ingest` because each
+    //    helper issues a full-table UPDATE against the ~2.7M-row `wallets`
+    //    table; running them on every steady-state `run()` (after the
+    //    one-shot migration has fired) would add multi-second per-run cost
+    //    for zero state change. The pre-existing `backfill::run_backfill`
+    //    already calls `apply_activation_rules` on its own cadence so the
+    //    sticky 0→1 activation gate keeps firing for newly-active wallets.
+    if did_ingest {
+        let trades_rows = ingest_trades_wallets(cache)?;
+        let trade_count_refreshed = cache.refresh_trade_counts()?;
+        let last_polymarket_fetch_seeded = cache.seed_last_polymarket_fetch_from_trades()?;
+        let last_funder_fetch_seeded = cache.seed_last_funder_fetch_from_done()?;
+        let activated = pile::apply_activation_rules(cache)?;
+        tracing::info!(
+            trades_rows,
+            trade_count_refreshed,
+            last_polymarket_fetch_seeded,
+            last_funder_fetch_seeded,
+            activated,
+            "auto_migrate_legacy: post-ingest sequence complete"
+        );
+    }
+
+    Ok(())
 }
 
 fn ingest_wallet_set(cache: &mut WalletCache, path: &Path) -> Result<usize, BootstrapError> {

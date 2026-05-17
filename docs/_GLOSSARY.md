@@ -321,16 +321,30 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `wallet_enum_max_backoff_secs` | 60 | Cap on retry backoff for transient enumeration errors. |
 | `wallet_enum_max_attempts` | 6 | Maximum retry attempts per `eth_getLogs` call before failing. |
 | `bootstrap_all_order_filled_topics` | `pe_source_onchain_polygon::contracts::ALL_ORDER_FILLED_TOPICS` | Canonical "what to scan" set used by every `OrderFilled` consumer (`polygon_ctf_delta::scan_active_wallets`, `wallet_enumeration::PolymarketTraderEnumeration`). Currently `[V1, V2]`. Hex values live in `contracts.rs` with self-validating keccak tests — the canonical source. Extending this array adds the new topic to every consumer automatically and triggers an additive Etherscan re-sweep on the next bootstrap run (issue #179). |
+| `wallet_enum_completed_contracts` (cursor) | `"wallet_enum_completed_contracts"` | `source_cursor` table key holding JSON-encoded `Vec<String>` of lowercase-hex contract addresses fully enumerated. Issue #181. Equivalent to the now-deleted `WalletSetState.completed_contracts` field. |
+| `wallet_enum_topic_hashes` (cursor) | `"wallet_enum_topic_hashes"` | `source_cursor` table key holding JSON-encoded `Vec<String>` of B256-Display topic hashes (each prefixed `0x`) fully enumerated. Issue #181. Equivalent to the now-deleted `WalletSetState.enumerated_topic_hashes` field. |
 
-**`WalletSetState.enumerated_topic_hashes` migration semantics (issue #179).**
-The wallet-set checkpoint format carries an `enumerated_topic_hashes: Vec<String>`
-field with `#[serde(default)]`. Pre-#179 JSON files have no such field; they
-load with an empty `Vec`, which the bootstrap orchestrator combines with a
-full `completed_contracts` set to detect "legacy V1-only complete; V2 enumeration
-pending" via set-membership over `ALL_EXCHANGE_CONTRACTS` (not `len()`, so a
-future V3 contract addition does not silently match a 4-entry legacy list).
-Partial-legacy state (e.g. crashed mid-V1 sweep) does NOT match the detector
-and triggers a full additive sweep of every `(topic, contract)` pair.
+**Enumeration progress migration (issue #181).**
+The `wallet_set.json` checkpoint file is consolidated into the SQLite cache on
+first post-deploy run via `migrate::auto_migrate_legacy`. The progress fields
+(`completed_contracts`, `enumerated_topic_hashes`) move from the JSON file to
+two `source_cursor` rows (keys above). Wallet hexes move into the `wallets`
+table with `SRC_WALLET_SET_JSON` source bit. Then the JSON file is **deleted**.
+Subsequent runs read enumeration progress via `migrate::load_enum_state`,
+which returns `(vec![], vec![])` on missing keys (fresh install). The
+"legacy V1-done" detection (pre-#179 checkpoint had full
+`completed_contracts` + empty `enumerated_topic_hashes`) is preserved across
+the migration by `auto_migrate_legacy` synthesizing the V1-topic-done state
+when ingesting bare-array files, and by `lib.rs::run()`'s set-membership
+check over `ALL_EXCHANGE_CONTRACTS` for pre-#179 checkpoints.
+
+**Trade-fetch scope (issue #181).**
+After consolidation, `lib.rs::run()` reads the per-wallet trade-fetch list via
+`cache.wallets_with_source_bit(SRC_WALLET_SET_JSON)` — narrowly scoped to
+wallets discovered via Etherscan/Dune-SQL/legacy migration. Do NOT use
+`cache.all_pile_wallet_hexes()` (the full 2.7M-row pile including Dune CSV
+imports) for trade fetch — that path would explode the per-wallet Polymarket
+API call count by ~54×.
 
 ### Operator graph
 
