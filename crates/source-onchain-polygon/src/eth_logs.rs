@@ -84,19 +84,17 @@ pub async fn eth_get_logs_bisect<P: Provider>(
         match provider.get_logs(&req_filter).await {
             Ok(logs) => return Ok(logs),
             Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                let is_rate_limit = msg.contains("429")
-                    || msg.contains("compute units")
-                    || msg.contains("throttle")
-                    || msg.contains("too many requests")
-                    || msg.contains("rate limit");
-                if is_rate_limit && backoff_secs <= RATE_LIMIT_MAX_BACKOFF_SECS {
+                let msg = e.to_string();
+                if let Some(kind) = classify_transient_error(&msg)
+                    && backoff_secs <= RATE_LIMIT_MAX_BACKOFF_SECS
+                {
                     tracing::warn!(
                         from,
                         to,
                         backoff_secs,
+                        kind = kind.as_str(),
                         error = %e,
-                        "polygon eth_getLogs: rate-limited, retrying with backoff"
+                        "polygon eth_getLogs: transient failure, retrying with backoff"
                     );
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = backoff_secs.saturating_mul(2);
@@ -149,6 +147,66 @@ pub async fn eth_get_logs_bisect<P: Provider>(
     let right = Box::pin(eth_get_logs_bisect(provider, filter, mid, to, min_chunk)).await?;
     left.extend(right);
     Ok(left)
+}
+
+/// Classification of which transient error class a `Provider::get_logs`
+/// failure falls into. Used by [`eth_get_logs_bisect`] to decide whether
+/// to retry with exponential backoff vs propagate immediately. `None`
+/// means "not transient — propagate to caller for cap-vs-other classification."
+///
+/// The `as_str()` rendering goes into the tracing label so operators can
+/// distinguish rate-limit-induced waits from decode-flake-induced waits in
+/// production dashboards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransientErrorKind {
+    /// Provider-side throttling: HTTP 429, "compute units exceeded", "throttle",
+    /// "too many requests", "rate limit". Backoff is the canonical mitigation.
+    RateLimit,
+    /// Client-side deserialization failure on an apparently-2xx HTTP response:
+    /// truncated stream, gateway 5xx body served as HTML/text, mid-response TCP
+    /// reset, JSON parse hitting EOF or an unexpected token. Observed in
+    /// production 2026-05-17 during a Polymarket V2 dense-region sweep —
+    /// Alchemy occasionally served partial responses that alloy's JSON-RPC
+    /// client could not parse. Retry typically clears it.
+    DecodeError,
+}
+
+impl TransientErrorKind {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate-limited",
+            Self::DecodeError => "decode-error",
+        }
+    }
+}
+
+/// Classify an alloy `Provider` error message as a transient retry-worthy
+/// failure, or `None` if the caller should propagate / bisect instead.
+///
+/// Case-insensitive substring match against the rendered error. Keep new
+/// patterns narrow — false-positive transient classifications cause silent
+/// indefinite retry on errors that should fail fast (e.g. config issues).
+#[must_use]
+pub(crate) fn classify_transient_error(error_message: &str) -> Option<TransientErrorKind> {
+    let msg = error_message.to_lowercase();
+    if msg.contains("429")
+        || msg.contains("compute units")
+        || msg.contains("throttle")
+        || msg.contains("too many requests")
+        || msg.contains("rate limit")
+    {
+        return Some(TransientErrorKind::RateLimit);
+    }
+    if msg.contains("decoding response body")
+        || msg.contains("error decoding response")
+        || msg.contains("eof while parsing")
+        || msg.contains("expected value")
+        || msg.contains("unexpected end of stream")
+    {
+        return Some(TransientErrorKind::DecodeError);
+    }
+    None
 }
 
 /// Testability seam for code that scans Polygon logs (issue #176).
@@ -270,5 +328,99 @@ pub mod test_support {
                 message: msg,
             })
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod classify_transient_error_tests {
+    use super::{TransientErrorKind, classify_transient_error};
+
+    /// PASS: every documented rate-limit-class substring classifies as
+    ///       `RateLimit`, regardless of surrounding text or case.
+    /// FAIL: any rate-limit phrase returns `None` (would cause the
+    ///       bisect retry loop to skip backoff and propagate the error
+    ///       immediately — regression on the issue #176 retry behavior).
+    #[test]
+    fn rate_limit_phrases_classify_as_rate_limit() {
+        for raw in [
+            "HTTP 429 Too Many Requests",
+            "Compute Units exceeded for this minute",
+            "request was throttled by upstream",
+            "Too Many Requests, please slow down",
+            "Rate limit reached for /eth_getLogs",
+            // Mixed case + surrounding noise — the classifier lowercases first.
+            "Some prefix RATE LIMIT some suffix",
+        ] {
+            assert_eq!(
+                classify_transient_error(raw),
+                Some(TransientErrorKind::RateLimit),
+                "expected RateLimit classification for: {raw}"
+            );
+        }
+    }
+
+    /// PASS: every documented decode-flake substring classifies as
+    ///       `DecodeError`. These are the patterns observed in production
+    ///       2026-05-17 (alloy + Alchemy partial responses on dense V2 regions).
+    /// FAIL: any decode-flake phrase returns `None` — without retry the
+    ///       whole bootstrap arm fails and costs a ~12-min
+    ///       `refresh_trade_counts` replay on wrapper restart.
+    #[test]
+    fn decode_flake_phrases_classify_as_decode_error() {
+        for raw in [
+            "error decoding response body: expected value at line 1",
+            "error decoding response: io error",
+            "EOF while parsing a value at line 0 column 0",
+            "expected value at line 5 column 17",
+            "unexpected end of stream",
+            // The exact alloy message observed at 2026-05-17T20:42:19Z.
+            "eth_getLogs [86133528, 86134308]: error decoding response body",
+        ] {
+            assert_eq!(
+                classify_transient_error(raw),
+                Some(TransientErrorKind::DecodeError),
+                "expected DecodeError classification for: {raw}"
+            );
+        }
+    }
+
+    /// PASS: non-transient errors return `None` so the caller's
+    ///       cap-vs-propagate logic in `eth_get_logs_bisect` runs. Notably,
+    ///       cap-hit errors ("response too large", "limit exceeded", "range")
+    ///       MUST NOT classify as transient — they're handled by the bisect
+    ///       branch downstream.
+    /// FAIL: a cap-hit phrase returns `Some(_)` — would cause the bisect
+    ///       retry loop to retry the same too-large range indefinitely
+    ///       instead of halving.
+    #[test]
+    fn cap_hit_and_unknown_errors_return_none() {
+        for raw in [
+            "Log response size exceeded",
+            "block range is too large",
+            "query returned too many results",
+            "Connection refused",
+            "DNS resolution failed",
+            "",
+            "some random error nothing transient",
+        ] {
+            assert_eq!(
+                classify_transient_error(raw),
+                None,
+                "expected None classification for: {raw}"
+            );
+        }
+    }
+
+    /// PASS: `as_str()` produces the operator-visible label that ends up
+    ///       in the tracing record's `kind` field. Pins the rendering
+    ///       so a future enum addition doesn't silently break log parsers
+    ///       grepping for these literals.
+    #[test]
+    fn as_str_renders_stable_labels() {
+        assert_eq!(TransientErrorKind::RateLimit.as_str(), "rate-limited");
+        assert_eq!(TransientErrorKind::DecodeError.as_str(), "decode-error");
     }
 }

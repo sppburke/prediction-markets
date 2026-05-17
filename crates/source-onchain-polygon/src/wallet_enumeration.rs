@@ -48,7 +48,16 @@ use crate::funder_discovery::topic_to_wallet;
 /// on dense historical periods; the bootstrap loops over chunks and persists
 /// after each one, so this is also the crash-recovery granularity.
 /// Canonical default in `docs/_GLOSSARY.md` "Wallet enumeration defaults".
-pub const SCAN_CHUNK_BLOCKS: u64 = 500_000;
+///
+/// Tuned down from 500_000 → 50_000 on 2026-05-17 after observing the V2-topic
+/// dense region (blocks ~86.1M onwards, near the Polymarket V2 launch) drive
+/// `eth_get_logs_bisect` to ~9 levels of recursion per chunk, accumulating
+/// ~500 in-flight HTTP futures and growing RSS by ~700MB/5min toward an OOM
+/// cap. 50k upfront keeps the worst-case bisect tree to ~6 levels and ~50
+/// pending futures, bounding peak memory to sub-GB per chunk while saving
+/// the chunk-progress cursor (issue #188 Item 2) 10x more often for finer-
+/// grained crash recovery.
+pub const SCAN_CHUNK_BLOCKS: u64 = 50_000;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
