@@ -169,6 +169,13 @@ pub(crate) enum TransientErrorKind {
     /// Alchemy occasionally served partial responses that alloy's JSON-RPC
     /// client could not parse. Retry typically clears it.
     DecodeError,
+    /// Transport-level mid-stream failure: TCP RST mid-request, write to a
+    /// closed socket (`broken pipe`), upstream gateway closing a long-running
+    /// query (`connection closed before message completed`), or client-side
+    /// request timeout (reqwest `operation timed out` / `request timeout`).
+    /// Statistically common on long-running sweeps against a remote provider;
+    /// retrying typically succeeds on the next attempt. Issue #191.
+    TransportError,
 }
 
 impl TransientErrorKind {
@@ -177,6 +184,7 @@ impl TransientErrorKind {
         match self {
             Self::RateLimit => "rate-limited",
             Self::DecodeError => "decode-error",
+            Self::TransportError => "transport-error",
         }
     }
 }
@@ -187,6 +195,21 @@ impl TransientErrorKind {
 /// Case-insensitive substring match against the rendered error. Keep new
 /// patterns narrow — false-positive transient classifications cause silent
 /// indefinite retry on errors that should fail fast (e.g. config issues).
+///
+/// # Substring-collision discipline (issue #191)
+///
+/// New substrings must be checked against the cap-hit branch in
+/// [`eth_get_logs_bisect`] (matches `"too large"`, `"too many"`,
+/// `"response size"`, `"limit exceeded"`, `"range"`). A substring that
+/// matches BOTH a transient pattern AND a cap-hit pattern causes the retry
+/// loop to fire FIRST, retrying the same too-large range up to 6×32s
+/// before propagating — the bisect branch never gets to halve the range.
+///
+/// **Concretely**: bare `"timeout"` is EXCLUDED because Alchemy's
+/// `"Query timeout exceeded. Consider reducing your block range."` cap-hit
+/// error contains it; the narrower `"timed out"` is included instead
+/// (different conjugation, no collision). Verified against the production
+/// Alchemy error logged 2026-05-17T20:21:39Z.
 #[must_use]
 pub(crate) fn classify_transient_error(error_message: &str) -> Option<TransientErrorKind> {
     let msg = error_message.to_lowercase();
@@ -197,6 +220,22 @@ pub(crate) fn classify_transient_error(error_message: &str) -> Option<TransientE
         || msg.contains("rate limit")
     {
         return Some(TransientErrorKind::RateLimit);
+    }
+    // Issue #191 — transport-level mid-stream failures. Carefully chosen
+    // substrings to avoid colliding with the cap-hit branch (see the
+    // module doc-comment on substring-collision discipline above).
+    // Checked BEFORE the DecodeError branch because hyper's
+    // `"connection closed before message completed"` could plausibly be
+    // wrapped as a decode error in some alloy versions; classifying it
+    // as TransportError is more accurate for operator dashboards.
+    if msg.contains("connection reset")
+        || msg.contains("broken pipe")
+        || msg.contains("connection closed")
+        || msg.contains("timed out")
+        || msg.contains("request timeout")
+        || msg.contains("early eof")
+    {
+        return Some(TransientErrorKind::TransportError);
     }
     if msg.contains("decoding response body")
         || msg.contains("error decoding response")
@@ -403,6 +442,7 @@ mod classify_transient_error_tests {
             "query returned too many results",
             "Connection refused",
             "DNS resolution failed",
+            "could not connect to host",
             "",
             "some random error nothing transient",
         ] {
@@ -422,5 +462,65 @@ mod classify_transient_error_tests {
     fn as_str_renders_stable_labels() {
         assert_eq!(TransientErrorKind::RateLimit.as_str(), "rate-limited");
         assert_eq!(TransientErrorKind::DecodeError.as_str(), "decode-error");
+        assert_eq!(
+            TransientErrorKind::TransportError.as_str(),
+            "transport-error"
+        );
+    }
+
+    /// PASS: every documented transport-flake substring classifies as
+    ///       `TransportError`. These are textbook transient — TCP RST,
+    ///       broken pipe, upstream gateway close, client-side timeout.
+    ///       Retry typically clears them on the next attempt.
+    /// FAIL: any phrase returns `None` — without retry the entire bootstrap
+    ///       arm fails and costs a ~12-min `refresh_trade_counts` replay on
+    ///       wrapper restart.
+    #[test]
+    fn transport_phrases_classify_as_transport_error() {
+        for raw in [
+            "connection reset by peer",
+            "broken pipe",
+            "connection closed before message completed",
+            "operation timed out",
+            "request timed out waiting for response",
+            "request timeout",
+            "early eof while parsing",
+            // Mixed case — classifier lowercases first.
+            "Some prefix CONNECTION RESET some suffix",
+        ] {
+            assert_eq!(
+                classify_transient_error(raw),
+                Some(TransientErrorKind::TransportError),
+                "expected TransportError classification for: {raw}"
+            );
+        }
+    }
+
+    /// PASS: the EXACT production Alchemy cap-hit error string still classifies
+    ///       as `None` (caller's cap-hit branch handles it via bisect). This
+    ///       regression test prevents the substring-collision foot-gun called
+    ///       out in the classify_transient_error doc-comment.
+    ///
+    /// **Why this is critical**: the cap-hit string contains the substring
+    /// `"timeout"`. If a future contributor adds bare `"timeout"` to the
+    /// classifier without checking the cap-hit branch, this test will catch
+    /// it — the retry loop would fire on cap-hit-disguised-as-timeout, retry
+    /// the same too-large range up to 6×32s, then propagate without ever
+    /// bisecting. Dense-region sweeps would stall indefinitely.
+    /// FAIL: this regression test catching adding bare `"timeout"` is the
+    ///       point.
+    #[test]
+    fn alchemy_query_timeout_exceeded_must_not_classify_as_transient() {
+        // Verbatim from `/tmp/bootstrap-v3-onchain.out` line at 2026-05-17T20:21:39Z.
+        let alchemy_cap_hit_error = "HTTP error 400 with body: {\"jsonrpc\":\"2.0\",\"id\":330,\
+            \"error\":{\"code\":-32000,\"message\":\"Query timeout exceeded. Consider \
+            reducing your block range. Based on your parameters and the response size \
+            limit, this block range should work: [0x5223c98, 0x5223e80]\"}}";
+        assert_eq!(
+            classify_transient_error(alchemy_cap_hit_error),
+            None,
+            "Alchemy cap-hit error MUST classify as None (handled by bisect branch); \
+             classifying as transient causes indefinite retry on a too-large range"
+        );
     }
 }

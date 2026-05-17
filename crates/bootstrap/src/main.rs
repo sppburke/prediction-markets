@@ -1,6 +1,6 @@
 use pe_bootstrap::{
-    BootstrapConfig, backfill, cache::WalletCache, config, discovery, parse_seed_as_of_env, run,
-    seed_historical_snapshots, weekly,
+    BootstrapConfig, backfill, cache::WalletCache, config, discovery, lock, migrate,
+    parse_seed_as_of_env, run, seed_historical_snapshots, weekly,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -110,6 +110,90 @@ async fn main() {
             }
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: --print-config failed");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Issue #191 Item 2 — one-shot V1-attribution backfill subcommand.
+    // Clears the V1 topic from `enumerated_topic_hashes` + V1-keyed entries
+    // from `chunk_progress` so the next normal `pe-bootstrap` run re-does V1
+    // enumeration via the standard chunked path, populating
+    // `polymarket_contracts_seen` bit 0 for every wallet with V1 activity.
+    //
+    // Optional `[toml-path]` second positional arg matches the subcommand
+    // dispatch above. `--dry-run` flag (any third positional arg literally
+    // matching) prints what WOULD be cleared without modifying.
+    if first_arg.as_deref() == Some("--backfill-v1-attribution") {
+        let toml_arg = std::env::args().nth(2).map(std::path::PathBuf::from);
+        let dry_run = std::env::args().any(|a| a == "--dry-run");
+        let cfg = match config::load(toml_arg.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "backfill-v1-attribution: config error");
+                std::process::exit(1);
+            }
+        };
+        let mut cache = match WalletCache::open(&cfg.cache_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "backfill-v1-attribution: cache open failed");
+                std::process::exit(1);
+            }
+        };
+        let _lock = match lock::CacheMutationLock::acquire(&cfg.cache_path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(error = %e, "backfill-v1-attribution: lock acquire failed");
+                std::process::exit(1);
+            }
+        };
+        if dry_run {
+            // Preview path: load cursors, compute what WOULD be removed.
+            let (_, topics) = match migrate::load_enum_state(&cache) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "backfill-v1-attribution: load_enum_state failed");
+                    std::process::exit(1);
+                }
+            };
+            let progress = match migrate::load_chunk_progress(&cache) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = %e, "backfill-v1-attribution: load_chunk_progress failed");
+                    std::process::exit(1);
+                }
+            };
+            let v1_topic_hex = format!(
+                "{}",
+                pe_source_onchain_polygon::contracts::TOPIC_ORDER_FILLED_V1
+            );
+            let v1_prefix = format!("{v1_topic_hex}|");
+            let topic_present = topics.contains(&v1_topic_hex);
+            let chunks_to_remove = progress
+                .keys()
+                .filter(|k| k.starts_with(&v1_prefix))
+                .count();
+            print!(
+                "DRY RUN: would clear V1 topic from enumerated_topic_hashes (present={topic_present}) \
+                 and {chunks_to_remove} entries from chunk_progress.\n\
+                 Re-run without --dry-run to apply.\n"
+            );
+            return;
+        }
+        match migrate::reset_v1_topic_cursors(&mut cache) {
+            Ok((topic_removed, chunks_removed)) => {
+                print!(
+                    "Cleared V1 topic from enumerated_topic_hashes (was_present={topic_removed}) \
+                     and {chunks_removed} entries from chunk_progress.\n\
+                     Run pe-bootstrap normally to re-enumerate V1; the per-chunk UPSERT will \
+                     populate polymarket_contracts_seen bit 1 for every wallet that has V1 \
+                     OrderFilled activity.\n"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "backfill-v1-attribution: reset failed");
                 std::process::exit(1);
             }
         }
