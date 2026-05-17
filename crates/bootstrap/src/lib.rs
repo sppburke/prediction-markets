@@ -26,6 +26,7 @@ pub mod dune;
 pub mod error;
 pub mod filter;
 pub mod gamma;
+pub mod lock;
 pub mod migrate;
 pub mod operator_audit;
 pub mod pile;
@@ -213,6 +214,16 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     )?;
                 }
                 WalletSource::OnChain => {
+                    // Issue #191 Item 2 — defensive cache-mutation lock for
+                    // the OnChain arm. The arm reads chunk_progress at line
+                    // ~283 below and writes it back per-chunk over potentially
+                    // hours; without this lock a concurrent
+                    // `pe-bootstrap --backfill-v1-attribution` subcommand
+                    // could silently lose its cleared cursor when our
+                    // eventual save overwrites the disk state. Lock is RAII;
+                    // released when the arm finishes (or on early return /
+                    // panic via Drop).
+                    let _cache_lock = lock::CacheMutationLock::acquire(&config.cache_path)?;
                     let rpc_url = config
                         .polygon_rpc_url
                         .clone()
