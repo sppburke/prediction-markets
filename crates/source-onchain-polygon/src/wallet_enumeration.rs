@@ -105,10 +105,13 @@ impl<F: ChainLogFetcher> PolymarketTraderEnumeration<F> {
         Self { fetcher, config }
     }
 
-    /// Borrow the active [`EnumerationConfig`] (read-only).
+    /// Borrow the [`ChainLogFetcher`] backend (read-only).
+    ///
+    /// Exposed primarily so tests can introspect mock state (e.g.
+    /// [`crate::eth_logs::test_support::InMemoryChainLogFetcher::last_call`]).
     #[must_use]
-    pub fn config(&self) -> &EnumerationConfig {
-        &self.config
+    pub fn fetcher(&self) -> &F {
+        &self.fetcher
     }
 
     /// Enumerate every distinct trader wallet across all Polymarket exchange contracts.
@@ -187,8 +190,11 @@ impl<F: ChainLogFetcher> PolymarketTraderEnumeration<F> {
     /// Bisect-on-cap and HTTP 429 retry live inside [`ChainLogFetcher::get_logs`]
     /// (which production-wraps [`crate::eth_get_logs_bisect`]).
     ///
-    /// # Precondition
-    /// `from_block <= to_block`.
+    /// # Errors
+    /// Returns [`EnumerationError::InvalidConfig`] when `from_block > to_block`.
+    /// This guard exists on every entry point (`enumerate`, `enumerate_one_contract`,
+    /// `enumerate_one_contract_for_topic`, and here) so callers cannot silently
+    /// no-op by passing an inverted range — see issue #188 Item 3.
     pub async fn enumerate_chunk(
         &self,
         contract: Address,
@@ -196,6 +202,11 @@ impl<F: ChainLogFetcher> PolymarketTraderEnumeration<F> {
         from_block: u64,
         to_block: u64,
     ) -> Result<HashSet<WalletAddress>, EnumerationError> {
+        if from_block > to_block {
+            return Err(EnumerationError::InvalidConfig(format!(
+                "from_block {from_block} > to_block {to_block}"
+            )));
+        }
         let operator_set: HashSet<WalletAddress> =
             self.config.operator_addresses.iter().copied().collect();
         let filter = Filter::new()
@@ -385,7 +396,7 @@ mod tests {
         assert!(wallets.contains(&w(0x02)));
         assert!(wallets.contains(&w(0x03)));
         assert!(wallets.contains(&w(0x04)));
-        assert_eq!(enumerator.fetcher.last_call(), Some((100, 600)));
+        assert_eq!(enumerator.fetcher().last_call(), Some((100, 600)));
     }
 
     /// Provider error propagates as `EnumerationError::Provider`.
@@ -417,6 +428,6 @@ mod tests {
         let enumerator = PolymarketTraderEnumeration::with_fetcher(fetcher, config);
         let result = enumerator.enumerate().await;
         assert!(matches!(result, Err(EnumerationError::InvalidConfig(_))));
-        assert_eq!(enumerator.fetcher.last_call(), None);
+        assert_eq!(enumerator.fetcher().last_call(), None);
     }
 }

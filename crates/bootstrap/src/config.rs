@@ -239,10 +239,20 @@ pub struct BootstrapConfig {
     #[serde(default = "default_gamma_base_url")]
     pub gamma_base_url: String,
 
-    /// Polygon JSON-RPC URL for the CTF `eth_getLogs` resolution scan
-    /// (issue #149). `None` skips the Polygon stage entirely — daily backfills
-    /// then rely on CLOB + Dune for resolutions. Set via
-    /// `PE_BOOTSTRAP_POLYGON_RPC_URL`.
+    /// Polygon JSON-RPC URL used by:
+    /// - the CTF `eth_getLogs` resolution scan (issue #149; optional)
+    /// - the daily delta-backfill scan (issue #176; optional)
+    /// - **the OnChain wallet-enumeration sweep (issue #186; required)** — required
+    ///   because `WalletSource::OnChain` (the default since #186) calls
+    ///   `provider.get_block_number()` and `enumerate_chunk` against this URL.
+    ///
+    /// Sources, in priority order (later overrides earlier):
+    /// 1. `PE_POLYGON_HTTP_URL` — shared with `pe-service` and
+    ///    `pe-source-onchain-polygon::live`. Issue #188 Item 1: read manually
+    ///    after figment extraction rather than via `#[serde(alias)]` so that
+    ///    setting both env vars doesn't trigger a "duplicate field" error.
+    /// 2. TOML `polygon_rpc_url = "..."`.
+    /// 3. `PE_BOOTSTRAP_POLYGON_RPC_URL` — bootstrap-specific override.
     #[serde(default, alias = "bootstrap_polygon_rpc_url")]
     pub polygon_rpc_url: Option<String>,
 
@@ -395,9 +405,11 @@ impl BootstrapConfig {
             WalletSource::Dune if self.dune_api_key.is_none() => {
                 Err(BootstrapError::MissingEnv("PE_DUNE_API_KEY".to_owned()))
             }
-            WalletSource::OnChain if self.polygon_rpc_url.is_none() => Err(
-                BootstrapError::MissingEnv("PE_BOOTSTRAP_POLYGON_RPC_URL".to_owned()),
-            ),
+            WalletSource::OnChain if self.polygon_rpc_url.is_none() => {
+                Err(BootstrapError::MissingEnv(
+                    "PE_POLYGON_HTTP_URL or PE_BOOTSTRAP_POLYGON_RPC_URL".to_owned(),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -578,7 +590,7 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
     if let Some(p) = path {
         fig = fig.merge(Toml::file(p));
     }
-    let cfg: BootstrapConfig = fig
+    let mut cfg: BootstrapConfig = fig
         .merge(
             Env::prefixed("PE_")
                 .lowercase(true)
@@ -586,6 +598,20 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
         )
         .merge(Env::prefixed("PE_BOOTSTRAP_").lowercase(true))
         .extract()?;
+    // Issue #188 Item 1: PE_POLYGON_HTTP_URL fallback. The workspace's other
+    // crates (`pe-service`, `pe-source-onchain-polygon::live`) bind to
+    // `PE_POLYGON_HTTP_URL`; the bootstrap historically used the longer
+    // `PE_BOOTSTRAP_POLYGON_RPC_URL`. `#[serde(alias)]` can't bridge the two
+    // because figment's env layers would contribute both keys when both vars
+    // are set, and serde rejects with "duplicate field". Manual fallback
+    // honours `PE_POLYGON_HTTP_URL` only when nothing else populated the
+    // field — bootstrap-specific override + TOML config still win.
+    if cfg.polygon_rpc_url.is_none()
+        && let Ok(url) = std::env::var("PE_POLYGON_HTTP_URL")
+        && !url.is_empty()
+    {
+        cfg.polygon_rpc_url = Some(url);
+    }
     cfg.validate()?;
     Ok(cfg)
 }
