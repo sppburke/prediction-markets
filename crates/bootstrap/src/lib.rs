@@ -158,6 +158,16 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         } else {
             match &config.wallet_source {
                 WalletSource::Dune => {
+                    // Issue #193 — defensive cache-mutation lock for the Dune
+                    // arm. Mirrors the OnChain arm's acquisition below. The
+                    // Dune arm writes to `enumerated_topic_hashes` via
+                    // `migrate::save_enum_state` at the end of this body —
+                    // exactly one of the cursors that
+                    // `pe-bootstrap --backfill-v1-attribution` clears. Without
+                    // this lock, a concurrent backfill subcommand could be
+                    // silently undone when this arm's end-of-sweep
+                    // save_enum_state rewrites the full topic list.
+                    let _cache_lock = lock::CacheMutationLock::acquire(&config.cache_path)?;
                     let api_key = config
                         .dune_api_key
                         .clone()
@@ -214,15 +224,16 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     )?;
                 }
                 WalletSource::OnChain => {
-                    // Issue #191 Item 2 — defensive cache-mutation lock for
-                    // the OnChain arm. The arm reads chunk_progress at line
-                    // ~283 below and writes it back per-chunk over potentially
-                    // hours; without this lock a concurrent
+                    // Issue #191 Item 2 / #193 — defensive cache-mutation lock.
+                    // The arm reads chunk_progress at line ~283 below and
+                    // writes it back per-chunk over potentially hours; without
+                    // this lock a concurrent
                     // `pe-bootstrap --backfill-v1-attribution` subcommand
                     // could silently lose its cleared cursor when our
                     // eventual save overwrites the disk state. Lock is RAII;
                     // released when the arm finishes (or on early return /
-                    // panic via Drop).
+                    // panic via Drop). Symmetric with the Dune arm above
+                    // since #193.
                     let _cache_lock = lock::CacheMutationLock::acquire(&config.cache_path)?;
                     let rpc_url = config
                         .polygon_rpc_url
