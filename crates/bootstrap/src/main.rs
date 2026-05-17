@@ -25,14 +25,14 @@ async fn main() {
         let bootstrap_config = match config::load(toml_arg.as_deref()) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("bootstrap: config error: {e}");
+                tracing::error!(error = %e, "bootstrap: config error");
                 std::process::exit(1);
             }
         };
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("bootstrap: cache open failed: {e}");
+                tracing::error!(error = %e, "bootstrap: cache open failed");
                 std::process::exit(1);
             }
         };
@@ -48,7 +48,7 @@ async fn main() {
                     0
                 }
                 Err(e) => {
-                    eprintln!("discovery: fatal: {e}");
+                    tracing::error!(error = %e, "discovery: fatal");
                     1
                 }
             },
@@ -68,11 +68,14 @@ async fn main() {
                     // steps (resolutions, refresh_trade_counts, apply_activation_rules)
                     // completed. Failed wallets stayed NULL and will be retried by the
                     // next backfill run. Non-zero exit so systemd / operators notice.
-                    eprintln!("backfill: partial: {e} — failed wallets will retry on next run");
+                    tracing::warn!(
+                        error = %e,
+                        "backfill: partial — failed wallets will retry on next run"
+                    );
                     2
                 }
                 Err(e) => {
-                    eprintln!("backfill: fatal: {e}");
+                    tracing::error!(error = %e, "backfill: fatal");
                     1
                 }
             },
@@ -88,7 +91,7 @@ async fn main() {
                     0
                 }
                 Err(e) => {
-                    eprintln!("weekly: fatal: {e}");
+                    tracing::error!(error = %e, "weekly: fatal");
                     1
                 }
             },
@@ -100,11 +103,13 @@ async fn main() {
     if first_arg.as_deref() == Some("--print-config") {
         match toml::to_string_pretty(&BootstrapConfig::default()) {
             Ok(s) => {
+                // --print-config is intentional non-log stdout: dumps a TOML config
+                // template for the operator to redirect/edit. Keep as `print!`.
                 print!("{s}");
                 return;
             }
             Err(e) => {
-                eprintln!("bootstrap: --print-config failed: {e}");
+                tracing::error!(error = %e, "bootstrap: --print-config failed");
                 std::process::exit(1);
             }
         }
@@ -114,7 +119,7 @@ async fn main() {
     let bootstrap_config = match config::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("bootstrap: config error: {e}");
+            tracing::error!(error = %e, "bootstrap: config error");
             std::process::exit(1);
         }
     };
@@ -127,7 +132,11 @@ async fn main() {
         let dates = match parse_seed_as_of_env(&seed_env) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("bootstrap: PE_SEED_AS_OF_DATES parse error: {e}");
+                tracing::error!(
+                    error = %e,
+                    env_var = "PE_SEED_AS_OF_DATES",
+                    "bootstrap: env-var parse error"
+                );
                 std::process::exit(1);
             }
         };
@@ -141,7 +150,7 @@ async fn main() {
                 return;
             }
             Err(e) => {
-                eprintln!("bootstrap: historical seed fatal: {e}");
+                tracing::error!(error = %e, "bootstrap: historical seed fatal");
                 std::process::exit(1);
             }
         }
@@ -156,7 +165,7 @@ async fn main() {
             );
         }
         Err(e) => {
-            eprintln!("bootstrap: fatal: {e}");
+            tracing::error!(error = %e, "bootstrap: fatal");
             std::process::exit(1);
         }
     }

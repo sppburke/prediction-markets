@@ -110,9 +110,9 @@ impl SuppressionTracker {
                 tracing::warn!(
                     quarter = %format!("{year}-Q{q}"),
                     suppression_pct = %pct,
+                    threshold_pct,
                     label = self.label,
-                    "{} suppression exceeds {threshold_pct}%",
-                    self.label,
+                    "backtest: suppression threshold exceeded"
                 );
             }
         }

@@ -427,6 +427,38 @@ Written to `jsonl_log_path` (default: `./paper.jsonl`). One JSON object per line
 | `paper_fill` | `idempotency_key`, `market`, `side`, `contracts`, `fill_price` | A paper-mode simulated fill |
 | `polygon_event` | _(implicit in body)_ | Decoded on-chain Polygon event |
 
+### Logging conventions (issue #184)
+
+Every log line in the workspace is JSONL, emitted via the `tracing` crate. Subscribers
+are configured to `.json()` in `pe-bootstrap`, `pe-backtest`, and `pe-service` (both
+stderr and file layers for service). Operators wanting human-readable console output
+pipe through `jq`. No production code path uses `eprintln!`/`println!` for logging.
+
+**Canonical field shapes:**
+
+| Pattern | Use |
+|---|---|
+| `error = %e` | The canonical field name for any error value displayed via `Display`. Never use positional `%e` (becomes `fields.e` not `fields.error`). |
+| `wallet = %wallet_hex` | Wallet entity context (40-char lowercase hex). |
+| `market_id = %market_id`, `contract = %contract_hex` | Market/contract entity context. |
+| `count = n`, `progress = n`, `total = n` | Numeric counts as structured fields, NEVER embedded in the format-string message. |
+
+**Field-name collisions to avoid:** `tracing`'s JSON formatter uses `fields.message` for the
+log message string. Passing `%message` as a field name aliases the message field and most
+JSON parsers will take the last value, **silently overwriting the log message text**. Always
+rename to `error = %message` or `text = %message` etc. The same applies to `%level`,
+`%target`, `%timestamp` — none should appear as field names.
+
+**Anti-pattern** (do not do this — values appear redundantly in message AND fields):
+```rust
+tracing::info!(progress = n, total = total_pending, "funder discovery {}/{}", n, total_pending);
+```
+
+**Correct shape** (values are queryable fields; message is a static label):
+```rust
+tracing::info!(progress = n, total = total_pending, "funder discovery progress");
+```
+
 ### Watchlist auto-fetcher (`WatchlistFetchConfig`)
 
 | Key | Default | Meaning |

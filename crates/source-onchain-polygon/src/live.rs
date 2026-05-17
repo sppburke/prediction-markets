@@ -174,10 +174,11 @@ impl LivePolygonConnector {
                 // `funder_source = "eth_logs"` once before flipping. Tracked
                 // as a follow-up to issue #52.
                 warn!(
-                    "funder_source = \"etherscan\": historical USDC Transfer events are NOT \
-                     written to the event log during discovery. Only the funder closure is \
-                     populated. Replay reproducibility for the historical range will be \
-                     incomplete unless eth_logs has previously populated the log."
+                    funder_source = "etherscan",
+                    "historical USDC Transfer events are NOT written to the event log during \
+                     discovery. Only the funder closure is populated. Replay reproducibility \
+                     for the historical range will be incomplete unless eth_logs has \
+                     previously populated the log."
                 );
             }
             other => {
@@ -499,7 +500,9 @@ fn make_usdc_subscription_filter(seed_wallets: &[WalletAddress]) -> Filter {
         .event_signature(TOPIC_ERC20_TRANSFER);
     if seed_wallets.is_empty() {
         warn!(
-            "WS USDC subscription has no topic[2] filter (empty seed_wallets); falling back to full firehose"
+            seed_wallet_count = 0,
+            "WS USDC subscription has no topic[2] filter (empty seed_wallets); \
+             falling back to full firehose"
         );
         base
     } else {

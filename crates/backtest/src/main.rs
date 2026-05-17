@@ -113,7 +113,10 @@ async fn main() -> Result<(), BacktestError> {
     );
 
     if all_trades.is_empty() {
-        tracing::warn!("no trades in cache — populate with pe-bootstrap first");
+        tracing::warn!(
+            cache_path = %config.bootstrap_cache_path.display(),
+            "no trades in cache — populate with pe-bootstrap first"
+        );
         return Ok(());
     }
 
@@ -167,8 +170,12 @@ async fn main() -> Result<(), BacktestError> {
     // Kelly fractions while the flag is set would produce N identical
     // reports. Suppress the sweep with one warning when both are set.
     let sweep = config.kelly_sweep_fractions.as_ref().filter(|_| {
-        if config.flat_usd.is_some() {
-            tracing::warn!("PE_BACKTEST_FLAT_USD set; ignoring kelly_sweep_fractions");
+        if let Some(flat_usd) = config.flat_usd {
+            tracing::warn!(
+                flat_usd = %flat_usd,
+                sweep_fractions_count = config.kelly_sweep_fractions.as_ref().map_or(0, Vec::len),
+                "PE_BACKTEST_FLAT_USD set; ignoring kelly_sweep_fractions"
+            );
             false
         } else {
             true
