@@ -95,6 +95,7 @@ fn wallets_with_source_bit_excludes_other_source_bits() {
             None,
             None,
             None,
+            0,
         ));
     }
     for i in 0..5u8 {
@@ -105,6 +106,7 @@ fn wallets_with_source_bit_excludes_other_source_bits() {
             None,
             None,
             None,
+            0,
         ));
     }
     for i in 0..2u8 {
@@ -115,6 +117,7 @@ fn wallets_with_source_bit_excludes_other_source_bits() {
             None,
             None,
             None,
+            0,
         ));
     }
     cache.upsert_wallets_bulk(&rows).unwrap();
@@ -150,7 +153,7 @@ fn wallets_with_source_bit_handles_multi_bit_wallets() {
     let combined = SRC_WALLET_SET_JSON | SRC_TRADES | SRC_DUNE_CSV;
     for bit in [SRC_WALLET_SET_JSON, SRC_TRADES, SRC_DUNE_CSV] {
         cache
-            .upsert_wallets_bulk(&[(hex.to_owned(), bit, false, None, None, None)])
+            .upsert_wallets_bulk(&[(hex.to_owned(), bit, false, None, None, None, 0)])
             .unwrap();
     }
 
@@ -191,6 +194,7 @@ fn wallets_with_source_bit_zero_returns_empty() {
             None,
             None,
             None,
+            0,
         )])
         .unwrap();
 

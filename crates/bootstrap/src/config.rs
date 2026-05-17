@@ -45,8 +45,8 @@ const DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS: i64 = 604_800;
 ///
 /// ## TOML structure
 /// ```toml
-/// wallet_source = "etherscan"
-/// etherscan_api_key = "..."
+/// wallet_source = "onchain"          # or legacy alias "etherscan"
+/// polygon_rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/<KEY>"
 /// output_path = "/home/user/watchlist.json"
 /// cache_path = "/home/user/backtest-data/wallet_cache.db"
 ///
@@ -56,7 +56,7 @@ const DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS: i64 = 604_800;
 /// Run `pe-bootstrap --print-config` to emit the full default configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
-    /// `PE_WALLET_SOURCE` — `"etherscan"` (default) or `"dune"`.
+    /// `PE_WALLET_SOURCE` — `"onchain"` (default; alias `"etherscan"`) or `"dune"`.
     #[serde(default = "default_wallet_source")]
     pub wallet_source: WalletSource,
 
@@ -68,16 +68,19 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub dune_namespace: Option<String>,
 
-    /// Required when `wallet_source = "etherscan"`. `PE_ETHERSCAN_API_KEY` overrides.
+    /// `PE_ETHERSCAN_API_KEY` overrides. Still used by Etherscan-only paths
+    /// (funder discovery + leaderboard fetch); the on-chain wallet enumeration
+    /// migrated to alloy + `polygon_rpc_url` in issue #186.
     #[serde(default)]
     pub etherscan_api_key: Option<String>,
 
-    /// Start block for Etherscan scan (default: CTF V1 deploy block).
-    /// `PE_WALLET_FROM_BLOCK` overrides.
+    /// Start block for the on-chain wallet enumeration scan
+    /// (default: CTF V1 deploy block). `PE_WALLET_FROM_BLOCK` overrides.
     #[serde(default = "default_wallet_from_block")]
     pub wallet_from_block: u64,
 
-    /// End block for Etherscan scan (`None` = current chain head).
+    /// End block for the on-chain wallet enumeration scan
+    /// (`None` = current chain head, resolved via `polygon_rpc_url`).
     /// `PE_WALLET_TO_BLOCK` overrides.
     #[serde(default)]
     pub wallet_to_block: Option<u64>,
@@ -392,8 +395,8 @@ impl BootstrapConfig {
             WalletSource::Dune if self.dune_api_key.is_none() => {
                 Err(BootstrapError::MissingEnv("PE_DUNE_API_KEY".to_owned()))
             }
-            WalletSource::Etherscan if self.etherscan_api_key.is_none() => Err(
-                BootstrapError::MissingEnv("PE_ETHERSCAN_API_KEY".to_owned()),
+            WalletSource::OnChain if self.polygon_rpc_url.is_none() => Err(
+                BootstrapError::MissingEnv("PE_BOOTSTRAP_POLYGON_RPC_URL".to_owned()),
             ),
             _ => Ok(()),
         }
@@ -403,7 +406,7 @@ impl BootstrapConfig {
 // ── Default helpers ───────────────────────────────────────────────────────────
 
 fn default_wallet_source() -> WalletSource {
-    WalletSource::Etherscan
+    WalletSource::OnChain
 }
 
 const fn default_wallet_from_block() -> u64 {
@@ -803,9 +806,12 @@ mod tests {
     fn write_snapshot_set_via_env_var() {
         figment::Jail::expect_with(|jail| {
             jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
-            // `wallet_source` defaults to Etherscan, which needs a key to pass
-            // `validate()`. The value is opaque to this test.
-            jail.set_env("PE_ETHERSCAN_API_KEY", "test-key-unused");
+            // `wallet_source` defaults to OnChain, which needs an RPC URL to
+            // pass `validate()`. The value is opaque to this test.
+            jail.set_env(
+                "PE_BOOTSTRAP_POLYGON_RPC_URL",
+                "https://example.invalid/rpc",
+            );
             jail.set_env("PE_BOOTSTRAP_WRITE_SNAPSHOT", "1");
             let cfg = load(Some(std::path::Path::new("config.toml")))
                 .map_err(|e| figment::Error::from(e.to_string()))?;
@@ -823,7 +829,10 @@ mod tests {
     fn write_snapshot_unset_keeps_false() {
         figment::Jail::expect_with(|jail| {
             jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
-            jail.set_env("PE_ETHERSCAN_API_KEY", "test-key-unused");
+            jail.set_env(
+                "PE_BOOTSTRAP_POLYGON_RPC_URL",
+                "https://example.invalid/rpc",
+            );
             let cfg = load(Some(std::path::Path::new("config.toml")))
                 .map_err(|e| figment::Error::from(e.to_string()))?;
             assert!(

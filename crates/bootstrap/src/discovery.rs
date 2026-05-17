@@ -90,6 +90,7 @@ pub async fn run_discovery(
                 Some(first_seen),
                 Some(trade_count),
                 None,
+                0,
             )
         })
         .collect();

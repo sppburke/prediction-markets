@@ -47,11 +47,13 @@ use futures::stream::{self, StreamExt};
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_onchain_polygon::{
-    BlockRange, EnumerationConfig, EtherscanFunderLookup, PolymarketTraderEnumeration,
+    AlloyChainLogFetcher, BlockRange, EnumerationConfig, EtherscanFunderLookup,
+    PolymarketTraderEnumeration,
     contracts::{
         ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, CTF_EXCHANGE_V1_DEPLOY_BLOCK,
-        TOPIC_ORDER_FILLED_V1,
+        TOPIC_ORDER_FILLED_V1, topic_to_contract_version_bit,
     },
+    wallet_enumeration::SCAN_CHUNK_BLOCKS,
 };
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_trader_index::{
@@ -70,9 +72,6 @@ use polymarket::PolymarketBulkFetcher;
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
-const DEFAULT_ETHERSCAN_BASE_URL: &str = "https://api.etherscan.io/v2/api";
-// bootstrap_eth_block_timeout_secs = 30
-const ETH_BLOCK_TIMEOUT_SECS: u64 = 30;
 // Upper-bound block for funder discovery — both endpoints finalized, result is time-invariant.
 const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 
@@ -82,9 +81,13 @@ const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 pub enum WalletSource {
     /// Use Dune Analytics (legacy path; requires `PE_DUNE_API_KEY`).
     Dune,
-    /// Use Etherscan `eth_getLogs` on Polygon (requires `PE_ETHERSCAN_API_KEY`).
+    /// Use Polygon RPC `eth_getLogs` via alloy (requires `PE_BOOTSTRAP_POLYGON_RPC_URL`).
+    /// Issue #186: migrated off Etherscan REST to escape the 100k/day free-tier
+    /// quota. `"etherscan"` is accepted as a serde alias for backward compat
+    /// with existing config files.
     #[default]
-    Etherscan,
+    #[serde(alias = "etherscan")]
+    OnChain,
 }
 
 /// Delta-backfill mode (issue #176).
@@ -178,7 +181,17 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     tracing::info!(count = found.len(), "bootstrap: dune returned wallets");
                     let rows: Vec<WalletUpsertRow> = found
                         .iter()
-                        .map(|w| (w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None))
+                        .map(|w| {
+                            (
+                                w.to_string(),
+                                SRC_WALLET_SET_JSON,
+                                false,
+                                None,
+                                None,
+                                None,
+                                0,
+                            )
+                        })
                         .collect();
                     cache.upsert_wallets_bulk(&rows)?;
                     // Mark all contracts complete so subsequent runs skip Dune.
@@ -199,14 +212,20 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         &enumerated_topic_hashes,
                     )?;
                 }
-                WalletSource::Etherscan => {
-                    let api_key = config
-                        .etherscan_api_key
+                WalletSource::OnChain => {
+                    let rpc_url = config
+                        .polygon_rpc_url
                         .clone()
                         .ok_or(BootstrapError::Internal)?;
+                    let http_url: reqwest::Url = rpc_url.parse()?;
+                    let provider = alloy::providers::ProviderBuilder::new().connect_http(http_url);
                     let to_block = match config.wallet_to_block {
                         Some(b) => b,
-                        None => fetch_current_block(&api_key).await?,
+                        None => alloy::providers::Provider::get_block_number(&provider)
+                            .await
+                            .map_err(|e| BootstrapError::PolygonCtf {
+                                message: format!("get_block_number: {e}"),
+                            })?,
                     };
                     tracing::info!(
                         from_block = config.wallet_from_block,
@@ -216,23 +235,25 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         contracts_total = total_contracts,
                         topics_done = enumerated_topic_hashes.len(),
                         topics_total = ALL_ORDER_FILLED_TOPICS.len(),
-                        "bootstrap: enumerating wallets via etherscan"
+                        "bootstrap: enumerating wallets via polygon RPC"
                     );
                     let enum_config = EnumerationConfig {
                         from_block: config.wallet_from_block,
                         to_block,
                         operator_addresses: config.operator_addresses.clone(),
                     };
-                    let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
+                    let fetcher = AlloyChainLogFetcher {
+                        provider,
+                        min_chunk: 1,
+                    };
+                    let enumerator =
+                        PolymarketTraderEnumeration::with_fetcher(fetcher, enum_config);
 
                     // Legacy-checkpoint upgrade (one-shot): a pre-#179
                     // structured checkpoint has every contract in
                     // `completed_contracts` but an empty
                     // `enumerated_topic_hashes`. Treat that exact state as
                     // "V1 fully done" so we don't redo the V1 sweep.
-                    // Set-membership (not `len()`) so adding a future V3
-                    // contract to ALL_EXCHANGE_CONTRACTS does not silently
-                    // match a legacy 4-entry list.
                     let legacy_v1_done = enumerated_topic_hashes.is_empty()
                         && ALL_EXCHANGE_CONTRACTS
                             .iter()
@@ -248,17 +269,13 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                             &enumerated_topic_hashes,
                         )?;
                     }
-                    // Partial-legacy state (e.g., crashed mid-V1 sweep) does
-                    // NOT match `legacy_v1_done` and therefore triggers a
-                    // full additive sweep of both topics across every
-                    // contract — accepted one-shot cost.
 
-                    // Per-topic outer loop: scans the FULL
-                    // ALL_ORDER_FILLED_TOPICS array on every invocation.
-                    // V1 contract bytecode cannot emit V2 events (and vice-
-                    // versa), so the V2-topic sweep across V1 contracts
-                    // returns 0 logs — expected, harmless, and simpler than
-                    // a per-(contract,topic) skip predicate.
+                    // Per-topic outer loop, chunk-level persistence inner
+                    // loop (issue #186): each `SCAN_CHUNK_BLOCKS`-sized window
+                    // is upserted before advancing, so a crash loses at most
+                    // one chunk's worth of work instead of an entire contract.
+                    // The V1/V2 contract-version bit is attributed per topic
+                    // and OR-merged into `polymarket_contracts_seen`.
                     for topic in &ALL_ORDER_FILLED_TOPICS {
                         let topic_hex = format!("{topic}");
                         if enumerated_topic_hashes.contains(&topic_hex) {
@@ -268,24 +285,40 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                             );
                             continue;
                         }
+                        let contract_bit = topic_to_contract_version_bit(*topic).unwrap_or(0);
                         for contract in &ALL_EXCHANGE_CONTRACTS {
                             let contract_hex = format!("0x{contract:x}");
-                            let found = enumerator
-                                .enumerate_one_contract_for_topic(*contract, *topic)
-                                .await?;
-                            tracing::info!(
-                                contract = %contract_hex,
-                                topic = %topic_hex,
-                                found = found.len(),
-                                "bootstrap: contract enumerated for topic"
-                            );
-                            let rows: Vec<WalletUpsertRow> = found
-                                .iter()
-                                .map(|w| {
-                                    (w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None)
-                                })
-                                .collect();
-                            cache.upsert_wallets_bulk(&rows)?;
+                            let mut chunk_from = config.wallet_from_block;
+                            while chunk_from <= to_block {
+                                let chunk_to = (chunk_from + SCAN_CHUNK_BLOCKS - 1).min(to_block);
+                                let found = enumerator
+                                    .enumerate_chunk(*contract, *topic, chunk_from, chunk_to)
+                                    .await?;
+                                tracing::info!(
+                                    contract = %contract_hex,
+                                    topic = %topic_hex,
+                                    chunk_from,
+                                    chunk_to,
+                                    found = found.len(),
+                                    "bootstrap: chunk enumerated"
+                                );
+                                let rows: Vec<WalletUpsertRow> = found
+                                    .iter()
+                                    .map(|w| {
+                                        (
+                                            w.to_string(),
+                                            SRC_WALLET_SET_JSON,
+                                            false,
+                                            None,
+                                            None,
+                                            None,
+                                            contract_bit,
+                                        )
+                                    })
+                                    .collect();
+                                cache.upsert_wallets_bulk(&rows)?;
+                                chunk_from = chunk_to + 1;
+                            }
                         }
                         enumerated_topic_hashes.push(topic_hex);
                         migrate::save_enum_state(
@@ -766,47 +799,6 @@ pub fn parse_seed_as_of_env(value: &str) -> Result<Vec<OffsetDateTime>, Bootstra
         out.push(date.midnight().assume_utc());
     }
     Ok(out)
-}
-
-/// Fetch the current Polygon chain head block number from Etherscan.
-async fn fetch_current_block(api_key: &str) -> Result<u64, BootstrapError> {
-    let url = format!(
-        "{DEFAULT_ETHERSCAN_BASE_URL}?chainid=137&module=proxy&action=eth_blockNumber&apikey={api_key}"
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(ETH_BLOCK_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| BootstrapError::Etherscan {
-            message: format!("build client: {e}"),
-        })?;
-    let bytes = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| BootstrapError::Etherscan {
-            message: format!("eth_blockNumber GET: {e}"),
-        })?
-        .bytes()
-        .await
-        .map_err(|e| BootstrapError::Etherscan {
-            message: format!("eth_blockNumber read body: {e}"),
-        })?;
-
-    #[derive(serde::Deserialize)]
-    struct Resp {
-        result: String,
-    }
-    let parsed: Resp = serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Etherscan {
-        message: format!("eth_blockNumber parse: {e}"),
-    })?;
-    u64::from_str_radix(parsed.result.trim_start_matches("0x"), 16).map_err(|e| {
-        BootstrapError::Etherscan {
-            message: format!(
-                "eth_blockNumber hex parse '{result}': {e}",
-                result = parsed.result
-            ),
-        }
-    })
 }
 
 /// Build a seed [`Watchlist`] from reconstructed ledgers using the bootstrap post-filter.

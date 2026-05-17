@@ -197,3 +197,78 @@ impl<P: Provider + Clone + Send + Sync> ChainLogFetcher for AlloyChainLogFetcher
         eth_get_logs_bisect(&self.provider, filter, from, to, self.min_chunk).await
     }
 }
+
+/// In-memory [`ChainLogFetcher`] for inline tests + scenario tests across crates.
+///
+/// Issue #186: relocated from `pe_bootstrap::polygon_ctf_delta::test_support` to
+/// this module (where the `ChainLogFetcher` trait lives) so that
+/// `wallet_enumeration` tests can use it without violating the dependency
+/// direction (`pe-source-onchain-polygon` cannot depend on `pe-bootstrap`).
+#[cfg(any(test, feature = "scenario"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub mod test_support {
+    use std::sync::Mutex;
+
+    use alloy::rpc::types::{Filter, Log};
+
+    use super::{ChainLogFetcher, PolygonRpcError};
+
+    /// In-memory fetcher returning canned responses.
+    pub struct InMemoryChainLogFetcher {
+        pub block_number: Result<u64, String>,
+        pub logs: Result<Vec<Log>, String>,
+        pub last_call: Mutex<Option<(u64, u64)>>,
+    }
+
+    impl InMemoryChainLogFetcher {
+        pub fn ok(block: u64, logs: Vec<Log>) -> Self {
+            Self {
+                block_number: Ok(block),
+                logs: Ok(logs),
+                last_call: Mutex::new(None),
+            }
+        }
+
+        pub fn block_number_err(msg: impl Into<String>) -> Self {
+            Self {
+                block_number: Err(msg.into()),
+                logs: Ok(Vec::new()),
+                last_call: Mutex::new(None),
+            }
+        }
+
+        pub fn get_logs_err(block: u64, msg: impl Into<String>) -> Self {
+            Self {
+                block_number: Ok(block),
+                logs: Err(msg.into()),
+                last_call: Mutex::new(None),
+            }
+        }
+
+        pub fn last_call(&self) -> Option<(u64, u64)> {
+            *self.last_call.lock().unwrap()
+        }
+    }
+
+    impl ChainLogFetcher for InMemoryChainLogFetcher {
+        async fn get_block_number(&self) -> Result<u64, PolygonRpcError> {
+            self.block_number
+                .clone()
+                .map_err(PolygonRpcError::GetBlockNumber)
+        }
+
+        async fn get_logs(
+            &self,
+            _filter: Filter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<Log>, PolygonRpcError> {
+            *self.last_call.lock().unwrap() = Some((from, to));
+            self.logs.clone().map_err(|msg| PolygonRpcError::GetLogs {
+                from,
+                to,
+                message: msg,
+            })
+        }
+    }
+}

@@ -38,9 +38,22 @@ use time::OffsetDateTime;
 
 use crate::error::BootstrapError;
 
-/// Row tuple for [`WalletCache::upsert_wallets_bulk`]:
-/// `(wallet_hex, source_bits, is_infra, dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps)`.
-pub type WalletUpsertRow = (String, i64, bool, Option<i64>, Option<i64>, Option<i64>);
+/// Row tuple for [`WalletCache::upsert_wallets_bulk`].
+///
+/// Fields (in order): `wallet_hex`, `source_bits`, `is_infra`, `dune_first_seen_unix`,
+/// `dune_closed_markets`, `dune_win_rate_bps`, `polymarket_contracts_seen` (issue #186 —
+/// bitmask of V1/V2 attribution per `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_*`).
+/// The 7th field is `0` for callers that don't have V1/V2 attribution available; the
+/// enumeration path passes the appropriate bit from `topic_to_contract_version_bit`.
+pub type WalletUpsertRow = (
+    String,
+    i64,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
 
 /// Number of consecutive known `source_trade_id`s that signals the incremental fetch is done.
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
@@ -143,7 +156,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     dune_first_seen_unix     INTEGER NULL,
     dune_closed_markets      INTEGER NULL,
     dune_win_rate_bps        INTEGER NULL,
-    discovered_at_unix       INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+    discovered_at_unix       INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
+    polymarket_contracts_seen INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_wallets_is_active ON wallets(is_active);
 CREATE INDEX IF NOT EXISTS idx_wallets_backfill
@@ -203,6 +217,26 @@ impl WalletCache {
                 "ALTER TABLE wallets ADD COLUMN last_polymarket_full_at INTEGER NULL",
             )?;
         }
+
+        // Migration (issue #186): add `polymarket_contracts_seen` bitmask if
+        // absent. Pre-migration rows default to 0 ("no V1/V2 attribution
+        // available"); enumeration populates via UPSERT OR-merge on each
+        // (wallet, topic) discovery. Live-execution callers must treat 0 as
+        // "unknown, route by liquidity" rather than "neither V1 nor V2."
+        let polymarket_contracts_seen_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('wallets') WHERE name='polymarket_contracts_seen'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !polymarket_contracts_seen_exists {
+            conn.execute_batch(
+                "ALTER TABLE wallets ADD COLUMN polymarket_contracts_seen INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -1129,6 +1163,11 @@ impl WalletCache {
     /// Wallets present in multiple sources accumulate all their bits. New rows are
     /// inserted with the provided fields; conflicting rows update `source_bits`,
     /// `is_infra` (sticky 0→1), and Dune fields only when the new value is non-NULL.
+    ///
+    /// Issue #186: this 6-arg API passes `polymarket_contracts_seen = 0`
+    /// internally (no V1/V2 attribution available). Callers that need to set
+    /// the bit use [`Self::upsert_wallets_bulk`] with the 7-tuple shape — see
+    /// `lib.rs::run()`'s `WalletSource::OnChain` arm for the canonical caller.
     pub fn upsert_wallet(
         &mut self,
         wallet_hex: &str,
@@ -1142,8 +1181,9 @@ impl WalletCache {
         self.conn.execute(
             "INSERT INTO wallets (\
                 wallet_hex, source_bits, is_infra, \
-                dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps, \
+                polymarket_contracts_seen\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0) \
              ON CONFLICT(wallet_hex) DO UPDATE SET \
                 source_bits = source_bits | excluded.source_bits, \
                 is_infra = MAX(is_infra, excluded.is_infra), \
@@ -1163,22 +1203,29 @@ impl WalletCache {
     }
 
     /// UPSERT many wallets in a single transaction. See [`Self::upsert_wallet`].
+    ///
+    /// Issue #186: the 7th tuple field (`polymarket_contracts_seen`) is OR-merged
+    /// with any existing value, matching the `source_bits` semantics. Callers
+    /// pass `0` when V1/V2 attribution is unavailable; the enumeration path
+    /// passes the bit from `topic_to_contract_version_bit`.
     pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO wallets (\
                     wallet_hex, source_bits, is_infra, \
-                    dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                    dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps, \
+                    polymarket_contracts_seen\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(wallet_hex) DO UPDATE SET \
                     source_bits = source_bits | excluded.source_bits, \
                     is_infra = MAX(is_infra, excluded.is_infra), \
                     dune_first_seen_unix = COALESCE(excluded.dune_first_seen_unix, dune_first_seen_unix), \
                     dune_closed_markets = COALESCE(excluded.dune_closed_markets, dune_closed_markets), \
-                    dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps)",
+                    dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps), \
+                    polymarket_contracts_seen = polymarket_contracts_seen | excluded.polymarket_contracts_seen",
             )?;
-            for (wallet, bits, infra, first_seen, closed, win_rate) in rows {
+            for (wallet, bits, infra, first_seen, closed, win_rate, version_bits) in rows {
                 let is_infra_int: i64 = i64::from(*infra);
                 stmt.execute(params![
                     wallet,
@@ -1187,6 +1234,7 @@ impl WalletCache {
                     first_seen,
                     closed,
                     win_rate,
+                    version_bits,
                 ])?;
             }
         }
@@ -1540,6 +1588,22 @@ impl WalletCache {
             )
             .expect("test-only direct SQL must succeed");
         n != 0
+    }
+
+    /// Test-only accessor for `polymarket_contracts_seen` (issue #186 V1/V2 bitmask).
+    ///
+    /// Returns 0 for a wallet that has not yet been observed via on-chain
+    /// enumeration (e.g. ingested via Dune-only or trade-fetch paths).
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_contracts_seen(&self, wallet_hex: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT polymarket_contracts_seen FROM wallets WHERE wallet_hex = ?1",
+                params![wallet_hex],
+                |r| r.get(0),
+            )
+            .expect("test-only direct SQL must succeed")
     }
 }
 

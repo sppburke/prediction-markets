@@ -18,7 +18,11 @@ name = "pe_bootstrap"
 path = "src/lib.rs"
 
 [features]
-scenario = []
+# Issue #186: pe-source-onchain-polygon hosts the cross-crate
+# `InMemoryChainLogFetcher` test stub; forwarding `scenario` keeps the inline
+# tests in `polygon_ctf_delta::tests` compiling whenever bootstrap's own
+# scenario feature is on (and under `--workspace --all-features`).
+scenario = ["pe-source-onchain-polygon/scenario"]
 
 [lints]
 workspace = true
@@ -46,6 +50,7 @@ tokio           = { workspace = true }
 toml            = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
+url             = { workspace = true }
 
 [dev-dependencies]
 blake3              = { workspace = true }

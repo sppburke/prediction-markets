@@ -309,7 +309,17 @@ fn ingest_wallet_set(cache: &mut WalletCache, path: &Path) -> Result<usize, Boot
         };
         let rows: Vec<WalletUpsertRow> = wallets
             .into_iter()
-            .map(|w| (w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None))
+            .map(|w| {
+                (
+                    w.to_string(),
+                    SRC_WALLET_SET_JSON,
+                    false,
+                    None,
+                    None,
+                    None,
+                    0,
+                )
+            })
             .collect();
         cache.upsert_wallets_bulk(&rows)?;
         return Ok(rows.len());
@@ -317,7 +327,15 @@ fn ingest_wallet_set(cache: &mut WalletCache, path: &Path) -> Result<usize, Boot
     let mut rows: Vec<WalletUpsertRow> = Vec::new();
     for hex in &state.wallets {
         if let Ok(w) = WalletAddress::from_hex(hex) {
-            rows.push((w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None));
+            rows.push((
+                w.to_string(),
+                SRC_WALLET_SET_JSON,
+                false,
+                None,
+                None,
+                None,
+                0,
+            ));
         }
     }
     cache.upsert_wallets_bulk(&rows)?;
@@ -332,7 +350,7 @@ fn ingest_trades_wallets(cache: &mut WalletCache) -> Result<usize, BootstrapErro
             // Trade rows already use canonical form via WalletAddress::Display,
             // but normalise defensively.
             let normalised = WalletAddress::from_hex(&h).ok()?.to_string();
-            Some((normalised, SRC_TRADES, false, None, None, None))
+            Some((normalised, SRC_TRADES, false, None, None, None, 0))
         })
         .collect();
     let len = rows.len();
@@ -364,14 +382,14 @@ fn ingest_dune_csvs(cache: &mut WalletCache, dir: &Path) -> Result<(usize, usize
             // Infra wallets still get a row so source_bits records they were seen.
             let upserts: Vec<WalletUpsertRow> = rows
                 .into_iter()
-                .map(|(hex, fs, cm, wr)| (hex, bits, true, fs, cm, wr))
+                .map(|(hex, fs, cm, wr)| (hex, bits, true, fs, cm, wr, 0))
                 .collect();
             infra += upserts.len();
             cache.upsert_wallets_bulk(&upserts)?;
         } else {
             let upserts: Vec<WalletUpsertRow> = rows
                 .into_iter()
-                .map(|(hex, fs, cm, wr)| (hex, bits, false, fs, cm, wr))
+                .map(|(hex, fs, cm, wr)| (hex, bits, false, fs, cm, wr, 0))
                 .collect();
             non_infra += upserts.len();
             cache.upsert_wallets_bulk(&upserts)?;

@@ -194,80 +194,6 @@ pub async fn scan_active_wallets<F: ChainLogFetcher>(
     }
 }
 
-#[cfg(any(test, feature = "scenario"))]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-pub mod test_support {
-    //! In-memory [`ChainLogFetcher`] for inline tests + scenario tests.
-    //!
-    //! Mirrors the `InMemoryLookup` pattern in
-    //! `pe_source_onchain_polygon::funder_discovery::tests`. Production code
-    //! uses [`pe_source_onchain_polygon::AlloyChainLogFetcher`].
-
-    use std::sync::Mutex;
-
-    use alloy::rpc::types::{Filter, Log};
-    use pe_source_onchain_polygon::{ChainLogFetcher, PolygonRpcError};
-
-    /// In-memory fetcher returning canned responses.
-    pub struct InMemoryChainLogFetcher {
-        pub block_number: Result<u64, String>,
-        pub logs: Result<Vec<Log>, String>,
-        pub last_call: Mutex<Option<(u64, u64)>>,
-    }
-
-    impl InMemoryChainLogFetcher {
-        pub fn ok(block: u64, logs: Vec<Log>) -> Self {
-            Self {
-                block_number: Ok(block),
-                logs: Ok(logs),
-                last_call: Mutex::new(None),
-            }
-        }
-
-        pub fn block_number_err(msg: impl Into<String>) -> Self {
-            Self {
-                block_number: Err(msg.into()),
-                logs: Ok(Vec::new()),
-                last_call: Mutex::new(None),
-            }
-        }
-
-        pub fn get_logs_err(block: u64, msg: impl Into<String>) -> Self {
-            Self {
-                block_number: Ok(block),
-                logs: Err(msg.into()),
-                last_call: Mutex::new(None),
-            }
-        }
-
-        pub fn last_call(&self) -> Option<(u64, u64)> {
-            *self.last_call.lock().unwrap()
-        }
-    }
-
-    impl ChainLogFetcher for InMemoryChainLogFetcher {
-        async fn get_block_number(&self) -> Result<u64, PolygonRpcError> {
-            self.block_number
-                .clone()
-                .map_err(PolygonRpcError::GetBlockNumber)
-        }
-
-        async fn get_logs(
-            &self,
-            _filter: Filter,
-            from: u64,
-            to: u64,
-        ) -> Result<Vec<Log>, PolygonRpcError> {
-            *self.last_call.lock().unwrap() = Some((from, to));
-            self.logs.clone().map_err(|msg| PolygonRpcError::GetLogs {
-                from,
-                to,
-                message: msg,
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -276,8 +202,8 @@ mod tests {
     use alloy::rpc::types::Log;
     use pe_core_types::WalletAddress;
     use pe_source_onchain_polygon::contracts::{TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2};
+    use pe_source_onchain_polygon::eth_logs::test_support::InMemoryChainLogFetcher;
     use tempfile::TempDir;
-    use test_support::InMemoryChainLogFetcher;
 
     fn open_cache() -> (TempDir, WalletCache) {
         let dir = TempDir::new().unwrap();

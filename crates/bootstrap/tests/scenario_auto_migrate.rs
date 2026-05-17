@@ -240,6 +240,7 @@ async fn no_legacy_files_skips_post_ingest_sequence() {
             None,
             None,
             None,
+            0,
         )])
         .unwrap();
     cache.conn_for_test_set_trade_count(hex, 999);

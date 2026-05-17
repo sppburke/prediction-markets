@@ -19,9 +19,9 @@ use alloy::rpc::types::Log;
 use pe_bootstrap::backfill::run_delta_scan_with_fetcher;
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::polygon_ctf_delta::POLYGON_CTF_BACKFILL_CURSOR_KEY;
-use pe_bootstrap::polygon_ctf_delta::test_support::InMemoryChainLogFetcher;
 use pe_core_types::WalletAddress;
 use pe_source_onchain_polygon::contracts::{TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2};
+use pe_source_onchain_polygon::eth_logs::test_support::InMemoryChainLogFetcher;
 use rusqlite::params;
 use tempfile::TempDir;
 
