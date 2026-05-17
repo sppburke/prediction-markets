@@ -234,7 +234,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     // silently marking every topic enumerated despite zero
                     // chunks scanned.
                     if config.wallet_from_block > to_block {
-                        return Err(BootstrapError::Parse {
+                        return Err(BootstrapError::Invalid {
                             message: format!(
                                 "wallet_from_block {} > to_block {}; refusing to mark enumeration done over an empty range",
                                 config.wallet_from_block, to_block
@@ -373,6 +373,16 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                 chunk_from = chunk_to + 1;
                             }
                         }
+                        // Topic is fully done. Drop the per-`(topic, contract)`
+                        // entries we just finished — the outer-loop skip via
+                        // `enumerated_topic_hashes.contains` short-circuits
+                        // resume before the cursor is consulted, so these
+                        // entries are dead weight. Keeps the JSON map bounded
+                        // and avoids the documentation lie that every entry
+                        // names an in-progress topic.
+                        let topic_prefix = format!("{topic_hex}|");
+                        chunk_progress.retain(|k, _| !k.starts_with(&topic_prefix));
+                        migrate::save_chunk_progress(&mut cache, &chunk_progress)?;
                         enumerated_topic_hashes.push(topic_hex);
                         migrate::save_enum_state(
                             &mut cache,

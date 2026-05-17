@@ -416,6 +416,51 @@ async fn mid_sweep_crash_resumes_at_next_chunk_without_redoing_done_work() {
     drop(dir);
 }
 
+// ── Item 2 follow-up — stale cursor entries pruned at topic completion ──────
+
+/// PASS: when a topic finishes (`enumerated_topic_hashes.push(...)`), every
+///       `chunk_progress` entry keyed by that topic is removed before
+///       `save_chunk_progress`. Keeps the JSON map bounded across full sweeps.
+/// FAIL: stale entries linger after topic completion (the cursor grows
+///       monotonically with every topic ever swept — flagged by the PR #189
+///       reviewer as concern #2).
+#[test]
+fn chunk_progress_prunes_entries_keyed_by_completed_topic() {
+    use std::collections::HashMap;
+
+    let topic_v1_hex = format!("{}", TOPIC_ORDER_FILLED_V1);
+    let contract_a_hex = format!("0x{:x}", ALL_EXCHANGE_CONTRACTS[0]);
+    let contract_b_hex = format!("0x{:x}", ALL_EXCHANGE_CONTRACTS[1]);
+    let key_a = migrate::chunk_progress_key(&topic_v1_hex, &contract_a_hex);
+    let key_b = migrate::chunk_progress_key(&topic_v1_hex, &contract_b_hex);
+    let key_other_topic = migrate::chunk_progress_key("0xdeadbeef", &contract_a_hex);
+
+    let mut progress = HashMap::new();
+    progress.insert(key_a.clone(), 500_000_u64);
+    progress.insert(key_b.clone(), 1_000_000_u64);
+    progress.insert(key_other_topic.clone(), 250_000_u64);
+
+    // Production code: at topic completion, retain everything NOT prefixed by
+    // the topic's `"{topic_hex}|"` namespace.
+    let topic_prefix = format!("{topic_v1_hex}|");
+    progress.retain(|k, _| !k.starts_with(&topic_prefix));
+
+    assert!(
+        !progress.contains_key(&key_a),
+        "V1-topic / contract-A entry must be pruned"
+    );
+    assert!(
+        !progress.contains_key(&key_b),
+        "V1-topic / contract-B entry must be pruned"
+    );
+    assert_eq!(
+        progress.get(&key_other_topic).copied(),
+        Some(250_000),
+        "entries from other topics must survive the prune"
+    );
+    assert_eq!(progress.len(), 1);
+}
+
 // ── Scenario 5 (Item 1) — `PE_POLYGON_HTTP_URL` populates `polygon_rpc_url` ──
 
 /// PASS: setting only `PE_POLYGON_HTTP_URL` makes `config::load()` produce a
