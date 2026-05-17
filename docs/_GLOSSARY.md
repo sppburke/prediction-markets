@@ -313,14 +313,21 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 
 ### Wallet enumeration defaults
 
+Issue #186: wallet enumeration migrated off Etherscan REST (100k requests/day
+free-tier cap) onto an alloy [`Provider`] against an Alchemy-compatible RPC.
+Bisect-on-cap + HTTP 429 retry now live in
+`pe_source_onchain_polygon::eth_logs::eth_get_logs_bisect`; `wallet_enumeration`
+only orchestrates the `(contract, topic0, chunk)` loop and operator filtering.
+
 | Key | Default | Meaning |
 |---|---:|---|
-| `wallet_enum_logs_page_cap` | 1_000 | Etherscan free-tier per-call `eth_getLogs` result cap. If a range returns exactly this many logs, the range is bisected and re-fetched. |
+| `wallet_enum_scan_chunk_blocks` | 500_000 | Top-level `eth_getLogs` chunk size. Also the **persistence granularity** for `pe-bootstrap`: the bootstrap upserts after each chunk so a crash loses at most one chunk's worth of work. Exported as `pe_source_onchain_polygon::wallet_enumeration::SCAN_CHUNK_BLOCKS`. |
 | `wallet_enum_from_block` | 33_605_403 | Earliest block to scan — approximate CTFExchange V1 deployment on Polygon. |
-| `wallet_enum_rate_limit_delay_ms` | 200 | Delay between successive Etherscan calls for enumeration (shared 5 req/s budget). |
-| `wallet_enum_max_backoff_secs` | 60 | Cap on retry backoff for transient enumeration errors. |
-| `wallet_enum_max_attempts` | 6 | Maximum retry attempts per `eth_getLogs` call before failing. |
-| `bootstrap_all_order_filled_topics` | `pe_source_onchain_polygon::contracts::ALL_ORDER_FILLED_TOPICS` | Canonical "what to scan" set used by every `OrderFilled` consumer (`polygon_ctf_delta::scan_active_wallets`, `wallet_enumeration::PolymarketTraderEnumeration`). Currently `[V1, V2]`. Hex values live in `contracts.rs` with self-validating keccak tests — the canonical source. Extending this array adds the new topic to every consumer automatically and triggers an additive Etherscan re-sweep on the next bootstrap run (issue #179). |
+| `wallet_enum_min_chunk` | 1 | `AlloyChainLogFetcher.min_chunk` for the bootstrap-owned enumerator. Floor at which `eth_get_logs_bisect` stops halving and propagates the underlying RPC error instead. |
+| `bootstrap_all_order_filled_topics` | `pe_source_onchain_polygon::contracts::ALL_ORDER_FILLED_TOPICS` | Canonical "what to scan" set used by every `OrderFilled` consumer (`polygon_ctf_delta::scan_active_wallets`, `wallet_enumeration::PolymarketTraderEnumeration`). Currently `[V1, V2]`. Hex values live in `contracts.rs` with self-validating keccak tests — the canonical source. Extending this array adds the new topic to every consumer automatically and triggers an additive re-sweep on the next bootstrap run (issue #179). |
+| `wallet_enum_contract_version_bit_v1` | 0b01 | `polymarket_contracts_seen` bit set on wallets discovered via `TOPIC_ORDER_FILLED_V1`. Hardcoded as `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_V1`. |
+| `wallet_enum_contract_version_bit_v2` | 0b10 | `polymarket_contracts_seen` bit set on wallets discovered via `TOPIC_ORDER_FILLED_V2`. Hardcoded as `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_V2`. |
+| `wallets.polymarket_contracts_seen` (column) | `i64`, default `0` | OR-merged bitmask of `CONTRACT_VERSION_BIT_V1` / `_V2` for every wallet, populated only on the on-chain enumeration path (Dune-CSV / trade-fetch / Dune-incremental upserts pass `0` and rely on the OR-merge to preserve any prior attribution). Used at go-live to route trades to the correct CTFExchange contract. |
 | `wallet_enum_completed_contracts` (cursor) | `"wallet_enum_completed_contracts"` | `source_cursor` table key holding JSON-encoded `Vec<String>` of lowercase-hex contract addresses fully enumerated. Issue #181. Equivalent to the now-deleted `WalletSetState.completed_contracts` field. |
 | `wallet_enum_topic_hashes` (cursor) | `"wallet_enum_topic_hashes"` | `source_cursor` table key holding JSON-encoded `Vec<String>` of B256-Display topic hashes (each prefixed `0x`) fully enumerated. Issue #181. Equivalent to the now-deleted `WalletSetState.enumerated_topic_hashes` field. |
 

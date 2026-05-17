@@ -108,6 +108,35 @@ pub const TOPIC_ORDER_FILLED_V2: B256 =
 /// `bootstrap_all_order_filled_topics`.
 pub const ALL_ORDER_FILLED_TOPICS: [B256; 2] = [TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2];
 
+/// Bit positions for the `wallets.polymarket_contracts_seen` bitmask (issue #186).
+/// Set during enumeration when the wallet is discovered via a V1-topic OrderFilled log.
+pub const CONTRACT_VERSION_BIT_V1: i64 = 0b01;
+
+/// Bit positions for the `wallets.polymarket_contracts_seen` bitmask (issue #186).
+/// Set during enumeration when the wallet is discovered via a V2-topic OrderFilled log.
+pub const CONTRACT_VERSION_BIT_V2: i64 = 0b10;
+
+/// Map a known `OrderFilled` topic hash to its contract-version bit. Returns
+/// `None` for unknown topics so future V3 additions surface at the call site
+/// (rather than silently producing `0`).
+///
+/// Issue #186: this is the canonical translation between the on-chain topic
+/// hash (which `wallet_enumeration` already filters by) and the bitmask field
+/// on the `wallets` table (which the future live-execution path reads to
+/// decide whether to route a copy trade through V1 or V2). Adding a future V3
+/// topic to [`ALL_ORDER_FILLED_TOPICS`] without also updating this helper is
+/// caught by the [`tests::every_topic_in_all_order_filled_has_a_version_bit`] test.
+#[must_use]
+pub fn topic_to_contract_version_bit(topic: B256) -> Option<i64> {
+    if topic == TOPIC_ORDER_FILLED_V1 {
+        Some(CONTRACT_VERSION_BIT_V1)
+    } else if topic == TOPIC_ORDER_FILLED_V2 {
+        Some(CONTRACT_VERSION_BIT_V2)
+    } else {
+        None
+    }
+}
+
 /// CTF ConditionResolution(bytes32 indexed conditionId, address indexed oracle,
 ///   bytes32 indexed questionId, uint outcomeSlotCount, uint[] payoutNumerators).
 /// Used by the multi-source pipeline (issue #149) to scan settled markets via
@@ -195,5 +224,41 @@ mod tests {
             ALL_ORDER_FILLED_TOPICS,
             [TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2]
         );
+    }
+
+    /// Issue #186 regression guard: every topic in `ALL_ORDER_FILLED_TOPICS`
+    /// must map to a `Some(bit)` via `topic_to_contract_version_bit`. Adding
+    /// a future V3 topic to the array without also updating the helper would
+    /// cause `polymarket_contracts_seen` to silently NOT carry the V3 bit,
+    /// breaking live-execution routing decisions.
+    #[test]
+    fn every_topic_in_all_order_filled_has_a_version_bit() {
+        for topic in ALL_ORDER_FILLED_TOPICS {
+            assert!(
+                topic_to_contract_version_bit(topic).is_some(),
+                "topic {topic} in ALL_ORDER_FILLED_TOPICS has no entry in \
+                 topic_to_contract_version_bit — adding a future V3 topic to \
+                 the array MUST also update the helper"
+            );
+        }
+    }
+
+    /// Bit values are stable: V1 = 0b01, V2 = 0b10. The bitmask interpretation
+    /// is referenced from `docs/_GLOSSARY.md` and from the future live-execution
+    /// code; changing these values is a breaking change for any persisted
+    /// `polymarket_contracts_seen` data.
+    #[test]
+    fn contract_version_bits_are_stable() {
+        assert_eq!(CONTRACT_VERSION_BIT_V1, 0b01);
+        assert_eq!(CONTRACT_VERSION_BIT_V2, 0b10);
+        assert_eq!(
+            topic_to_contract_version_bit(TOPIC_ORDER_FILLED_V1),
+            Some(0b01)
+        );
+        assert_eq!(
+            topic_to_contract_version_bit(TOPIC_ORDER_FILLED_V2),
+            Some(0b10)
+        );
+        assert_eq!(topic_to_contract_version_bit(B256::ZERO), None);
     }
 }
