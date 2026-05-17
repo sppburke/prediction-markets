@@ -110,7 +110,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             let bytes = match self.fetcher.fetch_page(&url).await {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
-                    warn!(%url, %message, "clob: fatal fetch error — aborting page");
+                    warn!(%url, error = %message, "clob: fatal fetch error — aborting page");
                     return Err(BootstrapError::Clob {
                         message: format!("fetch {url}: {message}"),
                     });

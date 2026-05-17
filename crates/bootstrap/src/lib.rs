@@ -419,9 +419,7 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                 tracing::info!(
                                     progress = n,
                                     total = total_pending,
-                                    "bootstrap: funder discovery {}/{}",
-                                    n,
-                                    total_pending
+                                    "bootstrap: funder discovery progress"
                                 );
                             }
                         }

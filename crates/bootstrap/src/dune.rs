@@ -709,11 +709,15 @@ pub(crate) fn render_discovery_sql(
 /// Missing or unparseable rows are warned and skipped.
 pub(crate) fn parse_discovery_rows(rows: Vec<serde_json::Value>) -> Vec<(String, i64, i64)> {
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (row_index, row) in rows.into_iter().enumerate() {
         let raw = match row.get("wallet_hex").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s,
             _ => {
-                tracing::warn!("dune: discovery row missing wallet_hex, skipping");
+                tracing::warn!(
+                    row_index,
+                    row = %row,
+                    "dune: discovery row missing wallet_hex, skipping"
+                );
                 continue;
             }
         };
@@ -765,11 +769,15 @@ pub(crate) fn normalise_wallet_hex(raw: &str) -> String {
 /// Out-of-range integer → warn and skip.
 fn parse_resolution_rows(rows: Vec<serde_json::Value>) -> Vec<(String, Option<u16>, i64)> {
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (row_index, row) in rows.into_iter().enumerate() {
         let raw_id = match row.get("condition_id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s,
             _ => {
-                tracing::warn!("dune: resolution row missing or empty condition_id, skipping");
+                tracing::warn!(
+                    row_index,
+                    row = %row,
+                    "dune: resolution row missing or empty condition_id, skipping"
+                );
                 continue;
             }
         };

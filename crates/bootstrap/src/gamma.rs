@@ -113,7 +113,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
-                    tracing::warn!(%market_id, %message, "gamma: schedule fetch error, skipping");
+                    tracing::warn!(%market_id, error = %message, "gamma: schedule fetch error, skipping");
                     continue;
                 }
                 Err(e) => {
@@ -126,7 +126,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
             let end_date_unix = match parse_gamma_schedule(&bytes) {
                 Ok(ts) => ts,
                 Err(e) => {
-                    tracing::warn!(%market_id, %e, "gamma: schedule parse error, inserting NULL");
+                    tracing::warn!(%market_id, error = %e, "gamma: schedule parse error, inserting NULL");
                     None
                 }
             };
@@ -193,7 +193,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
-                    tracing::warn!(%market_id, %message, "gamma: rewrite fetch error, skipping");
+                    tracing::warn!(%market_id, error = %message, "gamma: rewrite fetch error, skipping");
                     continue;
                 }
                 Err(e) => {
@@ -207,7 +207,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
                 Ok(Some(ts)) => ts,
                 Ok(None) => continue, // closed market with no endDate; leave row NULL
                 Err(e) => {
-                    tracing::warn!(%market_id, %e, "gamma: rewrite parse error, leaving NULL");
+                    tracing::warn!(%market_id, error = %e, "gamma: rewrite parse error, leaving NULL");
                     continue;
                 }
             };
@@ -279,7 +279,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
-                    tracing::warn!(%market_id, %message, "gamma: liquidity fetch error, skipping");
+                    tracing::warn!(%market_id, error = %message, "gamma: liquidity fetch error, skipping");
                     continue;
                 }
                 Err(e) => {
@@ -293,7 +293,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
                 Ok(Some(v)) => v,
                 Ok(None) => continue, // no liquidity field — skip; retry next run
                 Err(e) => {
-                    tracing::warn!(%market_id, %e, "gamma: liquidity parse error, skipping");
+                    tracing::warn!(%market_id, error = %e, "gamma: liquidity parse error, skipping");
                     continue;
                 }
             };
