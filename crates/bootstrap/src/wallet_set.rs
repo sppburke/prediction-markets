@@ -7,8 +7,17 @@
 //!
 //! **Current (checkpoint) format** — written by this module:
 //! ```json
-//! { "completed_contracts": ["0xabc..."], "wallets": ["0x111...", ...] }
+//! {
+//!   "completed_contracts": ["0xabc..."],
+//!   "wallets": ["0x111...", ...],
+//!   "enumerated_topic_hashes": ["0xd0a0...", "0xd543..."]
+//! }
 //! ```
+//!
+//! The `enumerated_topic_hashes` field (issue #179) carries `#[serde(default)]`
+//! so pre-#179 checkpoints (no field) load with an empty `Vec`; callers treat
+//! that exact state as "legacy V1-only complete; V2 enumeration pending" and
+//! kick off an additive sweep.
 //!
 //! **Legacy format** — written by pre-checkpoint bootstrap runs (PR #68):
 //! ```json
@@ -26,15 +35,30 @@ use crate::error::BootstrapError;
 
 /// Per-contract checkpoint state persisted between bootstrap runs.
 ///
-/// Enumeration proceeds contract by contract; after each contract the state
-/// is saved atomically.  On startup, contracts already in `completed_contracts`
-/// are skipped.
+/// Enumeration proceeds (topic, contract) pair by pair (issue #179); after
+/// each pair the state is saved atomically. On startup, topics already in
+/// `enumerated_topic_hashes` are skipped entirely.
+///
+/// `completed_contracts` is preserved for backward-compat detection of
+/// legacy (pre-#179) checkpoints — see `lib.rs` for the
+/// "legacy V1-only done" upgrade path. New runs do NOT append to it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct WalletSetState {
-    /// Lowercase-hex contract addresses whose enumeration is complete.
+    /// Lowercase-hex contract addresses whose enumeration is complete (legacy
+    /// V1-only signal; superseded by `enumerated_topic_hashes` for new runs).
     pub completed_contracts: Vec<String>,
-    /// Accumulated wallet addresses (hex) from all completed contracts so far.
+    /// Accumulated wallet addresses (hex) — union across every completed
+    /// (topic, contract) pair. Load-time dedup happens in the caller.
     pub wallets: Vec<String>,
+    /// Lowercase-hex `OrderFilled` topic0 hashes (B256 Display format —
+    /// includes the `0x` prefix) that have been fully enumerated across
+    /// `ALL_EXCHANGE_CONTRACTS`. Issue #179.
+    ///
+    /// `#[serde(default)]` makes pre-#179 JSON files load with an empty
+    /// `Vec`; the bootstrap orchestrator treats that exact state combined
+    /// with a full `completed_contracts` set as "V1 done, V2 pending".
+    #[serde(default)]
+    pub enumerated_topic_hashes: Vec<String>,
 }
 
 /// Load the checkpoint state from `path`.
@@ -162,11 +186,18 @@ mod tests {
                 "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
             ],
+            enumerated_topic_hashes: vec![
+                "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6".to_owned(),
+            ],
         };
         save_state(&path, &state).unwrap();
         let loaded = load_state(&path).unwrap().unwrap();
         assert_eq!(loaded.completed_contracts, state.completed_contracts);
         assert_eq!(loaded.wallets, state.wallets);
+        assert_eq!(
+            loaded.enumerated_topic_hashes,
+            state.enumerated_topic_hashes
+        );
     }
 
     #[test]
@@ -174,6 +205,26 @@ mod tests {
         let s = WalletSetState::default();
         assert!(s.completed_contracts.is_empty());
         assert!(s.wallets.is_empty());
+        assert!(s.enumerated_topic_hashes.is_empty());
+    }
+
+    /// Pre-#179 JSON has no `enumerated_topic_hashes` field. Verify
+    /// `#[serde(default)]` makes it load with an empty `Vec` (the
+    /// "legacy V1-only done" sentinel) rather than failing.
+    #[test]
+    fn state_loads_pre_179_json_with_empty_topics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallets.json");
+        // Exact shape the old binary wrote — no `enumerated_topic_hashes` key.
+        let legacy_json = br#"{"completed_contracts":["0xabc"],"wallets":["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let loaded = load_state(&path).unwrap().unwrap();
+        assert_eq!(loaded.completed_contracts, vec!["0xabc"]);
+        assert_eq!(loaded.wallets.len(), 1);
+        assert!(
+            loaded.enumerated_topic_hashes.is_empty(),
+            "pre-#179 JSON must load with empty enumerated_topic_hashes"
+        );
     }
 
     #[test]

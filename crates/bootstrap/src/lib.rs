@@ -48,7 +48,10 @@ use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_onchain_polygon::{
     BlockRange, EnumerationConfig, EtherscanFunderLookup, PolymarketTraderEnumeration,
-    contracts::{ALL_EXCHANGE_CONTRACTS, CTF_EXCHANGE_V1_DEPLOY_BLOCK},
+    contracts::{
+        ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+        TOPIC_ORDER_FILLED_V1,
+    },
 };
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_trader_index::{
@@ -142,6 +145,10 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                 .map(|c| format!("0x{c:x}"))
                                 .collect(),
                             wallets: legacy.iter().map(|w| w.to_string()).collect(),
+                            // Pre-#179 bare-array files are V1-only by
+                            // construction. Mark V1 as enumerated and let
+                            // the per-topic loop pick up V2 additively.
+                            enumerated_topic_hashes: vec![format!("{TOPIC_ORDER_FILLED_V1}")],
                         };
                         wallet_set::save_state(&config.wallet_set_path, &upgraded)?;
                         upgraded
@@ -152,11 +159,20 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
         };
 
         let total_contracts = ALL_EXCHANGE_CONTRACTS.len();
-        if state.completed_contracts.len() >= total_contracts {
+        // Issue #179: enumeration is complete only when every contract AND
+        // every known `OrderFilled` topic version has been swept. A
+        // pre-#179 checkpoint will have `enumerated_topic_hashes.is_empty()`
+        // and fall into the `else` branch where the per-topic loop runs an
+        // additive V2 sweep (V1 is marked done by the legacy-upgrade block
+        // inside the Etherscan arm).
+        let all_topics_done = ALL_ORDER_FILLED_TOPICS
+            .iter()
+            .all(|h| state.enumerated_topic_hashes.contains(&format!("{h}")));
+        if state.completed_contracts.len() >= total_contracts && all_topics_done {
             tracing::info!(
                 count = state.wallets.len(),
                 path = %config.wallet_set_path.display(),
-                "bootstrap: all contracts enumerated — skipping wallet discovery"
+                "bootstrap: wallet discovery complete — skipping"
             );
         } else {
             match &config.wallet_source {
@@ -189,6 +205,13 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         .iter()
                         .map(|c| format!("0x{c:x}"))
                         .collect();
+                    // Dune SQL covers all OrderFilled events across V1 and V2
+                    // implicitly; mark every known topic as enumerated so the
+                    // guard short-circuits next run instead of re-querying Dune.
+                    state.enumerated_topic_hashes = ALL_ORDER_FILLED_TOPICS
+                        .iter()
+                        .map(|h| format!("{h}"))
+                        .collect();
                     wallet_set::save_state(&config.wallet_set_path, &state)?;
                 }
                 WalletSource::Etherscan => {
@@ -206,6 +229,8 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         operators = config.operator_addresses.len(),
                         contracts_done = state.completed_contracts.len(),
                         contracts_total = total_contracts,
+                        topics_done = state.enumerated_topic_hashes.len(),
+                        topics_total = ALL_ORDER_FILLED_TOPICS.len(),
                         "bootstrap: enumerating wallets via etherscan"
                     );
                     let enum_config = EnumerationConfig {
@@ -214,23 +239,63 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                         operator_addresses: config.operator_addresses.clone(),
                     };
                     let enumerator = PolymarketTraderEnumeration::new(api_key, enum_config);
-                    for contract in &ALL_EXCHANGE_CONTRACTS {
-                        let contract_hex = format!("0x{contract:x}");
-                        if state.completed_contracts.contains(&contract_hex) {
+
+                    // Legacy-checkpoint upgrade (one-shot): a pre-#179
+                    // structured checkpoint has every contract in
+                    // `completed_contracts` but an empty
+                    // `enumerated_topic_hashes`. Treat that exact state as
+                    // "V1 fully done" so we don't redo the V1 sweep.
+                    // Set-membership (not `len()`) so adding a future V3
+                    // contract to ALL_EXCHANGE_CONTRACTS does not silently
+                    // match a legacy 4-entry list.
+                    let legacy_v1_done = state.enumerated_topic_hashes.is_empty()
+                        && ALL_EXCHANGE_CONTRACTS
+                            .iter()
+                            .all(|c| state.completed_contracts.contains(&format!("0x{c:x}")));
+                    if legacy_v1_done {
+                        tracing::info!(
+                            "bootstrap: legacy checkpoint upgraded; V1 marked complete, V2 pending"
+                        );
+                        state
+                            .enumerated_topic_hashes
+                            .push(format!("{TOPIC_ORDER_FILLED_V1}"));
+                        wallet_set::save_state(&config.wallet_set_path, &state)?;
+                    }
+                    // Partial-legacy state (e.g., crashed mid-V1 sweep) does
+                    // NOT match `legacy_v1_done` and therefore triggers a
+                    // full additive sweep of both topics across every
+                    // contract — accepted one-shot cost.
+
+                    // Per-topic outer loop: scans the FULL
+                    // ALL_ORDER_FILLED_TOPICS array on every invocation.
+                    // V1 contract bytecode cannot emit V2 events (and vice-
+                    // versa), so the V2-topic sweep across V1 contracts
+                    // returns 0 logs — expected, harmless, and simpler than
+                    // a per-(contract,topic) skip predicate.
+                    for topic in &ALL_ORDER_FILLED_TOPICS {
+                        let topic_hex = format!("{topic}");
+                        if state.enumerated_topic_hashes.contains(&topic_hex) {
                             tracing::info!(
-                                contract = %contract_hex,
-                                "bootstrap: contract already in checkpoint — skipping"
+                                topic = %topic_hex,
+                                "bootstrap: topic already enumerated — skipping"
                             );
                             continue;
                         }
-                        let found = enumerator.enumerate_one_contract(*contract).await?;
-                        tracing::info!(
-                            contract = %contract_hex,
-                            found = found.len(),
-                            "bootstrap: contract enumerated"
-                        );
-                        state.wallets.extend(found.iter().map(|w| w.to_string()));
-                        state.completed_contracts.push(contract_hex);
+                        for contract in &ALL_EXCHANGE_CONTRACTS {
+                            let contract_hex = format!("0x{contract:x}");
+                            let found = enumerator
+                                .enumerate_one_contract_for_topic(*contract, *topic)
+                                .await?;
+                            tracing::info!(
+                                contract = %contract_hex,
+                                topic = %topic_hex,
+                                found = found.len(),
+                                "bootstrap: contract enumerated for topic"
+                            );
+                            state.wallets.extend(found.iter().map(|w| w.to_string()));
+                            wallet_set::save_state(&config.wallet_set_path, &state)?;
+                        }
+                        state.enumerated_topic_hashes.push(topic_hex);
                         wallet_set::save_state(&config.wallet_set_path, &state)?;
                     }
                 }

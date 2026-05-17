@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use alloy::rpc::types::{Filter, Log};
 use pe_core_types::WalletAddress;
-use pe_source_onchain_polygon::contracts::{ALL_EXCHANGE_CONTRACTS, TOPIC_ORDER_FILLED};
+use pe_source_onchain_polygon::contracts::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
 use pe_source_onchain_polygon::{ChainLogFetcher, topic_to_wallet};
 
 use crate::cache::WalletCache;
@@ -92,9 +92,10 @@ pub fn cold_start_from_block(to_block: u64) -> u64 {
 ///    successful empty scan (`new_cursor = Some(to_block)`). Mirrors the
 ///    `scan_resolutions` precedent.
 /// 4. **Fetch logs**: builds a multi-address filter for all four exchange
-///    contracts + `TOPIC_ORDER_FILLED` and calls `fetcher.get_logs(...)`.
-///    Any RPC error is captured in `scan_error` with `new_cursor = None`;
-///    the caller falls back to legacy full-fetch this run.
+///    contracts + every topic in `ALL_ORDER_FILLED_TOPICS` (V1 and V2) and
+///    calls `fetcher.get_logs(...)`. Any RPC error is captured in
+///    `scan_error` with `new_cursor = None`; the caller falls back to legacy
+///    full-fetch this run.
 /// 5. **Extract wallets**: via [`extract_active_wallets`] from `logs`.
 /// 6. **Return**: `new_cursor = Some(to_block)` on success.
 ///
@@ -148,9 +149,14 @@ pub async fn scan_active_wallets<F: ChainLogFetcher>(
         };
     }
 
+    // Topic-0 OR-filter: alloy `event_signature` accepts `Into<Topic>`, and
+    // `Topic = FilterSet<B256>` has `From<Vec<B256>>`. Passing every known
+    // OrderFilled topic version captures V1 and V2 in a single RPC round-trip.
+    // Issue #179: a single-topic filter silently missed ~98% of current
+    // volume (V2 contracts) before this change.
     let filter = Filter::new()
         .address(ALL_EXCHANGE_CONTRACTS.to_vec())
-        .event_signature(TOPIC_ORDER_FILLED);
+        .event_signature(ALL_ORDER_FILLED_TOPICS.to_vec());
 
     tracing::info!(
         from_block = resolved_from,
@@ -269,6 +275,7 @@ mod tests {
     use alloy::primitives::{Address, B256, Bytes, LogData};
     use alloy::rpc::types::Log;
     use pe_core_types::WalletAddress;
+    use pe_source_onchain_polygon::contracts::{TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2};
     use tempfile::TempDir;
     use test_support::InMemoryChainLogFetcher;
 
@@ -284,17 +291,12 @@ mod tests {
         B256::from(b)
     }
 
-    fn order_filled_log(maker: u8, taker: u8) -> Log {
+    fn order_filled_log(topic0: B256, maker: u8, taker: u8) -> Log {
         let order_hash = B256::repeat_byte(0xaa);
         let inner = alloy::primitives::Log {
             address: Address::ZERO,
             data: LogData::new_unchecked(
-                vec![
-                    TOPIC_ORDER_FILLED,
-                    order_hash,
-                    wallet_topic(maker),
-                    wallet_topic(taker),
-                ],
+                vec![topic0, order_hash, wallet_topic(maker), wallet_topic(taker)],
                 Bytes::from(vec![0u8; 32]),
             ),
         };
@@ -304,11 +306,11 @@ mod tests {
         }
     }
 
-    fn malformed_log() -> Log {
+    fn malformed_log(topic0: B256) -> Log {
         // Only topic[0]; no maker/taker → topic_to_wallet returns None twice.
         let inner = alloy::primitives::Log {
             address: Address::ZERO,
-            data: LogData::new_unchecked(vec![TOPIC_ORDER_FILLED], Bytes::new()),
+            data: LogData::new_unchecked(vec![topic0], Bytes::new()),
         };
         Log {
             inner,
@@ -325,7 +327,10 @@ mod tests {
     #[test]
     fn extract_active_wallets_two_logs_four_unique() {
         // Two OrderFilled logs with 4 distinct maker/taker addresses.
-        let logs = vec![order_filled_log(0x01, 0x02), order_filled_log(0x03, 0x04)];
+        let logs = vec![
+            order_filled_log(TOPIC_ORDER_FILLED_V1, 0x01, 0x02),
+            order_filled_log(TOPIC_ORDER_FILLED_V1, 0x03, 0x04),
+        ];
         let set = extract_active_wallets(&logs);
         assert_eq!(set.len(), 4);
         assert!(set.contains(&make_wallet(0x01)));
@@ -338,9 +343,9 @@ mod tests {
     fn extract_active_wallets_deduplicates_repeated_addresses() {
         // Same maker/taker pair in 3 logs → set size 2, not 6.
         let logs = vec![
-            order_filled_log(0x05, 0x06),
-            order_filled_log(0x05, 0x06),
-            order_filled_log(0x06, 0x05),
+            order_filled_log(TOPIC_ORDER_FILLED_V1, 0x05, 0x06),
+            order_filled_log(TOPIC_ORDER_FILLED_V1, 0x05, 0x06),
+            order_filled_log(TOPIC_ORDER_FILLED_V1, 0x06, 0x05),
         ];
         let set = extract_active_wallets(&logs);
         assert_eq!(set.len(), 2);
@@ -354,7 +359,7 @@ mod tests {
 
     #[test]
     fn extract_active_wallets_skips_malformed_topics() {
-        let logs = vec![malformed_log()];
+        let logs = vec![malformed_log(TOPIC_ORDER_FILLED_V1)];
         assert!(extract_active_wallets(&logs).is_empty());
     }
 
@@ -368,12 +373,35 @@ mod tests {
     #[tokio::test]
     async fn scan_success_returns_active_wallets_and_new_cursor() {
         let (_dir, cache) = open_cache();
-        let logs = vec![order_filled_log(0x10, 0x11)];
+        let logs = vec![order_filled_log(TOPIC_ORDER_FILLED_V1, 0x10, 0x11)];
         let fetcher = InMemoryChainLogFetcher::ok(1_000_000, logs);
         let result = scan_active_wallets(&fetcher, Some(900_000), Some(950_000), 256, &cache).await;
         assert_eq!(result.active_wallets.len(), 2);
         assert_eq!(result.new_cursor, Some(950_000));
         assert!(result.scan_error.is_none());
+    }
+
+    /// Regression test for #179: a V2-topic log must be captured by the
+    /// delta-scan extractor (both V1 and V2 use topic[2]/topic[3] for
+    /// maker/taker — the change is purely the topic-0 filter). Without this
+    /// test, a future filter regression that silently drops V2 logs could
+    /// recur (the production bug was exactly this).
+    #[tokio::test]
+    async fn scan_captures_v2_topic_orderfilled_logs() {
+        let (_dir, cache) = open_cache();
+        let logs = vec![
+            order_filled_log(TOPIC_ORDER_FILLED_V1, 0x21, 0x22),
+            order_filled_log(TOPIC_ORDER_FILLED_V2, 0x23, 0x24),
+        ];
+        let fetcher = InMemoryChainLogFetcher::ok(1_000_000, logs);
+        let result = scan_active_wallets(&fetcher, Some(900_000), Some(950_000), 256, &cache).await;
+        assert_eq!(
+            result.active_wallets.len(),
+            4,
+            "must include both V1- and V2-topic maker/taker addresses"
+        );
+        assert!(result.active_wallets.contains(&make_wallet(0x23)));
+        assert!(result.active_wallets.contains(&make_wallet(0x24)));
     }
 
     #[tokio::test]

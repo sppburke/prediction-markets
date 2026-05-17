@@ -320,6 +320,17 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `wallet_enum_rate_limit_delay_ms` | 200 | Delay between successive Etherscan calls for enumeration (shared 5 req/s budget). |
 | `wallet_enum_max_backoff_secs` | 60 | Cap on retry backoff for transient enumeration errors. |
 | `wallet_enum_max_attempts` | 6 | Maximum retry attempts per `eth_getLogs` call before failing. |
+| `bootstrap_all_order_filled_topics` | `pe_source_onchain_polygon::contracts::ALL_ORDER_FILLED_TOPICS` | Canonical "what to scan" set used by every `OrderFilled` consumer (`polygon_ctf_delta::scan_active_wallets`, `wallet_enumeration::PolymarketTraderEnumeration`). Currently `[V1, V2]`. Hex values live in `contracts.rs` with self-validating keccak tests — the canonical source. Extending this array adds the new topic to every consumer automatically and triggers an additive Etherscan re-sweep on the next bootstrap run (issue #179). |
+
+**`WalletSetState.enumerated_topic_hashes` migration semantics (issue #179).**
+The wallet-set checkpoint format carries an `enumerated_topic_hashes: Vec<String>`
+field with `#[serde(default)]`. Pre-#179 JSON files have no such field; they
+load with an empty `Vec`, which the bootstrap orchestrator combines with a
+full `completed_contracts` set to detect "legacy V1-only complete; V2 enumeration
+pending" via set-membership over `ALL_EXCHANGE_CONTRACTS` (not `len()`, so a
+future V3 contract addition does not silently match a 4-entry legacy list).
+Partial-legacy state (e.g. crashed mid-V1 sweep) does NOT match the detector
+and triggers a full additive sweep of every `(topic, contract)` pair.
 
 ### Operator graph
 

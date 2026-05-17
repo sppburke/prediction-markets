@@ -23,11 +23,14 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use alloy::primitives::{Address, B256};
 use pe_core_types::WalletAddress;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::contracts::{ALL_EXCHANGE_CONTRACTS, CTF_EXCHANGE_V1_DEPLOY_BLOCK, TOPIC_ORDER_FILLED};
+use crate::contracts::{
+    ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+};
 use crate::etherscan::{FetchError, HttpFetcher};
 use crate::funder_discovery::FunderDiscoveryError;
 
@@ -158,7 +161,8 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
     /// Enumerate every distinct trader wallet across all Polymarket exchange contracts.
     ///
     /// Returns a deduplicated `HashSet<WalletAddress>` with operator addresses
-    /// removed. Scans both maker (topic2) and taker (topic3) from `OrderFilled` events.
+    /// removed. Scans both maker (topic2) and taker (topic3) from `OrderFilled` events
+    /// for every topic in [`ALL_ORDER_FILLED_TOPICS`] (V1 and V2).
     pub async fn enumerate(&self) -> Result<HashSet<WalletAddress>, EnumerationError> {
         if self.config.from_block > self.config.to_block {
             return Err(EnumerationError::InvalidConfig(format!(
@@ -173,18 +177,47 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
         Ok(wallets)
     }
 
-    /// Enumerate every distinct trader wallet for a single exchange `contract`.
+    /// Enumerate every distinct trader wallet for a single exchange `contract`,
+    /// scanning every topic in [`ALL_ORDER_FILLED_TOPICS`] (V1 and V2) and
+    /// returning the unioned wallet set.
+    ///
+    /// Thin wrapper over [`Self::enumerate_one_contract_for_topic`]. Issued as
+    /// one Etherscan REST call per topic per contract — the free-tier endpoint
+    /// rejects duplicate `topic0` query params with `"Invalid topic0 length"`,
+    /// so a single union call is not possible at the REST layer.
+    ///
+    /// # Precondition
+    /// `config.from_block <= config.to_block` — callers must validate the
+    /// range before calling (e.g. via [`Self::enumerate`] which checks up front).
+    pub async fn enumerate_one_contract(
+        &self,
+        contract: Address,
+    ) -> Result<HashSet<WalletAddress>, EnumerationError> {
+        let mut wallets: HashSet<WalletAddress> = HashSet::new();
+        for topic in &ALL_ORDER_FILLED_TOPICS {
+            wallets.extend(
+                self.enumerate_one_contract_for_topic(contract, *topic)
+                    .await?,
+            );
+        }
+        Ok(wallets)
+    }
+
+    /// Enumerate every distinct trader wallet for a single exchange `contract`
+    /// filtered to a single `topic0`. The unit primitive used by the bootstrap
+    /// per-(topic, contract) loop and by [`Self::enumerate_one_contract`].
     ///
     /// Scans `[from_block, to_block]` in `SCAN_CHUNK_BLOCKS`-sized windows,
-    /// bisecting on page-cap responses.  Operator addresses are excluded.
+    /// bisecting on page-cap responses. Operator addresses are excluded.
     /// Returns a deduplicated `HashSet<WalletAddress>`.
     ///
     /// # Precondition
     /// `config.from_block <= config.to_block` — callers must validate the
-    /// range before calling (e.g. via [`enumerate`] which checks up front).
-    pub async fn enumerate_one_contract(
+    /// range before calling.
+    pub async fn enumerate_one_contract_for_topic(
         &self,
-        contract: alloy::primitives::Address,
+        contract: Address,
+        topic0: B256,
     ) -> Result<HashSet<WalletAddress>, EnumerationError> {
         let operator_set: HashSet<WalletAddress> =
             self.config.operator_addresses.iter().copied().collect();
@@ -194,17 +227,20 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
         // Pre-chunk the full range into SCAN_CHUNK_BLOCKS windows so that the initial
         // request per chunk is small enough for Etherscan to handle without timing out.
         let contract_hex = format!("0x{contract:x}");
+        let topic0_hex = format!("{topic0}");
         let mut chunk_from = self.config.from_block;
         while chunk_from <= self.config.to_block {
             let chunk_to = (chunk_from + SCAN_CHUNK_BLOCKS - 1).min(self.config.to_block);
             tracing::info!(
                 contract = %contract_hex,
+                topic0 = %topic0_hex,
                 chunk_from,
                 chunk_to,
                 "wallet enumeration: scanning chunk"
             );
             self.scan_range(
                 &contract_hex,
+                &topic0_hex,
                 chunk_from,
                 chunk_to,
                 &operator_set,
@@ -217,11 +253,12 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
         Ok(wallets)
     }
 
-    /// Recursively scan `[from, to]` for `OrderFilled` logs, bisecting if the
-    /// response hits the page cap.
+    /// Recursively scan `[from, to]` for `OrderFilled` logs of `topic0_hex`,
+    /// bisecting if the response hits the page cap.
     fn scan_range<'a>(
         &'a self,
         contract_hex: &'a str,
+        topic0_hex: &'a str,
         from: u64,
         to: u64,
         operator_set: &'a HashSet<WalletAddress>,
@@ -230,7 +267,7 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
         Box<dyn std::future::Future<Output = Result<(), EnumerationError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let url = self.build_url(contract_hex, from, to);
+            let url = self.build_url(contract_hex, topic0_hex, from, to);
             let logs = self.fetch_logs_with_backoff(&url).await?;
             let count = logs.len();
 
@@ -241,6 +278,7 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
                     // returns.
                     warn!(
                         contract = %contract_hex,
+                        topic0 = %topic0_hex,
                         block = from,
                         count,
                         cap = LOGS_PAGE_CAP,
@@ -253,10 +291,10 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
                 // 5 req/s budget — the triggering fetch above already consumed one slot.
                 let mid = from + (to - from) / 2;
                 tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
-                self.scan_range(contract_hex, from, mid, operator_set, wallets)
+                self.scan_range(contract_hex, topic0_hex, from, mid, operator_set, wallets)
                     .await?;
                 tokio::time::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
-                self.scan_range(contract_hex, mid + 1, to, operator_set, wallets)
+                self.scan_range(contract_hex, topic0_hex, mid + 1, to, operator_set, wallets)
                     .await?;
             } else {
                 extract_wallets(&logs, operator_set, wallets);
@@ -265,9 +303,7 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
         })
     }
 
-    fn build_url(&self, contract_hex: &str, from: u64, to: u64) -> String {
-        // B256 Display already includes the "0x" prefix — do not add a second one.
-        let topic0 = format!("{TOPIC_ORDER_FILLED}");
+    fn build_url(&self, contract_hex: &str, topic0_hex: &str, from: u64, to: u64) -> String {
         format!(
             "{base}?chainid={chain}&module=logs&action=getLogs\
              &address={contract}&topic0={topic0}\
@@ -276,7 +312,7 @@ impl<F: HttpFetcher> PolymarketTraderEnumeration<F> {
             base = self.base_url,
             chain = POLYGON_CHAIN_ID,
             contract = contract_hex,
-            topic0 = topic0,
+            topic0 = topic0_hex,
             from = from,
             to = to,
             cap = LOGS_PAGE_CAP,
@@ -412,6 +448,7 @@ mod tests {
 
     use crate::contracts::{
         CTF_EXCHANGE_V1, CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V1, NEG_RISK_CTF_EXCHANGE_V2,
+        TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2,
     };
 
     use super::*;
@@ -432,10 +469,10 @@ mod tests {
         hex
     }
 
-    fn make_log(maker: WalletAddress, taker: WalletAddress) -> LogEntry {
+    fn make_log(topic0: B256, maker: WalletAddress, taker: WalletAddress) -> LogEntry {
         LogEntry {
             topics: vec![
-                format!("{TOPIC_ORDER_FILLED}"),
+                format!("{topic0}"),
                 "0x".to_owned() + &"0".repeat(64), // orderHash
                 topic_hex(maker),
                 topic_hex(taker),
@@ -487,7 +524,7 @@ mod tests {
     fn extract_wallets_collects_maker_and_taker() {
         let maker = w(0xaa);
         let taker = w(0xbb);
-        let logs = vec![make_log(maker, taker)];
+        let logs = vec![make_log(TOPIC_ORDER_FILLED_V1, maker, taker)];
         let operators = HashSet::new();
         let mut wallets = HashSet::new();
         extract_wallets(&logs, &operators, &mut wallets);
@@ -499,7 +536,7 @@ mod tests {
     fn extract_wallets_filters_operators() {
         let maker = w(0xaa);
         let operator = w(0xcc);
-        let logs = vec![make_log(maker, operator)];
+        let logs = vec![make_log(TOPIC_ORDER_FILLED_V1, maker, operator)];
         let mut operators = HashSet::new();
         operators.insert(operator);
         let mut wallets = HashSet::new();
@@ -512,11 +549,29 @@ mod tests {
     fn extract_wallets_deduplicates() {
         let maker = w(0xaa);
         let taker = w(0xbb);
-        let logs = vec![make_log(maker, taker), make_log(maker, taker)];
+        let logs = vec![
+            make_log(TOPIC_ORDER_FILLED_V1, maker, taker),
+            make_log(TOPIC_ORDER_FILLED_V1, maker, taker),
+        ];
         let operators = HashSet::new();
         let mut wallets = HashSet::new();
         extract_wallets(&logs, &operators, &mut wallets);
         assert_eq!(wallets.len(), 2);
+    }
+
+    /// Regression test for issue #179: the wallet-extractor must accept a
+    /// V2-topic log without dropping the maker/taker. Topic[0] is metadata only
+    /// — `extract_wallets` reads topic[2]/topic[3] regardless of version.
+    #[test]
+    fn extract_wallets_captures_v2_topic_log() {
+        let maker = w(0xab);
+        let taker = w(0xcd);
+        let logs = vec![make_log(TOPIC_ORDER_FILLED_V2, maker, taker)];
+        let operators = HashSet::new();
+        let mut wallets = HashSet::new();
+        extract_wallets(&logs, &operators, &mut wallets);
+        assert!(wallets.contains(&maker), "V2-topic maker must be captured");
+        assert!(wallets.contains(&taker), "V2-topic taker must be captured");
     }
 
     #[test]
@@ -568,10 +623,10 @@ mod tests {
         }
     }
 
-    fn json_logs(n: usize) -> Vec<u8> {
+    fn json_logs(topic0: B256, n: usize) -> Vec<u8> {
         let maker = w(0xaa);
         let taker = w(0xbb);
-        let topic0_str = format!("{TOPIC_ORDER_FILLED}"); // B256 Display already includes "0x"
+        let topic0_str = format!("{topic0}"); // B256 Display already includes "0x"
         let zero_str = "0x".to_owned() + &"0".repeat(64);
         let maker_str = topic_hex(maker);
         let taker_str = topic_hex(taker);
@@ -592,50 +647,50 @@ mod tests {
     /// Bisect-on-cap: if a range returns exactly LOGS_PAGE_CAP logs, the
     /// enumerator must bisect that range and re-fetch both halves. Verifies
     /// that the second-level calls are made with the correct sub-ranges.
+    ///
+    /// Under #179, `enumerate()` issues one call per (contract, topic) pair —
+    /// so the fixture map registers 2 URLs per contract (8 total) plus the
+    /// 2 bisect halves on the cap-triggering V1 call.
     #[tokio::test]
     async fn bisect_on_cap_triggers_recursion() {
-        // Block range 100..=101 on a single contract.
-        // First call (100..=101) → exactly LOGS_PAGE_CAP logs → must bisect.
-        // Second call (100..=100) → 1 log.
-        // Third call (101..=101) → 0 logs.
-        let contract = format!("0x{:x}", CTF_EXCHANGE_V1);
         let api_key = "TESTKEY";
         let base = "http://test.local";
 
-        let chain_id = POLYGON_CHAIN_ID;
-        let full_url = format!(
-            "{base}?chainid={chain_id}&module=logs&action=getLogs\
-             &address={contract}&topic0={topic0}\
-             &fromBlock=100&toBlock=101\
-             &offset={cap}&page=1&apikey={api_key}",
-            topic0 = TOPIC_ORDER_FILLED, // B256 Display already includes "0x"
-            cap = LOGS_PAGE_CAP,
-        );
-        let left_url = full_url.replace("fromBlock=100&toBlock=101", "fromBlock=100&toBlock=100");
-        let right_url = full_url.replace("fromBlock=100&toBlock=101", "fromBlock=101&toBlock=101");
+        let url_for = |contract: alloy::primitives::Address, topic: B256, from: u64, to: u64| {
+            format!(
+                "{base}?chainid={chain_id}&module=logs&action=getLogs\
+                 &address=0x{contract:x}&topic0={topic0}\
+                 &fromBlock={from}&toBlock={to}\
+                 &offset={cap}&page=1&apikey={api_key}",
+                chain_id = POLYGON_CHAIN_ID,
+                topic0 = topic, // B256 Display already includes "0x"
+                cap = LOGS_PAGE_CAP,
+            )
+        };
 
-        // Build URLs for the other 3 contracts (all empty).
+        // CTF_EXCHANGE_V1 / V1-topic: cap-hit forces bisect.
+        let v1_full = url_for(CTF_EXCHANGE_V1, TOPIC_ORDER_FILLED_V1, 100, 101);
+        let v1_left = url_for(CTF_EXCHANGE_V1, TOPIC_ORDER_FILLED_V1, 100, 100);
+        let v1_right = url_for(CTF_EXCHANGE_V1, TOPIC_ORDER_FILLED_V1, 101, 101);
+
         let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
-        responses.insert(full_url.clone(), json_logs(LOGS_PAGE_CAP));
-        responses.insert(left_url.clone(), json_logs(1));
-        responses.insert(right_url.clone(), json_empty());
+        responses.insert(v1_full, json_logs(TOPIC_ORDER_FILLED_V1, LOGS_PAGE_CAP));
+        responses.insert(v1_left, json_logs(TOPIC_ORDER_FILLED_V1, 1));
+        responses.insert(v1_right, json_empty());
 
-        // Add empty responses for V2 and NegRisk contracts.
+        // All other (contract, topic) pairs return empty — that includes
+        // CTF_EXCHANGE_V1/V2-topic, plus the full grid for the remaining
+        // 3 contracts × 2 topics = 6 URLs. Total: 1 (cap) + 2 (bisect) + 7 (empty).
         for contract_addr in [
+            CTF_EXCHANGE_V1,
             NEG_RISK_CTF_EXCHANGE_V1,
             CTF_EXCHANGE_V2,
             NEG_RISK_CTF_EXCHANGE_V2,
         ] {
-            let chain_id = POLYGON_CHAIN_ID;
-            let url = format!(
-                "{base}?chainid={chain_id}&module=logs&action=getLogs\
-                 &address=0x{contract_addr:x}&topic0={topic0}\
-                 &fromBlock=100&toBlock=101\
-                 &offset={cap}&page=1&apikey={api_key}",
-                topic0 = TOPIC_ORDER_FILLED, // B256 Display already includes "0x"
-                cap = LOGS_PAGE_CAP,
-            );
-            responses.insert(url, json_empty());
+            for topic in [TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2] {
+                let url = url_for(contract_addr, topic, 100, 101);
+                responses.entry(url).or_insert_with(json_empty);
+            }
         }
 
         let fetcher = FixtureFetcher::new(responses);

@@ -21,7 +21,7 @@ use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::polygon_ctf_delta::POLYGON_CTF_BACKFILL_CURSOR_KEY;
 use pe_bootstrap::polygon_ctf_delta::test_support::InMemoryChainLogFetcher;
 use pe_core_types::WalletAddress;
-use pe_source_onchain_polygon::contracts::TOPIC_ORDER_FILLED;
+use pe_source_onchain_polygon::contracts::{TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2};
 use rusqlite::params;
 use tempfile::TempDir;
 
@@ -37,17 +37,12 @@ fn wallet_topic(byte: u8) -> B256 {
     B256::from(b)
 }
 
-fn order_filled_log(maker: u8, taker: u8) -> Log {
+fn order_filled_log(topic0: B256, maker: u8, taker: u8) -> Log {
     let order_hash = B256::repeat_byte(0xaa);
     let inner = alloy::primitives::Log {
         address: Address::ZERO,
         data: LogData::new_unchecked(
-            vec![
-                TOPIC_ORDER_FILLED,
-                order_hash,
-                wallet_topic(maker),
-                wallet_topic(taker),
-            ],
+            vec![topic0, order_hash, wallet_topic(maker), wallet_topic(taker)],
             Bytes::from(vec![0u8; 32]),
         ),
     };
@@ -70,7 +65,10 @@ fn make_wallet(byte: u8) -> WalletAddress {
 #[tokio::test]
 async fn scenario_scan_success_populates_active_wallets() {
     let (_dir, cache) = open_cache();
-    let logs = vec![order_filled_log(0x01, 0x02), order_filled_log(0x03, 0x04)];
+    let logs = vec![
+        order_filled_log(TOPIC_ORDER_FILLED_V1, 0x01, 0x02),
+        order_filled_log(TOPIC_ORDER_FILLED_V1, 0x03, 0x04),
+    ];
     let fetcher = InMemoryChainLogFetcher::ok(1_000_000, logs);
     let (active, cursor) = run_delta_scan_with_fetcher(&fetcher, 256, &cache).await;
     // Expected `to_block` = 1_000_000 - 256 = 999_744; we don't assert that
@@ -80,6 +78,27 @@ async fn scenario_scan_success_populates_active_wallets() {
     assert!(cursor.is_some());
     let target = cursor.unwrap();
     assert_eq!(target, 999_744);
+}
+
+// ── Scenario 1b ──────────────────────────────────────────────────────────────
+// Issue #179: a V2-topic OrderFilled log must surface in active_wallets.
+// PASS criterion: a mixed-topic batch produces the union of all unique
+// maker/taker addresses, regardless of topic version.
+// FAIL: V2-topic wallets are silently dropped (the production bug).
+
+#[tokio::test]
+async fn scenario_v2_topic_orderfilled_log_produces_active_wallet() {
+    let (_dir, cache) = open_cache();
+    let logs = vec![
+        order_filled_log(TOPIC_ORDER_FILLED_V1, 0x10, 0x11),
+        order_filled_log(TOPIC_ORDER_FILLED_V2, 0x12, 0x13),
+    ];
+    let fetcher = InMemoryChainLogFetcher::ok(1_000_000, logs);
+    let (active, cursor) = run_delta_scan_with_fetcher(&fetcher, 256, &cache).await;
+    assert_eq!(active.len(), 4, "V2-topic wallets must not be dropped");
+    assert!(active.contains(&make_wallet(0x12)));
+    assert!(active.contains(&make_wallet(0x13)));
+    assert!(cursor.is_some());
 }
 
 // ── Scenario 2 ───────────────────────────────────────────────────────────────
@@ -126,9 +145,9 @@ async fn scenario_cursor_persistence() {
 async fn scenario_dedup_across_logs() {
     let (_dir, cache) = open_cache();
     let logs = vec![
-        order_filled_log(0x10, 0x11),
-        order_filled_log(0x11, 0x10), // same pair, swapped
-        order_filled_log(0x10, 0x12), // 0x10 again as maker, 0x12 new
+        order_filled_log(TOPIC_ORDER_FILLED_V1, 0x10, 0x11),
+        order_filled_log(TOPIC_ORDER_FILLED_V1, 0x11, 0x10), // same pair, swapped
+        order_filled_log(TOPIC_ORDER_FILLED_V1, 0x10, 0x12), // 0x10 again as maker, 0x12 new
     ];
     let fetcher = InMemoryChainLogFetcher::ok(1_000_000, logs);
     let (active, _) = run_delta_scan_with_fetcher(&fetcher, 256, &cache).await;
