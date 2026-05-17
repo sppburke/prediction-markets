@@ -203,8 +203,11 @@ pub fn auto_migrate_legacy(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<(), BootstrapError> {
+    let mut did_ingest = false;
+
     // 1. wallet_set.json → SQLite + source_cursor + delete.
     if config.wallet_set_path.exists() {
+        did_ingest = true;
         // Detect file shape BEFORE ingest so we know what enum-state to persist.
         let (contracts, topics) = match wallet_set::load_state(&config.wallet_set_path)? {
             Some(state) => {
@@ -241,6 +244,7 @@ pub fn auto_migrate_legacy(
 
     // 2. data/dune_csvs/*.csv → SQLite + rename to .csv.imported.
     if let Some(dir) = dune_csv_dir(config) {
+        did_ingest = true;
         let counts = ingest_dune_csvs(cache, &dir)?;
         tracing::info!(
             non_infra = counts.0,
@@ -271,20 +275,28 @@ pub fn auto_migrate_legacy(
 
     // 3. Post-ingest sequence — matches `run_migrate` exactly so the
     //    consolidated path is functionally equivalent to invoking
-    //    `pe-bootstrap migrate` once.
-    let trades_rows = ingest_trades_wallets(cache)?;
-    let trade_count_refreshed = cache.refresh_trade_counts()?;
-    let last_polymarket_fetch_seeded = cache.seed_last_polymarket_fetch_from_trades()?;
-    let last_funder_fetch_seeded = cache.seed_last_funder_fetch_from_done()?;
-    let activated = pile::apply_activation_rules(cache)?;
-    tracing::info!(
-        trades_rows,
-        trade_count_refreshed,
-        last_polymarket_fetch_seeded,
-        last_funder_fetch_seeded,
-        activated,
-        "auto_migrate_legacy: post-ingest sequence complete"
-    );
+    //    `pe-bootstrap migrate` once. GATED on `did_ingest` because each
+    //    helper issues a full-table UPDATE against the ~2.7M-row `wallets`
+    //    table; running them on every steady-state `run()` (after the
+    //    one-shot migration has fired) would add multi-second per-run cost
+    //    for zero state change. The pre-existing `backfill::run_backfill`
+    //    already calls `apply_activation_rules` on its own cadence so the
+    //    sticky 0→1 activation gate keeps firing for newly-active wallets.
+    if did_ingest {
+        let trades_rows = ingest_trades_wallets(cache)?;
+        let trade_count_refreshed = cache.refresh_trade_counts()?;
+        let last_polymarket_fetch_seeded = cache.seed_last_polymarket_fetch_from_trades()?;
+        let last_funder_fetch_seeded = cache.seed_last_funder_fetch_from_done()?;
+        let activated = pile::apply_activation_rules(cache)?;
+        tracing::info!(
+            trades_rows,
+            trade_count_refreshed,
+            last_polymarket_fetch_seeded,
+            last_funder_fetch_seeded,
+            activated,
+            "auto_migrate_legacy: post-ingest sequence complete"
+        );
+    }
 
     Ok(())
 }

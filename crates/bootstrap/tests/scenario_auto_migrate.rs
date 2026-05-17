@@ -212,6 +212,57 @@ async fn no_legacy_files_is_a_clean_noop() {
     assert!(topics.is_empty(), "fresh install: topics empty");
 }
 
+// ── Scenario D' (regression for code-review finding) ─────────────────────────
+// PASS: when no legacy files are on disk, the post-ingest sequence is SKIPPED
+//       (no full-table UPDATEs against the ~2.7M-row `wallets` table). Sketch:
+//       pre-populate the cache with a wallet whose `trade_count` is wrong,
+//       run auto_migrate_legacy with no legacy files, assert trade_count is
+//       UNCHANGED — proves `refresh_trade_counts` did not fire.
+// FAIL: trade_count changes on a no-op run (means the expensive post-ingest
+//       sequence is running unconditionally — the bug code-review caught).
+
+#[tokio::test]
+async fn no_legacy_files_skips_post_ingest_sequence() {
+    let dir = TempDir::new().unwrap();
+    let (cache_path, mut cache) = open_cache_in(&dir);
+    let wallet_set_path = dir.path().join("wallet_set.json");
+    let config = config_for(&dir, cache_path.clone(), wallet_set_path.clone());
+
+    // Insert a wallet with a deliberately-wrong trade_count via the
+    // scenario-only escape hatch. If the post-ingest sequence fires,
+    // `refresh_trade_counts` would reset it to 0 (no trades in this fixture).
+    let hex = "0xf000000000000000000000000000000000000000";
+    cache
+        .upsert_wallets_bulk(&[(
+            hex.to_owned(),
+            pe_bootstrap::pile::SRC_WALLET_SET_JSON,
+            false,
+            None,
+            None,
+            None,
+        )])
+        .unwrap();
+    cache.conn_for_test_set_trade_count(hex, 999);
+
+    auto_migrate_legacy(&config, &mut cache).unwrap();
+
+    // refresh_trade_counts would have reset this to 0 (no trades exist).
+    // The fact that it's still 999 proves the post-ingest sequence was skipped.
+    let count: i64 = cache
+        .raw_conn_for_test()
+        .query_row(
+            "SELECT trade_count FROM wallets WHERE wallet_hex = ?1",
+            rusqlite::params![hex],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 999,
+        "post-ingest sequence MUST be skipped when no legacy files exist; \
+         trade_count would have been reset to 0 if refresh_trade_counts ran"
+    );
+}
+
 // ── Scenario E ───────────────────────────────────────────────────────────────
 // PASS: data/dune_csvs/*.csv files are renamed to *.csv.imported after
 //       successful ingest. On a re-run, the .imported files are skipped
