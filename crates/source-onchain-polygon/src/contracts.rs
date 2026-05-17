@@ -80,12 +80,33 @@ pub const TOPIC_ERC20_TRANSFER: B256 =
 pub const TOPIC_PROXY_CREATION: B256 =
     b256!("4f51faf6c4561ff95f067657e43439f0f856d97c04d9ec9070a6199ad418e235");
 
-/// OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker,
+/// V1 — emitted by [`CTF_EXCHANGE_V1`] and [`NEG_RISK_CTF_EXCHANGE_V1`].
+/// `OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker,
 ///   uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled,
-///   uint256 takerAmountFilled, uint256 fee)
-/// verified 2026-05-05 via yzc.me/x01Crypto/decoding-polymarket + Etherscan OrderFilled logs
-pub const TOPIC_ORDER_FILLED: B256 =
+///   uint256 takerAmountFilled, uint256 fee)`
+/// Self-validated by [`tests::topic_order_filled_v1_matches_signature`].
+/// verified 2026-05-16 via Polygonscan getabi on 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+pub const TOPIC_ORDER_FILLED_V1: B256 =
     b256!("d0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6");
+
+/// V2 — emitted by [`CTF_EXCHANGE_V2`] and [`NEG_RISK_CTF_EXCHANGE_V2`] (~98%
+/// of current on-chain volume).
+/// `OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker,
+///   uint8 side, uint256 tokenId, uint256 makerAmountFilled,
+///   uint256 takerAmountFilled, uint256 fee, bytes32 builder, bytes32 sweepBuilder)`
+/// Self-validated by [`tests::topic_order_filled_v2_matches_signature`].
+/// verified 2026-05-16 via Polygonscan getabi on 0xE111180000d2663C0091e4f400237545B87B996B
+pub const TOPIC_ORDER_FILLED_V2: B256 =
+    b256!("d543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee");
+
+/// Canonical "what to scan" set used by every `OrderFilled` consumer in the
+/// workspace — `polygon_ctf_delta::scan_active_wallets` and
+/// `wallet_enumeration::PolymarketTraderEnumeration`. Extending this array
+/// adds the new topic to every consumer automatically and triggers an
+/// additive Etherscan re-sweep on the next bootstrap run.
+/// Canonical documentation lives in `docs/_GLOSSARY.md` under
+/// `bootstrap_all_order_filled_topics`.
+pub const ALL_ORDER_FILLED_TOPICS: [B256; 2] = [TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2];
 
 /// CTF ConditionResolution(bytes32 indexed conditionId, address indexed oracle,
 ///   bytes32 indexed questionId, uint outcomeSlotCount, uint[] payoutNumerators).
@@ -131,5 +152,48 @@ mod tests {
     fn topic_erc20_transfer_matches_signature() {
         let computed = keccak256(b"Transfer(address,address,uint256)");
         assert_eq!(computed, TOPIC_ERC20_TRANSFER);
+    }
+
+    /// Self-validating proof for V1 `OrderFilled`. Pinned to the canonical
+    /// 8-argument signature emitted by `CTF_EXCHANGE_V1` and
+    /// `NEG_RISK_CTF_EXCHANGE_V1`. If a future Polymarket contract change
+    /// renames a parameter type, this fails before the silent-wallet-loss
+    /// bug from issue #179 can recur.
+    #[test]
+    fn topic_order_filled_v1_matches_signature() {
+        let computed = keccak256(
+            b"OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)",
+        );
+        assert_eq!(
+            computed, TOPIC_ORDER_FILLED_V1,
+            "TOPIC_ORDER_FILLED_V1 drifted from the canonical V1 signature"
+        );
+    }
+
+    /// Self-validating proof for V2 `OrderFilled`. Pinned to the canonical
+    /// 10-argument signature emitted by `CTF_EXCHANGE_V2` and
+    /// `NEG_RISK_CTF_EXCHANGE_V2` (which carry ~98% of current on-chain
+    /// volume). Missing this test pre-#179 is the reason the V1 hash
+    /// shipped as the only consumer for both contract versions.
+    #[test]
+    fn topic_order_filled_v2_matches_signature() {
+        let computed = keccak256(
+            b"OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)",
+        );
+        assert_eq!(
+            computed, TOPIC_ORDER_FILLED_V2,
+            "TOPIC_ORDER_FILLED_V2 drifted from the canonical V2 signature"
+        );
+    }
+
+    /// Aggregator sanity-check: `ALL_ORDER_FILLED_TOPICS` must list each
+    /// known topic version exactly once, in V1→V2 order. Adding V3 means
+    /// editing this assertion in lock-step with the array.
+    #[test]
+    fn all_order_filled_topics_lists_v1_then_v2() {
+        assert_eq!(
+            ALL_ORDER_FILLED_TOPICS,
+            [TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2]
+        );
     }
 }
