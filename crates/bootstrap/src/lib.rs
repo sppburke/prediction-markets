@@ -227,6 +227,20 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                 message: format!("get_block_number: {e}"),
                             })?,
                     };
+                    // Issue #188 Item 3: refuse to enter the topic loop with an
+                    // inverted range. Without this guard, the inner `while
+                    // chunk_from <= to_block` skips silently while the outer
+                    // `enumerated_topic_hashes.push(...)` still fires —
+                    // silently marking every topic enumerated despite zero
+                    // chunks scanned.
+                    if config.wallet_from_block > to_block {
+                        return Err(BootstrapError::Invalid {
+                            message: format!(
+                                "wallet_from_block {} > to_block {}; refusing to mark enumeration done over an empty range",
+                                config.wallet_from_block, to_block
+                            ),
+                        });
+                    }
                     tracing::info!(
                         from_block = config.wallet_from_block,
                         to_block,
@@ -276,6 +290,14 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                     // one chunk's worth of work instead of an entire contract.
                     // The V1/V2 contract-version bit is attributed per topic
                     // and OR-merged into `polymarket_contracts_seen`.
+                    //
+                    // Issue #188 Item 2: per-chunk cursor (`chunk_progress`)
+                    // persists `(topic, contract) → last_completed_chunk_to`
+                    // after every successful chunk upsert. On mid-topic crash,
+                    // resume reads the cursor and skips already-completed
+                    // chunks — saves up to ~168 redundant `eth_getLogs` calls
+                    // per crash on a full historical sweep.
+                    let mut chunk_progress = migrate::load_chunk_progress(&cache)?;
                     for topic in &ALL_ORDER_FILLED_TOPICS {
                         let topic_hex = format!("{topic}");
                         if enumerated_topic_hashes.contains(&topic_hex) {
@@ -285,10 +307,33 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                             );
                             continue;
                         }
-                        let contract_bit = topic_to_contract_version_bit(*topic).unwrap_or(0);
+                        // Unreachable in practice — `pe_source_onchain_polygon::contracts::tests::
+                        // every_topic_in_all_order_filled_has_a_version_bit` fails CI if a topic
+                        // is added to ALL_ORDER_FILLED_TOPICS without a matching bit. Surfacing
+                        // `Internal` here keeps the contract explicit at the call site.
+                        let contract_bit = topic_to_contract_version_bit(*topic)
+                            .ok_or(BootstrapError::Internal)?;
                         for contract in &ALL_EXCHANGE_CONTRACTS {
                             let contract_hex = format!("0x{contract:x}");
-                            let mut chunk_from = config.wallet_from_block;
+                            let progress_key =
+                                migrate::chunk_progress_key(&topic_hex, &contract_hex);
+                            // Resume point: one past the last completed chunk, or
+                            // `wallet_from_block` if no progress recorded.
+                            let mut chunk_from = chunk_progress
+                                .get(&progress_key)
+                                .map(|last| last.saturating_add(1))
+                                .unwrap_or(config.wallet_from_block)
+                                .max(config.wallet_from_block);
+                            if chunk_from > to_block {
+                                tracing::info!(
+                                    contract = %contract_hex,
+                                    topic = %topic_hex,
+                                    resume_from = chunk_from,
+                                    to_block,
+                                    "bootstrap: (topic, contract) already complete up to to_block — skipping"
+                                );
+                                continue;
+                            }
                             while chunk_from <= to_block {
                                 let chunk_to = (chunk_from + SCAN_CHUNK_BLOCKS - 1).min(to_block);
                                 let found = enumerator
@@ -317,9 +362,27 @@ pub async fn run(config: &BootstrapConfig) -> Result<Watchlist, BootstrapError> 
                                     })
                                     .collect();
                                 cache.upsert_wallets_bulk(&rows)?;
+                                // Persist cursor AFTER successful upsert. Order
+                                // matters: if upsert fails, cursor isn't
+                                // advanced and the chunk is retried; if cursor
+                                // save fails after a successful upsert, the
+                                // chunk gets retried and OR-merge UPSERT
+                                // produces an idempotent result.
+                                chunk_progress.insert(progress_key.clone(), chunk_to);
+                                migrate::save_chunk_progress(&mut cache, &chunk_progress)?;
                                 chunk_from = chunk_to + 1;
                             }
                         }
+                        // Topic is fully done. Drop the per-`(topic, contract)`
+                        // entries we just finished — the outer-loop skip via
+                        // `enumerated_topic_hashes.contains` short-circuits
+                        // resume before the cursor is consulted, so these
+                        // entries are dead weight. Keeps the JSON map bounded
+                        // and avoids the documentation lie that every entry
+                        // names an in-progress topic.
+                        let topic_prefix = format!("{topic_hex}|");
+                        chunk_progress.retain(|k, _| !k.starts_with(&topic_prefix));
+                        migrate::save_chunk_progress(&mut cache, &chunk_progress)?;
                         enumerated_topic_hashes.push(topic_hex);
                         migrate::save_enum_state(
                             &mut cache,

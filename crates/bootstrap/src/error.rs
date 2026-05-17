@@ -45,6 +45,12 @@ pub enum BootstrapError {
     PolygonCtf { message: String },
     #[error("url parse: {0}")]
     UrlParse(#[from] url::ParseError),
+    /// Operator-misconfig / invariant violation surfaced from a runtime check
+    /// (e.g. `wallet_from_block > to_block` at the start of the OnChain
+    /// enumeration arm). Separate from `Parse` (which is for input parsing)
+    /// and from `Config` (which wraps figment's loader errors).
+    #[error("invalid: {message}")]
+    Invalid { message: String },
     #[error("internal error")]
     Internal,
 }

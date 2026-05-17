@@ -145,6 +145,19 @@ pub const CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS: &str = "wallet_enum_completed_
 /// JSON-encoded `Vec<String>` of B256-Display topic hashes (each prefixed `0x`).
 pub const CURSOR_WALLET_ENUM_TOPIC_HASHES: &str = "wallet_enum_topic_hashes";
 
+/// `source_cursor` key for the chunk-level enumeration-progress cursor
+/// (issue #188 Item 2). JSON-encoded `HashMap<String, u64>` keyed by
+/// `"{topic_hex}|{contract_hex}"` mapping to the last block successfully
+/// scanned for that `(topic, contract)` pair. Mid-topic crash recovery
+/// resumes from `last_completed_chunk_to + 1` instead of `wallet_from_block`,
+/// saving up to ~168 redundant `eth_getLogs` calls on a 21M-block sweep.
+///
+/// Missing key (fresh install or pre-#188 deployed cache) is treated as
+/// "no chunks done"; every `(topic, contract)` resumes from
+/// `wallet_from_block`. Backward-compat additive — older binaries that don't
+/// read this key continue to work.
+pub const CURSOR_WALLET_ENUM_CHUNK_PROGRESS: &str = "wallet_enum_chunk_progress";
+
 /// Read enumeration progress from the SQLite `source_cursor` table. Returns
 /// `(completed_contracts, enumerated_topic_hashes)` — empty `Vec`s on missing
 /// keys (fresh install). The `enumerated_topic_hashes.is_empty()` case
@@ -175,6 +188,43 @@ pub fn save_enum_state(
     let topics_json = serde_json::to_string(enumerated_topic_hashes)?;
     cache.set_source_cursor(CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS, &contracts_json)?;
     cache.set_source_cursor(CURSOR_WALLET_ENUM_TOPIC_HASHES, &topics_json)?;
+    Ok(())
+}
+
+/// Build the chunk-progress key for a given `(topic_hex, contract_hex)` pair.
+/// Format: `"<topic_hex>|<contract_hex>"` where both hexes are produced via
+/// the same `format!("{topic}")` / `format!("0x{contract:x}")` calls that
+/// `lib.rs::run()` uses to populate `enumerated_topic_hashes` /
+/// `completed_contracts`. Sharing this helper avoids subtle key-shape drift.
+#[must_use]
+pub fn chunk_progress_key(topic_hex: &str, contract_hex: &str) -> String {
+    format!("{topic_hex}|{contract_hex}")
+}
+
+/// Read the chunk-level progress cursor from `source_cursor`. Returns an empty
+/// map on missing key (fresh install, pre-#188 deployed cache). Each entry is
+/// `(topic_hex, contract_hex) → last_completed_chunk_to` per
+/// [`CURSOR_WALLET_ENUM_CHUNK_PROGRESS`]. Keys use [`chunk_progress_key`].
+pub fn load_chunk_progress(
+    cache: &WalletCache,
+) -> Result<std::collections::HashMap<String, u64>, BootstrapError> {
+    let map = cache
+        .get_source_cursor(CURSOR_WALLET_ENUM_CHUNK_PROGRESS)
+        .map(|s| serde_json::from_str::<std::collections::HashMap<String, u64>>(&s))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(map)
+}
+
+/// Persist the chunk-level progress cursor. Written after every successful
+/// chunk upsert in `lib.rs::run()` so mid-topic crash recovery skips already-
+/// completed chunks (issue #188 Item 2).
+pub fn save_chunk_progress(
+    cache: &mut WalletCache,
+    progress: &std::collections::HashMap<String, u64>,
+) -> Result<(), BootstrapError> {
+    let json = serde_json::to_string(progress)?;
+    cache.set_source_cursor(CURSOR_WALLET_ENUM_CHUNK_PROGRESS, &json)?;
     Ok(())
 }
 
