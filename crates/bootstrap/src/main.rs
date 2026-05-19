@@ -3,7 +3,7 @@ use pe_bootstrap::{
     cache::WalletCache,
     config, discovery, enumerate,
     error::BootstrapError,
-    fetch, fetch_resolutions_and_schedules, funder, lock, migrate, pile,
+    fetch, fetch_resolutions_and_schedules, funder, infra_probe, lock, migrate, pile,
     seed_historical::{self, parse_seed_as_of_env},
     watchlist_phase, weekly,
 };
@@ -43,6 +43,7 @@ async fn main() {
                 | "discovery"
                 | "backfill"
                 | "weekly"
+                | "classify-infra"
         )
     );
 
@@ -52,6 +53,7 @@ async fn main() {
         // `--dump-ledgers /path` for a config file path.
         let rest: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
         let mut strict = false;
+        let mut dry_run = false;
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
         let mut stage: Option<&str> = None;
         let mut as_of_arg: Option<&str> = None;
@@ -62,6 +64,8 @@ async fn main() {
             let a = rest[i];
             if a == "--strict" {
                 strict = true;
+            } else if a == "--dry-run" {
+                dry_run = true;
             } else if a == "--dump-ledgers" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -386,6 +390,32 @@ async fn main() {
                     1
                 }
             },
+
+            "classify-infra" => {
+                // Issue #197: retroactive sweep that mirrors the cold-start
+                // probe semantics over cached trades. `--dry-run` previews
+                // the would-flag set without writing.
+                let threshold = std::env::var("PE_BOOTSTRAP_INFRA_SPAN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(infra_probe::DEFAULT_INFRA_SPAN_SECS);
+                match cache.classify_infra_retroactive(threshold, dry_run) {
+                    Ok(r) => {
+                        tracing::info!(
+                            scanned = r.scanned,
+                            flagged = r.flagged,
+                            dry_run = r.dry_run,
+                            threshold_secs = threshold,
+                            "classify-infra: complete"
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "classify-infra: fatal");
+                        1
+                    }
+                }
+            }
 
             _ => unreachable!("known_sub filter restricts to known subcommand names"),
         };

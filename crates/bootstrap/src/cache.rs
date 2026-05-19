@@ -164,7 +164,26 @@ CREATE INDEX IF NOT EXISTS idx_wallets_backfill
     ON wallets(is_active, last_polymarket_fetch_at) WHERE is_active = 1;
 CREATE INDEX IF NOT EXISTS idx_wallets_weekly
     ON wallets(is_active, last_funder_fetch_at) WHERE is_active = 1;
+
+-- Issue #197: centralised filter for wallets that are simultaneously active
+-- AND not flagged as infrastructure. All wallet-selection queries should
+-- query this view instead of filtering ad-hoc, so future queries cannot
+-- accidentally include infra-flagged wallets.
+CREATE VIEW IF NOT EXISTS active_tradeable_wallets AS
+    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
 ";
+
+/// Result of `classify_infra_retroactive` (issue #197).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClassifyInfraReport {
+    /// Eligibility set: wallets with ≥500 trades in cache (the denominator).
+    pub scanned: usize,
+    /// Wallets meeting the infra threshold. Equal in dry-run and apply mode
+    /// — `dry_run` only controls whether the `mark_infra` UPDATE ran.
+    pub flagged: usize,
+    /// Whether this run was a preview (no writes).
+    pub dry_run: bool,
+}
 
 /// Permanent wallet trade-history cache backed by SQLite.
 pub struct WalletCache {
@@ -1354,9 +1373,8 @@ impl WalletCache {
     ) -> Result<Vec<String>, BootstrapError> {
         let cutoff = now_unix - staleness_secs;
         let mut stmt = self.conn.prepare(
-            "SELECT wallet_hex FROM wallets \
-             WHERE is_active = 1 \
-               AND (last_polymarket_full_at IS NULL OR last_polymarket_full_at < ?1) \
+            "SELECT wallet_hex FROM active_tradeable_wallets \
+             WHERE (last_polymarket_full_at IS NULL OR last_polymarket_full_at < ?1) \
              ORDER BY last_polymarket_full_at ASC NULLS FIRST, \
                       dune_win_rate_bps DESC NULLS LAST, \
                       dune_closed_markets DESC NULLS LAST",
@@ -1413,6 +1431,76 @@ impl WalletCache {
         Ok(())
     }
 
+    /// Retroactively classify already-cached wallets as infra (issue #197).
+    ///
+    /// Mirrors the cold-start probe semantics over cached trades: for each
+    /// wallet that has ≥500 trades, compute the timestamp span over the
+    /// OLDEST 500. If `(newest - oldest) < threshold_secs`, the wallet is
+    /// infra. The window-function SQL uses the `idx_trades_wallet_ts` index
+    /// for a direct partition+order scan.
+    ///
+    /// When `dry_run` is `true`, the report is computed but no `UPDATE`
+    /// runs — use this to preview before applying.
+    pub fn classify_infra_retroactive(
+        &mut self,
+        threshold_secs: i64,
+        dry_run: bool,
+    ) -> Result<ClassifyInfraReport, BootstrapError> {
+        // First: count the eligibility set (wallets with ≥500 trades, not
+        // yet flagged). This is the denominator operators want to see.
+        let scanned: usize = {
+            let mut stmt = self.conn.prepare(
+                "WITH ranked AS ( \
+                    SELECT wallet_hex, \
+                           ROW_NUMBER() OVER ( \
+                               PARTITION BY wallet_hex ORDER BY timestamp_unix ASC \
+                           ) AS rn \
+                    FROM trades \
+                 ) \
+                 SELECT COUNT(*) FROM ( \
+                    SELECT wallet_hex FROM ranked WHERE rn = 500 \
+                 )",
+            )?;
+            let n: i64 = stmt.query_row([], |r| r.get(0))?;
+            usize::try_from(n).unwrap_or(usize::MAX)
+        };
+
+        // Then: collect wallets meeting the infra threshold.
+        let candidates: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "WITH ranked AS ( \
+                    SELECT wallet_hex, timestamp_unix, \
+                           ROW_NUMBER() OVER ( \
+                               PARTITION BY wallet_hex ORDER BY timestamp_unix ASC \
+                           ) AS rn \
+                    FROM trades \
+                 ), \
+                 page AS ( \
+                    SELECT wallet_hex, \
+                           MIN(timestamp_unix) AS oldest, \
+                           MAX(timestamp_unix) AS newest, \
+                           COUNT(*) AS cnt \
+                    FROM ranked WHERE rn <= 500 \
+                    GROUP BY wallet_hex \
+                 ) \
+                 SELECT wallet_hex FROM page \
+                 WHERE cnt = 500 AND (newest - oldest) < ?1",
+            )?;
+            let rows = stmt.query_map(params![threshold_secs], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let flagged = candidates.len();
+        if !dry_run && !candidates.is_empty() {
+            self.mark_infra_bulk(&candidates)?;
+        }
+        Ok(ClassifyInfraReport {
+            scanned,
+            flagged,
+            dry_run,
+        })
+    }
+
     /// Select active wallets due for Polymarket backfill.
     ///
     /// Filters `is_active = 1` AND (`last_polymarket_fetch_at IS NULL` OR
@@ -1427,9 +1515,8 @@ impl WalletCache {
         limit: usize,
     ) -> Result<Vec<String>, BootstrapError> {
         let cutoff = now_unix - staleness_secs;
-        let base = "SELECT wallet_hex FROM wallets \
-                    WHERE is_active = 1 \
-                      AND (last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?1) \
+        let base = "SELECT wallet_hex FROM active_tradeable_wallets \
+                    WHERE (last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?1) \
                     ORDER BY last_polymarket_fetch_at ASC NULLS FIRST, \
                              dune_win_rate_bps DESC NULLS LAST, \
                              dune_closed_markets DESC NULLS LAST";
@@ -1458,9 +1545,8 @@ impl WalletCache {
         limit: usize,
     ) -> Result<Vec<String>, BootstrapError> {
         let cutoff = now_unix - staleness_secs;
-        let base = "SELECT wallet_hex FROM wallets \
-                    WHERE is_active = 1 \
-                      AND (last_funder_fetch_at IS NULL OR last_funder_fetch_at < ?1) \
+        let base = "SELECT wallet_hex FROM active_tradeable_wallets \
+                    WHERE (last_funder_fetch_at IS NULL OR last_funder_fetch_at < ?1) \
                     ORDER BY last_funder_fetch_at ASC NULLS FIRST, \
                              dune_win_rate_bps DESC NULLS LAST, \
                              dune_closed_markets DESC NULLS LAST";
@@ -1530,9 +1616,10 @@ impl WalletCache {
     /// trade fetch to the discovered-wallet subset (typically `SRC_WALLET_SET_JSON`),
     /// avoiding the ~2.7M-row blowup of [`Self::all_pile_wallet_hexes`].
     pub fn wallets_with_source_bit(&self, bit_mask: i64) -> Result<Vec<String>, BootstrapError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT wallet_hex FROM wallets WHERE (source_bits & ?1) != 0")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT wallet_hex FROM wallets \
+                 WHERE (source_bits & ?1) != 0 AND is_infra = 0",
+        )?;
         let rows = stmt.query_map(params![bit_mask], |r| r.get::<_, String>(0))?;
         let out: Result<Vec<_>, _> = rows.collect();
         Ok(out?)
@@ -1560,6 +1647,17 @@ impl WalletCache {
             .execute(
                 "UPDATE wallets SET trade_count = ?2 WHERE wallet_hex = ?1",
                 params![wallet_hex, count],
+            )
+            .expect("test-only direct SQL must succeed");
+    }
+
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_set_active(&mut self, wallet_hex: &str, active: i64) {
+        self.conn
+            .execute(
+                "UPDATE wallets SET is_active = ?2 WHERE wallet_hex = ?1",
+                params![wallet_hex, active],
             )
             .expect("test-only direct SQL must succeed");
     }
