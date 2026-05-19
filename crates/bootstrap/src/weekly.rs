@@ -50,7 +50,6 @@ pub async fn run_weekly(
 
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
     let due_hexes = pile::select_weekly_due(cache, now_unix, config.weekly_limit)?;
-    let due = due_hexes.len();
     if due_hexes.is_empty() {
         tracing::info!("weekly: no wallets due");
         return Ok(WeeklyReport::default());
@@ -81,6 +80,21 @@ pub async fn run_weekly(
                 .ok()
         })
         .collect();
+
+    // `due` reflects only parseable wallets so processed + failed == due.
+    let unparseable = due_hexes.len() - due_wallets.len();
+    if unparseable > 0 {
+        tracing::warn!(
+            unparseable,
+            total = due_hexes.len(),
+            "weekly: skipped unparseable wallets; check DB for corrupted addresses"
+        );
+    }
+    let due = due_wallets.len();
+    if due == 0 {
+        tracing::info!("weekly: all selected wallets unparseable, nothing to process");
+        return Ok(WeeklyReport::default());
+    }
 
     let report = funder::run_funder(
         cache,

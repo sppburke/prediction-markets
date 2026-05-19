@@ -47,49 +47,47 @@ async fn main() {
     );
 
     if let Some(sub) = first_arg.filter(|_| known_sub) {
-        // Parse flags from the remaining args (after the subcommand name).
+        // Single-pass flag parser. Tracks the actual string slices consumed
+        // as flag values so the TOML positional search doesn't mistake
+        // `--dump-ledgers /path` for a config file path.
         let rest: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
-        let strict = rest.contains(&"--strict");
-        let dump_ledgers_path: Option<std::path::PathBuf> = {
-            let mut path = None;
-            let mut it = rest.iter().peekable();
-            while let Some(&a) = it.next() {
-                if a == "--dump-ledgers" {
-                    path = it.next().map(|p| std::path::PathBuf::from(*p));
-                } else if let Some(v) = a.strip_prefix("--dump-ledgers=") {
-                    path = Some(std::path::PathBuf::from(v));
-                }
+        let mut strict = false;
+        let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
+        let mut stage: Option<&str> = None;
+        let mut as_of_arg: Option<&str> = None;
+        let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        let mut i = 0;
+        while i < rest.len() {
+            let a = rest[i];
+            if a == "--strict" {
+                strict = true;
+            } else if a == "--dump-ledgers" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                dump_ledgers_path = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--dump-ledgers=") {
+                dump_ledgers_path = Some(std::path::PathBuf::from(v));
+            } else if a == "--stage" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                stage = Some(rest[i]);
+            } else if let Some(v) = a.strip_prefix("--stage=") {
+                stage = Some(v);
+            } else if a == "--as-of" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                as_of_arg = Some(rest[i]);
+            } else if let Some(v) = a.strip_prefix("--as-of=") {
+                as_of_arg = Some(v);
             }
-            path
-        };
-        let stage: Option<&str> = {
-            let mut s = None;
-            let mut it = rest.iter().peekable();
-            while let Some(&a) = it.next() {
-                if a == "--stage" {
-                    s = it.next().copied();
-                } else if let Some(v) = a.strip_prefix("--stage=") {
-                    s = Some(v);
-                }
-            }
-            s
-        };
-        let as_of_arg: Option<&str> = {
-            let mut s = None;
-            let mut it = rest.iter().peekable();
-            while let Some(&a) = it.next() {
-                if a == "--as-of" {
-                    s = it.next().copied();
-                } else if let Some(v) = a.strip_prefix("--as-of=") {
-                    s = Some(v);
-                }
-            }
-            s
-        };
-        // TOML path: last non-flag positional argument.
+            i += 1;
+        }
+
+        // TOML path: last non-flag positional not consumed as a flag value.
         let toml_arg: Option<std::path::PathBuf> = rest
             .iter()
-            .rfind(|&&a| !a.starts_with("--"))
+            .rfind(|&&a| !a.starts_with("--") && !flag_values.contains(a))
             .map(|p| std::path::PathBuf::from(*p));
 
         let bootstrap_config = match config::load(toml_arg.as_deref()) {

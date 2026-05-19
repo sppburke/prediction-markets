@@ -166,76 +166,41 @@ async fn scenario_fetch_skip_trade_fetch_flag_is_a_noop() {
 
 // ── Scenario 3: run_fetch returns PartialFetch when wallets fail ──────────────
 //
-// PASS: Err(BootstrapError::PartialFetch { failed_wallets: 1 }) returned for
-//       a wallet whose fixture fetch returns no valid data at all (HangFetcher).
+// PASS: fetch::run_fetch returns Err(BootstrapError::PartialFetch { failed_wallets: 1 })
+//       when the wallet's HTTP request fails (connection refused to non-listening port).
 // FAIL: returns Ok or a different error variant.
 
 #[tokio::test]
 async fn scenario_fetch_partial_fail_returns_partial_fetch_error() {
     let dir = TempDir::new().unwrap();
     let mut config = config_with_dir(&dir);
-    config.polymarket_wallet_timeout_secs = 1; // fast timeout to fail quickly
+    config.polymarket_wallet_timeout_secs = 2; // fast but not flaky
+    // Point at a port with no listener; connection refused → wallet-level failure.
+    config.polymarket_base_url = "http://127.0.0.1:12321".to_owned();
 
     let mut cache = WalletCache::open(&config.cache_path).unwrap();
 
-    // wallet 0xBB has trades; wallet 0xCC has no fixture entry → timeout → failure.
-    let w_good = wallet(0xBB);
-    let w_bad = wallet(0xCC);
-
+    let w = wallet(0xCC);
     cache
-        .upsert_wallets_bulk(&[
-            (
-                w_good.to_string(),
-                SRC_WALLET_SET_JSON,
-                false,
-                None,
-                None,
-                None,
-                0,
-            ),
-            (
-                w_bad.to_string(),
-                SRC_WALLET_SET_JSON,
-                false,
-                None,
-                None,
-                None,
-                0,
-            ),
-        ])
+        .upsert_wallets_bulk(&[(
+            w.to_string(),
+            SRC_WALLET_SET_JSON,
+            false,
+            None,
+            None,
+            None,
+            0,
+        )])
         .unwrap();
 
-    // Good wallet gets a single-trade page + terminator.
-    let mut pages: HashMap<String, Vec<u8>> = HashMap::new();
-    pages.insert(trade_url_cold(w_good), trades_page(1, "aa"));
-    let end_url = PolymarketEndpoint::UserTradeActivity {
-        user: w_good.to_string(),
-        end: Some(1_700_000_001),
-        start: None,
-    }
-    .url(BASE_URL);
-    pages.insert(end_url, end_page());
-
-    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_concurrency(1)
-        .with_wallet_timeout(1);
-
-    let outcome = fetcher
-        .fetch_all(&[w_good, w_bad], &mut cache)
-        .await
-        .unwrap();
-    assert_eq!(
-        outcome.failed.len(),
-        1,
-        "w_bad should fail (no fixture, immediate timeout)"
-    );
-
-    // Now verify that run_fetch reports PartialFetch.
-    // Simulate the same scenario by checking the error variant directly.
-    let err = BootstrapError::PartialFetch { failed_wallets: 1 };
+    // run_fetch itself must propagate the per-wallet failure as PartialFetch.
+    let result = fetch::run_fetch(&config, &mut cache, &[w]).await;
     assert!(
-        matches!(err, BootstrapError::PartialFetch { failed_wallets: 1 }),
-        "PartialFetch variant must be accessible for caller matching"
+        matches!(
+            result,
+            Err(BootstrapError::PartialFetch { failed_wallets: 1 })
+        ),
+        "expected PartialFetch {{failed_wallets:1}}, got {result:?}"
     );
 }
 
