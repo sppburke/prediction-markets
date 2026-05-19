@@ -1439,6 +1439,11 @@ impl WalletCache {
     /// infra. The window-function SQL uses the `idx_trades_wallet_ts` index
     /// for a direct partition+order scan.
     ///
+    /// A SINGLE pass over the index produces both counts: every row
+    /// contributes to `scanned`, rows where the span is below threshold
+    /// also contribute to `flagged`. (Earlier two-pass version doubled the
+    /// I/O cost — ~40 GB read per pass on a 100 GB DB.)
+    ///
     /// When `dry_run` is `true`, the report is computed but no `UPDATE`
     /// runs — use this to preview before applying.
     pub fn classify_infra_retroactive(
@@ -1446,27 +1451,9 @@ impl WalletCache {
         threshold_secs: i64,
         dry_run: bool,
     ) -> Result<ClassifyInfraReport, BootstrapError> {
-        // First: count the eligibility set (wallets with ≥500 trades, not
-        // yet flagged). This is the denominator operators want to see.
-        let scanned: usize = {
-            let mut stmt = self.conn.prepare(
-                "WITH ranked AS ( \
-                    SELECT wallet_hex, \
-                           ROW_NUMBER() OVER ( \
-                               PARTITION BY wallet_hex ORDER BY timestamp_unix ASC \
-                           ) AS rn \
-                    FROM trades \
-                 ) \
-                 SELECT COUNT(*) FROM ( \
-                    SELECT wallet_hex FROM ranked WHERE rn = 500 \
-                 )",
-            )?;
-            let n: i64 = stmt.query_row([], |r| r.get(0))?;
-            usize::try_from(n).unwrap_or(usize::MAX)
-        };
-
-        // Then: collect wallets meeting the infra threshold.
-        let candidates: Vec<String> = {
+        // Single scan: every wallet with ≥500 trades contributes one row;
+        // `is_infra` = 1 when the OLDEST 500 span is below threshold.
+        let (scanned, candidates): (usize, Vec<String>) = {
             let mut stmt = self.conn.prepare(
                 "WITH ranked AS ( \
                     SELECT wallet_hex, timestamp_unix, \
@@ -1483,11 +1470,22 @@ impl WalletCache {
                     FROM ranked WHERE rn <= 500 \
                     GROUP BY wallet_hex \
                  ) \
-                 SELECT wallet_hex FROM page \
-                 WHERE cnt = 500 AND (newest - oldest) < ?1",
+                 SELECT wallet_hex, ((newest - oldest) < ?1) AS is_infra FROM page \
+                 WHERE cnt = 500",
             )?;
-            let rows = stmt.query_map(params![threshold_secs], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
+            let rows = stmt.query_map(params![threshold_secs], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut scanned = 0usize;
+            let mut candidates: Vec<String> = Vec::new();
+            for row in rows {
+                let (wallet_hex, is_infra) = row?;
+                scanned += 1;
+                if is_infra != 0 {
+                    candidates.push(wallet_hex);
+                }
+            }
+            (scanned, candidates)
         };
 
         let flagged = candidates.len();
