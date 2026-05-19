@@ -35,8 +35,6 @@ pub enum BootstrapError {
         "fetch incomplete: {failed_wallets} wallet(s) could not be fetched or cached; re-run to retry"
     )]
     PartialFetch { failed_wallets: usize },
-    #[error("funder discovery: {failed_wallets} wallet(s) failed; partial cache state")]
-    PartialFunderFetch { failed_wallets: usize },
     #[error("gamma: {message}")]
     Gamma { message: String },
     #[error("clob: {message}")]

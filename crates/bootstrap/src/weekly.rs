@@ -5,25 +5,21 @@
 //! 2. Resolve the upper block range dynamically: query Etherscan's
 //!    `eth_blockNumber`. Falls back to a sentinel if the call fails — see the
 //!    [`FALLBACK_TO_BLOCK`] constant for the rationale.
-//! 3. `EtherscanFunderLookup::funders_of_with_timestamps` for each due wallet.
-//! 4. `insert_funder_edges` persists the new edges; per-wallet atomic commit.
-//! 5. `update_last_funder_fetch_at = now` whether or not funders were found —
-//!    a wallet with zero discovered funders is still considered "queried".
+//! 3. `funder::run_funder` — shared inner loop (fetch + insert + timestamp update).
+//! 4. Returns `Err(BootstrapError::PartialFetch)` when any wallets fail so the
+//!    caller can exit 2 (soft-fail) rather than 0, making the partial visible to
+//!    operators and systemd.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use futures::stream::{self, StreamExt};
 use pe_core_types::WalletAddress;
 use pe_source_onchain_polygon::{
     BlockRange, EtherscanFunderLookup, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK,
 };
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
 
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;
+use crate::funder;
 use crate::pile;
 
 /// Fallback upper block when Etherscan's `eth_blockNumber` is unavailable.
@@ -54,13 +50,12 @@ pub async fn run_weekly(
 
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
     let due_hexes = pile::select_weekly_due(cache, now_unix, config.weekly_limit)?;
-    let due = due_hexes.len();
     if due_hexes.is_empty() {
         tracing::info!("weekly: no wallets due");
         return Ok(WeeklyReport::default());
     }
 
-    let lookup = EtherscanFunderLookup::new(api_key);
+    let lookup = EtherscanFunderLookup::new(api_key.clone());
     let to_block = match lookup.current_block().await {
         Ok(b) => b,
         Err(e) => {
@@ -77,71 +72,60 @@ pub async fn run_weekly(
         to: to_block,
     };
 
-    let processed: usize;
-    let failed: usize;
-    {
-        let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);
-        let lookup_ref = &lookup;
-        let processed_ref = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let failed_ref = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let block_range_local = block_range;
-        let fetched_at = now_unix;
+    let due_wallets: Vec<WalletAddress> = due_hexes
+        .iter()
+        .filter_map(|h| {
+            WalletAddress::from_hex(h)
+                .map_err(|e| tracing::warn!(address = %h, error = %e, "weekly: skipping unparseable wallet"))
+                .ok()
+        })
+        .collect();
 
-        stream::iter(due_hexes.iter().cloned())
-            .for_each_concurrent(config.funder_concurrency, |hex| {
-                let cache_mutex = &cache_mutex;
-                let processed_ref = Arc::clone(&processed_ref);
-                let failed_ref = Arc::clone(&failed_ref);
-                async move {
-                    let wallet = match WalletAddress::from_hex(&hex) {
-                        Ok(w) => w,
-                        Err(_) => {
-                            failed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return;
-                        }
-                    };
-                    let wallet_set: HashSet<WalletAddress> =
-                        std::iter::once(wallet).collect();
-                    let result = lookup_ref
-                        .funders_of_with_timestamps(&wallet_set, block_range_local)
-                        .await;
-                    match result {
-                        Ok(funders) => {
-                            let funders_vec: Vec<(WalletAddress, i64)> =
-                                funders.into_iter().collect();
-                            let mut guard = cache_mutex.lock().await;
-                            if let Err(e) =
-                                guard.insert_funder_edges(wallet, &funders_vec, fetched_at)
-                            {
-                                tracing::error!(wallet = %wallet, error = %e, "weekly: cache insert failed");
-                                failed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                return;
-                            }
-                            if let Err(e) = guard.update_last_funder_fetch(&hex, fetched_at) {
-                                tracing::error!(wallet = %wallet, error = %e, "weekly: timestamp update failed");
-                                failed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                return;
-                            }
-                            processed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            tracing::warn!(wallet = %wallet, error = %e, "weekly: funder fetch failed");
-                            failed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            })
-            .await;
-
-        processed = processed_ref.load(std::sync::atomic::Ordering::Relaxed);
-        failed = failed_ref.load(std::sync::atomic::Ordering::Relaxed);
+    // `due` reflects only parseable wallets so processed + failed == due.
+    let unparseable = due_hexes.len() - due_wallets.len();
+    if unparseable > 0 {
+        tracing::warn!(
+            unparseable,
+            total = due_hexes.len(),
+            "weekly: skipped unparseable wallets; check DB for corrupted addresses"
+        );
+    }
+    let due = due_wallets.len();
+    if due == 0 {
+        tracing::info!("weekly: all selected wallets unparseable, nothing to process");
+        return Ok(WeeklyReport::default());
     }
 
-    tracing::info!(due, processed, failed, to_block, "weekly: complete");
+    let report = funder::run_funder(
+        cache,
+        &due_wallets,
+        block_range,
+        &api_key,
+        config.funder_concurrency,
+        true, // weekly stamps last_funder_fetch_at per wallet
+    )
+    .await?;
+
+    tracing::info!(
+        due,
+        processed = report.processed,
+        failed = report.failed,
+        to_block,
+        "weekly: complete"
+    );
+
+    // Issue #195: return PartialFetch (exit 2) rather than Ok (exit 0) when any
+    // wallets failed, matching the exit-code convention of `backfill`.
+    if report.failed > 0 {
+        return Err(BootstrapError::PartialFetch {
+            failed_wallets: report.failed,
+        });
+    }
+
     Ok(WeeklyReport {
         due,
-        processed,
-        failed,
+        processed: report.processed,
+        failed: 0,
         to_block,
     })
 }
