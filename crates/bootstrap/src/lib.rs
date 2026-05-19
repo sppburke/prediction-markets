@@ -23,6 +23,7 @@ pub mod fetch;
 pub mod filter;
 pub mod funder;
 pub mod gamma;
+pub mod infra_probe;
 pub mod lock;
 pub mod migrate;
 pub mod operator_audit;

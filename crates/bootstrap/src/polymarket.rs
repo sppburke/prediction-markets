@@ -36,8 +36,20 @@ use tokio::sync::Mutex;
 
 use crate::cache::{INCREMENTAL_STOP_THRESHOLD, WalletCache};
 use crate::error::BootstrapError;
+use crate::infra_probe::{InfraProbe, ProbeClassification};
 
 const TRADE_FETCH_LIMIT: u32 = 500;
+
+/// Outcome of `fetch_wallet_incremental` (issue #197).
+///
+/// `Trades` is the normal path — the caller inserts via `cache.insert_new`.
+/// `Infra` signals the infra-probe fired on the first cold-start page; the
+/// caller calls `cache.mark_infra` and discards any parsed trades.
+#[derive(Debug)]
+pub(crate) enum WalletFetchResult {
+    Trades(Vec<RawTrade>),
+    Infra { span_secs: i64 },
+}
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
 
@@ -69,6 +81,10 @@ pub struct PolymarketBulkFetcher<F: PageFetcher> {
     concurrency: usize,
     wallet_timeout_secs: u64,
     stamp_on_success: bool,
+    /// Infra-wallet probe (issue #197). Stashed at construction so the env
+    /// var is read once per fetcher, keeping the threshold deterministic
+    /// across all wallets in a run.
+    infra_probe: InfraProbe,
 }
 
 /// Per-batch result of [`PolymarketBulkFetcher::fetch_all`].
@@ -115,6 +131,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             // the pile's `last_polymarket_fetch_at` updated per-wallet opt in
             // via `with_stamp_on_success(true)` (set by `backfill::run_backfill`).
             stamp_on_success: false,
+            infra_probe: InfraProbe::default(),
         }
     }
 
@@ -153,6 +170,17 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
     /// for the legacy seed-bootstrap path; `backfill::run_backfill` opts in.
     pub fn with_stamp_on_success(mut self, on: bool) -> Self {
         self.stamp_on_success = on;
+        self
+    }
+
+    /// Override the infra-wallet probe (issue #197). Default reads
+    /// `PE_BOOTSTRAP_INFRA_SPAN_SECS` once at construction. Set
+    /// `threshold_secs = 0` to effectively disable the probe (span >= 0
+    /// always, so `span < 0` is never true → never classifies Infra).
+    /// Used by tests with dense fixture data that would otherwise trigger
+    /// the probe.
+    pub fn with_infra_probe(mut self, probe: InfraProbe) -> Self {
+        self.infra_probe = probe;
         self
     }
 
@@ -239,7 +267,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                     };
 
                     match fetch_result {
-                        Ok(new_trades) => {
+                        Ok(WalletFetchResult::Trades(new_trades)) => {
                             let mut guard = cache_mutex.lock().await;
                             let inserted = match guard.insert_new(&wallet_hex, new_trades) {
                                 Ok(n) => n,
@@ -275,6 +303,29 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                                     );
                                 }
                             }
+                        }
+                        Ok(WalletFetchResult::Infra { span_secs }) => {
+                            // Issue #197: probe fired. Mark wallet infra under
+                            // the same mutex guard. Do NOT insert trades, do
+                            // NOT add to new_trades_map, do NOT stamp
+                            // last_polymarket_fetch_at — wallet stays out of
+                            // all re-queue paths via the active_tradeable_wallets
+                            // view + apply_activation_rules gate.
+                            let mut guard = cache_mutex.lock().await;
+                            if let Err(e) = guard.mark_infra(&wallet_hex) {
+                                tracing::error!(
+                                    wallet = %wallet_hex,
+                                    error = %e,
+                                    "polymarket: mark_infra failed after probe — wallet will be re-probed next run"
+                                );
+                                failed.lock().await.push(wallet);
+                                return;
+                            }
+                            tracing::info!(
+                                wallet = %wallet_hex,
+                                span_secs,
+                                "polymarket: wallet flagged infra by probe"
+                            );
                         }
                         Err(e) => {
                             tracing::error!(
@@ -317,7 +368,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
         wallet: WalletAddress,
         known_ids: &HashSet<SourceTradeId>,
         ts_bounds: Option<(i64, i64)>,
-    ) -> Result<Vec<RawTrade>, BootstrapError> {
+    ) -> Result<WalletFetchResult, BootstrapError> {
         let wallet_hex = wallet.to_string();
         let mut new_trades: Vec<RawTrade> = Vec::new();
 
@@ -367,6 +418,40 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
 
             if page.is_empty() {
                 break 'backward;
+            }
+
+            // ── Infra probe (issue #197) ──────────────────────────────────
+            // Fires only on the FIRST page of a cold-start fetch. Both
+            // guards are required: `ts_bounds.is_none()` distinguishes cold
+            // from incremental; `end_cursor.is_none()` distinguishes the
+            // first backward iteration from later ones (`end_cursor` is set
+            // at the bottom of the loop after iteration 1).
+            if ts_bounds.is_none() && end_cursor.is_none() {
+                match self.infra_probe.classify(&page, raw_count) {
+                    ProbeClassification::Infra { span_secs } => {
+                        tracing::warn!(
+                            wallet = %wallet_hex,
+                            span_secs,
+                            threshold = self.infra_probe.threshold_secs,
+                            "polymarket: infra probe triggered — flagging wallet, discarding probe page"
+                        );
+                        return Ok(WalletFetchResult::Infra { span_secs });
+                    }
+                    ProbeClassification::NotInfra { span_secs } => {
+                        tracing::debug!(
+                            wallet = %wallet_hex,
+                            span_secs,
+                            "polymarket: infra probe passed"
+                        );
+                    }
+                    ProbeClassification::Inconclusive { reason } => {
+                        tracing::debug!(
+                            wallet = %wallet_hex,
+                            reason,
+                            "polymarket: infra probe inconclusive"
+                        );
+                    }
+                }
             }
 
             // Sort newest-first (defensive; API normally returns this order).
@@ -471,7 +556,7 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
             }
         }
 
-        Ok(new_trades)
+        Ok(WalletFetchResult::Trades(new_trades))
     }
 }
 
@@ -780,7 +865,10 @@ mod tests {
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher);
+        // Disable probe: this test's dense fixture (ts ∈ [3001, 3500], span = 499s)
+        // would trigger the probe. The test exercises pagination, not infra logic.
+        let bulk = PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_infra_probe(InfraProbe { threshold_secs: 0 });
         bulk.fetch_all(&[wallet], &mut cache).await.unwrap();
 
         assert_eq!(cache.trade_count(), 1000);
@@ -922,7 +1010,10 @@ mod tests {
         let fetcher = FixtureFetcher::new(responses);
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        // Disable probe: this test's dense fixture would trigger it. The test
+        // exercises pagination across 7 full pages, not infra logic.
         PolymarketBulkFetcher::new(BASE_URL.to_owned(), fetcher)
+            .with_infra_probe(InfraProbe { threshold_secs: 0 })
             .fetch_all(&[wallet], &mut cache)
             .await
             .unwrap();
