@@ -53,6 +53,14 @@ fn insert_trade(cache: &mut WalletCache, trade_id: &str, wallet: WalletAddress, 
         source_trade_id: SourceTradeId(trade_id.to_owned()),
     };
     cache.insert_new(&wallet.to_string(), vec![trade]).unwrap();
+    // Issue #201: `wallets_needing_funder_lookup` is now scoped to the
+    // `active_tradeable_wallets` view (is_active=1 AND is_infra=0). These tests
+    // treat every traded wallet as a live candidate, so upsert a wallets row and
+    // mark it active. `insert_new` only writes the `trades` table.
+    cache
+        .upsert_wallets_bulk(&[(wallet.to_string(), 0, false, None, None, None, 0)])
+        .unwrap();
+    cache.conn_for_test_set_active(&wallet.to_string(), 1);
 }
 
 // ── Scenario 1 ────────────────────────────────────────────────────────────────
@@ -69,7 +77,7 @@ fn fresh_cache_all_wallets_pending() {
     insert_trade(&mut cache, "t2", wb, 1);
     insert_trade(&mut cache, "t3", wc, 2);
 
-    let mut pending = cache.wallets_needing_funder_lookup().unwrap();
+    let mut pending = cache.wallets_needing_funder_lookup(0).unwrap();
     pending.sort_by_key(|w| w.0);
 
     assert_eq!(pending.len(), 3);
@@ -97,7 +105,7 @@ fn partial_lookup_returns_remaining() {
         .insert_funder_edges(wa, &[(f1, BASE_UNIX)], BASE_UNIX)
         .unwrap();
 
-    let pending = cache.wallets_needing_funder_lookup().unwrap();
+    let pending = cache.wallets_needing_funder_lookup(0).unwrap();
     assert_eq!(pending.len(), 2);
     assert!(
         !pending.contains(&wa),
@@ -125,7 +133,7 @@ fn complete_lookup_returns_empty() {
     cache.insert_funder_edges(wb, &[], BASE_UNIX).unwrap();
     cache.insert_funder_edges(wc, &[], BASE_UNIX).unwrap();
 
-    let pending = cache.wallets_needing_funder_lookup().unwrap();
+    let pending = cache.wallets_needing_funder_lookup(0).unwrap();
     assert!(
         pending.is_empty(),
         "all wallets done — pending must be empty"
@@ -181,7 +189,7 @@ fn zero_funder_wallet_is_still_done() {
     // Insert with no funders.
     cache.insert_funder_edges(wa, &[], BASE_UNIX).unwrap();
 
-    let pending = cache.wallets_needing_funder_lookup().unwrap();
+    let pending = cache.wallets_needing_funder_lookup(0).unwrap();
     assert!(
         pending.is_empty(),
         "zero-funder wallet must still be marked done"
@@ -260,7 +268,7 @@ fn end_to_end_bootstrap_flow() {
     insert_trade(&mut cache, "t3", wc, 2);
 
     // Step 2: get pending — all 3 wallets should be pending.
-    let pending = cache.wallets_needing_funder_lookup().unwrap();
+    let pending = cache.wallets_needing_funder_lookup(0).unwrap();
     assert_eq!(pending.len(), 3);
 
     // Step 3: insert edges (simulates the Etherscan loop in pe-bootstrap).
@@ -274,7 +282,7 @@ fn end_to_end_bootstrap_flow() {
     cache.insert_funder_edges(wc, &[], BASE_UNIX).unwrap();
 
     // Step 4: pending list must now be empty.
-    let pending_after = cache.wallets_needing_funder_lookup().unwrap();
+    let pending_after = cache.wallets_needing_funder_lookup(0).unwrap();
     assert!(
         pending_after.is_empty(),
         "all wallets processed — pending must be empty"

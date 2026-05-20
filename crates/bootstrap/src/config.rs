@@ -334,6 +334,23 @@ pub struct BootstrapConfig {
     )]
     pub funder_concurrency: usize,
 
+    /// Per-run cap on the one-shot `pe-bootstrap funder` lookup (issue #201).
+    /// Mirrors `weekly_limit` (the Etherscan-API-budget throttle precedent), NOT
+    /// `backfill_limit`'s `0`: a bounded default keeps the one-shot funder short
+    /// and avoids the ~15h full-backlog surprise. `0` = no limit (explicit opt-in
+    /// for a full run). `PE_BOOTSTRAP_FUNDER_LIMIT` overrides.
+    #[serde(default = "default_funder_limit", alias = "bootstrap_funder_limit")]
+    pub funder_limit: usize,
+
+    /// Etherscan request-rate cap (req/s) for funder discovery (issue #201).
+    /// Default `3` = free-tier budget. Raise on a paid Etherscan tier to shorten
+    /// a full funder backlog. `PE_BOOTSTRAP_FUNDER_RATE_LIMIT_RPS` overrides.
+    #[serde(
+        default = "default_funder_rate_limit_rps",
+        alias = "bootstrap_funder_rate_limit_rps"
+    )]
+    pub funder_rate_limit_rps: u32,
+
     // ── Wallet pile (issue #166) ─────────────────────────────────────────────
     /// Cold-start lookback (days) for Dune incremental discovery when the
     /// `source_cursor.dune_discovery_last_run` row is absent. Default 2 (= 48h
@@ -481,6 +498,17 @@ const fn default_funder_concurrency() -> usize {
     DEFAULT_FUNDER_CONCURRENCY
 }
 
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #201).
+const fn default_funder_limit() -> usize {
+    200
+}
+
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #201).
+/// `3` = Etherscan free-tier req/s budget.
+const fn default_funder_rate_limit_rps() -> u32 {
+    3
+}
+
 fn default_gamma_base_url() -> String {
     crate::gamma::DEFAULT_GAMMA_BASE_URL.to_owned()
 }
@@ -564,6 +592,8 @@ impl Default for BootstrapConfig {
             skip_trade_fetch: false,
             write_snapshot: false,
             funder_concurrency: default_funder_concurrency(),
+            funder_limit: default_funder_limit(),
+            funder_rate_limit_rps: default_funder_rate_limit_rps(),
             discovery_lookback_days: default_discovery_lookback_days(),
             backfill_limit: default_backfill_limit(),
             weekly_limit: default_weekly_limit(),

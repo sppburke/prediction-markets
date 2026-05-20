@@ -9,6 +9,7 @@
 //! `pending` and `block_range`, and whether they need per-wallet timestamp updates.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,17 +53,22 @@ pub async fn run_funder(
     block_range: BlockRange,
     api_key: &str,
     concurrency: usize,
+    rate_limit_rps: u32,
     update_fetch_timestamps: bool,
 ) -> Result<FunderReport, BootstrapError> {
     let total_pending = pending.len();
+    // Issue #201: `0` (or an out-of-range value) falls back to the 3 req/s
+    // free-tier default; a paid Etherscan tier can raise this via config.
+    let rps = NonZeroU32::new(rate_limit_rps).unwrap_or(NonZeroU32::MIN.saturating_add(2));
     tracing::info!(
         pending = total_pending,
+        rate_limit_rps = rps.get(),
         update_timestamps = update_fetch_timestamps,
         "funder: discovery starting"
     );
 
     let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-    let lookup = EtherscanFunderLookup::new(api_key.to_owned());
+    let lookup = EtherscanFunderLookup::new(api_key.to_owned()).with_rate_limit_rps(rps);
 
     let (processed, failed) = {
         let cache_mutex: Mutex<&mut WalletCache> = Mutex::new(cache);

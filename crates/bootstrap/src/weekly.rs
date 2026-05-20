@@ -102,6 +102,7 @@ pub async fn run_weekly(
         block_range,
         &api_key,
         config.funder_concurrency,
+        config.funder_rate_limit_rps,
         true, // weekly stamps last_funder_fetch_at per wallet
     )
     .await?;

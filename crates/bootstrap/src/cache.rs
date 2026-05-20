@@ -996,19 +996,37 @@ impl WalletCache {
 
     // ── funder_edges / funder_lookup_done ─────────────────────────────────────
 
-    /// Return wallets that appear in `trades` but have not yet been queried for funders.
+    /// Return active, non-infra candidate wallets not yet queried for funders.
+    ///
+    /// Issue #201: scoped to the `active_tradeable_wallets` view (is_active=1 AND
+    /// is_infra=0) rather than every wallet that ever traded — operator-clustering
+    /// only needs the live candidate universe, and the prior all-trades scope
+    /// produced a ~456k bulk lookup at Etherscan's 3 req/s cap. Also correct for
+    /// wallets activated via Dune data that lack local `trades` rows. `limit == 0`
+    /// returns the full pending set (no `LIMIT` clause — mirrors `select_backfill_due`;
+    /// a literal `LIMIT 0` would return zero rows).
     ///
     /// # Precondition
-    /// Returns all distinct trade wallets when no funder discovery has been run.
-    pub fn wallets_needing_funder_lookup(&self) -> Result<Vec<WalletAddress>, BootstrapError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT wallet_hex FROM trades \
-             WHERE wallet_hex NOT IN (SELECT wallet_hex FROM funder_lookup_done)",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut result = Vec::new();
-        for row in rows {
-            let hex = row?;
+    /// Returns the full active-non-infra pending set when `limit == 0`.
+    pub fn wallets_needing_funder_lookup(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WalletAddress>, BootstrapError> {
+        let base = "SELECT wallet_hex FROM active_tradeable_wallets \
+                    WHERE wallet_hex NOT IN (SELECT wallet_hex FROM funder_lookup_done)";
+        let hexes: Vec<String> = if limit == 0 {
+            let mut stmt = self.conn.prepare(base)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let limited = format!("{base} LIMIT ?1");
+            let mut stmt = self.conn.prepare(&limited)?;
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+            let rows = stmt.query_map(params![limit_i64], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut result = Vec::with_capacity(hexes.len());
+        for hex in hexes {
             if let Ok(addr) = WalletAddress::from_hex(&hex) {
                 result.push(addr);
             }
@@ -1943,6 +1961,16 @@ mod tests {
 
     fn tmp_cache(dir: &TempDir) -> WalletCache {
         WalletCache::open(&dir.path().join("cache.db")).unwrap()
+    }
+
+    /// Issue #201: `wallets_needing_funder_lookup` is scoped to the
+    /// `active_tradeable_wallets` view, so a candidate wallet needs a `wallets`
+    /// row with is_active=1, is_infra=0. `insert_new` only writes `trades`.
+    fn activate_candidate(cache: &mut WalletCache, w: WalletAddress) {
+        cache
+            .upsert_wallets_bulk(&[(w.to_string(), 0, false, None, None, None, 0)])
+            .unwrap();
+        cache.conn_for_test_set_active(&w.to_string(), 1);
     }
 
     #[test]
@@ -2966,8 +2994,10 @@ mod tests {
         cache
             .insert_new(&w2.to_string(), vec![make_trade("t2", w2, 2_000)])
             .unwrap();
+        activate_candidate(&mut cache, w1);
+        activate_candidate(&mut cache, w2);
 
-        let pending = cache.wallets_needing_funder_lookup().unwrap();
+        let pending = cache.wallets_needing_funder_lookup(0).unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.contains(&w1));
         assert!(pending.contains(&w2));
@@ -2985,13 +3015,62 @@ mod tests {
         cache
             .insert_new(&w2.to_string(), vec![make_trade("t2", w2, 2_000)])
             .unwrap();
+        activate_candidate(&mut cache, w1);
+        activate_candidate(&mut cache, w2);
 
         // Mark w1 as done.
         cache.insert_funder_edges(w1, &[], 1_700_000_000).unwrap(); // zero funders
 
-        let pending = cache.wallets_needing_funder_lookup().unwrap();
+        let pending = cache.wallets_needing_funder_lookup(0).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0], w2);
+    }
+
+    #[test]
+    fn wallets_needing_lookup_scopes_to_active_non_infra_and_honours_limit() {
+        // Issue #201: only active, non-infra wallets are funder candidates, and
+        // `limit` truncates the result (LIMIT 0 ⇒ unbounded, not zero rows).
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        let active1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let active2 = addr("0xdddddddddddddddddddddddddddddddddddddddd");
+        let inactive = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let infra = addr("0xcccccccccccccccccccccccccccccccccccccccc");
+        for (i, w) in [active1, active2, inactive, infra].iter().enumerate() {
+            cache
+                .insert_new(
+                    &w.to_string(),
+                    vec![make_trade(&format!("t{i}"), *w, 1_000 + i as i64)],
+                )
+                .unwrap();
+        }
+        // active1/active2: active + non-infra (candidates).
+        activate_candidate(&mut cache, active1);
+        activate_candidate(&mut cache, active2);
+        // inactive: row exists, is_active stays 0.
+        cache
+            .upsert_wallets_bulk(&[(inactive.to_string(), 0, false, None, None, None, 0)])
+            .unwrap();
+        // infra: active but is_infra=1 → excluded by the view.
+        cache
+            .upsert_wallets_bulk(&[(infra.to_string(), 0, true, None, None, None, 0)])
+            .unwrap();
+        cache.conn_for_test_set_active(&infra.to_string(), 1);
+
+        let mut pending = cache.wallets_needing_funder_lookup(0).unwrap();
+        pending.sort_by_key(|w| w.0);
+        assert_eq!(
+            pending.len(),
+            2,
+            "only the two active non-infra wallets are candidates"
+        );
+        assert!(pending.contains(&active1) && pending.contains(&active2));
+        assert!(!pending.contains(&inactive), "inactive wallet excluded");
+        assert!(!pending.contains(&infra), "infra wallet excluded");
+
+        // LIMIT 1 truncates to one of the two candidates.
+        let limited = cache.wallets_needing_funder_lookup(1).unwrap();
+        assert_eq!(limited.len(), 1, "LIMIT 1 returns exactly one candidate");
     }
 
     #[test]
@@ -3033,14 +3112,15 @@ mod tests {
         cache
             .insert_new(&w.to_string(), vec![make_trade("t1", w, 1_000)])
             .unwrap();
+        activate_candidate(&mut cache, w);
 
         // Zero funders — wallet is still marked done.
         cache.insert_funder_edges(w, &[], 1_700_000_000).unwrap(); // no funder tuples
 
-        let pending = cache.wallets_needing_funder_lookup().unwrap();
+        let pending = cache.wallets_needing_funder_lookup(0).unwrap();
         assert!(
             pending.is_empty(),
-            "wallet with zero funders must still be marked done"
+            "active candidate with zero funders must still be marked done (excluded by done-ness, not scope)"
         );
 
         let edges = cache.load_funder_edges().unwrap();

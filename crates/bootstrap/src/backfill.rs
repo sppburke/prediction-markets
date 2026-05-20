@@ -193,7 +193,16 @@ pub async fn run_backfill(
     // ── 9. Resolutions + activation tail (unchanged) ─────────────────────────
     if config.fetch_resolutions {
         let market_ids = cache.all_market_ids();
-        fetch_resolutions_and_schedules(config, cache, &market_ids).await?;
+        // Issue #201: optional resolution stages soft-fail; a partial result is
+        // logged but does not change backfill's own exit accounting (a Polygon
+        // primary failure still propagates as Err via `?`).
+        let report = fetch_resolutions_and_schedules(config, cache, &market_ids).await?;
+        if report.has_failures() {
+            tracing::warn!(
+                stages_failed = ?report.stages_failed,
+                "backfill: resolutions partial — optional stages soft-failed"
+            );
+        }
     }
 
     cache.refresh_trade_counts()?;
