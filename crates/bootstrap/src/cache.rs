@@ -74,6 +74,13 @@ CREATE TABLE IF NOT EXISTS trades (
     timestamp_unix  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix);
+-- Issue #197 follow-up: index on market_id alone so `all_market_ids`
+-- (`SELECT DISTINCT market_id FROM trades ORDER BY market_id`, the only
+-- full-trades scan in the resolutions pipeline) becomes an index-only
+-- DISTINCT scan instead of a ~100 GB heap scan. Costs one extra B-tree
+-- update per trade insert; worth it given the scan runs every resolutions
+-- and `all` invocation.
+CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
 
 CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
     snapshot_at_unix INTEGER NOT NULL,
@@ -2356,6 +2363,29 @@ mod tests {
         assert_eq!(ids.len(), 2, "must deduplicate market_ids");
         assert!(ids.contains(&"0xmkt_a".to_owned()));
         assert!(ids.contains(&"0xmkt_b".to_owned()));
+    }
+
+    #[test]
+    fn all_market_ids_query_uses_market_id_index() {
+        // Regression guard for the #197-follow-up index: the DISTINCT market_id
+        // enumeration must be served by idx_trades_market_id, not a full heap
+        // scan of the (production: ~100 GB) trades table.
+        let dir = TempDir::new().unwrap();
+        let cache = tmp_cache(&dir);
+        let mut stmt = cache
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT DISTINCT market_id FROM trades ORDER BY market_id")
+            .unwrap();
+        // EXPLAIN QUERY PLAN row shape: (id, parent, notused, detail); detail is col 3.
+        let plan: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.contains("idx_trades_market_id")),
+            "all_market_ids must use idx_trades_market_id; plan was: {plan:?}"
+        );
     }
 
     #[test]
