@@ -10,7 +10,7 @@
 //! The BFS is decoupled from the network via the [`FunderLookup`] trait so
 //! it can be unit-tested without an RPC.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use alloy::primitives::B256;
@@ -20,8 +20,9 @@ use pe_core_types::WalletAddress;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::contracts::{TOPIC_ERC20_TRANSFER, USDC};
+use crate::contracts::{TOPIC_ERC20_TRANSFER, USDC, USDC_NATIVE};
 use crate::decoder;
+use crate::eth_logs::ChainLogFetcher;
 use crate::event::PolygonEvent;
 
 /// Cap on `eth_getLogs` retry backoff. Mirrors `live::MAX_BACKOFF_SECS`.
@@ -200,6 +201,99 @@ impl<P: Provider + Clone + Send + Sync> FunderLookup for EthGetLogsLookup<P> {
     }
 }
 
+/// Discover the direct funders of `funded` wallets via a batched, block-chunked
+/// `eth_getLogs` scan over BOTH USDC contracts, returning per-wallet attribution
+/// with on-chain event timestamps.
+///
+/// This is the bulk-backfill counterpart to the per-wallet, address-indexed
+/// [`crate::EtherscanFunderLookup::funders_of_with_timestamps`]: instead of one
+/// rate-limited HTTP call per wallet (~3 req/s), it issues one
+/// `Transfer(_, _, to ∈ batch)` filter per `topic_batch_size`-wallet group and
+/// scans `[range]` in `chunk_blocks`-block windows. The supplied
+/// [`ChainLogFetcher`] bisects each window on a provider response-size cap.
+///
+/// Every matching log yields a `(funded = topic[2], funder = topic[1],
+/// event_at = block_timestamp)` edge; the minimum timestamp is kept per
+/// `(funded, funder)` pair (earliest known funding event) — matching the
+/// Etherscan path's semantics. Both USDC contracts ([`USDC`] bridged +
+/// [`USDC_NATIVE`]) are scanned, preserving parity with the Etherscan backend.
+///
+/// Wallets with no discovered funders are simply absent from the returned map.
+/// Callers that must mark every candidate "done" should iterate their own input
+/// set, not the returned keys.
+///
+/// # Precondition
+/// The fetcher's provider must populate `Log::block_timestamp` (Alchemy does for
+/// `eth_getLogs`). On a provider that omits it, edges are stored with
+/// `event_at_unix = 0` (epoch sentinel — always visible in walk-forward
+/// simulations), preserving coverage at the cost of funding-event timing.
+pub async fn funder_edges_with_timestamps<F: ChainLogFetcher>(
+    fetcher: &F,
+    funded: &HashSet<WalletAddress>,
+    range: BlockRange,
+    chunk_blocks: u64,
+    topic_batch_size: usize,
+) -> Result<HashMap<WalletAddress, Vec<(WalletAddress, i64)>>, FunderDiscoveryError> {
+    if chunk_blocks == 0 {
+        return Err(FunderDiscoveryError::InvalidConfig(
+            "chunk_blocks must be > 0".to_string(),
+        ));
+    }
+    if topic_batch_size == 0 {
+        return Err(FunderDiscoveryError::InvalidConfig(
+            "topic_batch_size must be > 0".to_string(),
+        ));
+    }
+    if funded.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // funded → funder → earliest event_at_unix seen for that pair.
+    let mut edges: HashMap<WalletAddress, HashMap<WalletAddress, i64>> = HashMap::new();
+    let all: Vec<WalletAddress> = funded.iter().copied().collect();
+    for batch in all.chunks(topic_batch_size) {
+        let topic2: Vec<B256> = batch.iter().map(wallet_to_topic).collect();
+        // Block range is intentionally NOT set here: `ChainLogFetcher::get_logs`
+        // injects `[from, to]` per chunk (and per recursive bisect half).
+        let filter = Filter::new()
+            .address(vec![USDC, USDC_NATIVE])
+            .event_signature(TOPIC_ERC20_TRANSFER)
+            .topic2(topic2);
+        let mut block = range.from;
+        while block <= range.to {
+            let to_block = block.saturating_add(chunk_blocks - 1).min(range.to);
+            let logs = fetcher
+                .get_logs(filter.clone(), block, to_block)
+                .await
+                .map_err(|e| FunderDiscoveryError::GetLogs(e.to_string()))?;
+            for log in &logs {
+                let topics = log.topics();
+                let (Some(funder), Some(funded_wallet)) = (
+                    topic_to_wallet(topics.get(1)),
+                    topic_to_wallet(topics.get(2)),
+                ) else {
+                    continue;
+                };
+                let event_at = log
+                    .block_timestamp
+                    .and_then(|t| i64::try_from(t).ok())
+                    .unwrap_or(0);
+                edges
+                    .entry(funded_wallet)
+                    .or_default()
+                    .entry(funder)
+                    .and_modify(|min_ts| *min_ts = (*min_ts).min(event_at))
+                    .or_insert(event_at);
+            }
+            block = to_block.saturating_add(1);
+        }
+    }
+    let out = edges
+        .into_iter()
+        .map(|(funded_wallet, funders)| (funded_wallet, funders.into_iter().collect()))
+        .collect();
+    Ok(out)
+}
+
 /// Left-pad a 20-byte address into a 32-byte topic value.
 pub fn wallet_to_topic(w: &WalletAddress) -> B256 {
     let mut bytes = [0u8; 32];
@@ -229,7 +323,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use alloy::primitives::{Address, Bytes, LogData};
+    use alloy::rpc::types::Log;
+
     use super::*;
+    use crate::eth_logs::test_support::InMemoryChainLogFetcher;
 
     /// In-memory `FunderLookup` for BFS unit tests.
     ///
@@ -404,5 +502,109 @@ mod tests {
         // First 12 bytes must be zero; address occupies bytes 12..32.
         assert_eq!(&topic.as_slice()[..12], &[0u8; 12]);
         assert_eq!(&topic.as_slice()[12..], &w_in.0);
+    }
+
+    // ── funder_edges_with_timestamps ──────────────────────────────────────────
+
+    /// Build an ERC-20 `Transfer(from, to, _)` log: topic[1] = funder (from),
+    /// topic[2] = funded (to). `ts = None` models a provider that omitted
+    /// `block_timestamp`. `contract` is the emitting USDC address.
+    fn transfer_log(
+        funder: WalletAddress,
+        funded: WalletAddress,
+        ts: Option<u64>,
+        contract: Address,
+    ) -> Log {
+        let inner = alloy::primitives::Log {
+            address: contract,
+            data: LogData::new_unchecked(
+                vec![
+                    TOPIC_ERC20_TRANSFER,
+                    wallet_to_topic(&funder),
+                    wallet_to_topic(&funded),
+                ],
+                Bytes::new(),
+            ),
+        };
+        Log {
+            inner,
+            block_timestamp: ts,
+            ..Default::default()
+        }
+    }
+
+    /// PASS: per-wallet attribution is recovered (funded → its funders), the
+    ///       MINIMUM timestamp is kept per (funded, funder) pair, edges from
+    ///       BOTH USDC contracts are captured, and a missing `block_timestamp`
+    ///       falls back to the `0` epoch sentinel.
+    /// FAIL: any of attribution / both-contracts / min-ts / zero-sentinel is
+    ///       wrong — each is a parity break vs the Etherscan backend.
+    #[tokio::test]
+    async fn edges_carry_attribution_min_ts_and_zero_sentinel() {
+        let funded = w(0xa0);
+        let f1 = w(0xb0);
+        let f2 = w(0xc0);
+        let logs = vec![
+            // f1 funds via bridged USDC at ts=200 and native USDC at ts=100;
+            // the earlier (100) must win the per-pair minimum.
+            transfer_log(f1, funded, Some(200), USDC),
+            transfer_log(f1, funded, Some(100), USDC_NATIVE),
+            // f2 funds via bridged USDC with no block_timestamp → sentinel 0.
+            transfer_log(f2, funded, None, USDC),
+        ];
+        let fetcher = InMemoryChainLogFetcher::ok(80_000_000, logs);
+        let set: HashSet<WalletAddress> = [funded].into_iter().collect();
+        // One chunk (chunk_blocks > span) and one batch (topic_batch_size > 1)
+        // ⇒ the fetcher is queried exactly once.
+        let map = funder_edges_with_timestamps(&fetcher, &set, rng(), 1_000, 1_000)
+            .await
+            .unwrap();
+        let mut got = map.get(&funded).cloned().unwrap();
+        got.sort_by_key(|(funder, _)| funder.0);
+        let mut want = vec![(f1, 100i64), (f2, 0i64)];
+        want.sort_by_key(|(funder, _)| funder.0);
+        assert_eq!(got, want);
+    }
+
+    /// PASS: an empty `funded` set short-circuits to an empty map without
+    ///       touching the fetcher.
+    #[tokio::test]
+    async fn empty_funded_returns_empty_map() {
+        let fetcher = InMemoryChainLogFetcher::ok(100, vec![]);
+        let map = funder_edges_with_timestamps(&fetcher, &HashSet::new(), rng(), 1_000, 1_000)
+            .await
+            .unwrap();
+        assert!(map.is_empty());
+        // Fetcher must not have been called.
+        assert!(fetcher.last_call().is_none());
+    }
+
+    /// PASS: `chunk_blocks = 0` and `topic_batch_size = 0` are rejected as
+    ///       invalid config before any fetch (mirrors `EthGetLogsLookup`).
+    #[tokio::test]
+    async fn zero_sized_inputs_are_invalid_config() {
+        let fetcher = InMemoryChainLogFetcher::ok(100, vec![]);
+        let set: HashSet<WalletAddress> = [w(0xa0)].into_iter().collect();
+        let e1 = funder_edges_with_timestamps(&fetcher, &set, rng(), 0, 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(e1, FunderDiscoveryError::InvalidConfig(_)));
+        let e2 = funder_edges_with_timestamps(&fetcher, &set, rng(), 1_000, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(e2, FunderDiscoveryError::InvalidConfig(_)));
+    }
+
+    /// PASS: a fetch error propagates as `GetLogs` (fatal for the whole scan —
+    ///       nothing is attributed, so the caller marks no wallet done and the
+    ///       run retries cleanly).
+    #[tokio::test]
+    async fn scan_error_propagates_as_get_logs() {
+        let fetcher = InMemoryChainLogFetcher::get_logs_err(100, "response size exceeded");
+        let set: HashSet<WalletAddress> = [w(0xa0)].into_iter().collect();
+        let err = funder_edges_with_timestamps(&fetcher, &set, rng(), 1_000, 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FunderDiscoveryError::GetLogs(_)));
     }
 }

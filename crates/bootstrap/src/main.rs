@@ -1,3 +1,4 @@
+use alloy::providers::ProviderBuilder;
 use pe_bootstrap::{
     BootstrapConfig, FUNDER_DISCOVERY_TO_BLOCK, backfill,
     cache::WalletCache,
@@ -7,7 +8,9 @@ use pe_bootstrap::{
     seed_historical::{self, parse_seed_as_of_env},
     watchlist_phase, weekly,
 };
-use pe_source_onchain_polygon::{BlockRange, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK};
+use pe_source_onchain_polygon::{
+    AlloyChainLogFetcher, BlockRange, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -159,10 +162,13 @@ async fn main() {
             }
 
             "funder" => {
-                let api_key = match &bootstrap_config.etherscan_api_key {
-                    Some(k) => k.clone(),
+                // Issue #203: the bulk funder lookup runs against the Polygon RPC
+                // via batched `eth_getLogs` (the incremental `weekly` path keeps
+                // Etherscan). Requires `polygon_rpc_url`.
+                let rpc_url = match &bootstrap_config.polygon_rpc_url {
+                    Some(u) => u.clone(),
                     None => {
-                        tracing::error!("funder: PE_ETHERSCAN_API_KEY not set");
+                        tracing::error!("funder: PE_BOOTSTRAP_POLYGON_RPC_URL not set");
                         std::process::exit(1);
                     }
                 };
@@ -178,18 +184,28 @@ async fn main() {
                     tracing::info!("funder: no wallets pending funder lookup");
                     std::process::exit(0);
                 }
+                let http_url = match rpc_url.parse::<reqwest::Url>() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::error!(error = %e, "funder: invalid polygon_rpc_url");
+                        std::process::exit(1);
+                    }
+                };
+                let fetcher = AlloyChainLogFetcher {
+                    provider: ProviderBuilder::new().connect_http(http_url),
+                    min_chunk: 1,
+                };
                 let block_range = BlockRange {
                     from: CTF_EXCHANGE_V1_DEPLOY_BLOCK,
                     to: FUNDER_DISCOVERY_TO_BLOCK,
                 };
-                match funder::run_funder(
+                match funder::run_funder_eth_logs(
                     &mut cache,
                     &pending,
                     block_range,
-                    &api_key,
-                    bootstrap_config.funder_concurrency,
-                    bootstrap_config.funder_rate_limit_rps,
-                    false,
+                    &fetcher,
+                    bootstrap_config.funder_block_chunk,
+                    bootstrap_config.funder_topic_batch_size,
                 )
                 .await
                 {
@@ -620,8 +636,10 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     }
 
     // Step 3: funder-graph discovery (optional).
+    // Issue #203: the bulk path uses batched `eth_getLogs` against the Polygon
+    // RPC (the `weekly` path keeps Etherscan), so it gates on `polygon_rpc_url`.
     if config.fetch_funder_graph {
-        if let Some(api_key) = &config.etherscan_api_key {
+        if let Some(rpc_url) = &config.polygon_rpc_url {
             let pending = match cache.wallets_needing_funder_lookup(config.funder_limit) {
                 Ok(p) => p,
                 Err(e) => {
@@ -630,18 +648,28 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
                 }
             };
             if !pending.is_empty() {
+                let http_url = match rpc_url.parse::<reqwest::Url>() {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::error!(error = %e, "all: invalid polygon_rpc_url");
+                        return 1;
+                    }
+                };
+                let fetcher = AlloyChainLogFetcher {
+                    provider: ProviderBuilder::new().connect_http(http_url),
+                    min_chunk: 1,
+                };
                 let block_range = pe_source_onchain_polygon::BlockRange {
                     from: CTF_EXCHANGE_V1_DEPLOY_BLOCK,
                     to: FUNDER_DISCOVERY_TO_BLOCK,
                 };
-                match funder::run_funder(
+                match funder::run_funder_eth_logs(
                     cache,
                     &pending,
                     block_range,
-                    api_key,
-                    config.funder_concurrency,
-                    config.funder_rate_limit_rps,
-                    false,
+                    &fetcher,
+                    config.funder_block_chunk,
+                    config.funder_topic_batch_size,
                 )
                 .await
                 {
@@ -661,7 +689,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
             }
         } else {
             tracing::warn!(
-                "PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 but PE_ETHERSCAN_API_KEY not set — skipping"
+                "PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 but PE_BOOTSTRAP_POLYGON_RPC_URL not set — skipping"
             );
         }
     }

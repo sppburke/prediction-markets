@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::stream::{self, StreamExt};
 use pe_core_types::WalletAddress;
-use pe_source_onchain_polygon::{BlockRange, EtherscanFunderLookup};
+use pe_source_onchain_polygon::{
+    BlockRange, ChainLogFetcher, EtherscanFunderLookup, funder_edges_with_timestamps,
+};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
@@ -156,6 +158,86 @@ pub async fn run_funder(
         "funder: discovery complete"
     );
 
+    Ok(FunderReport {
+        pending: total_pending,
+        processed,
+        failed,
+        edges_total,
+    })
+}
+
+/// Bulk funder-graph discovery via batched `eth_getLogs` (issue #203).
+///
+/// The throughput counterpart to [`run_funder`]: instead of one rate-limited
+/// Etherscan call per wallet (~3 req/s ⇒ ~15h for the active backlog), it runs
+/// a single batched [`funder_edges_with_timestamps`] scan against an
+/// Alchemy-class RPC (any [`ChainLogFetcher`]) and inserts the resulting
+/// per-wallet edges. Used by the bulk paths (`pe-bootstrap funder` and the
+/// `all` pipeline); the incremental `weekly` refresh stays on [`run_funder`]
+/// because Etherscan's address-indexed lookup is cheaper for small staleness
+/// sets than a full-history block scan.
+///
+/// A scan failure is fatal (`Err`): no wallet is marked done, so the run
+/// retries cleanly on the next invocation. On success every wallet in `pending`
+/// is written to `funder_lookup_done` — **including wallets with zero
+/// discovered funders** — so they are not re-queried indefinitely.
+///
+/// # Precondition
+/// `pending` must not be empty (callers skip the call when the list is empty).
+pub async fn run_funder_eth_logs<F: ChainLogFetcher>(
+    cache: &mut WalletCache,
+    pending: &[WalletAddress],
+    block_range: BlockRange,
+    fetcher: &F,
+    chunk_blocks: u64,
+    topic_batch_size: usize,
+) -> Result<FunderReport, BootstrapError> {
+    let total_pending = pending.len();
+    tracing::info!(
+        pending = total_pending,
+        chunk_blocks,
+        topic_batch_size,
+        "funder(eth_logs): discovery starting"
+    );
+
+    let funded: HashSet<WalletAddress> = pending.iter().copied().collect();
+    let edges = funder_edges_with_timestamps(
+        fetcher,
+        &funded,
+        block_range,
+        chunk_blocks,
+        topic_batch_size,
+    )
+    .await
+    .map_err(|e| BootstrapError::Funder {
+        message: e.to_string(),
+    })?;
+
+    let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+    let mut processed = 0usize;
+    let mut failed = 0usize;
+    // Iterate ALL pending wallets, not just those with discovered funders, so a
+    // zero-funder wallet is still marked done in `funder_lookup_done` and not
+    // re-queried (parity with `run_funder`'s per-wallet insert).
+    for wallet in pending {
+        let funders_vec: &[(WalletAddress, i64)] = edges.get(wallet).map_or(&[], Vec::as_slice);
+        match cache.insert_funder_edges(*wallet, funders_vec, fetched_at) {
+            Ok(()) => processed += 1,
+            Err(e) => {
+                tracing::error!(wallet = %wallet, error = %e, "funder(eth_logs): cache insert failed");
+                failed += 1;
+            }
+        }
+    }
+
+    let edges_total = cache.load_funder_edges()?.len();
+    tracing::info!(
+        pending = total_pending,
+        processed,
+        failed,
+        edges_total,
+        "funder(eth_logs): discovery complete"
+    );
     Ok(FunderReport {
         pending: total_pending,
         processed,
