@@ -351,6 +351,26 @@ pub struct BootstrapConfig {
     )]
     pub funder_rate_limit_rps: u32,
 
+    /// Wallets per `topic[2]` filter in the batched `eth_getLogs` funder scan
+    /// (issue #203). Larger batches mean fewer block-range passes but bigger
+    /// request payloads (Alchemy caps topic-array size — validate before
+    /// raising). `PE_BOOTSTRAP_FUNDER_TOPIC_BATCH_SIZE` overrides.
+    #[serde(
+        default = "default_funder_topic_batch_size",
+        alias = "bootstrap_funder_topic_batch_size"
+    )]
+    pub funder_topic_batch_size: usize,
+
+    /// Block-range chunk size for the batched `eth_getLogs` funder scan
+    /// (issue #203). Independent of `polygon_ctf_chunk_blocks`; the
+    /// bisect-on-cap fallback subdivides dense ranges that exceed the
+    /// provider response cap. `PE_BOOTSTRAP_FUNDER_BLOCK_CHUNK` overrides.
+    #[serde(
+        default = "default_funder_block_chunk",
+        alias = "bootstrap_funder_block_chunk"
+    )]
+    pub funder_block_chunk: u64,
+
     // ── Wallet pile (issue #166) ─────────────────────────────────────────────
     /// Cold-start lookback (days) for Dune incremental discovery when the
     /// `source_cursor.dune_discovery_last_run` row is absent. Default 2 (= 48h
@@ -509,6 +529,16 @@ const fn default_funder_rate_limit_rps() -> u32 {
     3
 }
 
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #203).
+const fn default_funder_topic_batch_size() -> usize {
+    1_000
+}
+
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #203).
+const fn default_funder_block_chunk() -> u64 {
+    10_000
+}
+
 fn default_gamma_base_url() -> String {
     crate::gamma::DEFAULT_GAMMA_BASE_URL.to_owned()
 }
@@ -594,6 +624,8 @@ impl Default for BootstrapConfig {
             funder_concurrency: default_funder_concurrency(),
             funder_limit: default_funder_limit(),
             funder_rate_limit_rps: default_funder_rate_limit_rps(),
+            funder_topic_batch_size: default_funder_topic_batch_size(),
+            funder_block_chunk: default_funder_block_chunk(),
             discovery_lookback_days: default_discovery_lookback_days(),
             backfill_limit: default_backfill_limit(),
             weekly_limit: default_weekly_limit(),

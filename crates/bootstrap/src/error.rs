@@ -41,6 +41,8 @@ pub enum BootstrapError {
     Clob { message: String },
     #[error("polygon_ctf: {message}")]
     PolygonCtf { message: String },
+    #[error("funder: {message}")]
+    Funder { message: String },
     #[error("url parse: {0}")]
     UrlParse(#[from] url::ParseError),
     /// Operator-misconfig / invariant violation surfaced from a runtime check

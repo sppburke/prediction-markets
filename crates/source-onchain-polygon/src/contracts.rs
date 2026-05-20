@@ -12,6 +12,13 @@ use alloy::primitives::{Address, B256, address, b256};
 /// verified 2026-05-04 from github.com/Polymarket/neg-risk-ctf-adapter/blob/main/addresses.json
 pub const USDC: Address = address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
+/// Native USDC (Circle-issued) on Polygon PoS. Polymarket collateral is the
+/// bridged [`USDC`] (USDC.e), but wallets are commonly funded via the native
+/// contract too — so funder discovery scans BOTH. Mirrors the two-contract
+/// coverage of `etherscan::funders_of_with_timestamps`.
+/// verified 2026-05-20 from circle.com/multi-chain-usdc + PolygonScan token page
+pub const USDC_NATIVE: Address = address!("3c499c542cEF5E3811e1192ce70d8cC03d5c3359");
+
 /// Polymarket WrappedCollateral (brand name: pUSD; on-chain symbol: WCOL).
 /// NegRisk multi-outcome markets wrap USDC into WCOL 1:1 before market settlement.
 /// PUsdMint / PUsdBurn events are ERC-20 Transfer(from=0x0, ...) / Transfer(..., to=0x0).

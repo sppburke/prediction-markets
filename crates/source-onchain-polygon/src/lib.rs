@@ -55,7 +55,7 @@ pub use etherscan::{EtherscanFunderLookup, HttpFetcher};
 pub use event::{ExternalAddressKind, PolygonEvent, PolygonEventError, TxHash};
 pub use funder_discovery::{
     BlockRange, EthGetLogsLookup, FunderDiscoveryError, FunderLookup, discover_to_depth,
-    topic_to_wallet, wallet_to_topic,
+    funder_edges_with_timestamps, topic_to_wallet, wallet_to_topic,
 };
 pub use live::{LivePolygonConnector, LivePolygonError, PolygonConnectorConfig};
 pub use wallet_enumeration::{EnumerationConfig, EnumerationError, PolymarketTraderEnumeration};
