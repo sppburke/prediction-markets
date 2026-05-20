@@ -187,6 +187,17 @@ impl<F: HttpFetcher> EtherscanFunderLookup<F> {
         }
     }
 
+    /// Override the request-rate cap, builder-style (issue #201). Default is
+    /// 3 req/s (Etherscan free tier); a paid tier can raise this to shorten a
+    /// large funder backlog. Additive — leaves `new`/`with_fetcher` call sites
+    /// (incl. the live source) untouched.
+    #[must_use]
+    pub fn with_rate_limit_rps(mut self, rps: NonZeroU32) -> Self {
+        let quota = Quota::per_second(rps).allow_burst(rps);
+        self.limiter = RateLimiter::direct(quota);
+        self
+    }
+
     /// Test-only constructor that overrides the rate limit. Production code uses
     /// [`Self::with_fetcher`] (3 req/s); the cap-exhaustion scenario test bumps
     /// this so its `MAX_PAGES` cursor iterations don't take 33+ seconds at 3 rps.

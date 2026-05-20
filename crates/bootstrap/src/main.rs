@@ -166,13 +166,14 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                let pending = match cache.wallets_needing_funder_lookup() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(error = %e, "funder: cache read failed");
-                        std::process::exit(1);
-                    }
-                };
+                let pending =
+                    match cache.wallets_needing_funder_lookup(bootstrap_config.funder_limit) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(error = %e, "funder: cache read failed");
+                            std::process::exit(1);
+                        }
+                    };
                 if pending.is_empty() {
                     tracing::info!("funder: no wallets pending funder lookup");
                     std::process::exit(0);
@@ -187,6 +188,7 @@ async fn main() {
                     block_range,
                     &api_key,
                     bootstrap_config.funder_concurrency,
+                    bootstrap_config.funder_rate_limit_rps,
                     false,
                 )
                 .await
@@ -263,7 +265,16 @@ async fn main() {
                     None => all_ids,
                 };
                 match fetch_resolutions_and_schedules(&bootstrap_config, &mut cache, &ids).await {
-                    Ok(()) => {
+                    Ok(report) if report.has_failures() => {
+                        // Issue #201: optional stages soft-failed; surface as
+                        // partial (exit 2) so the skip is visible to operators.
+                        tracing::warn!(
+                            stages_failed = ?report.stages_failed,
+                            "resolutions: partial — some optional stages soft-failed; re-run to retry"
+                        );
+                        2
+                    }
+                    Ok(_) => {
                         tracing::info!("resolutions: complete");
                         0
                     }
@@ -611,7 +622,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     // Step 3: funder-graph discovery (optional).
     if config.fetch_funder_graph {
         if let Some(api_key) = &config.etherscan_api_key {
-            let pending = match cache.wallets_needing_funder_lookup() {
+            let pending = match cache.wallets_needing_funder_lookup(config.funder_limit) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(error = %e, "all: funder lookup list failed");
@@ -629,6 +640,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
                     block_range,
                     api_key,
                     config.funder_concurrency,
+                    config.funder_rate_limit_rps,
                     false,
                 )
                 .await
@@ -672,9 +684,21 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     // Step 5: resolutions (optional).
     if config.fetch_resolutions {
         let ids = cache.all_market_ids();
-        if let Err(e) = fetch_resolutions_and_schedules(config, cache, &ids).await {
-            tracing::error!(error = %e, "all: resolutions fatal");
-            return 1;
+        match fetch_resolutions_and_schedules(config, cache, &ids).await {
+            Ok(report) if report.has_failures() => {
+                // Issue #201: optional stages soft-failed → partial (exit 2),
+                // not fatal. Polygon (primary) failures still propagate as Err.
+                tracing::warn!(
+                    stages_failed = ?report.stages_failed,
+                    "all: resolutions partial — optional stages soft-failed"
+                );
+                soft_fail = true;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "all: resolutions fatal");
+                return 1;
+            }
         }
     }
 

@@ -95,6 +95,26 @@ pub enum DeltaMode {
     Delta,
 }
 
+/// Outcome of [`fetch_resolutions_and_schedules`] (issue #201).
+///
+/// The optional fallback stages (Dune, CLOB, Gamma, null-rewrite) soft-fail
+/// independently: a failure logs a warning and records the stage name here
+/// rather than aborting the pipeline. The primary Polygon stage hard-fails
+/// (propagates `Err`). A non-empty `stages_failed` ⇒ the caller should treat
+/// the run as partial (exit 2), matching the backfill/weekly convention.
+#[derive(Debug, Default, Clone)]
+pub struct ResolutionsReport {
+    /// Names of optional stages that soft-failed this run (e.g. `"dune"`).
+    pub stages_failed: Vec<&'static str>,
+}
+
+impl ResolutionsReport {
+    /// True when at least one optional stage soft-failed.
+    pub fn has_failures(&self) -> bool {
+        !self.stages_failed.is_empty()
+    }
+}
+
 /// Multi-source resolution + schedule pipeline (issue #149, extracted in #166).
 ///
 /// Stage ordering puts precision sources first so `INSERT OR IGNORE` keeps the
@@ -118,9 +138,7 @@ pub async fn fetch_resolutions_and_schedules(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     market_ids: &[String],
-) -> Result<(), BootstrapError> {
-    use pe_source_polymarket_public::ReqwestFetcher;
-
+) -> Result<ResolutionsReport, BootstrapError> {
     if config.rebuild_resolutions {
         let deleted = cache.delete_resolutions_by_sources(&["gamma", "clob"])?;
         tracing::info!(
@@ -129,7 +147,43 @@ pub async fn fetch_resolutions_and_schedules(
         );
     }
 
-    // 6a. Polygon RPC scan.
+    let mut stages_failed: Vec<&'static str> = Vec::new();
+
+    // 6a. Polygon RPC scan — primary precise source; hard-fail (propagate).
+    // An Alchemy outage aborts the run rather than silently producing a
+    // resolutions pass missing the gold source.
+    run_polygon_resolutions(config, cache).await?;
+
+    // 6b-6f are fallback/auxiliary sources (issue #201): a failure in one
+    // (e.g. a Dune subscription-tier 400) must NOT abort the others. Each is
+    // soft-failed — logged and recorded in the report — and the pipeline
+    // continues. A non-empty `stages_failed` makes the caller exit 2 (partial).
+    if let Err(e) = run_dune_resolutions(config, cache, market_ids).await {
+        tracing::warn!(error = %e, stage = "dune", "resolutions: stage soft-failed, continuing");
+        stages_failed.push("dune");
+    }
+    if let Err(e) = run_clob_closed_markets(config, cache).await {
+        tracing::warn!(error = %e, stage = "clob", "resolutions: stage soft-failed, continuing");
+        stages_failed.push("clob");
+    }
+    if let Err(e) = run_gamma_schedules_liquidity(config, cache, market_ids).await {
+        tracing::warn!(error = %e, stage = "gamma", "resolutions: stage soft-failed, continuing");
+        stages_failed.push("gamma");
+    }
+    if let Err(e) = run_gamma_null_rewrite(config, cache, market_ids).await {
+        tracing::warn!(error = %e, stage = "gamma_null_rewrite", "resolutions: stage soft-failed, continuing");
+        stages_failed.push("gamma_null_rewrite");
+    }
+
+    Ok(ResolutionsReport { stages_failed })
+}
+
+/// 6a. Polygon RPC CTF scan → `source='polygon'` (block timestamp). No-op when
+/// `polygon_rpc_url` is unset.
+async fn run_polygon_resolutions(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+) -> Result<(), BootstrapError> {
     if let Some(rpc_url) = config.polygon_rpc_url.as_deref() {
         let from_block = cache
             .get_source_cursor(polygon_ctf::POLYGON_CTF_CURSOR_KEY)
@@ -149,8 +203,16 @@ pub async fn fetch_resolutions_and_schedules(
             "bootstrap: polygon_ctf resolutions fetched"
         );
     }
+    Ok(())
+}
 
-    // 6b. Dune `ctf_evt_conditionresolution`.
+/// 6b. Dune `ctf_evt_conditionresolution` → `source='dune'`. No-op when
+/// `dune_api_key` is unset or no markets are unresolved.
+async fn run_dune_resolutions(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    market_ids: &[String],
+) -> Result<(), BootstrapError> {
     if let Some(api_key) = &config.dune_api_key {
         let unresolved = unresolved_market_ids(market_ids, &cache.resolved_market_ids());
         if !unresolved.is_empty() {
@@ -178,8 +240,15 @@ pub async fn fetch_resolutions_and_schedules(
             );
         }
     }
+    Ok(())
+}
 
-    // 6c. CLOB closed-market pagination.
+/// 6c. CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
+async fn run_clob_closed_markets(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+) -> Result<(), BootstrapError> {
+    use pe_source_polymarket_public::ReqwestFetcher;
     let clob_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
         .build()
@@ -194,8 +263,17 @@ pub async fn fetch_resolutions_and_schedules(
         clob_resolutions,
         "bootstrap: clob closed markets fetched"
     );
+    Ok(())
+}
 
-    // 6d/e. Gamma schedules + liquidity — open markets only.
+/// 6d/e. Gamma schedules + liquidity for still-open markets (computed AFTER the
+/// precision stages so only truly-open markets are fetched).
+async fn run_gamma_schedules_liquidity(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    market_ids: &[String],
+) -> Result<(), BootstrapError> {
+    use pe_source_polymarket_public::ReqwestFetcher;
     let open_ids: Vec<String> = unresolved_market_ids(market_ids, &cache.resolved_market_ids());
     let gamma_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
@@ -219,12 +297,29 @@ pub async fn fetch_resolutions_and_schedules(
         open_markets = open_ids.len(),
         "bootstrap: gamma liquidity fetched (open markets only)"
     );
+    Ok(())
+}
 
-    // 6f. Null-schedule rewrite pass (issue #137 Sub-PR 2).
+/// 6f. Gamma null-schedule rewrite pass (issue #137 Sub-PR 2). Scoped to the
+/// trade-set ∩ null-schedule markets.
+async fn run_gamma_null_rewrite(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    market_ids: &[String],
+) -> Result<(), BootstrapError> {
+    use pe_source_polymarket_public::ReqwestFetcher;
     let null_ids = cache.null_schedule_market_ids();
     let trade_set: HashSet<String> = market_ids.iter().cloned().collect();
     let rewrite_targets: Vec<String> = null_ids.intersection(&trade_set).cloned().collect();
     if !rewrite_targets.is_empty() {
+        let gamma_client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| BootstrapError::Internal)?;
+        let gamma_fetcher = gamma::GammaFetcher::new(
+            config.gamma_base_url.clone(),
+            ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
+        );
         let rewritten = gamma_fetcher
             .rewrite_null_schedules(&rewrite_targets, cache)
             .await?;
