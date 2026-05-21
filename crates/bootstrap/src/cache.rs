@@ -206,6 +206,33 @@ pub struct ClassifyInfraReport {
     pub dry_run: bool,
 }
 
+/// Backtest-readiness coverage counts (issue #208).
+///
+/// Every field is a *gap* count: `0` everywhere means the cache is ready for a
+/// backtest. Produced by [`WalletCache::coverage_counts`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageReport {
+    /// Active, non-infra wallets not yet queried for funders.
+    pub pending_funder: usize,
+    /// Active, non-infra wallets never fetched from Polymarket
+    /// (`last_polymarket_fetch_at IS NULL`).
+    pub fetch_incomplete: usize,
+    /// Distinct traded markets with no `market_resolutions` row.
+    pub missing_resolution: usize,
+    /// Distinct traded markets with no `market_schedules` row.
+    pub missing_schedule: usize,
+}
+
+impl CoverageReport {
+    /// True when every gap count is zero — the cache is backtest-ready.
+    pub fn is_clean(&self) -> bool {
+        self.pending_funder == 0
+            && self.fetch_incomplete == 0
+            && self.missing_resolution == 0
+            && self.missing_schedule == 0
+    }
+}
+
 /// Permanent wallet trade-history cache backed by SQLite.
 pub struct WalletCache {
     conn: Connection,
@@ -277,6 +304,23 @@ impl WalletCache {
             )?;
         }
 
+        Ok(Self { conn })
+    }
+
+    /// Open the cache **read-only**, skipping schema creation and migrations.
+    ///
+    /// Used by the read-only `coverage` probe (issue #208): it must not create
+    /// the file, must not run DDL (a `SQLITE_OPEN_READ_ONLY` connection cannot),
+    /// and must not take the `CacheMutationLock`. The mutating subcommands
+    /// create and migrate the database via [`Self::open`]; this opener only
+    /// reads existing tables and views.
+    ///
+    /// # Precondition
+    /// The database at `path` must already exist and have been migrated (opened
+    /// at least once via [`Self::open`]). A nonexistent path errors rather than
+    /// being created.
+    pub fn open_read_only(path: &Path) -> Result<Self, BootstrapError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self { conn })
     }
 
@@ -1016,6 +1060,44 @@ impl WalletCache {
             Ok(iter) => iter.filter_map(Result::ok).collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Compute the four backtest-readiness gap counts (issue #208) in one read pass.
+    ///
+    /// Each count is a dedicated `COUNT(*)` or set-difference — never a `.len()`
+    /// over a list-materialising helper. `pending_funder` and `fetch_incomplete`
+    /// mirror the `WHERE` clauses of [`Self::wallets_needing_funder_lookup`] and
+    /// [`Self::select_backfill_due`]'s `IS NULL` branch without materialising the
+    /// wallet lists. The `missing_*` counts difference [`Self::all_market_ids`]
+    /// against [`Self::resolved_market_ids`] / [`Self::scheduled_market_ids`],
+    /// inheriting the `0x`-prefixed join-key invariant the write paths maintain
+    /// (see the `market_events` schema note) — no fresh `LEFT JOIN`.
+    pub fn coverage_counts(&self) -> Result<CoverageReport, BootstrapError> {
+        let pending_funder: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM active_tradeable_wallets \
+             WHERE wallet_hex NOT IN (SELECT wallet_hex FROM funder_lookup_done)",
+            [],
+            |r| r.get(0),
+        )?;
+        let fetch_incomplete: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM active_tradeable_wallets \
+             WHERE last_polymarket_fetch_at IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        let traded = self.all_market_ids();
+        let resolved = self.resolved_market_ids();
+        let scheduled = self.scheduled_market_ids();
+        let missing_resolution = traded.iter().filter(|&m| !resolved.contains(m)).count();
+        let missing_schedule = traded.iter().filter(|&m| !scheduled.contains(m)).count();
+        Ok(CoverageReport {
+            // COUNT(*) is non-negative, so the conversion never saturates in
+            // practice; `unwrap_or(0)` keeps the lint happy without an `as` cast.
+            pending_funder: usize::try_from(pending_funder).unwrap_or(0),
+            fetch_incomplete: usize::try_from(fetch_incomplete).unwrap_or(0),
+            missing_resolution,
+            missing_schedule,
+        })
     }
 
     /// Returns `(oldest_ts, newest_ts)` for `wallet_hex`, or `None` if no trades cached.
