@@ -2,7 +2,7 @@ use alloy::providers::ProviderBuilder;
 use pe_bootstrap::{
     BootstrapConfig, FUNDER_DISCOVERY_TO_BLOCK, backfill,
     cache::WalletCache,
-    config, discovery, enumerate,
+    config, coverage, discovery, enumerate,
     error::BootstrapError,
     fetch, fetch_resolutions_and_schedules, funder, infra_probe, lock, migrate, pile,
     seed_historical::{self, parse_seed_as_of_env},
@@ -48,6 +48,7 @@ async fn main() {
                 | "backfill"
                 | "weekly"
                 | "classify-infra"
+                | "coverage"
         )
     );
 
@@ -105,6 +106,30 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+
+        // `coverage` (issue #208) is a read-only probe: open the cache
+        // READ_ONLY, never CREATE/migrate it, and never take the
+        // CacheMutationLock. Handle it before the shared read-write open below
+        // so it stays off the mutating path entirely.
+        //   exit 0 = clean (no gaps), 2 = partial (a gap was detected),
+        //   1 = fatal (cache/IO error) — per the convention above.
+        if sub == "coverage" {
+            let exit = match coverage::run_coverage(&bootstrap_config.cache_path) {
+                Ok(report) => {
+                    if report.is_clean() {
+                        0
+                    } else {
+                        2
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "coverage: fatal");
+                    1
+                }
+            };
+            std::process::exit(exit);
+        }
+
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
             Err(e) => {
