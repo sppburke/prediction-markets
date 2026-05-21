@@ -663,7 +663,11 @@ fn parse_wallet_rows(rows: Vec<serde_json::Value>) -> Result<Vec<WalletAddress>,
 ///
 /// DuneSQL returns varbinary casts with a `\x` prefix (e.g. `\x0aff…`). The cache
 /// uses `0x`-prefixed strings to match the Polymarket trade data format.
-fn normalise_condition_id(raw: &str) -> String {
+///
+/// `pub(crate)` so the Gamma `/events` sweep (`events.rs`) normalizes its
+/// `conditionId` through the same single source of truth — the join key
+/// `market_events.condition_id ↔ trades.market_id` must not drift by source.
+pub(crate) fn normalise_condition_id(raw: &str) -> String {
     if let Some(hex) = raw.strip_prefix("\\x") {
         format!("0x{hex}")
     } else {

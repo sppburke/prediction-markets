@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod dune;
 pub mod enumerate;
 pub mod error;
+pub mod events;
 pub mod fetch;
 pub mod filter;
 pub mod funder;
