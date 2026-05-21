@@ -106,6 +106,20 @@ CREATE TABLE IF NOT EXISTS market_schedules (
     source          TEXT    NOT NULL DEFAULT 'gamma'
 );
 
+-- Maps Polymarket conditionId → Gamma event (issue #206). One condition belongs
+-- to exactly one event; events group multiple markets (e.g. neg-risk bundles),
+-- which is the unit the sign-randomization skill test randomizes over. Populated
+-- by the `events` subcommand (Gamma /events bulk sweep). Orphan markets with no
+-- Gamma event match self-map: event_id = condition_id, event_slug = NULL.
+-- condition_id is the same `0x`-prefixed form as trades.market_id (join key).
+CREATE TABLE IF NOT EXISTS market_events (
+    condition_id    TEXT    PRIMARY KEY NOT NULL,
+    event_id        TEXT    NOT NULL,
+    event_slug      TEXT    NULL,
+    fetched_at_unix INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_events_event_id ON market_events(event_id);
+
 CREATE TABLE IF NOT EXISTS funder_edges (
     funder_hex      TEXT    NOT NULL,
     funded_hex      TEXT    NOT NULL,
@@ -901,6 +915,89 @@ impl WalletCache {
             index.insert(MarketId(VenueMarketId(market_id)), liquidity_usd);
         }
         Ok(index)
+    }
+
+    // ── market_events (issue #206) ────────────────────────────────────────────
+
+    /// Upsert a `conditionId → event` mapping.
+    ///
+    /// `INSERT OR REPLACE` because an event's market list can grow (neg-risk
+    /// bundles gain markets), so a later sweep overwrites an earlier row. The
+    /// caller must pass `condition_id` already normalized to the
+    /// `trades.market_id` form (via `dune::normalise_condition_id`).
+    pub fn upsert_market_events(
+        &mut self,
+        condition_id: &str,
+        event_id: &str,
+        event_slug: Option<&str>,
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO market_events \
+             (condition_id, event_id, event_slug, fetched_at_unix) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![condition_id, event_id, event_slug, fetched_at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Return the set of `condition_id`s already present in `market_events`.
+    ///
+    /// Used to compute the orphan set (traded markets with no event row) without
+    /// reloading the full map.
+    ///
+    /// # Precondition
+    /// Returns an empty set when no events have been swept.
+    pub fn mapped_condition_ids(&self) -> HashSet<String> {
+        let mut stmt = match self.conn.prepare("SELECT condition_id FROM market_events") {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Self-map a traded market with no Gamma event as its own singleton event:
+    /// `event_id = condition_id`, `event_slug = NULL`.
+    ///
+    /// `INSERT OR IGNORE` so a real mapping written by the sweep is never
+    /// clobbered by the orphan pass.
+    pub fn self_map_orphan(
+        &mut self,
+        condition_id: &str,
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO market_events \
+             (condition_id, event_id, event_slug, fetched_at_unix) \
+             VALUES (?1, ?1, NULL, ?2)",
+            params![condition_id, fetched_at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Load the full `market_events` table as `condition_id → event_id`.
+    ///
+    /// The downstream skill engine calls this once at startup to group trades by
+    /// event; a `condition_id` absent from the map falls back to itself (matching
+    /// the orphan self-map).
+    ///
+    /// # Precondition
+    /// Returns an empty map when no events have been swept.
+    pub fn load_market_event_map(&self) -> Result<HashMap<String, String>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT condition_id, event_id FROM market_events")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (condition_id, event_id) = row?;
+            map.insert(condition_id, event_id);
+        }
+        Ok(map)
     }
 
     /// Return all distinct `market_id` values present in the `trades` table, sorted.
@@ -1957,6 +2054,71 @@ mod tests {
             timestamp: SourceTimestamp(OffsetDateTime::from_unix_timestamp(ts).unwrap()),
             source_trade_id: SourceTradeId(id.to_owned()),
         }
+    }
+
+    // ── market_events (issue #206) ────────────────────────────────────────────
+
+    #[test]
+    fn market_events_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .upsert_market_events("0xa", "evt1", Some("slug-1"), 100)
+            .unwrap();
+        cache
+            .upsert_market_events("0xb", "evt1", Some("slug-1"), 100)
+            .unwrap();
+        let map = cache.load_market_event_map().unwrap();
+        assert_eq!(map.get("0xa").map(String::as_str), Some("evt1"));
+        assert_eq!(map.get("0xb").map(String::as_str), Some("evt1"));
+        // Two conditions, one event.
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn market_events_replace_overwrites_on_conflict() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.upsert_market_events("0xa", "old", None, 100).unwrap();
+        cache
+            .upsert_market_events("0xa", "new", Some("s"), 200)
+            .unwrap();
+        let map = cache.load_market_event_map().unwrap();
+        assert_eq!(map.get("0xa").map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn self_map_orphan_inserts_singleton_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.self_map_orphan("0xorphan", 100).unwrap();
+        let map = cache.load_market_event_map().unwrap();
+        // Orphan maps to itself.
+        assert_eq!(map.get("0xorphan").map(String::as_str), Some("0xorphan"));
+    }
+
+    #[test]
+    fn self_map_orphan_does_not_overwrite_real_mapping() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .upsert_market_events("0xa", "realevt", Some("s"), 100)
+            .unwrap();
+        // Orphan pass must not clobber the real event mapping.
+        cache.self_map_orphan("0xa", 200).unwrap();
+        let map = cache.load_market_event_map().unwrap();
+        assert_eq!(map.get("0xa").map(String::as_str), Some("realevt"));
+    }
+
+    #[test]
+    fn mapped_condition_ids_returns_present_set() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.upsert_market_events("0xa", "e", None, 100).unwrap();
+        cache.upsert_market_events("0xb", "e", None, 100).unwrap();
+        let set = cache.mapped_condition_ids();
+        assert!(set.contains("0xa") && set.contains("0xb"));
+        assert_eq!(set.len(), 2);
     }
 
     fn tmp_cache(dir: &TempDir) -> WalletCache {

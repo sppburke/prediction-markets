@@ -1,0 +1,325 @@
+//! Polymarket Gamma `/events` sweep — builds the `conditionId → event` map.
+//!
+//! Endpoint: `GET https://gamma-api.polymarket.com/events?limit={N}&offset={M}`
+//!
+//! Each event embeds a `markets[]` array, every element carrying a `conditionId`
+//! (= `trades.market_id`). An event groups multiple markets (avg ~2.1; neg-risk
+//! bundles can hold a dozen), and the event is the unit the sign-randomization
+//! skill test (issue #206 / SSRN 6617059) randomizes over — market-level
+//! randomization is invalid because within-event bets are correlated.
+//!
+//! Unlike the per-condition `/markets` fetch in [`crate::gamma`], `/events` is
+//! swept sequentially by offset: each page depends on the prior cursor, so there
+//! is no `buffer_unordered` parallelism. The shared rate-limit mutex inside
+//! [`ReqwestFetcher`] still gates throughput at `GAMMA_MIN_INTERVAL_MS`.
+//!
+//! Resumability: the next page offset is checkpointed in `source_cursor` under
+//! [`EVENTS_CURSOR_KEY`] after every committed page, and reset to `0` on
+//! completion (events are not append-only — a re-sweep must start from the top
+//! because market lists grow). After the sweep, an orphan pass self-maps any
+//! traded market with no Gamma event (`event_id = condition_id`), then a
+//! coverage gate (issue #206 AC1) warns/fails on the orphan rate.
+
+use std::time::Duration;
+
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::PageFetcher;
+use serde::Deserialize;
+use time::OffsetDateTime;
+use tracing::{info, warn};
+
+use crate::cache::WalletCache;
+use crate::config::BootstrapConfig;
+use crate::dune::normalise_condition_id;
+use crate::error::BootstrapError;
+
+/// `source_cursor` key holding the next `/events` page offset to fetch.
+pub(crate) const EVENTS_CURSOR_KEY: &str = "gamma_events_sweep_offset";
+
+/// Events fetched per `/events` page. Gamma caps the page size; 500 is the
+/// observed maximum that returns reliably.
+const EVENTS_PAGE_LIMIT: u64 = 500;
+
+/// Orphan-rate gate (issue #206 AC1). Reported every run; thresholds are integer
+/// percents to avoid any float. Canonical: `docs/_GLOSSARY.md` "Bootstrap
+/// defaults" (`bootstrap_event_orphan_warn_pct` / `bootstrap_event_orphan_fail_pct`).
+/// `warn` flags a join-key/coverage drift to investigate; `fail` (orphan rate so
+/// high it indicates a join-key/form break) aborts loudly. A small tail of
+/// legitimately unmappable (old/delisted) markets stays as singleton self-maps
+/// and must not false-fail the run.
+const ORPHAN_WARN_PCT: usize = 5;
+const ORPHAN_FAIL_PCT: usize = 50;
+
+/// Outcome of an `/events` sweep + orphan pass (issue #206).
+#[derive(Debug, Default, Clone)]
+pub struct EventsReport {
+    /// Events seen across all pages.
+    pub events_seen: usize,
+    /// `(condition_id → event)` rows written from real Gamma events.
+    pub conditions_mapped: usize,
+    /// Distinct traded `market_id`s in the cache (the coverage denominator).
+    pub total_traded_markets: usize,
+    /// Traded markets with no Gamma event, self-mapped as singleton events.
+    pub orphan_self_mapped: usize,
+}
+
+/// Sweeps Polymarket Gamma `/events` to populate the `market_events` map.
+///
+/// Generic over [`PageFetcher`] so production uses [`ReqwestFetcher`] and tests
+/// use [`FixtureFetcher`] with no live network.
+pub struct GammaEventsFetcher<F: PageFetcher> {
+    base_url: String,
+    fetcher: F,
+}
+
+impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
+    pub fn new(base_url: String, fetcher: F) -> Self {
+        Self { base_url, fetcher }
+    }
+
+    /// Sweep every `/events` page, upsert each market's `conditionId → event`
+    /// row, then self-map traded-market orphans and apply the coverage gate.
+    ///
+    /// Fatal on any fetch/parse error (a paged sweep cannot skip a page without
+    /// desyncing the offset). Returns [`BootstrapError::Gamma`] if the orphan
+    /// rate exceeds [`ORPHAN_FAIL_PCT`] (a join-key/form break).
+    pub async fn sweep(&self, cache: &mut WalletCache) -> Result<EventsReport, BootstrapError> {
+        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let mut offset: u64 = cache
+            .get_source_cursor(EVENTS_CURSOR_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        info!(
+            start_offset = offset,
+            "events: starting Gamma /events sweep"
+        );
+
+        let mut events_seen = 0usize;
+        let mut conditions_mapped = 0usize;
+
+        loop {
+            let url = format!(
+                "{}/events?limit={EVENTS_PAGE_LIMIT}&offset={offset}",
+                self.base_url
+            );
+            let bytes = match self.fetcher.fetch_page(&url).await {
+                Ok(b) => b,
+                Err(SourceError::Fatal { message }) => {
+                    return Err(BootstrapError::Gamma {
+                        message: format!("events fetch at offset {offset}: {message}"),
+                    });
+                }
+                Err(e) => {
+                    return Err(BootstrapError::Gamma {
+                        message: format!("events fetch at offset {offset}: {e}"),
+                    });
+                }
+            };
+
+            let page = parse_events_page(&bytes).map_err(|e| BootstrapError::Gamma {
+                message: format!("events parse at offset {offset}: {e}"),
+            })?;
+            if page.is_empty() {
+                break; // exhausted
+            }
+
+            for event in &page {
+                events_seen += 1;
+                // Grouping key: prefer the numeric event id, fall back to slug.
+                // Either is an opaque, stable per-event string.
+                let Some(event_key) = event.id.as_deref().or(event.slug.as_deref()) else {
+                    continue; // no usable event identity — cannot group
+                };
+                for market in &event.markets {
+                    let Some(raw_cond) = market.condition_id.as_deref() else {
+                        continue;
+                    };
+                    if raw_cond.is_empty() {
+                        continue;
+                    }
+                    let cond = normalise_condition_id(raw_cond);
+                    cache.upsert_market_events(
+                        &cond,
+                        event_key,
+                        event.slug.as_deref(),
+                        fetched_at,
+                    )?;
+                    conditions_mapped += 1;
+                }
+            }
+
+            offset += EVENTS_PAGE_LIMIT;
+            cache.set_source_cursor(EVENTS_CURSOR_KEY, &offset.to_string())?;
+            if events_seen.is_multiple_of(5_000) {
+                info!(
+                    events_seen,
+                    conditions_mapped, offset, "events: sweep progress"
+                );
+            }
+        }
+
+        // Events are not append-only — reset so the next run re-sweeps from the
+        // top and picks up markets added to existing (e.g. neg-risk) events.
+        cache.set_source_cursor(EVENTS_CURSOR_KEY, "0")?;
+
+        // Orphan pass: every traded market with no Gamma event becomes its own
+        // singleton event so AC2 holds (no unmapped traded market remains).
+        let traded = cache.all_market_ids();
+        let total_traded_markets = traded.len();
+        let mapped = cache.mapped_condition_ids();
+        let mut orphan_self_mapped = 0usize;
+        for market_id in &traded {
+            if !mapped.contains(market_id) {
+                cache.self_map_orphan(market_id, fetched_at)?;
+                orphan_self_mapped += 1;
+            }
+        }
+
+        let report = EventsReport {
+            events_seen,
+            conditions_mapped,
+            total_traded_markets,
+            orphan_self_mapped,
+        };
+
+        // Coverage gate (AC1/AC3): observable counts + warn/fail on orphan rate.
+        // Integer cross-multiply avoids any float: orphan/total > pct/100.
+        info!(
+            events_seen = report.events_seen,
+            conditions_mapped = report.conditions_mapped,
+            total_traded_markets = report.total_traded_markets,
+            orphan_self_mapped = report.orphan_self_mapped,
+            "events: sweep complete"
+        );
+        if total_traded_markets > 0 {
+            if orphan_self_mapped * 100 > total_traded_markets * ORPHAN_FAIL_PCT {
+                return Err(BootstrapError::Gamma {
+                    message: format!(
+                        "events: orphan rate {orphan_self_mapped}/{total_traded_markets} \
+                         exceeds {ORPHAN_FAIL_PCT}% — likely a conditionId join-key/form \
+                         break, not a legitimate unmappable tail; aborting"
+                    ),
+                });
+            }
+            if orphan_self_mapped * 100 > total_traded_markets * ORPHAN_WARN_PCT {
+                warn!(
+                    orphan_self_mapped,
+                    total_traded_markets,
+                    "events: orphan rate above {ORPHAN_WARN_PCT}% — investigate event coverage"
+                );
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+/// Build the production `/events` fetcher and run a full sweep.
+///
+/// Mirrors the Gamma client construction in [`crate::fetch_resolutions_and_schedules`]:
+/// a pooled `reqwest` client behind [`ReqwestFetcher`] gated at
+/// [`crate::gamma::GAMMA_MIN_INTERVAL_MS`].
+pub async fn run_events(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+) -> Result<EventsReport, BootstrapError> {
+    use pe_source_polymarket_public::ReqwestFetcher;
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| BootstrapError::Internal)?;
+    let fetcher = GammaEventsFetcher::new(
+        config.gamma_base_url.clone(),
+        ReqwestFetcher::new(client).with_min_interval_ms(crate::gamma::GAMMA_MIN_INTERVAL_MS),
+    );
+    fetcher.sweep(cache).await
+}
+
+/// Serde DTO for one element of the `/events` response array.
+///
+/// Extra fields are ignored. `id` may arrive as a JSON number or string; both
+/// render to the opaque `event_id` grouping key.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEventRaw {
+    #[serde(default, deserialize_with = "de_flex_string")]
+    id: Option<String>,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    markets: Vec<GammaEventMarketRaw>,
+}
+
+/// Serde DTO for one element of an event's `markets[]` array.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaEventMarketRaw {
+    #[serde(default)]
+    condition_id: Option<String>,
+}
+
+/// Parse one `/events` page (a JSON array of event objects).
+fn parse_events_page(bytes: &[u8]) -> Result<Vec<GammaEventRaw>, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("JSON parse: {e}"))
+}
+
+/// Deserialize a JSON value that may be a number or string into `Option<String>`.
+fn de_flex_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flex {
+        Str(String),
+        Int(i64),
+    }
+    Ok(match Option::<Flex>::deserialize(d)? {
+        None => None,
+        Some(Flex::Str(s)) => Some(s),
+        Some(Flex::Int(i)) => Some(i.to_string()),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_events_page_extracts_id_slug_and_conditions() {
+        let json = br#"[
+            {"id": 491919, "slug": "btc-may", "markets": [
+                {"conditionId": "0xaa"}, {"conditionId": "0xbb"}
+            ]}
+        ]"#;
+        let page = parse_events_page(json).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id.as_deref(), Some("491919")); // numeric id → string
+        assert_eq!(page[0].slug.as_deref(), Some("btc-may"));
+        assert_eq!(page[0].markets.len(), 2);
+        assert_eq!(page[0].markets[0].condition_id.as_deref(), Some("0xaa"));
+    }
+
+    #[test]
+    fn parse_events_page_accepts_string_id() {
+        let json = br#"[{"id": "evt-7", "slug": "s", "markets": []}]"#;
+        let page = parse_events_page(json).unwrap();
+        assert_eq!(page[0].id.as_deref(), Some("evt-7"));
+    }
+
+    #[test]
+    fn parse_events_page_empty_array() {
+        assert!(parse_events_page(b"[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_events_page_tolerates_missing_fields() {
+        // Event with no id and a market with no conditionId — must not error.
+        let json = br#"[{"slug": "s", "markets": [{}]}]"#;
+        let page = parse_events_page(json).unwrap();
+        assert_eq!(page[0].id, None);
+        assert_eq!(page[0].markets[0].condition_id, None);
+    }
+}

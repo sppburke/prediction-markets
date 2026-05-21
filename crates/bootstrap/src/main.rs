@@ -42,6 +42,7 @@ async fn main() {
                 | "funder"
                 | "watchlist"
                 | "resolutions"
+                | "events"
                 | "seed-historical"
                 | "discovery"
                 | "backfill"
@@ -300,6 +301,24 @@ async fn main() {
                     }
                 }
             }
+
+            "events" => match pe_bootstrap::events::run_events(&bootstrap_config, &mut cache).await
+            {
+                Ok(report) => {
+                    tracing::info!(
+                        events_seen = report.events_seen,
+                        conditions_mapped = report.conditions_mapped,
+                        total_traded_markets = report.total_traded_markets,
+                        orphan_self_mapped = report.orphan_self_mapped,
+                        "events: complete"
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "events: fatal");
+                    1
+                }
+            },
 
             "seed-historical" => {
                 let dates = if let Some(as_of) = as_of_arg {
