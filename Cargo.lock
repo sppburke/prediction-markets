@@ -3317,6 +3317,8 @@ dependencies = [
 name = "pe-skill-select"
 version = "0.1.0"
 dependencies = [
+ "pe-core-types",
+ "pe-trader-index",
  "rusqlite",
  "rust_decimal",
  "rust_decimal_macros",
