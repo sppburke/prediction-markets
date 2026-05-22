@@ -12,34 +12,35 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pe_skill_select::{SkillCache, WalletFeatures};
+use pe_skill_select::{DeterministicFeatures, SkillCache, WalletFeatures};
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 
 fn features(hex: &str, cutoff: i64, pnl: rust_decimal::Decimal) -> WalletFeatures {
     WalletFeatures {
-        wallet_hex: hex.to_owned(),
-        cutoff_unix: cutoff,
+        features: DeterministicFeatures {
+            wallet_hex: hex.to_owned(),
+            cutoff_unix: cutoff,
+            reconstruction_quality: 88,
+            closed_trades: 21,
+            distinct_markets: 15,
+            distinct_events: 9,
+            total_pnl_usd: pnl,
+            roi_bps: 420,
+            win_rate_bps: 5_500,
+            avg_hold_secs: 43_200,
+            trading_days: 9,
+            mean_daily_return_bps: 300,
+            std_daily_return_bps: 700,
+            sharpe_bps: 12_000,
+            skewness_bps: 0,
+            excess_kurtosis_bps: 3_000,
+            lcb_5pct_bps: -100,
+        },
         extracted_at_unix: 1_700_000_000,
-        reconstruction_quality: 88,
-        closed_trades: 21,
-        distinct_markets: 15,
-        distinct_events: 9,
-        total_pnl_usd: pnl,
-        roi_bps: 420,
-        win_rate_bps: 5_500,
-        lcb_5pct_bps: -100,
-        sharpe_bps: 12_000,
-        skewness_bps: 0,
-        excess_kurtosis_bps: 3_000,
-        compound_return_bps: 1_000,
-        buy_hold_return_bps: 250,
-        calibration_bps: 175,
-        avg_hold_secs: 43_200,
         skill_pnl_usd: pnl,
         skill_pvalue_bps: 320,
         skill_permutations: 999,
-        deflated_sharpe_bps: 1_500,
     }
 }
 

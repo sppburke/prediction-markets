@@ -3317,6 +3317,7 @@ dependencies = [
 name = "pe-skill-select"
 version = "0.1.0"
 dependencies = [
+ "pe-bootstrap",
  "pe-core-types",
  "pe-trader-index",
  "rusqlite",
@@ -3324,6 +3325,8 @@ dependencies = [
  "rust_decimal_macros",
  "tempfile",
  "thiserror",
+ "time",
+ "tracing",
 ]
 
 [[package]]

@@ -22,14 +22,19 @@ panic = "deny"
 float_arithmetic = "deny"
 
 [features]
-scenario = []
+# Forward to pe-bootstrap's scenario feature so the cache's test-only seeding
+# helpers (e.g. `conn_for_test_set_active`) are available to our scenario tests.
+scenario = ["pe-bootstrap/scenario"]
 
 [dependencies]
+pe-bootstrap = { path = "../bootstrap", version = "0.1.0" }
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-trader-index = { path = "../trader-index", version = "0.1.0" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
