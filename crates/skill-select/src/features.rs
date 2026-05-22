@@ -24,9 +24,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use pe_trader_index::TraderLedger;
-use rust_decimal::Decimal;
+use pe_trader_index::{ClosedTrade, TraderLedger};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, MathematicalOps};
 
 /// The simple deterministic per-wallet feature batch computed at a given cutoff.
 ///
@@ -56,6 +56,22 @@ pub struct DeterministicFeatures {
     pub win_rate_bps: i32,
     /// Mean hold duration over closed trades, seconds.
     pub avg_hold_secs: i64,
+    /// Distinct UTC calendar days with a closed trade (the daily-return series length).
+    pub trading_days: u32,
+    /// Mean of the daily return-on-cost series, basis points.
+    pub mean_daily_return_bps: i64,
+    /// Population standard deviation of the daily-return series, basis points.
+    pub std_daily_return_bps: i64,
+    /// Per-period Sharpe (`mean / std`) of the daily-return series × 10_000;
+    /// `0` when `std` is zero (DSR applies the √n scaling later).
+    pub sharpe_bps: i64,
+    /// Fisher skewness of the daily-return series × 10_000; `0` when `std` is zero.
+    pub skewness_bps: i64,
+    /// Excess kurtosis (kurtosis − 3) of the daily-return series × 10_000; `0` when `std` is zero.
+    pub excess_kurtosis_bps: i64,
+    /// Lower-confidence bound `mean − 1.645·(std/√n)` of the daily-return series,
+    /// basis points (5th-pct one-sided). Equals the mean when `n < 2`.
+    pub lcb_5pct_bps: i32,
 }
 
 /// Compute the simple deterministic feature batch for one wallet's train ledger.
@@ -134,6 +150,10 @@ pub fn extract_features(
     let count = u128::try_from(windowed.len()).unwrap_or(1).max(1);
     let avg_hold_secs = i64::try_from(total_hold / count).unwrap_or(i64::MAX);
 
+    // Daily return-on-cost series → distribution moments (DSR / LCB inputs).
+    let daily = daily_return_series(&windowed);
+    let m = compute_moments(&daily);
+
     Some(DeterministicFeatures {
         wallet_hex: ledger.wallet.to_string(),
         cutoff_unix,
@@ -145,7 +165,124 @@ pub fn extract_features(
         roi_bps,
         win_rate_bps,
         avg_hold_secs,
+        trading_days: u32::try_from(daily.len()).unwrap_or(u32::MAX),
+        mean_daily_return_bps: decimal_to_bps_i64(m.mean),
+        std_daily_return_bps: decimal_to_bps_i64(m.std),
+        sharpe_bps: decimal_to_bps_i64(m.sharpe),
+        skewness_bps: decimal_to_bps_i64(m.skewness),
+        excess_kurtosis_bps: decimal_to_bps_i64(m.excess_kurtosis),
+        lcb_5pct_bps: i32::try_from(decimal_to_bps_i64(m.lcb_5pct)).unwrap_or_else(|_| {
+            if m.lcb_5pct.is_sign_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        }),
     })
+}
+
+/// Build the per-UTC-day return-on-cost series: each trade's return is
+/// `realized_pnl / (entry_price × contracts)`; per-day returns sum the trades
+/// that closed that day (`day = floor(closed_at / 86_400)`). Mirrors the daily
+/// bucketing convention used elsewhere in the workspace.
+fn daily_return_series(windowed: &[&ClosedTrade]) -> Vec<Decimal> {
+    let mut by_day: HashMap<i64, Decimal> = HashMap::new();
+    for t in windowed {
+        let cost = t.entry_price.0 * Decimal::from(t.contracts.0);
+        let r = if cost.is_zero() {
+            Decimal::ZERO
+        } else {
+            t.realized_pnl_usd / cost
+        };
+        let day = t.closed_at_unix.div_euclid(86_400);
+        *by_day.entry(day).or_insert(Decimal::ZERO) += r;
+    }
+    by_day.into_values().collect()
+}
+
+/// Distribution moments of a return series (all `Decimal`, no `f64`).
+struct Moments {
+    mean: Decimal,
+    std: Decimal,
+    sharpe: Decimal,
+    skewness: Decimal,
+    excess_kurtosis: Decimal,
+    lcb_5pct: Decimal,
+}
+
+/// Population moments of `series`. `std`/`sharpe`/`skewness`/`excess_kurtosis`
+/// are `0` when the series has fewer than 2 points or zero dispersion (no
+/// dispersion ⇒ those shape stats are undefined; `0` is the safe sentinel).
+/// `lcb_5pct = mean − 1.645·(std/√n)` (one-sided 5th pct); equals `mean` when
+/// `n < 2`. Higher powers use repeated multiplication (no `powi`); `sqrt` via
+/// the `maths` feature.
+fn compute_moments(series: &[Decimal]) -> Moments {
+    let n = series.len();
+    if n == 0 {
+        return Moments {
+            mean: Decimal::ZERO,
+            std: Decimal::ZERO,
+            sharpe: Decimal::ZERO,
+            skewness: Decimal::ZERO,
+            excess_kurtosis: Decimal::ZERO,
+            lcb_5pct: Decimal::ZERO,
+        };
+    }
+    let n_dec = Decimal::from(u64::try_from(n).unwrap_or(u64::MAX));
+    let mean = series.iter().copied().sum::<Decimal>() / n_dec;
+
+    if n < 2 {
+        // Single point: no dispersion; LCB is the mean (stderr = 0).
+        return Moments {
+            mean,
+            std: Decimal::ZERO,
+            sharpe: Decimal::ZERO,
+            skewness: Decimal::ZERO,
+            excess_kurtosis: Decimal::ZERO,
+            lcb_5pct: mean,
+        };
+    }
+
+    let mut m2 = Decimal::ZERO;
+    let mut m3 = Decimal::ZERO;
+    let mut m4 = Decimal::ZERO;
+    for &x in series {
+        let d = x - mean;
+        let d2 = d * d;
+        m2 += d2;
+        m3 += d2 * d;
+        m4 += d2 * d2;
+    }
+    m2 /= n_dec; // variance (population)
+    m3 /= n_dec;
+    m4 /= n_dec;
+
+    let std = m2.sqrt().unwrap_or(Decimal::ZERO);
+    let (sharpe, skewness, excess_kurtosis) = if std.is_zero() {
+        (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+    } else {
+        let std3 = std * std * std;
+        let std4 = std3 * std;
+        (mean / std, m3 / std3, m4 / std4 - Decimal::from(3u32))
+    };
+
+    // stderr = std / sqrt(n); LCB = mean − 1.645 · stderr.
+    let stderr = std / n_dec.sqrt().unwrap_or(Decimal::ONE);
+    let lcb_5pct = mean - dec_const_1_645() * stderr;
+
+    Moments {
+        mean,
+        std,
+        sharpe,
+        skewness,
+        excess_kurtosis,
+        lcb_5pct,
+    }
+}
+
+/// The one-sided 5th-percentile normal z-score, `1.645`, as an exact `Decimal`.
+fn dec_const_1_645() -> Decimal {
+    Decimal::new(1645, 3)
 }
 
 /// Convert a ratio to basis points (`× 10_000`, rounded half-even), saturating
@@ -261,5 +398,61 @@ mod tests {
         let events = HashMap::new();
         let l = ledger(vec![]);
         assert!(extract_features(&l, 10_000, &events, 1).is_none());
+    }
+
+    #[test]
+    fn distribution_moments_by_hand() {
+        // Three distinct days; each trade cost = 0.50 × 100 = 50, so
+        // return = pnl/50: pnl 5/10/15 → daily returns 0.1 / 0.2 / 0.3.
+        let events = HashMap::new();
+        let l = ledger(vec![
+            closed("0xm1", dec!(0.50), 100, dec!(5.0), 60, 86_400),
+            closed("0xm2", dec!(0.50), 100, dec!(10.0), 60, 172_800),
+            closed("0xm3", dec!(0.50), 100, dec!(15.0), 60, 259_200),
+        ]);
+        let f = extract_features(&l, 10_000_000, &events, 1).unwrap();
+
+        assert_eq!(f.trading_days, 3);
+        // mean = 0.2 → 2000 bps (exact)
+        assert_eq!(f.mean_daily_return_bps, 2_000);
+        // symmetric series → skewness 0 (exact)
+        assert_eq!(f.skewness_bps, 0);
+        // m4/std^4 = 1.5 exactly → excess kurtosis -1.5 → -15000 bps (exact)
+        assert_eq!(f.excess_kurtosis_bps, -15_000);
+        // sqrt-dependent: std≈0.08165 (816 bps), sharpe≈2.449 (24495), lcb≈0.1225 (1225)
+        assert!(
+            (f.std_daily_return_bps - 816).abs() <= 2,
+            "std={}",
+            f.std_daily_return_bps
+        );
+        assert!(
+            (f.sharpe_bps - 24_495).abs() <= 5,
+            "sharpe={}",
+            f.sharpe_bps
+        );
+        assert!(
+            (f.lcb_5pct_bps - 1_225).abs() <= 3,
+            "lcb={}",
+            f.lcb_5pct_bps
+        );
+    }
+
+    #[test]
+    fn single_day_has_zero_dispersion_and_lcb_equals_mean() {
+        // All trades on one UTC day → 1 daily-return point → no dispersion.
+        let events = HashMap::new();
+        let l = ledger(vec![
+            closed("0xm1", dec!(0.50), 100, dec!(5.0), 60, 1_000),
+            closed("0xm2", dec!(0.50), 100, dec!(5.0), 60, 2_000),
+        ]);
+        let f = extract_features(&l, 10_000, &events, 1).unwrap();
+        assert_eq!(f.trading_days, 1);
+        assert_eq!(f.std_daily_return_bps, 0);
+        assert_eq!(f.sharpe_bps, 0);
+        assert_eq!(f.skewness_bps, 0);
+        assert_eq!(f.excess_kurtosis_bps, 0);
+        // both trades same day: returns 0.1 + 0.1 = 0.2 → mean 2000 bps; lcb == mean
+        assert_eq!(f.mean_daily_return_bps, 2_000);
+        assert_eq!(f.lcb_5pct_bps, 2_000);
     }
 }
