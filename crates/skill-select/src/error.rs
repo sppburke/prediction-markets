@@ -20,4 +20,16 @@ pub enum SkillSelectError {
     /// integer column outside the target type's range).
     #[error("decode: {0}")]
     Decode(String),
+
+    /// Config load/parse failure (TOML file or `PE_SKILL_*` env). Boxed because
+    /// `figment::Error` is large — keeps `SkillSelectError` (and every
+    /// `Result<_, SkillSelectError>`) small (clippy `result_large_err`).
+    #[error("config: {0}")]
+    Config(Box<figment::Error>),
+}
+
+impl From<figment::Error> for SkillSelectError {
+    fn from(e: figment::Error) -> Self {
+        SkillSelectError::Config(Box::new(e))
+    }
 }
