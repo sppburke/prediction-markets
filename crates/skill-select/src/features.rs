@@ -263,7 +263,14 @@ fn compute_moments(series: &[Decimal]) -> Moments {
     } else {
         let std3 = std * std * std;
         let std4 = std3 * std;
-        (mean / std, m3 / std3, m4 / std4 - Decimal::from(3u32))
+        // std3/std4 can underflow to Decimal::ZERO when std is extremely small
+        // (Decimal has 28-digit precision; std^3 for std≈1e-10 ≈ 1e-30, below the floor).
+        // Treat underflow the same as zero dispersion: shape stats are undefined.
+        if std3.is_zero() || std4.is_zero() {
+            (mean / std, Decimal::ZERO, Decimal::ZERO)
+        } else {
+            (mean / std, m3 / std3, m4 / std4 - Decimal::from(3u32))
+        }
     };
 
     // stderr = std / sqrt(n); LCB = mean − 1.645 · stderr.
@@ -454,5 +461,37 @@ mod tests {
         // both trades same day: returns 0.1 + 0.1 = 0.2 → mean 2000 bps; lcb == mean
         assert_eq!(f.mean_daily_return_bps, 2_000);
         assert_eq!(f.lcb_5pct_bps, 2_000);
+    }
+
+    #[test]
+    fn tiny_std_does_not_panic() {
+        // Regression: when std is positive but tiny, std^3 underflows to Decimal::ZERO
+        // (Decimal precision is 28 digits; std≈1e-10 → std^3≈1e-30, below the floor).
+        // The fix: treat std3/std4 underflow as zero dispersion — skewness/kurtosis = 0.
+        // Use many slightly-different returns across distinct days so std is non-zero but
+        // extremely small (pnl differences of 1 sub-cent across 1000-contract positions).
+        let events = HashMap::new();
+        // 30 trades on 30 distinct days; entry 0.50, contracts 1_000_000, tiny pnl diffs.
+        // daily return ≈ pnl / (0.50 × 1_000_000) = pnl / 500_000.
+        // With pnl ranging 1e-7..1e-7 + 29e-9, daily returns ≈ 2e-13, std ≈ tiny.
+        let trades: Vec<ClosedTrade> = (0u64..30)
+            .map(|i| {
+                let pnl = rust_decimal_macros::dec!(0.0000001) + Decimal::new(i as i64, 9); // adds i × 1e-9
+                closed(
+                    &format!("0xm{i}"),
+                    dec!(0.50),
+                    1_000_000,
+                    pnl,
+                    60,
+                    (i as i64 + 1) * 86_400,
+                )
+            })
+            .collect();
+        let l = ledger(trades);
+        // Must not panic. When std^3 underflows to Decimal::ZERO, skewness = 0.
+        let f = extract_features(&l, i64::MAX, &events, 1).unwrap();
+        assert_eq!(f.trading_days, 30);
+        assert_eq!(f.skewness_bps, 0);
+        assert_eq!(f.excess_kurtosis_bps, 0);
     }
 }
