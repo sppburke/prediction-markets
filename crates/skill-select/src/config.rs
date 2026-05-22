@@ -35,6 +35,15 @@ fn default_bhq_q_bps() -> u32 {
 fn default_top_n() -> usize {
     50
 }
+fn default_kelly_fraction_bps() -> u32 {
+    1_000
+}
+fn default_forward_min_bucket_trades() -> u32 {
+    5
+}
+fn default_forward_price_bucket_width_bps() -> u32 {
+    1_000
+}
 
 /// Skill-selection configuration. Every field has a default; `PE_SKILL_*` env
 /// vars (and an optional TOML file) override.
@@ -61,6 +70,16 @@ pub struct SkillConfig {
     /// Watchlist cap. `PE_SKILL_TOP_N`.
     #[serde(default = "default_top_n")]
     pub top_n: usize,
+    /// Kelly fraction `f` in basis points (1000 = 0.10). `PE_SKILL_KELLY_FRACTION_BPS`.
+    #[serde(default = "default_kelly_fraction_bps")]
+    pub kelly_fraction_bps: u32,
+    /// Min ≤cutoff resolved buys in an entry-price bucket for a reliable calibration
+    /// `p` (else flat-$1 fallback). `PE_SKILL_FORWARD_MIN_BUCKET_TRADES`.
+    #[serde(default = "default_forward_min_bucket_trades")]
+    pub forward_min_bucket_trades: u32,
+    /// Entry-price bucket width in basis points (1000 = 0.10). `PE_SKILL_FORWARD_PRICE_BUCKET_WIDTH_BPS`.
+    #[serde(default = "default_forward_price_bucket_width_bps")]
+    pub forward_price_bucket_width_bps: u32,
 }
 
 impl SkillConfig {
