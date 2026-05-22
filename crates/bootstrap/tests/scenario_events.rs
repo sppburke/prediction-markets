@@ -58,7 +58,8 @@ fn run_fixture_sweep() -> (WalletCache, TempDir) {
     responses.insert(
         format!("{BASE}/events?limit=500&offset=0"),
         br#"[{"id": 491919, "slug": "btc-event", "markets": [
-            {"conditionId": "0xaa"}, {"conditionId": "0xbb"}
+            {"conditionId": "0xaa", "clobTokenIds": "[\"111\",\"222\"]"},
+            {"conditionId": "0xbb", "clobTokenIds": "[\"333\",\"444\"]"}
         ]}]"#
             .to_vec(),
     );
@@ -77,6 +78,7 @@ fn run_fixture_sweep() -> (WalletCache, TempDir) {
     // Sanity on the report shape (not the scenario PASS criteria themselves).
     assert_eq!(report.total_traded_markets, 3);
     assert_eq!(report.conditions_mapped, 2);
+    assert_eq!(report.tokens_mapped, 4); // 2 markets × 2 clobTokenIds
     assert_eq!(report.orphan_self_mapped, 1);
 
     (cache, dir)
@@ -118,5 +120,27 @@ fn scenario_events_orphan_self_maps_and_full_coverage() {
     assert!(
         pass,
         "all 3 traded markets must be mapped; 0xcc must self-map to itself"
+    );
+}
+
+#[test]
+fn scenario_events_maps_token_ids_to_conditions() {
+    // PASS: every clobTokenId from the swept markets resolves to its market's
+    //       conditionId in token_conditions (issue #207 — the on-chain join map).
+    // FAIL: any token id is missing or maps to the wrong condition.
+    let (cache, _dir) = run_fixture_sweep();
+    let pass = cache.token_condition_count() == 4
+        && cache.condition_for_token("111").as_deref() == Some("0xaa")
+        && cache.condition_for_token("222").as_deref() == Some("0xaa")
+        && cache.condition_for_token("333").as_deref() == Some("0xbb")
+        && cache.condition_for_token("444").as_deref() == Some("0xbb");
+    println!(
+        "Scenario events_maps_token_ids_to_conditions: {} (count={})",
+        if pass { "PASS" } else { "FAIL" },
+        cache.token_condition_count()
+    );
+    assert!(
+        pass,
+        "all 4 clobTokenIds must map to their market's conditionId"
     );
 }

@@ -19,6 +19,12 @@
 //! because market lists grow). After the sweep, an orphan pass self-maps any
 //! traded market with no Gamma event (`event_id = condition_id`), then a
 //! coverage gate (issue #206 AC1) warns/fails on the orphan rate.
+//!
+//! The same `markets[]` elements also carry `clobTokenIds` (the two ERC-1155
+//! position-token ids), so the sweep doubles as the `token_id → condition_id`
+//! map builder (issue #207, Slice 0): on-chain `OrderFilled` legs are keyed by
+//! token id, and this map resolves them to a market. Captured in the same pass
+//! to avoid a second ~99k-event sweep.
 
 use std::time::Duration;
 
@@ -57,6 +63,8 @@ pub struct EventsReport {
     pub events_seen: usize,
     /// `(condition_id → event)` rows written from real Gamma events.
     pub conditions_mapped: usize,
+    /// `(token_id → condition_id)` rows written from `clobTokenIds` (issue #207).
+    pub tokens_mapped: usize,
     /// Distinct traded `market_id`s in the cache (the coverage denominator).
     pub total_traded_markets: usize,
     /// Traded markets with no Gamma event, self-mapped as singleton events.
@@ -97,6 +105,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
 
         let mut events_seen = 0usize;
         let mut conditions_mapped = 0usize;
+        let mut tokens_mapped = 0usize;
 
         loop {
             let url = format!(
@@ -124,6 +133,9 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                 break; // exhausted
             }
 
+            // `(token_id, condition_id)` rows for this page's markets, flushed in
+            // one transaction below (issue #207). A market carries 0..n tokens.
+            let mut token_rows: Vec<(String, String)> = Vec::new();
             for event in &page {
                 events_seen += 1;
                 // Grouping key: prefer the numeric event id, fall back to slug.
@@ -146,15 +158,20 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                         fetched_at,
                     )?;
                     conditions_mapped += 1;
+                    for token_id in parse_clob_token_ids(market.clob_token_ids.as_deref()) {
+                        token_rows.push((token_id, cond.clone()));
+                    }
                 }
             }
+            tokens_mapped += token_rows.len();
+            cache.upsert_token_conditions_batch(&token_rows, fetched_at)?;
 
             offset += EVENTS_PAGE_LIMIT;
             cache.set_source_cursor(EVENTS_CURSOR_KEY, &offset.to_string())?;
             if events_seen.is_multiple_of(5_000) {
                 info!(
                     events_seen,
-                    conditions_mapped, offset, "events: sweep progress"
+                    conditions_mapped, tokens_mapped, offset, "events: sweep progress"
                 );
             }
         }
@@ -179,6 +196,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
         let report = EventsReport {
             events_seen,
             conditions_mapped,
+            tokens_mapped,
             total_traded_markets,
             orphan_self_mapped,
         };
@@ -188,6 +206,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
         info!(
             events_seen = report.events_seen,
             conditions_mapped = report.conditions_mapped,
+            tokens_mapped = report.tokens_mapped,
             total_traded_markets = report.total_traded_markets,
             orphan_self_mapped = report.orphan_self_mapped,
             "events: sweep complete"
@@ -257,6 +276,24 @@ struct GammaEventRaw {
 struct GammaEventMarketRaw {
     #[serde(default)]
     condition_id: Option<String>,
+    /// `clobTokenIds` — Gamma returns this as a JSON-array *string* of the two
+    /// ERC-1155 position-token ids (decimal uint256), e.g. `"[\"123\",\"456\"]"`.
+    #[serde(default)]
+    clob_token_ids: Option<String>,
+}
+
+/// Parse Gamma's `clobTokenIds` (a stringified JSON array of decimal token ids)
+/// into the contained ids. Returns empty on `None`, malformed JSON, or a
+/// non-array — token mapping is best-effort and must never abort the sweep.
+/// Blank ids are dropped.
+fn parse_clob_token_ids(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(ids) => ids.into_iter().filter(|t| !t.is_empty()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Parse one `/events` page (a JSON array of event objects).
@@ -291,7 +328,8 @@ mod tests {
     fn parse_events_page_extracts_id_slug_and_conditions() {
         let json = br#"[
             {"id": 491919, "slug": "btc-may", "markets": [
-                {"conditionId": "0xaa"}, {"conditionId": "0xbb"}
+                {"conditionId": "0xaa", "clobTokenIds": "[\"111\",\"222\"]"},
+                {"conditionId": "0xbb"}
             ]}
         ]"#;
         let page = parse_events_page(json).unwrap();
@@ -300,6 +338,34 @@ mod tests {
         assert_eq!(page[0].slug.as_deref(), Some("btc-may"));
         assert_eq!(page[0].markets.len(), 2);
         assert_eq!(page[0].markets[0].condition_id.as_deref(), Some("0xaa"));
+        // clobTokenIds arrives as a stringified JSON array.
+        assert_eq!(
+            parse_clob_token_ids(page[0].markets[0].clob_token_ids.as_deref()),
+            vec!["111".to_string(), "222".to_string()]
+        );
+        // Market without clobTokenIds yields no tokens.
+        assert!(parse_clob_token_ids(page[0].markets[1].clob_token_ids.as_deref()).is_empty());
+    }
+
+    #[test]
+    fn parse_clob_token_ids_handles_edge_cases() {
+        assert_eq!(
+            parse_clob_token_ids(Some(
+                r#"["28182404005967940652495463228537840901","470448457534500220474364299688086011"]"#
+            )),
+            vec![
+                "28182404005967940652495463228537840901".to_string(),
+                "470448457534500220474364299688086011".to_string(),
+            ]
+        );
+        assert!(parse_clob_token_ids(None).is_empty());
+        assert!(parse_clob_token_ids(Some("")).is_empty()); // malformed → empty
+        assert!(parse_clob_token_ids(Some("not json")).is_empty());
+        // Blank ids are dropped.
+        assert_eq!(
+            parse_clob_token_ids(Some(r#"["123",""]"#)),
+            vec!["123".to_string()]
+        );
     }
 
     #[test]
