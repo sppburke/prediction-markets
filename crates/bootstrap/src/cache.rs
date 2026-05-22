@@ -1813,6 +1813,20 @@ impl WalletCache {
         Ok(out?)
     }
 
+    /// Return every `wallet_hex` in the `active_tradeable_wallets` view
+    /// (`is_active = 1 AND is_infra = 0`) — the ~182k candidate universe for the
+    /// skill-selection pipeline (issue #212). Unfiltered, unlike
+    /// `wallets_needing_funder_lookup` / `select_backfill_due` which add
+    /// staleness/limit clauses; mirrors [`Self::all_pile_wallet_hexes`].
+    pub fn active_tradeable_wallet_hexes(&self) -> Result<Vec<String>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT wallet_hex FROM active_tradeable_wallets")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let out: Result<Vec<_>, _> = rows.collect();
+        Ok(out?)
+    }
+
     /// Return every `wallet_hex` whose `source_bits` has at least one bit in
     /// common with `bit_mask`. Issue #181: used by `run()` to scope per-wallet
     /// trade fetch to the discovered-wallet subset (typically `SRC_WALLET_SET_JSON`),

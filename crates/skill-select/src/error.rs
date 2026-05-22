@@ -10,6 +10,11 @@ pub enum SkillSelectError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// A read against the bootstrap `WalletCache` (trades / wallets / event map)
+    /// failed during extraction.
+    #[error("bootstrap cache: {0}")]
+    Bootstrap(#[from] pe_bootstrap::error::BootstrapError),
+
     /// A persisted value could not be decoded back into its typed form
     /// (e.g. a money TEXT field that no longer parses as `Decimal`, or an
     /// integer column outside the target type's range).
