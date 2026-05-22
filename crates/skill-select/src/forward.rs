@@ -11,7 +11,10 @@
 //!     `p` is the wallet's **≤cutoff** resolution-win-rate in `c`'s entry-price
 //!     bucket (the ex-ante calibration prior, no look-ahead). A bucket with
 //!     fewer than `min_bucket_trades` ≤cutoff resolved buys is too sparse for a
-//!     reliable `p` → that position falls back to flat-$1 (flagged).
+//!     reliable `p` → that position takes the **neutral base stake `f` of $1**
+//!     (flagged), not a full $1. (A full-$1 fallback gave uncalibrated positions
+//!     10× the stake of calibrated ones — `f·edge ≤ f` — letting the sparse set
+//!     dominate the Kelly book; staking `f` keeps every position on one scale.)
 //!
 //! **Fees:** the April-2026 holdout is entirely post-fee (Polymarket fees since
 //! 2026-03-30; Akey et al. SSRN 6443103). v1 reports PnL **gross of fees** —
@@ -40,7 +43,7 @@ pub struct ForwardReport {
     pub resolved_positions: u32,
     /// Post-cutoff buys excluded (no resolution, or resolved-before-bought).
     pub excluded_positions: u32,
-    /// Resolved positions that used the flat-$1 Kelly fallback (sparse bucket).
+    /// Resolved positions that used the neutral base-`f` Kelly fallback (sparse bucket).
     pub kelly_fallback_positions: u32,
     /// Total flat-$1 PnL across all resolved positions (USD).
     pub flat_pnl_usd: Decimal,
@@ -129,9 +132,10 @@ pub fn forward_pnl_for_wallet(
                 }
             }
             _ => {
-                // Sparse bucket (or unpriceable c): fall back to flat $1.
+                // Sparse bucket (or unpriceable c): no edge estimate → take the
+                // neutral base stake `f` (same scale as calibrated `f·edge`).
                 pnl.kelly_fallback_positions += 1;
-                Decimal::ONE
+                kelly_fraction
             }
         };
         pnl.kelly_pnl_usd += kelly_stake * unit_return;
@@ -251,7 +255,7 @@ mod tests {
     fn flat_pnl_win_and_loss_by_hand() {
         // post-cutoff buy at 0.50 that wins → (1-0.5)/0.5 = +1.0; one at 0.50 that
         // loses → (0-0.5)/0.5 = -1.0. Net flat = 0. No ≤cutoff history → all Kelly
-        // positions fall back to flat $1, so kelly == flat.
+        // positions take the base-f fallback; the net still nets to 0 here.
         let trades = vec![
             buy("0xwin", 0, dec!(0.50), 2_000),
             buy("0xlose", 0, dec!(0.50), 2_000),
@@ -263,7 +267,21 @@ mod tests {
         assert_eq!(p.resolved_positions, 2);
         assert_eq!(p.flat_pnl_usd, dec!(0.0));
         assert_eq!(p.kelly_fallback_positions, 2); // no ≤cutoff calibration data
-        assert_eq!(p.kelly_pnl_usd, dec!(0.0)); // fallback = flat
+        assert_eq!(p.kelly_pnl_usd, dec!(0.0)); // f·(+1) + f·(-1) = 0
+    }
+
+    #[test]
+    fn sparse_fallback_stakes_base_f_not_full_dollar() {
+        // One post-cutoff winning buy at 0.50, no ≤cutoff history → sparse fallback.
+        // flat = +1.0; Kelly stakes the base fraction f=0.10 → kelly = 0.10·1.0 = 0.10
+        // (the old behaviour staked a full $1 → would have been 1.0).
+        let trades = vec![buy("0xwin", 0, dec!(0.50), 2_000)];
+        let resolutions: ResolutionIndex = [res("0xwin", 0, 3_000)].into_iter().collect();
+        let p = forward_pnl_for_wallet(&trades, 1_000, &resolutions, dec!(0.10), dec!(0.10), 5);
+        assert_eq!(p.resolved_positions, 1);
+        assert_eq!(p.kelly_fallback_positions, 1);
+        assert_eq!(p.flat_pnl_usd, dec!(1.0));
+        assert_eq!(p.kelly_pnl_usd, dec!(0.10)); // base-f, not full $1
     }
 
     #[test]

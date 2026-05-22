@@ -23,6 +23,9 @@ fn default_cache_path() -> PathBuf {
 fn default_min_closed_trades() -> u32 {
     20
 }
+fn default_min_trading_days() -> u32 {
+    20
+}
 fn default_permutations() -> u32 {
     999
 }
@@ -58,6 +61,12 @@ pub struct SkillConfig {
     /// Minimum train-window closed trades for a wallet to be scored. `PE_SKILL_MIN_CLOSED_TRADES`.
     #[serde(default = "default_min_closed_trades")]
     pub min_closed_trades: u32,
+    /// Minimum distinct trading days (daily-return observations) for a wallet to
+    /// be eligible for the deflated-Sharpe ranking. Below this the Sharpe is
+    /// degenerate; the wallet stays BHq-significant but is not selected.
+    /// `PE_SKILL_MIN_TRADING_DAYS`.
+    #[serde(default = "default_min_trading_days")]
+    pub min_trading_days: u32,
     /// Sign-randomization permutation count. `PE_SKILL_PERMUTATIONS`.
     #[serde(default = "default_permutations")]
     pub permutations: u32,
@@ -121,6 +130,7 @@ mod tests {
             assert_eq!(cfg.bhq_q_bps, 1_000);
             assert_eq!(cfg.top_n, 50);
             assert_eq!(cfg.min_closed_trades, 20);
+            assert_eq!(cfg.min_trading_days, 20);
             assert_eq!(cfg.rng_seed, 42);
             assert_eq!(cfg.cutoff_unix, 1_775_001_599);
             Ok(())

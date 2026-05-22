@@ -34,6 +34,10 @@ pub struct SelectionInput {
     pub skill_pvalue_bps: u32,
     /// Per-period Sharpe × 10_000 (from the daily-return moments).
     pub sharpe_bps: i64,
+    /// Distinct UTC trading days = the daily-return series length `n`. The Sharpe
+    /// of a series with very few points is degenerate (population std of 2 points
+    /// is `|Δ|/2`, so `mean/std` is unbounded), so it gates rank eligibility.
+    pub trading_days: u32,
 }
 
 /// Per-wallet selection outcome.
@@ -52,7 +56,14 @@ pub struct SelectionResult {
 }
 
 /// Select wallets: BHq(`bhq_q_bps`) gate over p-values, then the significant set
-/// ranked by deflated Sharpe and capped at `top_n`.
+/// — restricted to wallets with `trading_days >= min_trading_days` — ranked by
+/// deflated Sharpe and capped at `top_n`.
+///
+/// The `min_trading_days` gate applies only to the deflated-Sharpe **ranking**,
+/// not to the BHq significance test: the event-level sign-randomization p-value
+/// is valid regardless of day count, but the per-period Sharpe is degenerate on
+/// a handful of daily-return points, so low-day wallets stay `bhq_significant`
+/// yet are excluded from `selected` (their Sharpe rank is not trustworthy).
 ///
 /// Returns one [`SelectionResult`] per input, ordered `selected` first, then by
 /// deflated Sharpe descending, then `wallet_hex` (deterministic). `bhq_q_bps` is
@@ -61,6 +72,7 @@ pub fn select_wallets(
     inputs: &[SelectionInput],
     bhq_q_bps: u32,
     top_n: usize,
+    min_trading_days: u32,
 ) -> Vec<SelectionResult> {
     let m = inputs.len();
     if m == 0 {
@@ -104,9 +116,14 @@ pub fn select_wallets(
     }
     let significant: HashSet<usize> = order[..max_k].iter().copied().collect();
 
-    // Rank the significant set by deflated Sharpe desc (tie: p asc, wallet asc),
-    // cap at top_n.
-    let mut sig_ranked: Vec<usize> = order[..max_k].to_vec();
+    // Rank the significant set — restricted to wallets with enough daily-return
+    // observations for a non-degenerate Sharpe — by deflated Sharpe desc
+    // (tie: p asc, wallet asc), cap at top_n.
+    let mut sig_ranked: Vec<usize> = order[..max_k]
+        .iter()
+        .copied()
+        .filter(|&i| inputs[i].trading_days >= min_trading_days)
+        .collect();
     sig_ranked.sort_by(|&a, &b| {
         deflated[b]
             .cmp(&deflated[a])
@@ -150,11 +167,14 @@ fn decimal_to_bps_i64(v: Decimal) -> i64 {
 mod tests {
     use super::*;
 
+    /// Helper: trading_days defaults high (30) so the day gate is a no-op unless
+    /// a test sets `min_trading_days > 30`.
     fn input(hex: &str, pvalue_bps: u32, sharpe_bps: i64) -> SelectionInput {
         SelectionInput {
             wallet_hex: hex.to_owned(),
             skill_pvalue_bps: pvalue_bps,
             sharpe_bps,
+            trading_days: 30,
         }
     }
 
@@ -172,7 +192,7 @@ mod tests {
             input("0xc", 9_000, 90_000),
             input("0xd", 9_500, 10_000),
         ];
-        let out = select_wallets(&inputs, 1_000, 10);
+        let out = select_wallets(&inputs, 1_000, 10, 0);
         assert!(result_for(&out, "0xa").bhq_significant);
         assert!(result_for(&out, "0xb").bhq_significant);
         assert!(!result_for(&out, "0xc").bhq_significant);
@@ -190,7 +210,7 @@ mod tests {
             input("0xb", 10, 90_000), // highest Sharpe
             input("0xc", 10, 50_000),
         ];
-        let out = select_wallets(&inputs, 1_000, 1);
+        let out = select_wallets(&inputs, 1_000, 1, 0);
         assert!(out.iter().all(|r| r.bhq_significant));
         let selected: Vec<&str> = out
             .iter()
@@ -204,7 +224,7 @@ mod tests {
     fn deflated_sharpe_applies_multiple_testing_haircut() {
         // m=2 ⇒ e_max = √(2·ln 2) = √1.386 ≈ 1.1774 → 11774 bps.
         let inputs = vec![input("0xa", 10, 50_000), input("0xb", 10, 50_000)];
-        let out = select_wallets(&inputs, 1_000, 10);
+        let out = select_wallets(&inputs, 1_000, 10, 0);
         let r = result_for(&out, "0xa");
         // 50000 - 11774 = 38226 (±3 for sqrt/ln rounding)
         assert!(
@@ -217,17 +237,45 @@ mod tests {
     #[test]
     fn single_wallet_no_deflation_and_bhq_uses_q() {
         // m=1 ⇒ no haircut (deflated == sharpe); critical at rank 1 = q.
-        let pass = select_wallets(&[input("0xa", 900, 12_345)], 1_000, 10);
+        let pass = select_wallets(&[input("0xa", 900, 12_345)], 1_000, 10, 0);
         assert_eq!(pass[0].deflated_sharpe_bps, 12_345);
         assert!(pass[0].bhq_significant); // 900 ≤ 1000
         assert!(pass[0].selected);
-        let fail = select_wallets(&[input("0xa", 1_001, 12_345)], 1_000, 10);
+        let fail = select_wallets(&[input("0xa", 1_001, 12_345)], 1_000, 10, 0);
         assert!(!fail[0].bhq_significant); // 1001 > 1000
         assert!(!fail[0].selected);
     }
 
     #[test]
     fn empty_input_yields_empty() {
-        assert!(select_wallets(&[], 1_000, 10).is_empty());
+        assert!(select_wallets(&[], 1_000, 10, 0).is_empty());
+    }
+
+    #[test]
+    fn min_trading_days_excludes_low_day_wallets_from_ranking() {
+        // Two BHq-significant wallets; the higher-Sharpe one has too few trading
+        // days (degenerate Sharpe) and must be excluded from `selected` while
+        // remaining `bhq_significant`. The lower-Sharpe but eligible one wins.
+        let inputs = vec![
+            SelectionInput {
+                wallet_hex: "0xfew".to_owned(),
+                skill_pvalue_bps: 10,
+                sharpe_bps: 1_000_000, // huge but degenerate
+                trading_days: 2,
+            },
+            SelectionInput {
+                wallet_hex: "0xmany".to_owned(),
+                skill_pvalue_bps: 10,
+                sharpe_bps: 25_000, // modest but on a real track record
+                trading_days: 25,
+            },
+        ];
+        let out = select_wallets(&inputs, 1_000, 10, 20);
+        // Both still pass the skill-significance gate.
+        assert!(result_for(&out, "0xfew").bhq_significant);
+        assert!(result_for(&out, "0xmany").bhq_significant);
+        // But the low-day wallet is not selected; the eligible one is.
+        assert!(!result_for(&out, "0xfew").selected);
+        assert!(result_for(&out, "0xmany").selected);
     }
 }
