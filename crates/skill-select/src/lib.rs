@@ -11,6 +11,7 @@
 //! the streaming per-wallet pass that writes `wallet_features`). The forward-test
 //! harness and the binary land in later phases.
 
+pub mod config;
 pub mod db;
 pub mod error;
 pub mod extract;
@@ -18,6 +19,7 @@ pub mod features;
 pub mod selection;
 pub mod skill_test;
 
+pub use config::SkillConfig;
 pub use db::{SkillCache, WalletFeatures};
 pub use error::SkillSelectError;
 pub use extract::{ExtractReport, run_extract};
