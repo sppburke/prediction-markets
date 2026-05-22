@@ -16,6 +16,7 @@ pub mod db;
 pub mod error;
 pub mod extract;
 pub mod features;
+pub mod forward;
 pub mod selection;
 pub mod skill_test;
 
@@ -24,5 +25,6 @@ pub use db::{SkillCache, WalletFeatures};
 pub use error::SkillSelectError;
 pub use extract::{ExtractReport, run_extract};
 pub use features::{DeterministicFeatures, extract_features};
+pub use forward::{ForwardPnl, ForwardReport, forward_pnl_for_wallet, run_forward_test};
 pub use selection::{SelectionInput, SelectionResult, select_wallets};
 pub use skill_test::{SkillTestResult, sign_randomization_test};
