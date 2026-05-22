@@ -25,6 +25,8 @@ float_arithmetic = "deny"
 scenario = []
 
 [dependencies]
+pe-core-types = { path = "../core-types", version = "0.1.0" }
+pe-trader-index = { path = "../trader-index", version = "0.1.0" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
