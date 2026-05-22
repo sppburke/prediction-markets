@@ -4,10 +4,11 @@
 //!
 //! Storage conventions follow the bootstrap cache (`crates/bootstrap/src/cache.rs`):
 //! money is TEXT via `Decimal::to_string()` (no `f64` round-trip), ratios are
-//! integer basis points, and `INSERT OR REPLACE` keyed on `wallet_hex` makes
-//! re-extraction idempotent. A row is scoped to the `cutoff_unix` it was
-//! computed at, so re-running at a different cutoff replaces in place and
-//! [`SkillCache::load_features_for_cutoff`] selects one population.
+//! integer basis points, and `INSERT OR REPLACE` keyed on the composite
+//! `(cutoff_unix, wallet_hex)` primary key makes re-extraction idempotent. The
+//! cutoff is part of the key, so multiple cutoffs coexist (walk-forward / cutoff
+//! comparison); re-running at the *same* cutoff replaces that wallet's row in
+//! place, and [`SkillCache::load_features_for_cutoff`] selects one population.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -22,7 +23,7 @@ use crate::error::SkillSelectError;
 /// `add_column_if_missing` pattern from `cache.rs` rather than by editing this.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS wallet_features (
-    wallet_hex              TEXT    PRIMARY KEY NOT NULL,
+    wallet_hex              TEXT    NOT NULL,
     cutoff_unix             INTEGER NOT NULL,
     extracted_at_unix       INTEGER NOT NULL,
     reconstruction_quality  INTEGER NOT NULL,
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS wallet_features (
     skill_pnl_usd_str       TEXT    NOT NULL,
     skill_pvalue_bps        INTEGER NOT NULL,
     skill_permutations      INTEGER NOT NULL,
-    deflated_sharpe_bps     INTEGER NOT NULL
+    deflated_sharpe_bps     INTEGER NOT NULL,
+    PRIMARY KEY (cutoff_unix, wallet_hex)
 );
 CREATE INDEX IF NOT EXISTS idx_wallet_features_cutoff ON wallet_features(cutoff_unix);
 CREATE INDEX IF NOT EXISTS idx_wallet_features_skill ON wallet_features(skill_pvalue_bps, deflated_sharpe_bps);
@@ -134,7 +136,9 @@ impl SkillCache {
     }
 
     /// Upsert a batch of feature rows in one transaction. `INSERT OR REPLACE`
-    /// on `wallet_hex` — re-extraction is idempotent. Returns the row count.
+    /// on the `(cutoff_unix, wallet_hex)` key — re-extraction at the same cutoff
+    /// is idempotent, and a wallet may hold rows at multiple cutoffs. Returns the
+    /// row count.
     pub fn upsert_features_batch(
         &mut self,
         rows: &[WalletFeatures],
@@ -393,5 +397,28 @@ mod tests {
         let loaded = ro.load_features_for_cutoff(100).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].total_pnl_usd, dec!(9.99));
+    }
+
+    #[test]
+    fn same_wallet_at_two_cutoffs_coexists() {
+        // The PK is (cutoff_unix, wallet_hex): one wallet must be storable at
+        // both a train cutoff and a later cutoff without eviction.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        let mut cache = SkillCache::open(&path).unwrap();
+
+        cache
+            .upsert_features_batch(&[
+                sample("0xaaaa", 1_700_000_000, dec!(1.0)),
+                sample("0xaaaa", 1_743_465_599, dec!(2.0)),
+            ])
+            .unwrap();
+
+        let early = cache.load_features_for_cutoff(1_700_000_000).unwrap();
+        let late = cache.load_features_for_cutoff(1_743_465_599).unwrap();
+        assert_eq!(early.len(), 1);
+        assert_eq!(late.len(), 1);
+        assert_eq!(early[0].total_pnl_usd, dec!(1.0));
+        assert_eq!(late[0].total_pnl_usd, dec!(2.0));
     }
 }
