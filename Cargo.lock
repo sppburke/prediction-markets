@@ -3314,6 +3314,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-skill-select"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pe-source-core"
 version = "0.1.0"
 dependencies = [

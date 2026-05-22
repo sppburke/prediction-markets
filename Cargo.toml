@@ -21,6 +21,7 @@ members = [
     "crates/backtest",
     "crates/venue-polymarket",
     "crates/execution-core",
+    "crates/skill-select",
 ]
 
 [workspace.package]
