@@ -62,6 +62,7 @@ fn selected_wallets(cfg: &SkillConfig) -> Result<Vec<SelectionInput>, i32> {
             wallet_hex: w.features.wallet_hex.clone(),
             skill_pvalue_bps: w.skill_pvalue_bps,
             sharpe_bps: w.features.sharpe_bps,
+            trading_days: w.features.trading_days,
         })
         .collect())
 }
@@ -114,15 +115,16 @@ fn run_select_cmd(toml_path: Option<&std::path::Path>) -> i32 {
         Ok(i) => i,
         Err(code) => return code,
     };
-    let results = select_wallets(&inputs, cfg.bhq_q_bps, cfg.top_n);
+    let results = select_wallets(&inputs, cfg.bhq_q_bps, cfg.top_n, cfg.min_trading_days);
     let selected = results.iter().filter(|r| r.selected).count();
     println!(
-        "select: candidates={} selected={} (cutoff_unix={}, bhq_q_bps={}, top_n={})",
+        "select: candidates={} selected={} (cutoff_unix={}, bhq_q_bps={}, top_n={}, min_trading_days={})",
         inputs.len(),
         selected,
         cfg.cutoff_unix,
         cfg.bhq_q_bps,
         cfg.top_n,
+        cfg.min_trading_days,
     );
     for r in results.iter().filter(|r| r.selected) {
         println!(
@@ -142,7 +144,7 @@ fn run_forward_cmd(toml_path: Option<&std::path::Path>) -> i32 {
         Ok(i) => i,
         Err(code) => return code,
     };
-    let results = select_wallets(&inputs, cfg.bhq_q_bps, cfg.top_n);
+    let results = select_wallets(&inputs, cfg.bhq_q_bps, cfg.top_n, cfg.min_trading_days);
     let selected: Vec<String> = results
         .iter()
         .filter(|r| r.selected)
