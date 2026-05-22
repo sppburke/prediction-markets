@@ -120,6 +120,19 @@ CREATE TABLE IF NOT EXISTS market_events (
 );
 CREATE INDEX IF NOT EXISTS idx_market_events_event_id ON market_events(event_id);
 
+-- ERC-1155 position-token id -> conditionId map (issue #207, Slice 0).
+-- token_id is the decimal-string uint256 form Gamma returns in `clobTokenIds`;
+-- on-chain OrderFilled logs carry the same id as a 32-byte word (consumers
+-- normalise to decimal before joining). condition_id is the `0x`-prefixed form
+-- shared with trades.market_id / market_events. Lets the on-chain OrderFilled
+-- legs (keyed by token id) be resolved to a market.
+CREATE TABLE IF NOT EXISTS token_conditions (
+    token_id        TEXT    PRIMARY KEY NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    fetched_at_unix INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_token_conditions_condition ON token_conditions(condition_id);
+
 CREATE TABLE IF NOT EXISTS funder_edges (
     funder_hex      TEXT    NOT NULL,
     funded_hex      TEXT    NOT NULL,
@@ -983,6 +996,61 @@ impl WalletCache {
             params![condition_id, event_id, event_slug, fetched_at_unix],
         )?;
         Ok(())
+    }
+
+    /// Upsert a batch of `(token_id, condition_id)` rows into `token_conditions`
+    /// in one transaction (issue #207, Slice 0).
+    ///
+    /// `token_id` is the decimal-string uint256 form from Gamma `clobTokenIds`;
+    /// `condition_id` is the normalised `0x`-prefixed market id. `INSERT OR
+    /// REPLACE` keyed on `token_id` — a token belongs to exactly one condition,
+    /// and a re-sweep refreshes `fetched_at_unix` without duplicating rows.
+    pub fn upsert_token_conditions_batch(
+        &mut self,
+        rows: &[(String, String)],
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO token_conditions \
+                 (token_id, condition_id, fetched_at_unix) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (token_id, condition_id) in rows {
+                stmt.execute(params![token_id, condition_id, fetched_at_unix])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count of rows in `token_conditions` (distinct mapped token ids).
+    ///
+    /// # Precondition
+    /// Returns `0` when no token map has been swept.
+    pub fn token_condition_count(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM token_conditions", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    /// Resolve a single ERC-1155 `token_id` (decimal string) to its `condition_id`.
+    ///
+    /// The on-chain `OrderFilled` consumer (issue #207, Slice 1) normalises each
+    /// leg's token id to decimal and calls this to attribute the leg to a market.
+    ///
+    /// # Precondition
+    /// Returns `None` when the token has not been mapped (unswept, or a token
+    /// from a market Gamma did not return).
+    pub fn condition_for_token(&self, token_id: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT condition_id FROM token_conditions WHERE token_id = ?1",
+                params![token_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
     }
 
     /// Return the set of `condition_id`s already present in `market_events`.
@@ -2181,6 +2249,46 @@ mod tests {
             .unwrap();
         let map = cache.load_market_event_map().unwrap();
         assert_eq!(map.get("0xa").map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn token_conditions_batch_round_trips_and_replaces() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        assert_eq!(cache.token_condition_count(), 0);
+        cache
+            .upsert_token_conditions_batch(
+                &[
+                    ("111".to_string(), "0xaa".to_string()),
+                    ("222".to_string(), "0xaa".to_string()),
+                    ("333".to_string(), "0xbb".to_string()),
+                ],
+                100,
+            )
+            .unwrap();
+        assert_eq!(cache.token_condition_count(), 3);
+        // INSERT OR REPLACE keyed on token_id: re-mapping a token updates, not dupes.
+        cache
+            .upsert_token_conditions_batch(&[("111".to_string(), "0xcc".to_string())], 200)
+            .unwrap();
+        assert_eq!(cache.token_condition_count(), 3);
+        let cond: String = cache
+            .conn
+            .query_row(
+                "SELECT condition_id FROM token_conditions WHERE token_id = '111'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cond, "0xcc");
+    }
+
+    #[test]
+    fn token_conditions_empty_batch_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.upsert_token_conditions_batch(&[], 100).unwrap();
+        assert_eq!(cache.token_condition_count(), 0);
     }
 
     #[test]
