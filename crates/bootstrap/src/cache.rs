@@ -133,6 +133,48 @@ CREATE TABLE IF NOT EXISTS token_conditions (
 );
 CREATE INDEX IF NOT EXISTS idx_token_conditions_condition ON token_conditions(condition_id);
 
+-- Issue #207 Slice 1: per-fill counterparty edges from the on-chain CTF Exchange
+-- OrderFilled events (V1 + V2). Uniquely keyed by (tx_hash, log_index). One row
+-- per filled order leg; the per-tx aggregate (a market trade can produce multiple
+-- legs in one tx) is computed downstream by the §5 reconciliation step.
+--
+-- Schema notes:
+-- - `contract_version` is `1` (V1 topic) or `2` (V2 topic); distinct from the
+--   bitmask values in `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_*`.
+-- - `maker_asset_id_dec` / `taker_asset_id_dec` hold ERC-1155 token ids as
+--   **decimal strings** (matching `token_conditions.token_id`). V1 populates
+--   both; V2 stores the unified `tokenId` in maker_asset_id_dec and leaves
+--   taker_asset_id_dec NULL (the other leg is implicit USDC).
+-- - `side` is V2-only: 0 = maker BUY, 1 = maker SELL. NULL for V1.
+-- - Amounts (`maker_amount_raw`, `taker_amount_raw`, `fee_raw`) are uint256
+--   decimal strings — unit conversion (USDC vs position tokens) is deferred to
+--   the reconciliation step which joins to `token_conditions` to identify
+--   which leg is USDC.
+CREATE TABLE IF NOT EXISTS counterparty_edges (
+    tx_hash             TEXT    NOT NULL,
+    log_index           INTEGER NOT NULL,
+    block_number        INTEGER NOT NULL,
+    block_ts_unix       INTEGER NOT NULL,
+    contract_addr       TEXT    NOT NULL,
+    contract_version    INTEGER NOT NULL,
+    maker_hex           TEXT    NOT NULL,
+    taker_hex           TEXT    NOT NULL,
+    maker_asset_id_dec  TEXT    NOT NULL,
+    taker_asset_id_dec  TEXT,
+    side                INTEGER,
+    maker_amount_raw    TEXT    NOT NULL,
+    taker_amount_raw    TEXT    NOT NULL,
+    fee_raw             TEXT    NOT NULL,
+    PRIMARY KEY (tx_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_counterparty_edges_maker ON counterparty_edges(maker_hex);
+CREATE INDEX IF NOT EXISTS idx_counterparty_edges_taker ON counterparty_edges(taker_hex);
+CREATE INDEX IF NOT EXISTS idx_counterparty_edges_block ON counterparty_edges(block_number);
+CREATE INDEX IF NOT EXISTS idx_counterparty_edges_maker_asset
+    ON counterparty_edges(maker_asset_id_dec);
+CREATE INDEX IF NOT EXISTS idx_counterparty_edges_taker_asset
+    ON counterparty_edges(taker_asset_id_dec);
+
 CREATE TABLE IF NOT EXISTS funder_edges (
     funder_hex      TEXT    NOT NULL,
     funded_hex      TEXT    NOT NULL,
@@ -1051,6 +1093,111 @@ impl WalletCache {
                 |r| r.get::<_, String>(0),
             )
             .ok()
+    }
+
+    /// Upsert a batch of decoded `OrderFilled` legs into `counterparty_edges`
+    /// in one transaction (issue #207, Slice 1).
+    ///
+    /// Rows are keyed by `(tx_hash, log_index)`; `INSERT OR REPLACE` makes the
+    /// scan idempotent under re-runs (an interrupted scan resumes and re-writes
+    /// any partially-committed chunk).
+    ///
+    /// Inputs are 14 columns in positional order:
+    /// `(tx_hash, log_index, block_number, block_ts_unix, contract_addr,
+    ///   contract_version, maker_hex, taker_hex, maker_asset_id_dec,
+    ///   taker_asset_id_dec, side, maker_amount_raw, taker_amount_raw, fee_raw)`.
+    #[allow(clippy::type_complexity)]
+    pub fn upsert_counterparty_edges_batch(
+        &mut self,
+        rows: &[(
+            String,         // tx_hash
+            i64,            // log_index
+            i64,            // block_number
+            i64,            // block_ts_unix
+            String,         // contract_addr
+            i64,            // contract_version
+            String,         // maker_hex
+            String,         // taker_hex
+            String,         // maker_asset_id_dec
+            Option<String>, // taker_asset_id_dec
+            Option<i64>,    // side
+            String,         // maker_amount_raw
+            String,         // taker_amount_raw
+            String,         // fee_raw
+        )],
+    ) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO counterparty_edges \
+                 (tx_hash, log_index, block_number, block_ts_unix, contract_addr, \
+                  contract_version, maker_hex, taker_hex, maker_asset_id_dec, \
+                  taker_asset_id_dec, side, maker_amount_raw, taker_amount_raw, fee_raw) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
+            for (
+                tx_hash,
+                log_index,
+                block_number,
+                block_ts_unix,
+                contract_addr,
+                contract_version,
+                maker_hex,
+                taker_hex,
+                maker_asset_id_dec,
+                taker_asset_id_dec,
+                side,
+                maker_amount_raw,
+                taker_amount_raw,
+                fee_raw,
+            ) in rows
+            {
+                stmt.execute(params![
+                    tx_hash,
+                    log_index,
+                    block_number,
+                    block_ts_unix,
+                    contract_addr,
+                    contract_version,
+                    maker_hex,
+                    taker_hex,
+                    maker_asset_id_dec,
+                    taker_asset_id_dec,
+                    side,
+                    maker_amount_raw,
+                    taker_amount_raw,
+                    fee_raw,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count of rows in `counterparty_edges` (one per filled leg).
+    ///
+    /// # Precondition
+    /// Returns `0` when no on-chain scan has been run.
+    pub fn counterparty_edge_count(&self) -> i64 {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM counterparty_edges", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    /// Highest `block_number` in `counterparty_edges`, or `None` if empty.
+    ///
+    /// Used by the on-chain scanner to resume from the last persisted block on
+    /// re-run, matching the resolution-scan resumability pattern.
+    pub fn counterparty_edges_max_block(&self) -> Option<u64> {
+        self.conn
+            .query_row(
+                "SELECT MAX(block_number) FROM counterparty_edges",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .and_then(|n| u64::try_from(n).ok())
     }
 
     /// Return the set of `condition_id`s already present in `market_events`.
@@ -2289,6 +2436,129 @@ mod tests {
         let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
         cache.upsert_token_conditions_batch(&[], 100).unwrap();
         assert_eq!(cache.token_condition_count(), 0);
+    }
+
+    /// 14-tuple matching the `upsert_counterparty_edges_batch` parameter order.
+    type EdgeRow = (
+        String,         // tx_hash
+        i64,            // log_index
+        i64,            // block_number
+        i64,            // block_ts_unix
+        String,         // contract_addr
+        i64,            // contract_version
+        String,         // maker_hex
+        String,         // taker_hex
+        String,         // maker_asset_id_dec
+        Option<String>, // taker_asset_id_dec
+        Option<i64>,    // side
+        String,         // maker_amount_raw
+        String,         // taker_amount_raw
+        String,         // fee_raw
+    );
+
+    /// Helper: a fully-populated V1 edge row with parameterised fields.
+    fn v1_edge_row(
+        tx_hash: &str,
+        log_index: i64,
+        block_number: i64,
+        maker: &str,
+        taker: &str,
+    ) -> EdgeRow {
+        (
+            tx_hash.to_string(),
+            log_index,
+            block_number,
+            1_700_000_000,
+            "0xcccccccccccccccccccccccccccccccccccccccc".to_string(),
+            1,
+            maker.to_string(),
+            taker.to_string(),
+            "111".to_string(),
+            Some("222".to_string()),
+            None,
+            "1000000".to_string(),
+            "2000000".to_string(),
+            "500".to_string(),
+        )
+    }
+
+    #[test]
+    fn counterparty_edges_batch_round_trips_v1_and_v2() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        assert_eq!(cache.counterparty_edge_count(), 0);
+
+        let v1 = v1_edge_row("0xt1", 0, 100, "0xa", "0xb");
+        let v2 = (
+            "0xt2".to_string(),
+            1,
+            200,
+            1_700_000_100,
+            "0xdddddddddddddddddddddddddddddddddddddddd".to_string(),
+            2,
+            "0xa".to_string(),
+            "0xb".to_string(),
+            "999999".to_string(),
+            None, // V2: implicit USDC leg
+            Some(1),
+            "7".to_string(),
+            "8".to_string(),
+            "9".to_string(),
+        );
+        cache.upsert_counterparty_edges_batch(&[v1, v2]).unwrap();
+        assert_eq!(cache.counterparty_edge_count(), 2);
+        assert_eq!(cache.counterparty_edges_max_block(), Some(200));
+    }
+
+    #[test]
+    fn counterparty_edges_replace_on_duplicate_key() {
+        // INSERT OR REPLACE keyed on (tx_hash, log_index): a re-scan of the same
+        // chunk must not duplicate rows. Mutate maker_amount to prove the row
+        // was actually overwritten (not silently ignored).
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        let first = v1_edge_row("0xtx", 0, 100, "0xa", "0xb");
+        cache.upsert_counterparty_edges_batch(&[first]).unwrap();
+        let mut overwrite = v1_edge_row("0xtx", 0, 100, "0xa", "0xb");
+        overwrite.11 = "9999".to_string(); // maker_amount_raw
+        cache.upsert_counterparty_edges_batch(&[overwrite]).unwrap();
+        assert_eq!(cache.counterparty_edge_count(), 1);
+        let amt: String = cache
+            .conn
+            .query_row(
+                "SELECT maker_amount_raw FROM counterparty_edges WHERE tx_hash = '0xtx' AND log_index = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(amt, "9999");
+    }
+
+    #[test]
+    fn counterparty_edges_empty_batch_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.upsert_counterparty_edges_batch(&[]).unwrap();
+        assert_eq!(cache.counterparty_edge_count(), 0);
+        assert_eq!(cache.counterparty_edges_max_block(), None);
+    }
+
+    #[test]
+    fn counterparty_edges_max_block_returns_max_not_last() {
+        // Inserting out-of-order blocks: max_block must reflect MAX(), not the
+        // most-recently-written row (the scanner can re-write earlier chunks).
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .upsert_counterparty_edges_batch(&[v1_edge_row("0x1", 0, 500, "0xa", "0xb")])
+            .unwrap();
+        cache
+            .upsert_counterparty_edges_batch(&[v1_edge_row("0x2", 0, 200, "0xa", "0xb")])
+            .unwrap();
+        cache
+            .upsert_counterparty_edges_batch(&[v1_edge_row("0x3", 0, 400, "0xa", "0xb")])
+            .unwrap();
+        assert_eq!(cache.counterparty_edges_max_block(), Some(500));
     }
 
     #[test]
