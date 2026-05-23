@@ -8,6 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::events::GammaEventsFetcher;
@@ -15,11 +17,41 @@ use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
-use pe_source_polymarket_public::FixtureFetcher;
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::{FixtureFetcher, PageFetcher};
 use pe_trader_index::snapshot::RawTrade;
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 use time::OffsetDateTime;
+
+/// A `PageFetcher` that serves one good page then returns HTTP 422, simulating
+/// Gamma's behaviour when `offset >= total_event_count`.
+struct OneThenHttp422Fetcher {
+    good_response: Vec<u8>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl OneThenHttp422Fetcher {
+    fn new(good_response: Vec<u8>) -> Self {
+        Self {
+            good_response,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl PageFetcher for OneThenHttp422Fetcher {
+    async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, SourceError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(self.good_response.clone())
+        } else {
+            Err(SourceError::Fatal {
+                message: "HTTP 422".to_owned(),
+            })
+        }
+    }
+}
 
 const BASE: &str = "https://gamma-api.polymarket.com";
 const WALLET: &str = "0x1111111111111111111111111111111111111111";
@@ -142,5 +174,36 @@ fn scenario_events_maps_token_ids_to_conditions() {
     assert!(
         pass,
         "all 4 clobTokenIds must map to their market's conditionId"
+    );
+}
+
+#[test]
+fn scenario_events_422_at_page_boundary_treated_as_end_of_data() {
+    // PASS: sweep completes without error when Gamma returns HTTP 422 on the
+    //       second page (Gamma's "offset >= total" signal). Events from the
+    //       first page must be mapped correctly.
+    // FAIL: sweep returns Err (422 fatally aborts the sweep).
+    let dir = TempDir::new().unwrap();
+    let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+
+    let good_page = br#"[{"id": 1, "slug": "s", "markets": [
+        {"conditionId": "0xdd", "clobTokenIds": "[\"555\"]"}
+    ]}]"#
+        .to_vec();
+
+    let fetcher = GammaEventsFetcher::new(BASE.to_owned(), OneThenHttp422Fetcher::new(good_page));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(fetcher.sweep(&mut cache));
+    let pass = result.is_ok() && result.unwrap().events_seen == 1;
+    println!(
+        "Scenario events_422_at_page_boundary_treated_as_end_of_data: {}",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    assert!(
+        pass,
+        "HTTP 422 from Gamma must terminate sweep cleanly, not abort"
     );
 }

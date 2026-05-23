@@ -114,6 +114,9 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
             );
             let bytes = match self.fetcher.fetch_page(&url).await {
                 Ok(b) => b,
+                // Gamma returns 422 when offset >= total event count (instead of
+                // an empty array). Treat it as end-of-data, same as an empty page.
+                Err(SourceError::Fatal { message }) if message.contains("HTTP 422") => break,
                 Err(SourceError::Fatal { message }) => {
                     return Err(BootstrapError::Gamma {
                         message: format!("events fetch at offset {offset}: {message}"),
