@@ -46,15 +46,13 @@ pub(crate) const EVENTS_CURSOR_KEY: &str = "gamma_events_sweep_offset";
 /// observed maximum that returns reliably.
 const EVENTS_PAGE_LIMIT: u64 = 500;
 
-/// Orphan-rate gate (issue #206 AC1). Reported every run; thresholds are integer
-/// percents to avoid any float. Canonical: `docs/_GLOSSARY.md` "Bootstrap
-/// defaults" (`bootstrap_event_orphan_warn_pct` / `bootstrap_event_orphan_fail_pct`).
-/// `warn` flags a join-key/coverage drift to investigate; `fail` (orphan rate so
-/// high it indicates a join-key/form break) aborts loudly. A small tail of
-/// legitimately unmappable (old/delisted) markets stays as singleton self-maps
-/// and must not false-fail the run.
-const ORPHAN_WARN_PCT: usize = 5;
-const ORPHAN_FAIL_PCT: usize = 50;
+/// Orphan-rate warn threshold (integer percent). Gamma's /events covers only a
+/// curated subset of all traded condition IDs: a 90–99% orphan rate is expected
+/// on a full historical cache. Warn only at near-total orphan coverage (99%) to
+/// flag a genuine catastrophic format break; the hard-fail is replaced by the
+/// zero-conditions check below (events_seen > 0 but conditions_mapped == 0).
+/// Canonical: `docs/_GLOSSARY.md` "Bootstrap defaults" (`bootstrap_event_orphan_warn_pct`).
+const ORPHAN_WARN_PCT: usize = 99;
 
 /// Outcome of an `/events` sweep + orphan pass (issue #206).
 #[derive(Debug, Default, Clone)]
@@ -214,23 +212,27 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
             orphan_self_mapped = report.orphan_self_mapped,
             "events: sweep complete"
         );
-        if total_traded_markets > 0 {
-            if orphan_self_mapped * 100 > total_traded_markets * ORPHAN_FAIL_PCT {
-                return Err(BootstrapError::Gamma {
-                    message: format!(
-                        "events: orphan rate {orphan_self_mapped}/{total_traded_markets} \
-                         exceeds {ORPHAN_FAIL_PCT}% — likely a conditionId join-key/form \
-                         break, not a legitimate unmappable tail; aborting"
-                    ),
-                });
-            }
-            if orphan_self_mapped * 100 > total_traded_markets * ORPHAN_WARN_PCT {
-                warn!(
-                    orphan_self_mapped,
-                    total_traded_markets,
-                    "events: orphan rate above {ORPHAN_WARN_PCT}% — investigate event coverage"
-                );
-            }
+        // Format-break guard: if the sweep saw events but mapped zero conditions,
+        // Gamma's conditionId field has changed shape. This is the reliable signal
+        // for a join-key break; the old orphan-rate hard-fail was a false alarm on
+        // large historical caches (Gamma covers ~10k events vs. ~1M traded condition
+        // IDs, so a 96%+ orphan rate is correct and expected).
+        if events_seen > 0 && conditions_mapped == 0 {
+            return Err(BootstrapError::Gamma {
+                message: format!(
+                    "events: sweep saw {events_seen} events but mapped 0 conditions — \
+                     likely a conditionId field-name/format break in the Gamma response"
+                ),
+            });
+        }
+        if total_traded_markets > 0
+            && orphan_self_mapped * 100 > total_traded_markets * ORPHAN_WARN_PCT
+        {
+            warn!(
+                orphan_self_mapped,
+                total_traded_markets,
+                "events: orphan rate above {ORPHAN_WARN_PCT}% — investigate Gamma coverage"
+            );
         }
 
         Ok(report)
