@@ -288,6 +288,22 @@ impl CoverageReport {
     }
 }
 
+/// One row streamed by [`WalletCache::for_each_counterparty_edge_resolved`].
+///
+/// Carries everything the §5 reconciliation needs to decide which leg of a
+/// fill is USDC: the version-discriminator (`contract_version`), the V2 side
+/// flag, the two raw uint256 amounts as decimal strings, and the LEFT-JOIN
+/// result of looking up each asset id in `token_conditions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CounterpartyEdgeResolvedRow {
+    pub contract_version: i64,
+    pub side: Option<i64>,
+    pub maker_amount_raw: String,
+    pub taker_amount_raw: String,
+    pub maker_condition: Option<String>,
+    pub taker_condition: Option<String>,
+}
+
 /// Permanent wallet trade-history cache backed by SQLite.
 pub struct WalletCache {
     conn: Connection,
@@ -1198,6 +1214,62 @@ impl WalletCache {
             .ok()
             .flatten()
             .and_then(|n| u64::try_from(n).ok())
+    }
+
+    /// Stream the `counterparty_edges` rows LEFT JOIN'd against `token_conditions`
+    /// on both `maker_asset_id_dec` and `taker_asset_id_dec` (issue #207 Slice 1c).
+    ///
+    /// The callback fires once per fill leg with the data needed for the §5
+    /// reconciliation's USDC-leg resolution. Errors from the callback abort
+    /// the stream and propagate up. Read-only — does not modify the cache.
+    pub fn for_each_counterparty_edge_resolved(
+        &self,
+        mut f: impl FnMut(CounterpartyEdgeResolvedRow) -> Result<(), BootstrapError>,
+    ) -> Result<(), BootstrapError> {
+        let sql = "
+            SELECT
+                ce.contract_version,
+                ce.side,
+                ce.maker_amount_raw,
+                ce.taker_amount_raw,
+                tc_m.condition_id AS maker_cond,
+                tc_t.condition_id AS taker_cond
+            FROM counterparty_edges ce
+            LEFT JOIN token_conditions tc_m ON tc_m.token_id = ce.maker_asset_id_dec
+            LEFT JOIN token_conditions tc_t ON tc_t.token_id = ce.taker_asset_id_dec
+        ";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let r = CounterpartyEdgeResolvedRow {
+                contract_version: row.get(0)?,
+                side: row.get(1)?,
+                maker_amount_raw: row.get(2)?,
+                taker_amount_raw: row.get(3)?,
+                maker_condition: row.get(4)?,
+                taker_condition: row.get(5)?,
+            };
+            f(r)?;
+        }
+        Ok(())
+    }
+
+    /// Stream per-trade `(market_id, price_str, contracts)` from the `trades`
+    /// table, skipping rows with empty `market_id` (issue #207 Slice 1c).
+    ///
+    /// Read-only. The callback aggregates per market in caller-provided state
+    /// to avoid materialising ~269M rows.
+    pub fn for_each_trade_volume(
+        &self,
+        mut f: impl FnMut(String, String, i64) -> Result<(), BootstrapError>,
+    ) -> Result<(), BootstrapError> {
+        let sql = "SELECT market_id, price_str, contracts FROM trades WHERE market_id != ''";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            f(row.get(0)?, row.get(1)?, row.get(2)?)?;
+        }
+        Ok(())
     }
 
     /// Return the set of `condition_id`s already present in `market_events`.
