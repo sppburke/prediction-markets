@@ -47,6 +47,7 @@ pub mod etherscan;
 pub mod event;
 pub mod funder_discovery;
 pub mod live;
+pub mod order_filled;
 pub mod wallet_enumeration;
 
 pub use connector::PolygonReplayConnector;
@@ -58,4 +59,5 @@ pub use funder_discovery::{
     funder_edges_with_timestamps, topic_to_wallet, wallet_to_topic,
 };
 pub use live::{LivePolygonConnector, LivePolygonError, PolygonConnectorConfig};
+pub use order_filled::{DecodedOrderFilled, decode_order_filled};
 pub use wallet_enumeration::{EnumerationConfig, EnumerationError, PolymarketTraderEnumeration};
