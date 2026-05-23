@@ -14,6 +14,7 @@ pub mod backfill;
 pub mod cache;
 pub mod clob;
 pub mod config;
+pub mod counterparty_edges;
 pub mod coverage;
 pub mod delta_audit;
 pub mod discovery;

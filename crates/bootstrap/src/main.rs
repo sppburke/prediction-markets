@@ -43,6 +43,7 @@ async fn main() {
                 | "watchlist"
                 | "resolutions"
                 | "events"
+                | "counterparty-edges"
                 | "seed-historical"
                 | "discovery"
                 | "backfill"
@@ -341,6 +342,29 @@ async fn main() {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "events: fatal");
+                    1
+                }
+            },
+
+            "counterparty-edges" => match pe_bootstrap::counterparty_edges::run_counterparty_edges(
+                &bootstrap_config,
+                &mut cache,
+            )
+            .await
+            {
+                Ok(report) => {
+                    tracing::info!(
+                        edges_upserted = report.edges_upserted,
+                        edges_skipped = report.edges_skipped,
+                        chunks_scanned = report.chunks_scanned,
+                        from_block = report.from_block,
+                        to_block = report.to_block,
+                        "counterparty-edges: complete"
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "counterparty-edges: fatal");
                     1
                 }
             },
