@@ -44,6 +44,7 @@ async fn main() {
                 | "resolutions"
                 | "events"
                 | "counterparty-edges"
+                | "reconcile-volume"
                 | "seed-historical"
                 | "discovery"
                 | "backfill"
@@ -368,6 +369,32 @@ async fn main() {
                     1
                 }
             },
+
+            "reconcile-volume" => {
+                match pe_bootstrap::reconcile_volume::run_reconcile_volume(&cache) {
+                    Ok(report) => {
+                        tracing::info!(
+                            markets_reconciled = report.markets_reconciled,
+                            markets_only_data_api = report.markets_only_data_api,
+                            markets_only_on_chain = report.markets_only_on_chain,
+                            data_api_usd = %report.data_api_volume_usd,
+                            on_chain_usd = %report.on_chain_volume_usd,
+                            aggregate_ratio = ?report.aggregate_inflation_ratio,
+                            median_ratio = ?report.median_inflation_ratio,
+                            p25_ratio = ?report.p25_inflation_ratio,
+                            p75_ratio = ?report.p75_inflation_ratio,
+                            markets_above_1_5 = report.markets_above_threshold,
+                            on_chain_legs_unattributed = report.on_chain_legs_unattributed,
+                            "reconcile-volume: complete"
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "reconcile-volume: fatal");
+                        1
+                    }
+                }
+            }
 
             "seed-historical" => {
                 let dates = if let Some(as_of) = as_of_arg {

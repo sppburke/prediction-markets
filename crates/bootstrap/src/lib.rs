@@ -34,6 +34,7 @@ pub mod pile;
 pub mod polygon_ctf;
 pub mod polygon_ctf_delta;
 pub mod polymarket;
+pub mod reconcile_volume;
 pub mod seed_historical;
 pub mod wallet_set;
 pub mod watchlist_phase;
