@@ -132,6 +132,26 @@ async fn main() {
             std::process::exit(exit);
         }
 
+        // `reconcile-volume` is a pure reader (run_reconcile_volume takes
+        // `&WalletCache`, not `&mut`), so open the cache READ_ONLY and
+        // bypass the shared read-write open below. Lets the subcommand run
+        // alongside a long-running writer such as `counterparty-edges`
+        // without conflicting on the CacheMutationLock — SQLite WAL mode
+        // supports concurrent readers during writes. Mirrors the `coverage`
+        // dispatch above (issue #208).
+        if sub == "reconcile-volume" {
+            let exit = match pe_bootstrap::reconcile_volume::run_reconcile_volume_read_only(
+                &bootstrap_config.cache_path,
+            ) {
+                Ok(_report) => 0,
+                Err(e) => {
+                    tracing::error!(error = %e, "reconcile-volume: fatal");
+                    1
+                }
+            };
+            std::process::exit(exit);
+        }
+
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
             Err(e) => {
@@ -370,32 +390,8 @@ async fn main() {
                 }
             },
 
-            "reconcile-volume" => {
-                match pe_bootstrap::reconcile_volume::run_reconcile_volume(&cache) {
-                    Ok(report) => {
-                        tracing::info!(
-                            markets_reconciled = report.markets_reconciled,
-                            markets_only_data_api = report.markets_only_data_api,
-                            markets_only_on_chain = report.markets_only_on_chain,
-                            data_api_usd = %report.data_api_volume_usd,
-                            on_chain_usd = %report.on_chain_volume_usd,
-                            aggregate_ratio = ?report.aggregate_inflation_ratio,
-                            median_ratio = ?report.median_inflation_ratio,
-                            p25_ratio = ?report.p25_inflation_ratio,
-                            p75_ratio = ?report.p75_inflation_ratio,
-                            markets_above_1_5 = report.markets_above_threshold,
-                            on_chain_legs_unattributed = report.on_chain_legs_unattributed,
-                            "reconcile-volume: complete"
-                        );
-                        0
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "reconcile-volume: fatal");
-                        1
-                    }
-                }
-            }
-
+            // `reconcile-volume` is handled in the early read-only dispatch
+            // above (alongside `coverage`) — it never reaches this match.
             "seed-historical" => {
                 let dates = if let Some(as_of) = as_of_arg {
                     match parse_seed_as_of_env(as_of) {

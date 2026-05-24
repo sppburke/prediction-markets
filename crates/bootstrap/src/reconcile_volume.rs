@@ -46,6 +46,7 @@
 //! not run the on-chain scan yet).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
@@ -67,7 +68,12 @@ fn collateral_divisor() -> Decimal {
 const INFLATION_THRESHOLD: &str = "1.5";
 
 /// Outcome of one `run_reconcile_volume` invocation.
-#[derive(Debug, Clone, Default)]
+///
+/// `PartialEq`/`Eq` enable the read-only-vs-read-write scenario test (see
+/// `tests/scenario_reconcile_volume_read_only.rs`) to assert byte-identical
+/// reports; all fields are integer/decimal/option-thereof, no floats, so
+/// `Eq` is sound.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
     /// Markets with both Data-API trades and on-chain USDC fills (the only
     /// markets where a ratio is computable).
@@ -174,6 +180,29 @@ pub fn run_reconcile_volume(cache: &WalletCache) -> Result<ReconcileReport, Boot
     );
 
     Ok(report)
+}
+
+/// Open the cache **read-only** and run the reconciliation. Operationally
+/// useful: lets `pe-bootstrap reconcile-volume` run alongside another
+/// `pe-bootstrap` invocation that holds the writer (e.g. a long
+/// `counterparty-edges` scan) without conflicting on the
+/// `CacheMutationLock`, since SQLite WAL mode supports concurrent readers
+/// during writes.
+///
+/// Mirrors the `coverage` subcommand's read-only path
+/// ([`crate::coverage::run_coverage`], issue #208). The underlying
+/// [`run_reconcile_volume`] does not mutate the cache (`&WalletCache`, not
+/// `&mut`), so the read-only open is strictly safer than the shared
+/// read-write open in `main.rs`.
+///
+/// The database at `cache_path` must already exist and have been migrated
+/// (opened at least once via [`WalletCache::open`]); see
+/// [`WalletCache::open_read_only`] for the open-time contract.
+pub fn run_reconcile_volume_read_only(
+    cache_path: &Path,
+) -> Result<ReconcileReport, BootstrapError> {
+    let cache = WalletCache::open_read_only(cache_path)?;
+    run_reconcile_volume(&cache)
 }
 
 /// Iterate `counterparty_edges` and aggregate USDC volume per market.
