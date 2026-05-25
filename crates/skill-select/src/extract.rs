@@ -41,11 +41,18 @@ pub struct ExtractReport {
 ///
 /// Idempotent at a given cutoff (`INSERT OR REPLACE`). `extracted_at_unix` is
 /// stamped on every row. Returns counts; never partially-fails — a wallet that
-/// can't be scored is skipped, not fatal.
+/// can't be scored is skipped, not fatal. The `min_distinct_events` /
+/// `bb_alpha` / `bb_beta` knobs are the SSRN 6617059 §C event-count gate and
+/// the beta-binomial conjugate prior for the per-bet shrunk-edge feature;
+/// defaults live in [`crate::SkillConfig`].
+#[allow(clippy::too_many_arguments)] // canonical pipeline orchestrator; one site.
 pub fn run_extract(
     cache_path: &std::path::Path,
     cutoff_unix: i64,
     min_closed_trades: u32,
+    min_distinct_events: u32,
+    bb_alpha: u32,
+    bb_beta: u32,
     permutations: u32,
     seed: u64,
     extracted_at_unix: i64,
@@ -58,6 +65,7 @@ pub fn run_extract(
     // Read pass: bootstrap cache, read-only.
     let cache = WalletCache::open_read_only(cache_path)?;
     let event_map: HashMap<String, String> = cache.load_market_event_map()?;
+    let resolutions = cache.load_all_resolutions()?;
     let wallets = cache.active_tradeable_wallet_hexes()?;
     let ledger_config = LedgerConfig::default();
 
@@ -93,8 +101,16 @@ pub fn run_extract(
             continue;
         };
 
-        let Some(features) = extract_features(&ledger, cutoff_unix, &event_map, min_closed_trades)
-        else {
+        let Some(features) = extract_features(
+            &ledger,
+            cutoff_unix,
+            &event_map,
+            &resolutions,
+            min_closed_trades,
+            min_distinct_events,
+            bb_alpha,
+            bb_beta,
+        ) else {
             report.wallets_skipped += 1;
             continue;
         };
