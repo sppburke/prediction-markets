@@ -10,6 +10,7 @@ use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 
+use crate::composite::CompositeWeights;
 use crate::error::SkillSelectError;
 
 /// Train/forward cutoff default: `2026-03-31T23:59:59Z`. Derived from the date
@@ -64,6 +65,45 @@ fn default_extract_threads() -> usize {
     // tuning surface single-knob: callers either accept the platform default
     // or override via `PE_SKILL_EXTRACT_THREADS=N`.
     0
+}
+
+// Composite-ranker per-feature weight defaults (basis-points; sign = direction).
+// Mirror [`crate::composite::CompositeWeights::default`]; both must agree.
+fn default_w_sharpe_bps() -> i32 {
+    1_500
+}
+fn default_w_ev_mean_bps() -> i32 {
+    833
+}
+fn default_w_ev_tstat_bps() -> i32 {
+    833
+}
+fn default_w_bb_shrunk_edge_bps() -> i32 {
+    833
+}
+fn default_w_kelly_log_growth_bps() -> i32 {
+    833
+}
+fn default_w_brier_score_bps() -> i32 {
+    -833
+}
+fn default_w_brier_resolution_bps() -> i32 {
+    833
+}
+fn default_w_concentration_hhi_bps() -> i32 {
+    -500
+}
+fn default_w_concentration_n_eff_bps() -> i32 {
+    500
+}
+fn default_w_concentration_rpc_bps() -> i32 {
+    -500
+}
+fn default_w_first_entries_per_active_day_bps() -> i32 {
+    1_000
+}
+fn default_w_median_first_entry_to_resolution_secs() -> i32 {
+    -1_000
 }
 
 /// Skill-selection configuration. Every field has a default; `PE_SKILL_*` env
@@ -125,6 +165,58 @@ pub struct SkillConfig {
     /// `RAYON_NUM_THREADS`, else CPU count). `PE_SKILL_EXTRACT_THREADS`.
     #[serde(default = "default_extract_threads")]
     pub extract_threads: usize,
+    // ── Composite ranker per-feature weights (bps; signed) ─────────────────
+    // Flattened onto `SkillConfig` so env-override is a clean
+    // `PE_SKILL_COMPOSITE_W_<NAME>` form. Mirrors
+    // [`crate::composite::CompositeWeights`] field-for-field; the conversion
+    // helper [`Self::composite_weights`] keeps them in sync at call time.
+    #[serde(default = "default_w_sharpe_bps")]
+    pub composite_w_sharpe_bps: i32,
+    #[serde(default = "default_w_ev_mean_bps")]
+    pub composite_w_ev_mean_bps: i32,
+    #[serde(default = "default_w_ev_tstat_bps")]
+    pub composite_w_ev_tstat_bps: i32,
+    #[serde(default = "default_w_bb_shrunk_edge_bps")]
+    pub composite_w_bb_shrunk_edge_bps: i32,
+    #[serde(default = "default_w_kelly_log_growth_bps")]
+    pub composite_w_kelly_log_growth_bps: i32,
+    #[serde(default = "default_w_brier_score_bps")]
+    pub composite_w_brier_score_bps: i32,
+    #[serde(default = "default_w_brier_resolution_bps")]
+    pub composite_w_brier_resolution_bps: i32,
+    #[serde(default = "default_w_concentration_hhi_bps")]
+    pub composite_w_concentration_hhi_bps: i32,
+    #[serde(default = "default_w_concentration_n_eff_bps")]
+    pub composite_w_concentration_n_eff_bps: i32,
+    #[serde(default = "default_w_concentration_rpc_bps")]
+    pub composite_w_concentration_rpc_bps: i32,
+    #[serde(default = "default_w_first_entries_per_active_day_bps")]
+    pub composite_w_first_entries_per_active_day_bps: i32,
+    #[serde(default = "default_w_median_first_entry_to_resolution_secs")]
+    pub composite_w_median_first_entry_to_resolution_secs: i32,
+}
+
+impl SkillConfig {
+    /// Build a [`CompositeWeights`] from the flattened composite-weight
+    /// fields. Mirrors the post-flatten env shape onto the ranker's
+    /// struct-shape boundary so callers stay terse.
+    pub fn composite_weights(&self) -> CompositeWeights {
+        CompositeWeights {
+            w_sharpe_bps: self.composite_w_sharpe_bps,
+            w_ev_mean_bps: self.composite_w_ev_mean_bps,
+            w_ev_tstat_bps: self.composite_w_ev_tstat_bps,
+            w_bb_shrunk_edge_bps: self.composite_w_bb_shrunk_edge_bps,
+            w_kelly_log_growth_bps: self.composite_w_kelly_log_growth_bps,
+            w_brier_score_bps: self.composite_w_brier_score_bps,
+            w_brier_resolution_bps: self.composite_w_brier_resolution_bps,
+            w_concentration_hhi_bps: self.composite_w_concentration_hhi_bps,
+            w_concentration_n_eff_bps: self.composite_w_concentration_n_eff_bps,
+            w_concentration_rpc_bps: self.composite_w_concentration_rpc_bps,
+            w_first_entries_per_active_day_bps: self.composite_w_first_entries_per_active_day_bps,
+            w_median_first_entry_to_resolution_secs: self
+                .composite_w_median_first_entry_to_resolution_secs,
+        }
+    }
 }
 
 impl SkillConfig {
@@ -173,6 +265,17 @@ mod tests {
             assert_eq!(cfg.beta_binomial_alpha, 1);
             assert_eq!(cfg.beta_binomial_beta, 1);
             assert_eq!(cfg.extract_threads, 0);
+            // Composite weights — both flattened defaults and the assembled
+            // `CompositeWeights::default()` must agree (the two are mirrored).
+            assert_eq!(cfg.composite_w_sharpe_bps, 1_500);
+            assert_eq!(cfg.composite_w_ev_mean_bps, 833);
+            assert_eq!(cfg.composite_w_brier_score_bps, -833);
+            assert_eq!(cfg.composite_w_concentration_hhi_bps, -500);
+            assert_eq!(
+                cfg.composite_w_median_first_entry_to_resolution_secs,
+                -1_000
+            );
+            assert_eq!(cfg.composite_weights(), CompositeWeights::default());
             Ok(())
         });
     }
