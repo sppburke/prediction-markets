@@ -184,7 +184,23 @@ Needs a `market_liquidity_snapshots` table sampled at each first-entry's `block_
 4. **The 999-perm forward-negative is the strongest prior on the table** — every PR after this should include the forward-test number in the merge note so we know whether each addition moved the needle. If PR 1 doesn't move it, that's a real signal, not a bug.
 5. **Disk pressure during the counterparty-edges scan** — PR 2 is blocked until disk frees up. Do not start PR 2's wash-score backfill against the live cache while the scan is running.
 
-## 6. References
+## 6. Drift vs #205 reference
+
+Recorded after the 2026-05-25 plan-review of #205 against the live tree. These items are not bugs in the reference; they are **drift markers** between #205's specification and the current `pe-skill-select` implementation. Each names its resolution path; do not block PR 1 on them.
+
+### 6.1 Blocking drift
+
+1. **Perm count: 999 vs paper's 10,000.** `pe-skill-select::config.rs::default_permutations = 999` (file:line confirmed 2026-05-25). At 999 perms the p-value floor is `1/(999+1) = 10 bps`. The 2026-05-25 sweep over the full 65,468-wallet cohort tied **7,563 wallets at that floor** under BHq q=0.10, meaning the significance count is partly a resolution artifact rather than a discrimination result. **Resolution:** intentional speed trade-off for v1 — bumping to 10,000 makes `extract` 10× slower per wallet, which on the live cohort is hours rather than ~minutes. Production runs that need finer discrimination should set `PE_SKILL_PERMUTATIONS=10000`; canonization in `_GLOSSARY.md` waits until the longer extract budget is acceptable (or PR 3 lands and re-extract is no longer in the critical path).
+
+2. **DSR is a heuristic, not the calibrated False-Strategy Theorem.** `pe-skill-select::selection.rs:18` explicitly documents the implementation as `√(2 ln m)` Sharpe haircut — a multiple-testing penalty proxy, not Bailey & LdP's trial-Sharpe-variance-adjusted DSR formula. **No `DSR ≥ 0.95` gate is enforced anywhere in the codebase.** **Resolution:** PR 3 of this doc (`PR 3 — Replace DSR heuristic with PSR + MinTRL + true DSR`) explicitly replaces both the heuristic and adds the 0.95 gate. Until PR 3 lands, today's deflated-Sharpe values are *ordinally* correct (the ranking they produce is the right relative order under multiple testing) but the *absolute* deflated numbers and any "significant by DSR" claim are heuristic, not paper-faithful.
+
+### 6.2 Should-fix drift
+
+3. **Wash-cluster exclusion not yet in the Stage-1 cohort.** `pe-skill-select::extract.rs` does NOT filter the cohort by `wash_score`. The clustering machinery exists at `crates/operator-graph/src/clustering.rs:48` (`wash_cluster_match_threshold_pct = 60`), but no wash-exclusion wire reaches skill-select. **Resolution:** PR 2 of this doc (Sirolly Algorithm 1 + `wash_excluded` gate) — itself gated on the #207 counterparty-edges scan completion (currently disk-blocked at 87.6%; resumes when disk frees up). V1 evaluations DO NOT enforce wash exclusion; this is a known statistical-power leak in the current ranking.
+
+4. **`pe-backtest` OOM is dead-path, not patched.** #205 says "pe-backtest OOM dissolved by two-phase offline-score → load-only-top-N." T1 confirms `pe-skill-select` implements the two-phase design (wallet-at-a-time streaming, never holds 269M trades) AND `crates/backtest/src/main.rs:43 let mut all_trades = cache.all_trades();` is unchanged — the original OOM site is still in the original crate. **Resolution:** none planned within this doc — `pe-backtest`'s `all_trades()` path is now dead-path but not yet removed. Filing a tracked cleanup issue would make the dead-path explicit; until then, treat any direct `pe-backtest` run as a known OOM risk.
+
+## 7. References
 
 - #205 (this doc's parent reference issue) — full candidate set + selection methodology.
 - #209 (epic) / #206 (event grouping, closed) / #207 (counterparty edges, in flight) / #208 (coverage subcommand, closed).
