@@ -22,7 +22,7 @@ pub mod selection;
 pub mod skill_test;
 
 pub use composite::{CompositeResult, CompositeWeights, rank_by_composite};
-pub use config::SkillConfig;
+pub use config::{ForwardSource, SkillConfig};
 pub use db::{SkillCache, WalletFeatures};
 pub use error::SkillSelectError;
 pub use extract::{ExtractReport, run_extract};
