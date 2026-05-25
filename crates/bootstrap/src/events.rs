@@ -167,8 +167,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                     for token_id in parse_clob_token_ids(market.clob_token_ids.as_deref()) {
                         token_rows.push((token_id, cond.clone()));
                     }
-                    let taker_bps = fee_to_bps(market.taker_base_fee);
-                    let maker_bps = fee_to_bps(market.maker_base_fee);
+                    let (taker_bps, maker_bps) = fees_for_market(market);
                     fee_rows.push((cond, taker_bps, maker_bps, fetched_at));
                 }
             }
@@ -292,6 +291,15 @@ struct GammaEventRaw {
 }
 
 /// Serde DTO for one element of an event's `markets[]` array.
+///
+/// Fee shape (verified live 2026-05-24 via `gamma-api.polymarket.com/events`):
+/// - `feesEnabled: bool` — master gate; markets predating fee activation are `false`.
+/// - `feeSchedule: { rate: f, takerOnly: bool, ... }` — the canonical fee. `rate` is
+///   a fraction (e.g. `0.04` = 4% = 400 bps). When `takerOnly = true` the maker
+///   leg pays zero. This is the only field that matches Polymarket's user-facing
+///   fee; `takerBaseFee` / `makerBaseFee` on the market are raw contract-storage
+///   integers (always `1000` on fee-enabled markets in observed responses) and do
+///   *not* equal the basis-points fee — they are deliberately ignored here.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaEventMarketRaw {
@@ -301,22 +309,33 @@ struct GammaEventMarketRaw {
     /// ERC-1155 position-token ids (decimal uint256), e.g. `"[\"123\",\"456\"]"`.
     #[serde(default)]
     clob_token_ids: Option<String>,
-    /// Taker fee rate. Gamma may return this as a fraction (e.g. `0.02` = 2%) or
-    /// as basis points (e.g. `200`). Use `fee_to_bps` to normalise. Field name
-    /// is `takerBaseFee` in Gamma's current schema; `takerFee` accepted as alias.
+    /// Master fee gate. When `false` (or absent) both maker & taker bps are `0`
+    /// regardless of `feeSchedule` content (pre-fee-era markets).
+    #[serde(default)]
+    fees_enabled: bool,
+    /// Canonical Polymarket fee schedule. `None` when `feesEnabled = false` or the
+    /// field is absent. Drives both maker and taker bps via [`rate_and_taker_only`].
+    #[serde(default)]
+    fee_schedule: Option<GammaFeeSchedule>,
+}
+
+/// Polymarket fee schedule object (subset). Extra fields (`exponent`, `rebateRate`,
+/// vertical-specific multipliers) are ignored — only `rate` and `takerOnly` shape
+/// the bps values stored in `market_fees`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GammaFeeSchedule {
+    /// Fee as a fraction of notional, e.g. `0.04` = 4% = 400 bps. Accepts string,
+    /// float, or int via the shared decimal deserializer.
     #[serde(
         default,
-        alias = "takerFee",
         deserialize_with = "crate::gamma::deserialize_decimal_flexible"
     )]
-    taker_base_fee: Option<rust_decimal::Decimal>,
-    /// Maker fee rate. Same encoding as `taker_base_fee`.
-    #[serde(
-        default,
-        alias = "makerFee",
-        deserialize_with = "crate::gamma::deserialize_decimal_flexible"
-    )]
-    maker_base_fee: Option<rust_decimal::Decimal>,
+    rate: Option<rust_decimal::Decimal>,
+    /// When `true`, only the taker pays — maker fee is `0`. Default `false` is the
+    /// symmetric-fee fallback (charge both sides if Gamma omits the field).
+    #[serde(default)]
+    taker_only: bool,
 }
 
 /// Parse Gamma's `clobTokenIds` (a stringified JSON array of decimal token ids)
@@ -333,25 +352,39 @@ fn parse_clob_token_ids(raw: Option<&str>) -> Vec<String> {
     }
 }
 
-/// Normalise a Gamma fee field to basis points.
+/// Convert a `feeSchedule.rate` fraction to basis points.
 ///
-/// Gamma may return fees as a fraction (`0.02` = 2% = 200 bps) or as an integer
-/// bps value (`200`). Detection boundary, max clamp, and missing-fee sentinel are
-/// canonical defaults in `_GLOSSARY.md` (`market_fee_fraction_threshold`,
-/// `market_fee_max_bps`, `market_fee_missing_default_bps`).
-fn fee_to_bps(fee: Option<rust_decimal::Decimal>) -> i32 {
+/// `rate` is always a fraction of notional (e.g. `0.04` → 400 bps). Result is
+/// rounded and clamped to `[0, market_fee_max_bps]` per `_GLOSSARY.md`. `None` →
+/// `market_fee_missing_default_bps` (`0`).
+fn rate_to_bps(rate: Option<rust_decimal::Decimal>) -> i32 {
     use rust_decimal::prelude::ToPrimitive;
-    let Some(d) = fee else {
+    let Some(d) = rate else {
         return 0;
     };
-    let bps = if d <= rust_decimal::Decimal::ONE {
-        d * rust_decimal::Decimal::from(10_000)
-    } else {
-        d
-    };
-    // Round to nearest integer, clamp to [0, 10_000], then narrow to i32.
+    let bps = d * rust_decimal::Decimal::from(10_000);
     let rounded = bps.round().to_i64().unwrap_or(0);
     i32::try_from(rounded.clamp(0, 10_000)).unwrap_or(0)
+}
+
+/// Derive `(taker_bps, maker_bps)` for one market.
+///
+/// Rules (verified live 2026-05-24):
+/// - `feesEnabled = false` (or absent) ⇒ `(0, 0)` regardless of `feeSchedule`.
+/// - `feeSchedule.takerOnly = true` ⇒ maker bps is `0`; only the taker pays `rate`.
+/// - `feeSchedule.takerOnly = false` ⇒ both legs pay `rate` (symmetric fallback).
+/// - Missing `feeSchedule` on a `feesEnabled = true` market ⇒ `(0, 0)` (no schedule
+///   = no enforced fee; safe sentinel).
+fn fees_for_market(m: &GammaEventMarketRaw) -> (i32, i32) {
+    if !m.fees_enabled {
+        return (0, 0);
+    }
+    let Some(sched) = m.fee_schedule.as_ref() else {
+        return (0, 0);
+    };
+    let taker_bps = rate_to_bps(sched.rate);
+    let maker_bps = if sched.taker_only { 0 } else { taker_bps };
+    (taker_bps, maker_bps)
 }
 
 /// Parse one `/events` page (a JSON array of event objects).
@@ -447,42 +480,77 @@ mod tests {
         assert_eq!(page[0].markets[0].condition_id, None);
     }
 
-    // --- fee_to_bps / DTO tests (issue #23, PR 1) ---
+    // --- fee_schedule / DTO tests (PR 1.5: live-Gamma-shape fix) ---
 
     #[test]
-    fn fee_to_bps_fraction_form() {
-        // Gamma returns 0.02 (2%) → 200 bps.
+    fn rate_to_bps_canonical_polymarket_rate() {
+        // Live Gamma returns rate=0.04 (4%) → 400 bps.
         use rust_decimal_macros::dec;
-        assert_eq!(fee_to_bps(Some(dec!(0.02))), 200);
-        assert_eq!(fee_to_bps(Some(dec!(0.001))), 10); // 0.1% = 10 bps
+        assert_eq!(rate_to_bps(Some(dec!(0.04))), 400);
+        assert_eq!(rate_to_bps(Some(dec!(0.02))), 200);
+        assert_eq!(rate_to_bps(Some(dec!(0.001))), 10);
     }
 
     #[test]
-    fn fee_to_bps_integer_bps_form() {
-        // Gamma returns 200 (already bps, > 1.0).
-        use rust_decimal_macros::dec;
-        assert_eq!(fee_to_bps(Some(dec!(200))), 200);
-        assert_eq!(fee_to_bps(Some(dec!(0))), 0);
+    fn rate_to_bps_missing_defaults_to_zero() {
+        assert_eq!(rate_to_bps(None), 0);
     }
 
     #[test]
-    fn fee_to_bps_missing_defaults_to_zero() {
-        assert_eq!(fee_to_bps(None), 0);
-    }
-
-    #[test]
-    fn fee_dto_parses_fraction_and_alias() {
-        // takerBaseFee as fraction, makerFee (alias) as integer bps.
+    fn fees_for_market_disabled_gate_returns_zero() {
+        // Even with a populated schedule, feesEnabled=false → (0, 0).
         let json = br#"[{
             "id": 1, "markets": [{
                 "conditionId": "0xcc",
-                "takerBaseFee": 0.02,
-                "makerFee": 100
+                "feesEnabled": false,
+                "feeSchedule": {"rate": 0.04, "takerOnly": true}
             }]
         }]"#;
         let page = parse_events_page(json).unwrap();
-        let m = &page[0].markets[0];
-        assert_eq!(fee_to_bps(m.taker_base_fee), 200);
-        assert_eq!(fee_to_bps(m.maker_base_fee), 100);
+        assert_eq!(fees_for_market(&page[0].markets[0]), (0, 0));
+    }
+
+    #[test]
+    fn fees_for_market_taker_only_schedule() {
+        // Live shape: feesEnabled=true, rate=0.04, takerOnly=true → (400, 0).
+        let json = br#"[{
+            "id": 1, "markets": [{
+                "conditionId": "0xcc",
+                "takerBaseFee": 1000,
+                "makerBaseFee": 1000,
+                "feesEnabled": true,
+                "feeType": "politics_fees",
+                "feeSchedule": {"exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25}
+            }]
+        }]"#;
+        let page = parse_events_page(json).unwrap();
+        assert_eq!(fees_for_market(&page[0].markets[0]), (400, 0));
+    }
+
+    #[test]
+    fn fees_for_market_symmetric_when_taker_only_absent() {
+        // feesEnabled=true, takerOnly default-false → both legs pay rate.
+        let json = br#"[{
+            "id": 1, "markets": [{
+                "conditionId": "0xcc",
+                "feesEnabled": true,
+                "feeSchedule": {"rate": 0.02}
+            }]
+        }]"#;
+        let page = parse_events_page(json).unwrap();
+        assert_eq!(fees_for_market(&page[0].markets[0]), (200, 200));
+    }
+
+    #[test]
+    fn fees_for_market_enabled_but_no_schedule_is_zero() {
+        // Defensive: feesEnabled=true but no schedule object → (0, 0) sentinel.
+        let json = br#"[{
+            "id": 1, "markets": [{
+                "conditionId": "0xcc",
+                "feesEnabled": true
+            }]
+        }]"#;
+        let page = parse_events_page(json).unwrap();
+        assert_eq!(fees_for_market(&page[0].markets[0]), (0, 0));
     }
 }
