@@ -7,18 +7,26 @@
 //! ([`crate::features`]) and the sign-randomization skill test
 //! ([`crate::skill_test`]), then persist the assembled [`WalletFeatures`] row.
 //!
-//! v1 is **sequential**; parallelising the per-wallet loop with rayon (one
-//! read-only connection per worker) is a deferred performance follow-up. Reads
-//! (bootstrap `WalletCache`, read-only) and the single batched write (`SkillCache`,
-//! read-write) do not interleave.
+//! The per-wallet loop runs **in parallel** via rayon — each worker opens its
+//! own read-only `WalletCache` handle (SQLite needs per-thread connections) and
+//! the shared inputs (`event_map`, `resolutions`) are `Arc`-shared. Worker count
+//! is `extract_threads` (`0` = rayon's default — honours `RAYON_NUM_THREADS`,
+//! else CPU count). The read pass (bootstrap `WalletCache`) and the single
+//! batched write (`SkillCache`, read-write) do not interleave: every wallet has
+//! been scored before the single write transaction opens, so concurrent SQLite
+//! writers are not in scope.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pe_bootstrap::cache::WalletCache;
+use pe_bootstrap::cache::{ResolutionIndex, WalletCache};
 use pe_core_types::SourceTimestamp;
 use pe_trader_index::{LedgerConfig, TradeSnapshot, build_trader_ledgers};
+use rayon::prelude::*;
 use time::OffsetDateTime;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::db::{SkillCache, WalletFeatures};
 use crate::error::SkillSelectError;
@@ -44,7 +52,16 @@ pub struct ExtractReport {
 /// can't be scored is skipped, not fatal. The `min_distinct_events` /
 /// `bb_alpha` / `bb_beta` knobs are the SSRN 6617059 §C event-count gate and
 /// the beta-binomial conjugate prior for the per-bet shrunk-edge feature;
-/// defaults live in [`crate::SkillConfig`].
+/// defaults live in [`crate::SkillConfig`]. `extract_threads = 0` accepts
+/// rayon's default parallelism.
+///
+/// # Determinism note
+/// Per-wallet results are independent of execution order — every wallet's
+/// scoring is a pure function of its trades, the shared `event_map`, and the
+/// shared `resolutions` map. The sign-randomization test uses the same fixed
+/// `seed` per wallet regardless of which worker runs it. Set membership in the
+/// resulting `wallet_features` rows is therefore bit-identical across thread
+/// counts; only the on-disk row insertion order may differ.
 #[allow(clippy::too_many_arguments)] // canonical pipeline orchestrator; one site.
 pub fn run_extract(
     cache_path: &std::path::Path,
@@ -56,77 +73,85 @@ pub fn run_extract(
     permutations: u32,
     seed: u64,
     extracted_at_unix: i64,
+    extract_threads: usize,
 ) -> Result<ExtractReport, SkillSelectError> {
     let snapshot_at = SourceTimestamp(
         OffsetDateTime::from_unix_timestamp(cutoff_unix)
             .map_err(|e| SkillSelectError::Decode(format!("cutoff_unix {cutoff_unix}: {e}")))?,
     );
 
-    // Read pass: bootstrap cache, read-only.
-    let cache = WalletCache::open_read_only(cache_path)?;
-    let event_map: HashMap<String, String> = cache.load_market_event_map()?;
-    let resolutions = cache.load_all_resolutions()?;
-    let wallets = cache.active_tradeable_wallet_hexes()?;
-    let ledger_config = LedgerConfig::default();
-
-    let mut report = ExtractReport {
-        wallets_scanned: wallets.len(),
-        ..ExtractReport::default()
+    // Read-pass shared inputs: load once on the main thread, share to workers.
+    let (event_map, resolutions, wallets) = {
+        let cache = WalletCache::open_read_only(cache_path)?;
+        let event_map: HashMap<String, String> = cache.load_market_event_map()?;
+        let resolutions = cache.load_all_resolutions()?;
+        let wallets = cache.active_tradeable_wallet_hexes()?;
+        (event_map, resolutions, wallets)
     };
-    let mut batch: Vec<WalletFeatures> = Vec::new();
+    let event_map = Arc::new(event_map);
+    let resolutions = Arc::new(resolutions);
 
-    for hex in &wallets {
-        // All trades for this wallet; keep the train window (≤ cutoff).
-        let train: Vec<_> = cache
-            .trades_for(hex)
-            .into_iter()
-            .filter(|t| t.timestamp.0.unix_timestamp() <= cutoff_unix)
-            .collect();
-        if train.is_empty() {
-            report.wallets_skipped += 1;
-            continue;
-        }
+    // Workers count: 0 = rayon's default (CPU count / RAYON_NUM_THREADS).
+    // The default thread pool is global and lazy-initialised; a custom pool
+    // exists only when the caller wants a specific worker count.
+    let pool: Option<rayon::ThreadPool> = if extract_threads > 0 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(extract_threads)
+                .build()
+                .map_err(|e| SkillSelectError::Decode(format!("rayon pool: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let effective_threads = pool
+        .as_ref()
+        .map(rayon::ThreadPool::current_num_threads)
+        .unwrap_or_else(rayon::current_num_threads);
 
-        let snapshot = TradeSnapshot {
-            trades: train,
-            snapshot_at: snapshot_at.clone(),
-            audit_window_days: 0,
-        };
-        // One wallet in → at most one ledger out.
-        let Some(ledger) = build_trader_ledgers(&snapshot, &[], &ledger_config)
-            .into_iter()
-            .next()
-        else {
-            report.wallets_skipped += 1;
-            continue;
-        };
+    let wallets_scanned = wallets.len();
+    let wallets_skipped = AtomicUsize::new(0);
 
-        let Some(features) = extract_features(
-            &ledger,
-            cutoff_unix,
-            &event_map,
-            &resolutions,
-            min_closed_trades,
-            min_distinct_events,
-            bb_alpha,
-            bb_beta,
-        ) else {
-            report.wallets_skipped += 1;
-            continue;
-        };
+    // Drive the per-wallet work either on the custom pool (if any) or the
+    // global pool. `install` runs the closure inside the pool; outside callers
+    // see the same return type.
+    let per_wallet = || {
+        wallets
+            .par_iter()
+            .filter_map(|hex| {
+                process_wallet(
+                    hex,
+                    cache_path,
+                    cutoff_unix,
+                    min_closed_trades,
+                    min_distinct_events,
+                    bb_alpha,
+                    bb_beta,
+                    permutations,
+                    seed,
+                    extracted_at_unix,
+                    &snapshot_at,
+                    &event_map,
+                    &resolutions,
+                    &wallets_skipped,
+                )
+            })
+            .collect::<Vec<WalletFeatures>>()
+    };
+    let batch: Vec<WalletFeatures> = if let Some(p) = pool.as_ref() {
+        p.install(per_wallet)
+    } else {
+        per_wallet()
+    };
 
-        let skill = sign_randomization_test(&ledger.closed_trades, &event_map, permutations, seed);
-        batch.push(WalletFeatures {
-            features,
-            extracted_at_unix,
-            skill_pnl_usd: skill.observed_pnl,
-            skill_pvalue_bps: skill.pvalue_bps,
-            skill_permutations: skill.permutations,
-        });
-    }
-    report.wallets_written = batch.len();
+    let report = ExtractReport {
+        wallets_scanned,
+        wallets_written: batch.len(),
+        wallets_skipped: wallets_skipped.load(Ordering::Relaxed),
+    };
 
-    // Write pass: skill cache, read-write (single transaction).
+    // Write pass: skill cache, read-write (single transaction). The parallel
+    // section ends before this point — only the main thread writes.
     let mut skill_cache = SkillCache::open(cache_path)?;
     skill_cache.upsert_features_batch(&batch)?;
 
@@ -135,7 +160,87 @@ pub fn run_extract(
         wallets_written = report.wallets_written,
         wallets_skipped = report.wallets_skipped,
         cutoff_unix,
+        extract_threads = effective_threads,
         "skill-select extract: complete"
     );
     Ok(report)
+}
+
+/// Score one wallet. Opens its own read-only `WalletCache` handle so rayon
+/// workers each get a private SQLite connection; this is cheap on a file DB
+/// (~ms) and side-steps SQLite's "one connection per thread" rule. A wallet
+/// that fails to open the cache is logged-and-skipped rather than aborting the
+/// entire extract (matches the "never partially-fails" contract).
+#[allow(clippy::too_many_arguments)] // matches `run_extract` orchestrator surface.
+fn process_wallet(
+    hex: &str,
+    cache_path: &Path,
+    cutoff_unix: i64,
+    min_closed_trades: u32,
+    min_distinct_events: u32,
+    bb_alpha: u32,
+    bb_beta: u32,
+    permutations: u32,
+    seed: u64,
+    extracted_at_unix: i64,
+    snapshot_at: &SourceTimestamp,
+    event_map: &HashMap<String, String>,
+    resolutions: &ResolutionIndex,
+    wallets_skipped: &AtomicUsize,
+) -> Option<WalletFeatures> {
+    let cache = match WalletCache::open_read_only(cache_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, wallet = %hex, "skill-select extract: read-only open failed; skipping");
+            wallets_skipped.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+
+    let train: Vec<_> = cache
+        .trades_for(hex)
+        .into_iter()
+        .filter(|t| t.timestamp.0.unix_timestamp() <= cutoff_unix)
+        .collect();
+    if train.is_empty() {
+        wallets_skipped.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
+    let snapshot = TradeSnapshot {
+        trades: train,
+        snapshot_at: snapshot_at.clone(),
+        audit_window_days: 0,
+    };
+    let ledger_config = LedgerConfig::default();
+    let Some(ledger) = build_trader_ledgers(&snapshot, &[], &ledger_config)
+        .into_iter()
+        .next()
+    else {
+        wallets_skipped.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+
+    let Some(features) = extract_features(
+        &ledger,
+        cutoff_unix,
+        event_map,
+        resolutions,
+        min_closed_trades,
+        min_distinct_events,
+        bb_alpha,
+        bb_beta,
+    ) else {
+        wallets_skipped.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+
+    let skill = sign_randomization_test(&ledger.closed_trades, event_map, permutations, seed);
+    Some(WalletFeatures {
+        features,
+        extracted_at_unix,
+        skill_pnl_usd: skill.observed_pnl,
+        skill_pvalue_bps: skill.pvalue_bps,
+        skill_permutations: skill.permutations,
+    })
 }

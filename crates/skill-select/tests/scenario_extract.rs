@@ -125,7 +125,8 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
 
     // min_distinct_events=0 keeps the existing tiny-fixture scenario in scope;
     // the production default 10 is exercised by the unit tests in features.rs.
-    let report = run_extract(&path, CUTOFF, 1, 0, 1, 1, 99, 42, 1_700_000_000).unwrap();
+    // extract_threads=0 → rayon's default pool (whatever the test runner has).
+    let report = run_extract(&path, CUTOFF, 1, 0, 1, 1, 99, 42, 1_700_000_000, 0).unwrap();
 
     let rows = SkillCache::open_read_only(&path)
         .unwrap()
@@ -171,5 +172,93 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
     println!(
         "PASS: scenario_extract_writes_rows_for_eligible_active_wallets — scanned={} written={} skipped={}",
         report.wallets_scanned, report.wallets_written, report.wallets_skipped
+    );
+}
+
+/// Scenario: rayon parallelisation must not change extract output.
+///
+/// PASS: running `run_extract` with `extract_threads=1` and `extract_threads=4`
+///       on the same seeded cache yields identical set membership and
+///       byte-identical per-wallet feature rows (sort by wallet_hex before
+///       comparing — insertion order is allowed to differ).
+/// FAIL: any field on any row differs across thread counts, the report counts
+///       disagree, or either run errors.
+#[test]
+fn scenario_extract_parallel_matches_sequential() {
+    let dir_seq = TempDir::new().unwrap();
+    let dir_par = TempDir::new().unwrap();
+    let path_seq = dir_seq.path().join("wallet_cache.db");
+    let path_par = dir_par.path().join("wallet_cache.db");
+
+    // Seed two identical caches: 3 active eligible wallets across 4 events,
+    // each with a resolved buy→sell pair → 3 closed trades, all winners.
+    for path in [&path_seq, &path_par] {
+        let mut cache = WalletCache::open(path).unwrap();
+        for (idx, market) in ["0xma", "0xmb", "0xmc", "0xmd"].iter().enumerate() {
+            cache
+                .upsert_market_events(market, &format!("evt{idx}"), Some("slug"), 100)
+                .unwrap();
+            cache
+                .insert_resolution(market, Some(0), 5_000, 5_000)
+                .unwrap();
+        }
+        for (widx, hex) in [
+            "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+            "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+            "0xc3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        ]
+        .iter()
+        .enumerate()
+        {
+            activate(&mut cache, hex);
+            let mut trades = Vec::new();
+            for (midx, market) in ["0xma", "0xmb", "0xmc"].iter().enumerate() {
+                let ts = 1_000 + (widx as i64 * 100) + (midx as i64);
+                trades.push(raw(
+                    hex,
+                    market,
+                    Side::Buy,
+                    dec!(0.40),
+                    ts,
+                    &format!("0xb{widx}{midx}"),
+                ));
+                trades.push(raw(
+                    hex,
+                    market,
+                    Side::Sell,
+                    dec!(0.80),
+                    ts + 50,
+                    &format!("0xs{widx}{midx}"),
+                ));
+            }
+            cache.insert_new(hex, trades).unwrap();
+        }
+    }
+
+    let cutoff = 10_000;
+    let report_seq = run_extract(&path_seq, cutoff, 1, 0, 1, 1, 99, 42, 1_700_000_000, 1).unwrap();
+    let report_par = run_extract(&path_par, cutoff, 1, 0, 1, 1, 99, 42, 1_700_000_000, 4).unwrap();
+    assert_eq!(
+        report_seq, report_par,
+        "extract report differs across thread counts"
+    );
+
+    let load_sorted = |path: &std::path::Path| -> Vec<pe_skill_select::WalletFeatures> {
+        let mut rows = SkillCache::open_read_only(path)
+            .unwrap()
+            .load_features_for_cutoff(cutoff)
+            .unwrap();
+        rows.sort_by(|a, b| a.features.wallet_hex.cmp(&b.features.wallet_hex));
+        rows
+    };
+    let seq_rows = load_sorted(&path_seq);
+    let par_rows = load_sorted(&path_par);
+    assert_eq!(
+        seq_rows, par_rows,
+        "PASS criterion: per-wallet feature rows byte-identical regardless of extract_threads"
+    );
+    println!(
+        "PASS: scenario_extract_parallel_matches_sequential — {} rows, threads {{1, 4}} agree",
+        seq_rows.len()
     );
 }

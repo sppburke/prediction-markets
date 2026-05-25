@@ -146,7 +146,7 @@ No new tables, no new external API calls, no fee-data dependency, no #207 depend
 - PSR / MinTRL / true DSR replacement (PR 3).
 - Operator-level pooling (PR 3).
 - Liquidity / depth executability features (PR 5).
-- Rayon parallelism for `extract` (orthogonal performance task).
+- ~~Rayon parallelism for `extract`~~ (landed separately — see `extract.rs` module docs and `skill_extract_threads` in `_GLOSSARY.md`).
 
 ## 4. Later PRs — outlines only
 
