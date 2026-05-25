@@ -5,10 +5,12 @@
 //! deterministic skill-test seed. Writes to a `TempDir`.
 //!
 //! PASS: after `run_extract`, the active wallet with ≥1 reconstructable closed
-//!       trade has a `wallet_features` row (carrying its features + skill p-value);
-//!       the active wallet with no closed trade and the inactive wallet do not.
+//!       trade has a `wallet_features` row (carrying its features + skill p-value
+//!       + every PR-1 candidate-features column, populated from a seeded
+//!       resolution); the active wallet with no closed trade and the inactive
+//!       wallet do not.
 //! FAIL: the eligible wallet is missing, an ineligible/inactive wallet appears,
-//!       or the report counts disagree.
+//!       any PR-1 column is silently unpopulated, or the report counts disagree.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -66,6 +68,17 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
         cache
             .upsert_market_events("0xm1", "evtA", Some("slug"), 100)
             .unwrap();
+        // Seed a resolution for 0xm1 so the eligible wallet's per-bet quality
+        // (EV / Brier / Kelly) actually populates rather than defaulting to 0.
+        // The bought outcome is 0 (see raw()); winning_outcome_id=0 → o=1, win.
+        cache
+            .insert_resolution(
+                "0xm1",
+                Some(0), // winning outcome id
+                3_000,   // resolved after the sell at 2000
+                3_000,   // fetched_at
+            )
+            .unwrap();
 
         // Eligible: active, with a matched buy→sell → one closed trade (≤ cutoff).
         activate(&mut cache, W_ELIGIBLE);
@@ -110,7 +123,9 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
             .unwrap();
     } // drop the read-write cache before the read-only extract pass.
 
-    let report = run_extract(&path, CUTOFF, 1, 99, 42, 1_700_000_000).unwrap();
+    // min_distinct_events=0 keeps the existing tiny-fixture scenario in scope;
+    // the production default 10 is exercised by the unit tests in features.rs.
+    let report = run_extract(&path, CUTOFF, 1, 0, 1, 1, 99, 42, 1_700_000_000).unwrap();
 
     let rows = SkillCache::open_read_only(&path)
         .unwrap()
@@ -139,6 +154,20 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
     assert_eq!(r.features.closed_trades, 1);
     assert_eq!(r.features.win_rate_bps, 10_000); // the single closed trade won
     assert_eq!(r.skill_permutations, 99);
+    // PR-1 candidate features populate from the resolved trade:
+    //   bought outcome 0 = winner → o=1, c=0.50 → EV = 0.50 → 5000 bps.
+    //   Brier = (0.50 − 1)² = 0.25 → 2500 bps.
+    //   Single market with positive PnL → HHI = 1.0 → 10000 bps, N_eff = 1 → 10000 bps,
+    //   RPC = 1·1.0 = 1.0 → 10000 bps.
+    //   1 distinct market / 1 trading day → 1.0 → 10000 bps.
+    //   Resolution at 3000 minus first-entry at 1000 → median delta = 2000 secs.
+    assert_eq!(r.features.ev_mean_bps, 5_000);
+    assert_eq!(r.features.brier_score_bps, 2_500);
+    assert_eq!(r.features.concentration_hhi_bps, 10_000);
+    assert_eq!(r.features.concentration_n_eff_bps, 10_000);
+    assert_eq!(r.features.concentration_rpc_bps, 10_000);
+    assert_eq!(r.features.first_entries_per_active_day_bps, 10_000);
+    assert_eq!(r.features.median_first_entry_to_resolution_secs, 2_000);
     println!(
         "PASS: scenario_extract_writes_rows_for_eligible_active_wallets — scanned={} written={} skipped={}",
         report.wallets_scanned, report.wallets_written, report.wallets_skipped

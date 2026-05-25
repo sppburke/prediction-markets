@@ -47,6 +47,17 @@ fn default_forward_min_bucket_trades() -> u32 {
 fn default_forward_price_bucket_width_bps() -> u32 {
     1_000
 }
+fn default_min_distinct_events() -> u32 {
+    // SSRN 6617059 §C — skilled cohort has ≥10 distinct events traded.
+    10
+}
+fn default_beta_binomial_alpha() -> u32 {
+    // Laplace prior (α=β=1): mildest non-degenerate shrinkage on edge.
+    1
+}
+fn default_beta_binomial_beta() -> u32 {
+    1
+}
 
 /// Skill-selection configuration. Every field has a default; `PE_SKILL_*` env
 /// vars (and an optional TOML file) override.
@@ -89,6 +100,19 @@ pub struct SkillConfig {
     /// Entry-price bucket width in basis points (1000 = 0.10). `PE_SKILL_FORWARD_PRICE_BUCKET_WIDTH_BPS`.
     #[serde(default = "default_forward_price_bucket_width_bps")]
     pub forward_price_bucket_width_bps: u32,
+    /// Minimum distinct events a wallet must have traded for extraction (SSRN
+    /// 6617059 §C threshold). Below this `extract_features` returns `None` and
+    /// the wallet is skipped. `PE_SKILL_MIN_DISTINCT_EVENTS`.
+    #[serde(default = "default_min_distinct_events")]
+    pub min_distinct_events: u32,
+    /// Beta-binomial conjugate-prior `α` for shrunk-edge feature. Default 1
+    /// (Laplace). `PE_SKILL_BETA_BINOMIAL_ALPHA`.
+    #[serde(default = "default_beta_binomial_alpha")]
+    pub beta_binomial_alpha: u32,
+    /// Beta-binomial conjugate-prior `β` for shrunk-edge feature. Default 1
+    /// (Laplace). `PE_SKILL_BETA_BINOMIAL_BETA`.
+    #[serde(default = "default_beta_binomial_beta")]
+    pub beta_binomial_beta: u32,
 }
 
 impl SkillConfig {
@@ -133,6 +157,9 @@ mod tests {
             assert_eq!(cfg.min_trading_days, 20);
             assert_eq!(cfg.rng_seed, 42);
             assert_eq!(cfg.cutoff_unix, 1_775_001_599);
+            assert_eq!(cfg.min_distinct_events, 10);
+            assert_eq!(cfg.beta_binomial_alpha, 1);
+            assert_eq!(cfg.beta_binomial_beta, 1);
             Ok(())
         });
     }
