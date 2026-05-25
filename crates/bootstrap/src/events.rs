@@ -67,6 +67,8 @@ pub struct EventsReport {
     pub total_traded_markets: usize,
     /// Traded markets with no Gamma event, self-mapped as singleton events.
     pub orphan_self_mapped: usize,
+    /// `market_fees` rows upserted from Gamma `takerBaseFee`/`makerBaseFee` (issue #23).
+    pub fees_upserted: usize,
 }
 
 /// Sweeps Polymarket Gamma `/events` to populate the `market_events` map.
@@ -104,6 +106,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
         let mut events_seen = 0usize;
         let mut conditions_mapped = 0usize;
         let mut tokens_mapped = 0usize;
+        let mut fees_upserted = 0usize;
 
         loop {
             let url = format!(
@@ -137,6 +140,8 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
             // `(token_id, condition_id)` rows for this page's markets, flushed in
             // one transaction below (issue #207). A market carries 0..n tokens.
             let mut token_rows: Vec<(String, String)> = Vec::new();
+            // `(condition_id, taker_bps, maker_bps, _)` rows for market_fees (issue #23).
+            let mut fee_rows: Vec<(String, i32, i32, i64)> = Vec::new();
             for event in &page {
                 events_seen += 1;
                 // Grouping key: prefer the numeric event id, fall back to slug.
@@ -162,17 +167,26 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                     for token_id in parse_clob_token_ids(market.clob_token_ids.as_deref()) {
                         token_rows.push((token_id, cond.clone()));
                     }
+                    let taker_bps = fee_to_bps(market.taker_base_fee);
+                    let maker_bps = fee_to_bps(market.maker_base_fee);
+                    fee_rows.push((cond, taker_bps, maker_bps, fetched_at));
                 }
             }
             tokens_mapped += token_rows.len();
             cache.upsert_token_conditions_batch(&token_rows, fetched_at)?;
+            fees_upserted += fee_rows.len();
+            cache.upsert_market_fees_batch(&fee_rows, fetched_at)?;
 
             offset += EVENTS_PAGE_LIMIT;
             cache.set_source_cursor(EVENTS_CURSOR_KEY, &offset.to_string())?;
             if events_seen.is_multiple_of(5_000) {
                 info!(
                     events_seen,
-                    conditions_mapped, tokens_mapped, offset, "events: sweep progress"
+                    conditions_mapped,
+                    tokens_mapped,
+                    fees_upserted,
+                    offset,
+                    "events: sweep progress"
                 );
             }
         }
@@ -200,6 +214,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
             tokens_mapped,
             total_traded_markets,
             orphan_self_mapped,
+            fees_upserted,
         };
 
         // Coverage gate (AC1/AC3): observable counts + warn/fail on orphan rate.
@@ -208,6 +223,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
             events_seen = report.events_seen,
             conditions_mapped = report.conditions_mapped,
             tokens_mapped = report.tokens_mapped,
+            fees_upserted = report.fees_upserted,
             total_traded_markets = report.total_traded_markets,
             orphan_self_mapped = report.orphan_self_mapped,
             "events: sweep complete"
@@ -285,6 +301,22 @@ struct GammaEventMarketRaw {
     /// ERC-1155 position-token ids (decimal uint256), e.g. `"[\"123\",\"456\"]"`.
     #[serde(default)]
     clob_token_ids: Option<String>,
+    /// Taker fee rate. Gamma may return this as a fraction (e.g. `0.02` = 2%) or
+    /// as basis points (e.g. `200`). Use `fee_to_bps` to normalise. Field name
+    /// is `takerBaseFee` in Gamma's current schema; `takerFee` accepted as alias.
+    #[serde(
+        default,
+        alias = "takerFee",
+        deserialize_with = "crate::gamma::deserialize_decimal_flexible"
+    )]
+    taker_base_fee: Option<rust_decimal::Decimal>,
+    /// Maker fee rate. Same encoding as `taker_base_fee`.
+    #[serde(
+        default,
+        alias = "makerFee",
+        deserialize_with = "crate::gamma::deserialize_decimal_flexible"
+    )]
+    maker_base_fee: Option<rust_decimal::Decimal>,
 }
 
 /// Parse Gamma's `clobTokenIds` (a stringified JSON array of decimal token ids)
@@ -299,6 +331,27 @@ fn parse_clob_token_ids(raw: Option<&str>) -> Vec<String> {
         Ok(ids) => ids.into_iter().filter(|t| !t.is_empty()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Normalise a Gamma fee field to basis points.
+///
+/// Gamma may return fees as a fraction (`0.02` = 2% = 200 bps) or as an integer
+/// bps value (`200`). Detection boundary, max clamp, and missing-fee sentinel are
+/// canonical defaults in `_GLOSSARY.md` (`market_fee_fraction_threshold`,
+/// `market_fee_max_bps`, `market_fee_missing_default_bps`).
+fn fee_to_bps(fee: Option<rust_decimal::Decimal>) -> i32 {
+    use rust_decimal::prelude::ToPrimitive;
+    let Some(d) = fee else {
+        return 0;
+    };
+    let bps = if d <= rust_decimal::Decimal::ONE {
+        d * rust_decimal::Decimal::from(10_000)
+    } else {
+        d
+    };
+    // Round to nearest integer, clamp to [0, 10_000], then narrow to i32.
+    let rounded = bps.round().to_i64().unwrap_or(0);
+    i32::try_from(rounded.clamp(0, 10_000)).unwrap_or(0)
 }
 
 /// Parse one `/events` page (a JSON array of event objects).
@@ -392,5 +445,44 @@ mod tests {
         let page = parse_events_page(json).unwrap();
         assert_eq!(page[0].id, None);
         assert_eq!(page[0].markets[0].condition_id, None);
+    }
+
+    // --- fee_to_bps / DTO tests (issue #23, PR 1) ---
+
+    #[test]
+    fn fee_to_bps_fraction_form() {
+        // Gamma returns 0.02 (2%) → 200 bps.
+        use rust_decimal_macros::dec;
+        assert_eq!(fee_to_bps(Some(dec!(0.02))), 200);
+        assert_eq!(fee_to_bps(Some(dec!(0.001))), 10); // 0.1% = 10 bps
+    }
+
+    #[test]
+    fn fee_to_bps_integer_bps_form() {
+        // Gamma returns 200 (already bps, > 1.0).
+        use rust_decimal_macros::dec;
+        assert_eq!(fee_to_bps(Some(dec!(200))), 200);
+        assert_eq!(fee_to_bps(Some(dec!(0))), 0);
+    }
+
+    #[test]
+    fn fee_to_bps_missing_defaults_to_zero() {
+        assert_eq!(fee_to_bps(None), 0);
+    }
+
+    #[test]
+    fn fee_dto_parses_fraction_and_alias() {
+        // takerBaseFee as fraction, makerFee (alias) as integer bps.
+        let json = br#"[{
+            "id": 1, "markets": [{
+                "conditionId": "0xcc",
+                "takerBaseFee": 0.02,
+                "makerFee": 100
+            }]
+        }]"#;
+        let page = parse_events_page(json).unwrap();
+        let m = &page[0].markets[0];
+        assert_eq!(fee_to_bps(m.taker_base_fee), 200);
+        assert_eq!(fee_to_bps(m.maker_base_fee), 100);
     }
 }
