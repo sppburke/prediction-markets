@@ -127,7 +127,7 @@ fn scenario_composite_picks_per_bet_quality_over_raw_sharpe() {
     // min_distinct_events=10), 99 perms keeps the test fast, 1 thread for
     // determinism in the scenario (the cohort is 2 wallets — parallelism is
     // moot, sequential is the cleaner control here).
-    let report = run_extract(&path, CUTOFF, 20, 10, 1, 1, 99, 42, 1_700_000_000, 1).unwrap();
+    let report = run_extract(&path, CUTOFF, 20, 10, 1, 1, 99, 42, 1_700_000_000, 1, false).unwrap();
     assert_eq!(
         report.wallets_written, 2,
         "both wallets must clear extraction gates"

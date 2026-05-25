@@ -201,6 +201,29 @@ impl SkillCache {
         Ok(rows.len())
     }
 
+    /// Delete every `wallet_features` row at the given cutoff. Returns the row
+    /// count actually removed. Used by the extract pipeline's `--clean` path
+    /// (issue #236) so a re-extract on a tightened cohort gate (e.g. the
+    /// `min_distinct_events ≥ 10` gate added in PR #234) cannot leave behind
+    /// "ghost" rows from a prior run that the new extract chose not to write.
+    ///
+    /// # Precondition
+    /// Caller must have opened the cache via [`Self::open`] (read-write); the
+    /// read-only opener cannot DML. Runs in its own write transaction —
+    /// the brief "no rows" window between this call and the next
+    /// [`Self::upsert_features_batch`] is intentional, so the multi-minute
+    /// extract write-pass does not have to hold a write lock the whole time.
+    pub fn delete_features_for_cutoff(
+        &mut self,
+        cutoff_unix: i64,
+    ) -> Result<usize, SkillSelectError> {
+        let n = self.conn.execute(
+            "DELETE FROM wallet_features WHERE cutoff_unix = ?1",
+            params![cutoff_unix],
+        )?;
+        Ok(n)
+    }
+
     /// Load all feature rows for a given cutoff, ordered by `wallet_hex`.
     pub fn load_features_for_cutoff(
         &self,
@@ -544,5 +567,44 @@ mod tests {
         assert_eq!(late.len(), 1);
         assert_eq!(early[0].features.total_pnl_usd, dec!(1.0));
         assert_eq!(late[0].features.total_pnl_usd, dec!(2.0));
+    }
+
+    #[test]
+    fn delete_features_for_cutoff_scopes_to_one_cutoff() {
+        // Issue #236: delete must remove only the targeted cutoff's rows;
+        // other cutoffs survive untouched. Returns the deleted-row count.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        let mut cache = SkillCache::open(&path).unwrap();
+
+        cache
+            .upsert_features_batch(&[
+                sample("0xaaaa", 1_700_000_000, dec!(1.0)),
+                sample("0xbbbb", 1_700_000_000, dec!(2.0)),
+                sample("0xcccc", 1_743_465_599, dec!(3.0)),
+            ])
+            .unwrap();
+
+        let deleted = cache.delete_features_for_cutoff(1_700_000_000).unwrap();
+        assert_eq!(deleted, 2, "two rows at the target cutoff must be removed");
+
+        let early = cache.load_features_for_cutoff(1_700_000_000).unwrap();
+        let other = cache.load_features_for_cutoff(1_743_465_599).unwrap();
+        assert!(
+            early.is_empty(),
+            "targeted cutoff must be empty post-delete"
+        );
+        assert_eq!(other.len(), 1, "other-cutoff rows must survive");
+        assert_eq!(other[0].features.wallet_hex, "0xcccc");
+    }
+
+    #[test]
+    fn delete_features_for_cutoff_is_zero_on_empty_target() {
+        // A clean run before the first extract must not error — it returns 0.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        let mut cache = SkillCache::open(&path).unwrap();
+        let deleted = cache.delete_features_for_cutoff(1_775_001_599).unwrap();
+        assert_eq!(deleted, 0);
     }
 }

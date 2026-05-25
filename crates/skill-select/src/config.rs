@@ -105,6 +105,16 @@ fn default_w_first_entries_per_active_day_bps() -> i32 {
 fn default_w_median_first_entry_to_resolution_secs() -> i32 {
     -1_000
 }
+fn default_extract_clean_prior() -> bool {
+    // Opt-in (issue #236). The default is "additive" — `INSERT OR REPLACE`
+    // rewrites rows for wallets that pass the new extract's gates but leaves
+    // rows for wallets the new extract chose not to write (the "ghost row"
+    // problem after the PR #234 `min_distinct_events ≥ 10` gate ejected
+    // 8,943 wallets). Setting this to `true` via `PE_SKILL_EXTRACT_CLEAN_PRIOR=1`
+    // deletes every row at `cutoff_unix` before the extract begins, so the
+    // post-run table reflects only the new run's eligibility surface.
+    false
+}
 
 /// Skill-selection configuration. Every field has a default; `PE_SKILL_*` env
 /// vars (and an optional TOML file) override.
@@ -194,6 +204,13 @@ pub struct SkillConfig {
     pub composite_w_first_entries_per_active_day_bps: i32,
     #[serde(default = "default_w_median_first_entry_to_resolution_secs")]
     pub composite_w_median_first_entry_to_resolution_secs: i32,
+    /// Delete every `wallet_features` row at `cutoff_unix` before the extract
+    /// begins. Opt-in (default `false`). Avoids the "ghost row" problem
+    /// (issue #236) where a re-extract under a tightened cohort gate leaves
+    /// behind rows from the prior run that the new run chose not to write.
+    /// `PE_SKILL_EXTRACT_CLEAN_PRIOR`.
+    #[serde(default = "default_extract_clean_prior")]
+    pub extract_clean_prior: bool,
 }
 
 impl SkillConfig {
@@ -276,6 +293,7 @@ mod tests {
                 -1_000
             );
             assert_eq!(cfg.composite_weights(), CompositeWeights::default());
+            assert!(!cfg.extract_clean_prior);
             Ok(())
         });
     }
