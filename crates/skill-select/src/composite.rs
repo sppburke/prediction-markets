@@ -48,7 +48,8 @@ use crate::db::WalletFeatures;
 ///
 /// Default weights follow docs/24- §3.1 group structure ("per-bet quality
 /// dominant; equal-weight within families"). Override individually via
-/// `PE_SKILL_COMPOSITE_WEIGHT_*` env vars on [`crate::SkillConfig`].
+/// `PE_SKILL_COMPOSITE_W_*` env vars on [`crate::SkillConfig`] (e.g.
+/// `PE_SKILL_COMPOSITE_W_SHARPE_BPS=2000`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositeWeights {
     // ── Daily-return moments ───────────────────────────────────────────────
@@ -150,7 +151,22 @@ pub fn rank_by_composite(
     }
 
     let bhq_significant = bhq_gate(rows, bhq_q_bps);
-    let stats = CohortStats::from_rows(rows);
+    // Standardise z-scores over the BHq-significant cohort only — adding /
+    // removing wallets that fail the skill gate must not perturb the scores of
+    // wallets that pass it. (Scoring is then applied to every row, BHq-pass or
+    // not, so the diagnostic `selected=false` rows still get comparable scores.)
+    // Fallback when nothing passes BHq: use the full input cohort to avoid an
+    // empty-stats degenerate (every score = 0).
+    let bhq_rows: Vec<&WalletFeatures> = rows
+        .iter()
+        .zip(bhq_significant.iter())
+        .filter_map(|(r, &sig)| if sig { Some(r) } else { None })
+        .collect();
+    let stats = if bhq_rows.is_empty() {
+        CohortStats::from_iter(rows.iter())
+    } else {
+        CohortStats::from_iter(bhq_rows.iter().copied())
+    };
 
     let scores: Vec<i64> = rows
         .iter()
@@ -220,7 +236,15 @@ struct CohortStats {
 }
 
 impl CohortStats {
-    fn from_rows(rows: &[WalletFeatures]) -> Self {
+    /// Build over any iterator of `&WalletFeatures` so the BHq-subset path
+    /// (a `Vec<&WalletFeatures>`) and the full-set fallback (`&[WalletFeatures]`)
+    /// share one entry point. The iterator is materialised once into a `Vec`
+    /// because each per-feature `mean_std` pass needs two iterations.
+    fn from_iter<'r, I>(rows: I) -> Self
+    where
+        I: IntoIterator<Item = &'r WalletFeatures>,
+    {
+        let rows: Vec<&WalletFeatures> = rows.into_iter().collect();
         let extract: &[fn(&WalletFeatures) -> Decimal] = &[
             |w| Decimal::from(w.features.sharpe_bps),
             |w| Decimal::from(w.features.ev_mean_bps),
@@ -235,7 +259,7 @@ impl CohortStats {
             |w| Decimal::from(w.features.first_entries_per_active_day_bps),
             |w| Decimal::from(w.features.median_first_entry_to_resolution_secs),
         ];
-        let stats: Vec<(Decimal, Decimal)> = extract.iter().map(|f| mean_std(rows, *f)).collect();
+        let stats: Vec<(Decimal, Decimal)> = extract.iter().map(|f| mean_std(&rows, *f)).collect();
         // Position-indexed unpack to keep the struct labels honest with the closure order above.
         Self {
             sharpe_bps: stats[0],
@@ -256,13 +280,13 @@ impl CohortStats {
 
 /// Population mean + standard deviation of `f(row)` over `rows`. Empty input
 /// returns `(0, 0)`; `n=1` returns `(x, 0)` (no dispersion). All `Decimal`.
-fn mean_std(rows: &[WalletFeatures], f: fn(&WalletFeatures) -> Decimal) -> (Decimal, Decimal) {
+fn mean_std(rows: &[&WalletFeatures], f: fn(&WalletFeatures) -> Decimal) -> (Decimal, Decimal) {
     let n = rows.len();
     if n == 0 {
         return (Decimal::ZERO, Decimal::ZERO);
     }
     let n_dec = Decimal::from(u64::try_from(n).unwrap_or(u64::MAX));
-    let mean: Decimal = rows.iter().map(f).sum::<Decimal>() / n_dec;
+    let mean: Decimal = rows.iter().copied().map(f).sum::<Decimal>() / n_dec;
     if n < 2 {
         return (mean, Decimal::ZERO);
     }
@@ -446,11 +470,11 @@ mod tests {
     #[test]
     fn z_score_zero_when_cohort_has_no_dispersion() {
         // All wallets identical → σ=0 → composite is the empty sum = 0 for every wallet.
-        let rows = vec![
+        let rows = [
             wf("0xa", 1000, 100, 1000, 25, 10),
             wf("0xb", 1000, 100, 1000, 25, 10),
         ];
-        let stats = CohortStats::from_rows(&rows);
+        let stats = CohortStats::from_iter(rows.iter());
         let score = composite_score(&rows[0], &CompositeWeights::default(), &stats);
         assert_eq!(score, Decimal::ZERO);
     }
@@ -562,5 +586,51 @@ mod tests {
         let out = rank_by_composite(&rows, &CompositeWeights::default(), 1_000, 2, 0);
         let selected = out.iter().filter(|r| r.selected).count();
         assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn bhq_failing_outlier_does_not_perturb_bhq_passing_scores() {
+        // Regression for the cohort-stats bug (PR #237 review):
+        // z-score μ/σ must be computed over the BHq-significant subset only,
+        // so adding/removing wallets that fail BHq cannot move the score of any
+        // wallet that passes BHq. If μ/σ were over the full cohort, the giant
+        // outlier here would shift μ/σ enormously and change every passing
+        // wallet's z-scores.
+        let bhq_pass_rows = vec![
+            wf("0xa", 1_000, 100, 100, 25, 10),
+            wf("0xb", 2_000, 200, 200, 25, 10),
+            wf("0xc", 3_000, 300, 300, 25, 10),
+        ];
+        let with_outlier: Vec<WalletFeatures> = bhq_pass_rows
+            .iter()
+            .cloned()
+            .chain(std::iter::once(wf(
+                "0xfail",
+                i64::MAX / 2, // would skew μ/σ wildly if included
+                i64::MAX / 2,
+                i32::MAX / 2,
+                25,
+                9_999, // fails BHq at q=1000
+            )))
+            .collect();
+
+        let weights = weights_sharpe_only(10_000);
+        let no_outlier_out = rank_by_composite(&bhq_pass_rows, &weights, 1_000, 10, 0);
+        let with_outlier_out = rank_by_composite(&with_outlier, &weights, 1_000, 10, 0);
+
+        // Pull the scores of the three BHq-passing wallets in each run.
+        let scores_for = |out: &[CompositeResult], hex: &str| -> i64 {
+            out.iter()
+                .find(|r| r.wallet_hex == hex)
+                .map(|r| r.composite_score_bps)
+                .expect("missing wallet")
+        };
+        for hex in &["0xa", "0xb", "0xc"] {
+            assert_eq!(
+                scores_for(&no_outlier_out, hex),
+                scores_for(&with_outlier_out, hex),
+                "score for {hex} must be identical with vs without the BHq-failing outlier"
+            );
+        }
     }
 }
