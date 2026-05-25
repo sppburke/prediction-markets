@@ -91,6 +91,7 @@ fn run_extract_cmd(toml_path: Option<&std::path::Path>) -> i32 {
         cfg.permutations,
         cfg.rng_seed,
         extracted_at,
+        cfg.extract_threads,
     ) {
         Ok(report) => {
             println!(

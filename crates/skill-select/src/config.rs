@@ -58,6 +58,13 @@ fn default_beta_binomial_alpha() -> u32 {
 fn default_beta_binomial_beta() -> u32 {
     1
 }
+fn default_extract_threads() -> usize {
+    // `0` means "rayon's default" — `rayon::current_num_threads()`, which
+    // respects `RAYON_NUM_THREADS` and falls back to the CPU count. Keeps the
+    // tuning surface single-knob: callers either accept the platform default
+    // or override via `PE_SKILL_EXTRACT_THREADS=N`.
+    0
+}
 
 /// Skill-selection configuration. Every field has a default; `PE_SKILL_*` env
 /// vars (and an optional TOML file) override.
@@ -113,6 +120,11 @@ pub struct SkillConfig {
     /// (Laplace). `PE_SKILL_BETA_BINOMIAL_BETA`.
     #[serde(default = "default_beta_binomial_beta")]
     pub beta_binomial_beta: u32,
+    /// Rayon worker count for the per-wallet extraction loop. `0` (default)
+    /// means rayon's auto-tuning (`current_num_threads()` — honours
+    /// `RAYON_NUM_THREADS`, else CPU count). `PE_SKILL_EXTRACT_THREADS`.
+    #[serde(default = "default_extract_threads")]
+    pub extract_threads: usize,
 }
 
 impl SkillConfig {
@@ -160,6 +172,7 @@ mod tests {
             assert_eq!(cfg.min_distinct_events, 10);
             assert_eq!(cfg.beta_binomial_alpha, 1);
             assert_eq!(cfg.beta_binomial_beta, 1);
+            assert_eq!(cfg.extract_threads, 0);
             Ok(())
         });
     }

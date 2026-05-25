@@ -3321,6 +3321,7 @@ dependencies = [
  "pe-bootstrap",
  "pe-core-types",
  "pe-trader-index",
+ "rayon",
  "rusqlite",
  "rust_decimal",
  "rust_decimal_macros",

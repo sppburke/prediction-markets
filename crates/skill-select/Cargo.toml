@@ -31,6 +31,7 @@ pe-bootstrap = { path = "../bootstrap", version = "0.1.0" }
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-trader-index = { path = "../trader-index", version = "0.1.0" }
 figment = { workspace = true }
+rayon = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
