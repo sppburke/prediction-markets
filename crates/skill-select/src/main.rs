@@ -13,8 +13,8 @@
 //! 0 = success, 1 = fatal, 2 = usage error.
 
 use pe_skill_select::{
-    SelectionInput, SkillCache, SkillConfig, rank_by_composite, run_extract, run_forward_test,
-    select_wallets,
+    ForwardSource, SelectionInput, SkillCache, SkillConfig, rank_by_composite, run_extract,
+    run_forward_test, select_wallets,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -67,6 +67,53 @@ fn selected_wallets(cfg: &SkillConfig) -> Result<Vec<SelectionInput>, i32> {
             trading_days: w.features.trading_days,
         })
         .collect())
+}
+
+/// Build the selected-wallet hex list for `forward-test` by delegating to
+/// whichever ranker `cfg.forward_source` names. Both branches honour the same
+/// `bhq_q_bps` / `top_n` / `min_trading_days` gates; only the rank function
+/// differs.
+fn selected_wallets_for_source(cfg: &SkillConfig) -> Result<Vec<String>, i32> {
+    let cache = SkillCache::open_read_only(&cfg.cache_path).map_err(|e| {
+        tracing::error!(error = %e, "skill-select: cache open failed");
+        1
+    })?;
+    let rows = cache
+        .load_features_for_cutoff(cfg.cutoff_unix)
+        .map_err(|e| {
+            tracing::error!(error = %e, "skill-select: load failed");
+            1
+        })?;
+    let selected: Vec<String> = match cfg.forward_source {
+        ForwardSource::Select => {
+            let inputs: Vec<SelectionInput> = rows
+                .iter()
+                .map(|w| SelectionInput {
+                    wallet_hex: w.features.wallet_hex.clone(),
+                    skill_pvalue_bps: w.skill_pvalue_bps,
+                    sharpe_bps: w.features.sharpe_bps,
+                    trading_days: w.features.trading_days,
+                })
+                .collect();
+            select_wallets(&inputs, cfg.bhq_q_bps, cfg.top_n, cfg.min_trading_days)
+                .iter()
+                .filter(|r| r.selected)
+                .map(|r| r.wallet_hex.clone())
+                .collect()
+        }
+        ForwardSource::Composite => rank_by_composite(
+            &rows,
+            &cfg.composite_weights(),
+            cfg.bhq_q_bps,
+            cfg.top_n,
+            cfg.min_trading_days,
+        )
+        .iter()
+        .filter(|r| r.selected)
+        .map(|r| r.wallet_hex.clone())
+        .collect(),
+    };
+    Ok(selected)
 }
 
 /// Load config; on failure log and return the fatal exit code.
@@ -196,16 +243,10 @@ fn run_forward_cmd(toml_path: Option<&std::path::Path>) -> i32 {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let inputs = match selected_wallets(&cfg) {
-        Ok(i) => i,
+    let selected = match selected_wallets_for_source(&cfg) {
+        Ok(s) => s,
         Err(code) => return code,
     };
-    let results = select_wallets(&inputs, cfg.bhq_q_bps, cfg.top_n, cfg.min_trading_days);
-    let selected: Vec<String> = results
-        .iter()
-        .filter(|r| r.selected)
-        .map(|r| r.wallet_hex.clone())
-        .collect();
 
     let bps = |n: u32| Decimal::from(n) / Decimal::from(10_000u32);
     match run_forward_test(
@@ -218,8 +259,9 @@ fn run_forward_cmd(toml_path: Option<&std::path::Path>) -> i32 {
     ) {
         Ok(r) => {
             println!(
-                "forward-test (GROSS of fees): wallets={} resolved={} excluded={} kelly_fallback={} \
-                 flat_pnl_usd={} kelly_pnl_usd={} (cutoff_unix={}, f={})",
+                "forward-test (GROSS of fees): source={} wallets={} resolved={} excluded={} \
+                 kelly_fallback={} flat_pnl_usd={} kelly_pnl_usd={} (cutoff_unix={}, f={}, top_n={})",
+                cfg.forward_source,
                 r.wallets,
                 r.resolved_positions,
                 r.excluded_positions,
@@ -228,6 +270,7 @@ fn run_forward_cmd(toml_path: Option<&std::path::Path>) -> i32 {
                 r.kelly_pnl_usd,
                 cfg.cutoff_unix,
                 bps(cfg.kelly_fraction_bps),
+                cfg.top_n,
             );
             0
         }

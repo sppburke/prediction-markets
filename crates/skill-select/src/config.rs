@@ -13,6 +13,34 @@ use serde::Deserialize;
 use crate::composite::CompositeWeights;
 use crate::error::SkillSelectError;
 
+/// Which ranker drives the `forward-test` subcommand's selected-wallet list.
+/// Defaults to [`Self::Select`] (v1 deflated-Sharpe ranking) for backward
+/// compatibility. [`Self::Composite`] switches to the docs/24- PR-4-MVP
+/// weighted-z-score ranker so the same forward-test harness can A/B-compare
+/// the two ranker outputs on the same holdout window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardSource {
+    /// Deflated-Sharpe ranking via [`crate::select_wallets`].
+    Select,
+    /// Composite weighted-z-score ranking via [`crate::rank_by_composite`].
+    Composite,
+}
+
+impl std::fmt::Display for ForwardSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ForwardSource::Select => "select",
+            ForwardSource::Composite => "composite",
+        };
+        f.write_str(s)
+    }
+}
+
+fn default_forward_source() -> ForwardSource {
+    ForwardSource::Select
+}
+
 /// Train/forward cutoff default: `2026-03-31T23:59:59Z`. Derived from the date
 /// (not a hand-typed unix constant) so it cannot drift to the wrong year.
 fn default_cutoff_unix() -> i64 {
@@ -211,6 +239,14 @@ pub struct SkillConfig {
     /// `PE_SKILL_EXTRACT_CLEAN_PRIOR`.
     #[serde(default = "default_extract_clean_prior")]
     pub extract_clean_prior: bool,
+    /// Which ranker drives `forward-test`'s selected-wallet list:
+    /// `select` (v1 deflated-Sharpe — default for backward compat) or
+    /// `composite` (the docs/24- PR-4-MVP weighted-z-score ranker).
+    /// Set via `PE_SKILL_FORWARD_SOURCE`. Same `top_n` / `bhq_q_bps` /
+    /// `min_trading_days` gates apply to both paths — only the rank
+    /// function differs.
+    #[serde(default = "default_forward_source")]
+    pub forward_source: ForwardSource,
 }
 
 impl SkillConfig {
@@ -294,6 +330,7 @@ mod tests {
             );
             assert_eq!(cfg.composite_weights(), CompositeWeights::default());
             assert!(!cfg.extract_clean_prior);
+            assert_eq!(cfg.forward_source, ForwardSource::Select);
             Ok(())
         });
     }
