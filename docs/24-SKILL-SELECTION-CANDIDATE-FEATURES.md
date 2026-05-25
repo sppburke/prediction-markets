@@ -172,6 +172,8 @@ ONC clustering of feature correlation `d=√((1−ρ)/2)` → clustered MDA impo
 
 This is the actual #205 "Stage 2" object — the rest of the candidate features only contribute their predictive power through this composite.
 
+**MVP landed separately** (`composite` subcommand on `pe-skill-select`): hand-picked weights with z-score standardisation over the BHq-significant cohort. Defaults follow the group structure of §3.1 (per-bet quality dominant, sign-encoded direction). The full ONC/MDA/elastic-net/PBO pipeline above remains the proper PR 4. See `_GLOSSARY.md` "Composite-ranker weights" for current default magnitudes.
+
 ### PR 5 — Executability features (E)
 
 Needs a `market_liquidity_snapshots` table sampled at each first-entry's `block_ts`. New infra; separate plan.

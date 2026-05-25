@@ -13,7 +13,8 @@
 //! 0 = success, 1 = fatal, 2 = usage error.
 
 use pe_skill_select::{
-    SelectionInput, SkillCache, SkillConfig, run_extract, run_forward_test, select_wallets,
+    SelectionInput, SkillCache, SkillConfig, rank_by_composite, run_extract, run_forward_test,
+    select_wallets,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -32,10 +33,11 @@ fn main() {
     let exit = match sub {
         Some("extract") => run_extract_cmd(toml_path.as_deref()),
         Some("select") => run_select_cmd(toml_path.as_deref()),
+        Some("composite") => run_composite_cmd(toml_path.as_deref()),
         Some("forward-test") => run_forward_cmd(toml_path.as_deref()),
         other => {
             eprintln!(
-                "usage: pe-skill-select <extract|select|forward-test> [config.toml]   (got {other:?})"
+                "usage: pe-skill-select <extract|select|composite|forward-test> [config.toml]   (got {other:?})"
             );
             2
         }
@@ -134,6 +136,55 @@ fn run_select_cmd(toml_path: Option<&std::path::Path>) -> i32 {
         println!(
             "{}\tpvalue_bps={}\tdeflated_sharpe_bps={}",
             r.wallet_hex, r.skill_pvalue_bps, r.deflated_sharpe_bps
+        );
+    }
+    0
+}
+
+/// Stage-2 composite ranker (docs/24- §2 PR-4 MVP — hand-weighted z-score
+/// linear combo over the 12 features). BHq+min_trading_days gate identical to
+/// `select`; the only difference is the rank function.
+fn run_composite_cmd(toml_path: Option<&std::path::Path>) -> i32 {
+    let cfg = match load(toml_path) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let cache = match SkillCache::open_read_only(&cfg.cache_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "skill-select composite: cache open failed");
+            return 1;
+        }
+    };
+    let rows = match cache.load_features_for_cutoff(cfg.cutoff_unix) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "skill-select composite: load failed");
+            return 1;
+        }
+    };
+    let weights = cfg.composite_weights();
+    let results = rank_by_composite(
+        &rows,
+        &weights,
+        cfg.bhq_q_bps,
+        cfg.top_n,
+        cfg.min_trading_days,
+    );
+    let selected = results.iter().filter(|r| r.selected).count();
+    println!(
+        "composite: candidates={} selected={} (cutoff_unix={}, bhq_q_bps={}, top_n={}, min_trading_days={})",
+        rows.len(),
+        selected,
+        cfg.cutoff_unix,
+        cfg.bhq_q_bps,
+        cfg.top_n,
+        cfg.min_trading_days,
+    );
+    for r in results.iter().filter(|r| r.selected) {
+        println!(
+            "{}\tcomposite_bps={}\tpvalue_bps={}\tsharpe_bps={}",
+            r.wallet_hex, r.composite_score_bps, r.skill_pvalue_bps, r.sharpe_bps
         );
     }
     0
