@@ -336,10 +336,9 @@ fn parse_clob_token_ids(raw: Option<&str>) -> Vec<String> {
 /// Normalise a Gamma fee field to basis points.
 ///
 /// Gamma may return fees as a fraction (`0.02` = 2% = 200 bps) or as an integer
-/// bps value (`200`). Detection rule: if the value is ≤ 1.0 treat it as a
-/// fraction and multiply by 10 000; otherwise treat it as already-bps. Both forms
-/// are clamped to [0, 10 000] and converted to `i32` (always in range after clamp).
-/// `None` → `0` (pre-fee-era default; safe sentinel per `_GLOSSARY.md`).
+/// bps value (`200`). Detection boundary, max clamp, and missing-fee sentinel are
+/// canonical defaults in `_GLOSSARY.md` (`market_fee_fraction_threshold`,
+/// `market_fee_max_bps`, `market_fee_missing_default_bps`).
 fn fee_to_bps(fee: Option<rust_decimal::Decimal>) -> i32 {
     use rust_decimal::prelude::ToPrimitive;
     let Some(d) = fee else {
