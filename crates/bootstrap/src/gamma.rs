@@ -333,7 +333,7 @@ struct GammaMarketRaw {
 /// Gamma returns `liquidity` as a JSON number, but fixtures and other API surfaces
 /// sometimes serialize Decimal as a string. Accepting both keeps the DTO robust to
 /// upstream format changes without losing precision.
-fn deserialize_decimal_flexible<'de, D>(d: D) -> Result<Option<Decimal>, D::Error>
+pub(crate) fn deserialize_decimal_flexible<'de, D>(d: D) -> Result<Option<Decimal>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

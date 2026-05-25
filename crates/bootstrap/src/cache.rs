@@ -175,6 +175,18 @@ CREATE INDEX IF NOT EXISTS idx_counterparty_edges_maker_asset
 CREATE INDEX IF NOT EXISTS idx_counterparty_edges_taker_asset
     ON counterparty_edges(taker_asset_id_dec);
 
+-- Per-market Polymarket taker/maker fee schedule (issue #23, PR 1).
+-- Populated by the `events` subcommand from Gamma takerBaseFee / makerBaseFee.
+-- Fees are stored in basis points (0..=10_000) so all comparisons are integer.
+-- `fee_active_from_unix` is NULL until PR 4 backfills it from counterparty_edges.
+CREATE TABLE IF NOT EXISTS market_fees (
+    condition_id         TEXT    PRIMARY KEY NOT NULL,
+    taker_base_fee_bps   INTEGER NOT NULL,
+    maker_base_fee_bps   INTEGER NOT NULL,
+    fee_active_from_unix INTEGER,
+    fetched_at_unix      INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS funder_edges (
     funder_hex      TEXT    NOT NULL,
     funded_hex      TEXT    NOT NULL,
@@ -302,6 +314,13 @@ pub struct CounterpartyEdgeResolvedRow {
     pub taker_amount_raw: String,
     pub maker_condition: Option<String>,
     pub taker_condition: Option<String>,
+}
+
+/// Per-market fee schedule row loaded from `market_fees` (issue #23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketFeeRow {
+    pub taker_base_fee_bps: i32,
+    pub maker_base_fee_bps: i32,
 }
 
 /// Permanent wallet trade-history cache backed by SQLite.
@@ -1109,6 +1128,65 @@ impl WalletCache {
                 |r| r.get::<_, String>(0),
             )
             .ok()
+    }
+
+    /// Upsert a batch of per-market fee rows into `market_fees` in one transaction.
+    ///
+    /// Rows are `(condition_id, taker_base_fee_bps, maker_base_fee_bps, fetched_at_unix)`.
+    /// `INSERT OR REPLACE` makes re-sweeps idempotent; `fee_active_from_unix` is always
+    /// written as `NULL` in PR 1 (PR 4 backfills it from `counterparty_edges`).
+    ///
+    /// # Precondition
+    /// Returns immediately without writing when `rows` is empty.
+    pub fn upsert_market_fees_batch(
+        &mut self,
+        rows: &[(String, i32, i32, i64)],
+        fetched_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO market_fees \
+                 (condition_id, taker_base_fee_bps, maker_base_fee_bps, \
+                  fee_active_from_unix, fetched_at_unix) \
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+            )?;
+            for (condition_id, taker_bps, maker_bps, _fetched) in rows {
+                stmt.execute(params![condition_id, taker_bps, maker_bps, fetched_at_unix])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load all rows from `market_fees` as a `HashMap<condition_id, MarketFeeRow>`.
+    ///
+    /// # Precondition
+    /// Returns an empty map when the table has not been swept yet.
+    pub fn load_market_fees(
+        &self,
+    ) -> Result<std::collections::HashMap<String, MarketFeeRow>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT condition_id, taker_base_fee_bps, maker_base_fee_bps FROM market_fees",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MarketFeeRow {
+                    taker_base_fee_bps: row.get::<_, i32>(1)?,
+                    maker_base_fee_bps: row.get::<_, i32>(2)?,
+                },
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for result in rows {
+            let (condition_id, fee_row) = result?;
+            map.insert(condition_id, fee_row);
+        }
+        Ok(map)
     }
 
     /// Upsert a batch of decoded `OrderFilled` legs into `counterparty_edges`
