@@ -1,7 +1,7 @@
-# 22 — Skill-Selection Candidate Features (implementation plan for #205)
+# 24 — Skill-Selection Candidate Features (implementation plan for #205)
 
 **Status:** design — first-PR scope frozen; subsequent slices outlined.
-**Scope:** bridge the [#205 reference issue](https://github.com/<owner>/<repo>/issues/205) (research / parking) into concrete `skill-select` PRs.
+**Scope:** bridge the [#205 reference issue](https://github.com/sppburke/prediction-markets/issues/205) (research / parking) into concrete `skill-select` PRs.
 **Anchors:** SSRN 6617059 (Gómez-Cram et al., sign-randomization); Bailey & López de Prado (PSR, DSR, PBO); Akey et al. (SSRN 6443103, fee-era + persistence risk); [[project_skill_selection_research]].
 **Authority order:** this doc is below `_BASELINE.md` / `_GLOSSARY.md` / `19-WINNER-FOLLOW-STRATEGY.md`; any numeric default it introduces is mirrored into `_GLOSSARY.md` "Skill-selection defaults" in the same PR.
 
