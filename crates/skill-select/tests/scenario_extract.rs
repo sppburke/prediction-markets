@@ -126,7 +126,7 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
     // min_distinct_events=0 keeps the existing tiny-fixture scenario in scope;
     // the production default 10 is exercised by the unit tests in features.rs.
     // extract_threads=0 → rayon's default pool (whatever the test runner has).
-    let report = run_extract(&path, CUTOFF, 1, 0, 1, 1, 99, 42, 1_700_000_000, 0).unwrap();
+    let report = run_extract(&path, CUTOFF, 1, 0, 1, 1, 99, 42, 1_700_000_000, 0, false).unwrap();
 
     let rows = SkillCache::open_read_only(&path)
         .unwrap()
@@ -236,8 +236,34 @@ fn scenario_extract_parallel_matches_sequential() {
     }
 
     let cutoff = 10_000;
-    let report_seq = run_extract(&path_seq, cutoff, 1, 0, 1, 1, 99, 42, 1_700_000_000, 1).unwrap();
-    let report_par = run_extract(&path_par, cutoff, 1, 0, 1, 1, 99, 42, 1_700_000_000, 4).unwrap();
+    let report_seq = run_extract(
+        &path_seq,
+        cutoff,
+        1,
+        0,
+        1,
+        1,
+        99,
+        42,
+        1_700_000_000,
+        1,
+        false,
+    )
+    .unwrap();
+    let report_par = run_extract(
+        &path_par,
+        cutoff,
+        1,
+        0,
+        1,
+        1,
+        99,
+        42,
+        1_700_000_000,
+        4,
+        false,
+    )
+    .unwrap();
     assert_eq!(
         report_seq, report_par,
         "extract report differs across thread counts"
@@ -260,5 +286,92 @@ fn scenario_extract_parallel_matches_sequential() {
     println!(
         "PASS: scenario_extract_parallel_matches_sequential — {} rows, threads {{1, 4}} agree",
         seq_rows.len()
+    );
+}
+
+/// Scenario: `extract_clean_prior=true` deletes prior-cutoff rows before the
+/// new extract writes, eliminating the "ghost row" pathology from issue #236.
+///
+/// PASS: when an old extract has left rows for wallets the new extract chose
+///       NOT to write (e.g. wallet now fails a tightened gate), running the
+///       new extract with `clean_prior=true` removes the old rows so the
+///       post-run table reflects only the new run's eligibility surface.
+/// FAIL: ghost rows from the prior run survive into the new table.
+#[test]
+fn scenario_extract_clean_prior_removes_ghost_rows() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wallet_cache.db");
+
+    // Step 1: seed the cache with two active wallets, both eligible.
+    {
+        let mut cache = WalletCache::open(&path).unwrap();
+        cache
+            .upsert_market_events("0xm1", "evtA", Some("slug"), 100)
+            .unwrap();
+        cache
+            .insert_resolution("0xm1", Some(0), 3_000, 3_000)
+            .unwrap();
+
+        // W_ELIGIBLE always passes.
+        activate(&mut cache, W_ELIGIBLE);
+        cache
+            .insert_new(
+                W_ELIGIBLE,
+                vec![
+                    raw(W_ELIGIBLE, "0xm1", Side::Buy, dec!(0.50), 1_000, "0xb1"),
+                    raw(W_ELIGIBLE, "0xm1", Side::Sell, dec!(0.70), 2_000, "0xs1"),
+                ],
+            )
+            .unwrap();
+
+        // A second wallet that the FIRST run accepts (its one closed trade is
+        // sufficient with min_closed_trades=1) but the SECOND run will reject
+        // (we raise the gate to min_closed_trades=2). Without --clean, its row
+        // from the first run would persist; with --clean, it must be deleted.
+        const W_GHOST: &str = "0x9999999999999999999999999999999999999999";
+        activate(&mut cache, W_GHOST);
+        cache
+            .insert_new(
+                W_GHOST,
+                vec![
+                    raw(W_GHOST, "0xm1", Side::Buy, dec!(0.60), 1_500, "0xb2"),
+                    raw(W_GHOST, "0xm1", Side::Sell, dec!(0.80), 2_500, "0xs2"),
+                ],
+            )
+            .unwrap();
+    } // drop the read-write cache before the read-only extract pass.
+
+    // Step 2: first extract — permissive (min_closed_trades=1), no clean.
+    // Both wallets get rows.
+    let report1 = run_extract(&path, CUTOFF, 1, 0, 1, 1, 99, 42, 1_700_000_000, 0, false).unwrap();
+    assert_eq!(
+        report1.wallets_written, 2,
+        "permissive first run accepts both"
+    );
+    let rows1 = SkillCache::open_read_only(&path)
+        .unwrap()
+        .load_features_for_cutoff(CUTOFF)
+        .unwrap();
+    assert_eq!(rows1.len(), 2);
+
+    // Step 3: second extract — tightened (min_closed_trades=2 ejects both
+    // single-closed-trade wallets) WITH clean_prior=true. The new run
+    // produces zero rows; without --clean the table would still contain the
+    // 2 stale rows from step 2.
+    let report2 = run_extract(&path, CUTOFF, 2, 0, 1, 1, 99, 42, 1_710_000_000, 0, true).unwrap();
+    assert_eq!(report2.wallets_written, 0, "tightened run writes no rows");
+    let rows2 = SkillCache::open_read_only(&path)
+        .unwrap()
+        .load_features_for_cutoff(CUTOFF)
+        .unwrap();
+    assert!(
+        rows2.is_empty(),
+        "PASS criterion: clean_prior=true left ZERO rows (no ghosts); got {} rows",
+        rows2.len()
+    );
+    println!(
+        "PASS: scenario_extract_clean_prior_removes_ghost_rows — first_run_rows={} second_run_rows={}",
+        rows1.len(),
+        rows2.len()
     );
 }

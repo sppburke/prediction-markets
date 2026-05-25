@@ -74,11 +74,28 @@ pub fn run_extract(
     seed: u64,
     extracted_at_unix: i64,
     extract_threads: usize,
+    clean_prior: bool,
 ) -> Result<ExtractReport, SkillSelectError> {
     let snapshot_at = SourceTimestamp(
         OffsetDateTime::from_unix_timestamp(cutoff_unix)
             .map_err(|e| SkillSelectError::Decode(format!("cutoff_unix {cutoff_unix}: {e}")))?,
     );
+
+    // Opt-in pre-clean (issue #236): drop every row at `cutoff_unix` before the
+    // extract begins. Runs in its own short write transaction so it doesn't
+    // hold the SQLite write lock across the multi-minute extract body. The
+    // brief "no rows" window between this and the single batched write at the
+    // end is intentional — `select` / `composite` callers should not be
+    // running concurrently during an extract anyway.
+    if clean_prior {
+        let mut skill_cache = SkillCache::open(cache_path)?;
+        let deleted = skill_cache.delete_features_for_cutoff(cutoff_unix)?;
+        info!(
+            cutoff_unix,
+            deleted_rows = deleted,
+            "skill-select extract: pre-clean removed prior-cutoff rows"
+        );
+    }
 
     // Read-pass shared inputs: load once on the main thread, share to workers.
     let (event_map, resolutions, wallets) = {
