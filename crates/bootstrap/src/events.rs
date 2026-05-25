@@ -67,7 +67,7 @@ pub struct EventsReport {
     pub total_traded_markets: usize,
     /// Traded markets with no Gamma event, self-mapped as singleton events.
     pub orphan_self_mapped: usize,
-    /// `market_fees` rows upserted from Gamma `takerBaseFee`/`makerBaseFee` (issue #23).
+    /// `market_fees` rows upserted from Gamma `feeSchedule.rate` (gated by `feesEnabled`).
     pub fees_upserted: usize,
 }
 
@@ -299,7 +299,8 @@ struct GammaEventRaw {
 ///   leg pays zero. This is the only field that matches Polymarket's user-facing
 ///   fee; `takerBaseFee` / `makerBaseFee` on the market are raw contract-storage
 ///   integers (always `1000` on fee-enabled markets in observed responses) and do
-///   *not* equal the basis-points fee — they are deliberately ignored here.
+///   *not* equal the basis-points fee — they are deliberately ignored here. See
+///   [`fees_for_market`] for the `(taker_bps, maker_bps)` derivation rules.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaEventMarketRaw {
