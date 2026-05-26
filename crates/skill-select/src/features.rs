@@ -150,6 +150,12 @@ pub struct DeterministicFeatures {
     /// cutoff_unix` and at least one buy on that outcome before/at resolution.
     /// Basis points (0–10 000). `0` sentinel when no qualifying position exists.
     pub hold_to_resolution_rate_bps: i64,
+    // ─── Position sizing consistency (#253) ──────────────────────────────────────
+    /// Sample CV (`std / mean`, ddof=1) of per-buy position size
+    /// (`entry_price × contracts`) over buy-side closed trades in the window,
+    /// basis points; clamped to 100 000 (= 10×). `0` when fewer than 2 buy-side
+    /// closed trades exist or when the mean size is zero.
+    pub position_sizing_cv_bps: i64,
 }
 
 /// Compute the simple deterministic feature batch for one wallet's train ledger.
@@ -257,6 +263,7 @@ pub fn extract_features(
     let longshot_bias_ratio_bps = compute_longshot_bias_ratio(&per_bet);
     let hold_to_resolution_rate_bps =
         compute_hold_to_resolution_rate(raw_trades, resolutions, cutoff_unix);
+    let position_sizing_cv_bps = compute_position_sizing_cv(&windowed);
 
     // Per-event positive-PnL roll-up over all in-window closed trades
     // (resolved or not — realized PnL exists either way; group F is a
@@ -309,6 +316,7 @@ pub fn extract_features(
         median_first_entry_to_resolution_secs,
         longshot_bias_ratio_bps,
         hold_to_resolution_rate_bps,
+        position_sizing_cv_bps,
     })
 }
 
@@ -546,6 +554,42 @@ fn compute_hold_to_resolution_rate(
         return 0;
     }
     decimal_to_bps_i64(Decimal::from(held) / Decimal::from(qualifying)).clamp(0, 10_000)
+}
+
+// ─── Position sizing consistency (#253) ──────────────────────────────────────
+
+/// Sample CV (`std / mean`, ddof=1) of per-buy position size
+/// (`entry_price × contracts`) over the in-window buy-side closed trades,
+/// clamped to 10.0 (= 100 000 bps).
+///
+/// Returns `0` when fewer than 2 buy-side closed trades exist or when the
+/// mean size is zero.
+fn compute_position_sizing_cv(windowed: &[&ClosedTrade]) -> i64 {
+    let sizes: Vec<Decimal> = windowed
+        .iter()
+        .filter(|t| t.side == Side::Buy)
+        .map(|t| t.entry_price.0 * Decimal::from(t.contracts.0))
+        .collect();
+    let n = sizes.len();
+    if n < 2 {
+        return 0;
+    }
+    let n_dec = Decimal::from(u64::try_from(n).unwrap_or(u64::MAX));
+    let mean: Decimal = sizes.iter().copied().sum::<Decimal>() / n_dec;
+    if mean.is_zero() {
+        return 0;
+    }
+    let variance: Decimal = sizes
+        .iter()
+        .map(|&x| {
+            let d = x - mean;
+            d * d
+        })
+        .sum::<Decimal>()
+        / (n_dec - Decimal::ONE);
+    let std = variance.sqrt().unwrap_or(Decimal::ZERO);
+    let cv = (std / mean).min(Decimal::new(10, 0));
+    decimal_to_bps_i64(cv)
 }
 
 /// Output of the per-bet quality block (group A).
@@ -1243,5 +1287,110 @@ mod tests {
         // Same data, gate of 3 → accepted (boundary == passes).
         let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 3, 1, 1);
         assert!(f.is_some());
+    }
+
+    // ─── position_sizing_cv_bps unit tests (#253) ────────────────────────────
+
+    #[test]
+    fn position_sizing_cv_zero_when_single_buy() {
+        // n < 2 → sentinel 0.
+        let events = HashMap::new();
+        let l = ledger(vec![closed("0xa", dec!(0.50), 100, dec!(5.0), 60, 1_000)]);
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        assert_eq!(f.position_sizing_cv_bps, 0);
+    }
+
+    #[test]
+    fn position_sizing_cv_zero_when_all_sizes_equal() {
+        // std = 0 → cv = 0 → 0 bps.
+        let events = HashMap::new();
+        let l = ledger(vec![
+            closed("0xa", dec!(0.50), 100, dec!(5.0), 60, 1_000),
+            closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 2_000),
+            closed("0xc", dec!(0.50), 100, dec!(5.0), 60, 3_000),
+        ]);
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        assert_eq!(f.position_sizing_cv_bps, 0);
+    }
+
+    #[test]
+    fn position_sizing_cv_by_hand_three_buys() {
+        // sizes = {0.50×100, 0.50×200, 0.50×300} = {50, 100, 150}
+        // mean=100; Σ(xi−mean)²=5000; var(ddof=1)=2500; std=50; cv=0.5 → 5000 bps.
+        let events = HashMap::new();
+        let l = ledger(vec![
+            closed("0xa", dec!(0.50), 100, dec!(5.0), 60, 1_000),
+            closed("0xb", dec!(0.50), 200, dec!(5.0), 60, 2_000),
+            closed("0xc", dec!(0.50), 300, dec!(5.0), 60, 3_000),
+        ]);
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        assert_eq!(f.position_sizing_cv_bps, 5_000);
+    }
+
+    #[test]
+    fn position_sizing_cv_excludes_sells() {
+        // Two equal buys (cv=0); a sell with a very different size must not change the result.
+        let events = HashMap::new();
+        let mut trades = vec![
+            closed("0xa", dec!(0.50), 100, dec!(5.0), 60, 1_000),
+            closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 2_000),
+        ];
+        trades.push(ClosedTrade {
+            market_id: MarketId(VenueMarketId("0xc".to_owned())),
+            outcome_id: OutcomeId(0),
+            side: Side::Sell,
+            entry_price: Price::new(dec!(0.50)).unwrap(),
+            exit_price: Price::new(dec!(0.10)).unwrap(),
+            contracts: ContractQty(100_000),
+            hold_duration_seconds: 60,
+            realized_pnl_usd: dec!(-50_000.0),
+            opened_at_unix: 940,
+            closed_at_unix: 3_000,
+            source_trade_ids: vec![],
+        });
+        let l = ledger(trades);
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        assert_eq!(f.position_sizing_cv_bps, 0);
+    }
+
+    #[test]
+    fn position_sizing_cv_zero_when_mean_is_zero() {
+        // All zero-size buys (contracts=0) → mean=0 → sentinel 0.
+        let events = HashMap::new();
+        let l = ledger(vec![
+            closed("0xa", dec!(0.50), 0, dec!(0.0), 60, 1_000),
+            closed("0xb", dec!(0.50), 0, dec!(0.0), 60, 2_000),
+        ]);
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        assert_eq!(f.position_sizing_cv_bps, 0);
+    }
+
+    #[test]
+    fn position_sizing_cv_saturates_at_100000_bps() {
+        // 200 zero-size buys + 1 large buy → cv = sqrt(201) ≈ 14.18 > 10 → capped → 100_000 bps.
+        let events = HashMap::new();
+        let mut trades: Vec<ClosedTrade> = (0u64..200)
+            .map(|i| {
+                closed(
+                    &format!("0xz{i}"),
+                    dec!(0.50),
+                    0,
+                    dec!(0.0),
+                    60,
+                    1_000 + i as i64,
+                )
+            })
+            .collect();
+        trades.push(closed(
+            "0xbig",
+            dec!(0.50),
+            10_000,
+            dec!(5_000.0),
+            60,
+            300_000,
+        ));
+        let l = ledger(trades);
+        let f = extract_features(&l, &[], 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        assert_eq!(f.position_sizing_cv_bps, 100_000);
     }
 }
