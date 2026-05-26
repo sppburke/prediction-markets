@@ -459,6 +459,7 @@ mod tests {
                 concentration_rpc_bps: 0,
                 first_entries_per_active_day_bps: 0,
                 median_first_entry_to_resolution_secs: 0,
+                longshot_bias_ratio_bps: 0,
             },
             extracted_at_unix: 1,
             skill_pnl_usd: dec!(0.0),

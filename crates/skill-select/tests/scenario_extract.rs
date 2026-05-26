@@ -169,6 +169,8 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
     assert_eq!(r.features.concentration_rpc_bps, 10_000);
     assert_eq!(r.features.first_entries_per_active_day_bps, 10_000);
     assert_eq!(r.features.median_first_entry_to_resolution_secs, 2_000);
+    // longshot_bias_ratio: vwap_entry=0.50, which is neither <0.20 nor >0.80 → 0.
+    assert_eq!(r.features.longshot_bias_ratio_bps, 0);
     println!(
         "PASS: scenario_extract_writes_rows_for_eligible_active_wallets — scanned={} written={} skipped={}",
         report.wallets_scanned, report.wallets_written, report.wallets_skipped
