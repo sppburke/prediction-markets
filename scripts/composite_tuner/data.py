@@ -18,6 +18,21 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+# Canonical fee + slippage rates in basis points. Pinned by
+# `scripts/test_haircut_constants.py` against `docs/_GLOSSARY.md`
+# (`polymarket_fee_rate = 0.04`, `slippage_rate = 0.01`). Co-update both
+# the docs and these constants together; the CI drift-guard test fails
+# if they drift apart.
+#
+# These mirror the Rust production formula in
+# `crates/strategy-winner-follow/src/evaluate.rs:95-112`
+# where `c = price × (1 + polymarket_fee_rate + slippage_rate)` for BUY orders.
+# Used by `load_oos_positions(..., price_haircut_bps=…)` for the net-edge
+# stress test (tracker #248 sub-task #2) and by
+# `scripts/gbm_walkforward.py` for its CLI help text.
+POLYMARKET_FEE_RATE_BPS = 400  # = polymarket_fee_rate × 10_000
+SLIPPAGE_RATE_BPS = 100        # = slippage_rate × 10_000
+
 
 @dataclass(frozen=True)
 class OosPosition:
@@ -52,6 +67,8 @@ def load_oos_positions(
     cutoff_unix: int,
     fwd_end_unix: int,
     selected_wallets: frozenset[str],
+    *,
+    price_haircut_bps: int = 0,
 ) -> list[OosPosition]:
     """Post-cutoff resolved buys for the selected cohort, VWAP-collapsed per
     (wallet, market, outcome). Filters:
@@ -61,6 +78,16 @@ def load_oos_positions(
     - resolution row exists for the market AND r.winning_outcome_id IS NOT NULL
     - r.resolved_at_unix >= t.timestamp_unix (drop data anomalies)
     - VWAP in (0, 1) — exclude $0 / $1 prints
+
+    `price_haircut_bps` (keyword-only, default 0) inflates each position's
+    `vwap_entry` by `(1 + bps / 10_000)` before constructing `OosPosition`,
+    clamped to 0.999 so `(outcome - vwap) / vwap` stays defined. Default 0 =
+    gross-of-fees (matches `crates/skill-select/src/forward.rs::ForwardReport.
+    gross_of_fees == true`). Pass `POLYMARKET_FEE_RATE_BPS + SLIPPAGE_RATE_BPS`
+    to match the production net formula in `evaluate.rs:95-112`. The clamp
+    artificially compresses the haircut effect on high-priced positions
+    (>= 0.95) — acceptable for long-shot-dominated cohorts, would understate
+    impact for favorite-buyer cohorts (tracker #248 sub-task #2 open risk).
 
     Returns one OosPosition per (wallet, market, outcome) group.
     Empty selected_wallets returns []. Sparse cohorts return []. SQLite
@@ -72,6 +99,7 @@ def load_oos_positions(
     out: list[OosPosition] = []
     wallets_list = list(selected_wallets)
     chunk = 900
+    haircut_factor = 1.0 + price_haircut_bps / 10_000.0
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         for start in range(0, len(wallets_list), chunk):
             piece = wallets_list[start : start + chunk]
@@ -98,10 +126,11 @@ def load_oos_positions(
             """
             params = [*piece, cutoff_unix, fwd_end_unix]
             for w, _mid, _oid, vwap, outcome, resolved_at in conn.execute(sql, params):
+                vwap_entry = min(float(vwap) * haircut_factor, 0.999)
                 out.append(
                     OosPosition(
                         wallet_hex=w,
-                        vwap_entry=float(vwap),
+                        vwap_entry=vwap_entry,
                         outcome=float(outcome),
                         resolved_at_unix=int(resolved_at),
                     )

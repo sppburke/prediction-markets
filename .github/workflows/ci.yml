@@ -43,3 +43,11 @@ jobs:
       - run: cargo audit
 
       - run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python drift-guard tests
+        run: python3 scripts/test_haircut_constants.py
