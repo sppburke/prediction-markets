@@ -129,18 +129,38 @@ def invoke_composite(
     return parse_composite_stdout(result.stdout)
 
 
-def edge_lcb(positions: list, z: float = 1.645) -> Optional[float]:
-    """Mean per-bet edge LCB = mean(o-c) − z·pstdev(o-c)/√n.
+def edge_lcb(
+    positions: list,
+    z: float = 1.645,
+    metric: str = "edge",
+) -> Optional[float]:
+    """Per-bet LCB = mean(score) − z·pstdev(score)/√n.
 
-    `positions` is a list of objects with `.vwap_entry` and `.outcome` floats.
-    Returns None if n < 2 (no stderr possible).
+    `metric`:
+    - "edge":  score = (outcome − vwap_entry)  ∈ [-1, +1]  (probability-space)
+    - "flat":  score = (outcome − vwap_entry) / vwap_entry  (per-$1 staked
+               return — matches `pe-skill-select forward-test`'s flat_pnl_usd
+               per-position contribution, modulo the VWAP collapse over
+               (wallet, market, outcome) groups)
+
+    Returns None if n < 2 (no stderr possible) or any vwap_entry is 0
+    (would divide by zero for flat metric).
     """
     if len(positions) < 2:
         return None
-    edges = [p.outcome - p.vwap_entry for p in positions]
-    mu = statistics.fmean(edges)
-    sigma = statistics.pstdev(edges)
-    n = len(edges)
+    if metric == "edge":
+        scores = [p.outcome - p.vwap_entry for p in positions]
+    elif metric == "flat":
+        scores = []
+        for p in positions:
+            if p.vwap_entry == 0:
+                return None
+            scores.append((p.outcome - p.vwap_entry) / p.vwap_entry)
+    else:
+        raise ValueError(f"unknown metric {metric!r}; expected 'edge' or 'flat'")
+    mu = statistics.fmean(scores)
+    sigma = statistics.pstdev(scores)
+    n = len(scores)
     return mu - z * sigma / math.sqrt(n)
 
 
@@ -150,10 +170,11 @@ def score_window(
     fwd_end_unix: int,
     selected_wallets: frozenset[str],
     z: float = 1.645,
+    metric: str = "edge",
 ) -> WindowScore:
-    """Load OOS positions for the cohort and compute the cohort's edge-LCB."""
+    """Load OOS positions for the cohort and compute the cohort's LCB."""
     positions = load_oos_positions(db_path, cutoff_unix, fwd_end_unix, selected_wallets)
-    lcb = edge_lcb(positions, z=z)
+    lcb = edge_lcb(positions, z=z, metric=metric)
     return WindowScore(
         window_label=f"{cutoff_unix}_{fwd_end_unix}",
         selected_wallets=selected_wallets,
@@ -172,6 +193,7 @@ def evaluate_weights(
     bhq_q_bps: int = 1000,
     min_trading_days: int = 20,
     z: float = 1.645,
+    metric: str = "edge",
 ) -> tuple[float, list[WindowScore]]:
     """For each window: subprocess composite -> score_window. Returns
     (mean_lcb_across_windows, per_window_scores). Sentinel -inf for windows
@@ -201,7 +223,9 @@ def evaluate_weights(
                 )
             )
             continue
-        score = score_window(db_path, w.train_cutoff_unix, w.fwd_end_unix, hexes, z=z)
+        score = score_window(
+            db_path, w.train_cutoff_unix, w.fwd_end_unix, hexes, z=z, metric=metric
+        )
         per_window.append(
             WindowScore(
                 window_label=w.label,

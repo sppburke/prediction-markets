@@ -46,6 +46,16 @@ def parse_args(argv=None):
     p.add_argument("--min-trading-days", type=int, default=20)
     p.add_argument("--z-lcb", type=float, default=1.645)
     p.add_argument("--sampler", default="tpe", choices=["tpe", "cmaes"])
+    p.add_argument(
+        "--metric",
+        default="edge",
+        choices=["edge", "flat"],
+        help=(
+            "Optuna objective: 'edge' (default; mean(o-c) probability-space LCB) "
+            "or 'flat' (mean (o-c)/c LCB — matches pe-skill-select forward-test's "
+            "flat_pnl_usd metric per resolved position)."
+        ),
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--storage", default=None, help="Optuna SQLite URL (None=in-memory)")
     p.add_argument("--output-json", default=None)
@@ -162,6 +172,7 @@ def main(argv=None) -> int:
         min_trading_days=args.min_trading_days,
         z_lcb=args.z_lcb,
         optuna_sampler=args.sampler,
+        metric=args.metric,
         optuna_seed=args.seed,
         storage=args.storage,
     )
