@@ -122,13 +122,16 @@ def per_wallet_fwd_edge(db, cutoff_unix, fwd_end_unix, wallets):
 
 def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
                 min_distinct_events, min_fwd_pos, train_cutoffs, use_bhq=False,
-                label_type='perpos'):
+                label_type='perpos', *, n_seeds: int = 1, random_state: int = 42):
     """Train GBM on train_cutoffs (labeled by fwd edge), score at cutoff_unix.
 
     train_cutoffs must satisfy c + fwd_secs <= cutoff_unix (no forward-label bleed).
     Returns top-N wallet_hex list; if use_bhq, only BHq-significant wallets are scored.
     label_type: 'perpos' = mean edge per position (batch-2 default);
                 'throughput' = n_positions × mean_edge (B2 finding, +20% throughput).
+    n_seeds: number of GBM models to train with seeds [random_state, ..., random_state+n_seeds-1];
+             predictions are averaged before top-N selection. n_seeds=1 (default) reproduces
+             prior single-seed behaviour exactly. Compute scales linearly with n_seeds.
     """
     # Guard: drop any training cutoff whose forward window extends past the scoring cutoff.
     safe_train = [c for c in train_cutoffs if c + fwd_secs <= cutoff_unix]
@@ -167,13 +170,19 @@ def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
 
     X_test = test[FEATURE_COLS].values.astype(np.float64)
 
-    m = lgb.LGBMRegressor(
-        n_estimators=400, learning_rate=0.05, num_leaves=31,
-        min_data_in_leaf=200, objective='regression',
-        verbose=-1, n_jobs=-1, random_state=42,
-    )
-    m.fit(X, y)
-    test['s'] = m.predict(X_test)
+    seeds = list(range(random_state, random_state + n_seeds))
+    if n_seeds > 1:
+        print(f"  multi-seed: n_seeds={n_seeds} seeds={seeds}", file=sys.stderr)
+    per_seed_preds = []
+    for seed in seeds:
+        m = lgb.LGBMRegressor(
+            n_estimators=400, learning_rate=0.05, num_leaves=31,
+            min_data_in_leaf=200, objective='regression',
+            verbose=-1, n_jobs=-1, random_state=seed,
+        )
+        m.fit(X, y)
+        per_seed_preds.append(m.predict(X_test))
+    test['s'] = np.mean(per_seed_preds, axis=0)
     effective_top_n = min(top_n, len(test))
     return test.nlargest(effective_top_n, 's')['wallet_hex'].tolist()
 
@@ -190,6 +199,11 @@ def main():
     ap.add_argument('--min-trading-days', type=int, default=DEFAULT_MIN_TRADING_DAYS)
     ap.add_argument('--min-distinct-events', type=int, default=DEFAULT_MIN_DISTINCT_EVENTS)
     ap.add_argument('--min-fwd-pos', type=int, default=DEFAULT_MIN_FWD_POS)
+    ap.add_argument('--n-seeds', type=int, default=1,
+                    help='Number of GBM seeds to ensemble (scores averaged). '
+                         'Compute scales linearly. Default 1 = single-seed (prior behaviour).')
+    ap.add_argument('--random-state', type=int, default=42,
+                    help='Starting random seed. Seeds used: [random_state, ..., random_state+n_seeds-1].')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
 
@@ -229,7 +243,8 @@ def main():
         rankings[sc] = gbm_rank_at(args.db_path, sc, fwd_secs, args.top_n,
                                     args.min_trading_days, args.min_distinct_events,
                                     args.min_fwd_pos, train, use_bhq=use_bhq,
-                                    label_type=label_type)
+                                    label_type=label_type, n_seeds=args.n_seeds,
+                                    random_state=args.random_state)
 
     if K == 1:
         out_set = list(rankings[score_cutoffs[0]])
