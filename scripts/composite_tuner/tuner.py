@@ -35,6 +35,7 @@ class TunerConfig:
     optuna_seed: int = 42
     study_name: str = "composite_weight_tuner"
     storage: Optional[str] = None    # None = in-memory
+    metric: str = "edge"             # "edge" (default, mean(o-c)) or "flat" (mean (o-c)/c)
 
 
 @dataclasses.dataclass
@@ -79,6 +80,7 @@ def run_tuner(cfg: TunerConfig) -> TunerResult:
             bhq_q_bps=cfg.bhq_q_bps,
             min_trading_days=cfg.min_trading_days,
             z=cfg.z_lcb,
+            metric=cfg.metric,
         )
         # Record per-window LCB for PBO (replace -inf with NaN sentinel; pbo.py handles).
         row = [s.edge_lcb for s in per_window]
@@ -123,6 +125,7 @@ def run_tuner(cfg: TunerConfig) -> TunerResult:
         bhq_q_bps=cfg.bhq_q_bps,
         min_trading_days=cfg.min_trading_days,
         z=cfg.z_lcb,
+        metric=cfg.metric,
     )
 
     return TunerResult(
