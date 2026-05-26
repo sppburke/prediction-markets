@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Multi-anchor walk-forward GBM evaluation harness (tracker #248 sub-task #1).
+
+Promotes the ad-hoc iter3b_gbm_bhq_ensemble.py logic into a canonical, parameterised
+script. For each eligible anchor cutoff, builds the `gbm_bhq_intersection_3` cohort
+(K=3 most-recent scoring cutoffs, each trained walk-forward on prior cutoffs, BHq
+pre-filter on `skill_pvalue_bps`), then evaluates the cohort's forward edge over the
+next `--fwd-days` via `composite_tuner.data.load_oos_positions`.
+
+Output: per-anchor + aggregate JSON written to `data/eval-results/<utc-ts>-<strategy>.json`.
+
+Baseline metric (matches `crates/skill-select/src/forward.rs::ForwardReport.gross_of_fees == true`):
+    flat-$1 edge = (outcome - vwap_entry) / vwap_entry, hold-to-resolution, gross of fees.
+The optional fee+slippage haircut from tracker #248 sub-task #2 lands as a follow-up.
+
+USAGE:
+    .venv-analysis/bin/python3 scripts/gbm_walkforward.py \\
+        --db-path data/wallet_cache.db \\
+        --n-anchors 5
+
+REUSE NOTE: imports `gbm_rank_at` and friends from `monthly_rerank_gbm.py` so any
+future changes to GBM training stay in one place. The composite-ranker walk-forward
+loop already lives in `scripts/composite_tuner/objective.py::evaluate_weights` — this
+script is the GBM analogue, with intersection_K added.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+from datetime import datetime, timezone
+
+import numpy as np
+
+# Reuse the production GBM helpers (single source of truth for ranking logic).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from monthly_rerank_gbm import (  # noqa: E402
+    gbm_rank_at,
+    DEFAULT_TOP_N,
+    DEFAULT_FWD_DAYS,
+    DEFAULT_MIN_TRADING_DAYS,
+    DEFAULT_MIN_DISTINCT_EVENTS,
+    DEFAULT_MIN_FWD_POS,
+    BHQ_Q_BPS,
+)
+from composite_tuner import data as data_mod  # noqa: E402
+
+SCHEMA_VERSION = 1
+DEFAULT_OUTPUT_DIR = Path("data/eval-results")
+MAX_DEFAULT_ANCHORS = 10  # safety cap when --n-anchors not specified
+INTERSECTION_K = 3  # gbm_bhq_intersection_3
+
+
+def eligible_anchors(cutoffs, fwd_secs, max_n=None):
+    """Anchors with (a) at least K=3 cutoffs at-or-before for intersection, (b) at
+    least one prior cutoff for GBM training of the earliest scoring cutoff, and
+    (c) a fully-elapsed forward window (`anchor + fwd_secs <= max(cutoffs)`,
+    which approximates "DB has resolution data covering the forward window").
+    Returns most recent `max_n` (if specified) in ascending order.
+    """
+    if not cutoffs:
+        return []
+    latest = cutoffs[-1]
+    eligible = []
+    for a in cutoffs:
+        if a + fwd_secs > latest:
+            continue
+        at_or_before = [c for c in cutoffs if c <= a]
+        if len(at_or_before) < INTERSECTION_K:
+            continue
+        # Earliest scoring cutoff in the intersection needs at least one prior cutoff
+        # whose forward window doesn't bleed into it.
+        earliest_score = at_or_before[-INTERSECTION_K]
+        priors = [c for c in cutoffs if c < earliest_score and c + fwd_secs <= earliest_score]
+        if not priors:
+            continue
+        eligible.append(a)
+    if max_n is not None and len(eligible) > max_n:
+        eligible = eligible[-max_n:]
+    return eligible
+
+
+def evaluate_anchor(db, anchor, fwd_secs, all_cutoffs, top_n,
+                    min_trading_days, min_distinct_events, min_fwd_pos):
+    """Build gbm_bhq_intersection_3 cohort at `anchor` and measure forward edge.
+
+    K=3 scoring cutoffs ending at the anchor; each ranks via GBM trained on its
+    own prior cutoffs (with no forward-label bleed); intersection of the three
+    top-N lists is the cohort. Forward edge is computed over `(anchor, anchor+fwd_secs]`.
+    """
+    at_or_before = [c for c in all_cutoffs if c <= anchor]
+    score_cutoffs = at_or_before[-INTERSECTION_K:]
+
+    rankings = {}
+    for sc in score_cutoffs:
+        train = [c for c in all_cutoffs if c < sc]
+        rankings[sc] = gbm_rank_at(
+            db, sc, fwd_secs, top_n,
+            min_trading_days, min_distinct_events, min_fwd_pos,
+            train, use_bhq=True, label_type='perpos',
+        )
+
+    cohort = set(rankings[score_cutoffs[0]])
+    for sc in score_cutoffs[1:]:
+        cohort &= set(rankings[sc])
+
+    base = {
+        'anchor_date': datetime.utcfromtimestamp(anchor).date().isoformat(),
+        'anchor_unix': anchor,
+        'n_cohort': len(cohort),
+    }
+    if not cohort:
+        return {**base, 'n_positions': 0, 'mean_edge': 0.0, 'std_edge': 0.0,
+                'sharpe': 0.0, 'flat_pnl': 0.0}
+
+    positions = data_mod.load_oos_positions(db, anchor, anchor + fwd_secs, frozenset(cohort))
+    if not positions:
+        return {**base, 'n_positions': 0, 'mean_edge': 0.0, 'std_edge': 0.0,
+                'sharpe': 0.0, 'flat_pnl': 0.0}
+
+    edges = np.array([(p.outcome - p.vwap_entry) / p.vwap_entry for p in positions])
+    mean = float(edges.mean())
+    std = float(edges.std(ddof=1)) if len(edges) > 1 else 0.0
+    sharpe = mean / std if std > 0 else 0.0
+    return {**base, 'n_positions': len(edges), 'mean_edge': mean,
+            'std_edge': std, 'sharpe': sharpe, 'flat_pnl': float(edges.sum())}
+
+
+def aggregate(rows):
+    if not rows:
+        return {'n_anchors': 0, 'mean_of_mean_edge': 0.0, 'std_of_mean_edge': 0.0,
+                'total_flat_pnl': 0.0, 'n_anchors_negative': 0}
+    means = np.array([r['mean_edge'] for r in rows])
+    return {
+        'n_anchors': len(rows),
+        'mean_of_mean_edge': float(means.mean()),
+        'std_of_mean_edge': float(means.std(ddof=1)) if len(means) > 1 else 0.0,
+        'total_flat_pnl': float(sum(r['flat_pnl'] for r in rows)),
+        'n_anchors_negative': int((means < 0).sum()),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Multi-anchor walk-forward GBM evaluation harness (v1: gbm_bhq_intersection_3 only).',
+    )
+    ap.add_argument('--db-path', required=True)
+    ap.add_argument('--strategy', default='gbm_bhq_intersection_3',
+                    choices=['gbm_bhq_intersection_3'],
+                    help='v1 ships gbm_bhq_intersection_3 only (current production champion). '
+                         'Other strategies in follow-ups.')
+    ap.add_argument('--n-anchors', type=int, default=None,
+                    help=f'Number of most recent eligible anchors to evaluate. '
+                         f'Default: all eligible, capped at {MAX_DEFAULT_ANCHORS}.')
+    ap.add_argument('--fwd-days', type=int, default=DEFAULT_FWD_DAYS)
+    ap.add_argument('--top-n', type=int, default=DEFAULT_TOP_N)
+    ap.add_argument('--min-trading-days', type=int, default=DEFAULT_MIN_TRADING_DAYS)
+    ap.add_argument('--min-distinct-events', type=int, default=DEFAULT_MIN_DISTINCT_EVENTS)
+    ap.add_argument('--min-fwd-pos', type=int, default=DEFAULT_MIN_FWD_POS)
+    ap.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT_DIR)
+    args = ap.parse_args()
+
+    fwd_secs = args.fwd_days * 86400
+
+    all_cutoffs = data_mod.distinct_cutoffs(args.db_path)
+    if len(all_cutoffs) < INTERSECTION_K + 1:
+        print(f"ERROR: need >= {INTERSECTION_K + 1} cutoffs ({INTERSECTION_K} for intersection "
+              f"+ 1 prior for training), got {len(all_cutoffs)}", file=sys.stderr)
+        sys.exit(1)
+
+    max_n = args.n_anchors if args.n_anchors is not None else MAX_DEFAULT_ANCHORS
+    anchors = eligible_anchors(all_cutoffs, fwd_secs, max_n=max_n)
+    if not anchors:
+        print("ERROR: no eligible anchors. Need both fully-elapsed forward window "
+              f"(anchor + {args.fwd_days}d) and >= {INTERSECTION_K} cutoffs at-or-before.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    print(f"strategy={args.strategy} top_n={args.top_n} fwd_days={args.fwd_days} "
+          f"min_trading_days={args.min_trading_days} min_distinct_events={args.min_distinct_events}",
+          file=sys.stderr)
+    print(f"evaluating {len(anchors)} anchors: "
+          f"{[datetime.utcfromtimestamp(a).date().isoformat() for a in anchors]}",
+          file=sys.stderr)
+
+    rows = []
+    for i, a in enumerate(anchors, 1):
+        print(f"\n[{i}/{len(anchors)}] anchor={datetime.utcfromtimestamp(a).date().isoformat()}",
+              file=sys.stderr)
+        row = evaluate_anchor(
+            args.db_path, a, fwd_secs, all_cutoffs, args.top_n,
+            args.min_trading_days, args.min_distinct_events, args.min_fwd_pos,
+        )
+        print(f"  n_cohort={row['n_cohort']} n_pos={row['n_positions']} "
+              f"mean_edge={row['mean_edge']:+.4f} std={row['std_edge']:.4f} "
+              f"sharpe={row['sharpe']:+.3f} flat_pnl={row['flat_pnl']:+,.2f}",
+              file=sys.stderr)
+        rows.append(row)
+
+    agg = aggregate(rows)
+
+    out = {
+        'schema_version': SCHEMA_VERSION,
+        'strategy': args.strategy,
+        'generated_at_unix': int(datetime.now(timezone.utc).timestamp()),
+        'params': {
+            'top_n': args.top_n,
+            'fwd_days': args.fwd_days,
+            'min_trading_days': args.min_trading_days,
+            'min_distinct_events': args.min_distinct_events,
+            'min_fwd_pos': args.min_fwd_pos,
+            'intersection_k': INTERSECTION_K,
+            'bhq_q_bps': BHQ_Q_BPS,
+            'gbm': {
+                'n_estimators': 400, 'learning_rate': 0.05, 'num_leaves': 31,
+                'min_data_in_leaf': 200, 'random_state': 42,
+            },
+        },
+        'per_anchor': rows,
+        'aggregate': agg,
+    }
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    utc_ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    out_path = args.output_dir / f"{utc_ts}-{args.strategy}.json"
+    out_path.write_text(json.dumps(out, indent=2) + '\n')
+
+    print(f"\nwrote {out_path}", file=sys.stderr)
+    print(f"  n_anchors={agg['n_anchors']} "
+          f"mean_of_mean_edge={agg['mean_of_mean_edge']:+.4f} "
+          f"std_of_mean_edge={agg['std_of_mean_edge']:.4f} "
+          f"total_flat_pnl={agg['total_flat_pnl']:+,.2f} "
+          f"n_anchors_negative={agg['n_anchors_negative']}",
+          file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()
