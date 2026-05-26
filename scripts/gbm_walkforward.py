@@ -43,6 +43,10 @@ from monthly_rerank_gbm import (  # noqa: E402
     BHQ_Q_BPS,
 )
 from composite_tuner import data as data_mod  # noqa: E402
+from composite_tuner.data import (  # noqa: E402
+    POLYMARKET_FEE_RATE_BPS,
+    SLIPPAGE_RATE_BPS,
+)
 
 SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_DIR = Path("data/eval-results")
@@ -80,12 +84,16 @@ def eligible_anchors(cutoffs, fwd_secs, max_n=None):
 
 
 def evaluate_anchor(db, anchor, fwd_secs, all_cutoffs, top_n,
-                    min_trading_days, min_distinct_events, min_fwd_pos):
+                    min_trading_days, min_distinct_events, min_fwd_pos,
+                    price_haircut_bps=0):
     """Build gbm_bhq_intersection_3 cohort at `anchor` and measure forward edge.
 
     K=3 scoring cutoffs ending at the anchor; each ranks via GBM trained on its
     own prior cutoffs (with no forward-label bleed); intersection of the three
     top-N lists is the cohort. Forward edge is computed over `(anchor, anchor+fwd_secs]`.
+
+    `price_haircut_bps` (default 0 = gross-of-fees, matching forward.rs) is
+    passed through to `load_oos_positions` for the net-edge stress test.
     """
     at_or_before = [c for c in all_cutoffs if c <= anchor]
     score_cutoffs = at_or_before[-INTERSECTION_K:]
@@ -112,7 +120,10 @@ def evaluate_anchor(db, anchor, fwd_secs, all_cutoffs, top_n,
         return {**base, 'n_positions': 0, 'mean_edge': 0.0, 'std_edge': 0.0,
                 'sharpe': 0.0, 'flat_pnl': 0.0}
 
-    positions = data_mod.load_oos_positions(db, anchor, anchor + fwd_secs, frozenset(cohort))
+    positions = data_mod.load_oos_positions(
+        db, anchor, anchor + fwd_secs, frozenset(cohort),
+        price_haircut_bps=price_haircut_bps,
+    )
     if not positions:
         return {**base, 'n_positions': 0, 'mean_edge': 0.0, 'std_edge': 0.0,
                 'sharpe': 0.0, 'flat_pnl': 0.0}
@@ -157,7 +168,23 @@ def main():
     ap.add_argument('--min-distinct-events', type=int, default=DEFAULT_MIN_DISTINCT_EVENTS)
     ap.add_argument('--min-fwd-pos', type=int, default=DEFAULT_MIN_FWD_POS)
     ap.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT_DIR)
+    default_combined_haircut = POLYMARKET_FEE_RATE_BPS + SLIPPAGE_RATE_BPS
+    ap.add_argument(
+        '--price-haircut-bps', type=int, default=0,
+        help=(
+            f'Combined fee + slippage haircut (bps) applied as '
+            f'vwap_entry *= (1 + bps/10000), clamped to 0.999. '
+            f'Default 0 = gross-of-fees (matches '
+            f'forward.rs::ForwardReport.gross_of_fees). '
+            f'Pass {default_combined_haircut} to match production net edge per '
+            f'evaluate.rs:95-112; see docs/_GLOSSARY.md '
+            f'polymarket_fee_rate and slippage_rate for canonical defaults.'
+        ),
+    )
     args = ap.parse_args()
+
+    if args.price_haircut_bps < 0:
+        ap.error('--price-haircut-bps must be >= 0 (negative values do not model anything realistic)')
 
     fwd_secs = args.fwd_days * 86400
 
@@ -189,6 +216,7 @@ def main():
         row = evaluate_anchor(
             args.db_path, a, fwd_secs, all_cutoffs, args.top_n,
             args.min_trading_days, args.min_distinct_events, args.min_fwd_pos,
+            price_haircut_bps=args.price_haircut_bps,
         )
         print(f"  n_cohort={row['n_cohort']} n_pos={row['n_positions']} "
               f"mean_edge={row['mean_edge']:+.4f} std={row['std_edge']:.4f} "
@@ -210,6 +238,7 @@ def main():
             'min_fwd_pos': args.min_fwd_pos,
             'intersection_k': INTERSECTION_K,
             'bhq_q_bps': BHQ_Q_BPS,
+            'price_haircut_bps': args.price_haircut_bps,
             'gbm': {
                 'n_estimators': 400, 'learning_rate': 0.05, 'num_leaves': 31,
                 'min_data_in_leaf': 200, 'random_state': 42,
