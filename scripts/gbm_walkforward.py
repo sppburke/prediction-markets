@@ -193,6 +193,8 @@ def main():
 
     if args.price_haircut_bps < 0:
         ap.error('--price-haircut-bps must be >= 0 (negative values do not model anything realistic)')
+    if args.n_seeds < 1:
+        ap.error('--n-seeds must be >= 1')
 
     fwd_secs = args.fwd_days * 86400
 

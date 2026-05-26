@@ -207,6 +207,9 @@ def main():
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
 
+    if args.n_seeds < 1:
+        ap.error('--n-seeds must be >= 1')
+
     fwd_secs = args.fwd_days * 86400
 
     cutoffs = data_mod.distinct_cutoffs(args.db_path)
