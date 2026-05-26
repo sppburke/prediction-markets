@@ -50,9 +50,9 @@ pub(crate) fn compute_stats(
         .iter()
         .filter(|t| t.realized_pnl_usd > Decimal::ZERO)
         .count();
-    let win_rate_bps = BasisPoints::from_decimal(
-        Decimal::from(wins) / Decimal::from(in_window.len()) * dec!(10_000),
-    );
+    // Pass the ratio directly; BasisPoints::from_decimal scales by ×10_000 internally.
+    let win_rate_bps =
+        BasisPoints::from_decimal(Decimal::from(wins) / Decimal::from(in_window.len()));
 
     let distinct_markets_in_window: u32 = in_window
         .iter()
@@ -109,5 +109,51 @@ fn lcb_5pct(returns: &[Decimal], n: u32) -> BasisPoints {
 
     // z_{0.05} ≈ 1.645 (one-tailed 5th percentile of standard normal).
     let lcb = mean - dec!(1.645) * stderr;
-    BasisPoints::from_decimal(lcb * dec!(10000))
+    // Pass the return ratio directly; BasisPoints::from_decimal scales by ×10_000 internally.
+    BasisPoints::from_decimal(lcb)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn win_rate_two_thirds_is_6667_bps() {
+        // 2 wins out of 3 → 0.6667 → 6667 bps (MidpointNearestEven rounding).
+        // Before the fix this produced 66_666_667 (×10_000 applied twice).
+        let ratio = dec!(2) / dec!(3);
+        let bps = BasisPoints::from_decimal(ratio);
+        assert_eq!(bps.0, 6_667, "2/3 win rate must be 6667 bps, got {}", bps.0);
+    }
+
+    #[test]
+    fn win_rate_zero_is_zero_bps() {
+        assert_eq!(BasisPoints::from_decimal(Decimal::ZERO).0, 0);
+    }
+
+    #[test]
+    fn win_rate_one_is_10000_bps() {
+        assert_eq!(BasisPoints::from_decimal(Decimal::ONE).0, 10_000);
+    }
+
+    #[test]
+    fn lcb_5pct_known_value() {
+        // Two equal returns of 0.01 (1% per day): mean=0.01, variance=0, stderr=0 → lcb=mean.
+        // Expected: round(0.01 × 10_000) = 100 bps.
+        let returns = vec![dec!(0.01), dec!(0.01)];
+        let bps = lcb_5pct(&returns, 2);
+        assert_eq!(
+            bps.0, 100,
+            "lcb of constant 1% daily return must be 100 bps, got {}",
+            bps.0
+        );
+    }
+
+    #[test]
+    fn lcb_5pct_below_two_returns_sentinel() {
+        assert_eq!(lcb_5pct(&[dec!(0.05)], 1).0, i32::MIN);
+        assert_eq!(lcb_5pct(&[], 0).0, i32::MIN);
+    }
 }
