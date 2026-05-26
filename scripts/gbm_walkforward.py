@@ -7,16 +7,37 @@ script. For each eligible anchor cutoff, builds the `gbm_bhq_intersection_3` coh
 pre-filter on `skill_pvalue_bps`), then evaluates the cohort's forward edge over the
 next `--fwd-days` via `composite_tuner.data.load_oos_positions`.
 
-Output: per-anchor + aggregate JSON written to `data/eval-results/<utc-ts>-<strategy>.json`.
+Output: per-anchor + aggregate + pbo JSON written to
+`data/eval-results/<utc-ts>-<strategy>.json`.
 
 Baseline metric (matches `crates/skill-select/src/forward.rs::ForwardReport.gross_of_fees == true`):
     flat-$1 edge = (outcome - vwap_entry) / vwap_entry, hold-to-resolution, gross of fees.
 The optional fee+slippage haircut from tracker #248 sub-task #2 lands as a follow-up.
 
+Output schema (schema_version=2):
+    {
+      "schema_version": 2,
+      "strategy": "gbm_bhq_intersection_3",
+      "generated_at_unix": <int>,
+      "params": { ... },
+      "per_anchor": [ ... ],
+      "aggregate": { "n_anchors": N, "mean_of_mean_edge": ..., ... },
+      "pbo": {
+        "pbo": 0.312,            # fraction of IS/OOS half-splits where best-IS < OOS median
+        "verdict": "OK",         # "OK" | "OVERFIT" | "undefined"
+        "n_perms": 10,
+        "n_trials": 5,           # n_seeds (one trial = one stochastic GBM seed)
+        "n_windows": 5,          # n_anchors
+        "median_oos_rank": 0.61
+      }
+    }
+    verdict="OK" when pbo <= 0.5 AND n_seeds >= 2 AND n_anchors >= 4;
+    verdict="undefined" otherwise (raw pbo still present for < 4 anchors).
+
 USAGE:
     .venv-analysis/bin/python3 scripts/gbm_walkforward.py \\
         --db-path data/wallet_cache.db \\
-        --n-anchors 5
+        --n-anchors 5 --n-seeds 5
 
 REUSE NOTE: imports `gbm_rank_at` and friends from `monthly_rerank_gbm.py` so any
 future changes to GBM training stay in one place. The composite-ranker walk-forward
@@ -25,6 +46,7 @@ script is the GBM analogue, with intersection_K added.
 """
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -47,8 +69,9 @@ from composite_tuner.data import (  # noqa: E402
     POLYMARKET_FEE_RATE_BPS,
     SLIPPAGE_RATE_BPS,
 )
+from composite_tuner.pbo import compute_pbo, pbo_summary  # noqa: E402
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_OUTPUT_DIR = Path("data/eval-results")
 MAX_DEFAULT_ANCHORS = 10  # safety cap when --n-anchors not specified
 INTERSECTION_K = 3  # gbm_bhq_intersection_3
@@ -152,6 +175,22 @@ def aggregate(rows):
     }
 
 
+def pbo_result_to_dict(result, verdict: str) -> dict:
+    """Serialise a PboResult to a JSON-safe dict (drops logit_values).
+
+    verdict is passed in explicitly so callers can override it (e.g. force
+    'undefined' on thin trial axis) without re-running compute_pbo.
+    """
+    return {
+        'pbo': result.pbo,
+        'verdict': verdict,
+        'n_perms': result.n_perms,
+        'n_trials': result.n_trials,
+        'n_windows': result.n_windows,
+        'median_oos_rank': result.median_oos_rank,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Multi-anchor walk-forward GBM evaluation harness (v1: gbm_bhq_intersection_3 only).',
@@ -189,6 +228,11 @@ def main():
                          'Default 1 = single-seed (prior behaviour). Recommended production: 5.')
     ap.add_argument('--random-state', type=int, default=42,
                     help='Starting random seed. Seeds used: [random_state, ..., random_state+n_seeds-1].')
+    ap.add_argument('--pbo-perms', type=int, default=16,
+                    help='Upper bound on PBO permutation count. Effective n_perms = '
+                         'min(C(n_anchors, n_anchors//2), --pbo-perms). At 4-5 anchors '
+                         'the combinatorial cap is C(4,2)=6 or C(5,2)=10 regardless of '
+                         'this flag. Ignored when n_seeds < 2 or n_anchors < 2.')
     args = ap.parse_args()
 
     if args.price_haircut_bps < 0:
@@ -240,6 +284,57 @@ def main():
 
     agg = aggregate(rows)
 
+    # Build (n_seeds, n_anchors) score matrix for PBO. Each cell is the mean_edge
+    # for that (seed, anchor) pair, produced by re-running evaluate_anchor with
+    # n_seeds=1 for each seed. The main multi-seed loop (above) averages predictions
+    # before cohort selection and exposes only one mean_edge per anchor, so we
+    # cannot reuse those values — the per-seed PBO-data loop is separate.
+    n_anchors = len(anchors)
+    if args.n_seeds >= 2 and n_anchors >= 2:
+        print(f"\nbuilding PBO score matrix ({args.n_seeds} seeds × {n_anchors} anchors) "
+              f"— adds ~{args.n_seeds * n_anchors} single-seed evaluate_anchor calls",
+              file=sys.stderr)
+        pbo_matrix = np.zeros((args.n_seeds, n_anchors), dtype=float)
+        for si, seed in enumerate(range(args.random_state,
+                                        args.random_state + args.n_seeds)):
+            for ai, anchor in enumerate(anchors):
+                r = evaluate_anchor(
+                    args.db_path, anchor, fwd_secs, all_cutoffs, args.top_n,
+                    args.min_trading_days, args.min_distinct_events, args.min_fwd_pos,
+                    price_haircut_bps=args.price_haircut_bps,
+                    n_seeds=1, random_state=seed,
+                )
+                pbo_matrix[si, ai] = r['mean_edge']
+        n_perms = min(math.comb(n_anchors, n_anchors // 2), args.pbo_perms)
+        pbo_result = compute_pbo(pbo_matrix, n_perms=n_perms, rng_seed=42)
+        # Plan-gate: raw pbo value preserved even at n_anchors < 4, but verdict
+        # is forced to "undefined" — too thin a trial axis to commit to OK/OVERFIT.
+        if n_anchors < 4 and not math.isnan(pbo_result.pbo):
+            verdict = 'undefined'
+            print(f"PBO={pbo_result.pbo:.3f} (verdict=undefined — need ≥4 anchors "
+                  f"for a committed verdict; got n_anchors={n_anchors})", file=sys.stderr)
+        else:
+            verdict = 'undefined' if math.isnan(pbo_result.pbo) else (
+                'OVERFIT' if pbo_result.pbo > 0.5 else 'OK'
+            )
+            print(pbo_summary(pbo_result), file=sys.stderr)
+        pbo_dict = pbo_result_to_dict(pbo_result, verdict)
+    else:
+        pbo_dict = {
+            'pbo': float('nan'),
+            'verdict': 'undefined',
+            'n_perms': 0,
+            'n_trials': args.n_seeds,
+            'n_windows': n_anchors,
+            'median_oos_rank': float('nan'),
+        }
+        print(f"PBO=undefined — need ≥2 anchors and ≥2 seeds "
+              f"(got n_anchors={n_anchors}, n_seeds={args.n_seeds})", file=sys.stderr)
+
+    # Serialise NaN as null so the JSON is valid.
+    pbo_json = {k: (None if isinstance(v, float) and math.isnan(v) else v)
+                for k, v in pbo_dict.items()}
+
     out = {
         'schema_version': SCHEMA_VERSION,
         'strategy': args.strategy,
@@ -253,6 +348,7 @@ def main():
             'intersection_k': INTERSECTION_K,
             'bhq_q_bps': BHQ_Q_BPS,
             'price_haircut_bps': args.price_haircut_bps,
+            'pbo_perms': args.pbo_perms,
             'gbm': {
                 'n_estimators': 400, 'learning_rate': 0.05, 'num_leaves': 31,
                 'min_data_in_leaf': 200, 'random_state': args.random_state,
@@ -262,6 +358,7 @@ def main():
         },
         'per_anchor': rows,
         'aggregate': agg,
+        'pbo': pbo_json,
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
