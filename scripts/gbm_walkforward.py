@@ -85,7 +85,7 @@ def eligible_anchors(cutoffs, fwd_secs, max_n=None):
 
 def evaluate_anchor(db, anchor, fwd_secs, all_cutoffs, top_n,
                     min_trading_days, min_distinct_events, min_fwd_pos,
-                    price_haircut_bps=0):
+                    price_haircut_bps=0, n_seeds=1, random_state=42):
     """Build gbm_bhq_intersection_3 cohort at `anchor` and measure forward edge.
 
     K=3 scoring cutoffs ending at the anchor; each ranks via GBM trained on its
@@ -94,6 +94,7 @@ def evaluate_anchor(db, anchor, fwd_secs, all_cutoffs, top_n,
 
     `price_haircut_bps` (default 0 = gross-of-fees, matching forward.rs) is
     passed through to `load_oos_positions` for the net-edge stress test.
+    `n_seeds`/`random_state` are forwarded to `gbm_rank_at` for multi-seed ensembling.
     """
     at_or_before = [c for c in all_cutoffs if c <= anchor]
     score_cutoffs = at_or_before[-INTERSECTION_K:]
@@ -105,6 +106,7 @@ def evaluate_anchor(db, anchor, fwd_secs, all_cutoffs, top_n,
             db, sc, fwd_secs, top_n,
             min_trading_days, min_distinct_events, min_fwd_pos,
             train, use_bhq=True, label_type='perpos',
+            n_seeds=n_seeds, random_state=random_state,
         )
 
     cohort = set(rankings[score_cutoffs[0]])
@@ -181,10 +183,18 @@ def main():
             f'polymarket_fee_rate and slippage_rate for canonical defaults.'
         ),
     )
+    ap.add_argument('--n-seeds', type=int, default=1,
+                    help='Number of GBM seeds to ensemble (scores averaged before top-N). '
+                         'Compute scales linearly with n_seeds. '
+                         'Default 1 = single-seed (prior behaviour). Recommended production: 5.')
+    ap.add_argument('--random-state', type=int, default=42,
+                    help='Starting random seed. Seeds used: [random_state, ..., random_state+n_seeds-1].')
     args = ap.parse_args()
 
     if args.price_haircut_bps < 0:
         ap.error('--price-haircut-bps must be >= 0 (negative values do not model anything realistic)')
+    if args.n_seeds < 1:
+        ap.error('--n-seeds must be >= 1')
 
     fwd_secs = args.fwd_days * 86400
 
@@ -205,6 +215,9 @@ def main():
     print(f"strategy={args.strategy} top_n={args.top_n} fwd_days={args.fwd_days} "
           f"min_trading_days={args.min_trading_days} min_distinct_events={args.min_distinct_events}",
           file=sys.stderr)
+    if args.n_seeds > 1:
+        print(f"multi-seed ensemble: n_seeds={args.n_seeds} → ~{args.n_seeds}× compute per scoring cutoff",
+              file=sys.stderr)
     print(f"evaluating {len(anchors)} anchors: "
           f"{[datetime.utcfromtimestamp(a).date().isoformat() for a in anchors]}",
           file=sys.stderr)
@@ -217,6 +230,7 @@ def main():
             args.db_path, a, fwd_secs, all_cutoffs, args.top_n,
             args.min_trading_days, args.min_distinct_events, args.min_fwd_pos,
             price_haircut_bps=args.price_haircut_bps,
+            n_seeds=args.n_seeds, random_state=args.random_state,
         )
         print(f"  n_cohort={row['n_cohort']} n_pos={row['n_positions']} "
               f"mean_edge={row['mean_edge']:+.4f} std={row['std_edge']:.4f} "
@@ -241,7 +255,9 @@ def main():
             'price_haircut_bps': args.price_haircut_bps,
             'gbm': {
                 'n_estimators': 400, 'learning_rate': 0.05, 'num_leaves': 31,
-                'min_data_in_leaf': 200, 'random_state': 42,
+                'min_data_in_leaf': 200, 'random_state': args.random_state,
+                'n_seeds': args.n_seeds,
+                'seeds': list(range(args.random_state, args.random_state + args.n_seeds)),
             },
         },
         'per_anchor': rows,
