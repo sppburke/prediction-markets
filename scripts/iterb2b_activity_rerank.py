@@ -113,12 +113,16 @@ def main():
     log(f"=== Iter B2b: Activity-adjusted re-ranking (proxy for B2) ===\n")
     log(f"B1 rankings available for: {list(b1_rankings.keys())}\n")
 
-    # Activity weight strategies to test
+    # Activity weight strategies to test.
+    # score_fn(df) returns an activity score (higher = more active).
+    # The main loop computes adjusted_rank = gbm_rank / activity, so higher activity
+    # pushes wallets to lower (better) adjusted rank. gbm_rank must NOT appear in
+    # score_fn — it is applied as the numerator separately.
     strategies = {
         'gbm_only': lambda df: df['gbm_rank'].rank(ascending=True),  # baseline (B1)
-        'gbm_x_ct': lambda df: df['gbm_rank'] * np.log1p(df['closed_trades'].clip(lower=0)),
-        'gbm_x_fpd': lambda df: df['gbm_rank'] * np.log1p(df['first_entries_per_active_day_bps'].clip(lower=0)),
-        'gbm_x_td': lambda df: df['gbm_rank'] * np.log1p(df['trading_days'].clip(lower=0)),
+        'gbm_x_ct': lambda df: np.log1p(df['closed_trades'].clip(lower=0)),
+        'gbm_x_fpd': lambda df: np.log1p(df['first_entries_per_active_day_bps'].clip(lower=0)),
+        'gbm_x_td': lambda df: np.log1p(df['trading_days'].clip(lower=0)),
     }
 
     results = {s: [] for s in strategies}
