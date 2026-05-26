@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use pe_bootstrap::cache::ResolutionIndex;
-use pe_core_types::{MarketId, VenueMarketId};
-use pe_trader_index::{ClosedTrade, TraderLedger};
+use pe_core_types::{MarketId, Side, VenueMarketId};
+use pe_trader_index::{ClosedTrade, RawTrade, TraderLedger};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, MathematicalOps};
 
@@ -144,6 +144,12 @@ pub struct DeterministicFeatures {
     /// before the GBM sees them). Strict thresholds: exactly 0.20 / 0.80 is
     /// neither. (#248 §4; tracker threshold source: verbatim)
     pub longshot_bias_ratio_bps: i64,
+    // ─── Hold-to-resolution rate (#252) ─────────────────────────────────────────
+    /// Fraction of `(market, outcome)` positions where `cum_sells < cum_buys` at
+    /// `market.resolved_at_unix`, over resolved markets with `resolved_at_unix ≤
+    /// cutoff_unix` and at least one buy on that outcome before/at resolution.
+    /// Basis points (0–10 000). `0` sentinel when no qualifying position exists.
+    pub hold_to_resolution_rate_bps: i64,
 }
 
 /// Compute the simple deterministic feature batch for one wallet's train ledger.
@@ -167,6 +173,7 @@ pub struct DeterministicFeatures {
 #[allow(clippy::too_many_arguments)] // canonical extraction call; one site.
 pub fn extract_features(
     ledger: &TraderLedger,
+    raw_trades: &[RawTrade],
     cutoff_unix: i64,
     event_map: &HashMap<String, String>,
     resolutions: &ResolutionIndex,
@@ -248,6 +255,8 @@ pub fn extract_features(
     let per_bet = per_bet_outcomes(&windowed, resolutions);
     let per_bet_quality = compute_per_bet_quality(&per_bet, bb_alpha, bb_beta);
     let longshot_bias_ratio_bps = compute_longshot_bias_ratio(&per_bet);
+    let hold_to_resolution_rate_bps =
+        compute_hold_to_resolution_rate(raw_trades, resolutions, cutoff_unix);
 
     // Per-event positive-PnL roll-up over all in-window closed trades
     // (resolved or not — realized PnL exists either way; group F is a
@@ -299,6 +308,7 @@ pub fn extract_features(
         first_entries_per_active_day_bps,
         median_first_entry_to_resolution_secs,
         longshot_bias_ratio_bps,
+        hold_to_resolution_rate_bps,
     })
 }
 
@@ -468,6 +478,74 @@ fn compute_longshot_bias_ratio(per_bet: &[PerBet]) -> i64 {
     let n_low = Decimal::from(per_bet.iter().filter(|b| b.c < low).count());
     let n_high = Decimal::from(per_bet.iter().filter(|b| b.c > high).count());
     decimal_to_bps_i64((n_low - n_high) / n).clamp(-10_000, 10_000)
+}
+
+// ─── Hold-to-resolution rate (#252) ──────────────────────────────────────────
+
+/// Fraction of `(market, outcome)` positions where `cum_sells < cum_buys` at
+/// resolution, over positions with a resolution row satisfying
+/// `resolved_at_unix ≤ cutoff_unix` and at least one buy before/at that time.
+///
+/// Returns `0` when no qualifying position exists.
+/// One raw-trade event reduced to what `compute_hold_to_resolution_rate` needs.
+struct RawTick {
+    side: Side,
+    qty: u64,
+    ts: i64,
+}
+
+fn compute_hold_to_resolution_rate(
+    raw_trades: &[RawTrade],
+    resolutions: &ResolutionIndex,
+    cutoff_unix: i64,
+) -> i64 {
+    let mut per_position: HashMap<(String, u16), Vec<RawTick>> = HashMap::new();
+    for t in raw_trades {
+        let ts = t.timestamp.0.unix_timestamp();
+        per_position
+            .entry((t.market_id.0.0.clone(), t.outcome_id.0))
+            .or_default()
+            .push(RawTick {
+                side: t.side,
+                qty: t.contracts.0,
+                ts,
+            });
+    }
+
+    let mut held: u64 = 0;
+    let mut qualifying: u64 = 0;
+
+    for ((market_str, _outcome), trades) in &per_position {
+        let key = MarketId(VenueMarketId(market_str.clone()));
+        let Some(res) = resolutions.get(&key) else {
+            continue;
+        };
+        if res.resolved_at_unix > cutoff_unix {
+            continue;
+        }
+        let mut cum_buys: u64 = 0;
+        let mut cum_sells: u64 = 0;
+        for tick in trades {
+            if tick.ts <= res.resolved_at_unix {
+                match tick.side {
+                    Side::Buy => cum_buys = cum_buys.saturating_add(tick.qty),
+                    Side::Sell => cum_sells = cum_sells.saturating_add(tick.qty),
+                }
+            }
+        }
+        if cum_buys == 0 {
+            continue;
+        }
+        qualifying += 1;
+        if cum_sells < cum_buys {
+            held += 1;
+        }
+    }
+
+    if qualifying == 0 {
+        return 0;
+    }
+    decimal_to_bps_i64(Decimal::from(held) / Decimal::from(qualifying)).clamp(0, 10_000)
 }
 
 /// Output of the per-bet quality block (group A).
@@ -841,7 +919,7 @@ mod tests {
             closed("0xm3", dec!(0.20), 50, dec!(2.0), 1_800, 3_000),
         ]);
 
-        let f = extract_features(&l, 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
 
         assert_eq!(f.total_pnl_usd, dec!(7.0)); // 10 - 5 + 2
         assert_eq!(f.roi_bps, 636); // 7 / 110 = 0.063636… → 636 bps
@@ -861,7 +939,7 @@ mod tests {
             closed("0xm1", dec!(0.50), 100, dec!(10.0), 3_600, 1_000),
             closed("0xm2", dec!(0.50), 100, dec!(99.0), 3_600, 9_999), // after cutoff
         ]);
-        let f = extract_features(&l, 5_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 5_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
         assert_eq!(f.closed_trades, 1);
         assert_eq!(f.total_pnl_usd, dec!(10.0));
         assert_eq!(f.win_rate_bps, 10_000); // the one in-window trade won
@@ -871,14 +949,14 @@ mod tests {
     fn none_below_min_closed_trades() {
         let events = HashMap::new();
         let l = ledger(vec![closed("0xm1", dec!(0.5), 10, dec!(1.0), 60, 1_000)]);
-        assert!(extract_features(&l, 10_000, &events, &no_res(), 5, 0, 1, 1).is_none());
+        assert!(extract_features(&l, &[], 10_000, &events, &no_res(), 5, 0, 1, 1).is_none());
     }
 
     #[test]
     fn none_when_no_closed_trades() {
         let events = HashMap::new();
         let l = ledger(vec![]);
-        assert!(extract_features(&l, 10_000, &events, &no_res(), 1, 0, 1, 1).is_none());
+        assert!(extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).is_none());
     }
 
     #[test]
@@ -891,7 +969,7 @@ mod tests {
             closed("0xm2", dec!(0.50), 100, dec!(10.0), 60, 172_800),
             closed("0xm3", dec!(0.50), 100, dec!(15.0), 60, 259_200),
         ]);
-        let f = extract_features(&l, 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
 
         assert_eq!(f.trading_days, 3);
         // mean = 0.2 → 2000 bps (exact)
@@ -926,7 +1004,7 @@ mod tests {
             closed("0xm1", dec!(0.50), 100, dec!(5.0), 60, 1_000),
             closed("0xm2", dec!(0.50), 100, dec!(5.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
         assert_eq!(f.trading_days, 1);
         assert_eq!(f.std_daily_return_bps, 0);
         assert_eq!(f.sharpe_bps, 0);
@@ -963,7 +1041,7 @@ mod tests {
             .collect();
         let l = ledger(trades);
         // Must not panic. When std^3 underflows to Decimal::ZERO, skewness = 0.
-        let f = extract_features(&l, i64::MAX, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], i64::MAX, &events, &no_res(), 1, 0, 1, 1).unwrap();
         assert_eq!(f.trading_days, 30);
         assert_eq!(f.skewness_bps, 0);
         assert_eq!(f.excess_kurtosis_bps, 0);
@@ -987,7 +1065,7 @@ mod tests {
             closed("0xwin", dec!(0.40), 100, dec!(60.0), 60, 1_000),
             closed("0xlose", dec!(0.70), 100, dec!(-70.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         assert_eq!(f.ev_mean_bps, -500);
         assert_eq!(f.brier_score_bps, 4_250);
         assert_eq!(f.brier_resolution_bps, 2_500);
@@ -1010,7 +1088,7 @@ mod tests {
             closed("0xwin", dec!(0.40), 100, dec!(60.0), 60, 1_000),
             closed("0xlose", dec!(0.40), 100, dec!(-40.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         assert_eq!(f.bb_shrunk_edge_bps, 1_000);
         assert!(
             (f.kelly_log_growth_bps - 204).abs() <= 3,
@@ -1031,7 +1109,7 @@ mod tests {
             closed("0xa", dec!(0.40), 100, dec!(-40.0), 60, 1_000),
             closed("0xb", dec!(0.40), 100, dec!(-40.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         // p̂ = 0.25, c̄ = 0.40 → bb_edge = −0.15 → −1500 bps. Kelly = 0 (f* ≤ 0).
         assert_eq!(f.bb_shrunk_edge_bps, -1_500);
         assert_eq!(f.kelly_log_growth_bps, 0);
@@ -1048,7 +1126,7 @@ mod tests {
             closed("0xwin", dec!(0.50), 100, dec!(50.0), 60, 1_000),
             closed("0xunresolved", dec!(0.30), 100, dec!(-30.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         // Sample-size fields unchanged by resolution coverage.
         assert_eq!(f.closed_trades, 2);
         assert_eq!(f.distinct_markets, 2);
@@ -1068,7 +1146,7 @@ mod tests {
             closed("0xa", dec!(0.50), 100, dec!(50.0), 60, 1_000),
             closed("0xb", dec!(0.50), 100, dec!(-50.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         assert_eq!(f.brier_resolution_bps, 0);
     }
 
@@ -1084,7 +1162,7 @@ mod tests {
             closed("0xm1", dec!(0.50), 100, dec!(10.0), 60, 1_000),
             closed("0xm2", dec!(0.50), 100, dec!(10.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
         assert_eq!(f.concentration_hhi_bps, 5_000);
         assert_eq!(f.concentration_n_eff_bps, 20_000);
         assert_eq!(f.concentration_rpc_bps, 15_000);
@@ -1098,7 +1176,7 @@ mod tests {
             closed("0xa", dec!(0.50), 100, dec!(-10.0), 60, 1_000),
             closed("0xb", dec!(0.50), 100, dec!(-20.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
         assert_eq!(f.concentration_hhi_bps, 0);
         assert_eq!(f.concentration_n_eff_bps, 0);
         assert_eq!(f.concentration_rpc_bps, 0);
@@ -1113,7 +1191,7 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 172_800),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 60, 259_200),
         ]);
-        let f = extract_features(&l, 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
         assert_eq!(f.first_entries_per_active_day_bps, 10_000);
     }
 
@@ -1137,7 +1215,7 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 100, 1_100),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 100, 2_100),
         ]);
-        let f = extract_features(&l, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         assert_eq!(f.median_first_entry_to_resolution_secs, 200);
 
         // Drop the third trade → deltas [100, 200], even-length median = 150.
@@ -1145,7 +1223,7 @@ mod tests {
             closed("0xa", dec!(0.50), 100, dec!(5.0), 50, 50),
             closed("0xb", dec!(0.50), 100, dec!(5.0), 100, 1_100),
         ]);
-        let f2 = extract_features(&l2, 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f2 = extract_features(&l2, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
         assert_eq!(f2.median_first_entry_to_resolution_secs, 150);
     }
 
@@ -1161,9 +1239,9 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 2_000),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 60, 3_000),
         ]);
-        assert!(extract_features(&l, 10_000, &events, &no_res(), 1, 10, 1, 1).is_none());
+        assert!(extract_features(&l, &[], 10_000, &events, &no_res(), 1, 10, 1, 1).is_none());
         // Same data, gate of 3 → accepted (boundary == passes).
-        let f = extract_features(&l, 10_000, &events, &no_res(), 1, 3, 1, 1);
+        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 3, 1, 1);
         assert!(f.is_some());
     }
 }

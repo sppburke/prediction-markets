@@ -171,6 +171,8 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
     assert_eq!(r.features.median_first_entry_to_resolution_secs, 2_000);
     // longshot_bias_ratio: vwap_entry=0.50, which is neither <0.20 nor >0.80 → 0.
     assert_eq!(r.features.longshot_bias_ratio_bps, 0);
+    // hold_to_resolution_rate: bought 100, sold 100 before resolution → cum_sells == cum_buys → 0.
+    assert_eq!(r.features.hold_to_resolution_rate_bps, 0);
     println!(
         "PASS: scenario_extract_writes_rows_for_eligible_active_wallets — scanned={} written={} skipped={}",
         report.wallets_scanned, report.wallets_written, report.wallets_skipped
@@ -375,5 +377,66 @@ fn scenario_extract_clean_prior_removes_ghost_rows() {
         "PASS: scenario_extract_clean_prior_removes_ghost_rows — first_run_rows={} second_run_rows={}",
         rows1.len(),
         rows2.len()
+    );
+}
+
+/// Scenario: `hold_to_resolution_rate_bps` is non-zero when a wallet holds
+/// contracts to resolution (cum_sells < cum_buys at market resolution).
+///
+/// Fixture: wallet buys 100 contracts at ts=1000, buys another 100 at ts=1500,
+/// then sells 100 at ts=2000. Market resolves at ts=3000 (≤ cutoff). At
+/// resolution: cum_buys=200, cum_sells=100 → strictly held → rate=10000 bps.
+///
+/// PASS: `hold_to_resolution_rate_bps == 10_000`.
+/// FAIL: value is 0 (held position not detected) or any other wrong value.
+#[test]
+fn scenario_extract_hold_rate_nonzero_when_position_held_to_resolution() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wallet_cache.db");
+    const W_HOLDER: &str = "0x4444444444444444444444444444444444444444";
+    const CUTOFF2: i64 = 1_743_465_599;
+
+    {
+        let mut cache = WalletCache::open(&path).unwrap();
+        cache
+            .upsert_market_events("0xmH", "evtH", Some("slug"), 100)
+            .unwrap();
+        // Market resolves at ts=3000, before cutoff. Winning outcome = 0.
+        cache
+            .insert_resolution("0xmH", Some(0), 3_000, 3_000)
+            .unwrap();
+
+        activate(&mut cache, W_HOLDER);
+        // Two buys (total 200 contracts), one sell (100): at resolution
+        // cum_buys=200 > cum_sells=100 → "held" position.
+        // FIFO closes the first 100 contracts on the sell → 1 closed trade.
+        cache
+            .insert_new(
+                W_HOLDER,
+                vec![
+                    raw(W_HOLDER, "0xmH", Side::Buy, dec!(0.40), 1_000, "0xhb1"),
+                    raw(W_HOLDER, "0xmH", Side::Buy, dec!(0.40), 1_500, "0xhb2"),
+                    raw(W_HOLDER, "0xmH", Side::Sell, dec!(0.80), 2_000, "0xhs1"),
+                ],
+            )
+            .unwrap();
+    }
+
+    let report = run_extract(&path, CUTOFF2, 1, 0, 1, 1, 99, 42, 1_700_000_000, 0, false).unwrap();
+    assert_eq!(report.wallets_written, 1);
+
+    let rows = SkillCache::open_read_only(&path)
+        .unwrap()
+        .load_features_for_cutoff(CUTOFF2)
+        .unwrap();
+    let r = &rows[0];
+    assert_eq!(
+        r.features.hold_to_resolution_rate_bps, 10_000,
+        "PASS criterion: 1/1 positions held → hold_rate 10000 bps; got {}",
+        r.features.hold_to_resolution_rate_bps
+    );
+    println!(
+        "PASS: scenario_extract_hold_rate_nonzero_when_position_held_to_resolution — hold_rate_bps={}",
+        r.features.hold_to_resolution_rate_bps
     );
 }
