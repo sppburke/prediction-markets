@@ -29,10 +29,16 @@ import sys
 import unittest
 from pathlib import Path
 
-# Make `composite_tuner` importable from the package dir.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Import `data.py` directly without going through `composite_tuner/__init__.py`.
+# The package init re-exports `tuner` (numpy + optuna), neither of which is
+# installed in the CI Python step (this test is stdlib-only by design). Putting
+# `composite_tuner/` on the sys.path lets Python load `data.py` as a top-level
+# module — same file, same constants, no transitive heavy deps.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "composite_tuner"))
+import data as _data  # noqa: E402
 
-from composite_tuner.data import POLYMARKET_FEE_RATE_BPS, SLIPPAGE_RATE_BPS
+POLYMARKET_FEE_RATE_BPS = _data.POLYMARKET_FEE_RATE_BPS
+SLIPPAGE_RATE_BPS = _data.SLIPPAGE_RATE_BPS
 
 
 class HaircutConstantsTest(unittest.TestCase):
