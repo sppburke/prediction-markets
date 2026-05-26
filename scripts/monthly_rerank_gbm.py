@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Monthly production re-rank using the GBM ranker (per iter 2/3/3b finding).
+"""Monthly production re-rank using the GBM ranker (per iter 2/3/3b/B2 findings).
 
 Replaces scripts/monthly_rerank.py for the GBM workflow:
-- Trains LightGBM on historical (features, forward-edge) labels from cutoffs
+- Trains LightGBM on historical (features, forward-label) pairs from cutoffs
   whose full 30-day forward window has elapsed before the scoring cutoff.
 - Scores wallets at each scoring cutoff.
 - Optionally takes intersection_K across K most-recent scoring cutoffs.
@@ -13,18 +13,24 @@ Run after each `pe-skill-select extract` at a new monthly cutoff.
 USAGE:
     .venv-analysis/bin/python3 scripts/monthly_rerank_gbm.py \
         --db-path data/wallet_cache.db \
-        --strategy gbm_bhq_intersection_3 \
+        --strategy gbm_throughput_single \
         --out data/production-watchlist-gbm.txt
 
-STRATEGIES:
+STRATEGIES (throughput label — B2 finding, +20% vs per-pos):
+    gbm_throughput_single        GBM trained on n_pos×mean_edge, top-N single cutoff (RECOMMENDED)
+    gbm_throughput_intersection_3 GBM throughput label, intersection across 3 most-recent cutoffs
+
+STRATEGIES (per-pos edge label — batch-2 methods):
     gbm_single              GBM-top-N at most-recent cutoff only
     gbm_intersection_3      GBM-top-N intersection across 3 most-recent cutoffs (best per-pos flat edge)
     gbm_intersection_5      GBM-top-N intersection across 5 most-recent cutoffs (most selective)
-    gbm_bhq_intersection_3  GBM-top-N within BHq pool, intersection_3 (best Sharpe — recommended)
+    gbm_bhq_intersection_3  GBM-top-N within BHq pool, intersection_3 (best Sharpe)
     gbm_bhq_single          GBM-top-N within BHq pool, single cutoff
 
 Training cutoffs are strictly filtered to c + fwd_secs <= scoring_cutoff so
 no forward-window labels bleed into the evaluation period.
+
+B2 result (7-anchor walk-forward, N=5k): throughput label mean $+10,232 vs per-pos $+8,554 (+20%).
 """
 import argparse
 import sqlite3
@@ -115,11 +121,14 @@ def per_wallet_fwd_edge(db, cutoff_unix, fwd_end_unix, wallets):
 
 
 def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
-                min_distinct_events, min_fwd_pos, train_cutoffs, use_bhq=False):
+                min_distinct_events, min_fwd_pos, train_cutoffs, use_bhq=False,
+                label_type='perpos'):
     """Train GBM on train_cutoffs (labeled by fwd edge), score at cutoff_unix.
 
     train_cutoffs must satisfy c + fwd_secs <= cutoff_unix (no forward-label bleed).
     Returns top-N wallet_hex list; if use_bhq, only BHq-significant wallets are scored.
+    label_type: 'perpos' = mean edge per position (batch-2 default);
+                'throughput' = n_positions × mean_edge (B2 finding, +20% throughput).
     """
     # Guard: drop any training cutoff whose forward window extends past the scoring cutoff.
     safe_train = [c for c in train_cutoffs if c + fwd_secs <= cutoff_unix]
@@ -129,14 +138,20 @@ def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
     if not safe_train:
         raise ValueError(f"No safe training cutoffs available for scoring cutoff {cutoff_unix}")
 
-    print(f"  training on {len(safe_train)} prior cutoffs", file=sys.stderr)
+    print(f"  training on {len(safe_train)} prior cutoffs (label={label_type})", file=sys.stderr)
     train_dfs = []
     for c in safe_train:
         df = load_features(db, c, min_trading_days, min_distinct_events)
         labels = per_wallet_fwd_edge(db, c, c + fwd_secs, df['wallet_hex'].tolist())
-        df['label'] = df['wallet_hex'].map(
-            lambda w: labels.get(w, (None, 0))[0] if labels.get(w, (None, 0))[1] >= min_fwd_pos else None
-        )
+        if label_type == 'throughput':
+            df['label'] = df['wallet_hex'].map(
+                lambda w: labels[w][0] * labels[w][1]
+                if w in labels and labels[w][1] >= min_fwd_pos else None
+            )
+        else:
+            df['label'] = df['wallet_hex'].map(
+                lambda w: labels.get(w, (None, 0))[0] if labels.get(w, (None, 0))[1] >= min_fwd_pos else None
+            )
         train_dfs.append(df[df['label'].notna()].copy())
 
     tr = pd.concat(train_dfs, ignore_index=True)
@@ -166,8 +181,9 @@ def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--db-path', required=True)
-    ap.add_argument('--strategy', default='gbm_bhq_intersection_3',
-                    choices=['gbm_single', 'gbm_intersection_3', 'gbm_intersection_5',
+    ap.add_argument('--strategy', default='gbm_throughput_single',
+                    choices=['gbm_throughput_single', 'gbm_throughput_intersection_3',
+                             'gbm_single', 'gbm_intersection_3', 'gbm_intersection_5',
                              'gbm_bhq_intersection_3', 'gbm_bhq_single'])
     ap.add_argument('--top-n', type=int, default=DEFAULT_TOP_N)
     ap.add_argument('--fwd-days', type=int, default=DEFAULT_FWD_DAYS)
@@ -185,7 +201,10 @@ def main():
         sys.exit(1)
 
     use_bhq = args.strategy.startswith('gbm_bhq')
+    label_type = 'throughput' if args.strategy.startswith('gbm_throughput') else 'perpos'
     K = {
+        'gbm_throughput_single': 1,
+        'gbm_throughput_intersection_3': 3,
         'gbm_single': 1,
         'gbm_intersection_3': 3,
         'gbm_intersection_5': 5,
@@ -209,7 +228,8 @@ def main():
         print(f"\nRanking at {datetime.utcfromtimestamp(sc).date().isoformat()}", file=sys.stderr)
         rankings[sc] = gbm_rank_at(args.db_path, sc, fwd_secs, args.top_n,
                                     args.min_trading_days, args.min_distinct_events,
-                                    args.min_fwd_pos, train, use_bhq=use_bhq)
+                                    args.min_fwd_pos, train, use_bhq=use_bhq,
+                                    label_type=label_type)
 
     if K == 1:
         out_set = list(rankings[score_cutoffs[0]])
