@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Monthly production re-rank using the GBM ranker (per iter 2/3 finding).
+"""Monthly production re-rank using the GBM ranker (per iter 2/3/3b finding).
 
 Replaces scripts/monthly_rerank.py for the GBM workflow:
-- Trains LightGBM on ALL historical (features, forward-edge) labels
-  from cutoffs BEFORE the most-recent cutoff in wallet_features.
-- Scores wallets at the most-recent cutoff.
-- Optionally takes intersection_K across K most-recent cutoffs (default K=3).
+- Trains LightGBM on historical (features, forward-edge) labels from cutoffs
+  whose full 30-day forward window has elapsed before the scoring cutoff.
+- Scores wallets at each scoring cutoff.
+- Optionally takes intersection_K across K most-recent scoring cutoffs.
 - Writes a wallet hex list to --out.
 
 Run after each `pe-skill-select extract` at a new monthly cutoff.
@@ -13,13 +13,18 @@ Run after each `pe-skill-select extract` at a new monthly cutoff.
 USAGE:
     .venv-analysis/bin/python3 scripts/monthly_rerank_gbm.py \
         --db-path data/wallet_cache.db \
-        --strategy gbm_intersection_3 \
+        --strategy gbm_bhq_intersection_3 \
         --out data/production-watchlist-gbm.txt
 
 STRATEGIES:
-    gbm_single          GBM-top-N at most-recent cutoff only (highest Sharpe)
-    gbm_intersection_3  GBM-top-N intersection across 3 most-recent cutoffs (highest mean)
-    gbm_intersection_5  GBM-top-N intersection across 5 most-recent cutoffs (most selective)
+    gbm_single              GBM-top-N at most-recent cutoff only
+    gbm_intersection_3      GBM-top-N intersection across 3 most-recent cutoffs (best per-pos flat edge)
+    gbm_intersection_5      GBM-top-N intersection across 5 most-recent cutoffs (most selective)
+    gbm_bhq_intersection_3  GBM-top-N within BHq pool, intersection_3 (best Sharpe — recommended)
+    gbm_bhq_single          GBM-top-N within BHq pool, single cutoff
+
+Training cutoffs are strictly filtered to c + fwd_secs <= scoring_cutoff so
+no forward-window labels bleed into the evaluation period.
 """
 import argparse
 import sqlite3
@@ -30,6 +35,27 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+
+BHQ_Q_BPS = 1000  # q=0.10 — mirrors composite.rs bhq_gate default
+
+
+def bhq_significant_mask(skill_pvalue_bps_array, q_bps=BHQ_Q_BPS):
+    """Benjamini-Hochberg FDR gate; returns boolean mask of BHq-significant rows.
+    Mirrors composite.rs:bhq_gate and iter2b implementation.
+    """
+    m = len(skill_pvalue_bps_array)
+    if m == 0:
+        return np.array([], dtype=bool)
+    order = np.argsort(skill_pvalue_bps_array, kind='stable')
+    sorted_p = skill_pvalue_bps_array[order]
+    k_star = 0
+    for rank0, p in enumerate(sorted_p):
+        if p * m <= (rank0 + 1) * q_bps:
+            k_star = rank0 + 1
+    mask = np.zeros(m, dtype=bool)
+    if k_star > 0:
+        mask[order[:k_star]] = True
+    return mask
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from composite_tuner import data as data_mod
@@ -89,13 +115,23 @@ def per_wallet_fwd_edge(db, cutoff_unix, fwd_end_unix, wallets):
 
 
 def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
-                min_distinct_events, min_fwd_pos, train_cutoffs):
+                min_distinct_events, min_fwd_pos, train_cutoffs, use_bhq=False):
     """Train GBM on train_cutoffs (labeled by fwd edge), score at cutoff_unix.
-    Returns top-N wallet_hex list.
+
+    train_cutoffs must satisfy c + fwd_secs <= cutoff_unix (no forward-label bleed).
+    Returns top-N wallet_hex list; if use_bhq, only BHq-significant wallets are scored.
     """
-    print(f"  training on {len(train_cutoffs)} prior cutoffs", file=sys.stderr)
+    # Guard: drop any training cutoff whose forward window extends past the scoring cutoff.
+    safe_train = [c for c in train_cutoffs if c + fwd_secs <= cutoff_unix]
+    if len(safe_train) < len(train_cutoffs):
+        dropped = len(train_cutoffs) - len(safe_train)
+        print(f"  WARN: dropped {dropped} training cutoff(s) whose fwd window bleeds past {datetime.utcfromtimestamp(cutoff_unix).date()}", file=sys.stderr)
+    if not safe_train:
+        raise ValueError(f"No safe training cutoffs available for scoring cutoff {cutoff_unix}")
+
+    print(f"  training on {len(safe_train)} prior cutoffs", file=sys.stderr)
     train_dfs = []
-    for c in train_cutoffs:
+    for c in safe_train:
         df = load_features(db, c, min_trading_days, min_distinct_events)
         labels = per_wallet_fwd_edge(db, c, c + fwd_secs, df['wallet_hex'].tolist())
         df['label'] = df['wallet_hex'].map(
@@ -109,6 +145,11 @@ def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
     y = tr['label'].values.astype(np.float64)
 
     test = load_features(db, cutoff_unix, min_trading_days, min_distinct_events)
+    if use_bhq:
+        mask = bhq_significant_mask(test['skill_pvalue_bps'].values)
+        test = test[mask].copy()
+        print(f"  BHq pool: {len(test)} wallets", file=sys.stderr)
+
     X_test = test[FEATURE_COLS].values.astype(np.float64)
 
     m = lgb.LGBMRegressor(
@@ -118,14 +159,16 @@ def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
     )
     m.fit(X, y)
     test['s'] = m.predict(X_test)
-    return test.nlargest(top_n, 's')['wallet_hex'].tolist()
+    effective_top_n = min(top_n, len(test))
+    return test.nlargest(effective_top_n, 's')['wallet_hex'].tolist()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--db-path', required=True)
-    ap.add_argument('--strategy', default='gbm_intersection_3',
-                    choices=['gbm_single', 'gbm_intersection_3', 'gbm_intersection_5'])
+    ap.add_argument('--strategy', default='gbm_bhq_intersection_3',
+                    choices=['gbm_single', 'gbm_intersection_3', 'gbm_intersection_5',
+                             'gbm_bhq_intersection_3', 'gbm_bhq_single'])
     ap.add_argument('--top-n', type=int, default=DEFAULT_TOP_N)
     ap.add_argument('--fwd-days', type=int, default=DEFAULT_FWD_DAYS)
     ap.add_argument('--min-trading-days', type=int, default=DEFAULT_MIN_TRADING_DAYS)
@@ -141,7 +184,14 @@ def main():
         print(f"ERROR: need >=2 cutoffs, got {len(cutoffs)}", file=sys.stderr)
         sys.exit(1)
 
-    K = {'gbm_single': 1, 'gbm_intersection_3': 3, 'gbm_intersection_5': 5}[args.strategy]
+    use_bhq = args.strategy.startswith('gbm_bhq')
+    K = {
+        'gbm_single': 1,
+        'gbm_intersection_3': 3,
+        'gbm_intersection_5': 5,
+        'gbm_bhq_single': 1,
+        'gbm_bhq_intersection_3': 3,
+    }[args.strategy]
     if K > len(cutoffs):
         print(f"WARN: requested K={K} but only {len(cutoffs)} cutoffs available", file=sys.stderr)
         K = len(cutoffs)
@@ -159,7 +209,7 @@ def main():
         print(f"\nRanking at {datetime.utcfromtimestamp(sc).date().isoformat()}", file=sys.stderr)
         rankings[sc] = gbm_rank_at(args.db_path, sc, fwd_secs, args.top_n,
                                     args.min_trading_days, args.min_distinct_events,
-                                    args.min_fwd_pos, train)
+                                    args.min_fwd_pos, train, use_bhq=use_bhq)
 
     if K == 1:
         out_set = list(rankings[score_cutoffs[0]])
@@ -168,6 +218,10 @@ def main():
         for sc in score_cutoffs[1:]:
             out_set &= set(rankings[sc])
         out_set = list(out_set)
+        if not out_set:
+            print(f"ERROR: intersection of top-{args.top_n} across {K} cutoffs is empty — "
+                  f"rankings are too unstable or K is too large for the available data.", file=sys.stderr)
+            sys.exit(1)
 
     print(f"\nselected n={len(out_set)} wallets", file=sys.stderr)
     Path(args.out).write_text('\n'.join(out_set) + '\n')
