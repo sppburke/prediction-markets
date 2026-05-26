@@ -27,6 +27,8 @@ jobs:
         with:
           tool: cargo-nextest,cargo-deny,cargo-audit
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: rustc version contains 1.95.0
         run: rustc --version | grep -F '1.95.0'
 
