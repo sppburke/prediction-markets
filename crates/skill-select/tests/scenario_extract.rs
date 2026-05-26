@@ -173,6 +173,8 @@ fn scenario_extract_writes_rows_for_eligible_active_wallets() {
     assert_eq!(r.features.longshot_bias_ratio_bps, 0);
     // hold_to_resolution_rate: bought 100, sold 100 before resolution → cum_sells == cum_buys → 0.
     assert_eq!(r.features.hold_to_resolution_rate_bps, 0);
+    // position_sizing_cv: W_ELIGIBLE has a single closed buy-side trade → n < 2 → 0.
+    assert_eq!(r.features.position_sizing_cv_bps, 0);
     println!(
         "PASS: scenario_extract_writes_rows_for_eligible_active_wallets — scanned={} written={} skipped={}",
         report.wallets_scanned, report.wallets_written, report.wallets_skipped
