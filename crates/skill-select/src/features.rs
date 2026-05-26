@@ -135,6 +135,15 @@ pub struct DeterministicFeatures {
     /// Seconds. `0` when no qualifying market exists (sentinel only — never
     /// downstream-gated).
     pub median_first_entry_to_resolution_secs: i64,
+    // ─── Outcome-side specialization (#248 §4) ──────────────────────────────────
+    /// `int((frac(c < 0.20) − frac(c > 0.80)) × 10_000)` over resolved closed
+    /// trades, clamped to `[-10_000, +10_000]`. Positive = long-shot bias;
+    /// negative = favourite bias. `0` when no resolved closed trades exist
+    /// (indistinguishable from a perfectly balanced wallet; the BHq /
+    /// `min_distinct_events ≥ 10` gate upstream filters under-powered wallets
+    /// before the GBM sees them). Strict thresholds: exactly 0.20 / 0.80 is
+    /// neither. (#248 §4; tracker threshold source: verbatim)
+    pub longshot_bias_ratio_bps: i64,
 }
 
 /// Compute the simple deterministic feature batch for one wallet's train ledger.
@@ -238,6 +247,7 @@ pub fn extract_features(
     // Per-bet (o, c) pairs over resolved-market trades only.
     let per_bet = per_bet_outcomes(&windowed, resolutions);
     let per_bet_quality = compute_per_bet_quality(&per_bet, bb_alpha, bb_beta);
+    let longshot_bias_ratio_bps = compute_longshot_bias_ratio(&per_bet);
 
     // Per-event positive-PnL roll-up over all in-window closed trades
     // (resolved or not — realized PnL exists either way; group F is a
@@ -288,6 +298,7 @@ pub fn extract_features(
         concentration_rpc_bps: concentration.rpc_bps,
         first_entries_per_active_day_bps,
         median_first_entry_to_resolution_secs,
+        longshot_bias_ratio_bps,
     })
 }
 
@@ -440,6 +451,23 @@ fn per_bet_outcomes(windowed: &[&ClosedTrade], resolutions: &ResolutionIndex) ->
         });
     }
     out
+}
+
+/// Outcome-side specialization (#248 §4): fraction longshot minus fraction favourite
+/// over resolved closed trades, in basis points.
+///
+/// Returns `0` when `per_bet` is empty (sentinel — no observable bias without
+/// resolved trades; indistinguishable from a balanced wallet at this sample size).
+fn compute_longshot_bias_ratio(per_bet: &[PerBet]) -> i64 {
+    if per_bet.is_empty() {
+        return 0;
+    }
+    let n = Decimal::from(per_bet.len());
+    let low = Decimal::new(20, 2); // 0.20 — strict threshold
+    let high = Decimal::new(80, 2); // 0.80 — strict threshold
+    let n_low = Decimal::from(per_bet.iter().filter(|b| b.c < low).count());
+    let n_high = Decimal::from(per_bet.iter().filter(|b| b.c > high).count());
+    decimal_to_bps_i64((n_low - n_high) / n).clamp(-10_000, 10_000)
 }
 
 /// Output of the per-bet quality block (group A).

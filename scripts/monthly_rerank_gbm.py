@@ -76,6 +76,7 @@ FEATURE_COLS = [
     "brier_score_bps", "brier_resolution_bps",
     "concentration_hhi_bps", "concentration_n_eff_bps", "concentration_rpc_bps",
     "first_entries_per_active_day_bps", "median_first_entry_to_resolution_secs",
+    "longshot_bias_ratio_bps",
 ]
 DEFAULT_TOP_N = 5000
 DEFAULT_FWD_DAYS = 30
@@ -94,7 +95,8 @@ def load_features(db, cutoff_unix, min_trading_days, min_distinct_events):
                ev_mean_bps, ev_tstat_bps, bb_shrunk_edge_bps, kelly_log_growth_bps,
                brier_score_bps, brier_resolution_bps,
                concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps,
-               first_entries_per_active_day_bps, median_first_entry_to_resolution_secs
+               first_entries_per_active_day_bps, median_first_entry_to_resolution_secs,
+               longshot_bias_ratio_bps
         FROM wallet_features
         WHERE cutoff_unix = ?
           AND trading_days >= ?

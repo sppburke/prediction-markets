@@ -43,6 +43,7 @@ const PR1_ADDED_COLUMNS: &[(&str, &str)] = &[
         "median_first_entry_to_resolution_secs",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    ("longshot_bias_ratio_bps", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 use crate::error::SkillSelectError;
@@ -152,11 +153,12 @@ impl SkillCache {
                     ev_mean_bps, ev_tstat_bps, bb_shrunk_edge_bps, kelly_log_growth_bps, \
                     brier_score_bps, brier_resolution_bps, \
                     concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps, \
-                    first_entries_per_active_day_bps, median_first_entry_to_resolution_secs\
+                    first_entries_per_active_day_bps, median_first_entry_to_resolution_secs, \
+                    longshot_bias_ratio_bps\
                  ) VALUES (\
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                     ?16, ?17, ?18, ?19, ?20, ?21, \
-                    ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32\
+                    ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33\
                  )",
             )?;
             for w in rows {
@@ -194,6 +196,7 @@ impl SkillCache {
                     f.concentration_rpc_bps,
                     i64::from(f.first_entries_per_active_day_bps),
                     f.median_first_entry_to_resolution_secs,
+                    f.longshot_bias_ratio_bps,
                 ])?;
             }
         }
@@ -239,7 +242,8 @@ impl SkillCache {
                     ev_mean_bps, ev_tstat_bps, bb_shrunk_edge_bps, kelly_log_growth_bps, \
                     brier_score_bps, brier_resolution_bps, \
                     concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps, \
-                    first_entries_per_active_day_bps, median_first_entry_to_resolution_secs \
+                    first_entries_per_active_day_bps, median_first_entry_to_resolution_secs, \
+                    longshot_bias_ratio_bps \
              FROM wallet_features WHERE cutoff_unix = ?1 ORDER BY wallet_hex",
         )?;
         let rows = stmt.query_map(params![cutoff_unix], |r| {
@@ -276,6 +280,7 @@ impl SkillCache {
                 concentration_rpc_bps: r.get(29)?,
                 first_entries_per_active_day_bps: r.get(30)?,
                 median_first_entry_to_resolution_secs: r.get(31)?,
+                longshot_bias_ratio_bps: r.get(32)?,
             })
         })?;
         let mut out = Vec::new();
@@ -322,6 +327,7 @@ struct RawRow {
     concentration_rpc_bps: i64,
     first_entries_per_active_day_bps: i64,
     median_first_entry_to_resolution_secs: i64,
+    longshot_bias_ratio_bps: i64,
 }
 
 impl RawRow {
@@ -368,6 +374,7 @@ impl RawRow {
             concentration_rpc_bps: self.concentration_rpc_bps,
             first_entries_per_active_day_bps: narrow_i32(self.first_entries_per_active_day_bps)?,
             median_first_entry_to_resolution_secs: self.median_first_entry_to_resolution_secs,
+            longshot_bias_ratio_bps: self.longshot_bias_ratio_bps,
         };
         Ok(WalletFeatures {
             features,
@@ -444,6 +451,7 @@ mod tests {
                 concentration_rpc_bps: 27_500,
                 first_entries_per_active_day_bps: 25_000,
                 median_first_entry_to_resolution_secs: 604_800,
+                longshot_bias_ratio_bps: 1_500,
             },
             extracted_at_unix: 1_700_000_000,
             skill_pnl_usd: pnl,
@@ -544,6 +552,61 @@ mod tests {
         assert_eq!(f.ev_mean_bps, 0);
         assert_eq!(f.concentration_hhi_bps, 0);
         assert_eq!(f.median_first_entry_to_resolution_secs, 0);
+        assert_eq!(f.longshot_bias_ratio_bps, 0);
+        // Idempotent: a second open call must not error.
+        let _ = SkillCache::open(&path).unwrap();
+    }
+
+    #[test]
+    fn migration_adds_sub_task_4_column_to_pr1_table() {
+        // Simulate a DB created after PR 1 but before sub-task 4: SCHEMA + PR1
+        // columns, but without longshot_bias_ratio_bps.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            // Add PR-1 columns manually, skipping the new sub-task-4 column.
+            for (col, decl) in PR1_ADDED_COLUMNS
+                .iter()
+                .filter(|(c, _)| *c != "longshot_bias_ratio_bps")
+            {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE wallet_features ADD COLUMN {col} {decl}"
+                ))
+                .unwrap();
+            }
+            // Insert one row covering all pre-sub-task-4 columns.
+            conn.execute(
+                "INSERT INTO wallet_features (\
+                    wallet_hex, cutoff_unix, extracted_at_unix, reconstruction_quality, \
+                    closed_trades, distinct_markets, distinct_events, total_pnl_usd_str, \
+                    roi_bps, win_rate_bps, avg_hold_secs, trading_days, \
+                    mean_daily_return_bps, std_daily_return_bps, sharpe_bps, skewness_bps, \
+                    excess_kurtosis_bps, lcb_5pct_bps, skill_pnl_usd_str, skill_pvalue_bps, \
+                    skill_permutations, \
+                    ev_mean_bps, ev_tstat_bps, bb_shrunk_edge_bps, kelly_log_growth_bps, \
+                    brier_score_bps, brier_resolution_bps, \
+                    concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps, \
+                    first_entries_per_active_day_bps, median_first_entry_to_resolution_secs\
+                 ) VALUES (\
+                    '0xpre4', 200, 1, 100, 10, 8, 5, '3.0', 200, 7000, 1800, 3, \
+                    150, 100, 1500, 0, 0, 0, '3.0', 200, 999, \
+                    500, 0, 200, 50, 3000, 800, 2000, 50000, 15000, 10000, 86400\
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        // Open through SkillCache::open — triggers the migration, adding
+        // longshot_bias_ratio_bps with DEFAULT 0. Legacy row must survive.
+        let cache = SkillCache::open(&path).unwrap();
+        let loaded = cache.load_features_for_cutoff(200).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let f = &loaded[0].features;
+        assert_eq!(f.wallet_hex, "0xpre4");
+        assert_eq!(f.longshot_bias_ratio_bps, 0);
+        assert_eq!(f.ev_mean_bps, 500);
         // Idempotent: a second open call must not error.
         let _ = SkillCache::open(&path).unwrap();
     }

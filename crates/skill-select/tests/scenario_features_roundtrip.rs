@@ -47,6 +47,7 @@ fn features(hex: &str, cutoff: i64, pnl: rust_decimal::Decimal) -> WalletFeature
             concentration_rpc_bps: 19_500,
             first_entries_per_active_day_bps: 16_667,
             median_first_entry_to_resolution_secs: 432_000,
+            longshot_bias_ratio_bps: -2_500,
         },
         extracted_at_unix: 1_700_000_000,
         skill_pnl_usd: pnl,
