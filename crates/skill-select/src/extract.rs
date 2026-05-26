@@ -240,6 +240,7 @@ fn process_wallet(
 
     let Some(features) = extract_features(
         &ledger,
+        &snapshot.trades,
         cutoff_unix,
         event_map,
         resolutions,
