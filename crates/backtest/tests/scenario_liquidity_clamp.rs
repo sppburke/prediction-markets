@@ -153,6 +153,7 @@ fn base_config(dir: &TempDir, take_fraction: Decimal, min_required_usd: Decimal)
         max_positions_per_market: None,
         skip_unknown_operator: false,
         max_signal_price: None,
+        max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
     }
 }

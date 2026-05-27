@@ -194,6 +194,7 @@ fn base_config(
         max_positions_per_market: None,
         skip_unknown_operator: false,
         max_signal_price,
+        max_trade_count: 0,
         strategy: WinnerFollowConfig {
             slippage_rate,
             ..WinnerFollowConfig::default()

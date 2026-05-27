@@ -586,7 +586,6 @@ impl WalletCache {
     }
 
     /// Total number of unique trades stored across all wallets.
-    #[cfg(any(test, feature = "scenario"))]
     pub fn trade_count(&self) -> usize {
         self.conn
             .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get::<_, i64>(0))

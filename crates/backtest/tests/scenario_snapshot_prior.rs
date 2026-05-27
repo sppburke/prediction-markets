@@ -155,6 +155,7 @@ fn base_config(dir: &TempDir, min_snapshots: u32, extra_per_missing: u32) -> Bac
         max_positions_per_market: None,
         skip_unknown_operator: false,
         max_signal_price: None,
+        max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
     }
 }

@@ -25,6 +25,9 @@ const DEFAULT_BT_KELLY_P_PRIOR_BETA: u32 = 10;
 const DEFAULT_BT_KELLY_P_K_PER_MARKET: u32 = 6;
 const DEFAULT_BT_KELLY_P_MIN_SNAPSHOTS: u32 = 4;
 const DEFAULT_BT_KELLY_P_EXTRA_PER_MISSING_SNAPSHOT: u32 = 5;
+// Guard against loading the full 269M-trade production cache into RAM.
+// Canonical: `docs/_GLOSSARY.md` `backtest_max_trade_count_default`. 0 = unlimited.
+const DEFAULT_BT_MAX_TRADE_COUNT: u64 = 25_000_000;
 
 // Default fractions for sweep mode when env var is set but empty.
 // Canonical: `docs/_GLOSSARY.md` `backtest_kelly_sweep_fractions_default`.
@@ -281,6 +284,16 @@ pub struct BacktestConfig {
     #[serde(default = "default_max_signal_price")]
     pub max_signal_price: Option<Decimal>,
 
+    /// Maximum number of trades the cache may contain before `pe-backtest` refuses to
+    /// start.  Guards against accidentally loading the full 269M-trade production cache
+    /// into RAM (OOM kill).  `0` disables the guard entirely.
+    ///
+    /// Raise or disable when intentionally running against a large cache:
+    /// `PE_BACKTEST_MAX_TRADE_COUNT=50000000` or `PE_BACKTEST_MAX_TRADE_COUNT=0`.
+    /// Canonical: `docs/_GLOSSARY.md` `backtest_max_trade_count_default`.
+    #[serde(default = "default_max_trade_count")]
+    pub max_trade_count: u64,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -383,6 +396,10 @@ fn default_liquidity_min_required_usd() -> Decimal {
     Decimal::new(200, 0)
 }
 
+const fn default_max_trade_count() -> u64 {
+    DEFAULT_BT_MAX_TRADE_COUNT
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BacktestConfig {
@@ -415,6 +432,7 @@ impl Default for BacktestConfig {
             max_positions_per_market: default_max_positions_per_market(),
             skip_unknown_operator: default_skip_unknown_operator(),
             max_signal_price: default_max_signal_price(),
+            max_trade_count: default_max_trade_count(),
             strategy: WinnerFollowConfig::default(),
         }
     }
