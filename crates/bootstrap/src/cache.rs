@@ -81,6 +81,16 @@ CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades(wallet_hex, timestamp_
 -- update per trade insert; worth it given the scan runs every resolutions
 -- and `all` invocation.
 CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
+-- Sub-task #3 (first_mover_percentile_bps): covering index for the
+-- cross-wallet rank-index build query (`SELECT market_id, outcome_id,
+-- wallet_hex, MIN(timestamp_unix) FROM trades WHERE side='buy' AND
+-- timestamp_unix<=? GROUP BY market_id, outcome_id, wallet_hex`).
+-- Without this, the planner uses `idx_trades_market_id` + TEMP B-TREE
+-- for GROUP BY (>22 min on the live 269M-row trades table). With it
+-- the planner does an index-only scan in the proper order, finding
+-- each group's MIN(timestamp_unix) from the first matching entry.
+CREATE INDEX IF NOT EXISTS idx_trades_buy_market_outcome_wallet_ts
+    ON trades(side, market_id, outcome_id, wallet_hex, timestamp_unix);
 
 CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
     snapshot_at_unix INTEGER NOT NULL,
@@ -1405,6 +1415,56 @@ impl WalletCache {
         for row in rows {
             let (condition_id, event_id) = row?;
             map.insert(condition_id, event_id);
+        }
+        Ok(map)
+    }
+
+    /// Build the cross-wallet first-buy rank index used by
+    /// `first_mover_percentile_bps` (sub-task #3 of #248).
+    ///
+    /// For each `(market_id, outcome_id)` group across every wallet, returns
+    /// the sorted vector of *first-buy* timestamps — one per wallet that has at
+    /// least one buy on that outcome at or before `cutoff_unix`. A wallet's
+    /// per-position percentile is the fraction of group members whose first
+    /// entry is strictly earlier (computed downstream via `slice::partition_point`).
+    ///
+    /// # Look-ahead invariant
+    /// The `WHERE timestamp_unix <= ?` clause is mandatory: including post-cutoff
+    /// trades would leak future information into a training feature. The SQL
+    /// below filters strictly, and callers must pass the same `cutoff_unix`
+    /// they use elsewhere in the extract pipeline.
+    pub fn load_first_mover_rank_index(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<HashMap<(String, u16), Vec<i64>>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            // The covering index `idx_trades_buy_market_outcome_wallet_ts`
+            // (see SCHEMA) matches this query exactly: side equality first,
+            // then GROUP BY columns in order, then timestamp_unix last so
+            // MIN() is found from the first matching entry per group.
+            "SELECT market_id, outcome_id, MIN(timestamp_unix) AS first_buy_ts
+             FROM trades
+             WHERE side = 'buy' AND timestamp_unix <= ?1
+             GROUP BY market_id, outcome_id, wallet_hex",
+        )?;
+        let rows = stmt.query_map(params![cutoff_unix], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u16>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut map: HashMap<(String, u16), Vec<i64>> = HashMap::new();
+        for row in rows {
+            let (market_id, outcome_id, first_buy_ts) = row?;
+            map.entry((market_id, outcome_id))
+                .or_default()
+                .push(first_buy_ts);
+        }
+        // Sort each group's timestamps ascending so callers can binary-search
+        // via `partition_point` to find count_ahead in O(log N).
+        for v in map.values_mut() {
+            v.sort_unstable();
         }
         Ok(map)
     }

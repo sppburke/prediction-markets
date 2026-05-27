@@ -79,6 +79,7 @@ FEATURE_COLS = [
     "longshot_bias_ratio_bps",
     "hold_to_resolution_rate_bps",
     "position_sizing_cv_bps",
+    "first_mover_percentile_bps",
 ]
 DEFAULT_TOP_N = 5000
 DEFAULT_FWD_DAYS = 30
@@ -99,7 +100,7 @@ def load_features(db, cutoff_unix, min_trading_days, min_distinct_events):
                concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps,
                first_entries_per_active_day_bps, median_first_entry_to_resolution_secs,
                longshot_bias_ratio_bps, hold_to_resolution_rate_bps,
-               position_sizing_cv_bps
+               position_sizing_cv_bps, first_mover_percentile_bps
         FROM wallet_features
         WHERE cutoff_unix = ?
           AND trading_days >= ?

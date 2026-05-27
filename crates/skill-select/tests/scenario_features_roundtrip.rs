@@ -50,6 +50,7 @@ fn features(hex: &str, cutoff: i64, pnl: rust_decimal::Decimal) -> WalletFeature
             longshot_bias_ratio_bps: -2_500,
             hold_to_resolution_rate_bps: 6_000,
             position_sizing_cv_bps: 4_750,
+            first_mover_percentile_bps: 7_500,
         },
         extracted_at_unix: 1_700_000_000,
         skill_pnl_usd: pnl,

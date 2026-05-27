@@ -46,6 +46,7 @@ const PR1_ADDED_COLUMNS: &[(&str, &str)] = &[
     ("longshot_bias_ratio_bps", "INTEGER NOT NULL DEFAULT 0"),
     ("hold_to_resolution_rate_bps", "INTEGER NOT NULL DEFAULT 0"),
     ("position_sizing_cv_bps", "INTEGER NOT NULL DEFAULT 0"),
+    ("first_mover_percentile_bps", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 use crate::error::SkillSelectError;
@@ -157,11 +158,11 @@ impl SkillCache {
                     concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps, \
                     first_entries_per_active_day_bps, median_first_entry_to_resolution_secs, \
                     longshot_bias_ratio_bps, hold_to_resolution_rate_bps, \
-                    position_sizing_cv_bps\
+                    position_sizing_cv_bps, first_mover_percentile_bps\
                  ) VALUES (\
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                     ?16, ?17, ?18, ?19, ?20, ?21, \
-                    ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35\
+                    ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36\
                  )",
             )?;
             for w in rows {
@@ -202,6 +203,7 @@ impl SkillCache {
                     f.longshot_bias_ratio_bps,
                     f.hold_to_resolution_rate_bps,
                     f.position_sizing_cv_bps,
+                    f.first_mover_percentile_bps,
                 ])?;
             }
         }
@@ -249,7 +251,7 @@ impl SkillCache {
                     concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps, \
                     first_entries_per_active_day_bps, median_first_entry_to_resolution_secs, \
                     longshot_bias_ratio_bps, hold_to_resolution_rate_bps, \
-                    position_sizing_cv_bps \
+                    position_sizing_cv_bps, first_mover_percentile_bps \
              FROM wallet_features WHERE cutoff_unix = ?1 ORDER BY wallet_hex",
         )?;
         let rows = stmt.query_map(params![cutoff_unix], |r| {
@@ -289,6 +291,7 @@ impl SkillCache {
                 longshot_bias_ratio_bps: r.get(32)?,
                 hold_to_resolution_rate_bps: r.get(33)?,
                 position_sizing_cv_bps: r.get(34)?,
+                first_mover_percentile_bps: r.get(35)?,
             })
         })?;
         let mut out = Vec::new();
@@ -338,6 +341,7 @@ struct RawRow {
     longshot_bias_ratio_bps: i64,
     hold_to_resolution_rate_bps: i64,
     position_sizing_cv_bps: i64,
+    first_mover_percentile_bps: i64,
 }
 
 impl RawRow {
@@ -387,6 +391,7 @@ impl RawRow {
             longshot_bias_ratio_bps: self.longshot_bias_ratio_bps,
             hold_to_resolution_rate_bps: self.hold_to_resolution_rate_bps,
             position_sizing_cv_bps: self.position_sizing_cv_bps,
+            first_mover_percentile_bps: self.first_mover_percentile_bps,
         };
         Ok(WalletFeatures {
             features,
@@ -466,6 +471,7 @@ mod tests {
                 longshot_bias_ratio_bps: 1_500,
                 hold_to_resolution_rate_bps: 7_500,
                 position_sizing_cv_bps: 3_200,
+                first_mover_percentile_bps: 7_500,
             },
             extracted_at_unix: 1_700_000_000,
             skill_pnl_usd: pnl,
@@ -569,6 +575,7 @@ mod tests {
         assert_eq!(f.longshot_bias_ratio_bps, 0);
         assert_eq!(f.hold_to_resolution_rate_bps, 0);
         assert_eq!(f.position_sizing_cv_bps, 0);
+        assert_eq!(f.first_mover_percentile_bps, 0);
         // Idempotent: a second open call must not error.
         let _ = SkillCache::open(&path).unwrap();
     }
@@ -624,6 +631,7 @@ mod tests {
         assert_eq!(f.longshot_bias_ratio_bps, 0);
         assert_eq!(f.hold_to_resolution_rate_bps, 0);
         assert_eq!(f.position_sizing_cv_bps, 0);
+        assert_eq!(f.first_mover_percentile_bps, 0);
         assert_eq!(f.ev_mean_bps, 500);
         // Idempotent: a second open call must not error.
         let _ = SkillCache::open(&path).unwrap();
@@ -676,6 +684,7 @@ mod tests {
         assert_eq!(f.wallet_hex, "0xpre5");
         assert_eq!(f.hold_to_resolution_rate_bps, 0);
         assert_eq!(f.position_sizing_cv_bps, 0);
+        assert_eq!(f.first_mover_percentile_bps, 0);
         assert_eq!(f.longshot_bias_ratio_bps, 1200);
         let _ = SkillCache::open(&path).unwrap();
     }
@@ -726,8 +735,63 @@ mod tests {
         let f = &loaded[0].features;
         assert_eq!(f.wallet_hex, "0xpre6");
         assert_eq!(f.position_sizing_cv_bps, 0);
+        assert_eq!(f.first_mover_percentile_bps, 0);
         assert_eq!(f.hold_to_resolution_rate_bps, 8500);
         assert_eq!(f.longshot_bias_ratio_bps, 1200);
+        let _ = SkillCache::open(&path).unwrap();
+    }
+
+    #[test]
+    fn migration_adds_first_mover_column_to_pr1_table() {
+        // Simulate a DB created after sub-task 6 but before sub-task 3
+        // (first_mover_percentile_bps): all columns present except
+        // first_mover_percentile_bps.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for (col, decl) in PR1_ADDED_COLUMNS
+                .iter()
+                .filter(|(c, _)| *c != "first_mover_percentile_bps")
+            {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE wallet_features ADD COLUMN {col} {decl}"
+                ))
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO wallet_features (\
+                    wallet_hex, cutoff_unix, extracted_at_unix, reconstruction_quality, \
+                    closed_trades, distinct_markets, distinct_events, total_pnl_usd_str, \
+                    roi_bps, win_rate_bps, avg_hold_secs, trading_days, \
+                    mean_daily_return_bps, std_daily_return_bps, sharpe_bps, skewness_bps, \
+                    excess_kurtosis_bps, lcb_5pct_bps, skill_pnl_usd_str, skill_pvalue_bps, \
+                    skill_permutations, \
+                    ev_mean_bps, ev_tstat_bps, bb_shrunk_edge_bps, kelly_log_growth_bps, \
+                    brier_score_bps, brier_resolution_bps, \
+                    concentration_hhi_bps, concentration_n_eff_bps, concentration_rpc_bps, \
+                    first_entries_per_active_day_bps, median_first_entry_to_resolution_secs, \
+                    longshot_bias_ratio_bps, hold_to_resolution_rate_bps, \
+                    position_sizing_cv_bps\
+                 ) VALUES (\
+                    '0xpre3', 500, 1, 100, 10, 8, 5, '3.0', 200, 7000, 1800, 3, \
+                    150, 100, 1500, 0, 0, 0, '3.0', 200, 999, \
+                    500, 0, 200, 50, 3000, 800, 2000, 50000, 15000, 10000, 86400, \
+                    1200, 8500, 4400\
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = SkillCache::open(&path).unwrap();
+        let loaded = cache.load_features_for_cutoff(500).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let f = &loaded[0].features;
+        assert_eq!(f.wallet_hex, "0xpre3");
+        assert_eq!(f.first_mover_percentile_bps, 0);
+        assert_eq!(f.position_sizing_cv_bps, 4400);
+        assert_eq!(f.hold_to_resolution_rate_bps, 8500);
         let _ = SkillCache::open(&path).unwrap();
     }
 
