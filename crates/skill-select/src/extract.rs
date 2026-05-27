@@ -90,25 +90,64 @@ pub fn run_extract(
         );
     }
 
+    // Ensure first_mover_rank_cache table exists on existing DBs that predate
+    // this schema addition. DDL runs only on RW connections; open briefly then
+    // drop so the read-only block below doesn't compete for the write lock.
+    {
+        let _schema_init = WalletCache::open(cache_path)
+            .map_err(|e| SkillSelectError::Decode(format!("schema init: {e}")))?;
+    }
+
     // Read-pass shared inputs: load once on the main thread, share to workers.
-    let (event_map, resolutions, rank_index, wallets) = {
+    let (event_map, resolutions, rank_index, wallets, rank_index_was_cached) = {
         let cache = WalletCache::open_read_only(cache_path)?;
         let event_map: HashMap<String, String> = cache.load_market_event_map()?;
         let resolutions = cache.load_all_resolutions()?;
         // Cross-wallet first-buy rank index for `first_mover_percentile_bps`
-        // (#248 §3). Single SQL GROUP BY scan filtered by `timestamp_unix <=
-        // cutoff_unix` — the look-ahead invariant lives in the method.
+        // (#248 §3). Check the persistent cache first: the full GROUP BY scan
+        // over ~135M buy-side trades takes O(minutes) on a cold page cache;
+        // the cache table load is a simple indexed read of the already-computed
+        // result, measured in seconds.
         let rank_index_start = std::time::Instant::now();
-        let rank_index = cache.load_first_mover_rank_index(cutoff_unix)?;
+        let cached = cache
+            .rank_index_cache_exists(cutoff_unix)
+            .map_err(|e| SkillSelectError::Decode(format!("rank index cache check: {e}")))?;
+        let (rank_index, was_cached) = if cached {
+            let idx = cache
+                .load_rank_index_cache(cutoff_unix)
+                .map_err(|e| SkillSelectError::Decode(format!("rank index cache load: {e}")))?;
+            (idx, true)
+        } else {
+            let idx = cache
+                .load_first_mover_rank_index(cutoff_unix)
+                .map_err(|e| SkillSelectError::Decode(format!("rank index build: {e}")))?;
+            (idx, false)
+        };
         info!(
             elapsed_ms = u64::try_from(rank_index_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             groups_indexed = rank_index.len(),
+            from_cache = was_cached,
             cutoff_unix,
-            "skill-select extract: cross-wallet rank index built"
+            "skill-select extract: cross-wallet rank index ready"
         );
         let wallets = cache.active_tradeable_wallet_hexes()?;
-        (event_map, resolutions, rank_index, wallets)
+        (event_map, resolutions, rank_index, wallets, was_cached)
     };
+
+    // Persist a freshly-built rank index so the next re-extract at this cutoff
+    // skips the full GROUP BY scan. Done after the read-only block closes so
+    // the write transaction doesn't overlap with the long read pass.
+    if !rank_index_was_cached {
+        let mut write_cache = WalletCache::open(cache_path)
+            .map_err(|e| SkillSelectError::Decode(format!("rank index cache open: {e}")))?;
+        let saved = write_cache
+            .save_rank_index_cache(cutoff_unix, &rank_index)
+            .map_err(|e| SkillSelectError::Decode(format!("rank index cache save: {e}")))?;
+        info!(
+            saved_rows = saved,
+            cutoff_unix, "skill-select extract: rank index cached for future re-extracts"
+        );
+    }
     let event_map = Arc::new(event_map);
     let resolutions = Arc::new(resolutions);
     let rank_index = Arc::new(rank_index);

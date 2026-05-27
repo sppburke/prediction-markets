@@ -269,6 +269,28 @@ CREATE INDEX IF NOT EXISTS idx_wallets_weekly
 -- accidentally include infra-flagged wallets.
 CREATE VIEW IF NOT EXISTS active_tradeable_wallets AS
     SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+
+-- Cached result of `load_first_mover_rank_index` keyed by `cutoff_unix`.
+-- One row per (cutoff_unix, market_id, outcome_id) group; `ts_json` is a
+-- JSON array of i64 first-buy timestamps (one per wallet, sorted ascending).
+-- Storing the whole group in one row avoids PK collisions when two wallets
+-- share the same first-buy timestamp on the same (market, outcome) pair.
+-- Populated by the extract pipeline after the first build; subsequent
+-- re-extracts at the same cutoff skip the full GROUP BY scan on `trades`.
+-- LIMITATION: the cache is valid for a fixed `trades` table state. If
+-- bootstrap backfills pre-cutoff trades after the cache is built, the
+-- cached timestamps will be stale. Normal delta-mode bootstrap only appends
+-- trades with `timestamp_unix` beyond the latest processed block, so
+-- historical cutoffs are unaffected in the standard workflow.
+CREATE TABLE IF NOT EXISTS first_mover_rank_cache (
+    cutoff_unix  INTEGER NOT NULL,
+    market_id    TEXT    NOT NULL,
+    outcome_id   INTEGER NOT NULL,
+    ts_json      TEXT    NOT NULL,
+    PRIMARY KEY (cutoff_unix, market_id, outcome_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fmrc_cutoff
+    ON first_mover_rank_cache(cutoff_unix);
 ";
 
 /// Result of `classify_infra_retroactive` (issue #197).
@@ -1466,6 +1488,93 @@ impl WalletCache {
             v.sort_unstable();
         }
         Ok(map)
+    }
+
+    /// Return `true` if a cached rank index exists for `cutoff_unix`.
+    ///
+    /// Used by the extract pipeline to skip the expensive `load_first_mover_rank_index`
+    /// scan on re-extracts at an already-seen cutoff.
+    pub fn rank_index_cache_exists(&self, cutoff_unix: i64) -> Result<bool, BootstrapError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM first_mover_rank_cache WHERE cutoff_unix = ?1 LIMIT 1",
+            params![cutoff_unix],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Load the cached rank index for `cutoff_unix`.
+    ///
+    /// Returns the same structure as `load_first_mover_rank_index`: a map from
+    /// `(market_id, outcome_id)` to a sorted ascending list of first-buy timestamps
+    /// (one per wallet). Returns an empty map if no cache rows exist (callers should
+    /// check `rank_index_cache_exists` first to distinguish "cached empty result"
+    /// from "no cache entry").
+    ///
+    /// # Precondition
+    /// `rank_index_cache_exists(cutoff_unix)` should return `true`; otherwise the
+    /// result is indistinguishable from a cutoff with no buy-side trades.
+    pub fn load_rank_index_cache(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<HashMap<(String, u16), Vec<i64>>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT market_id, outcome_id, ts_json
+             FROM first_mover_rank_cache
+             WHERE cutoff_unix = ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff_unix], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u16>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut map: HashMap<(String, u16), Vec<i64>> = HashMap::new();
+        for row in rows {
+            let (market_id, outcome_id, ts_json) = row?;
+            let timestamps: Vec<i64> =
+                serde_json::from_str(&ts_json).map_err(|e| BootstrapError::Cache {
+                    message: format!("rank cache decode ({market_id},{outcome_id}): {e}"),
+                })?;
+            map.insert((market_id, outcome_id), timestamps);
+        }
+        Ok(map)
+    }
+
+    /// Persist a rank index so future re-extracts at `cutoff_unix` can skip
+    /// the full `trades` GROUP BY scan. Each `(market_id, outcome_id)` group's
+    /// sorted timestamp list is stored as a JSON array — one row per group, so
+    /// two wallets sharing the same first-buy timestamp are never collapsed.
+    /// Idempotent: uses `INSERT OR REPLACE` so calling twice at the same cutoff
+    /// is safe (the later call wins, which is correct since the input is identical).
+    pub fn save_rank_index_cache(
+        &mut self,
+        cutoff_unix: i64,
+        index: &HashMap<(String, u16), Vec<i64>>,
+    ) -> Result<usize, BootstrapError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO first_mover_rank_cache
+                 (cutoff_unix, market_id, outcome_id, ts_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for ((market_id, outcome_id), timestamps) in index {
+                let ts_json =
+                    serde_json::to_string(timestamps).map_err(|e| BootstrapError::Cache {
+                        message: format!("rank cache encode: {e}"),
+                    })?;
+                stmt.execute(params![
+                    cutoff_unix,
+                    market_id,
+                    i64::from(*outcome_id),
+                    ts_json
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(index.len())
     }
 
     /// Return all distinct `market_id` values present in the `trades` table, sorted.
@@ -4106,5 +4215,90 @@ mod tests {
         let snaps = snap_fixture();
         let alice = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert_eq!(snaps.snapshot_appearances_up_to(alice, i64::MAX), 3);
+    }
+
+    // ── first_mover_rank_cache ────────────────────────────────────────────────
+
+    #[test]
+    fn rank_index_cache_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        let mut cache = WalletCache::open(&path).unwrap();
+
+        let cutoff: i64 = 1_779_839_999;
+        assert!(!cache.rank_index_cache_exists(cutoff).unwrap());
+
+        let mut index: HashMap<(String, u16), Vec<i64>> = HashMap::new();
+        index
+            .entry(("market-a".to_owned(), 0u16))
+            .or_default()
+            .extend([100_i64, 200, 300]);
+        index
+            .entry(("market-a".to_owned(), 1u16))
+            .or_default()
+            .extend([150_i64, 250]);
+        index
+            .entry(("market-b".to_owned(), 0u16))
+            .or_default()
+            .push(50_i64);
+
+        let saved = cache.save_rank_index_cache(cutoff, &index).unwrap();
+        assert_eq!(saved, 3, "3 groups");
+
+        assert!(cache.rank_index_cache_exists(cutoff).unwrap());
+
+        let loaded = cache.load_rank_index_cache(cutoff).unwrap();
+        assert_eq!(loaded.len(), index.len());
+        for ((market, outcome), mut expected_ts) in index {
+            let mut got = loaded[&(market, outcome)].clone();
+            expected_ts.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, expected_ts);
+        }
+    }
+
+    #[test]
+    fn rank_index_cache_save_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        let mut cache = WalletCache::open(&path).unwrap();
+        let cutoff: i64 = 1_000;
+
+        let mut index: HashMap<(String, u16), Vec<i64>> = HashMap::new();
+        index
+            .entry(("mkt".to_owned(), 0u16))
+            .or_default()
+            .push(42_i64);
+
+        cache.save_rank_index_cache(cutoff, &index).unwrap();
+        cache.save_rank_index_cache(cutoff, &index).unwrap();
+
+        let loaded = cache.load_rank_index_cache(cutoff).unwrap();
+        assert_eq!(
+            loaded[&("mkt".to_owned(), 0u16)],
+            vec![42_i64],
+            "duplicate save must not duplicate rows"
+        );
+    }
+
+    #[test]
+    fn rank_index_cache_scoped_to_cutoff() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet_cache.db");
+        let mut cache = WalletCache::open(&path).unwrap();
+
+        let mut a: HashMap<(String, u16), Vec<i64>> = HashMap::new();
+        a.entry(("m".to_owned(), 0u16)).or_default().push(1_i64);
+        let mut b: HashMap<(String, u16), Vec<i64>> = HashMap::new();
+        b.entry(("m".to_owned(), 0u16)).or_default().push(2_i64);
+
+        cache.save_rank_index_cache(100, &a).unwrap();
+        cache.save_rank_index_cache(200, &b).unwrap();
+
+        assert!(!cache.rank_index_cache_exists(999).unwrap());
+        let la = cache.load_rank_index_cache(100).unwrap();
+        let lb = cache.load_rank_index_cache(200).unwrap();
+        assert_eq!(la[&("m".to_owned(), 0u16)], vec![1_i64]);
+        assert_eq!(lb[&("m".to_owned(), 0u16)], vec![2_i64]);
     }
 }
