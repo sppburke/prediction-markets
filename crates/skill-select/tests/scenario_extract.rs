@@ -442,3 +442,213 @@ fn scenario_extract_hold_rate_nonzero_when_position_held_to_resolution() {
         r.features.hold_to_resolution_rate_bps
     );
 }
+
+#[test]
+fn scenario_extract_cross_wallet_rank_index_sets_percentile() {
+    // 3 wallets, each with one buy on the same (market, outcome) at t=1000/2000/3000.
+    // After inversion (high = first-mover = good), expected bps are 10_000 / 5_000 / 0.
+    // PASS criterion: the three wallets receive exactly those bps values; median
+    // collapses to the single per-position value because each wallet has one position.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wallet_cache.db");
+    const M: &str = "0xmFM";
+    const W1: &str = "0x4444444444444444444444444444444444444444";
+    const W2: &str = "0x5555555555555555555555555555555555555555";
+    const W3: &str = "0x6666666666666666666666666666666666666666";
+    const CUTOFF_FM: i64 = 10_000;
+
+    {
+        let mut cache = WalletCache::open(&path).unwrap();
+        cache
+            .upsert_market_events(M, "evtFM", Some("fm"), 100)
+            .unwrap();
+        cache.insert_resolution(M, Some(0), 4_000, 4_000).unwrap();
+
+        activate(&mut cache, W1);
+        activate(&mut cache, W2);
+        activate(&mut cache, W3);
+
+        cache
+            .insert_new(
+                W1,
+                vec![
+                    raw(W1, M, Side::Buy, dec!(0.50), 1_000, "0xw1b"),
+                    raw(W1, M, Side::Sell, dec!(0.80), 1_500, "0xw1s"),
+                ],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                W2,
+                vec![
+                    raw(W2, M, Side::Buy, dec!(0.50), 2_000, "0xw2b"),
+                    raw(W2, M, Side::Sell, dec!(0.80), 2_500, "0xw2s"),
+                ],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                W3,
+                vec![
+                    raw(W3, M, Side::Buy, dec!(0.50), 3_000, "0xw3b"),
+                    raw(W3, M, Side::Sell, dec!(0.80), 3_500, "0xw3s"),
+                ],
+            )
+            .unwrap();
+    }
+
+    let report = run_extract(
+        &path,
+        CUTOFF_FM,
+        1,
+        0,
+        1,
+        1,
+        99,
+        42,
+        1_700_000_000,
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.wallets_written, 3);
+
+    let rows = SkillCache::open_read_only(&path)
+        .unwrap()
+        .load_features_for_cutoff(CUTOFF_FM)
+        .unwrap();
+    let by_hex: std::collections::HashMap<String, i64> = rows
+        .iter()
+        .map(|w| {
+            (
+                w.features.wallet_hex.clone(),
+                w.features.first_mover_percentile_bps,
+            )
+        })
+        .collect();
+
+    let w1_bps = by_hex[W1];
+    let w2_bps = by_hex[W2];
+    let w3_bps = by_hex[W3];
+
+    assert_eq!(
+        w1_bps, 10_000,
+        "PASS criterion: earliest mover (t=1000) → 10_000; got {}",
+        w1_bps
+    );
+    assert_eq!(
+        w2_bps, 5_000,
+        "PASS criterion: middle mover (t=2000) → 5_000; got {}",
+        w2_bps
+    );
+    assert_eq!(
+        w3_bps, 0,
+        "PASS criterion: latest mover (t=3000) → 0; got {}",
+        w3_bps
+    );
+    println!(
+        "PASS: scenario_extract_cross_wallet_rank_index_sets_percentile — w1={} w2={} w3={}",
+        w1_bps, w2_bps, w3_bps
+    );
+}
+
+#[test]
+fn scenario_extract_first_mover_median_aggregates_positions() {
+    // One wallet (W_TEST) with two positions:
+    //   - Position A on M_A: singleton group (only W_TEST bought it) → bps = 10_000
+    //     via the sole-participant rule.
+    //   - Position B on M_B: 3-wallet group, W_TEST is the latest buyer (t=3000 vs
+    //     decoys at 1000/2000) → count_ahead = 2, total = 3 → bps = 0.
+    // Median([0, 10_000]) = mean-of-middle-two = 5_000.
+    // PASS criterion: W_TEST's first_mover_percentile_bps == 5_000.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wallet_cache.db");
+    const M_A: &str = "0xmMA";
+    const M_B: &str = "0xmMB";
+    const W_TEST: &str = "0x7777777777777777777777777777777777777777";
+    const W_D1: &str = "0x8888888888888888888888888888888888888888";
+    const W_D2: &str = "0x9999999999999999999999999999999999999999";
+    const CUTOFF_MED: i64 = 10_000;
+
+    {
+        let mut cache = WalletCache::open(&path).unwrap();
+        cache
+            .upsert_market_events(M_A, "evtA", Some("a"), 100)
+            .unwrap();
+        cache
+            .upsert_market_events(M_B, "evtB", Some("b"), 100)
+            .unwrap();
+        cache.insert_resolution(M_A, Some(0), 4_000, 4_000).unwrap();
+        cache.insert_resolution(M_B, Some(0), 4_000, 4_000).unwrap();
+
+        activate(&mut cache, W_TEST);
+        activate(&mut cache, W_D1);
+        activate(&mut cache, W_D2);
+
+        cache
+            .insert_new(
+                W_TEST,
+                vec![
+                    raw(W_TEST, M_A, Side::Buy, dec!(0.50), 1_000, "0xtAb"),
+                    raw(W_TEST, M_A, Side::Sell, dec!(0.80), 1_500, "0xtAs"),
+                    raw(W_TEST, M_B, Side::Buy, dec!(0.50), 3_000, "0xtBb"),
+                    raw(W_TEST, M_B, Side::Sell, dec!(0.80), 3_500, "0xtBs"),
+                ],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                W_D1,
+                vec![
+                    raw(W_D1, M_B, Side::Buy, dec!(0.50), 1_000, "0xd1Bb"),
+                    raw(W_D1, M_B, Side::Sell, dec!(0.80), 1_500, "0xd1Bs"),
+                ],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                W_D2,
+                vec![
+                    raw(W_D2, M_B, Side::Buy, dec!(0.50), 2_000, "0xd2Bb"),
+                    raw(W_D2, M_B, Side::Sell, dec!(0.80), 2_500, "0xd2Bs"),
+                ],
+            )
+            .unwrap();
+    }
+
+    let report = run_extract(
+        &path,
+        CUTOFF_MED,
+        1,
+        0,
+        1,
+        1,
+        99,
+        42,
+        1_700_000_000,
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.wallets_written, 3);
+
+    let rows = SkillCache::open_read_only(&path)
+        .unwrap()
+        .load_features_for_cutoff(CUTOFF_MED)
+        .unwrap();
+    let test_w = rows
+        .iter()
+        .find(|w| w.features.wallet_hex == W_TEST)
+        .expect("W_TEST row");
+
+    let bps = test_w.features.first_mover_percentile_bps;
+    assert_eq!(
+        bps, 5_000,
+        "PASS criterion: median([0, 10_000]) = 5_000; got {}",
+        bps
+    );
+    println!(
+        "PASS: scenario_extract_first_mover_median_aggregates_positions — bps={}",
+        bps
+    );
+}

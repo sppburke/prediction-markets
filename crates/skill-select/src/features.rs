@@ -156,6 +156,29 @@ pub struct DeterministicFeatures {
     /// basis points; clamped to 100 000 (= 10×). `0` when fewer than 2 buy-side
     /// closed trades exist or when the mean size is zero.
     pub position_sizing_cv_bps: i64,
+    // ─── First-mover percentile (#248 §3) ────────────────────────────────────────
+    /// Median across the wallet's `(market_id, outcome_id)` positions of an
+    /// **inverted** cross-wallet rank: for each position, count the number of
+    /// other wallets in the same group whose first-buy timestamp is strictly
+    /// earlier (`count_ahead`); the per-position bps is
+    /// `10_000 - round(count_ahead / (total - 1) × 10_000)`, with a singleton
+    /// group (`total == 1`) returning `10_000` (sole-participant convention).
+    ///
+    /// **Direction**: high bps = first-mover = good. The inversion keeps the
+    /// `0` sentinel on the bad-direction side (late chaser / no qualifying
+    /// data), matching `hold_to_resolution_rate_bps` and
+    /// `longshot_bias_ratio_bps` precedent — any downstream gate that treats 0
+    /// as "low signal" then fails safe.
+    ///
+    /// **Tie-breaking**: wallets sharing the same `first_buy_ts` in a group
+    /// receive identical percentile-bps (`partition_point` uses strict `<`).
+    ///
+    /// **Median convention**: even-sized position sets use the mean of the two
+    /// middle values after sort; odd-sized use the middle element.
+    ///
+    /// **Sentinel**: `0` when the wallet has no qualifying buys (`side='buy'`
+    /// AND `timestamp_unix <= cutoff_unix`).
+    pub first_mover_percentile_bps: i64,
 }
 
 /// Compute the simple deterministic feature batch for one wallet's train ledger.
@@ -183,6 +206,7 @@ pub fn extract_features(
     cutoff_unix: i64,
     event_map: &HashMap<String, String>,
     resolutions: &ResolutionIndex,
+    rank_index: &HashMap<(String, u16), Vec<i64>>,
     min_closed_trades: u32,
     min_distinct_events: u32,
     bb_alpha: u32,
@@ -264,6 +288,8 @@ pub fn extract_features(
     let hold_to_resolution_rate_bps =
         compute_hold_to_resolution_rate(raw_trades, resolutions, cutoff_unix);
     let position_sizing_cv_bps = compute_position_sizing_cv(&windowed);
+    let first_mover_percentile_bps =
+        compute_first_mover_percentile(raw_trades, rank_index, cutoff_unix);
 
     // Per-event positive-PnL roll-up over all in-window closed trades
     // (resolved or not — realized PnL exists either way; group F is a
@@ -317,6 +343,7 @@ pub fn extract_features(
         longshot_bias_ratio_bps,
         hold_to_resolution_rate_bps,
         position_sizing_cv_bps,
+        first_mover_percentile_bps,
     })
 }
 
@@ -590,6 +617,87 @@ fn compute_position_sizing_cv(windowed: &[&ClosedTrade]) -> i64 {
     let std = variance.sqrt().unwrap_or(Decimal::ZERO);
     let cv = (std / mean).min(Decimal::new(10, 0));
     decimal_to_bps_i64(cv)
+}
+
+// ─── First-mover percentile (#248 §3) ────────────────────────────────────────
+
+/// Median across the wallet's `(market_id, outcome_id)` positions of an
+/// inverted cross-wallet rank. Buy-side only; look-ahead-safe via
+/// `timestamp_unix <= cutoff_unix`.
+///
+/// See [`DeterministicFeatures::first_mover_percentile_bps`] for the formula,
+/// direction convention, tie-breaking, and sentinel.
+fn compute_first_mover_percentile(
+    raw_trades: &[RawTrade],
+    rank_index: &HashMap<(String, u16), Vec<i64>>,
+    cutoff_unix: i64,
+) -> i64 {
+    // This wallet's first-buy timestamp per (market_id, outcome_id) — derived
+    // from its own trades only; the cross-wallet view lives in `rank_index`.
+    let mut wallet_first_buy: HashMap<(String, u16), i64> = HashMap::new();
+    for t in raw_trades {
+        if t.side != Side::Buy {
+            continue;
+        }
+        let ts = t.timestamp.0.unix_timestamp();
+        if ts > cutoff_unix {
+            continue;
+        }
+        let key = (t.market_id.0.0.clone(), t.outcome_id.0);
+        wallet_first_buy
+            .entry(key)
+            .and_modify(|min_ts| {
+                if ts < *min_ts {
+                    *min_ts = ts;
+                }
+            })
+            .or_insert(ts);
+    }
+    if wallet_first_buy.is_empty() {
+        return 0;
+    }
+
+    let mut percentiles_bps: Vec<i64> = Vec::with_capacity(wallet_first_buy.len());
+    for (key, first_buy_ts) in &wallet_first_buy {
+        let Some(group) = rank_index.get(key) else {
+            // The wallet's own buy is missing from the cohort-wide index. This
+            // can happen if the index was built from a stricter slice than the
+            // wallet's raw_trades — defensive skip, treat as no-data per position.
+            continue;
+        };
+        let total = group.len();
+        if total == 0 {
+            continue;
+        }
+        // Strict-less counts wallets that entered earlier; ties (including the
+        // wallet itself, which is in `group`) are NOT counted ahead.
+        let count_ahead = group.partition_point(|&ts| ts < *first_buy_ts);
+        let bps: i64 = if total == 1 {
+            // Sole participant in the group — trivial first-mover by convention.
+            10_000
+        } else {
+            // Decimal arithmetic matches `decimal_to_bps_i64` precedent and
+            // avoids any narrowing cast on usize → integer bps.
+            let count_ahead_dec = Decimal::from(u64::try_from(count_ahead).unwrap_or(u64::MAX));
+            let denom_dec = Decimal::from(u64::try_from(total - 1).unwrap_or(u64::MAX));
+            let ratio = count_ahead_dec / denom_dec;
+            let raw_bps = decimal_to_bps_i64(ratio).clamp(0, 10_000);
+            10_000 - raw_bps
+        };
+        percentiles_bps.push(bps);
+    }
+    if percentiles_bps.is_empty() {
+        return 0;
+    }
+
+    // Median: mean-of-middle-two for even sizes; middle element for odd.
+    percentiles_bps.sort_unstable();
+    let n = percentiles_bps.len();
+    if n % 2 == 1 {
+        percentiles_bps[n / 2]
+    } else {
+        (percentiles_bps[n / 2 - 1] + percentiles_bps[n / 2]) / 2
+    }
 }
 
 /// Output of the per-bet quality block (group A).
@@ -901,6 +1009,10 @@ mod tests {
         ResolutionIndex::new()
     }
 
+    fn no_rank_index() -> HashMap<(String, u16), Vec<i64>> {
+        HashMap::new()
+    }
+
     fn wallet() -> WalletAddress {
         WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
     }
@@ -963,7 +1075,19 @@ mod tests {
             closed("0xm3", dec!(0.20), 50, dec!(2.0), 1_800, 3_000),
         ]);
 
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(f.total_pnl_usd, dec!(7.0)); // 10 - 5 + 2
         assert_eq!(f.roi_bps, 636); // 7 / 110 = 0.063636… → 636 bps
@@ -983,7 +1107,19 @@ mod tests {
             closed("0xm1", dec!(0.50), 100, dec!(10.0), 3_600, 1_000),
             closed("0xm2", dec!(0.50), 100, dec!(99.0), 3_600, 9_999), // after cutoff
         ]);
-        let f = extract_features(&l, &[], 5_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            5_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.closed_trades, 1);
         assert_eq!(f.total_pnl_usd, dec!(10.0));
         assert_eq!(f.win_rate_bps, 10_000); // the one in-window trade won
@@ -993,14 +1129,42 @@ mod tests {
     fn none_below_min_closed_trades() {
         let events = HashMap::new();
         let l = ledger(vec![closed("0xm1", dec!(0.5), 10, dec!(1.0), 60, 1_000)]);
-        assert!(extract_features(&l, &[], 10_000, &events, &no_res(), 5, 0, 1, 1).is_none());
+        assert!(
+            extract_features(
+                &l,
+                &[],
+                10_000,
+                &events,
+                &no_res(),
+                &no_rank_index(),
+                5,
+                0,
+                1,
+                1
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn none_when_no_closed_trades() {
         let events = HashMap::new();
         let l = ledger(vec![]);
-        assert!(extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).is_none());
+        assert!(
+            extract_features(
+                &l,
+                &[],
+                10_000,
+                &events,
+                &no_res(),
+                &no_rank_index(),
+                1,
+                0,
+                1,
+                1
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1013,7 +1177,19 @@ mod tests {
             closed("0xm2", dec!(0.50), 100, dec!(10.0), 60, 172_800),
             closed("0xm3", dec!(0.50), 100, dec!(15.0), 60, 259_200),
         ]);
-        let f = extract_features(&l, &[], 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(f.trading_days, 3);
         // mean = 0.2 → 2000 bps (exact)
@@ -1048,7 +1224,19 @@ mod tests {
             closed("0xm1", dec!(0.50), 100, dec!(5.0), 60, 1_000),
             closed("0xm2", dec!(0.50), 100, dec!(5.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.trading_days, 1);
         assert_eq!(f.std_daily_return_bps, 0);
         assert_eq!(f.sharpe_bps, 0);
@@ -1085,7 +1273,19 @@ mod tests {
             .collect();
         let l = ledger(trades);
         // Must not panic. When std^3 underflows to Decimal::ZERO, skewness = 0.
-        let f = extract_features(&l, &[], i64::MAX, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            i64::MAX,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.trading_days, 30);
         assert_eq!(f.skewness_bps, 0);
         assert_eq!(f.excess_kurtosis_bps, 0);
@@ -1109,7 +1309,19 @@ mod tests {
             closed("0xwin", dec!(0.40), 100, dec!(60.0), 60, 1_000),
             closed("0xlose", dec!(0.70), 100, dec!(-70.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.ev_mean_bps, -500);
         assert_eq!(f.brier_score_bps, 4_250);
         assert_eq!(f.brier_resolution_bps, 2_500);
@@ -1132,7 +1344,19 @@ mod tests {
             closed("0xwin", dec!(0.40), 100, dec!(60.0), 60, 1_000),
             closed("0xlose", dec!(0.40), 100, dec!(-40.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.bb_shrunk_edge_bps, 1_000);
         assert!(
             (f.kelly_log_growth_bps - 204).abs() <= 3,
@@ -1153,7 +1377,19 @@ mod tests {
             closed("0xa", dec!(0.40), 100, dec!(-40.0), 60, 1_000),
             closed("0xb", dec!(0.40), 100, dec!(-40.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         // p̂ = 0.25, c̄ = 0.40 → bb_edge = −0.15 → −1500 bps. Kelly = 0 (f* ≤ 0).
         assert_eq!(f.bb_shrunk_edge_bps, -1_500);
         assert_eq!(f.kelly_log_growth_bps, 0);
@@ -1170,7 +1406,19 @@ mod tests {
             closed("0xwin", dec!(0.50), 100, dec!(50.0), 60, 1_000),
             closed("0xunresolved", dec!(0.30), 100, dec!(-30.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         // Sample-size fields unchanged by resolution coverage.
         assert_eq!(f.closed_trades, 2);
         assert_eq!(f.distinct_markets, 2);
@@ -1190,7 +1438,19 @@ mod tests {
             closed("0xa", dec!(0.50), 100, dec!(50.0), 60, 1_000),
             closed("0xb", dec!(0.50), 100, dec!(-50.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.brier_resolution_bps, 0);
     }
 
@@ -1206,7 +1466,19 @@ mod tests {
             closed("0xm1", dec!(0.50), 100, dec!(10.0), 60, 1_000),
             closed("0xm2", dec!(0.50), 100, dec!(10.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.concentration_hhi_bps, 5_000);
         assert_eq!(f.concentration_n_eff_bps, 20_000);
         assert_eq!(f.concentration_rpc_bps, 15_000);
@@ -1220,7 +1492,19 @@ mod tests {
             closed("0xa", dec!(0.50), 100, dec!(-10.0), 60, 1_000),
             closed("0xb", dec!(0.50), 100, dec!(-20.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.concentration_hhi_bps, 0);
         assert_eq!(f.concentration_n_eff_bps, 0);
         assert_eq!(f.concentration_rpc_bps, 0);
@@ -1235,7 +1519,19 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 172_800),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 60, 259_200),
         ]);
-        let f = extract_features(&l, &[], 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.first_entries_per_active_day_bps, 10_000);
     }
 
@@ -1259,7 +1555,19 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 100, 1_100),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 100, 2_100),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.median_first_entry_to_resolution_secs, 200);
 
         // Drop the third trade → deltas [100, 200], even-length median = 150.
@@ -1267,7 +1575,19 @@ mod tests {
             closed("0xa", dec!(0.50), 100, dec!(5.0), 50, 50),
             closed("0xb", dec!(0.50), 100, dec!(5.0), 100, 1_100),
         ]);
-        let f2 = extract_features(&l2, &[], 10_000, &events, &resolutions, 1, 0, 1, 1).unwrap();
+        let f2 = extract_features(
+            &l2,
+            &[],
+            10_000,
+            &events,
+            &resolutions,
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f2.median_first_entry_to_resolution_secs, 150);
     }
 
@@ -1283,9 +1603,34 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 2_000),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 60, 3_000),
         ]);
-        assert!(extract_features(&l, &[], 10_000, &events, &no_res(), 1, 10, 1, 1).is_none());
+        assert!(
+            extract_features(
+                &l,
+                &[],
+                10_000,
+                &events,
+                &no_res(),
+                &no_rank_index(),
+                1,
+                10,
+                1,
+                1
+            )
+            .is_none()
+        );
         // Same data, gate of 3 → accepted (boundary == passes).
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 3, 1, 1);
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            3,
+            1,
+            1,
+        );
         assert!(f.is_some());
     }
 
@@ -1296,7 +1641,19 @@ mod tests {
         // n < 2 → sentinel 0.
         let events = HashMap::new();
         let l = ledger(vec![closed("0xa", dec!(0.50), 100, dec!(5.0), 60, 1_000)]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.position_sizing_cv_bps, 0);
     }
 
@@ -1309,7 +1666,19 @@ mod tests {
             closed("0xb", dec!(0.50), 100, dec!(5.0), 60, 2_000),
             closed("0xc", dec!(0.50), 100, dec!(5.0), 60, 3_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.position_sizing_cv_bps, 0);
     }
 
@@ -1323,7 +1692,19 @@ mod tests {
             closed("0xb", dec!(0.50), 200, dec!(5.0), 60, 2_000),
             closed("0xc", dec!(0.50), 300, dec!(5.0), 60, 3_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.position_sizing_cv_bps, 5_000);
     }
 
@@ -1349,7 +1730,19 @@ mod tests {
             source_trade_ids: vec![],
         });
         let l = ledger(trades);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.position_sizing_cv_bps, 0);
     }
 
@@ -1361,7 +1754,19 @@ mod tests {
             closed("0xa", dec!(0.50), 0, dec!(0.0), 60, 1_000),
             closed("0xb", dec!(0.50), 0, dec!(0.0), 60, 2_000),
         ]);
-        let f = extract_features(&l, &[], 10_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.position_sizing_cv_bps, 0);
     }
 
@@ -1390,7 +1795,19 @@ mod tests {
             300_000,
         ));
         let l = ledger(trades);
-        let f = extract_features(&l, &[], 10_000_000, &events, &no_res(), 1, 0, 1, 1).unwrap();
+        let f = extract_features(
+            &l,
+            &[],
+            10_000_000,
+            &events,
+            &no_res(),
+            &no_rank_index(),
+            1,
+            0,
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(f.position_sizing_cv_bps, 100_000);
     }
 }

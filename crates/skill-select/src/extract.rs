@@ -98,15 +98,27 @@ pub fn run_extract(
     }
 
     // Read-pass shared inputs: load once on the main thread, share to workers.
-    let (event_map, resolutions, wallets) = {
+    let (event_map, resolutions, rank_index, wallets) = {
         let cache = WalletCache::open_read_only(cache_path)?;
         let event_map: HashMap<String, String> = cache.load_market_event_map()?;
         let resolutions = cache.load_all_resolutions()?;
+        // Cross-wallet first-buy rank index for `first_mover_percentile_bps`
+        // (#248 §3). Single SQL GROUP BY scan filtered by `timestamp_unix <=
+        // cutoff_unix` — the look-ahead invariant lives in the method.
+        let rank_index_start = std::time::Instant::now();
+        let rank_index = cache.load_first_mover_rank_index(cutoff_unix)?;
+        info!(
+            elapsed_ms = u64::try_from(rank_index_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            groups_indexed = rank_index.len(),
+            cutoff_unix,
+            "skill-select extract: cross-wallet rank index built"
+        );
         let wallets = cache.active_tradeable_wallet_hexes()?;
-        (event_map, resolutions, wallets)
+        (event_map, resolutions, rank_index, wallets)
     };
     let event_map = Arc::new(event_map);
     let resolutions = Arc::new(resolutions);
+    let rank_index = Arc::new(rank_index);
 
     // Workers count: 0 = rayon's default (CPU count / RAYON_NUM_THREADS).
     // The default thread pool is global and lazy-initialised; a custom pool
@@ -150,6 +162,7 @@ pub fn run_extract(
                     &snapshot_at,
                     &event_map,
                     &resolutions,
+                    &rank_index,
                     &wallets_skipped,
                 )
             })
@@ -203,6 +216,7 @@ fn process_wallet(
     snapshot_at: &SourceTimestamp,
     event_map: &HashMap<String, String>,
     resolutions: &ResolutionIndex,
+    rank_index: &HashMap<(String, u16), Vec<i64>>,
     wallets_skipped: &AtomicUsize,
 ) -> Option<WalletFeatures> {
     let cache = match WalletCache::open_read_only(cache_path) {
@@ -244,6 +258,7 @@ fn process_wallet(
         cutoff_unix,
         event_map,
         resolutions,
+        rank_index,
         min_closed_trades,
         min_distinct_events,
         bb_alpha,

@@ -462,6 +462,7 @@ mod tests {
                 longshot_bias_ratio_bps: 0,
                 hold_to_resolution_rate_bps: 0,
                 position_sizing_cv_bps: 0,
+                first_mover_percentile_bps: 0,
             },
             extracted_at_unix: 1,
             skill_pnl_usd: dec!(0.0),
