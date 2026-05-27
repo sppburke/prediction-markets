@@ -26,6 +26,15 @@ pub enum SkillSelectError {
     /// `Result<_, SkillSelectError>`) small (clippy `result_large_err`).
     #[error("config: {0}")]
     Config(Box<figment::Error>),
+
+    /// Field-mapping failure in `export-watchlist` (e.g. `ReconstructionQuality`
+    /// out-of-range, `OffsetDateTime` conversion failure, or `serde_json` error).
+    #[error("watchlist mapping: {0}")]
+    WatchlistMapping(String),
+
+    /// Filesystem I/O failure (file read, write, or atomic rename).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<figment::Error> for SkillSelectError {

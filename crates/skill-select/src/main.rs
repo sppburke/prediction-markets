@@ -8,13 +8,16 @@
 //!   forward-test [config.toml] — select, then hold each selected wallet's
 //!                             post-cutoff buys to resolution; print flat-$1 +
 //!                             Kelly-f PnL (GROSS of fees).
+//!   export-watchlist [config.toml] — convert a `.txt` watchlist of wallet hex
+//!                             addresses into a `pe_trader_index::Watchlist` JSON
+//!                             file consumable by `pe-service seed_watchlist_path`.
 //!
 //! Config is `PE_SKILL_*` env overlaid on an optional TOML path. Exit codes:
 //! 0 = success, 1 = fatal, 2 = usage error.
 
 use pe_skill_select::{
-    ForwardSource, SelectionInput, SkillCache, SkillConfig, rank_by_composite, run_extract,
-    run_forward_test, select_wallets,
+    ExportWatchlistConfig, ForwardSource, SelectionInput, SkillCache, SkillConfig,
+    rank_by_composite, run_export_watchlist, run_extract, run_forward_test, select_wallets,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -35,9 +38,10 @@ fn main() {
         Some("select") => run_select_cmd(toml_path.as_deref()),
         Some("composite") => run_composite_cmd(toml_path.as_deref()),
         Some("forward-test") => run_forward_cmd(toml_path.as_deref()),
+        Some("export-watchlist") => run_export_watchlist_cmd(toml_path.as_deref()),
         other => {
             eprintln!(
-                "usage: pe-skill-select <extract|select|composite|forward-test> [config.toml]   (got {other:?})"
+                "usage: pe-skill-select <extract|select|composite|forward-test|export-watchlist> [config.toml]   (got {other:?})"
             );
             2
         }
@@ -236,6 +240,36 @@ fn run_composite_cmd(toml_path: Option<&std::path::Path>) -> i32 {
         );
     }
     0
+}
+
+fn run_export_watchlist_cmd(toml_path: Option<&std::path::Path>) -> i32 {
+    let cfg = match load(toml_path) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let export_cfg = ExportWatchlistConfig {
+        cache_path: cfg.cache_path.clone(),
+        watchlist_txt_path: cfg.export_watchlist_input_path.clone(),
+        cutoff_unix: cfg.cutoff_unix,
+        output_path: cfg.export_watchlist_output_path.clone(),
+    };
+    match run_export_watchlist(&export_cfg) {
+        Ok(stats) => {
+            println!(
+                "export-watchlist: requested={} written={} missing={} (cutoff_unix={}, output={:?})",
+                stats.wallets_requested,
+                stats.wallets_written,
+                stats.wallets_missing,
+                cfg.cutoff_unix,
+                cfg.export_watchlist_output_path,
+            );
+            0
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "skill-select export-watchlist: fatal");
+            1
+        }
+    }
 }
 
 fn run_forward_cmd(toml_path: Option<&std::path::Path>) -> i32 {

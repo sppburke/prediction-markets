@@ -567,3 +567,21 @@ Winner-Follow can go to live-tiny only when:
 ## Live monitoring
 
 Demote or disable a leader/operator when any demotion criterion in `_GLOSSARY.md` triggers. Demotion is automatic; promotion requires the gates above plus a manual review.
+
+## Watchlist refresh (export-watchlist)
+
+The `pe-skill-select export-watchlist` subcommand bridges Python-ranked `.txt` watchlists into the `pe_trader_index::Watchlist` JSON format consumed by `pe-service` via `seed_watchlist_path`.
+
+**v1 cadence**: manual invocation only. Refresh after each monthly `pe-skill-select extract` + re-rank cycle:
+
+```bash
+PE_SKILL_CACHE_PATH=data/wallet_cache.db \
+PE_SKILL_CUTOFF_UNIX=<latest_cutoff> \
+PE_SKILL_EXPORT_WATCHLIST_INPUT_PATH=data/production-watchlist-b2-throughput-5k.txt \
+PE_SKILL_EXPORT_WATCHLIST_OUTPUT_PATH=data/seed_watchlist.json \
+  ./target/release/pe-skill-select export-watchlist
+```
+
+Field mapping from `wallet_features` → `WatchlistEntry`: `leader_score_bps = lcb_5pct_bps`, `win_rate_bps = win_rate_bps`, `closed_trades_in_window = closed_trades` (all-time count, closest available proxy). Schema and field semantics: `_GLOSSARY.md` "export-watchlist output schema".
+
+Cadence automation (cron/systemd timer) is a future follow-up — do not include in v1.
