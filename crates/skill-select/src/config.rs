@@ -94,6 +94,14 @@ fn default_extract_threads() -> usize {
     // or override via `PE_SKILL_EXTRACT_THREADS=N`.
     0
 }
+fn default_export_watchlist_input_path() -> PathBuf {
+    // Empty sentinel: `export-watchlist` requires this to be set via env or TOML;
+    // an empty path causes an Io error on read, which fails safely.
+    PathBuf::new()
+}
+fn default_export_watchlist_output_path() -> PathBuf {
+    PathBuf::new()
+}
 
 // Composite-ranker per-feature weight defaults (basis-points; sign = direction).
 // Mirror [`crate::composite::CompositeWeights::default`]; both must agree.
@@ -247,6 +255,15 @@ pub struct SkillConfig {
     /// function differs.
     #[serde(default = "default_forward_source")]
     pub forward_source: ForwardSource,
+    /// Input `.txt` watchlist path for `export-watchlist` (one `0x`-hex per
+    /// line, `#`-prefixed comments and blank lines ignored).
+    /// `PE_SKILL_EXPORT_WATCHLIST_INPUT_PATH`.
+    #[serde(default = "default_export_watchlist_input_path")]
+    pub export_watchlist_input_path: PathBuf,
+    /// Output JSON path for `export-watchlist` (written atomically via tmp +
+    /// rename). `PE_SKILL_EXPORT_WATCHLIST_OUTPUT_PATH`.
+    #[serde(default = "default_export_watchlist_output_path")]
+    pub export_watchlist_output_path: PathBuf,
 }
 
 impl SkillConfig {
