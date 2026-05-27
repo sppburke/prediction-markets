@@ -57,9 +57,10 @@ pub fn run_export_watchlist(cfg: &ExportWatchlistConfig) -> Result<ExportStats, 
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let addr = WalletAddress::from_hex(trimmed)
+        let normalised = trimmed.to_lowercase();
+        let addr = WalletAddress::from_hex(&normalised)
             .map_err(|_| SkillSelectError::Decode(format!("watchlist hex parse: {trimmed}")))?;
-        parsed.push((addr, trimmed.to_owned()));
+        parsed.push((addr, normalised));
     }
     let wallets_requested = parsed.len();
 
