@@ -39,6 +39,22 @@ async fn main() -> Result<(), BacktestError> {
 
     // Load wallet trade cache (mutable so Dune resolutions can be written).
     let mut cache = WalletCache::open(&config.bootstrap_cache_path)?;
+
+    // Pre-flight size guard (issue #241): refuse early rather than OOM-kill deep in
+    // the simulation. Runs a COUNT(*) before loading the full Vec<RawTrade>.
+    if config.max_trade_count > 0 {
+        let actual = cache.trade_count();
+        let limit = usize::try_from(config.max_trade_count).unwrap_or(usize::MAX);
+        if actual > limit {
+            return Err(BacktestError::Internal(format!(
+                "cache has {actual} trades which exceeds max_trade_count={}; \
+                 pe-skill-select handles full-cohort analysis. \
+                 Set PE_BACKTEST_MAX_TRADE_COUNT=0 to disable this guard.",
+                config.max_trade_count
+            )));
+        }
+    }
+
     let all_wallet_addresses = cache.all_wallet_addresses();
     let mut all_trades = cache.all_trades();
     let snapshots = cache.load_all_snapshots()?;

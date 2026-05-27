@@ -166,6 +166,7 @@ fn base_config_with(
         max_positions_per_market: None,
         skip_unknown_operator: false,
         max_signal_price: None,
+        max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
     }
 }
