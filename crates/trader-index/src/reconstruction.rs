@@ -178,17 +178,25 @@ fn build_operator_map(
 
 /// Compound key for per-wallet, per-(market, outcome) position buckets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct BucketKey {
-    market_id: MarketId,
-    outcome_id: OutcomeId,
+pub(crate) struct BucketKey {
+    pub(crate) market_id: MarketId,
+    pub(crate) outcome_id: OutcomeId,
 }
 
 /// A single trade fill tracked inside a FIFO queue.
-struct Fill {
-    price: Price,
-    contracts: u64,
-    timestamp_unix: i64,
-    source_trade_id: SourceTradeId,
+pub(crate) struct Fill {
+    pub(crate) price: Price,
+    pub(crate) contracts: u64,
+    pub(crate) timestamp_unix: i64,
+    pub(crate) source_trade_id: SourceTradeId,
+}
+
+pub(crate) fn quality_score(closed_contracts: u64, open_contracts: u64) -> u8 {
+    let total = closed_contracts.saturating_add(open_contracts);
+    if total == 0 {
+        return 0;
+    }
+    ((closed_contracts as u128 * 100) / total as u128).min(100) as u8
 }
 
 /// FIFO-match a closing fill against the head of `entries`.
@@ -196,7 +204,7 @@ struct Fill {
 /// Creates [`ClosedTrade`] records for each matched lot.
 /// Returns `Some(Fill)` with remaining contracts if the closing fill was only
 /// partially matched (entries exhausted before closing fill was fully consumed).
-fn match_against_queue(
+pub(crate) fn match_against_queue(
     mut closing: Fill,
     entries: &mut Vec<Fill>,
     entry_side: Side,
@@ -258,7 +266,7 @@ fn match_against_queue(
 /// Aggregate remaining fills in a queue into a single [`OpenPosition`].
 ///
 /// Returns `None` when all fills are fully consumed (contracts == 0).
-fn fills_to_open(key: &BucketKey, side: Side, fills: &[Fill]) -> Option<OpenPosition> {
+pub(crate) fn fills_to_open(key: &BucketKey, side: Side, fills: &[Fill]) -> Option<OpenPosition> {
     let total_contracts: u64 = fills
         .iter()
         .map(|f| f.contracts)
@@ -292,15 +300,4 @@ fn fills_to_open(key: &BucketKey, side: Side, fills: &[Fill]) -> Option<OpenPosi
         contracts: ContractQty(total_contracts),
         source_trade_ids,
     })
-}
-
-/// Quality score: fraction of all known contracts that are fully settled.
-///
-/// `quality = (closed / (closed + open)) × 100`, clamped to [0, 100].
-fn quality_score(closed_contracts: u64, open_contracts: u64) -> u8 {
-    let total = closed_contracts.saturating_add(open_contracts);
-    if total == 0 {
-        return 0;
-    }
-    ((closed_contracts as u128 * 100) / total as u128).min(100) as u8
 }
