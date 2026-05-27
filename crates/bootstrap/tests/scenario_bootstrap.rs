@@ -18,7 +18,7 @@ use pe_bootstrap::polymarket::PolymarketBulkFetcher;
 use pe_core_types::{SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
-use pe_trader_index::{LedgerConfig, build_trader_ledgers, snapshot::TradeSnapshot};
+use pe_trader_index::{LedgerConfig, build_trader_ledgers};
 use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -81,12 +81,13 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
         if trades.is_empty() {
             continue;
         }
-        let snapshot = TradeSnapshot {
-            trades,
-            snapshot_at: snapshot_at.clone(),
-            audit_window_days: u32::MAX,
-        };
-        ledgers.extend(build_trader_ledgers(&snapshot, empty, &ledger_config));
+        ledgers.extend(build_trader_ledgers(
+            &trades,
+            u32::MAX,
+            empty,
+            None,
+            &ledger_config,
+        ));
     }
 
     // Build seed watchlist with default filter thresholds.

@@ -16,7 +16,6 @@ use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
 use pe_operator_graph::OperatorIdentity;
 use pe_trader_index::{
     LedgerConfig, TraderLedger, Watchlist, WatchlistEntry, WatchlistTier, build_trader_ledgers,
-    snapshot::TradeSnapshot,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -74,14 +73,11 @@ pub async fn run_watchlist(
             continue;
         }
         total_trades += trades.len();
-        let snapshot = TradeSnapshot {
-            trades,
-            snapshot_at: snapshot_at.clone(),
-            audit_window_days,
-        };
         ledgers.extend(build_trader_ledgers(
-            &snapshot,
+            &trades,
+            audit_window_days,
             empty_operators,
+            None,
             &ledger_config,
         ));
     }

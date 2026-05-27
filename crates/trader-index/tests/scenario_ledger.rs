@@ -8,7 +8,7 @@
     clippy::too_many_arguments
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pe_core_types::{
     ContractQty, MarketId, OperatorId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
@@ -18,7 +18,7 @@ use pe_operator_graph::{
     clustering::ClusteringConfig,
     funding::{FundingEdge, FundingSnapshot},
 };
-use pe_trader_index::{LedgerConfig, RawTrade, TradeSnapshot, build_trader_ledgers};
+use pe_trader_index::{LedgerConfig, RawTrade, build_trader_ledgers};
 use rust_decimal_macros::dec;
 use time::macros::datetime;
 
@@ -83,13 +83,7 @@ fn single_wallet_fully_closed() {
         raw_trade(w, m.clone(), 0, Side::Sell, dec!(0.80), 5, 300, "sell-2"),
     ];
 
-    let snapshot = TradeSnapshot {
-        trades,
-        snapshot_at: ts(400),
-        audit_window_days: 30,
-    };
-
-    let ledgers = build_trader_ledgers(&snapshot, &[], &LedgerConfig::default());
+    let ledgers = build_trader_ledgers(&trades, 30, &[], None, &LedgerConfig::default());
 
     assert_eq!(ledgers.len(), 1, "expected one ledger");
     let ledger = &ledgers[0];
@@ -172,13 +166,7 @@ fn operator_merged_cluster_annotated() {
         raw_trade(w2, m.clone(), 0, Side::Buy, dec!(0.60), 4, 10, "w2-buy"),
     ];
 
-    let snapshot = TradeSnapshot {
-        trades,
-        snapshot_at: ts(100),
-        audit_window_days: 7,
-    };
-
-    let ledgers = build_trader_ledgers(&snapshot, &identities, &LedgerConfig::default());
+    let ledgers = build_trader_ledgers(&trades, 7, &identities, None, &LedgerConfig::default());
 
     assert_eq!(ledgers.len(), 2, "expected two ledgers (one per wallet)");
     for ledger in &ledgers {
@@ -209,13 +197,7 @@ fn fresh_wallet_partial_reconstruction() {
         raw_trade(w, m.clone(), 0, Side::Sell, dec!(0.60), 5, 100, "sell-a"),
     ];
 
-    let snapshot = TradeSnapshot {
-        trades,
-        snapshot_at: ts(200),
-        audit_window_days: 14,
-    };
-
-    let ledgers = build_trader_ledgers(&snapshot, &[], &LedgerConfig::default());
+    let ledgers = build_trader_ledgers(&trades, 14, &[], None, &LedgerConfig::default());
 
     assert_eq!(ledgers.len(), 1);
     let ledger = &ledgers[0];
@@ -254,4 +236,78 @@ fn fresh_wallet_partial_reconstruction() {
         q > 0,
         "quality should be > 0 with at least one closed trade; got {q}"
     );
+}
+
+// ─── scenario 4 ──────────────────────────────────────────────────────────────
+
+/// wallet_filter pre-filter is semantically identical to build-all + post-filter.
+///
+/// PASS: ledgers returned by `wallet_filter = Some({w1, w2})` are byte-identical
+///       to the subset from `wallet_filter = None` filtered down to {w1, w2}.
+/// FAIL: any ledger field differs between the two code paths.
+#[test]
+fn wallet_filter_matches_post_filter() {
+    let w1 = wallet(0x01);
+    let w2 = wallet(0x02);
+    let w3 = wallet(0x03); // excluded wallet
+    let m = market("mkt-filter");
+
+    let trades = vec![
+        // w1: one closed trade
+        raw_trade(w1, m.clone(), 0, Side::Buy, dec!(0.40), 5, 0, "w1-buy"),
+        raw_trade(w1, m.clone(), 0, Side::Sell, dec!(0.70), 5, 100, "w1-sell"),
+        // w2: one open position
+        raw_trade(w2, m.clone(), 0, Side::Buy, dec!(0.50), 3, 200, "w2-buy"),
+        // w3: one closed trade — must be absent from filtered output
+        raw_trade(w3, m.clone(), 0, Side::Buy, dec!(0.30), 2, 300, "w3-buy"),
+        raw_trade(w3, m.clone(), 0, Side::Sell, dec!(0.80), 2, 400, "w3-sell"),
+    ];
+
+    // Path A: build all, post-filter to {w1, w2}
+    let all_ledgers = build_trader_ledgers(&trades, 90, &[], None, &LedgerConfig::default());
+    let pool: HashSet<WalletAddress> = [w1, w2].into_iter().collect();
+    let mut post_filtered: Vec<_> = all_ledgers
+        .into_iter()
+        .filter(|l| pool.contains(&l.wallet))
+        .collect();
+    post_filtered.sort_by_key(|l| l.wallet.0);
+
+    // Path B: pre-filter via wallet_filter
+    let mut pre_filtered =
+        build_trader_ledgers(&trades, 90, &[], Some(&pool), &LedgerConfig::default());
+    pre_filtered.sort_by_key(|l| l.wallet.0);
+
+    assert_eq!(
+        pre_filtered.len(),
+        2,
+        "pre-filter must return exactly 2 ledgers (w1, w2)"
+    );
+    assert_eq!(
+        pre_filtered.len(),
+        post_filtered.len(),
+        "both paths must return the same number of ledgers"
+    );
+
+    for (a, b) in pre_filtered.iter().zip(post_filtered.iter()) {
+        assert_eq!(a.wallet, b.wallet, "wallet addresses must match");
+        assert_eq!(
+            a.closed_trades.len(),
+            b.closed_trades.len(),
+            "closed trade counts must match for wallet {:?}",
+            a.wallet
+        );
+        assert_eq!(
+            a.open_positions.len(),
+            b.open_positions.len(),
+            "open position counts must match for wallet {:?}",
+            a.wallet
+        );
+        assert_eq!(
+            a.reconstruction_quality.get(),
+            b.reconstruction_quality.get(),
+            "reconstruction quality must match for wallet {:?}",
+            a.wallet
+        );
+    }
+    println!("PASS: wallet_filter pre-filter matches post-filter for wallets w1 and w2");
 }

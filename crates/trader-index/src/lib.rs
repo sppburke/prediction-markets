@@ -20,6 +20,7 @@
 pub mod config;
 pub mod error;
 pub mod fetcher;
+pub mod incremental;
 pub mod ledger;
 pub mod ranker;
 pub mod reconstruction;
@@ -30,6 +31,7 @@ pub mod watchlist;
 pub use config::{LedgerConfig, RankerConfig};
 pub use error::TraderIndexError;
 pub use fetcher::{WatchlistFetchConfig, WatchlistFetchError, WatchlistFetcher};
+pub use incremental::IncrementalLedger;
 pub use ledger::{ClosedTrade, OpenPosition, TraderLedger};
 pub use ranker::build_watchlist;
 pub use reconstruction::build_trader_ledgers;

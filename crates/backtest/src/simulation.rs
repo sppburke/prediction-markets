@@ -22,8 +22,8 @@ use pe_risk_engine::snapshot::TradingMode;
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
-use pe_trader_index::snapshot::{RawTrade, TradeSnapshot};
-use pe_trader_index::{LedgerConfig, RankerConfig, build_trader_ledgers, build_watchlist};
+use pe_trader_index::snapshot::RawTrade;
+use pe_trader_index::{IncrementalLedger, LedgerConfig, RankerConfig, build_watchlist};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use time::{Date, OffsetDateTime};
@@ -384,6 +384,9 @@ pub fn run_simulation(
 
     let step = config.step_days.max(1) as usize;
 
+    let mut incr = IncrementalLedger::new();
+    let mut incr_cursor = 0usize;
+
     for (day_idx, &sim_date) in all_dates.iter().enumerate() {
         // Reset intraday PnL at day boundary.
         if last_intraday_reset != Some(sim_date) {
@@ -449,6 +452,17 @@ pub fn run_simulation(
             write_fill(fills_writer.as_mut(), &fill)?;
         }
 
+        // Advance incremental ledger: incorporate all trades strictly before today.
+        // Must run on every day (including skipped steps) so state stays current.
+        {
+            let new_end =
+                all_trades.partition_point(|t| t.timestamp.0.unix_timestamp() < sim_date_unix);
+            if new_end > incr_cursor {
+                incr.apply_batch(&all_trades[incr_cursor..new_end]);
+                incr_cursor = new_end;
+            }
+        }
+
         // Skip days that fall outside the step window.
         if day_idx % step != 0 {
             continue;
@@ -462,17 +476,17 @@ pub fn run_simulation(
             continue;
         }
 
-        // Ranker state: all trades strictly BEFORE today.
-        let ranker_cutoff_unix = sim_date.midnight().assume_utc().unix_timestamp();
-        let ranker_trades: Vec<RawTrade> = all_trades
-            .iter()
-            .filter(|t| t.timestamp.0.unix_timestamp() < ranker_cutoff_unix)
-            .cloned()
-            .collect();
-
-        if ranker_trades.is_empty() {
-            continue;
-        }
+        // Resolve the leaderboard pool. When snapshots are absent (test
+        // fixtures or pre-snapshot cache), build for all wallets (filter = None).
+        let pool = if snapshots.is_empty() {
+            None
+        } else {
+            match snapshots.for_date(sim_date_unix) {
+                Some(p) => Some(p),
+                // Simulation date precedes the first seeded snapshot — no candidates yet.
+                None => continue,
+            }
+        };
 
         // Build operator identities using only edges visible at this sim date.
         let operator_identities =
@@ -482,43 +496,24 @@ pub fn run_simulation(
             .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op)))
             .collect();
 
-        let snapshot = TradeSnapshot {
-            trades: ranker_trades,
-            snapshot_at: SourceTimestamp(sim_date.midnight().assume_utc()),
-            audit_window_days: config.audit_window_days,
-        };
-        let ledgers = build_trader_ledgers(&snapshot, &operator_identities, ledger_config);
+        // Confidence-filtered wallet → operator map for the incremental ledger.
+        let wallet_to_op: HashMap<WalletAddress, OperatorId> = operator_identities
+            .iter()
+            .filter(|op| op.confidence_ppm >= ledger_config.operator_min_confidence_ppm)
+            .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op.operator_id)))
+            .collect();
 
-        // Constrain the candidate pool to wallets present in the most-recent
-        // leaderboard snapshot ≤ sim_date. Wallet-level filter applied BEFORE
-        // operator grouping inside build_watchlist — strict "we didn't know
-        // about this wallet at week T" semantics. When snapshots are absent
-        // the filter degrades to a no-op (warned at start).
-        let filtered_ledgers: Vec<TraderLedger> = if snapshots.is_empty() {
-            ledgers
-        } else {
-            match snapshots.for_date(ranker_cutoff_unix) {
-                Some(pool) => ledgers
-                    .into_iter()
-                    .filter(|l| pool.contains(&l.wallet))
-                    .collect(),
-                // Simulation date precedes the first seeded snapshot — no candidates yet.
-                None => Vec::new(),
-            }
-        };
+        let snapshot_at = SourceTimestamp(sim_date.midnight().assume_utc());
+        let filtered_ledgers = incr.build_ledgers(pool, &wallet_to_op, config.audit_window_days);
 
         if filtered_ledgers.is_empty() {
             continue;
         }
 
-        let watchlist = build_watchlist(
-            &filtered_ledgers,
-            snapshot.snapshot_at.clone(),
-            ranker_config,
-        );
+        let watchlist = build_watchlist(&filtered_ledgers, snapshot_at.clone(), ranker_config);
 
         // Log on leaderboard snapshot transitions (replaces misleading day_idx % 30 gate).
-        let snapshot_unix = snapshots.snapshot_at_for_date(ranker_cutoff_unix);
+        let snapshot_unix = snapshots.snapshot_at_for_date(sim_date_unix);
         if snapshot_unix != last_logged_snapshot_unix {
             info!(
                 date = %sim_date,
