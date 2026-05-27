@@ -14,7 +14,7 @@
 //! 5. `reconstruction_quality = (closed_contracts / (closed + open)) × 100`.
 //! 6. Annotate with `operator_id` when `confidence_ppm >= config.operator_min_confidence_ppm`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pe_core_types::{
     ContractQty, MarketId, OperatorId, OutcomeId, Price, ReconstructionQuality, Side,
@@ -26,21 +26,31 @@ use rust_decimal::Decimal;
 use crate::{
     config::LedgerConfig,
     ledger::{ClosedTrade, OpenPosition, TraderLedger},
-    snapshot::{RawTrade, TradeSnapshot},
+    snapshot::RawTrade,
 };
 
-/// Build wallet-level [`TraderLedger`]s from a [`TradeSnapshot`] and operator identities.
+/// Build wallet-level [`TraderLedger`]s from a trade slice and operator identities.
+///
+/// - `trades` — all raw trades to reconstruct; may be any order (sorted per-wallet internally).
+/// - `audit_window_days` — stored on each returned ledger for downstream scoring.
+/// - `wallet_filter` — when `Some`, only builds ledgers for wallets in the set; when `None`,
+///   builds for every wallet present in `trades`.
 ///
 /// Pure and deterministic: same inputs always produce the same output.
 pub fn build_trader_ledgers(
-    snapshot: &TradeSnapshot,
+    trades: &[RawTrade],
+    audit_window_days: u32,
     operator_identities: &[OperatorIdentity],
+    wallet_filter: Option<&HashSet<WalletAddress>>,
     config: &LedgerConfig,
 ) -> Vec<TraderLedger> {
     let wallet_map = build_operator_map(operator_identities, config);
 
     let mut by_wallet: HashMap<WalletAddress, Vec<&RawTrade>> = HashMap::new();
-    for trade in &snapshot.trades {
+    for trade in trades {
+        if wallet_filter.is_some_and(|f| !f.contains(&trade.wallet)) {
+            continue;
+        }
         by_wallet.entry(trade.wallet).or_default().push(trade);
     }
 
@@ -143,7 +153,7 @@ pub fn build_trader_ledgers(
             reconstruction_quality,
             closed_trades: closed,
             open_positions: open,
-            audit_window_days: snapshot.audit_window_days,
+            audit_window_days,
         });
     }
 

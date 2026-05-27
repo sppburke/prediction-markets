@@ -22,10 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_bootstrap::cache::{ResolutionIndex, WalletCache};
-use pe_core_types::SourceTimestamp;
-use pe_trader_index::{LedgerConfig, TradeSnapshot, build_trader_ledgers};
+use pe_trader_index::{LedgerConfig, build_trader_ledgers};
 use rayon::prelude::*;
-use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use crate::db::{SkillCache, WalletFeatures};
@@ -76,11 +74,6 @@ pub fn run_extract(
     extract_threads: usize,
     clean_prior: bool,
 ) -> Result<ExtractReport, SkillSelectError> {
-    let snapshot_at = SourceTimestamp(
-        OffsetDateTime::from_unix_timestamp(cutoff_unix)
-            .map_err(|e| SkillSelectError::Decode(format!("cutoff_unix {cutoff_unix}: {e}")))?,
-    );
-
     // Opt-in pre-clean (issue #236): drop every row at `cutoff_unix` before the
     // extract begins. Runs in its own short write transaction so it doesn't
     // hold the SQLite write lock across the multi-minute extract body. The
@@ -159,7 +152,6 @@ pub fn run_extract(
                     permutations,
                     seed,
                     extracted_at_unix,
-                    &snapshot_at,
                     &event_map,
                     &resolutions,
                     &rank_index,
@@ -213,7 +205,6 @@ fn process_wallet(
     permutations: u32,
     seed: u64,
     extracted_at_unix: i64,
-    snapshot_at: &SourceTimestamp,
     event_map: &HashMap<String, String>,
     resolutions: &ResolutionIndex,
     rank_index: &HashMap<(String, u16), Vec<i64>>,
@@ -238,13 +229,8 @@ fn process_wallet(
         return None;
     }
 
-    let snapshot = TradeSnapshot {
-        trades: train,
-        snapshot_at: snapshot_at.clone(),
-        audit_window_days: 0,
-    };
     let ledger_config = LedgerConfig::default();
-    let Some(ledger) = build_trader_ledgers(&snapshot, &[], &ledger_config)
+    let Some(ledger) = build_trader_ledgers(&train, 0, &[], None, &ledger_config)
         .into_iter()
         .next()
     else {
@@ -254,7 +240,7 @@ fn process_wallet(
 
     let Some(features) = extract_features(
         &ledger,
-        &snapshot.trades,
+        &train,
         cutoff_unix,
         event_map,
         resolutions,

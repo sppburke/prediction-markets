@@ -22,7 +22,7 @@ use pe_risk_engine::snapshot::TradingMode;
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
-use pe_trader_index::snapshot::{RawTrade, TradeSnapshot};
+use pe_trader_index::snapshot::RawTrade;
 use pe_trader_index::{LedgerConfig, RankerConfig, build_trader_ledgers, build_watchlist};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -464,15 +464,29 @@ pub fn run_simulation(
 
         // Ranker state: all trades strictly BEFORE today.
         let ranker_cutoff_unix = sim_date.midnight().assume_utc().unix_timestamp();
-        let ranker_trades: Vec<RawTrade> = all_trades
-            .iter()
-            .filter(|t| t.timestamp.0.unix_timestamp() < ranker_cutoff_unix)
-            .cloned()
-            .collect();
 
-        if ranker_trades.is_empty() {
+        // O(log T) bisect — all_trades is sorted ascending by timestamp (invariant).
+        let ranker_end =
+            all_trades.partition_point(|t| t.timestamp.0.unix_timestamp() < ranker_cutoff_unix);
+        let ranker_slice = &all_trades[..ranker_end];
+
+        if ranker_slice.is_empty() {
             continue;
         }
+
+        // Resolve the leaderboard pool BEFORE building ledgers so we can pre-filter:
+        // only ledgers for pool wallets are needed. When snapshots are absent (test
+        // fixtures or pre-snapshot cache), build for all wallets (filter = None).
+        let pool = if snapshots.is_empty() {
+            None
+        } else {
+            match snapshots.for_date(ranker_cutoff_unix) {
+                Some(p) => Some(p),
+                // Simulation date precedes the first seeded snapshot — no candidates yet.
+                None => continue,
+            }
+        };
+        let wallet_filter = pool;
 
         // Build operator identities using only edges visible at this sim date.
         let operator_identities =
@@ -482,40 +496,20 @@ pub fn run_simulation(
             .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op)))
             .collect();
 
-        let snapshot = TradeSnapshot {
-            trades: ranker_trades,
-            snapshot_at: SourceTimestamp(sim_date.midnight().assume_utc()),
-            audit_window_days: config.audit_window_days,
-        };
-        let ledgers = build_trader_ledgers(&snapshot, &operator_identities, ledger_config);
-
-        // Constrain the candidate pool to wallets present in the most-recent
-        // leaderboard snapshot ≤ sim_date. Wallet-level filter applied BEFORE
-        // operator grouping inside build_watchlist — strict "we didn't know
-        // about this wallet at week T" semantics. When snapshots are absent
-        // the filter degrades to a no-op (warned at start).
-        let filtered_ledgers: Vec<TraderLedger> = if snapshots.is_empty() {
-            ledgers
-        } else {
-            match snapshots.for_date(ranker_cutoff_unix) {
-                Some(pool) => ledgers
-                    .into_iter()
-                    .filter(|l| pool.contains(&l.wallet))
-                    .collect(),
-                // Simulation date precedes the first seeded snapshot — no candidates yet.
-                None => Vec::new(),
-            }
-        };
+        let snapshot_at = SourceTimestamp(sim_date.midnight().assume_utc());
+        let filtered_ledgers = build_trader_ledgers(
+            ranker_slice,
+            config.audit_window_days,
+            &operator_identities,
+            wallet_filter,
+            ledger_config,
+        );
 
         if filtered_ledgers.is_empty() {
             continue;
         }
 
-        let watchlist = build_watchlist(
-            &filtered_ledgers,
-            snapshot.snapshot_at.clone(),
-            ranker_config,
-        );
+        let watchlist = build_watchlist(&filtered_ledgers, snapshot_at.clone(), ranker_config);
 
         // Log on leaderboard snapshot transitions (replaces misleading day_idx % 30 gate).
         let snapshot_unix = snapshots.snapshot_at_for_date(ranker_cutoff_unix);
