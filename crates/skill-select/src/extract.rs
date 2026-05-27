@@ -90,6 +90,14 @@ pub fn run_extract(
         );
     }
 
+    // Ensure first_mover_rank_cache table exists on existing DBs that predate
+    // this schema addition. DDL runs only on RW connections; open briefly then
+    // drop so the read-only block below doesn't compete for the write lock.
+    {
+        let _schema_init = WalletCache::open(cache_path)
+            .map_err(|e| SkillSelectError::Decode(format!("schema init: {e}")))?;
+    }
+
     // Read-pass shared inputs: load once on the main thread, share to workers.
     let (event_map, resolutions, rank_index, wallets, rank_index_was_cached) = {
         let cache = WalletCache::open_read_only(cache_path)?;
