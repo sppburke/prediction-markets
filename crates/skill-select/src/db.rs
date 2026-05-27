@@ -117,10 +117,6 @@ impl SkillCache {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
-        // 2 GB page cache + 4 GB mmap: reduces random-read thrashing on the
-        // 100+ GB wallet cache when 20 rayon threads query different wallets
-        // concurrently. Per-connection; no effect on the on-disk schema.
-        conn.execute_batch("PRAGMA cache_size = -2097152; PRAGMA mmap_size = 4294967296;")?;
         conn.execute_batch(SCHEMA)?;
         for (name, decl) in PR1_ADDED_COLUMNS {
             add_column_if_missing(&conn, "wallet_features", name, decl)?;
@@ -136,7 +132,6 @@ impl SkillCache {
     /// missing table errors rather than being created.
     pub fn open_read_only(path: &Path) -> Result<Self, SkillSelectError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.execute_batch("PRAGMA cache_size = -2097152; PRAGMA mmap_size = 4294967296;")?;
         Ok(Self { conn })
     }
 

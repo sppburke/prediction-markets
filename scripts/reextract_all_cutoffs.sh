@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Re-extract wallet_features across the 7 most recent cutoffs with CLEAN_PRIOR=true.
-# Runs newest-first so useful cutoffs finish early and the run can be killed once
-# the recent ones are done. The two oldest cutoffs (2025-09-30, 2025-10-31) are
-# omitted: they cover the largest trade windows, are the slowest to extract, and
-# contribute little to GBM training since the harness uses the most-recent K anchors.
+# Runs oldest-first: older cutoffs have fewer eligible wallets so they finish fastest,
+# warm the OS page-cache early, and let later (larger) cutoffs run against a warm DB.
+# The two oldest cutoffs (2025-09-30, 2025-10-31) are omitted: they cover the largest
+# trade windows and contribute little to GBM training since the harness uses the
+# most-recent K anchors.
 # Usage: bash scripts/reextract_all_cutoffs.sh
 
 set -euo pipefail
@@ -12,13 +13,13 @@ BIN="./target/release/pe-skill-select"
 DB="data/wallet_cache.db"
 
 CUTOFFS=(
-  1779839999   # 2026-05-26
-  1777679999   # 2026-05-01
-  1775001599   # 2026-03-31
-  1772495999   # 2026-03-02
-  1769903999   # 2026-01-31
-  1767225599   # 2025-12-31
   1764547199   # 2025-11-30
+  1767225599   # 2025-12-31
+  1769903999   # 2026-01-31
+  1772495999   # 2026-03-02
+  1775001599   # 2026-03-31
+  1777679999   # 2026-05-01
+  1779839999   # 2026-05-26
 )
 
 TOTAL=${#CUTOFFS[@]}
