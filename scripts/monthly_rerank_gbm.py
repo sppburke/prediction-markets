@@ -126,27 +126,16 @@ def per_wallet_fwd_edge(db, cutoff_unix, fwd_end_unix, wallets):
     return {w: (s / n, n) for w, (s, n) in by.items()}
 
 
-def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
-                min_distinct_events, min_fwd_pos, train_cutoffs, use_bhq=False,
-                label_type='perpos', *, n_seeds: int = 1, random_state: int = 42):
-    """Train GBM on train_cutoffs (labeled by fwd edge), score at cutoff_unix.
+def _gbm_train_and_score(db, cutoff_unix, fwd_secs, min_trading_days,
+                         min_distinct_events, min_fwd_pos, safe_train,
+                         use_bhq=False, label_type='perpos',
+                         n_seeds=1, random_state=42):
+    """Train GBM on safe_train and return the scored test DataFrame.
 
-    train_cutoffs must satisfy c + fwd_secs <= cutoff_unix (no forward-label bleed).
-    Returns top-N wallet_hex list; if use_bhq, only BHq-significant wallets are scored.
-    label_type: 'perpos' = mean edge per position (batch-2 default);
-                'throughput' = n_positions × mean_edge (B2 finding, +20% throughput).
-    n_seeds: number of GBM models to train with seeds [random_state, ..., random_state+n_seeds-1];
-             predictions are averaged before top-N selection. n_seeds=1 (default) reproduces
-             prior single-seed behaviour exactly. Compute scales linearly with n_seeds.
+    safe_train must already satisfy c + fwd_secs <= cutoff_unix (caller's
+    responsibility).  Returns the test DataFrame with column 's' (mean score
+    across seeds) in the same row order as load_features(cutoff_unix).
     """
-    # Guard: drop any training cutoff whose forward window extends past the scoring cutoff.
-    safe_train = [c for c in train_cutoffs if c + fwd_secs <= cutoff_unix]
-    if len(safe_train) < len(train_cutoffs):
-        dropped = len(train_cutoffs) - len(safe_train)
-        print(f"  WARN: dropped {dropped} training cutoff(s) whose fwd window bleeds past {datetime.utcfromtimestamp(cutoff_unix).date()}", file=sys.stderr)
-    if not safe_train:
-        raise ValueError(f"No safe training cutoffs available for scoring cutoff {cutoff_unix}")
-
     print(f"  training on {len(safe_train)} prior cutoffs (label={label_type})", file=sys.stderr)
     train_dfs = []
     for c in safe_train:
@@ -189,8 +178,64 @@ def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
         m.fit(X, y)
         per_seed_preds.append(m.predict(X_test))
     test['s'] = np.mean(per_seed_preds, axis=0)
+    return test
+
+
+def gbm_rank_at(db, cutoff_unix, fwd_secs, top_n, min_trading_days,
+                min_distinct_events, min_fwd_pos, train_cutoffs, use_bhq=False,
+                label_type='perpos', *, n_seeds: int = 1, random_state: int = 42):
+    """Train GBM on train_cutoffs (labeled by fwd edge), score at cutoff_unix.
+
+    train_cutoffs must satisfy c + fwd_secs <= cutoff_unix (no forward-label bleed).
+    Returns top-N wallet_hex list; if use_bhq, only BHq-significant wallets are scored.
+    label_type: 'perpos' = mean edge per position (batch-2 default);
+                'throughput' = n_positions × mean_edge (B2 finding, +20% throughput).
+    n_seeds: number of GBM models to train with seeds [random_state, ..., random_state+n_seeds-1];
+             predictions are averaged before top-N selection. n_seeds=1 (default) reproduces
+             prior single-seed behaviour exactly. Compute scales linearly with n_seeds.
+    """
+    # Guard: drop any training cutoff whose forward window extends past the scoring cutoff.
+    safe_train = [c for c in train_cutoffs if c + fwd_secs <= cutoff_unix]
+    if len(safe_train) < len(train_cutoffs):
+        dropped = len(train_cutoffs) - len(safe_train)
+        print(f"  WARN: dropped {dropped} training cutoff(s) whose fwd window bleeds past {datetime.utcfromtimestamp(cutoff_unix).date()}", file=sys.stderr)
+    if not safe_train:
+        raise ValueError(f"No safe training cutoffs available for scoring cutoff {cutoff_unix}")
+
+    test = _gbm_train_and_score(
+        db, cutoff_unix, fwd_secs, min_trading_days, min_distinct_events,
+        min_fwd_pos, safe_train, use_bhq=use_bhq, label_type=label_type,
+        n_seeds=n_seeds, random_state=random_state,
+    )
     effective_top_n = min(top_n, len(test))
     return test.nlargest(effective_top_n, 's')['wallet_hex'].tolist()
+
+
+def gbm_scores_at(db, cutoff_unix, fwd_secs, min_trading_days,
+                  min_distinct_events, min_fwd_pos, train_cutoffs,
+                  use_bhq=False, label_type='perpos',
+                  *, n_seeds: int = 1, random_state: int = 42):
+    """Train GBM and return per-wallet scores as a dict at cutoff_unix.
+
+    Identical training path to gbm_rank_at; returns all scored wallets (not
+    just top-N) so the caller can apply its own selection logic.
+
+    Returns:
+        dict[wallet_hex -> float]  (mean score across seeds; higher = better)
+    """
+    safe_train = [c for c in train_cutoffs if c + fwd_secs <= cutoff_unix]
+    if len(safe_train) < len(train_cutoffs):
+        dropped = len(train_cutoffs) - len(safe_train)
+        print(f"  WARN: dropped {dropped} training cutoff(s) whose fwd window bleeds past {datetime.utcfromtimestamp(cutoff_unix).date()}", file=sys.stderr)
+    if not safe_train:
+        raise ValueError(f"No safe training cutoffs available for scoring cutoff {cutoff_unix}")
+
+    test = _gbm_train_and_score(
+        db, cutoff_unix, fwd_secs, min_trading_days, min_distinct_events,
+        min_fwd_pos, safe_train, use_bhq=use_bhq, label_type=label_type,
+        n_seeds=n_seeds, random_state=random_state,
+    )
+    return dict(zip(test['wallet_hex'], test['s']))
 
 
 def main():
