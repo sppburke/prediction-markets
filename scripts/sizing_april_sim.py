@@ -138,20 +138,36 @@ def sim_flat(returns, stake, b0, min_pos):
     return b, placed, skipped
 
 
+def _load_watchlist_cohort(path):
+    """Return list of wallet hex addresses from a .txt watchlist file."""
+    result = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                result.append(line)
+    return result
+
+
 def run_holdout(db, args, label, cutoff, exante_cutoff, all_cutoffs):
     """Run Q4/Q5/Q6 for one monthly holdout (cohort selected at `cutoff`,
     forward 30d returns, Kelly fraction estimated ex-ante from `exante_cutoff`)."""
     fwd_secs = args.fwd_days * 86400
     print(f"\n{'#'*70}\n# HOLDOUT: {label}  (cutoff {cutoff}, ex-ante {exante_cutoff})\n{'#'*70}")
 
-    train = [c for c in all_cutoffs if c < cutoff]
-    if not train:
-        print(f"  no training cutoffs before {cutoff} — skip {label}"); return
-    print(f"ranking {label} cohort (top-{args.top_n}, throughput)...", file=sys.stderr)
-    cohort = gbm_rank_at(db, cutoff, fwd_secs, args.top_n,
-                         args.min_trading_days, args.min_distinct_events,
-                         args.min_fwd_pos, train, use_bhq=False,
-                         label_type="throughput", n_seeds=args.n_seeds)
+    if args.watchlist:
+        cohort = _load_watchlist_cohort(args.watchlist)
+        print(f"using watchlist cohort: {len(cohort)} wallets from {args.watchlist}",
+              file=sys.stderr)
+    else:
+        train = [c for c in all_cutoffs if c < cutoff]
+        if not train:
+            print(f"  no training cutoffs before {cutoff} — skip {label}"); return
+        print(f"ranking {label} cohort (top-{args.top_n}, throughput)...", file=sys.stderr)
+        cohort = gbm_rank_at(db, cutoff, fwd_secs, args.top_n,
+                             args.min_trading_days, args.min_distinct_events,
+                             args.min_fwd_pos, train, use_bhq=False,
+                             label_type="throughput", n_seeds=args.n_seeds)
     rets = returns_for(db, cutoff, fwd_secs, cohort, args.haircut_bps)
     print(f"{label}: cohort n={len(cohort)}, resolved fwd positions={len(rets)}")
     if not rets:
@@ -161,13 +177,17 @@ def run_holdout(db, args, label, cutoff, exante_cutoff, all_cutoffs):
           f"sum={sum(rets):+.2f}  (haircut={args.haircut_bps}bps, RESOLVED only)")
 
     # Ex-ante Kelly from the prior month's cohort/returns (no lookahead).
+    # When using a fixed watchlist, the same wallets serve as the ex-ante cohort.
     train_ex = [c for c in all_cutoffs if c < exante_cutoff]
     f_exante = 0.0
     if train_ex:
-        cohort_ex = gbm_rank_at(db, exante_cutoff, fwd_secs, args.top_n,
-                                args.min_trading_days, args.min_distinct_events,
-                                args.min_fwd_pos, train_ex, use_bhq=False,
-                                label_type="throughput", n_seeds=args.n_seeds)
+        if args.watchlist:
+            cohort_ex = cohort
+        else:
+            cohort_ex = gbm_rank_at(db, exante_cutoff, fwd_secs, args.top_n,
+                                    args.min_trading_days, args.min_distinct_events,
+                                    args.min_fwd_pos, train_ex, use_bhq=False,
+                                    label_type="throughput", n_seeds=args.n_seeds)
         ex_rets = returns_for(db, exante_cutoff, fwd_secs, cohort_ex, args.haircut_bps)
         f_exante = full_kelly_fraction(ex_rets)
     f_hind = full_kelly_fraction(rets)
@@ -251,6 +271,9 @@ def main():
     ap.add_argument("--n-seeds", type=int, default=5)
     ap.add_argument("--holdouts", default="April,May",
                     help="comma list of holdout labels to run (April, May)")
+    ap.add_argument("--watchlist", default=None,
+                    help="path to a .txt watchlist file; when provided, skips GBM "
+                         "ranking and uses the listed wallets as the fixed cohort")
     args = ap.parse_args()
 
     all_cutoffs = data_mod.distinct_cutoffs(args.db_path)

@@ -73,6 +73,11 @@ def main():
     ap.add_argument('--min-fwd-pos', type=int, default=3)
     ap.add_argument('--min-edge-score', type=float, default=0.0,
                     help='Greedy objective threshold (default 0.0)')
+    ap.add_argument('--max-candidates', type=int, default=None,
+                    dest='max_candidates',
+                    help='Cap the BHq pool to top-K before loading market sets '
+                         '(default max-n * 4; None = full pool, original behaviour). '
+                         'Major speedup when BHq pool is large (>500 wallets).')
     ap.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT_DIR)
     ap.add_argument('--label', default='portfolio_greedy',
                     help='Strategy label for output filenames')
@@ -101,6 +106,7 @@ def main():
         max_anchors=args.n_anchors,
         pbo_perms=args.pbo_perms,
         watchlist_path=args.watchlist,
+        max_candidates=args.max_candidates,
     )
 
     result = run_constructor(cfg)

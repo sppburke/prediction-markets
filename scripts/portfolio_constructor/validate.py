@@ -45,6 +45,7 @@ def evaluate_anchor_portfolio(
     overlap_lambda, max_n, min_edge_score,
     lookback_secs, haircut_bps, sizing_cfg_gross, sizing_cfg_net,
     use_bhq=True, label_type='perpos', n_seeds=5, random_state=42,
+    max_candidates=None,
 ):
     """Build a greedy portfolio at `anchor` and measure forward edge.
 
@@ -52,6 +53,12 @@ def evaluate_anchor_portfolio(
     Overlap = trailing (anchor - lookback_secs, anchor] Jaccard market sets.
     Forward positions = (anchor, anchor + fwd_secs].
     Ex-ante Kelly = prior-window returns from (anchor - lookback_secs, anchor].
+
+    max_candidates: cap the GBM score pool to the top-K before loading market
+    sets.  The greedy selector never picks a wallet outside the top-(max_n*4)
+    unless every higher-scored wallet is excluded by overlap — very unlikely for
+    max_n=50.  Defaults to max_n * 4 (e.g. 200 for max_n=50).  Set to None to
+    use the full BHq pool (original behaviour; much slower on large pools).
     """
     train_cutoffs = [c for c in all_cutoffs if c < anchor]
     scores = _edge.gbm_edge_scores(
@@ -69,6 +76,17 @@ def evaluate_anchor_portfolio(
         return AnchorResult(**base, n_cohort=0, n_positions=0,
                             mean_edge=0.0, std_edge=0.0, sharpe=0.0, flat_pnl=0.0,
                             sizing_gross=None, sizing_net=None)
+
+    # Prefilter to top-K candidates before the expensive market-sets DB load.
+    # load_wallet_market_sets is O(n_wallets) queries; cutting 5000 → 200 wallets
+    # gives ~25x fewer rows fetched with negligible effect on greedy selection.
+    _max_cands = max_candidates if max_candidates is not None else max_n * 4
+    if len(scores) > _max_cands:
+        top_keys = sorted(scores, key=scores.__getitem__, reverse=True)[:_max_cands]
+        scores = {k: scores[k] for k in top_keys}
+        print(f"  candidates: {_max_cands} (prefiltered from BHq pool)", flush=True)
+    else:
+        print(f"  candidates: {len(scores)}", flush=True)
 
     market_sets = _data.load_wallet_market_sets(db, anchor, list(scores.keys()), lookback_secs)
     selector = GreedySelector(overlap_fn=marginal_overlap, overlap_lambda=overlap_lambda)
@@ -123,7 +141,7 @@ def run_walk_forward(
     min_fwd_pos, overlap_lambda, max_n, min_edge_score, lookback_secs,
     haircut_bps, sizing_mode, kelly_fraction, min_position_usd, bankroll_usd,
     use_bhq=True, label_type='perpos', n_seeds=5, random_state=42,
-    max_anchors=None, pbo_perms=100,
+    max_anchors=None, pbo_perms=100, max_candidates=None,
 ):
     """Evaluate the greedy portfolio across all eligible anchors, compute PBO.
 
@@ -159,7 +177,7 @@ def run_walk_forward(
             lookback_secs=lookback_secs, haircut_bps=haircut_bps,
             sizing_cfg_gross=sizing_cfg_gross, sizing_cfg_net=sizing_cfg_net,
             use_bhq=use_bhq, label_type=label_type, n_seeds=n_seeds,
-            random_state=random_state,
+            random_state=random_state, max_candidates=max_candidates,
         )
         anchor_rows.append(row)
 
@@ -198,6 +216,7 @@ def run_walk_forward(
                     sizing_cfg_net=sizing_cfg_net,
                     use_bhq=use_bhq, label_type=label_type,
                     n_seeds=1, random_state=seed,
+                    max_candidates=max_candidates,
                 )
                 pbo_matrix[si, ai] = r.mean_edge
         n_perms_eff = min(_math.comb(n_eligible, n_eligible // 2), pbo_perms)
