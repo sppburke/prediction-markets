@@ -8,10 +8,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Allow `python3 scripts/portfolio_constructor/cli.py` from repo root.
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from . import data as _data  # noqa: E402
-from .constructor import PortfolioConfig, run_constructor  # noqa: E402
+from portfolio_constructor import data as _data  # noqa: E402
+from portfolio_constructor.constructor import PortfolioConfig, run_constructor  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = Path('data/eval-results')
 DEFAULT_MIN_CREDIBLE_ANCHORS = 4   # portfolio_min_credible_anchors
