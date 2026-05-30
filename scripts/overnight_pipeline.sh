@@ -32,7 +32,7 @@ PORTFOLIO_WL=$("$PY" scripts/portfolio_constructor/cli.py \
     --haircut-bps 500 \
     --label portfolio_greedy_fwd7d \
     2>&1 | tee -a "$LOG" \
-    | grep "^Deploy watchlist:" | awk '{print $NF}')
+    | grep "^Deploy watchlist:" | awk '{print $3}')
 
 log "STEP 1 complete — portfolio watchlist: $PORTFOLIO_WL"
 
