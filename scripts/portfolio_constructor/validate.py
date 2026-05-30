@@ -123,13 +123,19 @@ def run_walk_forward(
     min_fwd_pos, overlap_lambda, max_n, min_edge_score, lookback_secs,
     haircut_bps, sizing_mode, kelly_fraction, min_position_usd, bankroll_usd,
     use_bhq=True, label_type='perpos', n_seeds=5, random_state=42,
-    max_anchors=None,
+    max_anchors=None, pbo_perms=100,
 ):
     """Evaluate the greedy portfolio across all eligible anchors, compute PBO.
 
     Returns a dict matching the gbm_walkforward schema_version=2 shape, with
     an extra 'n_eligible_anchors' field and per-anchor sizing results.
+
+    PBO matrix is (n_seeds, n_anchors): each cell is the mean_edge for that
+    (seed, anchor) pair from a single-seed re-run, matching the gbm_walkforward
+    pattern (gbm_walkforward.py:297-307).  The main walk-forward above uses the
+    full n_seeds ensemble — the PBO data loop is separate.
     """
+    import math as _math
     anchors = eligible_anchors(all_cutoffs, fwd_secs, max_n=max_anchors)
     n_eligible = len(anchors)
 
@@ -171,13 +177,37 @@ def run_walk_forward(
     agg = aggregate(agg_rows)
     agg['n_eligible_anchors'] = n_eligible
 
-    # PBO: seeds × anchors score matrix.
-    # We use per-anchor mean_edge as a single-seed scalar.
-    scores_matrix = np.array([[r.mean_edge] for r in anchor_rows]).T  # (1, n_anchors)
-    pbo_result = compute_pbo(scores_matrix, n_perms=min(100, 10))
-    if n_seeds >= _COMMITTED_VERDICT_N_SEEDS and n_eligible >= _COMMITTED_VERDICT_N_ANCHORS:
-        verdict = 'OK' if pbo_result.pbo <= 0.5 else 'OVERFIT'
+    # PBO: build (n_seeds, n_anchors) matrix by re-running each anchor with
+    # n_seeds=1 per seed — same pattern as gbm_walkforward.py:297-307.
+    # The main walk-forward above averages all seeds before selection so we
+    # cannot reuse those per-anchor mean_edge values for PBO.
+    if n_seeds >= _COMMITTED_VERDICT_N_SEEDS and n_eligible >= 2:
+        print(f"\nbuilding PBO score matrix ({n_seeds} seeds × {n_eligible} anchors) "
+              f"— adds ~{n_seeds * n_eligible} single-seed anchor re-runs", flush=True)
+        pbo_matrix = np.zeros((n_seeds, n_eligible), dtype=float)
+        for si, seed in enumerate(range(random_state, random_state + n_seeds)):
+            for ai, anchor in enumerate(anchors):
+                r = evaluate_anchor_portfolio(
+                    db, anchor, fwd_secs, all_cutoffs,
+                    top_n=top_n, min_trading_days=min_trading_days,
+                    min_distinct_events=min_distinct_events, min_fwd_pos=min_fwd_pos,
+                    overlap_lambda=overlap_lambda, max_n=max_n,
+                    min_edge_score=min_edge_score,
+                    lookback_secs=lookback_secs, haircut_bps=0,
+                    sizing_cfg_gross=sizing_cfg_gross,
+                    sizing_cfg_net=sizing_cfg_net,
+                    use_bhq=use_bhq, label_type=label_type,
+                    n_seeds=1, random_state=seed,
+                )
+                pbo_matrix[si, ai] = r.mean_edge
+        n_perms_eff = min(_math.comb(n_eligible, n_eligible // 2), pbo_perms)
+        pbo_result = compute_pbo(pbo_matrix, n_perms=n_perms_eff, rng_seed=42)
+        if n_eligible < _COMMITTED_VERDICT_N_ANCHORS or _math.isnan(pbo_result.pbo):
+            verdict = 'undefined'
+        else:
+            verdict = 'OK' if pbo_result.pbo <= 0.5 else 'OVERFIT'
     else:
+        pbo_result = compute_pbo(np.zeros((1, max(n_eligible, 1))), n_perms=1)
         verdict = 'undefined'
 
     pbo_dict = pbo_result_to_dict(pbo_result, verdict)

@@ -38,6 +38,7 @@ class PortfolioConfig:
     n_seeds: int                = 5
     random_state: int           = 42
     max_anchors: int            = None
+    pbo_perms: int              = 100
     watchlist_path: str         = None   # required .txt path; deploy filter only
 
 
@@ -68,6 +69,7 @@ def run_constructor(cfg):
         bankroll_usd=cfg.bankroll_usd, use_bhq=cfg.use_bhq,
         label_type=cfg.label_type, n_seeds=cfg.n_seeds,
         random_state=cfg.random_state, max_anchors=cfg.max_anchors,
+        pbo_perms=cfg.pbo_perms,
     )
 
     # Deploy: select at the latest cutoff.

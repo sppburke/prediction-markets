@@ -97,6 +97,7 @@ def main():
         n_seeds=args.n_seeds,
         random_state=42,
         max_anchors=args.n_anchors,
+        pbo_perms=args.pbo_perms,
         watchlist_path=args.watchlist,
     )
 
