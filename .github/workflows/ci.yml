@@ -52,4 +52,6 @@ jobs:
           python-version: "3.11"
 
       - name: Python drift-guard tests
-        run: python3 scripts/test_haircut_constants.py
+        run: |
+          python3 scripts/test_haircut_constants.py
+          python3 scripts/test_portfolio_constructor.py

@@ -771,3 +771,19 @@ Config for the skill-based wallet-selection pipeline (issue #212; epic #209). Lo
 | **`gbm_walkforward_min_cohort_jaccard`** | 0.40 | Alert threshold for GBM `intersection_3` cohort Jaccard between consecutive monthly cutoffs (`|A∩B| / |A∪B|`). Phase 3 observed minimum: 0.494 (2026-03-31 → 2026-05-01). Below 0.40, cohort instability indicates the intersection is selecting near-randomly and the ensemble is unlikely to generalise. Monitor monthly after each re-extract + re-rank. BHq pool Jaccard (a looser signal) should stay above 0.60; empirical range 0.624–0.825. |
 | **`gbm_walkforward_production_fwd_days`** | 7 | Preferred forward-evaluation window for the most robust walk-forward results. Phase 3 (2026-05-27, 5 anchors): fwd=7d is the only window with 0 negative anchors (March near-flat at +$0.003 vs negative at 14d/30d); std of mean_edge is tightest (0.064). fwd=14d has higher mean_edge (+$0.085 vs +$0.066) but March is worst there (−$0.031). fwd=30d has the largest total PnL but 4 anchors only (March −$0.019). Use fwd=14d for higher-alpha-potential runs with awareness of one historically bad month; use fwd=7d as the conservative validation gate. |
 | **`gbm_walkforward_default_n_seeds`** | 5 | Number of GBM seeds for multi-seed ensemble in `gbm_walkforward.py` (`--n-seeds`). Seeds [42, 43, 44, 45, 46] are averaged before intersection. At n_seeds=5, PBO verdict uses seeds as the trial axis (n_trials=5) and anchors as the window axis. PBO=1.0 is expected at this small scale (C(4,2)=6 or C(5,2)=10 perms, n_trials=5) and does not disqualify results when we average all seeds rather than selecting the best — the multi-seed average mitigates the single-best-seed overfitting that PBO measures. |
+
+### Portfolio constructor defaults (`scripts/portfolio_constructor/`)
+
+Stage-2 portfolio construction (issue #276). See `docs/25-PORTFOLIO-CONSTRUCTOR.md`.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `portfolio_max_n` | 50 | Maximum wallets in the greedy-selected portfolio (`--max-n`). |
+| `portfolio_overlap_lambda` | 1.0 | Overlap penalty weight λ in the greedy objective `score × (1 − λ·overlap)`. λ=0 degenerates to pure top-N by GBM score; λ=1 (default) balances edge and diversity. |
+| `portfolio_min_edge_score` | 0.0 | Greedy objective threshold: stop adding wallets when the best remaining objective ≤ this value. Default 0.0 stops at zero or negative objective. |
+| `portfolio_lookback_days` | 90 | Trailing window (days) for the Jaccard market-overlap computation and ex-ante Kelly estimation (`--lookback-days`). |
+| `portfolio_sizing_kelly_fraction` | 0.25 | Multiplier on the ex-ante Kelly fraction: applied_f = portfolio_sizing_kelly_fraction × exante_kelly_fraction(prior_returns). Research default; **distinct from** the Winner-Follow Kelly fractions in `docs/19-` (do not confuse). |
+| `portfolio_sizing_min_position_usd` | 5.0 | Minimum position size in USD; bets whose stake < this floor are skipped (`--min-position`). |
+| `portfolio_sizing_bankroll_usd` | 1000.0 | Starting bankroll for the sizing simulation (`--starting-capital`). |
+| `portfolio_pbo_min_anchors` | 4 | Minimum anchor count for a committed PBO verdict (reuses the `gbm_walkforward.py` rule: `pbo<=0.5 AND n_seeds>=2 AND n_anchors>=4`; below this threshold, `verdict="undefined"`). **Intentionally the same value as `portfolio_min_credible_anchors`** at launch; they are distinct concepts and may diverge. |
+| `portfolio_min_credible_anchors` | 4 | Minimum eligible anchors for the deploy set to be considered credible. When `n_eligible_anchors < 4`, the aggregate is flagged `credible=false` and the deploy set is labelled "insufficient evidence". **Intentionally the same value as `portfolio_pbo_min_anchors`** at launch; they gate different things (PBO verdict vs. overall credibility). |
