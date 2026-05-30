@@ -40,6 +40,7 @@ class PortfolioConfig:
     max_anchors: int            = None
     pbo_perms: int              = 100
     watchlist_path: str         = None   # required .txt path; deploy filter only
+    max_candidates: int         = None   # prefilter BHq pool before market-sets load
 
 
 @dataclass
@@ -69,7 +70,7 @@ def run_constructor(cfg):
         bankroll_usd=cfg.bankroll_usd, use_bhq=cfg.use_bhq,
         label_type=cfg.label_type, n_seeds=cfg.n_seeds,
         random_state=cfg.random_state, max_anchors=cfg.max_anchors,
-        pbo_perms=cfg.pbo_perms,
+        pbo_perms=cfg.pbo_perms, max_candidates=cfg.max_candidates,
     )
 
     # Deploy: select at the latest cutoff.
@@ -87,6 +88,12 @@ def run_constructor(cfg):
     if cfg.watchlist_path:
         allowed = _load_watchlist(cfg.watchlist_path)
         scores = {w: s for w, s in scores.items() if w in allowed}
+
+    # Same candidate prefilter as evaluate_anchor_portfolio.
+    _max_cands = cfg.max_candidates if cfg.max_candidates is not None else cfg.max_n * 4
+    if len(scores) > _max_cands:
+        top_keys = sorted(scores, key=scores.__getitem__, reverse=True)[:_max_cands]
+        scores = {k: scores[k] for k in top_keys}
 
     market_sets = _data.load_wallet_market_sets(
         cfg.db, deploy_cutoff, list(scores.keys()), cfg.lookback_secs
