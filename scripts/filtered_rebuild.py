@@ -9,8 +9,10 @@ exFAT-safe (journal_mode=DELETE, no WAL). Reads stream from the fast internal
 NVMe; only the kept subset (~200 GB) is written to the slow external drive.
 """
 import sqlite3, sys, time
+from pathlib import Path
 
-SRC = "data/wallet_cache.db"
+_REPO = Path(__file__).resolve().parent.parent
+SRC = str(_REPO / "data/wallet_cache.db")
 DST = "/media/sean/CORSAIR/db_update/wallet_cache_pruned.db"
 KEEP_WHERE = "is_active = 1 AND is_infra = 0"
 
