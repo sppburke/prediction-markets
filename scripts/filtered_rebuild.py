@@ -37,7 +37,7 @@ def main():
     con = sqlite3.connect(DST, uri=True)
     con.execute("PRAGMA journal_mode=DELETE")     # exFAT: no WAL
     con.execute("PRAGMA synchronous=OFF")          # offline build; verified after
-    con.execute("PRAGMA cache_size=-2000000")      # 2GB page cache for speed
+    con.execute("PRAGMA cache_size=-1000000")      # 1GB page cache (OOM-safe on a 31GB box shared with other jobs)
     con.execute(f"ATTACH 'file:{SRC}?mode=ro' AS src")
 
     # keep-set temp table (indexed) for fast joins

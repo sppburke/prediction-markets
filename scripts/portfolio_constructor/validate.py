@@ -2,6 +2,7 @@
 
 numpy/local — requires .venv-analysis.  Not CI-tested.
 """
+import gc
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gbm_walkforward import eligible_anchors, aggregate, pbo_result_to_dict  # noqa: E402
+from monthly_rerank_gbm import safe_workers  # noqa: E402
 from composite_tuner.pbo import compute_pbo  # noqa: E402
 from . import data as _data  # noqa: E402
 from . import edge as _edge  # noqa: E402
@@ -186,7 +188,7 @@ def run_walk_forward(
 
     def _eval(anchor):
         print(f"\nPortfolio anchor {datetime.fromtimestamp(anchor, tz=timezone.utc).date()}", flush=True)
-        return evaluate_anchor_portfolio(
+        row = evaluate_anchor_portfolio(
             db, anchor, fwd_secs, all_cutoffs,
             top_n=top_n, min_trading_days=min_trading_days,
             min_distinct_events=min_distinct_events, min_fwd_pos=min_fwd_pos,
@@ -196,10 +198,16 @@ def run_walk_forward(
             use_bhq=use_bhq, label_type=label_type, n_seeds=n_seeds,
             random_state=random_state, max_candidates=max_candidates,
         )
+        gc.collect()  # release this anchor's training frame + GBM models promptly
+        return row
 
     # Concurrent across anchors; reassemble in anchor order (executor.map
-    # preserves input order) so the result is identical to sequential.
-    n_workers = max(1, min(max_workers, n_eligible))
+    # preserves input order) so the result is identical to sequential. Workers
+    # are capped by free RAM (each anchor holds a training frame + GBM models)
+    # to prevent OOM when memory is tight or the box is shared.
+    n_workers = safe_workers(max_workers, n_eligible)
+    if n_workers < min(max_workers, n_eligible):
+        print(f"  (memory guard: {n_workers} workers, requested {max_workers})", flush=True)
     if n_workers > 1:
         print(f"\nwalk-forward: {n_eligible} anchors on {n_workers} threads", flush=True)
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
