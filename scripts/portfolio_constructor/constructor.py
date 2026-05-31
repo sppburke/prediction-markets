@@ -41,6 +41,7 @@ class PortfolioConfig:
     pbo_perms: int              = 100
     watchlist_path: str         = None   # required .txt path; deploy filter only
     max_candidates: int         = None   # prefilter BHq pool before market-sets load
+    max_workers: int            = 1      # concurrent anchors in walk-forward loop
 
 
 @dataclass
@@ -71,6 +72,7 @@ def run_constructor(cfg):
         label_type=cfg.label_type, n_seeds=cfg.n_seeds,
         random_state=cfg.random_state, max_anchors=cfg.max_anchors,
         pbo_perms=cfg.pbo_perms, max_candidates=cfg.max_candidates,
+        max_workers=cfg.max_workers,
     )
 
     # Deploy: select at the latest cutoff.

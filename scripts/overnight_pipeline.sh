@@ -21,7 +21,7 @@ log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 log "=== overnight pipeline start ==="
 
 # ── Step 1: full portfolio constructor ──────────────────────────────────────
-log "STEP 1: portfolio constructor (n_seeds=1, max_candidates=200, fwd=7d, 500bps)"
+log "STEP 1: portfolio constructor (n_seeds=1, max_candidates=200, max_workers=4, fwd=7d, lookback=90d, 500bps)"
 PORTFOLIO_WL=""
 PORTFOLIO_WL=$("$PY" scripts/portfolio_constructor/cli.py \
     --db-path "$DB" \
@@ -29,6 +29,7 @@ PORTFOLIO_WL=$("$PY" scripts/portfolio_constructor/cli.py \
     --fwd-days 7 \
     --n-seeds 1 \
     --max-candidates 200 \
+    --max-workers 4 \
     --haircut-bps 500 \
     --label portfolio_greedy_fwd7d \
     2>&1 | tee -a "$LOG" \
