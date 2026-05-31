@@ -45,6 +45,26 @@ import lightgbm as lgb
 BHQ_Q_BPS = 1000  # q=0.10 — mirrors composite.rs bhq_gate default
 
 
+def safe_workers(requested, n_items, gb_per_worker=3.0, reserve_gb=3.0):
+    """Cap concurrency to what free RAM allows, to prevent OOM.
+
+    Each parallel anchor holds a training DataFrame + LightGBM model(s); on a
+    memory-constrained box (or when sharing the machine with another job) running
+    the full requested fan-out can exhaust RAM and OOM-kill the process. Read
+    MemAvailable from /proc/meminfo, reserve `reserve_gb`, and allow one worker
+    per `gb_per_worker` of the remainder. Falls back to the item-bounded request
+    if /proc/meminfo is unreadable (non-Linux). Always returns >= 1.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            avail_kb = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable"))
+        budget_gb = max(0.0, avail_kb / 1048576.0 - reserve_gb)
+        by_mem = max(1, int(budget_gb // gb_per_worker))
+    except Exception:
+        by_mem = requested
+    return max(1, min(requested, n_items, by_mem))
+
+
 def bhq_significant_mask(skill_pvalue_bps_array, q_bps=BHQ_Q_BPS):
     """Benjamini-Hochberg FDR gate; returns boolean mask of BHq-significant rows.
     Mirrors composite.rs:bhq_gate and iter2b implementation.
