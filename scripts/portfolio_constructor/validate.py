@@ -3,6 +3,7 @@
 numpy/local — requires .venv-analysis.  Not CI-tested.
 """
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -115,10 +116,17 @@ def evaluate_anchor_portfolio(
     exante_returns = [(p.outcome - p.vwap_entry) / p.vwap_entry for p in exante_pos]
     fwd_returns = edges.tolist()
 
-    net_positions = _data.load_oos_positions(
-        db, anchor, anchor + fwd_secs, cohort, price_haircut_bps=haircut_bps,
-    )
-    net_returns = [(p.outcome - p.vwap_entry) / p.vwap_entry for p in net_positions]
+    # Net returns use the SAME forward window/cohort as `positions`; the haircut
+    # is a pure post-fetch transform in load_oos_positions
+    # (vwap' = min(vwap * (1 + bps/1e4), 0.999)). Derive net in-memory instead of
+    # re-querying — bit-identical because the clamp composes: for f >= 1,
+    # min(min(raw, 0.999) * f, 0.999) == min(raw * f, 0.999). Saves one
+    # forward-window scan per anchor.
+    _hf = 1.0 + haircut_bps / 10_000.0
+    net_returns = []
+    for p in positions:
+        nv = min(p.vwap_entry * _hf, 0.999)
+        net_returns.append((p.outcome - nv) / nv)
 
     sizing_gross = size_portfolio(fwd_returns, exante_returns, sizing_cfg_gross)
     sizing_net = size_portfolio(net_returns, exante_returns, sizing_cfg_net)
@@ -141,7 +149,7 @@ def run_walk_forward(
     min_fwd_pos, overlap_lambda, max_n, min_edge_score, lookback_secs,
     haircut_bps, sizing_mode, kelly_fraction, min_position_usd, bankroll_usd,
     use_bhq=True, label_type='perpos', n_seeds=5, random_state=42,
-    max_anchors=None, pbo_perms=100, max_candidates=None,
+    max_anchors=None, pbo_perms=100, max_candidates=None, max_workers=1,
 ):
     """Evaluate the greedy portfolio across all eligible anchors, compute PBO.
 
@@ -152,6 +160,16 @@ def run_walk_forward(
     (seed, anchor) pair from a single-seed re-run, matching the gbm_walkforward
     pattern (gbm_walkforward.py:297-307).  The main walk-forward above uses the
     full n_seeds ensemble — the PBO data loop is separate.
+
+    max_workers: anchors are independent (read-only DB, own GBM fit, results
+    aggregated order-independently), so the main walk-forward loop runs them
+    concurrently on a thread pool. sqlite3 and LightGBM both release the GIL
+    (during query execution and fit), so threads overlap the dominant disk-read
+    waits. Output is bit-identical to sequential: each anchor's GBM fit keeps
+    n_jobs=-1 (num_threads fixed → same float-reduction order regardless of
+    concurrency), and per-anchor rows are reassembled in anchor order before
+    aggregation. Default 1 = sequential (original behaviour). The PBO data loop
+    below stays sequential — it only runs at n_seeds >= 2.
     """
     import math as _math
     anchors = eligible_anchors(all_cutoffs, fwd_secs, max_n=max_anchors)
@@ -166,10 +184,9 @@ def run_walk_forward(
         min_position_usd=min_position_usd, bankroll_usd=bankroll_usd,
     )
 
-    anchor_rows = []
-    for anchor in anchors:
+    def _eval(anchor):
         print(f"\nPortfolio anchor {datetime.fromtimestamp(anchor, tz=timezone.utc).date()}", flush=True)
-        row = evaluate_anchor_portfolio(
+        return evaluate_anchor_portfolio(
             db, anchor, fwd_secs, all_cutoffs,
             top_n=top_n, min_trading_days=min_trading_days,
             min_distinct_events=min_distinct_events, min_fwd_pos=min_fwd_pos,
@@ -179,7 +196,16 @@ def run_walk_forward(
             use_bhq=use_bhq, label_type=label_type, n_seeds=n_seeds,
             random_state=random_state, max_candidates=max_candidates,
         )
-        anchor_rows.append(row)
+
+    # Concurrent across anchors; reassemble in anchor order (executor.map
+    # preserves input order) so the result is identical to sequential.
+    n_workers = max(1, min(max_workers, n_eligible))
+    if n_workers > 1:
+        print(f"\nwalk-forward: {n_eligible} anchors on {n_workers} threads", flush=True)
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            anchor_rows = list(ex.map(_eval, anchors))
+    else:
+        anchor_rows = [_eval(a) for a in anchors]
 
     # Build rows for aggregate() — matches gbm_walkforward shape.
     agg_rows = [

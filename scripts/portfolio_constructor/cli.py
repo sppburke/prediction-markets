@@ -78,6 +78,12 @@ def main():
                     help='Cap the BHq pool to top-K before loading market sets '
                          '(default max-n * 4; None = full pool, original behaviour). '
                          'Major speedup when BHq pool is large (>500 wallets).')
+    ap.add_argument('--max-workers', type=int, default=1,
+                    dest='max_workers',
+                    help='Concurrent anchors in the walk-forward loop (default 1 = '
+                         'sequential). Anchors are independent and the DB is read-only, '
+                         'so threads overlap the dominant disk-read waits. Output is '
+                         'bit-identical to sequential. 4 is a good value on a 20-core box.')
     ap.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT_DIR)
     ap.add_argument('--label', default='portfolio_greedy',
                     help='Strategy label for output filenames')
@@ -107,6 +113,7 @@ def main():
         pbo_perms=args.pbo_perms,
         watchlist_path=args.watchlist,
         max_candidates=args.max_candidates,
+        max_workers=args.max_workers,
     )
 
     result = run_constructor(cfg)
