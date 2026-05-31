@@ -31,7 +31,10 @@ def log(m): print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 def main():
     t0 = time.time()
-    con = sqlite3.connect(DST)
+    # uri=True so the ATTACH below parses 'file:...?mode=ro' as a URI, not a
+    # literal filename. Without it sqlite treats the whole string as a path and
+    # fails: "unable to open database: file:...?mode=ro".
+    con = sqlite3.connect(DST, uri=True)
     con.execute("PRAGMA journal_mode=DELETE")     # exFAT: no WAL
     con.execute("PRAGMA synchronous=OFF")          # offline build; verified after
     con.execute("PRAGMA cache_size=-2000000")      # 2GB page cache for speed
