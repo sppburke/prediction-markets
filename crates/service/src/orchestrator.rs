@@ -19,17 +19,18 @@ use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, WalletProfile, classify_trade};
 use pe_core_types::{
-    OperatorId, Probability, ReconstructionQuality, SourceTimestamp, TraderId, VenueId,
-    WalletAddress,
+    EventSeq, MarketOutcomeId, OperatorId, Probability, ReconstructionQuality, SourceTimestamp,
+    TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::{AntiGamingFlag, OperatorIdentity};
+use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
 use pe_position_ledger::{ClusterObservationTracker, PositionLedger};
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::{SourceEvent, SourceStatus};
 use pe_source_onchain_polygon::PolygonEvent;
-use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowStrategy};
+use pe_strategy_winner_follow::{ExecutionMode, PaperFill, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::CLOBClient;
 use rust_decimal::Decimal;
@@ -62,6 +63,7 @@ pub struct Orchestrator<C: CLOBClient> {
     dispatcher: ExecutionDispatcher<C>,
     mode: ExecutionMode,
     bankroll: Decimal,
+    paper_state: Arc<PaperStateDb>,
     health: SharedHealth,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
@@ -79,6 +81,8 @@ impl<C: CLOBClient> Orchestrator<C> {
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
         dispatcher: ExecutionDispatcher<C>,
+        paper_state: Arc<PaperStateDb>,
+        leader_ledger: PositionLedger,
         health: SharedHealth,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
@@ -88,7 +92,7 @@ impl<C: CLOBClient> Orchestrator<C> {
             trade_rx,
             accumulator,
             operator_identities,
-            position_ledger: PositionLedger::new(),
+            position_ledger: leader_ledger,
             cluster_tracker: ClusterObservationTracker::new(config.cluster_observation_window_secs),
             watchlist,
             signal_config: config.signal_config,
@@ -96,6 +100,7 @@ impl<C: CLOBClient> Orchestrator<C> {
             dispatcher,
             mode: config.mode,
             bankroll: config.bankroll,
+            paper_state,
             health,
             min_quality,
         })
@@ -174,6 +179,18 @@ impl<C: CLOBClient> Orchestrator<C> {
             h.polymarket_last_event_at = Some(OffsetDateTime::now_utc());
         }
 
+        // INPUT DEDUP: the first action after recording freshness, before any
+        // ledger/cluster mutation. A trade already processed (RTDS then poll
+        // backstop, or a re-poll) must not advance the leader ledger a second time.
+        match self.paper_state.is_seen(&trade.source_trade_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                error!(error = %e, "paper-state is_seen failed; skipping trade");
+                return;
+            }
+        }
+
         // Look up wallet in watchlist; skip non-watchlisted wallets.
         let quality = self.quality_for(&trade.wallet);
         let profile = WalletProfile {
@@ -202,6 +219,10 @@ impl<C: CLOBClient> Orchestrator<C> {
         // Advance position ledger after classification inputs are captured.
         self.position_ledger.ingest(&trade);
 
+        // Snapshot the leader's post-ingest position for this (market, outcome) so it
+        // is mirrored into paper-state on every processed trade — fill or no fill.
+        let leader_row = self.leader_position_row(&trade);
+
         let Some(signal) = classify_trade(
             &trade,
             position.as_ref(),
@@ -213,6 +234,8 @@ impl<C: CLOBClient> Orchestrator<C> {
             VenueId::polymarket(),
             &self.signal_config,
         ) else {
+            // No signal: still mark seen + mirror the leader ledger (AC2).
+            self.commit_no_fill(&trade, &leader_row);
             return;
         };
 
@@ -222,12 +245,19 @@ impl<C: CLOBClient> Orchestrator<C> {
             .strategy
             .evaluate(&signal, p, snapshot, self.bankroll, self.mode)
         {
-            Err(e) => info!(reason = %e, "signal did not produce order"),
+            Err(e) => {
+                info!(reason = %e, "signal did not produce order");
+                self.commit_no_fill(&trade, &leader_row);
+            }
             Ok(intent) => {
                 let now = SourceTimestamp(OffsetDateTime::now_utc());
                 match self.dispatcher.execute(&intent, self.mode, now).await {
-                    Err(e) => error!(error = %e, "execution dispatcher failed"),
-                    Ok(DispatchResult::Paper(fill)) => {
+                    Err(e) => {
+                        error!(error = %e, "execution dispatcher failed");
+                        self.commit_no_fill(&trade, &leader_row);
+                    }
+                    Ok(DispatchResult::Paper { fill, seq }) => {
+                        self.commit_paper_fill(&trade, &leader_row, &fill, seq);
                         info!(
                             kind = "paper_fill",
                             idempotency_key = %fill.intent.idempotency_key,
@@ -238,6 +268,9 @@ impl<C: CLOBClient> Orchestrator<C> {
                         );
                     }
                     Ok(DispatchResult::Live(result)) => {
+                        // Live execution is out of paper-state's fill scope; still mark
+                        // seen + mirror the leader ledger so dedup holds across modes.
+                        self.commit_no_fill(&trade, &leader_row);
                         info!(
                             kind = "live_execution",
                             idempotency_key = %intent.idempotency_key,
@@ -247,6 +280,61 @@ impl<C: CLOBClient> Orchestrator<C> {
                     }
                 }
             }
+        }
+    }
+
+    /// Build the leader-position mirror row for the `(market, outcome)` this trade
+    /// touched, read from the in-memory ledger *after* the trade was ingested.
+    fn leader_position_row(&self, trade: &IncomingTrade) -> LeaderPositionRow {
+        let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+        let (long, short) = self
+            .position_ledger
+            .position(&trade.wallet)
+            .and_then(|snap| snap.positions.get(&key))
+            .map(|st| (st.long_contracts, st.short_contracts))
+            .unwrap_or((0, 0));
+        LeaderPositionRow {
+            wallet: trade.wallet,
+            market_id: trade.market_id.clone(),
+            outcome_id: trade.outcome_id,
+            long_contracts: long,
+            short_contracts: short,
+        }
+    }
+
+    /// Commit dedup + leader-ledger mirror for a processed trade that produced no fill.
+    fn commit_no_fill(&self, trade: &IncomingTrade, leader: &LeaderPositionRow) {
+        if let Err(e) = self
+            .paper_state
+            .commit_seen_no_fill(&trade.source_trade_id, leader)
+        {
+            error!(error = %e, "paper-state commit_seen_no_fill failed");
+        }
+    }
+
+    /// Commit dedup + leader-ledger mirror + fill accounting in one transaction, and
+    /// update the in-memory bankroll to the new persisted value (drawdown-aware sizing).
+    fn commit_paper_fill(
+        &mut self,
+        trade: &IncomingTrade,
+        leader: &LeaderPositionRow,
+        fill: &PaperFill,
+        seq: EventSeq,
+    ) {
+        let record = FillRecord {
+            idempotency_key: fill.intent.idempotency_key.clone(),
+            market_id: fill.intent.market_id.clone(),
+            outcome_id: fill.intent.outcome_id,
+            side: fill.intent.side,
+            contracts: fill.intent.contracts.0,
+            fill_price: fill.simulated_fill_price,
+        };
+        match self
+            .paper_state
+            .commit_fill(&trade.source_trade_id, leader, &record, seq)
+        {
+            Ok(new_bankroll) => self.bankroll = new_bankroll,
+            Err(e) => error!(error = %e, "paper-state commit_fill failed"),
         }
     }
 

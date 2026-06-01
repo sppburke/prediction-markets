@@ -100,6 +100,22 @@ pub struct ServiceConfig {
     #[serde(default = "default_jsonl_log_path")]
     pub jsonl_log_path: PathBuf,
 
+    // ── Paper trading state ──────────────────────────────────────────────────
+    /// Path to the crash-safe paper-state SQLite database.
+    /// See `docs/_GLOSSARY.md`: `paper_state_db_path`.
+    #[serde(default = "default_paper_state_db_path")]
+    pub paper_state_db_path: PathBuf,
+
+    /// BUY-side paper fill haircut (fee + slippage) in basis points.
+    /// See `docs/_GLOSSARY.md`: `paper_fill_haircut_bps`.
+    #[serde(default = "default_paper_fill_haircut_bps")]
+    pub paper_fill_haircut_bps: u32,
+
+    /// SELL-side paper fill slippage (no taker fee) in basis points.
+    /// See `docs/_GLOSSARY.md`: `paper_fill_slippage_bps`.
+    #[serde(default = "default_paper_fill_slippage_bps")]
+    pub paper_fill_slippage_bps: u32,
+
     // ── Operator graph ───────────────────────────────────────────────────────
     /// Rebuild cadence for `OperatorGraphScheduler` in seconds.
     /// See `docs/_GLOSSARY.md`: `operator_graph_rebuild_cadence_secs`.
@@ -203,6 +219,18 @@ fn default_jsonl_log_path() -> PathBuf {
     PathBuf::from("./paper.jsonl")
 }
 
+fn default_paper_state_db_path() -> PathBuf {
+    PathBuf::from("./paper_state.db")
+}
+
+const fn default_paper_fill_haircut_bps() -> u32 {
+    500
+}
+
+const fn default_paper_fill_slippage_bps() -> u32 {
+    100
+}
+
 fn default_bankroll_usd() -> String {
     "10000".to_string()
 }
@@ -246,6 +274,9 @@ impl Default for ServiceConfig {
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
+            paper_state_db_path: default_paper_state_db_path(),
+            paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
+            paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
             operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
             funding_max_hops: default_funding_max_hops(),
             funder_source: default_funder_source(),
@@ -313,6 +344,9 @@ mod tests {
         assert_eq!(cfg.funding_max_hops, 3);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
+        assert_eq!(cfg.paper_fill_haircut_bps, 500);
+        assert_eq!(cfg.paper_fill_slippage_bps, 100);
+        assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
     }
 
     #[test]

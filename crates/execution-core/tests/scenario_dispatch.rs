@@ -97,7 +97,7 @@ fn make_dispatcher(
 ) -> ExecutionDispatcher<FixtureCLOBClient> {
     let paper_writer = make_paper_writer(dir, "paper.log");
     let live_writer = make_paper_writer(dir, "live.log");
-    let paper = PaperExecutor::new(paper_writer, SourceId("paper".into()));
+    let paper = PaperExecutor::new(paper_writer, SourceId("paper".into()), 500, 100);
     let adapter = PolymarketVenueAdapter::new(client, test_creds());
     let live = pe_execution_core::LiveExecutor::new(adapter, live_writer, SourceId("live".into()));
     ExecutionDispatcher::new(paper, live)
@@ -114,7 +114,7 @@ async fn paper_mode_routes_to_paper_executor() {
         .await
         .unwrap();
     assert!(
-        matches!(result, DispatchResult::Paper(_)),
+        matches!(result, DispatchResult::Paper { .. }),
         "expected Paper dispatch, got {result:?}"
     );
 }
@@ -128,7 +128,7 @@ async fn shadow_mode_routes_to_paper_executor() {
         .execute(&test_intent(), ExecutionMode::Shadow, frozen_now())
         .await
         .unwrap();
-    assert!(matches!(result, DispatchResult::Paper(_)));
+    assert!(matches!(result, DispatchResult::Paper { .. }));
 }
 
 /// PASS: LiveTiny routes to LiveExecutor, FixtureCLOBClient returns Filled → LiveFill written.

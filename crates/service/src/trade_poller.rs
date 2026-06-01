@@ -5,10 +5,12 @@
 //! This module contains all the I/O for Polymarket trade ingestion; the orchestrator
 //! itself is pure dispatch logic.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use pe_copy_signal_engine::IncomingTrade;
 use pe_core_types::WalletAddress;
+use pe_paper_state::PaperStateDb;
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -31,6 +33,7 @@ pub struct TradePoller<F: PageFetcher> {
     wallets: Vec<WalletAddress>,
     fetcher: F,
     tx: mpsc::Sender<IncomingTrade>,
+    paper_state: Arc<PaperStateDb>,
 }
 
 impl<F: PageFetcher + Send + 'static> TradePoller<F> {
@@ -39,12 +42,14 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
         wallets: Vec<WalletAddress>,
         fetcher: F,
         tx: mpsc::Sender<IncomingTrade>,
+        paper_state: Arc<PaperStateDb>,
     ) -> Self {
         Self {
             config,
             wallets,
             fetcher,
             tx,
+            paper_state,
         }
     }
 
@@ -55,12 +60,21 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     pub async fn run(self) {
         loop {
             for &wallet in &self.wallets {
-                // Stateless single-page poll; no cursor needed — downstream dedup by
-                // source_trade_id handles any overlap between rounds.
+                // Timestamp cursor: fetch from the last-seen observed_at (inclusive
+                // lower bound). The orchestrator's source_trade_id dedup remains
+                // authoritative for the boundary trade; the cursor only trims redundant
+                // re-fetches across rounds.
+                let start = match self.paper_state.cursor(&wallet) {
+                    Ok(cursor) => cursor,
+                    Err(e) => {
+                        warn!(wallet = %wallet, error = %e, "paper-state cursor read failed; full fetch");
+                        None
+                    }
+                };
                 let url = PolymarketEndpoint::UserTradeActivity {
                     user: format!("{wallet}"),
                     end: None,
-                    start: None,
+                    start,
                 }
                 .url(&self.config.base_url);
 
@@ -69,11 +83,19 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                     Ok(bytes) => match trade_parser::parse_trades(&bytes, wallet) {
                         Err(e) => warn!(wallet = %wallet, error = %e, "trade parse error"),
                         Ok(trades) => {
+                            // Advance the cursor to the newest trade observed this round.
+                            let max_ts =
+                                trades.iter().map(|t| t.observed_at.unix_timestamp()).max();
                             for trade in trades {
                                 if self.tx.send(trade).await.is_err() {
                                     // Channel closed; orchestrator is shutting down.
                                     return;
                                 }
+                            }
+                            if let Some(ts) = max_ts
+                                && let Err(e) = self.paper_state.set_cursor(&wallet, ts)
+                            {
+                                warn!(wallet = %wallet, error = %e, "paper-state set_cursor failed");
                             }
                         }
                     },

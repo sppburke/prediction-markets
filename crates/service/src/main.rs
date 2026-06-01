@@ -12,7 +12,9 @@ use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::ClusteringConfig;
+use pe_paper_state::PaperStateDb;
 use pe_service::config::{self as service_config, ServiceConfig};
+use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_onchain_polygon::{LivePolygonConnector, PolygonConnectorConfig};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
     pe_service::logging::setup(&cfg.jsonl_log_path, "info")?;
     info!("pe-service starting");
 
-    let bankroll = Decimal::from_str(&cfg.bankroll_usd)
+    let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
     let mode = parse_mode(&cfg.mode)?;
 
@@ -70,10 +72,41 @@ async fn main() -> Result<()> {
         .context("bootstrap watchlist")?;
     info!(active = watchlist.active_count, "watchlist bootstrapped");
 
-    // Paper event-log writer.
+    // Crash-safe paper-state mirror. Open, initialise bankroll (idempotent), then
+    // reconcile any event-log fills whose SQLite commit was lost to a crash, and
+    // rehydrate the leader position ledger — all before the orchestrator runs.
+    let paper_state = Arc::new(
+        PaperStateDb::open(&cfg.paper_state_db_path)
+            .with_context(|| format!("open paper-state {}", cfg.paper_state_db_path.display()))?,
+    );
+    paper_state
+        .init_bankroll(configured_bankroll)
+        .context("initialise paper-state bankroll")?;
+    let reconciled = reconcile_paper_state(&cfg.event_log_path, &paper_state)
+        .context("reconcile paper-state from event log")?;
+    if reconciled > 0 {
+        info!(
+            reconciled,
+            "replayed uncommitted fills from event log on startup"
+        );
+    }
+    let bankroll = paper_state
+        .bankroll()
+        .context("read paper-state bankroll")?
+        .unwrap_or(configured_bankroll);
+    let leader_ledger =
+        build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
+    info!(bankroll = %bankroll, "paper-state opened");
+
+    // Paper event-log writer (opened after reconciliation reads the existing log).
     let paper_writer = Writer::open(&cfg.event_log_path)
         .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("pe-service.paper".into()));
+    let paper_executor = PaperExecutor::new(
+        paper_writer,
+        SourceId("pe-service.paper".into()),
+        cfg.paper_fill_haircut_bps,
+        cfg.paper_fill_slippage_bps,
+    );
 
     // Live event-log writer (separate file so paper and live fills are distinct streams).
     let live_log_path = cfg.event_log_path.with_extension("live.log");
@@ -194,6 +227,7 @@ async fn main() -> Result<()> {
             wallets,
             ReqwestFetcher::new(reqwest::Client::new()),
             trade_tx,
+            paper_state.clone(),
         )
         .run(),
     );
@@ -213,6 +247,8 @@ async fn main() -> Result<()> {
         },
         WinnerFollowStrategy::new(cfg.strategy.clone()),
         dispatcher,
+        paper_state.clone(),
+        leader_ledger,
         health.clone(),
     )
     .context("build orchestrator")?;

@@ -6,7 +6,7 @@
 //!
 //! `PaperExecutor` is imported from `pe-strategy-winner-follow` — not moved.
 
-use pe_core_types::SourceTimestamp;
+use pe_core_types::{EventSeq, SourceTimestamp};
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, PaperFill};
 use pe_venue_core::OrderIntent;
 use pe_venue_polymarket::CLOBClient;
@@ -37,8 +37,8 @@ impl<C: CLOBClient> ExecutionDispatcher<C> {
     ) -> Result<DispatchResult, ExecutionError> {
         match mode {
             ExecutionMode::Shadow | ExecutionMode::Paper => {
-                let fill = self.paper.execute(intent, now)?;
-                Ok(DispatchResult::Paper(fill))
+                let (fill, seq) = self.paper.execute(intent, now)?;
+                Ok(DispatchResult::Paper { fill, seq })
             }
             ExecutionMode::LiveTiny | ExecutionMode::Promoted => {
                 let result = self.live.execute(intent, now).await?;
@@ -49,8 +49,11 @@ impl<C: CLOBClient> ExecutionDispatcher<C> {
 }
 
 /// Outcome of a dispatch call: either a paper fill or a live result.
+///
+/// `Paper` carries the event-log [`EventSeq`] of the written fill frame so the
+/// service tier can advance the `paper-state` reconciliation cursor.
 #[derive(Debug, Clone)]
 pub enum DispatchResult {
-    Paper(PaperFill),
+    Paper { fill: PaperFill, seq: EventSeq },
     Live(LiveExecuteResult),
 }

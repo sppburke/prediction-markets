@@ -293,6 +293,14 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
 
+### Paper trading state (`paper-state`, issue #282)
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror (`seen_trades`, `fills`, `positions`, `leader_positions`, `bankroll`, `poll_cursors`, `meta`) |
+| `paper_fill_haircut_bps` | 500 | BUY-side paper fill haircut (fee + slippage), basis points. Recorded fill `= min(limit·(1 + bps/10_000), 0.999)`. Mirrors the sizing cost `c` in `evaluate` |
+| `paper_fill_slippage_bps` | 100 | SELL-side paper fill slippage (no taker fee), basis points. Recorded fill `= max(limit·(1 − bps/10_000), 0.001)`. Fill-realism only — diverges from `evaluate` sizing (which charges SELL nothing) and has no research analog |
+
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 
 | Key | Default | Meaning |

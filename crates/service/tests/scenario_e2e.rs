@@ -31,6 +31,8 @@ use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::OperatorIdentity;
+use pe_paper_state::PaperStateDb;
+use pe_position_ledger::PositionLedger;
 use pe_service::health::new_shared_health;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_core::SourceEvent;
@@ -90,7 +92,7 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
 fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
     let paper_path = dir.path().join("paper.log");
     let paper_writer = Writer::open(&paper_path).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()));
+    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
 
     let live_path = dir.path().join("live.log");
     let live_writer = Writer::open(&live_path).unwrap();
@@ -109,6 +111,10 @@ fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
 
 fn make_accumulator() -> Arc<Mutex<FundingGraphAccumulator>> {
     Arc::new(Mutex::new(FundingGraphAccumulator::new()))
+}
+
+fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
+    Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap())
 }
 
 fn empty_operator_rx() -> watch::Receiver<Vec<OperatorIdentity>> {
@@ -149,6 +155,8 @@ async fn scenario_e2e_clean_exit() {
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(&dir),
+        make_paper_state(&dir),
+        PositionLedger::new(),
         new_shared_health(),
     )
     .unwrap();
@@ -203,6 +211,8 @@ async fn scenario_graceful_shutdown() {
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(&dir),
+        make_paper_state(&dir),
+        PositionLedger::new(),
         new_shared_health(),
     )
     .unwrap();

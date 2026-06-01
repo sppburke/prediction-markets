@@ -38,4 +38,10 @@ pub enum PaperExecutionError {
     /// Event-log write or sync failed.
     #[error("log write error: {0}")]
     LogWrite(#[from] LogError),
+
+    /// The haircut-adjusted fill price fell outside the valid `(0, 1)` range.
+    /// Unreachable in practice — the haircut clamps into `[0.001, 0.999]` before
+    /// constructing the `Price` — but kept so the conversion is total.
+    #[error("internal: clamped fill price out of range")]
+    PriceOutOfRange,
 }
