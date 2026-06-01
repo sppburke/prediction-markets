@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS bankroll (
     bankroll_str TEXT NOT NULL
 );
 
--- Per-wallet poll cursor: last-seen observed_at unix timestamp (exclusive bound).
+-- Per-wallet poll cursor: the newest observed_at unix second seen. The poller
+-- fetches from `start = cursor - 1` because the `/activity` `start` bound is
+-- exclusive (`timestamp > start`), so the boundary second is re-included and deduped.
 CREATE TABLE IF NOT EXISTS poll_cursors (
     wallet_hex   TEXT    PRIMARY KEY NOT NULL,
     last_ts_unix INTEGER NOT NULL

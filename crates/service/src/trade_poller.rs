@@ -60,12 +60,17 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     pub async fn run(self) {
         loop {
             for &wallet in &self.wallets {
-                // Timestamp cursor: fetch from the last-seen observed_at (inclusive
-                // lower bound). The orchestrator's source_trade_id dedup remains
-                // authoritative for the boundary trade; the cursor only trims redundant
-                // re-fetches across rounds.
+                // Timestamp cursor: the stored cursor is the newest observed_at (whole
+                // seconds) seen for this wallet. The endpoint's `start` is *exclusive*
+                // (`timestamp > start`), so we fetch from `cursor - 1` to re-include the
+                // boundary second — otherwise an unseen trade sharing the newest second
+                // would never be fetched, and the orchestrator's source_trade_id dedup
+                // can only drop trades that *are* fetched. Re-fetched already-seen trades
+                // are deduped. (A trade arriving more than one second out of order
+                // relative to the cursor is not re-fetched; the cursor is a bandwidth
+                // optimisation on the backstop poll path, not a correctness gate.)
                 let start = match self.paper_state.cursor(&wallet) {
-                    Ok(cursor) => cursor,
+                    Ok(cursor) => cursor_start(cursor),
                     Err(e) => {
                         warn!(wallet = %wallet, error = %e, "paper-state cursor read failed; full fetch");
                         None
@@ -109,5 +114,30 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                 return;
             }
         }
+    }
+}
+
+/// Exclusive `start` bound for the next `/activity` fetch given the stored cursor.
+///
+/// The endpoint's `start` is exclusive (`timestamp > start`), so we step back one
+/// second to re-include the cursor's boundary second; downstream dedup drops the
+/// already-seen trades. `None` (no cursor yet) means an unbounded fetch.
+fn cursor_start(cursor: Option<i64>) -> Option<i64> {
+    cursor.map(|c| c.saturating_sub(1))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::cursor_start;
+
+    #[test]
+    fn cursor_start_steps_back_one_second_to_cover_the_boundary() {
+        // No cursor → unbounded.
+        assert_eq!(cursor_start(None), None);
+        // Exclusive `start = cursor - 1` re-includes the boundary second `cursor`.
+        assert_eq!(cursor_start(Some(1_700_000_000)), Some(1_699_999_999));
+        // Never underflows.
+        assert_eq!(cursor_start(Some(0)), Some(-1));
     }
 }
