@@ -55,8 +55,9 @@ fn scenario_paper_fill_round_trips_from_log() {
     // Write the fill.
     {
         let writer = Writer::open(&log_path).expect("open writer");
-        let mut executor = PaperExecutor::new(writer, paper_source());
-        let fill = executor
+        // haircut/slippage = 0 so this round-trip test stays behavior-neutral.
+        let mut executor = PaperExecutor::new(writer, paper_source(), 0, 0);
+        let (fill, _seq) = executor
             .execute(&intent, SourceTimestamp(NOW))
             .expect("execute");
 
@@ -121,7 +122,7 @@ fn scenario_multiple_fills_ordered_in_log() {
 
     {
         let writer = Writer::open(&log_path).expect("open writer");
-        let mut executor = PaperExecutor::new(writer, paper_source());
+        let mut executor = PaperExecutor::new(writer, paper_source(), 0, 0);
         for intent in &intents {
             executor
                 .execute(intent, SourceTimestamp(NOW))
@@ -148,4 +149,89 @@ fn scenario_multiple_fills_ordered_in_log() {
             "each fill price must match its intent"
         );
     }
+}
+
+// ─── scenario 3 (AC3) ────────────────────────────────────────────────────────
+
+fn intent_with(side: Side, price: rust_decimal::Decimal, key: &str) -> OrderIntent {
+    let mut i = sample_intent();
+    i.side = side;
+    i.limit_price = Price::new(price).expect("valid price");
+    i.idempotency_key = key.to_string();
+    i
+}
+
+fn recorded_fill_price(
+    dir: &TempDir,
+    log: &str,
+    intent: &OrderIntent,
+    haircut_bps: u32,
+    slippage_bps: u32,
+) -> rust_decimal::Decimal {
+    let writer = Writer::open(dir.path().join(log)).expect("open writer");
+    let mut executor = PaperExecutor::new(writer, paper_source(), haircut_bps, slippage_bps);
+    let (fill, _seq) = executor
+        .execute(intent, SourceTimestamp(NOW))
+        .expect("execute");
+    fill.simulated_fill_price.0
+}
+
+/// The side-split haircut is applied to the recorded fill price and clamped into (0, 1).
+///
+/// PASS: BUY pays +haircut (clamped at 0.999), SELL pays −slippage (floored at 0.001),
+///       and haircut_bps = 0 reproduces the un-haircut price.
+/// FAIL: any recorded fill price deviates from the expected side-split haircut.
+#[test]
+fn scenario_side_split_haircut_clamped() {
+    let dir = TempDir::new().expect("temp dir");
+
+    // BUY pays fee+slippage: 0.40 * (1 + 500/10_000) = 0.42.
+    let buy = intent_with(
+        Side::Buy,
+        dec!(0.40),
+        "wf|0x01|b1|mkt-paper-001|0|buy|1719835200",
+    );
+    assert_eq!(
+        recorded_fill_price(&dir, "buy.log", &buy, 500, 100),
+        dec!(0.42),
+        "BUY haircut"
+    );
+
+    // BUY clamps at 0.999: 0.98 * 1.05 = 1.029 -> 0.999.
+    let buy_hi = intent_with(
+        Side::Buy,
+        dec!(0.98),
+        "wf|0x01|b2|mkt-paper-001|0|buy|1719835201",
+    );
+    assert_eq!(
+        recorded_fill_price(&dir, "buyhi.log", &buy_hi, 500, 100),
+        dec!(0.999),
+        "BUY clamp at 0.999"
+    );
+
+    // SELL pays slippage only: 0.40 * (1 - 100/10_000) = 0.396.
+    let sell = intent_with(
+        Side::Sell,
+        dec!(0.40),
+        "wf|0x01|s1|mkt-paper-001|0|sell|1719835202",
+    );
+    assert_eq!(
+        recorded_fill_price(&dir, "sell.log", &sell, 500, 100),
+        dec!(0.396),
+        "SELL slippage only"
+    );
+
+    // haircut_bps = slippage_bps = 0 reproduces the limit price.
+    let neutral = intent_with(
+        Side::Buy,
+        dec!(0.40),
+        "wf|0x01|n1|mkt-paper-001|0|buy|1719835203",
+    );
+    assert_eq!(
+        recorded_fill_price(&dir, "neutral.log", &neutral, 0, 0),
+        dec!(0.40),
+        "haircut=0 reproduces limit price"
+    );
+
+    println!("PASS: side-split haircut applied and clamped into (0, 1)");
 }

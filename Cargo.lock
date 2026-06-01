@@ -3251,6 +3251,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-paper-state"
+version = "0.1.0"
+dependencies = [
+ "pe-core-types",
+ "rusqlite",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pe-position-ledger"
 version = "0.1.0"
 dependencies = [
@@ -3290,6 +3302,7 @@ dependencies = [
  "pe-execution-core",
  "pe-funding-graph",
  "pe-operator-graph",
+ "pe-paper-state",
  "pe-position-ledger",
  "pe-risk-engine",
  "pe-source-core",

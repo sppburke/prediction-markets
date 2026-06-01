@@ -33,6 +33,15 @@ impl PositionLedger {
         }
     }
 
+    /// Rehydrate the ledger from previously persisted per-wallet snapshots (the
+    /// `leader_positions` mirror in `paper-state`), so that classification after a
+    /// restart sees each leader's existing position rather than treating the first
+    /// post-restart trade as a fresh Entry. Reuses the existing `PositionSnapshot`
+    /// type; no trades are replayed.
+    pub fn from_snapshots(snapshots: HashMap<WalletAddress, PositionSnapshot>) -> Self {
+        Self { snapshots }
+    }
+
     /// Apply one trade to the ledger, updating net exposure for the wallet.
     ///
     /// Buying reduces short contracts first (covering), then adds to long.

@@ -35,6 +35,7 @@ pe-position-ledger          = { path = "../position-ledger",            version 
 pe-venue-core               = { path = "../venue-core",                 version = "0.1.0" }
 pe-venue-polymarket         = { path = "../venue-polymarket",           version = "0.1.0" }
 pe-execution-core           = { path = "../execution-core",             version = "0.1.0" }
+pe-paper-state              = { path = "../paper-state",                version = "0.1.0" }
 
 anyhow          = { workspace = true }
 axum            = { workspace = true }
