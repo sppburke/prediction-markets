@@ -39,6 +39,10 @@ async fn main() -> Result<()> {
     if env::args().any(|a| a == "--report") {
         return run_report();
     }
+    // --rebuild-state: wipe paper-state DB (after backup) and replay event log, exit.
+    if env::args().any(|a| a == "--rebuild-state") {
+        return run_rebuild_state();
+    }
 
     let cfg = load_config()?;
 
@@ -315,6 +319,58 @@ async fn main() -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Wipe the paper-state DB (after backup) and replay all event-log fills from scratch.
+///
+/// Reconstructs: `fills`, `positions`, `bankroll`, `last_applied_event_seq`.
+/// NOT reconstructed: `seen_trades` (no-fill trades never logged), `leader_positions`
+/// (no leader wallet in `PaperFill`/`OrderIntent`), `poll_cursors` (same reason).
+/// The idempotency-key PK backstop and organic cursor re-warm cover the gaps on restart.
+fn run_rebuild_state() -> Result<()> {
+    let cfg = load_config()?;
+    let db_path = &cfg.paper_state_db_path;
+
+    // Back up before wiping so the user can recover from an accidental rebuild.
+    let backup_path = db_path.with_extension("db.bak");
+    if db_path.exists() {
+        std::fs::rename(db_path, &backup_path)
+            .with_context(|| format!("backup {} → {}", db_path.display(), backup_path.display()))?;
+        println!(
+            "Backed up {} → {}",
+            db_path.display(),
+            backup_path.display()
+        );
+    }
+
+    let paper_state = PaperStateDb::open(db_path)
+        .with_context(|| format!("create paper-state {}", db_path.display()))?;
+    let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
+        .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
+    paper_state
+        .init_bankroll(configured_bankroll)
+        .context("init bankroll")?;
+
+    // last_applied_event_seq = None on a fresh DB → reconcile_paper_state replays all frames.
+    let applied =
+        reconcile_paper_state(&cfg.event_log_path, &paper_state).context("replay event log")?;
+
+    let bankroll = paper_state
+        .bankroll()
+        .context("read bankroll")?
+        .unwrap_or(configured_bankroll);
+
+    println!("Rebuilt paper-state from event log.");
+    println!("  fills replayed:  {applied}");
+    println!("  bankroll:        {bankroll}");
+    println!("  NOT rebuilt:     seen_trades, leader_positions, poll_cursors (not in event log)");
+    if cfg.paper_resolutions_path.exists() {
+        println!(
+            "  resolutions:     {} (untouched — re-apply via resolution poller on next start)",
+            cfg.paper_resolutions_path.display()
+        );
+    }
+    std::process::exit(0);
+}
 
 /// Print P&L report from the existing paper-state DB and exit.
 fn run_report() -> Result<()> {
