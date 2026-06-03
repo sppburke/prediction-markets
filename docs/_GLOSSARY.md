@@ -292,6 +292,10 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_base_url` | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL for order submission and status polling |
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
+| `position_reseed_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic leader-ledger reseeds from the positions API. 0 disables periodic reseeds (startup seed still runs). |
+| `position_page_limit` | 500 | `ServiceConfig` field. Maximum positions to fetch per page when seeding the leader ledger. |
+| `position_size_threshold` | 1 | `ServiceConfig` field. Minimum position size (contracts) to include; positions below this are treated as dust. |
+| `position_max_pages` | 20 | **Module const** in `crates/service/src/position_seeder.rs` (not a TOML/env key). Safety backstop: pagination stops after this many pages per wallet; a `warn!` is emitted if hit. |
 
 ### Paper trading state (`paper-state`, issue #282)
 

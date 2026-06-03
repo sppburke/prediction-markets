@@ -22,6 +22,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use pe_copy_signal_engine::PositionSnapshot;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
     BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
@@ -34,6 +35,7 @@ use pe_operator_graph::OperatorIdentity;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::health::new_shared_health;
+use pe_service::market_end_cache::MarketEndCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_core::SourceEvent;
 use pe_strategy_winner_follow::{
@@ -42,6 +44,7 @@ use pe_strategy_winner_follow::{
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch};
@@ -121,6 +124,10 @@ fn empty_operator_rx() -> watch::Receiver<Vec<OperatorIdentity>> {
     watch::channel(Vec::new()).1
 }
 
+fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, PositionSnapshot>> {
+    mpsc::channel(1).1
+}
+
 // ── Scenario 1: e2e_clean_exit ────────────────────────────────────────────────
 //
 // PASS: one IncomingTrade from a watchlisted wallet is processed; orchestrator
@@ -152,12 +159,15 @@ async fn scenario_e2e_clean_exit() {
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
             cluster_observation_window_secs: 300,
+            max_resolution_horizon_secs: 0, // disabled in tests
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
         new_shared_health(),
+        MarketEndCache::new(String::new()),
+        dead_reseed_rx(),
     )
     .unwrap();
 
@@ -208,12 +218,15 @@ async fn scenario_graceful_shutdown() {
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
             cluster_observation_window_secs: 300,
+            max_resolution_horizon_secs: 0, // disabled in tests
         },
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
         new_shared_health(),
+        MarketEndCache::new(String::new()),
+        dead_reseed_rx(),
     )
     .unwrap();
 
