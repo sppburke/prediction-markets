@@ -3251,6 +3251,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-paper-pnl"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "pe-core-types",
+ "pe-paper-state",
+ "pe-source-core",
+ "pe-source-polymarket-public",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pe-paper-state"
 version = "0.1.0"
 dependencies = [
@@ -3302,6 +3322,7 @@ dependencies = [
  "pe-execution-core",
  "pe-funding-graph",
  "pe-operator-graph",
+ "pe-paper-pnl",
  "pe-paper-state",
  "pe-position-ledger",
  "pe-risk-engine",

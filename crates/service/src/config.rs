@@ -116,6 +116,21 @@ pub struct ServiceConfig {
     #[serde(default = "default_paper_fill_slippage_bps")]
     pub paper_fill_slippage_bps: u32,
 
+    /// Path to the JSON sidecar that tracks settled-market resolutions.
+    /// See `docs/_GLOSSARY.md`: `paper_resolutions_path`.
+    #[serde(default = "default_paper_resolutions_path")]
+    pub paper_resolutions_path: PathBuf,
+
+    // ── Gamma / resolution polling ───────────────────────────────────────────
+    /// Gamma API base URL (no trailing slash). See `docs/_GLOSSARY.md`.
+    #[serde(default = "default_gamma_base_url")]
+    pub gamma_base_url: String,
+
+    /// Seconds between Gamma resolution poll rounds.
+    /// See `docs/_GLOSSARY.md`: `gamma_resolution_poll_interval_secs`.
+    #[serde(default = "default_gamma_resolution_poll_interval_secs")]
+    pub gamma_resolution_poll_interval_secs: u64,
+
     // ── Operator graph ───────────────────────────────────────────────────────
     /// Rebuild cadence for `OperatorGraphScheduler` in seconds.
     /// See `docs/_GLOSSARY.md`: `operator_graph_rebuild_cadence_secs`.
@@ -255,6 +270,18 @@ fn default_clob_base_url() -> String {
     "https://clob.polymarket.com".to_string()
 }
 
+fn default_paper_resolutions_path() -> PathBuf {
+    PathBuf::from("./paper_resolutions.json")
+}
+
+fn default_gamma_base_url() -> String {
+    "https://gamma-api.polymarket.com".to_string()
+}
+
+const fn default_gamma_resolution_poll_interval_secs() -> u64 {
+    3600
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for ServiceConfig {
@@ -277,6 +304,9 @@ impl Default for ServiceConfig {
             paper_state_db_path: default_paper_state_db_path(),
             paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
             paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
+            paper_resolutions_path: default_paper_resolutions_path(),
+            gamma_base_url: default_gamma_base_url(),
+            gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
             funding_max_hops: default_funding_max_hops(),
             funder_source: default_funder_source(),

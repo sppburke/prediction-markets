@@ -24,14 +24,22 @@ use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::health::{SharedHealth, new_shared_health};
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::paper_api::PaperApiState;
 use pe_service::seed;
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
+use time::OffsetDateTime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --report: load config, compute P&L snapshot, print, exit.
+    if env::args().any(|a| a == "--report") {
+        return run_report();
+    }
+
     let cfg = load_config()?;
 
     pe_service::logging::setup(&cfg.jsonl_log_path, "info")?;
@@ -253,11 +261,32 @@ async fn main() -> Result<()> {
     )
     .context("build orchestrator")?;
 
-    // HTTP health server.
+    // Resolution polling task: periodically fetch Gamma for closed markets.
+    let resolution_task = spawn_resolution_task(
+        paper_state.clone(),
+        cfg.gamma_base_url.clone(),
+        cfg.gamma_resolution_poll_interval_secs,
+        cfg.paper_resolutions_path.clone(),
+    );
+
+    // Shared state for paper API handlers.
+    let paper_api_state = Arc::new(PaperApiState {
+        paper_state: paper_state.clone(),
+        resolutions_path: cfg.paper_resolutions_path.clone(),
+        initial_bankroll: configured_bankroll,
+    });
+
+    // HTTP server: health + paper API.
     let app = Router::new()
         .route("/health/live", get(pe_service::health::live))
         .route("/health/ready", get(pe_service::health::ready))
-        .with_state(health);
+        .route("/paper/pnl", get(pe_service::paper_api::pnl))
+        .route("/paper/positions", get(pe_service::paper_api::positions))
+        .route("/paper/fills", get(pe_service::paper_api::fills))
+        .route("/paper/status", get(pe_service::paper_api::status))
+        .route("/dashboard", get(pe_service::paper_api::dashboard))
+        .with_state(health)
+        .layer(axum::Extension(paper_api_state));
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
@@ -280,15 +309,33 @@ async fn main() -> Result<()> {
     trade_task.abort();
     http_task.abort();
     scheduler_task.abort();
+    resolution_task.abort();
     info!("pe-service stopped");
     Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Print P&L report from the existing paper-state DB and exit.
+fn run_report() -> Result<()> {
+    let cfg = load_config()?;
+    let paper_state = PaperStateDb::open(&cfg.paper_state_db_path)
+        .with_context(|| format!("open paper-state {}", cfg.paper_state_db_path.display()))?;
+    let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
+        .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
+    let store = ResolutionStore::load(&cfg.paper_resolutions_path)
+        .with_context(|| format!("load resolutions {}", cfg.paper_resolutions_path.display()))?;
+    let snapshot = PnlLedger::snapshot(&paper_state, &store, configured_bankroll)
+        .context("compute P&L snapshot")?;
+    let json = serde_json::to_string_pretty(&snapshot).context("serialize snapshot")?;
+    println!("{json}");
+    std::process::exit(0);
+}
+
 fn load_config() -> Result<ServiceConfig> {
-    let first_arg = env::args().nth(1);
-    if first_arg.as_deref() == Some("--print-config") {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--print-config") {
         match toml::to_string_pretty(&ServiceConfig::default()) {
             Ok(s) => {
                 print!("{s}");
@@ -297,11 +344,93 @@ fn load_config() -> Result<ServiceConfig> {
             Err(e) => anyhow::bail!("--print-config failed: {e}"),
         }
     }
-    let config_path = first_arg.map(PathBuf::from);
+
+    // First non-flag argument is the optional TOML config path.
+    let config_path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from);
     service_config::load(config_path.as_deref()).with_context(|| match &config_path {
         Some(p) => format!("loading config from {}", p.display()),
         None => "loading config from environment".to_owned(),
     })
+}
+
+/// Periodically fetch Gamma resolutions for all open positions and credit the bankroll.
+fn spawn_resolution_task(
+    paper_state: Arc<PaperStateDb>,
+    gamma_base_url: String,
+    poll_interval_secs: u64,
+    resolutions_path: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let fetcher = GammaResolutionFetcher::new(
+            gamma_base_url,
+            ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50),
+        );
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+            if let Err(e) = tick_resolution(&paper_state, &fetcher, &resolutions_path).await {
+                tracing::warn!(error = %e, "resolution poll error");
+            }
+        }
+    })
+}
+
+async fn tick_resolution(
+    paper_state: &PaperStateDb,
+    fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
+    resolutions_path: &std::path::Path,
+) -> Result<()> {
+    let mut store = ResolutionStore::load(resolutions_path).context("load resolution store")?;
+
+    let positions = paper_state.paper_positions().context("read positions")?;
+
+    // Collect market IDs with open positions that have not been settled yet.
+    let pending: Vec<pe_core_types::MarketId> = positions
+        .iter()
+        .map(|p| p.market_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .filter(|mid| !store.is_settled(mid))
+        .collect();
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let resolved = fetcher
+        .fetch_closed(&pending)
+        .await
+        .context("fetch resolutions")?;
+
+    let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+    for res in resolved {
+        let market_positions: Vec<_> = positions
+            .iter()
+            .filter(|p| p.market_id == res.market_id)
+            .cloned()
+            .collect();
+        let credit = PnlLedger::resolution_credit(&market_positions, &res.outcome_prices);
+        // Write sidecar before crediting bankroll: a crash after sidecar but before SQLite
+        // means the market is already marked settled, so the next poll skips it (under-credit,
+        // not over-credit). The reverse order would double-credit on restart.
+        store
+            .mark_settled(
+                res.market_id.clone(),
+                res.outcome_prices.clone(),
+                credit,
+                now_unix,
+            )
+            .context("mark settled")?;
+        if credit > rust_decimal::Decimal::ZERO {
+            paper_state
+                .credit_bankroll(credit)
+                .context("credit bankroll")?;
+        }
+        tracing::info!(market = %res.market_id, %credit, "resolution applied");
+    }
+    Ok(())
 }
 
 fn parse_mode(s: &str) -> Result<ExecutionMode> {
