@@ -307,6 +307,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `paper_resolutions_path` | `./paper_resolutions.json` | Path to the JSON sidecar tracking settled-market resolution prices and bankroll credits. Loaded by `PnlLedger` and the `--report` flag; crash-safe atomic write |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
 | `gamma_resolution_poll_interval_secs` | 3600 | Seconds between Gamma resolution poll rounds in the live service. 1-hour cadence is sufficient because market resolution propagates on a minutes-to-hours timescale |
+| `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market `endDate` is further than this many seconds into the future. 0 disables the gate. Guards against locking capital in months-long markets. |
 
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 
