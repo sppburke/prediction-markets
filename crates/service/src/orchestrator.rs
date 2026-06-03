@@ -14,10 +14,12 @@
 //!
 //! The orchestrator is pure dispatch: it owns no I/O except through `ExecutionDispatcher`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use pe_copy_signal_engine::{IncomingTrade, SignalConfig, WalletProfile, classify_trade};
+use pe_copy_signal_engine::{
+    IncomingTrade, PositionSnapshot, SignalConfig, WalletProfile, classify_trade,
+};
 use pe_core_types::{
     EventSeq, MarketOutcomeId, OperatorId, Probability, ReconstructionQuality, SourceTimestamp,
     TraderId, VenueId, WalletAddress,
@@ -39,6 +41,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::health::SharedHealth;
+use crate::market_end_cache::MarketEndCache;
 
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
@@ -48,6 +51,9 @@ pub struct OrchestratorConfig {
     /// How long [`ClusterObservationTracker`] retains entries in seconds.
     /// Default from `_GLOSSARY.md`: `cluster_observation_window_secs = 300`.
     pub cluster_observation_window_secs: u64,
+    /// Drop signals whose market `endDate` is further than this many seconds into
+    /// the future. 0 disables the filter. Default: 48 h (172_800 s).
+    pub max_resolution_horizon_secs: u64,
 }
 
 pub struct Orchestrator<C: CLOBClient> {
@@ -65,9 +71,15 @@ pub struct Orchestrator<C: CLOBClient> {
     bankroll: Decimal,
     paper_state: Arc<PaperStateDb>,
     health: SharedHealth,
+    market_end_cache: MarketEndCache,
+    max_resolution_horizon_secs: u64,
+    // Tracks (market, outcome) pairs we already hold a paper position in.
+    // Prevents multiple leaders entering the same contract from stacking fills.
+    filled_positions: HashSet<MarketOutcomeId>,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
+    reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
 }
 
 impl<C: CLOBClient> Orchestrator<C> {
@@ -84,9 +96,21 @@ impl<C: CLOBClient> Orchestrator<C> {
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
+        market_end_cache: MarketEndCache,
+        reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
+
+        // Seed the dedup set from any positions already in the DB (crash-restart safety).
+        let filled_positions: HashSet<MarketOutcomeId> = paper_state
+            .paper_positions()
+            .map_err(|e| anyhow::anyhow!("load paper positions: {e}"))?
+            .into_iter()
+            .filter(|p| p.long_contracts > 0 || p.short_contracts > 0)
+            .map(|p| MarketOutcomeId::new(p.market_id, p.outcome_id))
+            .collect();
+
         Ok(Self {
             polygon_rx,
             trade_rx,
@@ -102,7 +126,11 @@ impl<C: CLOBClient> Orchestrator<C> {
             bankroll: config.bankroll,
             paper_state,
             health,
+            market_end_cache,
+            max_resolution_horizon_secs: config.max_resolution_horizon_secs,
+            filled_positions,
             min_quality,
+            reseed_rx,
         })
     }
 
@@ -115,6 +143,7 @@ impl<C: CLOBClient> Orchestrator<C> {
         tokio::pin!(shutdown);
         let mut polygon_done = false;
         let mut trades_done = false;
+        let mut reseed_done = false;
 
         loop {
             // Both channels closed naturally — exit without waiting for shutdown.
@@ -133,6 +162,16 @@ impl<C: CLOBClient> Orchestrator<C> {
                         self.handle_trade(trade).await;
                     }
                     break;
+                }
+                result = self.reseed_rx.recv(), if !reseed_done => {
+                    match result {
+                        Some(map) => {
+                            let n = map.len();
+                            self.position_ledger.overlay(map);
+                            info!(wallets = n, "leader ledger reseeded from live positions API");
+                        }
+                        None => reseed_done = true,
+                    }
                 }
                 result = self.polygon_rx.recv(), if !polygon_done => {
                     match result {
@@ -239,6 +278,40 @@ impl<C: CLOBClient> Orchestrator<C> {
             return;
         };
 
+        // Single-position-per-contract gate: drop if we already hold this (market, outcome).
+        let pos_key = MarketOutcomeId::new(signal.market_id.clone(), signal.outcome_id);
+        if self.filled_positions.contains(&pos_key) {
+            info!(
+                reason = "already hold position in this market outcome",
+                market = %signal.market_id,
+                outcome = signal.outcome_id.0,
+                "signal did not produce order",
+            );
+            self.commit_no_fill(&trade, &leader_row);
+            return;
+        }
+
+        // Resolution-horizon gate: drop signals for markets that close too far out.
+        if self.max_resolution_horizon_secs > 0 {
+            let end_unix = self.market_end_cache.end_date_unix(&signal.market_id).await;
+            if let Some(unix) = end_unix {
+                let horizon = OffsetDateTime::now_utc().unix_timestamp()
+                    + self.max_resolution_horizon_secs as i64;
+                if unix > horizon {
+                    info!(
+                        reason = "market resolves too far out",
+                        market = %signal.market_id,
+                        end_unix,
+                        max_horizon_secs = self.max_resolution_horizon_secs,
+                        "signal did not produce order",
+                    );
+                    self.commit_no_fill(&trade, &leader_row);
+                    return;
+                }
+            }
+            // If end_unix is None (Gamma has no endDate), allow through.
+        }
+
         let p = self.win_rate_p_for(&signal.leader);
         let snapshot = zeroed_risk_snapshot();
         match self
@@ -257,7 +330,12 @@ impl<C: CLOBClient> Orchestrator<C> {
                         self.commit_no_fill(&trade, &leader_row);
                     }
                     Ok(DispatchResult::Paper { fill, seq }) => {
+                        let filled_key = MarketOutcomeId::new(
+                            fill.intent.market_id.clone(),
+                            fill.intent.outcome_id,
+                        );
                         self.commit_paper_fill(&trade, &leader_row, &fill, seq);
+                        self.filled_positions.insert(filled_key);
                         info!(
                             kind = "paper_fill",
                             idempotency_key = %fill.intent.idempotency_key,

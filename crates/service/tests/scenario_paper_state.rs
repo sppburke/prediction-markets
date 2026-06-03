@@ -23,6 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use pe_copy_signal_engine::PositionSnapshot;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
     BasisPoints, ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality,
@@ -35,6 +36,7 @@ use pe_operator_graph::OperatorIdentity;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::health::new_shared_health;
+use pe_service::market_end_cache::MarketEndCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_core::SourceEvent;
@@ -46,6 +48,7 @@ use pe_venue_core::OrderIntent;
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch};
@@ -126,6 +129,10 @@ fn empty_operator_rx() -> watch::Receiver<Vec<OperatorIdentity>> {
     watch::channel(Vec::new()).1
 }
 
+fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, PositionSnapshot>> {
+    mpsc::channel(1).1
+}
+
 fn paper_state_at(dir: &TempDir) -> Arc<PaperStateDb> {
     Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap())
 }
@@ -159,12 +166,15 @@ async fn run_trades(
             mode,
             signal_config: SignalConfig::default(),
             cluster_observation_window_secs: 300,
+            max_resolution_horizon_secs: 0, // disabled in tests
         },
         WinnerFollowStrategy::new(strategy_cfg),
         make_dispatcher(dir),
         paper_state,
         leader_ledger,
         new_shared_health(),
+        MarketEndCache::new(String::new()),
+        dead_reseed_rx(),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;

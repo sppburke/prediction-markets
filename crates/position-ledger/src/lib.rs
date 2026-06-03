@@ -79,6 +79,16 @@ impl PositionLedger {
         self.snapshots.get(wallet)
     }
 
+    /// Overlay per-wallet snapshots from the live positions API, replacing each
+    /// wallet's entry wholesale (API wins). Wallets absent from `updates` are
+    /// untouched. A wallet present in `updates` with an empty `positions` map
+    /// clears that wallet's entry (all positions closed per the API).
+    pub fn overlay(&mut self, updates: HashMap<WalletAddress, PositionSnapshot>) {
+        for (wallet, snap) in updates {
+            self.snapshots.insert(wallet, snap);
+        }
+    }
+
     /// Required for replay reconciliation; deferred to Phase 1.
     pub fn rewind_to(&mut self, _ts: SourceTimestamp) {}
 }
@@ -263,6 +273,93 @@ mod tests {
         let state = snap.positions[&key];
         assert_eq!(state.long_contracts, 0);
         assert_eq!(state.short_contracts, 3);
+    }
+
+    #[test]
+    fn overlay_replaces_wallet_entry() {
+        let mut ledger = PositionLedger::new();
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        ledger.ingest(&trade(w, Side::Buy, 10, 1_000));
+        let key = MarketOutcomeId::new(market(), OutcomeId(0));
+
+        let mut new_positions = HashMap::new();
+        new_positions.insert(
+            key.clone(),
+            pe_copy_signal_engine::PositionState {
+                long_contracts: 99,
+                short_contracts: 0,
+            },
+        );
+        let snap = PositionSnapshot {
+            wallet: w,
+            positions: new_positions,
+        };
+        let mut updates = HashMap::new();
+        updates.insert(w, snap);
+
+        ledger.overlay(updates);
+        let result = ledger.position(&w).unwrap();
+        assert_eq!(result.positions[&key].long_contracts, 99);
+    }
+
+    #[test]
+    fn overlay_absent_wallet_untouched() {
+        let mut ledger = PositionLedger::new();
+        let w_a = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let w_b = wallet("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        ledger.ingest(&trade(w_a, Side::Buy, 5, 1_000));
+
+        // Overlay only touches w_b; w_a must remain unchanged.
+        let updates: HashMap<WalletAddress, PositionSnapshot> = {
+            let mut m = HashMap::new();
+            m.insert(
+                w_b,
+                PositionSnapshot {
+                    wallet: w_b,
+                    positions: HashMap::new(),
+                },
+            );
+            m
+        };
+        ledger.overlay(updates);
+
+        let key = MarketOutcomeId::new(market(), OutcomeId(0));
+        let state = ledger.position(&w_a).unwrap().positions[&key];
+        assert_eq!(state.long_contracts, 5);
+    }
+
+    #[test]
+    fn overlay_empty_snapshot_clears_wallet() {
+        let mut ledger = PositionLedger::new();
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        ledger.ingest(&trade(w, Side::Buy, 10, 1_000));
+
+        // An empty PositionSnapshot replaces the existing entry, clearing positions.
+        let mut updates = HashMap::new();
+        updates.insert(
+            w,
+            PositionSnapshot {
+                wallet: w,
+                positions: HashMap::new(),
+            },
+        );
+        ledger.overlay(updates);
+
+        let snap = ledger.position(&w).unwrap();
+        assert!(snap.positions.is_empty());
+    }
+
+    #[test]
+    fn overlay_empty_map_is_noop() {
+        let mut ledger = PositionLedger::new();
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        ledger.ingest(&trade(w, Side::Buy, 10, 1_000));
+
+        ledger.overlay(HashMap::new());
+
+        let key = MarketOutcomeId::new(market(), OutcomeId(0));
+        let state = ledger.position(&w).unwrap().positions[&key];
+        assert_eq!(state.long_contracts, 10);
     }
 
     #[test]

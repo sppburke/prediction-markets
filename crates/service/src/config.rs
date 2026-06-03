@@ -91,6 +91,23 @@ pub struct ServiceConfig {
     #[serde(default = "default_trade_poll_interval_secs")]
     pub trade_poll_interval_secs: u64,
 
+    /// Seconds between periodic leader-ledger reseeds from the positions API.
+    /// 0 disables periodic reseeds (startup seed still runs).
+    /// See `docs/_GLOSSARY.md`: `position_reseed_interval_secs`.
+    #[serde(default = "default_position_reseed_interval_secs")]
+    pub position_reseed_interval_secs: u64,
+
+    /// Maximum positions to fetch per page when seeding the leader ledger.
+    /// See `docs/_GLOSSARY.md`: `position_page_limit`.
+    #[serde(default = "default_position_page_limit")]
+    pub position_page_limit: u32,
+
+    /// Minimum position size (in contracts) to include in the leader ledger seed.
+    /// Positions smaller than this are treated as dust and dropped.
+    /// See `docs/_GLOSSARY.md`: `position_size_threshold`.
+    #[serde(default = "default_position_size_threshold")]
+    pub position_size_threshold: u32,
+
     // ── Logging / persistence ────────────────────────────────────────────────
     /// Path to the BLAKE3-chained binary event log.
     #[serde(default = "default_event_log_path")]
@@ -130,6 +147,11 @@ pub struct ServiceConfig {
     /// See `docs/_GLOSSARY.md`: `gamma_resolution_poll_interval_secs`.
     #[serde(default = "default_gamma_resolution_poll_interval_secs")]
     pub gamma_resolution_poll_interval_secs: u64,
+
+    /// Drop entry signals whose market `endDate` is further than this many seconds
+    /// into the future. Set to 0 to disable. Default: 172_800 (48 h).
+    #[serde(default = "default_max_resolution_horizon_secs")]
+    pub max_resolution_horizon_secs: u64,
 
     // ── Operator graph ───────────────────────────────────────────────────────
     /// Rebuild cadence for `OperatorGraphScheduler` in seconds.
@@ -226,6 +248,22 @@ const fn default_trade_poll_interval_secs() -> u64 {
     30
 }
 
+const fn default_max_resolution_horizon_secs() -> u64 {
+    48 * 3600 // 172_800 s = 48 h
+}
+
+const fn default_position_reseed_interval_secs() -> u64 {
+    300
+}
+
+const fn default_position_page_limit() -> u32 {
+    500
+}
+
+const fn default_position_size_threshold() -> u32 {
+    1
+}
+
 fn default_event_log_path() -> PathBuf {
     PathBuf::from("./paper.log")
 }
@@ -299,6 +337,9 @@ impl Default for ServiceConfig {
             watchlist_size: default_watchlist_size(),
             seed_watchlist_path: String::new(),
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
+            position_reseed_interval_secs: default_position_reseed_interval_secs(),
+            position_page_limit: default_position_page_limit(),
+            position_size_threshold: default_position_size_threshold(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
             paper_state_db_path: default_paper_state_db_path(),
@@ -307,6 +348,7 @@ impl Default for ServiceConfig {
             paper_resolutions_path: default_paper_resolutions_path(),
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
+            max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
             operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
             funding_max_hops: default_funding_max_hops(),
             funder_source: default_funder_source(),
@@ -349,7 +391,50 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
     if let Some(p) = path {
         fig = fig.merge(Toml::file(p));
     }
-    let cfg: ServiceConfig = fig.merge(Env::prefixed("PE_").lowercase(true)).extract()?;
+    // Only forward env vars that map to known ServiceConfig fields.
+    // PE_BACKTEST_*, PE_BOOTSTRAP_*, PE_DUNE_*, and per-account polygon variants
+    // are set in .env for sibling binaries and must not reach the service config
+    // (which uses deny_unknown_fields).
+    let env = Env::prefixed("PE_").lowercase(true).only(&[
+        "bind",
+        "polygon_http_url",
+        "polygon_ws_url",
+        "backfill_blocks",
+        "polygon_checkpoint_path",
+        "polygon_channel_capacity",
+        "polygon_backfill_page_size",
+        "polymarket_base_url",
+        "polymarket_channel_capacity",
+        "watchlist_size",
+        "seed_watchlist_path",
+        "trade_poll_interval_secs",
+        "position_reseed_interval_secs",
+        "position_page_limit",
+        "position_size_threshold",
+        "event_log_path",
+        "jsonl_log_path",
+        "paper_state_db_path",
+        "paper_fill_haircut_bps",
+        "paper_fill_slippage_bps",
+        "paper_resolutions_path",
+        "gamma_base_url",
+        "gamma_resolution_poll_interval_secs",
+        "max_resolution_horizon_secs",
+        "operator_graph_rebuild_cadence_secs",
+        "funding_max_hops",
+        "funder_source",
+        "etherscan_api_key",
+        "bankroll_usd",
+        "mode",
+        "strategy",
+        "polymarket_clob_base_url",
+        "polymarket_funder_address",
+        "polymarket_private_key",
+        "polymarket_clob_api_key",
+        "polymarket_clob_api_secret",
+        "polymarket_clob_api_passphrase",
+    ]);
+    let cfg: ServiceConfig = fig.merge(env).extract()?;
     Ok(cfg)
 }
 
@@ -377,6 +462,9 @@ mod tests {
         assert_eq!(cfg.paper_fill_haircut_bps, 500);
         assert_eq!(cfg.paper_fill_slippage_bps, 100);
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
+        assert_eq!(cfg.position_reseed_interval_secs, 300);
+        assert_eq!(cfg.position_page_limit, 500);
+        assert_eq!(cfg.position_size_threshold, 1);
     }
 
     #[test]

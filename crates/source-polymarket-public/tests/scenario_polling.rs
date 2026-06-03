@@ -31,7 +31,13 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
             end: None,
             start: None,
         },
-        PolymarketEndpoint::CurrentPositions { user: USER.into() },
+        PolymarketEndpoint::CurrentPositions {
+            user: USER.into(),
+            limit: None,
+            offset: None,
+            redeemable: None,
+            size_threshold: None,
+        },
         PolymarketEndpoint::ClosedPositions { user: USER.into() },
     ];
 
@@ -50,7 +56,14 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
         fixture("user_trade_activity.json"),
     );
     responses.insert(
-        PolymarketEndpoint::CurrentPositions { user: USER.into() }.url(BASE),
+        PolymarketEndpoint::CurrentPositions {
+            user: USER.into(),
+            limit: None,
+            offset: None,
+            redeemable: None,
+            size_threshold: None,
+        }
+        .url(BASE),
         fixture("current_positions.json"),
     );
     responses.insert(

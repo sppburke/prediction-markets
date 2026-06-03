@@ -292,6 +292,10 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_base_url` | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL for order submission and status polling |
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
+| `position_reseed_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic leader-ledger reseeds from the positions API. 0 disables periodic reseeds (startup seed still runs). |
+| `position_page_limit` | 500 | `ServiceConfig` field. Maximum positions to fetch per page when seeding the leader ledger. |
+| `position_size_threshold` | 1 | `ServiceConfig` field. Minimum position size (contracts) to include; positions below this are treated as dust. |
+| `position_max_pages` | 20 | **Module const** in `crates/service/src/position_seeder.rs` (not a TOML/env key). Safety backstop: pagination stops after this many pages per wallet; a `warn!` is emitted if hit. |
 
 ### Paper trading state (`paper-state`, issue #282)
 
@@ -303,6 +307,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `paper_resolutions_path` | `./paper_resolutions.json` | Path to the JSON sidecar tracking settled-market resolution prices and bankroll credits. Loaded by `PnlLedger` and the `--report` flag; crash-safe atomic write |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
 | `gamma_resolution_poll_interval_secs` | 3600 | Seconds between Gamma resolution poll rounds in the live service. 1-hour cadence is sufficient because market resolution propagates on a minutes-to-hours timescale |
+| `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market `endDate` is further than this many seconds into the future. 0 disables the gate. Guards against locking capital in months-long markets. |
 
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 

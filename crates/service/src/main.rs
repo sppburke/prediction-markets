@@ -26,9 +26,11 @@ use tracing::info;
 
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::health::{SharedHealth, new_shared_health};
+use pe_service::market_end_cache::MarketEndCache;
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
+use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::seed;
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use time::OffsetDateTime;
@@ -106,7 +108,7 @@ async fn main() -> Result<()> {
         .bankroll()
         .context("read paper-state bankroll")?
         .unwrap_or(configured_bankroll);
-    let leader_ledger =
+    let mut leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
     info!(bankroll = %bankroll, "paper-state opened");
 
@@ -203,8 +205,8 @@ async fn main() -> Result<()> {
             );
         }
     }
-    // Wallets feed both the Polygon WS topic[2] filter (via funder discovery)
-    // and the Polymarket trade poller.
+    // Wallets feed both the Polygon WS topic[2] filter (via funder discovery),
+    // the Polymarket trade poller, and the position seeder.
     let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
     // `funding_max_hops` is sourced from ServiceConfig so the value flows
     // through the config-hash; other ClusteringConfig fields stay at default
@@ -229,6 +231,56 @@ async fn main() -> Result<()> {
         health.clone(),
     );
 
+    // Startup seed: fetch current positions from the API for each watchlisted wallet,
+    // overlay onto the leader ledger, then advance each wallet's poll cursor to now so
+    // the trade poller skips the downtime backlog. Must run before wallets is moved into
+    // TradePoller::new so the borrow of wallets is valid, and before the cursor is
+    // advanced after the poller has already started consuming it.
+    {
+        let seed_fetcher = ReqwestFetcher::new(reqwest::Client::new());
+        let snapshot_map = seed_all(
+            &wallets,
+            &cfg.polymarket_base_url,
+            cfg.position_page_limit,
+            cfg.position_size_threshold,
+            &seed_fetcher,
+        )
+        .await;
+        let seeded = snapshot_map.len();
+        leader_ledger.overlay(snapshot_map.clone());
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        for wallet in snapshot_map.keys() {
+            if let Err(e) = paper_state.set_cursor(wallet, now_unix) {
+                tracing::warn!(wallet = %wallet, error = %e, "failed to advance startup cursor");
+            }
+        }
+        info!(
+            seeded,
+            total = wallets.len(),
+            "startup position seed complete"
+        );
+    }
+
+    // Reseed channel: carries periodic snapshots into the orchestrator (cap 1 = back-pressure).
+    let (reseed_tx, reseed_rx) = mpsc::channel(1);
+    let reseed_task = if cfg.position_reseed_interval_secs > 0 {
+        let reseed_wallets = wallets.clone();
+        let reseed_base_url = cfg.polymarket_base_url.clone();
+        let reseed_fetcher = ReqwestFetcher::new(reqwest::Client::new());
+        Some(tokio::spawn(run_reseed_loop(
+            reseed_wallets,
+            reseed_base_url,
+            cfg.position_page_limit,
+            cfg.position_size_threshold,
+            cfg.position_reseed_interval_secs,
+            reseed_fetcher,
+            reseed_tx,
+        )))
+    } else {
+        drop(reseed_tx);
+        None
+    };
+
     // Polymarket trade poller task.
     let trade_task = tokio::spawn(
         TradePoller::new(
@@ -245,6 +297,7 @@ async fn main() -> Result<()> {
     );
 
     // Orchestrator.
+    let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
     let orch = Orchestrator::new(
         polygon_rx,
         trade_rx,
@@ -256,12 +309,15 @@ async fn main() -> Result<()> {
             mode,
             signal_config: Default::default(),
             cluster_observation_window_secs: 300,
+            max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
         },
         WinnerFollowStrategy::new(cfg.strategy.clone()),
         dispatcher,
         paper_state.clone(),
         leader_ledger,
         health.clone(),
+        market_end_cache,
+        reseed_rx,
     )
     .context("build orchestrator")?;
 
@@ -314,6 +370,9 @@ async fn main() -> Result<()> {
     http_task.abort();
     scheduler_task.abort();
     resolution_task.abort();
+    if let Some(t) = reseed_task {
+        t.abort();
+    }
     info!("pe-service stopped");
     Ok(())
 }

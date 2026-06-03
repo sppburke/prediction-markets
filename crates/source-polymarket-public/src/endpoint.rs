@@ -17,8 +17,17 @@ pub enum PolymarketEndpoint {
         end: Option<i64>,
         start: Option<i64>,
     },
+    /// Live open positions for a single wallet via `/positions`.
+    ///
+    /// `redeemable`: when `Some(false)`, restrict to live (unresolved) positions.
+    /// `limit` / `offset`: pagination controls (default 100; `limit=500` works).
+    /// `size_threshold`: drop dust positions smaller than this many contracts.
     CurrentPositions {
         user: String,
+        limit: Option<u32>,
+        offset: Option<u32>,
+        redeemable: Option<bool>,
+        size_threshold: Option<u32>,
     },
     ClosedPositions {
         user: String,
@@ -50,7 +59,28 @@ impl PolymarketEndpoint {
                 }
                 url
             }
-            Self::CurrentPositions { user } => format!("{base}/positions?user={user}"),
+            Self::CurrentPositions {
+                user,
+                limit,
+                offset,
+                redeemable,
+                size_threshold,
+            } => {
+                let mut url = format!("{base}/positions?user={user}");
+                if let Some(r) = redeemable {
+                    url.push_str(&format!("&redeemable={r}"));
+                }
+                if let Some(l) = limit {
+                    url.push_str(&format!("&limit={l}"));
+                }
+                if let Some(o) = offset {
+                    url.push_str(&format!("&offset={o}"));
+                }
+                if let Some(t) = size_threshold {
+                    url.push_str(&format!("&sizeThreshold={t}"));
+                }
+                url
+            }
             Self::ClosedPositions { user } => {
                 format!("{base}/closed-positions?user={user}")
             }
@@ -96,6 +126,37 @@ mod tests {
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
             "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE&limit=500&offset=0&end=1700000000"
+        );
+    }
+
+    #[test]
+    fn current_positions_no_params() {
+        let ep = PolymarketEndpoint::CurrentPositions {
+            user: "0xabc".into(),
+            limit: None,
+            offset: None,
+            redeemable: None,
+            size_threshold: None,
+        };
+        assert_eq!(ep.key(), "current_positions");
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/positions?user=0xabc"
+        );
+    }
+
+    #[test]
+    fn current_positions_all_params() {
+        let ep = PolymarketEndpoint::CurrentPositions {
+            user: "0xabc".into(),
+            limit: Some(500),
+            offset: Some(500),
+            redeemable: Some(false),
+            size_threshold: Some(1),
+        };
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/positions?user=0xabc&redeemable=false&limit=500&offset=500&sizeThreshold=1"
         );
     }
 
