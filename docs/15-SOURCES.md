@@ -38,15 +38,20 @@
 
 ## Polymarket
 
+> **WebSocket design note (2026-06-03, issue #282 Phase 2 verification).**
+> `wss://ws-live-data.polymarket.com` (RTDS) provides comments, crypto prices, and equity prices only — no trade data.
+> `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include wallet address or `transaction_hash`; wallet-level trade identification is impossible via WebSocket.
+> No Polymarket WebSocket supports per-wallet trade subscriptions. The REST `/activity` poll remains the primary ingestion path (issue #282 Open risk #1 materialized). Phase 2 RTDS ingestion is deferred.
+
 | Link | Last checked | Re-verify by |
 |---|---|---|
 | https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/llms.txt | — | — |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
-| https://docs.polymarket.com/market-data/websocket/market-channel | — | — |
-| https://docs.polymarket.com/market-data/websocket/user-channel | — | — |
+| https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-03 | 2026-09-01 |
+| https://docs.polymarket.com/market-data/websocket/user-channel | 2026-06-03 | 2026-09-01 |
 | https://docs.polymarket.com/market-data/websocket/sports | — | — |
-| https://docs.polymarket.com/market-data/websocket/rtds | — | — |
+| https://docs.polymarket.com/market-data/websocket/rtds | 2026-06-03 | 2026-09-01 |
 | https://docs.polymarket.com/trading/overview | — | — |
 | https://docs.polymarket.com/trading/orders/create | — | — |
 | https://docs.polymarket.com/concepts/order-lifecycle | — | — |

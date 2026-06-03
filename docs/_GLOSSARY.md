@@ -300,6 +300,9 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror (`seen_trades`, `fills`, `positions`, `leader_positions`, `bankroll`, `poll_cursors`, `meta`) |
 | `paper_fill_haircut_bps` | 500 | BUY-side paper fill haircut (fee + slippage), basis points. Recorded fill `= min(limit·(1 + bps/10_000), 0.999)`. Mirrors the sizing cost `c` in `evaluate` |
 | `paper_fill_slippage_bps` | 100 | SELL-side paper fill slippage (no taker fee), basis points. Recorded fill `= max(limit·(1 − bps/10_000), 0.001)`. Fill-realism only — diverges from `evaluate` sizing (which charges SELL nothing) and has no research analog |
+| `paper_resolutions_path` | `./paper_resolutions.json` | Path to the JSON sidecar tracking settled-market resolution prices and bankroll credits. Loaded by `PnlLedger` and the `--report` flag; crash-safe atomic write |
+| `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
+| `gamma_resolution_poll_interval_secs` | 3600 | Seconds between Gamma resolution poll rounds in the live service. 1-hour cadence is sufficient because market resolution propagates on a minutes-to-hours timescale |
 
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 

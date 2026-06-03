@@ -23,6 +23,7 @@ members = [
     "crates/execution-core",
     "crates/skill-select",
     "crates/paper-state",
+    "crates/paper-pnl",
 ]
 
 [workspace.package]

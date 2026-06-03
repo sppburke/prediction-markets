@@ -272,6 +272,34 @@ impl PaperStateDb {
         raw.map(|s| parse_decimal(&s)).transpose()
     }
 
+    /// Credit `amount` to the bankroll (e.g. on market resolution payout).
+    ///
+    /// # Precondition
+    /// Idempotency is the caller's responsibility: use [`ResolutionStore`] to ensure
+    /// this is called at most once per market. `credit_bankroll` itself does not track
+    /// which markets have been settled.
+    pub fn credit_bankroll(&self, amount: Decimal) -> Result<Decimal, PaperStateError> {
+        let conn = self.lock();
+        let current = read_bankroll(&conn)?;
+        let new = current
+            .checked_add(amount)
+            .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
+        conn.execute(
+            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
+            params![BANKROLL_ROW_ID, new.to_string()],
+        )?;
+        Ok(new)
+    }
+
+    /// Number of fills recorded in the `fills` table.
+    pub fn fills_count(&self) -> Result<usize, PaperStateError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM fills", [], |row| row.get(0))?;
+        usize::try_from(n)
+            .map_err(|_| PaperStateError::Internal(format!("fills_count {n} exceeds usize::MAX")))
+    }
+
     // ── Reconciliation cursor ────────────────────────────────────────────────
 
     /// The highest event-log `seq` whose fill has been mirrored into SQLite.
@@ -810,6 +838,30 @@ mod tests {
         assert_eq!(db.cursor(&w).unwrap(), Some(1_700_000_000));
         db.set_cursor(&w, 1_700_000_500).unwrap();
         assert_eq!(db.cursor(&w).unwrap(), Some(1_700_000_500));
+    }
+
+    #[test]
+    fn credit_bankroll_adds_to_balance() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(100)).unwrap();
+        let new = db.credit_bankroll(dec!(25)).unwrap();
+        assert_eq!(new, dec!(125));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(125)));
+    }
+
+    #[test]
+    fn fills_count_increments_per_commit() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(1000)).unwrap();
+        assert_eq!(db.fills_count().unwrap(), 0);
+        db.commit_fill(
+            &SourceTradeId("a".to_string()),
+            &leader(10, 0),
+            &fill("k1", Side::Buy, 10, dec!(0.50)),
+            EventSeq(1),
+        )
+        .unwrap();
+        assert_eq!(db.fills_count().unwrap(), 1);
     }
 
     #[test]
