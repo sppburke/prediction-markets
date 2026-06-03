@@ -412,14 +412,22 @@ async fn tick_resolution(
             .cloned()
             .collect();
         let credit = PnlLedger::resolution_credit(&market_positions, &res.outcome_prices);
+        // Write sidecar before crediting bankroll: a crash after sidecar but before SQLite
+        // means the market is already marked settled, so the next poll skips it (under-credit,
+        // not over-credit). The reverse order would double-credit on restart.
+        store
+            .mark_settled(
+                res.market_id.clone(),
+                res.outcome_prices.clone(),
+                credit,
+                now_unix,
+            )
+            .context("mark settled")?;
         if credit > rust_decimal::Decimal::ZERO {
             paper_state
                 .credit_bankroll(credit)
                 .context("credit bankroll")?;
         }
-        store
-            .mark_settled(res.market_id.clone(), res.outcome_prices, credit, now_unix)
-            .context("mark settled")?;
         tracing::info!(market = %res.market_id, %credit, "resolution applied");
     }
     Ok(())
