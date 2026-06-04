@@ -24,32 +24,16 @@ Trigger a re-evaluation when **any** of these is true:
 
 ## Re-evaluation process
 
-### Step 1 — Refresh the DB
+The exact, verified command sequence lives in the operational runbook:
+[`26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md).
+This section covers only the **review gate** (Step 4 of the runbook) — the
+decision criteria that determine whether a freshly-constructed cohort is fit to
+deploy.
 
-```bash
-# Update wallet_features for the new cutoff
-PE_SKILL_CACHE_PATH=data/wallet_cache.db \
-PE_SKILL_CUTOFF_UNIX=<new_month_end_unix> \
-  ./target/release/pe-skill-select extract
-```
+Before reviewing, run runbook Part 1 (backfill) then Part 2 Steps 1–3 (extract →
+rank → construct). That produces an eval JSON under `data/eval-results/`.
 
-If a month has passed, add `PE_SKILL_EXTRACT_CLEAN_PRIOR=1` to avoid ghost rows from the previous extract.
-
-### Step 2 — Run portfolio_constructor
-
-```bash
-.venv-analysis/bin/python3 scripts/portfolio_constructor.py \
-  --db-path data/wallet_cache.db \
-  --target-n <see scaling table> \
-  --pbo-perms 100 \
-  --out data/eval-results/<timestamp>-pbo_n<N>_validate.json
-```
-
-The script selects the cohort size N that maximises mean forward edge subject to:
-- `credible = true` (PBO ≤ 0.5, 0 negative anchors)
-- `n_anchors_negative = 0`
-
-### Step 3 — Review the output
+### Deploy gate — review the eval JSON
 
 Open `data/eval-results/<timestamp>-pbo_n<N>_validate.json` and check:
 
@@ -60,26 +44,9 @@ Open `data/eval-results/<timestamp>-pbo_n<N>_validate.json` and check:
 | `n_anchors_negative` | 0 | Any negative anchor = regime risk |
 | `pbo.pbo` | ≤ 0.5 | Above 0.5 = overfit signal, do not deploy |
 
-If gating passes, proceed. If not:
+If gating passes, continue to runbook Part 2 Steps 5–6 (export + deploy). If not:
 - Try a smaller N (more concentrated = more stable).
 - If the most recent anchor is negative, the current month may be a regime shift — hold the existing cohort and re-check in 2 weeks.
-
-### Step 4 — Update the watchlist
-
-```bash
-# Regenerate the Watchlist JSON
-python3 scripts/export_watchlist.py \
-  --input data/eval-results/watchlist-<timestamp>-pbo_n<N>_validate.txt \
-  --output data/watchlist-production-n<N>.json \
-  --snapshot-at <timestamp>
-```
-
-Update `smoke-test/service.toml`:
-```toml
-seed_watchlist_path = "data/watchlist-production-n<N>.json"
-```
-
-Restart `pe-service`. The old cohort keeps running until the process restarts.
 
 ---
 
