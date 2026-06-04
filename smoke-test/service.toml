@@ -2,7 +2,7 @@
 # Secrets injected via PE_* env vars from .env.
 # Run: set -a; source .env; set +a; ./target/release/pe-service smoke-test/service.toml
 
-bind                             = "127.0.0.1:9090"
+bind                             = "0.0.0.0:8080"
 
 # Backfill ~2 weeks of Polygon blocks to seed the funding-graph with recent funder data
 # (~100k blocks ≈ 2 days; enough to capture active funders without a multi-hour backfill).
@@ -14,7 +14,10 @@ polygon_channel_capacity         = 256
 polymarket_base_url              = "https://data-api.polymarket.com"
 polymarket_channel_capacity      = 256
 
-watchlist_size                   = 20
+# Seed-only cohort: 0 means the live leaderboard contributes no wallets, so the
+# watchlist is exactly the seed file below. Startup always fetches + merges the
+# leaderboard, so this is the only way to follow ONLY the validated cohort.
+watchlist_size                   = 0
 trade_poll_interval_secs         = 30
 # Production 10-wallet cohort (portfolio_constructor greedy, 2026-06-03 PBO validation).
 seed_watchlist_path              = "data/watchlist-production-n10.json"
