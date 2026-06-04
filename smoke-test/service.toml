@@ -26,3 +26,9 @@ operator_graph_rebuild_cadence_secs = 60
 
 bankroll_usd                     = "10000"
 mode                             = "paper"
+
+# Flat sizing: bypasses Kelly (which requires calibrated win_rate_bps).
+# Until export-watchlist populates win_rate_bps from the bootstrap DB,
+# Kelly returns p=0 → NoEdge on every signal. $25/trade is safe for paper.
+[strategy]
+flat_usd_per_trade               = "25"
