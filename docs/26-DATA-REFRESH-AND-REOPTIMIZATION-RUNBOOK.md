@@ -62,6 +62,7 @@ not new discovery.)
 # 1. Refresh trades + resolutions for all stale active wallets (incremental).
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_POLYGON_RPC_URL=<polygon-rpc-url> \   # optional; improves resolution coverage
+PE_BOOTSTRAP_POLYMARKET_DELTA_MODE=off \           # REQUIRED on free-tier RPC — see Delta-mode note below
   ./target/release/pe-bootstrap backfill
 
 # 2. Refresh condition→event + fee mappings (needed by the ranker's
@@ -74,7 +75,42 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 \
   ./target/release/pe-bootstrap resolutions
+
+# 4. Backfill scheduled end_date for resolved markets missing a schedule row
+#    (RPC-free; Gamma &closed=true). Required for any time-to-resolution analysis —
+#    without it the TTR filter must fall back to on-chain resolved_at, which LEAKS
+#    future info (see the end_date-coverage note below). Idempotent; safe to re-run.
+PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
+  ./target/release/pe-bootstrap schedules
 ```
+
+> **Delta-mode note (important on a free-tier Polygon RPC).** `backfill` defaults to
+> `DeltaMode::Shadow` (`crates/bootstrap/src/lib.rs:88`), which runs an audit-only
+> on-chain `eth_getLogs` scan over the CTF block range *before* fetching any trades.
+> Free-tier Polygon RPC providers cap `eth_getLogs` at a **10-block** range, so that
+> scan bisects down to 10-block windows and is impractical across the ~900k-block gap —
+> it stalls the run before a single trade is fetched, while adding **no** wallets and
+> **no** trades (the scan is audit-only; in Shadow it never changes the fetch set —
+> `backfill.rs:108-112`). For a pure backfill on a free-tier RPC, set
+> `PE_BOOTSTRAP_POLYMARKET_DELTA_MODE=off`: this skips the scan and fetches every due
+> wallet directly, which is still "no new wallets". Reserve Shadow/Delta for a paid RPC
+> that allows wide `getLogs` ranges. (Verified 2026-06-04: a Shadow run logged
+> thousands of `response cap hit, bisecting` warnings and never reached trade-fetch;
+> the `off` run started fetching immediately.)
+
+> **end_date coverage note (look-ahead safety).** Any "time-to-resolution" / expiry
+> analysis must reference the *scheduled* `market_schedules.end_date_unix` (known at
+> entry), never `market_resolutions.resolved_at_unix` (on-chain settlement, known only
+> *after* the fact). Using `resolved_at` as the cutoff admits post-event and
+> early-resolution trades and inflates edge (verified 2026-06-05: on markets with both
+> refs, the resolved_at cutoff added 43% "leaked-in" positions and flipped population
+> edge −1.8% → 0). Closed markets never fetched while open have no schedule row, so
+> stages 6d/6f miss them; **step 4 (`pe-bootstrap schedules`, stage 6g)** backfills them
+> via Gamma `&closed=true`. For a large one-time backlog, `scripts/backfill_end_dates.py`
+> does the same via batched requests (~1200 markets/s vs the Rust per-ID ~20 req/s).
+> The 2026-06-05 backfill lifted resolved-market `end_date` coverage 45% → 90%; the
+> residual ~10% are markets Gamma no longer lists (exclude them — never fall back to
+> `resolved_at`).
 
 **Exit codes** (all `pe-bootstrap` subcommands): `0` = success, `1` = fatal,
 `2` = partial (some wallets failed — safe to re-run; it retries the failures).

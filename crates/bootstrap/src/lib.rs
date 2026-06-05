@@ -130,6 +130,9 @@ impl ResolutionsReport {
 /// - 6d. Gamma schedules → `source='gamma'` (open markets only).
 /// - 6e. Gamma liquidity → only Gamma exposes liquidity (open markets).
 /// - 6f. Gamma null-schedule rewrite pass (issue #137 Sub-PR 2).
+/// - 6g. Gamma schedule backfill for resolved-but-unscheduled markets (issue #137
+///   durable follow-up): inserts a `market_schedules` row for resolved markets that
+///   never had their schedule fetched while open.
 ///
 /// `open_ids` is computed AFTER 6a/6b/6c so Gamma only fetches truly-still-open
 /// markets. `market_ids` scopes the run — pass `cache.all_market_ids()` for the
@@ -177,6 +180,10 @@ pub async fn fetch_resolutions_and_schedules(
     if let Err(e) = run_gamma_null_rewrite(config, cache, market_ids).await {
         tracing::warn!(error = %e, stage = "gamma_null_rewrite", "resolutions: stage soft-failed, continuing");
         stages_failed.push("gamma_null_rewrite");
+    }
+    if let Err(e) = run_schedule_backfill(config, cache, market_ids).await {
+        tracing::warn!(error = %e, stage = "schedule_backfill", "resolutions: stage soft-failed, continuing");
+        stages_failed.push("schedule_backfill");
     }
 
     Ok(ResolutionsReport { stages_failed })
@@ -334,6 +341,50 @@ async fn run_gamma_null_rewrite(
         );
     }
     Ok(())
+}
+
+/// 6g. Gamma schedule backfill for resolved-but-unscheduled markets (issue #137
+/// durable follow-up). Stage 6d fetches open markets only and stage 6f rewrites
+/// only existing NULL rows, so a market that resolved before its schedule was ever
+/// fetched is left with NO `market_schedules` row forever. This stage fetches
+/// `endDate` for those markets via Gamma's `&closed=true` variant (RPC-independent)
+/// and INSERTs a row — even when `endDate` is absent — so the market is marked
+/// attempted and not re-fetched. Scoped to `resolved ∩ market_ids − scheduled`.
+pub async fn run_schedule_backfill(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    market_ids: &[String],
+) -> Result<usize, BootstrapError> {
+    use pe_source_polymarket_public::ReqwestFetcher;
+    let resolved = cache.resolved_market_ids();
+    let scheduled = cache.scheduled_market_ids();
+    let candidate_set: HashSet<String> = market_ids.iter().cloned().collect();
+    let missing: Vec<String> = resolved
+        .iter()
+        .filter(|id| !scheduled.contains(*id) && candidate_set.contains(*id))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        tracing::info!("bootstrap: gamma schedule backfill — no missing-schedule markets");
+        return Ok(0);
+    }
+    let gamma_client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| BootstrapError::Internal)?;
+    let gamma_fetcher = gamma::GammaFetcher::new(
+        config.gamma_base_url.clone(),
+        ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
+    );
+    let inserted = gamma_fetcher
+        .backfill_missing_schedules(&missing, cache)
+        .await?;
+    tracing::info!(
+        inserted,
+        candidates = missing.len(),
+        "bootstrap: gamma schedule backfill complete"
+    );
+    Ok(inserted)
 }
 
 /// Return every market in `all` that is not present in `resolved`.

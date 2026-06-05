@@ -221,6 +221,90 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         Ok(rewritten)
     }
 
+    /// Backfill `market_schedules` rows for resolved markets that never had their
+    /// schedule fetched while open (issue #137 durable follow-up).
+    ///
+    /// Background: stage 6d (`fetch_schedules`) only fetches still-open markets, and
+    /// stage 6f (`rewrite_null_schedules`) only rewrites *existing* NULL rows. A market
+    /// that resolved before its schedule was ever fetched therefore has NO
+    /// `market_schedules` row at all, and neither pass ever creates one. This method
+    /// closes that gap by fetching `endDate` via the `&closed=true` URL variant — the
+    /// same variant `rewrite_null_schedules` uses, RPC-independent — and inserting a row
+    /// for every passed `market_id`.
+    ///
+    /// Unlike [`Self::rewrite_null_schedules`] (which UPDATEs existing NULL rows), this
+    /// method INSERTs via [`WalletCache::insert_schedule`] (`INSERT OR IGNORE`). A row is
+    /// inserted even when `endDate` is `None`, so the market enters the skip-set and is
+    /// not re-fetched on the next run.
+    ///
+    /// Caller is responsible for scoping `market_ids` to the unscheduled-resolved set.
+    /// Returns the count of rows that received a non-NULL `endDate`.
+    pub async fn backfill_missing_schedules(
+        &self,
+        market_ids: &[String],
+        cache: &mut WalletCache,
+    ) -> Result<usize, BootstrapError> {
+        let total = market_ids.len();
+        info!(
+            total,
+            concurrency = GAMMA_CONCURRENCY,
+            "gamma: starting missing-schedule backfill pass"
+        );
+
+        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let fetcher = &self.fetcher;
+        let base_url = self.base_url.as_str();
+
+        let mut stream = stream::iter(market_ids.iter().cloned())
+            .map(|market_id| async move {
+                let url = format!("{base_url}/markets?condition_ids={market_id}&closed=true");
+                let result = fetcher.fetch_page(&url).await;
+                (market_id, result)
+            })
+            .buffer_unordered(GAMMA_CONCURRENCY);
+
+        let mut inserted = 0usize;
+        let mut processed = 0usize;
+        while let Some((market_id, result)) = stream.next().await {
+            processed += 1;
+            if processed.is_multiple_of(1_000) {
+                info!(
+                    processed,
+                    total, inserted, "gamma: missing-schedule backfill progress"
+                );
+            }
+
+            let bytes = match result {
+                Ok(b) => b,
+                Err(SourceError::Fatal { message }) => {
+                    tracing::warn!(%market_id, error = %message, "gamma: backfill fetch error, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(BootstrapError::Gamma {
+                        message: format!("backfill schedule {market_id}: {e}"),
+                    });
+                }
+            };
+
+            let end_date_unix = match parse_gamma_schedule(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(%market_id, error = %e, "gamma: backfill parse error, inserting NULL");
+                    None
+                }
+            };
+
+            cache.insert_schedule(&market_id, end_date_unix, fetched_at)?;
+            if end_date_unix.is_some() {
+                inserted += 1;
+            }
+        }
+
+        info!(inserted, total, "gamma: missing-schedule backfill complete");
+        Ok(inserted)
+    }
+
     /// Fetch Gamma `liquidity` (current order-book depth indicator) for every market ID
     /// not already present in `cache`.
     ///
@@ -693,6 +777,84 @@ mod tests {
         let sched = idx.values().next().unwrap();
         assert_eq!(sched.end_date_unix, None, "end_date_unix must be NULL");
         // NULL row must also be in the skip-set.
+        assert_eq!(cache.scheduled_market_ids().len(), 1);
+    }
+
+    #[test]
+    fn backfill_missing_schedules_inserts_parsed_end_date_for_closed_market() {
+        // A resolved-but-unscheduled market: no prior market_schedules row.
+        // backfill_missing_schedules must INSERT a row carrying the parsed endDate
+        // from the &closed=true variant and return inserted=1.
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        // No insert_schedule beforehand — the market has NO schedule row.
+        assert!(cache.scheduled_market_ids().is_empty());
+
+        let closed_url =
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcond&closed=true";
+        let mut responses = HashMap::new();
+        responses.insert(closed_url.to_owned(), closed_with_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let inserted = rt
+            .block_on(gamma.backfill_missing_schedules(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(
+            inserted, 1,
+            "closed market with endDate must count as 1 insert"
+        );
+
+        let idx = cache.load_all_schedules().unwrap();
+        assert_eq!(idx.len(), 1, "exactly one schedule row must be inserted");
+        let sched = idx.values().next().unwrap();
+        assert_eq!(
+            sched.end_date_unix,
+            Some(1_705_276_800),
+            "end_date must be the parsed closed-market value"
+        );
+        // Row is in the skip-set so it is not re-fetched next run.
+        assert_eq!(cache.scheduled_market_ids().len(), 1);
+    }
+
+    #[test]
+    fn backfill_missing_schedules_inserts_null_row_when_no_end_date() {
+        // Closed market with endDate absent (1/100 case). A row must still be
+        // INSERTed (NULL) so the market is marked attempted, but the inserted
+        // counter — which counts non-NULL endDates — must stay 0.
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        assert!(cache.scheduled_market_ids().is_empty());
+
+        let closed_url =
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcond&closed=true";
+        let mut responses = HashMap::new();
+        responses.insert(closed_url.to_owned(), closed_no_end_date_fixture());
+        let fetcher = FixtureFetcher::new(responses);
+        let gamma = GammaFetcher::new("https://gamma-api.polymarket.com".to_owned(), fetcher);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let inserted = rt
+            .block_on(gamma.backfill_missing_schedules(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(inserted, 0, "no endDate → non-NULL counter stays 0");
+
+        let idx = cache.load_all_schedules().unwrap();
+        assert_eq!(
+            idx.len(),
+            1,
+            "a NULL row must still be inserted (marked attempted)"
+        );
+        let sched = idx.values().next().unwrap();
+        assert_eq!(sched.end_date_unix, None, "end_date_unix must be NULL");
+        // NULL row is still in the skip-set so it is not re-fetched next run.
         assert_eq!(cache.scheduled_market_ids().len(), 1);
     }
 }

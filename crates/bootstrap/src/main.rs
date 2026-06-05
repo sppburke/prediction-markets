@@ -5,6 +5,7 @@ use pe_bootstrap::{
     config, coverage, discovery, enumerate,
     error::BootstrapError,
     fetch, fetch_resolutions_and_schedules, funder, infra_probe, lock, migrate, pile,
+    run_schedule_backfill,
     seed_historical::{self, parse_seed_as_of_env},
     watchlist_phase, weekly,
 };
@@ -42,6 +43,7 @@ async fn main() {
                 | "funder"
                 | "watchlist"
                 | "resolutions"
+                | "schedules"
                 | "events"
                 | "counterparty-edges"
                 | "reconcile-volume"
@@ -366,6 +368,20 @@ async fn main() {
                     1
                 }
             },
+
+            "schedules" => {
+                let all_ids = cache.all_market_ids();
+                match run_schedule_backfill(&bootstrap_config, &mut cache, &all_ids).await {
+                    Ok(inserted) => {
+                        tracing::info!(inserted, "schedules: complete");
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "schedules: fatal");
+                        1
+                    }
+                }
+            }
 
             "counterparty-edges" => match pe_bootstrap::counterparty_edges::run_counterparty_edges(
                 &bootstrap_config,
