@@ -32,6 +32,17 @@ operator_graph_rebuild_cadence_secs = 60
 bankroll_usd                     = "10000"
 mode                             = "paper"
 
+# Copy-entry gate (issue #290): align live copies with the band-cohort selection —
+# first-ever entry into a market, leader entry price in [0.40, 0.80], <72h to
+# resolution. Hold-to-resolution is enforced by the orchestrator's filled-positions set.
+wallet_market_history_path       = "smoke-test/wallet_market_history.json"
+entry_gate_price_band_lo         = "0.40"
+entry_gate_price_band_hi         = "0.80"
+# fail-open: a wallet whose history could not be fetched (first-run API failure) is
+# treated as new (copies allowed); the loader warns per absent wallet. Set true to block.
+entry_gate_fail_closed           = false
+max_resolution_horizon_secs      = 259200  # 72 h
+
 # Flat sizing: bypasses Kelly. The n13 watchlist DOES carry real win_rate_bps
 # (6316–8750), so Kelly is now available — remove flat_usd_per_trade to enable it.
 # Kept flat ($25/trade) for now as a safe, comparable paper baseline.

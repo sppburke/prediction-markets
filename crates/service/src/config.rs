@@ -149,9 +149,32 @@ pub struct ServiceConfig {
     pub gamma_resolution_poll_interval_secs: u64,
 
     /// Drop entry signals whose market `endDate` is further than this many seconds
-    /// into the future. Set to 0 to disable. Default: 172_800 (48 h).
+    /// into the future. Set to 0 to disable. Default: 259_200 (72 h) — aligned with
+    /// the band-cohort "<72 h before resolution" selection criterion (issue #290).
     #[serde(default = "default_max_resolution_horizon_secs")]
     pub max_resolution_horizon_secs: u64,
+
+    // ── Copy-entry gate (band-cohort alignment, issue #290) ───────────────────
+    /// Path to the JSON sidecar tracking each leader's previously-entered markets,
+    /// used by the first-entry gate. See `docs/_GLOSSARY.md`: `wallet_market_history_path`.
+    #[serde(default = "default_wallet_market_history_path")]
+    pub wallet_market_history_path: PathBuf,
+
+    /// Inclusive lower bound on the leader's entry price for a copy. Decimal string.
+    /// See `docs/_GLOSSARY.md`: `entry_gate_price_band_lo`.
+    #[serde(default = "default_entry_gate_price_band_lo")]
+    pub entry_gate_price_band_lo: String,
+
+    /// Inclusive upper bound on the leader's entry price for a copy. Decimal string.
+    /// See `docs/_GLOSSARY.md`: `entry_gate_price_band_hi`.
+    #[serde(default = "default_entry_gate_price_band_hi")]
+    pub entry_gate_price_band_hi: String,
+
+    /// First-entry gate posture for wallets whose history could not be loaded:
+    /// `false` (default) fails open (copies allowed), `true` fails closed (blocked).
+    /// See `docs/_GLOSSARY.md`: `entry_gate_fail_closed`.
+    #[serde(default)]
+    pub entry_gate_fail_closed: bool,
 
     // ── Operator graph ───────────────────────────────────────────────────────
     /// Rebuild cadence for `OperatorGraphScheduler` in seconds.
@@ -249,7 +272,19 @@ const fn default_trade_poll_interval_secs() -> u64 {
 }
 
 const fn default_max_resolution_horizon_secs() -> u64 {
-    48 * 3600 // 172_800 s = 48 h
+    72 * 3600 // 259_200 s = 72 h (band-cohort "<72 h before resolution" criterion)
+}
+
+fn default_wallet_market_history_path() -> PathBuf {
+    PathBuf::from("./wallet_market_history.json")
+}
+
+fn default_entry_gate_price_band_lo() -> String {
+    "0.40".to_string()
+}
+
+fn default_entry_gate_price_band_hi() -> String {
+    "0.80".to_string()
 }
 
 const fn default_position_reseed_interval_secs() -> u64 {
@@ -349,6 +384,10 @@ impl Default for ServiceConfig {
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
+            wallet_market_history_path: default_wallet_market_history_path(),
+            entry_gate_price_band_lo: default_entry_gate_price_band_lo(),
+            entry_gate_price_band_hi: default_entry_gate_price_band_hi(),
+            entry_gate_fail_closed: false,
             operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
             funding_max_hops: default_funding_max_hops(),
             funder_source: default_funder_source(),
@@ -420,6 +459,10 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
+        "wallet_market_history_path",
+        "entry_gate_price_band_lo",
+        "entry_gate_price_band_hi",
+        "entry_gate_fail_closed",
         "operator_graph_rebuild_cadence_secs",
         "funding_max_hops",
         "funder_source",
@@ -465,6 +508,14 @@ mod tests {
         assert_eq!(cfg.position_reseed_interval_secs, 300);
         assert_eq!(cfg.position_page_limit, 500);
         assert_eq!(cfg.position_size_threshold, 1);
+        assert_eq!(cfg.max_resolution_horizon_secs, 259_200);
+        assert_eq!(
+            cfg.wallet_market_history_path,
+            PathBuf::from("./wallet_market_history.json")
+        );
+        assert_eq!(cfg.entry_gate_price_band_lo, "0.40");
+        assert_eq!(cfg.entry_gate_price_band_hi, "0.80");
+        assert!(!cfg.entry_gate_fail_closed);
     }
 
     #[test]

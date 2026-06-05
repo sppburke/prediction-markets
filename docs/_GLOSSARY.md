@@ -307,7 +307,19 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `paper_resolutions_path` | `./paper_resolutions.json` | Path to the JSON sidecar tracking settled-market resolution prices and bankroll credits. Loaded by `PnlLedger` and the `--report` flag; crash-safe atomic write |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
 | `gamma_resolution_poll_interval_secs` | 3600 | Seconds between Gamma resolution poll rounds in the live service. 1-hour cadence is sufficient because market resolution propagates on a minutes-to-hours timescale |
-| `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market `endDate` is further than this many seconds into the future. 0 disables the gate. Guards against locking capital in months-long markets. |
+| `max_resolution_horizon_secs` | 259_200 (72 h) | `ServiceConfig` field. Drop entry signals whose market `endDate` is further than this many seconds into the future. 0 disables the gate. Aligned with the band-cohort "<72 h before resolution" selection criterion (issue #290); guards against locking capital in months-long markets. |
+
+### Copy-entry gate (band-cohort alignment, issue #290)
+
+Aligns the live copy path with the 13-wallet "72hr buy-and-hold band" cohort selection criteria. See `docs/19-WINNER-FOLLOW-STRATEGY.md` "Copy-scope gates" for the full gate sequence and fail posture.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `wallet_market_history_path` | `./wallet_market_history.json` | `ServiceConfig` field. Path to the JSON sidecar tracking each leader's previously-entered markets (loaded/merged/persisted at startup by `crate::wallet_history`). Drives the first-entry gate. |
+| `entry_gate_price_band_lo` | `0.40` | `ServiceConfig` field (decimal string). **Inclusive** lower bound on the leader's entry price for a copy. Checked against `signal.leader_price`. |
+| `entry_gate_price_band_hi` | `0.80` | `ServiceConfig` field (decimal string). **Inclusive** upper bound on the leader's entry price for a copy. Must be `> entry_gate_price_band_lo` (validated at startup). |
+| `entry_gate_fail_closed` | `false` | `ServiceConfig` field. Posture for a wallet absent from the history map (fetch failed, no stale sidecar): `false` fails open (copies allowed, treat as new), `true` fails closed (blocked). The loader warns per absent wallet either way. |
+| `history_max_pages` | 200 | **Module const** in `crates/service/src/wallet_history.rs` (not a TOML/env key). Safety backstop: per-wallet history pagination stops after this many 500-trade pages; a `warn!` is emitted if hit (older markets may be missed → possible false first-entry). |
 
 ### Polygon on-chain source (`PolygonConnectorConfig`)
 

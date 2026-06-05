@@ -35,6 +35,7 @@ use pe_funding_graph::FundingGraphAccumulator;
 use pe_operator_graph::OperatorIdentity;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
+use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
@@ -133,6 +134,16 @@ fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, Posi
     mpsc::channel(1).1
 }
 
+/// Copy-entry gate disabled for these correctness tests: full [0,1] band,
+/// fail-open. Paired with an empty history map so every first Entry is admitted.
+fn disabled_entry_gate() -> CopyEntryGateConfig {
+    CopyEntryGateConfig {
+        price_band_lo: Price::ZERO,
+        price_band_hi: Price::ONE,
+        fail_closed: false,
+    }
+}
+
 fn paper_state_at(dir: &TempDir) -> Arc<PaperStateDb> {
     Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap())
 }
@@ -167,7 +178,9 @@ async fn run_trades(
             signal_config: SignalConfig::default(),
             cluster_observation_window_secs: 300,
             max_resolution_horizon_secs: 0, // disabled in tests
+            entry_gate_config: disabled_entry_gate(),
         },
+        HashMap::new(),
         WinnerFollowStrategy::new(strategy_cfg),
         make_dispatcher(dir),
         paper_state,
