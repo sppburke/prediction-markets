@@ -1,0 +1,387 @@
+//! Startup per-wallet market-history backfill for the copy-entry gate.
+//!
+//! [`WalletHistoryLoader::load`] fetches each watchlisted wallet's complete set
+//! of previously-entered markets from the free Polymarket Data API
+//! (`/activity?type=TRADE`, cursor-paginated to completeness), unions it with a
+//! stale JSON sidecar (so the gate works immediately and survives an API outage),
+//! persists the merged map atomically, and warns for every wallet it could not
+//! populate. The returned map seeds [`crate::entry_gate::CopyEntryGate`].
+//!
+//! Lives in `crates/service` (not the pure, no-I/O `copy-signal-engine`) because
+//! it performs network and filesystem I/O.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use pe_core_types::{MarketId, VenueMarketId, WalletAddress};
+use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+/// Safety backstop: stop paginating after this many pages per wallet. At 500
+/// trades/page that is 100k trades; a wallet exceeding it gets partial history
+/// (and a loud warn) — a market entered before the cap could be missed, causing
+/// a false "first entry".
+const HISTORY_MAX_PAGES: u32 = 200;
+
+/// Page size hardcoded by [`PolymarketEndpoint::UserTradeActivity`] (`limit=500`).
+/// A page shorter than this signals the wallet's trade history is exhausted.
+const HISTORY_PAGE_SIZE: usize = 500;
+
+// ── Sidecar ─────────────────────────────────────────────────────────────────
+
+/// On-disk JSON sidecar: each wallet's previously-entered markets.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct WalletHistorySidecar {
+    wallets: Vec<WalletHistoryEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WalletHistoryEntry {
+    wallet: WalletAddress,
+    markets: Vec<MarketId>,
+}
+
+// ── Fetch DTO ───────────────────────────────────────────────────────────────
+
+/// Minimal projection of a `/activity?type=TRADE` item: the market entered and
+/// the trade timestamp used as the pagination cursor.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryItem {
+    condition_id: String,
+    timestamp: i64,
+}
+
+// ── Fetch ─────────────────────────────────────────────────────────────────────
+
+/// Fetch the complete set of markets `wallet` has ever traded, paginating the
+/// trade-activity endpoint backwards by timestamp until a short/empty page.
+async fn fetch_history_for_wallet<F: PageFetcher>(
+    wallet: WalletAddress,
+    base_url: &str,
+    fetcher: &F,
+) -> Result<HashSet<MarketId>, anyhow::Error> {
+    let mut markets: HashSet<MarketId> = HashSet::new();
+    let mut end: Option<i64> = None;
+
+    for page_num in 0..HISTORY_MAX_PAGES {
+        let url = PolymarketEndpoint::UserTradeActivity {
+            user: wallet.to_string(),
+            end,
+            start: None,
+        }
+        .url(base_url);
+
+        let bytes = fetcher
+            .fetch_page(&url)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch page {page_num}: {e}"))?;
+        let items: Vec<HistoryItem> = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parse page {page_num}: {e}"))?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        let mut oldest = i64::MAX;
+        for item in &items {
+            // Normalise ms → s (mirrors trade_parser) so the cursor stays in seconds.
+            let ts = if item.timestamp > 9_999_999_999 {
+                item.timestamp / 1_000
+            } else {
+                item.timestamp
+            };
+            oldest = oldest.min(ts);
+            markets.insert(MarketId(VenueMarketId(item.condition_id.clone())));
+        }
+
+        if items.len() < HISTORY_PAGE_SIZE {
+            break; // short page → history exhausted
+        }
+        if page_num + 1 >= HISTORY_MAX_PAGES {
+            warn!(
+                wallet = %wallet,
+                pages = HISTORY_MAX_PAGES,
+                "wallet history fetch hit page cap; older markets may be missed (possible false first-entry)"
+            );
+            break;
+        }
+        // `end` is inclusive; step strictly older to avoid re-fetching the boundary.
+        end = Some(oldest.saturating_sub(1));
+    }
+
+    Ok(markets)
+}
+
+// ── Loader ──────────────────────────────────────────────────────────────────
+
+/// Startup loader for the per-wallet market history consumed by the copy-entry gate.
+pub struct WalletHistoryLoader;
+
+impl WalletHistoryLoader {
+    /// Load the per-wallet market history: stale sidecar ∪ fresh API fetch.
+    ///
+    /// Sequence: read the stale sidecar (warn and continue on error) → fetch each
+    /// wallet's complete history warn-and-continue → union into the map → persist
+    /// atomically (tmp + rename) → warn for every wallet still absent from the
+    /// final map (fetch failed and no stale data).
+    ///
+    /// A wallet present with an empty set is *known* to have no prior markets (every
+    /// entry is a first entry); a wallet absent is *unknown* and is governed by
+    /// `entry_gate_fail_closed` in [`crate::entry_gate::CopyEntryGate`].
+    pub async fn load<F: PageFetcher>(
+        wallets: &[WalletAddress],
+        base_url: &str,
+        sidecar_path: &Path,
+        fetcher: &F,
+    ) -> HashMap<WalletAddress, HashSet<MarketId>> {
+        let mut map = load_sidecar(sidecar_path);
+
+        for &wallet in wallets {
+            match fetch_history_for_wallet(wallet, base_url, fetcher).await {
+                Ok(markets) => {
+                    map.entry(wallet).or_default().extend(markets);
+                }
+                Err(e) => {
+                    warn!(
+                        wallet = %wallet,
+                        error = %e,
+                        "wallet history fetch failed; using stale sidecar if present"
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = persist_sidecar(sidecar_path, &map) {
+            warn!(
+                path = %sidecar_path.display(),
+                error = %e,
+                "failed to persist wallet history sidecar"
+            );
+        }
+
+        for &wallet in wallets {
+            if !map.contains_key(&wallet) {
+                warn!(
+                    wallet = %wallet,
+                    "no market history (fetch failed, no stale sidecar); first-entry gate governed by entry_gate_fail_closed"
+                );
+            }
+        }
+
+        map
+    }
+}
+
+/// Read the sidecar into a map. Missing file → empty map (first run). A malformed
+/// file is warned and treated as empty rather than aborting startup.
+fn load_sidecar(path: &Path) -> HashMap<WalletAddress, HashSet<MarketId>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to read wallet history sidecar; starting empty"
+            );
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_slice::<WalletHistorySidecar>(&bytes) {
+        Ok(s) => s
+            .wallets
+            .into_iter()
+            .map(|e| (e.wallet, e.markets.into_iter().collect()))
+            .collect(),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "malformed wallet history sidecar; starting empty"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Persist the map atomically (tmp + rename), mirroring `paper-pnl`'s sidecar write.
+fn persist_sidecar(
+    path: &Path,
+    map: &HashMap<WalletAddress, HashSet<MarketId>>,
+) -> Result<(), anyhow::Error> {
+    let sidecar = WalletHistorySidecar {
+        wallets: map
+            .iter()
+            .map(|(wallet, markets)| WalletHistoryEntry {
+                wallet: *wallet,
+                markets: markets.iter().cloned().collect(),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&sidecar)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::collections::HashMap;
+
+    use pe_source_polymarket_public::FixtureFetcher;
+
+    use super::*;
+
+    const BASE: &str = "https://api.example.com";
+
+    fn wallet() -> WalletAddress {
+        serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
+    }
+
+    fn activity_url(w: WalletAddress, end: Option<i64>) -> String {
+        PolymarketEndpoint::UserTradeActivity {
+            user: w.to_string(),
+            end,
+            start: None,
+        }
+        .url(BASE)
+    }
+
+    /// Build a JSON activity array of `n` items at a fixed `timestamp`, condition
+    /// IDs `0x<prefix><i>`.
+    fn page(prefix: &str, n: usize, timestamp: i64) -> Vec<u8> {
+        let items: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"conditionId":"0x{prefix}{i}","timestamp":{timestamp}}}"#))
+            .collect();
+        format!("[{}]", items.join(",")).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn single_short_page_extracts_markets() {
+        let w = wallet();
+        let mut responses = HashMap::new();
+        responses.insert(activity_url(w, None), page("c", 3, 2_000));
+        let fetcher = FixtureFetcher::new(responses);
+
+        let markets = fetch_history_for_wallet(w, BASE, &fetcher).await.unwrap();
+        assert_eq!(markets.len(), 3);
+        assert!(markets.contains(&MarketId(VenueMarketId("0xc0".into()))));
+    }
+
+    #[tokio::test]
+    async fn paginates_until_short_page() {
+        let w = wallet();
+        let mut responses = HashMap::new();
+        // Page 1: a full page of 500 items at ts=2000 → oldest=2000 → next end=1999.
+        responses.insert(activity_url(w, None), page("a", HISTORY_PAGE_SIZE, 2_000));
+        // Page 2: a short page (1 item) at end=1999 → stop.
+        responses.insert(activity_url(w, Some(1_999)), page("b", 1, 1_500));
+        let fetcher = FixtureFetcher::new(responses);
+
+        let markets = fetch_history_for_wallet(w, BASE, &fetcher).await.unwrap();
+        // 500 distinct from page 1 + 1 from page 2.
+        assert_eq!(markets.len(), HISTORY_PAGE_SIZE + 1);
+        assert!(markets.contains(&MarketId(VenueMarketId("0xb0".into()))));
+    }
+
+    #[tokio::test]
+    async fn empty_first_page_yields_empty_history() {
+        let w = wallet();
+        let mut responses = HashMap::new();
+        responses.insert(activity_url(w, None), b"[]".to_vec());
+        let fetcher = FixtureFetcher::new(responses);
+
+        let markets = fetch_history_for_wallet(w, BASE, &fetcher).await.unwrap();
+        assert!(markets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_unions_stale_sidecar_with_fetch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wallet_market_history.json");
+        let w = wallet();
+
+        // Seed a stale sidecar with one market the API will not return.
+        let stale = WalletHistorySidecar {
+            wallets: vec![WalletHistoryEntry {
+                wallet: w,
+                markets: vec![MarketId(VenueMarketId("0xstale".into()))],
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(activity_url(w, None), page("fresh", 2, 2_000));
+        let fetcher = FixtureFetcher::new(responses);
+
+        let map = WalletHistoryLoader::load(&[w], BASE, &path, &fetcher).await;
+        let set = map.get(&w).expect("wallet present");
+        assert!(
+            set.contains(&MarketId(VenueMarketId("0xstale".into()))),
+            "stale retained"
+        );
+        assert!(
+            set.contains(&MarketId(VenueMarketId("0xfresh0".into()))),
+            "fresh unioned"
+        );
+        assert_eq!(set.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn load_fetch_failure_keeps_stale() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wallet_market_history.json");
+        let w = wallet();
+
+        let stale = WalletHistorySidecar {
+            wallets: vec![WalletHistoryEntry {
+                wallet: w,
+                markets: vec![MarketId(VenueMarketId("0xstale".into()))],
+            }],
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        // No fixture for the activity URL → fetch fails; stale entry must remain.
+        let fetcher = FixtureFetcher::new(HashMap::new());
+        let map = WalletHistoryLoader::load(&[w], BASE, &path, &fetcher).await;
+        let set = map.get(&w).expect("wallet present from stale");
+        assert!(set.contains(&MarketId(VenueMarketId("0xstale".into()))));
+    }
+
+    #[tokio::test]
+    async fn load_absent_wallet_omitted_on_fetch_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wallet_market_history.json");
+        let w = wallet();
+
+        // No sidecar, no fixture → fetch fails and wallet is absent from the map
+        // (the gate then governs it via entry_gate_fail_closed).
+        let fetcher = FixtureFetcher::new(HashMap::new());
+        let map = WalletHistoryLoader::load(&[w], BASE, &path, &fetcher).await;
+        assert!(!map.contains_key(&w), "absent wallet not in map");
+    }
+
+    #[tokio::test]
+    async fn load_persists_atomically_and_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wallet_market_history.json");
+        let w = wallet();
+
+        let mut responses = HashMap::new();
+        responses.insert(activity_url(w, None), page("m", 2, 2_000));
+        let fetcher = FixtureFetcher::new(responses);
+
+        WalletHistoryLoader::load(&[w], BASE, &path, &fetcher).await;
+        assert!(path.exists(), "sidecar persisted");
+
+        // Re-load from disk only (empty fetcher, fetch fails) → persisted data survives.
+        let empty = FixtureFetcher::new(HashMap::new());
+        let map = WalletHistoryLoader::load(&[w], BASE, &path, &empty).await;
+        let set = map.get(&w).expect("wallet present from persisted sidecar");
+        assert!(set.contains(&MarketId(VenueMarketId("0xm0".into()))));
+    }
+}

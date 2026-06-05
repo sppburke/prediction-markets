@@ -21,8 +21,8 @@ use pe_copy_signal_engine::{
     IncomingTrade, PositionSnapshot, SignalConfig, WalletProfile, classify_trade,
 };
 use pe_core_types::{
-    EventSeq, MarketOutcomeId, OperatorId, Probability, ReconstructionQuality, SourceTimestamp,
-    TraderId, VenueId, WalletAddress,
+    EventSeq, MarketId, MarketOutcomeId, OperatorId, Probability, ReconstructionQuality,
+    SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_funding_graph::FundingGraphAccumulator;
@@ -40,6 +40,7 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
+use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::health::SharedHealth;
 use crate::market_end_cache::MarketEndCache;
 
@@ -52,8 +53,11 @@ pub struct OrchestratorConfig {
     /// Default from `_GLOSSARY.md`: `cluster_observation_window_secs = 300`.
     pub cluster_observation_window_secs: u64,
     /// Drop signals whose market `endDate` is further than this many seconds into
-    /// the future. 0 disables the filter. Default: 48 h (172_800 s).
+    /// the future. 0 disables the filter. Default: 72 h (259_200 s).
     pub max_resolution_horizon_secs: u64,
+    /// Copy-entry gate config (price band + fail-closed posture). The per-wallet
+    /// market history is supplied separately to [`Orchestrator::new`].
+    pub entry_gate_config: CopyEntryGateConfig,
 }
 
 pub struct Orchestrator<C: CLOBClient> {
@@ -76,6 +80,9 @@ pub struct Orchestrator<C: CLOBClient> {
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
+    // Copy-entry gate: admits only first-ever entries into a market within the
+    // price band (band-cohort alignment, issue #290).
+    entry_gate: CopyEntryGate,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
@@ -91,6 +98,7 @@ impl<C: CLOBClient> Orchestrator<C> {
         operator_identities: watch::Receiver<Vec<OperatorIdentity>>,
         watchlist: Watchlist,
         config: OrchestratorConfig,
+        history_map: HashMap<WalletAddress, HashSet<MarketId>>,
         strategy: WinnerFollowStrategy,
         dispatcher: ExecutionDispatcher<C>,
         paper_state: Arc<PaperStateDb>,
@@ -129,6 +137,7 @@ impl<C: CLOBClient> Orchestrator<C> {
             market_end_cache,
             max_resolution_horizon_secs: config.max_resolution_horizon_secs,
             filled_positions,
+            entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
             reseed_rx,
         })
@@ -290,6 +299,23 @@ impl<C: CLOBClient> Orchestrator<C> {
             self.commit_no_fill(&trade, &leader_row);
             return;
         }
+
+        // Copy-entry gate: copy only first-ever entries into a market within the
+        // price band (band-cohort alignment, issue #290).
+        if let Some(reason) = self.entry_gate.admit(&signal) {
+            info!(
+                reason = %reason,
+                market = %signal.market_id,
+                leader_price = %signal.leader_price.0,
+                "signal did not produce order",
+            );
+            self.commit_no_fill(&trade, &leader_row);
+            return;
+        }
+        // Record the admitted entry so a same-session re-entry into this market is
+        // blocked even if a later gate or the strategy rejects this signal.
+        self.entry_gate
+            .record_entry(signal.leader.0, &signal.market_id);
 
         // Resolution-horizon gate: drop signals for markets that close too far out.
         if self.max_resolution_horizon_secs > 0 {

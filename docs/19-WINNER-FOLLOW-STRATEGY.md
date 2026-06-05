@@ -455,6 +455,23 @@ prefer_market_order                  = false # only true when "very liquid" gate
 
 The TOML above is the only authoritative copy. README, `04-PHASE-TRADING-STRATEGY.md`, and `14-COMPLIANCE-AND-RISK.md` reference this block by file path.
 
+## Copy-scope gates (service-side, issue #290)
+
+These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below, and align the live copy path with the 13-wallet "72hr buy-and-hold band" cohort selection criteria: a copied trade must be a **first-ever entry** into a market, at a **leader entry price in `[0.40, 0.80]`**, entered **< 72 h before resolution**, and **held to resolution**. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`).
+
+Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → classify:
+
+| # | Gate | Condition (copy iff …) | Source | Rationale |
+|---|---|---|---|---|
+| A | Hold-to-resolution | `(market, outcome)` not already held | `orchestrator.rs` `filled_positions` set | The cohort wallets sell winners early; dropping every later signal on a held contract (including the leader's own exits) reproduces copy-and-hold, capturing the full move. Re-seeded from `paper_positions()` on restart. **No code change in #290** — pre-existing behavior. |
+| B | First-ever entry | `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | `entry_gate.rs::admit` → `GateReject::NotAnEntry` / `NotFirstEntry` | The cohort was selected on first-ever market entries. Drops `Add`/`Trim`/`Exit`/`Flip` and re-entries. History is per-leader-wallet (`signal.leader.0`), backfilled at startup from the free Data API and a JSON sidecar (`wallet_market_history_path`); `record_entry` also blocks same-session re-entries. |
+| C | Price band | `entry_gate_price_band_lo ≤ signal.leader_price ≤ entry_gate_price_band_hi` (inclusive) | `entry_gate.rs::admit` → `GateReject::PriceBelowBand` / `PriceAboveBand` | The cohort edge was measured on entries in the 0.40–0.80 mid-price band (favorite-heavy below/above distort the result). Band checked against the **leader's** entry price — the selection criterion — not the simulated fill. |
+| D | Resolution horizon | market `endDate` ≤ now + `max_resolution_horizon_secs` (72 h) | `orchestrator.rs` resolution-horizon block | "<72 h before resolution" criterion. `endDate` from `MarketEndCache` (Gamma), known at entry. 0 disables. A market with no known `endDate` is allowed through. |
+
+**Fail posture (gate B history unknown).** A leader absent from the merged history map (startup fetch failed **and** no stale sidecar) is governed by `entry_gate_fail_closed` (`_GLOSSARY.md`): default `false` = **fail-open** (treat as new, copy allowed) to preserve availability for paper-only operation; `true` = **fail-closed** (block its `Entry` signals until history is known). Either way the loader emits a per-wallet `warn!`, so on a first-ever run a fetch failure is visible rather than silent. **Accepted exposure:** under the default fail-open posture, a transient API outage on first run can admit a non-first-entry as if it were a first entry; set `entry_gate_fail_closed = true` to trade availability for strictness.
+
+A rejected copy-scope gate logs the typed reason and commits a no-fill (the leader ledger is still mirrored, matching the existing no-edge path). Defaults for the four config keys live in `_GLOSSARY.md` "Copy-entry gate".
+
 ## Strategy-level trade gates
 
 These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fire in both backtest and production. They are checked before the risk engine is called. A gate returning `Err(WinnerFollowError::*)` means `evaluate_risk()` is never reached for that signal.

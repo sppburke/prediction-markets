@@ -24,7 +24,9 @@ use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use pe_core_types::Price;
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
+use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{SharedHealth, new_shared_health};
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
@@ -33,6 +35,7 @@ use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::seed;
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
+use pe_service::wallet_history::WalletHistoryLoader;
 use time::OffsetDateTime;
 
 #[tokio::main]
@@ -72,6 +75,48 @@ async fn main() -> Result<()> {
             mode_default
         );
     }
+
+    // Parse the copy-entry price band eagerly so a malformed/inverted band fails
+    // fast before any I/O (mirrors the parse_mode / kelly validation pattern).
+    let band_lo = Price::new(
+        Decimal::from_str(&cfg.entry_gate_price_band_lo).with_context(|| {
+            format!(
+                "parse entry_gate_price_band_lo '{}'",
+                cfg.entry_gate_price_band_lo
+            )
+        })?,
+    )
+    .with_context(|| {
+        format!(
+            "entry_gate_price_band_lo '{}' out of [0,1]",
+            cfg.entry_gate_price_band_lo
+        )
+    })?;
+    let band_hi = Price::new(
+        Decimal::from_str(&cfg.entry_gate_price_band_hi).with_context(|| {
+            format!(
+                "parse entry_gate_price_band_hi '{}'",
+                cfg.entry_gate_price_band_hi
+            )
+        })?,
+    )
+    .with_context(|| {
+        format!(
+            "entry_gate_price_band_hi '{}' out of [0,1]",
+            cfg.entry_gate_price_band_hi
+        )
+    })?;
+    anyhow::ensure!(
+        band_lo < band_hi,
+        "entry_gate_price_band_lo ({}) must be < entry_gate_price_band_hi ({})",
+        band_lo.0,
+        band_hi.0
+    );
+    let entry_gate_config = CopyEntryGateConfig {
+        price_band_lo: band_lo,
+        price_band_hi: band_hi,
+        fail_closed: cfg.entry_gate_fail_closed,
+    };
 
     // Bootstrap watchlist from live Polymarket leaderboard.
     let fetch_config = WatchlistFetchConfig {
@@ -261,6 +306,26 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Startup wallet-history backfill: each watchlisted wallet's complete set of
+    // previously-entered markets, so the copy-entry gate admits only first-ever
+    // entries. Borrows `wallets` (must run before it is moved into TradePoller).
+    let history_map = {
+        let history_fetcher = ReqwestFetcher::new(reqwest::Client::new());
+        let map = WalletHistoryLoader::load(
+            &wallets,
+            &cfg.polymarket_base_url,
+            &cfg.wallet_market_history_path,
+            &history_fetcher,
+        )
+        .await;
+        info!(
+            wallets_with_history = map.len(),
+            total = wallets.len(),
+            "wallet market-history backfill complete"
+        );
+        map
+    };
+
     // Reseed channel: carries periodic snapshots into the orchestrator (cap 1 = back-pressure).
     let (reseed_tx, reseed_rx) = mpsc::channel(1);
     let reseed_task = if cfg.position_reseed_interval_secs > 0 {
@@ -310,7 +375,9 @@ async fn main() -> Result<()> {
             signal_config: Default::default(),
             cluster_observation_window_secs: 300,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
+            entry_gate_config,
         },
+        history_map,
         WinnerFollowStrategy::new(cfg.strategy.clone()),
         dispatcher,
         paper_state.clone(),
