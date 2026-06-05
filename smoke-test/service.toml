@@ -19,8 +19,10 @@ polymarket_channel_capacity      = 256
 # leaderboard, so this is the only way to follow ONLY the validated cohort.
 watchlist_size                   = 0
 trade_poll_interval_secs         = 30
-# Production 10-wallet cohort (portfolio_constructor greedy, 2026-06-03 PBO validation).
-seed_watchlist_path              = "data/watchlist-production-n10.json"
+# 13-wallet 72hr buy-and-hold BAND cohort (mid-price 0.40-0.80; leak-free, copy-and-hold
+# validated, no exit adverse-selection). Supersedes the N=10 longshot list.
+# NOTE: this JSON lives under gitignored data/ — scp it to the VPS; `git pull` won't deliver it.
+seed_watchlist_path              = "data/watchlist-72hr-buyhold-band-n13.json"
 
 event_log_path                   = "smoke-test/paper.log"
 jsonl_log_path                   = "smoke-test/paper.jsonl"
@@ -30,8 +32,8 @@ operator_graph_rebuild_cadence_secs = 60
 bankroll_usd                     = "10000"
 mode                             = "paper"
 
-# Flat sizing: bypasses Kelly (which requires calibrated win_rate_bps).
-# Until export-watchlist populates win_rate_bps from the bootstrap DB,
-# Kelly returns p=0 → NoEdge on every signal. $25/trade is safe for paper.
+# Flat sizing: bypasses Kelly. The n13 watchlist DOES carry real win_rate_bps
+# (6316–8750), so Kelly is now available — remove flat_usd_per_trade to enable it.
+# Kept flat ($25/trade) for now as a safe, comparable paper baseline.
 [strategy]
 flat_usd_per_trade               = "25"
