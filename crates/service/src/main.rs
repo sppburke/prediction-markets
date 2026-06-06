@@ -359,6 +359,7 @@ async fn main() -> Result<()> {
             ReqwestFetcher::new(reqwest::Client::new()),
             trade_tx,
             paper_state.clone(),
+            health.clone(),
         )
         .run(),
     );

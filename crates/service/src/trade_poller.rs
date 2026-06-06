@@ -12,9 +12,11 @@ use pe_copy_signal_engine::IncomingTrade;
 use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::health::SharedHealth;
 use crate::trade_parser;
 
 /// Configuration for the trade poller.
@@ -34,6 +36,7 @@ pub struct TradePoller<F: PageFetcher> {
     fetcher: F,
     tx: mpsc::Sender<IncomingTrade>,
     paper_state: Arc<PaperStateDb>,
+    health: SharedHealth,
 }
 
 impl<F: PageFetcher + Send + 'static> TradePoller<F> {
@@ -43,6 +46,7 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
         fetcher: F,
         tx: mpsc::Sender<IncomingTrade>,
         paper_state: Arc<PaperStateDb>,
+        health: SharedHealth,
     ) -> Self {
         Self {
             config,
@@ -50,6 +54,7 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
             fetcher,
             tx,
             paper_state,
+            health,
         }
     }
 
@@ -85,25 +90,41 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
 
                 match self.fetcher.fetch_page(&url).await {
                     Err(e) => warn!(wallet = %wallet, error = %e, "trade fetch error"),
-                    Ok(bytes) => match trade_parser::parse_trades(&bytes, wallet) {
-                        Err(e) => warn!(wallet = %wallet, error = %e, "trade parse error"),
-                        Ok(trades) => {
-                            // Advance the cursor to the newest trade observed this round.
-                            let max_ts =
-                                trades.iter().map(|t| t.observed_at.unix_timestamp()).max();
-                            for trade in trades {
-                                if self.tx.send(trade).await.is_err() {
-                                    // Channel closed; orchestrator is shutting down.
-                                    return;
+                    Ok(bytes) => {
+                        // A successful fetch means the Polymarket source is reachable —
+                        // mark liveness even when the wallet had no new trades. The
+                        // orchestrator advances this too on each trade, but a sparse
+                        // buy-and-hold cohort can go minutes without one; without this,
+                        // /health/ready would false-flag polymarket_source_stale.
+                        {
+                            let mut h = self
+                                .health
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            h.polymarket_last_event_at = Some(OffsetDateTime::now_utc());
+                        }
+                        match trade_parser::parse_trades(&bytes, wallet) {
+                            Err(e) => {
+                                warn!(wallet = %wallet, error = %e, "trade parse error")
+                            }
+                            Ok(trades) => {
+                                // Advance the cursor to the newest trade observed this round.
+                                let max_ts =
+                                    trades.iter().map(|t| t.observed_at.unix_timestamp()).max();
+                                for trade in trades {
+                                    if self.tx.send(trade).await.is_err() {
+                                        // Channel closed; orchestrator is shutting down.
+                                        return;
+                                    }
+                                }
+                                if let Some(ts) = max_ts
+                                    && let Err(e) = self.paper_state.set_cursor(&wallet, ts)
+                                {
+                                    warn!(wallet = %wallet, error = %e, "paper-state set_cursor failed");
                                 }
                             }
-                            if let Some(ts) = max_ts
-                                && let Err(e) = self.paper_state.set_cursor(&wallet, ts)
-                            {
-                                warn!(wallet = %wallet, error = %e, "paper-state set_cursor failed");
-                            }
                         }
-                    },
+                    }
                 }
             }
 
