@@ -178,7 +178,7 @@ async fn scenario_e2e_clean_exit() {
         make_dispatcher(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
-        new_shared_health(),
+        new_shared_health(true),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )
@@ -239,7 +239,7 @@ async fn scenario_graceful_shutdown() {
         make_dispatcher(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
-        new_shared_health(),
+        new_shared_health(true),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )
