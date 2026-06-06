@@ -26,10 +26,14 @@ impl PnlLedger {
         initial_bankroll: Decimal,
     ) -> Result<PortfolioSnapshot, PnlError> {
         let current_bankroll = paper_state.bankroll()?.unwrap_or(Decimal::ZERO);
+        // A position whose market is settled is closed, not open — the resolution
+        // poller credits the bankroll but does not zero the row. Exclude settled
+        // markets so the count reflects genuinely-open positions.
         let open_position_count = paper_state
             .paper_positions()?
             .into_iter()
             .filter(|p| p.long_contracts > 0 || p.short_contracts > 0)
+            .filter(|p| !resolution_store.is_settled(&p.market_id))
             .count();
         let fills_count = paper_state.fills_count()?;
 

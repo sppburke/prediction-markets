@@ -92,6 +92,20 @@ pub struct FillRecord {
     pub fill_price: Price,
 }
 
+/// A recorded paper fill, read back from the `fills` table for inspection
+/// (dashboard, `/paper/fills`). The `idempotency_key` still encodes the leader,
+/// source trade id and observed-at bucket; callers parse it for those fields.
+#[derive(Debug, Clone)]
+pub struct FillRow {
+    pub idempotency_key: String,
+    pub market_id: MarketId,
+    pub outcome_id: OutcomeId,
+    pub side: Side,
+    pub contracts: u64,
+    pub fill_price: Price,
+    pub event_seq: i64,
+}
+
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
 pub struct PaperStateDb {
     conn: Mutex<Connection>,
@@ -298,6 +312,40 @@ impl PaperStateDb {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM fills", [], |row| row.get(0))?;
         usize::try_from(n)
             .map_err(|_| PaperStateError::Internal(format!("fills_count {n} exceeds usize::MAX")))
+    }
+
+    /// All recorded fills in chronological (event-log) order, newest last.
+    pub fn list_fills(&self) -> Result<Vec<FillRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT idempotency_key, market_id, outcome_id, side, contracts, fill_price_str, \
+             event_seq FROM fills ORDER BY event_seq ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, market, outcome, side, contracts, price_str, event_seq) = row?;
+            out.push(FillRow {
+                idempotency_key: key,
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_id: OutcomeId(parse_u16(outcome)?),
+                side: parse_side(&side)?,
+                contracts: parse_u64(contracts)?,
+                fill_price: Price(parse_decimal(&price_str)?),
+                event_seq,
+            });
+        }
+        Ok(out)
     }
 
     // ── Reconciliation cursor ────────────────────────────────────────────────
@@ -592,6 +640,14 @@ fn side_str(side: Side) -> &'static str {
     match side {
         Side::Buy => "buy",
         Side::Sell => "sell",
+    }
+}
+
+fn parse_side(s: &str) -> Result<Side, PaperStateError> {
+    match s {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        other => Err(PaperStateError::Corrupt(format!("bad side {other:?}"))),
     }
 }
 
