@@ -110,8 +110,8 @@ fn snapshot_matches_expected_after_resolution() {
     assert_eq!(snapshot.resolution_credits, dec!(10));
     assert_eq!(snapshot.settled_markets, 1);
     assert_eq!(
-        snapshot.open_position_count, 2,
-        "both markets have open positions"
+        snapshot.open_position_count, 1,
+        "only the unsettled market-B is open; settled market-A is excluded"
     );
     assert_eq!(snapshot.fills_count, 2);
 

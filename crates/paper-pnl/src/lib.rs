@@ -10,7 +10,7 @@ pub mod gamma;
 pub mod pnl;
 pub mod resolution;
 
-pub use dashboard::{PortfolioSnapshot, render_dashboard_html};
+pub use dashboard::{PortfolioSnapshot, TradeView, render_dashboard_html};
 pub use gamma::{GammaError, GammaResolutionFetcher, MarketResolution};
 pub use pnl::{PnlError, PnlLedger};
 pub use resolution::{ResolutionStore, ResolutionStoreError};

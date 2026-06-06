@@ -386,7 +386,7 @@ async fn main() -> Result<()> {
         paper_state.clone(),
         leader_ledger,
         health.clone(),
-        market_end_cache,
+        market_end_cache.clone(),
         reseed_rx,
     )
     .context("build orchestrator")?;
@@ -404,6 +404,7 @@ async fn main() -> Result<()> {
         paper_state: paper_state.clone(),
         resolutions_path: cfg.paper_resolutions_path.clone(),
         initial_bankroll: configured_bankroll,
+        market_end_cache,
     });
 
     // HTTP server: health + paper API.

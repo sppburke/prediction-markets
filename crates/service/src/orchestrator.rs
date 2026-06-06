@@ -317,25 +317,42 @@ impl<C: CLOBClient> Orchestrator<C> {
         self.entry_gate
             .record_entry(signal.leader.0, &signal.market_id);
 
-        // Resolution-horizon gate: drop signals for markets that close too far out.
+        // Resolution-horizon gate: only copy markets whose resolution time
+        // (umaEndDate, else the always-present endDate) is known AND within the
+        // horizon.
+        // Fail closed — skip when the resolution time is unknown (None) or too far
+        // out. An unknown resolution means we cannot confirm a <72h expiry, so we
+        // do not enter.
         if self.max_resolution_horizon_secs > 0 {
-            let end_unix = self.market_end_cache.end_date_unix(&signal.market_id).await;
-            if let Some(unix) = end_unix {
-                let horizon = OffsetDateTime::now_utc().unix_timestamp()
-                    + self.max_resolution_horizon_secs as i64;
-                if unix > horizon {
+            let resolution_unix = self
+                .market_end_cache
+                .resolution_unix(&signal.market_id)
+                .await;
+            let horizon = OffsetDateTime::now_utc().unix_timestamp()
+                + self.max_resolution_horizon_secs as i64;
+            match resolution_unix {
+                Some(unix) if unix <= horizon => { /* within horizon — allow */ }
+                Some(unix) => {
                     info!(
                         reason = "market resolves too far out",
                         market = %signal.market_id,
-                        end_unix,
+                        resolution_unix = unix,
                         max_horizon_secs = self.max_resolution_horizon_secs,
                         "signal did not produce order",
                     );
                     self.commit_no_fill(&trade, &leader_row);
                     return;
                 }
+                None => {
+                    info!(
+                        reason = "market resolution time unknown",
+                        market = %signal.market_id,
+                        "signal did not produce order",
+                    );
+                    self.commit_no_fill(&trade, &leader_row);
+                    return;
+                }
             }
-            // If end_unix is None (Gamma has no endDate), allow through.
         }
 
         let p = self.win_rate_p_for(&signal.leader);
