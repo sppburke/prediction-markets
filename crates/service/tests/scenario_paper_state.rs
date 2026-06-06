@@ -185,7 +185,7 @@ async fn run_trades(
         make_dispatcher(dir),
         paper_state,
         leader_ledger,
-        new_shared_health(),
+        new_shared_health(true),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )

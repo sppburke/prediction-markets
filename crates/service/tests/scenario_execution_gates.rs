@@ -184,7 +184,7 @@ async fn run_gate(
         make_dispatcher(dir),
         paper_state,
         PositionLedger::new(),
-        new_shared_health(),
+        new_shared_health(true),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )

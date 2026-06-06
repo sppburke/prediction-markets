@@ -221,7 +221,9 @@ async fn main() -> Result<()> {
     let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("pe-service.live".into()));
     let dispatcher = ExecutionDispatcher::new(paper_executor, live_executor);
 
-    let health = new_shared_health();
+    // Polygon liveness is only meaningful when the WS source is configured;
+    // an empty ws_url means "etherscan-only mode" (no live on-chain feed).
+    let health = new_shared_health(!cfg.polygon_ws_url.is_empty());
 
     // Bounded channels per _GLOSSARY.md defaults.
     let (polygon_tx, polygon_rx) = mpsc::channel(cfg.polygon_channel_capacity);
@@ -357,6 +359,7 @@ async fn main() -> Result<()> {
             ReqwestFetcher::new(reqwest::Client::new()),
             trade_tx,
             paper_state.clone(),
+            health.clone(),
         )
         .run(),
     );
