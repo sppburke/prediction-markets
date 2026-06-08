@@ -3,12 +3,26 @@
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use crate::valuation::ValuationOutput;
+
 /// Point-in-time portfolio summary.
+///
+/// `total_pnl` keeps its original meaning (`current_bankroll − initial_bankroll`,
+/// the realized bankroll delta) for `/paper/pnl` JSON backward-compatibility; the
+/// `realized_pnl`/`unrealized_pnl`/`open_market_value` fields are additive and carry
+/// the mark-to-market decomposition. The displayed headline is
+/// [`displayed_total`](Self::displayed_total) = `realized_pnl + unrealized_pnl`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PortfolioSnapshot {
     pub current_bankroll: Decimal,
     pub initial_bankroll: Decimal,
     pub total_pnl: Decimal,
+    /// P&L from settled markets (`T + open_cost`).
+    pub realized_pnl: Decimal,
+    /// Mark-to-market of open positions (`open_market_value − open_cost`).
+    pub unrealized_pnl: Decimal,
+    /// Current marked value of open positions (`Σ (long − short) × mid`).
+    pub open_market_value: Decimal,
     pub resolution_credits: Decimal,
     pub settled_markets: usize,
     pub open_position_count: usize,
@@ -16,13 +30,55 @@ pub struct PortfolioSnapshot {
 }
 
 impl PortfolioSnapshot {
-    /// Return value as a percentage of initial bankroll, or zero if initial is zero.
-    pub fn pnl_pct(&self) -> Decimal {
-        if self.initial_bankroll.is_zero() {
-            return Decimal::ZERO;
+    /// Project a [`ValuationOutput`] (+ store-derived counts) into a snapshot. The
+    /// single projection used by both the pure ledger and the service helper, so
+    /// the summary card cannot drift from the per-trade table.
+    pub fn from_valuation(
+        valuation: &ValuationOutput,
+        current_bankroll: Decimal,
+        initial_bankroll: Decimal,
+        resolution_credits: Decimal,
+        settled_markets: usize,
+        fills_count: usize,
+    ) -> Self {
+        Self {
+            current_bankroll,
+            initial_bankroll,
+            total_pnl: current_bankroll - initial_bankroll,
+            realized_pnl: valuation.realized_pnl,
+            unrealized_pnl: valuation.unrealized_pnl,
+            open_market_value: valuation.open_market_value,
+            resolution_credits,
+            settled_markets,
+            open_position_count: valuation.open_position_count,
+            fills_count,
         }
-        (self.total_pnl / self.initial_bankroll * Decimal::ONE_HUNDRED).round_dp(2)
     }
+
+    /// Headline P&L: realized + unrealized (mark-to-market).
+    pub fn displayed_total(&self) -> Decimal {
+        self.realized_pnl + self.unrealized_pnl
+    }
+
+    /// [`displayed_total`](Self::displayed_total) as a percentage of initial bankroll.
+    pub fn displayed_total_pct(&self) -> Decimal {
+        pct_of(self.displayed_total(), self.initial_bankroll)
+    }
+
+    /// Realized bankroll delta (`total_pnl`) as a percentage of initial bankroll.
+    /// Retained for `/paper/pnl` backward-compatibility; the dashboard headline
+    /// uses [`displayed_total_pct`](Self::displayed_total_pct).
+    pub fn pnl_pct(&self) -> Decimal {
+        pct_of(self.total_pnl, self.initial_bankroll)
+    }
+}
+
+/// `value / basis × 100`, rounded to 2 dp; zero when `basis` is zero.
+fn pct_of(value: Decimal, basis: Decimal) -> Decimal {
+    if basis.is_zero() {
+        return Decimal::ZERO;
+    }
+    (value / basis * Decimal::ONE_HUNDRED).round_dp(2)
 }
 
 /// One entered paper trade (a recorded fill), enriched with the leader, entry
@@ -46,11 +102,20 @@ pub struct TradeView {
     /// Leader trade observed-at (entry signal time), Unix seconds. From the
     /// idempotency-key bucket; `None` if the key could not be parsed.
     pub entry_unix: Option<i64>,
-    /// When the contract resolves/expires (Unix seconds): `umaEndDate` (exact),
-    /// else the scheduled `endDate`. `None` if it could not be determined.
+    /// When the contract resolves/expires (Unix seconds): for settled markets the
+    /// authoritative `settled_at_unix`; for open markets `umaEndDate`/`endDate`.
+    /// `None` if it could not be determined.
     pub resolution_unix: Option<i64>,
-    /// UMA resolution status (`resolved`/`proposed`/…), if known.
+    /// Resolution status: `resolved` for settled markets (from the resolution
+    /// store), else the open-market UMA status, if known.
     pub resolution_status: Option<String>,
+    /// Settled outcome for display: `won`/`lost`; `None` while the market is open.
+    pub outcome: Option<String>,
+    /// Realized P&L for a settled fill; `None` while the market is open.
+    pub realized_pnl: Option<Decimal>,
+    /// Current mark: resolved price (settled) or live mid (open); `None` if an open
+    /// market has no mid yet.
+    pub current_mid: Option<Decimal>,
 }
 
 impl TradeView {
@@ -80,6 +145,9 @@ impl TradeView {
             "resolution_utc": self.resolution_unix.and_then(tz::fmt_utc),
             "resolution_ct": self.resolution_unix.and_then(tz::fmt_ct),
             "resolution_status": self.resolution_status,
+            "outcome": self.outcome,
+            "realized_pnl": self.realized_pnl,
+            "current_mid": self.current_mid,
         })
     }
 }
@@ -93,17 +161,18 @@ pub fn render_dashboard_html(snapshot: &PortfolioSnapshot, trades: &[TradeView])
     });
     let json = serde_json::to_string_pretty(&raw).unwrap_or_else(|_| "{}".to_string());
 
-    let pnl_color = if snapshot.total_pnl >= Decimal::ZERO {
+    // Headline P&L is the mark-to-market total (realized + unrealized); colour and
+    // sign follow it, not the open-at-$0 bankroll delta.
+    let total = snapshot.displayed_total();
+    let pnl_color = if total >= Decimal::ZERO {
         "#2ecc71"
     } else {
         "#e74c3c"
     };
-    let pnl_sign = if snapshot.total_pnl >= Decimal::ZERO {
-        "+"
-    } else {
-        ""
-    };
-    let pnl_pct = snapshot.pnl_pct();
+    let total_sign = sign_of(total);
+    let realized_sign = sign_of(snapshot.realized_pnl);
+    let unrealized_sign = sign_of(snapshot.unrealized_pnl);
+    let total_pct = snapshot.displayed_total_pct();
     let trade_rows = render_trade_rows(trades);
 
     format!(
@@ -130,7 +199,9 @@ pre{{background:#0f3460;padding:1rem;border-radius:6px;overflow:auto;font-size:.
 <h1>Paper Trader Dashboard</h1>
 <div class="card">
   <div class="stat"><div class="label">Bankroll</div><div class="value">${current_bankroll}</div></div>
-  <div class="stat"><div class="label">P&amp;L</div><div class="value pnl">{pnl_sign}{total_pnl} ({pnl_pct}%)</div></div>
+  <div class="stat"><div class="label">Realized</div><div class="value">{realized_sign}{realized_pnl}</div></div>
+  <div class="stat"><div class="label">Unrealized</div><div class="value">{unrealized_sign}{unrealized_pnl}</div></div>
+  <div class="stat"><div class="label">Total P&amp;L</div><div class="value pnl">{total_sign}{total} ({total_pct}%)</div></div>
   <div class="stat"><div class="label">Resolution Credits</div><div class="value">${resolution_credits}</div></div>
   <div class="stat"><div class="label">Settled Markets</div><div class="value">{settled_markets}</div></div>
   <div class="stat"><div class="label">Open Positions</div><div class="value">{open_position_count}</div></div>
@@ -142,6 +213,7 @@ pre{{background:#0f3460;padding:1rem;border-radius:6px;overflow:auto;font-size:.
     <thead><tr>
       <th>Entry (CT)</th><th>Market</th><th>Out</th><th>Side</th>
       <th class="num">Contracts</th><th class="num">Fill</th><th class="num">Notional</th>
+      <th>Status</th><th>Outcome</th><th class="num">Realized</th>
       <th>Leader</th><th>Resolves (CT)</th>
     </tr></thead>
     <tbody>{trade_rows}</tbody>
@@ -150,7 +222,8 @@ pre{{background:#0f3460;padding:1rem;border-radius:6px;overflow:auto;font-size:.
 <div class="card"><details><summary>Raw JSON</summary><pre>{json}</pre></details></div>
 </body></html>"#,
         current_bankroll = snapshot.current_bankroll,
-        total_pnl = snapshot.total_pnl,
+        realized_pnl = snapshot.realized_pnl,
+        unrealized_pnl = snapshot.unrealized_pnl,
         resolution_credits = snapshot.resolution_credits,
         settled_markets = snapshot.settled_markets,
         open_position_count = snapshot.open_position_count,
@@ -158,9 +231,14 @@ pre{{background:#0f3460;padding:1rem;border-radius:6px;overflow:auto;font-size:.
     )
 }
 
+/// `"+"` for non-negative, `""` otherwise (negatives carry their own `-`).
+fn sign_of(value: Decimal) -> &'static str {
+    if value >= Decimal::ZERO { "+" } else { "" }
+}
+
 fn render_trade_rows(trades: &[TradeView]) -> String {
     if trades.is_empty() {
-        return "<tr><td colspan=\"9\">No trades yet.</td></tr>".to_string();
+        return "<tr><td colspan=\"12\">No trades yet.</td></tr>".to_string();
     }
     trades
         .iter()
@@ -173,14 +251,21 @@ fn render_trade_rows(trades: &[TradeView]) -> String {
                 .resolution_unix
                 .and_then(tz::fmt_ct)
                 .unwrap_or_else(|| "—".into());
+            let status = t.resolution_status.as_deref().unwrap_or("open");
+            let outcome = t.outcome.as_deref().unwrap_or("—");
+            let realized = match t.realized_pnl {
+                Some(p) => format!("{}{p}", sign_of(p)),
+                None => "—".to_string(),
+            };
             format!(
-                "<tr><td>{entry}</td><td title=\"{market_full}\">{market}</td><td>{outcome}</td>\
+                "<tr><td>{entry}</td><td title=\"{market_full}\">{market}</td><td>{outcome_id}</td>\
                  <td>{side}</td><td class=\"num\">{contracts}</td><td class=\"num\">{price}</td>\
-                 <td class=\"num\">{notional}</td><td title=\"{leader_full}\">{leader}</td>\
+                 <td class=\"num\">{notional}</td><td>{status}</td><td>{outcome}</td>\
+                 <td class=\"num\">{realized}</td><td title=\"{leader_full}\">{leader}</td>\
                  <td>{resolves}</td></tr>",
                 market_full = t.market_id,
                 market = short_id(&t.market_id),
-                outcome = t.outcome_id,
+                outcome_id = t.outcome_id,
                 side = t.side,
                 contracts = t.contracts,
                 price = t.fill_price,
@@ -285,6 +370,24 @@ mod tests {
             entry_unix: entry,
             resolution_unix: resolves,
             resolution_status: Some("resolved".to_string()),
+            outcome: Some("won".to_string()),
+            realized_pnl: Some(Decimal::new(30, 0)),
+            current_mid: Some(Decimal::ONE),
+        }
+    }
+
+    fn snapshot(realized: Decimal, unrealized: Decimal) -> PortfolioSnapshot {
+        PortfolioSnapshot {
+            current_bankroll: Decimal::new(9743, 0),
+            initial_bankroll: Decimal::new(10000, 0),
+            total_pnl: Decimal::new(-257, 0),
+            realized_pnl: realized,
+            unrealized_pnl: unrealized,
+            open_market_value: Decimal::new(241, 0),
+            resolution_credits: Decimal::ZERO,
+            settled_markets: 0,
+            open_position_count: 1,
+            fills_count: 1,
         }
     }
 
@@ -300,35 +403,37 @@ mod tests {
 
     #[test]
     fn raw_json_includes_trades_with_expiration_and_notional() {
-        let snap = PortfolioSnapshot {
-            current_bankroll: Decimal::new(9743, 0),
-            initial_bankroll: Decimal::new(10000, 0),
-            total_pnl: Decimal::new(-257, 0),
-            resolution_credits: Decimal::ZERO,
-            settled_markets: 0,
-            open_position_count: 1,
-            fills_count: 1,
-        };
+        let snap = snapshot(Decimal::new(8152, 2), Decimal::new(-1646, 2));
         let html = render_dashboard_html(&snap, &[trade(Some(1_705_320_000), Some(1_730_700_000))]);
         // Trade detail and derived fields are present in the page.
         assert!(html.contains("\"notional\""));
         assert!(html.contains("\"resolution_ct\""));
         assert!(html.contains("\"entry_ct\": \"2024-01-15 06:00:00 CST\""));
         assert!(html.contains("Entered Trades (1)"));
+        // New mark-to-market fields surface in the per-trade JSON.
+        assert!(html.contains("\"outcome\""));
+        assert!(html.contains("\"realized_pnl\""));
+        assert!(html.contains("\"current_mid\""));
+    }
+
+    #[test]
+    fn summary_shows_realized_unrealized_and_total() {
+        // realized +81.52, unrealized −16.46 → total +65.06.
+        let snap = snapshot(Decimal::new(8152, 2), Decimal::new(-1646, 2));
+        let html = render_dashboard_html(&snap, &[]);
+        assert!(html.contains(">Realized<"));
+        assert!(html.contains(">Unrealized<"));
+        assert!(html.contains(">Total P&amp;L<"));
+        assert!(html.contains("+65.06"));
+        assert_eq!(snap.displayed_total(), Decimal::new(6506, 2));
     }
 
     #[test]
     fn empty_trades_render_placeholder_row() {
-        let snap = PortfolioSnapshot {
-            current_bankroll: Decimal::new(10000, 0),
-            initial_bankroll: Decimal::new(10000, 0),
-            total_pnl: Decimal::ZERO,
-            resolution_credits: Decimal::ZERO,
-            settled_markets: 0,
-            open_position_count: 0,
-            fills_count: 0,
-        };
+        let snap = snapshot(Decimal::ZERO, Decimal::ZERO);
         let html = render_dashboard_html(&snap, &[]);
         assert!(html.contains("No trades yet."));
+        // Placeholder colspan matches the 12-column header.
+        assert!(html.contains("colspan=\"12\""));
     }
 }

@@ -7,6 +7,7 @@ pub mod entry_gate;
 pub mod health;
 pub mod logging;
 pub mod market_end_cache;
+pub mod mid_price_cache;
 pub mod operator_graph_scheduler;
 pub mod orchestrator;
 pub mod paper_api;

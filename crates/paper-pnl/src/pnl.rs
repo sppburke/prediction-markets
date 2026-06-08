@@ -4,11 +4,15 @@
 //! is supplied by `ResolutionStore`. The caller is responsible for applying resolution
 //! credits to the bankroll before calling `snapshot`.
 
+use std::collections::HashMap;
+
+use pe_core_types::MarketId;
 use pe_paper_state::{PaperPositionRow, PaperStateDb};
 use rust_decimal::Decimal;
 
 use crate::dashboard::PortfolioSnapshot;
 use crate::resolution::ResolutionStore;
+use crate::valuation::value_portfolio;
 
 /// Derives [`PortfolioSnapshot`] from DB state + settled resolutions.
 pub struct PnlLedger;
@@ -20,32 +24,40 @@ impl PnlLedger {
     /// Resolution credits must already be applied to the bankroll in `paper_state`
     /// (via [`PaperStateDb::credit_bankroll`]) before calling this. The snapshot
     /// reflects the bankroll as stored.
+    ///
+    /// `open_mids` carries current Polymarket mids (per `outcome_id`) for open
+    /// markets so open positions are marked to market; settled markets are valued
+    /// from the resolution store. Pass an empty map to value open positions at $0.
     pub fn snapshot(
         paper_state: &PaperStateDb,
         resolution_store: &ResolutionStore,
         initial_bankroll: Decimal,
+        open_mids: &HashMap<MarketId, Vec<Decimal>>,
     ) -> Result<PortfolioSnapshot, PnlError> {
         let current_bankroll = paper_state.bankroll()?.unwrap_or(Decimal::ZERO);
-        // A position whose market is settled is closed, not open — the resolution
-        // poller credits the bankroll but does not zero the row. Exclude settled
-        // markets so the count reflects genuinely-open positions.
-        let open_position_count = paper_state
-            .paper_positions()?
-            .into_iter()
-            .filter(|p| p.long_contracts > 0 || p.short_contracts > 0)
-            .filter(|p| !resolution_store.is_settled(&p.market_id))
-            .count();
-        let fills_count = paper_state.fills_count()?;
+        let positions = paper_state.paper_positions()?;
+        let fills = paper_state.list_fills()?;
 
-        Ok(PortfolioSnapshot {
+        // One valuation pass derives realized/unrealized, the open-position count
+        // (settled markets excluded), and per-fill marks; the summary card and the
+        // per-trade table cannot drift because both read this single result.
+        let valuation = value_portfolio(
+            &fills,
+            &positions,
+            resolution_store,
+            open_mids,
             current_bankroll,
             initial_bankroll,
-            total_pnl: current_bankroll - initial_bankroll,
-            resolution_credits: resolution_store.total_credits(),
-            settled_markets: resolution_store.settled_count(),
-            open_position_count,
-            fills_count,
-        })
+        );
+
+        Ok(PortfolioSnapshot::from_valuation(
+            &valuation,
+            current_bankroll,
+            initial_bankroll,
+            resolution_store.total_credits(),
+            resolution_store.settled_count(),
+            fills.len(),
+        ))
     }
 
     /// Compute the bankroll credit for a resolved market from the provided position rows.

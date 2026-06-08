@@ -41,6 +41,7 @@ pe-paper-pnl                = { path = "../paper-pnl",                  version 
 anyhow          = { workspace = true }
 axum            = { workspace = true }
 figment         = { workspace = true }
+futures         = { workspace = true }
 toml            = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }

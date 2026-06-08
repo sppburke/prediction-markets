@@ -29,6 +29,7 @@ use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{SharedHealth, new_shared_health};
 use pe_service::market_end_cache::MarketEndCache;
+use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
@@ -366,6 +367,8 @@ async fn main() -> Result<()> {
 
     // Orchestrator.
     let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
+    // Mid-price cache for marking open dashboard positions to market (own rate gate).
+    let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone());
     let orch = Orchestrator::new(
         polygon_rx,
         trade_rx,
@@ -405,6 +408,7 @@ async fn main() -> Result<()> {
         resolutions_path: cfg.paper_resolutions_path.clone(),
         initial_bankroll: configured_bankroll,
         market_end_cache,
+        mid_price_cache,
     });
 
     // HTTP server: health + paper API.
@@ -511,8 +515,15 @@ fn run_report() -> Result<()> {
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
     let store = ResolutionStore::load(&cfg.paper_resolutions_path)
         .with_context(|| format!("load resolutions {}", cfg.paper_resolutions_path.display()))?;
-    let snapshot = PnlLedger::snapshot(&paper_state, &store, configured_bankroll)
-        .context("compute P&L snapshot")?;
+    // `--report` is offline (no live mids): value open positions at $0, matching
+    // the prior report semantics.
+    let snapshot = PnlLedger::snapshot(
+        &paper_state,
+        &store,
+        configured_bankroll,
+        &std::collections::HashMap::new(),
+    )
+    .context("compute P&L snapshot")?;
     let json = serde_json::to_string_pretty(&snapshot).context("serialize snapshot")?;
     println!("{json}");
     std::process::exit(0);
