@@ -20,8 +20,10 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Per-developer Claude Code project state
-.claude/
+# Per-developer Claude Code project state (credentials, settings, plugins, MCP cache).
+# Track ONLY the shared, version-controlled agent skills (dev-cycle, feature-dev, plan-review).
+.claude/*
+!.claude/skills/
 
 # insta snapshot review state (developer-local)
 **/.*.pending-snap

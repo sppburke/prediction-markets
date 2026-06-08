@@ -8,6 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The root `AGENTS.md` is the human contributor guide; this `CLAUDE.md` is for coding-agent context. They are complementary — the contributor guide covers commit/PR conventions and dev workflow at a human level, while this file captures architecture, doc authority order, and the gotchas a fresh agent needs to avoid.
 
+## Investigation standard
+
+Prove every factual claim about this system from primary-source evidence before stating it — repo code at the current commit, scripted DB/API queries, executed tests, and runtime output captured this session — and do not fill gaps with unsupported speculation or hedging. The full standard (primary-source tiers, pre-committed falsifier, stop conditions, and the "Blocked" format) lives in `docs/_EVIDENCE-FIRST.md`. It applies to user responses, planning, debugging, code review, and self-checks.
+
 The CI gate is exactly:
 
 ```bash
