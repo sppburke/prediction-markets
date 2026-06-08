@@ -28,6 +28,13 @@ const HISTORY_MAX_PAGES: u32 = 200;
 /// A page shorter than this signals the wallet's trade history is exhausted.
 const HISTORY_PAGE_SIZE: usize = 500;
 
+/// Consecutive fully-cached pages required before the incremental walk stops.
+/// `/activity` is paginated newest-first by timestamp but only ~1 s-reliably
+/// ordered (see `trade_poller`), so a 2-page (1000-trade) margin absorbs boundary
+/// jitter: a genuinely-new market would have to land >1000 trades past its own
+/// timestamp to be skipped, far beyond the observed ordering noise.
+const KNOWN_PAGE_MARGIN: u32 = 2;
+
 // ── Sidecar ─────────────────────────────────────────────────────────────────
 
 /// On-disk JSON sidecar: each wallet's previously-entered markets.
@@ -58,11 +65,14 @@ struct HistoryItem {
 /// Fetch the markets `wallet` has traded that are not already in `known`,
 /// paginating the trade-activity endpoint backwards by timestamp.
 ///
-/// Incremental: the walk stops as soon as a full page contains no market outside
-/// `known` — because activity is newest-first and `known` is the previously-cached
-/// set, a fully-known page means all older history is already cached. A wallet with
-/// no cached history (`known` empty) is walked in full. The caller unions the result
-/// with the sidecar, so the merged set stays complete.
+/// Incremental: the walk stops after [`KNOWN_PAGE_MARGIN`] consecutive full pages
+/// that contain no market outside `known`. `/activity` is paginated newest-first by
+/// timestamp, so a run of fully-known pages means older history is already cached;
+/// the multi-page margin guards against the endpoint's ~1 s ordering jitter dropping
+/// a market that straddles the boundary. The caller unions the result with the
+/// sidecar, so under that ordering assumption the merged set stays complete; a wallet
+/// with no cached history (`known` empty) is walked in full, and any fetch failure
+/// falls back to the complete stale sidecar.
 async fn fetch_history_for_wallet<F: PageFetcher>(
     wallet: WalletAddress,
     base_url: &str,
@@ -71,6 +81,7 @@ async fn fetch_history_for_wallet<F: PageFetcher>(
 ) -> Result<HashSet<MarketId>, anyhow::Error> {
     let mut markets: HashSet<MarketId> = HashSet::new();
     let mut end: Option<i64> = None;
+    let mut known_page_streak: u32 = 0;
 
     for page_num in 0..HISTORY_MAX_PAGES {
         let url = PolymarketEndpoint::UserTradeActivity {
@@ -111,10 +122,16 @@ async fn fetch_history_for_wallet<F: PageFetcher>(
         if items.len() < HISTORY_PAGE_SIZE {
             break; // short page → history exhausted
         }
-        if !page_has_unknown {
-            // Reached history already covered by the cache; everything older is
-            // cached too, so stop rather than re-walk the wallet's full history.
-            break;
+        // Stop only after a margin of consecutive fully-cached pages, so a market
+        // straddling the boundary under the endpoint's ~1 s ordering jitter is not
+        // dropped; any unknown market resets the streak.
+        if page_has_unknown {
+            known_page_streak = 0;
+        } else {
+            known_page_streak += 1;
+            if known_page_streak >= KNOWN_PAGE_MARGIN {
+                break;
+            }
         }
         if page_num + 1 >= HISTORY_MAX_PAGES {
             warn!(
@@ -320,14 +337,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_stops_when_first_page_all_cached() {
-        // Caught-up wallet: the newest full page is entirely already-known markets.
-        // Must stop after page 1 rather than re-walking — no page-2 fixture exists,
-        // so a re-walk would error.
+    async fn incremental_stops_after_known_page_margin() {
+        // Caught-up wallet: stops after KNOWN_PAGE_MARGIN (2) consecutive fully-known
+        // full pages. Provide exactly the margin's worth and no more; a third fetch
+        // (no fixture) would error, proving the walk stopped at the margin.
         let w = wallet();
         let known = market_set("a", HISTORY_PAGE_SIZE);
         let mut responses = HashMap::new();
         responses.insert(activity_url(w, None), page("a", HISTORY_PAGE_SIZE, 2_000));
+        responses.insert(
+            activity_url(w, Some(1_999)),
+            page("a", HISTORY_PAGE_SIZE, 1_500),
+        );
         let fetcher = FixtureFetcher::new(responses);
 
         let markets = fetch_history_for_wallet(w, BASE, &fetcher, &known)
@@ -337,10 +358,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_margin_does_not_stop_on_single_known_page() {
+        // A single fully-known page (margin not yet reached) must NOT stop: a new
+        // market straddling the boundary onto the next page is still captured.
+        let w = wallet();
+        let known = market_set("a", HISTORY_PAGE_SIZE);
+        let mut responses = HashMap::new();
+        // Page 1: all known. Page 2: a straddling new market (then short → stop).
+        responses.insert(activity_url(w, None), page("a", HISTORY_PAGE_SIZE, 2_000));
+        responses.insert(activity_url(w, Some(1_999)), page("late", 1, 1_500));
+        let fetcher = FixtureFetcher::new(responses);
+
+        let markets = fetch_history_for_wallet(w, BASE, &fetcher, &known)
+            .await
+            .unwrap();
+        assert!(
+            markets.contains(&MarketId(VenueMarketId("0xlate0".into()))),
+            "market past a single known page must not be dropped"
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_walks_new_then_stops_at_cache_boundary() {
-        // New activity exists: page 1 is fresh markets, page 2 is the cached boundary.
-        // The walk captures the new markets, fetches the boundary page, then stops
-        // (no page-3 fixture). Union with the sidecar keeps the set complete.
+        // New activity exists: page 1 is fresh markets, then 2 cached pages reach the
+        // margin and stop (no page-4 fixture). Union with the sidecar stays complete.
         let w = wallet();
         let known = market_set("a", HISTORY_PAGE_SIZE);
         let mut responses = HashMap::new();
@@ -349,12 +390,17 @@ mod tests {
             activity_url(w, Some(2_999)),
             page("a", HISTORY_PAGE_SIZE, 2_000),
         );
+        responses.insert(
+            activity_url(w, Some(1_999)),
+            page("a", HISTORY_PAGE_SIZE, 1_500),
+        );
         let fetcher = FixtureFetcher::new(responses);
 
         let markets = fetch_history_for_wallet(w, BASE, &fetcher, &known)
             .await
             .unwrap();
         assert!(markets.contains(&MarketId(VenueMarketId("0xnew0".into()))));
+        // 500 new ∪ 500 known boundary = 1000 distinct.
         assert_eq!(markets.len(), HISTORY_PAGE_SIZE * 2);
     }
 
