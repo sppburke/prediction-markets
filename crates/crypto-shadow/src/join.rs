@@ -20,19 +20,26 @@ fn indicator_prob_up(c: Decimal, r: Decimal) -> Decimal {
 }
 
 /// Compute one [`EdgeObservation`] for a market given the latest Chainlink value
-/// `c` at `observed_at_ms`, the captured range-start value `range_start` (if
-/// known), and the latest `book` (if seen). Pure.
+/// `c` observed at `observed_at_ms` and received at the node at
+/// `chainlink_received_ms`, the captured range-start value `range_start` (if
+/// known), and the latest `book` paired with its own node-receive clock (if
+/// seen). Pure — the receive clocks arrive as data, so no clock is read here.
 pub fn compute_observation(
     meta: &BtcMarketMeta,
     c: Decimal,
     observed_at_ms: i64,
+    chainlink_received_ms: i64,
     range_start: Option<Decimal>,
-    book: Option<&BookUpdate>,
+    book: Option<(&BookUpdate, i64)>,
 ) -> EdgeObservation {
     let prob_up = range_start.map(|r| indicator_prob_up(c, r));
-    let best_ask = book.and_then(|b| b.best_ask).map(|p| p.0);
-    let mid = book.and_then(BookUpdate::mid);
-    let feed_to_book_lag_ms = book.and_then(|b| b.observed_at_ms.map(|bt| observed_at_ms - bt));
+    let best_ask = book.and_then(|(b, _)| b.best_ask).map(|p| p.0);
+    let mid = book.and_then(|(b, _)| b.mid());
+    // Book staleness at the node: how long ago the latest book was received,
+    // relative to this Chainlink tick's receipt. One coherent at-the-node clock
+    // for both feeds. `None` only when no book has been seen for this market.
+    let feed_to_book_lag_ms =
+        book.map(|(_, book_received_ms)| chainlink_received_ms - book_received_ms);
 
     // Gross edge of buying YES = P(up) - price paid. Only defined when both the
     // probability indicator and the relevant price are available.
@@ -75,6 +82,17 @@ pub fn compute_observation(
     }
 }
 
+/// The latest book for a market paired with the node-receive clock at which the
+/// runner read it. Kept alongside the book so the join can compute a coherent
+/// at-the-node `feed_to_book_lag_ms` without [`BookUpdate`] carrying a clock it
+/// would be trusted to stamp post-hoc (which an offline `raw_ticks` recompute
+/// would ship as a placeholder).
+#[derive(Debug, Clone)]
+struct BookEntry {
+    book: BookUpdate,
+    received_ms: i64,
+}
+
 /// Stateful join across the two feeds. Holds market metadata, the latest book
 /// per market, and the captured range-start BTC/USD value per market.
 ///
@@ -84,7 +102,7 @@ pub fn compute_observation(
 pub struct JoinState {
     markets: HashMap<String, BtcMarketMeta>,
     token_to_condition: HashMap<String, String>,
-    latest_book: HashMap<String, BookUpdate>,
+    latest_book: HashMap<String, BookEntry>,
     range_start_value: HashMap<String, Decimal>,
 }
 
@@ -110,11 +128,18 @@ impl JoinState {
         self.markets.len()
     }
 
-    /// Apply a book update, keyed by the market whose YES token it belongs to.
-    /// Unknown tokens are ignored (book for a market we are not tracking).
-    pub fn on_book_update(&mut self, update: BookUpdate) {
+    /// Apply a book update with the node-receive clock at which the runner read
+    /// it, keyed by the market whose YES token it belongs to. Unknown tokens are
+    /// ignored (book for a market we are not tracking).
+    pub fn on_book_update(&mut self, update: BookUpdate, received_ms: i64) {
         if let Some(condition) = self.token_to_condition.get(&update.token_id).cloned() {
-            self.latest_book.insert(condition, update);
+            self.latest_book.insert(
+                condition,
+                BookEntry {
+                    book: update,
+                    received_ms,
+                },
+            );
         }
     }
 
@@ -122,8 +147,15 @@ impl JoinState {
     /// has opened (first tick at/after `range_start_ms`), then emit one
     /// observation per market currently inside its `[range_start, range_end]`
     /// window.
-    pub fn on_chainlink_tick(&mut self, tick: &ChainlinkTick) -> Vec<EdgeObservation> {
+    pub fn on_chainlink_tick(
+        &mut self,
+        tick: &ChainlinkTick,
+        received_ms: i64,
+    ) -> Vec<EdgeObservation> {
         let c = tick.value.0;
+        // Window membership and range-start capture use the *source* clock `t`,
+        // never `received_ms` (which feeds only the lag stat) — so the set of
+        // in-window ticks is source-clock-defined and cannot drift.
         let t = tick.observed_at_ms;
 
         // Capture range-start values first (mutating borrow), collecting the set
@@ -149,8 +181,18 @@ impl JoinState {
                 continue;
             };
             let range_start = self.range_start_value.get(&condition).copied();
-            let book = self.latest_book.get(&condition);
-            out.push(compute_observation(meta, c, t, range_start, book));
+            let book = self
+                .latest_book
+                .get(&condition)
+                .map(|e| (&e.book, e.received_ms));
+            out.push(compute_observation(
+                meta,
+                c,
+                t,
+                received_ms,
+                range_start,
+                book,
+            ));
         }
         out
     }
@@ -194,9 +236,17 @@ mod tests {
     #[test]
     fn net_edge_subtracts_verified_fee() {
         let m = meta();
-        let b = book("0.48", "0.52", 2_000);
+        let b = book("0.48", "0.52", 2_000); // source ts no longer feeds the lag
         // c > r => prob_up = 1; gross vs ask = 1 - 0.52 = 0.48; fee at 0.52.
-        let obs = compute_observation(&m, dec!(60000), 2_500, Some(dec!(59000)), Some(&b));
+        // Lag = chainlink_received_ms - book_received_ms = 2_500 - 2_000 = 500.
+        let obs = compute_observation(
+            &m,
+            dec!(60000),
+            2_500,
+            2_500,
+            Some(dec!(59000)),
+            Some((&b, 2_000)),
+        );
         assert_eq!(obs.instantaneous_prob_up, Some(Decimal::ONE));
         assert_eq!(obs.best_ask, Some(dec!(0.52)));
         assert_eq!(obs.gross_edge_vs_ask, Some(dec!(0.48)));
@@ -210,7 +260,7 @@ mod tests {
     fn no_range_start_yields_null_prob_and_edges() {
         let m = meta();
         let b = book("0.40", "0.60", 100);
-        let obs = compute_observation(&m, dec!(60000), 200, None, Some(&b));
+        let obs = compute_observation(&m, dec!(60000), 200, 200, None, Some((&b, 100)));
         assert_eq!(obs.instantaneous_prob_up, None);
         assert_eq!(obs.gross_edge_vs_ask, None);
         assert_eq!(obs.net_edge_vs_ask, None);
@@ -221,7 +271,7 @@ mod tests {
     #[test]
     fn no_book_yields_null_price_fields() {
         let m = meta();
-        let obs = compute_observation(&m, dec!(60000), 2_000, Some(dec!(59000)), None);
+        let obs = compute_observation(&m, dec!(60000), 2_000, 2_000, Some(dec!(59000)), None);
         assert_eq!(obs.instantaneous_prob_up, Some(Decimal::ONE));
         assert_eq!(obs.best_ask, None);
         assert_eq!(obs.fee_cost, None);
@@ -230,37 +280,53 @@ mod tests {
     }
 
     #[test]
-    fn book_without_timestamp_yields_null_lag_not_giant() {
+    fn book_without_source_timestamp_still_has_received_lag() {
         let m = meta();
         let b = BookUpdate {
             token_id: "tok-yes".to_string(),
             best_bid: Some(Price(dec!(0.40))),
             best_ask: Some(Price(dec!(0.60))),
-            observed_at_ms: None,
+            observed_at_ms: None, // missing source timestamp
         };
-        let obs = compute_observation(&m, dec!(60000), 2_000, Some(dec!(59000)), Some(&b));
+        // The node-receive clock is supplied independently of the (absent)
+        // source timestamp, so the lag is the receive-clock skew, not null.
+        let obs = compute_observation(
+            &m,
+            dec!(60000),
+            2_500,
+            2_500,
+            Some(dec!(59000)),
+            Some((&b, 2_000)),
+        );
         assert_eq!(obs.best_ask, Some(dec!(0.60))); // book quote still present
-        assert_eq!(obs.feed_to_book_lag_ms, None); // but lag is null, not epoch-sized
+        assert_eq!(obs.mid, Some(dec!(0.50)));
+        assert_eq!(obs.feed_to_book_lag_ms, Some(500)); // received-clock lag, not null
     }
 
     #[test]
     fn join_emits_one_observation_per_active_market_and_captures_range_start() {
         let mut state = JoinState::new(vec![meta()]);
-        state.on_book_update(book("0.48", "0.52", 1_500));
+        state.on_book_update(book("0.48", "0.52", 1_500), 1_400);
         // First in-window tick captures range start = 59000.
-        let first = state.on_chainlink_tick(&ChainlinkTick {
-            symbol: "btc/usd".to_string(),
-            observed_at_ms: 1_200,
-            value: BtcUsdPrice(dec!(59000)),
-        });
+        let first = state.on_chainlink_tick(
+            &ChainlinkTick {
+                symbol: "btc/usd".to_string(),
+                observed_at_ms: 1_200,
+                value: BtcUsdPrice(dec!(59000)),
+            },
+            1_200,
+        );
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].range_start_value, Some(dec!(59000)));
         // Later tick keeps the captured range start, recomputes the indicator.
-        let later = state.on_chainlink_tick(&ChainlinkTick {
-            symbol: "btc/usd".to_string(),
-            observed_at_ms: 2_000,
-            value: BtcUsdPrice(dec!(60000)),
-        });
+        let later = state.on_chainlink_tick(
+            &ChainlinkTick {
+                symbol: "btc/usd".to_string(),
+                observed_at_ms: 2_000,
+                value: BtcUsdPrice(dec!(60000)),
+            },
+            2_000,
+        );
         assert_eq!(later[0].range_start_value, Some(dec!(59000)));
         assert_eq!(later[0].instantaneous_prob_up, Some(Decimal::ONE));
     }
@@ -268,11 +334,14 @@ mod tests {
     #[test]
     fn out_of_window_tick_emits_nothing() {
         let mut state = JoinState::new(vec![meta()]);
-        let before = state.on_chainlink_tick(&ChainlinkTick {
-            symbol: "btc/usd".to_string(),
-            observed_at_ms: 500, // before range_start_ms = 1000
-            value: BtcUsdPrice(dec!(59000)),
-        });
+        let before = state.on_chainlink_tick(
+            &ChainlinkTick {
+                symbol: "btc/usd".to_string(),
+                observed_at_ms: 500, // before range_start_ms = 1000
+                value: BtcUsdPrice(dec!(59000)),
+            },
+            500,
+        );
         assert!(before.is_empty());
     }
 }

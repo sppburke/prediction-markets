@@ -2,24 +2,25 @@
 //!
 //! `run` is the live path: it opens the DB, stamps run provenance + vantage,
 //! probes endpoint RTT, enumerates markets, spawns the two WS tasks, and drives
-//! the join loop until `ctrl_c`. It is **not** exercised by the offline CI gate
-//! (no network); its building blocks (decoders, join, db, report) are.
+//! the join loop (extracted into `drive`) until an injected `shutdown` fires. It
+//! is **not** exercised by the offline CI gate (no network); its building blocks
+//! (decoders, join, db, report) and the `drive` select loop are.
 
 use std::path::Path;
 use std::time::Duration;
 
-use pe_source_polymarket_public::ReqwestFetcher;
+use pe_source_polymarket_public::{PageFetcher, ReqwestFetcher};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::ShadowConfig;
-use crate::db::{SCHEMA_VERSION, ShadowDb};
+use crate::db::{LAG_CLOCK, SCHEMA_VERSION, ShadowDb};
 use crate::error::Error;
 use crate::fees::CRYPTO_FEES_V2_PROVENANCE;
 use crate::gamma::BtcMarketFetcher;
 use crate::join::JoinState;
 use crate::report::build_report;
-use crate::types::FeedSource;
+use crate::types::{FeedFrame, FeedSource};
 use crate::{chainlink_ws, clob_ws};
 
 /// Summary returned by a completed `run`.
@@ -29,12 +30,26 @@ pub struct RunSummary {
     pub raw_ticks: i64,
 }
 
-/// Drive the live shadow collection until `ctrl_c`.
-pub async fn run(config: &ShadowConfig) -> Result<RunSummary, Error> {
+/// Per-source decode-error tallies returned by [`drive`]. Decode failures
+/// increment a counter and are surfaced as a bounded periodic summary (never a
+/// per-frame log line), so a load test can assert the count without scraping
+/// logs and a 72k-frame run does not emit 72k warnings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DriveStats {
+    decode_errors_chainlink: u64,
+    decode_errors_clob: u64,
+}
+
+/// Drive the live shadow collection until `rx` closes or `shutdown` resolves.
+pub async fn run(
+    config: &ShadowConfig,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<RunSummary, Error> {
     let db = ShadowDb::open(Path::new(&config.db_path))?;
     db.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
     db.set_meta("fee_provenance", CRYPTO_FEES_V2_PROVENANCE)?;
     db.set_meta("vantage_label", &config.vantage_label)?;
+    db.set_meta("lag_clock", LAG_CLOCK)?;
     let rtt = probe_rtt(config).await;
     db.set_meta("vantage_rtt", &rtt)?;
     info!(vantage = %config.vantage_label, rtt = %rtt, "shadow: vantage recorded");
@@ -61,30 +76,80 @@ pub async fn run(config: &ShadowConfig) -> Result<RunSummary, Error> {
     ));
     refresh.tick().await; // discard the immediate first tick
 
+    let stats = drive(
+        &db,
+        &mut rx,
+        &mut state,
+        &gamma,
+        &mut refresh,
+        config,
+        shutdown,
+    )
+    .await?;
+    info!(
+        chainlink_decode_errors = stats.decode_errors_chainlink,
+        clob_decode_errors = stats.decode_errors_clob,
+        "shadow: drive loop ended"
+    );
+
+    Ok(RunSummary {
+        observations: db.observation_count()?,
+        raw_ticks: db.raw_tick_count()?,
+    })
+}
+
+/// Drive the join loop over inbound frames until `rx` closes or `shutdown`
+/// resolves. Extracted from [`run`] (which owns the network preamble that errors
+/// under the no-network gate) so the select loop is testable offline: an
+/// injected `shutdown`, a controlled `rx`, and a `FixtureFetcher`-backed `gamma`
+/// exercise every arm with no live socket. `shutdown` is polled first
+/// (`biased;`), so it wins over a still-draining `rx` — mirroring the shutdown
+/// idiom in `crates/service/src/orchestrator.rs`.
+async fn drive<F: PageFetcher + Send + Sync>(
+    db: &ShadowDb,
+    rx: &mut mpsc::Receiver<FeedFrame>,
+    state: &mut JoinState,
+    gamma: &BtcMarketFetcher<F>,
+    refresh: &mut tokio::time::Interval,
+    config: &ShadowConfig,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<DriveStats, Error> {
+    let mut stats = DriveStats::default();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("shadow: shutdown signalled, stopping drive loop");
+                break;
+            }
             maybe = rx.recv() => {
                 let Some(frame) = maybe else { break };
                 db.insert_raw_tick(frame.source, frame.received_ms, &frame.raw)?;
                 match frame.source {
                     FeedSource::Chainlink => match chainlink_ws::parse_chainlink_frame(&frame.raw) {
                         Ok(tick) => {
-                            let obs = state.on_chainlink_tick(&tick);
+                            let obs = state.on_chainlink_tick(&tick, frame.received_ms);
                             db.insert_observations(&obs)?;
                         }
-                        Err(e) => warn!(error = %e, "shadow: chainlink decode error"),
+                        // Raw frame already persisted to `raw_ticks`; tally and
+                        // recompute offline rather than logging per frame.
+                        Err(_) => stats.decode_errors_chainlink += 1,
                     },
                     FeedSource::Clob => match clob_ws::parse_clob_frame(&frame.raw) {
                         Ok(updates) => {
                             for u in updates {
-                                state.on_book_update(u);
+                                state.on_book_update(u, frame.received_ms);
                             }
                         }
-                        Err(e) => warn!(error = %e, "shadow: clob decode error"),
+                        Err(_) => stats.decode_errors_clob += 1,
                     },
                 }
             }
             _ = refresh.tick() => {
+                // Best-effort market refresh + the bounded periodic decode-error
+                // summary (tied to the refresh cadence, not the frame rate).
+                log_decode_errors(&stats, "cumulative");
                 match gamma.fetch_markets(&config.series()).await {
                     Ok(fresh) => {
                         for m in fresh.into_iter().take(config.max_open_markets) {
@@ -97,17 +162,23 @@ pub async fn run(config: &ShadowConfig) -> Result<RunSummary, Error> {
                     Err(e) => warn!(error = %e, "shadow: market refresh error"),
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("shadow: ctrl_c received, shutting down");
-                break;
-            }
         }
     }
+    log_decode_errors(&stats, "final");
+    Ok(stats)
+}
 
-    Ok(RunSummary {
-        observations: db.observation_count()?,
-        raw_ticks: db.raw_tick_count()?,
-    })
+/// Emit a bounded decode-error summary (one line per call, only when non-zero),
+/// replacing the per-frame warning that spammed ~72k lines under load.
+fn log_decode_errors(stats: &DriveStats, phase: &str) {
+    if stats.decode_errors_chainlink > 0 || stats.decode_errors_clob > 0 {
+        warn!(
+            chainlink = stats.decode_errors_chainlink,
+            clob = stats.decode_errors_clob,
+            phase,
+            "shadow: decode errors"
+        );
+    }
 }
 
 /// Build the realized-edge report JSON from the configured DB. Offline.
@@ -184,6 +255,111 @@ async fn probe_rtt(config: &ShadowConfig) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use pe_source_polymarket_public::FixtureFetcher;
+    use std::collections::HashMap;
+
+    fn test_gamma() -> BtcMarketFetcher<FixtureFetcher> {
+        // The refresh arm is never reached in these tests (long interval, loop
+        // exits first), so the fetcher is never invoked; empty fixtures suffice.
+        BtcMarketFetcher::new(
+            "https://gamma.test".to_string(),
+            FixtureFetcher::new(HashMap::new()),
+        )
+    }
+
+    fn garbage_clob_frame() -> FeedFrame {
+        // Fails `parse_clob_frame` (not valid JSON) → a decode error.
+        FeedFrame {
+            source: FeedSource::Clob,
+            received_ms: 1,
+            raw: "{not json".to_string(),
+        }
+    }
+
+    // AC1.4(a): under a flood of undecodable frames, `drive` returns the exact
+    // per-source error count, persists every raw frame, and emits no per-frame
+    // log line (summary only).
+    #[tokio::test]
+    async fn drive_counts_decode_errors_without_per_frame_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let mut state = JoinState::new(Vec::new());
+        let gamma = test_gamma();
+        let cfg = ShadowConfig::default();
+        let mut refresh = tokio::time::interval(Duration::from_secs(3_600));
+        refresh.tick().await; // discard immediate first tick
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let injected: u64 = 10_000;
+        tokio::spawn(async move {
+            for _ in 0..injected {
+                if tx.send(garbage_clob_frame()).await.is_err() {
+                    break;
+                }
+            }
+            // tx dropped here → rx closes once drained, ending the loop.
+        });
+
+        // A `pending` shutdown never fires, so the rx arm runs to completion.
+        let stats = drive(
+            &db,
+            &mut rx,
+            &mut state,
+            &gamma,
+            &mut refresh,
+            &cfg,
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.decode_errors_clob, injected);
+        assert_eq!(stats.decode_errors_chainlink, 0);
+        // Every frame was persisted before the (failed) decode — the recovery path.
+        assert_eq!(
+            db.raw_tick_count().unwrap(),
+            i64::try_from(injected).unwrap()
+        );
+        println!(
+            "PASS: drive_counts_decode_errors_without_per_frame_logs clob={}",
+            stats.decode_errors_clob
+        );
+    }
+
+    // AC1.4(b): a ready `shutdown` wins over a still-draining rx (`biased;`).
+    #[tokio::test]
+    async fn drive_shutdown_wins_over_draining_rx() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let mut state = JoinState::new(Vec::new());
+        let gamma = test_gamma();
+        let cfg = ShadowConfig::default();
+        let mut refresh = tokio::time::interval(Duration::from_secs(3_600));
+        refresh.tick().await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        for _ in 0..8 {
+            tx.try_send(garbage_clob_frame()).unwrap();
+        }
+        let _keep_open = tx; // keep the sender alive: rx stays "still-draining"
+
+        let stats = drive(
+            &db,
+            &mut rx,
+            &mut state,
+            &gamma,
+            &mut refresh,
+            &cfg,
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+
+        // Shutdown was polled first and won before any frame was drained.
+        assert_eq!(stats.decode_errors_clob, 0);
+        assert_eq!(db.raw_tick_count().unwrap(), 0);
+        println!("PASS: drive_shutdown_wins_over_draining_rx");
+    }
 
     #[test]
     fn host_port_parses_schemes_and_ports() {

@@ -45,13 +45,20 @@ async fn scenario_offline_pipeline() {
     assert_eq!(markets.len(), 1, "enumerate one market");
     let start = markets[0].range_start_ms;
 
-    // 2. DECODE in-memory WS frames + JOIN.
+    // 2. DECODE in-memory WS frames + JOIN. Book snapshots are arrays of
+    //    per-asset ladders with no `event_type` (issue #300 fix 4).
     let book_raw = format!(
-        r#"{{"event_type":"book","asset_id":"0xyes5","bids":[{{"price":"0.48"}}],"asks":[{{"price":"0.52"}}],"timestamp":"{}"}}"#,
+        r#"[{{"asset_id":"0xyes5","bids":[{{"price":"0.48"}}],"asks":[{{"price":"0.52"}}],"timestamp":"{}"}}]"#,
         start + 1000
     );
     let updates = parse_clob_frame(&book_raw).unwrap();
     assert_eq!(updates.len(), 1, "decode one book update");
+
+    // Node-receive clocks (fixtures derived from the parsed window — still no
+    // wall clock). Lag is chainlink_received - book_received (issue #300 fix 5).
+    let book_received_ms = start + 100;
+    let tick_start_received_ms = start + 300;
+    let tick_later_received_ms = start + 1100; // 1100 - 100 = 1000 lag vs book
 
     let cl_start = format!(
         r#"{{"symbol":"btc/usd","timestamp":{},"value":"59000"}}"#,
@@ -66,10 +73,11 @@ async fn scenario_offline_pipeline() {
 
     let mut state = JoinState::new(markets);
     for u in updates {
-        state.on_book_update(u);
+        state.on_book_update(u, book_received_ms);
     }
-    let _ = state.on_chainlink_tick(&tick_start); // captures range-start = 59000
-    let obs = state.on_chainlink_tick(&tick_later);
+    // captures range-start = 59000
+    let _ = state.on_chainlink_tick(&tick_start, tick_start_received_ms);
+    let obs = state.on_chainlink_tick(&tick_later, tick_later_received_ms);
     assert_eq!(obs.len(), 1, "one observation per active market");
 
     // 3. FEE MATH: c=60000 > r=59000 => prob_up=1; ask=0.52; fee=0.07*0.52*0.48.
@@ -78,6 +86,7 @@ async fn scenario_offline_pipeline() {
     assert_eq!(o.best_ask, Some(dec!(0.52)));
     assert_eq!(o.fee_cost, Some(dec!(0.017472)));
     assert_eq!(o.net_edge_vs_ask, Some(dec!(0.48) - dec!(0.017472)));
+    // Received-clock lag: tick_later_received - book_received = 1100 - 100.
     assert_eq!(o.feed_to_book_lag_ms, Some(1000));
 
     // 4. WRITE NOTHING on a fresh DB ...

@@ -44,7 +44,11 @@ async fn main() {
     };
 
     let exit = match sub {
-        "run" => match run(&cfg).await {
+        "run" => match run(&cfg, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        {
             Ok(s) => {
                 tracing::info!(
                     observations = s.observations,
