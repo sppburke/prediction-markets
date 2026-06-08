@@ -70,9 +70,11 @@ pub struct BookUpdate {
     /// Best ask (lowest sell), if the book had any asks.
     pub best_ask: Option<Price>,
     /// Source-supplied observation time, epoch milliseconds; `None` if the frame
-    /// omitted or carried an unparseable timestamp. Keeping it optional means a
-    /// missing timestamp yields a null `feed_to_book_lag_ms`, not a spurious
-    /// epoch-sized lag that would corrupt the p50/p95 latency stats.
+    /// omitted or carried an unparseable timestamp (e.g. `price_change` frames,
+    /// which carry none). This is the source publisher's clock, kept for offline
+    /// analysis and `raw_ticks` correlation; it does **not** drive
+    /// `feed_to_book_lag_ms`, which uses the node-receive clock (see
+    /// [`EdgeObservation::feed_to_book_lag_ms`]).
     pub observed_at_ms: Option<i64>,
 }
 
@@ -124,8 +126,12 @@ pub struct EdgeObservation {
     pub fee_cost: Option<Decimal>,
     pub net_edge_vs_ask: Option<Decimal>,
     pub net_edge_vs_mid: Option<Decimal>,
-    /// `chainlink.observed_at_ms - book.observed_at_ms` (positive = book lags
-    /// the feed). `None` if no book seen for this market.
+    /// `chainlink_received_ms - book_received_ms`: the latest book's staleness
+    /// **at the node** when this Chainlink tick was received — a single coherent
+    /// at-the-node clock for both feeds, **not** cross-venue propagation latency.
+    /// `None` only if no book has been seen for this market. With ~1k
+    /// `price_change`/s the latest book is near-always fresh, so the p50/p95 skew
+    /// is small; read it alongside the `meta` vantage point.
     pub feed_to_book_lag_ms: Option<i64>,
 }
 

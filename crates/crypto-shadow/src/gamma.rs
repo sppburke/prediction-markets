@@ -18,6 +18,19 @@ fn default_tick() -> Decimal {
     Decimal::new(1, 2) // 0.01
 }
 
+/// Parse a tick size that Gamma encodes as either a JSON number (`0.01`, the
+/// live `/events` shape) or a string (`"0.01"`). Both go through the value's
+/// *string* form into `Decimal` — never `f64` (prices are exact decimals per
+/// `CLAUDE.md`). Any other JSON shape yields `None`, so `parse_market` falls
+/// back to [`default_tick`].
+fn decimal_from_json_number_or_string(v: &serde_json::Value) -> Option<Decimal> {
+    match v {
+        serde_json::Value::String(s) => Decimal::from_str_exact(s).ok(),
+        serde_json::Value::Number(n) => Decimal::from_str_exact(&n.to_string()).ok(),
+        _ => None,
+    }
+}
+
 /// Error enumerating markets.
 #[derive(Debug, thiserror::Error)]
 pub enum GammaError {
@@ -44,8 +57,11 @@ struct GammaMarketJson {
     start_date: Option<String>,
     #[serde(rename = "endDate")]
     end_date: Option<String>,
+    /// `orderPriceMinTickSize` arrives as a JSON number (`0.01`) on live
+    /// `/events` and as a string (`"0.01"`) elsewhere; hold the raw value and
+    /// convert in `parse_market` (issue #300 fix 1).
     #[serde(rename = "orderPriceMinTickSize")]
-    tick: Option<String>,
+    tick: Option<serde_json::Value>,
 }
 
 fn iso_to_ms(s: &str) -> Option<i64> {
@@ -62,8 +78,8 @@ fn parse_market(m: &GammaMarketJson, series: BtcSeriesKind) -> Option<BtcMarketM
     let range_end_ms = iso_to_ms(m.end_date.as_deref()?)?;
     let tick = m
         .tick
-        .as_deref()
-        .and_then(|t| Decimal::from_str_exact(t).ok())
+        .as_ref()
+        .and_then(decimal_from_json_number_or_string)
         .unwrap_or_else(default_tick);
     Some(BtcMarketMeta {
         condition_id,
@@ -157,6 +173,20 @@ mod tests {
         assert_eq!(m.series, BtcSeriesKind::Five);
         assert_eq!(m.tick, dec!(0.01));
         assert_eq!(m.range_end_ms - m.range_start_ms, 5 * 60 * 1000);
+    }
+
+    #[test]
+    fn parses_numeric_tick_size() {
+        // Live Gamma sends `orderPriceMinTickSize` as a JSON number, not a
+        // string (issue #300 fix 1 / AC1.1).
+        let body = r#"[{"markets":[
+          {"conditionId":"0xcondN","clobTokenIds":"[\"0xyesN\",\"0xnoN\"]",
+           "startDate":"2026-06-08T12:00:00Z","endDate":"2026-06-08T12:05:00Z",
+           "orderPriceMinTickSize":0.01}
+        ]}]"#;
+        let markets = parse_events(body.as_bytes(), BtcSeriesKind::Five).unwrap();
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0].tick, dec!(0.01));
     }
 
     #[test]

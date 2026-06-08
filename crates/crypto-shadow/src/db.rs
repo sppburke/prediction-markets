@@ -16,6 +16,13 @@ use crate::types::{BtcMarketMeta, BtcSeriesKind, EdgeObservation, FeedSource};
 /// On-disk schema version, stamped into `PRAGMA user_version` on create.
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// Provenance value stamped into `meta["lag_clock"]` so a recompute can tell
+/// which clock basis `feed_to_book_lag_ms` was computed under. The column is
+/// re-meaninged within `v1` (source-timestamp skew → receive-node-clock skew,
+/// issue #300 fix 5); no migration is needed because no observation rows
+/// predate the change.
+pub const LAG_CLOCK: &str = "received_node_v2";
+
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
