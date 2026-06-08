@@ -35,6 +35,17 @@ struct Entry {
     settled_at_unix: i64,
 }
 
+/// Per-market settlement detail, cloned out of the private [`Entry`] for callers
+/// that need to value or mark settled positions (the dashboard valuation path).
+#[derive(Debug, Clone)]
+pub struct SettlementInfo {
+    /// Resolution price per `outcome_id` index (YES-wins ≈ `[1, 0]`).
+    pub outcome_prices: Vec<Decimal>,
+    /// Net bankroll credit applied at settlement (clamped ≥ 0).
+    pub credit_applied: Decimal,
+    pub settled_at_unix: i64,
+}
+
 /// In-memory resolution store. Load from a JSON sidecar path; persist on each new settlement.
 #[derive(Debug)]
 pub struct ResolutionStore {
@@ -139,6 +150,15 @@ impl ResolutionStore {
     pub fn settled_count(&self) -> usize {
         self.settled.len()
     }
+
+    /// Per-market settlement detail, or `None` if the market is not settled.
+    pub fn settlement_info(&self, market_id: &MarketId) -> Option<SettlementInfo> {
+        self.settled.get(market_id).map(|e| SettlementInfo {
+            outcome_prices: e.outcome_prices.clone(),
+            credit_applied: e.credit_applied,
+            settled_at_unix: e.settled_at_unix,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -187,6 +207,28 @@ mod tests {
         let store2 = ResolutionStore::load(&path).unwrap();
         assert!(store2.is_settled(&mid("0xcond1")));
         assert_eq!(store2.total_credits(), dec!(5.50));
+    }
+
+    #[test]
+    fn settlement_info_exposes_detail_after_mark_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("res.json");
+        let mut store = ResolutionStore::load(&path).unwrap();
+        assert!(store.settlement_info(&mid("0xcond1")).is_none());
+        store
+            .mark_settled(
+                mid("0xcond1"),
+                vec![dec!(1), dec!(0)],
+                dec!(7.25),
+                1_700_000_000,
+            )
+            .unwrap();
+        let info = store.settlement_info(&mid("0xcond1")).unwrap();
+        assert_eq!(info.outcome_prices, vec![dec!(1), dec!(0)]);
+        assert_eq!(info.credit_applied, dec!(7.25));
+        assert_eq!(info.settled_at_unix, 1_700_000_000);
+        // Unsettled market still returns None.
+        assert!(store.settlement_info(&mid("0xother")).is_none());
     }
 
     #[test]

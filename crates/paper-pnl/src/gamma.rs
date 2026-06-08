@@ -101,22 +101,35 @@ fn parse_resolution(bytes: &[u8], market_id: &MarketId) -> Option<MarketResoluti
         return None;
     }
     let prices_str = m.outcome_prices.as_deref()?;
-    let raw: Vec<String> = serde_json::from_str(prices_str)
-        .map_err(|e| warn!(%market_id, error = %e, "gamma-pnl: outcomePrices parse error"))
-        .ok()?;
+    let outcome_prices = parse_outcome_prices(prices_str)?;
     // Confirm condition_id matches (Gamma may return unrelated rows).
     if m.condition_id != market_id.to_string() {
         warn!(%market_id, returned = %m.condition_id, "gamma-pnl: condition_id mismatch");
         return None;
     }
-    let outcome_prices: Vec<Decimal> = raw
-        .iter()
-        .map(|s| Decimal::from_str(s).unwrap_or(Decimal::ZERO))
-        .collect();
     Some(MarketResolution {
         market_id: market_id.clone(),
         outcome_prices,
     })
+}
+
+/// Parse Gamma's `outcomePrices` field — a JSON-encoded decimal-string array such
+/// as `"[\"0.62\",\"0.38\"]"` (open-market mids) or `"[\"1\",\"0\"]"` (resolved) —
+/// into `Vec<Decimal>` indexed by `outcome_id`.
+///
+/// Returns `None` on malformed JSON (logged), so callers skip the market rather
+/// than mis-valuing it; individual non-decimal entries fall back to zero. Shared
+/// by the resolution parser and the service-tier mid-price cache so the decimal
+/// decoding lives in one place.
+pub fn parse_outcome_prices(prices_str: &str) -> Option<Vec<Decimal>> {
+    let raw: Vec<String> = serde_json::from_str(prices_str)
+        .map_err(|e| warn!(error = %e, "gamma: outcomePrices parse error"))
+        .ok()?;
+    Some(
+        raw.iter()
+            .map(|s| Decimal::from_str(s).unwrap_or(Decimal::ZERO))
+            .collect(),
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,6 +179,23 @@ mod tests {
         );
         let results = fetcher.fetch_closed(&[mid("0xcond")]).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn parse_outcome_prices_decodes_open_mids() {
+        let parsed = parse_outcome_prices(r#"["0.62","0.38"]"#).unwrap();
+        assert_eq!(parsed, vec![Decimal::new(62, 2), Decimal::new(38, 2)]);
+    }
+
+    #[test]
+    fn parse_outcome_prices_none_on_malformed_json() {
+        assert!(parse_outcome_prices("not-json").is_none());
+    }
+
+    #[test]
+    fn parse_outcome_prices_non_decimal_entry_falls_back_to_zero() {
+        let parsed = parse_outcome_prices(r#"["x","0.5"]"#).unwrap();
+        assert_eq!(parsed, vec![Decimal::ZERO, Decimal::new(5, 1)]);
     }
 
     #[tokio::test]

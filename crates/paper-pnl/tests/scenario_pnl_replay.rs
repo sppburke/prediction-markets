@@ -6,6 +6,8 @@
 //! verify the PnlLedger snapshot matches the expected values deterministically.
 //! Fixed inputs, no live network, no SystemTime::now().
 
+use std::collections::HashMap;
+
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
@@ -99,7 +101,7 @@ fn snapshot_matches_expected_after_resolution() {
         .unwrap();
 
     // bankroll after resolution credit = 993 + 10 = 1003
-    let snapshot = PnlLedger::snapshot(&db, &store, initial).unwrap();
+    let snapshot = PnlLedger::snapshot(&db, &store, initial, &HashMap::new()).unwrap();
 
     assert_eq!(snapshot.current_bankroll, dec!(1003), "bankroll mismatch");
     assert_eq!(
@@ -156,11 +158,11 @@ fn replay_equals_snapshot() {
         .mark_settled(mkt, vec![dec!(1), dec!(0)], credit, 1_700_000_000)
         .unwrap();
 
-    let snap1 = PnlLedger::snapshot(&db, &store, initial).unwrap();
+    let snap1 = PnlLedger::snapshot(&db, &store, initial, &HashMap::new()).unwrap();
 
     // Reload store to simulate restart.
     let store2 = ResolutionStore::load(&res_path).unwrap();
-    let snap2 = PnlLedger::snapshot(&db, &store2, initial).unwrap();
+    let snap2 = PnlLedger::snapshot(&db, &store2, initial, &HashMap::new()).unwrap();
 
     assert_eq!(
         snap1.current_bankroll, snap2.current_bankroll,
@@ -177,4 +179,59 @@ fn replay_equals_snapshot() {
     );
 
     println!("PASS: replay equals snapshot");
+}
+
+/// Scenario: an open (unsettled) position marked to market via supplied mids.
+/// PASS: realized = 0, open_market_value = mid × contracts, unrealized = MV − cost.
+/// FAIL: any numeric mismatch, or snapshot() returns Err.
+#[test]
+fn open_position_marked_to_market() {
+    println!("Scenario: pnl_replay — open position marked to market");
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("paper.db");
+    let res_path = dir.path().join("resolutions.json");
+
+    let db = PaperStateDb::open(&db_path).unwrap();
+    let initial = dec!(1000);
+    db.init_bankroll(initial).unwrap();
+
+    // BUY 100 YES @ 0.40 → cost 40, bankroll 960.
+    let mkt = market("0xopen");
+    db.commit_fill(
+        &SourceTradeId("tx1".to_string()),
+        &leader(mkt.clone(), 100),
+        &fill("k1", mkt.clone(), Side::Buy, 100, dec!(0.40)),
+        EventSeq(1),
+    )
+    .unwrap();
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(960)));
+
+    // No settlement; supply a live mid of 0.55 for the open market.
+    let store = ResolutionStore::load(&res_path).unwrap();
+    let mut mids = HashMap::new();
+    mids.insert(mkt.clone(), vec![dec!(0.55), dec!(0.45)]);
+
+    let snapshot = PnlLedger::snapshot(&db, &store, initial, &mids).unwrap();
+
+    assert_eq!(
+        snapshot.total_pnl,
+        dec!(-40),
+        "bankroll delta is −40 (cost debited)"
+    );
+    assert_eq!(
+        snapshot.realized_pnl,
+        dec!(0),
+        "nothing settled → realized 0"
+    );
+    assert_eq!(snapshot.open_market_value, dec!(55), "100 × 0.55");
+    assert_eq!(snapshot.unrealized_pnl, dec!(15), "55 − 40 cost");
+    assert_eq!(
+        snapshot.displayed_total(),
+        dec!(15),
+        "realized 0 + unrealized 15"
+    );
+    assert_eq!(snapshot.open_position_count, 1);
+
+    println!("PASS: open position marked to market");
 }

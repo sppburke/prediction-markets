@@ -3316,6 +3316,7 @@ dependencies = [
  "axum",
  "base64",
  "figment",
+ "futures",
  "pe-copy-signal-engine",
  "pe-core-types",
  "pe-event-log",

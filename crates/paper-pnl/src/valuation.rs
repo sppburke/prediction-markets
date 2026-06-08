@@ -1,0 +1,406 @@
+//! Pure portfolio valuation — the single source of truth for the dashboard's
+//! realized/unrealized P&L split and per-trade marks.
+//!
+//! No I/O. The service tier fetches live mids and passes them in as data; the
+//! settlement source is the in-memory [`ResolutionStore`]. Open vs settled is
+//! decided **solely** by [`ResolutionStore::is_settled`] — never by any cache —
+//! so the summary card and the per-trade table, both derived from one
+//! [`value_portfolio`] call, cannot drift.
+//!
+//! Accounting identities (`T = current_bankroll − initial_bankroll`):
+//! - `open_cost`           = Σ over open fills of `fill_price × contracts` (buy +, sell −)
+//! - `open_market_value`   = Σ over open positions of `(long − short) × mid[outcome_id]`
+//! - `realized_pnl`        = `T + open_cost`
+//! - `unrealized_pnl`      = `open_market_value − open_cost`
+//! - displayed total       = `realized_pnl + unrealized_pnl = T + open_market_value`
+//!
+//! An open position with no live mid contributes 0 to `open_market_value` and is
+//! counted in `open_positions_missing_price`; its per-row mark is `None`.
+
+use std::collections::HashMap;
+
+use pe_core_types::{MarketId, Side};
+use pe_paper_state::{FillRow, PaperPositionRow};
+use rust_decimal::Decimal;
+
+use crate::resolution::ResolutionStore;
+
+/// Settled-fill outcome, for the per-trade display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillOutcome {
+    /// Market settled and this fill realized a positive P&L.
+    Won,
+    /// Market settled and this fill realized a non-positive P&L.
+    Lost,
+    /// Market still open (not settled).
+    Open,
+}
+
+/// Per-fill valuation, parallel to the input `fills` slice (same order and length).
+#[derive(Debug, Clone)]
+pub struct TradeValuation {
+    pub outcome: FillOutcome,
+    /// Realized P&L for a settled fill; `None` while the market is open.
+    pub realized_pnl: Option<Decimal>,
+    /// Current mark: the resolved price for a settled fill, the live mid for an
+    /// open one, or `None` if an open market has no mid yet.
+    pub current_mid: Option<Decimal>,
+}
+
+/// Aggregate + per-fill output of [`value_portfolio`].
+#[derive(Debug, Clone)]
+pub struct ValuationOutput {
+    /// `T + open_cost` — P&L from settled markets (bankroll-derived).
+    pub realized_pnl: Decimal,
+    /// `open_market_value − open_cost` — mark-to-market of open positions.
+    pub unrealized_pnl: Decimal,
+    /// `Σ (long − short) × mid` over priced open positions.
+    pub open_market_value: Decimal,
+    /// `Σ fill_price × contracts` (buy +, sell −) over open fills.
+    pub open_cost: Decimal,
+    /// Open positions with contracts but no live mid; valued at 0 in the
+    /// aggregate, marked `None` per row.
+    pub open_positions_missing_price: usize,
+    /// Count of genuinely-open positions (non-zero contracts, market unsettled).
+    pub open_position_count: usize,
+    /// `realized_pnl − (recorded settlement credits − settled-fills cost)`. ~0 in
+    /// normal operation; the zero-floor bankroll debit clamp is a known legitimate
+    /// source of drift. Callers log (not panic) when it exceeds tolerance.
+    pub reconciliation_drift: Decimal,
+    /// Per-fill valuations, parallel to the input `fills` slice.
+    pub trades: Vec<TradeValuation>,
+}
+
+/// Value the portfolio from DB state + live mids. Pure and deterministic.
+///
+/// `open_cost` is folded from `fills`; `open_market_value` from `positions`; both
+/// over the same open set (`!is_settled`). `open_mids` supplies live marks for
+/// open markets only — settled marks come from `resolutions`.
+pub fn value_portfolio(
+    fills: &[FillRow],
+    positions: &[PaperPositionRow],
+    resolutions: &ResolutionStore,
+    open_mids: &HashMap<MarketId, Vec<Decimal>>,
+    current_bankroll: Decimal,
+    initial_bankroll: Decimal,
+) -> ValuationOutput {
+    let t = current_bankroll - initial_bankroll;
+
+    // open_cost: signed sum over OPEN fills (buy +, sell −).
+    // all_fills_cost: same over ALL fills, used by the bankroll reconciliation.
+    let mut open_cost = Decimal::ZERO;
+    let mut all_fills_cost = Decimal::ZERO;
+    for f in fills {
+        let signed = signed_cost(f);
+        all_fills_cost = all_fills_cost.checked_add(signed).unwrap_or(all_fills_cost);
+        if !resolutions.is_settled(&f.market_id) {
+            open_cost = open_cost.checked_add(signed).unwrap_or(open_cost);
+        }
+    }
+
+    // open_market_value: (long − short) × mid over OPEN positions. An unpriced open
+    // position contributes 0 and is counted; both predicates use is_settled.
+    let mut open_market_value = Decimal::ZERO;
+    let mut open_positions_missing_price = 0usize;
+    let mut open_position_count = 0usize;
+    for p in positions {
+        if p.long_contracts == 0 && p.short_contracts == 0 {
+            continue;
+        }
+        if resolutions.is_settled(&p.market_id) {
+            continue;
+        }
+        open_position_count += 1;
+        match mid_for(open_mids, &p.market_id, p.outcome_id.0) {
+            Some(mid) => {
+                let net = Decimal::from(p.long_contracts) - Decimal::from(p.short_contracts);
+                let v = net.checked_mul(mid).unwrap_or(Decimal::ZERO);
+                open_market_value = open_market_value
+                    .checked_add(v)
+                    .unwrap_or(open_market_value);
+            }
+            None => open_positions_missing_price += 1,
+        }
+    }
+
+    let realized_pnl = t.checked_add(open_cost).unwrap_or(t);
+    let unrealized_pnl = open_market_value
+        .checked_sub(open_cost)
+        .unwrap_or(open_market_value);
+
+    // Reconciliation: realized should equal recorded settlement credits minus the
+    // signed cost of settled fills. settled_fills_cost = all_fills_cost − open_cost.
+    let settled_fills_cost = all_fills_cost
+        .checked_sub(open_cost)
+        .unwrap_or(all_fills_cost);
+    let realized_from_settlements = resolutions
+        .total_credits()
+        .checked_sub(settled_fills_cost)
+        .unwrap_or(resolutions.total_credits());
+    let reconciliation_drift = realized_pnl
+        .checked_sub(realized_from_settlements)
+        .unwrap_or(Decimal::ZERO);
+
+    let trades = fills
+        .iter()
+        .map(|f| value_fill(f, resolutions, open_mids))
+        .collect();
+
+    ValuationOutput {
+        realized_pnl,
+        unrealized_pnl,
+        open_market_value,
+        open_cost,
+        open_positions_missing_price,
+        open_position_count,
+        reconciliation_drift,
+        trades,
+    }
+}
+
+/// Signed cash flow of a fill: buys debit (`+`), sells credit (`−`).
+fn signed_cost(f: &FillRow) -> Decimal {
+    let notional = f
+        .fill_price
+        .0
+        .checked_mul(Decimal::from(f.contracts))
+        .unwrap_or(Decimal::ZERO);
+    match f.side {
+        Side::Buy => notional,
+        Side::Sell => -notional,
+    }
+}
+
+/// Mid for `(market, outcome_id)`, if `open_mids` carries it.
+fn mid_for(
+    open_mids: &HashMap<MarketId, Vec<Decimal>>,
+    market: &MarketId,
+    outcome_id: u16,
+) -> Option<Decimal> {
+    open_mids
+        .get(market)
+        .and_then(|prices| prices.get(usize::from(outcome_id)).copied())
+}
+
+/// Value a single fill: settled → realized P&L + Won/Lost from the resolved price;
+/// open → the live mid as the current mark (or `None` if unpriced).
+fn value_fill(
+    f: &FillRow,
+    resolutions: &ResolutionStore,
+    open_mids: &HashMap<MarketId, Vec<Decimal>>,
+) -> TradeValuation {
+    if let Some(info) = resolutions.settlement_info(&f.market_id) {
+        let resolved = info
+            .outcome_prices
+            .get(usize::from(f.outcome_id.0))
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        // realized = side_sign × (resolved − fill_price) × contracts.
+        let diff = resolved
+            .checked_sub(f.fill_price.0)
+            .unwrap_or(Decimal::ZERO);
+        let magnitude = diff
+            .checked_mul(Decimal::from(f.contracts))
+            .unwrap_or(Decimal::ZERO);
+        let realized = match f.side {
+            Side::Buy => magnitude,
+            Side::Sell => -magnitude,
+        };
+        let outcome = if realized > Decimal::ZERO {
+            FillOutcome::Won
+        } else {
+            FillOutcome::Lost
+        };
+        TradeValuation {
+            outcome,
+            realized_pnl: Some(realized),
+            current_mid: Some(resolved),
+        }
+    } else {
+        TradeValuation {
+            outcome: FillOutcome::Open,
+            realized_pnl: None,
+            current_mid: mid_for(open_mids, &f.market_id, f.outcome_id.0),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use pe_core_types::{MarketId, OutcomeId, Price, VenueMarketId};
+    use rust_decimal_macros::dec;
+
+    fn mid(s: &str) -> MarketId {
+        MarketId(VenueMarketId(s.to_string()))
+    }
+
+    fn fill(market: &str, outcome: u16, side: Side, contracts: u64, price: Decimal) -> FillRow {
+        FillRow {
+            idempotency_key: format!("wf|0xL|0xS|{market}|{outcome}|buy|1700000000"),
+            market_id: mid(market),
+            outcome_id: OutcomeId(outcome),
+            side,
+            contracts,
+            fill_price: Price(price),
+            event_seq: 1,
+        }
+    }
+
+    fn pos(market: &str, outcome: u16, long: u64, short: u64) -> PaperPositionRow {
+        PaperPositionRow {
+            market_id: mid(market),
+            outcome_id: OutcomeId(outcome),
+            long_contracts: long,
+            short_contracts: short,
+        }
+    }
+
+    /// A store seeded with the given settled markets (price arrays + recorded credit).
+    fn store_with(
+        settled: &[(&str, Vec<Decimal>, Decimal)],
+    ) -> (tempfile::TempDir, ResolutionStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ResolutionStore::load(&dir.path().join("res.json")).unwrap();
+        for (m, prices, credit) in settled {
+            store
+                .mark_settled(mid(m), prices.clone(), *credit, 1_700_000_000)
+                .unwrap();
+        }
+        (dir, store)
+    }
+
+    #[test]
+    fn open_position_with_mid_marks_to_market() {
+        // Bought 100 of YES @ 0.40 (cost 40). Bankroll debited 40 → T = −40.
+        // Mid now 0.55 → MV = 55, unrealized = 55 − 40 = +15, realized = −40 + 40 = 0.
+        let (_d, store) = store_with(&[]);
+        let fills = vec![fill("0xm", 0, Side::Buy, 100, dec!(0.40))];
+        let positions = vec![pos("0xm", 0, 100, 0)];
+        let mut mids = HashMap::new();
+        mids.insert(mid("0xm"), vec![dec!(0.55), dec!(0.45)]);
+
+        let v = value_portfolio(&fills, &positions, &store, &mids, dec!(9960), dec!(10000));
+        assert_eq!(v.open_cost, dec!(40));
+        assert_eq!(v.open_market_value, dec!(55));
+        assert_eq!(v.unrealized_pnl, dec!(15));
+        assert_eq!(v.realized_pnl, dec!(0));
+        assert_eq!(v.open_positions_missing_price, 0);
+        assert_eq!(v.open_position_count, 1);
+        assert_eq!(v.trades[0].outcome, FillOutcome::Open);
+        assert_eq!(v.trades[0].current_mid, Some(dec!(0.55)));
+        assert_eq!(v.trades[0].realized_pnl, None);
+        assert_eq!(v.reconciliation_drift, dec!(0));
+    }
+
+    #[test]
+    fn settled_winner_realizes_profit() {
+        // Bought 100 YES @ 0.40 (cost 40); YES resolved → credit 100. Bankroll
+        // 10000 − 40 + 100 = 10060 → T = 60. realized = T + open_cost(0) = 60.
+        let (_d, store) = store_with(&[("0xm", vec![dec!(1), dec!(0)], dec!(100))]);
+        let fills = vec![fill("0xm", 0, Side::Buy, 100, dec!(0.40))];
+        let positions = vec![pos("0xm", 0, 100, 0)];
+
+        let v = value_portfolio(
+            &fills,
+            &positions,
+            &store,
+            &HashMap::new(),
+            dec!(10060),
+            dec!(10000),
+        );
+        assert_eq!(v.open_cost, dec!(0)); // settled, excluded from open
+        assert_eq!(v.realized_pnl, dec!(60));
+        assert_eq!(v.unrealized_pnl, dec!(0));
+        assert_eq!(v.open_position_count, 0);
+        assert_eq!(v.trades[0].outcome, FillOutcome::Won);
+        assert_eq!(v.trades[0].realized_pnl, Some(dec!(60))); // (1−0.40)×100
+        assert_eq!(v.reconciliation_drift, dec!(0));
+    }
+
+    #[test]
+    fn settled_loser_realizes_loss_without_double_count() {
+        // Bought 100 NO @ 0.30 (cost 30); YES resolved → NO worthless, credit 0.
+        // Bankroll 10000 − 30 = 9970 → T = −30. realized = −30, no double count.
+        let (_d, store) = store_with(&[("0xm", vec![dec!(1), dec!(0)], dec!(0))]);
+        let fills = vec![fill("0xm", 1, Side::Buy, 100, dec!(0.30))];
+        let positions = vec![pos("0xm", 1, 100, 0)];
+
+        let v = value_portfolio(
+            &fills,
+            &positions,
+            &store,
+            &HashMap::new(),
+            dec!(9970),
+            dec!(10000),
+        );
+        assert_eq!(v.realized_pnl, dec!(-30));
+        assert_eq!(v.unrealized_pnl, dec!(0));
+        assert_eq!(v.trades[0].outcome, FillOutcome::Lost);
+        assert_eq!(v.trades[0].realized_pnl, Some(dec!(-30))); // (0−0.30)×100
+        assert_eq!(v.reconciliation_drift, dec!(0));
+    }
+
+    #[test]
+    fn open_position_missing_mid_is_counted_and_valued_zero() {
+        let (_d, store) = store_with(&[]);
+        let fills = vec![fill("0xm", 0, Side::Buy, 100, dec!(0.40))];
+        let positions = vec![pos("0xm", 0, 100, 0)];
+        // No mid supplied for 0xm.
+        let v = value_portfolio(
+            &fills,
+            &positions,
+            &store,
+            &HashMap::new(),
+            dec!(9960),
+            dec!(10000),
+        );
+        assert_eq!(v.open_positions_missing_price, 1);
+        assert_eq!(v.open_market_value, dec!(0));
+        assert_eq!(v.unrealized_pnl, dec!(-40)); // 0 − open_cost(40)
+        assert_eq!(v.trades[0].current_mid, None);
+    }
+
+    #[test]
+    fn mixed_open_and_settled_reconciles() {
+        // Settled winner: bought 100 YES @ 0.40 → credit 100.
+        // Open: bought 50 YES @ 0.50 (cost 25), mid 0.60 → MV 30.
+        // Bankroll = 10000 − 40 (buy1) + 100 (credit) − 25 (buy2) = 10035 → T = 35.
+        // open_cost = 25, realized = 35 + 25 = 60, unrealized = 30 − 25 = 5.
+        let (_d, store) = store_with(&[("0xa", vec![dec!(1), dec!(0)], dec!(100))]);
+        let fills = vec![
+            fill("0xa", 0, Side::Buy, 100, dec!(0.40)),
+            fill("0xb", 0, Side::Buy, 50, dec!(0.50)),
+        ];
+        let positions = vec![pos("0xa", 0, 100, 0), pos("0xb", 0, 50, 0)];
+        let mut mids = HashMap::new();
+        mids.insert(mid("0xb"), vec![dec!(0.60), dec!(0.40)]);
+
+        let v = value_portfolio(&fills, &positions, &store, &mids, dec!(10035), dec!(10000));
+        assert_eq!(v.open_cost, dec!(25));
+        assert_eq!(v.realized_pnl, dec!(60));
+        assert_eq!(v.unrealized_pnl, dec!(5));
+        assert_eq!(v.realized_pnl + v.unrealized_pnl, dec!(65)); // displayed total
+        assert_eq!(v.open_position_count, 1);
+        assert_eq!(v.reconciliation_drift, dec!(0));
+    }
+
+    #[test]
+    fn reconciliation_drift_flags_credit_mismatch() {
+        // Bankroll reflects a 100 credit, but the store records only 90 → drift +10.
+        let (_d, store) = store_with(&[("0xm", vec![dec!(1), dec!(0)], dec!(90))]);
+        let fills = vec![fill("0xm", 0, Side::Buy, 100, dec!(0.40))];
+        let positions = vec![pos("0xm", 0, 100, 0)];
+        // Bankroll = 10000 − 40 + 100 = 10060 → realized = 60; recorded = 90 − 40 = 50.
+        let v = value_portfolio(
+            &fills,
+            &positions,
+            &store,
+            &HashMap::new(),
+            dec!(10060),
+            dec!(10000),
+        );
+        assert_eq!(v.reconciliation_drift, dec!(10));
+    }
+}
