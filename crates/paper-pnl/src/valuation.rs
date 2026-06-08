@@ -17,7 +17,7 @@
 //! An open position with no live mid contributes 0 to `open_market_value` and is
 //! counted in `open_positions_missing_price`; its per-row mark is `None`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pe_core_types::{MarketId, Side};
 use pe_paper_state::{FillRow, PaperPositionRow};
@@ -54,18 +54,20 @@ pub struct ValuationOutput {
     pub realized_pnl: Decimal,
     /// `open_market_value − open_cost` — mark-to-market of open positions.
     pub unrealized_pnl: Decimal,
-    /// `Σ (long − short) × mid` over priced open positions.
+    /// `Σ (long − short) × mid` over priced live open positions.
     pub open_market_value: Decimal,
-    /// `Σ fill_price × contracts` (buy +, sell −) over open fills.
+    /// `Σ fill_price × contracts` (buy +, sell −) over fills backing a live open
+    /// position.
     pub open_cost: Decimal,
-    /// Open positions with contracts but no live mid; valued at 0 in the
-    /// aggregate, marked `None` per row.
+    /// Live open positions with no live mid; valued at 0 in the aggregate, marked
+    /// `None` per row.
     pub open_positions_missing_price: usize,
-    /// Count of genuinely-open positions (non-zero contracts, market unsettled).
+    /// Count of genuinely-open positions (non-zero net contracts, market unsettled).
     pub open_position_count: usize,
-    /// `realized_pnl − (recorded settlement credits − settled-fills cost)`. ~0 in
-    /// normal operation; the zero-floor bankroll debit clamp is a known legitimate
-    /// source of drift. Callers log (not panic) when it exceeds tolerance.
+    /// `(T + all_fills_cost) − recorded total_credits` — bankroll-implied settlement
+    /// credits vs. the recorded total. ~0 in normal operation; the zero-floor
+    /// bankroll debit clamp is a known legitimate source of drift. Callers log (not
+    /// panic) when it exceeds tolerance.
     pub reconciliation_drift: Decimal,
     /// Per-fill valuations, parallel to the input `fills` slice.
     pub trades: Vec<TradeValuation>,
@@ -73,9 +75,17 @@ pub struct ValuationOutput {
 
 /// Value the portfolio from DB state + live mids. Pure and deterministic.
 ///
-/// `open_cost` is folded from `fills`; `open_market_value` from `positions`; both
-/// over the same open set (`!is_settled`). `open_mids` supplies live marks for
-/// open markets only — settled marks come from `resolutions`.
+/// A `(market, outcome)` is a **live open position** when it has a net position
+/// (`long ≠ short`) on an unsettled market. `open_market_value` marks those
+/// positions; `open_cost` is the signed cost of the fills that back them. Gating
+/// `open_cost` on *live* positions (not merely unsettled markets) means a position
+/// fully closed before settlement — a buy then equal sell — realizes its round-trip
+/// P&L (it stays in the bankroll delta `T`) instead of leaking into unrealized.
+///
+/// Cost-basis limitation: a *partially* closed position (e.g. bought 100, sold 40,
+/// 60 held) still folds all its fills into `open_cost`, so the sold portion's
+/// realized P&L is approximated as unrealized. `PaperPositionRow` carries no
+/// cost basis, so an exact split is out of scope; the displayed total stays correct.
 pub fn value_portfolio(
     fills: &[FillRow],
     positions: &[PaperPositionRow],
@@ -86,31 +96,20 @@ pub fn value_portfolio(
 ) -> ValuationOutput {
     let t = current_bankroll - initial_bankroll;
 
-    // open_cost: signed sum over OPEN fills (buy +, sell −).
-    // all_fills_cost: same over ALL fills, used by the bankroll reconciliation.
-    let mut open_cost = Decimal::ZERO;
-    let mut all_fills_cost = Decimal::ZERO;
-    for f in fills {
-        let signed = signed_cost(f);
-        all_fills_cost = all_fills_cost.checked_add(signed).unwrap_or(all_fills_cost);
-        if !resolutions.is_settled(&f.market_id) {
-            open_cost = open_cost.checked_add(signed).unwrap_or(open_cost);
-        }
-    }
-
-    // open_market_value: (long − short) × mid over OPEN positions. An unpriced open
-    // position contributes 0 and is counted; both predicates use is_settled.
+    // open_market_value: (long − short) × mid over live open positions. Record which
+    // (market, outcome) are live so open_cost can be gated on the same set. An
+    // unpriced live position contributes 0 to the value and is counted.
     let mut open_market_value = Decimal::ZERO;
     let mut open_positions_missing_price = 0usize;
     let mut open_position_count = 0usize;
+    let mut live: HashSet<(MarketId, u16)> = HashSet::new();
     for p in positions {
-        if p.long_contracts == 0 && p.short_contracts == 0 {
-            continue;
-        }
-        if resolutions.is_settled(&p.market_id) {
+        if (p.long_contracts == 0 && p.short_contracts == 0) || resolutions.is_settled(&p.market_id)
+        {
             continue;
         }
         open_position_count += 1;
+        live.insert((p.market_id.clone(), p.outcome_id.0));
         match mid_for(open_mids, &p.market_id, p.outcome_id.0) {
             Some(mid) => {
                 let net = Decimal::from(p.long_contracts) - Decimal::from(p.short_contracts);
@@ -123,22 +122,29 @@ pub fn value_portfolio(
         }
     }
 
+    // open_cost: signed cost of fills backing a still-live open position (buy +,
+    // sell −). all_fills_cost: every fill, for the bankroll reconciliation.
+    let mut open_cost = Decimal::ZERO;
+    let mut all_fills_cost = Decimal::ZERO;
+    for f in fills {
+        let signed = signed_cost(f);
+        all_fills_cost = all_fills_cost.checked_add(signed).unwrap_or(all_fills_cost);
+        if live.contains(&(f.market_id.clone(), f.outcome_id.0)) {
+            open_cost = open_cost.checked_add(signed).unwrap_or(open_cost);
+        }
+    }
+
     let realized_pnl = t.checked_add(open_cost).unwrap_or(t);
     let unrealized_pnl = open_market_value
         .checked_sub(open_cost)
         .unwrap_or(open_market_value);
 
-    // Reconciliation: realized should equal recorded settlement credits minus the
-    // signed cost of settled fills. settled_fills_cost = all_fills_cost − open_cost.
-    let settled_fills_cost = all_fills_cost
-        .checked_sub(open_cost)
-        .unwrap_or(all_fills_cost);
-    let realized_from_settlements = resolutions
-        .total_credits()
-        .checked_sub(settled_fills_cost)
-        .unwrap_or(resolutions.total_credits());
-    let reconciliation_drift = realized_pnl
-        .checked_sub(realized_from_settlements)
+    // Reconciliation (split-independent): the bankroll-implied settlement credits
+    // (`T + all_fills_cost`) should equal the recorded `total_credits`. Drift flags a
+    // bankroll↔settlement skew (e.g. the zero-floor debit clamp); logged, not panicked.
+    let implied_credits = t.checked_add(all_fills_cost).unwrap_or(t);
+    let reconciliation_drift = implied_credits
+        .checked_sub(resolutions.total_credits())
         .unwrap_or(Decimal::ZERO);
 
     let trades = fills
@@ -383,6 +389,40 @@ mod tests {
         assert_eq!(v.unrealized_pnl, dec!(5));
         assert_eq!(v.realized_pnl + v.unrealized_pnl, dec!(65)); // displayed total
         assert_eq!(v.open_position_count, 1);
+        assert_eq!(v.reconciliation_drift, dec!(0));
+    }
+
+    #[test]
+    fn closed_unsettled_roundtrip_realizes_pnl() {
+        // BUY 100 @0.40 then SELL 100 @0.55 on an OPEN market → position nets to 0.
+        // The +15 round-trip gain is realized (locked in), not unrealized.
+        let (_d, store) = store_with(&[]);
+        let fills = vec![
+            fill("0xm", 0, Side::Buy, 100, dec!(0.40)),
+            fill("0xm", 0, Side::Sell, 100, dec!(0.55)),
+        ];
+        let positions = vec![pos("0xm", 0, 0, 0)]; // fully closed
+        // Bankroll: 10000 − 40 + 55 = 10015 → T = 15.
+        let v = value_portfolio(
+            &fills,
+            &positions,
+            &store,
+            &HashMap::new(),
+            dec!(10015),
+            dec!(10000),
+        );
+        assert_eq!(
+            v.open_cost,
+            dec!(0),
+            "a closed position contributes no open cost"
+        );
+        assert_eq!(
+            v.realized_pnl,
+            dec!(15),
+            "round-trip gain is realized, not unrealized"
+        );
+        assert_eq!(v.unrealized_pnl, dec!(0));
+        assert_eq!(v.open_position_count, 0);
         assert_eq!(v.reconciliation_drift, dec!(0));
     }
 
