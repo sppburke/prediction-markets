@@ -313,7 +313,13 @@ async fn main() -> Result<()> {
     // previously-entered markets, so the copy-entry gate admits only first-ever
     // entries. Borrows `wallets` (must run before it is moved into TradePoller).
     let history_map = {
-        let history_fetcher = ReqwestFetcher::new(reqwest::Client::new());
+        // Per-request timeout so a stalled Polymarket connection can't hang startup
+        // (the loader falls back to the cached sidecar for any wallet that times out).
+        let history_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .context("build wallet-history http client")?;
+        let history_fetcher = ReqwestFetcher::new(history_client);
         let map = WalletHistoryLoader::load(
             &wallets,
             &cfg.polymarket_base_url,
