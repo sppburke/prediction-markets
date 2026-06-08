@@ -815,3 +815,19 @@ Stage-2 portfolio construction (issue #276). See `docs/25-PORTFOLIO-CONSTRUCTOR.
 | `portfolio_sizing_bankroll_usd` | 1000.0 | Starting bankroll for the sizing simulation (`--starting-capital`). |
 | `portfolio_pbo_min_anchors` | 4 | Minimum anchor count for a committed PBO verdict (reuses the `gbm_walkforward.py` rule: `pbo<=0.5 AND n_seeds>=2 AND n_anchors>=4`; below this threshold, `verdict="undefined"`). **Intentionally the same value as `portfolio_min_credible_anchors`** at launch; they are distinct concepts and may diverge. |
 | `portfolio_min_credible_anchors` | 4 | Minimum eligible anchors for the deploy set to be considered credible. When `n_eligible_anchors < 4`, the aggregate is flagged `credible=false` and the deploy set is labelled "insufficient evidence". **Intentionally the same value as `portfolio_pbo_min_anchors`** at launch; they gate different things (PBO verdict vs. overall credibility). |
+
+### BTC shadow harness defaults (`pe-crypto-shadow`)
+
+Measurement-only shadow harness for BTC up/down latency-arb (issue #297, Strategy 1+). Places no orders. See `crates/crypto-shadow/`.
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `crypto_fees_v2_rate` | 0.07 | Polymarket Crypto-category taker fee rate (`feeSchedule.rate`). Per-share taker fee = `rate · p · (1−p)` (exponent=1), **verified 2026-06-08** against docs.polymarket.com/trading/fees — matches the published table to the cent (100 sh @ p=0.50 → $1.75). The maker-rebates page's 0.072 is pooled/stale; the per-market `feeSchedule` value governs. Taker/entry-buy only; sell-side fee is ambiguous between two official Polymarket sources. Single source of truth: `crates/crypto-shadow/src/fees.rs`. |
+| `crypto_shadow_channel_capacity` | 1024 | Bounded `mpsc` capacity for WS frames → join loop. Backpressure: drop-newest on full (dropped frames are logged; under sustained overload `raw_ticks` is best-effort, not gap-free). |
+| `crypto_shadow_market_refresh_interval_secs` | 60 | Period for re-enumerating open BTC markets from Gamma during a `run`. |
+| `crypto_shadow_max_open_markets` | 64 | Cap on simultaneously tracked markets per run. |
+| `crypto_shadow_ws_max_backoff_secs` | 60 | Exponential-backoff cap for WS reconnect (mirrors `MAX_BACKOFF_SECS` in `source-onchain-polygon/src/live.rs`). |
+| `crypto_shadow_rtt_probe_pings` | 5 | TCP-connect samples per endpoint for the startup vantage RTT probe; p50 stamped into `meta` so the measured edge carries the location it was taken from. |
+| `crypto_shadow_gamma_base_url` | `https://gamma-api.polymarket.com` | Gamma API root for market enumeration. |
+| `crypto_shadow_chainlink_ws_url` | `wss://ws-live-data.polymarket.com` | RTDS feed root (`crypto_prices_chainlink`, `btc/usd` — the 5m/15m settling value). |
+| `crypto_shadow_clob_ws_url` | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | CLOB market book WS. |
