@@ -4,6 +4,10 @@ ignore = [
     # paste is an indirect dep of alloy; the advisory is an unmaintained notice only.
     # No vulnerability; no security risk. Will resolve when alloy drops paste.
     "RUSTSEC-2024-0436",
+    # proc-macro-error2 is a build-time proc-macro dep of alloy-sol-macro (alloy).
+    # Author confirmed it unmaintained (RUSTSEC-2026-0173); unmaintained notice only,
+    # no vulnerability. Will resolve when alloy-sol-macro migrates off it.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
