@@ -32,7 +32,7 @@ pub fn compute_observation(
     let prob_up = range_start.map(|r| indicator_prob_up(c, r));
     let best_ask = book.and_then(|b| b.best_ask).map(|p| p.0);
     let mid = book.and_then(BookUpdate::mid);
-    let feed_to_book_lag_ms = book.map(|b| observed_at_ms - b.observed_at_ms);
+    let feed_to_book_lag_ms = book.and_then(|b| b.observed_at_ms.map(|bt| observed_at_ms - bt));
 
     // Gross edge of buying YES = P(up) - price paid. Only defined when both the
     // probability indicator and the relevant price are available.
@@ -180,7 +180,7 @@ mod tests {
             token_id: "tok-yes".to_string(),
             best_bid: Some(Price(bid.parse().unwrap())),
             best_ask: Some(Price(ask.parse().unwrap())),
-            observed_at_ms: ts,
+            observed_at_ms: Some(ts),
         }
     }
 
@@ -227,6 +227,20 @@ mod tests {
         assert_eq!(obs.fee_cost, None);
         assert_eq!(obs.net_edge_vs_ask, None);
         assert_eq!(obs.feed_to_book_lag_ms, None);
+    }
+
+    #[test]
+    fn book_without_timestamp_yields_null_lag_not_giant() {
+        let m = meta();
+        let b = BookUpdate {
+            token_id: "tok-yes".to_string(),
+            best_bid: Some(Price(dec!(0.40))),
+            best_ask: Some(Price(dec!(0.60))),
+            observed_at_ms: None,
+        };
+        let obs = compute_observation(&m, dec!(60000), 2_000, Some(dec!(59000)), Some(&b));
+        assert_eq!(obs.best_ask, Some(dec!(0.60))); // book quote still present
+        assert_eq!(obs.feed_to_book_lag_ms, None); // but lag is null, not epoch-sized
     }
 
     #[test]

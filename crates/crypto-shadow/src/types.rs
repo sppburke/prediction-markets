@@ -69,8 +69,11 @@ pub struct BookUpdate {
     pub best_bid: Option<Price>,
     /// Best ask (lowest sell), if the book had any asks.
     pub best_ask: Option<Price>,
-    /// Source-supplied observation time, epoch milliseconds.
-    pub observed_at_ms: i64,
+    /// Source-supplied observation time, epoch milliseconds; `None` if the frame
+    /// omitted or carried an unparseable timestamp. Keeping it optional means a
+    /// missing timestamp yields a null `feed_to_book_lag_ms`, not a spurious
+    /// epoch-sized lag that would corrupt the p50/p95 latency stats.
+    pub observed_at_ms: Option<i64>,
 }
 
 impl BookUpdate {

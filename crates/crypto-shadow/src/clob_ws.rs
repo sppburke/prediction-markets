@@ -75,11 +75,10 @@ pub fn parse_clob_frame(raw: &str) -> Result<Vec<BookUpdate>, DecodeError> {
         if f.event_type != "book" {
             continue;
         }
-        let observed_at_ms = f
-            .timestamp
-            .as_deref()
-            .and_then(|t| t.parse::<i64>().ok())
-            .unwrap_or(0);
+        // Absent/unparseable timestamp -> None, so the join produces a null lag
+        // rather than a spurious epoch-sized one (the frame shape is unverified
+        // until the live smoke; a field-name mismatch must degrade safely).
+        let observed_at_ms = f.timestamp.as_deref().and_then(|t| t.parse::<i64>().ok());
         out.push(BookUpdate {
             token_id: f.asset_id,
             best_bid: best_price(&f.bids, true),
@@ -143,7 +142,7 @@ mod tests {
         assert_eq!(u.token_id, "0xyes");
         assert_eq!(u.best_bid, Some(Price(dec!(0.48)))); // highest bid
         assert_eq!(u.best_ask, Some(Price(dec!(0.52)))); // lowest ask
-        assert_eq!(u.observed_at_ms, 1_717_848_000_123);
+        assert_eq!(u.observed_at_ms, Some(1_717_848_000_123));
     }
 
     #[test]
@@ -165,6 +164,13 @@ mod tests {
         let u = &parse_clob_frame(raw).unwrap()[0];
         assert_eq!(u.best_bid, Some(Price(dec!(0.40))));
         assert_eq!(u.best_ask, None);
+    }
+
+    #[test]
+    fn missing_timestamp_yields_none_not_zero() {
+        let raw = r#"{"event_type":"book","asset_id":"0xyes","bids":[{"price":"0.40"}],"asks":[{"price":"0.60"}]}"#;
+        let u = &parse_clob_frame(raw).unwrap()[0];
+        assert_eq!(u.observed_at_ms, None);
     }
 
     #[test]
