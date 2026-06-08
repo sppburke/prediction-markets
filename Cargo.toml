@@ -24,6 +24,7 @@ members = [
     "crates/skill-select",
     "crates/paper-state",
     "crates/paper-pnl",
+    "crates/crypto-shadow",
 ]
 
 [workspace.package]
@@ -63,6 +64,7 @@ tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "serde-well-known", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 alloy = { version = "=1.0.9", default-features = false, features = [
     "std",
     "provider-http",

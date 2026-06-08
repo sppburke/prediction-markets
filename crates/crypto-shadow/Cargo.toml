@@ -1,0 +1,49 @@
+[package]
+name = "pe-crypto-shadow"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pe-crypto-shadow"
+path = "src/main.rs"
+
+[lib]
+name = "pe_crypto_shadow"
+path = "src/lib.rs"
+
+[features]
+# Scenario tests live behind this feature; `--all-features` (the CI gate) enables it.
+scenario = []
+
+[lints]
+workspace = true
+
+[dependencies]
+pe-core-types               = { path = "../core-types",                version = "0.1.0" }
+pe-source-core              = { path = "../source-core",               version = "0.1.0" }
+pe-source-polymarket-public = { path = "../source-polymarket-public",  version = "0.1.0" }
+
+anyhow             = { workspace = true }
+figment            = { workspace = true }
+futures            = { workspace = true }
+reqwest            = { workspace = true }
+rust_decimal       = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+time               = { workspace = true }
+tokio              = { workspace = true }
+tokio-tungstenite  = { workspace = true }
+toml               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Declared per-crate (matching `bootstrap`/`paper-state`) rather than as a
+# workspace dep, because the bundled feature is specific to SQLite-using crates.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }
+tempfile            = { workspace = true }

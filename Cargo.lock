@@ -3169,6 +3169,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "pe-crypto-shadow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "figment",
+ "futures",
+ "pe-core-types",
+ "pe-source-core",
+ "pe-source-polymarket-public",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pe-event-log"
 version = "0.1.0"
 dependencies = [
