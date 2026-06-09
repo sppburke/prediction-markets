@@ -7,8 +7,10 @@ use std::path::Path;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::consensus::ConsensusParams;
 use crate::types::BtcSeriesKind;
 
 fn default_db_path() -> String {
@@ -41,6 +43,27 @@ fn default_rtt_probe_pings() -> u32 {
 fn default_true() -> bool {
     true
 }
+fn default_bybit_ws_url() -> String {
+    "wss://stream.bybit.com/v5/public/spot".to_string()
+}
+fn default_okx_ws_url() -> String {
+    "wss://ws.okx.com:8443/ws/v5/public".to_string()
+}
+fn default_coinbase_ws_url() -> String {
+    "wss://ws-feed.exchange.coinbase.com".to_string()
+}
+fn default_move_threshold_bps() -> Decimal {
+    Decimal::new(30, 1) // 3.0 bps
+}
+fn default_move_window_ms() -> i64 {
+    300
+}
+fn default_move_cooldown_ms() -> i64 {
+    1000
+}
+fn default_min_venues() -> usize {
+    2
+}
 
 /// Harness configuration. See `docs/_GLOSSARY.md` for the canonical defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +92,27 @@ pub struct ShadowConfig {
     pub track_5m: bool,
     #[serde(default = "default_true")]
     pub track_15m: bool,
+    /// Exchange trade/ticker WS URLs feeding the consensus median (the trigger).
+    #[serde(default = "default_bybit_ws_url")]
+    pub bybit_ws_url: String,
+    #[serde(default = "default_okx_ws_url")]
+    pub okx_ws_url: String,
+    #[serde(default = "default_coinbase_ws_url")]
+    pub coinbase_ws_url: String,
+    /// Consensus move-detector tuning (see `docs/_GLOSSARY.md`).
+    #[serde(default = "default_move_threshold_bps")]
+    pub move_threshold_bps: Decimal,
+    #[serde(default = "default_move_window_ms")]
+    pub move_window_ms: i64,
+    #[serde(default = "default_move_cooldown_ms")]
+    pub move_cooldown_ms: i64,
+    #[serde(default = "default_min_venues")]
+    pub min_venues: usize,
+    /// Sponsored Chainlink Data Streams API key for the `btc/usd` settlement
+    /// feed. **Deferred** (issue #300 AC2.3): off by default; without it the
+    /// Chainlink leg captures `raw_ticks` only and yields no live settlement.
+    #[serde(default)]
+    pub chainlink_api_key: Option<String>,
 }
 
 impl Default for ShadowConfig {
@@ -85,6 +129,14 @@ impl Default for ShadowConfig {
             rtt_probe_pings: default_rtt_probe_pings(),
             track_5m: default_true(),
             track_15m: default_true(),
+            bybit_ws_url: default_bybit_ws_url(),
+            okx_ws_url: default_okx_ws_url(),
+            coinbase_ws_url: default_coinbase_ws_url(),
+            move_threshold_bps: default_move_threshold_bps(),
+            move_window_ms: default_move_window_ms(),
+            move_cooldown_ms: default_move_cooldown_ms(),
+            min_venues: default_min_venues(),
+            chainlink_api_key: None,
         }
     }
 }
@@ -100,6 +152,16 @@ impl ShadowConfig {
             v.push(BtcSeriesKind::Fifteen);
         }
         v
+    }
+
+    /// Consensus median + move-detector tuning derived from this config.
+    pub fn consensus_params(&self) -> ConsensusParams {
+        ConsensusParams {
+            min_venues: self.min_venues,
+            threshold_bps: self.move_threshold_bps,
+            window_ms: self.move_window_ms,
+            cooldown_ms: self.move_cooldown_ms,
+        }
     }
 }
 

@@ -14,7 +14,13 @@ use rust_decimal::Decimal;
 use crate::types::{BtcMarketMeta, BtcSeriesKind, EdgeObservation, FeedSource};
 
 /// On-disk schema version, stamped into `PRAGMA user_version` on create.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// Bumped to `2` for the move-trigger re-architecture (issue #300 Phase 2):
+/// `observations` swaps `chainlink_value_str` → `signal_value_str` (the
+/// exchange-consensus median, not the Chainlink settling value) and adds
+/// `move_magnitude_bps_str` / `move_direction`. No migration is provided because
+/// no observation rows predate the change (production `observations = 0`).
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Provenance value stamped into `meta["lag_clock"]` so a recompute can tell
 /// which clock basis `feed_to_book_lag_ms` was computed under. The column is
@@ -49,21 +55,23 @@ CREATE TABLE IF NOT EXISTS raw_ticks (
 );
 
 CREATE TABLE IF NOT EXISTS observations (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    condition_id        TEXT NOT NULL,
-    series              TEXT NOT NULL,
-    observed_at_ms      INTEGER NOT NULL,
-    chainlink_value_str TEXT NOT NULL,
-    range_start_str     TEXT,
-    prob_up_str         TEXT,
-    best_ask_str        TEXT,
-    mid_str             TEXT,
-    gross_edge_ask_str  TEXT,
-    gross_edge_mid_str  TEXT,
-    fee_cost_str        TEXT,
-    net_edge_ask_str    TEXT,
-    net_edge_mid_str    TEXT,
-    feed_to_book_lag_ms INTEGER
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id         TEXT NOT NULL,
+    series               TEXT NOT NULL,
+    observed_at_ms       INTEGER NOT NULL,
+    signal_value_str     TEXT NOT NULL,
+    range_start_str      TEXT,
+    prob_up_str          TEXT,
+    best_ask_str         TEXT,
+    mid_str              TEXT,
+    gross_edge_ask_str   TEXT,
+    gross_edge_mid_str   TEXT,
+    fee_cost_str         TEXT,
+    net_edge_ask_str     TEXT,
+    net_edge_mid_str     TEXT,
+    feed_to_book_lag_ms  INTEGER,
+    move_magnitude_bps_str TEXT NOT NULL,
+    move_direction       TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_obs_series ON observations(series);
@@ -197,16 +205,17 @@ impl ShadowDb {
         for o in rows {
             tx.execute(
                 "INSERT INTO observations
-                   (condition_id, series, observed_at_ms, chainlink_value_str,
+                   (condition_id, series, observed_at_ms, signal_value_str,
                     range_start_str, prob_up_str, best_ask_str, mid_str,
                     gross_edge_ask_str, gross_edge_mid_str, fee_cost_str,
-                    net_edge_ask_str, net_edge_mid_str, feed_to_book_lag_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    net_edge_ask_str, net_edge_mid_str, feed_to_book_lag_ms,
+                    move_magnitude_bps_str, move_direction)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     o.condition_id,
                     o.series.as_str(),
                     o.observed_at_ms,
-                    o.chainlink_value.to_string(),
+                    o.signal_value.to_string(),
                     o.range_start_value.map(|d| d.to_string()),
                     o.instantaneous_prob_up.map(|d| d.to_string()),
                     o.best_ask.map(|d| d.to_string()),
@@ -217,6 +226,8 @@ impl ShadowDb {
                     o.net_edge_vs_ask.map(|d| d.to_string()),
                     o.net_edge_vs_mid.map(|d| d.to_string()),
                     o.feed_to_book_lag_ms,
+                    o.move_magnitude_bps.to_string(),
+                    o.move_direction.as_str(),
                 ],
             )?;
         }
@@ -296,7 +307,7 @@ mod tests {
             condition_id: "0xcond".to_string(),
             series: BtcSeriesKind::Five,
             observed_at_ms: 1_000,
-            chainlink_value: dec!(60000),
+            signal_value: dec!(60000),
             range_start_value: Some(dec!(59000)),
             instantaneous_prob_up: Some(Decimal::ONE),
             best_ask: Some(dec!(0.52)),
@@ -307,6 +318,8 @@ mod tests {
             net_edge_vs_ask: Some(dec!(0.462528)),
             net_edge_vs_mid: Some(dec!(0.4825)),
             feed_to_book_lag_ms: Some(500),
+            move_magnitude_bps: dec!(4),
+            move_direction: crate::types::MoveDirection::Up,
         }
     }
 

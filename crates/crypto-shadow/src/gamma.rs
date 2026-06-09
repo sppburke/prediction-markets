@@ -4,12 +4,16 @@
 //!
 //! Production wires a `ReqwestFetcher`; tests inject a `FixtureFetcher` for
 //! deterministic, no-live-network coverage.
+//!
+//! **Issue #300 fix 2 (AC2.1):** the 5m/15m settlement window is derived from
+//! the **event slug** unix timestamp (`btc-updown-5m-<unix_start>`), *not* from
+//! the market's `startDate`/`endDate` — live Gamma reports those as a ≈1-day
+//! span for these markets, so the old ISO-date derivation produced day-long
+//! windows. The slug's trailing unix-seconds value is the window open.
 
 use pe_source_polymarket_public::PageFetcher;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use crate::types::{BtcMarketMeta, BtcSeriesKind};
 
@@ -31,6 +35,25 @@ fn decimal_from_json_number_or_string(v: &serde_json::Value) -> Option<Decimal> 
     }
 }
 
+/// Derive `(range_start_ms, range_end_ms)` from a BTC up/down **event slug**
+/// (`btc-updown-5m-<unix_start>`): the trailing integer is the window-open time
+/// in unix **seconds**; the span is 300 s (5m) or 900 s (15m). Returns `None`
+/// for any slug whose trailing token is not a plausible epoch-seconds value, so
+/// a non-time slug is skipped rather than producing a bogus window.
+fn window_from_event_slug(slug: &str, series: BtcSeriesKind) -> Option<(i64, i64)> {
+    let last = slug.rsplit('-').next()?;
+    let unix_start: i64 = last.parse().ok()?;
+    // Plausible epoch-seconds sanity (≈2017-07 .. ≈2099) — rejects non-time slugs.
+    if !(1_500_000_000..=4_100_000_000).contains(&unix_start) {
+        return None;
+    }
+    let span_secs: i64 = match series {
+        BtcSeriesKind::Five => 300,
+        BtcSeriesKind::Fifteen => 900,
+    };
+    Some((unix_start * 1000, (unix_start + span_secs) * 1000))
+}
+
 /// Error enumerating markets.
 #[derive(Debug, thiserror::Error)]
 pub enum GammaError {
@@ -42,6 +65,9 @@ pub enum GammaError {
 
 #[derive(Debug, Deserialize)]
 struct GammaEvent {
+    /// Event slug, e.g. `btc-updown-5m-1765192500`; carries the window-open time.
+    #[serde(default)]
+    slug: Option<String>,
     #[serde(default)]
     markets: Vec<GammaMarketJson>,
 }
@@ -53,10 +79,6 @@ struct GammaMarketJson {
     /// JSON-encoded array string, e.g. `"[\"0xyes\",\"0xno\"]"`.
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Option<String>,
-    #[serde(rename = "startDate")]
-    start_date: Option<String>,
-    #[serde(rename = "endDate")]
-    end_date: Option<String>,
     /// `orderPriceMinTickSize` arrives as a JSON number (`0.01`) on live
     /// `/events` and as a string (`"0.01"`) elsewhere; hold the raw value and
     /// convert in `parse_market` (issue #300 fix 1).
@@ -64,18 +86,19 @@ struct GammaMarketJson {
     tick: Option<serde_json::Value>,
 }
 
-fn iso_to_ms(s: &str) -> Option<i64> {
-    let odt = OffsetDateTime::parse(s, &Rfc3339).ok()?;
-    i64::try_from(odt.unix_timestamp_nanos() / 1_000_000).ok()
-}
-
-fn parse_market(m: &GammaMarketJson, series: BtcSeriesKind) -> Option<BtcMarketMeta> {
+/// Build a [`BtcMarketMeta`] from one market JSON plus the window the parent
+/// event slug resolved to. Markets missing required identity fields yield
+/// `None` (skipped, not fatal).
+fn parse_market(
+    m: &GammaMarketJson,
+    series: BtcSeriesKind,
+    range_start_ms: i64,
+    range_end_ms: i64,
+) -> Option<BtcMarketMeta> {
     let condition_id = m.condition_id.clone()?;
     let token_ids_raw = m.clob_token_ids.as_deref()?;
     let token_ids: Vec<String> = serde_json::from_str(token_ids_raw).ok()?;
     let yes_token_id = token_ids.into_iter().next()?;
-    let range_start_ms = iso_to_ms(m.start_date.as_deref()?)?;
-    let range_end_ms = iso_to_ms(m.end_date.as_deref()?)?;
     let tick = m
         .tick
         .as_ref()
@@ -92,14 +115,22 @@ fn parse_market(m: &GammaMarketJson, series: BtcSeriesKind) -> Option<BtcMarketM
 }
 
 /// Parse a Gamma `/events` response body into the markets for one series.
-/// Markets missing required fields are skipped (not fatal).
+/// Events whose slug does not resolve to a 5m/15m window are skipped; within a
+/// kept event, markets missing required fields are skipped (not fatal).
 pub fn parse_events(bytes: &[u8], series: BtcSeriesKind) -> Result<Vec<BtcMarketMeta>, GammaError> {
     let events: Vec<GammaEvent> =
         serde_json::from_slice(bytes).map_err(|e| GammaError::Parse(e.to_string()))?;
     let mut out = Vec::new();
     for ev in events {
+        let Some((range_start_ms, range_end_ms)) = ev
+            .slug
+            .as_deref()
+            .and_then(|s| window_from_event_slug(s, series))
+        else {
+            continue;
+        };
         for m in &ev.markets {
-            if let Some(meta) = parse_market(m, series) {
+            if let Some(meta) = parse_market(m, series, range_start_ms, range_end_ms) {
                 out.push(meta);
             }
         }
@@ -155,16 +186,22 @@ mod tests {
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
+    // Live-shaped event: the slug carries the 5-min window-open (unix seconds),
+    // while `startDate`/`endDate` span ≈1 day (Gamma's actual shape) and are now
+    // ignored. 1765192500 = 2025-12-08T12:35:00Z.
     const EVENTS_5M: &str = r#"[
-      {"markets":[
+      {"slug":"btc-updown-5m-1765192500",
+       "startDate":"2025-12-08T00:00:00Z","endDate":"2025-12-09T00:00:00Z",
+       "markets":[
         {"conditionId":"0xcond5","clobTokenIds":"[\"0xyes5\",\"0xno5\"]",
-         "startDate":"2026-06-08T12:00:00Z","endDate":"2026-06-08T12:05:00Z",
+         "startDate":"2025-12-08T00:00:00Z","endDate":"2025-12-09T00:00:00Z",
          "orderPriceMinTickSize":"0.01"}
       ]}
     ]"#;
 
     #[test]
-    fn parses_events_into_market_meta() {
+    fn window_comes_from_slug_not_iso_dates() {
+        // AC2.1: the window is the 5-min slug span, NOT the ≈1-day ISO span.
         let markets = parse_events(EVENTS_5M.as_bytes(), BtcSeriesKind::Five).unwrap();
         assert_eq!(markets.len(), 1);
         let m = &markets[0];
@@ -172,17 +209,29 @@ mod tests {
         assert_eq!(m.yes_token_id, "0xyes5");
         assert_eq!(m.series, BtcSeriesKind::Five);
         assert_eq!(m.tick, dec!(0.01));
+        assert_eq!(m.range_start_ms, 1_765_192_500_000);
         assert_eq!(m.range_end_ms - m.range_start_ms, 5 * 60 * 1000);
+    }
+
+    #[test]
+    fn fifteen_minute_span_from_slug() {
+        let body = r#"[{"slug":"btc-updown-15m-1765192500","markets":[
+          {"conditionId":"0xc15","clobTokenIds":"[\"0xy15\",\"0xn15\"]","orderPriceMinTickSize":"0.01"}
+        ]}]"#;
+        let markets = parse_events(body.as_bytes(), BtcSeriesKind::Fifteen).unwrap();
+        assert_eq!(markets.len(), 1);
+        assert_eq!(
+            markets[0].range_end_ms - markets[0].range_start_ms,
+            15 * 60 * 1000
+        );
     }
 
     #[test]
     fn parses_numeric_tick_size() {
         // Live Gamma sends `orderPriceMinTickSize` as a JSON number, not a
         // string (issue #300 fix 1 / AC1.1).
-        let body = r#"[{"markets":[
-          {"conditionId":"0xcondN","clobTokenIds":"[\"0xyesN\",\"0xnoN\"]",
-           "startDate":"2026-06-08T12:00:00Z","endDate":"2026-06-08T12:05:00Z",
-           "orderPriceMinTickSize":0.01}
+        let body = r#"[{"slug":"btc-updown-5m-1765192500","markets":[
+          {"conditionId":"0xcondN","clobTokenIds":"[\"0xyesN\",\"0xnoN\"]","orderPriceMinTickSize":0.01}
         ]}]"#;
         let markets = parse_events(body.as_bytes(), BtcSeriesKind::Five).unwrap();
         assert_eq!(markets.len(), 1);
@@ -190,10 +239,26 @@ mod tests {
     }
 
     #[test]
-    fn skips_markets_missing_required_fields() {
-        let body = r#"[{"markets":[{"conditionId":"0xonly"}]}]"#;
-        let markets = parse_events(body.as_bytes(), BtcSeriesKind::Five).unwrap();
-        assert!(markets.is_empty());
+    fn event_with_non_time_slug_is_skipped() {
+        let body = r#"[{"slug":"some-other-market","markets":[
+          {"conditionId":"0xx","clobTokenIds":"[\"0xy\",\"0xn\"]","orderPriceMinTickSize":"0.01"}
+        ]}]"#;
+        assert!(
+            parse_events(body.as_bytes(), BtcSeriesKind::Five)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn skips_market_missing_required_fields() {
+        // Event slug is valid, but the market lacks clobTokenIds → market skipped.
+        let body = r#"[{"slug":"btc-updown-5m-1765192500","markets":[{"conditionId":"0xonly"}]}]"#;
+        assert!(
+            parse_events(body.as_bytes(), BtcSeriesKind::Five)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

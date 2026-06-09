@@ -829,5 +829,13 @@ Measurement-only shadow harness for BTC up/down latency-arb (issue #297, Strateg
 | `crypto_shadow_ws_max_backoff_secs` | 60 | Exponential-backoff cap for WS reconnect (mirrors `MAX_BACKOFF_SECS` in `source-onchain-polygon/src/live.rs`). |
 | `crypto_shadow_rtt_probe_pings` | 5 | TCP-connect samples per endpoint for the startup vantage RTT probe; p50 stamped into `meta` so the measured edge carries the location it was taken from. |
 | `crypto_shadow_gamma_base_url` | `https://gamma-api.polymarket.com` | Gamma API root for market enumeration. |
-| `crypto_shadow_chainlink_ws_url` | `wss://ws-live-data.polymarket.com` | RTDS feed root (`crypto_prices_chainlink`, `btc/usd` — the 5m/15m settling value). |
+| `crypto_shadow_chainlink_ws_url` | `wss://ws-live-data.polymarket.com` | RTDS feed root for the Chainlink **settlement** value (`btc/usd`). Subscribe topic is `crypto_prices` + `type:update` + symbol under stringified `filters` (issue #300 fix 3); the live `btc/usd` source needs a sponsored Chainlink key (`crypto_shadow_chainlink_api_key`, deferred — AC2.3). Captured to `raw_ticks`; does not drive observations. |
 | `crypto_shadow_clob_ws_url` | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | CLOB market book WS. |
+| `crypto_shadow_bybit_ws_url` | `wss://stream.bybit.com/v5/public/spot` | Bybit public spot trade stream (`publicTrade.BTCUSDT`) — a consensus trigger feed. |
+| `crypto_shadow_okx_ws_url` | `wss://ws.okx.com:8443/ws/v5/public` | OKX public trades stream (`trades`/`BTC-USDT`) — a consensus trigger feed. |
+| `crypto_shadow_coinbase_ws_url` | `wss://ws-feed.exchange.coinbase.com` | Coinbase ticker stream (`ticker`/`BTC-USD`, USD-quoted) — a consensus trigger feed. |
+| `crypto_shadow_move_threshold_bps` | 3.0 | Consensus-median move size (basis points) that triggers an observation. From the feed bake-off (`docs/27`): outsized moves were defined as ≥3 bps. |
+| `crypto_shadow_move_window_ms` | 300 | Look-back window (ms) over which the move is measured (reference = median ≈this long ago). |
+| `crypto_shadow_move_cooldown_ms` | 1000 | Minimum gap (ms) between two move fires (debounce), so a single move emits once until it sustains past the cooldown. |
+| `crypto_shadow_min_venues` | 2 | Minimum exchanges with a price before the consensus median is computed (no median ⇒ no move ⇒ no observation). |
+| `crypto_shadow_chainlink_api_key` | _(unset)_ | Sponsored Chainlink Data Streams key for the `btc/usd` settlement feed (Polymarket onboarding: pm-ds-request.streams.chain.link). **Deferred** (issue #300 AC2.3): off by default; without it the Chainlink leg yields no live settlement value. |
