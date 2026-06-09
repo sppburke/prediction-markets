@@ -64,7 +64,12 @@ pub async fn run(
     for m in &markets {
         db.upsert_market(m)?;
     }
-    let token_ids: Vec<String> = markets.iter().map(|m| m.yes_token_id.clone()).collect();
+    // Subscribe BOTH outcome books: the YES (Up) token and the NO (Down) token,
+    // so a down-move can be priced against the real NO ask.
+    let token_ids: Vec<String> = markets
+        .iter()
+        .flat_map(|m| [m.yes_token_id.clone(), m.no_token_id.clone()])
+        .collect();
     info!(markets = markets.len(), "shadow: enumerated markets");
     let mut state = JoinState::new(markets, config.consensus_params());
 
