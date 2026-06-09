@@ -148,8 +148,9 @@ Hermes (~2 s stale) is decisively unusable for a speed strategy.
 - **Edge window** (consensus move → active-market book reprice): **median
   ~161 ms** (p25 137, p75 184).
 - **Only ~4 of 13 (≈30%) of 3 bps moves repriced the book within 3 s** — the
-  5-min book is **sticky** on small moves. This is either a **stale-quote pickoff
-  opportunity** or a wide/illiquid book; the larger sample will disambiguate.
+  5-min book is **sticky** on small moves. §3.4 resolves which kind: the book is
+  **tight (~2 ¢)**, so this is the **stale-tight-quote pickoff** regime, *not* a
+  wide/illiquid book.
 - **Head start** (`PM reprice − source detect`):
 
 | Source | Head start over Polymarket |
@@ -165,7 +166,43 @@ Negative = the source shows you the move *after* Polymarket already moved.
 **From Ireland, only Bybit/Coinbase/OKX put you ahead of Polymarket; Binance and
 Pyth put you behind.**
 
-### 3.4 Provisional feed pick
+### 3.4 Book spread — how wide is the market (n=1,644 active-market quote samples)
+The "sticky book" of §3.3 is a **tight** book, not an illiquid one:
+
+| metric | value |
+|---|---|
+| spread (ask − bid) | p10 **1 ¢**, median **2 ¢**, p90 **3 ¢**, max 15 ¢ |
+| frac spread ≤ 2 ¢ / ≤ 5 ¢ | **54% / 97%** |
+| mid = P(up) | p10 0.34, median **0.53**, p90 0.86 |
+
+Min tick is 1 ¢, so the median 2 ¢ spread is just **two ticks**. The book stays
+tight **across the entire 5-min window** — it does *not* widen toward settlement:
+
+| window progress | median spread | p90 | median P(up) |
+|---|---|---|---|
+| 0–20% | 2 ¢ | 3 ¢ | 0.54 |
+| 20–40% | 2 ¢ | 3 ¢ | 0.54 |
+| 40–60% | 2 ¢ | 3 ¢ | 0.54 |
+| 60–80% | 2 ¢ | 3 ¢ | 0.63 |
+| 80–100% | 2 ¢ | 5 ¢ | 0.38 |
+
+Spread is ~flat at 2 ¢ throughout; only the p90 ticks up (3→5 ¢) in the final
+20%. The mid stays near 0.50 (uncertain) for the first ~60% then drifts off as
+the outcome decides — so the **uncertain, latency-relevant regime is the first
+~60% of the window**, and it is consistently tight.
+
+**Economics implication.** To profit you must clear roughly **half-spread (~1 ¢)
++ the `crypto_fees_v2` taker fee (~1.75 ¢ at p≈0.5) ≈ ~2.7 ¢** of mispricing —
+the **fee is ~65% of the hurdle**. A 3 bps BTC move shifts fair `P(up)` by ≈
+`φ(0)·(Δ/σ_5m)` ≈ ~3 ¢ mid-window (5-min terminal σ ≈ ~36 bps) — **only
+marginally above the ~2.7 ¢ hurdle**; sensitivity *grows* later in the window
+(smaller residual σ) until `P(up)` saturates near settlement. So the exploitable
+regime is **larger moves and/or later in the window**, against a book that stays
+tight — exactly what `pe-crypto-shadow` must measure to settle the thesis. (This
+is a back-of-envelope; realized edge is the harness's job, not the bake-off's.)
+Computed by `scripts/feed-bakeoff/spread.py`.
+
+### 3.5 Provisional feed pick
 **Coinbase** or **Bybit** as the BTC reference. Coinbase is USD (no USDT basis)
 with solid cadence and ~+211 ms head start; Bybit leads most often (+257 ms) but
 is USDT. Decision pending the 9 h sample.
@@ -232,7 +269,8 @@ beats it short of a Polymarket-direct order path.
 
 Scripts are committed under **`scripts/feed-bakeoff/`** (copied verbatim from the
 run): `feed_bakeoff_v2.py` (collector), `analyze2.py` (corrected analyzer),
-`launch9.sh` (9 h detached launcher). On the VPS they live at `~/feed-bakeoff/`
+`spread.py` (book-width / window-progress), `launch9.sh` (9 h detached launcher).
+On the VPS they live at `~/feed-bakeoff/`
 with output CSVs under `~/feed-bakeoff/run/`.
 
 ```bash
