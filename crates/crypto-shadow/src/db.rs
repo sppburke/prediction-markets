@@ -249,10 +249,6 @@ impl ShadowDb {
         Ok(())
     }
 
-    /// Persist one CLOB trade print. `INSERT OR IGNORE` on the `transaction_hash`
-    /// UNIQUE column makes it idempotent against reconnect-replayed duplicates.
-    /// `condition_id`/`series` are the join-resolved attribution (`None` for a
-    /// trade on a token not in the current market map).
     /// Persist a decoded CLOB trade print. `condition_id` is taken from the trade
     /// itself (the frame's authoritative `market` field — always present), so a
     /// trade is attributed even before the join knows its token. `series`

@@ -189,6 +189,19 @@ pub fn parse_clob_trade(raw: &str) -> Result<Option<ClobTrade>, DecodeError> {
     let frame: LastTradePriceFrame =
         serde_json::from_value(value).map_err(|e| DecodeError::Json(e.to_string()))?;
 
+    // serde's required `String` rejects a *missing* field but accepts `""`. Guard
+    // the two fields whose blank value would corrupt persistence: `market` backs
+    // the NOT NULL `condition_id` (a blank would store an unattributed trade), and
+    // `transaction_hash` is the UNIQUE dedup key (two blanks would collapse to one
+    // row via INSERT OR IGNORE, silently dropping a distinct trade). The live feed
+    // has never emitted a blank (verified 2026-06-09); this is belt-and-suspenders.
+    if frame.market.is_empty() {
+        return Err(DecodeError::Missing("market"));
+    }
+    if frame.transaction_hash.is_empty() {
+        return Err(DecodeError::Missing("transaction_hash"));
+    }
+
     let price_d =
         Decimal::from_str(&frame.price).map_err(|_| DecodeError::Decimal(frame.price.clone()))?;
     let price = Price::new(price_d).map_err(|_| DecodeError::Decimal(frame.price.clone()))?;
@@ -554,6 +567,23 @@ mod tests {
         assert!(matches!(
             parse_clob_trade(raw),
             Err(DecodeError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn blank_market_or_tx_hash_is_a_decode_error_not_silent_storage() {
+        // A blank `market` would store an unattributed trade under the NOT NULL
+        // condition_id; a blank `transaction_hash` would collapse distinct trades
+        // via INSERT OR IGNORE. Both must surface as a decode error instead.
+        let blank_market = r#"{"market":"","asset_id":"t","price":"0.5","size":"1","side":"BUY","timestamp":"1","event_type":"last_trade_price","transaction_hash":"0x1"}"#;
+        assert!(matches!(
+            parse_clob_trade(blank_market),
+            Err(DecodeError::Missing("market"))
+        ));
+        let blank_tx = r#"{"market":"0xc","asset_id":"t","price":"0.5","size":"1","side":"BUY","timestamp":"1","event_type":"last_trade_price","transaction_hash":""}"#;
+        assert!(matches!(
+            parse_clob_trade(blank_tx),
+            Err(DecodeError::Missing("transaction_hash"))
         ));
     }
 }
