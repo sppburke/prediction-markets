@@ -201,36 +201,37 @@ async fn scenario_trade_capture() {
     let markets = gamma.fetch_markets(&[BtcSeriesKind::Five]).await.unwrap();
     let state = JoinState::new(markets, ShadowConfig::default().consensus_params());
 
-    // A live-shaped trade print on the YES token (matches the captured shape).
-    let trade_frame = r#"{"market":"0xmkt","asset_id":"0xyes5","price":"0.78","size":"5.166663","fee_rate_bps":"0","side":"BUY","timestamp":"1781032143544","event_type":"last_trade_price","transaction_hash":"0xdeadbeef"}"#;
+    // A live-shaped trade print on the KNOWN YES token; its `market` field is
+    // the condition_id "0xcond5" (matches the enumerated market).
+    let trade_frame = r#"{"market":"0xcond5","asset_id":"0xyes5","price":"0.78","size":"5.166663","fee_rate_bps":"0","side":"BUY","timestamp":"1781032143544","event_type":"last_trade_price","transaction_hash":"0xdeadbeef"}"#;
 
     // The runner's Clob arm: the book decoder yields nothing on a trade frame ...
     assert!(
         parse_clob_frame(trade_frame).unwrap().is_empty(),
         "a trade frame is not a book update (no double-count)"
     );
-    // ... and the trade decoder yields exactly the print.
+    // ... and the trade decoder yields exactly the print, self-attributed to its
+    // market via the frame's own `market` field (no join lookup needed).
     let trade = parse_clob_trade(trade_frame).unwrap().unwrap();
     assert_eq!(trade.token_id, "0xyes5");
-
-    // Resolve token -> market, exactly as the runner does before the insert.
-    let (cond, series) = state.lookup_token(&trade.token_id);
     assert_eq!(
-        cond.as_deref(),
-        Some("0xcond5"),
-        "trade attributed to market"
+        trade.condition_id, "0xcond5",
+        "condition_id from frame's market"
     );
+
+    // The join supplies only the series label for a known token.
+    let (_cond, series) = state.lookup_token(&trade.token_id);
     assert_eq!(series, Some("5m"));
 
     let dir = tempfile::tempdir().unwrap();
     let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
-    db.insert_clob_trade(&trade, 1_781_032_143_600, cond.as_deref(), series)
+    db.insert_clob_trade(&trade, 1_781_032_143_600, series)
         .unwrap();
     assert_eq!(db.clob_trade_count().unwrap(), 1, "one trade persisted");
 
     // Idempotent on transaction_hash (INSERT OR IGNORE): a re-delivered print
     // (different received clock, same hash) does not double-count.
-    db.insert_clob_trade(&trade, 1_781_032_143_999, cond.as_deref(), series)
+    db.insert_clob_trade(&trade, 1_781_032_143_999, series)
         .unwrap();
     assert_eq!(
         db.clob_trade_count().unwrap(),
@@ -238,20 +239,40 @@ async fn scenario_trade_capture() {
         "dedup on transaction_hash"
     );
 
+    // ROBUSTNESS: a trade prints on a token the join does NOT yet know (a new 5m
+    // market that traded before its book was enumerated). It is STILL attributed
+    // to its market via the frame's `market` field — series is NULL (recoverable
+    // offline), but the trade is never dropped or left unattributed.
+    let unknown_frame = r#"{"market":"0xcondZ","asset_id":"0xunknown","price":"0.51","size":"2","fee_rate_bps":"0","side":"SELL","timestamp":"1781032144000","event_type":"last_trade_price","transaction_hash":"0xfeed01"}"#;
+    let unknown = parse_clob_trade(unknown_frame).unwrap().unwrap();
+    let (_uc, useries) = state.lookup_token(&unknown.token_id);
+    assert_eq!(useries, None, "unknown token has no series from the join");
+    assert_eq!(
+        unknown.condition_id, "0xcondZ",
+        "still attributed via frame"
+    );
+    db.insert_clob_trade(&unknown, 1_781_032_144_050, useries)
+        .unwrap();
+    assert_eq!(
+        db.clob_trade_count().unwrap(),
+        2,
+        "unknown-token trade captured"
+    );
+
     // A price_change frame is book state, not a trade -> no row added.
-    let pc = r#"{"market":"0xmkt","price_changes":[{"asset_id":"0xyes5","best_bid":"0.77","best_ask":"0.79"}]}"#;
+    let pc = r#"{"market":"0xcond5","price_changes":[{"asset_id":"0xyes5","best_bid":"0.77","best_ask":"0.79"}]}"#;
     assert!(
         parse_clob_trade(pc).unwrap().is_none(),
         "price_change is not a trade"
     );
     assert_eq!(
         db.clob_trade_count().unwrap(),
-        1,
+        2,
         "price_change adds no trade row"
     );
 
     println!(
-        "PASS: scenario_trade_capture (trade tape persisted + attributed to market, dedup on tx hash, price_change ignored)"
+        "PASS: scenario_trade_capture (self-attributed via frame market incl. unknown token, dedup on tx hash, price_change ignored)"
     );
 }
 

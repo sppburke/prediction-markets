@@ -40,15 +40,17 @@
 
 > **WebSocket design note (2026-06-03, issue #282 Phase 2 verification).**
 > `wss://ws-live-data.polymarket.com` (RTDS) provides comments, crypto prices, and equity prices only — no trade data.
-> `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include wallet address or `transaction_hash`; wallet-level trade identification is impossible via WebSocket.
+> `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include the **wallet address**; wallet-level trade identification is impossible from the frame alone.
 > No Polymarket WebSocket supports per-wallet trade subscriptions. The REST `/activity` poll remains the primary ingestion path (issue #282 Open risk #1 materialized). Phase 2 RTDS ingestion is deferred.
+>
+> **Correction (2026-06-09, issue #300 live capture).** A live `last_trade_price` market-channel frame **does** carry `transaction_hash` — verified against 2,581 captured frames (100% present, one unique hash per print, zero collisions). The earlier note that it omits `transaction_hash` is superseded; only the wallet address is absent, so wallet-level identity still requires an on-chain tx lookup, but the print is uniquely keyable. Full frame shape: `{market, asset_id, price, size, side, timestamp, fee_rate_bps, event_type, transaction_hash}` — `market` is the condition_id (authoritative, present on every print). `pe-crypto-shadow` keys `clob_trades` on `transaction_hash` and attributes via `market`.
 
 | Link | Last checked | Re-verify by |
 |---|---|---|
 | https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/llms.txt | — | — |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
-| https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-03 | 2026-09-01 |
+| https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-09 | 2026-09-01 |
 | https://docs.polymarket.com/market-data/websocket/user-channel | 2026-06-03 | 2026-09-01 |
 | https://docs.polymarket.com/market-data/websocket/sports | — | — |
 | https://docs.polymarket.com/market-data/websocket/rtds | 2026-06-03 | 2026-09-01 |

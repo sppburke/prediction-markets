@@ -27,7 +27,10 @@ use crate::types::{BtcMarketMeta, BtcSeriesKind, ClobTrade, EdgeObservation, Fee
 ///   `no_best_ask_str` / `no_mid_str` (the real Down-buy entry price, so
 ///   down-moves are scored on the NO book rather than `1 − yes_bid`).
 /// - `4` — trade-feed capture: adds `clob_trades` (`last_trade_price` prints,
-///   the maker-fill-simulation input).
+///   the maker-fill-simulation input). `condition_id` is `NOT NULL` — taken from
+///   the frame's authoritative `market` field so a trade is attributed even
+///   before the join knows its token — and is indexed alongside `token_id` and
+///   `traded_at_ms` for offline time-windowed strategy comparison.
 pub const SCHEMA_VERSION: i64 = 4;
 
 /// Provenance value stamped into `meta["lag_clock"]` so a recompute can tell
@@ -96,7 +99,7 @@ CREATE TABLE IF NOT EXISTS resolutions (
 CREATE TABLE IF NOT EXISTS clob_trades (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id          TEXT NOT NULL,
-    condition_id      TEXT,
+    condition_id      TEXT NOT NULL,
     series            TEXT,
     price_str         TEXT NOT NULL,
     size_str          TEXT NOT NULL,
@@ -109,6 +112,7 @@ CREATE TABLE IF NOT EXISTS clob_trades (
 
 CREATE INDEX IF NOT EXISTS idx_clob_trades_token ON clob_trades(token_id);
 CREATE INDEX IF NOT EXISTS idx_clob_trades_condition ON clob_trades(condition_id);
+CREATE INDEX IF NOT EXISTS idx_clob_trades_traded_at ON clob_trades(traded_at_ms);
 ";
 
 /// Persistence error.
@@ -249,11 +253,18 @@ impl ShadowDb {
     /// UNIQUE column makes it idempotent against reconnect-replayed duplicates.
     /// `condition_id`/`series` are the join-resolved attribution (`None` for a
     /// trade on a token not in the current market map).
+    /// Persist a decoded CLOB trade print. `condition_id` is taken from the trade
+    /// itself (the frame's authoritative `market` field — always present), so a
+    /// trade is attributed even before the join knows its token. `series`
+    /// (5m/15m) comes from the join's token lookup and may be `None` for a trade
+    /// that printed before its market was registered (recoverable offline from
+    /// `markets`/Gamma). `INSERT OR IGNORE` on the unique `transaction_hash`
+    /// dedups a re-delivered print without dropping any distinct trade (the hash
+    /// is one-per-print on the live feed, verified 2026-06-09).
     pub fn insert_clob_trade(
         &self,
         trade: &ClobTrade,
         received_at_ms: i64,
-        condition_id: Option<&str>,
         series: Option<&str>,
     ) -> Result<(), DbError> {
         let conn = self.lock();
@@ -264,7 +275,7 @@ impl ShadowDb {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 trade.token_id,
-                condition_id,
+                trade.condition_id,
                 series,
                 trade.price.0.to_string(),
                 trade.size.to_string(),
@@ -561,6 +572,7 @@ mod tests {
     fn sample_trade() -> ClobTrade {
         ClobTrade {
             token_id: "0xtok".to_string(),
+            condition_id: "0xcond".to_string(),
             price: pe_core_types::Price(dec!(0.78)),
             size: dec!(5.166663),
             taker_is_buy: true,
@@ -575,12 +587,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
         let t = sample_trade();
-        db.insert_clob_trade(&t, 1_781_032_143_600, Some("0xcond"), Some("5m"))
+        db.insert_clob_trade(&t, 1_781_032_143_600, Some("5m"))
             .unwrap();
         // Same transaction_hash (reconnect replay) -> ignored, not duplicated.
-        db.insert_clob_trade(&t, 1_781_032_143_700, Some("0xcond"), Some("5m"))
+        db.insert_clob_trade(&t, 1_781_032_143_700, Some("5m"))
             .unwrap();
         assert_eq!(db.clob_trade_count().unwrap(), 1);
+        // condition_id was taken from the trade's own `market` field.
+        let conn = db.lock();
+        let cond: String = conn
+            .query_row("SELECT condition_id FROM clob_trades", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cond, "0xcond");
     }
 
     #[test]

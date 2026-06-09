@@ -182,13 +182,13 @@ async fn drive<F: PageFetcher + Send + Sync>(
                         }
                         match clob_ws::parse_clob_trade(&frame.raw) {
                             Ok(Some(trade)) => {
-                                let (cond, series) = state.lookup_token(&trade.token_id);
-                                if let Err(e) = db.insert_clob_trade(
-                                    &trade,
-                                    frame.received_ms,
-                                    cond.as_deref(),
-                                    series,
-                                ) {
+                                // condition_id is on the trade (frame's `market`);
+                                // the join only supplies the 5m/15m series label,
+                                // which is `None` if the token is not yet known.
+                                let (_cond, series) = state.lookup_token(&trade.token_id);
+                                if let Err(e) =
+                                    db.insert_clob_trade(&trade, frame.received_ms, series)
+                                {
                                     warn!(error = %e, "shadow: clob_trade insert error");
                                 }
                             }

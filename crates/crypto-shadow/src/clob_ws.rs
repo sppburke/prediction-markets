@@ -70,10 +70,14 @@ struct PriceChangeEntry {
     best_ask: Option<String>,
 }
 
-/// Raw JSON shape of a `last_trade_price` CLOB frame (the trade print).
+/// Raw JSON shape of a `last_trade_price` CLOB frame (the trade print). The live
+/// market channel sends exactly: `asset_id`, `market`, `price`, `size`, `side`,
+/// `timestamp`, `fee_rate_bps`, `event_type`, `transaction_hash` (verified
+/// 2026-06-09 — see `docs/15-SOURCES.md`).
 #[derive(Debug, Deserialize)]
 struct LastTradePriceFrame {
     asset_id: String,
+    market: String, // condition_id — authoritative, present on every print
     price: String,
     size: String,
     side: String,      // "BUY" | "SELL" (taker side)
@@ -210,6 +214,7 @@ pub fn parse_clob_trade(raw: &str) -> Result<Option<ClobTrade>, DecodeError> {
 
     Ok(Some(ClobTrade {
         token_id: frame.asset_id,
+        condition_id: frame.market,
         price,
         size,
         taker_is_buy,
@@ -487,21 +492,32 @@ mod tests {
         assert!(msg.contains("\"type\":\"market\""));
     }
 
-    // Live-captured `last_trade_price` shape (from a 2026-06-09 raw_ticks frame).
-    const TRADE_FRAME: &str = r#"{"market":"0xmkt","asset_id":"0xtok","price":"0.78","size":"5.166663","fee_rate_bps":"0","side":"BUY","timestamp":"1781032143544","event_type":"last_trade_price","transaction_hash":"0x3b70"}"#;
+    // A real `last_trade_price` frame captured verbatim from a 2026-06-09 live
+    // `raw_ticks` row (full-length token id + tx hash, the venue's whitespace).
+    const TRADE_FRAME: &str = r#"{"market":"0x4cfa48e6eb11a784e978e7798ac4cf94283f749f9d67d705cde99a6d6861bf04", "asset_id":"28288731664375269942632075758054005863241563384094117462481799570396361563475", "price":"0.55", "size":"3.581817", "fee_rate_bps":"0", "side":"BUY", "timestamp":"1781034208488", "event_type":"last_trade_price", "transaction_hash":"0x1b855f6954e3af5de7b5cd058f2808e871dbc1f91745ef02489a7b2a78f504b0"}"#;
 
     #[test]
     fn decodes_last_trade_price() {
         let t = parse_clob_trade(TRADE_FRAME).unwrap().unwrap();
-        assert_eq!(t.token_id, "0xtok");
-        assert_eq!(t.price, Price(dec!(0.78)));
-        assert_eq!(t.size, dec!(5.166663));
+        assert_eq!(
+            t.token_id,
+            "28288731664375269942632075758054005863241563384094117462481799570396361563475"
+        );
+        assert_eq!(
+            t.condition_id,
+            "0x4cfa48e6eb11a784e978e7798ac4cf94283f749f9d67d705cde99a6d6861bf04"
+        );
+        assert_eq!(t.price, Price(dec!(0.55)));
+        assert_eq!(t.size, dec!(3.581817));
         assert!(t.taker_is_buy);
-        assert_eq!(t.traded_at_ms, 1_781_032_143_544);
+        assert_eq!(t.traded_at_ms, 1_781_034_208_488);
         // ms, not seconds (a seconds value would be ~1.78e9, not ~1.78e12).
         assert!(t.traded_at_ms > 1_700_000_000_000 && t.traded_at_ms < 2_000_000_000_000);
         assert_eq!(t.fee_rate_bps, 0);
-        assert_eq!(t.transaction_hash, "0x3b70");
+        assert_eq!(
+            t.transaction_hash,
+            "0x1b855f6954e3af5de7b5cd058f2808e871dbc1f91745ef02489a7b2a78f504b0"
+        );
     }
 
     #[test]
@@ -522,17 +538,19 @@ mod tests {
 
     #[test]
     fn no_token_sell_trade_is_side_agnostic() {
-        // NO token + SELL: the decoder stores the raw token_id + taker_is_buy,
-        // with no YES/NO or condition resolution (that happens in the join).
-        let raw = r#"{"asset_id":"tok-no","price":"0.49","size":"10","side":"SELL","timestamp":"1781032143544","event_type":"last_trade_price","transaction_hash":"0xabc","fee_rate_bps":"0"}"#;
+        // NO token + SELL: the decoder stores the raw token_id + taker_is_buy
+        // and the frame's own `market` as condition_id; the YES/NO side
+        // resolution happens in the join, not here.
+        let raw = r#"{"market":"0xcondX","asset_id":"tok-no","price":"0.49","size":"10","side":"SELL","timestamp":"1781032143544","event_type":"last_trade_price","transaction_hash":"0xabc","fee_rate_bps":"0"}"#;
         let t = parse_clob_trade(raw).unwrap().unwrap();
         assert_eq!(t.token_id, "tok-no");
+        assert_eq!(t.condition_id, "0xcondX");
         assert!(!t.taker_is_buy);
     }
 
     #[test]
     fn unknown_side_is_invalid_value_err() {
-        let raw = r#"{"asset_id":"t","price":"0.5","size":"1","side":"WAT","timestamp":"1","event_type":"last_trade_price","transaction_hash":"0x1"}"#;
+        let raw = r#"{"market":"0xc","asset_id":"t","price":"0.5","size":"1","side":"WAT","timestamp":"1","event_type":"last_trade_price","transaction_hash":"0x1"}"#;
         assert!(matches!(
             parse_clob_trade(raw),
             Err(DecodeError::InvalidValue(_))

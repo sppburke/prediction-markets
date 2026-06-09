@@ -164,12 +164,16 @@ impl BookUpdate {
 
 /// A decoded Polymarket CLOB trade print from a `last_trade_price` frame — the
 /// maker-fill-simulation input. `taker_is_buy` is the raw taker side (BUY=true).
-/// Side-agnostic w.r.t. YES/NO: the `token_id → (market, side)` resolution
-/// happens in the join layer, not here, so this stays a pure decoder output.
-/// `transaction_hash` is the natural on-chain dedup key.
+/// Side-agnostic w.r.t. YES/NO: the YES/NO `side` resolution happens in the join
+/// layer, not here, so this stays a pure decoder output. `transaction_hash` is
+/// the natural on-chain dedup key (verified present + unique per print on the
+/// live market channel, 2026-06-09). `condition_id` is the frame's own `market`
+/// field — the **authoritative** market id, present on every print, so a trade
+/// is self-attributing even before the join has registered its token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClobTrade {
     pub token_id: String,
+    pub condition_id: String,
     pub price: Price,
     pub size: Decimal,
     pub taker_is_buy: bool,
