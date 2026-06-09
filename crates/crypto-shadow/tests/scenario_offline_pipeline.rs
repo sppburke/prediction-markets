@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use pe_crypto_shadow::chainlink_ws::parse_chainlink_frame;
-use pe_crypto_shadow::clob_ws::parse_clob_frame;
+use pe_crypto_shadow::clob_ws::{parse_clob_frame, parse_clob_trade};
 use pe_crypto_shadow::db::ShadowDb;
 use pe_crypto_shadow::gamma::BtcMarketFetcher;
 use pe_crypto_shadow::join::JoinState;
@@ -172,6 +172,86 @@ async fn scenario_offline_pipeline() {
 
     println!(
         "PASS: scenario_offline_pipeline (slug-enumerate + chainlink-decode + median-move-trigger + fee-math + roundtrip)"
+    );
+}
+
+/// CLOB trade-tape capture (v2 market-making data): the runner's Clob arm runs
+/// BOTH decoders on every frame — `parse_clob_frame` (book) and
+/// `parse_clob_trade` (the `last_trade_price` print) — and persists each trade
+/// with its resolved condition/series for the offline maker-vs-taker comparison.
+///
+/// PASS: a `last_trade_price` frame on a known token decodes, resolves to its
+/// market via `lookup_token`, and inserts exactly one `clob_trades` row;
+/// re-delivering the same transaction hash is idempotent; and a `price_change`
+/// frame is not a trade, leaving the count unchanged.
+/// FAIL: the trade is dropped, double-counted, attributed to no market, or a
+/// price_change frame is mistaken for a trade.
+#[tokio::test]
+async fn scenario_trade_capture() {
+    // Enumerate one 5m market so the join knows token "0xyes5".
+    let mut fixtures = HashMap::new();
+    fixtures.insert(
+        "https://gamma.test/events?series_slug=btc-up-or-down-5m&closed=false".to_string(),
+        EVENTS_5M.as_bytes().to_vec(),
+    );
+    let gamma = BtcMarketFetcher::new(
+        "https://gamma.test".to_string(),
+        FixtureFetcher::new(fixtures),
+    );
+    let markets = gamma.fetch_markets(&[BtcSeriesKind::Five]).await.unwrap();
+    let state = JoinState::new(markets, ShadowConfig::default().consensus_params());
+
+    // A live-shaped trade print on the YES token (matches the captured shape).
+    let trade_frame = r#"{"market":"0xmkt","asset_id":"0xyes5","price":"0.78","size":"5.166663","fee_rate_bps":"0","side":"BUY","timestamp":"1781032143544","event_type":"last_trade_price","transaction_hash":"0xdeadbeef"}"#;
+
+    // The runner's Clob arm: the book decoder yields nothing on a trade frame ...
+    assert!(
+        parse_clob_frame(trade_frame).unwrap().is_empty(),
+        "a trade frame is not a book update (no double-count)"
+    );
+    // ... and the trade decoder yields exactly the print.
+    let trade = parse_clob_trade(trade_frame).unwrap().unwrap();
+    assert_eq!(trade.token_id, "0xyes5");
+
+    // Resolve token -> market, exactly as the runner does before the insert.
+    let (cond, series) = state.lookup_token(&trade.token_id);
+    assert_eq!(
+        cond.as_deref(),
+        Some("0xcond5"),
+        "trade attributed to market"
+    );
+    assert_eq!(series, Some("5m"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+    db.insert_clob_trade(&trade, 1_781_032_143_600, cond.as_deref(), series)
+        .unwrap();
+    assert_eq!(db.clob_trade_count().unwrap(), 1, "one trade persisted");
+
+    // Idempotent on transaction_hash (INSERT OR IGNORE): a re-delivered print
+    // (different received clock, same hash) does not double-count.
+    db.insert_clob_trade(&trade, 1_781_032_143_999, cond.as_deref(), series)
+        .unwrap();
+    assert_eq!(
+        db.clob_trade_count().unwrap(),
+        1,
+        "dedup on transaction_hash"
+    );
+
+    // A price_change frame is book state, not a trade -> no row added.
+    let pc = r#"{"market":"0xmkt","price_changes":[{"asset_id":"0xyes5","best_bid":"0.77","best_ask":"0.79"}]}"#;
+    assert!(
+        parse_clob_trade(pc).unwrap().is_none(),
+        "price_change is not a trade"
+    );
+    assert_eq!(
+        db.clob_trade_count().unwrap(),
+        1,
+        "price_change adds no trade row"
+    );
+
+    println!(
+        "PASS: scenario_trade_capture (trade tape persisted + attributed to market, dedup on tx hash, price_change ignored)"
     );
 }
 

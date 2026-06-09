@@ -178,6 +178,24 @@ impl JoinState {
         self.markets.len()
     }
 
+    /// Whether a token id (YES or NO) is already registered. Used by `drive` to
+    /// compute the incremental CLOB subscribe set on refresh.
+    pub fn knows_token(&self, token_id: &str) -> bool {
+        self.token_to_condition.contains_key(token_id)
+    }
+
+    /// Resolve a token id to its `(condition_id, series_label)` for attributing a
+    /// CLOB trade to a market. `(None, None)` for an unknown token. Read-only.
+    pub fn lookup_token(&self, token_id: &str) -> (Option<String>, Option<&'static str>) {
+        match self.token_to_condition.get(token_id) {
+            None => (None, None),
+            Some((condition, _side)) => {
+                let series = self.markets.get(condition).map(|m| m.series.as_str());
+                (Some(condition.clone()), series)
+            }
+        }
+    }
+
     /// Apply a book update with the node-receive clock at which the runner read
     /// it, routed to the YES or NO book of the market whose token it belongs to.
     /// Unknown tokens are ignored (book for a market we are not tracking).
@@ -576,5 +594,23 @@ mod tests {
                 .on_exchange_tick(&etick(ExchangeVenue::Bybit, dec!(61000), 1_200), 1_200)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn lookup_and_knows_token_resolve_both_sides() {
+        let state = JoinState::new(vec![meta()], params());
+        assert!(state.knows_token("tok-yes"));
+        assert!(state.knows_token("tok-no"));
+        assert!(!state.knows_token("tok-unknown"));
+        // Both outcome tokens resolve to the same market + series.
+        assert_eq!(
+            state.lookup_token("tok-yes"),
+            (Some("0xcond".to_string()), Some("5m"))
+        );
+        assert_eq!(
+            state.lookup_token("tok-no"),
+            (Some("0xcond".to_string()), Some("5m"))
+        );
+        assert_eq!(state.lookup_token("nope"), (None, None));
     }
 }
