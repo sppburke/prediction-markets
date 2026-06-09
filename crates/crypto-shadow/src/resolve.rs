@@ -16,6 +16,7 @@ use std::str::FromStr as _;
 use pe_source_polymarket_public::PageFetcher;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use tracing::warn;
 
 /// Error fetching/parsing resolutions.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +55,13 @@ pub fn parse_outcome_prices(s: &str) -> Option<Vec<Decimal>> {
 /// `closed`, and has a parseable `outcomePrices`. The YES/Up side wins when the
 /// first settled price is the decisive `1` (resolved markets settle to exactly
 /// `1`/`0`; the `> 0.5` test is robust to either encoding). Pure.
+///
+/// Limitation: a closed market that settled non-decisively (e.g. a 50/50 void,
+/// `["0.5","0.5"]`) would be classified as a YES loss rather than excluded. No
+/// such settlement has been observed for these binary BTC up/down markets
+/// (live-verified shape is exactly `1`/`0`); since this is a shadow-only
+/// measurement harness that places no orders, the YES-side classification is an
+/// accepted, documented limitation, not a trading risk.
 pub fn parse_resolution(bytes: &[u8], condition_id: &str) -> Option<MarketResolution> {
     let markets: Vec<GammaMarket> = serde_json::from_slice(bytes).ok()?;
     let m = markets.iter().find(|m| m.condition_id == condition_id)?;
@@ -90,19 +98,27 @@ impl<F: PageFetcher + Send + Sync> BtcResolutionFetcher<F> {
     /// Fetch resolutions for `condition_ids` (sequential — the per-run market
     /// count is small). Markets that are not yet closed (or unparseable) are
     /// silently skipped, so an in-progress 5m market simply yields no row yet.
+    ///
+    /// Per-market resilience (mirrors `pe-paper-pnl::GammaResolutionFetcher`): a
+    /// transient fetch failure on one market is logged and skipped, never
+    /// discarding the resolutions already gathered this run. `resolve` is
+    /// re-runnable (idempotent upsert), so the failed market is retried next
+    /// time. The `Result` is retained for the public error surface.
     pub async fn fetch_resolutions(
         &self,
         condition_ids: &[String],
     ) -> Result<Vec<MarketResolution>, ResolveError> {
         let mut out = Vec::new();
         for cid in condition_ids {
-            let bytes = self
-                .fetcher
-                .fetch_page(&self.url(cid))
-                .await
-                .map_err(|e| ResolveError::Fetch(e.to_string()))?;
-            if let Some(r) = parse_resolution(&bytes, cid) {
-                out.push(r);
+            match self.fetcher.fetch_page(&self.url(cid)).await {
+                Ok(bytes) => {
+                    if let Some(r) = parse_resolution(&bytes, cid) {
+                        out.push(r);
+                    }
+                }
+                Err(e) => {
+                    warn!(condition_id = %cid, error = %e, "shadow: resolution fetch error, skipping");
+                }
             }
         }
         Ok(out)
@@ -172,6 +188,29 @@ mod tests {
         let f = BtcResolutionFetcher::new("https://g.test".to_string(), FixtureFetcher::new(fx));
         let res = f.fetch_resolutions(&["0xc".to_string()]).await.unwrap();
         assert_eq!(res.len(), 1);
+        assert!(res[0].yes_won);
+    }
+
+    // A transient fetch failure on one market (no fixture → `fetch_page` errors)
+    // is skipped, not fatal: the other market still resolves in the same run.
+    #[tokio::test]
+    async fn one_fetch_error_does_not_discard_the_batch() {
+        use pe_source_polymarket_public::FixtureFetcher;
+        use std::collections::HashMap;
+        let good = r#"[{"conditionId":"0xgood","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#;
+        let mut fx = HashMap::new();
+        fx.insert(
+            "https://g.test/markets?condition_ids=0xgood&closed=true".to_string(),
+            good.as_bytes().to_vec(),
+        );
+        // `0xbad` has no fixture → `FixtureFetcher` returns a fatal error.
+        let f = BtcResolutionFetcher::new("https://g.test".to_string(), FixtureFetcher::new(fx));
+        let res = f
+            .fetch_resolutions(&["0xbad".to_string(), "0xgood".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1, "the failed market is skipped, not fatal");
+        assert_eq!(res[0].condition_id, "0xgood");
         assert!(res[0].yes_won);
     }
 }
