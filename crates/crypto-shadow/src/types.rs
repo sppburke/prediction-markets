@@ -134,10 +134,10 @@ pub struct MoveEvent {
     pub observed_at_ms: i64,
 }
 
-/// A decoded CLOB book update for a single YES token.
+/// A decoded CLOB book update for a single outcome token (YES or NO).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BookUpdate {
-    /// CLOB asset (token) id — the YES outcome token.
+    /// CLOB asset (token) id — the YES or NO outcome token it belongs to.
     pub token_id: String,
     /// Best bid (highest buy), if the book had any bids.
     pub best_bid: Option<Price>,
@@ -167,8 +167,12 @@ impl BookUpdate {
 pub struct BtcMarketMeta {
     /// Polymarket `conditionId`.
     pub condition_id: String,
-    /// `clobTokenIds[0]` — the YES outcome token id.
+    /// `clobTokenIds[0]` — the YES (Up) outcome token id.
     pub yes_token_id: String,
+    /// `clobTokenIds[1]` — the NO (Down) outcome token id. Subscribed alongside
+    /// the YES book so a **down-move** observation can price the real executable
+    /// NO ask, instead of approximating it as `1 − yes_bid`.
+    pub no_token_id: String,
     /// 5m or 15m series.
     pub series: BtcSeriesKind,
     /// Window start (range-start reference time), epoch milliseconds.
@@ -200,8 +204,15 @@ pub struct EdgeObservation {
     /// (which needs the deferred Chainlink settlement feed). Overstates certainty
     /// mid-window (see the issue's open risks).
     pub instantaneous_prob_up: Option<Decimal>,
+    /// YES-side top-of-book ask / mid at the move (the Up-buy entry price).
     pub best_ask: Option<Decimal>,
     pub mid: Option<Decimal>,
+    /// NO-side top-of-book ask / mid at the move — the **Down-buy** entry price,
+    /// captured from the NO token's own book (not approximated). `None` if no NO
+    /// book has been seen for this market. The realized layer prices a down-move
+    /// against `no_best_ask`; an up-move against `best_ask`.
+    pub no_best_ask: Option<Decimal>,
+    pub no_mid: Option<Decimal>,
     pub gross_edge_vs_ask: Option<Decimal>,
     pub gross_edge_vs_mid: Option<Decimal>,
     pub fee_cost: Option<Decimal>,

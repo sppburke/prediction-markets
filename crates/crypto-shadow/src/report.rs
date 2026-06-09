@@ -25,19 +25,23 @@ pub struct Report {
     /// exchange-median-implied P(up) at trigger time.
     pub groups: Vec<ReportGroup>,
     /// **Realized** edge groups (per series × move-direction), using the actual
-    /// Gamma market resolution as ground truth. The `up` rows are the buy-YES
-    /// signal's realized performance. Empty until `resolve` has run.
+    /// Gamma market resolution as ground truth. Each group scores the side the
+    /// move-direction strategy buys (up → YES, down → NO). Empty until `resolve`
+    /// has run.
     pub realized: Vec<RealizedGroup>,
 }
 
 /// One (series, move-direction) realized aggregate over observations whose
-/// market has resolved. Realized YES-buy edge =
-/// `(yes_won ? 1 : 0) − best_ask − fee(best_ask)`.
+/// market has resolved. Scores the **move-direction side** the strategy would
+/// buy: an `up` move buys YES at `best_ask` and wins iff `yes_won`; a `down` move
+/// buys NO at `no_best_ask` and wins iff the market resolved Down (`!yes_won`).
+/// Realized edge = `(entry_won ? 1 : 0) − entry_ask − fee(entry_ask)`.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct RealizedGroup {
     pub series: String,
     pub move_direction: String,
-    /// Observations in this group whose market has resolved and had an ask.
+    /// Observations in this group whose market has resolved and had an entry-side
+    /// ask (YES ask for up-moves, NO ask for down-moves).
     pub count_scored: usize,
     pub mean_realized_net_vs_ask: Option<Decimal>,
     pub p50_realized_net_vs_ask: Option<Decimal>,
@@ -179,17 +183,25 @@ pub fn build_report(
     }
 }
 
-/// Aggregate realized YES-buy edge per (series, move-direction) over the
-/// observations whose market has resolved. Pure.
+/// Aggregate realized edge per (series, move-direction) over the observations
+/// whose market has resolved, scoring the **move-direction side** the strategy
+/// would actually buy (up → YES at `best_ask`; down → NO at `no_best_ask`). Pure.
 pub fn build_realized(rows: &[RealizedRow]) -> Vec<RealizedGroup> {
     let mut groups: BTreeMap<(String, String), Vec<Decimal>> = BTreeMap::new();
     for r in rows {
-        // Score only observations with an ask and a resolved outcome.
-        let (Some(ask), Some(yes_won)) = (r.best_ask, r.yes_won) else {
+        // Pick the entry side by move direction: an up-move buys YES (wins iff
+        // yes_won); a down-move buys NO (wins iff the market resolved Down).
+        let (entry_ask, entry_won) = match r.move_direction.as_str() {
+            "up" => (r.best_ask, r.yes_won),
+            "down" => (r.no_best_ask, r.yes_won.map(|w| !w)),
+            _ => (None, None), // unknown direction → not scored
+        };
+        // Score only observations with an entry-side ask and a resolved outcome.
+        let (Some(ask), Some(won)) = (entry_ask, entry_won) else {
             continue;
         };
-        let realized_yes = if yes_won { Decimal::ONE } else { Decimal::ZERO };
-        let net = realized_yes - ask - taker_fee_per_share(ask);
+        let realized = if won { Decimal::ONE } else { Decimal::ZERO };
+        let net = realized - ask - taker_fee_per_share(ask);
         groups
             .entry((r.series.clone(), r.move_direction.clone()))
             .or_default()
@@ -277,28 +289,41 @@ mod tests {
     }
 
     #[test]
-    fn realized_edge_scores_resolved_observations_only() {
-        let rr = |dir: &str, ask: &str, won: Option<bool>| RealizedRow {
+    fn realized_scores_each_direction_on_its_entry_side() {
+        let rr = |dir: &str, yes_ask: &str, no_ask: &str, won: Option<bool>| RealizedRow {
             series: "5m".to_string(),
             move_direction: dir.to_string(),
-            best_ask: Some(ask.parse().unwrap()),
+            best_ask: Some(yes_ask.parse().unwrap()),
+            no_best_ask: Some(no_ask.parse().unwrap()),
             yes_won: won,
         };
         let rows = vec![
-            // up move, ask 0.52, Up won -> 1 - 0.52 - fee(0.52) = 0.462528
-            rr("up", "0.52", Some(true)),
-            // up move, ask 0.60, Up lost -> 0 - 0.60 - fee(0.60) = -0.6168
-            rr("up", "0.60", Some(false)),
-            // unresolved -> not scored, forms no group
-            rr("down", "0.40", None),
+            // UP move buys YES at 0.52; Up won  -> 1 - 0.52 - fee(0.52) = 0.462528
+            rr("up", "0.52", "0.49", Some(true)),
+            // UP move buys YES at 0.60; Up lost -> 0 - 0.60 - fee(0.60) = -0.6168
+            rr("up", "0.60", "0.41", Some(false)),
+            // DOWN move buys NO at 0.45; market resolved Down (yes_won=false, NO won)
+            //   -> 1 - 0.45 - fee(0.45) = 0.55 - 0.017325 = 0.532675
+            rr("down", "0.56", "0.45", Some(false)),
+            // DOWN move buys NO at 0.50; market resolved Up (yes_won=true, NO lost)
+            //   -> 0 - 0.50 - fee(0.50) = -0.5175
+            rr("down", "0.51", "0.50", Some(true)),
+            // unresolved -> not scored on either side
+            rr("up", "0.40", "0.61", None),
         ];
         let groups = build_realized(&rows);
-        assert_eq!(groups.len(), 1, "only the resolved 'up' group is scored");
-        let g = &groups[0];
-        assert_eq!(g.move_direction, "up");
-        assert_eq!(g.count_scored, 2);
-        assert_eq!(g.frac_realized_positive, Some(dec!(0.5)));
-        // mean = (0.462528 + (-0.6168)) / 2 = -0.077136
-        assert_eq!(g.mean_realized_net_vs_ask, Some(dec!(-0.077136)));
+        assert_eq!(groups.len(), 2, "an up group and a down group");
+
+        let up = groups.iter().find(|g| g.move_direction == "up").unwrap();
+        assert_eq!(up.count_scored, 2, "the unresolved up row is excluded");
+        assert_eq!(up.frac_realized_positive, Some(dec!(0.5)));
+        // YES-side: mean = (0.462528 + (-0.6168)) / 2 = -0.077136
+        assert_eq!(up.mean_realized_net_vs_ask, Some(dec!(-0.077136)));
+
+        let down = groups.iter().find(|g| g.move_direction == "down").unwrap();
+        assert_eq!(down.count_scored, 2);
+        assert_eq!(down.frac_realized_positive, Some(dec!(0.5)));
+        // NO-side: mean = (0.532675 + (-0.5175)) / 2 = 0.0075875
+        assert_eq!(down.mean_realized_net_vs_ask, Some(dec!(0.0075875)));
     }
 }

@@ -175,19 +175,31 @@ async fn scenario_offline_pipeline() {
     );
 }
 
-/// A 5m/up observation in market `cid` with the given ask. All other fields are
-/// fixed fixtures (the realized path reads only `series`, `move_direction`,
-/// `best_ask`, and `condition_id`).
-fn up_obs(cid: &str, ask: Decimal) -> EdgeObservation {
+/// A 5m **up**-move observation in market `cid` priced at YES ask `yes_ask`.
+/// `no_best_ask` is set but unused by up-move scoring (the up leg buys YES).
+fn up_obs(cid: &str, yes_ask: Decimal) -> EdgeObservation {
+    obs(cid, MoveDirection::Up, yes_ask, dec!(0.49))
+}
+
+/// A 5m **down**-move observation in market `cid` priced at the real NO ask
+/// `no_ask` (the Down-buy entry). `best_ask` (YES) is set but unused down-scoring.
+fn down_obs(cid: &str, no_ask: Decimal) -> EdgeObservation {
+    obs(cid, MoveDirection::Down, dec!(0.50), no_ask)
+}
+
+fn obs(cid: &str, dir: MoveDirection, yes_ask: Decimal, no_ask: Decimal) -> EdgeObservation {
+    let up = dir == MoveDirection::Up;
     EdgeObservation {
         condition_id: cid.to_string(),
         series: BtcSeriesKind::Five,
         observed_at_ms: 1_000,
         signal_value: dec!(60024),
         range_start_value: Some(dec!(60000)),
-        instantaneous_prob_up: Some(dec!(1)),
-        best_ask: Some(ask),
-        mid: Some(ask),
+        instantaneous_prob_up: Some(if up { dec!(1) } else { dec!(0) }),
+        best_ask: Some(yes_ask),
+        mid: Some(yes_ask),
+        no_best_ask: Some(no_ask),
+        no_mid: Some(no_ask),
         gross_edge_vs_ask: None,
         gross_edge_vs_mid: None,
         fee_cost: None,
@@ -195,32 +207,33 @@ fn up_obs(cid: &str, ask: Decimal) -> EdgeObservation {
         net_edge_vs_mid: None,
         feed_to_book_lag_ms: Some(50),
         move_magnitude_bps: dec!(4),
-        move_direction: MoveDirection::Up,
+        move_direction: dir,
     }
 }
 
 /// Key-free realized-edge join (issue #300 AC2.3 closed without the Chainlink
 /// settlement key): the exact sequence `runner::resolve` runs, but with an
-/// injected `PageFetcher` so it is offline + deterministic.
+/// injected `PageFetcher` so it is offline + deterministic — now **direction
+/// aware**: up-moves score the YES buy, down-moves score the real NO buy.
 ///
-/// PASS: three observed markets (two settle Up-won / Down-won, one still open)
-/// resolve through the real SQLite LEFT JOIN into ONE `up` realized group whose
-/// `count_scored` excludes the open market and whose mean net YES-buy edge equals
-/// the hand-computed `(0.462528 + -0.6168) / 2 = -0.077136`.
-/// FAIL: the open market is scored, the join drops a resolved row, the fetcher
-/// resolves the wrong side, or the report omits the realized section.
+/// PASS: four observed markets (Up-won, Down-won, still-open, and a down-move
+/// that settles Down) resolve through the real SQLite LEFT JOIN into an `up`
+/// group scored on the YES ask (mean `-0.077136`, open market excluded) and a
+/// `down` group scored on the NO ask (mean `0.532675`).
+/// FAIL: the open market is scored, a down-move is scored on the YES side, the
+/// join drops a resolved row, or the report omits a realized section.
 #[tokio::test]
 async fn scenario_realized_edge_join() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("s.db");
     let db = ShadowDb::open(&db_path).unwrap();
 
-    // Three 5m/up observations across three markets. condA settles Up-won (YES
-    // wins), condB settles Down-won (YES loses), condC stays open (no row yet).
+    // condA up/Up-won, condB up/Down-won, condC up/open, condD down/Down-won.
     db.insert_observations(&[
         up_obs("0xcondA", dec!(0.52)),
         up_obs("0xcondB", dec!(0.60)),
         up_obs("0xcondC", dec!(0.55)),
+        down_obs("0xcondD", dec!(0.45)),
     ])
     .unwrap();
 
@@ -232,13 +245,14 @@ async fn scenario_realized_edge_join() {
         vec![
             "0xcondA".to_string(),
             "0xcondB".to_string(),
-            "0xcondC".to_string()
+            "0xcondC".to_string(),
+            "0xcondD".to_string()
         ],
         "resolve targets every observed market"
     );
 
-    // Injected Gamma resolutions: condA Up-won, condB Down-won, condC still open
-    // (empty list ⇒ skipped, mirroring an in-progress 5m market).
+    // Injected Gamma resolutions: condA Up-won, condB & condD Down-won, condC
+    // still open (empty list ⇒ skipped, mirroring an in-progress 5m market).
     let mut fx = HashMap::new();
     fx.insert(
         "https://gamma.test/markets?condition_ids=0xcondA&closed=true".to_string(),
@@ -252,37 +266,47 @@ async fn scenario_realized_edge_join() {
         "https://gamma.test/markets?condition_ids=0xcondC&closed=true".to_string(),
         b"[]".to_vec(),
     );
+    fx.insert(
+        "https://gamma.test/markets?condition_ids=0xcondD&closed=true".to_string(),
+        br#"[{"conditionId":"0xcondD","closed":true,"outcomePrices":"[\"0\",\"1\"]"}]"#.to_vec(),
+    );
 
     let resolver =
         BtcResolutionFetcher::new("https://gamma.test".to_string(), FixtureFetcher::new(fx));
     let resolutions = resolver.fetch_resolutions(&cids).await.unwrap();
-    assert_eq!(resolutions.len(), 2, "the open market yields no resolution");
+    assert_eq!(resolutions.len(), 3, "the open market yields no resolution");
     // Persist with a fixture clock (no wall clock), as `runner::resolve` does.
     for r in &resolutions {
         db.upsert_resolution(&r.condition_id, r.yes_won, 1_765_000_000_000)
             .unwrap();
     }
-    assert_eq!(db.resolution_count().unwrap(), 2);
+    assert_eq!(db.resolution_count().unwrap(), 3);
 
-    // The real LEFT JOIN keeps all three observations; only two carry an outcome.
+    // The real LEFT JOIN keeps all four observations; three carry an outcome.
     let rows = db.all_realized_rows().unwrap();
-    assert_eq!(rows.len(), 3, "LEFT JOIN keeps the unresolved observation");
+    assert_eq!(rows.len(), 4, "LEFT JOIN keeps the unresolved observation");
     let scored = rows.iter().filter(|r| r.yes_won.is_some()).count();
-    assert_eq!(scored, 2, "only resolved markets are scored");
+    assert_eq!(scored, 3, "only resolved markets are scored");
 
     let groups = build_realized(&rows);
-    assert_eq!(groups.len(), 1, "one (5m, up) realized group");
-    let g = &groups[0];
-    assert_eq!(g.series, "5m");
-    assert_eq!(g.move_direction, "up");
-    assert_eq!(g.count_scored, 2, "open market excluded from the score");
-    assert_eq!(g.frac_realized_positive, Some(dec!(0.5)));
-    // (1 - 0.52 - 0.07*0.52*0.48) + (0 - 0.60 - 0.07*0.60*0.40) = 0.462528 - 0.6168
-    assert_eq!(g.mean_realized_net_vs_ask, Some(dec!(-0.077136)));
+    assert_eq!(groups.len(), 2, "an up group and a down group");
+
+    let up = groups.iter().find(|g| g.move_direction == "up").unwrap();
+    assert_eq!(up.series, "5m");
+    assert_eq!(up.count_scored, 2, "open market excluded from the score");
+    assert_eq!(up.frac_realized_positive, Some(dec!(0.5)));
+    // YES leg: (1 - 0.52 - fee(0.52)) + (0 - 0.60 - fee(0.60)) = 0.462528 - 0.6168
+    assert_eq!(up.mean_realized_net_vs_ask, Some(dec!(-0.077136)));
+
+    let down = groups.iter().find(|g| g.move_direction == "down").unwrap();
+    assert_eq!(down.count_scored, 1);
+    // NO leg: Down won, NO ask 0.45 -> 1 - 0.45 - fee(0.45) = 0.55 - 0.017325
+    assert_eq!(down.mean_realized_net_vs_ask, Some(dec!(0.532675)));
+    assert_eq!(down.frac_realized_positive, Some(dec!(1)));
 
     drop(db);
 
-    // `generate_report` surfaces the realized section over the same DB.
+    // `generate_report` surfaces both realized groups over the same DB.
     let cfg = ShadowConfig {
         db_path: db_path.to_string_lossy().into_owned(),
         ..ShadowConfig::default()
@@ -296,8 +320,12 @@ async fn scenario_realized_edge_join() {
         report.contains("\"move_direction\": \"up\""),
         "report carries the up realized group"
     );
+    assert!(
+        report.contains("\"move_direction\": \"down\""),
+        "report carries the down realized group"
+    );
 
     println!(
-        "PASS: scenario_realized_edge_join (distinct-cids + injected-gamma-resolve + LEFT-JOIN + realized-mean -0.077136)"
+        "PASS: scenario_realized_edge_join (direction-aware: up YES-buy mean -0.077136, down NO-buy mean 0.532675)"
     );
 }

@@ -14,13 +14,19 @@ use rust_decimal::Decimal;
 use crate::types::{BtcMarketMeta, BtcSeriesKind, EdgeObservation, FeedSource};
 
 /// On-disk schema version, stamped into `PRAGMA user_version` on create.
+/// Currently `3`. No migration is provided because no rows predate any of these
+/// changes (production `observations = 0`); an older DB is rejected by the
+/// version-mismatch guard in [`ShadowDb::open`] rather than silently mis-read.
 ///
-/// Bumped to `2` for the move-trigger re-architecture (issue #300 Phase 2):
-/// `observations` swaps `chainlink_value_str` → `signal_value_str` (the
-/// exchange-consensus median, not the Chainlink settling value) and adds
-/// `move_magnitude_bps_str` / `move_direction`. No migration is provided because
-/// no observation rows predate the change (production `observations = 0`).
-pub const SCHEMA_VERSION: i64 = 2;
+/// History:
+/// - `2` — move-trigger re-architecture (issue #300 Phase 2): `observations`
+///   swaps `chainlink_value_str` → `signal_value_str` (the exchange-consensus
+///   median, not the Chainlink settling value) and adds `move_magnitude_bps_str`
+///   / `move_direction`.
+/// - `3` — NO-side capture: `markets` adds `no_token_id` and `observations` adds
+///   `no_best_ask_str` / `no_mid_str` (the real Down-buy entry price, so
+///   down-moves are scored on the NO book rather than `1 − yes_bid`).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Provenance value stamped into `meta["lag_clock"]` so a recompute can tell
 /// which clock basis `feed_to_book_lag_ms` was computed under. The column is
@@ -41,6 +47,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS markets (
     condition_id   TEXT PRIMARY KEY NOT NULL,
     yes_token_id   TEXT NOT NULL,
+    no_token_id    TEXT NOT NULL,
     series         TEXT NOT NULL,
     range_start_ms INTEGER NOT NULL,
     range_end_ms   INTEGER NOT NULL,
@@ -64,6 +71,8 @@ CREATE TABLE IF NOT EXISTS observations (
     prob_up_str          TEXT,
     best_ask_str         TEXT,
     mid_str              TEXT,
+    no_best_ask_str      TEXT,
+    no_mid_str           TEXT,
     gross_edge_ask_str   TEXT,
     gross_edge_mid_str   TEXT,
     fee_cost_str         TEXT,
@@ -106,12 +115,15 @@ pub struct ObsRow {
 
 /// One observation joined to its market resolution (if resolved), for the
 /// **realized**-edge report. `yes_won` is `None` while the market is still open
-/// or unresolved — those rows are not scored.
+/// or unresolved — those rows are not scored. The realized layer picks the entry
+/// side by `move_direction`: an up-move buys YES at `best_ask`; a down-move buys
+/// NO at `no_best_ask`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealizedRow {
     pub series: String,
     pub move_direction: String,
     pub best_ask: Option<Decimal>,
+    pub no_best_ask: Option<Decimal>,
     pub yes_won: Option<bool>,
 }
 
@@ -177,10 +189,11 @@ impl ShadowDb {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO markets
-               (condition_id, yes_token_id, series, range_start_ms, range_end_ms, tick_str)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               (condition_id, yes_token_id, no_token_id, series, range_start_ms, range_end_ms, tick_str)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(condition_id) DO UPDATE SET
                yes_token_id = excluded.yes_token_id,
+               no_token_id  = excluded.no_token_id,
                series       = excluded.series,
                range_start_ms = excluded.range_start_ms,
                range_end_ms   = excluded.range_end_ms,
@@ -188,6 +201,7 @@ impl ShadowDb {
             params![
                 m.condition_id,
                 m.yes_token_id,
+                m.no_token_id,
                 m.series.as_str(),
                 m.range_start_ms,
                 m.range_end_ms,
@@ -224,10 +238,11 @@ impl ShadowDb {
                 "INSERT INTO observations
                    (condition_id, series, observed_at_ms, signal_value_str,
                     range_start_str, prob_up_str, best_ask_str, mid_str,
+                    no_best_ask_str, no_mid_str,
                     gross_edge_ask_str, gross_edge_mid_str, fee_cost_str,
                     net_edge_ask_str, net_edge_mid_str, feed_to_book_lag_ms,
                     move_magnitude_bps_str, move_direction)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![
                     o.condition_id,
                     o.series.as_str(),
@@ -237,6 +252,8 @@ impl ShadowDb {
                     o.instantaneous_prob_up.map(|d| d.to_string()),
                     o.best_ask.map(|d| d.to_string()),
                     o.mid.map(|d| d.to_string()),
+                    o.no_best_ask.map(|d| d.to_string()),
+                    o.no_mid.map(|d| d.to_string()),
                     o.gross_edge_vs_ask.map(|d| d.to_string()),
                     o.gross_edge_vs_mid.map(|d| d.to_string()),
                     o.fee_cost.map(|d| d.to_string()),
@@ -310,7 +327,7 @@ impl ShadowDb {
     pub fn all_realized_rows(&self) -> Result<Vec<RealizedRow>, DbError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT o.series, o.move_direction, o.best_ask_str, r.yes_won
+            "SELECT o.series, o.move_direction, o.best_ask_str, o.no_best_ask_str, r.yes_won
              FROM observations o
              LEFT JOIN resolutions r ON o.condition_id = r.condition_id",
         )?;
@@ -319,16 +336,18 @@ impl ShadowDb {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (series, move_direction, best_ask, yes_won) = row?;
+            let (series, move_direction, best_ask, no_best_ask, yes_won) = row?;
             out.push(RealizedRow {
                 series,
                 move_direction,
                 best_ask: parse_opt_decimal(best_ask.as_deref())?,
+                no_best_ask: parse_opt_decimal(no_best_ask.as_deref())?,
                 yes_won: yes_won.map(|v| v != 0),
             });
         }
@@ -398,6 +417,8 @@ mod tests {
             instantaneous_prob_up: Some(Decimal::ONE),
             best_ask: Some(dec!(0.52)),
             mid: Some(dec!(0.50)),
+            no_best_ask: Some(dec!(0.49)),
+            no_mid: Some(dec!(0.47)),
             gross_edge_vs_ask: Some(dec!(0.48)),
             gross_edge_vs_mid: Some(dec!(0.50)),
             fee_cost: Some(dec!(0.017472)),
@@ -430,6 +451,19 @@ mod tests {
         assert_eq!(rows[0].best_ask, Some(dec!(0.52)));
         assert_eq!(rows[0].net_edge_vs_ask, Some(dec!(0.462528)));
         assert_eq!(rows[0].feed_to_book_lag_ms, Some(500));
+    }
+
+    #[test]
+    fn realized_rows_carry_no_best_ask() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        db.insert_observations(&[sample_obs()]).unwrap();
+        let rows = db.all_realized_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].move_direction, "up");
+        assert_eq!(rows[0].best_ask, Some(dec!(0.52)));
+        assert_eq!(rows[0].no_best_ask, Some(dec!(0.49)));
+        assert_eq!(rows[0].yes_won, None, "no resolution upserted yet");
     }
 
     #[test]

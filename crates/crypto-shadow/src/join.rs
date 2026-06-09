@@ -31,9 +31,9 @@ fn indicator_prob_up(c: Decimal, r: Decimal) -> Decimal {
 /// Compute one [`EdgeObservation`] for a market given the triggering consensus
 /// median `c` observed at `observed_at_ms` and received at the node at
 /// `signal_received_ms`, the captured window-open reference `range_start` (if
-/// known), the latest `book` paired with its own node-receive clock (if seen),
-/// and the magnitude/direction of the triggering move. Pure — the receive clocks
-/// arrive as data, so no clock is read here.
+/// known), the latest YES `book` and NO `no_book` each paired with its own
+/// node-receive clock (if seen), and the magnitude/direction of the triggering
+/// move. Pure — the receive clocks arrive as data, so no clock is read here.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_observation(
     meta: &BtcMarketMeta,
@@ -42,13 +42,17 @@ pub fn compute_observation(
     signal_received_ms: i64,
     range_start: Option<Decimal>,
     book: Option<(&BookUpdate, i64)>,
+    no_book: Option<(&BookUpdate, i64)>,
     move_magnitude_bps: Decimal,
     move_direction: MoveDirection,
 ) -> EdgeObservation {
     let prob_up = range_start.map(|r| indicator_prob_up(c, r));
     let best_ask = book.and_then(|(b, _)| b.best_ask).map(|p| p.0);
     let mid = book.and_then(|(b, _)| b.mid());
-    // Book staleness at the node: how long ago the latest book was received,
+    // NO-side executable entry for a down-move, from the NO token's own book.
+    let no_best_ask = no_book.and_then(|(b, _)| b.best_ask).map(|p| p.0);
+    let no_mid = no_book.and_then(|(b, _)| b.mid());
+    // Book staleness at the node: how long ago the latest YES book was received,
     // relative to this triggering median tick's receipt. One coherent
     // at-the-node clock for both feeds. `None` only when no book has been seen.
     let feed_to_book_lag_ms =
@@ -86,6 +90,8 @@ pub fn compute_observation(
         instantaneous_prob_up: prob_up,
         best_ask,
         mid,
+        no_best_ask,
+        no_mid,
         gross_edge_vs_ask,
         gross_edge_vs_mid,
         fee_cost,
@@ -108,16 +114,27 @@ struct BookEntry {
     received_ms: i64,
 }
 
-/// Stateful join across the feeds. Holds market metadata, the latest book per
-/// market, the captured window-open reference per market, and the consensus
-/// median tracker + move detector that gate observation emission.
+/// Which outcome token a CLOB book update belongs to. A market's YES and NO
+/// tokens are tracked separately so a down-move prices the real NO book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BookSide {
+    Yes,
+    No,
+}
+
+/// Stateful join across the feeds. Holds market metadata, the latest YES and NO
+/// books per market, the captured window-open reference per market, and the
+/// consensus median tracker + move detector that gate observation emission.
 ///
 /// The consensus median is shared across all active BTC markets, so one detected
 /// move produces one observation per active market.
 pub struct JoinState {
     markets: HashMap<String, BtcMarketMeta>,
-    token_to_condition: HashMap<String, String>,
-    latest_book: HashMap<String, BookEntry>,
+    /// Both outcome tokens map to their market; the side selects which book the
+    /// update belongs to.
+    token_to_condition: HashMap<String, (String, BookSide)>,
+    latest_yes_book: HashMap<String, BookEntry>,
+    latest_no_book: HashMap<String, BookEntry>,
     range_start_value: HashMap<String, Decimal>,
     median: MedianTracker,
     detector: MoveDetector,
@@ -129,7 +146,8 @@ impl JoinState {
         let mut state = Self {
             markets: HashMap::new(),
             token_to_condition: HashMap::new(),
-            latest_book: HashMap::new(),
+            latest_yes_book: HashMap::new(),
+            latest_no_book: HashMap::new(),
             range_start_value: HashMap::new(),
             median: MedianTracker::new(params.min_venues),
             detector: MoveDetector::new(params),
@@ -140,10 +158,18 @@ impl JoinState {
         state
     }
 
-    /// Add or replace a market (used on startup and on periodic refresh).
+    /// Add or replace a market (used on startup and on periodic refresh). Both
+    /// the YES and NO tokens are registered so each side's book routes to this
+    /// market.
     pub fn upsert_market(&mut self, meta: BtcMarketMeta) {
-        self.token_to_condition
-            .insert(meta.yes_token_id.clone(), meta.condition_id.clone());
+        self.token_to_condition.insert(
+            meta.yes_token_id.clone(),
+            (meta.condition_id.clone(), BookSide::Yes),
+        );
+        self.token_to_condition.insert(
+            meta.no_token_id.clone(),
+            (meta.condition_id.clone(), BookSide::No),
+        );
         self.markets.insert(meta.condition_id.clone(), meta);
     }
 
@@ -153,18 +179,20 @@ impl JoinState {
     }
 
     /// Apply a book update with the node-receive clock at which the runner read
-    /// it, keyed by the market whose YES token it belongs to. Unknown tokens are
-    /// ignored (book for a market we are not tracking).
+    /// it, routed to the YES or NO book of the market whose token it belongs to.
+    /// Unknown tokens are ignored (book for a market we are not tracking).
     pub fn on_book_update(&mut self, update: BookUpdate, received_ms: i64) {
-        if let Some(condition) = self.token_to_condition.get(&update.token_id).cloned() {
-            self.latest_book.insert(
-                condition,
-                BookEntry {
-                    book: update,
-                    received_ms,
-                },
-            );
-        }
+        let Some((condition, side)) = self.token_to_condition.get(&update.token_id).cloned() else {
+            return;
+        };
+        let entry = BookEntry {
+            book: update,
+            received_ms,
+        };
+        match side {
+            BookSide::Yes => self.latest_yes_book.insert(condition, entry),
+            BookSide::No => self.latest_no_book.insert(condition, entry),
+        };
     }
 
     /// Apply an exchange trade tick: update the consensus median, capture the
@@ -215,7 +243,11 @@ impl JoinState {
             };
             let range_start = self.range_start_value.get(&condition).copied();
             let book = self
-                .latest_book
+                .latest_yes_book
+                .get(&condition)
+                .map(|e| (&e.book, e.received_ms));
+            let no_book = self
+                .latest_no_book
                 .get(&condition)
                 .map(|e| (&e.book, e.received_ms));
             out.push(compute_observation(
@@ -225,6 +257,7 @@ impl JoinState {
                 received_ms,
                 range_start,
                 book,
+                no_book,
                 mv.magnitude_bps,
                 mv.direction,
             ));
@@ -254,6 +287,7 @@ mod tests {
         BtcMarketMeta {
             condition_id: "0xcond".to_string(),
             yes_token_id: "tok-yes".to_string(),
+            no_token_id: "tok-no".to_string(),
             series: BtcSeriesKind::Five,
             range_start_ms: 1_000,
             range_end_ms: 301_000,
@@ -262,8 +296,12 @@ mod tests {
     }
 
     fn book(bid: &str, ask: &str, ts: i64) -> BookUpdate {
+        token_book("tok-yes", bid, ask, ts)
+    }
+
+    fn token_book(token_id: &str, bid: &str, ask: &str, ts: i64) -> BookUpdate {
         BookUpdate {
-            token_id: "tok-yes".to_string(),
+            token_id: token_id.to_string(),
             best_bid: Some(Price(bid.parse().unwrap())),
             best_ask: Some(Price(ask.parse().unwrap())),
             observed_at_ms: Some(ts),
@@ -298,6 +336,7 @@ mod tests {
             2_500,
             Some(dec!(59000)),
             Some((&b, 2_000)),
+            None,
             dec!(4),
             MoveDirection::Up,
         );
@@ -311,6 +350,35 @@ mod tests {
         assert_eq!(obs.feed_to_book_lag_ms, Some(500));
         assert_eq!(obs.move_magnitude_bps, dec!(4));
         assert_eq!(obs.move_direction, MoveDirection::Up);
+        // No NO book supplied here → NO-side fields are null.
+        assert_eq!(obs.no_best_ask, None);
+        assert_eq!(obs.no_mid, None);
+    }
+
+    #[test]
+    fn down_move_prices_the_no_book() {
+        let m = meta();
+        let yes = book("0.48", "0.52", 2_000); // YES side
+        let no = token_book("tok-no", "0.46", "0.50", 2_000); // NO side
+        // A down move: median below the window-open reference → prob_up = 0.
+        let obs = compute_observation(
+            &m,
+            dec!(58000),
+            2_500,
+            2_500,
+            Some(dec!(59000)),
+            Some((&yes, 2_000)),
+            Some((&no, 2_000)),
+            dec!(4),
+            MoveDirection::Down,
+        );
+        assert_eq!(obs.move_direction, MoveDirection::Down);
+        assert_eq!(obs.instantaneous_prob_up, Some(Decimal::ZERO));
+        // YES-side fields still captured for reference.
+        assert_eq!(obs.best_ask, Some(dec!(0.52)));
+        // NO-side executable entry captured from the NO book (not 1 - yes_bid).
+        assert_eq!(obs.no_best_ask, Some(dec!(0.50)));
+        assert_eq!(obs.no_mid, Some(dec!(0.48)));
     }
 
     #[test]
@@ -324,6 +392,7 @@ mod tests {
             200,
             None,
             Some((&b, 100)),
+            None,
             dec!(3),
             MoveDirection::Up,
         );
@@ -343,6 +412,7 @@ mod tests {
             2_000,
             2_000,
             Some(dec!(59000)),
+            None,
             None,
             dec!(3),
             MoveDirection::Up,
@@ -370,6 +440,7 @@ mod tests {
             2_500,
             Some(dec!(59000)),
             Some((&b, 2_000)),
+            None,
             dec!(3),
             MoveDirection::Up,
         );
@@ -416,6 +487,43 @@ mod tests {
         assert_eq!(o.best_ask, Some(dec!(0.52)));
         // lag = signal_received (1450) - book_received (1400)
         assert_eq!(o.feed_to_book_lag_ms, Some(50));
+    }
+
+    #[test]
+    fn down_move_routes_the_no_book_through_state() {
+        let mut state = JoinState::new(vec![meta()], params());
+        state.on_book_update(book("0.48", "0.52", 1_500), 1_400); // YES book
+        state.on_book_update(token_book("tok-no", "0.46", "0.50", 1_500), 1_400); // NO book
+
+        assert!(
+            state
+                .on_exchange_tick(&etick(ExchangeVenue::Bybit, dec!(60000), 1_100), 1_100)
+                .is_empty()
+        );
+        // median 60000 captured as the window-open reference.
+        assert!(
+            state
+                .on_exchange_tick(&etick(ExchangeVenue::Coinbase, dec!(60000), 1_150), 1_150)
+                .is_empty()
+        );
+        // median 59988 (-2 bps) — below threshold, no fire.
+        assert!(
+            state
+                .on_exchange_tick(&etick(ExchangeVenue::Bybit, dec!(59976), 1_400), 1_400)
+                .is_empty()
+        );
+        // median 59976 (-4 bps vs 60000) within the window -> fires a DOWN move.
+        let obs =
+            state.on_exchange_tick(&etick(ExchangeVenue::Coinbase, dec!(59976), 1_450), 1_450);
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert_eq!(o.move_direction, MoveDirection::Down);
+        assert_eq!(o.instantaneous_prob_up, Some(Decimal::ZERO));
+        // The NO book routed to its own side: down-move entry is the real NO ask.
+        assert_eq!(o.no_best_ask, Some(dec!(0.50)));
+        assert_eq!(o.no_mid, Some(dec!(0.48)));
+        // YES book still present for reference.
+        assert_eq!(o.best_ask, Some(dec!(0.52)));
     }
 
     #[test]

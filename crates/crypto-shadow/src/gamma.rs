@@ -98,7 +98,11 @@ fn parse_market(
     let condition_id = m.condition_id.clone()?;
     let token_ids_raw = m.clob_token_ids.as_deref()?;
     let token_ids: Vec<String> = serde_json::from_str(token_ids_raw).ok()?;
-    let yes_token_id = token_ids.into_iter().next()?;
+    // Require both outcome tokens: [0] = YES (Up), [1] = NO (Down). A market
+    // missing either token is skipped (the NO book is needed to price down-moves).
+    let mut it = token_ids.into_iter();
+    let yes_token_id = it.next()?;
+    let no_token_id = it.next()?;
     let tick = m
         .tick
         .as_ref()
@@ -107,6 +111,7 @@ fn parse_market(
     Some(BtcMarketMeta {
         condition_id,
         yes_token_id,
+        no_token_id,
         series,
         range_start_ms,
         range_end_ms,
@@ -207,6 +212,7 @@ mod tests {
         let m = &markets[0];
         assert_eq!(m.condition_id, "0xcond5");
         assert_eq!(m.yes_token_id, "0xyes5");
+        assert_eq!(m.no_token_id, "0xno5");
         assert_eq!(m.series, BtcSeriesKind::Five);
         assert_eq!(m.tick, dec!(0.01));
         assert_eq!(m.range_start_ms, 1_765_192_500_000);
@@ -254,6 +260,20 @@ mod tests {
     fn skips_market_missing_required_fields() {
         // Event slug is valid, but the market lacks clobTokenIds → market skipped.
         let body = r#"[{"slug":"btc-updown-5m-1765192500","markets":[{"conditionId":"0xonly"}]}]"#;
+        assert!(
+            parse_events(body.as_bytes(), BtcSeriesKind::Five)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn skips_market_with_only_one_token() {
+        // Both YES and NO tokens are required (the NO book prices down-moves); a
+        // market exposing a single token is skipped.
+        let body = r#"[{"slug":"btc-updown-5m-1765192500","markets":[
+          {"conditionId":"0xc1","clobTokenIds":"[\"0xonlyyes\"]","orderPriceMinTickSize":"0.01"}
+        ]}]"#;
         assert!(
             parse_events(body.as_bytes(), BtcSeriesKind::Five)
                 .unwrap()
