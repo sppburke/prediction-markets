@@ -1,10 +1,11 @@
 # 27 — BTC Latency-Arb Feed Bake-off (vantage, feed leadership, and latency budget)
 
-**Status:** LIVING DOCUMENT. Methodology is final; results below are from a
-**preliminary ~70-minute window (2026-06-08/09, calm market, n=13 outsized
-moves)**. A **9-hour** collection is in progress to enlarge the sample; the
-results section will be updated from that run's final analysis. Treat all
-specific numbers as directional until the 9 h sample lands.
+**Status:** FINAL. Results below are from the **complete 9-hour run
+(2026-06-08/09, window 540.0 min, n=134 outsized moves, 37 book-matched)**; the
+collector exited cleanly at the full duration. The earlier ~70-minute
+preliminary cut is superseded. A multi-day repeat (different volatility regime)
+would tighten the head-start confidence intervals but is not required to act on
+the qualitative ranking.
 
 Relates to: issue **#297** (BTC latency-arb shadow harness `pe-crypto-shadow`),
 issue **#300** (Phase-2 venue integration), `crates/crypto-shadow/`,
@@ -108,88 +109,108 @@ persisted:
 
 ---
 
-## 3. Results (preliminary — ~70 min, n=13 moves, n=4 book-matched)
+## 3. Results (final — 9 h run, window 540.0 min, n=134 symmetric moves, n=37 book-matched)
 
 All venues — **including Binance** — are reachable from the Ireland box (Binance
-was blocked from the dev sandbox; the real box matters).
+was blocked from the dev sandbox; the real box matters). Numbers below are the
+**complete 9 h run** (collector exited cleanly at 540.0 min; 1.83 M ticks, 54,944
+book reprices over 218 market windows). The earlier ~70 min preliminary cut is
+superseded; where the larger sample moved a number, it is called out.
 
 ### 3.1 Cadence & staleness
 | Feed | Cadence | Median staleness (`recv − venue_stamp`) | Quote |
 |---|---|---|---|
-| binance | ~46/s | ~123 ms | USDT |
-| bybit | ~9/s | ~94 ms | USDT |
-| coinbase | ~7/s | ~49 ms | USD |
-| okx | ~5/s | ~118 ms | USDT |
-| kraken | ~1/s | ~14–19 ms | USD |
-| pyth | ~2/s | **~2,100–2,300 ms** | USD oracle |
+| binance | ~35.5/s | ~131 ms | USDT |
+| bybit | ~9.0/s | ~97 ms | USDT |
+| coinbase | ~5.9/s | ~54 ms | USD |
+| okx | ~3.4/s | ~123 ms | USDT |
+| kraken | ~0.5/s | ~14 ms | USD |
+| pyth | ~2.0/s | **~2,828 ms** | USD oracle |
 
 USDT venues (binance/okx/bybit) trade **~4.7–5 bps above** USD venues
 (coinbase/kraken/pyth) — the USDT/USD basis. Irrelevant to move *detection*
 (cancels in price changes); relevant only to absolute settlement comparison, so
 prefer a **USD-quoted** reference or basis-correct.
 
-### 3.2 Move-leadership (symmetric, n=13) — the counterintuitive result
+### 3.2 Move-leadership (symmetric, n=134) — the counterintuitive result
 | Feed | Led | Median ms behind leader |
 |---|---|---|
-| **bybit** | 6/13 | **0** |
-| coinbase | 4/13 | 38 |
-| okx | 3/13 | 44 |
-| kraken | 0/13 | 236 (freshest-when-it-ticks but too sparse at ~1/s) |
-| **binance** | 0/13 | **441** |
-| pyth | 0/13 | 1,496 |
+| **bybit** | 51/134 (38%) | **11** |
+| coinbase | 28/134 | 64 |
+| okx | 23/134 | 65 |
+| **binance** | 22/134 | **182** |
+| kraken | 8/134 | 192 (freshest-when-it-ticks but too sparse at ~0.5/s) |
+| pyth | 1/134 | 1,202 |
 
-**Binance is *last* among exchanges from Ireland, not first.** The naive
+**Binance is *near-last* among exchanges from Ireland, not first.** The naive
 "Binance is the global BTC price leader, use it" intuition is **wrong for this
 vantage** — its Tokyo matching engine is too far; the move reaches
-Bybit/Coinbase/OKX (and the consensus) before Binance's packets arrive. Pyth
-Hermes (~2 s stale) is decisively unusable for a speed strategy.
+Bybit/Coinbase/OKX (and the consensus) before Binance's packets arrive. Binance
+*occasionally* leads (22/134) but is bimodal — when it doesn't lead it is a full
+**182 ms behind** the leader. Pyth Hermes (~2.8 s stale) is decisively unusable
+for a speed strategy. **bybit** is the front-runner: leads 38% of moves and is
+only **11 ms** behind on the ones it doesn't.
 
-### 3.3 Edge window & head start vs Polymarket (n=4 matched)
+> **Methodology cross-check (live demonstration of the §2.5 fix).** The
+> collector's *own* built-in detector — which triggers on Binance moves — reports
+> "binance led 85/179" in `run.log` for this same run. That is the **biased**
+> artifact §2.5 warns about (detect-on-binance ⇒ binance-wins-by-construction).
+> The unbiased symmetric analyzer (cross-exchange median) gives bybit 51 / binance
+> 22. **Cite the symmetric numbers; the `run.log` 85/179 is retained only as the
+> bias demonstration.**
+
+### 3.3 Edge window & head start vs Polymarket (n=37 matched)
 - **Edge window** (consensus move → active-market book reprice): **median
-  ~161 ms** (p25 137, p75 184).
-- **Only ~4 of 13 (≈30%) of 3 bps moves repriced the book within 3 s** — the
+  ~77 ms** (p25 31, p75 235).
+- **Only 37 of 134 (≈28%) of 3 bps moves repriced the book in-window** — the
   5-min book is **sticky** on small moves. §3.4 resolves which kind: the book is
   **tight (~2 ¢)**, so this is the **stale-tight-quote pickoff** regime, *not* a
   wide/illiquid book.
-- **Head start** (`PM reprice − source detect`):
+- **Head start** (`PM reprice − source detect`), median (n matched):
 
 | Source | Head start over Polymarket |
 |---|---|
-| bybit | **+257 ms** |
-| coinbase | +211 ms |
-| okx | +206 ms |
-| kraken | −10 ms |
-| binance | **−179 ms** (sees it *after* PM reprices) |
-| pyth | −1,239 ms |
+| okx | **+188 ms** (n=32) |
+| bybit | +164 ms (n=32) |
+| coinbase | +135 ms (n=34) |
+| binance | +43 ms (n=32) |
+| kraken | +23 ms (n=28) |
+| pyth | **−723 ms** (n=5) |
 
-Negative = the source shows you the move *after* Polymarket already moved.
-**From Ireland, only Bybit/Coinbase/OKX put you ahead of Polymarket; Binance and
-Pyth put you behind.**
+Negative = the source shows you the move *after* Polymarket already moved. On the
+9 h sample the head-start medians **compressed** vs the n=4 preliminary cut
+(bybit +257→+164) but stayed **solidly positive and well-separated** for the
+top three. **From Ireland, Bybit/OKX/Coinbase put you ~135–188 ms ahead of
+Polymarket; Pyth puts you ~0.7 s behind, and Binance's edge (+43 ms) is too thin
+to rely on.**
 
-### 3.4 Book spread — how wide is the market (n=1,644 active-market quote samples)
+### 3.4 Book spread — how wide is the market (n=27,199 active-market quote samples)
 The "sticky book" of §3.3 is a **tight** book, not an illiquid one:
 
 | metric | value |
 |---|---|
-| spread (ask − bid) | p10 **1 ¢**, median **2 ¢**, p90 **3 ¢**, max 15 ¢ |
-| frac spread ≤ 2 ¢ / ≤ 5 ¢ | **54% / 97%** |
-| mid = P(up) | p10 0.34, median **0.53**, p90 0.86 |
+| spread (ask − bid) | p10 **1 ¢**, median **2 ¢**, p90 **5 ¢**, max 63 ¢ |
+| frac spread ≤ 2 ¢ / ≤ 5 ¢ | **50% / 91%** |
+| mid = P(up) | p10 0.13, median **0.51**, p90 0.90 |
 
 Min tick is 1 ¢, so the median 2 ¢ spread is just **two ticks**. The book stays
-tight **across the entire 5-min window** — it does *not* widen toward settlement:
+tight **across the entire 5-min window** — it does *not* widen toward settlement
+until the very end:
 
 | window progress | median spread | p90 | median P(up) |
 |---|---|---|---|
-| 0–20% | 2 ¢ | 3 ¢ | 0.54 |
-| 20–40% | 2 ¢ | 3 ¢ | 0.54 |
-| 40–60% | 2 ¢ | 3 ¢ | 0.54 |
-| 60–80% | 2 ¢ | 3 ¢ | 0.63 |
-| 80–100% | 2 ¢ | 5 ¢ | 0.38 |
+| 0–20% | 2 ¢ | 2 ¢ | 0.51 |
+| 20–40% | 2 ¢ | 3 ¢ | 0.47 |
+| 40–60% | 2 ¢ | 3 ¢ | 0.49 |
+| 60–80% | 2 ¢ | 3 ¢ | 0.57 |
+| 80–100% | 2 ¢ | 8 ¢ | 0.52 |
 
-Spread is ~flat at 2 ¢ throughout; only the p90 ticks up (3→5 ¢) in the final
-20%. The mid stays near 0.50 (uncertain) for the first ~60% then drifts off as
-the outcome decides — so the **uncertain, latency-relevant regime is the first
-~60% of the window**, and it is consistently tight.
+Spread is ~flat at 2 ¢ throughout; only the p90 widens (3→8 ¢) in the final 20%
+as settlement nears. The mid stays near 0.50 (uncertain) through most of the
+window — so the **uncertain, latency-relevant regime is the first ~80% of the
+window**, and it is consistently tight. (The 27 k-sample tail is fatter than the
+preliminary cut — max 63 ¢ — but those are rare wide ticks; the median/p90 are
+unchanged at the order of ~2/5 ¢.)
 
 **Economics implication.** To profit you must clear roughly **half-spread (~1 ¢)
 + the `crypto_fees_v2` taker fee (~1.75 ¢ at p≈0.5) ≈ ~2.7 ¢** of mispricing —
@@ -202,10 +223,16 @@ tight — exactly what `pe-crypto-shadow` must measure to settle the thesis. (Th
 is a back-of-envelope; realized edge is the harness's job, not the bake-off's.)
 Computed by `scripts/feed-bakeoff/spread.py`.
 
-### 3.5 Provisional feed pick
-**Coinbase** or **Bybit** as the BTC reference. Coinbase is USD (no USDT basis)
-with solid cadence and ~+211 ms head start; Bybit leads most often (+257 ms) but
-is USDT. Decision pending the 9 h sample.
+### 3.5 Feed pick (final)
+**Move trigger = cross-exchange median of {bybit, okx, coinbase}** — what the
+analyzer already keys on, and more robust than any single feed (no single venue's
+packet jitter or brief outage can fire or miss a move alone). For a **single
+primary** reference, **Coinbase**: USD-quoted (matches Chainlink BTC/USD
+settlement, no USDT basis), freshest staleness (~54 ms), +135 ms head start over
+Polymarket. **Bybit** leads most often (38%, +164 ms) but is USDT → basis-correct
+if used. **OKX** has the single largest head start (+188 ms) but lower cadence
+(3.4/s). **Binance, Kraken, Pyth are out** — Binance's +43 ms edge is too thin
+and bimodal, Kraken too sparse (0.5/s), Pyth ~0.7 s *behind* Polymarket.
 
 ---
 
@@ -230,9 +257,9 @@ Order submit path (Tier-1, repo): `POST /order` to `https://clob.polymarket.com`
 ### Budget
 | | |
 |---|---|
-| Best-source head start over PM reprice | **~210–257 ms** |
+| Best-source head start over PM reprice (9 h, n≥32) | **~135–188 ms** |
 | Warm order RTT from Ireland | **~20–28 ms** (~25–50 ms to ack) |
-| **Net slack** | **~180–235 ms** ✅ |
+| **Net slack** | **~110–165 ms** ✅ |
 
 **The latency leg of the thesis is viable from Ireland.** Cold RTT (~85 ms) only
 bites the first order after (re)connecting — hold a keep-alive HTTP/2 connection.
@@ -244,10 +271,12 @@ beats it short of a Polymarket-direct order path.
 
 ## 5. Caveats & limitations
 
-- **Small sample (preliminary).** ~70 min, calm market, **13 moves / 4
-  book-matched**. The leadership ordering among the top cluster
-  (bybit/coinbase/okx, within ~44 ms) may shuffle; the edge-window and
-  head-start medians are n=4. The 9 h run addresses this.
+- **Sample (final).** 9 h, **134 symmetric moves / 37 book-matched**; head-start
+  medians are n=28–34 per feed. The top-3 ordering (bybit by lead-count;
+  okx/bybit/coinbase by head start) is stable across the last six 25-min
+  snapshots. Still a **single 9 h session in one volatility regime** — a
+  multi-day repeat would tighten the head-start CIs, but the qualitative ranking
+  (USDT/USD exchanges ahead, Pyth/Binance unusable) is firm.
 - **Vantage-specific.** All leadership/head-start/RTT numbers are for **Ireland**.
   A different region would reorder the feeds (e.g., Binance would lead from
   Tokyo). Re-measure if the deployment box moves.
@@ -293,19 +322,22 @@ immediately, with a **separate** SSH for verification.
 
 ## 7. Conclusions & next steps
 
-1. **Latency: solved and favorable from Ireland.** Best free feed (Bybit/Coinbase)
-   sees the move ~210–257 ms before Polymarket reprices; warm order RTT ~20–28 ms
-   → ~180–235 ms slack. **Pyth Hermes and Binance are unsuitable from this
-   vantage** (too slow / too far) — overturning the earlier plan to use Pyth.
-2. **Phase-2 reference (#300):** use a **fast, USD-quoted exchange feed
-   (Coinbase, or Bybit with USDT basis-correction)** as the live BTC reference —
-   *not* Pyth, *not* Chainlink Data Streams ($5k/mo). Realized ground truth comes
-   from actual market resolutions.
+1. **Latency: solved and favorable from Ireland.** Best free feeds (Bybit/OKX/
+   Coinbase) see the move ~135–188 ms before Polymarket reprices; warm order RTT
+   ~20–28 ms → **~110–165 ms slack**. **Pyth Hermes and Binance are unsuitable
+   from this vantage** (Pyth ~0.7 s behind PM; Binance +43 ms, bimodal) —
+   overturning the earlier plan to use Pyth.
+2. **Phase-2 reference (#300):** trigger on the **cross-exchange median of
+   {bybit, okx, coinbase}**; if a single primary is needed, **Coinbase**
+   (USD-quoted, freshest, +135 ms) — *not* Pyth, *not* Chainlink Data Streams
+   ($5k/mo). Realized ground truth comes from actual market resolutions.
 3. **Open / decisive question:** the **economics** — does a fast move's
-   mispricing beat the ~3% crypto fee? Only ~30% of small (3 bps) moves repriced
-   the book here, hinting at sticky quotes (possible pickoff) — but this must be
-   measured properly by `pe-crypto-shadow`, which is what #300 builds toward.
-4. **Pending:** finalize §3 from the 9 h run; optionally a move-threshold sweep
-   (2/2.5/3 bps) on the raw data for statistical power.
+   mispricing beat the ~2.8 ¢ fee+spread hurdle (fee ≈ 65% of it)? Only ~28% of
+   small (3 bps) moves repriced the tight ~2 ¢ book in-window, the
+   stale-tight-quote pickoff regime — but realized edge must be measured by
+   `pe-crypto-shadow`, which is what #300 builds toward.
+4. **Optional follow-ups:** a move-threshold sweep (2/2.5/3 bps) on the raw CSVs
+   for statistical power, and a multi-day repeat to tighten the head-start CIs.
 
-_Last updated: 2026-06-09 (preliminary ~70 min window; 9 h run in progress)._
+_Last updated: 2026-06-09 (final — complete 9 h run, window 540.0 min, n=134
+moves / 37 book-matched; supersedes the preliminary ~70 min cut)._
