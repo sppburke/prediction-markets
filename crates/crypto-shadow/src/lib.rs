@@ -18,6 +18,7 @@ pub mod fees;
 pub mod gamma;
 pub mod join;
 pub mod report;
+pub mod resolve;
 pub mod types;
 
 mod error;
@@ -26,5 +27,6 @@ mod ws;
 
 pub use config::{ConfigError, ShadowConfig, load};
 pub use error::Error;
-pub use report::{Report, ReportGroup, build_report};
-pub use runner::{RunSummary, generate_report, run};
+pub use report::{RealizedGroup, Report, ReportGroup, build_report};
+pub use resolve::{BtcResolutionFetcher, MarketResolution};
+pub use runner::{RunSummary, generate_report, resolve, run};

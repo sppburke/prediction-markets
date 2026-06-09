@@ -22,10 +22,11 @@ use pe_crypto_shadow::clob_ws::parse_clob_frame;
 use pe_crypto_shadow::db::ShadowDb;
 use pe_crypto_shadow::gamma::BtcMarketFetcher;
 use pe_crypto_shadow::join::JoinState;
+use pe_crypto_shadow::report::build_realized;
 use pe_crypto_shadow::types::{
-    BtcSeriesKind, ExchangeTick, ExchangeVenue, FeedSource, MoveDirection,
+    BtcSeriesKind, EdgeObservation, ExchangeTick, ExchangeVenue, FeedSource, MoveDirection,
 };
-use pe_crypto_shadow::{ShadowConfig, generate_report};
+use pe_crypto_shadow::{BtcResolutionFetcher, ShadowConfig, generate_report};
 use pe_source_polymarket_public::FixtureFetcher;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -171,5 +172,132 @@ async fn scenario_offline_pipeline() {
 
     println!(
         "PASS: scenario_offline_pipeline (slug-enumerate + chainlink-decode + median-move-trigger + fee-math + roundtrip)"
+    );
+}
+
+/// A 5m/up observation in market `cid` with the given ask. All other fields are
+/// fixed fixtures (the realized path reads only `series`, `move_direction`,
+/// `best_ask`, and `condition_id`).
+fn up_obs(cid: &str, ask: Decimal) -> EdgeObservation {
+    EdgeObservation {
+        condition_id: cid.to_string(),
+        series: BtcSeriesKind::Five,
+        observed_at_ms: 1_000,
+        signal_value: dec!(60024),
+        range_start_value: Some(dec!(60000)),
+        instantaneous_prob_up: Some(dec!(1)),
+        best_ask: Some(ask),
+        mid: Some(ask),
+        gross_edge_vs_ask: None,
+        gross_edge_vs_mid: None,
+        fee_cost: None,
+        net_edge_vs_ask: None,
+        net_edge_vs_mid: None,
+        feed_to_book_lag_ms: Some(50),
+        move_magnitude_bps: dec!(4),
+        move_direction: MoveDirection::Up,
+    }
+}
+
+/// Key-free realized-edge join (issue #300 AC2.3 closed without the Chainlink
+/// settlement key): the exact sequence `runner::resolve` runs, but with an
+/// injected `PageFetcher` so it is offline + deterministic.
+///
+/// PASS: three observed markets (two settle Up-won / Down-won, one still open)
+/// resolve through the real SQLite LEFT JOIN into ONE `up` realized group whose
+/// `count_scored` excludes the open market and whose mean net YES-buy edge equals
+/// the hand-computed `(0.462528 + -0.6168) / 2 = -0.077136`.
+/// FAIL: the open market is scored, the join drops a resolved row, the fetcher
+/// resolves the wrong side, or the report omits the realized section.
+#[tokio::test]
+async fn scenario_realized_edge_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("s.db");
+    let db = ShadowDb::open(&db_path).unwrap();
+
+    // Three 5m/up observations across three markets. condA settles Up-won (YES
+    // wins), condB settles Down-won (YES loses), condC stays open (no row yet).
+    db.insert_observations(&[
+        up_obs("0xcondA", dec!(0.52)),
+        up_obs("0xcondB", dec!(0.60)),
+        up_obs("0xcondC", dec!(0.55)),
+    ])
+    .unwrap();
+
+    // The markets `resolve` will fetch outcomes for — exactly the observed set.
+    let mut cids = db.distinct_observation_condition_ids().unwrap();
+    cids.sort();
+    assert_eq!(
+        cids,
+        vec![
+            "0xcondA".to_string(),
+            "0xcondB".to_string(),
+            "0xcondC".to_string()
+        ],
+        "resolve targets every observed market"
+    );
+
+    // Injected Gamma resolutions: condA Up-won, condB Down-won, condC still open
+    // (empty list ⇒ skipped, mirroring an in-progress 5m market).
+    let mut fx = HashMap::new();
+    fx.insert(
+        "https://gamma.test/markets?condition_ids=0xcondA&closed=true".to_string(),
+        br#"[{"conditionId":"0xcondA","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#.to_vec(),
+    );
+    fx.insert(
+        "https://gamma.test/markets?condition_ids=0xcondB&closed=true".to_string(),
+        br#"[{"conditionId":"0xcondB","closed":true,"outcomePrices":"[\"0\",\"1\"]"}]"#.to_vec(),
+    );
+    fx.insert(
+        "https://gamma.test/markets?condition_ids=0xcondC&closed=true".to_string(),
+        b"[]".to_vec(),
+    );
+
+    let resolver =
+        BtcResolutionFetcher::new("https://gamma.test".to_string(), FixtureFetcher::new(fx));
+    let resolutions = resolver.fetch_resolutions(&cids).await.unwrap();
+    assert_eq!(resolutions.len(), 2, "the open market yields no resolution");
+    // Persist with a fixture clock (no wall clock), as `runner::resolve` does.
+    for r in &resolutions {
+        db.upsert_resolution(&r.condition_id, r.yes_won, 1_765_000_000_000)
+            .unwrap();
+    }
+    assert_eq!(db.resolution_count().unwrap(), 2);
+
+    // The real LEFT JOIN keeps all three observations; only two carry an outcome.
+    let rows = db.all_realized_rows().unwrap();
+    assert_eq!(rows.len(), 3, "LEFT JOIN keeps the unresolved observation");
+    let scored = rows.iter().filter(|r| r.yes_won.is_some()).count();
+    assert_eq!(scored, 2, "only resolved markets are scored");
+
+    let groups = build_realized(&rows);
+    assert_eq!(groups.len(), 1, "one (5m, up) realized group");
+    let g = &groups[0];
+    assert_eq!(g.series, "5m");
+    assert_eq!(g.move_direction, "up");
+    assert_eq!(g.count_scored, 2, "open market excluded from the score");
+    assert_eq!(g.frac_realized_positive, Some(dec!(0.5)));
+    // (1 - 0.52 - 0.07*0.52*0.48) + (0 - 0.60 - 0.07*0.60*0.40) = 0.462528 - 0.6168
+    assert_eq!(g.mean_realized_net_vs_ask, Some(dec!(-0.077136)));
+
+    drop(db);
+
+    // `generate_report` surfaces the realized section over the same DB.
+    let cfg = ShadowConfig {
+        db_path: db_path.to_string_lossy().into_owned(),
+        ..ShadowConfig::default()
+    };
+    let report = generate_report(&cfg).unwrap();
+    assert!(
+        report.contains("\"realized\""),
+        "report has a realized section"
+    );
+    assert!(
+        report.contains("\"move_direction\": \"up\""),
+        "report carries the up realized group"
+    );
+
+    println!(
+        "PASS: scenario_realized_edge_join (distinct-cids + injected-gamma-resolve + LEFT-JOIN + realized-mean -0.077136)"
     );
 }
