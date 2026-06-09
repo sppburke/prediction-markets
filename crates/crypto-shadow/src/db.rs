@@ -11,10 +11,10 @@ use std::sync::{Mutex, PoisonError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use rust_decimal::Decimal;
 
-use crate::types::{BtcMarketMeta, BtcSeriesKind, EdgeObservation, FeedSource};
+use crate::types::{BtcMarketMeta, BtcSeriesKind, ClobTrade, EdgeObservation, FeedSource};
 
 /// On-disk schema version, stamped into `PRAGMA user_version` on create.
-/// Currently `3`. No migration is provided because no rows predate any of these
+/// Currently `4`. No migration is provided because no rows predate any of these
 /// changes (production `observations = 0`); an older DB is rejected by the
 /// version-mismatch guard in [`ShadowDb::open`] rather than silently mis-read.
 ///
@@ -26,7 +26,12 @@ use crate::types::{BtcMarketMeta, BtcSeriesKind, EdgeObservation, FeedSource};
 /// - `3` — NO-side capture: `markets` adds `no_token_id` and `observations` adds
 ///   `no_best_ask_str` / `no_mid_str` (the real Down-buy entry price, so
 ///   down-moves are scored on the NO book rather than `1 − yes_bid`).
-pub const SCHEMA_VERSION: i64 = 3;
+/// - `4` — trade-feed capture: adds `clob_trades` (`last_trade_price` prints,
+///   the maker-fill-simulation input). `condition_id` is `NOT NULL` — taken from
+///   the frame's authoritative `market` field so a trade is attributed even
+///   before the join knows its token — and is indexed alongside `token_id` and
+///   `traded_at_ms` for offline time-windowed strategy comparison.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Provenance value stamped into `meta["lag_clock"]` so a recompute can tell
 /// which clock basis `feed_to_book_lag_ms` was computed under. The column is
@@ -90,6 +95,24 @@ CREATE TABLE IF NOT EXISTS resolutions (
     yes_won       INTEGER NOT NULL,
     fetched_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS clob_trades (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id          TEXT NOT NULL,
+    condition_id      TEXT NOT NULL,
+    series            TEXT,
+    price_str         TEXT NOT NULL,
+    size_str          TEXT NOT NULL,
+    taker_is_buy      INTEGER NOT NULL,
+    traded_at_ms      INTEGER NOT NULL,
+    received_at_ms    INTEGER NOT NULL,
+    fee_rate_bps      INTEGER NOT NULL,
+    transaction_hash  TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_clob_trades_token ON clob_trades(token_id);
+CREATE INDEX IF NOT EXISTS idx_clob_trades_condition ON clob_trades(condition_id);
+CREATE INDEX IF NOT EXISTS idx_clob_trades_traded_at ON clob_trades(traded_at_ms);
 ";
 
 /// Persistence error.
@@ -224,6 +247,49 @@ impl ShadowDb {
             params![source.as_str(), received_ms, payload_json],
         )?;
         Ok(())
+    }
+
+    /// Persist a decoded CLOB trade print. `condition_id` is taken from the trade
+    /// itself (the frame's authoritative `market` field — always present), so a
+    /// trade is attributed even before the join knows its token. `series`
+    /// (5m/15m) comes from the join's token lookup and may be `None` for a trade
+    /// that printed before its market was registered (recoverable offline from
+    /// `markets`/Gamma). `INSERT OR IGNORE` on the unique `transaction_hash`
+    /// dedups a re-delivered print without dropping any distinct trade (the hash
+    /// is one-per-print on the live feed, verified 2026-06-09).
+    pub fn insert_clob_trade(
+        &self,
+        trade: &ClobTrade,
+        received_at_ms: i64,
+        series: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO clob_trades
+               (token_id, condition_id, series, price_str, size_str, taker_is_buy,
+                traded_at_ms, received_at_ms, fee_rate_bps, transaction_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                trade.token_id,
+                trade.condition_id,
+                series,
+                trade.price.0.to_string(),
+                trade.size.to_string(),
+                i64::from(trade.taker_is_buy),
+                trade.traded_at_ms,
+                received_at_ms,
+                i64::from(trade.fee_rate_bps),
+                trade.transaction_hash,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Count rows in `clob_trades`.
+    pub fn clob_trade_count(&self) -> Result<i64, DbError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM clob_trades", [], |r| r.get(0))?;
+        Ok(n)
     }
 
     /// Batch-insert computed observations in a single transaction.
@@ -496,6 +562,52 @@ mod tests {
         assert!(matches!(
             result,
             Err(DbError::SchemaVersionMismatch { found: 999, .. })
+        ));
+    }
+
+    fn sample_trade() -> ClobTrade {
+        ClobTrade {
+            token_id: "0xtok".to_string(),
+            condition_id: "0xcond".to_string(),
+            price: pe_core_types::Price(dec!(0.78)),
+            size: dec!(5.166663),
+            taker_is_buy: true,
+            traded_at_ms: 1_781_032_143_544,
+            fee_rate_bps: 0,
+            transaction_hash: "0xdead".to_string(),
+        }
+    }
+
+    #[test]
+    fn clob_trade_dedups_on_transaction_hash() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let t = sample_trade();
+        db.insert_clob_trade(&t, 1_781_032_143_600, Some("5m"))
+            .unwrap();
+        // Same transaction_hash (reconnect replay) -> ignored, not duplicated.
+        db.insert_clob_trade(&t, 1_781_032_143_700, Some("5m"))
+            .unwrap();
+        assert_eq!(db.clob_trade_count().unwrap(), 1);
+        // condition_id was taken from the trade's own `market` field.
+        let conn = db.lock();
+        let cond: String = conn
+            .query_row("SELECT condition_id FROM clob_trades", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cond, "0xcond");
+    }
+
+    #[test]
+    fn schema_v3_rejected_after_bump() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 3_i64).unwrap();
+        }
+        assert!(matches!(
+            ShadowDb::open(&path),
+            Err(DbError::SchemaVersionMismatch { found: 3, .. })
         ));
     }
 }

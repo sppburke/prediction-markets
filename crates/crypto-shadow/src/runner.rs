@@ -75,7 +75,9 @@ pub async fn run(
 
     let (tx, mut rx) = mpsc::channel(config.channel_capacity);
     let _chainlink = chainlink_ws::spawn(config.chainlink_ws_url.clone(), tx.clone());
-    let _clob = clob_ws::spawn(config.clob_ws_url.clone(), token_ids, tx.clone());
+    // The CLOB task returns a handle so `drive` can subscribe markets enumerated
+    // after startup (without it, only the startup batch ever gets book frames).
+    let (_clob, clob_sub) = clob_ws::spawn(config.clob_ws_url.clone(), token_ids, tx.clone());
     // Exchange trigger feeds (free; chosen by the bake-off, docs/27).
     let _bybit = exchange_ws::spawn(
         ExchangeVenue::Bybit,
@@ -102,6 +104,7 @@ pub async fn run(
         &gamma,
         &mut refresh,
         config,
+        &clob_sub,
         shutdown,
     )
     .await?;
@@ -125,6 +128,7 @@ pub async fn run(
 /// exercise every arm with no live socket. `shutdown` is polled first
 /// (`biased;`), so it wins over a still-draining `rx` — mirroring the shutdown
 /// idiom in `crates/service/src/orchestrator.rs`.
+#[allow(clippy::too_many_arguments)] // single orchestration loop; each arg is a distinct live dependency.
 async fn drive<F: PageFetcher + Send + Sync>(
     db: &ShadowDb,
     rx: &mut mpsc::Receiver<FeedFrame>,
@@ -132,6 +136,7 @@ async fn drive<F: PageFetcher + Send + Sync>(
     gamma: &BtcMarketFetcher<F>,
     refresh: &mut tokio::time::Interval,
     config: &ShadowConfig,
+    clob_sub: &clob_ws::ClobSubscribeHandle,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<DriveStats, Error> {
     let mut stats = DriveStats::default();
@@ -157,14 +162,43 @@ async fn drive<F: PageFetcher + Send + Sync>(
                             stats.decode_errors_chainlink += 1;
                         }
                     }
-                    FeedSource::Clob => match clob_ws::parse_clob_frame(&frame.raw) {
-                        Ok(updates) => {
-                            for u in updates {
-                                state.on_book_update(u, frame.received_ms);
+                    // A CLOB frame is at most one of: a book/price_change update
+                    // (book state) or a `last_trade_price` print (executed-trade
+                    // tape). Both share the `market` channel, so we attempt each
+                    // decoder: book updates feed the join; trades are persisted
+                    // with their condition/series for the offline maker-vs-taker
+                    // comparison. A genuinely malformed frame fails BOTH decoders
+                    // but is ONE unprocessable frame, so the error tally is
+                    // incremented at most once per frame.
+                    FeedSource::Clob => {
+                        let mut clob_decode_failed = false;
+                        match clob_ws::parse_clob_frame(&frame.raw) {
+                            Ok(updates) => {
+                                for u in updates {
+                                    state.on_book_update(u, frame.received_ms);
+                                }
                             }
+                            Err(_) => clob_decode_failed = true,
                         }
-                        Err(_) => stats.decode_errors_clob += 1,
-                    },
+                        match clob_ws::parse_clob_trade(&frame.raw) {
+                            Ok(Some(trade)) => {
+                                // condition_id is on the trade (frame's `market`);
+                                // the join only supplies the 5m/15m series label,
+                                // which is `None` if the token is not yet known.
+                                let (_cond, series) = state.lookup_token(&trade.token_id);
+                                if let Err(e) =
+                                    db.insert_clob_trade(&trade, frame.received_ms, series)
+                                {
+                                    warn!(error = %e, "shadow: clob_trade insert error");
+                                }
+                            }
+                            Ok(None) => {} // book/price_change frame, not a trade
+                            Err(_) => clob_decode_failed = true,
+                        }
+                        if clob_decode_failed {
+                            stats.decode_errors_clob += 1;
+                        }
+                    }
                     // Exchange trigger feeds drive the consensus median + move
                     // detector; a fired move emits observations.
                     FeedSource::Bybit | FeedSource::Okx | FeedSource::Coinbase => {
@@ -187,10 +221,31 @@ async fn drive<F: PageFetcher + Send + Sync>(
                 log_decode_errors(&stats, "cumulative");
                 match gamma.fetch_markets(&config.series()).await {
                     Ok(fresh) => {
+                        // Tokens the join has never seen need a fresh CLOB
+                        // subscription, else a market enumerated after startup
+                        // (e.g. a new 5m expiry) never receives book frames — the
+                        // startup-only-subscription bug that made the first 4hr
+                        // run mostly unscorable (#300). Collect them BEFORE the
+                        // upsert (which registers the tokens), then subscribe once.
+                        let mut new_tokens: Vec<String> = Vec::new();
                         for m in fresh.into_iter().take(config.max_open_markets) {
+                            if !state.knows_token(&m.yes_token_id) {
+                                new_tokens.push(m.yes_token_id.clone());
+                            }
+                            if !state.knows_token(&m.no_token_id) {
+                                new_tokens.push(m.no_token_id.clone());
+                            }
                             state.upsert_market(m.clone());
                             if let Err(e) = db.upsert_market(&m) {
                                 warn!(error = %e, "shadow: market upsert error");
+                            }
+                        }
+                        if !new_tokens.is_empty() {
+                            let count = new_tokens.len();
+                            if clob_sub.add_tokens(new_tokens) {
+                                info!(count, "shadow: subscribed new CLOB tokens");
+                            } else {
+                                warn!(count, "shadow: new CLOB subscribe dropped (heals on reconnect)");
                             }
                         }
                     }
@@ -385,6 +440,7 @@ mod tests {
             &gamma,
             &mut refresh,
             &cfg,
+            &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
             std::future::pending::<()>(),
         )
         .await
@@ -427,6 +483,7 @@ mod tests {
             &gamma,
             &mut refresh,
             &cfg,
+            &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
             std::future::ready(()),
         )
         .await

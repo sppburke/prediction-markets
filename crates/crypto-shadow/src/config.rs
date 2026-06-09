@@ -26,7 +26,11 @@ fn default_clob_ws_url() -> String {
     "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string()
 }
 fn default_channel_capacity() -> usize {
-    1024
+    // Raised 1024 -> 4096 (v2): the added CLOB trade tape (`last_trade_price`)
+    // roughly doubles CLOB frame volume, and a deeper buffer absorbs bursty
+    // book+trade activity around a BTC move without the hot path dropping frames.
+    // See `docs/_GLOSSARY.md`: `crypto_shadow_channel_capacity`.
+    4096
 }
 fn default_market_refresh_interval_secs() -> u64 {
     60
@@ -199,7 +203,7 @@ mod tests {
     #[test]
     fn defaults_load_without_a_file() {
         let cfg = load(None).unwrap();
-        assert_eq!(cfg.channel_capacity, 1024);
+        assert_eq!(cfg.channel_capacity, 4096);
         assert_eq!(cfg.max_open_markets, 64);
         assert_eq!(cfg.vantage_label, "local");
         assert_eq!(cfg.series().len(), 2);
