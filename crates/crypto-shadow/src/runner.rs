@@ -20,8 +20,8 @@ use crate::fees::CRYPTO_FEES_V2_PROVENANCE;
 use crate::gamma::BtcMarketFetcher;
 use crate::join::JoinState;
 use crate::report::build_report;
-use crate::types::{FeedFrame, FeedSource};
-use crate::{chainlink_ws, clob_ws};
+use crate::types::{ExchangeVenue, FeedFrame, FeedSource};
+use crate::{chainlink_ws, clob_ws, exchange_ws};
 
 /// Summary returned by a completed `run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct RunSummary {
 struct DriveStats {
     decode_errors_chainlink: u64,
     decode_errors_clob: u64,
+    decode_errors_exchange: u64,
 }
 
 /// Drive the live shadow collection until `rx` closes or `shutdown` resolves.
@@ -64,11 +65,23 @@ pub async fn run(
     }
     let token_ids: Vec<String> = markets.iter().map(|m| m.yes_token_id.clone()).collect();
     info!(markets = markets.len(), "shadow: enumerated markets");
-    let mut state = JoinState::new(markets);
+    let mut state = JoinState::new(markets, config.consensus_params());
 
     let (tx, mut rx) = mpsc::channel(config.channel_capacity);
     let _chainlink = chainlink_ws::spawn(config.chainlink_ws_url.clone(), tx.clone());
     let _clob = clob_ws::spawn(config.clob_ws_url.clone(), token_ids, tx.clone());
+    // Exchange trigger feeds (free; chosen by the bake-off, docs/27).
+    let _bybit = exchange_ws::spawn(
+        ExchangeVenue::Bybit,
+        config.bybit_ws_url.clone(),
+        tx.clone(),
+    );
+    let _okx = exchange_ws::spawn(ExchangeVenue::Okx, config.okx_ws_url.clone(), tx.clone());
+    let _coinbase = exchange_ws::spawn(
+        ExchangeVenue::Coinbase,
+        config.coinbase_ws_url.clone(),
+        tx.clone(),
+    );
     drop(tx); // only the WS tasks hold senders now
 
     let mut refresh = tokio::time::interval(Duration::from_secs(
@@ -89,6 +102,7 @@ pub async fn run(
     info!(
         chainlink_decode_errors = stats.decode_errors_chainlink,
         clob_decode_errors = stats.decode_errors_clob,
+        exchange_decode_errors = stats.decode_errors_exchange,
         "shadow: drive loop ended"
     );
 
@@ -127,15 +141,16 @@ async fn drive<F: PageFetcher + Send + Sync>(
                 let Some(frame) = maybe else { break };
                 db.insert_raw_tick(frame.source, frame.received_ms, &frame.raw)?;
                 match frame.source {
-                    FeedSource::Chainlink => match chainlink_ws::parse_chainlink_frame(&frame.raw) {
-                        Ok(tick) => {
-                            let obs = state.on_chainlink_tick(&tick, frame.received_ms);
-                            db.insert_observations(&obs)?;
+                    // Chainlink is the deferred settlement reader: decode to
+                    // exercise the corrected decoder + tally, but emit no
+                    // observations — the realized-outcome join needs the
+                    // sponsored key (issue #300 AC2.3). The raw frame is already
+                    // persisted above for offline recompute.
+                    FeedSource::Chainlink => {
+                        if chainlink_ws::parse_chainlink_frame(&frame.raw).is_err() {
+                            stats.decode_errors_chainlink += 1;
                         }
-                        // Raw frame already persisted to `raw_ticks`; tally and
-                        // recompute offline rather than logging per frame.
-                        Err(_) => stats.decode_errors_chainlink += 1,
-                    },
+                    }
                     FeedSource::Clob => match clob_ws::parse_clob_frame(&frame.raw) {
                         Ok(updates) => {
                             for u in updates {
@@ -144,6 +159,20 @@ async fn drive<F: PageFetcher + Send + Sync>(
                         }
                         Err(_) => stats.decode_errors_clob += 1,
                     },
+                    // Exchange trigger feeds drive the consensus median + move
+                    // detector; a fired move emits observations.
+                    FeedSource::Bybit | FeedSource::Okx | FeedSource::Coinbase => {
+                        if let Some(venue) = frame.source.exchange_venue() {
+                            match exchange_ws::parse_trade_frame(venue, &frame.raw) {
+                                Ok(Some(tick)) => {
+                                    let obs = state.on_exchange_tick(&tick, frame.received_ms);
+                                    db.insert_observations(&obs)?;
+                                }
+                                Ok(None) => {} // non-trade frame (ack/heartbeat)
+                                Err(_) => stats.decode_errors_exchange += 1,
+                            }
+                        }
+                    }
                 }
             }
             _ = refresh.tick() => {
@@ -171,10 +200,14 @@ async fn drive<F: PageFetcher + Send + Sync>(
 /// Emit a bounded decode-error summary (one line per call, only when non-zero),
 /// replacing the per-frame warning that spammed ~72k lines under load.
 fn log_decode_errors(stats: &DriveStats, phase: &str) {
-    if stats.decode_errors_chainlink > 0 || stats.decode_errors_clob > 0 {
+    if stats.decode_errors_chainlink > 0
+        || stats.decode_errors_clob > 0
+        || stats.decode_errors_exchange > 0
+    {
         warn!(
             chainlink = stats.decode_errors_chainlink,
             clob = stats.decode_errors_clob,
+            exchange = stats.decode_errors_exchange,
             phase,
             "shadow: decode errors"
         );
@@ -237,6 +270,9 @@ async fn probe_rtt(config: &ShadowConfig) -> String {
         ("chainlink", config.chainlink_ws_url.as_str()),
         ("clob", config.clob_ws_url.as_str()),
         ("gamma", config.gamma_base_url.as_str()),
+        ("bybit", config.bybit_ws_url.as_str()),
+        ("okx", config.okx_ws_url.as_str()),
+        ("coinbase", config.coinbase_ws_url.as_str()),
     ];
     for (label, url) in endpoints {
         let value = match host_port(url) {
@@ -283,7 +319,7 @@ mod tests {
     async fn drive_counts_decode_errors_without_per_frame_logs() {
         let dir = tempfile::tempdir().unwrap();
         let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
-        let mut state = JoinState::new(Vec::new());
+        let mut state = JoinState::new(Vec::new(), ShadowConfig::default().consensus_params());
         let gamma = test_gamma();
         let cfg = ShadowConfig::default();
         let mut refresh = tokio::time::interval(Duration::from_secs(3_600));
@@ -331,7 +367,7 @@ mod tests {
     async fn drive_shutdown_wins_over_draining_rx() {
         let dir = tempfile::tempdir().unwrap();
         let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
-        let mut state = JoinState::new(Vec::new());
+        let mut state = JoinState::new(Vec::new(), ShadowConfig::default().consensus_params());
         let gamma = test_gamma();
         let cfg = ShadowConfig::default();
         let mut refresh = tokio::time::interval(Duration::from_secs(3_600));

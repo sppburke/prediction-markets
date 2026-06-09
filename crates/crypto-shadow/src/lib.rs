@@ -11,7 +11,9 @@
 pub mod chainlink_ws;
 pub mod clob_ws;
 pub mod config;
+pub mod consensus;
 pub mod db;
+pub mod exchange_ws;
 pub mod fees;
 pub mod gamma;
 pub mod join;
