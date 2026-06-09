@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_obs_series ON observations(series);
+
+CREATE TABLE IF NOT EXISTS resolutions (
+    condition_id  TEXT PRIMARY KEY NOT NULL,
+    yes_won       INTEGER NOT NULL,
+    fetched_at_ms INTEGER NOT NULL
+);
 ";
 
 /// Persistence error.
@@ -96,6 +102,17 @@ pub struct ObsRow {
     pub net_edge_vs_ask: Option<Decimal>,
     pub net_edge_vs_mid: Option<Decimal>,
     pub feed_to_book_lag_ms: Option<i64>,
+}
+
+/// One observation joined to its market resolution (if resolved), for the
+/// **realized**-edge report. `yes_won` is `None` while the market is still open
+/// or unresolved — those rows are not scored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RealizedRow {
+    pub series: String,
+    pub move_direction: String,
+    pub best_ask: Option<Decimal>,
+    pub yes_won: Option<bool>,
 }
 
 /// SQLite-backed store. Cheap to clone the handle is not supported; share via a
@@ -247,6 +264,75 @@ impl ShadowDb {
         let conn = self.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM raw_ticks", [], |r| r.get(0))?;
         Ok(n)
+    }
+
+    /// Upsert a market resolution (`yes_won` = the Up/YES token won).
+    pub fn upsert_resolution(
+        &self,
+        condition_id: &str,
+        yes_won: bool,
+        fetched_at_ms: i64,
+    ) -> Result<(), DbError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO resolutions (condition_id, yes_won, fetched_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(condition_id) DO UPDATE SET
+               yes_won = excluded.yes_won,
+               fetched_at_ms = excluded.fetched_at_ms",
+            params![condition_id, i64::from(yes_won), fetched_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Count rows in `resolutions`.
+    pub fn resolution_count(&self) -> Result<i64, DbError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM resolutions", [], |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// Distinct `condition_id`s that have at least one observation — the markets
+    /// the `resolve` step fetches outcomes for.
+    pub fn distinct_observation_condition_ids(&self) -> Result<Vec<String>, DbError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT DISTINCT condition_id FROM observations")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Observations left-joined to their resolution, for the realized report.
+    /// Unresolved markets yield `yes_won = None` (not scored).
+    pub fn all_realized_rows(&self) -> Result<Vec<RealizedRow>, DbError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT o.series, o.move_direction, o.best_ask_str, r.yes_won
+             FROM observations o
+             LEFT JOIN resolutions r ON o.condition_id = r.condition_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (series, move_direction, best_ask, yes_won) = row?;
+            out.push(RealizedRow {
+                series,
+                move_direction,
+                best_ask: parse_opt_decimal(best_ask.as_deref())?,
+                yes_won: yes_won.map(|v| v != 0),
+            });
+        }
+        Ok(out)
     }
 
     /// Read all observations needed for the report aggregation.

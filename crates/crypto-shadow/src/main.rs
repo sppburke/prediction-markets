@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
 
-use pe_crypto_shadow::{generate_report, load, run};
+use pe_crypto_shadow::{generate_report, load, resolve, run};
 
 #[tokio::main]
 async fn main() {
@@ -17,9 +17,9 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let first = args.get(1).map(String::as_str);
-    let known = matches!(first, Some("run" | "report" | "print-config"));
+    let known = matches!(first, Some("run" | "resolve" | "report" | "print-config"));
     let Some(sub) = first.filter(|_| known) else {
-        eprintln!("usage: pe-crypto-shadow <run|report|print-config> [--config <path>]");
+        eprintln!("usage: pe-crypto-shadow <run|resolve|report|print-config> [--config <path>]");
         std::process::exit(2);
     };
 
@@ -59,6 +59,16 @@ async fn main() {
             }
             Err(e) => {
                 tracing::error!(error = %e, "run failed");
+                1
+            }
+        },
+        "resolve" => match resolve(&cfg).await {
+            Ok(n) => {
+                tracing::info!(resolutions = n, "resolve complete");
+                0
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "resolve failed");
                 1
             }
         },

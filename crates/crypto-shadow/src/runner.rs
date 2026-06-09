@@ -20,7 +20,8 @@ use crate::fees::CRYPTO_FEES_V2_PROVENANCE;
 use crate::gamma::BtcMarketFetcher;
 use crate::join::JoinState;
 use crate::report::build_report;
-use crate::types::{ExchangeVenue, FeedFrame, FeedSource};
+use crate::resolve::BtcResolutionFetcher;
+use crate::types::{ExchangeVenue, FeedFrame, FeedSource, now_unix_ms};
 use crate::{chainlink_ws, clob_ws, exchange_ws};
 
 /// Summary returned by a completed `run`.
@@ -214,10 +215,13 @@ fn log_decode_errors(stats: &DriveStats, phase: &str) {
     }
 }
 
-/// Build the realized-edge report JSON from the configured DB. Offline.
+/// Build the report JSON from the configured DB. Offline. Includes realized-edge
+/// groups when `resolve` has populated the `resolutions` table; otherwise the
+/// `realized` section is empty and only signal-edge groups are present.
 pub fn generate_report(config: &ShadowConfig) -> Result<String, Error> {
     let db = ShadowDb::open(Path::new(&config.db_path))?;
     let rows = db.all_observations_for_report()?;
+    let realized_rows = db.all_realized_rows()?;
     let fee_provenance = db
         .get_meta("fee_provenance")?
         .unwrap_or_else(|| CRYPTO_FEES_V2_PROVENANCE.to_string());
@@ -225,8 +229,40 @@ pub fn generate_report(config: &ShadowConfig) -> Result<String, Error> {
         .get_meta("vantage_label")?
         .unwrap_or_else(|| config.vantage_label.clone());
     let vantage_rtt = db.get_meta("vantage_rtt")?;
-    let report = build_report(&rows, fee_provenance, vantage_label, vantage_rtt);
+    let report = build_report(
+        &rows,
+        &realized_rows,
+        fee_provenance,
+        vantage_label,
+        vantage_rtt,
+    );
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+/// Fetch + persist market resolutions for every observed market — the key-free
+/// realized ground truth (Gamma `outcomePrices`; no Chainlink key). Network;
+/// returns the number of resolutions stored. Markets still open simply yield no
+/// row yet, so this is safe to re-run as 5m/15m markets settle.
+pub async fn resolve(config: &ShadowConfig) -> Result<usize, Error> {
+    let db = ShadowDb::open(Path::new(&config.db_path))?;
+    let condition_ids = db.distinct_observation_condition_ids()?;
+    if condition_ids.is_empty() {
+        info!("shadow: no observed markets to resolve");
+        return Ok(0);
+    }
+    let fetcher = ReqwestFetcher::new(reqwest::Client::new());
+    let resolver = BtcResolutionFetcher::new(config.gamma_base_url.clone(), fetcher);
+    let resolutions = resolver.fetch_resolutions(&condition_ids).await?;
+    let now = now_unix_ms();
+    for r in &resolutions {
+        db.upsert_resolution(&r.condition_id, r.yes_won, now)?;
+    }
+    info!(
+        observed_markets = condition_ids.len(),
+        resolved = resolutions.len(),
+        "shadow: resolutions fetched"
+    );
+    Ok(resolutions.len())
 }
 
 fn host_port(url: &str) -> Option<(String, u16)> {

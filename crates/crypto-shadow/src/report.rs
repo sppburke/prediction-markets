@@ -8,7 +8,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use serde::Serialize;
 
-use crate::db::ObsRow;
+use crate::db::{ObsRow, RealizedRow};
+use crate::fees::taker_fee_per_share;
 
 /// Top-level report payload, serialized to JSON for `report` stdout.
 #[derive(Debug, Serialize, PartialEq)]
@@ -20,7 +21,27 @@ pub struct Report {
     /// Startup RTT-to-endpoint summary, if probed (free-text JSON).
     pub vantage_rtt: Option<String>,
     pub total_observations: usize,
+    /// **Signal** edge groups (per series × price-bucket), using the
+    /// exchange-median-implied P(up) at trigger time.
     pub groups: Vec<ReportGroup>,
+    /// **Realized** edge groups (per series × move-direction), using the actual
+    /// Gamma market resolution as ground truth. The `up` rows are the buy-YES
+    /// signal's realized performance. Empty until `resolve` has run.
+    pub realized: Vec<RealizedGroup>,
+}
+
+/// One (series, move-direction) realized aggregate over observations whose
+/// market has resolved. Realized YES-buy edge =
+/// `(yes_won ? 1 : 0) − best_ask − fee(best_ask)`.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct RealizedGroup {
+    pub series: String,
+    pub move_direction: String,
+    /// Observations in this group whose market has resolved and had an ask.
+    pub count_scored: usize,
+    pub mean_realized_net_vs_ask: Option<Decimal>,
+    pub p50_realized_net_vs_ask: Option<Decimal>,
+    pub frac_realized_positive: Option<Decimal>,
 }
 
 /// One (series, price-bucket) aggregate. Edge stats are over observations whose
@@ -103,9 +124,10 @@ struct Accum {
     lag: Vec<i64>,
 }
 
-/// Build the report from observation rows plus run provenance.
+/// Build the report from observation rows, realized-join rows, and provenance.
 pub fn build_report(
     rows: &[ObsRow],
+    realized_rows: &[RealizedRow],
     fee_provenance: String,
     vantage_label: String,
     vantage_rtt: Option<String>,
@@ -153,7 +175,41 @@ pub fn build_report(
         vantage_rtt,
         total_observations: rows.len(),
         groups: out,
+        realized: build_realized(realized_rows),
     }
+}
+
+/// Aggregate realized YES-buy edge per (series, move-direction) over the
+/// observations whose market has resolved. Pure.
+pub fn build_realized(rows: &[RealizedRow]) -> Vec<RealizedGroup> {
+    let mut groups: BTreeMap<(String, String), Vec<Decimal>> = BTreeMap::new();
+    for r in rows {
+        // Score only observations with an ask and a resolved outcome.
+        let (Some(ask), Some(yes_won)) = (r.best_ask, r.yes_won) else {
+            continue;
+        };
+        let realized_yes = if yes_won { Decimal::ONE } else { Decimal::ZERO };
+        let net = realized_yes - ask - taker_fee_per_share(ask);
+        groups
+            .entry((r.series.clone(), r.move_direction.clone()))
+            .or_default()
+            .push(net);
+    }
+
+    let q50 = Decimal::new(5, 1);
+    let mut out = Vec::with_capacity(groups.len());
+    for ((series, move_direction), mut nets) in groups {
+        nets.sort_unstable();
+        out.push(RealizedGroup {
+            series,
+            move_direction,
+            count_scored: nets.len(),
+            mean_realized_net_vs_ask: mean_decimal(&nets),
+            p50_realized_net_vs_ask: percentile_decimal(&nets, q50),
+            frac_realized_positive: frac_positive(&nets),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -202,8 +258,12 @@ mod tests {
             row("5m", "0.55", "0.20", 300),
             row("15m", "0.31", "-0.05", 50),
         ];
-        let report = build_report(&rows, "prov".to_string(), "local".to_string(), None);
+        let report = build_report(&rows, &[], "prov".to_string(), "local".to_string(), None);
         assert_eq!(report.total_observations, 3);
+        assert!(
+            report.realized.is_empty(),
+            "no resolutions -> no realized groups"
+        );
         // 5m/0.50-0.60 has 2 rows; 15m/0.30-0.40 has 1.
         let g = report
             .groups
@@ -214,5 +274,31 @@ mod tests {
         assert_eq!(g.mean_net_edge_vs_ask, Some(dec!(0.15)));
         assert_eq!(g.frac_net_positive_vs_ask, Some(dec!(1)));
         assert_eq!(g.p50_lag_ms, Some(100));
+    }
+
+    #[test]
+    fn realized_edge_scores_resolved_observations_only() {
+        let rr = |dir: &str, ask: &str, won: Option<bool>| RealizedRow {
+            series: "5m".to_string(),
+            move_direction: dir.to_string(),
+            best_ask: Some(ask.parse().unwrap()),
+            yes_won: won,
+        };
+        let rows = vec![
+            // up move, ask 0.52, Up won -> 1 - 0.52 - fee(0.52) = 0.462528
+            rr("up", "0.52", Some(true)),
+            // up move, ask 0.60, Up lost -> 0 - 0.60 - fee(0.60) = -0.6168
+            rr("up", "0.60", Some(false)),
+            // unresolved -> not scored, forms no group
+            rr("down", "0.40", None),
+        ];
+        let groups = build_realized(&rows);
+        assert_eq!(groups.len(), 1, "only the resolved 'up' group is scored");
+        let g = &groups[0];
+        assert_eq!(g.move_direction, "up");
+        assert_eq!(g.count_scored, 2);
+        assert_eq!(g.frac_realized_positive, Some(dec!(0.5)));
+        // mean = (0.462528 + (-0.6168)) / 2 = -0.077136
+        assert_eq!(g.mean_realized_net_vs_ask, Some(dec!(-0.077136)));
     }
 }
