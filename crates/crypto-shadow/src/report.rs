@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::db::{ObsRow, RealizedRow};
 use crate::fees::taker_fee_per_share;
+use crate::stats::{frac_positive, mean_decimal, percentile_decimal, percentile_i64};
 
 /// Top-level report payload, serialized to JSON for `report` stdout.
 #[derive(Debug, Serialize, PartialEq)]
@@ -75,49 +76,6 @@ fn price_bucket(ask: Option<Decimal>) -> String {
             format!("{lo:.2}-{hi:.2}")
         }
     }
-}
-
-fn mean_decimal(values: &[Decimal]) -> Option<Decimal> {
-    if values.is_empty() {
-        return None;
-    }
-    let sum: Decimal = values.iter().copied().sum();
-    Some(sum / Decimal::from(values.len()))
-}
-
-/// Nearest-rank percentile (`q` in [0,1]) over an already-sorted slice.
-fn percentile_decimal(sorted: &[Decimal], q: Decimal) -> Option<Decimal> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let rank = (q * Decimal::from(sorted.len()))
-        .ceil()
-        .to_i64()
-        .unwrap_or(1)
-        .max(1);
-    let idx = usize::try_from(rank - 1).unwrap_or(0).min(sorted.len() - 1);
-    sorted.get(idx).copied()
-}
-
-fn percentile_i64(sorted: &[i64], q: Decimal) -> Option<i64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let rank = (q * Decimal::from(sorted.len()))
-        .ceil()
-        .to_i64()
-        .unwrap_or(1)
-        .max(1);
-    let idx = usize::try_from(rank - 1).unwrap_or(0).min(sorted.len() - 1);
-    sorted.get(idx).copied()
-}
-
-fn frac_positive(values: &[Decimal]) -> Option<Decimal> {
-    if values.is_empty() {
-        return None;
-    }
-    let pos = values.iter().filter(|v| **v > Decimal::ZERO).count();
-    Some(Decimal::from(pos) / Decimal::from(values.len()))
 }
 
 #[derive(Default)]
@@ -246,21 +204,6 @@ mod tests {
         assert_eq!(price_bucket(Some(dec!(0.00))), "0.00-0.10");
         assert_eq!(price_bucket(Some(dec!(0.999))), "0.90-1.00");
         assert_eq!(price_bucket(None), "no-ask");
-    }
-
-    #[test]
-    fn percentile_nearest_rank() {
-        let v = vec![dec!(1), dec!(2), dec!(3), dec!(4), dec!(5)];
-        assert_eq!(percentile_decimal(&v, dec!(0.5)), Some(dec!(3)));
-        assert_eq!(percentile_decimal(&v, dec!(0.95)), Some(dec!(5)));
-        assert_eq!(percentile_decimal(&[], dec!(0.5)), None);
-    }
-
-    #[test]
-    fn mean_and_frac_positive() {
-        let v = vec![dec!(-1), dec!(1), dec!(3)];
-        assert_eq!(mean_decimal(&v), Some(dec!(1)));
-        assert_eq!(frac_positive(&v), Some(dec!(2) / dec!(3)));
     }
 
     #[test]

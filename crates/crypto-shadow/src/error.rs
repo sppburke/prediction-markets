@@ -20,4 +20,6 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("sweep: {0}")]
+    Sweep(String),
 }
