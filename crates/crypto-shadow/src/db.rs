@@ -177,6 +177,19 @@ pub struct RawTickRow {
     pub payload_json: String,
 }
 
+/// One `clob_trades` print read back for the #310 MM fill simulation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClobTradeRow {
+    pub token_id: String,
+    pub price: Decimal,
+    /// Raw taker side (BUY = true). A maker **buy** fills on `false` (taker sell).
+    pub taker_is_buy: bool,
+    /// Source-supplied trade time (data only — scorers run on the node clock).
+    pub traded_at_ms: i64,
+    /// Node-receive clock — the MM fill window's time base.
+    pub received_at_ms: i64,
+}
+
 /// SQLite-backed store. Cheap to clone the handle is not supported; share via a
 /// reference or `Arc`.
 pub struct ShadowDb {
@@ -623,6 +636,32 @@ impl ShadowDb {
         Ok(out)
     }
 
+    /// Every `clob_trades` print needed by the #310 MM fill simulation, in
+    /// insertion (`id`) order. `received_at_ms` is the node clock (the scorer
+    /// time base); `traded_at_ms` is retained as data.
+    pub fn all_clob_trade_rows(&self) -> Result<Vec<ClobTradeRow>, DbError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT token_id, price_str, taker_is_buy, traded_at_ms, received_at_ms
+             FROM clob_trades ORDER BY id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let price_str: String = row.get(1)?;
+            let price = Decimal::from_str(&price_str)
+                .map_err(|_| DbError::Corrupt(format!("bad trade price {price_str:?}")))?;
+            out.push(ClobTradeRow {
+                token_id: row.get(0)?,
+                price,
+                taker_is_buy: row.get::<_, i64>(2)? != 0,
+                traded_at_ms: row.get(3)?,
+                received_at_ms: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Every `observations` row, fully decoded, in insertion (`id`) order — the
     /// live side of the #310 reference-cell fidelity compare. [`EdgeObservation`]
     /// derives `PartialEq`, so replay rows compare directly.
@@ -1005,5 +1044,28 @@ mod tests {
             ShadowDb::open_readonly(&empty),
             Err(DbError::SchemaVersionMismatch { found: 0, .. })
         ));
+    }
+
+    #[test]
+    fn clob_trade_rows_round_trip_in_order() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let mut second = sample_trade();
+        second.transaction_hash = "0xbeef".to_string();
+        second.taker_is_buy = false;
+        second.price = pe_core_types::Price(dec!(0.47));
+        db.insert_clob_trade(&sample_trade(), 1_000, Some("5m"))
+            .unwrap();
+        db.insert_clob_trade(&second, 2_000, None).unwrap();
+        let rows = db.all_clob_trade_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].price, rows[0].taker_is_buy, rows[0].received_at_ms),
+            (dec!(0.78), true, 1_000)
+        );
+        assert_eq!(
+            (rows[1].price, rows[1].taker_is_buy, rows[1].received_at_ms),
+            (dec!(0.47), false, 2_000)
+        );
     }
 }

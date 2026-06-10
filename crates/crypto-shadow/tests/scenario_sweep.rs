@@ -445,3 +445,63 @@ fn s6_scalp_exits_at_each_horizon_on_the_post_fire_book() {
     }
     println!("PASS: s6_scalp_exits_at_each_horizon_on_the_post_fire_book");
 }
+
+#[test]
+fn s7_mm_fills_at_the_pre_move_quote_and_holds_to_resolution() {
+    use pe_core_types::Price;
+    use pe_crypto_shadow::fees::maker_rebate_per_share;
+    use pe_crypto_shadow::types::ClobTrade;
+
+    let m = market("0xc1", "y1", "n1");
+    let mut fx = Fixture::new(std::slice::from_ref(&m), std::slice::from_ref(&m));
+    let frames = fire_once_frames("0xc1", "y1", "n1");
+    fx.feed(&as_refs(&frames));
+    fx.stamp_clean_drop_counters();
+    fx.db.upsert_resolution("0xc1", true, 9_999).unwrap();
+
+    // Trade tape on the YES token around the fire (fire received at 1_450;
+    // resting bid = pre-move best bid 0.48 from the tape-1 book frame):
+    let print = |hash: &str, price, taker_is_buy, received| {
+        let trade = ClobTrade {
+            token_id: "y1".to_string(),
+            condition_id: "0xc1".to_string(),
+            price: Price(price),
+            size: dec!(10),
+            taker_is_buy,
+            traded_at_ms: received - 50,
+            fee_rate_bps: 0,
+            transaction_hash: hash.to_string(),
+        };
+        fx.db
+            .insert_clob_trade(&trade, received, Some("5m"))
+            .unwrap();
+    };
+    print("0xa", dec!(0.47), true, 1_600); // taker BUY: wrong side, no fill
+    print("0xb", dec!(0.47), false, 1_900); // taker sell <= bid inside window: FILL
+    print("0xc", dec!(0.30), false, 9_000); // outside the 1000 ms window
+
+    let out = fx.run_sweep();
+    let cell = out
+        .cells
+        .iter()
+        .find(|c| {
+            c.threshold_bps == dec!(3)
+                && c.window_ms == 300
+                && c.cooldown_ms == 1000
+                && c.top_n == 3
+        })
+        .unwrap();
+    assert_eq!(cell.mm.len(), 1, "{:?}", cell.mm);
+    let g = &cell.mm[0];
+    assert_eq!((g.series.as_str(), g.move_direction.as_str()), ("5m", "up"));
+    assert_eq!(
+        (g.count_resting, g.count_filled, g.count_scored),
+        (1, 1, 1),
+        "one quote rested, one qualifying print filled it"
+    );
+    // Fill at the QUOTE (0.48); resolved Up -> won; rebate = 0.20 * taker_fee.
+    let expected = dec!(1) - dec!(0.48) + maker_rebate_per_share(dec!(0.48));
+    assert_eq!(g.mean_net, Some(expected));
+    assert_eq!(g.frac_positive, Some(dec!(1)));
+    println!("PASS: s7_mm_fills_at_the_pre_move_quote_and_holds_to_resolution");
+}
