@@ -1,12 +1,13 @@
 //! `pe-crypto-shadow` binary: `run` (live collect) / `report` (offline stats) /
-//! `print-config`. Manual arg parsing (the workspace has no `clap` dep), exit
-//! codes, JSON tracing — matching the `pe-bootstrap` convention.
+//! `sweep` (offline #310 strategy sweep over a copied run DB) / `print-config`.
+//! Manual arg parsing (the workspace has no `clap` dep), exit codes, JSON
+//! tracing — matching the `pe-bootstrap` convention.
 
 use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
 
-use pe_crypto_shadow::{generate_report, load, resolve, run};
+use pe_crypto_shadow::{generate_report, load, resolve, run, sweep_cmd};
 
 #[tokio::main]
 async fn main() {
@@ -17,9 +18,14 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let first = args.get(1).map(String::as_str);
-    let known = matches!(first, Some("run" | "resolve" | "report" | "print-config"));
+    let known = matches!(
+        first,
+        Some("run" | "resolve" | "report" | "sweep" | "print-config")
+    );
     let Some(sub) = first.filter(|_| known) else {
-        eprintln!("usage: pe-crypto-shadow <run|resolve|report|print-config> [--config <path>]");
+        eprintln!(
+            "usage: pe-crypto-shadow <run|resolve|report|sweep|print-config> [--config <path>]\n       sweep: --db <copied-run-db> [--out <json-path>]"
+        );
         std::process::exit(2);
     };
 
@@ -79,6 +85,13 @@ async fn main() {
             }
             Err(e) => {
                 tracing::error!(error = %e, "report failed");
+                1
+            }
+        },
+        "sweep" => match sweep_cmd(&cfg, rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!(error = %e, "sweep failed");
                 1
             }
         },

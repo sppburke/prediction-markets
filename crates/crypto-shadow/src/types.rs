@@ -115,6 +115,17 @@ impl MoveDirection {
             Self::Down => "down",
         }
     }
+
+    /// Parse the stable label back to a direction (inverse of [`Self::as_str`]).
+    /// Used by the #310 sweep to read `observations` rows back for the
+    /// reference-cell fidelity compare.
+    pub fn from_str_label(s: &str) -> Option<Self> {
+        match s {
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
 }
 
 /// An outsized BTC move detected on the exchange-consensus median — the
@@ -285,6 +296,26 @@ impl FeedSource {
     }
 }
 
+impl TryFrom<&str> for FeedSource {
+    type Error = DecodeError;
+
+    /// Inverse of [`Self::as_str`] — decodes the `raw_ticks.source` column for
+    /// the #310 offline sweep. Unknown labels are a [`DecodeError::InvalidValue`]
+    /// (a tape written by a newer schema, or corruption), never a silent skip.
+    fn try_from(s: &str) -> Result<Self, DecodeError> {
+        match s {
+            "chainlink" => Ok(Self::Chainlink),
+            "clob" => Ok(Self::Clob),
+            "bybit" => Ok(Self::Bybit),
+            "okx" => Ok(Self::Okx),
+            "coinbase" => Ok(Self::Coinbase),
+            other => Err(DecodeError::InvalidValue(format!(
+                "unknown feed source label {other:?}"
+            ))),
+        }
+    }
+}
+
 impl From<ExchangeVenue> for FeedSource {
     fn from(v: ExchangeVenue) -> Self {
         match v {
@@ -323,4 +354,35 @@ pub enum DecodeError {
 pub fn now_unix_ms() -> i64 {
     let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
     i64::try_from(nanos / 1_000_000).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_source_label_round_trips() {
+        for src in [
+            FeedSource::Chainlink,
+            FeedSource::Clob,
+            FeedSource::Bybit,
+            FeedSource::Okx,
+            FeedSource::Coinbase,
+        ] {
+            assert_eq!(FeedSource::try_from(src.as_str()).unwrap(), src);
+        }
+        assert!(matches!(
+            FeedSource::try_from("binance"),
+            Err(DecodeError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn move_direction_label_round_trips() {
+        for dir in [MoveDirection::Up, MoveDirection::Down] {
+            assert_eq!(MoveDirection::from_str_label(dir.as_str()), Some(dir));
+        }
+        assert_eq!(MoveDirection::from_str_label("sideways"), None);
+    }
 }

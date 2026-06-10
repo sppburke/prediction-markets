@@ -23,6 +23,8 @@ pub mod types;
 
 mod error;
 mod runner;
+mod stats;
+mod sweep;
 mod ws;
 
 pub use config::{ConfigError, ShadowConfig, load};
@@ -30,3 +32,7 @@ pub use error::Error;
 pub use report::{RealizedGroup, Report, ReportGroup, build_report};
 pub use resolve::{BtcResolutionFetcher, MarketResolution};
 pub use runner::{RunSummary, generate_report, resolve, run};
+pub use sweep::{
+    BUY_HOLD_FEE_PROVENANCE, CAPTURE_CONFIG_PROVENANCE, CellResult, DecodeStats, FidelitySummary,
+    ReferenceParams, SweepArgs, SweepOutput, TapeValidity, sweep, sweep_cmd,
+};

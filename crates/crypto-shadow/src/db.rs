@@ -11,7 +11,11 @@ use std::sync::{Mutex, PoisonError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use rust_decimal::Decimal;
 
-use crate::types::{BtcMarketMeta, BtcSeriesKind, ClobTrade, EdgeObservation, FeedSource};
+use std::collections::HashMap;
+
+use crate::types::{
+    BtcMarketMeta, BtcSeriesKind, ClobTrade, EdgeObservation, FeedSource, MoveDirection,
+};
 
 /// On-disk schema version, stamped into `PRAGMA user_version` on create.
 /// Currently `4`. No migration is provided because no rows predate any of these
@@ -39,6 +43,18 @@ pub const SCHEMA_VERSION: i64 = 4;
 /// issue #300 fix 5); no migration is needed because no observation rows
 /// predate the change.
 pub const LAG_CLOCK: &str = "received_node_v2";
+
+/// `meta` keys carrying the per-source frames-dropped tallies the runner stamps
+/// at run end (issue #311). Shared by the runner's stamp and the #310 sweep's
+/// tape-validity read so the two cannot drift. Order mirrors the runner's
+/// `DropCounters` fields.
+pub(crate) const FRAMES_DROPPED_META_KEYS: [&str; 5] = [
+    "frames_dropped_chainlink",
+    "frames_dropped_clob",
+    "frames_dropped_bybit",
+    "frames_dropped_okx",
+    "frames_dropped_coinbase",
+];
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -148,6 +164,17 @@ pub struct RealizedRow {
     pub best_ask: Option<Decimal>,
     pub no_best_ask: Option<Decimal>,
     pub yes_won: Option<bool>,
+}
+
+/// One `raw_ticks` row streamed back in tape (`id`) order for the #310 offline
+/// sweep. `id` is the canonical tape position (single-writer insertion order,
+/// pinned by `frame_batch_persists_both_tables_in_order`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTickRow {
+    pub id: i64,
+    pub source: FeedSource,
+    pub received_ms: i64,
+    pub payload_json: String,
 }
 
 /// SQLite-backed store. Cheap to clone the handle is not supported; share via a
@@ -503,6 +530,155 @@ impl ShadowDb {
         }
         Ok(out)
     }
+
+    /// Open an existing database **read-only** — the #310 sweep path (always a
+    /// copy of a run DB, never the live one). Keeps the `user_version` guard;
+    /// unlike [`Self::open`], version `0` (fresh/empty) is also rejected because
+    /// a read-only connection cannot create the schema.
+    pub fn open_readonly(path: &Path) -> Result<Self, DbError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found != SCHEMA_VERSION {
+            return Err(DbError::SchemaVersionMismatch {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Stream every `raw_ticks` row in `id` (tape) order through `f` — the #310
+    /// sweep's single decode pass. Streaming by design: one prepared statement,
+    /// row-at-a-time; the full tape is never materialized.
+    pub fn raw_ticks_ordered<F>(&self, mut f: F) -> Result<(), DbError>
+    where
+        F: FnMut(RawTickRow) -> Result<(), DbError>,
+    {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, source, received_ms, payload_json FROM raw_ticks ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let source_label: String = row.get(1)?;
+            let source = FeedSource::try_from(source_label.as_str()).map_err(|_| {
+                DbError::Corrupt(format!("unknown raw_ticks.source {source_label:?}"))
+            })?;
+            f(RawTickRow {
+                id: row.get(0)?,
+                source,
+                received_ms: row.get(2)?,
+                payload_json: row.get(3)?,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// All markets the capture run registered (boot + delivery-gated refresh
+    /// upserts) — the #310 sweep's market universe.
+    pub fn all_markets(&self) -> Result<Vec<BtcMarketMeta>, DbError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT condition_id, yes_token_id, no_token_id, series,
+                    range_start_ms, range_end_ms, tick_str
+             FROM markets",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let series_label: String = row.get(3)?;
+            let series = BtcSeriesKind::from_str_label(&series_label)
+                .ok_or_else(|| DbError::Corrupt(format!("unknown series {series_label:?}")))?;
+            let tick_str: String = row.get(6)?;
+            let tick = Decimal::from_str(&tick_str)
+                .map_err(|_| DbError::Corrupt(format!("bad tick {tick_str:?}")))?;
+            out.push(BtcMarketMeta {
+                condition_id: row.get(0)?,
+                yes_token_id: row.get(1)?,
+                no_token_id: row.get(2)?,
+                series,
+                range_start_ms: row.get(4)?,
+                range_end_ms: row.get(5)?,
+                tick,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `condition_id -> yes_won` for every stored resolution — the #310 buy-hold
+    /// scorer's ground truth. Markets without a row are unresolved (unscored).
+    pub fn all_resolutions_map(&self) -> Result<HashMap<String, bool>, DbError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT condition_id, yes_won FROM resolutions")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (condition_id, yes_won) = row?;
+            out.insert(condition_id, yes_won);
+        }
+        Ok(out)
+    }
+
+    /// Every `observations` row, fully decoded, in insertion (`id`) order — the
+    /// live side of the #310 reference-cell fidelity compare. [`EdgeObservation`]
+    /// derives `PartialEq`, so replay rows compare directly.
+    pub fn all_observations_full(&self) -> Result<Vec<EdgeObservation>, DbError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT condition_id, series, observed_at_ms, signal_value_str,
+                    range_start_str, prob_up_str, best_ask_str, mid_str,
+                    no_best_ask_str, no_mid_str,
+                    gross_edge_ask_str, gross_edge_mid_str, fee_cost_str,
+                    net_edge_ask_str, net_edge_mid_str, feed_to_book_lag_ms,
+                    move_magnitude_bps_str, move_direction
+             FROM observations ORDER BY id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let series_label: String = row.get(1)?;
+            let series = BtcSeriesKind::from_str_label(&series_label)
+                .ok_or_else(|| DbError::Corrupt(format!("unknown series {series_label:?}")))?;
+            let signal_str: String = row.get(3)?;
+            let signal_value = Decimal::from_str(&signal_str)
+                .map_err(|_| DbError::Corrupt(format!("bad signal_value {signal_str:?}")))?;
+            let magnitude_str: String = row.get(16)?;
+            let move_magnitude_bps = Decimal::from_str(&magnitude_str)
+                .map_err(|_| DbError::Corrupt(format!("bad move_magnitude {magnitude_str:?}")))?;
+            let direction_label: String = row.get(17)?;
+            let move_direction =
+                MoveDirection::from_str_label(&direction_label).ok_or_else(|| {
+                    DbError::Corrupt(format!("unknown direction {direction_label:?}"))
+                })?;
+            out.push(EdgeObservation {
+                condition_id: row.get(0)?,
+                series,
+                observed_at_ms: row.get(2)?,
+                signal_value,
+                range_start_value: parse_opt_decimal(row.get::<_, Option<String>>(4)?.as_deref())?,
+                instantaneous_prob_up: parse_opt_decimal(
+                    row.get::<_, Option<String>>(5)?.as_deref(),
+                )?,
+                best_ask: parse_opt_decimal(row.get::<_, Option<String>>(6)?.as_deref())?,
+                mid: parse_opt_decimal(row.get::<_, Option<String>>(7)?.as_deref())?,
+                no_best_ask: parse_opt_decimal(row.get::<_, Option<String>>(8)?.as_deref())?,
+                no_mid: parse_opt_decimal(row.get::<_, Option<String>>(9)?.as_deref())?,
+                gross_edge_vs_ask: parse_opt_decimal(row.get::<_, Option<String>>(10)?.as_deref())?,
+                gross_edge_vs_mid: parse_opt_decimal(row.get::<_, Option<String>>(11)?.as_deref())?,
+                fee_cost: parse_opt_decimal(row.get::<_, Option<String>>(12)?.as_deref())?,
+                net_edge_vs_ask: parse_opt_decimal(row.get::<_, Option<String>>(13)?.as_deref())?,
+                net_edge_vs_mid: parse_opt_decimal(row.get::<_, Option<String>>(14)?.as_deref())?,
+                feed_to_book_lag_ms: row.get(15)?,
+                move_magnitude_bps,
+                move_direction,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn parse_opt_decimal(s: Option<&str>) -> Result<Option<Decimal>, DbError> {
@@ -714,6 +890,120 @@ mod tests {
         assert!(matches!(
             ShadowDb::open(&path),
             Err(DbError::SchemaVersionMismatch { found: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn full_observation_round_trips_exactly() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let mut sparse = sample_obs();
+        // A row with None book fields (the no-book live case) must round-trip too.
+        sparse.best_ask = None;
+        sparse.mid = None;
+        sparse.fee_cost = None;
+        sparse.net_edge_vs_ask = None;
+        sparse.feed_to_book_lag_ms = None;
+        db.insert_observations(&[sample_obs(), sparse.clone()])
+            .unwrap();
+        let rows = db.all_observations_full().unwrap();
+        assert_eq!(
+            rows,
+            vec![sample_obs(), sparse],
+            "insertion order, exact fields"
+        );
+    }
+
+    #[test]
+    fn markets_and_resolutions_round_trip() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let m = BtcMarketMeta {
+            condition_id: "0xc".to_string(),
+            yes_token_id: "y".to_string(),
+            no_token_id: "n".to_string(),
+            series: BtcSeriesKind::Fifteen,
+            range_start_ms: 1_000,
+            range_end_ms: 901_000,
+            tick: dec!(0.01),
+        };
+        db.upsert_market(&m).unwrap();
+        assert_eq!(db.all_markets().unwrap(), vec![m]);
+
+        db.upsert_resolution("0xc", true, 5).unwrap();
+        db.upsert_resolution("0xd", false, 6).unwrap();
+        let map = db.all_resolutions_map().unwrap();
+        assert_eq!(map.get("0xc"), Some(&true));
+        assert_eq!(map.get("0xd"), Some(&false));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn raw_ticks_stream_in_tape_order_with_decoded_source() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let ticks = vec![
+            (FeedSource::Clob, 10_i64, "a".to_string()),
+            (FeedSource::Bybit, 11_i64, "b".to_string()),
+            (FeedSource::Chainlink, 12_i64, "c".to_string()),
+        ];
+        db.insert_frame_batch(&ticks, &[]).unwrap();
+        let mut seen = Vec::new();
+        db.raw_ticks_ordered(|row| {
+            seen.push((row.id, row.source, row.received_ms, row.payload_json));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (1, FeedSource::Clob, 10, "a".to_string()),
+                (2, FeedSource::Bybit, 11, "b".to_string()),
+                (3, FeedSource::Chainlink, 12, "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_ticks_unknown_source_is_corrupt() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO raw_ticks (source, received_ms, payload_json) VALUES ('binance', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        let result = db.raw_ticks_ordered(|_| Ok(()));
+        assert!(matches!(result, Err(DbError::Corrupt(_))));
+    }
+
+    #[test]
+    fn open_readonly_reads_but_rejects_writes_and_fresh_dbs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        {
+            let db = ShadowDb::open(&path).unwrap();
+            db.insert_observations(&[sample_obs()]).unwrap();
+        }
+        let ro = ShadowDb::open_readonly(&path).unwrap();
+        assert_eq!(ro.all_observations_full().unwrap().len(), 1);
+        assert!(
+            ro.set_meta("k", "v").is_err(),
+            "read-only handle must reject writes"
+        );
+
+        // A fresh (version-0) file is rejected: read-only cannot create schema.
+        let empty = dir.path().join("empty.db");
+        {
+            let conn = Connection::open(&empty).unwrap();
+            conn.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        }
+        assert!(matches!(
+            ShadowDb::open_readonly(&empty),
+            Err(DbError::SchemaVersionMismatch { found: 0, .. })
         ));
     }
 }

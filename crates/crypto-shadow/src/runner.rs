@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::ShadowConfig;
-use crate::db::{LAG_CLOCK, SCHEMA_VERSION, ShadowDb};
+use crate::db::{FRAMES_DROPPED_META_KEYS, LAG_CLOCK, SCHEMA_VERSION, ShadowDb};
 use crate::error::Error;
 use crate::fees::CRYPTO_FEES_V2_PROVENANCE;
 use crate::gamma::BtcMarketFetcher;
@@ -62,21 +62,18 @@ struct DropCounters {
 }
 
 impl DropCounters {
-    /// `(meta key, current value)` per source, for the `meta` stamp.
+    /// `(meta key, current value)` per source, for the `meta` stamp. Keys come
+    /// from the shared [`FRAMES_DROPPED_META_KEYS`] so the #310 sweep's
+    /// tape-validity read cannot drift from what is stamped here.
     fn snapshot(&self) -> [(&'static str, u64); 5] {
-        [
-            (
-                "frames_dropped_chainlink",
-                self.chainlink.load(Ordering::Relaxed),
-            ),
-            ("frames_dropped_clob", self.clob.load(Ordering::Relaxed)),
-            ("frames_dropped_bybit", self.bybit.load(Ordering::Relaxed)),
-            ("frames_dropped_okx", self.okx.load(Ordering::Relaxed)),
-            (
-                "frames_dropped_coinbase",
-                self.coinbase.load(Ordering::Relaxed),
-            ),
-        ]
+        let values = [
+            self.chainlink.load(Ordering::Relaxed),
+            self.clob.load(Ordering::Relaxed),
+            self.bybit.load(Ordering::Relaxed),
+            self.okx.load(Ordering::Relaxed),
+            self.coinbase.load(Ordering::Relaxed),
+        ];
+        std::array::from_fn(|i| (FRAMES_DROPPED_META_KEYS[i], values[i]))
     }
 }
 
