@@ -4,7 +4,7 @@
 #   (default)  LIVE-SAFE — process / disk / watchdog / run.log greps ONLY.
 #              Touches NEITHER the SQLite DB NOR the network. Safe to run at
 #              any cadence while the capture is live.
-#   --post     Full #311 AC queries + resolve + report. REFUSES to run while
+#   --post     Full #311 + #317 AC queries + resolve + report. REFUSES to run while
 #              the capture process exists (override with --force, which WILL
 #              invalidate the tape — see below).
 #
@@ -92,6 +92,15 @@ if [ -z "$AC_KEYS" ]; then
   echo "FRAMES_DROPPED=MISSING (crashed capture? not-clean per #310 tape-validity)"
 else
   echo "$AC_KEYS"
+fi
+# Issue #317 AC2: max CLOB inter-frame gap (secs), stamped to meta at clean run
+# end like frames_dropped_*. MISSING = crashed capture (not-clean); >= 300 = a
+# CLOB feed died mid-run (fails crypto_shadow_tape_validity_max_gap_secs=300).
+MAX_GAP=$(sqlite3 "$DB" "SELECT value FROM meta WHERE key='max_clob_gap_secs';" 2>/dev/null)
+if [ -z "$MAX_GAP" ]; then
+  echo "MAX_CLOB_GAP_SECS=MISSING (crashed capture? not-clean per #317 AC)"
+else
+  echo "MAX_CLOB_GAP_SECS=$MAX_GAP"
 fi
 sqlite3 "$DB" "SELECT 'CLOB_5M_STALENESS_S='||CAST((strftime('%s','now')*1000 - MAX(received_at_ms))/1000 AS INTEGER) FROM clob_trades WHERE series='5m';" 2>/dev/null
 ./pe-crypto-shadow resolve >/tmp/resolve.log 2>&1
