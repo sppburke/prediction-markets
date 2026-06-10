@@ -1,5 +1,5 @@
-//! Strategy scorers over replayed fires: buy-hold (PR1) and scalp (PR2); MM is
-//! PR3 (issue #310).
+//! Strategy scorers over replayed fires: buy-hold (PR1), scalp (PR2), and
+//! maker/MM (PR3) — issue #310.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -7,12 +7,13 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 
 use crate::db::RealizedRow;
-use crate::fees::taker_fee_per_share;
+use crate::fees::{maker_rebate_per_share, taker_fee_per_share};
 use crate::report::{RealizedGroup, build_realized};
 use crate::stats::{frac_positive, mean_decimal, percentile_decimal};
 use crate::types::{BtcMarketMeta, EdgeObservation, MoveDirection};
 
 use super::book_index::BookIndex;
+use super::trade_index::TradeIndex;
 
 /// One replayed fire: the rebuilt observation (books resolved from the
 /// per-frame index through the same pure `compute_observation` live uses) plus
@@ -122,6 +123,113 @@ pub(super) fn score_scalp(
             mean_net: mean_decimal(&values),
             p50_net: percentile_decimal(&values, q50),
             frac_positive: frac_positive(&values),
+        });
+    }
+    out
+}
+
+/// MM fill window after a fire, in milliseconds — deliberately decoupled from
+/// the cell's `window_ms` so the MM column is comparable across cells.
+/// Canonical: `docs/_GLOSSARY.md` `mm_fill_window_ms`.
+pub(super) const MM_FILL_WINDOW_MS: i64 = 1_000;
+
+/// One (series × direction) maker aggregate. The maker rests a **buy** at the
+/// direction-side token's pre-move best bid just before the fire; it fills iff
+/// a `taker_is_buy = false` print crosses at `price <= bid` within
+/// [`MM_FILL_WINDOW_MS`] on the node clock; fill at the quote; hold to
+/// resolution. `net = (won?1:0) − bid + maker_rebate(bid)` — an **upper bound
+/// twice over** (front-of-queue fills + the per-fill 20% rebate idealization
+/// of the daily pro-rata pool): read as a ceiling, not an expectation.
+/// Captures adverse selection: fills cluster on the wrong side of the move.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct MmGroup {
+    pub series: String,
+    pub move_direction: String,
+    /// Fires where a direction-side pre-move bid existed to join.
+    pub count_resting: usize,
+    /// Resting quotes hit by a qualifying print inside the window.
+    pub count_filled: usize,
+    /// Filled legs whose market has resolved (the stats base).
+    pub count_scored: usize,
+    pub mean_net: Option<Decimal>,
+    pub p50_net: Option<Decimal>,
+    pub frac_positive: Option<Decimal>,
+}
+
+/// Score the maker strategy for every fire, direction-aware (down-moves rest
+/// on the NO token's own book).
+pub(super) fn score_mm(
+    fires: &[ReplayFire],
+    books: &BookIndex,
+    trades: &TradeIndex,
+    markets_by_condition: &HashMap<String, BtcMarketMeta>,
+    resolutions: &HashMap<String, bool>,
+) -> Vec<MmGroup> {
+    #[derive(Default)]
+    struct Accum {
+        resting: usize,
+        filled: usize,
+        nets: Vec<Decimal>,
+    }
+    let mut groups: BTreeMap<(String, String), Accum> = BTreeMap::new();
+    for fire in fires {
+        let Some(meta) = markets_by_condition.get(&fire.obs.condition_id) else {
+            continue;
+        };
+        let token = match fire.obs.move_direction {
+            MoveDirection::Up => meta.yes_token_id.as_str(),
+            MoveDirection::Down => meta.no_token_id.as_str(),
+        };
+        // The pre-move quote: the latest direction-side book strictly before
+        // the fire frame (same tape-position lookup the rebuilt observation
+        // uses). No book or no bid side -> nothing to rest.
+        let Some(resting_bid) = books
+            .book_at_tape(token, fire.fire_tape_id)
+            .and_then(|(book, _)| book.best_bid.map(|p| p.0))
+        else {
+            continue;
+        };
+        let acc = groups
+            .entry((
+                fire.obs.series.as_str().to_string(),
+                fire.obs.move_direction.as_str().to_string(),
+            ))
+            .or_default();
+        acc.resting += 1;
+        if trades
+            .first_maker_fill(token, resting_bid, fire.fire_received_ms, MM_FILL_WINDOW_MS)
+            .is_none()
+        {
+            continue;
+        }
+        acc.filled += 1;
+        // Hold to resolution: a down-move's NO position wins iff !yes_won.
+        let won = match (
+            fire.obs.move_direction,
+            resolutions.get(&fire.obs.condition_id),
+        ) {
+            (_, None) => continue, // unresolved -> filled but unscored
+            (MoveDirection::Up, Some(yes_won)) => *yes_won,
+            (MoveDirection::Down, Some(yes_won)) => !*yes_won,
+        };
+        let realized = if won { Decimal::ONE } else { Decimal::ZERO };
+        acc.nets
+            .push(realized - resting_bid + maker_rebate_per_share(resting_bid));
+    }
+
+    let q50 = Decimal::new(5, 1);
+    let mut out = Vec::with_capacity(groups.len());
+    for ((series, move_direction), mut acc) in groups {
+        acc.nets.sort_unstable();
+        out.push(MmGroup {
+            series,
+            move_direction,
+            count_resting: acc.resting,
+            count_filled: acc.filled,
+            count_scored: acc.nets.len(),
+            mean_net: mean_decimal(&acc.nets),
+            p50_net: percentile_decimal(&acc.nets, q50),
+            frac_positive: frac_positive(&acc.nets),
         });
     }
     out
@@ -292,5 +400,77 @@ mod tests {
             - taker_fee_per_share(dec!(0.50))
             - taker_fee_per_share(dec!(0.58));
         assert_eq!(groups[0].mean_net, Some(expected));
+    }
+
+    #[test]
+    fn mm_rests_at_the_pre_move_bid_and_fills_only_on_qualifying_prints() {
+        use super::super::book_index::BookIndex;
+        use super::super::trade_index::TradeIndex;
+        use crate::db::ClobTradeRow;
+        use crate::fees::maker_rebate_per_share;
+        use crate::types::BookUpdate;
+        use pe_core_types::Price;
+
+        let mut markets = HashMap::new();
+        markets.insert(
+            "0xup".to_string(),
+            BtcMarketMeta {
+                condition_id: "0xup".to_string(),
+                yes_token_id: "y".to_string(),
+                no_token_id: "n".to_string(),
+                series: BtcSeriesKind::Five,
+                range_start_ms: 1_000,
+                range_end_ms: 301_000,
+                tick: dec!(0.01),
+            },
+        );
+        let mut books = BookIndex::new(1_000);
+        books.push(
+            1,
+            1_050,
+            &BookUpdate {
+                token_id: "y".to_string(),
+                best_bid: Some(Price(dec!(0.48))),
+                best_ask: Some(Price(dec!(0.52))),
+                observed_at_ms: None,
+            },
+        );
+        let trade = |price, taker_is_buy, received| ClobTradeRow {
+            token_id: "y".to_string(),
+            price,
+            taker_is_buy,
+            traded_at_ms: received,
+            received_at_ms: received,
+        };
+        // Wrong side, then the fill, then one outside the window.
+        let trades = TradeIndex::new(&[
+            trade(dec!(0.47), true, 1_600),
+            trade(dec!(0.47), false, 1_900),
+            trade(dec!(0.30), false, 9_000),
+        ]);
+        let mut resolutions = HashMap::new();
+        resolutions.insert("0xup".to_string(), true);
+
+        let fires = vec![fire("0xup", MoveDirection::Up)]; // fire at 1_450, tape 7
+        let groups = score_mm(&fires, &books, &trades, &markets, &resolutions);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!((g.count_resting, g.count_filled, g.count_scored), (1, 1, 1));
+        // Fill at the QUOTE (0.48), not the print price; won -> 1.
+        let expected = dec!(1) - dec!(0.48) + maker_rebate_per_share(dec!(0.48));
+        assert_eq!(g.mean_net, Some(expected));
+
+        // No qualifying print -> resting but unfilled, no stats.
+        let no_cross = TradeIndex::new(&[trade(dec!(0.49), false, 1_900)]);
+        let groups = score_mm(&fires, &books, &no_cross, &markets, &resolutions);
+        assert_eq!(
+            (
+                groups[0].count_resting,
+                groups[0].count_filled,
+                groups[0].count_scored
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(groups[0].mean_net, None);
     }
 }

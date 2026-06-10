@@ -19,6 +19,7 @@ mod grid;
 mod output;
 mod ranking;
 mod scorers;
+mod trade_index;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,9 +36,9 @@ use crate::types::{BtcMarketMeta, ExchangeTick};
 pub use events::DecodeStats;
 pub use output::{
     BUY_HOLD_FEE_PROVENANCE, CAPTURE_CONFIG_PROVENANCE, CellResult, FidelitySummary,
-    ReferenceParams, SCALP_FEE_PROVENANCE, SweepOutput, TapeValidity,
+    MM_FEE_PROVENANCE, ReferenceParams, SCALP_FEE_PROVENANCE, SweepOutput, TapeValidity,
 };
-pub use scorers::ScalpGroup;
+pub use scorers::{MmGroup, ScalpGroup};
 
 use events::Tape;
 use scorers::ReplayFire;
@@ -93,6 +94,8 @@ pub fn sweep(config: &ShadowConfig, args: &SweepArgs) -> Result<SweepOutput, Err
     let resolutions = db.all_resolutions_map()?;
     let live_observations = db.all_observations_full()?;
 
+    let trade_rows = db.all_clob_trade_rows()?;
+    let trades = trade_index::TradeIndex::new(&trade_rows);
     let tape = events::load_and_decode(&db, &markets)?;
     info!(
         frames = tape.stats.frames_total,
@@ -173,6 +176,13 @@ pub fn sweep(config: &ShadowConfig, args: &SweepArgs) -> Result<SweepOutput, Err
             near_degenerate_window: cell.near_degenerate_window(),
             buy_hold: scorers::buy_hold_groups(&fires, &resolutions),
             scalp: scorers::score_scalp(&fires, &tape.books, &markets_by_condition),
+            mm: scorers::score_mm(
+                &fires,
+                &tape.books,
+                &trades,
+                &markets_by_condition,
+                &resolutions,
+            ),
         });
     }
 
@@ -195,6 +205,7 @@ pub fn sweep(config: &ShadowConfig, args: &SweepArgs) -> Result<SweepOutput, Err
                 crate::fees::CRYPTO_FEES_V2_PROVENANCE.to_string(),
                 BUY_HOLD_FEE_PROVENANCE.to_string(),
                 SCALP_FEE_PROVENANCE.to_string(),
+                MM_FEE_PROVENANCE.to_string(),
             ],
         },
         cells,

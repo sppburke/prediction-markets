@@ -34,6 +34,6 @@ pub use resolve::{BtcResolutionFetcher, MarketResolution};
 pub use runner::{RunSummary, generate_report, resolve, run};
 pub use sweep::{
     BUY_HOLD_FEE_PROVENANCE, CAPTURE_CONFIG_PROVENANCE, CellResult, DecodeStats, FidelitySummary,
-    ReferenceParams, SCALP_FEE_PROVENANCE, ScalpGroup, SweepArgs, SweepOutput, TapeValidity, sweep,
-    sweep_cmd,
+    MM_FEE_PROVENANCE, MmGroup, ReferenceParams, SCALP_FEE_PROVENANCE, ScalpGroup, SweepArgs,
+    SweepOutput, TapeValidity, sweep, sweep_cmd,
 };

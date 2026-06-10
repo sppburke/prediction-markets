@@ -10,7 +10,7 @@ use crate::report::RealizedGroup;
 use crate::types::EdgeObservation;
 
 use super::events::DecodeStats;
-use super::scorers::{ReplayFire, ScalpGroup};
+use super::scorers::{MmGroup, ReplayFire, ScalpGroup};
 
 /// Stamped into the output because the tape does not record the capture run's
 /// trigger params (`meta` carries only schema/fee/vantage/lag-clock/drop keys).
@@ -27,6 +27,15 @@ pub const BUY_HOLD_FEE_PROVENANCE: &str = "buy-hold: net = (won?1:0) - entry_ask
 pub const SCALP_FEE_PROVENANCE: &str = "scalp: net = exit_bid(fire+H) - entry_ask - \
      taker_fee(entry_ask) - taker_fee(exit_bid); exit-leg fee conservative-if-charged \
      (sell-side officially ambiguous, see crypto_fees_v2 provenance)";
+
+/// MM fee/fill assumptions — an **upper bound twice over**: front-of-queue
+/// fills (v1) + the per-fill 20% rebate idealization of the daily pro-rata,
+/// liquidity-weighted pool. Rebate rate source: per-market Gamma
+/// `feeSchedule.rebateRate = 0.2` (see `fees.rs`).
+pub const MM_FEE_PROVENANCE: &str = "mm: net = (won?1:0) - resting_bid + \
+     0.20*taker_fee(resting_bid); UPPER BOUND x2 (front-of-queue fills + per-fill \
+     rebate idealization of the daily pro-rata pool); rebate rate from per-market \
+     feeSchedule.rebateRate (verified live 2026-06-09)";
 
 /// Trigger parameters of the reference cell (read from the sweep invocation's
 /// `ShadowConfig`; `top_n = 3` = all live venues).
@@ -91,6 +100,8 @@ pub struct CellResult {
     pub buy_hold: Vec<RealizedGroup>,
     /// Per (series × direction × horizon) scalp stats (PR2).
     pub scalp: Vec<ScalpGroup>,
+    /// Per (series × direction) maker stats (PR3) — read as a ceiling.
+    pub mm: Vec<MmGroup>,
 }
 
 /// Full sweep output: tape validity + the 480-cell grid.
@@ -183,6 +194,20 @@ impl SweepOutput {
                     ));
                 }
                 out.push_str(&format!("        scalp {series}/{direction}:{cols}\n"));
+            }
+            for g in &c.mm {
+                let mean = g
+                    .mean_net
+                    .map_or("-".to_string(), |m| m.round_dp(4).to_string());
+                out.push_str(&format!(
+                    "        mm    {}/{}: rest={} fill={} scored={} mean={} (ceiling)\n",
+                    g.series,
+                    g.move_direction,
+                    g.count_resting,
+                    g.count_filled,
+                    g.count_scored,
+                    mean
+                ));
             }
         }
         out

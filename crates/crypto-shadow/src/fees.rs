@@ -42,6 +42,32 @@ pub fn taker_fee_per_share(price: Decimal) -> Decimal {
     crypto_fees_v2_rate() * price * (Decimal::ONE - price)
 }
 
+/// Maker rebate rate for the Crypto category: the per-market Gamma
+/// `feeSchedule.rebateRate`.
+///
+/// **VERIFIED LIVE 2026-06-09** on a `btc-up-or-down-5m` market:
+/// `feeSchedule = {"exponent": 1, "rate": 0.07, "takerOnly": true,
+/// "rebateRate": 0.2}` (`feeType = crypto_fees_v2`). The per-market value
+/// governs over the Polymarket maker-rebates docs page, per the 0.072-vs-0.07
+/// precedent above; the docs page is cited only for the **pool structure**
+/// (rebates are a daily pro-rata, liquidity-weighted pool of collected fees,
+/// not a per-fill credit). See `docs/_GLOSSARY.md`: `maker_rebate_rate`.
+pub fn maker_rebate_rate() -> Decimal {
+    // 20 * 10^-2 = 0.20.
+    Decimal::new(20, 2)
+}
+
+/// Per-share maker rebate at fill price `price`:
+/// `maker_rebate_rate() * taker_fee_per_share(price)`.
+///
+/// An **upper-bound idealization** of the real rebate (issue #310): the live
+/// pool is daily pro-rata and liquidity-weighted across all makers, so a
+/// per-fill credit of the full 20% of the fill's taker-fee equivalent is a
+/// ceiling, never an expectation. Stamped as such in the sweep output.
+pub fn maker_rebate_per_share(price: Decimal) -> Decimal {
+    maker_rebate_rate() * taker_fee_per_share(price)
+}
+
 /// Provenance string stamped into `meta` and the `report` header so a recompute
 /// under a corrected fee is unambiguous and self-documenting.
 pub const CRYPTO_FEES_V2_PROVENANCE: &str = "crypto_fees_v2: fee_per_share = 0.07*p*(1-p) (exponent=1); \
@@ -85,5 +111,13 @@ mod tests {
     #[test]
     fn rate_is_seven_percent() {
         assert_eq!(crypto_fees_v2_rate(), dec!(0.07));
+    }
+
+    #[test]
+    fn maker_rebate_is_a_fifth_of_the_taker_fee() {
+        assert_eq!(maker_rebate_rate(), dec!(0.20));
+        // 0.20 * 0.07 * 0.48 * 0.52 = 0.00349440
+        assert_eq!(maker_rebate_per_share(dec!(0.48)), dec!(0.0034944));
+        assert_eq!(maker_rebate_per_share(dec!(0)), Decimal::ZERO);
     }
 }
