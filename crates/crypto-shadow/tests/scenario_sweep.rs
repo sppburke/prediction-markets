@@ -389,3 +389,59 @@ fn s5_buy_hold_column_matches_build_realized_formula() {
     assert_eq!(group.frac_realized_positive, Some(dec!(1)));
     println!("PASS: s5_buy_hold_column_matches_build_realized_formula");
 }
+
+#[test]
+fn s6_scalp_exits_at_each_horizon_on_the_post_fire_book() {
+    let m = market("0xc1", "y1", "n1");
+    let mut fx = Fixture::new(std::slice::from_ref(&m), std::slice::from_ref(&m));
+    let mut frames = fire_once_frames("0xc1", "y1", "n1");
+    // Post-fire book path on the YES (direction-side) token: bid 0.55 until
+    // 35s, then bid 0.40 — so h=10/30 exit at 0.55 and h=60/120 at 0.40.
+    frames.push((
+        FeedSource::Clob,
+        5_000,
+        price_change("0xc1", "y1", Some("0.55"), Some("0.58")),
+    ));
+    frames.push((
+        FeedSource::Clob,
+        35_000,
+        price_change("0xc1", "y1", Some("0.40"), Some("0.43")),
+    ));
+    fx.feed(&as_refs(&frames));
+    fx.stamp_clean_drop_counters();
+
+    let out = fx.run_sweep();
+    // Post-fire book frames must not disturb the fidelity gate.
+    let f = &out.tape_validity.fidelity;
+    assert_eq!((f.matched, f.missing_rows, f.extra_rows), (1, 0, 0));
+
+    let cell = out
+        .cells
+        .iter()
+        .find(|c| {
+            c.threshold_bps == dec!(3)
+                && c.window_ms == 300
+                && c.cooldown_ms == 1000
+                && c.top_n == 3
+        })
+        .unwrap();
+    assert_eq!(
+        cell.scalp.len(),
+        4,
+        "all four horizons scored: {:?}",
+        cell.scalp
+    );
+    let entry_fee = taker_fee_per_share(dec!(0.52));
+    for g in &cell.scalp {
+        assert_eq!((g.series.as_str(), g.move_direction.as_str()), ("5m", "up"));
+        assert_eq!(g.count_scored, 1);
+        let exit_bid = if g.horizon_s <= 30 {
+            dec!(0.55)
+        } else {
+            dec!(0.40)
+        };
+        let expected = exit_bid - dec!(0.52) - entry_fee - taker_fee_per_share(exit_bid);
+        assert_eq!(g.mean_net, Some(expected), "h={}", g.horizon_s);
+    }
+    println!("PASS: s6_scalp_exits_at_each_horizon_on_the_post_fire_book");
+}
