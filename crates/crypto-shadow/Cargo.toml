@@ -47,3 +47,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
 tempfile            = { workspace = true }
+# Same crate+features as the main dependency; lets the scenario tests probe the
+# written DB with direct SQL (e.g. `series IS NULL` after a prune).
+rusqlite            = { version = "0.32", features = ["bundled"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the
+# deterministic flush-interval and delivery-gating tests (issue #311).
+tokio               = { workspace = true, features = ["test-util"] }

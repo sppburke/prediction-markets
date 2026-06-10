@@ -17,12 +17,13 @@
 //! ([`crate::exchange_ws`] / [`crate::consensus`]).
 
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::warn;
 
 use crate::types::{BtcUsdPrice, ChainlinkTick, DecodeError, FeedFrame, FeedSource, now_unix_ms};
 use crate::ws::ws_reconnect_loop;
@@ -77,8 +78,14 @@ pub fn subscribe_message() -> String {
 
 /// Spawn the Chainlink WS task. Forwards each raw text frame as a [`FeedFrame`]
 /// to `tx`; on a full channel it drops the frame (declared backpressure:
-/// drop-newest) and on a closed channel it stops.
-pub fn spawn(ws_url: String, tx: mpsc::Sender<FeedFrame>) -> JoinHandle<()> {
+/// drop-newest; counted into `frames_dropped`, not logged per-frame — the
+/// runner surfaces the tally periodically + in `meta`, issue #311) and on a
+/// closed channel it stops.
+pub fn spawn(
+    ws_url: String,
+    tx: mpsc::Sender<FeedFrame>,
+    frames_dropped: Arc<AtomicU64>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         ws_reconnect_loop(ws_url, subscribe_message(), move |raw| {
             let frame = FeedFrame {
@@ -89,7 +96,7 @@ pub fn spawn(ws_url: String, tx: mpsc::Sender<FeedFrame>) -> JoinHandle<()> {
             match tx.try_send(frame) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!("chainlink: channel full, dropping frame");
+                    frames_dropped.fetch_add(1, Ordering::Relaxed);
                     true
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => false,

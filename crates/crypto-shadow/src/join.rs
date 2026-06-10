@@ -19,6 +19,17 @@ use crate::consensus::{ConsensusParams, MedianTracker, MoveDetector};
 use crate::fees::taker_fee_per_share;
 use crate::types::{BookUpdate, BtcMarketMeta, EdgeObservation, ExchangeTick, MoveDirection};
 
+/// Whether a market is expired at `now_ms`: strictly past its window end by
+/// more than `grace_ms` (the grace keeps late settlement prints attributable).
+/// The **single** expiry definition (issue #311), shared by the runner's
+/// admission guard (startup + refresh enumeration) and
+/// [`JoinState::expired_condition_ids`] (prune) so the two boundaries cannot
+/// drift — a market Gamma still lists as open (`closed=false` lags
+/// `range_end_ms`) is kept out by the same predicate that pruned it.
+pub fn market_expired(meta: &BtcMarketMeta, now_ms: i64, grace_ms: i64) -> bool {
+    now_ms > meta.range_end_ms + grace_ms
+}
+
 /// Binary indicator P(up): `1` if `c > r`, `0.5` on a tie, `0` if `c < r`.
 fn indicator_prob_up(c: Decimal, r: Decimal) -> Decimal {
     match c.cmp(&r) {
@@ -176,6 +187,44 @@ impl JoinState {
     /// Number of tracked markets.
     pub fn market_count(&self) -> usize {
         self.markets.len()
+    }
+
+    /// Condition ids of tracked markets that [`market_expired`] judges expired
+    /// at `now_ms` — the runner's prune candidates. A market stays in this set
+    /// until [`Self::remove_market`] runs, so an undelivered prune command
+    /// self-retries on the next refresh tick (issue #311 delivery gating).
+    pub fn expired_condition_ids(&self, now_ms: i64, grace_ms: i64) -> Vec<String> {
+        self.markets
+            .values()
+            .filter(|m| market_expired(m, now_ms, grace_ms))
+            .map(|m| m.condition_id.clone())
+            .collect()
+    }
+
+    /// The YES + NO token ids of a tracked market (empty if untracked). The
+    /// runner collects these **before** [`Self::remove_market`] mutates the
+    /// maps, to build the CLOB prune command.
+    pub fn market_tokens(&self, condition_id: &str) -> Vec<String> {
+        match self.markets.get(condition_id) {
+            None => Vec::new(),
+            Some(m) => vec![m.yes_token_id.clone(), m.no_token_id.clone()],
+        }
+    }
+
+    /// Remove a market from **all five** maps (markets, both token routes, both
+    /// latest books, and the window-open reference). After this, a late trade
+    /// print on its tokens still persists via the frame's own `market` field —
+    /// with `series = NULL`, recoverable offline from `markets` — and
+    /// [`Self::knows_token`] returns `false`, which is what makes the runner's
+    /// admission guard (not this method) responsible for keeping the market out.
+    pub fn remove_market(&mut self, condition_id: &str) {
+        if let Some(meta) = self.markets.remove(condition_id) {
+            self.token_to_condition.remove(&meta.yes_token_id);
+            self.token_to_condition.remove(&meta.no_token_id);
+        }
+        self.latest_yes_book.remove(condition_id);
+        self.latest_no_book.remove(condition_id);
+        self.range_start_value.remove(condition_id);
     }
 
     /// Whether a token id (YES or NO) is already registered. Used by `drive` to
@@ -594,6 +643,68 @@ mod tests {
                 .on_exchange_tick(&etick(ExchangeVenue::Bybit, dec!(61000), 1_200), 1_200)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn market_expired_boundary_is_strict_past_grace() {
+        let m = meta(); // range_end_ms = 301_000
+        let grace = 120_000;
+        // Exactly at end + grace: NOT expired (strict >).
+        assert!(!market_expired(&m, 301_000 + grace, grace));
+        // One ms past: expired.
+        assert!(market_expired(&m, 301_000 + grace + 1, grace));
+    }
+
+    #[test]
+    fn expired_condition_ids_filters_by_the_shared_predicate() {
+        let mut live = meta();
+        live.condition_id = "0xlive".to_string();
+        live.yes_token_id = "live-yes".to_string();
+        live.no_token_id = "live-no".to_string();
+        live.range_end_ms = 1_000_000;
+        let state = JoinState::new(vec![meta(), live], params());
+        let grace = 120_000;
+        // At 500_000: meta() (end 301_000) is 79_000ms past grace; live is not.
+        assert_eq!(
+            state.expired_condition_ids(500_000, grace),
+            vec!["0xcond".to_string()]
+        );
+        assert!(state.expired_condition_ids(100_000, grace).is_empty());
+    }
+
+    #[test]
+    fn market_tokens_lists_both_sides_or_empty() {
+        let state = JoinState::new(vec![meta()], params());
+        assert_eq!(
+            state.market_tokens("0xcond"),
+            vec!["tok-yes".to_string(), "tok-no".to_string()]
+        );
+        assert!(state.market_tokens("0xnope").is_empty());
+    }
+
+    #[test]
+    fn remove_market_prunes_all_five_maps() {
+        let mut state = JoinState::new(vec![meta()], params());
+        // Populate both books and the window-open reference.
+        state.on_book_update(book("0.48", "0.52", 1_500), 1_400);
+        state.on_book_update(token_book("tok-no", "0.46", "0.50", 1_500), 1_400);
+        state.on_exchange_tick(&etick(ExchangeVenue::Bybit, dec!(60000), 1_100), 1_100);
+        state.on_exchange_tick(&etick(ExchangeVenue::Coinbase, dec!(60000), 1_150), 1_150);
+        assert!(state.range_start_value.contains_key("0xcond"));
+        assert!(state.latest_yes_book.contains_key("0xcond"));
+        assert!(state.latest_no_book.contains_key("0xcond"));
+
+        state.remove_market("0xcond");
+
+        assert!(state.markets.is_empty());
+        assert!(state.token_to_condition.is_empty());
+        assert!(state.latest_yes_book.is_empty());
+        assert!(state.latest_no_book.is_empty());
+        assert!(state.range_start_value.is_empty());
+        assert!(!state.knows_token("tok-yes"));
+        assert!(!state.knows_token("tok-no"));
+        // Removing an unknown market is a no-op, not a panic.
+        state.remove_market("0xcond");
     }
 
     #[test]

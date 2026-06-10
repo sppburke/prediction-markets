@@ -26,11 +26,23 @@ fn default_clob_ws_url() -> String {
     "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string()
 }
 fn default_channel_capacity() -> usize {
-    // Raised 1024 -> 4096 (v2): the added CLOB trade tape (`last_trade_price`)
-    // roughly doubles CLOB frame volume, and a deeper buffer absorbs bursty
-    // book+trade activity around a BTC move without the hot path dropping frames.
+    // Raised 4096 -> 8192 (issue #311): with batched flushes the consumer drains
+    // far faster than it writes, and the deeper buffer absorbs a full flush
+    // window of bursty book+trade activity around a BTC move without drops.
     // See `docs/_GLOSSARY.md`: `crypto_shadow_channel_capacity`.
-    4096
+    8192
+}
+fn default_flush_interval_ms() -> u64 {
+    250
+}
+fn default_flush_max_frames() -> usize {
+    256
+}
+fn default_prune_grace_ms() -> i64 {
+    120_000
+}
+fn default_force_reconnect_after_ms() -> u64 {
+    900_000
 }
 fn default_market_refresh_interval_secs() -> u64 {
     60
@@ -82,6 +94,24 @@ pub struct ShadowConfig {
     pub clob_ws_url: String,
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
+    /// Frame-buffer flush cadence in `drive` (issue #311): buffered frames are
+    /// written in one batched transaction every this-many ms, OR as soon as
+    /// `flush_max_frames` are buffered, whichever comes first. Crash-loss is
+    /// bounded by one flush window.
+    #[serde(default = "default_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+    #[serde(default = "default_flush_max_frames")]
+    pub flush_max_frames: usize,
+    /// Grace after a market's `range_end_ms` before it is pruned from the join
+    /// state and the CLOB subscription set (late settlement prints land within
+    /// this window).
+    #[serde(default = "default_prune_grace_ms")]
+    pub prune_grace_ms: i64,
+    /// Minimum elapsed time since the last CLOB (re)connect before a
+    /// `ForceReconnect` (sent after a delivered prune) is honored — natural
+    /// reconnects apply the pruned set for free in the common case.
+    #[serde(default = "default_force_reconnect_after_ms")]
+    pub force_reconnect_after_ms: u64,
     #[serde(default = "default_market_refresh_interval_secs")]
     pub market_refresh_interval_secs: u64,
     #[serde(default = "default_max_open_markets")]
@@ -127,6 +157,10 @@ impl Default for ShadowConfig {
             chainlink_ws_url: default_chainlink_ws_url(),
             clob_ws_url: default_clob_ws_url(),
             channel_capacity: default_channel_capacity(),
+            flush_interval_ms: default_flush_interval_ms(),
+            flush_max_frames: default_flush_max_frames(),
+            prune_grace_ms: default_prune_grace_ms(),
+            force_reconnect_after_ms: default_force_reconnect_after_ms(),
             market_refresh_interval_secs: default_market_refresh_interval_secs(),
             max_open_markets: default_max_open_markets(),
             vantage_label: default_vantage_label(),
@@ -203,7 +237,11 @@ mod tests {
     #[test]
     fn defaults_load_without_a_file() {
         let cfg = load(None).unwrap();
-        assert_eq!(cfg.channel_capacity, 4096);
+        assert_eq!(cfg.channel_capacity, 8192);
+        assert_eq!(cfg.flush_interval_ms, 250);
+        assert_eq!(cfg.flush_max_frames, 256);
+        assert_eq!(cfg.prune_grace_ms, 120_000);
+        assert_eq!(cfg.force_reconnect_after_ms, 900_000);
         assert_eq!(cfg.max_open_markets, 64);
         assert_eq!(cfg.vantage_label, "local");
         assert_eq!(cfg.series().len(), 2);
