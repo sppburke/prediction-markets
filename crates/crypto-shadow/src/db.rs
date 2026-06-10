@@ -126,9 +126,14 @@ CREATE TABLE IF NOT EXISTS clob_trades (
     transaction_hash  TEXT NOT NULL UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS idx_clob_trades_token ON clob_trades(token_id);
-CREATE INDEX IF NOT EXISTS idx_clob_trades_condition ON clob_trades(condition_id);
-CREATE INDEX IF NOT EXISTS idx_clob_trades_traded_at ON clob_trades(traded_at_ms);
+-- The three query-side `clob_trades` indexes (token_id, condition_id,
+-- traded_at_ms) are intentionally NOT created here (issue #317): per-insert
+-- O(log N) index maintenance was a capture-time saturation contributor. They are
+-- built once at the end of a successful `run()` via `build_clob_trade_indexes`,
+-- so a cleanly-finished tape ends with the same indexes it had before — just
+-- built once rather than incrementally during capture. `transaction_hash …
+-- UNIQUE` (the `INSERT OR IGNORE` dedup key) stays inline: it is load-bearing
+-- during capture, not a query-side convenience.
 ";
 
 /// Persistence error.
@@ -331,6 +336,24 @@ impl ShadowDb {
         let conn = self.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM clob_trades", [], |r| r.get(0))?;
         Ok(n)
+    }
+
+    /// Build the three query-side `clob_trades` indexes (token_id, condition_id,
+    /// traded_at_ms) in one batch. Deferred from schema creation (issue #317) so
+    /// per-insert index maintenance does not contend with the capture hot path;
+    /// `run()` is the single caller and invokes it once after a clean shutdown.
+    /// `IF NOT EXISTS` makes it idempotent — a no-op on a tape that already has
+    /// them (e.g. one captured before #317). They serve ad-hoc forensic SQL only:
+    /// the #310 sweep reads `clob_trades` via `all_clob_trade_rows` (`ORDER BY
+    /// id` on the PK), so their absence on a SIGKILL'd tape is immaterial.
+    pub fn build_clob_trade_indexes(&self) -> Result<(), DbError> {
+        let conn = self.lock();
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_clob_trades_token ON clob_trades(token_id);
+             CREATE INDEX IF NOT EXISTS idx_clob_trades_condition ON clob_trades(condition_id);
+             CREATE INDEX IF NOT EXISTS idx_clob_trades_traded_at ON clob_trades(traded_at_ms);",
+        )?;
+        Ok(())
     }
 
     /// Persist one flush window of buffered frames in a **single transaction**
@@ -916,6 +939,52 @@ mod tests {
         db.insert_frame_batch(&[], &[]).unwrap();
         assert_eq!(db.raw_tick_count().unwrap(), 0);
         assert_eq!(db.clob_trade_count().unwrap(), 0);
+    }
+
+    fn clob_trade_index_names(db: &ShadowDb) -> Vec<String> {
+        let conn = db.lock();
+        let mut stmt = conn.prepare("PRAGMA index_list(clob_trades)").unwrap();
+        // index_list columns: (seq, name, unique, origin, partial) — name is col 1.
+        stmt.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn build_clob_trade_indexes_creates_indexes() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        // Fresh tape (issue #317): the 3 query-side indexes are deferred, so they
+        // are absent at create — only the implicit UNIQUE index on
+        // transaction_hash exists.
+        let before = clob_trade_index_names(&db);
+        for idx in [
+            "idx_clob_trades_token",
+            "idx_clob_trades_condition",
+            "idx_clob_trades_traded_at",
+        ] {
+            assert!(
+                !before.contains(&idx.to_string()),
+                "{idx} present before build"
+            );
+        }
+        db.build_clob_trade_indexes().unwrap();
+        let after = clob_trade_index_names(&db);
+        for idx in [
+            "idx_clob_trades_token",
+            "idx_clob_trades_condition",
+            "idx_clob_trades_traded_at",
+        ] {
+            assert!(
+                after.contains(&idx.to_string()),
+                "{idx} missing after build"
+            );
+        }
+        // Idempotent (IF NOT EXISTS): a second call on a tape that already has
+        // them is a no-op, not an error — the SIGINT-then-replay safety net.
+        db.build_clob_trade_indexes().unwrap();
+        println!("PASS: build_clob_trade_indexes_creates_indexes");
     }
 
     #[test]

@@ -80,6 +80,29 @@ fn default_move_cooldown_ms() -> i64 {
 fn default_min_venues() -> usize {
     2
 }
+fn default_write_channel_capacity() -> usize {
+    // Bounded `mpsc` capacity for the decoupled DB-writer channel (issue #317):
+    // `drive` enqueues already-batched `WriteCmd`s (~4 messages/s steady-state),
+    // and the `spawn_blocking` writer drains far faster, so a shallow buffer
+    // suffices. Backpressure is `send().await` (never drop inside the pipeline).
+    // See `docs/_GLOSSARY.md`: `crypto_shadow_write_channel_capacity`.
+    64
+}
+fn default_clob_ping_interval_secs() -> u64 {
+    // The Polymarket CLOB market channel's documented application-level heartbeat
+    // cadence (issue #317): the client sends the text `PING` every 10s and the
+    // server replies the text `PONG`; missing heartbeats are the documented cause
+    // of connection drops. See `docs/15-SOURCES.md` (wss-overview, 2026-06-10).
+    10
+}
+fn default_clob_read_idle_limit_secs() -> u64 {
+    // Reconnect the CLOB socket if no inbound frame arrives for this long (issue
+    // #317): the half-open-peer detector. 120s = 12× the heartbeat cadence, so a
+    // healthy connection (inbound traffic at least every ~10s) never trips it,
+    // while a silently-vanished peer is converted to a reconnect well under the
+    // 300s `crypto_shadow_tape_validity_max_gap_secs` gate.
+    120
+}
 
 /// Harness configuration. See `docs/_GLOSSARY.md` for the canonical defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,11 +120,19 @@ pub struct ShadowConfig {
     /// Frame-buffer flush cadence in `drive` (issue #311): buffered frames are
     /// written in one batched transaction every this-many ms, OR as soon as
     /// `flush_max_frames` are buffered, whichever comes first. Crash-loss is
-    /// bounded by one flush window.
+    /// bounded by `write_channel_capacity` in-flight batches + one flush window
+    /// (issue #317: the batch is enqueued to the decoupled writer, not committed
+    /// inline; steady-state the channel stays shallow as the writer outpaces the
+    /// ~4-batch/s producer rate, and a crashed capture is not-clean regardless).
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
     #[serde(default = "default_flush_max_frames")]
     pub flush_max_frames: usize,
+    /// Bounded `mpsc` capacity for the decoupled DB-writer channel (issue #317):
+    /// `drive` sends batched `WriteCmd`s to a `spawn_blocking` writer so the
+    /// socket-drain task never blocks on SQLite. See `docs/_GLOSSARY.md`.
+    #[serde(default = "default_write_channel_capacity")]
+    pub write_channel_capacity: usize,
     /// Grace after a market's `range_end_ms` before it is pruned from the join
     /// state and the CLOB subscription set (late settlement prints land within
     /// this window).
@@ -112,6 +143,18 @@ pub struct ShadowConfig {
     /// reconnects apply the pruned set for free in the common case.
     #[serde(default = "default_force_reconnect_after_ms")]
     pub force_reconnect_after_ms: u64,
+    /// CLOB market-channel application-level heartbeat cadence (issue #317): the
+    /// client sends the text `PING` every this-many seconds; the server replies
+    /// the text `PONG`. The venue-documented anti-reaping contract. See
+    /// `docs/15-SOURCES.md` (wss-overview).
+    #[serde(default = "default_clob_ping_interval_secs")]
+    pub clob_ping_interval_secs: u64,
+    /// CLOB read-idle reconnect deadline (issue #317): if no inbound frame
+    /// arrives for this long, the socket is treated as half-open and the task
+    /// reconnects + resubscribes — the half-open-peer detector that bounds
+    /// `max_clob_gap_secs` under the tape-validity gate.
+    #[serde(default = "default_clob_read_idle_limit_secs")]
+    pub clob_read_idle_limit_secs: u64,
     #[serde(default = "default_market_refresh_interval_secs")]
     pub market_refresh_interval_secs: u64,
     #[serde(default = "default_max_open_markets")]
@@ -159,8 +202,11 @@ impl Default for ShadowConfig {
             channel_capacity: default_channel_capacity(),
             flush_interval_ms: default_flush_interval_ms(),
             flush_max_frames: default_flush_max_frames(),
+            write_channel_capacity: default_write_channel_capacity(),
             prune_grace_ms: default_prune_grace_ms(),
             force_reconnect_after_ms: default_force_reconnect_after_ms(),
+            clob_ping_interval_secs: default_clob_ping_interval_secs(),
+            clob_read_idle_limit_secs: default_clob_read_idle_limit_secs(),
             market_refresh_interval_secs: default_market_refresh_interval_secs(),
             max_open_markets: default_max_open_markets(),
             vantage_label: default_vantage_label(),
@@ -240,8 +286,11 @@ mod tests {
         assert_eq!(cfg.channel_capacity, 8192);
         assert_eq!(cfg.flush_interval_ms, 250);
         assert_eq!(cfg.flush_max_frames, 256);
+        assert_eq!(cfg.write_channel_capacity, 64);
         assert_eq!(cfg.prune_grace_ms, 120_000);
         assert_eq!(cfg.force_reconnect_after_ms, 900_000);
+        assert_eq!(cfg.clob_ping_interval_secs, 10);
+        assert_eq!(cfg.clob_read_idle_limit_secs, 120);
         assert_eq!(cfg.max_open_markets, 64);
         assert_eq!(cfg.vantage_label, "local");
         assert_eq!(cfg.series().len(), 2);
