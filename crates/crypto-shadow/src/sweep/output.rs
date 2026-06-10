@@ -10,7 +10,7 @@ use crate::report::RealizedGroup;
 use crate::types::EdgeObservation;
 
 use super::events::DecodeStats;
-use super::scorers::ReplayFire;
+use super::scorers::{ReplayFire, ScalpGroup};
 
 /// Stamped into the output because the tape does not record the capture run's
 /// trigger params (`meta` carries only schema/fee/vantage/lag-clock/drop keys).
@@ -20,6 +20,13 @@ pub const CAPTURE_CONFIG_PROVENANCE: &str =
 /// Buy-hold fee assumption, stamped per the issue #310 fee-model boundary.
 pub const BUY_HOLD_FEE_PROVENANCE: &str = "buy-hold: net = (won?1:0) - entry_ask - \
      taker_fee(entry_ask); entry/taker-buy leg only (crypto_fees_v2)";
+
+/// Scalp fee assumption: the exit-leg fee is charged at the exit price and is
+/// **conservative-if-charged** — the official sell-side taker fee is ambiguous
+/// between two Polymarket sources (`fees.rs` provenance).
+pub const SCALP_FEE_PROVENANCE: &str = "scalp: net = exit_bid(fire+H) - entry_ask - \
+     taker_fee(entry_ask) - taker_fee(exit_bid); exit-leg fee conservative-if-charged \
+     (sell-side officially ambiguous, see crypto_fees_v2 provenance)";
 
 /// Trigger parameters of the reference cell (read from the sweep invocation's
 /// `ShadowConfig`; `top_n = 3` = all live venues).
@@ -82,6 +89,8 @@ pub struct CellResult {
     pub near_degenerate_window: bool,
     /// Per (series × direction) buy-hold realized stats.
     pub buy_hold: Vec<RealizedGroup>,
+    /// Per (series × direction × horizon) scalp stats (PR2).
+    pub scalp: Vec<ScalpGroup>,
 }
 
 /// Full sweep output: tape validity + the 480-cell grid.
@@ -154,6 +163,27 @@ impl SweepOutput {
                 "{:>5} {:>4} {:>4}  {:>4} {:>6} {:>5} |{}\n",
                 c.threshold_bps, c.window_ms, c.cooldown_ms, c.top_n, c.fires, flag, groups
             ));
+            // Scalp sub-lines: one per (series, direction), horizons inline.
+            let mut by_leg: BTreeMap<(&str, &str), Vec<&ScalpGroup>> = BTreeMap::new();
+            for g in &c.scalp {
+                by_leg
+                    .entry((g.series.as_str(), g.move_direction.as_str()))
+                    .or_default()
+                    .push(g);
+            }
+            for ((series, direction), legs) in by_leg {
+                let mut cols = String::new();
+                for g in legs {
+                    let mean = g
+                        .mean_net
+                        .map_or("-".to_string(), |m| m.round_dp(4).to_string());
+                    cols.push_str(&format!(
+                        " h{}s n={} mean={}",
+                        g.horizon_s, g.count_scored, mean
+                    ));
+                }
+                out.push_str(&format!("        scalp {series}/{direction}:{cols}\n"));
+            }
         }
         out
     }
@@ -322,6 +352,7 @@ mod tests {
         ReplayFire {
             obs: o,
             fire_tape_id: tape_id,
+            fire_received_ms: 0,
         }
     }
 

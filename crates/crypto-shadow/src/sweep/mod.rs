@@ -35,8 +35,9 @@ use crate::types::{BtcMarketMeta, ExchangeTick};
 pub use events::DecodeStats;
 pub use output::{
     BUY_HOLD_FEE_PROVENANCE, CAPTURE_CONFIG_PROVENANCE, CellResult, FidelitySummary,
-    ReferenceParams, SweepOutput, TapeValidity,
+    ReferenceParams, SCALP_FEE_PROVENANCE, SweepOutput, TapeValidity,
 };
+pub use scorers::ScalpGroup;
 
 use events::Tape;
 use scorers::ReplayFire;
@@ -171,6 +172,7 @@ pub fn sweep(config: &ShadowConfig, args: &SweepArgs) -> Result<SweepOutput, Err
             fires: fires.len(),
             near_degenerate_window: cell.near_degenerate_window(),
             buy_hold: scorers::buy_hold_groups(&fires, &resolutions),
+            scalp: scorers::score_scalp(&fires, &tape.books, &markets_by_condition),
         });
     }
 
@@ -192,6 +194,7 @@ pub fn sweep(config: &ShadowConfig, args: &SweepArgs) -> Result<SweepOutput, Err
             fee_provenance: vec![
                 crate::fees::CRYPTO_FEES_V2_PROVENANCE.to_string(),
                 BUY_HOLD_FEE_PROVENANCE.to_string(),
+                SCALP_FEE_PROVENANCE.to_string(),
             ],
         },
         cells,
@@ -267,6 +270,7 @@ fn replay_cell(
             fires.push(ReplayFire {
                 obs: rebuilt,
                 fire_tape_id: ev.tape_id,
+                fire_received_ms: ev.received_ms,
             });
         }
     }

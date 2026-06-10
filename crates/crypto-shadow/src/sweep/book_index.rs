@@ -103,6 +103,38 @@ impl BookIndex {
         ))
     }
 
+    /// The latest book for `token_id` received at or before `received_ms` on
+    /// the **node clock** — the scalp/MM scorers' exit-side lookup (`fire+H`).
+    /// Valid per token because all of a token's frames come from the single
+    /// CLOB producer task, so per-token `received_ms` is monotone. Same cap
+    /// semantics as [`Self::book_at_tape`]: past the cap horizon, `None`.
+    pub(super) fn book_at_time(
+        &self,
+        token_id: &str,
+        received_ms: i64,
+    ) -> Option<(BookUpdate, i64)> {
+        let token = self.per_token.get(token_id)?;
+        let idx = token
+            .entries
+            .partition_point(|e| e.received_ms <= received_ms);
+        if idx == 0 {
+            return None;
+        }
+        let last = token.entries.get(idx - 1)?;
+        if token.capped && idx == token.entries.len() && received_ms > last.received_ms {
+            return None;
+        }
+        Some((
+            BookUpdate {
+                token_id: token_id.to_string(),
+                best_bid: last.best_bid,
+                best_ask: last.best_ask,
+                observed_at_ms: None,
+            },
+            last.received_ms,
+        ))
+    }
+
     /// Frames dropped after a token hit the cap (0 on healthy tapes).
     pub(super) fn dropped_after_cap(&self) -> u64 {
         self.dropped_after_cap
@@ -171,5 +203,24 @@ mod tests {
         assert_eq!(ix.book_at_tape("y", 2).unwrap().1, 200);
         // Past the horizon: unknown, not stale.
         assert_eq!(ix.book_at_tape("y", 3), None);
+    }
+
+    #[test]
+    fn time_keyed_lookup_resolves_by_node_clock_with_cap_semantics() {
+        let mut ix = BookIndex::new(2);
+        ix.push(1, 1_000, &update("y", Some("0.48"), Some("0.52")));
+        ix.push(2, 5_000, &update("y", Some("0.55"), Some("0.58")));
+        ix.push(3, 9_000, &update("y", Some("0.60"), Some("0.62"))); // dropped (cap 2)
+        assert_eq!(ix.book_at_time("y", 999), None);
+        assert_eq!(
+            ix.book_at_time("y", 1_000).unwrap().0.best_bid,
+            Some(Price(dec!(0.48)))
+        );
+        // Between entries -> the earlier one; at/after the second -> the later.
+        assert_eq!(ix.book_at_time("y", 4_999).unwrap().1, 1_000);
+        assert_eq!(ix.book_at_time("y", 5_000).unwrap().1, 5_000);
+        // Past the cap horizon: unknown, not stale.
+        assert_eq!(ix.book_at_time("y", 9_000), None);
+        assert_eq!(ix.book_at_time("n", 5_000), None);
     }
 }
