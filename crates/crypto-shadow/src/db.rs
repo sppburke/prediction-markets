@@ -253,10 +253,11 @@ impl ShadowDb {
     /// itself (the frame's authoritative `market` field — always present), so a
     /// trade is attributed even before the join knows its token. `series`
     /// (5m/15m) comes from the join's token lookup and may be `None` for a trade
-    /// that printed before its market was registered (recoverable offline from
-    /// `markets`/Gamma). `INSERT OR IGNORE` on the unique `transaction_hash`
-    /// dedups a re-delivered print without dropping any distinct trade (the hash
-    /// is one-per-print on the live feed, verified 2026-06-09).
+    /// that printed before its market was registered **or after it was pruned**
+    /// (issue #311) — both recoverable offline from `markets`/Gamma. `INSERT OR
+    /// IGNORE` on the unique `transaction_hash` dedups a re-delivered print
+    /// without dropping any distinct trade (the hash is one-per-print on the
+    /// live feed, verified 2026-06-09).
     pub fn insert_clob_trade(
         &self,
         trade: &ClobTrade,
@@ -290,6 +291,59 @@ impl ShadowDb {
         let conn = self.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM clob_trades", [], |r| r.get(0))?;
         Ok(n)
+    }
+
+    /// Persist one flush window of buffered frames in a **single transaction**
+    /// spanning `raw_ticks` and `clob_trades` (issue #311): per-frame
+    /// auto-commits on the hot path could not keep up with CLOB book volume
+    /// (~450–1800 ms/s of blocking at ~900 frames/s), saturating the bounded
+    /// channel. One commit per flush window cuts that to ~10–20 ms/s.
+    ///
+    /// The tuples are the runner's buffer element types, passed as the buffers
+    /// themselves. `raw_ticks.id` stays insertion-ordered (single writer
+    /// connection; rows execute in slice order). Trades keep `INSERT OR IGNORE`
+    /// semantics on the unique `transaction_hash` — a duplicate inside one batch
+    /// is ignored, not an error.
+    pub fn insert_frame_batch(
+        &self,
+        ticks: &[(FeedSource, i64, String)],
+        trades: &[(ClobTrade, i64, Option<&'static str>)],
+    ) -> Result<(), DbError> {
+        if ticks.is_empty() && trades.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut tick_stmt = tx.prepare_cached(
+                "INSERT INTO raw_ticks (source, received_ms, payload_json) VALUES (?1, ?2, ?3)",
+            )?;
+            for (source, received_ms, payload_json) in ticks {
+                tick_stmt.execute(params![source.as_str(), received_ms, payload_json])?;
+            }
+            let mut trade_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO clob_trades
+                   (token_id, condition_id, series, price_str, size_str, taker_is_buy,
+                    traded_at_ms, received_at_ms, fee_rate_bps, transaction_hash)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            )?;
+            for (trade, received_at_ms, series) in trades {
+                trade_stmt.execute(params![
+                    trade.token_id,
+                    trade.condition_id,
+                    series,
+                    trade.price.0.to_string(),
+                    trade.size.to_string(),
+                    i64::from(trade.taker_is_buy),
+                    trade.traded_at_ms,
+                    received_at_ms,
+                    i64::from(trade.fee_rate_bps),
+                    trade.transaction_hash,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Batch-insert computed observations in a single transaction.
@@ -595,6 +649,58 @@ mod tests {
             .query_row("SELECT condition_id FROM clob_trades", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cond, "0xcond");
+    }
+
+    #[test]
+    fn frame_batch_persists_both_tables_in_order() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let ticks = vec![
+            (FeedSource::Clob, 10_i64, "{\"a\":1}".to_string()),
+            (FeedSource::Bybit, 11_i64, "{\"b\":2}".to_string()),
+            (FeedSource::Clob, 12_i64, "{\"c\":3}".to_string()),
+        ];
+        let trades = vec![(sample_trade(), 13_i64, Some("5m"))];
+        db.insert_frame_batch(&ticks, &trades).unwrap();
+        assert_eq!(db.raw_tick_count().unwrap(), 3);
+        assert_eq!(db.clob_trade_count().unwrap(), 1);
+        // `raw_ticks.id` is insertion-ordered (single writer; slice order) —
+        // the #310 sweep depends on it.
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare("SELECT received_ms FROM raw_ticks ORDER BY id")
+            .unwrap();
+        let got: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(got, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn frame_batch_dedups_duplicate_tx_hash_within_one_batch() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let mut other = sample_trade();
+        other.transaction_hash = "0xbeef".to_string();
+        // 3 trades, 1 in-batch duplicate hash => 2 rows, no error.
+        let trades = vec![
+            (sample_trade(), 1_i64, Some("5m")),
+            (sample_trade(), 2_i64, Some("5m")),
+            (other, 3_i64, None),
+        ];
+        db.insert_frame_batch(&[], &trades).unwrap();
+        assert_eq!(db.clob_trade_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn empty_frame_batch_is_noop() {
+        let dir = tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        db.insert_frame_batch(&[], &[]).unwrap();
+        assert_eq!(db.raw_tick_count().unwrap(), 0);
+        assert_eq!(db.clob_trade_count().unwrap(), 0);
     }
 
     #[test]

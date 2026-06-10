@@ -17,6 +17,8 @@
 //! covers (no network).
 
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -24,7 +26,6 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::warn;
 
 use crate::types::{DecodeError, ExchangeTick, ExchangeVenue, FeedFrame, FeedSource, now_unix_ms};
 use crate::ws::ws_reconnect_loop;
@@ -127,8 +128,15 @@ fn last_array_tick(
 }
 
 /// Spawn one exchange WS task. Same backpressure (drop-newest on full) and
-/// stop-on-closed semantics as the other feed tasks.
-pub fn spawn(venue: ExchangeVenue, ws_url: String, tx: mpsc::Sender<FeedFrame>) -> JoinHandle<()> {
+/// stop-on-closed semantics as the other feed tasks. `frames_dropped` counts
+/// frames lost to a full channel (counted, not logged per-frame — the runner
+/// surfaces the tally periodically + in `meta`, issue #311).
+pub fn spawn(
+    venue: ExchangeVenue,
+    ws_url: String,
+    tx: mpsc::Sender<FeedFrame>,
+    frames_dropped: Arc<AtomicU64>,
+) -> JoinHandle<()> {
     let source = FeedSource::from(venue);
     tokio::spawn(async move {
         ws_reconnect_loop(ws_url, subscribe_message(venue), move |raw| {
@@ -140,10 +148,7 @@ pub fn spawn(venue: ExchangeVenue, ws_url: String, tx: mpsc::Sender<FeedFrame>) 
             match tx.try_send(frame) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        venue = source.as_str(),
-                        "exchange: channel full, dropping frame"
-                    );
+                    frames_dropped.fetch_add(1, Ordering::Relaxed);
                     true
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => false,

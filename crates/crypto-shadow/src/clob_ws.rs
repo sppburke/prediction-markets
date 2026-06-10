@@ -11,6 +11,8 @@
 
 use std::collections::HashSet;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
@@ -27,8 +29,9 @@ use crate::types::{BookUpdate, ClobTrade, DecodeError, FeedFrame, FeedSource, no
 use crate::ws::MAX_BACKOFF_SECS;
 
 /// Bounded capacity for the subscribe-command channel from `drive` to the CLOB
-/// task. One slot per incremental subscribe batch. A dropped command is
-/// self-healing: the next reconnect re-subscribes the full cumulative set.
+/// task. One slot per [`SubCmd`]. An undelivered `Add`/`Prune` self-retries on
+/// the next refresh tick via delivery gating in the runner (issue #311); a
+/// reconnect re-subscribes the current (pruned) set, never a cumulative one.
 /// See `docs/_GLOSSARY.md`: `crypto_shadow_clob_subscribe_channel_capacity`.
 pub const CLOB_SUBSCRIBE_CHANNEL_CAPACITY: usize = 16;
 
@@ -243,52 +246,166 @@ pub fn subscribe_message(token_ids: &[String]) -> String {
     format!(r#"{{"type":"market","assets_ids":{assets}}}"#)
 }
 
-/// Handle for pushing incremental subscription additions to the live CLOB task,
-/// so markets enumerated after startup get their YES+NO books subscribed.
+/// A subscription-set command from `drive`'s refresh arm to the CLOB task
+/// (issue #311). The task owns the **current** token set (no longer grow-only):
+/// `Add` extends it, `Prune` shrinks it, and every (re)connect subscribes
+/// exactly that set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubCmd {
+    /// Subscribe these tokens: incremental subscribe when the stream is live,
+    /// and part of the full-set subscribe on every later (re)connect.
+    Add(Vec<String>),
+    /// Remove these tokens from the set. The market channel has no protocol
+    /// unsubscribe (verified 2026-06-09), so a live `Prune` mutates the stored
+    /// set only — book frames keep flowing until the next (re)connect applies
+    /// the smaller set.
+    Prune(Vec<String>),
+    /// Reconnect now so a pruned set takes effect without waiting for a natural
+    /// drop. Honored only when no reconnect happened within
+    /// `force_reconnect_after` (redundant sends are harmless no-ops).
+    ForceReconnect,
+}
+
+/// Net effect of applying a batch of [`SubCmd`]s to the subscription set.
+struct SubCmdOutcome {
+    /// Tokens genuinely new to the set, in application order — the live stream
+    /// sends an incremental subscribe for exactly these; a reconnect-time drain
+    /// ignores them (the full-set subscribe that follows covers everything).
+    newly_added: Vec<String>,
+    /// Whether the batch carried a `ForceReconnect`.
+    force_reconnect: bool,
+}
+
+/// Apply subscription commands to the `(seen, all_tokens)` set, in order. Pure
+/// (no I/O, no clock) — the single mutation point for the set, used both by the
+/// reconnect-time drain and the live-stream command arm, so the two paths
+/// cannot disagree on semantics. An `Add` then `Prune` of the same token within
+/// one batch nets out to removed (and emits no incremental subscribe).
+fn apply_sub_cmds(
+    cmds: Vec<SubCmd>,
+    seen: &mut HashSet<String>,
+    all_tokens: &mut Vec<String>,
+) -> SubCmdOutcome {
+    let mut newly_added = Vec::new();
+    let mut force_reconnect = false;
+    for cmd in cmds {
+        match cmd {
+            SubCmd::Add(tokens) => {
+                for t in tokens {
+                    if seen.insert(t.clone()) {
+                        all_tokens.push(t.clone());
+                        newly_added.push(t);
+                    }
+                }
+            }
+            SubCmd::Prune(tokens) => {
+                for t in &tokens {
+                    seen.remove(t);
+                }
+                all_tokens.retain(|t| seen.contains(t));
+                newly_added.retain(|t| seen.contains(t));
+            }
+            SubCmd::ForceReconnect => force_reconnect = true,
+        }
+    }
+    SubCmdOutcome {
+        newly_added,
+        force_reconnect,
+    }
+}
+
+/// Handle for pushing subscription-set commands ([`SubCmd`]) to the live CLOB
+/// task, so markets enumerated after startup get their YES+NO books subscribed
+/// and expired markets get pruned from the set.
 pub struct ClobSubscribeHandle {
-    tx: mpsc::Sender<Vec<String>>,
+    tx: mpsc::Sender<SubCmd>,
 }
 
 impl ClobSubscribeHandle {
     /// Test-only constructor: a handle whose receiver is already dropped, so
-    /// `add_tokens` is a no-op without a live task.
+    /// every send reports undelivered (`false`) without a live task.
     #[cfg(test)]
     pub(crate) fn disconnected_for_test() -> Self {
         let (tx, _rx) = mpsc::channel(1);
         Self { tx }
     }
 
-    /// Push a batch of new token ids onto the subscribe channel. Non-blocking
-    /// (`try_send`): a full channel is logged and dropped — self-healing, since
-    /// the next reconnect re-subscribes the full cumulative set. Returns `false`
-    /// if dropped or the task has exited.
+    /// Test-only constructor exposing the receiver, so runner tests can fill
+    /// the channel (delivery-gating false branches) and inspect sent commands.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_capacity(capacity: usize) -> (Self, mpsc::Receiver<SubCmd>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    /// Push an `Add` batch. Non-blocking (`try_send`). Returns `true` only when
+    /// the command was accepted; on `false` the runner must NOT register the
+    /// market, so `knows_token` stays false and the add self-retries on the
+    /// next refresh tick (issue #311 — a dropped Add was previously a permanent
+    /// unsubscribe).
     pub fn add_tokens(&self, tokens: Vec<String>) -> bool {
         if tokens.is_empty() {
             return true;
         }
-        match self.tx.try_send(tokens) {
+        match self.tx.try_send(SubCmd::Add(tokens)) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("clob: subscribe channel full, incremental add dropped (heals on reconnect)");
+                warn!("clob: subscribe channel full, add deferred (retries next refresh)");
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
+
+    /// Push a `Prune` batch. Non-blocking (`try_send`). Returns `true` only
+    /// when the command was accepted; on `false` the runner must NOT remove the
+    /// market from its state, so the prune self-retries on the next refresh
+    /// tick (issue #311 delivery gating).
+    pub fn prune_tokens(&self, tokens: Vec<String>) -> bool {
+        if tokens.is_empty() {
+            return true;
+        }
+        match self.tx.try_send(SubCmd::Prune(tokens)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("clob: subscribe channel full, prune deferred (retries next refresh)");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Request a reconnect so a delivered prune takes effect. Fire-and-forget:
+    /// an undelivered force is re-sent by the next prune-delivering tick, and
+    /// the task gates it on elapsed-time anyway.
+    pub fn force_reconnect(&self) {
+        let _ = self.tx.try_send(SubCmd::ForceReconnect);
+    }
 }
 
 /// Spawn the CLOB market WS task over the initial YES+NO token ids, returning a
-/// [`ClobSubscribeHandle`] for incremental additions from `drive`'s refresh arm.
-/// The task owns the cumulative token set and re-subscribes the **full** set on
-/// every reconnect, so a transient drop never loses coverage.
+/// [`ClobSubscribeHandle`] for [`SubCmd`]s from `drive`'s refresh arm. The task
+/// owns the **current** token set: every (re)connect first drains all pending
+/// commands (so a prune queued while disconnected still applies), then
+/// subscribes exactly that set. `frames_dropped` counts frames lost to a full
+/// frame channel (surfaced by the runner's periodic summary + `meta` stamp).
 pub fn spawn(
     ws_url: String,
     initial_token_ids: Vec<String>,
     tx: mpsc::Sender<FeedFrame>,
+    force_reconnect_after: Duration,
+    frames_dropped: Arc<AtomicU64>,
 ) -> (JoinHandle<()>, ClobSubscribeHandle) {
     let (sub_tx, sub_rx) = mpsc::channel(CLOB_SUBSCRIBE_CHANNEL_CAPACITY);
     let handle = ClobSubscribeHandle { tx: sub_tx };
-    let join = tokio::spawn(clob_task(ws_url, initial_token_ids, tx, sub_rx));
+    let join = tokio::spawn(clob_task(
+        ws_url,
+        initial_token_ids,
+        tx,
+        sub_rx,
+        force_reconnect_after,
+        frames_dropped,
+    ));
     (join, handle)
 }
 
@@ -301,20 +418,53 @@ enum ClobStreamOutcome {
     StreamEnded(String),
 }
 
-/// CLOB-specific reconnect loop. Owns the cumulative `(all_tokens, seen)` set so
-/// every reconnect re-subscribes everything. `ws::ws_reconnect_loop` is left
+/// CLOB-specific reconnect loop. Owns the current `(all_tokens, seen)` set so
+/// every reconnect subscribes exactly it. `ws::ws_reconnect_loop` is left
 /// unchanged (still used by the static Chainlink subscription).
 async fn clob_task(
     ws_url: String,
     initial_token_ids: Vec<String>,
     tx: mpsc::Sender<FeedFrame>,
-    mut sub_rx: mpsc::Receiver<Vec<String>>,
+    mut sub_rx: mpsc::Receiver<SubCmd>,
+    force_reconnect_after: Duration,
+    frames_dropped: Arc<AtomicU64>,
 ) {
     let mut seen: HashSet<String> = initial_token_ids.iter().cloned().collect();
     let mut all_tokens: Vec<String> = initial_token_ids;
     let mut backoff_secs: u64 = 1;
+    let mut last_reconnect_at = tokio::time::Instant::now();
     loop {
-        match clob_connect_and_stream(&ws_url, &mut all_tokens, &mut seen, &tx, &mut sub_rx).await {
+        // Drain every pending command BEFORE the connect attempt: the reconnect
+        // is the definitive sync point where the (possibly pruned) set takes
+        // effect, and draining here keeps the bounded command channel moving
+        // even across failed attempts. A `ForceReconnect` seen in this drain is
+        // a no-op (we are already reconnecting); `newly_added` is ignored (the
+        // full-set subscribe below covers it).
+        let mut pending = Vec::new();
+        loop {
+            match sub_rx.try_recv() {
+                Ok(cmd) => pending.push(cmd),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    debug!("clob: subscribe sender dropped, stopping");
+                    return;
+                }
+            }
+        }
+        let _ = apply_sub_cmds(pending, &mut seen, &mut all_tokens);
+
+        match clob_connect_and_stream(
+            &ws_url,
+            &mut all_tokens,
+            &mut seen,
+            &tx,
+            &mut sub_rx,
+            &mut last_reconnect_at,
+            force_reconnect_after,
+            &frames_dropped,
+        )
+        .await
+        {
             ClobStreamOutcome::ConsumerClosed => {
                 debug!("clob: consumer closed, stopping");
                 return;
@@ -332,12 +482,16 @@ async fn clob_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one live stream; each arg is a distinct piece of task state.
 async fn clob_connect_and_stream(
     url: &str,
     all_tokens: &mut Vec<String>,
     seen: &mut HashSet<String>,
     tx: &mpsc::Sender<FeedFrame>,
-    sub_rx: &mut mpsc::Receiver<Vec<String>>,
+    sub_rx: &mut mpsc::Receiver<SubCmd>,
+    last_reconnect_at: &mut tokio::time::Instant,
+    force_reconnect_after: Duration,
+    frames_dropped: &AtomicU64,
 ) -> ClobStreamOutcome {
     let (ws, _resp) = match tokio_tungstenite::connect_async(url).await {
         Ok(v) => v,
@@ -345,11 +499,13 @@ async fn clob_connect_and_stream(
     };
     let (mut write, mut read) = ws.split();
 
-    // Re-subscribe the FULL cumulative set on every (re)connect.
+    // Subscribe the CURRENT set (post-drain, so prunes applied while
+    // disconnected are already reflected) on every (re)connect.
     let sub_msg = subscribe_message(all_tokens);
     if let Err(e) = write.send(Message::Text(Utf8Bytes::from(sub_msg))).await {
         return ClobStreamOutcome::ConnectFailed(format!("subscribe send: {e}"));
     }
+    *last_reconnect_at = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -364,7 +520,10 @@ async fn clob_connect_and_stream(
                         match tx.try_send(frame) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!("clob: channel full, dropping frame");
+                                // Counted, not logged per-frame: under saturation
+                                // a per-drop warn is its own flood. The runner
+                                // surfaces the tally periodically + in `meta`.
+                                frames_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 return ClobStreamOutcome::ConsumerClosed;
@@ -376,33 +535,33 @@ async fn clob_connect_and_stream(
                     None => return ClobStreamOutcome::StreamEnded("stream end".to_string()),
                 }
             }
-            maybe_new = sub_rx.recv() => {
-                match maybe_new {
+            maybe_cmd = sub_rx.recv() => {
+                match maybe_cmd {
                     None => return ClobStreamOutcome::ConsumerClosed,
-                    Some(new_tokens) => {
-                        // Dedup against the cumulative set; push truly-new tokens
-                        // (so a later reconnect re-subscribes them) and send an
-                        // incremental subscribe for just those.
-                        let truly_new: Vec<String> = new_tokens
-                            .into_iter()
-                            .filter(|t| {
-                                let is_new = seen.insert(t.clone());
-                                if is_new {
-                                    all_tokens.push(t.clone());
-                                }
-                                is_new
-                            })
-                            .collect();
-                        if truly_new.is_empty() {
-                            continue;
+                    Some(cmd) => {
+                        let outcome = apply_sub_cmds(vec![cmd], seen, all_tokens);
+                        if outcome.force_reconnect
+                            && last_reconnect_at.elapsed() >= force_reconnect_after
+                        {
+                            // Backoff resets to 1s via StreamEnded; the
+                            // reconnect-time drain + full-set subscribe apply
+                            // the pruned set.
+                            return ClobStreamOutcome::StreamEnded(
+                                "forced reconnect to apply pruned set".to_string(),
+                            );
                         }
-                        let inc_msg = subscribe_message(&truly_new);
-                        if let Err(e) = write.send(Message::Text(Utf8Bytes::from(inc_msg))).await {
-                            // `all_tokens` already holds the new tokens, so the
-                            // reconnect re-subscribes them.
-                            return ClobStreamOutcome::StreamEnded(format!(
-                                "incremental subscribe: {e}"
-                            ));
+                        // A live Prune mutated the stored set only (no protocol
+                        // unsubscribe exists); a live Add gets an immediate
+                        // incremental subscribe for its truly-new tokens.
+                        if !outcome.newly_added.is_empty() {
+                            let inc_msg = subscribe_message(&outcome.newly_added);
+                            if let Err(e) = write.send(Message::Text(Utf8Bytes::from(inc_msg))).await {
+                                // `all_tokens` already holds the new tokens, so
+                                // the reconnect re-subscribes them.
+                                return ClobStreamOutcome::StreamEnded(format!(
+                                    "incremental subscribe: {e}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -503,6 +662,83 @@ mod tests {
         let msg = subscribe_message(&["a".to_string(), "b".to_string()]);
         assert!(msg.contains("\"assets_ids\":[\"a\",\"b\"]"));
         assert!(msg.contains("\"type\":\"market\""));
+    }
+
+    fn set_of(tokens: &[&str]) -> (HashSet<String>, Vec<String>) {
+        let v: Vec<String> = tokens.iter().map(ToString::to_string).collect();
+        (v.iter().cloned().collect(), v)
+    }
+
+    fn toks(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn apply_add_extends_and_dedups() {
+        let (mut seen, mut all) = set_of(&["a"]);
+        let out = apply_sub_cmds(
+            vec![SubCmd::Add(toks(&["a", "b", "c", "b"]))],
+            &mut seen,
+            &mut all,
+        );
+        assert_eq!(out.newly_added, toks(&["b", "c"]));
+        assert!(!out.force_reconnect);
+        assert_eq!(all, toks(&["a", "b", "c"]));
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn apply_prune_shrinks_both_set_and_vec() {
+        let (mut seen, mut all) = set_of(&["a", "b", "c"]);
+        let out = apply_sub_cmds(vec![SubCmd::Prune(toks(&["b", "zz"]))], &mut seen, &mut all);
+        assert!(out.newly_added.is_empty());
+        assert_eq!(all, toks(&["a", "c"]));
+        assert!(!seen.contains("b"));
+        assert!(seen.contains("a") && seen.contains("c"));
+    }
+
+    #[test]
+    fn apply_add_then_prune_of_same_tokens_nets_out() {
+        // A token added and pruned in the same drained batch must end removed
+        // AND must not be reported for an incremental subscribe.
+        let (mut seen, mut all) = set_of(&["a"]);
+        let out = apply_sub_cmds(
+            vec![
+                SubCmd::Add(toks(&["b", "c"])),
+                SubCmd::Prune(toks(&["b"])),
+                SubCmd::ForceReconnect,
+            ],
+            &mut seen,
+            &mut all,
+        );
+        assert_eq!(out.newly_added, toks(&["c"]));
+        assert!(out.force_reconnect);
+        assert_eq!(all, toks(&["a", "c"]));
+    }
+
+    #[test]
+    fn apply_prune_queued_while_disconnected_then_readd() {
+        // The reconnect-time drain applies Prune-then-Add in order: the re-add
+        // wins (the runner re-admitted the market), and the token is back in
+        // the set the following subscribe uses.
+        let (mut seen, mut all) = set_of(&["a", "b"]);
+        let out = apply_sub_cmds(
+            vec![SubCmd::Prune(toks(&["b"])), SubCmd::Add(toks(&["b"]))],
+            &mut seen,
+            &mut all,
+        );
+        assert_eq!(out.newly_added, toks(&["b"]));
+        assert_eq!(all, toks(&["a", "b"]));
+        assert!(seen.contains("b"));
+    }
+
+    #[test]
+    fn apply_empty_batch_is_noop() {
+        let (mut seen, mut all) = set_of(&["a"]);
+        let out = apply_sub_cmds(Vec::new(), &mut seen, &mut all);
+        assert!(out.newly_added.is_empty());
+        assert!(!out.force_reconnect);
+        assert_eq!(all, toks(&["a"]));
     }
 
     // A real `last_trade_price` frame captured verbatim from a 2026-06-09 live

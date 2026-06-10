@@ -21,7 +21,7 @@ use pe_crypto_shadow::chainlink_ws::parse_chainlink_frame;
 use pe_crypto_shadow::clob_ws::{parse_clob_frame, parse_clob_trade};
 use pe_crypto_shadow::db::ShadowDb;
 use pe_crypto_shadow::gamma::BtcMarketFetcher;
-use pe_crypto_shadow::join::JoinState;
+use pe_crypto_shadow::join::{JoinState, market_expired};
 use pe_crypto_shadow::report::build_realized;
 use pe_crypto_shadow::types::{
     BtcSeriesKind, EdgeObservation, ExchangeTick, ExchangeVenue, FeedSource, MoveDirection,
@@ -273,6 +273,130 @@ async fn scenario_trade_capture() {
 
     println!(
         "PASS: scenario_trade_capture (self-attributed via frame market incl. unknown token, dedup on tx hash, price_change ignored)"
+    );
+}
+
+/// Issue #311: expired-market prune + re-admission guard + late-print survival.
+///
+/// PASS: at a fixture "now" past `range_end + grace`, the expired market (and
+/// only it) is listed by `expired_condition_ids`; after `remove_market` its
+/// tokens are unknown; the SAME Gamma fixture that still lists the expired
+/// market (Gamma's `closed=false` lags `range_end_ms`) is kept out by the
+/// shared `market_expired` admission predicate (not re-registered, no
+/// re-subscribe tokens); a LATE trade print on the pruned token still persists,
+/// attributed via the frame's own `market` field with `series` NULL; and the
+/// active market is untouched.
+/// FAIL: the active market is pruned, the expired market is re-admitted, the
+/// late print is dropped or mis-attributed, or its `series` is non-NULL.
+///
+/// Determinism: "now" is a fixture clock derived from the slug window — no wall
+/// clock anywhere.
+#[tokio::test]
+async fn scenario_prune_clob_and_join() {
+    // Two 5m markets: E (expires first) and A (window opens an hour later).
+    // 1765192500 = 2025-12-08T12:35:00Z; each window = 5 min from the slug.
+    const EVENTS_BOTH: &str = r#"[
+      {"slug":"btc-updown-5m-1765192500",
+       "startDate":"2025-12-08T00:00:00Z","endDate":"2025-12-09T00:00:00Z",
+       "markets":[
+        {"conditionId":"0xcondE","clobTokenIds":"[\"0xyesE\",\"0xnoE\"]",
+         "orderPriceMinTickSize":"0.01"}
+       ]},
+      {"slug":"btc-updown-5m-1765196100",
+       "startDate":"2025-12-08T00:00:00Z","endDate":"2025-12-09T00:00:00Z",
+       "markets":[
+        {"conditionId":"0xcondA","clobTokenIds":"[\"0xyesA\",\"0xnoA\"]",
+         "orderPriceMinTickSize":"0.01"}
+       ]}
+    ]"#;
+    let mut fixtures = HashMap::new();
+    fixtures.insert(
+        "https://gamma.test/events?series_slug=btc-up-or-down-5m&closed=false".to_string(),
+        EVENTS_BOTH.as_bytes().to_vec(),
+    );
+    let gamma = BtcMarketFetcher::new(
+        "https://gamma.test".to_string(),
+        FixtureFetcher::new(fixtures),
+    );
+    let markets = gamma.fetch_markets(&[BtcSeriesKind::Five]).await.unwrap();
+    assert_eq!(markets.len(), 2, "enumerate both markets");
+    let e_end_ms = markets
+        .iter()
+        .find(|m| m.condition_id == "0xcondE")
+        .unwrap()
+        .range_end_ms;
+
+    let mut state = JoinState::new(markets, ShadowConfig::default().consensus_params());
+    assert!(state.knows_token("0xyesE") && state.knows_token("0xyesA"));
+
+    // Fixture clock: 60s past E's grace boundary; A is nowhere near expired.
+    let grace_ms = 120_000;
+    let now_ms = e_end_ms + grace_ms + 60_000;
+
+    // 1. Only E is a prune candidate.
+    assert_eq!(
+        state.expired_condition_ids(now_ms, grace_ms),
+        vec!["0xcondE".to_string()]
+    );
+
+    // 2. Prune in the runner's order: collect tokens BEFORE mutation, remove.
+    let tokens = state.market_tokens("0xcondE");
+    assert_eq!(tokens, vec!["0xyesE".to_string(), "0xnoE".to_string()]);
+    state.remove_market("0xcondE");
+    assert!(!state.knows_token("0xyesE") && !state.knows_token("0xnoE"));
+    assert_eq!(state.market_count(), 1, "active market untouched");
+    assert!(state.knows_token("0xyesA") && state.knows_token("0xnoA"));
+
+    // 3. Re-admission guard (B2): the fixture STILL lists E, but the shared
+    //    expiry predicate keeps it out of the admission set, so a refresh tick
+    //    neither re-registers nor re-subscribes it.
+    let refetched = gamma.fetch_markets(&[BtcSeriesKind::Five]).await.unwrap();
+    assert!(
+        refetched.iter().any(|m| m.condition_id == "0xcondE"),
+        "Gamma (closed=false) still lists the expired market"
+    );
+    let admitted: Vec<_> = refetched
+        .into_iter()
+        .filter(|m| !market_expired(m, now_ms, grace_ms))
+        .collect();
+    assert_eq!(admitted.len(), 1, "only the active market is admitted");
+    assert_eq!(admitted[0].condition_id, "0xcondA");
+
+    // 4. A LATE print on the pruned token still persists: condition_id from the
+    //    frame's own `market` field, series NULL (the join no longer knows it).
+    let late = format!(
+        r#"{{"market":"0xcondE","asset_id":"0xyesE","price":"0.97","size":"4","fee_rate_bps":"0","side":"BUY","timestamp":"{now_ms}","event_type":"last_trade_price","transaction_hash":"0xlate01"}}"#
+    );
+    let trade = parse_clob_trade(&late).unwrap().unwrap();
+    let (cond, series) = state.lookup_token(&trade.token_id);
+    assert_eq!((cond, series), (None, None), "pruned token unknown to join");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("s.db");
+    let db = ShadowDb::open(&db_path).unwrap();
+    db.insert_clob_trade(&trade, now_ms + 5, series).unwrap();
+    assert_eq!(db.clob_trade_count().unwrap(), 1, "late print persisted");
+    drop(db);
+
+    // Direct SQL probe: attributed to E via the frame, series NULL.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (got_cond, got_series): (String, Option<String>) = conn
+        .query_row(
+            "SELECT condition_id, series FROM clob_trades WHERE transaction_hash = '0xlate01'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        got_cond, "0xcondE",
+        "attributed via the frame's market field"
+    );
+    assert_eq!(
+        got_series, None,
+        "series NULL — recoverable offline from `markets`"
+    );
+
+    println!(
+        "PASS: scenario_prune_clob_and_join (only E pruned, admission guard blocks re-add, late print persists with series NULL, A untouched)"
     );
 }
 
