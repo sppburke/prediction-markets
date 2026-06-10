@@ -33,18 +33,22 @@ pub struct RunSummary {
     pub raw_ticks: i64,
 }
 
-/// Per-source decode-error tallies + flush count returned by [`drive`]. Decode
-/// failures increment a counter and are surfaced as a bounded periodic summary
-/// (never a per-frame log line), so a load test can assert the count without
-/// scraping logs and a 72k-frame run does not emit 72k warnings.
+/// Per-source decode-error tallies + the max CLOB inter-frame gap returned by
+/// [`drive`]. Decode failures increment a counter surfaced as a bounded periodic
+/// summary (never a per-frame log line), so a load test can assert the count
+/// without scraping logs and a 72k-frame run does not emit 72k warnings. The
+/// frame-batch commit count moved to [`WriterStats`] (issue #317: the decoupled
+/// writer owns it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct DriveStats {
     decode_errors_chainlink: u64,
     decode_errors_clob: u64,
     decode_errors_exchange: u64,
-    /// Non-empty frame-batch flushes committed (size-triggered, interval, or
-    /// loop-exit). The saturation test asserts the size trigger ran.
-    flushes: u64,
+    /// Largest gap (ms) between consecutive CLOB frames over the run, with the
+    /// final `now − last` gap folded in at loop exit (issue #317), so a CLOB feed
+    /// that dies near run-end is visible. Stamped to `meta` as `max_clob_gap_secs`
+    /// — a tape-validity PASS gate (< 300s).
+    max_clob_gap_ms: i64,
 }
 
 /// Per-source frames-dropped counters, shared with the WS producer tasks
@@ -77,12 +81,79 @@ impl DropCounters {
     }
 }
 
+/// A unit of persistence work for the decoupled DB-writer task (issue #317).
+/// Both variants carry owned, `Send + 'static` data (`String`, owned `ClobTrade`,
+/// `&'static str` series), so the message crosses cleanly to the blocking writer.
+enum WriteCmd {
+    /// One flush window: raw ticks + trade prints, persisted in one transaction.
+    FrameBatch {
+        ticks: Vec<(FeedSource, i64, String)>,
+        trades: Vec<(ClobTrade, i64, Option<&'static str>)>,
+    },
+    /// Computed observations from a fired move (rare; their own transaction).
+    Observations(Vec<crate::types::EdgeObservation>),
+}
+
+/// Commit tallies returned by [`writer_loop`]. `flushes` is the non-empty
+/// frame-batch commit count (the saturation test asserts the size trigger ran);
+/// `frames_written` is the total raw ticks persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct WriterStats {
+    flushes: u64,
+    frames_written: u64,
+}
+
+/// One iteration's selected event in `drive`'s inner (fair) select (issue #317).
+/// Separating it from the outer biased shutdown branch keeps shutdown winning,
+/// while the inner `rx`/`refresh`/`flush` select is non-biased so the refresh +
+/// prune + drop-log arm no longer starves exactly under saturation (the fully
+/// `biased;` loop's failure mode).
+enum DriveEvent {
+    Frame(FeedFrame),
+    RxClosed,
+    Refresh,
+    Flush,
+}
+
+/// Dedicated blocking DB-writer (issue #317). Drains `write_rx` and commits each
+/// [`WriteCmd`] to SQLite **off** the socket-drain task, so `drive` never blocks
+/// on a `rusqlite` transaction. Hosted on `tokio::task::spawn_blocking`, so
+/// `blocking_recv` is valid (it runs off the async worker pool).
+///
+/// **Fail-fast**: the first `DbError` returns `Err(Error::Db(..))` immediately,
+/// preserving the issue #311 invariant that a tape with silent holes is worse
+/// than a stopped run (the write no longer happens inline under `?` in `drive`,
+/// so `run` recovers this error from the awaited writer handle and propagates it
+/// in preference to the channel-closed signal `drive` sees). On clean channel
+/// close (all senders dropped) returns `Ok(WriterStats)`. There is deliberately
+/// **no** `write_errors` counter — a fail-fast writer has at most one (fatal)
+/// error, so a counter would imply the disallowed continue-on-error semantics.
+fn writer_loop(
+    db: Arc<ShadowDb>,
+    mut write_rx: mpsc::Receiver<WriteCmd>,
+) -> Result<WriterStats, Error> {
+    let mut stats = WriterStats::default();
+    while let Some(cmd) = write_rx.blocking_recv() {
+        match cmd {
+            WriteCmd::FrameBatch { ticks, trades } => {
+                db.insert_frame_batch(&ticks, &trades)?;
+                stats.flushes += 1;
+                stats.frames_written += u64::try_from(ticks.len()).unwrap_or(u64::MAX);
+            }
+            WriteCmd::Observations(obs) => {
+                db.insert_observations(&obs)?;
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Drive the live shadow collection until `rx` closes or `shutdown` resolves.
 pub async fn run(
     config: &ShadowConfig,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<RunSummary, Error> {
-    let db = ShadowDb::open(Path::new(&config.db_path))?;
+    let db = Arc::new(ShadowDb::open(Path::new(&config.db_path))?);
     db.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
     db.set_meta("fee_provenance", CRYPTO_FEES_V2_PROVENANCE)?;
     db.set_meta("vantage_label", &config.vantage_label)?;
@@ -127,6 +198,8 @@ pub async fn run(
         token_ids,
         tx.clone(),
         Duration::from_millis(config.force_reconnect_after_ms),
+        Duration::from_secs(config.clob_ping_interval_secs),
+        Duration::from_secs(config.clob_read_idle_limit_secs),
         Arc::clone(&drops.clob),
     );
     // Exchange trigger feeds (free; chosen by the bake-off, docs/27).
@@ -150,12 +223,21 @@ pub async fn run(
     );
     drop(tx); // only the WS tasks hold senders now
 
+    // Decoupled DB-writer (issue #317): `drive` sends batched `WriteCmd`s here so
+    // the socket-drain task never blocks on a `rusqlite` transaction. Bounded
+    // channel; backpressure is `send().await` (never a silent drop in-pipeline).
+    let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(config.write_channel_capacity);
+    let writer = {
+        let db = Arc::clone(&db);
+        tokio::task::spawn_blocking(move || writer_loop(db, write_rx))
+    };
+
     let mut refresh = tokio::time::interval(Duration::from_secs(
         config.market_refresh_interval_secs.max(1),
     ));
     refresh.tick().await; // discard the immediate first tick
 
-    let stats = drive(
+    let drive_result = drive(
         &db,
         &mut rx,
         &mut state,
@@ -164,21 +246,48 @@ pub async fn run(
         config,
         &clob_sub,
         &drops,
+        &write_tx,
         shutdown,
     )
-    .await?;
+    .await;
+    // Close the writer channel so its `blocking_recv` returns None → Ok(stats).
+    drop(write_tx);
+    // Error precedence (issue #317): the writer's fail-fast `DbError` is the true
+    // cause and wins over the channel-closed signal `drive` observed. Only a clean
+    // writer join proceeds to stamp `meta` + build the deferred indexes.
+    let writer_stats = match writer.await {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(e)) => return Err(e),
+        Err(join_err) => {
+            warn!(error = %join_err, "shadow: DB-writer task panicked");
+            return Err(Error::Io(std::io::Error::other(format!(
+                "db-writer task panicked: {join_err}"
+            ))));
+        }
+    };
+    let drive_stats = drive_result?;
     info!(
-        chainlink_decode_errors = stats.decode_errors_chainlink,
-        clob_decode_errors = stats.decode_errors_clob,
-        exchange_decode_errors = stats.decode_errors_exchange,
-        flushes = stats.flushes,
+        chainlink_decode_errors = drive_stats.decode_errors_chainlink,
+        clob_decode_errors = drive_stats.decode_errors_clob,
+        exchange_decode_errors = drive_stats.decode_errors_exchange,
+        max_clob_gap_ms = drive_stats.max_clob_gap_ms,
+        flushes = writer_stats.flushes,
+        frames_written = writer_stats.frames_written,
         "shadow: drive loop ended"
     );
-    // Stamp the drop tallies so the post-run validation AC (`frames_dropped_*`
-    // all zero) is a `meta` query, not a log scrape. Meaningful at run end only.
+    // Stamp the drop tallies + the max CLOB gap so the post-run validation AC
+    // (`frames_dropped_*` = 0 AND `max_clob_gap_secs` < 300) is a `meta` query,
+    // not a log scrape. Meaningful at run end only.
     for (key, value) in drops.snapshot() {
         db.set_meta(key, &value.to_string())?;
     }
+    db.set_meta(
+        "max_clob_gap_secs",
+        &(drive_stats.max_clob_gap_ms / 1000).to_string(),
+    )?;
+    // Build the deferred `clob_trades` indexes once, now that capture is done
+    // (issue #317) — a cleanly-finished tape ends with the same indexes as before.
+    db.build_clob_trade_indexes()?;
 
     Ok(RunSummary {
         observations: db.observation_count()?,
@@ -190,16 +299,24 @@ pub async fn run(
 /// resolves. Extracted from [`run`] (which owns the network preamble that errors
 /// under the no-network gate) so the select loop is testable offline: an
 /// injected `shutdown`, a controlled `rx`, and a `FixtureFetcher`-backed `gamma`
-/// exercise every arm with no live socket. `shutdown` is polled first
-/// (`biased;`), so it wins over a still-draining `rx` — mirroring the shutdown
-/// idiom in `crates/service/src/orchestrator.rs`.
+/// exercise every arm with no live socket.
 ///
-/// Persistence is **batched** (issue #311): raw frames and trade prints buffer
-/// in-memory and flush in one transaction every `flush_interval_ms` OR
-/// `flush_max_frames`, whichever first, plus once after the loop exits — so the
-/// invariant is "every received frame is persisted by loop exit", not "before
-/// decode". Crash-loss is bounded by one flush window (the post-loop flush does
-/// not run on panic). A flush error is fail-fast: it stops the run.
+/// The loop is a **nested** select (issue #317): an outer `biased;` select polls
+/// `shutdown` first (so it still wins over a still-draining `rx`, mirroring the
+/// shutdown idiom in `crates/service/src/orchestrator.rs`), then a **fair** inner
+/// select over `rx`/`refresh`/`flush` — so the refresh + prune + drop-log arm no
+/// longer starves under sustained load (the prior fully-`biased;` failure mode).
+/// `rx.recv()` is cancel-safe, so a shutdown that drops the in-flight inner
+/// branch loses no buffered frame.
+///
+/// Persistence is **batched + decoupled** (issues #311, #317): raw frames and
+/// trade prints buffer in-memory and are enqueued as one [`WriteCmd::FrameBatch`]
+/// to the [`writer_loop`] task every `flush_interval_ms` OR `flush_max_frames`,
+/// whichever first, plus once after the loop exits — so `drive` itself never
+/// touches SQLite on the hot path. The persistence invariant is "every received
+/// frame is persisted by the time [`run`] finishes draining the writer" (was "by
+/// loop exit"). A writer `DbError` is fail-fast: it closes the write channel,
+/// `drive` breaks, and `run` surfaces the true error from the writer handle.
 #[allow(clippy::too_many_arguments)] // single orchestration loop; each arg is a distinct live dependency.
 async fn drive<F: PageFetcher + Send + Sync>(
     db: &ShadowDb,
@@ -210,25 +327,54 @@ async fn drive<F: PageFetcher + Send + Sync>(
     config: &ShadowConfig,
     clob_sub: &clob_ws::ClobSubscribeHandle,
     drops: &DropCounters,
+    write_tx: &mpsc::Sender<WriteCmd>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<DriveStats, Error> {
     let mut stats = DriveStats::default();
     let mut tick_buf: Vec<(FeedSource, i64, String)> = Vec::with_capacity(config.flush_max_frames);
     let mut trade_buf: Vec<(ClobTrade, i64, Option<&'static str>)> = Vec::new();
+    let mut last_clob_received_ms: Option<i64> = None;
     let mut flush_tick =
         tokio::time::interval(Duration::from_millis(config.flush_interval_ms.max(1)));
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     flush_tick.tick().await; // discard the immediate first tick
     tokio::pin!(shutdown);
     loop {
-        tokio::select! {
+        // Outer biased select: shutdown wins. Inner select (the async block) is
+        // fair, so refresh/flush no longer starve under load (issue #317).
+        // `rx.recv()`/`Interval::tick()` are cancel-safe, so dropping the inner
+        // branch when shutdown fires loses no frame or tick.
+        let event = tokio::select! {
             biased;
             _ = &mut shutdown => {
                 info!("shadow: shutdown signalled, stopping drive loop");
                 break;
             }
-            maybe = rx.recv() => {
-                let Some(frame) = maybe else { break };
+            ev = async {
+                tokio::select! {
+                    maybe = rx.recv() => match maybe {
+                        Some(frame) => DriveEvent::Frame(frame),
+                        None => DriveEvent::RxClosed,
+                    },
+                    _ = refresh.tick() => DriveEvent::Refresh,
+                    _ = flush_tick.tick() => DriveEvent::Flush,
+                }
+            } => ev,
+        };
+        match event {
+            DriveEvent::RxClosed => break,
+            DriveEvent::Frame(frame) => {
+                // Max CLOB inter-frame gap (issue #317): the tail (now − last) is
+                // folded at loop exit so a feed that dies near run-end shows too.
+                if frame.source == FeedSource::Clob {
+                    if let Some(prev) = last_clob_received_ms {
+                        let gap = frame.received_ms - prev;
+                        if gap > stats.max_clob_gap_ms {
+                            stats.max_clob_gap_ms = gap;
+                        }
+                    }
+                    last_clob_received_ms = Some(frame.received_ms);
+                }
                 match frame.source {
                     // Chainlink is the deferred settlement reader: decode to
                     // exercise the corrected decoder + tally, but emit no
@@ -276,17 +422,23 @@ async fn drive<F: PageFetcher + Send + Sync>(
                         }
                     }
                     // Exchange trigger feeds drive the consensus median + move
-                    // detector; a fired move emits observations. Observations
-                    // stay synchronous (rare; their own transaction) — after a
-                    // crash they may precede their causal raw frames by up to
-                    // one flush window, so an offline recompute over a crashed
-                    // tail is a lower bound on live observations.
+                    // detector; a fired move emits observations. They ride the
+                    // same FIFO `WriteCmd` channel (issue #317), enqueued before
+                    // the causal raw frame's `FrameBatch`, so the "may precede
+                    // their causal raw frames by up to one flush window" ordering
+                    // is preserved — an offline recompute over a crashed tail is a
+                    // lower bound on live observations. The non-empty guard mirrors
+                    // `insert_observations`' empty early-return.
                     FeedSource::Bybit | FeedSource::Okx | FeedSource::Coinbase => {
                         if let Some(venue) = frame.source.exchange_venue() {
                             match exchange_ws::parse_trade_frame(venue, &frame.raw) {
                                 Ok(Some(tick)) => {
                                     let obs = state.on_exchange_tick(&tick, frame.received_ms);
-                                    db.insert_observations(&obs)?;
+                                    if !obs.is_empty()
+                                        && write_tx.send(WriteCmd::Observations(obs)).await.is_err()
+                                    {
+                                        break; // writer exited; `run` surfaces it
+                                    }
                                 }
                                 Ok(None) => {} // non-trade frame (ack/heartbeat)
                                 Err(_) => stats.decode_errors_exchange += 1,
@@ -297,17 +449,18 @@ async fn drive<F: PageFetcher + Send + Sync>(
                 // Every received frame produces a raw tick (trades are a
                 // subset), so the size trigger keys off `tick_buf` alone.
                 tick_buf.push((frame.source, frame.received_ms, frame.raw));
-                if tick_buf.len() >= config.flush_max_frames {
-                    flush_frames(db, &mut tick_buf, &mut trade_buf, &mut stats)?;
+                if tick_buf.len() >= config.flush_max_frames
+                    && !send_batch(write_tx, &mut tick_buf, &mut trade_buf).await
+                {
+                    break; // writer exited; `run` surfaces the true error
                 }
             }
-            _ = refresh.tick() => {
+            DriveEvent::Refresh => {
                 // Best-effort market refresh + the bounded periodic summaries
-                // (tied to the refresh cadence, not the frame rate). With the
-                // biased select this arm is polled only when `rx` is momentarily
-                // empty: if the producers permanently outpace the consumer,
-                // pruning stops exactly when it is most needed — the tell is a
-                // non-zero drop tally below, which invalidates the run.
+                // (tied to the refresh cadence, not the frame rate). The inner
+                // select is fair (issue #317), so this arm gets a turn even under
+                // sustained inbound load — the prior fully-`biased;` loop starved
+                // it exactly when pruning mattered most.
                 log_decode_errors(&stats, "cumulative");
                 log_dropped_frames(drops, "cumulative");
                 let now_ms = now_unix_ms();
@@ -365,7 +518,10 @@ async fn drive<F: PageFetcher + Send + Sync>(
                                 }
                                 info!(count, "shadow: subscribed new CLOB tokens");
                             } else {
-                                warn!(count, "shadow: new CLOB subscribe dropped; retrying next refresh");
+                                warn!(
+                                    count,
+                                    "shadow: new CLOB subscribe dropped; retrying next refresh"
+                                );
                             }
                         }
                         // Prune expired markets (issue #311), delivery-gated the
@@ -391,37 +547,49 @@ async fn drive<F: PageFetcher + Send + Sync>(
                     Err(e) => warn!(error = %e, "shadow: market refresh error"),
                 }
             }
-            _ = flush_tick.tick() => {
-                flush_frames(db, &mut tick_buf, &mut trade_buf, &mut stats)?;
+            DriveEvent::Flush => {
+                if !send_batch(write_tx, &mut tick_buf, &mut trade_buf).await {
+                    break; // writer exited; `run` surfaces the true error
+                }
             }
         }
     }
-    // Post-loop flush: covers both the shutdown and the rx-closed exits, so
-    // every received frame is persisted by the time `drive` returns.
-    flush_frames(db, &mut tick_buf, &mut trade_buf, &mut stats)?;
+    // Post-loop flush: covers both the shutdown and the rx-closed exits, enqueuing
+    // any buffered frames. Best-effort — if the writer already exited on a
+    // `DbError`, the send fails and `run` surfaces the true error from the handle.
+    let _ = send_batch(write_tx, &mut tick_buf, &mut trade_buf).await;
+    // Tail-fold the final CLOB gap (issue #317): now − last seen.
+    if let Some(prev) = last_clob_received_ms {
+        let tail = now_unix_ms() - prev;
+        if tail > stats.max_clob_gap_ms {
+            stats.max_clob_gap_ms = tail;
+        }
+    }
     log_decode_errors(&stats, "final");
     log_dropped_frames(drops, "final");
     Ok(stats)
 }
 
-/// Flush the frame buffers in one transaction (no-op when both are empty).
-/// Fail-fast on a DB error — a tape with silent holes is worse than a stopped
-/// run (this tightens trade persistence from warn-and-continue to fail-fast,
-/// per the issue #311 locked decision).
-fn flush_frames(
-    db: &ShadowDb,
+/// Enqueue the buffered frames to the decoupled writer as one
+/// [`WriteCmd::FrameBatch`] (no-op when both buffers are empty). Returns `false`
+/// if the writer channel is closed — during a live run that means the writer task
+/// exited (a `DbError` that `run` recovers from the writer handle); the caller
+/// breaks the drive loop. The commit count is owned by the writer
+/// ([`WriterStats::flushes`]), not incremented here. `mem::take` moves the buffer
+/// contents to the writer thread (no copy); the next window re-grows the buffer.
+async fn send_batch(
+    write_tx: &mpsc::Sender<WriteCmd>,
     tick_buf: &mut Vec<(FeedSource, i64, String)>,
     trade_buf: &mut Vec<(ClobTrade, i64, Option<&'static str>)>,
-    stats: &mut DriveStats,
-) -> Result<(), Error> {
+) -> bool {
     if tick_buf.is_empty() && trade_buf.is_empty() {
-        return Ok(());
+        return true;
     }
-    db.insert_frame_batch(tick_buf, trade_buf)?;
-    tick_buf.clear();
-    trade_buf.clear();
-    stats.flushes += 1;
-    Ok(())
+    let cmd = WriteCmd::FrameBatch {
+        ticks: std::mem::take(tick_buf),
+        trades: std::mem::take(trade_buf),
+    };
+    write_tx.send(cmd).await.is_ok()
 }
 
 /// Emit a bounded frames-dropped summary (one line per call, only when
@@ -607,13 +775,62 @@ mod tests {
         }
     }
 
+    fn clob_frame_at(received_ms: i64) -> FeedFrame {
+        FeedFrame {
+            source: FeedSource::Clob,
+            received_ms,
+            raw: "{not json".to_string(),
+        }
+    }
+
+    /// Spawn the real `writer_loop` on a fresh write channel (issue #317). Used by
+    /// the **non-paused** persistence tests, where a live `spawn_blocking` writer
+    /// is safe to run concurrently with `drive`.
+    fn spawn_test_writer(
+        db: Arc<ShadowDb>,
+    ) -> (
+        mpsc::Sender<WriteCmd>,
+        tokio::task::JoinHandle<Result<WriterStats, Error>>,
+    ) {
+        let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
+        (write_tx, spawn_writer_with(db, write_rx))
+    }
+
+    /// Spawn the real `writer_loop` on a caller-provided `write_rx` — for the
+    /// spawn-writer-**after**-drive shape (paused-clock tests, where a live
+    /// blocking task during `drive` would inhibit the clock's auto-advance).
+    fn spawn_writer_with(
+        db: Arc<ShadowDb>,
+        write_rx: mpsc::Receiver<WriteCmd>,
+    ) -> tokio::task::JoinHandle<Result<WriterStats, Error>> {
+        tokio::task::spawn_blocking(move || writer_loop(db, write_rx))
+    }
+
+    /// A regular async sink (`tokio::spawn`, NOT `spawn_blocking`, so it does not
+    /// inhibit the paused-clock auto-advance — issue #317) that counts the
+    /// `FrameBatch`es it receives into a shared counter.
+    fn spawn_counting_sink(
+        mut write_rx: mpsc::Receiver<WriteCmd>,
+    ) -> (tokio::task::JoinHandle<()>, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        let handle = tokio::spawn(async move {
+            while let Some(cmd) = write_rx.recv().await {
+                if matches!(cmd, WriteCmd::FrameBatch { .. }) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        (handle, count)
+    }
+
     // AC1.4(a): under a flood of undecodable frames, `drive` returns the exact
     // per-source error count, persists every raw frame, and emits no per-frame
     // log line (summary only).
     #[tokio::test]
     async fn drive_counts_decode_errors_without_per_frame_logs() {
         let dir = tempfile::tempdir().unwrap();
-        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let db = Arc::new(ShadowDb::open(&dir.path().join("s.db")).unwrap());
         let mut state = JoinState::new(Vec::new(), ShadowConfig::default().consensus_params());
         let gamma = test_gamma();
         let cfg = ShadowConfig::default();
@@ -631,7 +848,10 @@ mod tests {
             // tx dropped here → rx closes once drained, ending the loop.
         });
 
-        // A `pending` shutdown never fires, so the rx arm runs to completion.
+        // Live writer join-first shape (issue #317): non-paused, so a concurrent
+        // `spawn_blocking` writer is safe. A `pending` shutdown never fires, so
+        // the rx arm runs to completion.
+        let (write_tx, writer) = spawn_test_writer(Arc::clone(&db));
         let stats = drive(
             &db,
             &mut rx,
@@ -641,19 +861,23 @@ mod tests {
             &cfg,
             &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
             &DropCounters::default(),
+            &write_tx,
             std::future::pending::<()>(),
         )
         .await
         .unwrap();
+        drop(write_tx);
+        let writer_stats = writer.await.unwrap().unwrap();
 
         assert_eq!(stats.decode_errors_clob, injected);
         assert_eq!(stats.decode_errors_chainlink, 0);
-        // Every frame is persisted by loop exit (batched flush, issue #311) —
+        // Every frame is persisted by the writer (batched, issues #311/#317) —
         // including frames whose decode failed: the recovery path.
         assert_eq!(
             db.raw_tick_count().unwrap(),
             i64::try_from(injected).unwrap()
         );
+        assert_eq!(writer_stats.frames_written, injected);
         println!(
             "PASS: drive_counts_decode_errors_without_per_frame_logs clob={}",
             stats.decode_errors_clob
@@ -677,6 +901,10 @@ mod tests {
         }
         let _keep_open = tx; // keep the sender alive: rx stays "still-draining"
 
+        // Counting sink (issue #317): the stronger no-drain check is that the
+        // writer channel received ZERO `WriteCmd`s, not just that `flushes == 0`.
+        let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
+        let (sink, sink_count) = spawn_counting_sink(write_rx);
         let stats = drive(
             &db,
             &mut rx,
@@ -686,15 +914,22 @@ mod tests {
             &cfg,
             &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
             &DropCounters::default(),
+            &write_tx,
             std::future::ready(()),
         )
         .await
         .unwrap();
+        drop(write_tx);
+        sink.await.unwrap();
 
-        // Shutdown was polled first and won before any frame was drained: the
-        // buffer is empty, so the post-loop flush is a no-op.
+        // Shutdown was polled first and won before any frame was drained: no
+        // `WriteCmd` was ever enqueued, and nothing was persisted.
+        assert_eq!(
+            sink_count.load(Ordering::Relaxed),
+            0,
+            "no WriteCmd enqueued"
+        );
         assert_eq!(stats.decode_errors_clob, 0);
-        assert_eq!(stats.flushes, 0);
         assert_eq!(db.raw_tick_count().unwrap(), 0);
         println!("PASS: drive_shutdown_wins_over_draining_rx");
     }
@@ -704,7 +939,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drive_flushes_on_shutdown_with_buffered_frames() {
         let dir = tempfile::tempdir().unwrap();
-        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let db = Arc::new(ShadowDb::open(&dir.path().join("s.db")).unwrap());
         let mut state = JoinState::new(Vec::new(), ShadowConfig::default().consensus_params());
         let gamma = test_gamma();
         let cfg = ShadowConfig::default();
@@ -717,10 +952,15 @@ mod tests {
         }
         let _keep_open = tx; // rx never closes; 8 < 256 so no size trigger
 
-        // Shutdown at 10ms: the frames are drained into the buffer first (the
-        // shutdown timer is pending at t=0), and the 250ms interval flush never
-        // arrives — only the post-loop flush can persist them.
-        let stats = drive(
+        // Spawn-writer-AFTER-drive (issue #317): no `spawn_blocking` task is alive
+        // during `drive`, so the paused clock's 10ms shutdown sleep auto-advances
+        // normally (a live blocking task would inhibit it → deadlock). The frames
+        // are drained into the buffer first (shutdown timer pending at t=0) and
+        // the 250ms interval flush never arrives, so only the post-loop flush
+        // enqueues them — into the cap-64 channel, where the single batch fits
+        // without blocking. The writer then persists it.
+        let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
+        drive(
             &db,
             &mut rx,
             &mut state,
@@ -729,21 +969,29 @@ mod tests {
             &cfg,
             &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
             &DropCounters::default(),
+            &write_tx,
             async {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             },
         )
         .await
         .unwrap();
+        drop(write_tx);
+        let writer_stats = spawn_writer_with(Arc::clone(&db), write_rx)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(db.raw_tick_count().unwrap(), 8);
-        assert_eq!(stats.flushes, 1, "exactly the post-loop flush");
+        assert_eq!(writer_stats.flushes, 1, "exactly the post-loop flush");
         println!("PASS: drive_flushes_on_shutdown_with_buffered_frames");
     }
 
-    // Issue #311: the interval flush persists buffered frames MID-RUN (no size
-    // trigger, shutdown far away) — the crash-loss ≤ one-flush-window bound
-    // depends on this, so the rows must be visible BEFORE shutdown fires.
+    // Issue #311/#317: the interval flush enqueues buffered frames MID-RUN (no
+    // size trigger, shutdown far away). After the writer split the persistence is
+    // the writer's job, so this asserts the interval flush *fired* (one
+    // `FrameBatch` reached the channel) before any size trigger, via a counting
+    // sink — a regular async task that does not inhibit the paused clock.
     #[tokio::test(start_paused = true)]
     async fn drive_flushes_on_interval_without_size_trigger() {
         let dir = tempfile::tempdir().unwrap();
@@ -762,6 +1010,8 @@ mod tests {
 
         let handle = clob_ws::ClobSubscribeHandle::disconnected_for_test();
         let drops = DropCounters::default();
+        let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
+        let (sink, sink_count) = spawn_counting_sink(write_rx);
         let drive_fut = drive(
             &db,
             &mut rx,
@@ -771,6 +1021,7 @@ mod tests {
             &cfg,
             &handle,
             &drops,
+            &write_tx,
             async {
                 tokio::time::sleep(Duration::from_millis(600)).await;
             },
@@ -778,29 +1029,35 @@ mod tests {
         let probe = async {
             // After the 250ms interval flush, well before the 600ms shutdown.
             tokio::time::sleep(Duration::from_millis(400)).await;
-            db.raw_tick_count().unwrap()
+            sink_count.load(Ordering::Relaxed)
         };
-        let (stats, mid_run_count) = tokio::join!(drive_fut, probe);
-        let stats = stats.unwrap();
+        let (stats, mid_run_flushes) = tokio::join!(drive_fut, probe);
+        stats.unwrap();
+        drop(write_tx);
+        sink.await.unwrap();
 
-        assert_eq!(mid_run_count, 5, "interval flush visible before shutdown");
-        assert_eq!(db.raw_tick_count().unwrap(), 5);
         assert_eq!(
-            stats.flushes, 1,
-            "one interval flush; the post-loop flush of an empty buffer is a no-op"
+            mid_run_flushes, 1,
+            "interval flush fired before shutdown (and before any size trigger)"
+        );
+        assert_eq!(
+            sink_count.load(Ordering::Relaxed),
+            1,
+            "exactly one FrameBatch; the post-loop flush of an empty buffer is a no-op"
         );
         println!("PASS: drive_flushes_on_interval_without_size_trigger");
     }
 
-    // Issue #311 AC: a 100k-frame flood through `drive` with production-shaped
-    // settings persists EVERY frame. The producer uses awaited `send`
-    // (deterministic backpressure, never drops); the flush-count assertion
-    // proves the size-trigger path ran — a broken trigger masked by the
-    // post-loop flush would show ~1 flush.
+    // Issue #311/#317 AC: a 100k-frame flood through `drive` → write channel →
+    // real `spawn_blocking` writer persists EVERY frame. The producer uses
+    // awaited `send` (deterministic backpressure, never drops); `drive` likewise
+    // backpressures on the write channel. The writer's flush-count assertion
+    // proves the size-trigger path ran — a broken trigger masked by the post-loop
+    // flush would show ~1 flush.
     #[tokio::test]
     async fn scenario_saturation_no_drops() {
         let dir = tempfile::tempdir().unwrap();
-        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let db = Arc::new(ShadowDb::open(&dir.path().join("s.db")).unwrap());
         let mut state = JoinState::new(Vec::new(), ShadowConfig::default().consensus_params());
         let gamma = test_gamma();
         let cfg = ShadowConfig::default(); // channel 8192, flush 250ms / 256
@@ -818,6 +1075,66 @@ mod tests {
             // tx dropped here → rx closes once drained, ending the loop.
         });
 
+        let (write_tx, writer) = spawn_test_writer(Arc::clone(&db));
+        drive(
+            &db,
+            &mut rx,
+            &mut state,
+            &gamma,
+            &mut refresh,
+            &cfg,
+            &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
+            &DropCounters::default(),
+            &write_tx,
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+        drop(write_tx);
+        let writer_stats = writer.await.unwrap().unwrap();
+
+        assert_eq!(
+            db.raw_tick_count().unwrap(),
+            i64::try_from(injected).unwrap()
+        );
+        assert_eq!(writer_stats.frames_written, injected);
+        // The buffer never exceeds `flush_max_frames`, so a full persist takes
+        // at least ⌈100_000 / 256⌉ flushes.
+        let min_flushes = injected.div_ceil(u64::try_from(cfg.flush_max_frames).unwrap());
+        assert!(
+            writer_stats.flushes >= min_flushes,
+            "flushes {} < required minimum {min_flushes}: size trigger did not run",
+            writer_stats.flushes
+        );
+        println!(
+            "PASS: scenario_saturation_no_drops frames={injected} flushes={}",
+            writer_stats.flushes
+        );
+    }
+
+    // Issue #317: `drive` tracks the largest gap between consecutive CLOB frames
+    // (stamped to `meta` as `max_clob_gap_secs`, a tape-validity PASS gate). The
+    // receive times are in the recent past (`base = now − 5000`), so the
+    // loop-exit tail fold (`now − last`, a few ms) stays well under the 4000ms
+    // inter-frame max — making the captured max exactly the inter-frame gap.
+    #[tokio::test(start_paused = true)]
+    async fn drive_tracks_max_clob_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ShadowDb::open(&dir.path().join("s.db")).unwrap();
+        let mut state = JoinState::new(Vec::new(), ShadowConfig::default().consensus_params());
+        let gamma = test_gamma();
+        let cfg = ShadowConfig::default();
+        let mut refresh = tokio::time::interval(Duration::from_secs(3_600));
+        refresh.tick().await;
+
+        let base = now_unix_ms() - 5_000;
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(clob_frame_at(base)).unwrap(); // first CLOB frame: no gap yet
+        tx.try_send(clob_frame_at(base + 1_000)).unwrap(); // gap 1000 ms
+        tx.try_send(clob_frame_at(base + 5_000)).unwrap(); // gap 4000 ms (the max)
+        let _keep_open = tx;
+
+        let (write_tx, _write_rx) = mpsc::channel::<WriteCmd>(64);
         let stats = drive(
             &db,
             &mut rx,
@@ -827,26 +1144,21 @@ mod tests {
             &cfg,
             &clob_ws::ClobSubscribeHandle::disconnected_for_test(),
             &DropCounters::default(),
-            std::future::pending::<()>(),
+            &write_tx,
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            },
         )
         .await
         .unwrap();
 
         assert_eq!(
-            db.raw_tick_count().unwrap(),
-            i64::try_from(injected).unwrap()
-        );
-        // The buffer never exceeds `flush_max_frames`, so a full persist takes
-        // at least ⌈100_000 / 256⌉ flushes.
-        let min_flushes = injected.div_ceil(u64::try_from(cfg.flush_max_frames).unwrap());
-        assert!(
-            stats.flushes >= min_flushes,
-            "flushes {} < required minimum {min_flushes}: size trigger did not run",
-            stats.flushes
+            stats.max_clob_gap_ms, 4_000,
+            "largest inter-frame CLOB gap captured"
         );
         println!(
-            "PASS: scenario_saturation_no_drops frames={injected} flushes={}",
-            stats.flushes
+            "PASS: drive_tracks_max_clob_gap gap_ms={}",
+            stats.max_clob_gap_ms
         );
     }
 
@@ -885,6 +1197,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<FeedFrame>(4);
         let _keep_open = tx;
         let drops = DropCounters::default();
+        // The write channel is unused here (no frames injected), but `drive`
+        // requires it (issue #317); a held receiver keeps it open.
+        let (write_tx, _write_rx) = mpsc::channel::<WriteCmd>(64);
         let drive_fut = drive(
             &db,
             &mut rx,
@@ -894,6 +1209,7 @@ mod tests {
             &cfg,
             &handle,
             &drops,
+            &write_tx,
             async {
                 tokio::time::sleep(Duration::from_millis(125)).await;
             },
@@ -953,6 +1269,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<FeedFrame>(4);
         let _keep_open = tx;
         let drops = DropCounters::default();
+        // The write channel is unused here (no frames injected), but `drive`
+        // requires it (issue #317); a held receiver keeps it open.
+        let (write_tx, _write_rx) = mpsc::channel::<WriteCmd>(64);
         let drive_fut = drive(
             &db,
             &mut rx,
@@ -962,6 +1281,7 @@ mod tests {
             &cfg,
             &handle,
             &drops,
+            &write_tx,
             async {
                 tokio::time::sleep(Duration::from_millis(125)).await;
             },

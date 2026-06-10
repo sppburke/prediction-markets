@@ -44,9 +44,12 @@
 > No Polymarket WebSocket supports per-wallet trade subscriptions. The REST `/activity` poll remains the primary ingestion path (issue #282 Open risk #1 materialized). Phase 2 RTDS ingestion is deferred.
 >
 > **Correction (2026-06-09, issue #300 live capture).** A live `last_trade_price` market-channel frame **does** carry `transaction_hash` — verified against 2,581 captured frames (100% present, one unique hash per print, zero collisions). The earlier note that it omits `transaction_hash` is superseded; only the wallet address is absent, so wallet-level identity still requires an on-chain tx lookup, but the print is uniquely keyable. Full frame shape: `{market, asset_id, price, size, side, timestamp, fee_rate_bps, event_type, transaction_hash}` — `market` is the condition_id (authoritative, present on every print). `pe-crypto-shadow` keys `clob_trades` on `transaction_hash` and attributes via `market`.
+>
+> **Heartbeat contract (2026-06-10, issue #317, `wss-overview`).** The CLOB market **and** user channels require an **application-level** heartbeat: the client sends the text message `PING` every ~10s and the server replies the text `PONG`; the troubleshooting section attributes "connection drops after about 10 seconds" to a missing heartbeat. This is **not** a WS protocol Ping frame — it is a literal text payload. `pe-crypto-shadow` sends `Message::Text("PING")` every `crypto_shadow_clob_ping_interval_secs` (10) and filters the `PONG` reply (case-insensitive — sports channel lowercases it) out of the frame stream. The same page documents dynamic-subscription ops `{"operation":"subscribe"|"unsubscribe"}`; the harness intentionally does not use `unsubscribe` (prune applies at the next reconnect — a filed follow-up). The heartbeat lives only on this overview page, which is why it was missed until #317 (the `market-channel` page, checked 2026-06-09, has no heartbeat section).
 
 | Link | Last checked | Re-verify by |
 |---|---|---|
+| https://docs.polymarket.com/developers/CLOB/websocket/wss-overview | 2026-06-10 | 2026-08-09 |
 | https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/llms.txt | — | — |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |

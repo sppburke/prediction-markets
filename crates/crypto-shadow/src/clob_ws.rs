@@ -255,10 +255,12 @@ pub enum SubCmd {
     /// Subscribe these tokens: incremental subscribe when the stream is live,
     /// and part of the full-set subscribe on every later (re)connect.
     Add(Vec<String>),
-    /// Remove these tokens from the set. The market channel has no protocol
-    /// unsubscribe (verified 2026-06-09), so a live `Prune` mutates the stored
-    /// set only — book frames keep flowing until the next (re)connect applies
-    /// the smaller set.
+    /// Remove these tokens from the set. The venue documents an
+    /// `{"operation":"unsubscribe"}` op (wss-overview, fetched 2026-06-10), but
+    /// the harness intentionally does not use it (issue #317 — adopting it is a
+    /// filed follow-up simplification): a live `Prune` mutates the stored set
+    /// only, and book frames keep flowing until the next (re)connect applies the
+    /// smaller set.
     Prune(Vec<String>),
     /// Reconnect now so a pruned set takes effect without waiting for a natural
     /// drop. Honored only when no reconnect happened within
@@ -394,6 +396,8 @@ pub fn spawn(
     initial_token_ids: Vec<String>,
     tx: mpsc::Sender<FeedFrame>,
     force_reconnect_after: Duration,
+    clob_ping_interval: Duration,
+    clob_read_idle_limit: Duration,
     frames_dropped: Arc<AtomicU64>,
 ) -> (JoinHandle<()>, ClobSubscribeHandle) {
     let (sub_tx, sub_rx) = mpsc::channel(CLOB_SUBSCRIBE_CHANNEL_CAPACITY);
@@ -404,6 +408,8 @@ pub fn spawn(
         tx,
         sub_rx,
         force_reconnect_after,
+        clob_ping_interval,
+        clob_read_idle_limit,
         frames_dropped,
     ));
     (join, handle)
@@ -420,13 +426,20 @@ enum ClobStreamOutcome {
 
 /// CLOB-specific reconnect loop. Owns the current `(all_tokens, seen)` set so
 /// every reconnect subscribes exactly it. `ws::ws_reconnect_loop` is left
-/// unchanged (still used by the static Chainlink subscription).
+/// unchanged: it backs the static Chainlink subscription **and** all three
+/// exchange feeds (`exchange_ws.rs:31,142`; `chainlink_ws.rs:29,90`). The
+/// app-level heartbeat (issue #317) is added here on the CLOB socket only — the
+/// observed reconnect churn was CLOB-specific; the lower-volume `ws.rs` feeds
+/// rely on tungstenite's protocol-level auto-pong, which is sufficient for them.
+#[allow(clippy::too_many_arguments)] // one reconnect loop; each arg is distinct task state.
 async fn clob_task(
     ws_url: String,
     initial_token_ids: Vec<String>,
     tx: mpsc::Sender<FeedFrame>,
     mut sub_rx: mpsc::Receiver<SubCmd>,
     force_reconnect_after: Duration,
+    clob_ping_interval: Duration,
+    clob_read_idle_limit: Duration,
     frames_dropped: Arc<AtomicU64>,
 ) {
     let mut seen: HashSet<String> = initial_token_ids.iter().cloned().collect();
@@ -461,6 +474,8 @@ async fn clob_task(
             &mut sub_rx,
             &mut last_reconnect_at,
             force_reconnect_after,
+            clob_ping_interval,
+            clob_read_idle_limit,
             &frames_dropped,
         )
         .await
@@ -491,6 +506,8 @@ async fn clob_connect_and_stream(
     sub_rx: &mut mpsc::Receiver<SubCmd>,
     last_reconnect_at: &mut tokio::time::Instant,
     force_reconnect_after: Duration,
+    clob_ping_interval: Duration,
+    clob_read_idle_limit: Duration,
     frames_dropped: &AtomicU64,
 ) -> ClobStreamOutcome {
     let (ws, _resp) = match tokio_tungstenite::connect_async(url).await {
@@ -507,32 +524,85 @@ async fn clob_connect_and_stream(
     }
     *last_reconnect_at = tokio::time::Instant::now();
 
+    // CLOB keepalive (issue #317). Two independent mechanisms on this socket:
+    // - `heartbeat`: the venue's documented application-level heartbeat — send
+    //   the text `PING` every `clob_ping_interval` (default 10s); the server
+    //   replies the text `PONG`. Missing heartbeats are the documented cause of
+    //   connection drops. It is NOT a half-open detector (a send into a
+    //   vanished-but-not-RST socket succeeds for ~minutes of TCP retransmit).
+    // - `last_msg_at` + a `sleep_until` deadline: the actual half-open detector.
+    //   Any inbound frame (including the server's `PONG`) resets `last_msg_at`,
+    //   so a healthy connection — inbound traffic at least every ~10s under the
+    //   heartbeat — never trips it; a silent peer trips it in
+    //   `clob_read_idle_limit` (default 120s) → reconnect, bounding
+    //   `max_clob_gap_secs` under the 300s tape-validity gate.
+    let mut heartbeat = tokio::time::interval(clob_ping_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // discard the immediate first tick
+    let mut last_msg_at = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
             maybe_msg = read.next() => {
                 match maybe_msg {
-                    Some(Ok(Message::Text(t))) => {
-                        let frame = FeedFrame {
-                            source: FeedSource::Clob,
-                            received_ms: now_unix_ms(),
-                            raw: t.to_string(),
-                        };
-                        match tx.try_send(frame) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Counted, not logged per-frame: under saturation
-                                // a per-drop warn is its own flood. The runner
-                                // surfaces the tally periodically + in `meta`.
-                                frames_dropped.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                return ClobStreamOutcome::ConsumerClosed;
+                    Some(Ok(msg)) => {
+                        // Any inbound traffic proves the peer is alive: reset the
+                        // half-open deadline (`last_msg_at` is `Copy`, so the
+                        // `sleep_until` branch below reads a snapshot — no borrow
+                        // conflict with this write).
+                        last_msg_at = tokio::time::Instant::now();
+                        if let Message::Text(t) = msg {
+                            // Filter the heartbeat reply: a text frame that is
+                            // exactly `PONG` (case-insensitive — market/user docs
+                            // use uppercase, the sports channel lowercase) is the
+                            // reply to our `PING`, never a real book/trade frame
+                            // (those are JSON). Forwarding it would cost one
+                            // `decode_errors_clob` + one junk `raw_ticks` row per
+                            // heartbeat (~1,440 per 4h tape) that the #310 replay
+                            // would re-count.
+                            if !t.as_str().eq_ignore_ascii_case("pong") {
+                                let frame = FeedFrame {
+                                    source: FeedSource::Clob,
+                                    received_ms: now_unix_ms(),
+                                    raw: t.to_string(),
+                                };
+                                match tx.try_send(frame) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        // Counted, not logged per-frame: under
+                                        // saturation a per-drop warn is its own
+                                        // flood. The runner surfaces the tally
+                                        // periodically + in `meta`.
+                                        frames_dropped.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        return ClobStreamOutcome::ConsumerClosed;
+                                    }
+                                }
                             }
                         }
+                        // Non-text frames (protocol ping/pong/binary/close) carry
+                        // no book data and are ignored; tungstenite auto-pongs
+                        // protocol-level server pings on this read path.
                     }
-                    Some(Ok(_)) => {} // ping/pong/binary/close: ignore
                     Some(Err(e)) => return ClobStreamOutcome::StreamEnded(e.to_string()),
                     None => return ClobStreamOutcome::StreamEnded("stream end".to_string()),
+                }
+            }
+            _ = tokio::time::sleep_until(last_msg_at + clob_read_idle_limit) => {
+                // No inbound frame for `clob_read_idle_limit`: treat the socket as
+                // half-open and reconnect (resets backoff, re-subscribes the set).
+                return ClobStreamOutcome::StreamEnded("read idle".to_string());
+            }
+            _ = heartbeat.tick() => {
+                // App-level heartbeat. `write` is exclusively borrowed in this arm
+                // body (the sub_rx arm's `write.send` cannot run concurrently), so
+                // there is no double-borrow.
+                if let Err(e) = write
+                    .send(Message::Text(Utf8Bytes::from_static("PING")))
+                    .await
+                {
+                    return ClobStreamOutcome::StreamEnded(format!("heartbeat send: {e}"));
                 }
             }
             maybe_cmd = sub_rx.recv() => {
@@ -550,8 +620,9 @@ async fn clob_connect_and_stream(
                                 "forced reconnect to apply pruned set".to_string(),
                             );
                         }
-                        // A live Prune mutated the stored set only (no protocol
-                        // unsubscribe exists); a live Add gets an immediate
+                        // A live Prune mutated the stored set only (the documented
+                        // `unsubscribe` op is intentionally not used — see
+                        // `SubCmd::Prune`); a live Add gets an immediate
                         // incremental subscribe for its truly-new tokens.
                         if !outcome.newly_added.is_empty() {
                             let inc_msg = subscribe_message(&outcome.newly_added);
