@@ -257,3 +257,21 @@ automatically on restart.
 See doc 25's "Artifact naming convention". Retire superseded artifacts to
 `data/archive/`; never delete eval JSONs (they are the audit trail for why a cohort
 was deployed).
+
+---
+
+## Adding new wallets — winner-discovery pipeline
+
+The runbook above operates on the **current pile** (no new wallet ingest).  To
+discover new candidate wallets from the Polymarket leaderboard, use the
+winner-discovery pipeline documented in
+`docs/27-WINNER-DISCOVERY-RUNBOOK.md`.  That pipeline:
+
+1. Fetches 4 leaderboard slices via `pe-bootstrap winner-discovery`.
+2. Backfills trade history for newly-activated wallets.
+3. Runs the full extract → composite → export-watchlist chain.
+4. Emits `data/winner_discovery_candidates.json` for manual review.
+
+The production watchlist is **not** auto-updated — a human reviews the
+candidates JSON and runs `portfolio_constructor` on the merged set before any
+VPS deploy.

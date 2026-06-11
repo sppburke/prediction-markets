@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use pe_core_types::{BasisPoints, WalletAddress};
-use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
+use pe_source_polymarket_public::{
+    FixtureFetcher, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint,
+};
 use pe_trader_index::{WatchlistFetchConfig, WatchlistFetcher, WatchlistTier};
 
 fn addr(hex: &str) -> WalletAddress {
@@ -19,7 +21,12 @@ fn addr(hex: &str) -> WalletAddress {
 
 fn make_fetcher(fixture_bytes: Vec<u8>) -> WatchlistFetcher<FixtureFetcher> {
     let base = "https://data-api.polymarket.com";
-    let url = PolymarketEndpoint::Leaderboard.url(base);
+    let url = PolymarketEndpoint::Leaderboard {
+        sort: LeaderboardSort::Profit,
+        window: LeaderboardWindow::AllTime,
+        limit: 5,
+    }
+    .url(base);
     let mut responses = HashMap::new();
     responses.insert(url, fixture_bytes);
     let ff = FixtureFetcher::new(responses);
@@ -87,7 +94,12 @@ async fn scenario_top5_leaderboard_produces_watchlist() {
 #[tokio::test]
 async fn scenario_watchlist_size_cap() {
     let fixture = include_bytes!("fixtures/leaderboard_top5.json").to_vec();
-    let url = PolymarketEndpoint::Leaderboard.url("https://data-api.polymarket.com");
+    let url = PolymarketEndpoint::Leaderboard {
+        sort: LeaderboardSort::Profit,
+        window: LeaderboardWindow::AllTime,
+        limit: 3,
+    }
+    .url("https://data-api.polymarket.com");
     let mut responses = HashMap::new();
     responses.insert(url, fixture);
     let ff = FixtureFetcher::new(responses);
@@ -122,7 +134,12 @@ async fn scenario_parse_error_on_bad_json() {
     use pe_trader_index::WatchlistFetchError;
 
     let bad_bytes = b"not valid json at all".to_vec();
-    let url = PolymarketEndpoint::Leaderboard.url("https://data-api.polymarket.com");
+    let url = PolymarketEndpoint::Leaderboard {
+        sort: LeaderboardSort::Profit,
+        window: LeaderboardWindow::AllTime,
+        limit: 20,
+    }
+    .url("https://data-api.polymarket.com");
     let mut responses = HashMap::new();
     responses.insert(url, bad_bytes);
     let ff = FixtureFetcher::new(responses);

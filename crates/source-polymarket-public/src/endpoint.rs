@@ -2,11 +2,34 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The four Polymarket public REST API endpoints polled by this source.
+/// Sort dimension for the `/v1/leaderboard` endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeaderboardSort {
+    Profit,
+    Volume,
+}
+
+/// Time window for the `/v1/leaderboard` endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LeaderboardWindow {
+    Monthly,
+    AllTime,
+}
+
+/// The Polymarket public REST API endpoints polled by this source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketEndpoint {
-    Leaderboard,
+    /// Leaderboard endpoint — top traders by `sort` within `window`.
+    ///
+    /// `limit`: entries per request (capped by the API; 500 is the practical max).
+    Leaderboard {
+        sort: LeaderboardSort,
+        window: LeaderboardWindow,
+        limit: u32,
+    },
     /// Cursor-based trade history for a single wallet via `/activity?type=TRADE`.
     ///
     /// `end` (inclusive): return trades with `timestamp <= end`. `None` = no upper bound.
@@ -38,7 +61,7 @@ impl PolymarketEndpoint {
     /// Returns a stable string key for use in config maps and metrics.
     pub fn key(&self) -> &'static str {
         match self {
-            Self::Leaderboard => "leaderboard",
+            Self::Leaderboard { .. } => "leaderboard",
             Self::UserTradeActivity { .. } => "user_trade_activity",
             Self::CurrentPositions { .. } => "current_positions",
             Self::ClosedPositions { .. } => "closed_positions",
@@ -48,7 +71,21 @@ impl PolymarketEndpoint {
     /// Build the request URL given a base URL (no trailing slash).
     pub fn url(&self, base: &str) -> String {
         match self {
-            Self::Leaderboard => format!("{base}/v1/leaderboard"),
+            Self::Leaderboard {
+                sort,
+                window,
+                limit,
+            } => {
+                let sort_str = match sort {
+                    LeaderboardSort::Profit => "profit",
+                    LeaderboardSort::Volume => "volume",
+                };
+                let window_str = match window {
+                    LeaderboardWindow::Monthly => "monthly",
+                    LeaderboardWindow::AllTime => "allTime",
+                };
+                format!("{base}/v1/leaderboard?sort={sort_str}&window={window_str}&limit={limit}")
+            }
             Self::UserTradeActivity { user, end, start } => {
                 let mut url = format!("{base}/activity?user={user}&type=TRADE&limit=500&offset=0");
                 if let Some(e) = end {
@@ -93,12 +130,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leaderboard_key_and_url() {
-        let ep = PolymarketEndpoint::Leaderboard;
+    fn leaderboard_profit_monthly() {
+        let ep = PolymarketEndpoint::Leaderboard {
+            sort: LeaderboardSort::Profit,
+            window: LeaderboardWindow::Monthly,
+            limit: 500,
+        };
         assert_eq!(ep.key(), "leaderboard");
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard"
+            "https://data-api.polymarket.com/v1/leaderboard?sort=profit&window=monthly&limit=500"
+        );
+    }
+
+    #[test]
+    fn leaderboard_volume_alltime() {
+        let ep = PolymarketEndpoint::Leaderboard {
+            sort: LeaderboardSort::Volume,
+            window: LeaderboardWindow::AllTime,
+            limit: 100,
+        };
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/v1/leaderboard?sort=volume&window=allTime&limit=100"
         );
     }
 

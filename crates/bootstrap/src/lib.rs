@@ -27,6 +27,7 @@ pub mod filter;
 pub mod funder;
 pub mod gamma;
 pub mod infra_probe;
+pub mod leaderboard_discovery;
 pub mod lock;
 pub mod migrate;
 pub mod operator_audit;
@@ -34,11 +35,14 @@ pub mod pile;
 pub mod polygon_ctf;
 pub mod polygon_ctf_delta;
 pub mod polymarket;
+pub mod radion;
 pub mod reconcile_volume;
 pub mod seed_historical;
+pub mod wallet_discovery;
 pub mod wallet_set;
 pub mod watchlist_phase;
 pub mod weekly;
+pub mod winner_discovery;
 
 pub use config::BootstrapConfig;
 // Re-exports for callers that previously imported these from the crate root.

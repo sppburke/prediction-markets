@@ -8,7 +8,9 @@
 //! modules remain pure and synchronous.
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
-use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
+use pe_source_polymarket_public::{
+    LeaderboardSort, LeaderboardWindow, PageFetcher, PolymarketEndpoint,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -84,7 +86,12 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
     /// Returns [`WatchlistFetchError::Network`] on transport failures,
     /// [`WatchlistFetchError::Parse`] on malformed JSON or invalid addresses.
     pub async fn fetch_watchlist(&mut self) -> Result<Watchlist, WatchlistFetchError> {
-        let url = PolymarketEndpoint::Leaderboard.url(&self.config.base_url);
+        let url = PolymarketEndpoint::Leaderboard {
+            sort: LeaderboardSort::Profit,
+            window: LeaderboardWindow::AllTime,
+            limit: self.config.watchlist_size as u32,
+        }
+        .url(&self.config.base_url);
         let bytes =
             self.fetcher
                 .fetch_page(&url)
