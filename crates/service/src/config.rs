@@ -35,36 +35,6 @@ pub struct ServiceConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
 
-    // ── Polygon on-chain source ──────────────────────────────────────────────
-    /// Alchemy HTTPS endpoint. Required for `funder_source = "eth_logs"`.
-    /// Set via `PE_POLYGON_HTTP_URL`; never committed.
-    #[serde(default)]
-    pub polygon_http_url: String,
-
-    /// Alchemy WSS endpoint. Required for `funder_source = "eth_logs"`.
-    /// Set via `PE_POLYGON_WS_URL`; never committed.
-    #[serde(default)]
-    pub polygon_ws_url: String,
-
-    /// Blocks to backfill on first run (≈ 16 months).
-    /// See `docs/_GLOSSARY.md`: `polygon_backfill_blocks`.
-    #[serde(default = "default_backfill_blocks")]
-    pub backfill_blocks: u64,
-
-    /// Path to the Polygon block-checkpoint file.
-    #[serde(default = "default_checkpoint_path")]
-    pub polygon_checkpoint_path: PathBuf,
-
-    /// Bounded channel capacity for Polygon events.
-    /// See `docs/_GLOSSARY.md`: `polygon_channel_capacity`.
-    #[serde(default = "default_channel_capacity")]
-    pub polygon_channel_capacity: usize,
-
-    /// Max blocks per `eth_getLogs` page during backfill.
-    /// See `docs/_GLOSSARY.md`: `polygon_backfill_page_size`.
-    #[serde(default = "default_backfill_page_size")]
-    pub polygon_backfill_page_size: u64,
-
     // ── Polymarket public source ─────────────────────────────────────────────
     /// Base URL for the Polymarket Data API (no trailing slash).
     #[serde(default = "default_polymarket_base_url")]
@@ -176,27 +146,6 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub entry_gate_fail_closed: bool,
 
-    // ── Operator graph ───────────────────────────────────────────────────────
-    /// Rebuild cadence for `OperatorGraphScheduler` in seconds.
-    /// See `docs/_GLOSSARY.md`: `operator_graph_rebuild_cadence_secs`.
-    #[serde(default = "default_operator_graph_rebuild_cadence_secs")]
-    pub operator_graph_rebuild_cadence_secs: u64,
-
-    /// Maximum hops in the funding-path BFS.
-    /// See `docs/_GLOSSARY.md`: `funding_max_hops`.
-    #[serde(default = "default_funding_max_hops")]
-    pub funding_max_hops: u8,
-
-    /// Funder discovery backend: `"eth_logs"` (default) or `"etherscan"`.
-    /// See `docs/_GLOSSARY.md`: `funder_source`.
-    #[serde(default = "default_funder_source")]
-    pub funder_source: String,
-
-    /// Etherscan V2 API key (chain id 137). Required when `funder_source = "etherscan"`.
-    /// Set via `PE_ETHERSCAN_API_KEY`; never committed.
-    #[serde(default)]
-    pub etherscan_api_key: String,
-
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to `Decimal` at startup.
     #[serde(default = "default_bankroll_usd")]
@@ -243,20 +192,8 @@ fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
 
-const fn default_backfill_blocks() -> u64 {
-    21_000_000
-}
-
-fn default_checkpoint_path() -> PathBuf {
-    PathBuf::from("./polygon_checkpoint.json")
-}
-
 const fn default_channel_capacity() -> usize {
     256
-}
-
-const fn default_backfill_page_size() -> u64 {
-    10
 }
 
 fn default_polymarket_base_url() -> String {
@@ -323,18 +260,6 @@ fn default_bankroll_usd() -> String {
     "10000".to_string()
 }
 
-const fn default_operator_graph_rebuild_cadence_secs() -> u64 {
-    60
-}
-
-const fn default_funding_max_hops() -> u8 {
-    3
-}
-
-fn default_funder_source() -> String {
-    "eth_logs".to_string()
-}
-
 fn default_mode() -> String {
     "paper".to_string()
 }
@@ -361,12 +286,6 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
-            polygon_http_url: String::new(),
-            polygon_ws_url: String::new(),
-            backfill_blocks: default_backfill_blocks(),
-            polygon_checkpoint_path: default_checkpoint_path(),
-            polygon_channel_capacity: default_channel_capacity(),
-            polygon_backfill_page_size: default_backfill_page_size(),
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             watchlist_size: default_watchlist_size(),
@@ -388,10 +307,6 @@ impl Default for ServiceConfig {
             entry_gate_price_band_lo: default_entry_gate_price_band_lo(),
             entry_gate_price_band_hi: default_entry_gate_price_band_hi(),
             entry_gate_fail_closed: false,
-            operator_graph_rebuild_cadence_secs: default_operator_graph_rebuild_cadence_secs(),
-            funding_max_hops: default_funding_max_hops(),
-            funder_source: default_funder_source(),
-            etherscan_api_key: String::new(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
@@ -436,12 +351,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
     // (which uses deny_unknown_fields).
     let env = Env::prefixed("PE_").lowercase(true).only(&[
         "bind",
-        "polygon_http_url",
-        "polygon_ws_url",
-        "backfill_blocks",
-        "polygon_checkpoint_path",
-        "polygon_channel_capacity",
-        "polygon_backfill_page_size",
         "polymarket_base_url",
         "polymarket_channel_capacity",
         "watchlist_size",
@@ -463,10 +372,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "entry_gate_price_band_lo",
         "entry_gate_price_band_hi",
         "entry_gate_fail_closed",
-        "operator_graph_rebuild_cadence_secs",
-        "funding_max_hops",
-        "funder_source",
-        "etherscan_api_key",
         "bankroll_usd",
         "mode",
         "strategy",
@@ -492,14 +397,9 @@ mod tests {
     fn default_values() {
         let cfg = ServiceConfig::default();
         assert_eq!(cfg.bind, "127.0.0.1:8080");
-        assert_eq!(cfg.backfill_blocks, 21_000_000);
-        assert_eq!(cfg.polygon_channel_capacity, 256);
-        assert_eq!(cfg.polygon_backfill_page_size, 10);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
         assert_eq!(cfg.watchlist_size, 20);
         assert_eq!(cfg.trade_poll_interval_secs, 30);
-        assert_eq!(cfg.operator_graph_rebuild_cadence_secs, 60);
-        assert_eq!(cfg.funding_max_hops, 3);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
         assert_eq!(cfg.paper_fill_haircut_bps, 500);
@@ -534,30 +434,5 @@ mode = "shadow"
         assert_eq!(cfg.bind, "0.0.0.0:9000");
         assert_eq!(cfg.bankroll_usd, "5000");
         assert_eq!(cfg.mode, "shadow");
-    }
-
-    #[test]
-    fn backfill_page_size_toml_override() {
-        use std::io::Write as _;
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(f, r#"polygon_backfill_page_size = 2000"#).unwrap();
-        let cfg = load(Some(f.path())).unwrap();
-        assert_eq!(cfg.polygon_backfill_page_size, 2000);
-    }
-
-    #[test]
-    fn parses_polygon_urls() {
-        use std::io::Write as _;
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        write!(
-            f,
-            r#"polygon_http_url = "https://polygon-mainnet.g.alchemy.com/v2/key"
-polygon_ws_url = "wss://polygon-mainnet.g.alchemy.com/v2/key"
-"#
-        )
-        .unwrap();
-        let cfg = load(Some(f.path())).unwrap();
-        assert!(cfg.polygon_http_url.starts_with("https://"));
-        assert!(cfg.polygon_ws_url.starts_with("wss://"));
     }
 }

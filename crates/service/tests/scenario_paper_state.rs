@@ -20,7 +20,7 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use pe_copy_signal_engine::PositionSnapshot;
@@ -31,8 +31,6 @@ use pe_core_types::{
 };
 use pe_event_log::{Reader, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
-use pe_funding_graph::FundingGraphAccumulator;
-use pe_operator_graph::OperatorIdentity;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::entry_gate::CopyEntryGateConfig;
@@ -40,7 +38,6 @@ use pe_service::health::new_shared_health;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
-use pe_source_core::SourceEvent;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
 };
@@ -52,7 +49,7 @@ use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -126,10 +123,6 @@ fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
     ExecutionDispatcher::new(paper_executor, live_executor)
 }
 
-fn empty_operator_rx() -> watch::Receiver<Vec<OperatorIdentity>> {
-    watch::channel(Vec::new()).1
-}
-
 fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, PositionSnapshot>> {
     mpsc::channel(1).1
 }
@@ -158,25 +151,19 @@ async fn run_trades(
     strategy_cfg: WinnerFollowConfig,
     trades: Vec<IncomingTrade>,
 ) {
-    let (polygon_tx, polygon_rx) = mpsc::channel::<SourceEvent>(16);
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
         trade_tx.send(t).await.unwrap();
     }
     drop(trade_tx);
-    drop(polygon_tx);
 
     let orch = Orchestrator::new(
-        polygon_rx,
         trade_rx,
-        Arc::new(Mutex::new(FundingGraphAccumulator::new())),
-        empty_operator_rx(),
         make_watchlist(leader_wallet()),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode,
             signal_config: SignalConfig::default(),
-            cluster_observation_window_secs: 300,
             max_resolution_horizon_secs: 0, // disabled in tests
             entry_gate_config: disabled_entry_gate(),
         },
@@ -185,7 +172,7 @@ async fn run_trades(
         make_dispatcher(dir),
         paper_state,
         leader_ledger,
-        new_shared_health(true),
+        new_shared_health(false),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )

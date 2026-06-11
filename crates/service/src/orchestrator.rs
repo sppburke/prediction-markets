@@ -1,44 +1,30 @@
-//! Event dispatch loop: routes decoded source events to the funding-graph accumulator
-//! and copy-signal-engine, then gates signals through strategy evaluation and
-//! execution dispatch.
-//!
-//! # Architecture
-//!
-//! ```text
-//! polygon_rx (SourceEvent) ──► FundingGraphAccumulator (Arc<Mutex<...>>)
-//!                                   └──► OperatorGraphScheduler ──► watch::Sender
-//! trade_rx   (IncomingTrade) ──► classify_trade ──► WinnerFollowStrategy::evaluate
-//!                                  ▲                   ──► ExecutionDispatcher::execute
-//!                           watch::Receiver (operator IDs, refreshed every 60s)
-//! ```
+//! Event dispatch loop: routes decoded trade events to the copy-signal-engine,
+//! then gates signals through strategy evaluation and execution dispatch.
 //!
 //! The orchestrator is pure dispatch: it owns no I/O except through `ExecutionDispatcher`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pe_copy_signal_engine::{
     IncomingTrade, PositionSnapshot, SignalConfig, WalletProfile, classify_trade,
 };
 use pe_core_types::{
-    EventSeq, MarketId, MarketOutcomeId, OperatorId, Probability, ReconstructionQuality,
-    SourceTimestamp, TraderId, VenueId, WalletAddress,
+    EventSeq, MarketId, MarketOutcomeId, Probability, ReconstructionQuality, SourceTimestamp,
+    TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
-use pe_funding_graph::FundingGraphAccumulator;
-use pe_operator_graph::{AntiGamingFlag, OperatorIdentity};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
-use pe_position_ledger::{ClusterObservationTracker, PositionLedger};
+use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
-use pe_source_core::{SourceEvent, SourceStatus};
-use pe_source_onchain_polygon::PolygonEvent;
+use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{ExecutionMode, PaperFill, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::CLOBClient;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tokio::sync::mpsc;
+use tracing::{error, info};
 
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::health::SharedHealth;
@@ -49,9 +35,6 @@ pub struct OrchestratorConfig {
     pub bankroll: Decimal,
     pub mode: ExecutionMode,
     pub signal_config: SignalConfig,
-    /// How long [`ClusterObservationTracker`] retains entries in seconds.
-    /// Default from `_GLOSSARY.md`: `cluster_observation_window_secs = 300`.
-    pub cluster_observation_window_secs: u64,
     /// Drop signals whose market `endDate` is further than this many seconds into
     /// the future. 0 disables the filter. Default: 72 h (259_200 s).
     pub max_resolution_horizon_secs: u64,
@@ -61,12 +44,8 @@ pub struct OrchestratorConfig {
 }
 
 pub struct Orchestrator<C: CLOBClient> {
-    polygon_rx: mpsc::Receiver<SourceEvent>,
     trade_rx: mpsc::Receiver<IncomingTrade>,
-    accumulator: Arc<Mutex<FundingGraphAccumulator>>,
-    operator_identities: watch::Receiver<Vec<OperatorIdentity>>,
     position_ledger: PositionLedger,
-    cluster_tracker: ClusterObservationTracker,
     watchlist: Watchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
@@ -92,10 +71,7 @@ pub struct Orchestrator<C: CLOBClient> {
 impl<C: CLOBClient> Orchestrator<C> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        polygon_rx: mpsc::Receiver<SourceEvent>,
         trade_rx: mpsc::Receiver<IncomingTrade>,
-        accumulator: Arc<Mutex<FundingGraphAccumulator>>,
-        operator_identities: watch::Receiver<Vec<OperatorIdentity>>,
         watchlist: Watchlist,
         config: OrchestratorConfig,
         history_map: HashMap<WalletAddress, HashSet<MarketId>>,
@@ -120,12 +96,8 @@ impl<C: CLOBClient> Orchestrator<C> {
             .collect();
 
         Ok(Self {
-            polygon_rx,
             trade_rx,
-            accumulator,
-            operator_identities,
             position_ledger: leader_ledger,
-            cluster_tracker: ClusterObservationTracker::new(config.cluster_observation_window_secs),
             watchlist,
             signal_config: config.signal_config,
             strategy,
@@ -143,30 +115,24 @@ impl<C: CLOBClient> Orchestrator<C> {
         })
     }
 
-    /// Run the dispatch loop until both source channels are closed OR until the
+    /// Run the dispatch loop until the trade channel closes OR until the
     /// provided `shutdown` future resolves.
     ///
-    /// On shutdown, remaining events already buffered in both channels are drained
+    /// On shutdown, remaining trades already buffered in the channel are drained
     /// and processed before returning — no in-flight fills are lost.
     pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
-        let mut polygon_done = false;
         let mut trades_done = false;
         let mut reseed_done = false;
 
         loop {
-            // Both channels closed naturally — exit without waiting for shutdown.
-            if polygon_done && trades_done {
+            if trades_done {
                 break;
             }
 
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    // Drain remaining buffered events synchronously before exiting.
-                    while let Ok(event) = self.polygon_rx.try_recv() {
-                        self.handle_polygon(event);
-                    }
                     while let Ok(trade) = self.trade_rx.try_recv() {
                         self.handle_trade(trade).await;
                     }
@@ -182,12 +148,6 @@ impl<C: CLOBClient> Orchestrator<C> {
                         None => reseed_done = true,
                     }
                 }
-                result = self.polygon_rx.recv(), if !polygon_done => {
-                    match result {
-                        Some(event) => self.handle_polygon(event),
-                        None => polygon_done = true,
-                    }
-                }
                 result = self.trade_rx.recv(), if !trades_done => {
                     match result {
                         Some(trade) => self.handle_trade(trade).await,
@@ -199,23 +159,6 @@ impl<C: CLOBClient> Orchestrator<C> {
     }
 
     // ── Private handlers ──────────────────────────────────────────────────────
-
-    fn handle_polygon(&mut self, event: SourceEvent) {
-        match serde_json::from_slice::<PolygonEvent>(&event.payload) {
-            Err(e) => warn!(error = %e, "polygon payload decode failed"),
-            Ok(pe) => {
-                self.accumulator
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .ingest(pe);
-                let mut h = self
-                    .health
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                h.polygon_last_event_at = Some(OffsetDateTime::now_utc());
-            }
-        }
-    }
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
         // Mark polymarket freshness.
@@ -247,22 +190,14 @@ impl<C: CLOBClient> Orchestrator<C> {
             age_seconds: 0,        // honest sentinel; treated as "fresh" conservative stub
         };
 
-        // Look up operator ID from the latest scheduler snapshot (non-blocking borrow).
-        let operator_id = self.operator_id_for(&trade.wallet);
+        let operator_id = None;
 
         // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
         // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
         // classification, not before.
         let position = self.position_ledger.position(&trade.wallet).cloned();
 
-        // Record cluster entry when operator is known; prune stale entries.
-        // Ingest into tracker first so the current trade is included in cluster_obs_for.
-        if let Some(op) = operator_id {
-            self.cluster_tracker.ingest(&trade, op);
-        }
-
-        let cluster_obs =
-            operator_id.and_then(|op| self.cluster_tracker.cluster_obs_for(&trade, op));
+        let cluster_obs = None;
 
         // Advance position ledger after classification inputs are captured.
         self.position_ledger.ingest(&trade);
@@ -484,18 +419,6 @@ impl<C: CLOBClient> Orchestrator<C> {
         // Infallible after clamping to [0, 10_000]: p_raw is in [0, 1].
         Probability::new(p_raw).unwrap_or(Probability::ZERO)
     }
-
-    /// Look up the operator ID for `wallet` from the latest scheduler snapshot.
-    ///
-    /// Uses a non-blocking `borrow()` — always returns the most recently published
-    /// cluster list without any synchronization cost.
-    fn operator_id_for(&self, wallet: &WalletAddress) -> Option<OperatorId> {
-        self.operator_identities
-            .borrow()
-            .iter()
-            .find(|id| id.member_wallets.contains(wallet))
-            .map(|id| id.operator_id)
-    }
 }
 
 // ── Stub risk snapshot ────────────────────────────────────────────────────────
@@ -518,7 +441,7 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         funder_inherited_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        anti_gaming_flags: HashSet::<AntiGamingFlag>::new(),
+        anti_gaming_flags: Default::default(),
         onchain_source_status: SourceStatus::Healthy,
         proxy_funder_mapping_proven: true, // stub: assume proven so inherited-prior isn't blocked
         funder_seeding_rate_suspicious: false,
