@@ -1,8 +1,7 @@
 //! Ledger reconstruction algorithm.
 //!
-//! [`build_trader_ledgers`] groups raw trades by wallet, FIFO-matches entry fills
-//! with exit fills within each `(market_id, outcome_id)` bucket, and annotates
-//! each ledger with the operator identity when confidence is sufficient.
+//! [`build_trader_ledgers`] groups raw trades by wallet and FIFO-matches entry
+//! fills with exit fills within each `(market_id, outcome_id)` bucket.
 //!
 //! # Algorithm
 //! 1. Group trades by wallet, sort each wallet's trades by timestamp (FIFO).
@@ -12,24 +11,21 @@
 //!    A Sell fill closes open longs first; remaining contracts open a short.
 //! 4. `realized_pnl_usd = (exit_price − entry_price) × contracts`.
 //! 5. `reconstruction_quality = (closed_contracts / (closed + open)) × 100`.
-//! 6. Annotate with `operator_id` when `confidence_ppm >= config.operator_min_confidence_ppm`.
 
 use std::collections::{HashMap, HashSet};
 
 use pe_core_types::{
-    ContractQty, MarketId, OperatorId, OutcomeId, Price, ReconstructionQuality, Side,
-    SourceTradeId, WalletAddress,
+    ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceTradeId,
+    WalletAddress,
 };
-use pe_operator_graph::OperatorIdentity;
 use rust_decimal::Decimal;
 
 use crate::{
-    config::LedgerConfig,
     ledger::{ClosedTrade, OpenPosition, TraderLedger},
     snapshot::RawTrade,
 };
 
-/// Build wallet-level [`TraderLedger`]s from a trade slice and operator identities.
+/// Build wallet-level [`TraderLedger`]s from a trade slice.
 ///
 /// - `trades` — all raw trades to reconstruct; may be any order (sorted per-wallet internally).
 /// - `audit_window_days` — stored on each returned ledger for downstream scoring.
@@ -40,12 +36,8 @@ use crate::{
 pub fn build_trader_ledgers(
     trades: &[RawTrade],
     audit_window_days: u32,
-    operator_identities: &[OperatorIdentity],
     wallet_filter: Option<&HashSet<WalletAddress>>,
-    config: &LedgerConfig,
 ) -> Vec<TraderLedger> {
-    let wallet_map = build_operator_map(operator_identities, config);
-
     let mut by_wallet: HashMap<WalletAddress, Vec<&RawTrade>> = HashMap::new();
     for trade in trades {
         if wallet_filter.is_some_and(|f| !f.contains(&trade.wallet)) {
@@ -145,11 +137,8 @@ pub fn build_trader_ledgers(
             },
         };
 
-        let operator_id = wallet_map.get(&wallet).copied();
-
         ledgers.push(TraderLedger {
             wallet,
-            operator_id,
             reconstruction_quality,
             closed_trades: closed,
             open_positions: open,
@@ -158,22 +147,6 @@ pub fn build_trader_ledgers(
     }
 
     ledgers
-}
-
-/// Wallet address → OperatorId for operators meeting the confidence threshold.
-fn build_operator_map(
-    identities: &[OperatorIdentity],
-    config: &LedgerConfig,
-) -> HashMap<WalletAddress, OperatorId> {
-    let mut map = HashMap::new();
-    for identity in identities {
-        if identity.confidence_ppm >= config.operator_min_confidence_ppm {
-            for &wallet in &identity.member_wallets {
-                map.insert(wallet, identity.operator_id);
-            }
-        }
-    }
-    map
 }
 
 /// Compound key for per-wallet, per-(market, outcome) position buckets.

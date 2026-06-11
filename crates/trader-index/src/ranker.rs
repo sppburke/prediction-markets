@@ -1,12 +1,12 @@
-//! Walk-forward operator-aware ranker.
+//! Walk-forward per-wallet ranker.
 //!
 //! [`build_watchlist`] takes a slice of [`TraderLedger`]s (one per wallet),
-//! groups them by operator, scores each group using the LCB_5pct signal,
-//! applies eligibility gates, and returns a size-capped [`Watchlist`].
+//! scores each using the LCB_5pct signal, applies eligibility gates, and
+//! returns a size-capped [`Watchlist`].
 
 use std::collections::HashMap;
 
-use pe_core_types::{OperatorId, SourceTimestamp, WalletAddress};
+use pe_core_types::{SourceTimestamp, WalletAddress};
 
 use crate::{
     config::RankerConfig,
@@ -30,13 +30,13 @@ pub fn build_watchlist(
     let active_window_start = now_unix - (config.active_window_days as i64) * 86_400;
     let incubator_window_start = now_unix - (config.incubator_window_days as i64) * 86_400;
 
-    // Group ledgers by operator_id (wallets with no operator form singleton groups keyed by wallet).
-    let groups = group_by_operator(ledgers);
+    // Group ledgers by wallet (reconstruction emits one ledger per wallet).
+    let groups = group_by_wallet(ledgers);
 
     let mut active_entries: Vec<WatchlistEntry> = Vec::new();
     let mut incubator_entries: Vec<WatchlistEntry> = Vec::new();
 
-    for (group_key, group_ledgers) in &groups {
+    for (wallet, group_ledgers) in &groups {
         let min_quality = group_ledgers
             .iter()
             .map(|l| l.reconstruction_quality.get())
@@ -66,8 +66,7 @@ pub fn build_watchlist(
                     Err(_) => group_ledgers[0].reconstruction_quality,
                 };
             active_entries.push(WatchlistEntry {
-                wallet: group_key.representative,
-                operator_id: group_key.operator_id,
+                wallet: *wallet,
                 tier: WatchlistTier::Active,
                 leader_score_bps: stats.leader_score_bps,
                 lcb_5pct_bps: stats.lcb_5pct_bps,
@@ -92,8 +91,7 @@ pub fn build_watchlist(
                     Err(_) => group_ledgers[0].reconstruction_quality,
                 };
             incubator_entries.push(WatchlistEntry {
-                wallet: group_key.representative,
-                operator_id: group_key.operator_id,
+                wallet: *wallet,
                 tier: WatchlistTier::Incubator,
                 leader_score_bps: stats.leader_score_bps,
                 lcb_5pct_bps: stats.lcb_5pct_bps,
@@ -125,49 +123,13 @@ pub fn build_watchlist(
     }
 }
 
-/// Compound key for operator-level groups.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GroupKey {
-    /// `Some(id)` for wallets attributed to a known operator; `None` for singletons.
-    operator_id: Option<OperatorId>,
-    /// Lowest-sorted wallet in the group (tie-breaker / representative address).
-    representative: WalletAddress,
-}
-
-/// Group ledgers by operator_id; singletons get their own group.
-fn group_by_operator(ledgers: &[TraderLedger]) -> HashMap<GroupKey, Vec<&TraderLedger>> {
-    // First pass: collect all wallets per operator.
-    let mut op_wallets: HashMap<OperatorId, Vec<WalletAddress>> = HashMap::new();
+/// Group ledgers by wallet. Reconstruction emits one ledger per wallet, so each
+/// group is a singleton; the grouping is retained to keep the scoring loop's
+/// quality-merge structure uniform.
+fn group_by_wallet(ledgers: &[TraderLedger]) -> HashMap<WalletAddress, Vec<&TraderLedger>> {
+    let mut groups: HashMap<WalletAddress, Vec<&TraderLedger>> = HashMap::new();
     for l in ledgers {
-        if let Some(oid) = l.operator_id {
-            op_wallets.entry(oid).or_default().push(l.wallet);
-        }
-    }
-    // Sort each group to get a stable representative (lowest address).
-    for wallets in op_wallets.values_mut() {
-        wallets.sort_by_key(|w| w.0);
-    }
-
-    let mut groups: HashMap<GroupKey, Vec<&TraderLedger>> = HashMap::new();
-    for l in ledgers {
-        let key = match l.operator_id {
-            Some(oid) => {
-                let rep = op_wallets
-                    .get(&oid)
-                    .and_then(|v| v.first())
-                    .copied()
-                    .unwrap_or(l.wallet);
-                GroupKey {
-                    operator_id: Some(oid),
-                    representative: rep,
-                }
-            }
-            None => GroupKey {
-                operator_id: None,
-                representative: l.wallet,
-            },
-        };
-        groups.entry(key).or_default().push(l);
+        groups.entry(l.wallet).or_default().push(l);
     }
     groups
 }

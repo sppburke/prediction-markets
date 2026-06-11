@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pe_core_types::{OperatorId, ReconstructionQuality, Side, WalletAddress};
+use pe_core_types::{ReconstructionQuality, Side, WalletAddress};
 
 use crate::{
     ledger::{ClosedTrade, OpenPosition, TraderLedger},
@@ -67,12 +67,7 @@ impl WalletState {
         }
     }
 
-    fn to_ledger(
-        &self,
-        wallet: WalletAddress,
-        operator_id: Option<OperatorId>,
-        audit_window_days: u32,
-    ) -> Option<TraderLedger> {
+    fn to_ledger(&self, wallet: WalletAddress, audit_window_days: u32) -> Option<TraderLedger> {
         let mut open: Vec<OpenPosition> = Vec::new();
         for (key, (buy_fills, sell_fills)) in &self.buckets {
             if let Some(pos) = fills_to_open(key, Side::Buy, buy_fills) {
@@ -111,7 +106,6 @@ impl WalletState {
 
         Some(TraderLedger {
             wallet,
-            operator_id,
             reconstruction_quality,
             closed_trades: self.closed_trades.clone(),
             open_positions: open,
@@ -159,36 +153,27 @@ impl IncrementalLedger {
     }
 
     /// Materialise [`TraderLedger`]s for `pool` wallets (or all tracked wallets
-    /// when `pool` is `None`), annotated with operator identities from `wallet_to_op`.
+    /// when `pool` is `None`).
     ///
     /// This is a snapshot read — it borrows current state without mutating it.
     pub fn build_ledgers(
         &self,
         pool: Option<&HashSet<WalletAddress>>,
-        wallet_to_op: &HashMap<WalletAddress, OperatorId>,
         audit_window_days: u32,
     ) -> Vec<TraderLedger> {
         let mut ledgers: Vec<TraderLedger> = match pool {
             Some(p) => p
                 .iter()
                 .filter_map(|wallet| {
-                    self.states.get(wallet)?.to_ledger(
-                        *wallet,
-                        wallet_to_op.get(wallet).copied(),
-                        audit_window_days,
-                    )
+                    self.states
+                        .get(wallet)?
+                        .to_ledger(*wallet, audit_window_days)
                 })
                 .collect(),
             None => self
                 .states
                 .iter()
-                .filter_map(|(wallet, state)| {
-                    state.to_ledger(
-                        *wallet,
-                        wallet_to_op.get(wallet).copied(),
-                        audit_window_days,
-                    )
-                })
+                .filter_map(|(wallet, state)| state.to_ledger(*wallet, audit_window_days))
                 .collect(),
         };
         ledgers.sort_by_key(|l| l.wallet.0);

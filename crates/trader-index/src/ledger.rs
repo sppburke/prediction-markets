@@ -1,8 +1,8 @@
 //! Output types produced by the ledger reconstruction engine.
 
 use pe_core_types::{
-    ContractQty, MarketId, OperatorId, OutcomeId, Price, ReconstructionQuality, Side,
-    SourceTradeId, WalletAddress,
+    ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceTradeId,
+    WalletAddress,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -47,8 +47,6 @@ pub struct OpenPosition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraderLedger {
     pub wallet: WalletAddress,
-    /// Set when `OperatorIdentity.confidence_ppm >= LedgerConfig.operator_min_confidence_ppm`.
-    pub operator_id: Option<OperatorId>,
     /// 0–100: fraction of entry contracts that were matched to exit fills.
     /// Values below `LedgerConfig.research_only_quality_threshold` (default 60)
     /// indicate the ledger is suitable for research only, not watchlist eligibility.

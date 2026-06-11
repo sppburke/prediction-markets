@@ -156,7 +156,6 @@ mod tests {
     fn make_ledger(trades: Vec<ClosedTrade>) -> TraderLedger {
         TraderLedger {
             wallet: WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
-            operator_id: None,
             reconstruction_quality: ReconstructionQuality::new(80).unwrap(),
             closed_trades: trades,
             open_positions: vec![],

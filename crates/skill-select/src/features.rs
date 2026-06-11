@@ -1055,7 +1055,6 @@ mod tests {
     fn ledger(closed_trades: Vec<ClosedTrade>) -> TraderLedger {
         TraderLedger {
             wallet: wallet(),
-            operator_id: None,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
             closed_trades,
             open_positions: vec![],

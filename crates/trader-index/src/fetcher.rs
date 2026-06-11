@@ -122,7 +122,6 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
             let rank_score = BasisPoints(score_value);
             entries.push(WatchlistEntry {
                 wallet,
-                operator_id: None,
                 tier: WatchlistTier::Active,
                 leader_score_bps: rank_score,
                 lcb_5pct_bps: rank_score,

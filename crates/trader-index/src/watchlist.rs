@@ -1,8 +1,6 @@
 //! Output types for the walk-forward ranker.
 
-use pe_core_types::{
-    BasisPoints, OperatorId, ReconstructionQuality, SourceTimestamp, WalletAddress,
-};
+use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
 use serde::{Deserialize, Serialize};
 
 /// Tier assignment for a [`WatchlistEntry`].
@@ -17,10 +15,8 @@ pub enum WatchlistTier {
 /// A single ranked entry in the watchlist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchlistEntry {
-    /// Representative wallet address (lowest-sorted wallet for operator groups).
+    /// Wallet address.
     pub wallet: WalletAddress,
-    /// Set when the wallet belongs to a confirmed operator cluster.
-    pub operator_id: Option<OperatorId>,
     pub tier: WatchlistTier,
     /// Primary ranking signal: LCB_5pct + bonus/penalty terms (in basis points).
     pub leader_score_bps: BasisPoints,

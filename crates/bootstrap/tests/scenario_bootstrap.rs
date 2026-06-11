@@ -16,9 +16,8 @@ use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::filter::FilterConfig;
 use pe_bootstrap::polymarket::PolymarketBulkFetcher;
 use pe_core_types::{SourceTimestamp, WalletAddress};
-use pe_operator_graph::OperatorIdentity;
 use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
-use pe_trader_index::{LedgerConfig, build_trader_ledgers};
+use pe_trader_index::build_trader_ledgers;
 use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -73,21 +72,13 @@ async fn seed_watchlist_passes_winner_and_rejects_loser() {
 
     // Reconstruct ledgers per-wallet (mirrors production rank phase).
     let snapshot_at = SourceTimestamp(OffsetDateTime::from_unix_timestamp(SNAPSHOT_UNIX).unwrap());
-    let empty: &[OperatorIdentity] = &[];
-    let ledger_config = LedgerConfig::default();
     let mut ledgers = Vec::new();
     for wallet in &wallets {
         let trades = cache.trades_for(&wallet.to_string());
         if trades.is_empty() {
             continue;
         }
-        ledgers.extend(build_trader_ledgers(
-            &trades,
-            u32::MAX,
-            empty,
-            None,
-            &ledger_config,
-        ));
+        ledgers.extend(build_trader_ledgers(&trades, u32::MAX, None));
     }
 
     // Build seed watchlist with default filter thresholds.

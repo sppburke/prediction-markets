@@ -96,7 +96,6 @@ pub fn run_export_watchlist(cfg: &ExportWatchlistConfig) -> Result<ExportStats, 
                 )?;
                 entries.push(WatchlistEntry {
                     wallet,
-                    operator_id: None,
                     tier: WatchlistTier::Active,
                     leader_score_bps: BasisPoints(wf.features.lcb_5pct_bps),
                     lcb_5pct_bps: BasisPoints(wf.features.lcb_5pct_bps),
