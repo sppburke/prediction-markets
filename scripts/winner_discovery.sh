@@ -11,10 +11,9 @@
 # The optional positional argument is a BootstrapConfig TOML path.  If omitted,
 # the binary falls back to PE_BOOTSTRAP_CONFIG or its own built-in defaults.
 #
-# Required env:
-#   PE_BOOTSTRAP_DISCOVERY_ENABLED=1   (gates the leaderboard fetch)
-#
 # Optional env (examples):
+# (PE_BOOTSTRAP_DISCOVERY_ENABLED gates only the legacy `discovery` subcommand,
+#  not winner-discovery.)
 #   PE_BOOTSTRAP_LEADERBOARD_BASE_URL  override leaderboard host
 #   PE_BOOTSTRAP_LEADERBOARD_TOP_N     default 500
 #   PE_BOOTSTRAP_RADION_API_URL        enables Radion source

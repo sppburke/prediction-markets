@@ -9,9 +9,8 @@ deployment.  This is the only sanctioned path for adding new wallets; see
 
 ## Required environment
 
-```
-PE_BOOTSTRAP_DISCOVERY_ENABLED=1   # gates the leaderboard fetch in pe-bootstrap
-```
+No mandatory environment variables. The `winner-discovery` subcommand does not
+read `discovery_enabled` (that flag gates only the legacy `discovery` subcommand).
 
 Optional overrides (all have safe defaults — see `_GLOSSARY.md` "Bootstrap
 defaults"):
