@@ -13,25 +13,21 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
 const WINNER_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 const LOSER_HEX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 // Base timestamp: 2023-11-01 00:00:00 UTC.
 const BASE_UNIX: i64 = 1_698_796_800;
@@ -66,19 +62,6 @@ fn make_trade(
             if side == Side::Buy { "buy" } else { "sell" }
         )),
     }
-}
-
-/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs inserted into a fresh cache.
-///
-/// Edges are timestamped at Unix 0 so they are visible at every simulation date.
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 /// Ranker config relaxed to allow our synthetic fixture to qualify.
@@ -123,7 +106,6 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -154,24 +136,20 @@ fn generate_winner_trades(winner: WalletAddress) -> Vec<RawTrade> {
 #[tokio::test]
 async fn winner_wallet_produces_positive_pnl() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut all_trades = generate_winner_trades(winner);
     all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -197,7 +175,6 @@ async fn winner_wallet_produces_positive_pnl() {
 #[tokio::test]
 async fn open_at_horizon_excluded_from_realized_pnl() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut all_trades = generate_winner_trades(winner);
     // Extra BUY on the last day with no corresponding SELL.
@@ -205,18 +182,15 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
     all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -249,9 +223,7 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
 #[tokio::test]
 async fn per_trader_win_rate_used_as_probability() {
     let high_winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let low_winner = wallet(LOSER_HEX);
-    let funder2 = WalletAddress::from_hex("0xdddddddddddddddddddddddddddddddddddddddd").unwrap();
 
     // High winner: 65 round-trips, all profitable (100% win rate).
     let mut all_trades = generate_winner_trades(high_winner);
@@ -271,18 +243,15 @@ async fn per_trader_win_rate_used_as_probability() {
     all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(high_winner, funder), (low_winner, funder2)]);
 
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -307,7 +276,6 @@ async fn per_trader_win_rate_used_as_probability() {
 #[tokio::test]
 async fn fee_model_reduces_edge_at_high_prices() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut all_trades = generate_winner_trades(winner);
 
@@ -325,18 +293,15 @@ async fn fee_model_reduces_edge_at_high_prices() {
     all_trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )

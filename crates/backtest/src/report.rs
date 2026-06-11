@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use pe_core_types::{KellyFraction, OperatorId};
+use pe_core_types::KellyFraction;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -34,10 +34,6 @@ pub struct WinnerFollowReport {
     /// Number of copy positions still open at the simulation horizon.
     /// These are excluded from `total_pnl_usd` because their final PnL is unknown.
     pub open_at_horizon: u64,
-    /// False once the temporal funder-graph filter (`FunderGraphTimeline`) is active.
-    /// Kept for JSON backwards-compatibility; always `false` in current runs.
-    #[serde(default)]
-    pub funder_graph_snapshot_caveat: bool,
     /// Fraction (0–1) of buy signals suppressed by `max_hours_to_expiry` because
     /// the market's resolution was too far out or unknown pre-fix. Zero when
     /// `max_hours_to_expiry` is not configured.
@@ -47,18 +43,6 @@ pub struct WinnerFollowReport {
     /// `max_hours_to_expiry` is not configured.
     #[serde(default)]
     pub expiry_suppression_by_quarter: BTreeMap<String, Decimal>,
-    /// Fraction (0–100, percentage) of BUY signals suppressed by the
-    /// `skip_unknown_operator` gate (issue #141) — i.e. watchlisted leaders
-    /// whose wallet has no resolved operator identity in the funder graph.
-    /// Zero when `skip_unknown_operator = false`. Denominator is BUY signals
-    /// that reached the gate (after duplicate-open and per-market-cap, before
-    /// horizon-cooldown), not all signals.
-    #[serde(default)]
-    pub unknown_operator_suppression_pct: Decimal,
-    /// Per-calendar-quarter suppression fraction (key: `"YYYY-Qn"`) for the
-    /// `skip_unknown_operator` gate. Empty when `skip_unknown_operator = false`.
-    #[serde(default)]
-    pub unknown_operator_suppression_by_quarter: BTreeMap<String, Decimal>,
     /// Fraction (0–100, percentage) of BUY signals suppressed by the
     /// `max_signal_price` cap (issue #142) — i.e. signals whose
     /// slippage-adjusted `fill_price` was ≥ the cap. Zero when
@@ -188,7 +172,6 @@ pub struct TradeFill {
     #[serde(with = "time::serde::rfc3339")]
     pub simulated_at: OffsetDateTime,
     pub leader_wallet: String,
-    pub operator_id: Option<String>,
     pub market_id: String,
     pub outcome_id: u16,
     pub side: String,
@@ -206,9 +189,8 @@ pub struct PnlAccumulator {
 }
 
 impl PnlAccumulator {
-    pub fn record(&mut self, operator_id: Option<&OperatorId>, pnl: Decimal) {
-        let key = operator_id.map_or_else(|| "unknown".to_owned(), |o| o.to_string());
-        *self.per_operator.entry(key).or_default() += pnl;
+    pub fn record(&mut self, pnl: Decimal) {
+        *self.per_operator.entry("total".to_owned()).or_default() += pnl;
         self.total_copies += 1;
         if pnl > Decimal::ZERO {
             self.total_wins += 1;

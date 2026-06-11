@@ -20,18 +20,15 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_core_types::{
     ContractQty, KellyFraction, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
     VenueMarketId, WalletAddress,
 };
 use pe_strategy_winner_follow::{PerTradeCap, WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -41,7 +38,6 @@ use time::OffsetDateTime;
 const BASE_UNIX: i64 = 1_698_796_800;
 const SPECIALIST_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GENERALIST_HEX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const FUNDER_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 
 fn wallet(hex: &str) -> WalletAddress {
     WalletAddress::from_hex(hex).unwrap()
@@ -70,16 +66,6 @@ fn make_trade(
         ),
         source_trade_id: SourceTradeId(format!("0xhash_{market_idx}_{day_offset}_{tx_suffix}")),
     }
-}
-
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 /// Ranker config matching new canonical defaults: ≥15 closed trades, ≥1 distinct market.
@@ -125,7 +111,6 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig {
@@ -184,16 +169,11 @@ fn generalist_trades(leader: WalletAddress) -> Vec<RawTrade> {
 /// `kelly_fraction_override = 0.01` scales both runs into [0, 200 bps) so
 /// concentration caps do not block either leader. PnL differences arise solely
 /// from the N_eff-derived shrunk_p.
-async fn run_leader(
-    mut trades: Vec<RawTrade>,
-    leader: WalletAddress,
-    funder: WalletAddress,
-) -> Decimal {
+async fn run_leader(mut trades: Vec<RawTrade>) -> Decimal {
     trades.sort_by_key(|t| t.timestamp.0);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
-    let timeline = make_timeline(&dir, &[(leader, funder)]);
     let snapshots = LeaderboardSnapshots::default();
     let resolutions = ResolutionIndex::new();
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
@@ -205,13 +185,11 @@ async fn run_leader(
     run_simulation(
         &base_config(&dir),
         &trades,
-        &timeline,
         &snapshots,
         &resolutions,
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &strategy,
         false,
     )
@@ -222,12 +200,11 @@ async fn run_leader(
 /// PASS: generalist_pnl > specialist_pnl AND both > 0.
 #[tokio::test]
 async fn generalist_outperforms_specialist_via_n_eff() {
-    let funder = wallet(FUNDER_HEX);
     let specialist = wallet(SPECIALIST_HEX);
     let generalist = wallet(GENERALIST_HEX);
 
-    let specialist_pnl = run_leader(specialist_trades(specialist), specialist, funder).await;
-    let generalist_pnl = run_leader(generalist_trades(generalist), generalist, funder).await;
+    let specialist_pnl = run_leader(specialist_trades(specialist)).await;
+    let generalist_pnl = run_leader(generalist_trades(generalist)).await;
 
     assert!(
         specialist_pnl > Decimal::ZERO,

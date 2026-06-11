@@ -39,26 +39,24 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
 use pe_bootstrap::cache::{
     LeaderboardSnapshots, LiquidityIndex, MarketResolution, MarketSchedule, ResolutionIndex,
-    ScheduleIndex, WalletCache,
+    ScheduleIndex,
 };
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
 const ALICE_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_HEX: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 /// 2024-01-01 00:00:00 UTC. Day 0.
 const BASE_UNIX: i64 = 1_704_067_200;
 const DAY: i64 = 86_400;
@@ -105,14 +103,6 @@ fn winner_book(w: WalletAddress) -> Vec<RawTrade> {
         t.push(make_trade(w, i, i + 2, Side::Sell, dec!(0.75), 1));
     }
     t
-}
-
-fn make_timeline(dir: &TempDir) -> FunderGraphTimeline {
-    let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    cache.insert_funder_edges(alice, &[(funder, 0)], 0).unwrap();
-    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -164,7 +154,6 @@ fn base_config_with(
         no_buy_within_horizon_days: None,
         require_known_expiry,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -193,20 +182,17 @@ async fn unknown_expiry_market_allowed_through() {
     let resolutions = ResolutionIndex::new();
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     // Configure a tight 48-hour window. Market 9999 has unknown expiry → allowed.
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -243,19 +229,16 @@ async fn known_far_expiry_is_suppressed() {
     );
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -279,19 +262,16 @@ async fn suppression_pct_zero_without_filter() {
     let mut trades = winner_book(alice);
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, None), // no expiry filter
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -343,19 +323,16 @@ async fn expiry_filter_uses_schedule_over_resolution() {
     );
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -407,19 +384,16 @@ async fn null_schedule_falls_through_to_resolution() {
     );
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -461,19 +435,16 @@ async fn expiry_filter_falls_back_to_resolution_when_no_schedule() {
     let schedules = ScheduleIndex::new();
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir, Some(48)),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -514,19 +485,16 @@ async fn require_known_expiry_suppresses_null_schedule_no_resolution() {
     );
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config_with(&dir, Some(48), true),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -566,19 +534,16 @@ async fn require_known_expiry_off_allows_null_schedule_no_resolution() {
     );
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config_with(&dir, Some(48), false),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -611,19 +576,16 @@ async fn require_known_expiry_suppresses_missing_market() {
     let schedules = ScheduleIndex::new();
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir);
 
     trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config_with(&dir, Some(48), true),
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &resolutions,
         &schedules,
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )

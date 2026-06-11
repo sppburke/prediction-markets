@@ -24,19 +24,16 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::KellySweepRun;
 use pe_backtest::simulation::{SweepContext, run_one_kelly_fraction, run_simulation};
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_core_types::{
     ContractQty, KellyFraction, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
     VenueMarketId, WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rayon::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -46,7 +43,6 @@ use time::OffsetDateTime;
 // ── fixtures ──────────────────────────────────────────────────────────────────
 
 const WINNER_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 // Fixed base timestamp (2023-11-01 UTC). Deterministic — no SystemTime::now().
 const BASE_UNIX: i64 = 1_698_796_800;
 
@@ -80,16 +76,6 @@ fn make_trade(
             if side == Side::Buy { "buy" } else { "sell" }
         )),
     }
-}
-
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -133,7 +119,6 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -156,15 +141,13 @@ fn unsorted_winner_trades(winner: WalletAddress) -> Vec<RawTrade> {
     trades
 }
 
-fn build_fixture() -> (TempDir, FunderGraphTimeline, Vec<RawTrade>) {
+fn build_fixture() -> (TempDir, Vec<RawTrade>) {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let mut trades = unsorted_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
-    (dir, timeline, trades)
+    (dir, trades)
 }
 
 // ── Scenario 1 ────────────────────────────────────────────────────────────────
@@ -175,20 +158,18 @@ fn build_fixture() -> (TempDir, FunderGraphTimeline, Vec<RawTrade>) {
 ///       that is known to be eligible under the relaxed ranker.
 #[tokio::test]
 async fn pre_sorted_slice_produces_valid_report() {
-    let (dir, timeline, trades) = build_fixture();
+    let (dir, trades) = build_fixture();
     let config = base_config(&dir);
     let strategy = WinnerFollowStrategy::new(config.strategy.clone());
 
     let report = run_simulation(
         &config,
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &strategy,
         false,
     )
@@ -208,25 +189,22 @@ async fn pre_sorted_slice_produces_valid_report() {
 /// FAIL: fewer/more runs returned, or any per-fraction run errors out.
 #[tokio::test]
 async fn sweep_with_shared_slice_produces_one_run_per_fraction() {
-    let (dir, timeline, trades) = build_fixture();
+    let (dir, trades) = build_fixture();
     let config = base_config(&dir);
     let snapshots = LeaderboardSnapshots::default();
     let resolutions = ResolutionIndex::new();
     let schedules = ScheduleIndex::new();
     let liq_index = LiquidityIndex::new();
     let ranker_config = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
         liq_index: &liq_index,
         ranker_config: &ranker_config,
-        ledger_config: &ledger_config,
     };
 
     let fractions = [
@@ -260,25 +238,22 @@ async fn sweep_with_shared_slice_produces_one_run_per_fraction() {
 ///       the two sweeps.
 #[tokio::test]
 async fn sweep_reports_are_deterministic_across_repeated_runs() {
-    let (dir, timeline, trades) = build_fixture();
+    let (dir, trades) = build_fixture();
     let config = base_config(&dir);
     let snapshots = LeaderboardSnapshots::default();
     let resolutions = ResolutionIndex::new();
     let schedules = ScheduleIndex::new();
     let liq_index = LiquidityIndex::new();
     let ranker_config = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
         liq_index: &liq_index,
         ranker_config: &ranker_config,
-        ledger_config: &ledger_config,
     };
 
     let fractions = [
@@ -331,10 +306,8 @@ async fn sweep_reports_are_deterministic_across_repeated_runs() {
 #[should_panic(expected = "all_trades must be sorted")]
 async fn unsorted_input_triggers_debug_assert() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     // Deliberately do NOT sort.
     let trades = unsorted_winner_trades(winner);
@@ -346,13 +319,11 @@ async fn unsorted_input_triggers_debug_assert() {
     let _ = run_simulation(
         &config,
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &strategy,
         false,
     );

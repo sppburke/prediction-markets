@@ -23,18 +23,15 @@
 
 use std::collections::HashSet;
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -43,7 +40,6 @@ use time::OffsetDateTime;
 const ALICE_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB_HEX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const CAROL_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
-const FUNDER_HEX: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 
 /// Base timestamp: 2024-01-01 00:00:00 UTC. Day 0.
 const BASE_UNIX: i64 = 1_704_067_200;
@@ -101,21 +97,6 @@ fn winner_book(w: WalletAddress, start_day: u32, mkt_base: u32) -> Vec<RawTrade>
     trades
 }
 
-/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs at Unix 0.
-///
-/// Tests with populated `LeaderboardSnapshots` can use `FunderGraphTimeline::empty()`
-/// instead (has_funder = !snapshots.is_empty() = true). Tests with empty snapshots
-/// must provide actual funder edges so that the operator identity is resolved.
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
-}
-
 fn relaxed_ranker() -> RankerConfig {
     RankerConfig {
         active_min_closed_trades: 15,
@@ -157,7 +138,6 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -203,20 +183,16 @@ async fn wallet_outside_snapshot_emits_no_signals() {
     let snapshots = LeaderboardSnapshots::from_pairs(snap_pairs);
 
     let dir = TempDir::new().unwrap();
-    // Populated snapshots → has_funder = !snapshots.is_empty() = true for all wallets.
-    let timeline = FunderGraphTimeline::empty();
 
     all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -251,19 +227,16 @@ async fn weekly_pool_swap_changes_active_leaders() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let timeline = FunderGraphTimeline::empty();
 
     all_trades.sort_by_key(|t| t.timestamp.0);
     let _ = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -294,19 +267,16 @@ async fn wallet_present_throughout_emits_throughout() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let timeline = FunderGraphTimeline::empty();
 
     all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -336,19 +306,16 @@ async fn position_opened_in_week1_persists_after_drop() {
     ]);
 
     let dir = TempDir::new().unwrap();
-    let timeline = FunderGraphTimeline::empty();
 
     all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -366,33 +333,25 @@ async fn position_opened_in_week1_persists_after_drop() {
 /// PASS: an empty snapshot index degrades to legacy "all wallets" behavior. A
 ///       100%-winner produces ≥1 copy and positive PnL.
 /// FAIL: snapshot filter blocks all signals despite there being no snapshots.
-///
-/// Note: empty snapshots means `has_funder` depends on `op_identity.is_some()`, so
-/// the timeline must contain actual funder edges for the winner wallet.
 #[tokio::test]
 async fn empty_snapshots_falls_back_to_full_history() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut all_trades = winner_book(alice, 0, 0);
     let snapshots = LeaderboardSnapshots::default();
     assert!(snapshots.is_empty(), "fixture sanity");
 
     let dir = TempDir::new().unwrap();
-    // Empty snapshots → has_funder depends on op_identity. Must provide funder edges.
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
 
     all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -425,19 +384,16 @@ async fn simulation_date_before_first_snapshot_emits_nothing() {
     let snapshots = LeaderboardSnapshots::from_pairs(vec![(day_unix(100), vec![alice])]);
 
     let dir = TempDir::new().unwrap();
-    let timeline = FunderGraphTimeline::empty();
 
     all_trades.sort_by_key(|t| t.timestamp.0);
     let report = run_simulation(
         &base_config(&dir),
         &all_trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
