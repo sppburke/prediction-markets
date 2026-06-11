@@ -19,7 +19,7 @@
 )]
 
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use pe_copy_signal_engine::PositionSnapshot;
@@ -30,15 +30,12 @@ use pe_core_types::{
 };
 use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
-use pe_funding_graph::FundingGraphAccumulator;
-use pe_operator_graph::OperatorIdentity;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_source_core::SourceEvent;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
 };
@@ -48,7 +45,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -113,16 +110,8 @@ fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
     ExecutionDispatcher::new(paper_executor, live_executor)
 }
 
-fn make_accumulator() -> Arc<Mutex<FundingGraphAccumulator>> {
-    Arc::new(Mutex::new(FundingGraphAccumulator::new()))
-}
-
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
     Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap())
-}
-
-fn empty_operator_rx() -> watch::Receiver<Vec<OperatorIdentity>> {
-    watch::channel(Vec::new()).1
 }
 
 fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, PositionSnapshot>> {
@@ -151,25 +140,19 @@ async fn scenario_e2e_clean_exit() {
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
-    let (polygon_tx, polygon_rx) = mpsc::channel::<SourceEvent>(16);
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(16);
 
-    // Send one trade then close both channels so the orchestrator exits cleanly.
+    // Send one trade then close the channel so the orchestrator exits cleanly.
     trade_tx.send(make_trade(wallet)).await.unwrap();
     drop(trade_tx);
-    drop(polygon_tx);
 
     let orch = Orchestrator::new(
-        polygon_rx,
         trade_rx,
-        make_accumulator(),
-        empty_operator_rx(),
         make_watchlist(wallet),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
-            cluster_observation_window_secs: 300,
             max_resolution_horizon_secs: 0, // disabled in tests
             entry_gate_config: disabled_entry_gate(),
         },
@@ -178,7 +161,7 @@ async fn scenario_e2e_clean_exit() {
         make_dispatcher(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
-        new_shared_health(true),
+        new_shared_health(false),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )
@@ -208,7 +191,6 @@ async fn scenario_graceful_shutdown() {
     let dir = TempDir::new().unwrap();
     let wallet = wallet_a();
 
-    let (polygon_tx, polygon_rx) = mpsc::channel::<SourceEvent>(16);
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(16);
 
     // Pre-fill channel with 2 trades before the orchestrator starts.
@@ -221,16 +203,12 @@ async fn scenario_graceful_shutdown() {
     shutdown_tx.send(()).unwrap();
 
     let orch = Orchestrator::new(
-        polygon_rx,
         trade_rx,
-        make_accumulator(),
-        empty_operator_rx(),
         make_watchlist(wallet),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
-            cluster_observation_window_secs: 300,
             max_resolution_horizon_secs: 0, // disabled in tests
             entry_gate_config: disabled_entry_gate(),
         },
@@ -239,7 +217,7 @@ async fn scenario_graceful_shutdown() {
         make_dispatcher(&dir),
         make_paper_state(&dir),
         PositionLedger::new(),
-        new_shared_health(true),
+        new_shared_health(false),
         MarketEndCache::new(String::new()),
         dead_reseed_rx(),
     )
@@ -258,6 +236,5 @@ async fn scenario_graceful_shutdown() {
         "paper.log should have at least the 5-byte header; got {len} bytes"
     );
 
-    drop(polygon_tx);
     drop(trade_tx);
 }

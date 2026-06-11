@@ -3,19 +3,16 @@
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
-use pe_funding_graph::FundingGraphAccumulator;
-use pe_operator_graph::ClusteringConfig;
 use pe_paper_state::PaperStateDb;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
-use pe_source_onchain_polygon::{LivePolygonConnector, PolygonConnectorConfig};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::fetcher::{WatchlistFetchConfig, WatchlistFetcher};
@@ -27,10 +24,9 @@ use tracing::info;
 use pe_core_types::Price;
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::entry_gate::CopyEntryGateConfig;
-use pe_service::health::{SharedHealth, new_shared_health};
+use pe_service::health::new_shared_health;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
-use pe_service::operator_graph_scheduler::OperatorGraphScheduler;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
@@ -222,16 +218,10 @@ async fn main() -> Result<()> {
     let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("pe-service.live".into()));
     let dispatcher = ExecutionDispatcher::new(paper_executor, live_executor);
 
-    // Polygon liveness is only meaningful when the WS source is configured;
-    // an empty ws_url means "etherscan-only mode" (no live on-chain feed).
-    let health = new_shared_health(!cfg.polygon_ws_url.is_empty());
+    let health = new_shared_health(false);
 
-    // Bounded channels per _GLOSSARY.md defaults.
-    let (polygon_tx, polygon_rx) = mpsc::channel(cfg.polygon_channel_capacity);
+    // Bounded channel per _GLOSSARY.md defaults.
     let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
-
-    // Shared accumulator: orchestrator ingests polygon events; scheduler reads snapshots.
-    let accumulator = Arc::new(Mutex::new(FundingGraphAccumulator::new()));
 
     // Merge leaderboard with optional bootstrap seed. The merged Watchlist
     // carries full WatchlistEntry metadata for every wallet so the Orchestrator
@@ -253,31 +243,8 @@ async fn main() -> Result<()> {
             );
         }
     }
-    // Wallets feed both the Polygon WS topic[2] filter (via funder discovery),
-    // the Polymarket trade poller, and the position seeder.
+    // Wallets feed the Polymarket trade poller and the position seeder.
     let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
-    // `funding_max_hops` is sourced from ServiceConfig so the value flows
-    // through the config-hash; other ClusteringConfig fields stay at default
-    // until they're surfaced in their own follow-up.
-    let clustering_config = ClusteringConfig {
-        funding_max_hops: cfg.funding_max_hops,
-        ..ClusteringConfig::default()
-    };
-
-    // Operator-graph scheduler — rebuilds clusters every 60s and publishes via watch.
-    let (scheduler, operator_identities_rx) = OperatorGraphScheduler::new(
-        accumulator.clone(),
-        clustering_config.clone(),
-        cfg.operator_graph_rebuild_cadence_secs,
-    );
-    let scheduler_task = tokio::spawn(scheduler.run());
-
-    // Polygon source task.
-    let polygon_task = spawn_polygon_task(
-        polygon_config_from(&cfg, wallets.clone(), clustering_config.funding_max_hops),
-        polygon_tx,
-        health.clone(),
-    );
 
     // Startup seed: fetch current positions from the API for each watchlisted wallet,
     // overlay onto the leader ledger, then advance each wallet's poll cursor to now so
@@ -376,16 +343,12 @@ async fn main() -> Result<()> {
     // Mid-price cache for marking open dashboard positions to market (own rate gate).
     let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone());
     let orch = Orchestrator::new(
-        polygon_rx,
         trade_rx,
-        accumulator,
-        operator_identities_rx,
         watchlist,
         OrchestratorConfig {
             bankroll,
             mode,
             signal_config: Default::default(),
-            cluster_observation_window_secs: 300,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
             entry_gate_config,
         },
@@ -446,10 +409,8 @@ async fn main() -> Result<()> {
     .await;
 
     info!("orchestrator stopped; cleaning up");
-    polygon_task.abort();
     trade_task.abort();
     http_task.abort();
-    scheduler_task.abort();
     resolution_task.abort();
     if let Some(t) = reseed_task {
         t.abort();
@@ -647,71 +608,4 @@ fn parse_mode(s: &str) -> Result<ExecutionMode> {
             other
         )),
     }
-}
-
-fn polygon_config_from(
-    cfg: &ServiceConfig,
-    seed_wallets: Vec<pe_core_types::WalletAddress>,
-    funding_max_hops: u8,
-) -> PolygonConnectorConfig {
-    PolygonConnectorConfig {
-        http_url: cfg.polygon_http_url.clone(),
-        ws_url: cfg.polygon_ws_url.clone(),
-        backfill_blocks: cfg.backfill_blocks,
-        backfill_page_size: cfg.polygon_backfill_page_size,
-        checkpoint_path: cfg.polygon_checkpoint_path.clone(),
-        channel_capacity: cfg.polygon_channel_capacity,
-        seed_wallets,
-        funding_max_hops,
-        funder_source: cfg.funder_source.clone(),
-        etherscan_api_key: cfg.etherscan_api_key.clone(),
-    }
-}
-
-fn spawn_polygon_task(
-    config: PolygonConnectorConfig,
-    tx: mpsc::Sender<pe_source_core::SourceEvent>,
-    health: SharedHealth,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        match LivePolygonConnector::connect(SourceId("polygon".into()), config).await {
-            Err(e) => {
-                tracing::error!(error = %e, "polygon connector failed to connect");
-                let mut h = health
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                h.polygon_status = pe_source_core::SourceStatus::Dead;
-            }
-            Ok(mut connector) => {
-                use pe_source_core::SourceConnector as _;
-                loop {
-                    match connector.next_event().await {
-                        Err(e) => {
-                            {
-                                let mut h = health
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                h.polygon_status = connector.health().status;
-                            }
-                            tracing::warn!(error = %e, "polygon source error");
-                            if matches!(e, pe_source_core::SourceError::Fatal { .. }) {
-                                break;
-                            }
-                        }
-                        Ok(event) => {
-                            {
-                                let mut h = health
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                h.polygon_status = connector.health().status;
-                            }
-                            if tx.send(event).await.is_err() {
-                                break; // orchestrator dropped its receiver
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    })
 }
