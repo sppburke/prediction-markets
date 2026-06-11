@@ -34,6 +34,10 @@ const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
 // Issue #176: delta-backfill confirmations + paranoia staleness window.
 const DEFAULT_POLYGON_CTF_CONFIRMATIONS: u64 = 256;
 const DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS: i64 = 604_800;
+// Issue #324: winner-discovery pipeline defaults.
+const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
+const DEFAULT_LEADERBOARD_TOP_N: u32 = 500;
+const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -434,6 +438,59 @@ pub struct BootstrapConfig {
         alias = "bootstrap_polymarket_full_fetch_staleness_secs"
     )]
     pub polymarket_full_fetch_staleness_secs: i64,
+
+    // ── Winner-discovery (issue #324) ─────────────────────────────────────────
+    /// Base URL for the Polymarket leaderboard endpoint. When absent, falls back
+    /// to `polymarket_base_url`. `PE_BOOTSTRAP_LEADERBOARD_BASE_URL` overrides.
+    #[serde(default)]
+    pub leaderboard_base_url: Option<String>,
+
+    /// Minimum interval (ms) between leaderboard HTTP requests. Default 500.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS` overrides.
+    #[serde(
+        default = "default_leaderboard_request_interval_ms",
+        alias = "bootstrap_leaderboard_request_interval_ms"
+    )]
+    pub leaderboard_request_interval_ms: u64,
+
+    /// Top-N entries requested per leaderboard (sort × window) slice. Default 500.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_LEADERBOARD_TOP_N` overrides.
+    #[serde(
+        default = "default_leaderboard_top_n",
+        alias = "bootstrap_leaderboard_top_n"
+    )]
+    pub leaderboard_top_n: u32,
+
+    /// Radion REST API base URL. When absent, Radion discovery is skipped silently.
+    /// `PE_BOOTSTRAP_RADION_API_URL` overrides.
+    #[serde(default)]
+    pub radion_api_url: Option<String>,
+
+    /// Radion API key. `PE_BOOTSTRAP_RADION_API_KEY` overrides.
+    #[serde(default)]
+    pub radion_api_key: Option<String>,
+
+    /// Minimum interval (ms) between Radion HTTP requests. Default 500.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_RADION_REQUEST_INTERVAL_MS` overrides.
+    #[serde(
+        default = "default_radion_request_interval_ms",
+        alias = "bootstrap_radion_request_interval_ms"
+    )]
+    pub radion_request_interval_ms: u64,
+
+    /// When `true`, the legacy `discovery` subcommand (Dune incremental) runs normally.
+    /// When `false` (default), `discovery` exits with a warning directing operators to
+    /// use `winner-discovery` instead. Does not gate `winner-discovery`.
+    /// `PE_BOOTSTRAP_DISCOVERY_ENABLED` overrides.
+    #[serde(
+        default,
+        alias = "bootstrap_discovery_enabled",
+        deserialize_with = "deserialize_bool_or_01"
+    )]
+    pub discovery_enabled: bool,
 }
 
 impl BootstrapConfig {
@@ -584,6 +641,18 @@ const fn default_clob_concurrency() -> usize {
     DEFAULT_CLOB_CONCURRENCY
 }
 
+const fn default_leaderboard_request_interval_ms() -> u64 {
+    DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS
+}
+
+const fn default_leaderboard_top_n() -> u32 {
+    DEFAULT_LEADERBOARD_TOP_N
+}
+
+const fn default_radion_request_interval_ms() -> u64 {
+    DEFAULT_RADION_REQUEST_INTERVAL_MS
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BootstrapConfig {
@@ -633,6 +702,13 @@ impl Default for BootstrapConfig {
             polymarket_delta_mode: DeltaMode::default(),
             polygon_ctf_confirmations: default_polygon_ctf_confirmations(),
             polymarket_full_fetch_staleness_secs: default_polymarket_full_fetch_staleness_secs(),
+            leaderboard_base_url: None,
+            leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
+            leaderboard_top_n: default_leaderboard_top_n(),
+            radion_api_url: None,
+            radion_api_key: None,
+            radion_request_interval_ms: default_radion_request_interval_ms(),
+            discovery_enabled: false,
         }
     }
 }

@@ -39,6 +39,10 @@ pub enum BootstrapError {
     Gamma { message: String },
     #[error("clob: {message}")]
     Clob { message: String },
+    #[error("leaderboard: {message}")]
+    Leaderboard { message: String },
+    #[error("radion: {message}")]
+    Radion { message: String },
     #[error("polygon_ctf: {message}")]
     PolygonCtf { message: String },
     #[error("funder: {message}")]

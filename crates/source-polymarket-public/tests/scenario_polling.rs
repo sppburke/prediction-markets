@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use pe_core_types::SourceId;
 use pe_source_core::SourceConnector;
 use pe_source_polymarket_public::{
-    FixtureFetcher, PollingConfig, PolymarketEndpoint, PolymarketPublicConnector,
+    FixtureFetcher, LeaderboardSort, LeaderboardWindow, PollingConfig, PolymarketEndpoint,
+    PolymarketPublicConnector,
 };
 
 const BASE: &str = "https://data-api.polymarket.com";
@@ -25,7 +26,11 @@ fn fixture(name: &str) -> Vec<u8> {
 
 fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
     let endpoints = vec![
-        PolymarketEndpoint::Leaderboard,
+        PolymarketEndpoint::Leaderboard {
+            sort: LeaderboardSort::Profit,
+            window: LeaderboardWindow::AllTime,
+            limit: 500,
+        },
         PolymarketEndpoint::UserTradeActivity {
             user: USER.into(),
             end: None,
@@ -43,7 +48,12 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
 
     let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
     responses.insert(
-        PolymarketEndpoint::Leaderboard.url(BASE),
+        PolymarketEndpoint::Leaderboard {
+            sort: LeaderboardSort::Profit,
+            window: LeaderboardWindow::AllTime,
+            limit: 500,
+        }
+        .url(BASE),
         fixture("leaderboard.json"),
     );
     responses.insert(

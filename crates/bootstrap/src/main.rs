@@ -7,7 +7,7 @@ use pe_bootstrap::{
     fetch, fetch_resolutions_and_schedules, funder, infra_probe, lock, migrate, pile,
     run_schedule_backfill,
     seed_historical::{self, parse_seed_as_of_env},
-    watchlist_phase, weekly,
+    watchlist_phase, weekly, winner_discovery,
 };
 use pe_source_onchain_polygon::{
     AlloyChainLogFetcher, BlockRange, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK,
@@ -53,6 +53,7 @@ async fn main() {
                 | "weekly"
                 | "classify-infra"
                 | "coverage"
+                | "winner-discovery"
         )
     );
 
@@ -459,21 +460,30 @@ async fn main() {
             }
 
             // ── Existing subcommands (UNCHANGED names) ───────────────────────
-            "discovery" => match discovery::run_discovery(&bootstrap_config, &mut cache).await {
-                Ok(r) => {
-                    tracing::info!(
-                        uploaded = r.uploaded,
-                        new_wallets = r.new_wallets,
-                        activated = r.activated,
-                        "discovery: complete"
+            "discovery" => {
+                if !bootstrap_config.discovery_enabled {
+                    tracing::warn!(
+                        "discovery: disabled (PE_BOOTSTRAP_DISCOVERY_ENABLED not set) \
+                         — use winner-discovery instead"
                     );
-                    0
+                    std::process::exit(0);
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "discovery: fatal");
-                    1
+                match discovery::run_discovery(&bootstrap_config, &mut cache).await {
+                    Ok(r) => {
+                        tracing::info!(
+                            uploaded = r.uploaded,
+                            new_wallets = r.new_wallets,
+                            activated = r.activated,
+                            "discovery: complete"
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "discovery: fatal");
+                        1
+                    }
                 }
-            },
+            }
 
             "backfill" => match backfill::run_backfill(&bootstrap_config, &mut cache).await {
                 Ok(r) => {
@@ -546,6 +556,24 @@ async fn main() {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "classify-infra: fatal");
+                        1
+                    }
+                }
+            }
+
+            "winner-discovery" => {
+                match winner_discovery::run_winner_discovery(&bootstrap_config, &mut cache).await {
+                    Ok(r) => {
+                        tracing::info!(
+                            leaderboard_unique = r.leaderboard_unique,
+                            leaderboard_activated = r.leaderboard_activated,
+                            radion_unique = r.radion_unique,
+                            "winner-discovery: complete"
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "winner-discovery: fatal");
                         1
                     }
                 }
