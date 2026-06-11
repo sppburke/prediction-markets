@@ -8,15 +8,11 @@
     clippy::too_many_arguments
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use pe_core_types::{
-    ContractQty, MarketId, OperatorId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
-    VenueMarketId, WalletAddress,
-};
-use pe_operator_graph::{
-    clustering::ClusteringConfig,
-    funding::{FundingEdge, FundingSnapshot},
+    ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
+    WalletAddress,
 };
 use pe_trader_index::{LedgerConfig, RawTrade, build_trader_ledgers};
 use rust_decimal_macros::dec;
@@ -83,7 +79,7 @@ fn single_wallet_fully_closed() {
         raw_trade(w, m.clone(), 0, Side::Sell, dec!(0.80), 5, 300, "sell-2"),
     ];
 
-    let ledgers = build_trader_ledgers(&trades, 30, &[], None, &LedgerConfig::default());
+    let ledgers = build_trader_ledgers(&trades, 30, None);
 
     assert_eq!(ledgers.len(), 1, "expected one ledger");
     let ledger = &ledgers[0];
@@ -95,7 +91,6 @@ fn single_wallet_fully_closed() {
     );
     assert_eq!(ledger.closed_trades.len(), 2, "expected 2 closed trades");
     assert_eq!(ledger.reconstruction_quality.get(), 100);
-    assert!(ledger.operator_id.is_none());
 
     // First closed trade: 10 contracts @ 0.40 entry, 0.70 exit → pnl = 0.30 * 10 = 3.00
     let ct0 = &ledger.closed_trades[0];
@@ -115,72 +110,6 @@ fn single_wallet_fully_closed() {
 
 // ─── scenario 2 ──────────────────────────────────────────────────────────────
 
-/// Operator-merged cluster: 2 wallets share one OperatorIdentity with high confidence.
-///
-/// PASS: both TraderLedger records have operator_id = Some(expected_operator_id).
-#[test]
-fn operator_merged_cluster_annotated() {
-    let root = wallet(0xA0);
-    let w1 = wallet(0xA1);
-    let w2 = wallet(0xA2);
-    let m = market("mkt-B");
-
-    // Build a minimal FundingSnapshot so the operator_graph can produce an OperatorIdentity.
-    let edge = |funder: WalletAddress, funded: WalletAddress| FundingEdge {
-        funder,
-        funded,
-        amount_usd: dec!(1000),
-        timestamp: ts(-86_400), // 1 day before snapshot
-    };
-
-    let mut wallet_ages = HashMap::new();
-    wallet_ages.insert(root, 365 * 86_400u32);
-    wallet_ages.insert(w1, 180 * 86_400u32);
-    wallet_ages.insert(w2, 180 * 86_400u32);
-
-    let funding_snap = FundingSnapshot {
-        edges: vec![edge(root, w1), edge(root, w2)],
-        wallet_ages,
-        known_external: HashMap::new(),
-        closed_trade_counts: HashMap::new(),
-        realized_pnl_usd: HashMap::new(),
-        snapshot_at: ts(0),
-    };
-
-    let identities = pe_operator_graph::clustering::build_operator_identities(
-        &funding_snap,
-        &ClusteringConfig::default(),
-    )
-    .expect("clustering should succeed");
-
-    assert_eq!(
-        identities.len(),
-        1,
-        "should produce exactly one OperatorIdentity"
-    );
-    let expected_op_id: OperatorId = identities[0].operator_id;
-
-    // Give each wallet one trade.
-    let trades = vec![
-        raw_trade(w1, m.clone(), 0, Side::Buy, dec!(0.55), 3, 0, "w1-buy"),
-        raw_trade(w2, m.clone(), 0, Side::Buy, dec!(0.60), 4, 10, "w2-buy"),
-    ];
-
-    let ledgers = build_trader_ledgers(&trades, 7, &identities, None, &LedgerConfig::default());
-
-    assert_eq!(ledgers.len(), 2, "expected two ledgers (one per wallet)");
-    for ledger in &ledgers {
-        assert_eq!(
-            ledger.operator_id,
-            Some(expected_op_id),
-            "wallet {:?} should be annotated with the operator_id",
-            ledger.wallet
-        );
-    }
-}
-
-// ─── scenario 3 ──────────────────────────────────────────────────────────────
-
 /// Fresh wallet: fewer than 2 closed trades, some still open.
 ///
 /// PASS: ledger has < 2 closed trades and reconstruction_quality < 100
@@ -197,7 +126,7 @@ fn fresh_wallet_partial_reconstruction() {
         raw_trade(w, m.clone(), 0, Side::Sell, dec!(0.60), 5, 100, "sell-a"),
     ];
 
-    let ledgers = build_trader_ledgers(&trades, 14, &[], None, &LedgerConfig::default());
+    let ledgers = build_trader_ledgers(&trades, 14, None);
 
     assert_eq!(ledgers.len(), 1);
     let ledger = &ledgers[0];
@@ -264,7 +193,7 @@ fn wallet_filter_matches_post_filter() {
     ];
 
     // Path A: build all, post-filter to {w1, w2}
-    let all_ledgers = build_trader_ledgers(&trades, 90, &[], None, &LedgerConfig::default());
+    let all_ledgers = build_trader_ledgers(&trades, 90, None);
     let pool: HashSet<WalletAddress> = [w1, w2].into_iter().collect();
     let mut post_filtered: Vec<_> = all_ledgers
         .into_iter()
@@ -273,8 +202,7 @@ fn wallet_filter_matches_post_filter() {
     post_filtered.sort_by_key(|l| l.wallet.0);
 
     // Path B: pre-filter via wallet_filter
-    let mut pre_filtered =
-        build_trader_ledgers(&trades, 90, &[], Some(&pool), &LedgerConfig::default());
+    let mut pre_filtered = build_trader_ledgers(&trades, 90, Some(&pool));
     pre_filtered.sort_by_key(|l| l.wallet.0);
 
     assert_eq!(

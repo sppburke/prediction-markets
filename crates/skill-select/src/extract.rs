@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_bootstrap::cache::{ResolutionIndex, WalletCache};
-use pe_trader_index::{LedgerConfig, build_trader_ledgers};
+use pe_trader_index::build_trader_ledgers;
 use rayon::prelude::*;
 use tracing::{info, warn};
 
@@ -268,11 +268,7 @@ fn process_wallet(
         return None;
     }
 
-    let ledger_config = LedgerConfig::default();
-    let Some(ledger) = build_trader_ledgers(&train, 0, &[], None, &ledger_config)
-        .into_iter()
-        .next()
-    else {
+    let Some(ledger) = build_trader_ledgers(&train, 0, None).into_iter().next() else {
         wallets_skipped.fetch_add(1, Ordering::Relaxed);
         return None;
     };

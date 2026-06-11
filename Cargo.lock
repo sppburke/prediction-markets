@@ -3463,7 +3463,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "pe-core-types",
- "pe-operator-graph",
  "pe-source-polymarket-public",
  "rust_decimal",
  "rust_decimal_macros",

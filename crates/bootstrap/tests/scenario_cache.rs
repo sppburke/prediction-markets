@@ -14,9 +14,8 @@ use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::filter::FilterConfig;
 use pe_bootstrap::polymarket::PolymarketBulkFetcher;
 use pe_core_types::{SourceTimestamp, SourceTradeId, WalletAddress};
-use pe_operator_graph::OperatorIdentity;
 use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
-use pe_trader_index::{LedgerConfig, build_trader_ledgers};
+use pe_trader_index::build_trader_ledgers;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
@@ -262,12 +261,10 @@ async fn scenario_replay_reproducibility() {
 
     let fixed_snapshot_at =
         SourceTimestamp(OffsetDateTime::from_unix_timestamp(1_701_000_000).unwrap());
-    let empty_ops: &[OperatorIdentity] = &[];
 
     let build_watchlist = |c: &WalletCache| {
         let trades = c.trades_for(WALLET_A_HEX);
-        let ledgers =
-            build_trader_ledgers(&trades, u32::MAX, empty_ops, None, &LedgerConfig::default());
+        let ledgers = build_trader_ledgers(&trades, u32::MAX, None);
         build_seed_watchlist(ledgers, fixed_snapshot_at.clone(), &FilterConfig::default())
     };
 
@@ -382,9 +379,7 @@ async fn scenario_unlimited_window_includes_all_trades() {
     let trades = cache.trades_for(WALLET_A_HEX);
     assert_eq!(trades.len(), 2);
 
-    let empty_ops: &[OperatorIdentity] = &[];
-    let ledgers =
-        build_trader_ledgers(&trades, u32::MAX, empty_ops, None, &LedgerConfig::default());
+    let ledgers = build_trader_ledgers(&trades, u32::MAX, None);
     let ledger = ledgers
         .iter()
         .find(|l| l.wallet == wallet_a())

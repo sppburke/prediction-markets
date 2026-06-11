@@ -463,10 +463,8 @@ pub fn run_simulation(
             }
         };
 
-        let wallet_to_op: HashMap<WalletAddress, OperatorId> = HashMap::new();
-
         let snapshot_at = SourceTimestamp(sim_date.midnight().assume_utc());
-        let filtered_ledgers = incr.build_ledgers(pool, &wallet_to_op, config.audit_window_days);
+        let filtered_ledgers = incr.build_ledgers(pool, config.audit_window_days);
 
         if filtered_ledgers.is_empty() {
             continue;
@@ -1437,7 +1435,6 @@ mod tests {
         }
         TraderLedger {
             wallet: wallet(0),
-            operator_id: None,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
             closed_trades: closed,
             open_positions: vec![],
@@ -1562,7 +1559,6 @@ mod tests {
         }
         TraderLedger {
             wallet: wallet(0),
-            operator_id: None,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
             closed_trades: closed,
             open_positions: vec![],

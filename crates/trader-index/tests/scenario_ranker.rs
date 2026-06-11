@@ -9,8 +9,8 @@
 )]
 
 use pe_core_types::{
-    ContractQty, MarketId, OperatorId, OutcomeId, Price, ReconstructionQuality, Side,
-    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceTimestamp,
+    SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_trader_index::{ClosedTrade, RankerConfig, TraderLedger, WatchlistTier, build_watchlist};
 use rust_decimal_macros::dec;
@@ -41,10 +41,6 @@ fn trade_id(n: u32) -> SourceTradeId {
 
 fn quality(q: u8) -> ReconstructionQuality {
     ReconstructionQuality::new(q).expect("quality in 0..=100")
-}
-
-fn op_id(seed: &[u8]) -> OperatorId {
-    OperatorId(blake3::hash(seed))
 }
 
 /// Construct a profitable closed trade within the active 180-day window.
@@ -90,7 +86,6 @@ fn fully_eligible_active_leader() {
 
     let ledger = TraderLedger {
         wallet: w,
-        operator_id: None,
         reconstruction_quality: quality(100),
         closed_trades: trades,
         open_positions: Vec::new(),
@@ -132,7 +127,6 @@ fn incubator_only_insufficient_trades() {
 
     let ledger = TraderLedger {
         wallet: w,
-        operator_id: None,
         reconstruction_quality: quality(90),
         closed_trades: trades,
         open_positions: Vec::new(),
@@ -146,78 +140,4 @@ fn incubator_only_insufficient_trades() {
 
     let entry = &watchlist.entries[0];
     assert_eq!(entry.tier, WatchlistTier::Incubator);
-}
-
-// ─── scenario 3 ──────────────────────────────────────────────────────────────
-
-/// Two wallets share one operator_id. Each has 35 trades (above the 15-trade active
-/// threshold individually, but treated as a single operator entry). Combined they have
-/// 70 trades across 32 distinct markets.
-///
-/// PASS: the operator group appears once with `tier == WatchlistTier::Active`.
-#[test]
-fn operator_aggregated_crosses_threshold() {
-    let oid = op_id(b"test-operator-1");
-    let w1 = wallet(0x10);
-    let w2 = wallet(0x11);
-
-    // Wallet 1: markets 0–15 (16 markets), 35 trades.
-    let trades_w1: Vec<ClosedTrade> = (0u32..35)
-        .map(|i| {
-            let market_n = (i % 16) as u8;
-            let day_offset = 1 + i * 4;
-            closed_trade(market_n, day_offset, i * 2)
-        })
-        .collect();
-
-    // Wallet 2: markets 16–31 (16 distinct markets), 35 trades.
-    let trades_w2: Vec<ClosedTrade> = (0u32..35)
-        .map(|i| {
-            let market_n = 16 + (i % 16) as u8;
-            let day_offset = 2 + i * 4;
-            closed_trade(market_n, day_offset, 10_000 + i * 2)
-        })
-        .collect();
-
-    let ledger1 = TraderLedger {
-        wallet: w1,
-        operator_id: Some(oid),
-        reconstruction_quality: quality(95),
-        closed_trades: trades_w1,
-        open_positions: Vec::new(),
-        audit_window_days: 180,
-    };
-
-    let ledger2 = TraderLedger {
-        wallet: w2,
-        operator_id: Some(oid),
-        reconstruction_quality: quality(95),
-        closed_trades: trades_w2,
-        open_positions: Vec::new(),
-        audit_window_days: 180,
-    };
-
-    let watchlist = build_watchlist(&[ledger1, ledger2], snapshot_at(), &RankerConfig::default());
-
-    assert_eq!(
-        watchlist.active_count, 1,
-        "operator group should produce exactly 1 active entry"
-    );
-    assert_eq!(
-        watchlist.incubator_count, 0,
-        "no separate incubator entry expected"
-    );
-
-    let entry = &watchlist.entries[0];
-    assert_eq!(entry.tier, WatchlistTier::Active);
-    assert_eq!(
-        entry.operator_id,
-        Some(oid),
-        "entry should carry the operator_id"
-    );
-    // combined 70 trades in window
-    assert_eq!(
-        entry.closed_trades_in_window, 70,
-        "combined trade count should be 70"
-    );
 }

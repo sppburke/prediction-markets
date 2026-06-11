@@ -60,7 +60,6 @@ async fn scenario_top5_leaderboard_produces_watchlist() {
     // All entries are Active tier.
     for entry in &watchlist.entries {
         assert_eq!(entry.tier, WatchlistTier::Active);
-        assert!(entry.operator_id.is_none());
     }
 
     // Rank-inverted scores: rank 1 → 5×100=500, rank 5 → 1×100=100.

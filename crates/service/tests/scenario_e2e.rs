@@ -59,7 +59,6 @@ fn make_watchlist(wallet: WalletAddress) -> Watchlist {
     Watchlist {
         entries: vec![WatchlistEntry {
             wallet,
-            operator_id: None,
             tier: WatchlistTier::Active,
             leader_score_bps: score,
             lcb_5pct_bps: score,

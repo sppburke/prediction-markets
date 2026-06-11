@@ -13,9 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use pe_core_types::{BasisPoints, SourceTimestamp, WalletAddress};
-use pe_operator_graph::OperatorIdentity;
 use pe_trader_index::{
-    LedgerConfig, TraderLedger, Watchlist, WatchlistEntry, WatchlistTier, build_trader_ledgers,
+    TraderLedger, Watchlist, WatchlistEntry, WatchlistTier, build_trader_ledgers,
 };
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -62,8 +61,6 @@ pub async fn run_watchlist(
 ) -> Result<WatchlistReport, BootstrapError> {
     let snapshot_at = SourceTimestamp(OffsetDateTime::now_utc());
     let audit_window_days = config.audit_window_days.unwrap_or(u32::MAX);
-    let empty_operators: &[OperatorIdentity] = &[];
-    let ledger_config = LedgerConfig::default();
     let mut ledgers: Vec<TraderLedger> = Vec::with_capacity(wallets.len());
     let mut total_trades: usize = 0;
 
@@ -73,13 +70,7 @@ pub async fn run_watchlist(
             continue;
         }
         total_trades += trades.len();
-        ledgers.extend(build_trader_ledgers(
-            &trades,
-            audit_window_days,
-            empty_operators,
-            None,
-            &ledger_config,
-        ));
+        ledgers.extend(build_trader_ledgers(&trades, audit_window_days, None));
     }
     let ledger_count = ledgers.len();
     tracing::info!(
@@ -142,8 +133,7 @@ pub async fn run_watchlist(
 /// Build a seed [`Watchlist`] from reconstructed ledgers using the bootstrap post-filter.
 ///
 /// Uses win-rate basis points as the score (no historical LCB_5pct available at bootstrap).
-/// All passing wallets are assigned `Active` tier; `operator_id` is always `None` since
-/// operator attribution requires `source-onchain-polygon` data not available here.
+/// All passing wallets are assigned `Active` tier.
 pub fn build_seed_watchlist(
     ledgers: Vec<TraderLedger>,
     snapshot_at: SourceTimestamp,
@@ -167,7 +157,6 @@ pub fn build_seed_watchlist(
         let win_rate = BasisPoints(win_rate_bps(wins, total));
         entries.push(WatchlistEntry {
             wallet: ledger.wallet,
-            operator_id: None,
             tier: WatchlistTier::Active,
             leader_score_bps: win_rate,
             lcb_5pct_bps: BasisPoints(0),

@@ -90,7 +90,6 @@ mod tests {
     fn entry(w: WalletAddress) -> WatchlistEntry {
         WatchlistEntry {
             wallet: w,
-            operator_id: None,
             tier: WatchlistTier::Active,
             leader_score_bps: BasisPoints(0),
             lcb_5pct_bps: BasisPoints(0),

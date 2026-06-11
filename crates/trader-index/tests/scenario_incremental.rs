@@ -11,13 +11,13 @@
     clippy::too_many_arguments
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use pe_core_types::{
-    ContractQty, MarketId, OperatorId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId,
-    VenueMarketId, WalletAddress,
+    ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
+    WalletAddress,
 };
-use pe_trader_index::{IncrementalLedger, LedgerConfig, RawTrade, build_trader_ledgers};
+use pe_trader_index::{IncrementalLedger, RawTrade, build_trader_ledgers};
 use rust_decimal_macros::dec;
 use time::macros::datetime;
 
@@ -83,15 +83,14 @@ fn incremental_matches_batch_reconstruction() {
     ];
 
     // ── batch path ──────────────────────────────────────────────────────────
-    let batch_ledgers = build_trader_ledgers(&trades, 90, &[], None, &LedgerConfig::default());
+    let batch_ledgers = build_trader_ledgers(&trades, 90, None);
 
     // ── incremental path ────────────────────────────────────────────────────
     let mut incr = IncrementalLedger::new();
     incr.apply_batch(&trades);
 
     let all_wallets: HashSet<WalletAddress> = [w1, w2, w3].into_iter().collect();
-    let wallet_to_op: HashMap<WalletAddress, OperatorId> = HashMap::new();
-    let mut incr_ledgers = incr.build_ledgers(Some(&all_wallets), &wallet_to_op, 90);
+    let mut incr_ledgers = incr.build_ledgers(Some(&all_wallets), 90);
     incr_ledgers.sort_by_key(|l| l.wallet.0);
 
     // ── compare ─────────────────────────────────────────────────────────────
@@ -164,18 +163,16 @@ fn incremental_split_batch_matches_single() {
         raw_trade(w, m.clone(), 0, Side::Sell, dec!(0.80), 7, 300, "s2"),
     ];
 
-    let wallet_to_op: HashMap<WalletAddress, OperatorId> = HashMap::new();
-
     // Single batch.
     let mut incr_single = IncrementalLedger::new();
     incr_single.apply_batch(&trades);
-    let single = incr_single.build_ledgers(None, &wallet_to_op, 90);
+    let single = incr_single.build_ledgers(None, 90);
 
     // Two halves.
     let mut incr_split = IncrementalLedger::new();
     incr_split.apply_batch(&trades[..2]);
     incr_split.apply_batch(&trades[2..]);
-    let split = incr_split.build_ledgers(None, &wallet_to_op, 90);
+    let split = incr_split.build_ledgers(None, 90);
 
     assert_eq!(single.len(), split.len());
     let s = &single[0];

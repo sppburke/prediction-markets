@@ -57,11 +57,10 @@ fn price(d: rust_decimal::Decimal) -> Price {
 }
 
 /// Build a minimal active-watchlist with a single wallet entry.
-fn active_watchlist(w: WalletAddress, op: Option<OperatorId>) -> Watchlist {
+fn active_watchlist(w: WalletAddress) -> Watchlist {
     Watchlist {
         entries: vec![WatchlistEntry {
             wallet: w,
-            operator_id: op,
             tier: WatchlistTier::Active,
             leader_score_bps: BasisPoints(500),
             lcb_5pct_bps: BasisPoints(200),
@@ -116,7 +115,7 @@ fn entry_new_position() {
     let w = wallet(0x01);
     let mkt = market(1);
     let trade = incoming(w, mkt.clone(), Side::Buy, 100);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let signal = classify_trade(
         &trade,
@@ -149,7 +148,7 @@ fn add_to_existing() {
     let w = wallet(0x02);
     let mkt = market(2);
     let trade = incoming(w, mkt.clone(), Side::Buy, 50);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let mut positions = HashMap::new();
     positions.insert(
@@ -190,7 +189,7 @@ fn trim_partial_close() {
     let w = wallet(0x03);
     let mkt = market(3);
     let trade = incoming(w, mkt.clone(), Side::Sell, 300);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let mut positions = HashMap::new();
     positions.insert(
@@ -231,7 +230,7 @@ fn exit_full_close() {
     let w = wallet(0x04);
     let mkt = market(4);
     let trade = incoming(w, mkt.clone(), Side::Sell, 950);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let mut positions = HashMap::new();
     positions.insert(
@@ -272,7 +271,7 @@ fn flip_side_reversal() {
     let w = wallet(0x05);
     let mkt = market(5);
     let trade = incoming(w, mkt.clone(), Side::Sell, 1_500);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let mut positions = HashMap::new();
     positions.insert(
@@ -418,7 +417,7 @@ fn unknown_action_suppressed() {
     let w = wallet(0x08);
     let mkt = market(8);
     let trade = incoming(w, mkt.clone(), Side::Buy, 100);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let result = classify_trade(
         &trade,
@@ -449,7 +448,7 @@ fn add_low_confidence_suppressed() {
     let w = wallet(0x09);
     let mkt = market(9);
     let trade = incoming(w, mkt.clone(), Side::Buy, 50);
-    let watchlist = active_watchlist(w, None);
+    let watchlist = active_watchlist(w);
 
     let mut positions = HashMap::new();
     positions.insert(
@@ -492,7 +491,7 @@ proptest::proptest! {
         let w = wallet(0x20);
         let mkt = market(8);
         let trade = incoming(w, mkt.clone(), Side::Buy, 100);
-        let watchlist = active_watchlist(w, None);
+        let watchlist = active_watchlist(w);
         let q = quality(quality_val);
 
         let s1 = classify_trade(
