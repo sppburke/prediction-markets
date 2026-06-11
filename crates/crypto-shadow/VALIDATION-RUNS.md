@@ -23,7 +23,7 @@ model.
 | **v2 (pre-#311)** | 2026-06-09, aborted ~T+147 (23:21Z) | #309 (`9d3b366`) | aborted | deleted | INVALID | channel saturation — 78,736 dropped frames, 5m tape dead 73 min |
 | **run1** | 2026-06-10 01:39:15Z–05:39:14Z | #311 (`b16624b`, PR #312) | 240.0 min | 7,903,076,352 B (7.36 GiB) | INVALID | AC1: `frames_dropped_clob = 3230` (+ ~25-min CLOB outage) |
 | **run2** | 2026-06-10 06:46:44Z–10:46:43Z | #311 (`b16624b`, PR #312) | 240.0 min | 10,786,172,928 B (10.05 GiB) | INVALID | AC1: `frames_dropped_clob = 36428` (steady-state saturation) |
-| **run3 (clean attempt)** | launched 2026-06-10 19:53:26Z, ETA ~23:53Z | #317 (`0a74552`, PR #318) | 4 h target | — | *in progress* | — |
+| **run3** ✅ | 2026-06-10 19:53:26Z–23:53:26Z | #317 (`0a74552`, PR #318) | 240.0 min | 10,314,039,296 B (9.60 GiB) | **CLEAN — first valid tape + sweep** | none (AC1 all 0, AC2 1 s, AC3 0 s) |
 
 Runs 1–2 are the two post-#311 captures that motivated the deeper #317 fix.
 The earlier "v2" run (#309 binary) is listed for lineage only — its tape and
@@ -33,12 +33,15 @@ run1/run2.
 
 ### TL;DR verdict
 
-Both runs 1 and 2 ran the full 4 hours and wrote complete tapes, but **both fail
-the hard-zero clean-tape acceptance criteria (AC1)** because the #311 binary
-still dropped CLOB book frames. They are unusable for a decision-grade #310
-sweep. Their realized-edge reads are **not trustworthy** (tiny n, frame-loss,
-single-regime) and exist here only as a methodology record. The clean decision
-artifact is the run3 (#318 binary) sweep, pending.
+Runs 1 and 2 ran the full 4 hours and wrote complete tapes, but **both fail the
+hard-zero clean-tape acceptance criteria (AC1)** because the #311 binary still
+dropped CLOB book frames. They are unusable for a decision-grade #310 sweep and
+exist here only as a methodology record. **Run 3 (#318 binary) is the first CLEAN
+tape — all three AC pass — and produced the first `valid=true` sweep.** Its
+realized read, under adversarial market-clustered inference, is **mostly
+down-regime drift, not tradeable edge** — see *Run 3* below. So as of run3 the
+**infrastructure is validated end-to-end** while the **strategy signal is not yet
+demonstrated**; the next step is multi-regime tape collection.
 
 ---
 
@@ -273,6 +276,67 @@ Sweep **reference cell** (`3 bps / 300 ms / 1000 ms / top_n 3`, fires 196):
 | mm (mean / fills) | — / 0 | — / 0 | +0.315 / 10 | −0.083 / 8 |
 
 `tape_validity.valid = false`; `fidelity` 196/196 matched, 0 missing/extra, no divergence.
+
+---
+
+## Run 3 — FIRST CLEAN TAPE (infrastructure validated; signal = drift, not edge)
+
+**Tape:** `data/crypto-shadow-tape/crypto_shadow_run3_clean.db` (10,314,039,296 B / 9.60 GiB — **retained**, rsync resume+compress home, size-verified + `PRAGMA quick_check ok`).
+**Window:** 2026-06-10 19:53:26Z → 23:53:26Z (240.0 min, full 4 h, clean SIGINT via `timeout -s INT 14400`). **Binary:** #318 `0a74552`. **`schema_version` = 4.**
+
+### All three hard-zero AC PASS ✅
+
+| AC | value | result |
+|----|-------|--------|
+| AC1 `frames_dropped_*` (chainlink/clob/bybit/okx/coinbase) | all **0** | ✅ |
+| AC2 `max_clob_gap_secs` | **1** (`drive` end `max_clob_gap_ms=1995`) | ✅ (< 300) |
+| AC3 5m-trade staleness (capture-end-relative) | **0.0 s** | ✅ (< 300) |
+
+> **AC3 tooling caveat (immortalized):** `checkin.sh --post` reported AC3 = **870 s** = FAIL, but that is an artifact — the query computes `(now − MAX(received_at_ms))` against **wall-clock `now`**, and `--post` ran 14.5 min after shutdown (3.5 min graceful shutdown + check delay); 00:07:46Z − 23:53:16Z = 870 s exactly. Verified Tier-1 that the 5m tape was alive to the final frame: **last 5m trade = last overall trade = 23:53:16Z**, with **2,354 5m trades in the final 5 min**. The true capture-end-relative staleness is 0.0 s. **Follow-up filed: `checkin.sh` AC3 should compute end-relative staleness, not vs `now`,** so a late `--post` does not false-FAIL.
+
+### `#318` fix validated end-to-end
+
+- **CLOB reconnects collapsed 144 (run1) → 6 (run3)** — the venue-documented app-level `PING`@10s keepalive works. (Of the run's ~129 *other* reconnects, all were exchange-WS, which do not gate any AC.)
+- **13,090,901 frames captured, 0 dropped.** `drive` end stats: `flushes=77926`, `frames_written=13,090,901`, `max_clob_gap_ms=1995`.
+
+### Capture volume
+
+| table | rows |
+|-------|------|
+| `raw_ticks` | 13,090,901 (clob dominant; 24,835,154 book-updates indexed in replay) |
+| `clob_trades` | 145,187 |
+| `observations` | 376 (down 210 / up 166; **100% resolved**) |
+| `markets` | 90 (64 resolved; the 26 unresolved are *future-enumerated* windows — out to 04:45Z — that never completed in-capture, so they carry zero observations; `resolve` re-run added 0) |
+| `resolutions` | 64 → 38 down (59%) / 26 up |
+
+### Sweep — first `valid=true`
+
+`pe-crypto-shadow sweep --db crypto_shadow_run3_clean.db --out sweep_run3.json` (run **locally**, copy-home workflow): **`tape_validity.valid = true`, `frames_dropped_status = clean`, fidelity 376/376 matched, 0 missing/extra.** Reference cell (3 bps/300 ms/1000 ms/top_n 3, 376 fires), realized net/share:
+
+| strategy | 15m down | 15m up | 5m down | 5m up |
+|---|---|---|---|---|
+| buy_hold (mean, frac+) | +0.040 (68%) | −0.027 (37%) | **+0.103 (60%)** | −0.016 (45%) |
+| scalp (best H) | +0.016 @30s | +0.007 @10s | +0.045 @10s | +0.030 @10s |
+| mm (mean / fills) | +0.002 / 6 | −0.047 / 9 | +0.250 / 16 | −0.037 / 14 |
+
+Grid robustness: 5m-down buy_hold positive in **100% of 480 cells** (grid-mean +0.221); 15m-down 72%; up-moves flat/negative.
+
+### Adversarial decomposition — the +0.103 is MOSTLY DRIFT (not tradeable)
+
+A 4-lens analysis with **market-clustered inference** (the obs are pseudo-replicated: 105 "5m-down" obs share only **38 distinct market outcomes**, and 5m/15m fire on the *same* triggers). 3 of 4 lenses → `drift_artifact`, 1 → `mixed`:
+
+1. **Clustering kills significance.** Naive 95% CI on +0.103 = [+0.035, +0.171] (t=2.98); cluster-robust (38 markets) mean drops to **+0.070, CI [−0.049, +0.188] — includes 0** (t=1.15). Not distinguishable from zero.
+2. **"60% positive" = the regime.** 60.0% frac-positive vs the **59.4% unconditional down base rate** → exact binomial **p=0.92** (indistinguishable). In a down-skewed window, mechanically buying NO *looks* profitable.
+3. **Concentrated, not spread.** Half the effect is one 1-h sub-window (W2 20:53–21:53Z: +0.218 @ 96.7% win, obs piled on the 7/8 markets that settled down); ex-W2 → +0.057 / 58.7% win. Win-rate spread across the 4 h: **0.516–0.967**.
+4. **Decisive — profitability tracks the TREND, not the trigger.** UP-fires *become profitable* (W3 +0.088, W4 +0.016) exactly when the down-regime pauses; in down-legs down pays and up loses, in balanced legs both pay. That is a momentum/regime bet — the opposite of "we see the move before the book reprices."
+
+**Faint genuine whisper at 5m only** (why Lens A = mixed, not pure drift): market-clustered permutation p=0.038 **and** 5m-up *also* p=0.027 (symmetric significance is anti-drift evidence — pure drift lifts only the down side); within-market fire-share separates DOWN-settled (0.635) from UP-settled (0.397) markets; the price mechanism is latency-arb-shaped (win-rate 0.695 vs entry ask 0.581, gap +0.114 ≈ 10× the fee, at **7 ms median feed-to-book lag** — the book genuinely hadn't repriced). But that component is **tiny (+0.03 per-market lift), n≈38 effective, single regime**. **15m = pure drift** (per-market lift exactly 0.000; permutation p=0.235; 17/17 markets received *both* fire directions → trigger carries zero market-level info).
+
+> The naive "+0.10 in 100% of 480 cells" was a **false positive the measure-first machine correctly caught** — exactly its purpose (`CLAUDE.md`: *"a negative result is a valid, valuable outcome"*).
+
+### Acceptance bar going forward (set by run3)
+
+A trigger qualifies as edge only if it **predicts the entered side independent of the prevailing trend** (the W3/W4 up-fire reversal is the failure mode), under **market-clustered inference** (cluster on `condition_id`; the ~1.75× variance inflation is the whole story), validated across **multiple regimes** — at minimum an up-skewed and a balanced window, not one down-skewed 4 h. (Next experiment: the multi-regime tape-collection feature.)
 
 ---
 
