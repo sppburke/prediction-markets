@@ -15,7 +15,6 @@ use pe_core_types::{
     ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId,
     WalletAddress, WinnerFollowSignalKind,
 };
-use pe_operator_graph::OperatorIdentity;
 use pe_risk_engine::RiskSnapshot;
 use pe_risk_engine::clamp_contracts_to_liquidity;
 use pe_risk_engine::snapshot::TradingMode;
@@ -23,7 +22,7 @@ use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
 use pe_trader_index::snapshot::RawTrade;
-use pe_trader_index::{IncrementalLedger, LedgerConfig, RankerConfig, build_watchlist};
+use pe_trader_index::{IncrementalLedger, RankerConfig, build_watchlist};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use time::{Date, OffsetDateTime};
@@ -31,7 +30,6 @@ use tracing::info;
 
 use crate::config::BacktestConfig;
 use crate::error::BacktestError;
-use crate::funder_graph::{FunderGraphTimeline, build_operator_identities_at};
 use crate::report::{
     KellySweepRun, PnlAccumulator, TradeFill, WinnerFollowReport, max_drawdown_pct, sharpe_ratio,
 };
@@ -124,7 +122,6 @@ impl SuppressionTracker {
 struct OpenPosition {
     contracts: u64,
     avg_fill_price: Decimal,
-    operator_id: Option<OperatorId>,
     /// Calendar date on which the copy was opened. Used by the resolution sweep to
     /// guard against anomalies where a market's resolved_at precedes the bought_on date.
     bought_on: Date,
@@ -245,13 +242,11 @@ impl ExposureTracker {
 pub fn run_simulation(
     config: &BacktestConfig,
     all_trades: &[RawTrade],
-    funder_timeline: &FunderGraphTimeline,
     snapshots: &LeaderboardSnapshots,
     resolutions: &ResolutionIndex,
     schedules: &ScheduleIndex,
     liq_index: &LiquidityIndex,
     ranker_config: &RankerConfig,
-    ledger_config: &LedgerConfig,
     strategy: &WinnerFollowStrategy,
     write_output: bool,
 ) -> Result<WinnerFollowReport, BacktestError> {
@@ -327,31 +322,12 @@ pub fn run_simulation(
 
     let mut fills_writer = maybe_open_trades_ndjson(&config.output_dir, write_output)?;
 
-    // Emit funder graph temporal filter diagnostic once before the main loop.
-    if !funder_timeline.is_empty() {
-        let first_day_unix = all_dates
-            .first()
-            .map_or(0, |d| d.midnight().assume_utc().unix_timestamp());
-        info!(
-            edges_visible_at_sim_start = funder_timeline.view_at(first_day_unix).len(),
-            total_edges = funder_timeline.total_edge_count(),
-            "funder graph temporal filter active"
-        );
-    }
-
     // Tracks leaderboard snapshot transitions for the log gate (replaces the
     // misleading `day_idx % 30` gate that fired every 30 array indices, not days).
     let mut last_logged_snapshot_unix: Option<i64> = None;
 
     // Tracks BUY-signal suppression from the max_hours_to_expiry filter.
     let mut suppression_tracker = SuppressionTracker::new("expiry filter");
-    // Tracks BUY-signal suppression from the `skip_unknown_operator` gate
-    // (issue #141). A second `SuppressionTracker` instance — the struct's
-    // shape (per-quarter `record(date, suppressed)`) already fits this filter;
-    // a separate struct would be pure duplication. `warn_high_quarters` is
-    // intentionally not called on this tracker: operator suppression is
-    // intentional, not a safety check.
-    let mut unknown_op_tracker = SuppressionTracker::new("unknown operator");
     // Tracks BUY-signal suppression from the `max_signal_price` cap (issue #142).
     let mut high_price_tracker = SuppressionTracker::new("high-price cap");
 
@@ -434,14 +410,13 @@ pub fn run_simulation(
             intraday_realized_pnl += pnl;
 
             let bps_removed = proposed_trade_bps(open.contracts, open.avg_fill_price, bankroll);
-            exposure.remove(leader, open.operator_id.as_ref(), &pos_key.0, bps_removed);
+            exposure.remove(leader, None, &pos_key.0, bps_removed);
 
-            pnl_accum.record(open.operator_id.as_ref(), pnl);
+            pnl_accum.record(pnl);
 
             let fill = TradeFill {
                 simulated_at: sim_date.midnight().assume_utc(),
                 leader_wallet: leader.to_string(),
-                operator_id: open.operator_id.as_ref().map(|o| o.to_string()),
                 market_id: pos_key.0.0.0.clone(),
                 outcome_id: pos_key.1.0,
                 side: "resolution".to_owned(),
@@ -469,9 +444,9 @@ pub fn run_simulation(
         }
 
         // Skip days before the first leaderboard snapshot — filtered_ledgers
-        // would be empty regardless and the trade-filter / operator-graph /
-        // ledger build below are pure CPU waste on those days. The full-history
-        // fallback (snapshots.is_empty()) keeps its prior behaviour.
+        // would be empty regardless and the trade-filter and ledger build below
+        // are pure CPU waste on those days. The full-history fallback
+        // (snapshots.is_empty()) keeps its prior behaviour.
         if !snapshots.is_empty() && snapshots.for_date(sim_date_unix).is_none() {
             continue;
         }
@@ -488,20 +463,7 @@ pub fn run_simulation(
             }
         };
 
-        // Build operator identities using only edges visible at this sim date.
-        let operator_identities =
-            build_operator_identities_at(funder_timeline, all_trades, sim_date_unix)?;
-        let wallet_to_operator: HashMap<WalletAddress, &OperatorIdentity> = operator_identities
-            .iter()
-            .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op)))
-            .collect();
-
-        // Confidence-filtered wallet → operator map for the incremental ledger.
-        let wallet_to_op: HashMap<WalletAddress, OperatorId> = operator_identities
-            .iter()
-            .filter(|op| op.confidence_ppm >= ledger_config.operator_min_confidence_ppm)
-            .flat_map(|op| op.member_wallets.iter().map(move |w| (*w, op.operator_id)))
-            .collect();
+        let wallet_to_op: HashMap<WalletAddress, OperatorId> = HashMap::new();
 
         let snapshot_at = SourceTimestamp(sim_date.midnight().assume_utc());
         let filtered_ledgers = incr.build_ledgers(pool, &wallet_to_op, config.audit_window_days);
@@ -584,13 +546,8 @@ pub fn run_simulation(
             }
 
             let leader = trade.wallet;
-            let op_identity = wallet_to_operator.get(&leader).copied();
-            let operator_id = op_identity.map(|op| &op.operator_id);
-            // When leaderboard snapshots are in use the snapshot membership serves
-            // as the funder/quality proxy — treat every snapshot wallet as having a
-            // proven funder mapping so the risk engine's funder-check doesn't block
-            // all signals in the absence of Etherscan data.
-            let has_funder = op_identity.is_some() || !snapshots.is_empty();
+            let operator_id: Option<&OperatorId> = None;
+            let has_funder = true;
 
             let pos_key = (trade.market_id.clone(), trade.outcome_id);
             let wallet_pos_key = (leader, pos_key.clone());
@@ -612,25 +569,6 @@ pub fn run_simulation(
                         && exposure.market_position_count(&trade.market_id) >= cap.get()
                     {
                         continue;
-                    }
-
-                    // Skip-unknown-operator gate (issue #141). Wallets that the
-                    // funder-graph clustering has not attached to any operator
-                    // are an oversized share of negative PnL per the A1 oracle-
-                    // lift analysis. Default-on; scenarios opt out via
-                    // `skip_unknown_operator: false`. Placed after the
-                    // per-market cap so both flat-USD and Kelly paths honor it.
-                    //
-                    // Mirrors the `max_hours_to_expiry` idiom: the tracker only
-                    // records when the gate is active, so the suppression-pct
-                    // denominator is "signals that reached an enabled gate" —
-                    // not "all BUY signals." Disabled → tracker empty.
-                    if config.skip_unknown_operator {
-                        let suppressed = op_identity.is_none();
-                        unknown_op_tracker.record(sim_date, suppressed);
-                        if suppressed {
-                            continue;
-                        }
                     }
 
                     // Horizon cooldown — suppress new opens when within
@@ -722,7 +660,6 @@ pub fn run_simulation(
                             OpenPosition {
                                 contracts,
                                 avg_fill_price: fill_price,
-                                operator_id: operator_id.cloned(),
                                 bought_on: sim_date,
                             },
                         );
@@ -730,7 +667,6 @@ pub fn run_simulation(
                         let fill = TradeFill {
                             simulated_at: sim_date.midnight().assume_utc(),
                             leader_wallet: leader.to_string(),
-                            operator_id: operator_id.map(|o| o.to_string()),
                             market_id: trade.market_id.0.0.clone(),
                             outcome_id: trade.outcome_id.0,
                             side: "buy".to_owned(),
@@ -883,7 +819,6 @@ pub fn run_simulation(
                         OpenPosition {
                             contracts: contracts_count,
                             avg_fill_price: fill_price,
-                            operator_id: operator_id.cloned(),
                             bought_on: sim_date,
                         },
                     );
@@ -891,7 +826,6 @@ pub fn run_simulation(
                     let fill = TradeFill {
                         simulated_at: sim_date.midnight().assume_utc(),
                         leader_wallet: leader.to_string(),
-                        operator_id: operator_id.map(|o| o.to_string()),
                         market_id: trade.market_id.0.0.clone(),
                         outcome_id: trade.outcome_id.0,
                         side: "buy".to_owned(),
@@ -931,19 +865,13 @@ pub fn run_simulation(
 
                     let bps_removed =
                         proposed_trade_bps(closed_contracts, open.avg_fill_price, bankroll);
-                    exposure.remove(
-                        leader,
-                        open.operator_id.as_ref(),
-                        &trade.market_id,
-                        bps_removed,
-                    );
+                    exposure.remove(leader, None, &trade.market_id, bps_removed);
 
-                    pnl_accum.record(open.operator_id.as_ref(), pnl);
+                    pnl_accum.record(pnl);
 
                     let fill = TradeFill {
                         simulated_at: sim_date.midnight().assume_utc(),
                         leader_wallet: leader.to_string(),
-                        operator_id: open.operator_id.as_ref().map(|o| o.to_string()),
                         market_id: trade.market_id.0.0.clone(),
                         outcome_id: trade.outcome_id.0,
                         side: "sell".to_owned(),
@@ -985,11 +913,8 @@ pub fn run_simulation(
         bankroll_final: bankroll,
         slippage_assumption_bps,
         open_at_horizon,
-        funder_graph_snapshot_caveat: false,
         expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
-        unknown_operator_suppression_pct: unknown_op_tracker.suppression_pct_global(),
-        unknown_operator_suppression_by_quarter: unknown_op_tracker.per_quarter_suppression(),
         high_price_suppression_pct: high_price_tracker.suppression_pct_global(),
         high_price_suppression_by_quarter: high_price_tracker.per_quarter_suppression(),
         total_signals_evaluated,
@@ -1046,13 +971,11 @@ pub fn run_simulation(
 pub struct SweepContext<'a> {
     pub config: &'a BacktestConfig,
     pub all_trades: &'a [RawTrade],
-    pub funder_timeline: &'a FunderGraphTimeline,
     pub snapshots: &'a LeaderboardSnapshots,
     pub resolutions: &'a ResolutionIndex,
     pub schedules: &'a ScheduleIndex,
     pub liq_index: &'a LiquidityIndex,
     pub ranker_config: &'a RankerConfig,
-    pub ledger_config: &'a LedgerConfig,
 }
 
 /// Run a single Kelly-fraction iteration of the sweep against `ctx`.
@@ -1084,13 +1007,11 @@ pub fn run_one_kelly_fraction(
     let report = run_simulation(
         ctx.config,
         ctx.all_trades,
-        ctx.funder_timeline,
         ctx.snapshots,
         ctx.resolutions,
         ctx.schedules,
         ctx.liq_index,
         ctx.ranker_config,
-        ctx.ledger_config,
         &strategy,
         false,
     )?;

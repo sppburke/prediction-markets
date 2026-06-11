@@ -47,19 +47,16 @@
 
 use std::io::BufRead as _;
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::WinnerFollowReport;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -68,7 +65,6 @@ use time::OffsetDateTime;
 // Base timestamp: 2023-11-01 00:00:00 UTC.
 const BASE_UNIX: i64 = 1_698_796_800;
 const LEADER_A_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_A_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 
 fn wallet(hex: &str) -> WalletAddress {
     WalletAddress::from_hex(hex).unwrap()
@@ -112,16 +108,6 @@ fn training_book(w: WalletAddress, start_market: u32, tag: &str) -> Vec<RawTrade
         t.push(raw_trade(w, m, 0, i + 2, 1, Side::Sell, dec!(0.75), tag));
     }
     t
-}
-
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -192,7 +178,6 @@ fn base_config(
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price,
         max_trade_count: 0,
         strategy: WinnerFollowConfig {
@@ -222,27 +207,20 @@ fn run_with_ranker(
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
-    let leader_a = wallet(LEADER_A_HEX);
-    let funder_a = wallet(FUNDER_A_HEX);
-
-    let timeline = make_timeline(&dir, &[(leader_a, funder_a)]);
     let snapshots = LeaderboardSnapshots::default();
     let schedules = ScheduleIndex::new();
     let liq_index = LiquidityIndex::new();
-    let ledger_config = LedgerConfig::default();
     let config = base_config(&dir, cap, slippage_rate);
     let strategy = WinnerFollowStrategy::new(config.strategy.clone());
 
     let report = run_simulation(
         &config,
         &trades,
-        &timeline,
         &snapshots,
         &ResolutionIndex::new(),
         &schedules,
         &liq_index,
         &ranker_config,
-        &ledger_config,
         &strategy,
         true,
     )

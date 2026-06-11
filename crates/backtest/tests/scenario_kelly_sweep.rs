@@ -21,13 +21,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::{KellySweepReport, KellySweepRun, WinnerFollowReport};
 use pe_backtest::simulation::{SweepContext, run_one_kelly_fraction, run_simulation};
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId, Price, Probability,
@@ -37,7 +34,7 @@ use pe_core_types::{
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rayon::prelude::*;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -47,7 +44,6 @@ use time::OffsetDateTime;
 // ── fixtures ──────────────────────────────────────────────────────────────────
 
 const WINNER_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 // Base timestamp: 2023-11-01 00:00:00 UTC.
 const BASE_UNIX: i64 = 1_698_796_800;
 
@@ -81,17 +77,6 @@ fn make_trade(
             if side == Side::Buy { "buy" } else { "sell" }
         )),
     }
-}
-
-/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs at Unix 0.
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
 }
 
 fn relaxed_ranker() -> RankerConfig {
@@ -135,7 +120,6 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -256,7 +240,6 @@ fn override_changes_sizing_vs_default() {
 #[tokio::test]
 async fn sweep_produces_correct_run_count() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let mut trades = generate_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
 
@@ -266,22 +249,18 @@ async fn sweep_produces_correct_run_count() {
         kelly_sweep_fractions: Some(fractions.clone()),
         ..base_config(&dir)
     };
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &ScheduleIndex::new(),
         liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
-        ledger_config: &ledger_config,
     };
 
     let mut runs: Vec<KellySweepRun> = Vec::new();
@@ -359,11 +338,8 @@ fn to_markdown_table_covers_all_runs() {
             bankroll_final: dec!(10_100),
             slippage_assumption_bps: 100,
             open_at_horizon: 0,
-            funder_graph_snapshot_caveat: false,
             expiry_filter_suppression_pct: dec!(0),
             expiry_suppression_by_quarter: BTreeMap::new(),
-            unknown_operator_suppression_pct: dec!(0),
-            unknown_operator_suppression_by_quarter: BTreeMap::new(),
             high_price_suppression_pct: dec!(0),
             high_price_suppression_by_quarter: BTreeMap::new(),
             liquidity_clamps_fired: 0,
@@ -408,14 +384,12 @@ fn to_markdown_table_covers_all_runs() {
 #[tokio::test]
 async fn sweep_suppresses_per_run_output() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let mut trades = generate_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
 
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
     let config = base_config(&dir);
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
 
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
         kelly_fraction_override: Some(KellyFraction::ONE),
@@ -424,13 +398,11 @@ async fn sweep_suppresses_per_run_output() {
     run_simulation(
         &config,
         &trades,
-        &timeline,
         &LeaderboardSnapshots::default(),
         &ResolutionIndex::new(),
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &strategy,
         false,
     )
@@ -455,7 +427,6 @@ async fn sweep_suppresses_per_run_output() {
 #[tokio::test]
 async fn parallel_sweep_matches_sequential() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let mut trades = generate_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
     let fractions = vec![kf(dec!(0.10)), kf(dec!(0.50)), kf(dec!(1.0))];
@@ -464,23 +435,19 @@ async fn parallel_sweep_matches_sequential() {
         kelly_sweep_fractions: Some(fractions.clone()),
         ..base_config(&dir)
     };
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
     let schedules = ScheduleIndex::new();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
         liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
-        ledger_config: &ledger_config,
     };
 
     // Sequential reference.
@@ -553,7 +520,6 @@ async fn parallel_sweep_matches_sequential() {
 #[tokio::test]
 async fn parallel_sweep_is_deterministic() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let mut trades = generate_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
     let fractions = vec![
@@ -568,23 +534,19 @@ async fn parallel_sweep_is_deterministic() {
         kelly_sweep_fractions: Some(fractions.clone()),
         ..base_config(&dir)
     };
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
     let schedules = ScheduleIndex::new();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
         liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
-        ledger_config: &ledger_config,
     };
 
     let run_parallel = || -> Vec<KellySweepRun> {
@@ -648,7 +610,6 @@ async fn parallel_sweep_is_deterministic() {
 #[tokio::test]
 async fn parallel_sweep_output_sorted_by_fraction() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let mut trades = generate_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
     // Deliberately scrambled input order — output must be sorted regardless.
@@ -664,23 +625,19 @@ async fn parallel_sweep_output_sorted_by_fraction() {
         kelly_sweep_fractions: Some(fractions.clone()),
         ..base_config(&dir)
     };
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
     let schedules = ScheduleIndex::new();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
         liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
-        ledger_config: &ledger_config,
     };
 
     let mut runs: Vec<KellySweepRun> = fractions
@@ -725,7 +682,6 @@ async fn parallel_sweep_output_sorted_by_fraction() {
 #[tokio::test]
 async fn parallel_sweep_single_fraction() {
     let winner = wallet(WINNER_HEX);
-    let funder = wallet(FUNDER_HEX);
     let mut trades = generate_winner_trades(winner);
     trades.sort_by_key(|t| t.timestamp.0);
     let fractions = vec![kf(dec!(0.50))];
@@ -734,23 +690,19 @@ async fn parallel_sweep_single_fraction() {
         kelly_sweep_fractions: Some(fractions.clone()),
         ..base_config(&dir)
     };
-    let timeline = make_timeline(&dir, &[(winner, funder)]);
     let resolutions = ResolutionIndex::new();
     let snapshots = LeaderboardSnapshots::default();
     let ranker = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
     let schedules = ScheduleIndex::new();
 
     let ctx = SweepContext {
         config: &config,
         all_trades: &trades,
-        funder_timeline: &timeline,
         snapshots: &snapshots,
         resolutions: &resolutions,
         schedules: &schedules,
         liq_index: &LiquidityIndex::new(),
         ranker_config: &ranker,
-        ledger_config: &ledger_config,
     };
 
     let runs: Vec<KellySweepRun> = fractions

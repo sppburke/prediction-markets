@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::{BacktestConfig, load};
 use pe_backtest::error::BacktestError;
 use pe_backtest::report::{KellySweepReport, KellySweepRun};
@@ -11,7 +10,7 @@ use pe_backtest::simulation;
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::dune::DuneClient;
 use pe_strategy_winner_follow::WinnerFollowStrategy;
-use pe_trader_index::{LedgerConfig, RankerConfig};
+use pe_trader_index::RankerConfig;
 use rayon::prelude::*;
 use time::OffsetDateTime;
 use tracing::info;
@@ -152,9 +151,6 @@ async fn main() -> Result<(), BacktestError> {
         "backtest: trades pre-sorted for Kelly sweep"
     );
 
-    // Phase 0: build temporal funder graph from cached edges (populated by pe-bootstrap).
-    let funder_timeline = FunderGraphTimeline::from_cache(&cache)?;
-
     // Phase 1: walk-forward simulation.
     std::fs::create_dir_all(&config.output_dir)?;
 
@@ -210,17 +206,14 @@ async fn main() -> Result<(), BacktestError> {
             fractions = fractions.len(),
             "backtest: Kelly sweep mode — starting parallel runs"
         );
-        let ledger_config = LedgerConfig::default();
         let ctx = simulation::SweepContext {
             config: &config,
             all_trades: &all_trades,
-            funder_timeline: &funder_timeline,
             snapshots: &snapshots,
             resolutions: &resolutions,
             schedules: &schedules,
             liq_index: &liq_index,
             ranker_config: &ranker_config,
-            ledger_config: &ledger_config,
         };
         let mut runs: Vec<KellySweepRun> = fractions
             .par_iter()
@@ -262,13 +255,11 @@ async fn main() -> Result<(), BacktestError> {
         let mut report = simulation::run_simulation(
             &config,
             &all_trades,
-            &funder_timeline,
             &snapshots,
             &resolutions,
             &schedules,
             &liq_index,
             &ranker_config,
-            &LedgerConfig::default(),
             &strategy,
             true, // write report.json + trades.ndjson
         )?;

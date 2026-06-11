@@ -35,19 +35,17 @@
 use std::io::BufRead as _;
 use std::num::NonZeroU32;
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
 use pe_bootstrap::cache::{
     LeaderboardSnapshots, LiquidityIndex, MarketResolution, ResolutionIndex, ScheduleIndex,
-    WalletCache,
 };
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -57,11 +55,6 @@ use time::OffsetDateTime;
 const BASE_UNIX: i64 = 1_698_796_800;
 const LEADER_A_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const LEADER_B_HEX: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-// Distinct funders per leader — sharing a funder would cluster A and B into
-// the same operator identity and `build_watchlist` would emit only one
-// representative wallet (lowest-sorted), suppressing B's signals.
-const FUNDER_A_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
-const FUNDER_B_HEX: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 
 fn wallet(hex: &str) -> WalletAddress {
     WalletAddress::from_hex(hex).unwrap()
@@ -109,16 +102,6 @@ fn training_book(w: WalletAddress, start_market: u32, tag: &str) -> Vec<RawTrade
     t
 }
 
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
-}
-
 fn relaxed_ranker() -> RankerConfig {
     RankerConfig {
         active_min_closed_trades: 15,
@@ -162,7 +145,6 @@ fn base_config(dir: &TempDir, cap: Option<NonZeroU32>) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: cap,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -185,30 +167,21 @@ fn run_with(
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
-    let leader_a = wallet(LEADER_A_HEX);
-    let leader_b = wallet(LEADER_B_HEX);
-    let funder_a = wallet(FUNDER_A_HEX);
-    let funder_b = wallet(FUNDER_B_HEX);
-
-    let timeline = make_timeline(&dir, &[(leader_a, funder_a), (leader_b, funder_b)]);
     let snapshots = LeaderboardSnapshots::default();
     let schedules = ScheduleIndex::new();
     let liq_index = LiquidityIndex::new();
     let ranker_config = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
     let config = base_config(&dir, cap);
     let strategy = WinnerFollowStrategy::new(config.strategy.clone());
 
     let _report = run_simulation(
         &config,
         &trades,
-        &timeline,
         &snapshots,
         &resolutions,
         &schedules,
         &liq_index,
         &ranker_config,
-        &ledger_config,
         &strategy,
         true,
     )

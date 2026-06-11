@@ -14,26 +14,23 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::simulation::run_simulation;
 use pe_bootstrap::cache::{
     LeaderboardSnapshots, LiquidityIndex, MarketResolution, ResolutionIndex, ScheduleIndex,
-    WalletCache,
 };
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
 const ALICE_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_HEX: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
 /// 2024-01-01 00:00:00 UTC.
 const BASE_UNIX: i64 = 1_704_067_200;
 const DAY: i64 = 86_400;
@@ -86,17 +83,6 @@ fn winner_book(w: WalletAddress) -> Vec<RawTrade> {
     t
 }
 
-/// Build a `FunderGraphTimeline` from `(funded, funder)` pairs at Unix 0.
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
-}
-
 fn relaxed_ranker() -> RankerConfig {
     RankerConfig {
         active_min_closed_trades: 15,
@@ -138,7 +124,6 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -152,20 +137,17 @@ fn default_strategy() -> WinnerFollowStrategy {
 fn run_sim(
     dir: &TempDir,
     mut trades: Vec<RawTrade>,
-    timeline: &FunderGraphTimeline,
     resolutions: &ResolutionIndex,
 ) -> pe_backtest::report::WinnerFollowReport {
     trades.sort_by_key(|t| t.timestamp.0);
     run_simulation(
         &base_config(dir),
         &trades,
-        timeline,
         &LeaderboardSnapshots::default(),
         resolutions,
         &ScheduleIndex::new(),
         &LiquidityIndex::new(),
         &relaxed_ranker(),
-        &LedgerConfig::default(),
         &default_strategy(),
         true,
     )
@@ -206,7 +188,6 @@ fn fills_by_side(output_dir: &std::path::Path, side: &str) -> Vec<serde_json::Va
 #[tokio::test]
 async fn resolved_yes_closes_position_at_full_price() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
@@ -216,8 +197,7 @@ async fn resolved_yes_closes_position_at_full_price() {
     resolutions.insert(mkt(9999), res_yes(71));
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &resolutions);
+    let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
@@ -243,7 +223,6 @@ async fn resolved_yes_closes_position_at_full_price() {
 #[tokio::test]
 async fn resolved_no_closes_position_at_zero() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
@@ -253,8 +232,7 @@ async fn resolved_no_closes_position_at_zero() {
     resolutions.insert(mkt(9999), res_no(71));
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &resolutions);
+    let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
@@ -287,7 +265,6 @@ async fn resolved_no_closes_position_at_zero() {
 #[tokio::test]
 async fn future_resolution_leaves_position_open_at_horizon() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
@@ -296,8 +273,7 @@ async fn future_resolution_leaves_position_open_at_horizon() {
     resolutions.insert(mkt(9999), res_yes(200)); // far future
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &resolutions);
+    let report = run_sim(&dir, trades, &resolutions);
 
     assert!(
         report.open_at_horizon > 0,
@@ -319,7 +295,6 @@ async fn future_resolution_leaves_position_open_at_horizon() {
 #[tokio::test]
 async fn anomaly_guard_preserves_position_with_early_resolution() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
@@ -330,8 +305,7 @@ async fn anomaly_guard_preserves_position_with_early_resolution() {
     resolutions.insert(mkt(9999), res_yes(69));
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &resolutions);
+    let report = run_sim(&dir, trades, &resolutions);
 
     assert!(
         report.open_at_horizon > 0,
@@ -352,14 +326,12 @@ async fn anomaly_guard_preserves_position_with_early_resolution() {
 #[tokio::test]
 async fn empty_resolution_index_leaves_all_positions_open() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9999, 70, Side::Buy, dec!(0.35), 0));
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &ResolutionIndex::new());
+    let report = run_sim(&dir, trades, &ResolutionIndex::new());
 
     assert!(
         report.open_at_horizon > 0,
@@ -380,7 +352,6 @@ async fn empty_resolution_index_leaves_all_positions_open() {
 #[tokio::test]
 async fn resolution_data_reduces_open_at_horizon() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let build_trades = || {
         let mut t = winner_book(alice);
@@ -393,17 +364,10 @@ async fn resolution_data_reduces_open_at_horizon() {
     resolutions.insert(mkt(9999), res_yes(71));
 
     let dir_with = TempDir::new().unwrap();
-    let timeline_with = make_timeline(&dir_with, &[(alice, funder)]);
-    let with_res = run_sim(&dir_with, build_trades(), &timeline_with, &resolutions);
+    let with_res = run_sim(&dir_with, build_trades(), &resolutions);
 
     let dir_without = TempDir::new().unwrap();
-    let timeline_without = make_timeline(&dir_without, &[(alice, funder)]);
-    let without_res = run_sim(
-        &dir_without,
-        build_trades(),
-        &timeline_without,
-        &ResolutionIndex::new(),
-    );
+    let without_res = run_sim(&dir_without, build_trades(), &ResolutionIndex::new());
 
     assert!(
         with_res.open_at_horizon < without_res.open_at_horizon,
@@ -421,7 +385,6 @@ async fn resolution_data_reduces_open_at_horizon() {
 #[tokio::test]
 async fn sequential_markets_each_swept_independently() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(alice);
     trades.push(make_trade(alice, 9998, 70, Side::Buy, dec!(0.35), 0));
@@ -433,8 +396,7 @@ async fn sequential_markets_each_swept_independently() {
     resolutions.insert(mkt(9999), res_yes(75));
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &resolutions);
+    let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,
@@ -458,7 +420,6 @@ async fn sequential_markets_each_swept_independently() {
 #[tokio::test]
 async fn sweep_and_leader_sell_same_day_no_double_close() {
     let alice = wallet(ALICE_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let initial_bankroll = Decimal::from(10_000u32);
 
@@ -470,8 +431,7 @@ async fn sweep_and_leader_sell_same_day_no_double_close() {
     resolutions.insert(mkt(9999), res_yes(71));
 
     let dir = TempDir::new().unwrap();
-    let timeline = make_timeline(&dir, &[(alice, funder)]);
-    let report = run_sim(&dir, trades, &timeline, &resolutions);
+    let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
         report.open_at_horizon, 0,

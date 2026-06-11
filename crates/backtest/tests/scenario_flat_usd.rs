@@ -35,19 +35,16 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use pe_backtest::FunderGraphTimeline;
 use pe_backtest::config::BacktestConfig;
 use pe_backtest::report::WinnerFollowReport;
 use pe_backtest::simulation::run_simulation;
-use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
-};
+use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
-use pe_trader_index::{LedgerConfig, RankerConfig, snapshot::RawTrade};
+use pe_trader_index::{RankerConfig, snapshot::RawTrade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::io::BufRead as _;
@@ -57,7 +54,6 @@ use time::OffsetDateTime;
 // Base timestamp: 2023-11-01 00:00:00 UTC.
 const BASE_UNIX: i64 = 1_698_796_800;
 const LEADER_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const FUNDER_HEX: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
 
 fn wallet(hex: &str) -> WalletAddress {
     WalletAddress::from_hex(hex).unwrap()
@@ -103,16 +99,6 @@ fn winner_book(w: WalletAddress) -> Vec<RawTrade> {
     t
 }
 
-fn make_timeline(dir: &TempDir, pairs: &[(WalletAddress, WalletAddress)]) -> FunderGraphTimeline {
-    let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-    for &(funded, funder) in pairs {
-        cache
-            .insert_funder_edges(funded, &[(funder, 0)], 0)
-            .unwrap();
-    }
-    FunderGraphTimeline::from_cache(&cache).unwrap()
-}
-
 fn relaxed_ranker() -> RankerConfig {
     RankerConfig {
         active_min_closed_trades: 15,
@@ -154,7 +140,6 @@ fn base_config(dir: &TempDir, flat_usd: Option<Decimal>, bankroll: Decimal) -> B
         no_buy_within_horizon_days: None,
         require_known_expiry: false,
         max_positions_per_market: None,
-        skip_unknown_operator: false,
         max_signal_price: None,
         max_trade_count: 0,
         strategy: WinnerFollowConfig::default(),
@@ -168,18 +153,15 @@ fn run(flat_usd: Option<Decimal>, bankroll: Decimal) -> (WinnerFollowReport, Vec
     std::fs::create_dir_all(dir.path().join("output")).unwrap();
 
     let leader = wallet(LEADER_HEX);
-    let funder = wallet(FUNDER_HEX);
 
     let mut trades = winner_book(leader);
     trades.sort_by_key(|t| t.timestamp.0);
 
-    let timeline = make_timeline(&dir, &[(leader, funder)]);
     let snapshots = LeaderboardSnapshots::default();
     let resolutions = ResolutionIndex::new();
     let schedules = ScheduleIndex::new();
     let liq_index = LiquidityIndex::new();
     let ranker_config = relaxed_ranker();
-    let ledger_config = LedgerConfig::default();
 
     let config = base_config(&dir, flat_usd, bankroll);
     let strategy = WinnerFollowStrategy::new(config.strategy.clone());
@@ -187,13 +169,11 @@ fn run(flat_usd: Option<Decimal>, bankroll: Decimal) -> (WinnerFollowReport, Vec
     let report = run_simulation(
         &config,
         &trades,
-        &timeline,
         &snapshots,
         &resolutions,
         &schedules,
         &liq_index,
         &ranker_config,
-        &ledger_config,
         &strategy,
         true,
     )
