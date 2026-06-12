@@ -10,9 +10,9 @@
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, ContractQty, LeaderAction, MarketId, OperatorId, OutcomeId, Price, Probability,
+    BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
     ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
-    VenueMarketId, WalletAddress, WinnerFollowSignalKind,
+    VenueMarketId, WalletAddress,
 };
 use pe_risk_engine::{RiskBlock, RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
@@ -32,10 +32,6 @@ fn wallet(b: u8) -> WalletAddress {
     WalletAddress(bytes)
 }
 
-fn op_id(seed: &[u8]) -> OperatorId {
-    OperatorId(blake3::hash(seed))
-}
-
 fn price(d: rust_decimal::Decimal) -> Price {
     Price::new(d).expect("valid price")
 }
@@ -50,14 +46,11 @@ fn p_high() -> Probability {
 
 fn make_signal_at_price(
     wallet_byte: u8,
-    signal_kind: WinnerFollowSignalKind,
     action: LeaderAction,
-    operator_id: Option<OperatorId>,
     leader_price: Price,
 ) -> LeaderSignal {
     LeaderSignal {
         leader: TraderId(wallet(wallet_byte)),
-        operator_id,
         venue: VenueId::polymarket(),
         market_id: MarketId(VenueMarketId("mkt-flat-001".to_string())),
         outcome_id: OutcomeId(0),
@@ -68,21 +61,13 @@ fn make_signal_at_price(
         observed_at: NOW,
         received_at: NOW,
         reconstruction_quality: quality(100),
-        signal_kind,
-        inherited_prior: None,
         source_trade_id: SourceTradeId("tid-flat-001".to_string()),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
     }
 }
 
 fn make_signal(wallet_byte: u8, action: LeaderAction) -> LeaderSignal {
-    make_signal_at_price(
-        wallet_byte,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        action,
-        None,
-        price(dec!(0.50)),
-    )
+    make_signal_at_price(wallet_byte, action, price(dec!(0.50)))
 }
 
 fn clean_snapshot() -> RiskSnapshot {
@@ -143,13 +128,7 @@ fn scenario_flat_sizing_correct_contract_count() {
 /// PASS: `intent.contracts.0 == 10_000`.
 #[test]
 fn scenario_flat_sizing_low_price_large_count() {
-    let signal = make_signal_at_price(
-        0xF2,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-        price(dec!(0.01)),
-    );
+    let signal = make_signal_at_price(0xF2, LeaderAction::Entry, price(dec!(0.01)));
     let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
 
     let intent = strategy
@@ -240,21 +219,12 @@ fn scenario_flat_sizing_risk_gate_still_fires() {
 
 // ─── scenario F5 ─────────────────────────────────────────────────────────────
 
-/// Shadow mode gate fires before flat sizing — no order emitted.
-///
-/// ClusterCoordination signal in LiveTiny is clamped to Shadow.
+/// Shadow mode gate fires before flat sizing — no order emitted when Shadow is requested.
 ///
 /// PASS: `Err(ShadowMode)`.
 #[test]
 fn scenario_flat_sizing_shadow_mode_still_blocks() {
-    let op = op_id(b"flat-sizing-cc");
-    let signal = make_signal_at_price(
-        0xF5,
-        WinnerFollowSignalKind::ClusterCoordination,
-        LeaderAction::Entry,
-        Some(op),
-        price(dec!(0.50)),
-    );
+    let signal = make_signal(0xF5, LeaderAction::Entry);
     let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
 
     let result = strategy.evaluate(
@@ -262,12 +232,12 @@ fn scenario_flat_sizing_shadow_mode_still_blocks() {
         p_high(),
         clean_snapshot(),
         dec!(10_000),
-        ExecutionMode::LiveTiny,
+        ExecutionMode::Shadow,
     );
 
     assert!(
         matches!(result, Err(WinnerFollowError::ShadowMode)),
-        "Shadow gate must fire before flat sizing; got {result:?}"
+        "Shadow request must yield ShadowMode before flat sizing; got {result:?}"
     );
 }
 
@@ -304,13 +274,7 @@ fn scenario_flat_sizing_flip_gate_still_fires() {
 /// PASS: `Err(NoEdge)`.
 #[test]
 fn scenario_kelly_path_used_when_flat_none() {
-    let signal = make_signal_at_price(
-        0xF7,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-        price(dec!(0.40)),
-    );
+    let signal = make_signal_at_price(0xF7, LeaderAction::Entry, price(dec!(0.40)));
     let config = WinnerFollowConfig {
         flat_usd_per_trade: None,
         ..WinnerFollowConfig::default()

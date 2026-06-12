@@ -3138,7 +3138,6 @@ version = "0.1.0"
 name = "pe-copy-signal-engine"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "pe-core-types",
  "pe-trader-index",
  "proptest",
@@ -3310,7 +3309,6 @@ dependencies = [
 name = "pe-position-ledger"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "pe-copy-signal-engine",
  "pe-core-types",
  "rust_decimal",
@@ -3438,7 +3436,6 @@ dependencies = [
 name = "pe-strategy-winner-follow"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "pe-copy-signal-engine",
  "pe-core-types",
  "pe-event-log",

@@ -29,6 +29,5 @@ serde = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
-blake3 = { workspace = true }
 proptest = { workspace = true }
 rust_decimal_macros = { workspace = true }

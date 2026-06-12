@@ -1,24 +1,17 @@
 // Scenario tests for the copy-signal classifier.
 // Run with: cargo nextest run -p pe-copy-signal-engine --features scenario
 #![cfg(feature = "scenario")]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::too_many_arguments
-)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashMap;
 
 use pe_copy_signal_engine::{
-    ClusterEntry, ClusterObs, IncomingTrade, PositionSnapshot, PositionState, SignalConfig,
-    WalletProfile, classify_trade,
+    IncomingTrade, PositionSnapshot, PositionState, SignalConfig, classify_trade,
 };
 use pe_core_types::{BasisPoints, SourceTimestamp};
 use pe_core_types::{
-    ContractQty, LeaderAction, MarketId, MarketOutcomeId, OperatorId, OutcomeId, Price,
-    ReconstructionQuality, Side, SourceTradeId, VenueId, VenueMarketId, WalletAddress,
-    WinnerFollowSignalKind,
+    ContractQty, LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality,
+    Side, SourceTradeId, VenueId, VenueMarketId, WalletAddress,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal_macros::dec;
@@ -26,9 +19,8 @@ use time::macros::datetime;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-// Frozen observation: 2024-07-01 00:00:00 UTC → unix = 1_719_792_000
+// Frozen observation: 2024-07-01 00:00:00 UTC
 const NOW: time::OffsetDateTime = datetime!(2024-07-01 00:00:00 UTC);
-const NOW_UNIX: i64 = 1_719_792_000;
 
 fn wallet(b: u8) -> WalletAddress {
     let mut bytes = [0u8; 20];
@@ -38,10 +30,6 @@ fn wallet(b: u8) -> WalletAddress {
 
 fn market(n: u8) -> MarketId {
     MarketId(VenueMarketId(format!("mkt-{n:03}")))
-}
-
-fn op_id(seed: &[u8]) -> OperatorId {
-    OperatorId(blake3::hash(seed))
 }
 
 fn quality(q: u8) -> ReconstructionQuality {
@@ -97,19 +85,11 @@ fn incoming(w: WalletAddress, mkt: MarketId, side: Side, contracts: u64) -> Inco
     }
 }
 
-fn stale_profile(w: WalletAddress) -> WalletProfile {
-    WalletProfile {
-        wallet: w,
-        closed_trade_count: 100,
-        age_seconds: 9_999_999,
-    }
-}
-
 // ─── scenario 1 ──────────────────────────────────────────────────────────────
 
 /// Wallet on active watchlist, no prior position.
 ///
-/// PASS: `action == Entry`, `signal_kind == NormalLeaderFollow`.
+/// PASS: `action == Entry`.
 #[test]
 fn entry_new_position() {
     let w = wallet(0x01);
@@ -121,9 +101,6 @@ fn entry_new_position() {
         &trade,
         None,
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(90),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -131,10 +108,6 @@ fn entry_new_position() {
     .expect("active watchlist wallet should produce a signal");
 
     assert_eq!(signal.action, LeaderAction::Entry);
-    assert_eq!(
-        signal.signal_kind,
-        WinnerFollowSignalKind::NormalLeaderFollow
-    );
     assert_eq!(signal.action_confidence_ppm.0, 900_000);
 }
 
@@ -167,9 +140,6 @@ fn add_to_existing() {
         &trade,
         Some(&position),
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(100),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -208,9 +178,6 @@ fn trim_partial_close() {
         &trade,
         Some(&position),
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(100),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -249,9 +216,6 @@ fn exit_full_close() {
         &trade,
         Some(&position),
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(100),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -290,9 +254,6 @@ fn flip_side_reversal() {
         &trade,
         Some(&position),
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(100),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -304,110 +265,33 @@ fn flip_side_reversal() {
 
 // ─── scenario 6 ──────────────────────────────────────────────────────────────
 
-/// Fresh wallet (0 closed trades, 1-day age) linked to a known operator buys $100 notional.
+/// Wallet is NOT on the active watchlist. The watchlist is now the sole eligibility
+/// gate, so the trade is suppressed.
 ///
-/// PASS: `signal_kind == FreshWalletFirstTrade`.
+/// PASS: `classify_trade` returns `None`.
 #[test]
-fn fresh_wallet_first_trade() {
+fn non_watchlisted_wallet_suppressed() {
     let w = wallet(0x06);
-    let op = op_id(b"test-operator-fw");
     let mkt = market(6);
-    // price=0.50, contracts=200 → notional = $100 ≥ $50 threshold
-    let trade = IncomingTrade {
-        wallet: w,
-        market_id: mkt.clone(),
-        outcome_id: OutcomeId(0),
-        side: Side::Buy,
-        price: price(dec!(0.50)),
-        contracts: ContractQty(200),
-        observed_at: NOW,
-        received_at: NOW,
-        source_trade_id: trade_id(10),
-    };
+    let trade = incoming(w, mkt.clone(), Side::Buy, 100);
     let watchlist = empty_watchlist();
-    let profile = WalletProfile {
-        wallet: w,
-        closed_trade_count: 0,
-        age_seconds: 86_400,
-    };
 
-    let signal = classify_trade(
+    let result = classify_trade(
         &trade,
         None,
         &watchlist,
-        &profile,
-        None,
-        Some(op),
-        quality(70),
+        quality(90),
         VenueId::polymarket(),
         &SignalConfig::default(),
-    )
-    .expect("fresh-wallet signal expected");
-
-    assert_eq!(
-        signal.signal_kind,
-        WinnerFollowSignalKind::FreshWalletFirstTrade
     );
-    assert!(signal.inherited_prior.is_some());
+
+    assert!(
+        result.is_none(),
+        "non-watchlisted wallet must be suppressed; got {result:?}"
+    );
 }
 
 // ─── scenario 7 ──────────────────────────────────────────────────────────────
-
-/// Three wallets of the same operator enter the same (market, outcome, side) within
-/// 300 seconds with aggregate notional ≥ $1_000.
-///
-/// PASS: `signal_kind == ClusterCoordination`.
-#[test]
-fn cluster_coordination_fires() {
-    let op = op_id(b"test-operator-cc");
-    let w1 = wallet(0x10);
-    let w2 = wallet(0x11);
-    let w3 = wallet(0x12);
-    let mkt = market(7);
-
-    // Each buys 700 contracts at price 0.50 → notional $350 each; aggregate $1050 ≥ $1000.
-    let make_entry = |w: WalletAddress, t_offset: i64| ClusterEntry {
-        wallet: w,
-        price: price(dec!(0.50)),
-        contracts: ContractQty(700),
-        observed_at_unix: NOW_UNIX - t_offset,
-    };
-
-    let cluster = ClusterObs {
-        operator_id: op,
-        market_id: mkt.clone(),
-        outcome_id: OutcomeId(0),
-        side: Side::Buy,
-        wallet_entries: vec![
-            make_entry(w1, 200), // 200s ago — within 300s window
-            make_entry(w2, 100), // 100s ago
-            make_entry(w3, 0),   // now (the current trade)
-        ],
-    };
-
-    let trade = incoming(w3, mkt.clone(), Side::Buy, 700);
-    let watchlist = empty_watchlist();
-
-    let signal = classify_trade(
-        &trade,
-        None,
-        &watchlist,
-        &stale_profile(w3),
-        Some(&cluster),
-        Some(op),
-        quality(80),
-        VenueId::polymarket(),
-        &SignalConfig::default(),
-    )
-    .expect("cluster signal expected");
-
-    assert_eq!(
-        signal.signal_kind,
-        WinnerFollowSignalKind::ClusterCoordination
-    );
-}
-
-// ─── scenario 8 ──────────────────────────────────────────────────────────────
 
 /// Zero reconstruction quality with no position data → Unknown action → signal suppressed.
 ///
@@ -423,9 +307,6 @@ fn unknown_action_suppressed() {
         &trade,
         None,
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(0),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -437,10 +318,10 @@ fn unknown_action_suppressed() {
     );
 }
 
-// ─── scenario 9 ──────────────────────────────────────────────────────────────
+// ─── scenario 8 ──────────────────────────────────────────────────────────────
 
 /// Wallet adds to an existing long with reconstruction quality 60 (600_000 ppm < 700_000
-/// threshold) → signal suppressed despite valid signal kind.
+/// threshold) → signal suppressed despite an eligible watchlist wallet.
 ///
 /// PASS: `classify_trade` returns `None`.
 #[test]
@@ -468,9 +349,6 @@ fn add_low_confidence_suppressed() {
         &trade,
         Some(&position),
         &watchlist,
-        &stale_profile(w),
-        None,
-        None,
         quality(60),
         VenueId::polymarket(),
         &SignalConfig::default(),
@@ -495,17 +373,14 @@ proptest::proptest! {
         let q = quality(quality_val);
 
         let s1 = classify_trade(
-            &trade, None, &watchlist, &stale_profile(w), None, None,
-            q, VenueId::polymarket(), &SignalConfig::default(),
+            &trade, None, &watchlist, q, VenueId::polymarket(), &SignalConfig::default(),
         );
         let s2 = classify_trade(
-            &trade, None, &watchlist, &stale_profile(w), None, None,
-            q, VenueId::polymarket(), &SignalConfig::default(),
+            &trade, None, &watchlist, q, VenueId::polymarket(), &SignalConfig::default(),
         );
 
         let (s1, s2) = (s1.expect("signal expected"), s2.expect("signal expected"));
         proptest::prop_assert_eq!(s1.action, s2.action);
-        proptest::prop_assert_eq!(s1.signal_kind, s2.signal_kind);
         proptest::prop_assert_eq!(s1.action_confidence_ppm.0, s2.action_confidence_ppm.0);
         proptest::prop_assert_eq!(s1.source_trade_id, s2.source_trade_id);
     }

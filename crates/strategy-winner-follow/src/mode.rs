@@ -1,15 +1,11 @@
-//! Execution mode and signal-kind clamping rules.
+//! Execution mode for Winner-Follow copy trades.
 
-use pe_core_types::WinnerFollowSignalKind;
 use pe_risk_engine::snapshot::TradingMode;
 use serde::{Deserialize, Serialize};
 
 /// Execution mode for a Winner-Follow copy trade.
 ///
-/// Signal-kind clamping (enforced by [`clamp_mode`]):
-/// - `ClusterCoordination` → always `Shadow`
-/// - `FreshWalletFirstTrade` → at most `Paper`
-/// - `NormalLeaderFollow` → uses the requested mode unchanged
+/// The requested mode is used as-is; copy signals are ordinary leader-follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
@@ -21,18 +17,6 @@ pub enum ExecutionMode {
     LiveTiny,
     /// Post-promotion live stage; Kelly fraction = 0.25, max_trade = 100 bps.
     Promoted,
-}
-
-/// Clamp the requested mode to the ceiling imposed by the signal kind.
-pub fn clamp_mode(requested: ExecutionMode, signal_kind: WinnerFollowSignalKind) -> ExecutionMode {
-    match signal_kind {
-        WinnerFollowSignalKind::ClusterCoordination => ExecutionMode::Shadow,
-        WinnerFollowSignalKind::FreshWalletFirstTrade => match requested {
-            ExecutionMode::Shadow | ExecutionMode::Paper => requested,
-            ExecutionMode::LiveTiny | ExecutionMode::Promoted => ExecutionMode::Paper,
-        },
-        WinnerFollowSignalKind::NormalLeaderFollow => requested,
-    }
 }
 
 /// Map an `ExecutionMode` to the risk-engine's `TradingMode`.

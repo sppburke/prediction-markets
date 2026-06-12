@@ -1,44 +1,32 @@
 //! Trade classification logic.
 
-use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive as _;
-
 use pe_core_types::{
-    InheritedPriorPpm, LeaderAction, MarketOutcomeId, OperatorId, ProbabilityPpm, Quantity,
-    ReconstructionQuality, Side, TraderId, VenueId, WalletAddress, WinnerFollowSignalKind,
+    LeaderAction, MarketOutcomeId, ProbabilityPpm, Quantity, ReconstructionQuality, Side, TraderId,
+    VenueId, WalletAddress,
 };
 use pe_trader_index::{Watchlist, WatchlistTier};
 
 use crate::{
     config::SignalConfig,
     signal::LeaderSignal,
-    snapshot::{ClusterObs, IncomingTrade, PositionSnapshot, WalletProfile},
+    snapshot::{IncomingTrade, PositionSnapshot},
 };
 
-/// Classify an incoming leader trade into a [`LeaderSignal`].
+/// Classify an incoming leader trade from a watchlisted leader into a [`LeaderSignal`].
 ///
-/// Returns `None` if the wallet qualifies under no signal kind (not on the active
-/// watchlist, not a fresh-wallet first trade, not a cluster-coordination event).
-#[allow(clippy::too_many_arguments)]
+/// Returns `None` if the wallet is not on the active watchlist, or if the classified
+/// action is ineligible (an `Unknown` action, or a low-confidence `Add`/`Trim`/`Exit`).
 pub fn classify_trade(
     trade: &IncomingTrade,
     position: Option<&PositionSnapshot>,
     watchlist: &Watchlist,
-    wallet_profile: &WalletProfile,
-    cluster_obs: Option<&ClusterObs>,
-    operator_id: Option<OperatorId>,
     reconstruction_quality: ReconstructionQuality,
     venue: VenueId,
     config: &SignalConfig,
 ) -> Option<LeaderSignal> {
-    let signal_kind = classify_signal_kind(
-        trade,
-        watchlist,
-        wallet_profile,
-        cluster_obs,
-        operator_id,
-        config,
-    )?;
+    if !is_on_active_watchlist(trade.wallet, watchlist) {
+        return None;
+    }
 
     let action = classify_action(trade, position, reconstruction_quality, config);
     let action_confidence_ppm = confidence_from_quality(reconstruction_quality);
@@ -47,13 +35,8 @@ pub fn classify_trade(
         return None;
     }
 
-    // Placeholder: real shrinkage computed by model-calibrated weights per 03-PHASE-MODEL-ENGINE.md.
-    let inherited_prior = (signal_kind == WinnerFollowSignalKind::FreshWalletFirstTrade)
-        .then_some(InheritedPriorPpm(0));
-
     Some(LeaderSignal {
         leader: TraderId(trade.wallet),
-        operator_id,
         venue,
         market_id: trade.market_id.clone(),
         outcome_id: trade.outcome_id,
@@ -64,32 +47,9 @@ pub fn classify_trade(
         observed_at: trade.observed_at,
         received_at: trade.received_at,
         reconstruction_quality,
-        signal_kind,
-        inherited_prior,
         source_trade_id: trade.source_trade_id.clone(),
         action_confidence_ppm,
     })
-}
-
-/// Determine the signal kind in priority order: Cluster > FreshWallet > NormalLeaderFollow.
-fn classify_signal_kind(
-    trade: &IncomingTrade,
-    watchlist: &Watchlist,
-    profile: &WalletProfile,
-    cluster_obs: Option<&ClusterObs>,
-    operator_id: Option<OperatorId>,
-    config: &SignalConfig,
-) -> Option<WinnerFollowSignalKind> {
-    if is_cluster_coordination(trade, cluster_obs, config) {
-        return Some(WinnerFollowSignalKind::ClusterCoordination);
-    }
-    if is_fresh_wallet_first_trade(trade, profile, operator_id, config) {
-        return Some(WinnerFollowSignalKind::FreshWalletFirstTrade);
-    }
-    if is_on_active_watchlist(trade.wallet, watchlist) {
-        return Some(WinnerFollowSignalKind::NormalLeaderFollow);
-    }
-    None
 }
 
 /// Classify the action from the current position state.
@@ -163,71 +123,11 @@ fn is_near_close(remaining: u64, original: u64, config: &SignalConfig) -> bool {
     remaining.saturating_mul(100) <= original.saturating_mul(config.near_close_remaining_pct as u64)
 }
 
-fn is_cluster_coordination(
-    trade: &IncomingTrade,
-    cluster_obs: Option<&ClusterObs>,
-    config: &SignalConfig,
-) -> bool {
-    let Some(obs) = cluster_obs else {
-        return false;
-    };
-
-    if obs.market_id != trade.market_id
-        || obs.outcome_id != trade.outcome_id
-        || obs.side != trade.side
-    {
-        return false;
-    }
-
-    let trade_unix = trade.observed_at.unix_timestamp();
-    let window_start = trade_unix.saturating_sub(config.cluster_coord_window_seconds as i64);
-
-    let mut member_count: u32 = 0;
-    let mut aggregate_notional_usd: u64 = 0;
-
-    for entry in &obs.wallet_entries {
-        if entry.observed_at_unix >= window_start && entry.observed_at_unix <= trade_unix {
-            member_count += 1;
-            let notional = price_times_contracts_usd(entry.price.0, entry.contracts.0);
-            aggregate_notional_usd = aggregate_notional_usd.saturating_add(notional);
-        }
-    }
-
-    member_count >= config.cluster_coord_min_members
-        && aggregate_notional_usd >= config.cluster_coord_min_aggregate_usd as u64
-}
-
-fn is_fresh_wallet_first_trade(
-    trade: &IncomingTrade,
-    profile: &WalletProfile,
-    operator_id: Option<OperatorId>,
-    config: &SignalConfig,
-) -> bool {
-    if operator_id.is_none() {
-        return false;
-    }
-    if profile.closed_trade_count > config.fresh_wallet_max_closed_trades {
-        return false;
-    }
-    if profile.age_seconds > config.fresh_wallet_max_age_seconds {
-        return false;
-    }
-    let notional = price_times_contracts_usd(trade.price.0, trade.contracts.0);
-    notional >= config.inherited_prior_min_position_usd as u64
-}
-
 fn is_on_active_watchlist(wallet: WalletAddress, watchlist: &Watchlist) -> bool {
     watchlist
         .entries
         .iter()
         .any(|e| e.wallet == wallet && e.tier == WatchlistTier::Active)
-}
-
-/// Compute `floor(price * contracts)` in whole USD using integer-safe Decimal arithmetic.
-///
-/// Returns 0 on overflow or if the conversion fails (price is guaranteed in [0,1]).
-fn price_times_contracts_usd(price: Decimal, contracts: u64) -> u64 {
-    (price * Decimal::from(contracts)).to_u64().unwrap_or(0)
 }
 
 /// Gate on action type and confidence before emitting a signal.

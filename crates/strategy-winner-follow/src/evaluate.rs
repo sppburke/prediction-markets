@@ -6,18 +6,14 @@ use rust_decimal::prelude::ToPrimitive as _;
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, KellyFraction, LeaderAction, Price, Probability, Side, StrategyId,
-    WinnerFollowSignalKind,
 };
-use pe_kelly_sizer::{
-    KELLY_CLUSTER_COORDINATION, KELLY_INHERITED_PRIOR, KELLY_NORMAL, KELLY_PAPER_BACKTEST,
-    KellyInput, size_contracts,
-};
+use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
 use pe_risk_engine::{RiskDecision, RiskSnapshot, clamp_contracts_to_cap, evaluate_risk};
 use pe_venue_core::OrderIntent;
 
 use crate::{
     WinnerFollowConfig, WinnerFollowError,
-    mode::{ExecutionMode, clamp_mode, to_risk_trading_mode},
+    mode::{ExecutionMode, to_risk_trading_mode},
 };
 
 const STRATEGY_ID: &str = "winner-follow";
@@ -39,11 +35,11 @@ impl WinnerFollowStrategy {
     ///
     /// Steps:
     /// 1. Gate Flip actions on `flip_human_approved`.
-    /// 2. Clamp `mode` to the ceiling imposed by `signal.signal_kind`.
+    /// 2. Use the requested `mode` directly as the effective mode (no signal-kind clamping).
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Size contracts: flat (`config.flat_usd_per_trade` is `Some`) or fractional Kelly.
     ///    Flat path: `max(1, floor(flat / leader_price))` — bypasses Kelly fraction and `p`.
-    ///    Kelly path: select fraction for mode + kind, compute cost-adjusted `c`, call `size_contracts`.
+    ///    Kelly path: select fraction for the mode, compute cost-adjusted `c`, call `size_contracts`.
     /// 5. Clamp contracts to `per_trade_cap`; return `NoEdge` if clamped to 0.
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
@@ -67,8 +63,8 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::FlipNotApproved);
         }
 
-        // 2. Clamp mode to signal-kind ceiling.
-        let effective_mode = clamp_mode(mode, signal.signal_kind);
+        // 2. Effective mode = requested mode (no per-signal-kind clamping).
+        let effective_mode = mode;
 
         // 3. Shadow → record only, no order.
         if effective_mode == ExecutionMode::Shadow {
@@ -88,11 +84,7 @@ impl WinnerFollowStrategy {
         } else {
             // Kelly path.
             // 4. Kelly fraction.
-            let kf = kelly_fraction(
-                signal.signal_kind,
-                effective_mode,
-                self.config.kelly_fraction_override,
-            );
+            let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
 
             // 5. Size contracts.
             // c = leader_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
@@ -159,28 +151,23 @@ impl WinnerFollowStrategy {
     }
 }
 
-/// Select the Kelly fraction for this signal kind and effective mode.
+/// Select the Kelly fraction for this effective mode.
 ///
-/// When `override_` is `Some`, it is returned for all signal kinds and modes.
+/// When `override_` is `Some`, it is returned for all modes.
 /// In production, `pe-service` validates at startup that any override does not exceed
 /// the mode default without `kelly_fraction_above_default_human_approved = true`.
 fn kelly_fraction(
-    signal_kind: WinnerFollowSignalKind,
     effective_mode: ExecutionMode,
     override_: Option<KellyFraction>,
 ) -> KellyFraction {
     if let Some(kf) = override_ {
         return kf;
     }
-    match signal_kind {
-        WinnerFollowSignalKind::FreshWalletFirstTrade => KELLY_INHERITED_PRIOR,
-        WinnerFollowSignalKind::ClusterCoordination => KELLY_CLUSTER_COORDINATION,
-        WinnerFollowSignalKind::NormalLeaderFollow => match effective_mode {
-            ExecutionMode::Paper => KELLY_PAPER_BACKTEST,
-            ExecutionMode::LiveTiny | ExecutionMode::Promoted => KELLY_NORMAL,
-            // Shadow is filtered before reaching here; fall back to most conservative.
-            ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
-        },
+    match effective_mode {
+        ExecutionMode::Paper => KELLY_PAPER_BACKTEST,
+        ExecutionMode::LiveTiny | ExecutionMode::Promoted => KELLY_NORMAL,
+        // Shadow is filtered before reaching here; fall back to most conservative.
+        ExecutionMode::Shadow => KELLY_PAPER_BACKTEST,
     }
 }
 
@@ -198,7 +185,7 @@ fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> Basi
 
 /// Build the idempotency key per `_GLOSSARY.md`.
 ///
-/// Format: `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{bucket}[|{operator_id}]`
+/// Format: `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{bucket}`
 /// where `bucket = floor(observed_at_ms / 1_000) = observed_at.unix_timestamp()`.
 fn build_idempotency_key(signal: &LeaderSignal) -> String {
     let side_str = match signal.leader_side {
@@ -206,7 +193,7 @@ fn build_idempotency_key(signal: &LeaderSignal) -> String {
         pe_core_types::Side::Sell => "sell",
     };
     let bucket = signal.observed_at.unix_timestamp();
-    let base = format!(
+    format!(
         "wf|{}|{}|{}|{}|{}|{}",
         signal.leader,
         signal.source_trade_id.0,
@@ -214,11 +201,5 @@ fn build_idempotency_key(signal: &LeaderSignal) -> String {
         signal.outcome_id.0,
         side_str,
         bucket,
-    );
-    match (signal.signal_kind, signal.operator_id) {
-        (WinnerFollowSignalKind::ClusterCoordination, Some(op)) => {
-            format!("{base}|{op}")
-        }
-        _ => base,
-    }
+    )
 }

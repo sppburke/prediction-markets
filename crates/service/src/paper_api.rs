@@ -195,7 +195,6 @@ async fn build_dashboard(
             fill_price: fill.fill_price.0,
             leader: parsed.leader.unwrap_or_default(),
             source_trade_id: parsed.source_trade_id.unwrap_or_default(),
-            operator_id: parsed.operator_id,
             event_seq: fill.event_seq,
             entry_unix: parsed.entry_unix,
             resolution_unix,
@@ -225,22 +224,20 @@ fn side_str(side: Side) -> &'static str {
 }
 
 /// Fields recovered from a Winner-Follow idempotency key:
-/// `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{observed_at}[|{operator}]`.
+/// `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{observed_at}`.
 /// (Format defined in `strategy-winner-follow::evaluate::build_idempotency_key`.)
 #[derive(Default)]
 struct ParsedKey {
     leader: Option<String>,
     source_trade_id: Option<String>,
     entry_unix: Option<i64>,
-    operator_id: Option<String>,
 }
 
 impl ParsedKey {
     fn from_key(key: &str) -> Self {
         let parts: Vec<&str> = key.split('|').collect();
-        // Index 0 is the "wf" tag; 1=leader, 2=source_trade_id, 6=observed_at bucket,
-        // 7=operator (cluster-coordination only). Anything shorter is a legacy/foreign
-        // key — leave fields empty rather than guess.
+        // Index 0 is the "wf" tag; 1=leader, 2=source_trade_id, 6=observed_at bucket.
+        // Anything shorter is a legacy/foreign key — leave fields empty rather than guess.
         if parts.len() < 7 || parts[0] != "wf" {
             return Self::default();
         }
@@ -248,7 +245,6 @@ impl ParsedKey {
             leader: Some(parts[1].to_string()),
             source_trade_id: Some(parts[2].to_string()),
             entry_unix: parts[6].parse().ok(),
-            operator_id: parts.get(7).map(|s| s.to_string()),
         }
     }
 }
@@ -274,14 +270,6 @@ mod tests {
         assert_eq!(p.leader.as_deref(), Some("0xleader"));
         assert_eq!(p.source_trade_id.as_deref(), Some("0xsrc"));
         assert_eq!(p.entry_unix, Some(1_705_320_000));
-        assert_eq!(p.operator_id, None);
-    }
-
-    #[test]
-    fn parses_operator_for_cluster_keys() {
-        let k = "wf|0xleader|0xsrc|0xmarket|3|sell|1705320000|op-42";
-        let p = ParsedKey::from_key(k);
-        assert_eq!(p.operator_id.as_deref(), Some("op-42"));
     }
 
     #[test]

@@ -140,7 +140,7 @@ mod tests {
     use pe_core_types::{
         ContractQty, LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, Quantity,
         ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
-        WalletAddress, WinnerFollowSignalKind,
+        WalletAddress,
     };
     use rust_decimal_macros::dec;
     use time::OffsetDateTime;
@@ -158,7 +158,6 @@ mod tests {
         let ts = OffsetDateTime::UNIX_EPOCH;
         LeaderSignal {
             leader: TraderId(wallet()),
-            operator_id: None,
             venue: VenueId::polymarket(),
             market_id,
             outcome_id: OutcomeId(0),
@@ -169,8 +168,6 @@ mod tests {
             observed_at: ts,
             received_at: ts,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-            signal_kind: WinnerFollowSignalKind::NormalLeaderFollow,
-            inherited_prior: None,
             source_trade_id: SourceTradeId("t1".to_string()),
             action_confidence_ppm: ProbabilityPpm(1_000_000),
         }

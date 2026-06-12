@@ -4,11 +4,16 @@
 //!   1. e2e_clean_exit    — trade from watchlisted wallet processed; orchestrator exits cleanly
 //!      when both channels close.
 //!   2. graceful_shutdown — trades buffered before shutdown are drained before orchestrator exits.
+//!   3. normal_leader_follow_order_intent_equivalence — a watchlisted NormalLeaderFollow trade
+//!      drives the surviving classify→evaluate path to a frozen `OrderIntent` (operator-free
+//!      idempotency key), proving the operator/cluster signal-collapse (#326) preserved the
+//!      ordinary copy path end-to-end.
 //!
-//! Note: with the Phase 0B placeholder (p = c = leader_price in evaluate.rs), the strategy always
-//! returns NoEdge and no paper fills are written. These tests verify orchestrator lifecycle
-//! correctness (no hang, no panic) rather than fill counts. Fill assertions land in Phase 0C when
-//! the model engine provides calibrated probabilities.
+//! Note: scenarios 1–2 use the Phase 0B placeholder (p = c = leader_price in evaluate.rs), so the
+//! strategy returns NoEdge and no paper fills are written; they verify orchestrator lifecycle
+//! correctness (no hang, no panic) rather than fill counts. Scenario 3 uses a flat-sizing config to
+//! force a deterministic order. Fill assertions through the orchestrator land in Phase 0C when the
+//! model engine provides calibrated probabilities.
 
 #![cfg(feature = "scenario")]
 #![allow(
@@ -23,21 +28,24 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use pe_copy_signal_engine::PositionSnapshot;
-use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
+use pe_copy_signal_engine::{IncomingTrade, SignalConfig, classify_trade};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
-    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
+    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, VenueId, VenueMarketId,
+    WalletAddress,
 };
 use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
+use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, PerTradeCap, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
@@ -124,6 +132,25 @@ fn disabled_entry_gate() -> CopyEntryGateConfig {
         price_band_lo: Price::ZERO,
         price_band_hi: Price::ONE,
         fail_closed: false,
+    }
+}
+
+/// A risk snapshot with no exposure, healthy source, and headroom under every cap,
+/// so the risk gate approves. `proposed_trade_bps`/`per_trade_cap_bps`/`trading_mode`
+/// are overwritten by `evaluate()` before the gate runs.
+fn clean_snapshot() -> RiskSnapshot {
+    RiskSnapshot {
+        leader_exposure_bps: BasisPoints(0),
+        market_exposure_bps: BasisPoints(0),
+        family_exposure_bps: BasisPoints(0),
+        total_copy_exposure_bps: BasisPoints(0),
+        intraday_pnl_bps: BasisPoints(0),
+        rolling_7d_pnl_bps: BasisPoints(0),
+        onchain_source_status: SourceStatus::Healthy,
+        copy_latency_p95_ms: 500,
+        trading_mode: TradingMode::LiveTiny,
+        proposed_trade_bps: BasisPoints(10),
+        per_trade_cap_bps: 25,
     }
 }
 
@@ -236,4 +263,74 @@ async fn scenario_graceful_shutdown() {
     );
 
     drop(trade_tx);
+}
+
+// ── Scenario 3: normal_leader_follow_order_intent_equivalence ─────────────────
+//
+// PASS: a watchlisted NormalLeaderFollow trade drives classify_trade → evaluate to
+//       an OrderIntent whose side/limit_price/contracts and operator-free idempotency
+//       key match the frozen pre-collapse expectation (flat $50 / $0.65 = 76 contracts;
+//       key = `wf|{leader}|trade_a1|{market}|0|buy|1704067200`, exactly 7 fields).
+// FAIL: any field differs, the key carries an 8th (operator) segment, or no order is
+//       produced.
+
+#[test]
+fn scenario_normal_leader_follow_order_intent_equivalence() {
+    let wallet = wallet_a();
+    let watchlist = make_watchlist(wallet);
+    let trade = make_trade(wallet);
+
+    // 1. Surviving classification path: watchlist-gated NormalLeaderFollow.
+    let signal = classify_trade(
+        &trade,
+        None,
+        &watchlist,
+        ReconstructionQuality::new(100).unwrap(),
+        VenueId::polymarket(),
+        &SignalConfig::default(),
+    )
+    .expect("watchlisted wallet must classify to a signal");
+    assert_eq!(signal.action, LeaderAction::Entry);
+
+    // 2. Evaluate with a flat-sizing config so the OrderIntent is fully determined
+    //    (flat path bypasses Kelly and `p`; clean snapshot → risk-approved).
+    let config = WinnerFollowConfig {
+        flat_usd_per_trade: Some(Decimal::from(50u32)),
+        per_trade_cap: PerTradeCap::Unlimited,
+        ..WinnerFollowConfig::default()
+    };
+    let intent = WinnerFollowStrategy::new(config)
+        .evaluate(
+            &signal,
+            Probability::new(Decimal::from_str("0.70").unwrap()).unwrap(),
+            clean_snapshot(),
+            Decimal::from(10_000u32),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("NormalLeaderFollow flat-sized order");
+
+    // 3. Frozen behavioral contract for the surviving copy path.
+    assert_eq!(intent.side, Side::Buy);
+    assert_eq!(
+        intent.limit_price,
+        Price(Decimal::from_str("0.65").unwrap())
+    );
+    assert_eq!(
+        intent.contracts,
+        ContractQty(76),
+        "flat $50 / price $0.65 = floor(76.9) = 76 contracts"
+    );
+
+    // Idempotency key is the canonical operator-free 7-field form (the `|{operator}`
+    // branch — which only ever fired for ClusterCoordination — is gone).
+    let expected_key = format!(
+        "wf|{}|trade_a1|0x1111111111111111111111111111111111111111|0|buy|1704067200",
+        signal.leader
+    );
+    assert_eq!(intent.idempotency_key, expected_key);
+    assert_eq!(
+        intent.idempotency_key.split('|').count(),
+        7,
+        "NormalLeaderFollow key must have exactly 7 fields (no operator suffix)"
+    );
 }

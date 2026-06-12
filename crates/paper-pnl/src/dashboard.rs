@@ -95,8 +95,6 @@ pub struct TradeView {
     pub leader: String,
     /// Leader's source trade id (parsed from the idempotency key).
     pub source_trade_id: String,
-    /// Operator id, present only for cluster-coordination fills.
-    pub operator_id: Option<String>,
     /// Event-log sequence number — the chronological order anchor.
     pub event_seq: i64,
     /// Leader trade observed-at (entry signal time), Unix seconds. From the
@@ -136,7 +134,6 @@ impl TradeView {
             "notional": self.notional(),
             "leader": self.leader,
             "source_trade_id": self.source_trade_id,
-            "operator_id": self.operator_id,
             "event_seq": self.event_seq,
             "entry_unix": self.entry_unix,
             "entry_utc": self.entry_unix.and_then(tz::fmt_utc),
@@ -365,7 +362,6 @@ mod tests {
             fill_price: Decimal::new(40, 2), // 0.40
             leader: "0x1111222233334444555566667777888899990000".to_string(),
             source_trade_id: "0xdeadbeef".to_string(),
-            operator_id: None,
             event_seq: 1,
             entry_unix: entry,
             resolution_unix: resolves,
