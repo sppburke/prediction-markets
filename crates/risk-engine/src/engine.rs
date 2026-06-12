@@ -12,7 +12,9 @@ pub enum RiskDecision {
 /// Evaluate whether a proposed trade passes all risk gates.
 ///
 /// Checks are applied in priority order: kill switches first, drawdown stops,
-/// latency, source health, identity flags, concentration caps last.
+/// latency, source health, then the per-trade size cap and pure-wallet
+/// concentration caps last. (Operator/funder/cluster/anti-gaming gates were
+/// removed in the wallet-isolation purge, #326.)
 pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
     // 1. Absolute kill switch (strategy-wide; manual review required to resume)
     if s.intraday_pnl_bps.0 <= -1_000 {
@@ -39,44 +41,14 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
         return RiskDecision::Blocked(RiskBlock::OnchainSourceUnhealthy);
     }
 
-    // 6. Proxy-funder mapping
-    if !s.proxy_funder_mapping_proven {
-        return RiskDecision::Blocked(RiskBlock::ProxyFunderMappingUnproven);
-    }
-
-    // 7. Anti-gaming flags
-    if !s.anti_gaming_flags.is_empty() {
-        return RiskDecision::Blocked(RiskBlock::AntiGamingFlagActive);
-    }
-
-    // 8. Funder seeding rate
-    if s.funder_seeding_rate_suspicious {
-        return RiskDecision::Blocked(RiskBlock::FunderSeedingRateSuspicious);
-    }
-
-    // 9. Cluster membership stability
-    if !s.cluster_membership_stable {
-        return RiskDecision::Blocked(RiskBlock::ClusterMembershipUnstable);
-    }
-
-    // 10. Funding hop count (max 3, from _GLOSSARY.md)
-    if let Some(hops) = s.funding_hop_count
-        && hops.0 > 3
-    {
-        return RiskDecision::Blocked(RiskBlock::FunderHopCountExcessive);
-    }
-
-    // 11. Per-trade size cap (defense-in-depth; clamp_contracts_to_cap normally prevents this)
+    // 6. Per-trade size cap (defense-in-depth; clamp_contracts_to_cap normally prevents this)
     if s.proposed_trade_bps.0 > s.per_trade_cap_bps {
         return RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded);
     }
 
-    // 12. Concentration caps (add proposed trade to existing exposure)
+    // 7. Concentration caps (add proposed trade to existing exposure)
     let proposed = s.proposed_trade_bps.0;
 
-    if s.operator_exposure_bps.0 + proposed > 300 {
-        return RiskDecision::Blocked(RiskBlock::OperatorConcentrationExceeded);
-    }
     if s.leader_exposure_bps.0 + proposed > 300 {
         return RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded);
     }
@@ -89,9 +61,6 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
     if s.total_copy_exposure_bps.0 + proposed > 2_500 {
         return RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded);
     }
-    if s.funder_inherited_exposure_bps.0 + proposed > 100 {
-        return RiskDecision::Blocked(RiskBlock::FunderInheritedExposureExceeded);
-    }
 
     RiskDecision::Approved
 }
@@ -99,9 +68,7 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashSet;
-
-    use pe_core_types::{BasisPoints, FundingHopCount};
+    use pe_core_types::BasisPoints;
     use pe_source_core::SourceStatus;
 
     use super::*;
@@ -110,19 +77,12 @@ mod tests {
     pub(super) fn clean_snapshot() -> RiskSnapshot {
         RiskSnapshot {
             leader_exposure_bps: BasisPoints(0),
-            operator_exposure_bps: BasisPoints(0),
             market_exposure_bps: BasisPoints(0),
             family_exposure_bps: BasisPoints(0),
             total_copy_exposure_bps: BasisPoints(0),
-            funder_inherited_exposure_bps: BasisPoints(0),
             intraday_pnl_bps: BasisPoints(0),
             rolling_7d_pnl_bps: BasisPoints(0),
-            anti_gaming_flags: HashSet::new(),
             onchain_source_status: SourceStatus::Healthy,
-            proxy_funder_mapping_proven: true,
-            funder_seeding_rate_suspicious: false,
-            cluster_membership_stable: true,
-            funding_hop_count: Some(FundingHopCount(1)),
             copy_latency_p95_ms: 100,
             trading_mode: TradingMode::LiveTiny,
             proposed_trade_bps: BasisPoints(10),

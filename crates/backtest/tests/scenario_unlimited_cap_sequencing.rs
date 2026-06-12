@@ -8,13 +8,11 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::HashSet;
-
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, ContractQty, FundingHopCount, LeaderAction, MarketId, OutcomeId, Price,
-    Probability, ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId,
-    VenueId, VenueMarketId, WalletAddress, WinnerFollowSignalKind,
+    BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
+    ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
+    VenueMarketId, WalletAddress, WinnerFollowSignalKind,
 };
 use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
@@ -66,19 +64,12 @@ fn make_signal(market_idx: u8) -> LeaderSignal {
 fn clean_snapshot() -> RiskSnapshot {
     RiskSnapshot {
         leader_exposure_bps: BasisPoints(0),
-        operator_exposure_bps: BasisPoints(0),
         market_exposure_bps: BasisPoints(0),
         family_exposure_bps: BasisPoints(0),
         total_copy_exposure_bps: BasisPoints(0),
-        funder_inherited_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        anti_gaming_flags: HashSet::new(),
         onchain_source_status: SourceStatus::Healthy,
-        proxy_funder_mapping_proven: true,
-        funder_seeding_rate_suspicious: false,
-        cluster_membership_stable: true,
-        funding_hop_count: Some(FundingHopCount(1)),
         copy_latency_p95_ms: 500,
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(0),

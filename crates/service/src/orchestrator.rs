@@ -434,19 +434,12 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
     use pe_core_types::BasisPoints;
     RiskSnapshot {
         leader_exposure_bps: BasisPoints(0),
-        operator_exposure_bps: BasisPoints(0),
         market_exposure_bps: BasisPoints(0),
         family_exposure_bps: BasisPoints(0),
         total_copy_exposure_bps: BasisPoints(0),
-        funder_inherited_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        anti_gaming_flags: Default::default(),
         onchain_source_status: SourceStatus::Healthy,
-        proxy_funder_mapping_proven: true, // stub: assume proven so inherited-prior isn't blocked
-        funder_seeding_rate_suspicious: false,
-        cluster_membership_stable: true,
-        funding_hop_count: None,
         copy_latency_p95_ms: 0,
         trading_mode: TradingMode::LiveTiny, // overridden by evaluate()
         proposed_trade_bps: BasisPoints(0),  // overridden by evaluate()
