@@ -6,9 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use pe_copy_signal_engine::{
-    IncomingTrade, PositionSnapshot, SignalConfig, WalletProfile, classify_trade,
-};
+use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, SignalConfig, classify_trade};
 use pe_core_types::{
     EventSeq, MarketId, MarketOutcomeId, Probability, ReconstructionQuality, SourceTimestamp,
     TraderId, VenueId, WalletAddress,
@@ -184,20 +182,11 @@ impl<C: CLOBClient> Orchestrator<C> {
 
         // Look up wallet in watchlist; skip non-watchlisted wallets.
         let quality = self.quality_for(&trade.wallet);
-        let profile = WalletProfile {
-            wallet: trade.wallet,
-            closed_trade_count: 0, // honest sentinel per Phase 0B scope
-            age_seconds: 0,        // honest sentinel; treated as "fresh" conservative stub
-        };
-
-        let operator_id = None;
 
         // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
         // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
         // classification, not before.
         let position = self.position_ledger.position(&trade.wallet).cloned();
-
-        let cluster_obs = None;
 
         // Advance position ledger after classification inputs are captured.
         self.position_ledger.ingest(&trade);
@@ -210,9 +199,6 @@ impl<C: CLOBClient> Orchestrator<C> {
             &trade,
             position.as_ref(),
             &self.watchlist,
-            &profile,
-            cluster_obs.as_ref(),
-            operator_id,
             quality,
             VenueId::polymarket(),
             &self.signal_config,

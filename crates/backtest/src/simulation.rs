@@ -11,9 +11,8 @@ use std::path::Path;
 use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, KellyFraction, LeaderAction, MarketId, OperatorId, OutcomeId, Probability,
-    ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId,
-    WalletAddress, WinnerFollowSignalKind,
+    BasisPoints, KellyFraction, LeaderAction, MarketId, OutcomeId, Probability, ProbabilityPpm,
+    Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_risk_engine::RiskSnapshot;
 use pe_risk_engine::clamp_contracts_to_liquidity;
@@ -527,7 +526,6 @@ pub fn run_simulation(
             }
 
             let leader = trade.wallet;
-            let operator_id: Option<&OperatorId> = None;
 
             let pos_key = (trade.market_id.clone(), trade.outcome_id);
             let wallet_pos_key = (leader, pos_key.clone());
@@ -706,7 +704,7 @@ pub fn run_simulation(
                         continue;
                     };
 
-                    let signal = raw_trade_to_leader_signal(trade, operator_id.cloned(), quality);
+                    let signal = raw_trade_to_leader_signal(trade, quality);
 
                     let risk_snapshot = build_risk_snapshot(&RiskContext {
                         exposure: &exposure,
@@ -1011,15 +1009,10 @@ pub fn run_one_kelly_fraction(
 
 /// Build a `LeaderSignal` from a raw simulation trade for routing through evaluate().
 ///
-/// All backtest signals use `NormalLeaderFollow` kind and `Add` action (BUY entry).
-fn raw_trade_to_leader_signal(
-    trade: &RawTrade,
-    operator_id: Option<OperatorId>,
-    quality: ReconstructionQuality,
-) -> LeaderSignal {
+/// All backtest signals use the `Add` action (BUY entry).
+fn raw_trade_to_leader_signal(trade: &RawTrade, quality: ReconstructionQuality) -> LeaderSignal {
     LeaderSignal {
         leader: TraderId(trade.wallet),
-        operator_id,
         venue: VenueId::polymarket(),
         market_id: trade.market_id.clone(),
         outcome_id: trade.outcome_id,
@@ -1030,8 +1023,6 @@ fn raw_trade_to_leader_signal(
         observed_at: trade.timestamp.0,
         received_at: trade.timestamp.0,
         reconstruction_quality: quality,
-        signal_kind: WinnerFollowSignalKind::NormalLeaderFollow,
-        inherited_prior: None,
         source_trade_id: trade.source_trade_id.clone(),
         action_confidence_ppm: ProbabilityPpm(700_000),
     }

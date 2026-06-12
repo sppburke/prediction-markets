@@ -1,7 +1,6 @@
 //! `pe-copy-signal-engine` — classify leader trades into typed [`LeaderSignal`]s.
 //!
-//! Determines what a watchlisted leader just did ([`LeaderAction`]), which mechanism
-//! generated the signal ([`WinnerFollowSignalKind`]), and computes
+//! Determines what a watchlisted leader just did ([`LeaderAction`]) and computes
 //! `action_confidence_ppm` from the wallet's reconstruction quality.
 //!
 //! # Architecture constraints
@@ -10,7 +9,6 @@
 //! - No `unwrap`/`expect`/`panic!` in production code.
 //!
 //! [`LeaderAction`]: pe_core_types::LeaderAction
-//! [`WinnerFollowSignalKind`]: pe_core_types::WinnerFollowSignalKind
 
 pub mod classifier;
 pub mod config;
@@ -20,6 +18,4 @@ pub mod snapshot;
 pub use classifier::classify_trade;
 pub use config::SignalConfig;
 pub use signal::LeaderSignal;
-pub use snapshot::{
-    ClusterEntry, ClusterObs, IncomingTrade, PositionSnapshot, PositionState, WalletProfile,
-};
+pub use snapshot::{IncomingTrade, PositionSnapshot, PositionState};

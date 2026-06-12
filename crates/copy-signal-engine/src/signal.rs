@@ -1,9 +1,8 @@
 //! Output type assembled by the classifier.
 
 use pe_core_types::{
-    InheritedPriorPpm, LeaderAction, MarketId, OperatorId, OutcomeId, Price, ProbabilityPpm,
-    Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
-    WinnerFollowSignalKind,
+    LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, Quantity, ReconstructionQuality,
+    Side, SourceTradeId, TraderId, VenueId,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -12,7 +11,6 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderSignal {
     pub leader: TraderId,
-    pub operator_id: Option<OperatorId>,
     pub venue: VenueId,
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
@@ -25,9 +23,6 @@ pub struct LeaderSignal {
     #[serde(with = "time::serde::rfc3339")]
     pub received_at: OffsetDateTime,
     pub reconstruction_quality: ReconstructionQuality,
-    pub signal_kind: WinnerFollowSignalKind,
-    /// Non-`None` for `FreshWalletFirstTrade` signals; carries the shrunk operator prior.
-    pub inherited_prior: Option<InheritedPriorPpm>,
     pub source_trade_id: SourceTradeId,
     /// Confidence in the action classification (0..=1_000_000).
     ///

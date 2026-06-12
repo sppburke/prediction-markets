@@ -20,8 +20,6 @@ use pe_core_types::{ContractQty, KellyFraction, Price, Probability};
 use rust_decimal_macros::dec;
 
 pub const KELLY_NORMAL: KellyFraction = KellyFraction(dec!(0.25));
-pub const KELLY_INHERITED_PRIOR: KellyFraction = KellyFraction(dec!(0.05));
-pub const KELLY_CLUSTER_COORDINATION: KellyFraction = KellyFraction(dec!(0.15));
 pub const KELLY_PAPER_BACKTEST: KellyFraction = KellyFraction(dec!(0.10));
 pub const KELLY_HARD_MAX: KellyFraction = KellyFraction(dec!(0.50));
 

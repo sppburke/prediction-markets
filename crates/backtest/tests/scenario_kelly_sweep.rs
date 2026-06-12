@@ -29,7 +29,7 @@ use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId, Price, Probability,
     ProbabilityPpm, Quantity, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
-    VenueMarketId, WalletAddress, WinnerFollowSignalKind,
+    VenueMarketId, WalletAddress,
 };
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
@@ -145,7 +145,6 @@ fn thin_edge_signal() -> LeaderSignal {
     let leader = TraderId(wallet(WINNER_HEX));
     LeaderSignal {
         leader,
-        operator_id: None,
         venue: VenueId::polymarket(),
         market_id: MarketId(VenueMarketId("sweep-mkt-001".to_string())),
         outcome_id: OutcomeId(0),
@@ -156,8 +155,6 @@ fn thin_edge_signal() -> LeaderSignal {
         observed_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
         received_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
         reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
-        signal_kind: WinnerFollowSignalKind::NormalLeaderFollow,
-        inherited_prior: None,
         source_trade_id: SourceTradeId("sweep-tid-001".to_string()),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
     }

@@ -12,7 +12,7 @@ use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
     ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
-    VenueMarketId, WalletAddress, WinnerFollowSignalKind,
+    VenueMarketId, WalletAddress,
 };
 use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
@@ -43,7 +43,6 @@ fn make_signal(market_idx: u8) -> LeaderSignal {
     let market_id = format!("mkt-{market_idx:03}");
     LeaderSignal {
         leader: TraderId(wallet(0x10)),
-        operator_id: None,
         venue: VenueId::polymarket(),
         market_id: MarketId(VenueMarketId(market_id.clone())),
         outcome_id: OutcomeId(0),
@@ -54,8 +53,6 @@ fn make_signal(market_idx: u8) -> LeaderSignal {
         observed_at: NOW,
         received_at: NOW,
         reconstruction_quality: quality(100),
-        signal_kind: WinnerFollowSignalKind::NormalLeaderFollow,
-        inherited_prior: None,
         source_trade_id: SourceTradeId(format!("tid-seq-{market_idx}")),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
     }

@@ -10,9 +10,9 @@
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, ContractQty, InheritedPriorPpm, LeaderAction, MarketId, OperatorId, OutcomeId,
-    Price, Probability, ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId,
-    TraderId, VenueId, VenueMarketId, WalletAddress, WinnerFollowSignalKind,
+    BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
+    ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
+    VenueMarketId, WalletAddress,
 };
 use pe_risk_engine::{RiskBlock, RiskDecision, RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
@@ -30,10 +30,6 @@ fn wallet(b: u8) -> WalletAddress {
     let mut bytes = [0u8; 20];
     bytes[19] = b;
     WalletAddress(bytes)
-}
-
-fn op_id(seed: &[u8]) -> OperatorId {
-    OperatorId(blake3::hash(seed))
 }
 
 fn price(d: rust_decimal::Decimal) -> Price {
@@ -62,15 +58,9 @@ fn p_moderate() -> Probability {
     Probability::new(dec!(0.44)).expect("0.44 is valid")
 }
 
-fn make_signal(
-    wallet_byte: u8,
-    signal_kind: WinnerFollowSignalKind,
-    action: LeaderAction,
-    operator_id: Option<OperatorId>,
-) -> LeaderSignal {
+fn make_signal(wallet_byte: u8, action: LeaderAction) -> LeaderSignal {
     LeaderSignal {
         leader: TraderId(wallet(wallet_byte)),
-        operator_id,
         venue: VenueId::polymarket(),
         market_id: MarketId(VenueMarketId("mkt-001".to_string())),
         outcome_id: OutcomeId(0),
@@ -81,8 +71,6 @@ fn make_signal(
         observed_at: NOW,
         received_at: NOW,
         reconstruction_quality: quality(100),
-        signal_kind,
-        inherited_prior: None,
         source_trade_id: SourceTradeId("tid-000001".to_string()),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
     }
@@ -112,12 +100,7 @@ fn clean_snapshot() -> RiskSnapshot {
 /// PASS: `Err(NoEdge)`.
 #[test]
 fn scenario_no_edge_when_p_equals_price() {
-    let signal = make_signal(
-        0x01,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-    );
+    let signal = make_signal(0x01, LeaderAction::Entry);
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
 
     let result = strategy.evaluate(
@@ -143,12 +126,7 @@ fn scenario_no_edge_when_p_equals_price() {
 /// PASS: result is NOT `Err(NoEdge)`.
 #[test]
 fn scenario_positive_p_breaks_no_edge() {
-    let signal = make_signal(
-        0x07,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-    );
+    let signal = make_signal(0x07, LeaderAction::Entry);
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
 
     let result = strategy.evaluate(
@@ -162,67 +140,6 @@ fn scenario_positive_p_breaks_no_edge() {
     assert!(
         !matches!(result, Err(WinnerFollowError::NoEdge)),
         "p=0.70 >> price=0.40: must find edge; got {result:?}"
-    );
-}
-
-// ─── scenario 2 ──────────────────────────────────────────────────────────────
-
-/// Cluster-coordination signal, LiveTiny mode requested → clamped to Shadow.
-///
-/// PASS: `Err(ShadowMode)`.
-#[test]
-fn scenario_cluster_coordination_clamped_to_shadow() {
-    let op = op_id(b"test-operator-cc");
-    let signal = make_signal(
-        0x02,
-        WinnerFollowSignalKind::ClusterCoordination,
-        LeaderAction::Entry,
-        Some(op),
-    );
-    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
-
-    let result = strategy.evaluate(
-        &signal,
-        p_high(),
-        clean_snapshot(),
-        dec!(10_000),
-        ExecutionMode::LiveTiny,
-    );
-
-    assert!(
-        matches!(result, Err(WinnerFollowError::ShadowMode)),
-        "cluster signal must be clamped to shadow; got {result:?}"
-    );
-}
-
-// ─── scenario 3 ──────────────────────────────────────────────────────────────
-
-/// Fresh-wallet signal, LiveTiny mode requested → clamped to Paper (not Shadow).
-///
-/// PASS: result is NOT `Err(ShadowMode)`.
-#[test]
-fn scenario_fresh_wallet_clamped_to_paper_not_shadow() {
-    let op = op_id(b"test-operator-fw");
-    let mut signal = make_signal(
-        0x03,
-        WinnerFollowSignalKind::FreshWalletFirstTrade,
-        LeaderAction::Entry,
-        Some(op),
-    );
-    signal.inherited_prior = Some(InheritedPriorPpm(0));
-    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
-
-    let result = strategy.evaluate(
-        &signal,
-        p_high(),
-        clean_snapshot(),
-        dec!(10_000),
-        ExecutionMode::LiveTiny,
-    );
-
-    assert!(
-        !matches!(result, Err(WinnerFollowError::ShadowMode)),
-        "fresh-wallet LiveTiny must clamp to Paper, not Shadow; got {result:?}"
     );
 }
 
@@ -253,12 +170,7 @@ fn scenario_risk_block_intraday_drawdown() {
 /// PASS: `Err(FlipNotApproved)`.
 #[test]
 fn scenario_flip_blocked_by_default() {
-    let signal = make_signal(
-        0x05,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Flip,
-        None,
-    );
+    let signal = make_signal(0x05, LeaderAction::Flip);
     let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
 
     let result = strategy.evaluate(
@@ -282,12 +194,7 @@ fn scenario_flip_blocked_by_default() {
 /// PASS: result is NOT `Err(FlipNotApproved)`.
 #[test]
 fn scenario_flip_approved_passes_gate() {
-    let signal = make_signal(
-        0x06,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Flip,
-        None,
-    );
+    let signal = make_signal(0x06, LeaderAction::Flip);
     let config = WinnerFollowConfig {
         flip_human_approved: true,
         ..WinnerFollowConfig::default()
@@ -318,12 +225,7 @@ fn scenario_flip_approved_passes_gate() {
 /// PASS: `intent.contracts.0 == 62` (Kelly would have sized ~205 without cap).
 #[test]
 fn scenario_clamp_bps_cap_limits_contracts() {
-    let signal = make_signal(
-        0x08,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-    );
+    let signal = make_signal(0x08, LeaderAction::Entry);
     let config = WinnerFollowConfig {
         per_trade_cap: PerTradeCap::Bps(25),
         ..WinnerFollowConfig::default()
@@ -360,12 +262,7 @@ fn scenario_clamp_bps_cap_limits_contracts() {
 /// PASS: `unlimited > capped` (i.e. `unlimited > 62`).
 #[test]
 fn scenario_unlimited_cap_yields_more_contracts_than_bps_cap() {
-    let signal = make_signal(
-        0x09,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-    );
+    let signal = make_signal(0x09, LeaderAction::Entry);
     let config_capped = WinnerFollowConfig {
         per_trade_cap: PerTradeCap::Bps(25),
         ..WinnerFollowConfig::default()
@@ -410,12 +307,7 @@ fn scenario_unlimited_cap_yields_more_contracts_than_bps_cap() {
 /// PASS: `Err(NoEdge)`.
 #[test]
 fn scenario_bankroll_below_price_yields_no_edge() {
-    let signal = make_signal(
-        0x0A,
-        WinnerFollowSignalKind::NormalLeaderFollow,
-        LeaderAction::Entry,
-        None,
-    );
+    let signal = make_signal(0x0A, LeaderAction::Entry);
     let config = WinnerFollowConfig {
         per_trade_cap: PerTradeCap::Unlimited,
         ..WinnerFollowConfig::default()
@@ -442,12 +334,7 @@ proptest::proptest! {
     /// `evaluate` is deterministic: identical inputs always produce the same result.
     #[test]
     fn evaluate_is_deterministic(bankroll_raw in 1_000u64..=1_000_000u64) {
-        let signal = make_signal(
-            0x20,
-            WinnerFollowSignalKind::NormalLeaderFollow,
-            LeaderAction::Entry,
-            None,
-        );
+        let signal = make_signal(0x20, LeaderAction::Entry);
         let strategy = WinnerFollowStrategy::new(WinnerFollowConfig::default());
         let bankroll = rust_decimal::Decimal::from(bankroll_raw);
         let p = p_high();

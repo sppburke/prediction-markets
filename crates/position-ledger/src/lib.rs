@@ -1,14 +1,12 @@
-//! Pure deterministic position and cluster-observation accumulators.
+//! Pure deterministic position accumulator.
 //!
-//! Both types are stateful in-memory accumulators; they have no I/O and produce
+//! [`PositionLedger`] is a stateful in-memory accumulator; it has no I/O and produces
 //! deterministic output given the same ordered input stream.
 
 use std::collections::HashMap;
 
-use pe_copy_signal_engine::{ClusterEntry, ClusterObs, IncomingTrade, PositionSnapshot};
-use pe_core_types::{
-    MarketId, MarketOutcomeId, OperatorId, OutcomeId, Side, SourceTimestamp, WalletAddress,
-};
+use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot};
+use pe_core_types::{MarketOutcomeId, Side, SourceTimestamp, WalletAddress};
 
 // ── PositionLedger ────────────────────────────────────────────────────────────
 
@@ -96,104 +94,6 @@ impl PositionLedger {
 impl Default for PositionLedger {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ── ClusterObservationTracker ─────────────────────────────────────────────────
-
-/// Tracks recent intra-cluster trade entries per `(operator, market, outcome, side)`.
-///
-/// Entries older than `window_secs` are pruned on each [`ingest`] call.
-/// The tracker is keyed by operator — wallets with no known operator are never
-/// recorded and will always produce `None` from [`cluster_obs_for`].
-///
-/// # Precondition
-///
-/// Call [`ingest`] with the current trade *before* calling [`cluster_obs_for`]
-/// so that the current trade is included in the returned [`ClusterObs`]. The
-/// classifier's `is_cluster_coordination` then applies its own member-count and
-/// notional-aggregate gates on the full set.
-///
-/// [`ingest`]: ClusterObservationTracker::ingest
-/// [`cluster_obs_for`]: ClusterObservationTracker::cluster_obs_for
-pub struct ClusterObservationTracker {
-    /// How long entries are retained. Should be ≥ `cluster_coord_window_seconds_W`
-    /// (default 300 s) so the classifier always has the full window to evaluate.
-    window_secs: u64,
-    entries: HashMap<ClusterKey, Vec<ClusterEntry>>,
-}
-
-/// Internal key for one coordination bucket.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ClusterKey {
-    operator_id: OperatorId,
-    market_id: MarketId,
-    outcome_id: OutcomeId,
-    side: Side,
-}
-
-impl ClusterObservationTracker {
-    /// `window_secs` — how long entries are retained in memory.
-    /// Default from `_GLOSSARY.md`: `cluster_observation_window_secs = 300`.
-    pub fn new(window_secs: u64) -> Self {
-        Self {
-            window_secs,
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Record an entry for the trade. Prunes entries older than `window_secs`.
-    pub fn ingest(&mut self, trade: &IncomingTrade, operator_id: OperatorId) {
-        let key = ClusterKey {
-            operator_id,
-            market_id: trade.market_id.clone(),
-            outcome_id: trade.outcome_id,
-            side: trade.side,
-        };
-
-        let trade_ts = trade.observed_at.unix_timestamp();
-        let cutoff = trade_ts.saturating_sub(self.window_secs as i64);
-
-        let bucket = self.entries.entry(key).or_default();
-        bucket.push(ClusterEntry {
-            wallet: trade.wallet,
-            price: trade.price,
-            contracts: trade.contracts,
-            observed_at_unix: trade_ts,
-        });
-        bucket.retain(|e| e.observed_at_unix >= cutoff);
-    }
-
-    /// Return a [`ClusterObs`] for the given trade and operator if any entries
-    /// exist in the bucket. Returns `None` if no entry has been recorded yet for
-    /// this `(operator, market, outcome, side)`.
-    ///
-    /// The classifier applies its own member-count and notional-aggregate gates;
-    /// this method returns `Some` whenever the bucket is non-empty.
-    pub fn cluster_obs_for(
-        &self,
-        trade: &IncomingTrade,
-        operator_id: OperatorId,
-    ) -> Option<ClusterObs> {
-        let key = ClusterKey {
-            operator_id,
-            market_id: trade.market_id.clone(),
-            outcome_id: trade.outcome_id,
-            side: trade.side,
-        };
-
-        let entries = self.entries.get(&key)?;
-        if entries.is_empty() {
-            return None;
-        }
-
-        Some(ClusterObs {
-            operator_id,
-            market_id: trade.market_id.clone(),
-            outcome_id: trade.outcome_id,
-            side: trade.side,
-            wallet_entries: entries.clone(),
-        })
     }
 }
 
