@@ -1,9 +1,6 @@
 #![cfg(feature = "scenario")]
 
-use std::collections::HashSet;
-
-use pe_core_types::{BasisPoints, FundingHopCount};
-use pe_operator_graph::AntiGamingFlag;
+use pe_core_types::BasisPoints;
 use pe_risk_engine::{
     RiskBlock, RiskSnapshot,
     engine::{RiskDecision, evaluate_risk},
@@ -14,19 +11,12 @@ use pe_source_core::SourceStatus;
 fn base_snapshot() -> RiskSnapshot {
     RiskSnapshot {
         leader_exposure_bps: BasisPoints(0),
-        operator_exposure_bps: BasisPoints(0),
         market_exposure_bps: BasisPoints(0),
         family_exposure_bps: BasisPoints(0),
         total_copy_exposure_bps: BasisPoints(0),
-        funder_inherited_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(0),
         rolling_7d_pnl_bps: BasisPoints(0),
-        anti_gaming_flags: HashSet::new(),
         onchain_source_status: SourceStatus::Healthy,
-        proxy_funder_mapping_proven: true,
-        funder_seeding_rate_suspicious: false,
-        cluster_membership_stable: true,
-        funding_hop_count: Some(FundingHopCount(1)),
         copy_latency_p95_ms: 100,
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(10),
@@ -60,18 +50,6 @@ fn scenario_3_kill_switch_at_minus_1000() {
     assert_eq!(
         evaluate_risk(&s),
         RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
-    );
-}
-
-/// Scenario 4: Concentration cap fires (operator at 280, proposed 25 → 305 > 300)
-#[test]
-fn scenario_4_operator_concentration_exceeded() {
-    let mut s = base_snapshot();
-    s.operator_exposure_bps = BasisPoints(280);
-    s.proposed_trade_bps = BasisPoints(25);
-    assert_eq!(
-        evaluate_risk(&s),
-        RiskDecision::Blocked(RiskBlock::OperatorConcentrationExceeded)
     );
 }
 
@@ -109,8 +87,8 @@ fn scenario_6_snapshot_cap_field_controls_gate() {
 /// Scenario 7: Unlimited cap (10_000 bps) — trade above the 25-bps default is approved.
 ///
 /// 50 bps is above the 25-bps mode default (would have been blocked by the old mode-keyed
-/// match), but below all concentration caps (funder-inherited 100, market 200, operator/leader
-/// 300 bps), so the risk gate approves when `per_trade_cap_bps = 10_000`.
+/// match), but below all pure-wallet concentration caps (market 200, leader 300, family
+/// 800 bps), so the risk gate approves when `per_trade_cap_bps = 10_000`.
 ///
 /// PASS: `Approved` when `proposed_trade_bps = 50 ≤ per_trade_cap_bps = 10_000`.
 #[test]
@@ -120,8 +98,3 @@ fn scenario_7_unlimited_cap_approves_large_trade() {
     s.proposed_trade_bps = BasisPoints(50);
     assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
 }
-
-// Suppress unused import warning for AntiGamingFlag (available for future scenarios)
-const _: fn() = || {
-    let _ = AntiGamingFlag::BaitWalletSuspect;
-};

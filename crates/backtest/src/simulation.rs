@@ -130,13 +130,11 @@ struct OpenPosition {
 /// Position key: (market, outcome, BUY side).
 type PosKey = (MarketId, OutcomeId);
 
-/// Exposure tracker: per-leader, per-market, per-operator.
+/// Exposure tracker: per-leader, per-market.
 #[derive(Debug, Default)]
 struct ExposureTracker {
     /// Open exposure in bps of bankroll per leader.
     by_leader: HashMap<WalletAddress, i32>,
-    /// Open exposure in bps of bankroll per operator.
-    by_operator: HashMap<OperatorId, i32>,
     /// Open exposure in bps of bankroll per market.
     by_market: HashMap<MarketId, i32>,
     /// Count of concurrent open positions per market (issue #138). Used by the
@@ -150,15 +148,6 @@ struct ExposureTracker {
 impl ExposureTracker {
     fn leader_bps(&self, w: WalletAddress) -> i32 {
         self.by_leader.get(&w).copied().unwrap_or(0)
-    }
-
-    /// Returns 0 when `op` is `None` — unclustered wallets bypass operator concentration.
-    ///
-    /// The operator concentration cap prevents overexposure to a single multi-wallet operator.
-    /// A wallet with no known operator is standalone and is instead governed by the per-leader cap.
-    fn operator_bps(&self, op: Option<&OperatorId>) -> i32 {
-        let Some(op) = op else { return 0 };
-        self.by_operator.get(op).copied().unwrap_or(0)
     }
 
     fn market_bps(&self, m: &MarketId) -> i32 {
@@ -178,11 +167,8 @@ impl ExposureTracker {
     /// Split from `remove` because `by_market_count` is non-linear (each open
     /// adds 1 regardless of `bps`); a `remove → add(-bps)` delegation would
     /// incorrectly increment the counter on close.
-    fn add(&mut self, w: WalletAddress, op: Option<&OperatorId>, m: &MarketId, bps: i32) {
+    fn add(&mut self, w: WalletAddress, m: &MarketId, bps: i32) {
         *self.by_leader.entry(w).or_default() += bps;
-        if let Some(op) = op {
-            *self.by_operator.entry(*op).or_default() += bps;
-        }
         *self.by_market.entry(m.clone()).or_default() += bps;
         *self.by_market_count.entry(m.clone()).or_default() += 1;
         self.total += bps;
@@ -193,11 +179,8 @@ impl ExposureTracker {
     /// Mirror of `add`. `by_market_count` decrements with saturation at 0 to
     /// guard against a hypothetical double-close that callers should never
     /// trigger but which a panic would convert into a fatal error.
-    fn remove(&mut self, w: WalletAddress, op: Option<&OperatorId>, m: &MarketId, bps: i32) {
+    fn remove(&mut self, w: WalletAddress, m: &MarketId, bps: i32) {
         *self.by_leader.entry(w).or_default() -= bps;
-        if let Some(op) = op {
-            *self.by_operator.entry(*op).or_default() -= bps;
-        }
         *self.by_market.entry(m.clone()).or_default() -= bps;
         if let Some(n) = self.by_market_count.get_mut(m) {
             *n = n.saturating_sub(1);
@@ -410,7 +393,7 @@ pub fn run_simulation(
             intraday_realized_pnl += pnl;
 
             let bps_removed = proposed_trade_bps(open.contracts, open.avg_fill_price, bankroll);
-            exposure.remove(leader, None, &pos_key.0, bps_removed);
+            exposure.remove(leader, &pos_key.0, bps_removed);
 
             pnl_accum.record(pnl);
 
@@ -545,7 +528,6 @@ pub fn run_simulation(
 
             let leader = trade.wallet;
             let operator_id: Option<&OperatorId> = None;
-            let has_funder = true;
 
             let pos_key = (trade.market_id.clone(), trade.outcome_id);
             let wallet_pos_key = (leader, pos_key.clone());
@@ -651,7 +633,7 @@ pub fn run_simulation(
                         bankroll -= notional;
 
                         let actual_bps = proposed_trade_bps(contracts, fill_price, bankroll);
-                        exposure.add(leader, operator_id, &trade.market_id, actual_bps);
+                        exposure.add(leader, &trade.market_id, actual_bps);
 
                         open_positions.insert(
                             wallet_pos_key,
@@ -729,11 +711,9 @@ pub fn run_simulation(
                     let risk_snapshot = build_risk_snapshot(&RiskContext {
                         exposure: &exposure,
                         leader,
-                        operator_id,
                         market_id: &trade.market_id,
                         intraday_bps,
                         rolling_7d_bps,
-                        has_funder,
                         proposed_bps: 0, // evaluate() overwrites this
                     });
 
@@ -810,7 +790,7 @@ pub fn run_simulation(
                     bankroll -= notional;
 
                     let actual_bps = proposed_trade_bps(contracts_count, fill_price, bankroll);
-                    exposure.add(leader, operator_id, &trade.market_id, actual_bps);
+                    exposure.add(leader, &trade.market_id, actual_bps);
 
                     open_positions.insert(
                         wallet_pos_key,
@@ -863,7 +843,7 @@ pub fn run_simulation(
 
                     let bps_removed =
                         proposed_trade_bps(closed_contracts, open.avg_fill_price, bankroll);
-                    exposure.remove(leader, None, &trade.market_id, bps_removed);
+                    exposure.remove(leader, &trade.market_id, bps_removed);
 
                     pnl_accum.record(pnl);
 
@@ -1152,30 +1132,21 @@ fn decimal_to_bps(pnl: Decimal, bankroll: Decimal) -> i32 {
 struct RiskContext<'a> {
     exposure: &'a ExposureTracker,
     leader: WalletAddress,
-    operator_id: Option<&'a OperatorId>,
     market_id: &'a MarketId,
     intraday_bps: i32,
     rolling_7d_bps: i32,
-    has_funder: bool,
     proposed_bps: i32,
 }
 
 fn build_risk_snapshot(ctx: &RiskContext<'_>) -> RiskSnapshot {
     RiskSnapshot {
         leader_exposure_bps: BasisPoints(ctx.exposure.leader_bps(ctx.leader)),
-        operator_exposure_bps: BasisPoints(ctx.exposure.operator_bps(ctx.operator_id)),
         market_exposure_bps: BasisPoints(ctx.exposure.market_bps(ctx.market_id)),
         family_exposure_bps: BasisPoints(0),
         total_copy_exposure_bps: BasisPoints(ctx.exposure.total),
-        funder_inherited_exposure_bps: BasisPoints(0),
         intraday_pnl_bps: BasisPoints(ctx.intraday_bps),
         rolling_7d_pnl_bps: BasisPoints(ctx.rolling_7d_bps),
-        anti_gaming_flags: std::collections::HashSet::new(),
         onchain_source_status: SourceStatus::Healthy,
-        proxy_funder_mapping_proven: ctx.has_funder,
-        funder_seeding_rate_suspicious: false,
-        cluster_membership_stable: true,
-        funding_hop_count: None,
         copy_latency_p95_ms: 0,
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(ctx.proposed_bps),
@@ -1226,109 +1197,20 @@ mod tests {
         MarketId(VenueMarketId(s.to_owned()))
     }
 
-    fn op(s: &str) -> OperatorId {
-        OperatorId(blake3::hash(s.as_bytes()))
-    }
-
     fn wallet(b: u8) -> WalletAddress {
         WalletAddress::from_hex(&format!("0x{:040x}", b)).unwrap()
     }
 
-    // ── ExposureTracker: operator_bps with None ────────────────────────────────
-
-    #[test]
-    fn operator_bps_none_returns_zero_initially() {
-        let tracker = ExposureTracker::default();
-        assert_eq!(tracker.operator_bps(None), 0);
-    }
-
-    #[test]
-    fn operator_bps_none_stays_zero_after_none_adds() {
-        let mut tracker = ExposureTracker::default();
-        let m = market("mkt-a");
-        // Add 3 different wallets all with op=None — must not accumulate in any shared bucket.
-        for i in 0u8..3 {
-            tracker.add(wallet(i), None, &m, 25);
-        }
-        assert_eq!(
-            tracker.operator_bps(None),
-            0,
-            "None operator must never accumulate exposure"
-        );
-    }
-
-    #[test]
-    fn operator_bps_none_does_not_affect_named_operator() {
-        let mut tracker = ExposureTracker::default();
-        let m = market("mkt-b");
-        let known_op = op("op-alpha");
-        tracker.add(wallet(1), Some(&known_op), &m, 50);
-        tracker.add(wallet(2), None, &m, 100);
-        // The known operator's bps is 50, None's is still 0.
-        assert_eq!(tracker.operator_bps(Some(&known_op)), 50);
-        assert_eq!(tracker.operator_bps(None), 0);
-    }
-
-    #[test]
-    fn operator_bps_named_operator_accumulates_correctly() {
-        let mut tracker = ExposureTracker::default();
-        let m = market("mkt-c");
-        let op_a = op("op-a");
-        let op_b = op("op-b");
-        // Two wallets in op-a each contribute 25 bps.
-        tracker.add(wallet(1), Some(&op_a), &m, 25);
-        tracker.add(wallet(2), Some(&op_a), &m, 25);
-        tracker.add(wallet(3), Some(&op_b), &m, 30);
-        assert_eq!(tracker.operator_bps(Some(&op_a)), 50);
-        assert_eq!(tracker.operator_bps(Some(&op_b)), 30);
-        assert_eq!(tracker.operator_bps(None), 0);
-    }
-
-    #[test]
-    fn remove_none_operator_does_not_panic_or_corrupt_state() {
-        let mut tracker = ExposureTracker::default();
-        let m = market("mkt-d");
-        tracker.add(wallet(1), None, &m, 25);
-        // Remove should mirror add — must not panic and must leave leader/market correct.
-        tracker.remove(wallet(1), None, &m, 25);
-        assert_eq!(tracker.leader_bps(wallet(1)), 0);
-        assert_eq!(tracker.market_bps(&m), 0);
-        assert_eq!(tracker.total, 0);
-        assert_eq!(tracker.operator_bps(None), 0);
-    }
-
-    #[test]
-    fn operator_concentration_cap_does_not_block_unrelated_none_wallets() {
-        // Verifies the original bug is fixed: N wallets with None operator must not
-        // hit the 300 bps concentration cap from each other's exposure.
-        let mut tracker = ExposureTracker::default();
-        let m = market("mkt-e");
-        // Add 20 different wallets each at 25 bps — total 500 bps through None path.
-        // operator_bps(None) must stay 0 throughout so the risk gate never fires.
-        for i in 0u8..20 {
-            tracker.add(wallet(i), None, &m, 25);
-            assert_eq!(
-                tracker.operator_bps(None),
-                0,
-                "operator_bps(None) must be 0 after {} adds",
-                i + 1
-            );
-        }
-        // per-leader and total are still tracked correctly.
-        assert_eq!(tracker.leader_bps(wallet(5)), 25);
-        assert_eq!(tracker.total, 500);
-    }
-
-    // ── ExposureTracker: leader and market caps still apply for None-operator wallets ──
+    // ── ExposureTracker: leader and market caps ───────────────────────────────
 
     #[test]
     fn leader_bps_and_market_bps_track_none_operator_wallets() {
         let mut tracker = ExposureTracker::default();
         let m1 = market("mkt-f");
         let m2 = market("mkt-g");
-        tracker.add(wallet(1), None, &m1, 25);
-        tracker.add(wallet(1), None, &m2, 25);
-        tracker.add(wallet(2), None, &m1, 30);
+        tracker.add(wallet(1), &m1, 25);
+        tracker.add(wallet(1), &m2, 25);
+        tracker.add(wallet(2), &m1, 30);
         assert_eq!(tracker.leader_bps(wallet(1)), 50);
         assert_eq!(tracker.leader_bps(wallet(2)), 30);
         assert_eq!(tracker.market_bps(&m1), 55);
@@ -1351,9 +1233,9 @@ mod tests {
         // This is the invariant that prevents `remove → add(-bps)` delegation.
         let mut tracker = ExposureTracker::default();
         let m = market("mkt-i");
-        tracker.add(wallet(1), None, &m, 250);
-        tracker.add(wallet(2), None, &m, 1);
-        tracker.add(wallet(3), None, &m, 5_000);
+        tracker.add(wallet(1), &m, 250);
+        tracker.add(wallet(2), &m, 1);
+        tracker.add(wallet(3), &m, 5_000);
         assert_eq!(tracker.market_position_count(&m), 3);
         // bps still accumulates linearly.
         assert_eq!(tracker.market_bps(&m), 5_251);
@@ -1366,14 +1248,12 @@ mod tests {
         // drifts `add` and `remove` apart will trip this test.
         let mut tracker = ExposureTracker::default();
         let m = market("mkt-j");
-        let op_a = op("op-symm");
-        tracker.add(wallet(1), Some(&op_a), &m, 100);
-        tracker.add(wallet(2), Some(&op_a), &m, 200);
-        tracker.remove(wallet(1), Some(&op_a), &m, 100);
-        tracker.remove(wallet(2), Some(&op_a), &m, 200);
+        tracker.add(wallet(1), &m, 100);
+        tracker.add(wallet(2), &m, 200);
+        tracker.remove(wallet(1), &m, 100);
+        tracker.remove(wallet(2), &m, 200);
         assert_eq!(tracker.market_position_count(&m), 0);
         assert_eq!(tracker.market_bps(&m), 0);
-        assert_eq!(tracker.operator_bps(Some(&op_a)), 0);
         assert_eq!(tracker.total, 0);
     }
 
@@ -1383,7 +1263,7 @@ mod tests {
         // recoverable caller bug into a fatal simulation error.
         let mut tracker = ExposureTracker::default();
         let m = market("mkt-k");
-        tracker.remove(wallet(1), None, &m, 10);
+        tracker.remove(wallet(1), &m, 10);
         assert_eq!(tracker.market_position_count(&m), 0);
     }
 
@@ -1394,12 +1274,12 @@ mod tests {
         // `add(-bps)` would trip this test (count would tick to 1 on remove).
         let mut tracker = ExposureTracker::default();
         let m = market("mkt-l");
-        tracker.add(wallet(1), None, &m, 50);
+        tracker.add(wallet(1), &m, 50);
         assert_eq!(tracker.market_position_count(&m), 1);
-        tracker.remove(wallet(1), None, &m, 50);
+        tracker.remove(wallet(1), &m, 50);
         assert_eq!(tracker.market_position_count(&m), 0);
         // A second remove must not increment.
-        tracker.remove(wallet(2), None, &m, 25);
+        tracker.remove(wallet(2), &m, 25);
         assert_eq!(tracker.market_position_count(&m), 0);
     }
 
