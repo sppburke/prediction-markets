@@ -25,7 +25,6 @@ schemars = ["dep:schemars"]
 arbitrary = ["dep:proptest"]
 
 [dependencies]
-blake3 = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

@@ -295,27 +295,6 @@ impl Default for BasisPoints {
     }
 }
 
-/// Shrunk operator-prior probability in parts per million: 0..=1_000_000.
-///
-/// Carried by `FreshWalletFirstTrade` signals; passed to Kelly sizing after
-/// shrinkage toward the category baseline per `19-WINNER-FOLLOW-STRATEGY.md`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct InheritedPriorPpm(pub u32);
-
-impl InheritedPriorPpm {
-    pub fn new(n: u32) -> Result<Self, Error> {
-        if n > 1_000_000 {
-            return Err(Error::OutOfRange {
-                field: "InheritedPriorPpm",
-            });
-        }
-        Ok(Self(n))
-    }
-}
-
 /// Fractional-Kelly bet size on [0, 1].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
