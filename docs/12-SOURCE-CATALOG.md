@@ -74,7 +74,6 @@ These are starting defaults for `max_stale`. They are overridden by the `_GLOSSA
 | Chainlink stream | 30 s | 2 min |
 | Exchange WS trades/books | 2 s | 6 s |
 | Polymarket Data API poll | 1.5× polling interval | 4× polling interval |
-| `source-onchain-polygon` | `onchain_block_lag_warn` blocks | `onchain_block_lag_block` blocks |
 | BLS/BEA/Census release watcher | 5 min after expected | 30 min after expected |
 | Spotify/Netflix/Apple chart page | publication cadence × 2 | publication cadence × 4 |
 | USGS/NHC event feed | 10 min | 60 min |
@@ -110,11 +109,10 @@ pub enum SourceDisagreementPolicy {
 ### Polygon public chain sources
 
 - Polymarket proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral-flow event logs where publicly derivable.
-- Wallet funding path and funder-root events for operator identity (`funding_max_hops` in `_GLOSSARY.md`).
 - Publicly versioned exchange/bridge/hot-wallet boundary labels.
 - Polygon JSON-RPC/archive node or equivalent licensed public-chain provider.
 
-These sources feed `source-onchain-polygon` and `operator-graph`. They are not venue execution APIs and must remain replayable from raw logs plus parser/config versions.
+These sources support the Polygon resolution scan and on-chain timing verification. They are not venue execution APIs and must remain replayable from raw logs plus parser/config versions.
 
 ### Kalshi trader/flow sources
 

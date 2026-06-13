@@ -2,7 +2,7 @@
 ## Polymarket + Kalshi, resolver-first, cross-venue
 
 > See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule, toolchain pin, lints, and common acceptance gate.
-> See [`_GLOSSARY.md`](_GLOSSARY.md) for vocabulary (wallet/trader/operator/leader/candidate), type aliases, latency budget, rate limits, anti-gaming flag thresholds, and configuration defaults.
+> See [`_GLOSSARY.md`](_GLOSSARY.md) for vocabulary (wallet/trader/leader/candidate), type aliases, latency budget, rate limits, and configuration defaults.
 > See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, eligibility thresholds, and promotion ladders.
 
 This v5 package makes **Winner-Follow** the first deployable strategy while preserving the prior resolver-first Polymarket/Kalshi architecture. The system starts by finding the fastest-compounding public traders/operators, reconstructing their behavior, and copying only the subset of trades that survive empirical latency, liquidity, cost, and risk-cap checks. Resolver/source-arbitrage strategies remain Strategy 1+, but the first build target is trader-intelligence plus speed.
@@ -17,18 +17,16 @@ The first production strategy continuously discovers, ranks, watches, and select
 
 Winner-Follow ships before weather, crypto, macro, sports, and chart/source-arbitrage strategies because it can be built using public venue/profile/trade data, deterministic analysis, and speed. Resolver-source strategies (Strategy 1+) are used later to validate whether copied trades have independent fundamental support.
 
-Winner-Follow is **operator-aware**: a wallet is an observable proxy, not necessarily a distinct economic actor. The plan adds a native Polygon funding/collateral graph and pure `operator-graph` layer to collapse wallets into deterministic operators when public proxy-wallet, pUSD, deposit/onramp, and funder evidence supports it. CrowdIntel-style funding clusters are research inspiration, not a production data dependency.
-
-Fresh-wallet first-trade following is a constrained incubator mode (default paper). Cluster-coordination is a separate mode (default shadow). Each has its own promotion ladder; see [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md).
+Winner-Follow is **per-wallet**: each public wallet is copied independently on deterministic criteria (the wallet→operator clustering layer was removed in #326 — see [`28-OPERATOR-GRAPH-ARCHIVE.md`](28-OPERATOR-GRAPH-ARCHIVE.md)). CrowdIntel-style funding clusters are research inspiration, not a production data dependency.
 
 ### Venue support — summary (full detail in [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md))
 
-- **Polymarket:** first-class. Public Data API exposes leaderboard, user trades, positions, activity. Funding identity is verified from public proxy/funder/collateral evidence.
+- **Polymarket:** first-class. Public Data API exposes leaderboard, user trades, positions, activity.
 - **Kalshi:** copy-trading disabled by default; public trade messages do not identify the trader. Kalshi remains a venue for resolver-source strategies, market-flow analytics, and cross-venue checks.
 
 ### Ranking objective — summary
 
-Rank operators/traders by **walk-forward LCB_5pct expected log-growth per day** for a follower account after simulated latency, spread, slippage, fees, partial fills, and position caps. Raw PnL, win rate, leaderboard rank, and cluster reputation are inputs, not the final ranking target.
+Rank traders by **walk-forward LCB_5pct expected log-growth per day** for a follower account after simulated latency, spread, slippage, fees, partial fills, and position caps. Raw PnL, win rate, and leaderboard rank are inputs, not the final ranking target.
 
 ### Eligibility, sizing, risk caps
 
@@ -39,7 +37,6 @@ See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for the canon
 - Every markdown file updated to specify Rust 2024 implementation requirements pinned to stable Rust 1.95.0.
 - The architecture is **event-sourced**: every source update, market update, model output, risk decision, order attempt, fill, cancel, and settlement is recorded and replayable.
 - The system uses a **Rust workspace** with small crates, strict type boundaries, deterministic replay, and fake venues/sources before live trading.
-- Winner-Follow includes `source-onchain-polygon` and `operator-graph` planning for native, replayable funding/collateral identity.
 - Kalshi and Polymarket are implemented as separate venue adapters. A common trait exists for orchestration, but venue-specific behavior is preserved.
 - All source connectors are Rust actors with bounded channels, parser versions, source health, raw payload hashes, and replay fixtures.
 - All modeling is Rust-native: rule engines, finite-state machines, benchmark-window accumulators, Polars/DataFusion analytics, and optional Rust ML/inference.
@@ -89,7 +86,6 @@ See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for the canon
 - No live deployment before fake connector replay, historical replay, paper mode, and shadow mode.
 - No cross-venue "hedge" label until resolver compatibility proves it.
 - No CrowdIntel UI scraping or opaque third-party cluster scores in the production decision path.
-- No fresh-wallet inherited-prior live sizing until proxy/funder/collateral mapping and mode-specific backtests are proven.
 
 ## Coding-agent instructions
 

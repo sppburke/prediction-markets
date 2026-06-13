@@ -85,7 +85,6 @@ Rules:
 - Do not attempt to deanonymize Kalshi traders from anonymous public trades.
 - Do not use hacked, leaked, private, or access-controlled data.
 - Do not use CrowdIntel UI output, opaque proprietary scores, or non-replayable third-party cluster labels in live decisions unless a reviewed license and replayable export/API exist.
-- Do not infer Polymarket operator identity from a simplistic first-USDC-sender rule; account for proxy wallets, pUSD collateral, deposit addresses, bridge/onramp flows, and documented funder semantics.
 - Do not market the system as guaranteed returns.
 - Display drawdown, ruin, liquidity, and copy-delay risk in operator dashboards.
 - Require explicit human approval before increasing Kelly fraction, bankroll, or venue permissions (via `kelly_fraction_above_default_human_approved`).
@@ -93,19 +92,15 @@ Rules:
 Risk controls specific to Winner-Follow are enforced via the canonical TOML in `19-`. Risk-block taxonomy (with halt scope per variant) is also in `19-` ("Risk-block taxonomy and halt scope"); the enum is shared with `risk-engine`:
 
 ```rust
-pub enum WinnerFollowRiskBlock {
-    OperatorConcentrationExceeded,
+// Mirrors `pe_risk_engine::RiskBlock` (operator/funder/cluster/anti-gaming
+// variants were removed in #326).
+pub enum RiskBlock {
     LeaderConcentrationExceeded,
     MarketConcentrationExceeded,
     FamilyConcentrationExceeded,
     TotalCopyExposureExceeded,
-    FunderInheritedExposureExceeded,
-    FunderSeedingRateSuspicious,
-    ClusterMembershipUnstable,
-    FunderHopCountExcessive,
     OnchainSourceUnhealthy,
-    ProxyFunderMappingUnproven,
-    AntiGamingFlagActive,
+    PerTradeSizeExceeded,
     IntradayDrawdownStop,
     Rolling7dDrawdownStop,
     KillSwitchDrawdown,
@@ -113,4 +108,4 @@ pub enum WinnerFollowRiskBlock {
 }
 ```
 
-The halt scope for each variant (this trade, this funder for the day, mode-wide, strategy-wide) is documented canonically in `19-`. Manual review is required to clear any `KillSwitchDrawdown`.
+The halt scope for each variant (this trade, strategy-wide) is documented canonically in `19-`. Manual review is required to clear any `KillSwitchDrawdown`.

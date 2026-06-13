@@ -13,7 +13,6 @@ Define concrete crate boundaries and dependency rules for the Rust implementatio
 core-types
   -> config, event-log, resolver-card, source-core, venue-core
       -> source-* and venue-*
-      -> operator-graph
       -> model-core and model-*
       -> strategy-core, trader-index, copy-signal-engine, kelly-sizer,
          strategy-winner-follow, execution-core, risk-engine
@@ -26,14 +25,13 @@ Forbidden:
 - venue crates depend on strategy crates;
 - source crates depend on venue crates;
 - model crates submit orders;
-- risk engine calls network APIs;
-- `operator-graph` calls network APIs or depends on execution/strategy crates.
+- risk engine calls network APIs.
 
 ## Core crates
 
 ### `core-types`
 
-Authoritative home for all newtypes listed in `_GLOSSARY.md` ("Type aliases"): IDs, prices, ticks, quantities, probabilities, basis points, timestamps, hashes, source IDs, venue IDs, market families, operator/funder identities.
+Authoritative home for all newtypes listed in `_GLOSSARY.md` ("Type aliases"): IDs, prices, ticks, quantities, probabilities, basis points, timestamps, hashes, source IDs, venue IDs, and market families.
 
 ### `event-log`
 
@@ -46,14 +44,6 @@ Resolver schema, parser/validator, JSON Schema, property tests for timing/roundi
 ### `source-core`
 
 Connector trait, source health, source manifests, retry/backoff, source event envelope. Source-freshness defaults are in `_GLOSSARY.md`.
-
-### `source-onchain-polygon`
-
-Public Polygon event connector for Winner-Follow identity research. Ingests pUSD, USDC/USDC.e, proxy-wallet, deposit/onramp, and funding-path evidence where publicly derivable. Emits normalized source events with raw hashes and parser versions; does not perform clustering or ranking.
-
-### `operator-graph`
-
-Pure logic for wallet-to-operator clustering, funder-root identity, inherited priors, cluster-coordination features, and anti-gaming flags (concrete thresholds in `_GLOSSARY.md`). Consumes event snapshots and config, emits deterministic `OperatorIdentity` and `OperatorTrackRecord` snapshots, has no I/O.
 
 ### `venue-core`
 
@@ -110,10 +100,7 @@ debug = "line-tables-only"
 
 ## Winner-Follow crate boundaries
 
-- `source-onchain-polygon` may ingest public chain/collateral events but cannot classify leaders, size trades, or submit orders.
-- `operator-graph` may build deterministic identities, reputations, priors, and anti-gaming flags but cannot call external systems.
-- `trader-index` may depend on venue data types and event-log types but not execution.
-- `trader-index` consumes operator snapshots to collapse wallets into `OperatorId` views for ranking and concentration accounting.
+- `trader-index` may depend on venue data types and event-log types but not execution. Ranking and concentration accounting are per-wallet.
 - `copy-signal-engine` may classify leader trades but cannot size or route orders.
 - `kelly-sizer` is pure math with deterministic inputs and property tests.
 - `strategy-winner-follow` consumes ranked leader signals and emits `OrderIntent` only.

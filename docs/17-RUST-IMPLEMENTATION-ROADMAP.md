@@ -9,21 +9,17 @@ Create workspace, strict lints, CI, `rust-toolchain.toml`, fake service binary, 
 
 ## Phase 0A — Winner-Follow first milestone
 
-1. Add `source-onchain-polygon`, `operator-graph`, `trader-index`, `copy-signal-engine`, `kelly-sizer`, and `strategy-winner-follow` crates.
+1. Add `trader-index`, `copy-signal-engine`, `kelly-sizer`, and `strategy-winner-follow` crates.
 2. Build Polymarket public trader ingestion.
-3. Build `source-onchain-polygon` for public Polygon funding/collateral events and replay fixtures.
-4. Verify Polymarket proxy-wallet, funder, pUSD, deposit, and bridge/onramp mapping against official docs and historical chain fixtures (per `21-`).
-5. Build `operator-graph` for strict funder-root clustering, operator identities, inherited priors, and anti-gaming flags using thresholds from `_GLOSSARY.md`.
-6. Build trader ledger reconstruction with wallet-level facts and operator annotations.
-7. Build walk-forward operator-aware ranker.
-8. Build top-`active_watchlist_size` watchlist.
-9. Build copy-signal classification with separate action and signal-kind fields.
-10. Build pure fractional-Kelly sizing with normal, inherited-prior, and cluster-coordination fractions (canonical TOML in `19-`).
-11. Build risk gates with operator, funder, inherited-prior, and cluster caps (canonical TOML in `19-`).
-12. Build paper-copy execution.
-13. Build live-tiny mode for ordinary leader-follow with hard-coded bankroll cap.
-14. Keep inherited-prior first-trade in paper and cluster-coordination in shadow until separately validated per `19-` "Promotion ladder".
-15. Only then proceed to larger source/resolver strategies.
+3. Build trader ledger reconstruction with wallet-level facts.
+4. Build walk-forward per-wallet ranker.
+5. Build top-`active_watchlist_size` watchlist.
+6. Build copy-signal classification with action labeling.
+7. Build pure fractional-Kelly sizing (canonical TOML in `19-`).
+8. Build risk gates with per-wallet concentration and drawdown caps (canonical TOML in `19-`).
+9. Build paper-copy execution.
+10. Build live-tiny mode for leader-follow with hard-coded bankroll cap.
+11. Only then proceed to larger source/resolver strategies.
 
 ## Phase 1 — Core types and event log
 
@@ -67,6 +63,4 @@ Record-only, shadow, paper, live-tiny, scaling rules. Promotion gates per `_GLOS
 
 ## Recommended first live candidate
 
-Start with **Winner-Follow in Polymarket paper mode**, then live-tiny for ordinary leader-follow only. Do not start with weather/crypto live execution until the Winner-Follow scanner, operator-aware ranker, Kelly sizing, event log, and risk gates are working end to end. Kalshi copy-trading remains disabled unless authorized trader-level data exists.
-
-`inherited_prior_first_trade` and `cluster_coordination` modes share the Winner-Follow infrastructure but remain shadow/paper until they have separate walk-forward validation per `19-` "Promotion ladder".
+Start with **Winner-Follow in Polymarket paper mode**, then live-tiny for leader-follow. Do not start with weather/crypto live execution until the Winner-Follow scanner, per-wallet ranker, Kelly sizing, event log, and risk gates are working end to end. Kalshi copy-trading remains disabled unless authorized trader-level data exists.

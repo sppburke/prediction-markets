@@ -36,13 +36,11 @@ It still has real risk: the strategy's edge is not "free money"; it is a measura
 
 ```text
 Candidate discovery
-  -> public Polygon funding/collateral graph
-  -> operator identity collapse
   -> public trader ledger reconstruction
   -> walk-forward follower simulation
-  -> top-N active operator/leader ranking          (N = active_watchlist_size, _GLOSSARY.md)
+  -> top-N active leader ranking                   (N = active_watchlist_size, _GLOSSARY.md)
   -> continuous leader watch
-  -> trade and signal-kind classification
+  -> trade classification
   -> copy eligibility check
   -> calibrated p and fractional Kelly             (see 19-)
   -> risk-gated OrderIntent                        (see 19-)
@@ -53,7 +51,7 @@ Candidate discovery
 
 ### Trader universe
 
-Polymarket candidate discovery starts from sources listed in `19-WINNER-FOLLOW-STRATEGY.md` ("Candidate discovery"). Wallets are collapsed into operators only when funding/collateral evidence is public, reproducible, and confidence-scored at `≥ funder_root_min_confidence_ppm` (`_GLOSSARY.md`).
+Polymarket candidate discovery starts from sources listed in `19-WINNER-FOLLOW-STRATEGY.md` ("Candidate discovery"). Each wallet is evaluated independently (the wallet→operator collapse was removed in #326).
 
 Kalshi candidate discovery is not equivalent because public trades do not identify traders. Kalshi copy trading is enabled only for public/authorized trader data; otherwise Kalshi signals remain market-flow and source/resolver signals.
 
@@ -63,17 +61,7 @@ See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibil
 
 ### Trade classification
 
-Each observed leader trade is classified as `Entry`, `Add`, `Trim`, `Exit`, `Flip`, or `Unknown`. Action eligibility (which actions can initiate, reduce, or are blocked) and the confidence thresholds (`add_high_confidence_threshold_ppm`, `exit_high_confidence_threshold_ppm`) are defined canonically in `19-WINNER-FOLLOW-STRATEGY.md` ("Signal classification").
-
-```rust
-pub enum WinnerFollowSignalKind {
-    NormalLeaderFollow,
-    FreshWalletFirstTrade,
-    ClusterCoordination,
-}
-```
-
-Signal-kind preconditions and `K`/`W` defaults (`cluster_coord_min_members_K = 3`, `cluster_coord_window_seconds_W = 300`) are in `_GLOSSARY.md`.
+Each observed leader trade is classified as `Entry`, `Add`, `Trim`, `Exit`, `Flip`, or `Unknown` (`LeaderAction` in `core-types`). Action eligibility (which actions can initiate, reduce, or are blocked) and the confidence thresholds (`add_high_confidence_threshold_ppm`, `exit_high_confidence_threshold_ppm`) are defined canonically in `19-WINNER-FOLLOW-STRATEGY.md` ("Signal classification").
 
 ### Copy eligibility
 
@@ -87,15 +75,6 @@ Do not copy unless ALL are true:
 6. leader's family-specific model has positive lower-confidence expected log growth;
 7. portfolio risk caps permit new exposure (caps in `19-`);
 8. order can be represented as an idempotent `OrderIntent` and replayed (key in `_GLOSSARY.md` "Idempotency").
-
-Additional gates for inherited-prior and cluster-coordination signals:
-
-1. operator identity confidence ≥ `funder_root_min_confidence_ppm`;
-2. `source-onchain-polygon` is healthy and within `onchain_block_lag_block`;
-3. proxy-wallet/funder/collateral mapping is proven for the wallet class (see `21-`);
-4. inherited prior is shrinkage-adjusted with `effective_n ≤ inherited_prior_max_effective_n`;
-5. anti-gaming flags absent or configured to demote rather than block;
-6. mode-specific promotion state permits the order mode (`19-` "Promotion ladder").
 
 ### Fractional Kelly sizing
 

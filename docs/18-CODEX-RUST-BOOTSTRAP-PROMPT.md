@@ -55,12 +55,6 @@ First milestone:
 Winner-Follow requirements (full spec in `19-WINNER-FOLLOW-STRATEGY.md`):
 - Implement Polymarket public trader ingestion first: leaderboard, user trades, user
   positions, user activity, market/orderbook data.
-- Implement native Polygon funding/collateral ingestion for operator identity:
-  proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding-path evidence where
-  publicly derivable.
-- Build `operator-graph` as pure deterministic logic for wallet-to-operator collapse,
-  inherited priors, cluster-coordination features, and anti-gaming flags
-  (thresholds in `_GLOSSARY.md`).
 - Implement Kalshi copy support only as authorized/public trader-level data; otherwise
   keep Kalshi public trades as anonymous market-flow data.
 - Rank operators/traders by walk-forward LCB_5pct of follower log-growth per day,
@@ -69,6 +63,5 @@ Winner-Follow requirements (full spec in `19-WINNER-FOLLOW-STRATEGY.md`):
 - Copy only entry/add trades that survive liquidity, latency, slippage, cost, and
   portfolio risk checks (gates in `04-PHASE-TRADING-STRATEGY.md`).
 - Size with calibrated quarter-Kelly by default; hard caps from `19-`.
-- Fresh-wallet first-trade defaults to paper; cluster-coordination defaults to shadow.
 - Produce deterministic replay showing why each copied trade was or was not taken.
 ```

@@ -83,11 +83,11 @@ The Rust adapter implements:
 1. `LeaderboardSnapshot` ingestion across categories and pagination;
 2. `TraderTradeEvent` ingestion by watched user;
 3. `TraderPositionLedger` reconstruction from trades, activity, and positions;
-4. proxy-wallet/funder fields as typed optional identity evidence for `operator-graph`;
-5. `LeaderSignal` generation for entry/add/trim/exit/flip with separate signal-kind annotations (definitions in `19-WINNER-FOLLOW-STRATEGY.md`);
+4. proxy-wallet/funder fields as typed optional public Polymarket metadata;
+5. `LeaderSignal` generation for entry/add/trim/exit/flip (definitions in `19-WINNER-FOLLOW-STRATEGY.md`);
 6. market websocket subscription management for every watched leader's active markets;
-7. copy-order idempotency keyed exactly as in `_GLOSSARY.md` ("Idempotency"): `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)`. Cluster-coordination signals add `operator_id` to the key.
+7. copy-order idempotency keyed exactly as in `_GLOSSARY.md` ("Idempotency"): `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)`.
 
 Do not rely on UI scraping. Use official APIs first, then documented public chain data for timing validation where needed.
 
-Funding/collateral identity is not owned by `venue-polymarket`. It is produced by `source-onchain-polygon` and `operator-graph`; the venue adapter supplies typed public Polymarket fields and transaction references.
+The venue adapter supplies typed public Polymarket fields and transaction references only; the wallet→operator funding/collateral identity layer was removed in #326.

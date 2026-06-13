@@ -1,6 +1,6 @@
 # 23 — Fee Backfill (Polymarket per-market taker/maker fees)
 
-**Status:** design.
+**Status:** design. **Update (#326):** the on-chain fee path (Option B — `counterparty_edges.fee_raw`, decoded on-chain) was removed with the operator/funder purge; Option A (Gamma → `market_fees`) is the canonical live source. The Option-B analysis below is retained as historical record.
 **Scope:** capture per-market fee schedule + plumb net-of-fees through `reconcile-volume` and `skill-select forward-test`.
 **Why now:** the April-2026 holdout is **entirely post-fee** (Polymarket activated trading fees on all markets 2026-03-30 per Akey et al. SSRN 6443103). `forward.rs:21` already flags `gross_of_fees=true` and explicitly defers netting to "a per-market `takerBaseFee` backfill" — this doc plans that backfill. `reconcile-volume` (§5, #228) is also gross; with fees ignored, the on-chain vs Data-API volume comparison silently mixes gross+net.
 **Authority order:** below `_BASELINE.md` / `_GLOSSARY.md` / `19-`; new defaults mirrored into `_GLOSSARY.md`.

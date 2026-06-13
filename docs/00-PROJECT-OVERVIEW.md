@@ -38,7 +38,7 @@ All production decisions must be reproducible from:
 
 ## Strategy 0 — Winner-Follow Copy Engine (summary)
 
-Winner-Follow is the first deployable strategy. Full specification — including venue support, eligibility thresholds, ranking objective, Kelly sizing, anti-gaming flags, risk caps, and promotion ladders — lives in [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md). This file does not restate those values; if a number appears here that conflicts with `19`, `19` wins.
+Winner-Follow is the first deployable strategy. Full specification — including venue support, eligibility thresholds, ranking objective, Kelly sizing, risk caps, and the promotion ladder — lives in [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md). This file does not restate those values; if a number appears here that conflicts with `19`, `19` wins.
 
 Strategy 0 starts here because it can be built using public venue/profile/trade data, deterministic analysis, and speed. Resolver-source strategies remain Strategy 1+ and are used later to validate whether copied trades have independent fundamental support.
 

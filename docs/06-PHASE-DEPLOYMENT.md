@@ -13,8 +13,6 @@ Deploy the Rust system as reliable, observable, replayable, low-latency services
 
 ```text
 source-gateway-trader              Rust binary
-source-gateway-onchain-polygon     Rust binary
-operator-graph-worker              Rust binary
 trader-ledger-builder              Rust binary
 leader-ranker                      Rust binary
 copy-signal-engine                 Rust binary
@@ -126,16 +124,12 @@ Otherwise stay on Fargate. Use Graviton (`aarch64-unknown-linux-gnu`) where depe
 ### Winner-Follow deployment services
 
 - `source-gateway-trader`: pulls public trader/profile/trade data and market websockets.
-- `source-gateway-onchain-polygon`: ingests public Polygon proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and funding/collateral events.
-- `operator-graph-worker`: builds deterministic operator identities, inherited priors, cluster-coordination features, and anti-gaming flags.
 - `trader-ledger-builder`: reconstructs per-trader positions.
 - `leader-ranker`: produces top-`active_watchlist_size` lists.
-- `copy-signal-engine`: converts newly observed leader trades into classified actions and signal kinds.
+- `copy-signal-engine`: converts newly observed leader trades into classified actions.
 - `strategy-winner-follow`: emits risk-checked order intents.
 - `execution-router`: submits/cancels/reconciles venue orders.
 - `risk-supervisor`: enforces bankroll, exposure, drawdown, kill-switch, and copy-latency limits.
-
-Inherited-prior first-trade and cluster-coordination modes default to shadow/paper in deployed configs. Ordinary leader-follow may reach live-tiny before these modes; their validation, risk caps, and source-health dependencies are separate.
 
 ### Secrets and keys
 
