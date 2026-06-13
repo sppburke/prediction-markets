@@ -58,7 +58,7 @@ As bankroll grows, a larger cohort spreads risk and captures more market coverag
 |---|---|---|
 | < $5k | 10 | Current deploy. Concentrated — one wallet's bad month matters. |
 | $5k – $20k | 15 – 25 | Run portfolio_constructor with `--target-n 25`; take what passes gating. |
-| $20k – $100k | 25 – 50 | At this range, operator-level deduplication matters — check `operator_id` fields. |
+| $20k – $100k | 25 – 50 | At this range, per-wallet diversification matters — avoid over-concentrating in correlated wallets. |
 | > $100k | 50 – 100 | Diversification within the validated universe. Add `--min-jaccard` gate. |
 
 These are starting points. Always let the PBO validation determine the actual deployed N — do not force a size that fails gating just to hit a target.

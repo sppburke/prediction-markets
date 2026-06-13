@@ -30,8 +30,7 @@ All three are also installed automatically in CI via `taiki-e/install-action`.
 | Account | Purpose | Free tier |
 |---|---|---|
 | [Dune Analytics](https://dune.com) | Wallet discovery SQL | 2,500 credits/month |
-| [Etherscan V2](https://etherscan.io/apis) | Funder graph (Polygon chain 137) | 300 req/s free |
-| Polygon RPC provider (e.g. Alchemy, Infura, QuickNode) | On-chain events | ~30M CU/month free |
+| Polygon RPC provider (e.g. Alchemy, Infura, QuickNode) | Market-resolution scan (on-chain) | ~30M CU/month free |
 
 Polymarket CLOB credentials are only needed for live order submission (not backtest or bootstrap).
 
@@ -69,7 +68,6 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 | `PE_BOOTSTRAP_CACHE_PATH` | Path for wallet cache SQLite | **[req]** | — |
 | `PE_BOOTSTRAP_WALLET_SET_PATH` | Path for wallet set JSON | **[req]** | — |
 | `PE_BOOTSTRAP_FETCH_RESOLUTIONS` | `1` to populate `market_resolutions` table | | `0` |
-| `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH` | `1` to populate `funder_edges` table (~2 h for 15 k wallets) | | `0` |
 | `PE_BOOTSTRAP_SKIP_TRADE_FETCH` | `1` to skip Polymarket trade fetch (use cached data) | | `0` |
 | `PE_BOOTSTRAP_DUNE_MIN_MARKETS` | Min distinct resolved markets for Dune seed | | `15` |
 | `PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT` | Min win rate % for Dune seed | | `95` |

@@ -91,14 +91,6 @@ Per-venue and per-source budgets, retry/backoff, and 429/5xx handling are first-
 - Pyth/reference feed connector when permitted
 - venue RTDS/price feeds where useful
 
-### `source-onchain-polygon`
-
-- Polygon JSON-RPC/archive-node ingestion
-- Polymarket proxy wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral-flow event logs where publicly derivable
-- wallet funding-path events for operator identity research
-- maintained exchange/bridge/hot-wallet boundary labels with config hashes
-- block-lag and reorg-aware health state, using `onchain_block_lag_warn` / `onchain_block_lag_block` from `_GLOSSARY.md`
-
 ### `source-sports`
 
 - official league result/status connectors
@@ -162,21 +154,6 @@ Before specialized weather/crypto/sports/macro source gateways, build the trader
 - websocket market trade/orderbook events for markets currently held or newly traded by watched leaders;
 - optional on-chain transaction hash enrichment when needed for timing validation.
 
-### `source-onchain-polygon` for Winner-Follow
-
-Build the native funding/collateral graph instead of depending on CrowdIntel output or UI scraping.
-
-Responsibilities:
-
-- ingest normalized Polygon events such as `CollateralTransfer`, `UsdcTransfer`, `PusdMintOrWrap`, `ProxyWalletCreated`, `DepositAddressCreated`, and `BridgeDepositObserved` where supported by official/public contract evidence;
-- record transaction hash, block number, log index, contract address, event signature, parser version, raw payload hash, observed timestamp, and received timestamp;
-- maintain a first-funding index for each observed Polymarket wallet/proxy using the first public inbound collateral event, the first non-exchange direct funder where available, and an N-hop funding path (`funding_max_hops` in `_GLOSSARY.md`) with stop rules at exchanges, bridges, mixers, or unknown high-risk contracts;
-- preserve both strict single-root clusters and optional secondary transitive clusters; only strict clusters are eligible for sizing in v1;
-- keep a versioned CEX/bridge/hot-wallet boundary list in config so changes are replayable by config hash;
-- expose source health with RPC block lag, reorg depth, parse-error count, schema drift, and label-version state.
-
-Polymarket proxy-wallet reality is a research gate. The implementation must prove, with replay fixtures, how public `proxyWallet`/funder/collateral/deposit evidence maps to the economic actor for representative historical accounts (per `21-RESEARCH-AND-SOURCE-DISCOVERY.md`). If this mapping is incomplete, inherited-prior and cluster-coordination signals remain shadow-only.
-
 ### `source-trader::kalshi`
 
 - public trade stream and historical trades for market-flow analysis;
@@ -190,4 +167,3 @@ Polymarket proxy-wallet reality is a research gate. The implementation must prov
 - Every poll result is diffed against the last event hash; duplicate trade events are ignored by the deterministic idempotency key in `_GLOSSARY.md` ("Idempotency").
 - WebSocket streams are used for market-state latency, but public trader identification is reconstructed from Data API/profile endpoints and public transaction metadata when needed.
 - All scanner loops respect the budgets in `_GLOSSARY.md` ("Venue rate limits"); rate-limit handling is a first-class event, not an exception swallowed by retry logic.
-- If `source-onchain-polygon` is unhealthy or lags beyond `onchain_block_lag_block`, degrade gracefully: block fresh-wallet first-trade and cluster-coordination signals, but do not block ordinary leaderboard-based Winner-Follow when its required Polymarket sources are healthy.

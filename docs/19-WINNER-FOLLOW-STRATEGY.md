@@ -1,13 +1,13 @@
 # 19 — Winner-Follow Strategy
 
 > See `_BASELINE.md` for the Rust-only implementation rule, toolchain pin, lints, and common acceptance gate.
-> See `_GLOSSARY.md` for vocabulary (wallet/trader/operator/leader/candidate), type aliases, latency budget, rate limits, anti-gaming flag thresholds, and configuration defaults.
+> See `_GLOSSARY.md` for vocabulary (wallet/trader/leader/candidate), type aliases, latency budget, rate limits, and configuration defaults.
 
-**This file is the canonical source of truth for Winner-Follow risk caps, Kelly fractions, eligibility thresholds, mode definitions, and promotion ladders.** Other files reference this file rather than restating these values.
+**This file is the canonical source of truth for Winner-Follow risk caps, Kelly fractions, eligibility thresholds, execution modes, and the promotion ladder.** Other files reference this file rather than restating these values.
 
 ## Objective
 
-Make Winner-Follow the first deployable strategy. The system continuously identifies the fastest-compounding public traders/operators, selects the subset whose future trades are likely to remain profitable after copy delay and costs, and mirrors qualifying entries using risk-capped fractional Kelly.
+Make Winner-Follow the first deployable strategy. The system continuously identifies the fastest-compounding public traders, selects the subset whose future trades are likely to remain profitable after copy delay and costs, and mirrors qualifying entries using risk-capped fractional Kelly.
 
 The goal is not to copy famous accounts. The goal is to maximize **follower bankroll log-growth per day** while minimizing ruin risk, overfitting, copy slippage, hidden liquidity risk, and false skill.
 
@@ -18,7 +18,7 @@ leader skill + public detectability + speed + liquidity + risk sizing
     > fees + slippage + adverse selection + decay
 ```
 
-If walk-forward evidence cannot support that inequality at the configured Kelly fraction, the affected leader/operator is demoted to paper or off (see "Demotion criteria" in `_GLOSSARY.md`).
+If walk-forward evidence cannot support that inequality at the configured Kelly fraction, the affected leader is demoted to paper or off (see "Demotion criteria" in `_GLOSSARY.md`).
 
 ## Venue support
 
@@ -34,8 +34,6 @@ Polymarket is the primary Winner-Follow venue because public data supports user-
 - market/orderbook websocket state;
 - transaction hashes for timing validation.
 
-Polymarket also uses proxy wallets, pUSD collateral, deposit addresses, and bridge/onramp flows. Funder identity is therefore derived from verified public proxy/funder/collateral evidence in `source-onchain-polygon` and `operator-graph`, never from a naive first-USDC-sender heuristic.
-
 ### Kalshi — conditional
 
 Kalshi public trades are useful for market-flow analysis, but public trade events do not identify the trader. Kalshi Winner-Follow requires one of:
@@ -46,54 +44,24 @@ Kalshi public trades are useful for market-flow analysis, but public trade event
 
 Until then, Kalshi copy-following is disabled by default; Kalshi remains a source/resolver and market-flow venue.
 
-## Operator identity and funding graph
-
-Winner-Follow follows public economic actors, not isolated wallet strings. The wallet-level ledger remains the base observation; `operator-graph` collapses wallets into a deterministic `OperatorId` when public funding/collateral evidence is strong enough (`identity_confidence ≥ funder_root_min_confidence_ppm`; see `_GLOSSARY.md`).
-
-Identity layer:
-
-```rust
-pub struct OperatorIdentity {
-    pub operator_id: OperatorId,
-    pub funder_root: Option<FunderRootId>,
-    pub member_wallets: BTreeSet<WalletAddress>,
-    pub cluster_rule_version: semver::Version,
-    pub identity_confidence: ProbabilityPpm,
-}
-
-pub struct InheritedPriorPpm {
-    pub mean_p: ProbabilityPpm,
-    pub stderr_ppm: u32,
-    pub effective_n: u32,                     // capped at inherited_prior_max_effective_n
-}
-
-pub struct OperatorTrackRecord {
-    pub operator_id: OperatorId,
-    pub closed_trades: u32,
-    pub realized_pnl_ppm: i64,
-    pub category_log_growth_lcb_bps: BTreeMap<MarketFamily, i32>,
-    pub cluster_size_history: Vec<(time::Date, ClusterSize)>,
-    pub seeding_velocity_per_week: Decimal,
-}
-```
-
-The graph is built natively from public Polygon data and public/official Polymarket data. CrowdIntel-style clusters are research references; CrowdIntel UI data, proprietary scores, and non-replayable labels are not live decision inputs unless an authorized, stable, replayable export/API exists and has been reviewed.
-
 ## System pipeline
+
+> Winner-Follow follows public economic actors at the **wallet** level. The
+> wallet→operator clustering layer (operator identity, funding graph, inherited
+> priors, cluster coordination) was removed end-to-end in #326 — see
+> `docs/28-OPERATOR-GRAPH-ARCHIVE.md` for the archived design and rationale. Copy
+> decisions are now purely per-wallet deterministic criteria.
 
 ```text
 Discover candidates
   -> hydrate public profiles/trades/positions
-  -> ingest public Polygon funding/collateral events
-  -> build operator identity and inherited-prior snapshots
-  -> collapse wallet ledgers where identity confidence is high
   -> reconstruct trader ledgers
   -> label entries/adds/exits/flips
   -> settle historical outcomes
   -> simulate follower execution walk-forward
   -> rank by lower-confidence daily log growth
   -> watch top-`active_watchlist_size` leaders continuously
-  -> classify new trade events and signal kind
+  -> classify new trade events
   -> estimate current copied-trade p
   -> fractional Kelly sizing
   -> risk gates
@@ -107,7 +75,7 @@ Discover candidates
 ### Bootstrap quality filters (also applied continuously in live stream)
 
 The `pe-bootstrap` Dune query seeds the initial watchlist using four quality filters. These same
-criteria **must be mirrored as continuous live eligibility gates** in `operator-graph` /
+criteria **must be mirrored as continuous live eligibility gates** in
 `strategy-winner-follow` so that wallets that degrade after bootstrap are demoted or excluded:
 
 | Filter | Canonical default | Env override |
@@ -138,30 +106,20 @@ Candidate sources:
 4. Wallets whose trades lead favorable post-trade drift.
 5. Wallets with strong realized performance in markets resolving within 1–7 days.
 6. Incubator accounts with too little sample but unusually strong live drift.
-7. Fresh wallets linked to known high-quality operators/funders, eligible only for inherited-prior incubator mode (`fresh_wallet_max_closed_trades`, `fresh_wallet_max_age_seconds`).
-8. Same-operator clusters with `≥ cluster_coord_min_members_K` member wallets entering the same `(market, outcome, side)` within `cluster_coord_window_seconds_W`.
 
 ## Ledger reconstruction
 
 ```rust
 pub struct TraderLedger {
-    pub trader: TraderId,
-    pub venue: VenueId,
-    pub operator_id: Option<OperatorId>,
-    pub funder_root: Option<FunderRootId>,
-    pub funding_hop_count: Option<FundingHopCount>,
-    pub wallet_age: Option<WalletAgeSeconds>,
-    pub cluster_size_at_observation: Option<ClusterSize>,
-    pub events: Vec<TraderLedgerEvent>,
-    pub positions: BTreeMap<MarketOutcomeId, PositionState>,
-    pub closed_trades: Vec<ClosedTrade>,
+    pub wallet: WalletAddress,
     pub reconstruction_quality: ReconstructionQuality,
+    pub closed_trades: Vec<ClosedTrade>,
+    pub open_positions: Vec<OpenPosition>,
+    pub audit_window_days: u32,
 }
 ```
 
 A ledger event is one of buy/open, add, trim, exit, flip, settlement, merge/split/redemption/accounting action, or unknown. `Unknown` events are never copied. `reconstruction_quality < 60` demotes the leader to research-only.
-
-Operator identity does not overwrite wallet history. The ledger keeps wallet-level facts and adds identity annotations with confidence and rule version so replay can reproduce exactly why a wallet was or was not collapsed into an operator.
 
 ## Eligibility thresholds
 
@@ -182,15 +140,6 @@ Operator identity does not overwrite wallet history. The ledger keeps wallet-lev
 
 The incubator list is for research and paper-copying; it cannot receive meaningful live capital until promoted.
 
-Inherited-prior incubator additionally requires:
-
-- operator has active-leader-level sample size and positive lower-confidence family-specific log-growth;
-- fresh wallet meets `fresh_wallet_max_closed_trades` and `fresh_wallet_max_age_seconds`;
-- funding/collateral hop count ≤ `funding_max_hops`;
-- proxy/funder/collateral mapping is proven for this wallet class (see `21-RESEARCH-AND-SOURCE-DISCOVERY.md`);
-- cluster size, seeding velocity, membership stability within configured bands;
-- no `BaitWalletSuspect`, `DilutionAttack`, `LaunderedFunder`, `WashCluster`, or equivalent flag blocks the signal.
-
 ## Ranking objective
 
 Walk-forward lower-confidence daily compounding:
@@ -205,19 +154,6 @@ leader_score = LCB_5pct(E[log(B_t / B_{t-1}) per day after costs])
              - drawdown_penalty
              - reconstruction_penalty
              - drift_penalty
-```
-
-When operator identity is confident:
-
-```text
-operator_score = LCB_5pct(E[operator follower log-growth per day after costs])
-               + latency_survivability_bonus
-               + capacity_bonus
-               + exit_clarity_bonus
-               - membership_uncertainty_penalty
-               - seeding_velocity_penalty
-               - concentration_penalty
-               - anti_gaming_penalty
 ```
 
 The bonus/penalty weights in `03-PHASE-MODEL-ENGINE.md` are illustrative starting values; final weights are tuned by walk-forward optimization and persisted with the model artifact.
@@ -251,18 +187,11 @@ pub enum LeaderAction {
     Unknown,
 }
 
-pub enum WinnerFollowSignalKind {
-    NormalLeaderFollow,
-    FreshWalletFirstTrade,
-    ClusterCoordination,
-}
-
 pub struct LeaderSignal {
     pub leader: TraderId,
-    pub operator_id: Option<OperatorId>,
     pub venue: VenueId,
-    pub market: MarketId,
-    pub outcome: OutcomeId,
+    pub market_id: MarketId,
+    pub outcome_id: OutcomeId,
     pub action: LeaderAction,
     pub leader_side: Side,
     pub leader_price: Price,
@@ -270,8 +199,6 @@ pub struct LeaderSignal {
     pub observed_at: OffsetDateTime,
     pub received_at: OffsetDateTime,
     pub reconstruction_quality: ReconstructionQuality,
-    pub signal_kind: WinnerFollowSignalKind,
-    pub inherited_prior: Option<InheritedPriorPpm>,
     pub source_trade_id: SourceTradeId,
     pub action_confidence_ppm: ProbabilityPpm,
 }
@@ -288,13 +215,7 @@ Action eligibility:
 | `Flip` | requires `flip_human_approved = true` | Default-deny |
 | `Unknown` | block | Always |
 
-Signal-kind rules:
-
-- `NormalLeaderFollow`: wallet/operator already qualifies under standard active-leader ranking.
-- `FreshWalletFirstTrade`: a fresh wallet (≤ `fresh_wallet_max_closed_trades`, age ≤ `fresh_wallet_max_age_seconds`) enters a position ≥ `inherited_prior_min_position_usd`, inherits a heavily shrunk prior from a known operator/funder, defaults to paper.
-- `ClusterCoordination`: ≥ `cluster_coord_min_members_K` member wallets of the same operator enter the same `(market, outcome, side)` within `cluster_coord_window_seconds_W` and aggregate notional ≥ `cluster_coord_min_aggregate_usd`. Debounced once per `(operator, market, outcome, side, dedup_window)`; defaults to shadow.
-
-Idempotency key: `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)` (1-second buckets). Cluster-coordination adds `operator_id`.
+Idempotency key: `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)` (1-second buckets).
 
 ## Kelly sizing
 
@@ -319,8 +240,6 @@ Kelly fractions:
 | Live-tiny | 0.25 |
 | Promoted | 0.25 |
 | Maximum (with `kelly_fraction_above_default_human_approved`) | 0.50 |
-| Inherited-prior first trade | 0.05 |
-| Cluster coordination | 0.15 |
 
 Above 0.50 requires a separate, signed config change.
 
@@ -331,8 +250,6 @@ Above 0.50 requires a separate, signed config change.
 ```text
 p = calibrated_probability(
       leader,
-      operator_identity,
-      signal_kind,
       market_family,
       odds_bucket,
       action_type,
@@ -344,18 +261,6 @@ p = calibrated_probability(
       resolver_confidence
     )
 ```
-
-For `FreshWalletFirstTrade`:
-
-```text
-p_effective = shrink(
-    inherited_operator_prior_by_family_and_odds_bucket,
-    toward = category_baseline,
-    cap_effective_n = inherited_prior_max_effective_n
-)
-```
-
-This is a prior over the copied follower trade, not a posterior on the new wallet.
 
 ## Per-trade cap configuration
 
@@ -391,15 +296,13 @@ Default: `None` (Kelly path). Canonical: `_GLOSSARY.md` `flat_usd_per_trade_defa
 
 ## Anti-gaming flags
 
-`operator-graph` computes deterministic flags from public funding/collateral and trading history. Concrete thresholds are in `_GLOSSARY.md`.
-
-| Flag | Default action |
-|---|---|
-| `BaitWalletSuspect` | Demote inherited prior; keep paper |
-| `DilutionAttack` | Shrink prior by membership uncertainty |
-| `LaunderedFunder` | Block fresh-wallet first-trade |
-| `WashCluster` | Block cluster-coordination signal |
-| `MarketNarrowness` | Category-only prior; do not generalize |
+The operator-clustering anti-gaming flags (`BaitWalletSuspect`, `DilutionAttack`,
+`LaunderedFunder`, `WashCluster`) were removed with the operator graph in #326 —
+see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`. No anti-gaming flag is computed in live
+code. The surviving per-wallet concern, market narrowness, is enforced
+structurally rather than as a flag: the eligibility table caps single-market
+profit share ("Max profit from one market"), and the ranking objective subtracts
+a `concentration_penalty`.
 
 ## Canonical risk caps (single source of truth)
 
@@ -410,16 +313,12 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 
 [winner_follow.modes]
 leader_follow                = "live_tiny"   # paper -> live_tiny -> promoted (see promotion criteria below)
-inherited_prior_first_trade  = "paper"
-cluster_coordination         = "shadow"
 
 [winner_follow.kelly]
 fraction_backtest_sanity     = 0.10
 fraction_paper               = 0.10
 fraction_leader_live_tiny    = 0.25          # = 0.25x Kelly
 fraction_leader_promoted     = 0.25          # raise to 0.50 only with kelly_fraction_above_default_human_approved
-fraction_inherited_prior     = 0.05
-fraction_cluster_coordination = 0.15
 fraction_hard_max            = 0.50          # absolute ceiling without separate signed config change
 
 [winner_follow.risk]
@@ -429,21 +328,13 @@ max_trade_promoted_bps               = 100   # 1.00 %
 
 # Concentration caps
 max_leader_bps                       = 300   # 3.00 % per leader
-max_operator_bps                     = 300   # 3.00 % per operator
-max_per_operator_per_market_bps      = 75    # 0.75 % per (operator, market)
 max_market_bps                       = 200   # 2.00 % per market
 max_family_bps                       = 800   # 8.00 % per MarketFamily
 max_total_copy_bps                   = 2500  # 25.00 % total open copy exposure
 
-# Mode-specific exposure
-max_funder_inherited_bps             = 100   # 1.00 % all inherited-prior across funders
-max_inherited_prior_per_funder_per_day_count = 3
-max_cluster_coord_bps                = 200   # 2.00 % all cluster-coordination
-
 # Drawdown stops
 intraday_stop_bps                    = -200  # halt new entries at -2.00 % intraday
 rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
-inherited_prior_kill_if_drawdown_bps = -150  # -1.50 % inherited-prior PnL kills the mode
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
 copy_latency_kill_switch_ms          = 3000  # fire when p95 > 1.5× the 2000 ms p95 budget
 
@@ -478,20 +369,20 @@ These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fir
 
 | # | Gate | Condition | Source | `WinnerFollowError` | Rationale |
 |---|---|---|---|---|---|
-| 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:64–66` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and require a manual signed config change. The flag prevents automated flip copying until an operator explicitly approves it. |
-| 2 | Shadow mode | `effective_mode == Shadow` | `evaluate.rs:72–74` | `ShadowMode` | Shadow is record-only; no order is emitted. Returned as `Err` (not a hard failure) so callers can distinguish "intentionally suppressed" from "legitimately blocked". |
-| 3 | Price invalid after fee | `Price::new(leader_price + fee_per_share)` fails | `evaluate.rs:92` | `NoEdge` | `c` (cost = leader price + taker fee) must be a valid `Price` in `(0, 1)`. If the leader traded at a price that after fees would round to ≥ $1.00 there is no upside — the trade has no edge. |
-| 4 | Kelly sizes to zero | `size_contracts(kelly_input) == 0` | `evaluate.rs:102–104` | `NoEdge` | Kelly sizing returned zero contracts — the bankroll is too small to buy even one contract at this price with the configured fraction. Not an error; the signal is valid but unsizeable. |
-| 5 | Cap-clamp to zero | `clamp_contracts_to_cap(...) == 0` | `evaluate.rs:111–113` | `NoEdge` | After applying the per-trade cap (basis points of bankroll), available bankroll is smaller than the price of a single contract. Fractional contracts are not supported; skip this trade. |
+| 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:62–64` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and require a manual signed config change. The flag prevents automated flip copying until an operator explicitly approves it. |
+| 2 | Shadow mode | `effective_mode == Shadow` | `evaluate.rs:70–72` | `ShadowMode` | Shadow is record-only; no order is emitted. Returned as `Err` (not a hard failure) so callers can distinguish "intentionally suppressed" from "legitimately blocked". |
+| 3 | Price invalid after fee | `Price::new(leader_price + fee_per_share)` fails | `evaluate.rs:104` | `NoEdge` | `c` (cost = leader price + taker fee) must be a valid `Price` in `(0, 1)`. If the leader traded at a price that after fees would round to ≥ $1.00 there is no upside — the trade has no edge. |
+| 4 | Kelly sizes to zero | `size_contracts(kelly_input) == 0` | `evaluate.rs:112–114` | `NoEdge` | Kelly sizing returned zero contracts — the bankroll is too small to buy even one contract at this price with the configured fraction. Not an error; the signal is valid but unsizeable. |
+| 5 | Cap-clamp to zero | `clamp_contracts_to_cap(...) == 0` | `evaluate.rs:124–126` | `NoEdge` | After applying the per-trade cap (basis points of bankroll), available bankroll is smaller than the price of a single contract. Fractional contracts are not supported; skip this trade. |
 
-Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the 16 risk-engine block reasons.
+Gates 1–5 fire in order. Gate 6 onward is the risk-engine (`evaluate_risk`), which returns `RiskDecision::Blocked(reason)` → `Err(WinnerFollowError::Blocked(reason))`. See the risk-block taxonomy below for the 10 risk-engine block reasons.
 
 **Relationship between layers:**
 
 ```
 simulation.rs gates (backtest only, lines 457-518)
   → strategy-level gates 1-5 (evaluate.rs, both backtest and production)
-      → risk-engine evaluate_risk() → 16 RiskBlock variants (production and backtest)
+      → risk-engine evaluate_risk() → 10 RiskBlock variants (production and backtest)
 ```
 
 ## Risk-block taxonomy and halt scope
@@ -500,22 +391,16 @@ simulation.rs gates (backtest only, lines 457-518)
 
 | Block reason | Halt scope |
 |---|---|
-| `OperatorConcentrationExceeded` | this trade |
+| `KillSwitchDrawdown` | strategy-wide; manual review required to resume |
+| `IntradayDrawdownStop` | strategy-wide new entries until calendar reset |
+| `Rolling7dDrawdownStop` | strategy-wide new entries until 7-day window clears |
+| `CopyLatencyKillSwitch` | strategy-wide new entries until p95 returns under budget |
+| `OnchainSourceUnhealthy` | this trade (on-chain resolution source is Degraded or Dead) |
+| `PerTradeSizeExceeded` | this trade |
 | `LeaderConcentrationExceeded` | this trade |
 | `MarketConcentrationExceeded` | this trade |
 | `FamilyConcentrationExceeded` | this trade |
 | `TotalCopyExposureExceeded` | this trade |
-| `FunderInheritedExposureExceeded` | this trade + this funder for the day |
-| `FunderSeedingRateSuspicious` | this funder + all dependent inherited-prior signals |
-| `ClusterMembershipUnstable` | this cluster + cluster-coordination mode for `cluster_membership_stability_window_d` |
-| `FunderHopCountExcessive` | this trade |
-| `OnchainSourceUnhealthy` | inherited-prior + cluster-coordination modes |
-| `ProxyFunderMappingUnproven` | inherited-prior + cluster-coordination modes |
-| `AntiGamingFlagActive` | per-flag default action (see `_GLOSSARY.md`) |
-| `IntradayDrawdownStop` | strategy-wide new entries until calendar reset |
-| `Rolling7dDrawdownStop` | strategy-wide new entries until 7-day window clears |
-| `KillSwitchDrawdown` | strategy-wide; manual review required to resume |
-| `CopyLatencyKillSwitch` | strategy-wide new entries until p95 returns under budget |
 
 ## Execution rules
 
@@ -526,11 +411,11 @@ simulation.rs gates (backtest only, lines 457-518)
 5. Recheck risk after partial fills.
 6. Reconcile against venue state before the next order.
 7. Follow exits only when the follower has mirrored exposure and the exit's `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
-8. Block inherited-prior and cluster-coordination live orders when `source-onchain-polygon` is unhealthy or operator identity is unstable (see "Risk-block taxonomy" above).
+8. Block live orders when the on-chain resolution source is unhealthy (`OnchainSourceUnhealthy`; see "Risk-block taxonomy" above).
 
 ## Promotion ladder
 
-Each mode has its own ladder. Promotion of one mode does not promote another.
+Winner-Follow has a single leader-follow promotion ladder.
 
 ### Ordinary leader-follow
 
@@ -542,32 +427,11 @@ historical reconstruction
   -> promoted (same kelly, max_trade = 100 bps) after another 30-day live-tiny window passes the gates
 ```
 
-### Fresh-wallet inherited-prior
-
-```
-historical reconstruction (paper, kelly = 0.05)
-  -> walk-forward backtest with separate report
-  -> paper ≥ 30 days, ≥ 60 closed inherited-prior trades, drift within "close behavior"
-  -> shadow (orders generated and recorded but not submitted) ≥ 14 days
-  -> live-tiny (max_inherited_prior_per_funder_per_day_count = 3, max_funder_inherited_bps = 100)
-  -> promoted only after a fresh 30-day live-tiny window AND no `BaitWalletSuspect` / `LaunderedFunder` flags fired in window
-```
-
-### Cluster coordination
-
-```
-historical reconstruction (shadow, kelly = 0.15)
-  -> walk-forward backtest with separate report
-  -> shadow ≥ 30 days, ≥ 60 cluster signals, drift within "close behavior"
-  -> paper ≥ 14 days
-  -> live-tiny (max_cluster_coord_bps = 200) only after `WashCluster` flag is absent for entire window
-```
-
-A demotion in any mode resets that mode's promotion clock.
+A demotion resets the promotion clock.
 
 ## Promotion and demotion criteria
 
-See `_GLOSSARY.md` for the quantified gates ("Promotion criteria — quantified" and "Demotion criteria"). They apply uniformly across all three modes.
+See `_GLOSSARY.md` for the quantified gates ("Promotion criteria — quantified" and "Demotion criteria").
 
 ## Backtest acceptance
 
@@ -578,12 +442,11 @@ Winner-Follow can go to live-tiny only when:
 - LCB_5pct of daily log-growth is positive after costs;
 - max drawdown is below the bankroll-tier limit;
 - paper-copy behavior is "close to simulation" (`_GLOSSARY.md` definition);
-- every copied/passed trade has a replayable decision record;
-- inherited-prior and cluster-coordination modes have separate walk-forward reports and promote on their own ladders.
+- every copied/passed trade has a replayable decision record.
 
 ## Live monitoring
 
-Demote or disable a leader/operator when any demotion criterion in `_GLOSSARY.md` triggers. Demotion is automatic; promotion requires the gates above plus a manual review.
+Demote or disable a leader when any demotion criterion in `_GLOSSARY.md` triggers. Demotion is automatic; promotion requires the gates above plus a manual review.
 
 ## Watchlist refresh (export-watchlist)
 

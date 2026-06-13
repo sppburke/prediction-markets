@@ -22,7 +22,6 @@ prediction-edge/
 │   ├── resolver-card/
 │   ├── source-core/
 │   ├── source-trader/                # consolidated; venue-specific behavior in submodules
-│   ├── source-onchain-polygon/
 │   ├── source-weather/
 │   ├── source-crypto/
 │   ├── source-sports/
@@ -35,7 +34,6 @@ prediction-edge/
 │   ├── model-core/
 │   ├── model-weather/
 │   ├── model-crypto/
-│   ├── operator-graph/
 │   ├── strategy-core/
 │   ├── strategy-winner-follow/
 │   ├── trader-index/
@@ -100,11 +98,6 @@ pub struct BasisPoints(pub i32);
 pub struct SourceTimestamp(pub time::OffsetDateTime);
 pub struct ReceivedAt(pub time::OffsetDateTime);
 pub struct WalletAddress(pub [u8; 20]);
-pub struct FunderRootId(pub WalletAddress);
-pub struct OperatorId(pub blake3::Hash);
-pub struct FundingHopCount(pub u8);
-pub struct WalletAgeSeconds(pub u32);
-pub struct ClusterSize(pub u16);
 ```
 
 If a doc uses a type that is not in `_GLOSSARY.md`, that is a glossary bug; fix the glossary, not the doc.
@@ -117,8 +110,6 @@ If a doc uses a type that is not in `_GLOSSARY.md`, that is a glossary bug; fix 
 - Risk engine cannot call external APIs.
 - Model crates cannot mutate venue state.
 - Replay uses production crates, not duplicate research logic.
-- `source-onchain-polygon` emits normalized public-chain events only; it does not rank traders or size orders.
-- `operator-graph` is pure logic: no network, no database calls, no venue submission, deterministic output from event snapshots plus config.
 
 ## CI gates
 
@@ -143,8 +134,6 @@ Winner-Follow is built as separate crates so it cannot leak venue-specific short
 
 ```text
 crates/
-├── source-onchain-polygon/   # Polygon collateral/funding events for trader identity research
-├── operator-graph/           # pure clustering, operator identity, reputation, inherited priors
 ├── trader-index/             # public trader discovery, ledgers, identity-safe mappings
 ├── copy-signal-engine/       # entry/add/trim/exit/flip classification and watchlist scanning
 ├── kelly-sizer/              # calibrated fractional-Kelly and portfolio caps

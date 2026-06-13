@@ -85,7 +85,7 @@ Winner-Follow extension (emitted alongside the base report by `strategy-winner-f
 ```rust
 pub struct WinnerFollowReport {
     pub base: BacktestReport,
-    pub mode: WinnerFollowMode,                      // leader_follow | inherited_prior_first_trade | cluster_coordination
+    pub mode: ExecutionMode,                         // shadow | paper | live_tiny | promoted (#326: leader_follow is the only signal mode)
 
     // Compounding and exposure
     pub expected_log_growth_per_day: Decimal,
@@ -109,15 +109,6 @@ pub struct WinnerFollowReport {
     // Watchlist dynamics
     pub leader_churn_rate_per_day: Decimal,
     pub demotion_count_by_cause: BTreeMap<DemotionCause, u32>,
-
-    // Operator-aware
-    pub exposure_by_operator_bps: BTreeMap<OperatorId, i32>,
-    pub wallet_to_operator_confidence_p50: ProbabilityPpm,
-    pub inherited_prior_effective_n_p50: u32,
-    pub fresh_wallet_outcomes: ModeOutcomes,
-    pub cluster_coordination_outcomes: ModeOutcomes,
-    pub anti_gaming_flag_counts: BTreeMap<AntiGamingFlag, u32>,
-    pub onchain_source_lag_p95_blocks: u32,
 
     // Promotion-relevant
     pub paper_vs_backtest_ks_pvalue: Decimal,
@@ -155,23 +146,17 @@ A research lever (issue #134) that short-circuits the entire sizing pipeline. Se
 | `total_signals_evaluated`, `snapshot_prior_*`, `liquidity_*` counters | Stay at 0 (those code paths never execute) |
 | `kelly_sweep_fractions` interaction | Sweep is suppressed in `main.rs`; one `tracing::warn!` is emitted and a single run executes |
 
-`BacktestConfig` is not imported by the live service crate — the flag cannot leak into production by construction. Operator-level scenario coverage lives in `crates/backtest/tests/scenario_flat_usd.rs`.
+`BacktestConfig` is not imported by the live service crate — the flag cannot leak into production by construction. Scenario coverage lives in `crates/backtest/tests/scenario_flat_usd.rs`.
 
 ### Per-market position cap (`PE_BACKTEST_MAX_POSITIONS_PER_MARKET`)
 
 A structural gate (issue #138) that caps concurrent open positions on any `market_id`. `BacktestConfig::max_positions_per_market = Some(n)` blocks new BUY signals once `n` positions are open on that market across every leader and outcome; the slot reopens when positions close via SELL or resolution sweep. The cap is keyed strictly on `market_id` — leader A on outcome 0 and leader B on outcome 1 of the same binary market count against the same slot, preventing simultaneous exposure to both sides of one contract. Default `Some(1)`; `None` disables. `NonZeroU32` rejects `0` at deserialize time so a typo cannot silently block every BUY.
 
-Operator-level scenario coverage lives in `crates/backtest/tests/scenario_market_position_cap.rs`.
+Scenario coverage lives in `crates/backtest/tests/scenario_market_position_cap.rs`.
 
-### Skip unknown-operator gate (`PE_BACKTEST_SKIP_UNKNOWN_OPERATOR`)
+### Skip unknown-operator gate (removed in #326)
 
-A signal-time gate (issue #141) that suppresses BUY signals from watchlisted leaders whose wallet has no resolved operator identity in the funder graph. `BacktestConfig::skip_unknown_operator = true` causes the BUY arm to `continue` whenever `op_identity.is_none()`; the SELL arm is unaffected. The discriminator is the already-computed `wallet_to_operator.get(&leader)`, so the gate adds no new graph traversal. Placement: after the per-market cap and before the horizon-cooldown filter, so both flat-USD and Kelly sizing paths honor it.
-
-Suppression rate is reported as `unknown_operator_suppression_pct` (global, percent of BUY signals reaching the gate that were suppressed) and `unknown_operator_suppression_by_quarter` (per-calendar-quarter map). Per the `max_hours_to_expiry` tracker idiom the suppression counters only record while the gate is active; with `skip_unknown_operator = false` the report fields stay at `0` / empty.
-
-Motivation: A1 oracle-lift analysis on the 2026-05-09 sweep attributed +$23.99 to skipping unmapped wallets — they are an oversized share of negative PnL. Default `true`; the gate fires uniformly when the funder-edge cache is empty/stale (the "no Etherscan data" case) and for individual wallets the clustering does not attach to any operator.
-
-Operator-level scenario coverage lives in `crates/backtest/tests/scenario_skip_unknown_operator.rs`.
+The `PE_BACKTEST_SKIP_UNKNOWN_OPERATOR` gate (issue #141) depended on the operator/funder graph and was removed with it. Its rationale and the unconfirmed +$23.99 oracle-lift hypothesis are archived in `docs/28-OPERATOR-GRAPH-ARCHIVE.md`. If revisited, re-express it as a per-wallet history-depth criterion (no operator graph required).
 
 ### High-price BUY cap (`PE_BACKTEST_MAX_SIGNAL_PRICE`)
 
@@ -181,11 +166,11 @@ Gating on `fill_price` rather than the leader's signal price is the load-bearing
 
 Default `Some(0.85)`; `None` disables. The gate fires *before* the flat-USD short-circuit and Kelly path, so every sizing branch honors it. Per-quarter suppression telemetry is emitted via `WinnerFollowReport::high_price_suppression_pct` and `high_price_suppression_by_quarter`; warns at the canonical `backtest_suppression_warn_threshold_pct = 30` (shared with `expiry_filter_suppression_pct` via a labeled `SuppressionTracker` instance).
 
-Operator-level scenario coverage lives in `crates/backtest/tests/scenario_max_signal_price.rs`.
+Scenario coverage lives in `crates/backtest/tests/scenario_max_signal_price.rs`.
 
 ### Scenario-test contributor note
 
-`BacktestConfig` has four fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3), `max_positions_per_market: Some(1)`, `skip_unknown_operator: true`, and `max_signal_price: Some(0.85)`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false`, `max_positions_per_market: None`, `skip_unknown_operator: false`, and `max_signal_price: None`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting any of these in a new scenario will produce confusing fewer-than-expected BUY fills (cap), fewer-than-expected through-fills (require_known_expiry), no fills at all on fixtures that don't supply funder edges (skip_unknown_operator), or no fills on fixtures with prices ≥ 0.85 (max_signal_price).
+`BacktestConfig` has three fields whose production-correct defaults are restrictive: `require_known_expiry: true` (target post #137 Sub-PR 3), `max_positions_per_market: Some(1)`, and `max_signal_price: Some(0.85)`. **Scenario tests under `crates/backtest/tests/scenario_*.rs` opt out by setting `require_known_expiry: false`, `max_positions_per_market: None`, and `max_signal_price: None`** unless the test is specifically exercising one of those gates. The defaults are intentional for production correctness; scenario tests opt out, never opt in. Forgetting any of these in a new scenario will produce confusing fewer-than-expected BUY fills (cap), fewer-than-expected through-fills (require_known_expiry), or no fills on fixtures with prices ≥ 0.85 (max_signal_price).
 
 ## Ranker-level presets
 
@@ -201,7 +186,7 @@ A runbook preset (issue #143) that tightens two ranker thresholds to filter thin
 PE_BACKTEST_ACTIVE_MIN_CLOSED=30 PE_BACKTEST_INCUBATOR_MIN_CLOSED=10 pe-backtest <toml>
 ```
 
-**Hypothesis:** thin-history leaders are statistically underpowered and are expected to contribute disproportionately to negative PnL in the unknown-operator bucket. The preset's lift is **not yet empirically confirmed**; a post-merge sweep against the current cache is the confirmation step. Run the sweep after the cap-the-bleed simulation-level gates land (issues #141 `skip_unknown_operator`, #142 `max_signal_price`) so the baseline reflects the final filtered behaviour. If the sweep refutes the hypothesis, update this section to flag the preset as "don't use" — do not remove it, the negative result is itself valuable.
+**Hypothesis:** thin-history leaders are statistically underpowered and are expected to contribute disproportionately to negative PnL. The preset's lift is **not yet empirically confirmed**; a post-merge sweep against the current cache is the confirmation step. Run the sweep after the cap-the-bleed simulation-level gate lands (issue #142 `max_signal_price`) so the baseline reflects the final filtered behaviour. If the sweep refutes the hypothesis, update this section to flag the preset as "don't use" — do not remove it, the negative result is itself valuable.
 
 **Values are starting points subject to empirical tuning.** 3× the current backtest defaults (`ACTIVE_MIN_CLOSED`: 10 → 30; `INCUBATOR_MIN_CLOSED`: 3 → 10) is a reasonable opening bid: stricter than the current live default of 15 (`_GLOSSARY.md` `active_min_closed_trades`) and well short of the historical pre-N_eff live default of 60. If the sweep shows the optimum lies elsewhere, update the values in this section directly rather than opening a new issue.
 
@@ -209,7 +194,7 @@ PE_BACKTEST_ACTIVE_MIN_CLOSED=30 PE_BACKTEST_INCUBATOR_MIN_CLOSED=10 pe-backtest
 
 | Env var | Why excluded |
 |---|---|
-| `PE_BACKTEST_MIN_QUALITY` | `reconstruction_quality` is closed contracts as a fraction of total contracts (`crates/trader-index/src/reconstruction.rs:290`). The Polymarket CLOB API does not return market-resolution redemption events, so buy-and-hold-to-resolution traders score quality=0 regardless of actual performance. Tightening `MIN_QUALITY` would filter conviction operators for structural data reasons unrelated to history depth — the wrong lever. |
+| `PE_BACKTEST_MIN_QUALITY` | `reconstruction_quality` is closed contracts as a fraction of total contracts (`crates/trader-index/src/reconstruction.rs:290`). The Polymarket CLOB API does not return market-resolution redemption events, so buy-and-hold-to-resolution traders score quality=0 regardless of actual performance. Tightening `MIN_QUALITY` would filter conviction traders for structural data reasons unrelated to history depth — the wrong lever. |
 | `PE_BACKTEST_ACTIVE_MIN_MARKETS` / `PE_BACKTEST_INCUBATOR_MIN_MARKETS` | The min-markets filter is a hard gate in the ranker (`crates/trader-index/src/ranker.rs:60,87`). N_eff shrinkage in Kelly sizing (`docs/19-WINNER-FOLLOW-STRATEGY.md` § p estimation, `kelly_p_k_per_market`) prices specialists with narrow market breadth correctly via shrinkage. The current design deliberately lowered the hard filter to 1 *because* N_eff downstream does that work. Tightening here would re-introduce the hard cliff that the N_eff design explicitly chose to avoid — it excludes specialists rather than down-weights them. |
 
 **Expected effect** (to be confirmed by post-merge sweep):
@@ -231,7 +216,6 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 3. **Follower replay:** copy eligible trades after simulated latency and with book-aware fill assumptions.
 4. **Portfolio replay:** apply Kelly sizing, caps, correlated exposure limits, exits, and drawdown stops (caps in `19-`).
 5. **Live-vs-backtest drift replay:** compare paper/live outcomes against simulated expectations using the "close to simulation" definition in `_GLOSSARY.md`.
-6. **Operator graph replay:** rebuild funding/collateral graph state and operator identities exactly as known at historical time `t`.
 
 ### Bias controls
 
@@ -242,9 +226,8 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 - No ignoring missed exits.
 - No ignoring market delistings, disputes, or stale prices.
 - No treating Kalshi public market trades as trader-attributed signals unless identity is public/authorized.
-- No using future funding edges, future cluster members, future labels, or future operator PnL to identify a funder as skilled at historical time `t`.
-- No treating CrowdIntel or other opaque third-party cluster scores as replayable production truth unless the exact input/export is logged and licensed.
+- No treating CrowdIntel or other opaque third-party scores as replayable production truth unless the exact input/export is logged and licensed.
 
 ### Acceptance gate
 
-Winner-Follow can enter live-tiny only if the gates in `19-WINNER-FOLLOW-STRATEGY.md` ("Promotion ladder") and `_GLOSSARY.md` ("Promotion criteria — quantified") all pass for ordinary leader-follow. `inherited_prior_first_trade` and `cluster_coordination` modes have separate walk-forward acceptance reports and are not promoted because ordinary leader-follow passed.
+Winner-Follow can enter live-tiny only if the gates in `19-WINNER-FOLLOW-STRATEGY.md` ("Promotion ladder") and `_GLOSSARY.md` ("Promotion criteria — quantified") all pass for the leader-follow strategy.

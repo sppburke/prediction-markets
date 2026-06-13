@@ -46,9 +46,9 @@ Before coding trader-copy logic, verify:
 - whether the proxy/funder/collateral mapping is derivable from public chain data and official docs for representative historical examples;
 - whether any third-party data source has an authorized replayable API/export, or is only an opaque UI product.
 
-## Operator graph source checks
+## Polygon resolution-scan source checks
 
-Before coding `source-onchain-polygon` or `operator-graph`, verify:
+Before coding the Polygon resolution scan (`pe_bootstrap::chain` / `polygon_ctf`), verify:
 
 - official Polymarket contract addresses and deployment/factory docs;
 - public event signatures for proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral flows;

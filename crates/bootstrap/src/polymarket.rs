@@ -100,10 +100,10 @@ pub struct FetchOutcome {
     /// progress was rolled back per-wallet; the rest of the batch succeeded.
     pub failed: Vec<WalletAddress>,
     /// Per-wallet count of newly inserted trade rows (issue #176). Contains
-    /// **only** wallets with `count > 0`; wallets that succeeded with zero
-    /// new trades are NOT inserted (saves ~95% of entries in shadow mode and
-    /// lets `delta_audit::classify_and_record` use `contains_key` as the
-    /// "had activity" predicate without a `> 0` guard).
+    /// **only** wallets with `count > 0`; wallets that succeeded with zero new
+    /// trades are NOT inserted. (The delta-backfill audit that consumed this as
+    /// a "had activity" predicate was removed in #326; the map is retained for
+    /// callers that want per-wallet new-trade counts.)
     pub new_trades: HashMap<WalletAddress, usize>,
 }
 
@@ -281,9 +281,9 @@ impl<F: PageFetcher> PolymarketBulkFetcher<F> {
                                     return;
                                 }
                             };
-                            // Issue #176: only wallets with new trades enter
-                            // the map. `delta_audit::classify_and_record` uses
-                            // `contains_key` as the "had activity" predicate.
+                            // Issue #176: only wallets with new trades enter the
+                            // map (the delta-backfill audit that used it was
+                            // removed in #326).
                             if inserted > 0 {
                                 new_trades_map.lock().await.insert(wallet, inserted);
                             }

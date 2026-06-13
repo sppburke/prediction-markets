@@ -2,19 +2,16 @@
 
 Single source of truth for terms used across `docs/`. When a definition changes, update it here and let other files reference back.
 
-## Vocabulary: wallet vs trader vs operator vs leader vs candidate
+## Vocabulary: wallet vs trader vs leader vs candidate
 
 | Term | Definition |
 |---|---|
 | **Wallet** | A single Polygon address (or venue equivalent). Observable, public, but not necessarily a distinct economic actor. |
 | **Trader** | A venue-account-level identity. On Polymarket, currently 1:1 with a public proxy wallet. On Kalshi, a venue user (anonymous in public trade messages). |
-| **Operator** | A clustered economic actor, typically composed of one or more wallets/proxies, derived deterministically by `operator-graph` from public funding/collateral evidence. Identified by `OperatorId`. |
-| **Funder** | A wallet that supplied initial collateral to one or more proxy wallets. The earliest non-exchange direct funder along the funding path becomes the candidate `funder_root`. |
-| **Cluster** | The set of wallets that share a `funder_root` under the active cluster rule version. |
-| **Candidate** | An operator/trader currently being evaluated for inclusion in the watchlist. |
+| **Candidate** | A trader currently being evaluated for inclusion in the watchlist. |
 | **Leader** | A candidate that has passed eligibility thresholds and is in the active top-`active_watchlist_size` watchlist. |
 
-When the docs say "trader" and the system has confident operator identity, the operator-level aggregation is preferred for ranking, sizing, and risk caps; the wallet-level ledger remains as a sub-aggregation for replay and audit.
+Ranking, sizing, and risk caps apply per wallet. (The wallet→operator clustering layer was removed in #326 — see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`.)
 
 ## Phase vs Strategy index
 
@@ -124,8 +121,6 @@ pub struct EventSeq(pub u64);
 pub struct WalletAddress(pub [u8; 20]);
 pub struct TraderId(pub WalletAddress);       // Polymarket; Kalshi traders use VenueAccountId
 pub struct VenueAccountId(pub String);
-pub struct OperatorId(pub blake3::Hash);
-pub struct FunderRootId(pub WalletAddress);
 
 // Quantities, prices, probabilities
 pub struct ContractQty(pub u64);
@@ -144,10 +139,7 @@ pub struct SourceTimestamp(pub time::OffsetDateTime);
 pub struct ReceivedAt(pub time::OffsetDateTime);
 pub struct ObservedAtBucket(pub i64);         // floor(observed_at_ms / BUCKET_MS); BUCKET_MS = 1_000
 
-// Operator-graph
-pub struct FundingHopCount(pub u8);
-pub struct WalletAgeSeconds(pub u32);
-pub struct ClusterSize(pub u16);
+// Ledger reconstruction
 pub struct ReconstructionQuality(pub u8);     // 0..=100
 
 // Sides
@@ -278,7 +270,7 @@ let card = ResolverCard {
 
 ## Configuration defaults — concrete values
 
-Where the docs use vague qualifiers, these are the canonical defaults. They live in code as `WinnerFollowConfig` and `OperatorGraphConfig` and are restated here for cross-reference.
+Where the docs use vague qualifiers, these are the canonical defaults. They live in code as `WinnerFollowConfig` and are restated here for cross-reference.
 
 ### Polymarket public source (`PollingConfig`)
 
@@ -321,109 +313,34 @@ Aligns the live copy path with the 13-wallet "72hr buy-and-hold band" cohort sel
 | `entry_gate_fail_closed` | `false` | `ServiceConfig` field. Posture for a wallet absent from the history map (fetch failed, no stale sidecar): `false` fails open (copies allowed, treat as new), `true` fails closed (blocked). The loader warns per absent wallet either way. |
 | `history_max_pages` | 200 | **Module const** in `crates/service/src/wallet_history.rs` (not a TOML/env key). Safety backstop: per-wallet history pagination stops after this many 500-trade pages; a `warn!` is emitted if hit (older markets may be missed → possible false first-entry). |
 
-### Polygon on-chain source (`PolygonConnectorConfig`)
+### Wallet enumeration and relocated chain primitives
+
+Wallet enumeration is now **Dune-only** (#326). The on-chain `eth_getLogs`
+enumeration path, the delta scan, and funder discovery were deleted with the
+`pe-source-onchain-polygon` crate — see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`. The
+small set of Polygon-RPC primitives the surviving paths still need was relocated
+into `crates/bootstrap/src/chain.rs` (each constant keeps its `verified <date>
+from <source>` comment and a self-validating keccak test):
+
+| Symbol (`pe_bootstrap::chain::*`) | Purpose |
+|---|---|
+| `CTF`, `CTF_DEPLOY_BLOCK`, `TOPIC_CONDITION_RESOLUTION` | Precise market-resolution scan (`polygon_ctf::scan_resolutions`, issue #149). |
+| `ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, `TOPIC_ORDER_FILLED_V1` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy` and the Dune-arm enumeration completion marker. |
+| `eth_get_logs_bisect` | Bisect-on-cap helper with a transient-error retry classifier (`TransientErrorKind`: rate-limit / decode / transport, exponential backoff, max 6 attempts) used by the resolution scan. |
+
+Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
 
 | Key | Default | Meaning |
-|---|---:|---|
-| `polygon_http_url` | `""` | Alchemy (or compatible) HTTPS endpoint for `eth_getLogs` backfill. **Required for `funder_source = "eth_logs"`; ignored for `"etherscan"`.** |
-| `polygon_ws_url` | `""` | Alchemy (or compatible) WSS endpoint for live `eth_subscribe` logs. Required for `funder_source = "eth_logs"`. When empty and `funder_source = "etherscan"`, the live WS subscription is skipped; only funder discovery runs. |
-| `polygon_checkpoint_path` | `"./polygon_checkpoint.json"` | Path to the JSON block-checkpoint file used to resume backfill across restarts. |
-| `polygon_backfill_blocks` | 21_000_000 | Blocks to backfill from current head on first run (≈ 16 months at ~2 s/block). **eth_logs only.** |
-| `polygon_backfill_page_size` | 10 | Max blocks per `eth_getLogs` page during discovery/backfill. Alchemy free tier hard-caps this at 10; paid/dedicated tiers allow ~2_000+. **eth_logs only.** |
-| `polygon_channel_capacity` | 256 | Bounded mpsc channel capacity between backfill/WS workers and `next_event` consumer |
-| `funder_source` | `"eth_logs"` | Funder discovery backend: `"eth_logs"` (default, Alchemy CU) or `"etherscan"` (Etherscan V2 free tier). With `"etherscan"` + empty Polygon URLs, funder discovery runs via Etherscan and no live WS subscription is started. |
-| `etherscan_funder_rps` | 3 | Etherscan V2 free-tier rate limit: 3 requests per second. Verified via in-band `Max calls per sec rate limit reached (3/sec)` responses; the historical doc value of 5 was optimistic. |
-| `etherscan_funder_concurrency` | 4 | Concurrent per-wallet funder-discovery tasks (`PE_BOOTSTRAP_FUNDER_CONCURRENCY`). Rate is enforced by the token-bucket limiter (`etherscan_funder_rps`), not by concurrency, so both can be tuned independently. N=4 covers HTTP RTT variance and 429 backoff windows at the 3 req/s free-tier ceiling. |
-| `etherscan_funder_max_pages` | 100 | Safety cap on paginated cursor iterations per (wallet, contract) pair. Stops the page loop after 100 × 10,000 = 1,000,000 transfers; emits `warn!` if hit so hub-like wallets are visible in logs. Cursor pages are sequential (each query depends on the previous), so worst-case wall time per capped contract is ~33s at 3 req/s regardless of concurrency. Wallets exceeding 1M transfers (rare) get partial coverage. |
-| `etherscan_funder_max_backoff_secs` | 60 | Cap on retry backoff for transient Etherscan errors. |
-| `etherscan_funder_max_attempts` | 6 | Maximum retry attempts before failing the discovery hop. |
-| `etherscan_funder_http_timeout_secs` | 30 | Per-request HTTP timeout for Etherscan calls. |
+|---|---|---|
+| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (`pe_bootstrap::lock::CacheMutationLock`). Acquired by the Dune enumeration arm (`enumerate::run_enumerate`) to serialize cache mutations; stale-PID reclaim handles a crashed prior holder. |
+| `wallets.polymarket_contracts_seen` (column) | `i64`, default `0` | Legacy OR-merged V1/V2 CTF-exchange attribution bitmask. Its on-chain enumeration writer was removed in #326, so every wallet is now left `0`; the column persists for schema backward-compat. |
+| `wallet_enum_completed_contracts` / `wallet_enum_topic_hashes` / `wallet_enum_chunk_progress` (cursors) | `source_cursor` keys (`pe_bootstrap::migrate::CURSOR_WALLET_ENUM_*`) | Legacy on-chain enumeration progress. Written once by the `wallet_set.json` → SQLite migration (`migrate::auto_migrate_legacy`) and read by `migrate::load_enum_state` during Dune-arm setup for the full-enumeration short-circuit; no enumeration path writes them now. |
 
-### Wallet enumeration defaults
-
-Issue #186: wallet enumeration migrated off Etherscan REST (100k requests/day
-free-tier cap) onto an alloy [`Provider`] against an Alchemy-compatible RPC.
-Bisect-on-cap + HTTP 429 retry now live in
-`pe_source_onchain_polygon::eth_logs::eth_get_logs_bisect`; `wallet_enumeration`
-only orchestrates the `(contract, topic0, chunk)` loop and operator filtering.
-
-| Key | Default | Meaning |
-|---|---:|---|
-| `wallet_enum_scan_chunk_blocks` | 50_000 | Top-level `eth_getLogs` chunk size. Also the **persistence granularity** for `pe-bootstrap`: the bootstrap upserts after each chunk so a crash loses at most one chunk's worth of work. Tuned down from 500_000 → 50_000 on 2026-05-17 after observing V2-topic dense regions drive `eth_get_logs_bisect` to ~9 recursion levels and ~700 MB/5min RSS growth; 50k caps the bisect tree at ~6 levels and bounds peak memory to sub-GB per chunk. Exported as `pe_source_onchain_polygon::wallet_enumeration::SCAN_CHUNK_BLOCKS`. |
-| `wallet_enum_decode_retry` | (classifier in `eth_get_logs_bisect`) | Transient deserialization failures from alloy (`error decoding response body`, truncated streams, gateway 5xx served as HTML, EOF mid-parse) are treated as transient and retried with the same exponential backoff as rate-limit errors (1→2→4→…→32s, max 6 attempts). Observed in production 2026-05-17 during the Polymarket V2 dense-region sweep — without this widening a single Alchemy partial response fails the entire bootstrap and costs a ~12-min `refresh_trade_counts` replay on wrapper restart. |
-| `wallet_enum_transport_retry` | (classifier in `eth_get_logs_bisect`) | Transport-level transient failures (`connection reset`, `broken pipe`, `connection closed before message completed`, `operation timed out` / `request timeout`, `early eof`) are treated as transient and retried with the same exponential backoff profile (max 6 attempts). Issue #191 Item 1. **Critical**: bare `"timeout"` is EXCLUDED — it collides with Alchemy's `"Query timeout exceeded"` cap-hit error and would prevent the bisect-on-cap branch from firing. The narrower `"timed out"` is used instead (different conjugation; verified against the production Alchemy error). |
-| `wallet_enum_backfill_v1_attribution` | `pe-bootstrap --backfill-v1-attribution [config.toml] [--dry-run]` | One-shot operator subcommand (issue #191 Item 2) that clears the V1 topic from `enumerated_topic_hashes` and V1-keyed entries from `chunk_progress`, so the next normal `pe-bootstrap` run re-enumerates V1 and populates `polymarket_contracts_seen` bit 0 for legacy-ingested wallets (the 38,790 from `wallet_set.json` migration that were ingested before the column existed). Acquires `lock::CacheMutationLock` to refuse concurrent execution against an in-flight sweep. `--dry-run` previews what would be cleared without modifying. |
-| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (issue #191 Item 2) at `<cache_path>.lock`. Acquired by **both** enumeration arms in `lib.rs::run()` (OnChain since #192, Dune since #193 for symmetric mutex semantics) and by the `--backfill-v1-attribution` subcommand to serialize cursor-state mutations. Stale-PID reclaim handles the case where a previous holder crashed without dropping the lock. Module: `pe_bootstrap::lock`. |
-| `wallet_enum_from_block` | 33_605_403 | Earliest block to scan — approximate CTFExchange V1 deployment on Polygon. |
-| `wallet_enum_min_chunk` | 1 | `AlloyChainLogFetcher.min_chunk` for the bootstrap-owned enumerator. Floor at which `eth_get_logs_bisect` stops halving and propagates the underlying RPC error instead. **Behavioural shift from the legacy Etherscan path** (issue #186): the old path accepted-with-warn on a single-block cap hit and continued the sweep; the alloy path hard-fails the chunk and aborts the bootstrap. On a paid Alchemy tier this is the correct posture (errors are real, not cap-hits), but operators should know the sweep no longer absorbs single-block anomalies silently. |
-| `bootstrap_all_order_filled_topics` | `pe_source_onchain_polygon::contracts::ALL_ORDER_FILLED_TOPICS` | Canonical "what to scan" set used by every `OrderFilled` consumer (`polygon_ctf_delta::scan_active_wallets`, `wallet_enumeration::PolymarketTraderEnumeration`). Currently `[V1, V2]`. Hex values live in `contracts.rs` with self-validating keccak tests — the canonical source. Extending this array adds the new topic to every consumer automatically and triggers an additive re-sweep on the next bootstrap run (issue #179). |
-| `wallet_enum_contract_version_bit_v1` | 0b01 | `polymarket_contracts_seen` bit set on wallets discovered via `TOPIC_ORDER_FILLED_V1`. Hardcoded as `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_V1`. |
-| `wallet_enum_contract_version_bit_v2` | 0b10 | `polymarket_contracts_seen` bit set on wallets discovered via `TOPIC_ORDER_FILLED_V2`. Hardcoded as `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_V2`. |
-| `wallets.polymarket_contracts_seen` (column) | `i64`, default `0` | OR-merged bitmask of `CONTRACT_VERSION_BIT_V1` / `_V2` for every wallet, populated only on the on-chain enumeration path (Dune-CSV / trade-fetch / Dune-incremental upserts pass `0` and rely on the OR-merge to preserve any prior attribution). Used at go-live to route trades to the correct CTFExchange contract. |
-| `wallet_enum_completed_contracts` (cursor) | `"wallet_enum_completed_contracts"` | `source_cursor` table key holding JSON-encoded `Vec<String>` of lowercase-hex contract addresses fully enumerated. Issue #181. Equivalent to the now-deleted `WalletSetState.completed_contracts` field. |
-| `wallet_enum_topic_hashes` (cursor) | `"wallet_enum_topic_hashes"` | `source_cursor` table key holding JSON-encoded `Vec<String>` of B256-Display topic hashes (each prefixed `0x`) fully enumerated. Issue #181. Equivalent to the now-deleted `WalletSetState.enumerated_topic_hashes` field. |
-| `wallet_enum_chunk_progress` (cursor) | `"wallet_enum_chunk_progress"` | `source_cursor` table key holding a JSON-encoded `HashMap<String, u64>` keyed by `"{topic_hex}\|{contract_hex}"` mapping to the last block successfully scanned for that `(topic, contract)` pair. Mid-topic crash recovery resumes from `last_completed_chunk_to + 1` instead of `wallet_from_block`, saving up to ~168 redundant `eth_getLogs` calls per mid-topic crash on a 21M-block historical sweep. Issue #188. Missing key (pre-#188 deployed cache) is treated as "no chunks done" — backward-compat additive. |
-
-**Enumeration progress migration (issue #181).**
-The `wallet_set.json` checkpoint file is consolidated into the SQLite cache on
-first post-deploy run via `migrate::auto_migrate_legacy`. The progress fields
-(`completed_contracts`, `enumerated_topic_hashes`) move from the JSON file to
-two `source_cursor` rows (keys above). Wallet hexes move into the `wallets`
-table with `SRC_WALLET_SET_JSON` source bit. Then the JSON file is **deleted**.
-Subsequent runs read enumeration progress via `migrate::load_enum_state`,
-which returns `(vec![], vec![])` on missing keys (fresh install). The
-"legacy V1-done" detection (pre-#179 checkpoint had full
-`completed_contracts` + empty `enumerated_topic_hashes`) is preserved across
-the migration by `auto_migrate_legacy` synthesizing the V1-topic-done state
-when ingesting bare-array files, and by `lib.rs::run()`'s set-membership
-check over `ALL_EXCHANGE_CONTRACTS` for pre-#179 checkpoints.
-
-**Trade-fetch scope (issue #181).**
-After consolidation, `lib.rs::run()` reads the per-wallet trade-fetch list via
-`cache.wallets_with_source_bit(SRC_WALLET_SET_JSON)` — narrowly scoped to
-wallets discovered via Etherscan/Dune-SQL/legacy migration. Do NOT use
-`cache.all_pile_wallet_hexes()` (the full 2.7M-row pile including Dune CSV
-imports) for trade fetch — that path would explode the per-wallet Polymarket
-API call count by ~54×.
-
-### Operator graph
-
-| Key | Default | Meaning |
-|---|---:|---|
-| `funding_max_hops` | 3 | Hops along funding path before traversal stops. Surfaced in `ServiceConfig` so the value participates in the config-hash. |
-| `funder_root_min_confidence_ppm` | 850_000 | Minimum identity confidence (= 0.85) to attribute a funder root |
-| `cluster_min_size` | 1 | Minimum wallets in cluster |
-| `cluster_max_size` | 25 | Cluster sizes above this require manual review |
-| `seeding_velocity_warn_per_week` | 5 | New seeded wallets per week before flag |
-| `seeding_velocity_block_per_week` | 12 | Hard block threshold |
-| `cluster_membership_stability_window_d` | 30 | Window for membership-instability checks |
-| `cluster_membership_max_churn_pct` | 30 | % membership change above which cluster is "unstable" |
-| `family_concentration_warn_pct` | 60 | Single-`MarketFamily` % beyond which `MarketNarrowness` flag fires |
-| `onchain_block_lag_warn` | 8 | Polygon blocks of lag before degraded health |
-| `onchain_block_lag_block` | 25 | Polygon blocks of lag before inherited-prior + cluster modes are blocked |
-| `reorg_depth_block` | 12 | Reorg depth that invalidates pending events |
-
-### Fresh-wallet inherited-prior incubator
-
-| Key | Default | Meaning |
-|---|---:|---|
-| `fresh_wallet_max_closed_trades` | 2 | Wallet still counts as "fresh" if closed-trade count ≤ this |
-| `fresh_wallet_min_age_seconds` | 0 | Age lower bound (none) |
-| `fresh_wallet_max_age_seconds` | 1_209_600 | 14 days; older wallets are not "fresh" |
-| `inherited_prior_max_effective_n` | 12 | Cap on effective sample size after shrinkage |
-| `inherited_prior_min_position_usd` | 50 | Below this, signal is debounced (noise) |
-| `inherited_prior_max_position_usd_paper` | 5_000 | Above this in paper, treat as research alert only |
-
-### Cluster coordination
-
-| Key | Default | Meaning |
-|---|---:|---|
-| `cluster_coord_min_members_K` | 3 | Minimum coordinating wallets |
-| `cluster_coord_window_seconds_W` | 300 | Window during which coordinating entries count |
-| `cluster_coord_min_aggregate_usd` | 1_000 | Minimum aggregate notional across members |
-| `cluster_coord_dedup_window_seconds` | 600 | Debounce duplicate signals per `(operator,market,outcome,side)` |
-| `cluster_observation_window_secs` | 300 | How long `ClusterObservationTracker` retains entries; must be ≥ `cluster_coord_window_seconds_W` |
-| `operator_graph_rebuild_cadence_secs` | 60 | How often `OperatorGraphScheduler` calls `build_operator_identities`; controls operator-ID freshness |
+**Trade-fetch scope (issue #181).** The per-wallet trade-fetch list comes from
+`cache.wallets_with_source_bit(SRC_WALLET_SET_JSON)` — wallets discovered via
+Dune-SQL / legacy migration — not `cache.all_pile_wallet_hexes()` (the full
+multi-million-row pile including Dune CSV imports), which would explode the
+per-wallet Polymarket API call count.
 
 ### Trade classification
 
@@ -465,7 +382,6 @@ Written to `jsonl_log_path` (default: `./paper.jsonl`). One JSON object per line
 | `kind` | Extra fields | Description |
 |---|---|---|
 | `paper_fill` | `idempotency_key`, `market`, `side`, `contracts`, `fill_price` | A paper-mode simulated fill |
-| `polygon_event` | _(implicit in body)_ | Decoded on-chain Polygon event |
 
 ### Logging conventions (issue #184)
 
@@ -491,12 +407,12 @@ rename to `error = %message` or `text = %message` etc. The same applies to `%lev
 
 **Anti-pattern** (do not do this — values appear redundantly in message AND fields):
 ```rust
-tracing::info!(progress = n, total = total_pending, "funder discovery {}/{}", n, total_pending);
+tracing::info!(progress = n, total = total_pending, "wallet backfill {}/{}", n, total_pending);
 ```
 
 **Correct shape** (values are queryable fields; message is a static label):
 ```rust
-tracing::info!(progress = n, total = total_pending, "funder discovery progress");
+tracing::info!(progress = n, total = total_pending, "wallet backfill progress");
 ```
 
 ### Watchlist auto-fetcher (`WatchlistFetchConfig`)
@@ -511,7 +427,7 @@ tracing::info!(progress = n, total = total_pending, "funder discovery progress")
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `active_watchlist_size` | 50 | Top-N active leaders/operators |
+| `active_watchlist_size` | 50 | Top-N active leaders |
 | `incubator_watchlist_size` | 250 | Candidates under research |
 
 ### Ranker eligibility thresholds
@@ -534,7 +450,7 @@ Incubator tier:
 
 ### Idempotency
 
-`observed_at_bucket = floor(observed_at_ms / 1_000)` — 1-second buckets. The tuple `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` is the unique idempotency key. Two events with the same key are the same trade. Operator-aware idempotency adds `operator_id` for cluster-coordination signals.
+`observed_at_bucket = floor(observed_at_ms / 1_000)` — 1-second buckets. The tuple `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` is the unique idempotency key. Two events with the same key are the same trade.
 
 ### Approval mechanism
 
@@ -561,30 +477,16 @@ A leader/strategy promotes from one mode to the next only when ALL of:
 
 Live-tiny → promoted requires the same gates over a fresh 30-day window with live-tiny capital.
 
-The `inherited_prior_first_trade` and `cluster_coordination` modes use the same gate template but each maintains its own ladder. Promotion of one mode does not promote another.
-
 ### Demotion criteria
 
-A leader/operator is demoted (mode steps down: promoted → live-tiny → paper → off) when ANY of:
+A leader is demoted (mode steps down: promoted → live-tiny → paper → off) when ANY of:
 
 - live copied PnL underperforms simulation by ≥ 2 standard errors over a 14-day window;
 - p95 copy delay drifts > 1.5× the production budget for two consecutive hourly windows;
 - reconstruction quality drops by ≥ 20 points (out of 100);
 - profit concentration (max single-market %) increases above the eligibility threshold;
 - trader becomes inactive (no trades for ≥ 14 days);
-- copied exits become unreliable (≥ 3 missed/late exits in 30 d);
-- operator identity confidence falls below `funder_root_min_confidence_ppm`;
-- `BaitWalletSuspect`, `DilutionAttack`, `LaunderedFunder`, or `WashCluster` flag fires.
-
-### Anti-gaming flag thresholds
-
-| Flag | Concrete rule |
-|---|---|
-| `BaitWalletSuspect` | Operator seeded `> seeding_velocity_warn_per_week` wallets in any 7-day window AND one fresh wallet from that batch posts a position ≥ `inherited_prior_max_position_usd_paper` |
-| `DilutionAttack` | Cluster size grew by `> cluster_membership_max_churn_pct` in `cluster_membership_stability_window_d` AND new members have aggregate negative realized PnL OR each has < 5 closed trades |
-| `LaunderedFunder` | Funder root is < 7 days old AND its first inbound funding is from a CEX/bridge AND it fans out to ≥ 5 wallets within 72 h of funding |
-| `WashCluster` | ≥ 60 % of cluster member trades over a 30-day window match counterpart trades from another cluster member within 60 s, OR intra-cluster trade volume / total cluster volume > 0.40 |
-| `MarketNarrowness` | A single `MarketFamily` accounts for `> family_concentration_warn_pct` of the operator's audited PnL |
+- copied exits become unreliable (≥ 3 missed/late exits in 30 d).
 
 ### "Very liquid market" threshold (when market orders are permitted)
 
@@ -603,7 +505,6 @@ Otherwise the engine submits limit orders.
 | Polymarket market WS | 2 s | 6 s |
 | Kalshi market WS | 2 s | 6 s |
 | Polymarket Data API (poll) | 1.5× polling interval | 4× polling interval |
-| `source-onchain-polygon` | `onchain_block_lag_warn` blocks | `onchain_block_lag_block` blocks |
 | Resolver source (NWS final, BLS release, etc.) | per-source SLA in `12-SOURCE-CATALOG.md` | per-source |
 
 ### Backtest-vs-paper "close behavior" definition
@@ -637,17 +538,14 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_polymarket_concurrency` | 16 | Concurrent per-wallet trade fetches against the Polymarket Data API; the `ReqwestFetcher` rate-limit gate caps aggregate throughput at ≤ 20 req/s regardless. Set via `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY`. |
 | `bootstrap_polymarket_wallet_timeout_secs` | 300 | Per-wallet wall-clock budget (seconds) for `pe-bootstrap backfill` / `run`'s Polymarket fetch loop (issue #173). `0` disables the timeout; positive values wrap each `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets that trip the budget are soft-failed (added to `FetchOutcome::failed`); the post-fetch pipeline still runs and `last_polymarket_fetch_at` remains NULL so the next backfill re-queues them. Set via `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS`. |
 | `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |
-| `bootstrap_wallet_source` | `"etherscan"` | Wallet discovery backend (`"etherscan"` or `"dune"`); set via `PE_WALLET_SOURCE` |
-| `bootstrap_wallet_from_block` | `CTF_EXCHANGE_V1_DEPLOY_BLOCK` (33_605_403) | Start block for Etherscan wallet scan; set via `PE_WALLET_FROM_BLOCK` |
-| `bootstrap_wallet_to_block` | current chain head | End block for Etherscan wallet scan; set via `PE_WALLET_TO_BLOCK` (fetched from Etherscan if absent) |
-| `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to the enumerated wallet address list. If the file exists, Etherscan/Dune enumeration is skipped entirely. Delete the file to force a fresh scan; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
+| `bootstrap_wallet_source` | `"dune"` | Wallet discovery backend. `"dune"` is the only live backend; `"onchain"` / `"etherscan"` are accepted as deprecated aliases (#326). Set via `PE_WALLET_SOURCE`. |
+| `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to the enumerated wallet address list. If the file exists, Dune enumeration is skipped entirely. Delete the file to force a fresh scan; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
 | `bootstrap_seed_as_of_dates` | unset | Comma-separated `YYYY-MM-DD` UTC dates. When set, `pe-bootstrap` switches to historical-seed mode: runs the parameterized Dune query for each date and inserts the results into `leaderboard_snapshots`. Idempotent on `(snapshot_at_unix, wallet_hex)`. Mutually exclusive with the regular pipeline. Set via `PE_SEED_AS_OF_DATES`. |
 | `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` fetches resolution data from the Polymarket Gamma API after the trade-fetch phase and stores it in `market_resolutions`. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
 | `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs. Stage 6a (Polygon RPC, if configured) and 6b (Dune) then re-populate those markets with block-timestamp `resolved_at_unix` values via `INSERT OR IGNORE`. Idempotent — safe to set on every run; once all rows are precision-sourced subsequent runs delete 0 rows and skip the re-fetch. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
-| `bootstrap_fetch_funder_graph` | `false` | When `true`, `pe-bootstrap` queries Etherscan for funder edges for every wallet not yet in `funder_lookup_done` and persists them in `funder_edges`. Per-wallet atomic commit enables resume after failure. One-time ~4–5 h for ~23k wallets (concurrent N=4, token-bucket 3 req/s); all subsequent runs are near-instant. Requires `PE_ETHERSCAN_API_KEY`. Set `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1` to enable. |
-| `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (funder graph, resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
+| `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
 | `infra_probe_span_secs` | `3600` | Maximum span (newest − oldest, seconds) across the first 500 trades of a cold-start wallet for it to be classified as infrastructure (issue #197). 500 trades in < 1 h ⇒ > 8 trades/min ⇒ market-maker / treasury / arbitrage bot. Below threshold: wallet is flagged `is_infra = 1`, the probe page is discarded, and downstream consumers skip via the `active_tradeable_wallets` view. The same threshold drives the `pe-bootstrap classify-infra` retroactive sweep over already-cached trades. Override via `PE_BOOTSTRAP_INFRA_SPAN_SECS`; canonical const lives in `pe_bootstrap::infra_probe::DEFAULT_INFRA_SPAN_SECS`. |
-| `bootstrap_write_snapshot` | `false` | When `true`, the main `pe-bootstrap` pipeline persists a `(snapshot_at_unix, wallet)` row-set to `leaderboard_snapshots` at run time, stamped with the current `snapshot_at`. Default `false` keeps ad-hoc bootstrap runs (resolutions watchdog retries, funder-graph reruns, dev shells) from polluting the snapshot timeline with near-duplicate intra-day rows — only the official weekly refresh path should opt in. Historical seeding via `PE_SEED_AS_OF_DATES` is independent of this flag and always writes its target rows. Set `PE_BOOTSTRAP_WRITE_SNAPSHOT=1` to enable. |
+| `bootstrap_write_snapshot` | `false` | When `true`, the main `pe-bootstrap` pipeline persists a `(snapshot_at_unix, wallet)` row-set to `leaderboard_snapshots` at run time, stamped with the current `snapshot_at`. Default `false` keeps ad-hoc bootstrap runs (resolutions watchdog retries, dev shells) from polluting the snapshot timeline with near-duplicate intra-day rows — only the official weekly refresh path should opt in. Historical seeding via `PE_SEED_AS_OF_DATES` is independent of this flag and always writes its target rows. Set `PE_BOOTSTRAP_WRITE_SNAPSHOT=1` to enable. |
 | `bootstrap_gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API. Override via `PE_GAMMA_BASE_URL` (useful for testing against a stub). |
 | `bootstrap_gamma_min_interval_ms` | 50 | Minimum milliseconds between Gamma API requests (20 req/s). Live-tested ceiling is ≥ 27 req/s; 50 ms keeps ~25% margin. Enforced globally by `ReqwestFetcher`'s shared mutex regardless of caller concurrency. |
 | `bootstrap_gamma_concurrency` | 10 | Number of in-flight Gamma requests issued concurrently per fetch loop (`buffer_unordered`). With ~300 ms per-request RTT, ~6 in-flight saturates the 20 req/s rate limit; 10 leaves headroom for latency spikes. The global rate cap is still enforced by `bootstrap_gamma_min_interval_ms`. |
@@ -661,20 +559,8 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / Radion / 502-gap) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
 | `bootstrap_discovery_lookback_days` | 2 | Cold-start lookback (days) for `pe-bootstrap discovery` when the `source_cursor.dune_discovery_last_run` row is absent. Matches the 48h timer interval so warm restarts pick up where the previous run left off via the cursor. Set via `PE_BOOTSTRAP_DISCOVERY_LOOKBACK_DAYS`. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. Initial deployment runs with `0` to drain the bulk catch-up queue; steady-state daily timers may set a positive value if daily run time grows unmanageable. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
-| `bootstrap_weekly_limit` | 200 | Per-run cap on `pe-bootstrap weekly`. `0` removes the cap. Weekly funder refresh runs against Etherscan; the cap throttles API budget on the Sunday timer. Set via `PE_BOOTSTRAP_WEEKLY_LIMIT`. |
-| `bootstrap_funder_limit` | 200 | Per-run cap on the one-shot `pe-bootstrap funder` lookup (issue #201). Mirrors `bootstrap_weekly_limit` (the Etherscan-budget-throttle precedent), NOT `bootstrap_backfill_limit`'s `0`: the funder hits Etherscan, so a bounded default keeps the one-shot short and avoids the ~15h full-backlog surprise. `0` = no limit (explicit opt-in for a full run). The funder candidate set is scoped to `active_tradeable_wallets` (is_active=1 AND is_infra=0). Set via `PE_BOOTSTRAP_FUNDER_LIMIT`. |
-| `bootstrap_funder_rate_limit_rps` | 3 | Etherscan request-rate cap (req/s) for funder discovery (issue #201). `3` = free-tier budget. Raise on a paid Etherscan tier to shorten a large funder backlog (at 3 req/s a full ~164k-wallet active backlog is ~15h). `0` or out-of-range falls back to 3. Set via `PE_BOOTSTRAP_FUNDER_RATE_LIMIT_RPS`. |
-| `bootstrap_funder_topic_batch_size` | 1_000 | Wallets per `topic[2]` filter in the batched `eth_getLogs` funder backend (issue #203 — the bulk-path counterpart to the Etherscan funder). Larger batches mean fewer block-range passes but bigger request payloads; Alchemy caps topic-array size, so validate before raising. Total scan cost ≈ `block_pages × ceil(pending / batch_size)`. Set via `PE_BOOTSTRAP_FUNDER_TOPIC_BATCH_SIZE`. |
-| `bootstrap_funder_block_chunk` | 10_000 | Block-range chunk size for the batched `eth_getLogs` funder scan (issue #203). Independent of `bootstrap_polygon_ctf_chunk_blocks` (a separate scan); the bisect-on-cap fallback subdivides dense ranges that exceed the provider response-size cap. Set via `PE_BOOTSTRAP_FUNDER_BLOCK_CHUNK`. |
 | `bootstrap_known_wallets_dune_table` | `"apexurellc.known_wallets"` | Dune user table (under `dune_namespace`) where `pe-bootstrap discovery` uploads the current pile for the anti-join. Replaced on every run (DELETE → CREATE → INSERT). Set via `PE_BOOTSTRAP_KNOWN_WALLETS_DUNE_TABLE`. |
 | `bootstrap_backfill_staleness_secs` | 86_400 (1 day) | Per-wallet staleness window for `pe-bootstrap backfill` (issue #166). A wallet is eligible for re-fetch when `last_polymarket_fetch_at IS NULL OR < now - 86_400`. Hardcoded as `pe_bootstrap::pile::BACKFILL_STALENESS_SECS`; matches the daily systemd timer cadence. |
-| `bootstrap_weekly_staleness_secs` | 604_800 (7 days) | Per-wallet staleness window for `pe-bootstrap weekly` (issue #166). A wallet is eligible for funder re-fetch when `last_funder_fetch_at IS NULL OR < now - 604_800`. Hardcoded as `pe_bootstrap::pile::WEEKLY_STALENESS_SECS`; matches the Sunday systemd timer cadence. |
-| `bootstrap_funder_fallback_to_block` | 200_000_000 | Fallback upper-bound Polygon block for `pe-bootstrap weekly` when Etherscan's `eth_blockNumber` is unavailable (issue #166). Set well above the chain head as of 2026-05; advance manually if Polygon catches up. Hardcoded as `pe_bootstrap::weekly::FALLBACK_TO_BLOCK`. |
-| `bootstrap_polymarket_delta_mode` | `"shadow"` | Delta-backfill mode for `pe-bootstrap backfill` (issue #176). `"off"` = legacy fetch-all-due. `"shadow"` (default) = run on-chain CTF `OrderFilled` scan + legacy full fetch on every run; classifications written to `delta_audit` table. `"delta"` = use the scan to filter the fetch set; weekly paranoia backstops. Set via `PE_BOOTSTRAP_POLYMARKET_DELTA_MODE`. |
-| `bootstrap_polygon_ctf_confirmations` | 256 | Polygon confirmation depth (blocks ≈ 8.5 min at 2 s blocktime) the delta scanner subtracts from chain head to derive `to_block` (issue #176). Covers worst-case observed reorg depth. Set via `PE_BOOTSTRAP_POLYGON_CTF_CONFIRMATIONS`. |
-| `bootstrap_polymarket_full_fetch_staleness_secs` | 604_800 (7 days) | Paranoia staleness window for the weekly full-fetch backstop in delta mode (issue #176). Wallets whose `last_polymarket_full_at` is NULL or older than this many seconds are auto-unioned into the fetch set regardless of the on-chain scan result — bounds worst-case staleness if the scanner ever misses a wallet. Set via `PE_BOOTSTRAP_POLYMARKET_FULL_FETCH_STALENESS_SECS`. |
-| `bootstrap_delta_cold_start_lookback_blocks` | 43_200 | Cold-start lookback (Polygon blocks ≈ 24 h at 2 s blocktime) used by `polygon_ctf_delta::scan_active_wallets` when no `polygon_ctf_backfill_last_block` cursor is present in `source_cursor` (issue #176). Keeps the first delta-scan run from walking the entire chain history. Hardcoded as `pe_bootstrap::polygon_ctf_delta::COLD_START_LOOKBACK_BLOCKS`. |
-| `bootstrap_delta_rate_limit_max_backoff_secs` | 32 | Maximum per-attempt backoff (seconds) for `eth_get_logs_bisect`'s rate-limit retry loop (issue #176 follow-up). Exponential backoff `1 → 2 → 4 → 8 → 16 → 32` s; once the next backoff would exceed this cap, the retry loop exits and the error propagates so `backfill::run_backfill` can fall back to legacy fetch. Mirrors the pattern in `funder_discovery::EthGetLogsLookup` but bounded (the bisect helper is single-shot per call frame, not a BFS). Hardcoded as `pe_source_onchain_polygon::eth_logs::RATE_LIMIT_MAX_BACKOFF_SECS`. |
 | `bootstrap_leaderboard_request_interval_ms` | 500 | Minimum milliseconds between Polymarket leaderboard API requests during `pe-bootstrap winner-discovery` (issue #324). Applied per-fetch via `ReqwestFetcher::with_min_interval_ms`. Set via `PE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS`. |
 | `bootstrap_leaderboard_top_n` | 500 | Maximum wallets fetched per leaderboard slice during `pe-bootstrap winner-discovery` (issue #324). Four slices are always fetched: profit×monthly, profit×allTime, volume×monthly, volume×allTime. Set via `PE_BOOTSTRAP_LEADERBOARD_TOP_N`. |
 | `bootstrap_radion_request_interval_ms` | 500 | Minimum milliseconds between Radion REST API requests during `pe-bootstrap winner-discovery` (issue #324). Stub only until the Radion REST contract is finalised; ignored when `radion_api_url` is unset. Set via `PE_BOOTSTRAP_RADION_REQUEST_INTERVAL_MS`. |
@@ -682,7 +568,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 #### Wallet pile (`wallets` table, issue #166)
 
 Canonical wallet identity store maintained by the `migrate` / `discovery` /
-`backfill` / `weekly` subcommands. `wallet_hex` form is `"0x" + 40 lowercase
+`backfill` subcommands. `wallet_hex` form is `"0x" + 40 lowercase
 hex chars` (matches `WalletAddress::Display` in `crates/core-types`).
 
 `source_bits` masks (defined in `crates/bootstrap/src/pile.rs`):
@@ -730,7 +616,7 @@ CREATE TABLE leaderboard_snapshots (
 
 **Look-ahead invariant.** The Dune wallet-discovery SQL is parameterized with an `as_of` cutoff that fences three forward-looking surfaces: the `resolved` CTE (resolutions before `as_of` only), the `recently_active` CTE (trades in `[as_of - active_window, as_of)`), and the `wallet_condition` join (trades before `as_of` only). Without all three, a snapshot taken "as of" a past date would still leak future market outcomes through the win-rate computation. Verified by `tests::rendered_sql_fences_all_three_forward_surfaces` and `tests::rendered_sql_contains_no_now_call` in `crates/bootstrap/src/dune.rs`.
 
-**Backtest semantics.** At each simulated day `D`, the simulation looks up the most-recent snapshot ≤ `D` and filters reconstructed `TraderLedger`s to that wallet set BEFORE the ranker groups by operator. Strict (wallet-level) filter: even if wallet `X` shares an `operator_id` with `Y, Z` that are in the snapshot, `X`'s ledger does not contribute to the operator group's score because we wouldn't have known about `X` that week. When the table is empty the simulation falls back to "all wallets in trade history" with a single warning at start (legacy behavior; survivorship-biased).
+**Backtest semantics.** At each simulated day `D`, the simulation looks up the most-recent snapshot ≤ `D` and filters reconstructed `TraderLedger`s to that wallet set before the ranker scores them. The filter is wallet-level: a wallet absent from the snapshot that week does not contribute to any score because we wouldn't have known about it then. When the table is empty the simulation falls back to "all wallets in trade history" with a single warning at start (legacy behavior; survivorship-biased).
 
 ### Backtest defaults (`pe-backtest`)
 
@@ -759,7 +645,6 @@ CREATE TABLE leaderboard_snapshots (
 | `backtest_suppression_warn_threshold_pct` | 30 | Single warn threshold shared by every per-quarter BUY-signal suppression diagnostic (`expiry_filter_suppression_pct`, `high_price_suppression_pct`, …). Logged as a warning when any quarter exceeds it. Hardcoded as `SUPPRESSION_WARN_THRESHOLD` in `crates/backtest/src/simulation.rs`. |
 | `backtest_require_known_expiry_default` | `true` | Strict-mode flag for the `max_hours_to_expiry` filter. `true` (default after #137 Sub-PR 3, gated on PR #154 stage 6f raising trade-set schedule coverage to 99.64%) — when both schedule and resolution are absent for a market, the BUY signal fails closed (suppressed). `false` (rollback / legacy) — both-absent allows the trade through. The fallback chain (schedule → resolution → flag) was unified in PR #139; pre-#139 the NULL-schedule path short-circuited to allow regardless of resolution. Set via `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY`. |
 | `backtest_max_positions_per_market_default` | `Some(1)` | Cap on concurrent open positions per `market_id` (issue #138). `None` disables the cap entirely. `Some(n)` blocks new BUY signals on any market that already has ≥ `n` open positions across every leader and outcome — leader A on outcome 0 and leader B on outcome 1 of the same binary market count against the same slot. Slot reopens when positions close via SELL or resolution sweep. `NonZeroU32` rejects `0` at deserialize-time so `PE_BACKTEST_MAX_POSITIONS_PER_MARKET=0` is an explicit error. Set via `PE_BACKTEST_MAX_POSITIONS_PER_MARKET`. |
-| `backtest_skip_unknown_operator_default` | `true` | Suppress BUY signals from watchlisted leaders whose `op_identity` is unresolved in the funder graph (issue #141). Discriminator is `op_identity.is_none()` — fires uniformly when the funder-edge cache is empty/stale (the "no Etherscan data" production case) and for any individual wallet that the clustering does not attach to an operator. Production-correct by default; scenarios that don't supply funder edges opt out via `skip_unknown_operator: false`. Suppression rate is reported as `unknown_operator_suppression_pct` (and per-quarter breakdown). Set via `PE_BACKTEST_SKIP_UNKNOWN_OPERATOR`. |
 | `backtest_max_signal_price_default` | `Some(0.85)` | Upper-bound cap on slippage-adjusted `fill_price` for BUY copies (issue #142). `None` disables the cap. `Some(cap)` skips any BUY where `fill_price >= cap` — comparison is `>=` (not `>`), so a fill at exactly `cap` is suppressed; strictly conservative. Gates on `fill_price = signal_price × (1 + slippage_rate)` rather than the leader's signal price so a 0.849 + 1% slippage = 0.857 cannot squeak past. High-price contracts have catastrophic payoff geometry (100 bps slippage on a $0.99 contract burns nearly all upside; binary $0/$1 payoff means any miss is total loss). A3 analysis showed +$20.60 oracle lift in-sample at this threshold. Set via `PE_BACKTEST_MAX_SIGNAL_PRICE`. |
 | `backtest_max_trade_count_default` | `25_000_000` | Pre-flight guard against loading the full production cache (~269M trades) into RAM. `pe-backtest` counts trades before calling `all_trades()` and refuses with a clear error if the cache exceeds this limit, directing users to `pe-skill-select` for full-cohort work. `0` disables the guard. Set via `PE_BACKTEST_MAX_TRADE_COUNT` (issue #241). |
 
@@ -793,7 +678,7 @@ Config for the skill-based wallet-selection pipeline (issue #212; epic #209). Lo
 | **`position_sizing_cv_bps`** | `int(min(std / mean, 10) × 10_000)`, saturating at 100 000 | Sample coefficient of variation (ddof=1) of per-buy position size (`entry_price × contracts`) over buy-side closed trades in the train window, in basis points. Measures position-sizing consistency: a low CV wallet sizes bets predictably; a high CV wallet has erratic sizing (which may be informative of either opportunism or noise). Uses only `Side::Buy` closed trades; `0` when fewer than 2 buy-side trades exist or when the mean size is zero. Capped at 10× (= 100 000 bps) to prevent extreme outliers from dominating GBM splits. Computed from the `windowed` `ClosedTrade` slice (no `raw_trades` needed). SQLite column: `INTEGER NOT NULL DEFAULT 0` (migration-safe). Consumer: `scripts/monthly_rerank_gbm.py` `FEATURE_COLS` + SELECT; composite-ranker integration deferred per tracker #248 GBM-only consumer strategy. |
 | `skill_export_watchlist_input_path` | `""` (empty) | Path to the `.txt` watchlist consumed by `pe-skill-select export-watchlist`. One `0x`-prefixed hex address per line; lines starting with `#` and blank lines are skipped. Set via `PE_SKILL_EXPORT_WATCHLIST_INPUT_PATH`. An empty default causes an `Io` error on read (safe sentinel — the subcommand is explicit-invocation-only). |
 | `skill_export_watchlist_output_path` | `""` (empty) | Output path for the `pe_trader_index::Watchlist` JSON file produced by `pe-skill-select export-watchlist`. Written atomically (tmp + rename, matching bootstrap `watchlist_phase.rs:202` precedent). Set via `PE_SKILL_EXPORT_WATCHLIST_OUTPUT_PATH`. |
-| **export-watchlist output schema** | `pe_trader_index::Watchlist` JSON | Schema written by `pe-skill-select export-watchlist`. Top-level fields: `entries` (array of `WatchlistEntry`), `snapshot_at` (RFC3339, set to `cutoff_unix`), `active_count` (= `entries.len()`), `incubator_count` (= 0). Each `WatchlistEntry`: `wallet` (20-byte hex), `operator_id` (null — deferred to operator-graph phase), `tier` (`Active`), `leader_score_bps` (= `lcb_5pct_bps` from `wallet_features`), `lcb_5pct_bps` (same), `win_rate_bps`, `closed_trades_in_window` (= all-time `closed_trades` — closest available proxy for the eligibility-window count), `reconstruction_quality`. Entries are sorted descending by `leader_score_bps`. Consumed by `pe-service` via `seed_watchlist_path` config key. |
+| **export-watchlist output schema** | `pe_trader_index::Watchlist` JSON | Schema written by `pe-skill-select export-watchlist`. Top-level fields: `entries` (array of `WatchlistEntry`), `snapshot_at` (RFC3339, set to `cutoff_unix`), `active_count` (= `entries.len()`), `incubator_count` (= 0). Each `WatchlistEntry`: `wallet` (20-byte hex), `tier` (`Active`), `leader_score_bps` (= `lcb_5pct_bps` from `wallet_features`), `lcb_5pct_bps` (same), `win_rate_bps`, `closed_trades_in_window` (= all-time `closed_trades` — closest available proxy for the eligibility-window count), `reconstruction_quality`. Entries are sorted descending by `leader_score_bps`. Consumed by `pe-service` via `seed_watchlist_path` config key. |
 | **`first_mover_percentile_bps`** | `median over the wallet's (market_id, outcome_id) positions of: 10_000 if singleton, else 10_000 − round(count_ahead / (total − 1) × 10_000)`, clamped `[0, 10_000]` | First-mover signal (#248 §3). For each buy-side position by the wallet (`side='buy'` AND `timestamp_unix ≤ cutoff_unix`), the wallet's first-buy timestamp is ranked against every other wallet's first-buy timestamp on the same `(market_id, outcome_id)`. The cross-wallet rank index is built once per `run_extract` invocation via `WalletCache::load_first_mover_rank_index(cutoff_unix)` (a single `GROUP BY market_id, outcome_id, wallet_hex` SQL scan covered by `idx_trades_buy_market_outcome_wallet_ts`) and `Arc`-shared across rayon workers. **Direction**: high bps = first-mover = good (the raw count_ahead/total ratio is inverted so the `0` sentinel stays on the bad-direction side, matching `hold_to_resolution_rate_bps` / `longshot_bias_ratio_bps` precedent). **Tie-breaking**: `partition_point` uses strict `<`, so wallets sharing a `first_buy_ts` all get the same `count_ahead`. **Singleton fallback**: a group with `total == 1` returns `10_000` (sole-participant convention). **Median**: mean-of-middle-two for even-sized position sets; middle element for odd. **Sentinel**: `0` when the wallet has no qualifying buys. SQLite column: `INTEGER NOT NULL DEFAULT 0` (migration-safe). Consumer: `scripts/monthly_rerank_gbm.py` `FEATURE_COLS` + SELECT; composite-ranker integration deferred per tracker #248 GBM-only consumer strategy. |
 | **Candidate-features resolution-coverage bias** | resolved-markets-only for group A/D | The per-bet quality features (`ev_mean_bps`, `ev_tstat_bps`, `bb_shrunk_edge_bps`, `kelly_log_growth_bps`, `brier_score_bps`, `brier_resolution_bps`) and the capital-velocity feature (`median_first_entry_to_resolution_secs`) are computed over **closed trades whose market has a resolution row** — unresolved-market trades are excluded from those statistics (mirroring `forward.rs`). Sample-size fields (`closed_trades`, `distinct_markets`, `distinct_events`) and concentration (group F) are unchanged. This biases the per-bet estimates toward markets that have actually settled, which is the right empirical object for "did this wallet earn edge on resolved bets" but slightly under-represents long-tail unsettled positions. |
 | **Forward-test fee posture** | gross-of-fees (v1) | The forward test reports PnL **gross of taker fees** (`ForwardReport::gross_of_fees == true`). The April-2026 holdout is entirely post-fee (Polymarket fees since 2026-03-30, Akey et al. SSRN 6443103); the headline overstates net edge by ≈ the taker fee. Netting awaits a per-market `takerBaseFee` backfill (not yet in the cache). |
@@ -838,7 +723,7 @@ Measurement-only shadow harness for BTC up/down latency-arb (issue #297, Strateg
 | `crypto_shadow_clob_read_idle_limit_secs` | 120 | CLOB read-idle reconnect deadline (issue #317): if no inbound frame arrives for this long the socket is treated as half-open and the task reconnects + resubscribes. The actual half-open-peer detector (a heartbeat *send* into a vanished-but-not-RST socket succeeds for ~minutes); 12× the heartbeat cadence, so a healthy connection never trips it while bounding `max_clob_gap_secs` under the 300s gate. |
 | `crypto_shadow_market_refresh_interval_secs` | 60 | Period for re-enumerating open BTC markets from Gamma during a `run`. |
 | `crypto_shadow_max_open_markets` | 64 | Cap on simultaneously tracked markets per run. |
-| `crypto_shadow_ws_max_backoff_secs` | 60 | Exponential-backoff cap for WS reconnect (mirrors `MAX_BACKOFF_SECS` in `source-onchain-polygon/src/live.rs`). |
+| `crypto_shadow_ws_max_backoff_secs` | 60 | Exponential-backoff cap for WS reconnect. |
 | `crypto_shadow_rtt_probe_pings` | 5 | TCP-connect samples per endpoint for the startup vantage RTT probe; p50 stamped into `meta` so the measured edge carries the location it was taken from. |
 | `crypto_shadow_gamma_base_url` | `https://gamma-api.polymarket.com` | Gamma API root for market enumeration. |
 | `crypto_shadow_chainlink_ws_url` | `wss://ws-live-data.polymarket.com` | RTDS feed root for the Chainlink **settlement** value (`btc/usd`). Subscribe topic is `crypto_prices` + `type:update` + symbol under stringified `filters` (issue #300 fix 3); the live `btc/usd` source needs a sponsored Chainlink key (`crypto_shadow_chainlink_api_key`, deferred — AC2.3). Captured to `raw_ticks`; does not drive observations. |

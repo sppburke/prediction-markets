@@ -55,11 +55,11 @@ Marked ⛔ where the feature is the bottleneck for the next "real" result.
 | **E. Executability/capacity** | % first-entries in markets above depth floor | ❌ | Deferred (PR 5 — needs liquidity snapshots at entry) |
 | | Avg entry-time liquidity | ❌ | Deferred (PR 5) |
 | **F. Concentration** | HHI of profit shares, N_eff, RPC | ❌ | **PR 1** |
-| **G. Anti-gaming gates** | Intra-cluster wash (Sirolly Algorithm 1) | ❌ | PR 2 (depends on #207 counterparty-edges scan) |
-| | Sybil fan-out (operator ≥5 children) | ❌ | PR 2 (needs funder graph + operator pooling) |
+| **G. Anti-gaming gates** | Intra-cluster wash (Sirolly Algorithm 1) | ❌ | PR 2 — BLOCKED by #326 (`counterparty_edges` dropped) |
+| | Sybil fan-out (≥5 funded children) | ❌ | PR 2 — BLOCKED by #326 (funder graph removed) |
 | | Infra/MM exclusion (richer than current heuristic) | partial (`infra` flag in cache) | PR 2 (needs `wallet_fill_roles` from #207 slice 3) |
 | | Round-number / Benford anomaly | ❌ | Deferred (weak secondary) |
-| **H. Operator-level pooling** | Rank at operator level when funder-graph confident | ❌ | PR 3 (composite stage) |
+| **H. Operator-level pooling** | Rank at operator level when funder-graph confident | ❌ | PR 3 — BLOCKED by #326 (funder/operator graph removed) |
 
 **PR 1 covers all the additive per-bet/concentration features that need no new tables, no new external data, no counterparty-edge dependency, and no fee data.** Those become bricks the Stage-2 composite (PR 3+) consumes.
 
@@ -144,7 +144,7 @@ No new tables, no new external API calls, no fee-data dependency, no #207 depend
 - Sirolly wash / Sybil / richer MM exclusion (needs #207 scan complete + slice 3).
 - The Stage-2 weighted composite (PR 4).
 - PSR / MinTRL / true DSR replacement (PR 3).
-- Operator-level pooling (PR 3).
+- Operator-level pooling (PR 3) — BLOCKED by #326 (funder/operator graph removed).
 - Liquidity / depth executability features (PR 5).
 - ~~Rayon parallelism for `extract`~~ (landed separately — see `extract.rs` module docs and `skill_extract_threads` in `_GLOSSARY.md`).
 
@@ -154,15 +154,15 @@ No new tables, no new external API calls, no fee-data dependency, no #207 depend
 
 **Depends on:** counterparty-edges scan complete (#207) + slice 3 (`wallet_fill_roles`).
 
-Wash gate: Sirolly Algorithm 1 on the counterparty adjacency `b_ij` from `counterparty_edges`. Initial score = closure propensity. ~12 iterations to tol 1e-5. Flag trades with `min(x_i, x_j) ≥ θ=0.9`. Persist a per-wallet `wash_score_bps` + a boolean `wash_excluded` gate. Add a config knob `wash_theta_bps = 9000`.
+Wash gate (BLOCKED — #326 dropped `counterparty_edges`; needs a replacement counterparty data source): Sirolly Algorithm 1 on the counterparty adjacency `b_ij` from `counterparty_edges`. Initial score = closure propensity. ~12 iterations to tol 1e-5. Flag trades with `min(x_i, x_j) ≥ θ=0.9`. Persist a per-wallet `wash_score_bps` + a boolean `wash_excluded` gate. Add a config knob `wash_theta_bps = 9000`.
 
-Sybil fan-out: query `funder_edges` for any wallet with ≥5 funded children whose first-entries cluster within a configurable window. Persist `sybil_fanout_n` + a boolean `sybil_excluded` gate.
+Sybil fan-out (BLOCKED — #326 dropped `funder_edges`): query `funder_edges` for any wallet with ≥5 funded children whose first-entries cluster within a configurable window. Persist `sybil_fanout_n` + a boolean `sybil_excluded` gate.
 
 MM exclusion: replace the current `infra` heuristic with a maker-share threshold derived from `wallet_fill_roles` (e.g. maker_share > 0.7 over ≥20 fills → excluded). Persist `maker_share_bps`.
 
 ### PR 3 — Replace DSR heuristic with PSR + MinTRL + true DSR
 
-Drop the `√(2 ln m)` heuristic haircut; implement Bailey & LdP 2012 (PSR + MinTRL) and 2014 (DSR with the false-strategy threshold `SR₀=√V·[(1−γ)Φ⁻¹(1−1/N)+γΦ⁻¹(1−1/Ne)]`). Selection still BHq-FDR-gated. Optional: rank at operator level when funder-graph confidence > threshold (operator-pooling option from #205 §H).
+Drop the `√(2 ln m)` heuristic haircut; implement Bailey & LdP 2012 (PSR + MinTRL) and 2014 (DSR with the false-strategy threshold `SR₀=√V·[(1−γ)Φ⁻¹(1−1/N)+γΦ⁻¹(1−1/Ne)]`). Selection still BHq-FDR-gated. Optional (BLOCKED by #326 — funder/operator graph removed): rank at operator level when funder-graph confidence > threshold (operator-pooling option from #205 §H).
 
 This is also where the existing **`deflated_sharpe_bps` scaling bug** (memory: "top = 1,779,231 ≈ DSR 178 if ÷10⁴, suspected scaling bug in `selection.rs`") gets fixed for real.
 
@@ -198,7 +198,7 @@ Recorded after the 2026-05-25 plan-review of #205 against the live tree. These i
 
 ### 6.2 Should-fix drift
 
-3. **Wash-cluster exclusion not yet in the Stage-1 cohort.** `pe-skill-select::extract.rs` does NOT filter the cohort by `wash_score`. The clustering machinery exists at `crates/operator-graph/src/clustering.rs:48` (`wash_cluster_match_threshold_pct = 60`), but no wash-exclusion wire reaches skill-select. **Resolution:** PR 2 of this doc (Sirolly Algorithm 1 + `wash_excluded` gate) — itself gated on the #207 counterparty-edges scan completion (currently disk-blocked at 87.6%; resumes when disk frees up). V1 evaluations DO NOT enforce wash exclusion; this is a known statistical-power leak in the current ranking.
+3. **Wash-cluster exclusion not yet in the Stage-1 cohort.** `pe-skill-select::extract.rs` does NOT filter the cohort by `wash_score`. The operator-graph clustering machinery that once backed this was removed in #326 (along with the `counterparty_edges` table), so the wash-exclusion path now has no data source. **Resolution:** PR 2 of this doc (Sirolly Algorithm 1 + `wash_excluded` gate) is blocked until a replacement counterparty data source exists. V1 evaluations DO NOT enforce wash exclusion; this is a known statistical-power leak in the current ranking.
 
 4. **`pe-backtest` OOM is dead-path, now guarded.** #205 says "pe-backtest OOM dissolved by two-phase offline-score → load-only-top-N." T1 confirms `pe-skill-select` implements the two-phase design (wallet-at-a-time streaming, never holds 269M trades). The `all_trades()` call in `main.rs` is still present for simulation use, but PR #271 (issue #241) added a pre-flight `COUNT(*)` guard (`max_trade_count = 25M` default, configurable via `PE_BACKTEST_MAX_TRADE_COUNT`) that refuses with a clear error before loading. **Resolution:** PR #271 / `backtest_max_trade_count_default` — direct `pe-backtest` runs against the production cache now fail cleanly rather than OOM-killing.
 

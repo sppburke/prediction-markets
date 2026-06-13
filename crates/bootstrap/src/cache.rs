@@ -37,9 +37,9 @@ use crate::error::BootstrapError;
 ///
 /// Fields (in order): `wallet_hex`, `source_bits`, `is_infra`, `dune_first_seen_unix`,
 /// `dune_closed_markets`, `dune_win_rate_bps`, `polymarket_contracts_seen` (issue #186 —
-/// bitmask of V1/V2 attribution per `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_*`).
-/// The 7th field is `0` for callers that don't have V1/V2 attribution available; the
-/// enumeration path passes the appropriate bit from `topic_to_contract_version_bit`.
+/// a V1/V2 CTF-exchange attribution bitmask: bit0 = V1, bit1 = V2). The 7th field is
+/// `0` for every caller now that on-chain enumeration was removed (#326); Dune
+/// enumeration leaves it unset.
 pub type WalletUpsertRow = (
     String,
     i64,

@@ -17,25 +17,21 @@
 Build a public trader-intelligence pipeline:
 
 1. ingest public trader data;
-2. ingest public Polygon funding/collateral data where permitted;
-3. collapse wallets into operators only with replayable evidence (`funder_root_min_confidence_ppm` in `_GLOSSARY.md`);
-4. reconstruct ledgers;
-5. classify trades and signal kinds (rules in `19-`);
-6. rank operators/leaders by walk-forward LCB_5pct daily log growth;
-7. detect new leader entries quickly (latency budget in `_GLOSSARY.md`);
-8. size using calibrated fractional Kelly (fractions and caps in `19-`);
-9. emit risk-checked `OrderIntent`;
-10. record everything for replay.
+2. reconstruct ledgers;
+3. classify trades (rules in `19-`);
+4. rank leaders by walk-forward LCB_5pct daily log growth;
+5. detect new leader entries quickly (latency budget in `_GLOSSARY.md`);
+6. size using calibrated fractional Kelly (fractions and caps in `19-`);
+7. emit risk-checked `OrderIntent`;
+8. record everything for replay.
 
 Quality bar:
 
 - no future leakage;
 - conservative fill modeling;
-- robust sample-size shrinkage (cap at `inherited_prior_max_effective_n`);
+- robust sample-size shrinkage (Bayesian prior, see `19-` § p estimation);
 - latency/edge decay measured against the production budget in `_GLOSSARY.md`;
 - Kalshi identity restrictions respected (`07-`);
-- CrowdIntel-style funding concepts reimplemented natively instead of scraped;
-- inherited-prior fresh-wallet signals kept paper/shadow until separately validated per `19-` "Promotion ladder";
 - live-tiny only after paper-copy validation per `_GLOSSARY.md` "Promotion criteria — quantified".
 
 ## Skill: Venue adapter implementation
