@@ -1,12 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pe_core_types::{
-    BasisPoints, ClusterSize, ContractQty, EventSeq, FundingHopCount, KalshiPriceCents,
-    KellyFraction, MarketId, MarketOutcomeId, ModelId, ObservedAtBucket, OperatorId, OrderLocalId,
-    OutcomeId, PolymarketPriceDecimal, Price, PriceDelta, Probability, ProbabilityPpm, Quantity,
-    ReconstructionQuality, ResolverCardId, RoundingPolicy, Side, SourceId, SourceTimestamp,
-    SourceTradeId, StrategyId, TraderId, VenueAccountId, VenueId, VenueMarketId, WalletAddress,
-    WalletAgeSeconds,
+    BasisPoints, ContractQty, EventSeq, KalshiPriceCents, KellyFraction, MarketId, MarketOutcomeId,
+    ModelId, ObservedAtBucket, OrderLocalId, OutcomeId, PolymarketPriceDecimal, Price, PriceDelta,
+    Probability, ProbabilityPpm, Quantity, ReconstructionQuality, ResolverCardId, RoundingPolicy,
+    Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId, VenueAccountId, VenueId,
+    VenueMarketId, WalletAddress,
 };
 use rust_decimal::Decimal;
 #[allow(unused_imports)]
@@ -160,36 +159,6 @@ fn snapshot_trader_id() {
 fn snapshot_venue_account_id() {
     let v = VenueAccountId("kalshi-user-42".to_string());
     insta::assert_json_snapshot!(v, @r#""kalshi-user-42""#);
-}
-
-#[test]
-fn snapshot_operator_id() {
-    let hash = blake3::hash(b"test-operator");
-    let v = OperatorId(hash);
-    let json = serde_json::to_string(&v).unwrap();
-    // 64-char lowercase hex, no 0x prefix
-    assert_eq!(json.len(), 66); // 64 chars + 2 quotes
-    assert!(json.starts_with('"'));
-    assert!(!json.contains("0x"));
-    insta::assert_json_snapshot!(v);
-}
-
-#[test]
-fn snapshot_funding_hop_count() {
-    let v = FundingHopCount(3);
-    insta::assert_json_snapshot!(v, @"3");
-}
-
-#[test]
-fn snapshot_wallet_age_seconds() {
-    let v = WalletAgeSeconds(86_400);
-    insta::assert_json_snapshot!(v, @"86400");
-}
-
-#[test]
-fn snapshot_cluster_size() {
-    let v = ClusterSize(5);
-    insta::assert_json_snapshot!(v, @"5");
 }
 
 #[test]
@@ -388,32 +357,6 @@ fn venue_id_serde_roundtrip() {
 fn venue_id_rejects_unknown() {
     let result: Result<VenueId, _> = serde_json::from_str(r#""binance""#);
     assert!(result.is_err());
-}
-
-#[test]
-fn operator_id_debug_shows_prefix() {
-    let hash = blake3::hash(b"op");
-    let id = OperatorId(hash);
-    let dbg = format!("{id:?}");
-    assert!(dbg.starts_with("OperatorId("));
-    assert!(dbg.ends_with("…)"));
-    // Strip prefix and suffix, then check that the remaining 8 chars are hex
-    let inner = dbg
-        .strip_prefix("OperatorId(")
-        .unwrap()
-        .strip_suffix("…)")
-        .unwrap();
-    assert_eq!(inner.len(), 8);
-    assert!(inner.chars().all(|c| c.is_ascii_hexdigit()));
-}
-
-#[test]
-fn operator_id_serde_roundtrip() {
-    let hash = blake3::hash(b"roundtrip");
-    let id = OperatorId(hash);
-    let json = serde_json::to_string(&id).unwrap();
-    let back: OperatorId = serde_json::from_str(&json).unwrap();
-    assert_eq!(id, back);
 }
 
 #[test]

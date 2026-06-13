@@ -1,6 +1,0 @@
----
-source: crates/core-types/tests/wire_format.rs
-assertion_line: 174
-expression: v
----
-"d41bcb43f81e9528c7de118aeab81c2b33b38ef604129b98d631465d6749d4f3"
