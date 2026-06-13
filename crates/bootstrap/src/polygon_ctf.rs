@@ -11,15 +11,15 @@
 //! When the cursor is absent (first run), `from_block` falls back to
 //! [`CTF_DEPLOY_BLOCK`].
 //!
-//! [`CTF_DEPLOY_BLOCK`]: pe_source_onchain_polygon::contracts::CTF_DEPLOY_BLOCK
+//! [`CTF_DEPLOY_BLOCK`]: crate::chain::CTF_DEPLOY_BLOCK
 
 use alloy::primitives::{B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolValue;
-use pe_source_onchain_polygon::contracts::{CTF, TOPIC_CONDITION_RESOLUTION};
-use pe_source_onchain_polygon::eth_get_logs_bisect;
 use time::OffsetDateTime;
+
+use crate::chain::{CTF, TOPIC_CONDITION_RESOLUTION, eth_get_logs_bisect};
 use tracing::info;
 
 use crate::cache::WalletCache;

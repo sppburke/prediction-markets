@@ -9,29 +9,21 @@ publish.workspace = true
 name = "pe-bootstrap"
 path = "src/main.rs"
 
-[[bin]]
-name = "pe-operator-audit"
-path = "src/bin/operator-audit.rs"
-
 [lib]
 name = "pe_bootstrap"
 path = "src/lib.rs"
 
 [features]
-# Issue #186: pe-source-onchain-polygon hosts the cross-crate
-# `InMemoryChainLogFetcher` test stub; forwarding `scenario` keeps the inline
-# tests in `polygon_ctf_delta::tests` compiling whenever bootstrap's own
-# scenario feature is on (and under `--workspace --all-features`).
-scenario = ["pe-source-onchain-polygon/scenario"]
+# Gates bootstrap's `tests/scenario_*.rs` integration tests so a plain
+# `cargo test` (without `--all-features`) skips them.
+scenario = []
 
 [lints]
 workspace = true
 
 [dependencies]
 pe-core-types                 = { path = "../core-types",                   version = "0.1.0" }
-pe-operator-graph             = { path = "../operator-graph",               version = "0.1.0" }
 pe-source-core                = { path = "../source-core",                  version = "0.1.0" }
-pe-source-onchain-polygon     = { path = "../source-onchain-polygon",       version = "0.1.0" }
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",                 version = "0.1.0" }
 
@@ -53,6 +45,5 @@ tracing-subscriber = { workspace = true }
 url             = { workspace = true }
 
 [dev-dependencies]
-blake3              = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tempfile            = { workspace = true }

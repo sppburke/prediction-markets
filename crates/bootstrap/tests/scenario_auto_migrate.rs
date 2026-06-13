@@ -18,13 +18,13 @@
 use std::path::PathBuf;
 
 use pe_bootstrap::cache::WalletCache;
+use pe_bootstrap::chain::{
+    ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2,
+};
 use pe_bootstrap::config::BootstrapConfig;
 use pe_bootstrap::migrate::{
     self, CURSOR_WALLET_ENUM_COMPLETED_CONTRACTS, CURSOR_WALLET_ENUM_TOPIC_HASHES,
     auto_migrate_legacy,
-};
-use pe_source_onchain_polygon::contracts::{
-    ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2,
 };
 use tempfile::TempDir;
 

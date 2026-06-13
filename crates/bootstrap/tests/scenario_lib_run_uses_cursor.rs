@@ -15,11 +15,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pe_bootstrap::cache::{WalletCache, WalletUpsertRow};
-use pe_bootstrap::migrate::{self, save_enum_state};
-use pe_bootstrap::pile::{SRC_DUNE_CSV, SRC_TRADES, SRC_WALLET_SET_JSON};
-use pe_source_onchain_polygon::contracts::{
+use pe_bootstrap::chain::{
     ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2,
 };
+use pe_bootstrap::migrate::{self, save_enum_state};
+use pe_bootstrap::pile::{SRC_DUNE_CSV, SRC_TRADES, SRC_WALLET_SET_JSON};
 use tempfile::TempDir;
 
 fn open_cache() -> (TempDir, WalletCache) {

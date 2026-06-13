@@ -8,9 +8,7 @@
 //!    each CSV's filename (infra / leaderboard / radion / gap502 / generic).
 //! 4. Seed `last_polymarket_fetch_at` from `MAX(trades.timestamp_unix)` so the
 //!    daily backfill doesn't redundantly re-fetch already-seeded wallets.
-//! 5. Seed `last_funder_fetch_at` from `funder_lookup_done.fetched_at_unix`
-//!    so the weekly funder refresh doesn't redundantly re-fetch existing wallets.
-//! 6. `apply_activation_rules` LAST — by this point every fetch-timestamp is
+//! 5. `apply_activation_rules` LAST — by this point every fetch-timestamp is
 //!    seeded, so a crash here never leaves `is_active=1` wallets with NULL
 //!    fetch timestamps.
 //!
@@ -19,8 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::chain::{ALL_EXCHANGE_CONTRACTS, TOPIC_ORDER_FILLED_V1};
 use pe_core_types::WalletAddress;
-use pe_source_onchain_polygon::contracts::{ALL_EXCHANGE_CONTRACTS, TOPIC_ORDER_FILLED_V1};
 
 use crate::cache::{WalletCache, WalletUpsertRow};
 use crate::config::BootstrapConfig;
@@ -42,7 +40,6 @@ pub struct MigrateReport {
     pub infra_rows: usize,
     pub trade_count_refreshed: usize,
     pub last_polymarket_fetch_seeded: usize,
-    pub last_funder_fetch_seeded: usize,
     pub activated: usize,
 }
 
@@ -94,14 +91,7 @@ pub fn run_migrate(
         "migrate: last_polymarket_fetch_at seeded"
     );
 
-    // 5. Seed last_funder_fetch_at from funder_lookup_done.
-    let last_funder_fetch_seeded = cache.seed_last_funder_fetch_from_done()?;
-    tracing::info!(
-        seeded = last_funder_fetch_seeded,
-        "migrate: last_funder_fetch_at seeded"
-    );
-
-    // 6. Activation rules LAST.
+    // 5. Activation rules LAST.
     let activated = pile::apply_activation_rules(cache)?;
     tracing::info!(activated, "migrate: activation rules applied");
 
@@ -112,7 +102,6 @@ pub fn run_migrate(
         infra_rows,
         trade_count_refreshed,
         last_polymarket_fetch_seeded,
-        last_funder_fetch_seeded,
         activated,
     })
 }
@@ -228,60 +217,6 @@ pub fn save_chunk_progress(
     Ok(())
 }
 
-/// One-shot backfill helper for the V1-attribution gap (issue #191 Item 2).
-///
-/// The 38,790 wallets ingested via `wallet_set.json` migration (issue #181)
-/// were inserted into the cache **before** the `polymarket_contracts_seen`
-/// column existed (added in issue #186), so they sit at `bit=0` ("no
-/// attribution"). The normal V1 enumeration skips them because
-/// `enumerated_topic_hashes` already records the V1 topic as complete.
-///
-/// This helper clears the cursor state that prevents V1 from re-running:
-/// 1. Removes the V1 topic hash from [`CURSOR_WALLET_ENUM_TOPIC_HASHES`]
-/// 2. Removes V1-keyed entries from [`CURSOR_WALLET_ENUM_CHUNK_PROGRESS`]
-/// 3. Returns `(removed_topic_present, removed_chunks)` so the caller can
-///    print an operator-friendly receipt.
-///
-/// **After this returns**, the next `pe-bootstrap` run will re-enumerate
-/// V1 from `wallet_from_block` and populate `polymarket_contracts_seen`
-/// bit 0 for every wallet with V1 `OrderFilled` activity via the per-chunk
-/// UPSERT OR-merge mechanism. Existing wallets at bit=0 get OR-merged to
-/// bit=1 (V1); existing wallets at bit=2 (V2-only) get OR-merged to
-/// bit=3 (V1+V2).
-///
-/// **Concurrency**: this helper does NOT acquire a cache mutation lock.
-/// The caller (`main.rs::main()` under the `--backfill-v1-attribution`
-/// flag) is responsible for holding a [`crate::cache::CacheMutationLock`]
-/// before invoking — running this concurrently with a normal `pe-bootstrap`
-/// sweep can silently undo the backfill (the in-flight sweep's in-memory
-/// `chunk_progress` overwrites the cleared cursor on its next save).
-///
-/// **Idempotent**: calling on a cache where V1 is already not in the cursor
-/// returns `(false, 0)` without erroring.
-pub fn reset_v1_topic_cursors(cache: &mut WalletCache) -> Result<(bool, usize), BootstrapError> {
-    let v1_topic_hex = format!("{TOPIC_ORDER_FILLED_V1}");
-
-    // 1. Remove V1 from enumerated_topic_hashes (or leave alone if absent).
-    let (contracts, mut topics) = load_enum_state(cache)?;
-    let topic_present = topics.iter().any(|t| t == &v1_topic_hex);
-    if topic_present {
-        topics.retain(|t| t != &v1_topic_hex);
-        save_enum_state(cache, &contracts, &topics)?;
-    }
-
-    // 2. Remove V1-keyed entries from chunk_progress.
-    let v1_prefix = format!("{v1_topic_hex}|");
-    let mut progress = load_chunk_progress(cache)?;
-    let before = progress.len();
-    progress.retain(|k, _| !k.starts_with(&v1_prefix));
-    let removed_chunks = before - progress.len();
-    if removed_chunks > 0 {
-        save_chunk_progress(cache, &progress)?;
-    }
-
-    Ok((topic_present, removed_chunks))
-}
-
 /// One-shot consolidation of legacy on-disk artifacts into the SQLite cache.
 /// Issue #181 — called at the top of `lib.rs::run()` on every invocation.
 /// Idempotent: detects legacy files on disk, ingests them, persists
@@ -390,13 +325,11 @@ pub fn auto_migrate_legacy(
         let trades_rows = ingest_trades_wallets(cache)?;
         let trade_count_refreshed = cache.refresh_trade_counts()?;
         let last_polymarket_fetch_seeded = cache.seed_last_polymarket_fetch_from_trades()?;
-        let last_funder_fetch_seeded = cache.seed_last_funder_fetch_from_done()?;
         let activated = pile::apply_activation_rules(cache)?;
         tracing::info!(
             trades_rows,
             trade_count_refreshed,
             last_polymarket_fetch_seeded,
-            last_funder_fetch_seeded,
             activated,
             "auto_migrate_legacy: post-ingest sequence complete"
         );

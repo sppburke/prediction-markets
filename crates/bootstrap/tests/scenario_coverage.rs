@@ -57,7 +57,7 @@ fn seed_active_wallet(cache: &mut WalletCache, hex: &str) {
 /// Scenario: a partially-prepared cache reports one gap in every category.
 ///
 /// PASS: `run_coverage` returns exactly
-///   `{ pending_funder: 1, fetch_incomplete: 1, missing_resolution: 1, missing_schedule: 1 }`
+///   `{ fetch_incomplete: 1, missing_resolution: 1, missing_schedule: 1 }`
 ///   (a non-clean report → exit category `2`).
 /// FAIL: any count differs, or the probe errors.
 #[test]
@@ -86,11 +86,9 @@ fn scenario_coverage_reports_one_gap_per_category() {
             .insert_schedule(MARKET_A, Some(1_700_200_000), 1_700_200_001)
             .unwrap();
 
-        // Two active wallets. W1: funder-done + fetched. W2: neither → the gap
-        // in both pending_funder and fetch_incomplete.
+        // Two active wallets. W1: fetched. W2: not fetched → the fetch_incomplete gap.
         seed_active_wallet(&mut cache, WALLET_1_HEX);
         seed_active_wallet(&mut cache, WALLET_2_HEX);
-        cache.insert_funder_edges(w1, &[], 1_700_300_000).unwrap();
         cache
             .update_last_polymarket_fetch(WALLET_1_HEX, 1_700_300_001)
             .unwrap();
@@ -99,7 +97,6 @@ fn scenario_coverage_reports_one_gap_per_category() {
     let report = run_coverage(&db_path).expect("coverage probe must not error");
 
     let expected = CoverageReport {
-        pending_funder: 1,
         fetch_incomplete: 1,
         missing_resolution: 1,
         missing_schedule: 1,
@@ -113,7 +110,7 @@ fn scenario_coverage_reports_one_gap_per_category() {
 
 /// Scenario: a fully-prepared cache reports clean (exit category `0`).
 ///
-/// PASS: `run_coverage` returns a report where `is_clean()` is true (all four
+/// PASS: `run_coverage` returns a report where `is_clean()` is true (all
 ///   counts zero).
 /// FAIL: any count is non-zero, or the probe errors.
 #[test]
@@ -139,7 +136,6 @@ fn scenario_coverage_clean_when_fully_covered() {
             .unwrap();
 
         seed_active_wallet(&mut cache, WALLET_1_HEX);
-        cache.insert_funder_edges(w1, &[], 1_700_300_000).unwrap();
         cache
             .update_last_polymarket_fetch(WALLET_1_HEX, 1_700_300_001)
             .unwrap();

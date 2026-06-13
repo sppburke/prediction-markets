@@ -6,12 +6,10 @@ use figment::{
     Figment,
     providers::{Env, Format, Toml},
 };
-use pe_core_types::WalletAddress;
-use pe_source_onchain_polygon::contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DeltaMode, WalletSource,
+    WalletSource,
     error::BootstrapError,
     filter::{
         DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION, DEFAULT_MIN_CLOSED_TRADES,
@@ -31,9 +29,6 @@ const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
 const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
-// Issue #176: delta-backfill confirmations + paranoia staleness window.
-const DEFAULT_POLYGON_CTF_CONFIRMATIONS: u64 = 256;
-const DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS: i64 = 604_800;
 // Issue #324: winner-discovery pipeline defaults.
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_LEADERBOARD_TOP_N: u32 = 500;
@@ -49,18 +44,16 @@ const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
 ///
 /// ## TOML structure
 /// ```toml
-/// wallet_source = "onchain"          # or legacy alias "etherscan"
-/// polygon_rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/<KEY>"
+/// wallet_source = "dune"             # "onchain"/"etherscan" accepted as aliases
+/// polygon_rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/<KEY>"  # resolution scan
 /// output_path = "/home/user/watchlist.json"
 /// cache_path = "/home/user/backtest-data/wallet_cache.db"
-///
-/// operator_addresses = ["0xaaa...", "0xbbb..."]
 /// ```
 ///
 /// Run `pe-bootstrap --print-config` to emit the full default configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
-    /// `PE_WALLET_SOURCE` — `"onchain"` (default; alias `"etherscan"`) or `"dune"`.
+    /// `PE_WALLET_SOURCE` — `"dune"` (default). `"onchain"` / `"etherscan"` are accepted aliases.
     #[serde(default = "default_wallet_source")]
     pub wallet_source: WalletSource,
 
@@ -71,32 +64,6 @@ pub struct BootstrapConfig {
     /// Dune username for server-side JOIN. `PE_DUNE_NAMESPACE` overrides.
     #[serde(default)]
     pub dune_namespace: Option<String>,
-
-    /// `PE_ETHERSCAN_API_KEY` overrides. Still used by Etherscan-only paths
-    /// (funder discovery + leaderboard fetch); the on-chain wallet enumeration
-    /// migrated to alloy + `polygon_rpc_url` in issue #186.
-    #[serde(default)]
-    pub etherscan_api_key: Option<String>,
-
-    /// Start block for the on-chain wallet enumeration scan
-    /// (default: CTF V1 deploy block). `PE_WALLET_FROM_BLOCK` overrides.
-    #[serde(default = "default_wallet_from_block")]
-    pub wallet_from_block: u64,
-
-    /// End block for the on-chain wallet enumeration scan
-    /// (`None` = current chain head, resolved via `polygon_rpc_url`).
-    /// `PE_WALLET_TO_BLOCK` overrides.
-    #[serde(default)]
-    pub wallet_to_block: Option<u64>,
-
-    /// Matching-engine operator addresses to exclude. TOML: array of hex strings.
-    /// Env `PE_POLYMARKET_OPERATOR_ADDRESSES`: comma-separated hex.
-    #[serde(
-        default,
-        alias = "polymarket_operator_addresses",
-        deserialize_with = "deserialize_operator_addresses"
-    )]
-    pub operator_addresses: Vec<WalletAddress>,
 
     /// Output path for the watchlist JSON. **Required.**
     ///
@@ -405,40 +372,6 @@ pub struct BootstrapConfig {
     )]
     pub known_wallets_dune_table: String,
 
-    // ── Delta-backfill (issue #176) ──────────────────────────────────────────
-    /// Delta-backfill mode for `pe-bootstrap backfill`. Default `Shadow` runs
-    /// the on-chain scan alongside the legacy full fetch and writes a
-    /// `delta_audit` row for every wallet with new trades OR in the delta set
-    /// — operators flip to `Delta` after the audit table is empty of
-    /// `DELTA_MISS` rows. See [`DeltaMode`] for full semantics.
-    /// `PE_BOOTSTRAP_POLYMARKET_DELTA_MODE` overrides (`"off"`/`"shadow"`/`"delta"`).
-    #[serde(default, alias = "bootstrap_polymarket_delta_mode")]
-    pub polymarket_delta_mode: DeltaMode,
-
-    /// Polygon confirmation depth (blocks) the delta scanner subtracts from the
-    /// chain head to derive `to_block`. 256 blocks ≈ 8.5 min on Polygon's 2 s
-    /// blocktime — covers worst-case observed reorg depth. Canonical default
-    /// in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-    /// `PE_BOOTSTRAP_POLYGON_CTF_CONFIRMATIONS` overrides.
-    #[serde(
-        default = "default_polygon_ctf_confirmations",
-        alias = "bootstrap_polygon_ctf_confirmations"
-    )]
-    pub polygon_ctf_confirmations: u64,
-
-    /// Paranoia staleness window (seconds) for the weekly full-fetch backstop.
-    /// Each daily backfill auto-unions wallets where `last_polymarket_full_at`
-    /// is NULL or older than this many seconds into the fetch set, regardless
-    /// of `polymarket_delta_mode`. Default 604_800 (7 days) bounds the worst
-    /// case if the on-chain scanner ever misses a wallet.
-    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-    /// `PE_BOOTSTRAP_POLYMARKET_FULL_FETCH_STALENESS_SECS` overrides.
-    #[serde(
-        default = "default_polymarket_full_fetch_staleness_secs",
-        alias = "bootstrap_polymarket_full_fetch_staleness_secs"
-    )]
-    pub polymarket_full_fetch_staleness_secs: i64,
-
     // ── Winner-discovery (issue #324) ─────────────────────────────────────────
     /// Base URL for the Polymarket leaderboard endpoint. When absent, falls back
     /// to `polymarket_base_url`. `PE_BOOTSTRAP_LEADERBOARD_BASE_URL` overrides.
@@ -493,30 +426,10 @@ pub struct BootstrapConfig {
     pub discovery_enabled: bool,
 }
 
-impl BootstrapConfig {
-    fn validate(&self) -> Result<(), BootstrapError> {
-        match self.wallet_source {
-            WalletSource::Dune if self.dune_api_key.is_none() => {
-                Err(BootstrapError::MissingEnv("PE_DUNE_API_KEY".to_owned()))
-            }
-            WalletSource::OnChain if self.polygon_rpc_url.is_none() => {
-                Err(BootstrapError::MissingEnv(
-                    "PE_POLYGON_HTTP_URL or PE_BOOTSTRAP_POLYGON_RPC_URL".to_owned(),
-                ))
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
 // ── Default helpers ───────────────────────────────────────────────────────────
 
 fn default_wallet_source() -> WalletSource {
-    WalletSource::OnChain
-}
-
-const fn default_wallet_from_block() -> u64 {
-    CTF_EXCHANGE_V1_DEPLOY_BLOCK
+    WalletSource::Dune
 }
 
 fn default_cache_path() -> PathBuf {
@@ -604,14 +517,6 @@ const fn default_polygon_ctf_chunk_blocks() -> u64 {
     DEFAULT_POLYGON_CTF_CHUNK_BLOCKS
 }
 
-const fn default_polygon_ctf_confirmations() -> u64 {
-    DEFAULT_POLYGON_CTF_CONFIRMATIONS
-}
-
-const fn default_polymarket_full_fetch_staleness_secs() -> i64 {
-    DEFAULT_POLYMARKET_FULL_FETCH_STALENESS_SECS
-}
-
 // ── Wallet pile (issue #166) ──────────────────────────────────────────────────
 
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
@@ -661,10 +566,6 @@ impl Default for BootstrapConfig {
             wallet_source: default_wallet_source(),
             dune_api_key: None,
             dune_namespace: None,
-            etherscan_api_key: None,
-            wallet_from_block: default_wallet_from_block(),
-            wallet_to_block: None,
-            operator_addresses: Vec::new(),
             output_path: PathBuf::from("./watchlist.json"),
             cache_path: default_cache_path(),
             wallet_set_path: default_wallet_set_path(),
@@ -699,9 +600,6 @@ impl Default for BootstrapConfig {
             backfill_limit: default_backfill_limit(),
             weekly_limit: default_weekly_limit(),
             known_wallets_dune_table: default_known_wallets_dune_table(),
-            polymarket_delta_mode: DeltaMode::default(),
-            polygon_ctf_confirmations: default_polygon_ctf_confirmations(),
-            polymarket_full_fetch_staleness_secs: default_polymarket_full_fetch_staleness_secs(),
             leaderboard_base_url: None,
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
@@ -721,8 +619,12 @@ impl Default for BootstrapConfig {
 /// When `path` is `None`, only env vars and struct defaults apply.
 ///
 /// `PE_BOOTSTRAP_*` env vars take priority over `PE_*` env vars; both are supported.
-/// Post-load validation checks that the required API key for the chosen `wallet_source`
-/// is present.
+/// Loads config from an optional TOML file plus the `PE_*` / `PE_BOOTSTRAP_*`
+/// env overlay, then applies the `PE_POLYGON_HTTP_URL` → `polygon_rpc_url`
+/// fallback. The Dune API key needed for wallet enumeration is checked at the
+/// enumeration call site (`enumerate::run_enumerate`), not here, so the
+/// non-enumerating subcommands (`backfill`, `events`, `coverage`, …) load
+/// without requiring it.
 pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
     let mut fig = Figment::new();
     if let Some(p) = path {
@@ -750,7 +652,6 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
     {
         cfg.polygon_rpc_url = Some(url);
     }
-    cfg.validate()?;
     Ok(cfg)
 }
 
@@ -852,49 +753,6 @@ where
             v.parse::<u32>()
                 .map(Some)
                 .map_err(|_| de::Error::custom(format!("'{v}' is not a valid u32 or 'unlimited'")))
-        }
-    }
-
-    d.deserialize_any(V)
-}
-
-fn deserialize_operator_addresses<'de, D>(d: D) -> Result<Vec<WalletAddress>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{self, SeqAccess, Visitor};
-
-    struct V;
-
-    impl<'de> Visitor<'de> for V {
-        type Value = Vec<WalletAddress>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("comma-separated hex addresses or array of hex addresses")
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<WalletAddress>, E> {
-            if v.trim().is_empty() {
-                return Ok(Vec::new());
-            }
-            v.split(',')
-                .filter(|s| !s.trim().is_empty())
-                .map(|hex| {
-                    WalletAddress::from_hex(hex.trim())
-                        .map_err(|e| de::Error::custom(format!("invalid address '{hex}': {e}")))
-                })
-                .collect()
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<WalletAddress>, A::Error> {
-            let mut addrs = Vec::new();
-            while let Some(s) = seq.next_element::<String>()? {
-                addrs.push(
-                    WalletAddress::from_hex(s.trim())
-                        .map_err(|e| de::Error::custom(format!("invalid address '{s}': {e}")))?,
-                );
-            }
-            Ok(addrs)
         }
     }
 
