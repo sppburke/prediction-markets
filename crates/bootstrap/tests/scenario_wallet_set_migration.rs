@@ -12,10 +12,10 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pe_bootstrap::wallet_set::{self, WalletSetState};
-use pe_source_onchain_polygon::contracts::{
+use pe_bootstrap::chain::{
     ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2,
 };
+use pe_bootstrap::wallet_set::{self, WalletSetState};
 use tempfile::TempDir;
 
 fn contract_hex_set() -> Vec<String> {

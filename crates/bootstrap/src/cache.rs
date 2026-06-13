@@ -1,6 +1,6 @@
 //! Permanent wallet trade-history cache — SQLite (WAL mode), no TTL.
 //!
-//! Six tables:
+//! Key tables:
 //! - `trades` — append-only per-trade rows, indexed by `(wallet_hex, timestamp_unix)`.
 //! - `leaderboard_snapshots` — `(snapshot_at_unix, wallet_hex)` rows, one row-set per
 //!   `pe-bootstrap` run, written from the post-filtered watchlist. Read by
@@ -10,15 +10,10 @@
 //! - `market_schedules` — one row per market whose scheduled `endDate` has been
 //!   fetched from Gamma. `end_date_unix NULL` means Gamma had no `endDate` for this
 //!   market (it is still in the skip-set to avoid re-fetching).
-//! - `funder_edges` — one row per `(funder, funded)` pair discovered via Etherscan.
-//!   Time-invariant once the block range is finalized; populated by `pe-bootstrap`
-//!   when `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1`.
-//! - `funder_lookup_done` — one row per wallet that has been queried for funders.
-//!   Distinguishes "queried and found zero funders" from "not yet queried".
 //! - `wallets` — canonical wallet pile (issue #166). One row per known wallet across
 //!   every discovery source (`wallet_set.json`, `trades`, Dune CSV, Dune incremental,
 //!   Polymarket leaderboard, Radion, 502-gap). `is_active` is sticky (0→1 only) and
-//!   controls which wallets the `backfill`/`weekly` subcommands process.
+//!   controls which wallets the `backfill` subcommand processes.
 //!
 //! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
 //! is needed. Per-wallet streaming reads keep peak memory bounded.
@@ -143,48 +138,6 @@ CREATE TABLE IF NOT EXISTS token_conditions (
 );
 CREATE INDEX IF NOT EXISTS idx_token_conditions_condition ON token_conditions(condition_id);
 
--- Issue #207 Slice 1: per-fill counterparty edges from the on-chain CTF Exchange
--- OrderFilled events (V1 + V2). Uniquely keyed by (tx_hash, log_index). One row
--- per filled order leg; the per-tx aggregate (a market trade can produce multiple
--- legs in one tx) is computed downstream by the §5 reconciliation step.
---
--- Schema notes:
--- - `contract_version` is `1` (V1 topic) or `2` (V2 topic); distinct from the
---   bitmask values in `pe_source_onchain_polygon::contracts::CONTRACT_VERSION_BIT_*`.
--- - `maker_asset_id_dec` / `taker_asset_id_dec` hold ERC-1155 token ids as
---   **decimal strings** (matching `token_conditions.token_id`). V1 populates
---   both; V2 stores the unified `tokenId` in maker_asset_id_dec and leaves
---   taker_asset_id_dec NULL (the other leg is implicit USDC).
--- - `side` is V2-only: 0 = maker BUY, 1 = maker SELL. NULL for V1.
--- - Amounts (`maker_amount_raw`, `taker_amount_raw`, `fee_raw`) are uint256
---   decimal strings — unit conversion (USDC vs position tokens) is deferred to
---   the reconciliation step which joins to `token_conditions` to identify
---   which leg is USDC.
-CREATE TABLE IF NOT EXISTS counterparty_edges (
-    tx_hash             TEXT    NOT NULL,
-    log_index           INTEGER NOT NULL,
-    block_number        INTEGER NOT NULL,
-    block_ts_unix       INTEGER NOT NULL,
-    contract_addr       TEXT    NOT NULL,
-    contract_version    INTEGER NOT NULL,
-    maker_hex           TEXT    NOT NULL,
-    taker_hex           TEXT    NOT NULL,
-    maker_asset_id_dec  TEXT    NOT NULL,
-    taker_asset_id_dec  TEXT,
-    side                INTEGER,
-    maker_amount_raw    TEXT    NOT NULL,
-    taker_amount_raw    TEXT    NOT NULL,
-    fee_raw             TEXT    NOT NULL,
-    PRIMARY KEY (tx_hash, log_index)
-);
-CREATE INDEX IF NOT EXISTS idx_counterparty_edges_maker ON counterparty_edges(maker_hex);
-CREATE INDEX IF NOT EXISTS idx_counterparty_edges_taker ON counterparty_edges(taker_hex);
-CREATE INDEX IF NOT EXISTS idx_counterparty_edges_block ON counterparty_edges(block_number);
-CREATE INDEX IF NOT EXISTS idx_counterparty_edges_maker_asset
-    ON counterparty_edges(maker_asset_id_dec);
-CREATE INDEX IF NOT EXISTS idx_counterparty_edges_taker_asset
-    ON counterparty_edges(taker_asset_id_dec);
-
 -- Per-market Polymarket taker/maker fee schedule (issue #23, PR 1).
 -- Populated by the `events` subcommand from Gamma takerBaseFee / makerBaseFee.
 -- Fees are stored in basis points (0..=10_000) so all comparisons are integer.
@@ -195,20 +148,6 @@ CREATE TABLE IF NOT EXISTS market_fees (
     maker_base_fee_bps   INTEGER NOT NULL,
     fee_active_from_unix INTEGER,
     fetched_at_unix      INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS funder_edges (
-    funder_hex      TEXT    NOT NULL,
-    funded_hex      TEXT    NOT NULL,
-    fetched_at_unix INTEGER NOT NULL,
-    event_at_unix   INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (funder_hex, funded_hex)
-);
-CREATE INDEX IF NOT EXISTS idx_funder_edges_funded ON funder_edges(funded_hex);
-
-CREATE TABLE IF NOT EXISTS funder_lookup_done (
-    wallet_hex      TEXT    PRIMARY KEY NOT NULL,
-    fetched_at_unix INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS market_liquidity (
@@ -222,21 +161,6 @@ CREATE TABLE IF NOT EXISTS source_cursor (
     value      TEXT    NOT NULL,
     updated_at INTEGER NOT NULL
 );
-
--- Delta-backfill audit table (issue #176). One row per (run, wallet) where
--- the wallet had at least one new trade OR appeared in the on-chain scan's
--- delta_set this run. True-negative wallets (no activity, not in delta_set)
--- produce no row so the audit table grows ~5–10% of the daily backfill size
--- instead of full ~105k/day.
-CREATE TABLE IF NOT EXISTS delta_audit (
-    run_at_unix        INTEGER NOT NULL,
-    wallet_hex         TEXT    NOT NULL,
-    classification     TEXT    NOT NULL,
-    new_trades_fetched INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (run_at_unix, wallet_hex)
-);
-CREATE INDEX IF NOT EXISTS idx_delta_audit_classification
-    ON delta_audit(classification, new_trades_fetched);
 
 -- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
 -- `WalletAddress::Display`: `\"0x\" + 40 lowercase hex chars`.
@@ -311,8 +235,6 @@ pub struct ClassifyInfraReport {
 /// backtest. Produced by [`WalletCache::coverage_counts`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CoverageReport {
-    /// Active, non-infra wallets not yet queried for funders.
-    pub pending_funder: usize,
     /// Active, non-infra wallets never fetched from Polymarket
     /// (`last_polymarket_fetch_at IS NULL`).
     pub fetch_incomplete: usize,
@@ -325,27 +247,8 @@ pub struct CoverageReport {
 impl CoverageReport {
     /// True when every gap count is zero — the cache is backtest-ready.
     pub fn is_clean(&self) -> bool {
-        self.pending_funder == 0
-            && self.fetch_incomplete == 0
-            && self.missing_resolution == 0
-            && self.missing_schedule == 0
+        self.fetch_incomplete == 0 && self.missing_resolution == 0 && self.missing_schedule == 0
     }
-}
-
-/// One row streamed by [`WalletCache::for_each_counterparty_edge_resolved`].
-///
-/// Carries everything the §5 reconciliation needs to decide which leg of a
-/// fill is USDC: the version-discriminator (`contract_version`), the V2 side
-/// flag, the two raw uint256 amounts as decimal strings, and the LEFT-JOIN
-/// result of looking up each asset id in `token_conditions`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CounterpartyEdgeResolvedRow {
-    pub contract_version: i64,
-    pub side: Option<i64>,
-    pub maker_amount_raw: String,
-    pub taker_amount_raw: String,
-    pub maker_condition: Option<String>,
-    pub taker_condition: Option<String>,
 }
 
 /// Per-market fee schedule row loaded from `market_fees` (issue #23).
@@ -368,21 +271,18 @@ impl WalletCache {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         conn.execute_batch(SCHEMA)?;
-        // Migration: add event_at_unix if absent (DBs created before this change keep
-        // the default 0, which makes existing edges always visible in walk-forward sims).
-        let col_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('funder_edges') WHERE name='event_at_unix'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
-        if !col_exists {
-            conn.execute_batch(
-                "ALTER TABLE funder_edges ADD COLUMN event_at_unix INTEGER NOT NULL DEFAULT 0",
-            )?;
-        }
+        // Migration (#326 PR4): drop the operator/funder/delta tables. They fed
+        // only the deleted operator-graph machinery; dropping reclaims the bulk of
+        // the cache (`counterparty_edges` alone was ~275M rows). Idempotent — a
+        // no-op once dropped, and the tables are no longer in SCHEMA so fresh DBs
+        // never recreate them. `token_conditions` + `market_fees` are KEPT (still
+        // written by the surviving `events` sweep).
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS counterparty_edges; \
+             DROP TABLE IF EXISTS funder_edges; \
+             DROP TABLE IF EXISTS funder_lookup_done; \
+             DROP TABLE IF EXISTS delta_audit;",
+        )?;
         // Migration: add `source` column to market_resolutions / market_schedules. DBs
         // created before this change keep `DEFAULT 'gamma'` — correct since every
         // pre-migration row was inserted by the Gamma fetcher.
@@ -1220,149 +1120,6 @@ impl WalletCache {
         Ok(map)
     }
 
-    /// Upsert a batch of decoded `OrderFilled` legs into `counterparty_edges`
-    /// in one transaction (issue #207, Slice 1).
-    ///
-    /// Rows are keyed by `(tx_hash, log_index)`; `INSERT OR REPLACE` makes the
-    /// scan idempotent under re-runs (an interrupted scan resumes and re-writes
-    /// any partially-committed chunk).
-    ///
-    /// Inputs are 14 columns in positional order:
-    /// `(tx_hash, log_index, block_number, block_ts_unix, contract_addr,
-    ///   contract_version, maker_hex, taker_hex, maker_asset_id_dec,
-    ///   taker_asset_id_dec, side, maker_amount_raw, taker_amount_raw, fee_raw)`.
-    #[allow(clippy::type_complexity)]
-    pub fn upsert_counterparty_edges_batch(
-        &mut self,
-        rows: &[(
-            String,         // tx_hash
-            i64,            // log_index
-            i64,            // block_number
-            i64,            // block_ts_unix
-            String,         // contract_addr
-            i64,            // contract_version
-            String,         // maker_hex
-            String,         // taker_hex
-            String,         // maker_asset_id_dec
-            Option<String>, // taker_asset_id_dec
-            Option<i64>,    // side
-            String,         // maker_amount_raw
-            String,         // taker_amount_raw
-            String,         // fee_raw
-        )],
-    ) -> Result<(), BootstrapError> {
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO counterparty_edges \
-                 (tx_hash, log_index, block_number, block_ts_unix, contract_addr, \
-                  contract_version, maker_hex, taker_hex, maker_asset_id_dec, \
-                  taker_asset_id_dec, side, maker_amount_raw, taker_amount_raw, fee_raw) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            )?;
-            for (
-                tx_hash,
-                log_index,
-                block_number,
-                block_ts_unix,
-                contract_addr,
-                contract_version,
-                maker_hex,
-                taker_hex,
-                maker_asset_id_dec,
-                taker_asset_id_dec,
-                side,
-                maker_amount_raw,
-                taker_amount_raw,
-                fee_raw,
-            ) in rows
-            {
-                stmt.execute(params![
-                    tx_hash,
-                    log_index,
-                    block_number,
-                    block_ts_unix,
-                    contract_addr,
-                    contract_version,
-                    maker_hex,
-                    taker_hex,
-                    maker_asset_id_dec,
-                    taker_asset_id_dec,
-                    side,
-                    maker_amount_raw,
-                    taker_amount_raw,
-                    fee_raw,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Count of rows in `counterparty_edges` (one per filled leg).
-    ///
-    /// # Precondition
-    /// Returns `0` when no on-chain scan has been run.
-    pub fn counterparty_edge_count(&self) -> i64 {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM counterparty_edges", [], |r| r.get(0))
-            .unwrap_or(0)
-    }
-
-    /// Highest `block_number` in `counterparty_edges`, or `None` if empty.
-    ///
-    /// Used by the on-chain scanner to resume from the last persisted block on
-    /// re-run, matching the resolution-scan resumability pattern.
-    pub fn counterparty_edges_max_block(&self) -> Option<u64> {
-        self.conn
-            .query_row(
-                "SELECT MAX(block_number) FROM counterparty_edges",
-                [],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .ok()
-            .flatten()
-            .and_then(|n| u64::try_from(n).ok())
-    }
-
-    /// Stream the `counterparty_edges` rows LEFT JOIN'd against `token_conditions`
-    /// on both `maker_asset_id_dec` and `taker_asset_id_dec` (issue #207 Slice 1c).
-    ///
-    /// The callback fires once per fill leg with the data needed for the §5
-    /// reconciliation's USDC-leg resolution. Errors from the callback abort
-    /// the stream and propagate up. Read-only — does not modify the cache.
-    pub fn for_each_counterparty_edge_resolved(
-        &self,
-        mut f: impl FnMut(CounterpartyEdgeResolvedRow) -> Result<(), BootstrapError>,
-    ) -> Result<(), BootstrapError> {
-        let sql = "
-            SELECT
-                ce.contract_version,
-                ce.side,
-                ce.maker_amount_raw,
-                ce.taker_amount_raw,
-                tc_m.condition_id AS maker_cond,
-                tc_t.condition_id AS taker_cond
-            FROM counterparty_edges ce
-            LEFT JOIN token_conditions tc_m ON tc_m.token_id = ce.maker_asset_id_dec
-            LEFT JOIN token_conditions tc_t ON tc_t.token_id = ce.taker_asset_id_dec
-        ";
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let r = CounterpartyEdgeResolvedRow {
-                contract_version: row.get(0)?,
-                side: row.get(1)?,
-                maker_amount_raw: row.get(2)?,
-                taker_amount_raw: row.get(3)?,
-                maker_condition: row.get(4)?,
-                taker_condition: row.get(5)?,
-            };
-            f(r)?;
-        }
-        Ok(())
-    }
-
     /// Stream per-trade `(market_id, price_str, contracts)` from the `trades`
     /// table, skipping rows with empty `market_id` (issue #207 Slice 1c).
     ///
@@ -1598,20 +1355,13 @@ impl WalletCache {
     /// Compute the four backtest-readiness gap counts (issue #208) in one read pass.
     ///
     /// Each count is a dedicated `COUNT(*)` or set-difference — never a `.len()`
-    /// over a list-materialising helper. `pending_funder` and `fetch_incomplete`
-    /// mirror the `WHERE` clauses of [`Self::wallets_needing_funder_lookup`] and
-    /// [`Self::select_backfill_due`]'s `IS NULL` branch without materialising the
-    /// wallet lists. The `missing_*` counts difference [`Self::all_market_ids`]
-    /// against [`Self::resolved_market_ids`] / [`Self::scheduled_market_ids`],
-    /// inheriting the `0x`-prefixed join-key invariant the write paths maintain
-    /// (see the `market_events` schema note) — no fresh `LEFT JOIN`.
+    /// over a list-materialising helper. `fetch_incomplete` mirrors the `IS NULL`
+    /// branch of [`Self::select_backfill_due`] without materialising the wallet
+    /// list. The `missing_*` counts difference [`Self::all_market_ids`] against
+    /// [`Self::resolved_market_ids`] / [`Self::scheduled_market_ids`], inheriting
+    /// the `0x`-prefixed join-key invariant the write paths maintain (see the
+    /// `market_events` schema note) — no fresh `LEFT JOIN`.
     pub fn coverage_counts(&self) -> Result<CoverageReport, BootstrapError> {
-        let pending_funder: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM active_tradeable_wallets \
-             WHERE wallet_hex NOT IN (SELECT wallet_hex FROM funder_lookup_done)",
-            [],
-            |r| r.get(0),
-        )?;
         let fetch_incomplete: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM active_tradeable_wallets \
              WHERE last_polymarket_fetch_at IS NULL",
@@ -1626,7 +1376,6 @@ impl WalletCache {
         Ok(CoverageReport {
             // COUNT(*) is non-negative, so the conversion never saturates in
             // practice; `unwrap_or(0)` keeps the lint happy without an `as` cast.
-            pending_funder: usize::try_from(pending_funder).unwrap_or(0),
             fetch_incomplete: usize::try_from(fetch_incomplete).unwrap_or(0),
             missing_resolution,
             missing_schedule,
@@ -1704,134 +1453,6 @@ impl WalletCache {
             );
         }
         Ok(index)
-    }
-
-    // ── funder_edges / funder_lookup_done ─────────────────────────────────────
-
-    /// Return active, non-infra candidate wallets not yet queried for funders.
-    ///
-    /// Issue #201: scoped to the `active_tradeable_wallets` view (is_active=1 AND
-    /// is_infra=0) rather than every wallet that ever traded — operator-clustering
-    /// only needs the live candidate universe, and the prior all-trades scope
-    /// produced a ~456k bulk lookup at Etherscan's 3 req/s cap. Also correct for
-    /// wallets activated via Dune data that lack local `trades` rows. `limit == 0`
-    /// returns the full pending set (no `LIMIT` clause — mirrors `select_backfill_due`;
-    /// a literal `LIMIT 0` would return zero rows).
-    ///
-    /// # Precondition
-    /// Returns the full active-non-infra pending set when `limit == 0`.
-    pub fn wallets_needing_funder_lookup(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<WalletAddress>, BootstrapError> {
-        let base = "SELECT wallet_hex FROM active_tradeable_wallets \
-                    WHERE wallet_hex NOT IN (SELECT wallet_hex FROM funder_lookup_done)";
-        let hexes: Vec<String> = if limit == 0 {
-            let mut stmt = self.conn.prepare(base)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        } else {
-            let limited = format!("{base} LIMIT ?1");
-            let mut stmt = self.conn.prepare(&limited)?;
-            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-            let rows = stmt.query_map(params![limit_i64], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let mut result = Vec::with_capacity(hexes.len());
-        for hex in hexes {
-            if let Ok(addr) = WalletAddress::from_hex(&hex) {
-                result.push(addr);
-            }
-        }
-        Ok(result)
-    }
-
-    /// Record funder edges for `wallet` and mark it as done.
-    ///
-    /// `funders` is a slice of `(funder_address, event_at_unix)` pairs where
-    /// `event_at_unix` is the Polygon block timestamp of the earliest funding
-    /// transaction. Use `0` as the sentinel for edges without a known on-chain
-    /// timestamp — `0` is treated as epoch (Jan 1 1970) by `FunderGraphTimeline`,
-    /// making those edges always visible in walk-forward simulations.
-    ///
-    /// Atomic per-wallet commit: N edge inserts + 1 done-mark in a single transaction.
-    /// Idempotent: repeated calls for the same `(funder, funded)` pair are safe.
-    /// A wallet with zero funders is still written to `funder_lookup_done` so it is
-    /// not re-queried on subsequent runs.
-    pub fn insert_funder_edges(
-        &mut self,
-        wallet: WalletAddress,
-        funders: &[(WalletAddress, i64)],
-        fetched_at_unix: i64,
-    ) -> Result<(), BootstrapError> {
-        let wallet_hex = wallet.to_string();
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO funder_edges \
-                 (funder_hex, funded_hex, fetched_at_unix, event_at_unix) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (funder, event_at) in funders {
-                stmt.execute(params![
-                    funder.to_string(),
-                    wallet_hex,
-                    fetched_at_unix,
-                    event_at
-                ])?;
-            }
-            tx.execute(
-                "INSERT OR REPLACE INTO funder_lookup_done \
-                 (wallet_hex, fetched_at_unix) VALUES (?1, ?2)",
-                params![wallet_hex, fetched_at_unix],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Load all funder edges as `(funder, funded)` address pairs.
-    ///
-    /// # Precondition
-    /// Returns an empty `Vec` if no funder discovery has been run yet.
-    pub fn load_funder_edges(&self) -> Result<Vec<(WalletAddress, WalletAddress)>, BootstrapError> {
-        Ok(self
-            .load_funder_edges_with_timestamp()?
-            .into_iter()
-            .map(|(funder, funded, _)| (funder, funded))
-            .collect())
-    }
-
-    /// Load all funder edges with their on-chain event timestamp, sorted ascending.
-    ///
-    /// Returns `(funder, funded, event_at_unix)` triples. Rows migrated from older
-    /// DB versions have `event_at_unix = 0` (epoch sentinel — always visible in
-    /// walk-forward simulations). Used by `FunderGraphTimeline`.
-    pub fn load_funder_edges_with_timestamp(
-        &self,
-    ) -> Result<Vec<(WalletAddress, WalletAddress, i64)>, BootstrapError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT funder_hex, funded_hex, event_at_unix \
-             FROM funder_edges ORDER BY event_at_unix ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            let (funder_hex, funded_hex, event_at) = row?;
-            if let (Ok(funder), Ok(funded)) = (
-                WalletAddress::from_hex(&funder_hex),
-                WalletAddress::from_hex(&funded_hex),
-            ) {
-                result.push((funder, funded, event_at));
-            }
-        }
-        Ok(result)
     }
 
     /// Return the full resolution record for `market_id` if present, including
@@ -2039,23 +1660,6 @@ impl WalletCache {
         Ok(affected)
     }
 
-    /// Seed `last_funder_fetch_at = funder_lookup_done.fetched_at_unix` for already-discovered wallets.
-    ///
-    /// Run during migrate so the first `run_weekly` doesn't redundantly re-fetch
-    /// funders for the existing wallet set via Etherscan.
-    pub fn seed_last_funder_fetch_from_done(&mut self) -> Result<usize, BootstrapError> {
-        let affected = self.conn.execute(
-            "UPDATE wallets SET last_funder_fetch_at = (\
-                SELECT fetched_at_unix FROM funder_lookup_done \
-                WHERE funder_lookup_done.wallet_hex = wallets.wallet_hex\
-             ) WHERE EXISTS (\
-                SELECT 1 FROM funder_lookup_done WHERE funder_lookup_done.wallet_hex = wallets.wallet_hex\
-             )",
-            [],
-        )?;
-        Ok(affected)
-    }
-
     /// Set `last_polymarket_fetch_at = now_unix` for a single wallet.
     pub fn update_last_polymarket_fetch(
         &mut self,
@@ -2118,32 +1722,6 @@ impl WalletCache {
         )?;
         let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Bulk-insert classification rows into the `delta_audit` table.
-    ///
-    /// Idempotent on `(run_at_unix, wallet_hex)` PK — re-running the same
-    /// classification pass is a no-op. Issue #176.
-    pub fn insert_delta_audit_rows(
-        &mut self,
-        rows: &[(i64, String, &'static str, i64)],
-    ) -> Result<(), BootstrapError> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO delta_audit \
-                 (run_at_unix, wallet_hex, classification, new_trades_fetched) \
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (run_at, hex, class, count) in rows {
-                stmt.execute(params![run_at, hex, class, count])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     /// Mark a wallet as infrastructure (sticky 0→1).
@@ -2349,8 +1927,8 @@ impl WalletCache {
     /// Return every `wallet_hex` in the `active_tradeable_wallets` view
     /// (`is_active = 1 AND is_infra = 0`) — the ~182k candidate universe for the
     /// skill-selection pipeline (issue #212). Unfiltered, unlike
-    /// `wallets_needing_funder_lookup` / `select_backfill_due` which add
-    /// staleness/limit clauses; mirrors [`Self::all_pile_wallet_hexes`].
+    /// `select_backfill_due` which adds staleness/limit clauses; mirrors
+    /// [`Self::all_pile_wallet_hexes`].
     pub fn active_tradeable_wallet_hexes(&self) -> Result<Vec<String>, BootstrapError> {
         let mut stmt = self
             .conn
@@ -2756,129 +2334,6 @@ mod tests {
         assert_eq!(cache.token_condition_count(), 0);
     }
 
-    /// 14-tuple matching the `upsert_counterparty_edges_batch` parameter order.
-    type EdgeRow = (
-        String,         // tx_hash
-        i64,            // log_index
-        i64,            // block_number
-        i64,            // block_ts_unix
-        String,         // contract_addr
-        i64,            // contract_version
-        String,         // maker_hex
-        String,         // taker_hex
-        String,         // maker_asset_id_dec
-        Option<String>, // taker_asset_id_dec
-        Option<i64>,    // side
-        String,         // maker_amount_raw
-        String,         // taker_amount_raw
-        String,         // fee_raw
-    );
-
-    /// Helper: a fully-populated V1 edge row with parameterised fields.
-    fn v1_edge_row(
-        tx_hash: &str,
-        log_index: i64,
-        block_number: i64,
-        maker: &str,
-        taker: &str,
-    ) -> EdgeRow {
-        (
-            tx_hash.to_string(),
-            log_index,
-            block_number,
-            1_700_000_000,
-            "0xcccccccccccccccccccccccccccccccccccccccc".to_string(),
-            1,
-            maker.to_string(),
-            taker.to_string(),
-            "111".to_string(),
-            Some("222".to_string()),
-            None,
-            "1000000".to_string(),
-            "2000000".to_string(),
-            "500".to_string(),
-        )
-    }
-
-    #[test]
-    fn counterparty_edges_batch_round_trips_v1_and_v2() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
-        assert_eq!(cache.counterparty_edge_count(), 0);
-
-        let v1 = v1_edge_row("0xt1", 0, 100, "0xa", "0xb");
-        let v2 = (
-            "0xt2".to_string(),
-            1,
-            200,
-            1_700_000_100,
-            "0xdddddddddddddddddddddddddddddddddddddddd".to_string(),
-            2,
-            "0xa".to_string(),
-            "0xb".to_string(),
-            "999999".to_string(),
-            None, // V2: implicit USDC leg
-            Some(1),
-            "7".to_string(),
-            "8".to_string(),
-            "9".to_string(),
-        );
-        cache.upsert_counterparty_edges_batch(&[v1, v2]).unwrap();
-        assert_eq!(cache.counterparty_edge_count(), 2);
-        assert_eq!(cache.counterparty_edges_max_block(), Some(200));
-    }
-
-    #[test]
-    fn counterparty_edges_replace_on_duplicate_key() {
-        // INSERT OR REPLACE keyed on (tx_hash, log_index): a re-scan of the same
-        // chunk must not duplicate rows. Mutate maker_amount to prove the row
-        // was actually overwritten (not silently ignored).
-        let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
-        let first = v1_edge_row("0xtx", 0, 100, "0xa", "0xb");
-        cache.upsert_counterparty_edges_batch(&[first]).unwrap();
-        let mut overwrite = v1_edge_row("0xtx", 0, 100, "0xa", "0xb");
-        overwrite.11 = "9999".to_string(); // maker_amount_raw
-        cache.upsert_counterparty_edges_batch(&[overwrite]).unwrap();
-        assert_eq!(cache.counterparty_edge_count(), 1);
-        let amt: String = cache
-            .conn
-            .query_row(
-                "SELECT maker_amount_raw FROM counterparty_edges WHERE tx_hash = '0xtx' AND log_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(amt, "9999");
-    }
-
-    #[test]
-    fn counterparty_edges_empty_batch_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
-        cache.upsert_counterparty_edges_batch(&[]).unwrap();
-        assert_eq!(cache.counterparty_edge_count(), 0);
-        assert_eq!(cache.counterparty_edges_max_block(), None);
-    }
-
-    #[test]
-    fn counterparty_edges_max_block_returns_max_not_last() {
-        // Inserting out-of-order blocks: max_block must reflect MAX(), not the
-        // most-recently-written row (the scanner can re-write earlier chunks).
-        let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
-        cache
-            .upsert_counterparty_edges_batch(&[v1_edge_row("0x1", 0, 500, "0xa", "0xb")])
-            .unwrap();
-        cache
-            .upsert_counterparty_edges_batch(&[v1_edge_row("0x2", 0, 200, "0xa", "0xb")])
-            .unwrap();
-        cache
-            .upsert_counterparty_edges_batch(&[v1_edge_row("0x3", 0, 400, "0xa", "0xb")])
-            .unwrap();
-        assert_eq!(cache.counterparty_edges_max_block(), Some(500));
-    }
-
     #[test]
     fn self_map_orphan_inserts_singleton_when_absent() {
         let dir = TempDir::new().unwrap();
@@ -2915,16 +2370,6 @@ mod tests {
 
     fn tmp_cache(dir: &TempDir) -> WalletCache {
         WalletCache::open(&dir.path().join("cache.db")).unwrap()
-    }
-
-    /// Issue #201: `wallets_needing_funder_lookup` is scoped to the
-    /// `active_tradeable_wallets` view, so a candidate wallet needs a `wallets`
-    /// row with is_active=1, is_infra=0. `insert_new` only writes `trades`.
-    fn activate_candidate(cache: &mut WalletCache, w: WalletAddress) {
-        cache
-            .upsert_wallets_bulk(&[(w.to_string(), 0, false, None, None, None, 0)])
-            .unwrap();
-        cache.conn_for_test_set_active(&w.to_string(), 1);
     }
 
     #[test]
@@ -3932,222 +3377,6 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(cache.resolved_market_ids().len(), 1);
-    }
-
-    // ── funder_edges / funder_lookup_done unit tests ──────────────────────────
-
-    #[test]
-    fn wallets_needing_lookup_returns_all_when_none_done() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        cache
-            .insert_new(&w1.to_string(), vec![make_trade("t1", w1, 1_000)])
-            .unwrap();
-        cache
-            .insert_new(&w2.to_string(), vec![make_trade("t2", w2, 2_000)])
-            .unwrap();
-        activate_candidate(&mut cache, w1);
-        activate_candidate(&mut cache, w2);
-
-        let pending = cache.wallets_needing_funder_lookup(0).unwrap();
-        assert_eq!(pending.len(), 2);
-        assert!(pending.contains(&w1));
-        assert!(pending.contains(&w2));
-    }
-
-    #[test]
-    fn wallets_needing_lookup_returns_only_pending() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        cache
-            .insert_new(&w1.to_string(), vec![make_trade("t1", w1, 1_000)])
-            .unwrap();
-        cache
-            .insert_new(&w2.to_string(), vec![make_trade("t2", w2, 2_000)])
-            .unwrap();
-        activate_candidate(&mut cache, w1);
-        activate_candidate(&mut cache, w2);
-
-        // Mark w1 as done.
-        cache.insert_funder_edges(w1, &[], 1_700_000_000).unwrap(); // zero funders
-
-        let pending = cache.wallets_needing_funder_lookup(0).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0], w2);
-    }
-
-    #[test]
-    fn wallets_needing_lookup_scopes_to_active_non_infra_and_honours_limit() {
-        // Issue #201: only active, non-infra wallets are funder candidates, and
-        // `limit` truncates the result (LIMIT 0 ⇒ unbounded, not zero rows).
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let active1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let active2 = addr("0xdddddddddddddddddddddddddddddddddddddddd");
-        let inactive = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let infra = addr("0xcccccccccccccccccccccccccccccccccccccccc");
-        for (i, w) in [active1, active2, inactive, infra].iter().enumerate() {
-            cache
-                .insert_new(
-                    &w.to_string(),
-                    vec![make_trade(&format!("t{i}"), *w, 1_000 + i as i64)],
-                )
-                .unwrap();
-        }
-        // active1/active2: active + non-infra (candidates).
-        activate_candidate(&mut cache, active1);
-        activate_candidate(&mut cache, active2);
-        // inactive: row exists, is_active stays 0.
-        cache
-            .upsert_wallets_bulk(&[(inactive.to_string(), 0, false, None, None, None, 0)])
-            .unwrap();
-        // infra: active but is_infra=1 → excluded by the view.
-        cache
-            .upsert_wallets_bulk(&[(infra.to_string(), 0, true, None, None, None, 0)])
-            .unwrap();
-        cache.conn_for_test_set_active(&infra.to_string(), 1);
-
-        let mut pending = cache.wallets_needing_funder_lookup(0).unwrap();
-        pending.sort_by_key(|w| w.0);
-        assert_eq!(
-            pending.len(),
-            2,
-            "only the two active non-infra wallets are candidates"
-        );
-        assert!(pending.contains(&active1) && pending.contains(&active2));
-        assert!(!pending.contains(&inactive), "inactive wallet excluded");
-        assert!(!pending.contains(&infra), "infra wallet excluded");
-
-        // LIMIT 1 truncates to one of the two candidates.
-        let limited = cache.wallets_needing_funder_lookup(1).unwrap();
-        assert_eq!(limited.len(), 1, "LIMIT 1 returns exactly one candidate");
-    }
-
-    #[test]
-    fn insert_funder_edges_round_trips() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let funded = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let funder1 = addr("0x1111111111111111111111111111111111111111");
-        let funder2 = addr("0x2222222222222222222222222222222222222222");
-        let funder3 = addr("0x3333333333333333333333333333333333333333");
-
-        cache
-            .insert_funder_edges(
-                funded,
-                &[
-                    (funder1, 1_600_000_000),
-                    (funder2, 1_600_000_001),
-                    (funder3, 1_600_000_002),
-                ],
-                1_700_000_000,
-            )
-            .unwrap();
-
-        let edges = cache.load_funder_edges().unwrap();
-        assert_eq!(edges.len(), 3);
-        let funded_addrs: Vec<_> = edges.iter().map(|(_, f)| *f).collect();
-        assert!(funded_addrs.iter().all(|f| *f == funded));
-        let funder_addrs: Vec<_> = edges.iter().map(|(f, _)| *f).collect();
-        assert!(funder_addrs.contains(&funder1));
-        assert!(funder_addrs.contains(&funder2));
-        assert!(funder_addrs.contains(&funder3));
-    }
-
-    #[test]
-    fn insert_funder_edges_zero_funders_marks_done() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let w = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        cache
-            .insert_new(&w.to_string(), vec![make_trade("t1", w, 1_000)])
-            .unwrap();
-        activate_candidate(&mut cache, w);
-
-        // Zero funders — wallet is still marked done.
-        cache.insert_funder_edges(w, &[], 1_700_000_000).unwrap(); // no funder tuples
-
-        let pending = cache.wallets_needing_funder_lookup(0).unwrap();
-        assert!(
-            pending.is_empty(),
-            "active candidate with zero funders must still be marked done (excluded by done-ness, not scope)"
-        );
-
-        let edges = cache.load_funder_edges().unwrap();
-        assert!(edges.is_empty());
-    }
-
-    #[test]
-    fn insert_funder_edges_is_idempotent() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let funded = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let funder = addr("0x1111111111111111111111111111111111111111");
-
-        cache
-            .insert_funder_edges(funded, &[(funder, 1_600_000_000)], 1_700_000_000)
-            .unwrap();
-        cache
-            .insert_funder_edges(funded, &[(funder, 1_600_000_001)], 1_700_000_001)
-            .unwrap();
-
-        let edges = cache.load_funder_edges().unwrap();
-        assert_eq!(
-            edges.len(),
-            1,
-            "duplicate (funder, funded) must not double-insert"
-        );
-    }
-
-    #[test]
-    fn load_funder_edges_full_table() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = tmp_cache(&dir);
-        let w1 = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let w2 = addr("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        let f1 = addr("0x1111111111111111111111111111111111111111");
-        let f2 = addr("0x2222222222222222222222222222222222222222");
-        let f3 = addr("0x3333333333333333333333333333333333333333");
-
-        // w1 has 2 funders, w2 has 1.
-        cache
-            .insert_funder_edges(
-                w1,
-                &[(f1, 1_600_000_000), (f2, 1_600_000_001)],
-                1_700_000_000,
-            )
-            .unwrap();
-        cache
-            .insert_funder_edges(w2, &[(f3, 1_600_000_002)], 1_700_000_001)
-            .unwrap();
-
-        let edges = cache.load_funder_edges().unwrap();
-        assert_eq!(edges.len(), 3);
-    }
-
-    #[test]
-    fn funder_edges_round_trip_through_disk() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("cache.db");
-        let funded = addr("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let funder = addr("0x1111111111111111111111111111111111111111");
-
-        {
-            let mut cache = WalletCache::open(&path).unwrap();
-            cache
-                .insert_funder_edges(funded, &[(funder, 1_600_000_000)], 1_700_000_000)
-                .unwrap();
-        }
-        {
-            let cache = WalletCache::open(&path).unwrap();
-            let edges = cache.load_funder_edges().unwrap();
-            assert_eq!(edges.len(), 1);
-            assert_eq!(edges[0], (funder, funded));
-        }
     }
 
     // ── snapshot_appearances_up_to ───────────────────────────────────────────

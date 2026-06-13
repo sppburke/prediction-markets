@@ -87,7 +87,7 @@ fn config_with_dir(dir: &TempDir) -> BootstrapConfig {
 
 #[tokio::test]
 async fn scenario_enumerate_skips_when_state_is_complete() {
-    use pe_source_onchain_polygon::contracts::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
+    use pe_bootstrap::chain::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
 
     let dir = TempDir::new().unwrap();
     let config = config_with_dir(&dir);
@@ -360,7 +360,7 @@ fn scenario_weekly_partial_error_matches_exit2_arm() {
 
 #[tokio::test]
 async fn scenario_enumerate_wallets_discovered_counts_source_bit_wallets() {
-    use pe_source_onchain_polygon::contracts::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
+    use pe_bootstrap::chain::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
 
     let dir = TempDir::new().unwrap();
     let config = config_with_dir(&dir);

@@ -2,21 +2,19 @@
 //!
 //! Pipeline (invoked as `pe-bootstrap all` or no-arg):
 //! 1. `migrate::auto_migrate_legacy` — one-shot SQLite consolidation.
-//! 2. `enumerate::run_enumerate` — discover wallets via Dune or Polygon on-chain.
+//! 2. `enumerate::run_enumerate` — discover wallets via Dune.
 //! 3. `fetch::run_fetch` — fetch Polymarket trade history per wallet.
-//! 4. `funder::run_funder` — resolve on-chain funder edges (opt-in).
-//! 5. `watchlist_phase::run_watchlist` — reconstruct ledgers, filter, write watchlist.json.
-//! 6. `fetch_resolutions_and_schedules` — fetch market resolution data (opt-in).
+//! 4. `watchlist_phase::run_watchlist` — reconstruct ledgers, filter, write watchlist.json.
+//! 5. `fetch_resolutions_and_schedules` — fetch market resolution data (opt-in).
 //!
 //! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
 pub mod backfill;
 pub mod cache;
+pub mod chain;
 pub mod clob;
 pub mod config;
-pub mod counterparty_edges;
 pub mod coverage;
-pub mod delta_audit;
 pub mod discovery;
 pub mod dune;
 pub mod enumerate;
@@ -24,24 +22,19 @@ pub mod error;
 pub mod events;
 pub mod fetch;
 pub mod filter;
-pub mod funder;
 pub mod gamma;
 pub mod infra_probe;
 pub mod leaderboard_discovery;
 pub mod lock;
 pub mod migrate;
-pub mod operator_audit;
 pub mod pile;
 pub mod polygon_ctf;
-pub mod polygon_ctf_delta;
 pub mod polymarket;
 pub mod radion;
-pub mod reconcile_volume;
 pub mod seed_historical;
 pub mod wallet_discovery;
 pub mod wallet_set;
 pub mod watchlist_phase;
-pub mod weekly;
 pub mod winner_discovery;
 
 pub use config::BootstrapConfig;
@@ -52,11 +45,11 @@ pub use watchlist_phase::build_seed_watchlist;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use pe_source_onchain_polygon::contracts::CTF_DEPLOY_BLOCK;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use cache::WalletCache;
+use chain::CTF_DEPLOY_BLOCK;
 use dune::DuneClient;
 use error::BootstrapError;
 
@@ -64,43 +57,18 @@ use error::BootstrapError;
 pub const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 
 /// Wallet discovery backend.
+///
+/// Collapsed to Dune-only in #326 PR4: the on-chain enumeration backend (the
+/// `source-onchain-polygon` crate) was deleted. `"onchain"` / `"etherscan"` are
+/// still accepted as serde aliases so legacy config files parse — they resolve
+/// to Dune.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WalletSource {
-    /// Use Dune Analytics (legacy path; requires `PE_DUNE_API_KEY`).
+    /// Use Dune Analytics (requires `PE_DUNE_API_KEY`).
+    #[default]
+    #[serde(alias = "onchain", alias = "etherscan")]
     Dune,
-    /// Use Polygon RPC `eth_getLogs` via alloy (requires `PE_BOOTSTRAP_POLYGON_RPC_URL`).
-    /// `"etherscan"` is accepted as a serde alias for backward compat with existing config files.
-    #[default]
-    #[serde(alias = "etherscan")]
-    OnChain,
-}
-
-/// Delta-backfill mode (issue #176).
-///
-/// Selects how `backfill::run_backfill` uses the Polygon CTF on-chain `eth_getLogs`
-/// scan to narrow the per-day Polymarket API surface.
-///
-/// - [`DeltaMode::Off`] — legacy behaviour. Every due wallet from
-///   `select_backfill_due` is fetched. No on-chain scan; no audit rows.
-/// - [`DeltaMode::Shadow`] — runs the on-chain scan AND the legacy full fetch on
-///   every backfill run; classifies each wallet into `DELTA_HIT` / `DELTA_MISS` /
-///   `DELTA_EXTRA` rows in the `delta_audit` table.
-/// - [`DeltaMode::Delta`] — the on-chain scan filters the fetch set down to
-///   `(full_due_set ∩ delta_set) ∪ paranoia_set`.
-///
-/// `Default` is [`DeltaMode::Shadow`] — safe-by-default. The delta scanner is only
-/// invoked inside `backfill::run_backfill`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeltaMode {
-    /// Disable the on-chain scan entirely; legacy fetch-all-due behaviour.
-    Off,
-    /// Run scan + full fetch; populate `delta_audit` but do not change the fetch set.
-    #[default]
-    Shadow,
-    /// Use the scan to filter the fetch set; weekly paranoia provides the backstop.
-    Delta,
 }
 
 /// Outcome of [`fetch_resolutions_and_schedules`] (issue #201).

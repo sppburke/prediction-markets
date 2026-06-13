@@ -1,16 +1,11 @@
-use alloy::providers::ProviderBuilder;
 use pe_bootstrap::{
-    BootstrapConfig, FUNDER_DISCOVERY_TO_BLOCK, backfill,
+    BootstrapConfig, backfill,
     cache::WalletCache,
     config, coverage, discovery, enumerate,
     error::BootstrapError,
-    fetch, fetch_resolutions_and_schedules, funder, infra_probe, lock, migrate, pile,
-    run_schedule_backfill,
+    fetch, fetch_resolutions_and_schedules, infra_probe, migrate, pile, run_schedule_backfill,
     seed_historical::{self, parse_seed_as_of_env},
-    watchlist_phase, weekly, winner_discovery,
-};
-use pe_source_onchain_polygon::{
-    AlloyChainLogFetcher, BlockRange, contracts::CTF_EXCHANGE_V1_DEPLOY_BLOCK,
+    watchlist_phase, winner_discovery,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -40,17 +35,13 @@ async fn main() {
             "all"
                 | "enumerate"
                 | "fetch"
-                | "funder"
                 | "watchlist"
                 | "resolutions"
                 | "schedules"
                 | "events"
-                | "counterparty-edges"
-                | "reconcile-volume"
                 | "seed-historical"
                 | "discovery"
                 | "backfill"
-                | "weekly"
                 | "classify-infra"
                 | "coverage"
                 | "winner-discovery"
@@ -135,26 +126,6 @@ async fn main() {
             std::process::exit(exit);
         }
 
-        // `reconcile-volume` is a pure reader (run_reconcile_volume takes
-        // `&WalletCache`, not `&mut`), so open the cache READ_ONLY and
-        // bypass the shared read-write open below. Lets the subcommand run
-        // alongside a long-running writer such as `counterparty-edges`
-        // without conflicting on the CacheMutationLock — SQLite WAL mode
-        // supports concurrent readers during writes. Mirrors the `coverage`
-        // dispatch above (issue #208).
-        if sub == "reconcile-volume" {
-            let exit = match pe_bootstrap::reconcile_volume::run_reconcile_volume_read_only(
-                &bootstrap_config.cache_path,
-            ) {
-                Ok(_report) => 0,
-                Err(e) => {
-                    tracing::error!(error = %e, "reconcile-volume: fatal");
-                    1
-                }
-            };
-            std::process::exit(exit);
-        }
-
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
             Err(e) => {
@@ -207,81 +178,6 @@ async fn main() {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "fetch: fatal");
-                        1
-                    }
-                }
-            }
-
-            "funder" => {
-                // Issue #203: the bulk funder lookup runs against the Polygon RPC
-                // via batched `eth_getLogs` (the incremental `weekly` path keeps
-                // Etherscan). Requires `polygon_rpc_url`.
-                let rpc_url = match &bootstrap_config.polygon_rpc_url {
-                    Some(u) => u.clone(),
-                    None => {
-                        tracing::error!("funder: PE_BOOTSTRAP_POLYGON_RPC_URL not set");
-                        std::process::exit(1);
-                    }
-                };
-                let pending =
-                    match cache.wallets_needing_funder_lookup(bootstrap_config.funder_limit) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!(error = %e, "funder: cache read failed");
-                            std::process::exit(1);
-                        }
-                    };
-                if pending.is_empty() {
-                    tracing::info!("funder: no wallets pending funder lookup");
-                    std::process::exit(0);
-                }
-                let http_url = match rpc_url.parse::<reqwest::Url>() {
-                    Ok(u) => u,
-                    Err(e) => {
-                        tracing::error!(error = %e, "funder: invalid polygon_rpc_url");
-                        std::process::exit(1);
-                    }
-                };
-                let fetcher = AlloyChainLogFetcher {
-                    provider: ProviderBuilder::new().connect_http(http_url),
-                    min_chunk: 1,
-                };
-                let block_range = BlockRange {
-                    from: CTF_EXCHANGE_V1_DEPLOY_BLOCK,
-                    to: FUNDER_DISCOVERY_TO_BLOCK,
-                };
-                match funder::run_funder_eth_logs(
-                    &mut cache,
-                    &pending,
-                    block_range,
-                    &fetcher,
-                    bootstrap_config.funder_block_chunk,
-                    bootstrap_config.funder_topic_batch_size,
-                )
-                .await
-                {
-                    Ok(r) if r.failed > 0 && !strict => {
-                        tracing::warn!(
-                            failed = r.failed,
-                            "funder: partial — failed wallets will retry on next run"
-                        );
-                        2
-                    }
-                    Ok(r) if r.failed > 0 => {
-                        tracing::error!(failed = r.failed, "funder: partial (--strict)");
-                        1
-                    }
-                    Ok(r) => {
-                        tracing::info!(
-                            pending = r.pending,
-                            processed = r.processed,
-                            edges_total = r.edges_total,
-                            "funder: complete"
-                        );
-                        0
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "funder: fatal");
                         1
                     }
                 }
@@ -384,31 +280,6 @@ async fn main() {
                 }
             }
 
-            "counterparty-edges" => match pe_bootstrap::counterparty_edges::run_counterparty_edges(
-                &bootstrap_config,
-                &mut cache,
-            )
-            .await
-            {
-                Ok(report) => {
-                    tracing::info!(
-                        edges_upserted = report.edges_upserted,
-                        edges_skipped = report.edges_skipped,
-                        chunks_scanned = report.chunks_scanned,
-                        from_block = report.from_block,
-                        to_block = report.to_block,
-                        "counterparty-edges: complete"
-                    );
-                    0
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "counterparty-edges: fatal");
-                    1
-                }
-            },
-
-            // `reconcile-volume` is handled in the early read-only dispatch
-            // above (alongside `coverage`) — it never reaches this match.
             "seed-historical" => {
                 let dates = if let Some(as_of) = as_of_arg {
                     match parse_seed_as_of_env(as_of) {
@@ -509,32 +380,6 @@ async fn main() {
                 }
             },
 
-            "weekly" => match weekly::run_weekly(&bootstrap_config, &mut cache).await {
-                Ok(r) => {
-                    tracing::info!(
-                        due = r.due,
-                        processed = r.processed,
-                        failed = r.failed,
-                        to_block = r.to_block,
-                        "weekly: complete"
-                    );
-                    0
-                }
-                Err(e @ BootstrapError::PartialFetch { .. }) => {
-                    // Issue #195: weekly now returns PartialFetch (exit 2) when any
-                    // wallets fail, matching backfill's exit-code convention.
-                    tracing::warn!(
-                        error = %e,
-                        "weekly: partial — failed wallets will retry on next run"
-                    );
-                    2
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "weekly: fatal");
-                    1
-                }
-            },
-
             "classify-infra" => {
                 // Issue #197: retroactive sweep that mirrors the cold-start
                 // probe semantics over cached trades. `--dry-run` previews
@@ -593,81 +438,6 @@ async fn main() {
             }
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: --print-config failed");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // Issue #191 Item 2 — one-shot V1-attribution backfill subcommand.
-    if first_arg == Some("--backfill-v1-attribution") {
-        let toml_arg = args.get(2).map(std::path::PathBuf::from);
-        let dry_run = args.iter().any(|a| a == "--dry-run");
-        let cfg = match config::load(toml_arg.as_deref()) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "backfill-v1-attribution: config error");
-                std::process::exit(1);
-            }
-        };
-        let mut cache = match WalletCache::open(&cfg.cache_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "backfill-v1-attribution: cache open failed");
-                std::process::exit(1);
-            }
-        };
-        let _lock = match lock::CacheMutationLock::acquire(&cfg.cache_path) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(error = %e, "backfill-v1-attribution: lock acquire failed");
-                std::process::exit(1);
-            }
-        };
-        if dry_run {
-            let (_, topics) = match migrate::load_enum_state(&cache) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "backfill-v1-attribution: load_enum_state failed");
-                    std::process::exit(1);
-                }
-            };
-            let progress = match migrate::load_chunk_progress(&cache) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(error = %e, "backfill-v1-attribution: load_chunk_progress failed");
-                    std::process::exit(1);
-                }
-            };
-            let v1_topic_hex = format!(
-                "{}",
-                pe_source_onchain_polygon::contracts::TOPIC_ORDER_FILLED_V1
-            );
-            let v1_prefix = format!("{v1_topic_hex}|");
-            let topic_present = topics.contains(&v1_topic_hex);
-            let chunks_to_remove = progress
-                .keys()
-                .filter(|k| k.starts_with(&v1_prefix))
-                .count();
-            print!(
-                "DRY RUN: would clear V1 topic from enumerated_topic_hashes (present={topic_present}) \
-                 and {chunks_to_remove} entries from chunk_progress.\n\
-                 Re-run without --dry-run to apply.\n"
-            );
-            return;
-        }
-        match migrate::reset_v1_topic_cursors(&mut cache) {
-            Ok((topic_removed, chunks_removed)) => {
-                print!(
-                    "Cleared V1 topic from enumerated_topic_hashes (was_present={topic_removed}) \
-                     and {chunks_removed} entries from chunk_progress.\n\
-                     Run pe-bootstrap normally to re-enumerate V1; the per-chunk UPSERT will \
-                     populate polymarket_contracts_seen bit 1 for every wallet that has V1 \
-                     OrderFilled activity.\n"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "backfill-v1-attribution: reset failed");
                 std::process::exit(1);
             }
         }
@@ -770,66 +540,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
         }
     }
 
-    // Step 3: funder-graph discovery (optional).
-    // Issue #203: the bulk path uses batched `eth_getLogs` against the Polygon
-    // RPC (the `weekly` path keeps Etherscan), so it gates on `polygon_rpc_url`.
-    if config.fetch_funder_graph {
-        if let Some(rpc_url) = &config.polygon_rpc_url {
-            let pending = match cache.wallets_needing_funder_lookup(config.funder_limit) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(error = %e, "all: funder lookup list failed");
-                    return 1;
-                }
-            };
-            if !pending.is_empty() {
-                let http_url = match rpc_url.parse::<reqwest::Url>() {
-                    Ok(u) => u,
-                    Err(e) => {
-                        tracing::error!(error = %e, "all: invalid polygon_rpc_url");
-                        return 1;
-                    }
-                };
-                let fetcher = AlloyChainLogFetcher {
-                    provider: ProviderBuilder::new().connect_http(http_url),
-                    min_chunk: 1,
-                };
-                let block_range = pe_source_onchain_polygon::BlockRange {
-                    from: CTF_EXCHANGE_V1_DEPLOY_BLOCK,
-                    to: FUNDER_DISCOVERY_TO_BLOCK,
-                };
-                match funder::run_funder_eth_logs(
-                    cache,
-                    &pending,
-                    block_range,
-                    &fetcher,
-                    config.funder_block_chunk,
-                    config.funder_topic_batch_size,
-                )
-                .await
-                {
-                    Ok(r) if r.failed > 0 && !strict => {
-                        soft_fail = true;
-                    }
-                    Ok(r) if r.failed > 0 => {
-                        tracing::error!(failed = r.failed, "all: funder partial (--strict)");
-                        return 1;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(error = %e, "all: funder fatal");
-                        return 1;
-                    }
-                }
-            }
-        } else {
-            tracing::warn!(
-                "PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1 but PE_BOOTSTRAP_POLYGON_RPC_URL not set — skipping"
-            );
-        }
-    }
-
-    // Step 4: watchlist build.
+    // Step 3: watchlist build.
     match watchlist_phase::run_watchlist(config, cache, &wallets, None).await {
         Ok(r) => {
             tracing::info!(
@@ -844,7 +555,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
         }
     }
 
-    // Step 5: resolutions (optional).
+    // Step 4: resolutions (optional).
     if config.fetch_resolutions {
         let ids = cache.all_market_ids();
         match fetch_resolutions_and_schedules(config, cache, &ids).await {
