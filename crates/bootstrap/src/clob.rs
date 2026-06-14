@@ -13,9 +13,9 @@
 //!
 //! **Approximation:** `resolved_at_unix` is set to the parsed
 //! `end_date_iso` because CLOB does not expose a block-timestamp
-//! resolution time. Polygon RPC + Dune provide the authoritative value
-//! and win on `INSERT OR IGNORE` ordering, so CLOB's approximation only
-//! sticks for markets neither of those sources catches.
+//! resolution time. Polygon RPC provides the authoritative value and wins
+//! on `INSERT OR IGNORE` ordering, so CLOB's approximation only sticks for
+//! markets Polygon RPC doesn't catch.
 
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
@@ -150,7 +150,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 // time), so a malformed value would otherwise stamp the row
                 // with `resolved_at = now()`, lying about when the market
                 // actually settled. Skipping leaves the market unresolved so
-                // Polygon RPC or Dune can fill in an accurate timestamp later.
+                // Polygon RPC can fill in an accurate timestamp later.
                 let winner = winner_index(&market.tokens);
                 if market.closed
                     && let Some(resolved_at) = end_date_unix

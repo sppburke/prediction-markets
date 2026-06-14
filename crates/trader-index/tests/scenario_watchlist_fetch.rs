@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use pe_core_types::{BasisPoints, WalletAddress};
 use pe_source_polymarket_public::{
-    FixtureFetcher, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint,
+    FixtureFetcher, LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint,
 };
 use pe_trader_index::{WatchlistFetchConfig, WatchlistFetcher, WatchlistTier};
 
@@ -24,6 +24,7 @@ fn make_fetcher(fixture_bytes: Vec<u8>) -> WatchlistFetcher<FixtureFetcher> {
     let url = PolymarketEndpoint::Leaderboard {
         sort: LeaderboardSort::Profit,
         window: LeaderboardWindow::AllTime,
+        category: LeaderboardCategory::Overall,
         limit: 5,
     }
     .url(base);
@@ -96,6 +97,7 @@ async fn scenario_watchlist_size_cap() {
     let url = PolymarketEndpoint::Leaderboard {
         sort: LeaderboardSort::Profit,
         window: LeaderboardWindow::AllTime,
+        category: LeaderboardCategory::Overall,
         limit: 3,
     }
     .url("https://data-api.polymarket.com");
@@ -136,6 +138,7 @@ async fn scenario_parse_error_on_bad_json() {
     let url = PolymarketEndpoint::Leaderboard {
         sort: LeaderboardSort::Profit,
         window: LeaderboardWindow::AllTime,
+        category: LeaderboardCategory::Overall,
         limit: 20,
     }
     .url("https://data-api.polymarket.com");

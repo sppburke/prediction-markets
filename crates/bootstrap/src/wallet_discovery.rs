@@ -56,8 +56,13 @@ pub async fn run_source_discovery(
                     .with_min_interval_ms(config.leaderboard_request_interval_ms),
             );
             let _lock = CacheMutationLock::acquire(&config.cache_path)?;
-            let r: LeaderboardDiscoveryReport =
-                run_leaderboard_discovery(&fetcher, config.leaderboard_top_n, cache).await?;
+            let r: LeaderboardDiscoveryReport = run_leaderboard_discovery(
+                &fetcher,
+                &config.leaderboard_categories,
+                config.leaderboard_top_n,
+                cache,
+            )
+            .await?;
             Ok(SourceDiscoveryResult {
                 unique_wallets: r.unique_wallets,
                 activated: r.activated,

@@ -8,7 +8,7 @@
 //!    [`FetchOutcome`] with the failed list AND a `new_trades` map of
 //!    wallets with at least one new inserted row.
 //! 3. `fetch_resolutions_and_schedules` — multi-source pipeline (Polygon RPC →
-//!    Dune → CLOB → Gamma) on the full cache market set so newly-discovered
+//!    CLOB → Gamma) on the full cache market set so newly-discovered
 //!    market_ids get their resolution / schedule rows.
 //! 4. `refresh_trade_counts` + `apply_activation_rules` — newly-qualifying
 //!    wallets flip to `is_active=1`.

@@ -48,7 +48,7 @@ const MIN_CHUNK_BLOCKS: u64 = 1;
 /// Skip-set: every market already present in `market_resolutions` (any
 /// source) is silently filtered out, so the function is idempotent across
 /// repeated invocations and earlier sources (Polygon ran first → CLOB and
-/// Dune see no work to do).
+/// Gamma see no work to do).
 ///
 /// After every successful chunk, the `polygon_ctf_last_block` cursor
 /// advances so daily re-runs resume from the new floor. A crash mid-chunk
@@ -154,11 +154,11 @@ pub async fn scan_resolutions(
 ///
 /// Returns `None` when the log is malformed OR the market is non-binary
 /// (`outcomeSlotCount != 2`) OR `payoutNumerators` length disagrees with
-/// `outcomeSlotCount`. The caller silently skips these — Dune covers
-/// multi-outcome markets as a fallback. Returning `None` (rather than
+/// `outcomeSlotCount`. The caller silently skips these — the CLOB/Gamma stages
+/// cover multi-outcome markets as a fallback. Returning `None` (rather than
 /// `Some((id, None))`) is load-bearing: a row with `winner=None` would
 /// still occupy the `market_resolutions` table and short-circuit the
-/// `unresolved_market_ids` filter at the Dune gate, leaving multi-outcome
+/// `unresolved_market_ids` filter at the CLOB/Gamma gate, leaving multi-outcome
 /// markets permanently unresolved (issue #149 PR #151 code-review fix).
 ///
 /// **Winner rule (issue #149 design) for binary markets:** count the
@@ -175,7 +175,7 @@ pub fn decode_resolution_log(log: &Log) -> Option<(String, Option<u16>)> {
 
     let (slot_count, numerators) = decode_payout_numerators(&log.data().data)?;
     if slot_count != U256::from(2u64) {
-        // Non-binary: skip entirely so Dune can resolve it later.
+        // Non-binary: skip entirely so the CLOB/Gamma stages can resolve it later.
         return None;
     }
     if numerators.len() != 2 {
@@ -274,13 +274,13 @@ mod tests {
     fn decode_multi_outcome_returns_none_to_skip_entirely() {
         // Multi-outcome (slot_count != 2) must return `None` (not
         // `Some((id, None))`) so the row never enters `market_resolutions`
-        // and Dune's `unresolved_market_ids` filter still picks it up.
+        // and the CLOB/Gamma resolution stages still pick it up.
         // Issue #149 PR #151 code-review fix.
         let cond = B256::repeat_byte(0xee);
         let data = encode_payout(3, &[0, 1, 0]);
         assert!(
             decode_resolution_log(&make_log(cond, data)).is_none(),
-            "non-binary markets must be skipped entirely; Dune covers them as fallback"
+            "non-binary markets must be skipped entirely; CLOB/Gamma cover them as fallback"
         );
     }
 

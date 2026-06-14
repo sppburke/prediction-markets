@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use pe_core_types::SourceId;
 use pe_source_core::SourceConnector;
 use pe_source_polymarket_public::{
-    FixtureFetcher, LeaderboardSort, LeaderboardWindow, PollingConfig, PolymarketEndpoint,
-    PolymarketPublicConnector,
+    FixtureFetcher, LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PollingConfig,
+    PolymarketEndpoint, PolymarketPublicConnector,
 };
 
 const BASE: &str = "https://data-api.polymarket.com";
@@ -29,6 +29,7 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
         PolymarketEndpoint::Leaderboard {
             sort: LeaderboardSort::Profit,
             window: LeaderboardWindow::AllTime,
+            category: LeaderboardCategory::Overall,
             limit: 500,
         },
         PolymarketEndpoint::UserTradeActivity {
@@ -51,6 +52,7 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
         PolymarketEndpoint::Leaderboard {
             sort: LeaderboardSort::Profit,
             window: LeaderboardWindow::AllTime,
+            category: LeaderboardCategory::Overall,
             limit: 500,
         }
         .url(BASE),

@@ -1,10 +1,10 @@
-//! Scenario tests for the Dune on-chain resolution pipeline.
+//! Scenario tests for the cache resolution layer.
 //!
-//! Scenarios exercise `max_resolved_at_unix`, the `parse → insert → load` pipeline,
-//! and the incremental / idempotency semantics of the cache resolution layer.
-//! No network calls; Dune HTTP responses are not mocked — the parse logic is covered
-//! by unit tests in `dune.rs`. These tests verify the cache behaviour that the
-//! wired-up pipeline relies on.
+//! Scenarios exercise `max_resolved_at_unix`, the `insert → load` pipeline, and
+//! the multi-source / idempotency semantics of the cache resolution layer
+//! (`INSERT OR IGNORE` on `market_id`, per-source delete). No network calls.
+//! Some fixtures use a legacy `"dune"` source tag, which deployed caches may
+//! still contain even though that source is no longer produced (#335).
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]

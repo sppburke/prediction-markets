@@ -9,10 +9,11 @@
 //!   [`eth_get_logs_bisect`]).
 //! - [`fetch_resolutions_and_schedules`](crate::fetch_resolutions_and_schedules)
 //!   — floor block when no cursor exists ([`CTF_DEPLOY_BLOCK`]).
-//! - [`auto_migrate_legacy`](crate::migrate::auto_migrate_legacy) +
-//!   [`run_enumerate`](crate::enumerate::run_enumerate) (Dune arm) — legacy
-//!   enum-state synthesis ([`ALL_EXCHANGE_CONTRACTS`],
-//!   [`ALL_ORDER_FILLED_TOPICS`], [`TOPIC_ORDER_FILLED_V1`]).
+//! - [`auto_migrate_legacy`](crate::migrate::auto_migrate_legacy) — legacy
+//!   V1-done enum-state synthesis for the `wallet_set.json` one-shot
+//!   ([`ALL_EXCHANGE_CONTRACTS`], [`TOPIC_ORDER_FILLED_V1`]).
+//! - [`normalise_condition_id`] — `0x` condition-id canonicalisation shared by
+//!   the Gamma `/events` sweep (relocated from the deleted `dune.rs` in #335).
 //!
 //! On-chain wallet enumeration, the delta scan, and funder discovery were
 //! deleted with their crate, so the fetcher abstraction (`ChainLogFetcher`,
@@ -58,8 +59,8 @@ pub const CTF_EXCHANGE_V2: Address = address!("E111180000d2663C0091e4f400237545B
 pub const NEG_RISK_CTF_EXCHANGE_V2: Address = address!("e2222d279d744050d28e00520010520000310F59");
 
 /// All Polymarket exchange contracts (V1 + V2). Used to synthesize the legacy
-/// "all contracts enumerated" enum-state in [`crate::migrate::auto_migrate_legacy`]
-/// and the Dune-arm enumeration completion marker.
+/// "all contracts enumerated" enum-state marker in
+/// [`crate::migrate::auto_migrate_legacy`].
 pub const ALL_EXCHANGE_CONTRACTS: [Address; 4] = [
     CTF_EXCHANGE_V1,
     NEG_RISK_CTF_EXCHANGE_V1,
@@ -274,6 +275,24 @@ pub async fn eth_get_logs_bisect<P: Provider>(
     Ok(left)
 }
 
+/// Normalise a varbinary-cast condition id to `0x`-prefixed lowercase hex.
+///
+/// Upstream casts of the form `CAST(conditionid AS VARCHAR)` emit a `\x`-prefixed
+/// string (e.g. `\x0aff…`); the cache stores `0x`-prefixed strings to match the
+/// Polymarket trade-data format. The Gamma `/events` sweep ([`crate::events`])
+/// normalises its `conditionId` through this single source of truth so the join
+/// key `market_events.condition_id ↔ trades.market_id` never drifts by source.
+///
+/// Relocated from the deleted `dune.rs` in #335: it outlived its original SQL
+/// caller, but the Gamma path still needs it.
+pub(crate) fn normalise_condition_id(raw: &str) -> String {
+    if let Some(hex) = raw.strip_prefix("\\x") {
+        format!("0x{hex}")
+    } else {
+        raw.to_owned()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -282,7 +301,16 @@ mod tests {
     use super::{
         ALL_ORDER_FILLED_TOPICS, TOPIC_CONDITION_RESOLUTION, TOPIC_ORDER_FILLED_V1,
         TOPIC_ORDER_FILLED_V2, TransientErrorKind, classify_transient_error,
+        normalise_condition_id,
     };
+
+    /// PASS: `\x`-prefixed varbinary casts become `0x`-prefixed; already-`0x`
+    /// strings pass through unchanged.
+    #[test]
+    fn normalise_condition_id_handles_both_forms() {
+        assert_eq!(normalise_condition_id("\\x0aff"), "0x0aff");
+        assert_eq!(normalise_condition_id("0xdeadbeef"), "0xdeadbeef");
+    }
 
     /// Self-validating proof that [`TOPIC_CONDITION_RESOLUTION`] matches the
     /// canonical Gnosis-CTF event signature.

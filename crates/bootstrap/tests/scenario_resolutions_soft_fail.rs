@@ -6,9 +6,8 @@
 //!       abort the pipeline.
 //! FAIL: the function returns `Err`, or `stages_failed` is empty.
 //!
-//! Dune (not injectable — `DuneClient` always hits api.dune.com) and Polygon are
-//! disabled so the test is deterministic with no live network calls; the soft-fail
-//! logic is identical across stages.
+//! Polygon is disabled (`polygon_rpc_url: None`) so the test is deterministic with
+//! no live network calls; the soft-fail logic is identical across stages.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -29,7 +28,6 @@ async fn resolutions_soft_fails_unreachable_optional_stages() {
         cache_path,
         clob_base_url: "http://127.0.0.1:1".to_owned(),
         gamma_base_url: "http://127.0.0.1:1".to_owned(),
-        dune_api_key: None,
         polygon_rpc_url: None,
         ..BootstrapConfig::default()
     };

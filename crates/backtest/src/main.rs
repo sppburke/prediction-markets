@@ -1,6 +1,5 @@
 //! `pe-backtest` binary entry point.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use pe_backtest::config::{BacktestConfig, load};
@@ -8,7 +7,6 @@ use pe_backtest::error::BacktestError;
 use pe_backtest::report::{KellySweepReport, KellySweepRun};
 use pe_backtest::simulation;
 use pe_bootstrap::cache::WalletCache;
-use pe_bootstrap::dune::DuneClient;
 use pe_strategy_winner_follow::WinnerFollowStrategy;
 use pe_trader_index::RankerConfig;
 use rayon::prelude::*;
@@ -36,8 +34,8 @@ async fn main() -> Result<(), BacktestError> {
     let config_path = first_arg.map(PathBuf::from);
     let config = load(config_path.as_deref())?;
 
-    // Load wallet trade cache (mutable so Dune resolutions can be written).
-    let mut cache = WalletCache::open(&config.bootstrap_cache_path)?;
+    // Load wallet trade cache (read-only).
+    let cache = WalletCache::open(&config.bootstrap_cache_path)?;
 
     // Pre-flight size guard (issue #241): refuse early rather than OOM-kill deep in
     // the simulation. Runs a COUNT(*) before loading the full Vec<RawTrade>.
@@ -58,61 +56,9 @@ async fn main() -> Result<(), BacktestError> {
     let mut all_trades = cache.all_trades();
     let snapshots = cache.load_all_snapshots()?;
 
-    // Fetch on-chain resolutions via Dune before running the simulation so that
-    // financial/quantitative markets (absent from the Gamma API) are resolved.
-    if let Some(api_key) = &config.dune_api_key {
-        let all_market_ids: HashSet<String> = cache.all_market_ids().into_iter().collect();
-        let already_resolved = cache.resolved_market_ids();
-        let unresolved: HashSet<String> = all_market_ids
-            .difference(&already_resolved)
-            .cloned()
-            .collect();
-        if unresolved.is_empty() {
-            info!("backtest: all markets already resolved — skipping Dune fetch");
-        } else {
-            // Scope the Dune scan to our actual trade history window, not all of
-            // history from epoch 0. A 30-day buffer before the earliest trade
-            // captures resolutions for markets entered near our data horizon.
-            const THIRTY_DAYS_SECS: i64 = 30 * 86_400;
-            let min_trade_ts = cache.min_trade_unix()?.saturating_sub(THIRTY_DAYS_SECS);
-            info!(
-                unresolved = unresolved.len(),
-                from_unix = min_trade_ts,
-                "backtest: fetching Dune resolutions"
-            );
-            let dune = DuneClient::new(api_key.clone());
-            match dune
-                .fetch_resolutions(&unresolved, min_trade_ts, config.dune_namespace.as_deref())
-                .await
-            {
-                Ok(rows) => {
-                    let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-                    let mut inserted = 0usize;
-                    for (market_id, winner, resolved_at_unix) in rows {
-                        cache.insert_resolution(
-                            &market_id,
-                            winner,
-                            resolved_at_unix,
-                            fetched_at,
-                        )?;
-                        inserted += 1;
-                    }
-                    info!(
-                        inserted,
-                        unresolved = unresolved.len(),
-                        "backtest: Dune resolutions fetched"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "backtest: Dune resolution fetch failed — continuing without on-chain resolutions"
-                    );
-                }
-            }
-        }
-    }
-
+    // Resolutions come from the bootstrap pipeline's Polygon CTF + CLOB/Gamma
+    // stages (the Dune fallback was removed in #335). The backtest reads
+    // whatever the cache already holds.
     let resolutions = pe_bootstrap::gamma::load_resolutions(&cache)?;
     let schedules = pe_bootstrap::gamma::load_schedules(&cache)?;
     let liq_index = pe_bootstrap::gamma::load_liquidity(&cache)?;

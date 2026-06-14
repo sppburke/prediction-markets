@@ -2,7 +2,8 @@
 //!
 //! Pipeline (invoked as `pe-bootstrap all` or no-arg):
 //! 1. `migrate::auto_migrate_legacy` — one-shot SQLite consolidation.
-//! 2. `enumerate::run_enumerate` — discover wallets via Dune.
+//! 2. `winner_discovery::run_winner_discovery` — discover wallets via the
+//!    Polymarket leaderboard (all categories) + Radion (when activated).
 //! 3. `fetch::run_fetch` — fetch Polymarket trade history per wallet.
 //! 4. `watchlist_phase::run_watchlist` — reconstruct ledgers, filter, write watchlist.json.
 //! 5. `fetch_resolutions_and_schedules` — fetch market resolution data (opt-in).
@@ -15,9 +16,6 @@ pub mod chain;
 pub mod clob;
 pub mod config;
 pub mod coverage;
-pub mod discovery;
-pub mod dune;
-pub mod enumerate;
 pub mod error;
 pub mod events;
 pub mod fetch;
@@ -31,7 +29,6 @@ pub mod pile;
 pub mod polygon_ctf;
 pub mod polymarket;
 pub mod radion;
-pub mod seed_historical;
 pub mod wallet_discovery;
 pub mod wallet_set;
 pub mod watchlist_phase;
@@ -39,48 +36,28 @@ pub mod winner_discovery;
 
 pub use config::BootstrapConfig;
 // Re-exports for callers that previously imported these from the crate root.
-pub use seed_historical::parse_seed_as_of_env;
 pub use watchlist_phase::build_seed_watchlist;
 
 use std::collections::HashSet;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
-
 use cache::WalletCache;
 use chain::CTF_DEPLOY_BLOCK;
-use dune::DuneClient;
 use error::BootstrapError;
 
 // Upper-bound block for funder discovery — both endpoints finalized, result is time-invariant.
 pub const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 
-/// Wallet discovery backend.
-///
-/// Collapsed to Dune-only in #326 PR4: the on-chain enumeration backend (the
-/// `source-onchain-polygon` crate) was deleted. `"onchain"` / `"etherscan"` are
-/// still accepted as serde aliases so legacy config files parse — they resolve
-/// to Dune.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WalletSource {
-    /// Use Dune Analytics (requires `PE_DUNE_API_KEY`).
-    #[default]
-    #[serde(alias = "onchain", alias = "etherscan")]
-    Dune,
-}
-
 /// Outcome of [`fetch_resolutions_and_schedules`] (issue #201).
 ///
-/// The optional fallback stages (Dune, CLOB, Gamma, null-rewrite) soft-fail
-/// independently: a failure logs a warning and records the stage name here
-/// rather than aborting the pipeline. The primary Polygon stage hard-fails
+/// The optional fallback stages (CLOB, Gamma, null-rewrite, schedule-backfill)
+/// soft-fail independently: a failure logs a warning and records the stage name
+/// here rather than aborting the pipeline. The primary Polygon stage hard-fails
 /// (propagates `Err`). A non-empty `stages_failed` ⇒ the caller should treat
 /// the run as partial (exit 2), matching the backfill/weekly convention.
 #[derive(Debug, Default, Clone)]
 pub struct ResolutionsReport {
-    /// Names of optional stages that soft-failed this run (e.g. `"dune"`).
+    /// Names of optional stages that soft-failed this run (e.g. `"clob"`).
     pub stages_failed: Vec<&'static str>,
 }
 
@@ -97,7 +74,6 @@ impl ResolutionsReport {
 /// most accurate `resolved_at_unix`:
 ///
 /// - 6a. Polygon RPC CTF scan → `source='polygon'` (block timestamp).
-/// - 6b. Dune `ctf_evt_conditionresolution` → `source='dune'` (block timestamp).
 /// - 6c. CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
 /// - 6d. Gamma schedules → `source='gamma'` (open markets only).
 /// - 6e. Gamma liquidity → only Gamma exposes liquidity (open markets).
@@ -106,7 +82,7 @@ impl ResolutionsReport {
 ///   durable follow-up): inserts a `market_schedules` row for resolved markets that
 ///   never had their schedule fetched while open.
 ///
-/// `open_ids` is computed AFTER 6a/6b/6c so Gamma only fetches truly-still-open
+/// `open_ids` is computed AFTER 6a/6c so Gamma only fetches truly-still-open
 /// markets. `market_ids` scopes the run — pass `cache.all_market_ids()` for the
 /// full pipeline or just the wallets-newly-fetched market set for targeted backfill.
 ///
@@ -133,14 +109,10 @@ pub async fn fetch_resolutions_and_schedules(
     // resolutions pass missing the gold source.
     run_polygon_resolutions(config, cache).await?;
 
-    // 6b-6f are fallback/auxiliary sources (issue #201): a failure in one
-    // (e.g. a Dune subscription-tier 400) must NOT abort the others. Each is
+    // 6c-6g are fallback/auxiliary sources (issue #201): a failure in one
+    // (e.g. a CLOB pagination hiccup) must NOT abort the others. Each is
     // soft-failed — logged and recorded in the report — and the pipeline
     // continues. A non-empty `stages_failed` makes the caller exit 2 (partial).
-    if let Err(e) = run_dune_resolutions(config, cache, market_ids).await {
-        tracing::warn!(error = %e, stage = "dune", "resolutions: stage soft-failed, continuing");
-        stages_failed.push("dune");
-    }
     if let Err(e) = run_clob_closed_markets(config, cache).await {
         tracing::warn!(error = %e, stage = "clob", "resolutions: stage soft-failed, continuing");
         stages_failed.push("clob");
@@ -185,43 +157,6 @@ async fn run_polygon_resolutions(
             from_block,
             "bootstrap: polygon_ctf resolutions fetched"
         );
-    }
-    Ok(())
-}
-
-/// 6b. Dune `ctf_evt_conditionresolution` → `source='dune'`. No-op when
-/// `dune_api_key` is unset or no markets are unresolved.
-async fn run_dune_resolutions(
-    config: &BootstrapConfig,
-    cache: &mut WalletCache,
-    market_ids: &[String],
-) -> Result<(), BootstrapError> {
-    if let Some(api_key) = &config.dune_api_key {
-        let unresolved = unresolved_market_ids(market_ids, &cache.resolved_market_ids());
-        if !unresolved.is_empty() {
-            let dune_resolution_client = DuneClient::new(api_key.clone());
-            let unresolved_set: HashSet<String> = unresolved.into_iter().collect();
-            let rows = dune_resolution_client
-                .fetch_resolutions(&unresolved_set, 0, config.dune_namespace.as_deref())
-                .await?;
-            let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-            let mut inserted = 0usize;
-            for (market_id, winner, resolved_at_unix) in rows {
-                cache.insert_resolution_with_source(
-                    &market_id,
-                    winner,
-                    resolved_at_unix,
-                    fetched_at,
-                    "dune",
-                )?;
-                inserted += 1;
-            }
-            tracing::info!(
-                inserted,
-                unresolved = unresolved_set.len(),
-                "bootstrap: dune resolutions fetched"
-            );
-        }
     }
     Ok(())
 }

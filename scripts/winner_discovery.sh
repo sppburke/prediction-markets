@@ -12,11 +12,10 @@
 # the binary falls back to PE_BOOTSTRAP_CONFIG or its own built-in defaults.
 #
 # Optional env (examples):
-# (PE_BOOTSTRAP_DISCOVERY_ENABLED gates only the legacy `discovery` subcommand,
-#  not winner-discovery.)
-#   PE_BOOTSTRAP_LEADERBOARD_BASE_URL  override leaderboard host
-#   PE_BOOTSTRAP_LEADERBOARD_TOP_N     default 500
-#   PE_BOOTSTRAP_RADION_API_URL        enables Radion source
+#   PE_BOOTSTRAP_LEADERBOARD_BASE_URL    override leaderboard host
+#   PE_BOOTSTRAP_LEADERBOARD_TOP_N       default 50 (the API caps limit at 50)
+#   PE_BOOTSTRAP_LEADERBOARD_CATEGORIES  TOML array; default = all 10 categories
+#   PE_BOOTSTRAP_RADION_API_URL          enables Radion source
 #   PE_BOOTSTRAP_RADION_API_KEY
 
 set -euo pipefail

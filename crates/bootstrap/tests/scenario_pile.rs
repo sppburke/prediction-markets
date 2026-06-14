@@ -1,8 +1,8 @@
 //! Scenario tests for the wallet pile (issue #166).
 //!
-//! Operator-level checks of the end-to-end migrate → backfill → activation
-//! flow against a synthetic SQLite + fixture-backed Polymarket fetcher. No
-//! network calls; deterministic.
+//! Operator-level checks of the migrate → backfill → activation flow against a
+//! synthetic SQLite + fixture-backed Polymarket fetcher. No network calls;
+//! deterministic.
 //!
 //! Each scenario has a single PASS/FAIL criterion stated before the test body.
 
@@ -10,11 +10,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
-use std::io::Write;
 
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::migrate::run_migrate;
-use pe_bootstrap::pile::{self, PILE_ACTIVATION_MIN_TRADES, SRC_DUNE_INCREMENTAL, SRC_LEADERBOARD};
+use pe_bootstrap::pile::{self, PILE_ACTIVATION_MIN_TRADES, SRC_LEADERBOARD, SRC_WALLET_SET_JSON};
 use pe_bootstrap::polymarket::PolymarketBulkFetcher;
 use pe_core_types::WalletAddress;
 use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
@@ -54,90 +53,62 @@ fn page_json(trades: &[(&str, &str, i64)]) -> Vec<u8> {
     s.into_bytes()
 }
 
-// ── Scenario 1: migrate flow on empty cache ─────────────────────────────────
+// ── Scenario 1: leaderboard membership bypasses the trade-count gate ─────────
 //
-// PASS: A wallet_set.json with one wallet that has 0 DB trades and is also in
-//       a leaderboard CSV gets activated (curation-list path bypasses the
-//       trade-count gate).
-// FAIL: wallet stays inactive, or activation fires before timestamp seeding.
+// PASS: a wallet upserted with SRC_LEADERBOARD and 0 DB trades is activated by
+//       apply_activation_rules — leaderboard membership is itself an activation
+//       source (no trade-count gate).
+// FAIL: wallet stays inactive.
 
 #[tokio::test]
-async fn scenario_migrate_activates_curation_list_wallets_with_zero_trades() {
+async fn scenario_leaderboard_membership_activates_with_zero_trades() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
-    // wallet_set.json with one wallet.
-    let wallet_set_path = dir.path().join("wallet_set.json");
-    std::fs::write(&wallet_set_path, format!(r#"["{}"]"#, wallet_hex(0xaa))).unwrap();
-
-    // dune_csvs/ with same wallet in leaderboard CSV.
-    let dune_csv_dir = dir.path().join("dune_csvs");
-    std::fs::create_dir(&dune_csv_dir).unwrap();
-    let mut f = std::fs::File::create(dune_csv_dir.join("leaderboard.csv")).unwrap();
-    writeln!(f, "wallet_hex").unwrap();
-    writeln!(f, "{}", wallet_hex(0xaa)).unwrap();
-    f.flush().unwrap();
-
-    let report = run_migrate(&mut cache, &wallet_set_path, Some(&dune_csv_dir)).unwrap();
-    assert_eq!(report.wallet_set_rows, 1);
-    assert_eq!(report.dune_csv_rows, 1);
-    assert_eq!(report.activated, 1);
+    cache
+        .upsert_wallet(&wallet_hex(0xaa), SRC_LEADERBOARD, false, None, None, None)
+        .unwrap();
+    let activated = pile::apply_activation_rules(&mut cache).unwrap();
+    assert_eq!(activated, 1);
     assert_eq!(cache.active_wallet_count().unwrap(), 1);
 }
 
-// ── Scenario 2: infra CSV blocks activation across all paths ────────────────
+// ── Scenario 2: is_infra blocks activation across all paths ──────────────────
 //
-// PASS: A wallet listed in BOTH the infra CSV AND the leaderboard CSV stays
-//       inactive — is_infra=1 takes precedence over every activation branch.
-// FAIL: wallet is_active = 1, which would copy from an infrastructure address.
+// PASS: a wallet with is_infra=1 stays inactive even with SRC_LEADERBOARD set —
+//       is_infra takes precedence over every activation branch.
+// FAIL: wallet is_active=1, which would copy from an infrastructure address.
 
 #[tokio::test]
-async fn scenario_infra_csv_takes_precedence_over_curation_list() {
+async fn scenario_is_infra_takes_precedence_over_leaderboard() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
-
-    let wallet_set_path = dir.path().join("wallet_set.json");
-    std::fs::write(&wallet_set_path, "[]").unwrap();
-
-    let dune_csv_dir = dir.path().join("dune_csvs");
-    std::fs::create_dir(&dune_csv_dir).unwrap();
     let target = wallet_hex(0xbb);
 
-    // Same wallet appears in both leaderboard and infra CSVs.
-    let mut lb = std::fs::File::create(dune_csv_dir.join("leaderboard.csv")).unwrap();
-    writeln!(lb, "wallet_hex").unwrap();
-    writeln!(lb, "{}", target).unwrap();
-    lb.flush().unwrap();
-
-    let mut infra = std::fs::File::create(dune_csv_dir.join("infra.csv")).unwrap();
-    writeln!(infra, "wallet_hex").unwrap();
-    writeln!(infra, "{}", target).unwrap();
-    infra.flush().unwrap();
-
-    let report = run_migrate(&mut cache, &wallet_set_path, Some(&dune_csv_dir)).unwrap();
-    assert_eq!(
-        report.activated, 0,
-        "infra CSV must block leaderboard activation"
-    );
+    cache
+        .upsert_wallet(&target, SRC_LEADERBOARD, true, None, None, None)
+        .unwrap();
+    let activated = pile::apply_activation_rules(&mut cache).unwrap();
+    assert_eq!(activated, 0, "is_infra must block leaderboard activation");
     assert!(cache.conn_for_test_is_infra(&target));
 }
 
-// ── Scenario 3: discovery wallets pre-populated via dune_closed_markets ─────
+// ── Scenario 3: dune_closed_markets proxy activates a non-leaderboard wallet ─
 //
-// PASS: A Dune-incremental wallet inserted with dune_closed_markets >= 100 and
-//       source_bits SRC_DUNE_INCREMENTAL gets activated immediately by
-//       apply_activation_rules (no DB trades required).
-// FAIL: wallet stays inactive (chicken-and-egg from earlier review).
+// PASS: a wallet (SRC_WALLET_SET_JSON — not a leaderboard bypass) with
+//       dune_closed_markets >= PILE_ACTIVATION_MIN_TRADES is activated by
+//       apply_activation_rules with no DB trades.
+// FAIL: wallet stays inactive (chicken-and-egg from an earlier review).
 
 #[tokio::test]
-async fn scenario_discovery_inserts_activate_via_dune_closed_markets_proxy() {
+async fn scenario_closed_markets_proxy_activates_wallet() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
     cache
         .upsert_wallet(
             &wallet_hex(0xcc),
-            SRC_DUNE_INCREMENTAL,
+            SRC_WALLET_SET_JSON,
             false,
             Some(1_700_000_000),
             Some(150), // dune_closed_markets >= PILE_ACTIVATION_MIN_TRADES
@@ -151,9 +122,9 @@ async fn scenario_discovery_inserts_activate_via_dune_closed_markets_proxy() {
 // ── Scenario 4: backfill drains the queue and refreshes trade_count ─────────
 //
 // PASS: After PolymarketBulkFetcher returns N>=PILE_ACTIVATION_MIN_TRADES new
-//       trades for a Dune-discovered wallet (source_bits = SRC_DUNE_INCREMENTAL
-//       only), running refresh_trade_counts + apply_activation_rules promotes
-//       it to is_active=1 even when dune_closed_markets is NULL.
+//       trades for a wallet known only from the set (source_bits =
+//       SRC_WALLET_SET_JSON, no closed-markets proxy), running
+//       refresh_trade_counts + apply_activation_rules promotes it to is_active=1.
 // FAIL: trade_count stays 0 after backfill, or activation never fires.
 
 #[tokio::test]
@@ -162,16 +133,9 @@ async fn scenario_backfill_refreshes_trade_count_and_activates() {
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
     let w = wallet(0xdd);
 
-    // Pre-stage: Dune incremental insertion WITHOUT dune_closed_markets.
+    // Pre-stage: known wallet WITHOUT any activation source set yet.
     cache
-        .upsert_wallet(
-            &w.to_string(),
-            SRC_DUNE_INCREMENTAL,
-            false,
-            None,
-            None,
-            None,
-        )
+        .upsert_wallet(&w.to_string(), SRC_WALLET_SET_JSON, false, None, None, None)
         .unwrap();
     assert_eq!(
         pile::apply_activation_rules(&mut cache).unwrap(),
@@ -258,41 +222,39 @@ async fn scenario_backfill_due_ordering_prioritises_quality_wallets() {
     assert_eq!(due[2], wallet_hex(0x30), "NULL quality signals last");
 }
 
-// ── Scenario 6: idempotent re-migrate accumulates source bits ───────────────
+// ── Scenario 6: source bits accumulate (bit-OR) across upserts ──────────────
 //
-// PASS: Running migrate twice with overlapping inputs (wallet_set.json and a
-//       Dune CSV both containing wallet W) leaves W with source_bits =
-//       wallet_set_json | dune_csv (bit-OR). No row duplication.
-// FAIL: the second source's bit is silently dropped (INSERT OR IGNORE bug).
+// PASS: a wallet present in wallet_set.json (migrate) then re-upserted as a
+//       leaderboard member ends with source_bits = wallet_set_json | leaderboard
+//       (bit-OR). No row duplication.
+// FAIL: the second source's bit is dropped, or the row is duplicated.
 
 #[tokio::test]
-async fn scenario_migrate_accumulates_source_bits_on_rerun() {
+async fn scenario_source_bits_accumulate_across_upserts() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
     let target = wallet_hex(0x55);
 
-    // Run 1: wallet_set.json only.
+    // Run 1: wallet_set.json via migrate.
     let wallet_set_path = dir.path().join("wallet_set.json");
     std::fs::write(&wallet_set_path, format!(r#"["{}"]"#, target)).unwrap();
-    let _r1 = run_migrate(&mut cache, &wallet_set_path, None).unwrap();
-    let bits_after_run1 = cache.conn_for_test_source_bits(&target);
-    assert_eq!(bits_after_run1, pile::SRC_WALLET_SET_JSON);
-
-    // Run 2: add a Dune CSV with the same wallet.
-    let dune_csv_dir = dir.path().join("dune_csvs");
-    std::fs::create_dir(&dune_csv_dir).unwrap();
-    let mut f = std::fs::File::create(dune_csv_dir.join("leaderboard.csv")).unwrap();
-    writeln!(f, "wallet_hex").unwrap();
-    writeln!(f, "{}", target).unwrap();
-    f.flush().unwrap();
-    let _r2 = run_migrate(&mut cache, &wallet_set_path, Some(&dune_csv_dir)).unwrap();
-
-    let bits_after_run2 = cache.conn_for_test_source_bits(&target);
+    let _r1 = run_migrate(&mut cache, &wallet_set_path).unwrap();
     assert_eq!(
-        bits_after_run2,
+        cache.conn_for_test_source_bits(&target),
+        pile::SRC_WALLET_SET_JSON
+    );
+
+    // Run 2: same wallet re-upserted as a leaderboard member.
+    cache
+        .upsert_wallet(&target, SRC_LEADERBOARD, false, None, None, None)
+        .unwrap();
+
+    let bits = cache.conn_for_test_source_bits(&target);
+    assert_eq!(
+        bits,
         pile::SRC_WALLET_SET_JSON | pile::SRC_LEADERBOARD,
         "expected both bits set, got 0b{:07b}",
-        bits_after_run2
+        bits
     );
     assert_eq!(cache.wallet_pile_size().unwrap(), 1, "no duplicate rows");
 }
@@ -331,10 +293,10 @@ async fn scenario_migrate_seeds_timestamps_before_activating() {
         .await
         .unwrap();
 
-    // Run migrate (no CSVs, no wallet_set).
+    // Run migrate (no wallet_set entries; trades-derived wallet only).
     let wallet_set_path = dir.path().join("wallet_set.json");
     std::fs::write(&wallet_set_path, "[]").unwrap();
-    let report = run_migrate(&mut cache, &wallet_set_path, None).unwrap();
+    let report = run_migrate(&mut cache, &wallet_set_path).unwrap();
 
     assert_eq!(report.trades_rows, 1, "trade-derived wallet inserted");
     assert_eq!(report.last_polymarket_fetch_seeded, 1);

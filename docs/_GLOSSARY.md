@@ -315,9 +315,10 @@ Aligns the live copy path with the 13-wallet "72hr buy-and-hold band" cohort sel
 
 ### Wallet enumeration and relocated chain primitives
 
-Wallet enumeration is now **Dune-only** (#326). The on-chain `eth_getLogs`
+Wallet discovery is now the **all-category Polymarket leaderboard** sweep
+(#335). The Dune client was deleted in #335; the on-chain `eth_getLogs`
 enumeration path, the delta scan, and funder discovery were deleted with the
-`pe-source-onchain-polygon` crate — see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`. The
+`pe-source-onchain-polygon` crate in #326 — see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`. The
 small set of Polygon-RPC primitives the surviving paths still need was relocated
 into `crates/bootstrap/src/chain.rs` (each constant keeps its `verified <date>
 from <source>` comment and a self-validating keccak test):
@@ -332,15 +333,15 @@ Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (`pe_bootstrap::lock::CacheMutationLock`). Acquired by the Dune enumeration arm (`enumerate::run_enumerate`) to serialize cache mutations; stale-PID reclaim handles a crashed prior holder. |
+| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (`pe_bootstrap::lock::CacheMutationLock`). Acquired by the cache-mutating subcommands (`winner-discovery`, `backfill`, `--backfill-v1-attribution`) to serialize cache mutations; stale-PID reclaim handles a crashed prior holder. |
 | `wallets.polymarket_contracts_seen` (column) | `i64`, default `0` | Legacy OR-merged V1/V2 CTF-exchange attribution bitmask. Its on-chain enumeration writer was removed in #326, so every wallet is now left `0`; the column persists for schema backward-compat. |
-| `wallet_enum_completed_contracts` / `wallet_enum_topic_hashes` / `wallet_enum_chunk_progress` (cursors) | `source_cursor` keys (`pe_bootstrap::migrate::CURSOR_WALLET_ENUM_*`) | Legacy on-chain enumeration progress. Written once by the `wallet_set.json` → SQLite migration (`migrate::auto_migrate_legacy`) and read by `migrate::load_enum_state` during Dune-arm setup for the full-enumeration short-circuit; no enumeration path writes them now. |
+| `wallet_enum_completed_contracts` / `wallet_enum_topic_hashes` / `wallet_enum_chunk_progress` (cursors) | `source_cursor` keys (`pe_bootstrap::migrate::CURSOR_WALLET_ENUM_*`) | Legacy on-chain enumeration progress. Still written once by the `wallet_set.json` → SQLite migration (`migrate::auto_migrate_legacy` → `save_enum_state`) as a migration-audit marker, but **no longer read** — the reader (`load_enum_state`) and the `enumerate` subcommand were removed in #335. |
 
 **Trade-fetch scope (issue #181).** The per-wallet trade-fetch list comes from
-`cache.wallets_with_source_bit(SRC_WALLET_SET_JSON)` — wallets discovered via
-Dune-SQL / legacy migration — not `cache.all_pile_wallet_hexes()` (the full
-multi-million-row pile including Dune CSV imports), which would explode the
-per-wallet Polymarket API call count.
+`cache.wallets_with_source_bit(SRC_LEADERBOARD)` — wallets discovered via the
+leaderboard sweep / legacy migration — not `cache.all_pile_wallet_hexes()` (the
+full multi-million-row pile), which would explode the per-wallet Polymarket API
+call count.
 
 ### Trade classification
 
@@ -524,45 +525,36 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_min_win_rate_pct` | 95 | Minimum win-rate (percent, integer) to pass the bootstrap post-filter (exclusive: must exceed 95%) |
 | `bootstrap_post_filter_active_window_days` | 30 | Recency window: wallet must have at least one trade opened within this many days of snapshot time |
 | `bootstrap_post_filter_max_avg_hours_to_resolution` | 72 | Maximum average hours from first entry on a market to that market's resolution; filters out late entrants (exclusive: < 72 h) |
-| `bootstrap_dune_min_closed_markets` | 15 | Minimum distinct resolved binary markets a wallet must have traded (exclusive: > 15) for Dune discovery |
-| `bootstrap_dune_min_win_rate_pct` | 95 | Minimum win-rate (percent, integer) on those markets for Dune discovery (exclusive: > 95%) |
-| `bootstrap_dune_active_window_days` | 30 | Wallet must have at least one trade on a resolved market within this many calendar days for Dune discovery |
-| `bootstrap_dune_max_avg_hours_to_resolution` | 72 | Maximum average hours from a wallet's first entry on a condition to that condition's resolution; filters out late entrants (exclusive: < 72 h) |
 | `bootstrap_polymarket_audit_window_days` | `None` (unlimited) | Trade lookback window. `None` means all available history; set `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS` to an integer or `unlimited`/empty for no limit. Passed as `u32::MAX` to `TradeSnapshot` internally. |
 | `bootstrap_incremental_fetch_known_id_threshold` | 3 | Number of consecutive already-cached `source_trade_id`s that signals incremental fetch is complete for a wallet |
-| `bootstrap_dune_poll_interval_secs` | 3 | Seconds between Dune execution result polling attempts |
-| `bootstrap_dune_max_wait_secs` | 300 | Maximum seconds to wait for a Dune query to complete before aborting |
 | `bootstrap_trade_fetch_limit` | 500 | Trades per page when fetching wallet history from the Polymarket `/activity?type=TRADE` endpoint |
 | `bootstrap_polymarket_pagination` | `"end-cursor"` | Pagination strategy for per-wallet trade fetch. Uses `end=<ts>` and `start=<ts>` cursor parameters on `/activity?type=TRADE`; no hard cap on history depth. |
 | `bootstrap_polymarket_min_retry_after_secs` | 1 | Minimum sleep duration (seconds) when the Polymarket Data API returns HTTP 429. Floors the `Retry-After` header value so a zero or absent header does not cause a tight retry loop. |
 | `bootstrap_polymarket_concurrency` | 16 | Concurrent per-wallet trade fetches against the Polymarket Data API; the `ReqwestFetcher` rate-limit gate caps aggregate throughput at ≤ 20 req/s regardless. Set via `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY`. |
 | `bootstrap_polymarket_wallet_timeout_secs` | 300 | Per-wallet wall-clock budget (seconds) for `pe-bootstrap backfill` / `run`'s Polymarket fetch loop (issue #173). `0` disables the timeout; positive values wrap each `fetch_wallet_incremental` call in `tokio::time::timeout`. Wallets that trip the budget are soft-failed (added to `FetchOutcome::failed`); the post-fetch pipeline still runs and `last_polymarket_fetch_at` remains NULL so the next backfill re-queues them. Set via `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS`. |
 | `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |
-| `bootstrap_wallet_source` | `"dune"` | Wallet discovery backend. `"dune"` is the only live backend; `"onchain"` / `"etherscan"` are accepted as deprecated aliases (#326). Set via `PE_WALLET_SOURCE`. |
-| `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to the enumerated wallet address list. If the file exists, Dune enumeration is skipped entirely. Delete the file to force a fresh scan; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
-| `bootstrap_seed_as_of_dates` | unset | Comma-separated `YYYY-MM-DD` UTC dates. When set, `pe-bootstrap` switches to historical-seed mode: runs the parameterized Dune query for each date and inserts the results into `leaderboard_snapshots`. Idempotent on `(snapshot_at_unix, wallet_hex)`. Mutually exclusive with the regular pipeline. Set via `PE_SEED_AS_OF_DATES`. |
+| `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to a legacy enumerated wallet address list. Consumed once by `migrate::auto_migrate_legacy` (ingested into the pile, then deleted). Not produced by any current path; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
 | `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` fetches resolution data from the Polymarket Gamma API after the trade-fetch phase and stores it in `market_resolutions`. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
-| `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs. Stage 6a (Polygon RPC, if configured) and 6b (Dune) then re-populate those markets with block-timestamp `resolved_at_unix` values via `INSERT OR IGNORE`. Idempotent — safe to set on every run; once all rows are precision-sourced subsequent runs delete 0 rows and skip the re-fetch. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
+| `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs. Stage 6a (Polygon RPC, if configured) then re-populates those markets with block-timestamp `resolved_at_unix` values via `INSERT OR IGNORE`. Idempotent — safe to set on every run; once all rows are precision-sourced subsequent runs delete 0 rows and skip the re-fetch. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
 | `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
 | `infra_probe_span_secs` | `3600` | Maximum span (newest − oldest, seconds) across the first 500 trades of a cold-start wallet for it to be classified as infrastructure (issue #197). 500 trades in < 1 h ⇒ > 8 trades/min ⇒ market-maker / treasury / arbitrage bot. Below threshold: wallet is flagged `is_infra = 1`, the probe page is discarded, and downstream consumers skip via the `active_tradeable_wallets` view. The same threshold drives the `pe-bootstrap classify-infra` retroactive sweep over already-cached trades. Override via `PE_BOOTSTRAP_INFRA_SPAN_SECS`; canonical const lives in `pe_bootstrap::infra_probe::DEFAULT_INFRA_SPAN_SECS`. |
-| `bootstrap_write_snapshot` | `false` | When `true`, the main `pe-bootstrap` pipeline persists a `(snapshot_at_unix, wallet)` row-set to `leaderboard_snapshots` at run time, stamped with the current `snapshot_at`. Default `false` keeps ad-hoc bootstrap runs (resolutions watchdog retries, dev shells) from polluting the snapshot timeline with near-duplicate intra-day rows — only the official weekly refresh path should opt in. Historical seeding via `PE_SEED_AS_OF_DATES` is independent of this flag and always writes its target rows. Set `PE_BOOTSTRAP_WRITE_SNAPSHOT=1` to enable. |
+| `bootstrap_write_snapshot` | `false` | When `true`, the main `pe-bootstrap` pipeline persists a `(snapshot_at_unix, wallet)` row-set to `leaderboard_snapshots` at run time, stamped with the current `snapshot_at`. Default `false` keeps ad-hoc bootstrap runs (resolutions watchdog retries, dev shells) from polluting the snapshot timeline with near-duplicate intra-day rows — only the official weekly refresh path should opt in. Set `PE_BOOTSTRAP_WRITE_SNAPSHOT=1` to enable. |
 | `bootstrap_gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API. Override via `PE_GAMMA_BASE_URL` (useful for testing against a stub). |
 | `bootstrap_gamma_min_interval_ms` | 50 | Minimum milliseconds between Gamma API requests (20 req/s). Live-tested ceiling is ≥ 27 req/s; 50 ms keeps ~25% margin. Enforced globally by `ReqwestFetcher`'s shared mutex regardless of caller concurrency. |
 | `bootstrap_gamma_concurrency` | 10 | Number of in-flight Gamma requests issued concurrently per fetch loop (`buffer_unordered`). With ~300 ms per-request RTT, ~6 in-flight saturates the 20 req/s rate limit; 10 leaves headroom for latency spikes. The global rate cap is still enforced by `bootstrap_gamma_min_interval_ms`. |
 | `bootstrap_event_orphan_warn_pct` | 99 | `pe-bootstrap events` coverage gate (issue #206): warn if more than 99% of distinct traded markets are orphans (self-mapped). Gamma's /events covers only a curated subset of all condition IDs; a 90–99% orphan rate on a large historical cache is expected and correct. The format-break hard-fail (abort if `events_seen > 0` but `conditions_mapped == 0`) replaces the old percentage-based abort. Const `ORPHAN_WARN_PCT` in `pe_bootstrap::events`. |
 | `market_fee_missing_default_bps` | 0 | Default fee in bps when Gamma sets `feesEnabled = false`, omits `feeSchedule`, or omits `feeSchedule.rate`. Zero is the safe sentinel: it never over-discounts PnL and treats pre-fee-era markets correctly. Used by `fees_for_market` / `rate_to_bps` in `pe_bootstrap::events`. |
 | `market_fee_max_bps` | 10_000 | Upper clamp for `market_fees.taker_base_fee_bps` / `maker_base_fee_bps`. Polymarket's live `feeSchedule.rate` is `0.04` (= 400 bps); the 10 000 bps ceiling (100%) is a hard guard against malformed API responses, not a normal value. |
-| `bootstrap_polygon_rpc_url` | `None` | Polygon JSON-RPC URL for the CTF `eth_getLogs` resolution scan (issue #149 multi-source pipeline). When unset the Polygon stage is skipped — daily backfills then rely on CLOB + Dune. Set via `PE_BOOTSTRAP_POLYGON_RPC_URL`. |
+| `bootstrap_polygon_rpc_url` | `None` | Polygon JSON-RPC URL for the CTF `eth_getLogs` resolution scan (issue #149 multi-source pipeline). When unset the Polygon stage is skipped — daily backfills then rely on CLOB + Gamma. Set via `PE_BOOTSTRAP_POLYGON_RPC_URL`. |
 | `bootstrap_polygon_ctf_chunk_blocks` | 10_000 | Block-range chunk size for the Polygon CTF scan. Larger chunks issue fewer RPC calls but are more likely to hit provider response-size caps and trigger the bisect-on-cap fallback. Set via `PE_BOOTSTRAP_POLYGON_CTF_CHUNK_BLOCKS`. |
 | `bootstrap_clob_base_url` | `https://clob.polymarket.com` | Base URL for the Polymarket CLOB API (`/markets?closed=true` paginated listing). Override via `PE_CLOB_BASE_URL` for testing against a stub. |
 | `bootstrap_clob_concurrency` | 8 | Number of in-flight CLOB requests issued concurrently per fetch loop, mirroring the Gamma `buffer_unordered` pattern. Set via `PE_BOOTSTRAP_CLOB_CONCURRENCY`. |
 | `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / Radion / 502-gap) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
-| `bootstrap_discovery_lookback_days` | 2 | Cold-start lookback (days) for `pe-bootstrap discovery` when the `source_cursor.dune_discovery_last_run` row is absent. Matches the 48h timer interval so warm restarts pick up where the previous run left off via the cursor. Set via `PE_BOOTSTRAP_DISCOVERY_LOOKBACK_DAYS`. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. Initial deployment runs with `0` to drain the bulk catch-up queue; steady-state daily timers may set a positive value if daily run time grows unmanageable. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
-| `bootstrap_known_wallets_dune_table` | `"apexurellc.known_wallets"` | Dune user table (under `dune_namespace`) where `pe-bootstrap discovery` uploads the current pile for the anti-join. Replaced on every run (DELETE → CREATE → INSERT). Set via `PE_BOOTSTRAP_KNOWN_WALLETS_DUNE_TABLE`. |
 | `bootstrap_backfill_staleness_secs` | 86_400 (1 day) | Per-wallet staleness window for `pe-bootstrap backfill` (issue #166). A wallet is eligible for re-fetch when `last_polymarket_fetch_at IS NULL OR < now - 86_400`. Hardcoded as `pe_bootstrap::pile::BACKFILL_STALENESS_SECS`; matches the daily systemd timer cadence. |
 | `bootstrap_leaderboard_request_interval_ms` | 500 | Minimum milliseconds between Polymarket leaderboard API requests during `pe-bootstrap winner-discovery` (issue #324). Applied per-fetch via `ReqwestFetcher::with_min_interval_ms`. Set via `PE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS`. |
-| `bootstrap_leaderboard_top_n` | 500 | Maximum wallets fetched per leaderboard slice during `pe-bootstrap winner-discovery` (issue #324). Four slices are always fetched: profit×monthly, profit×allTime, volume×monthly, volume×allTime. Set via `PE_BOOTSTRAP_LEADERBOARD_TOP_N`. |
+| `bootstrap_leaderboard_top_n` | 50 | Maximum wallets fetched per leaderboard slice during `pe-bootstrap winner-discovery` (#324; all-category in #335). The `/v1/leaderboard` API hard-caps `limit` at 50; larger values are silently truncated server-side (verified live 2026-06-14). Set via `PE_BOOTSTRAP_LEADERBOARD_TOP_N`. |
+| `bootstrap_leaderboard_categories` | all 10 | Leaderboard categories swept by `winner-discovery` (#335). Default = `OVERALL, POLITICS, SPORTS, CRYPTO, CULTURE, MENTIONS, WEATHER, ECONOMICS, TECH, FINANCE`. Each is crossed with `{PNL,VOL} × {DAY,WEEK,MONTH,ALL}` (≤ 80 slices); a category the API rejects (4xx) is skipped with a `warn!`. Results dedupe before the pile upsert. Set via `PE_BOOTSTRAP_LEADERBOARD_CATEGORIES` (TOML array of category names). |
 | `bootstrap_radion_request_interval_ms` | 500 | Minimum milliseconds between Radion REST API requests during `pe-bootstrap winner-discovery` (issue #324). Stub only until the Radion REST contract is finalised; ignored when `radion_api_url` is unset. Set via `PE_BOOTSTRAP_RADION_REQUEST_INTERVAL_MS`. |
 
 #### Wallet pile (`wallets` table, issue #166)
@@ -577,8 +569,8 @@ hex chars` (matches `WalletAddress::Display` in `crates/core-types`).
 |---:|---:|---|
 | 0 | 0b0000001 | `wallet_set.json` |
 | 1 | 0b0000010 | `trades` table (DB-resident) |
-| 2 | 0b0000100 | Dune CSV (generic) |
-| 3 | 0b0001000 | Dune incremental discovery |
+| 2 | 0b0000100 | _(removed #335 — was Dune CSV; gap kept, persisted)_ |
+| 3 | 0b0001000 | _(removed #335 — was Dune incremental; gap kept, persisted)_ |
 | 4 | 0b0010000 | Polymarket leaderboard |
 | 5 | 0b0100000 | Radion |
 | 6 | 0b1000000 | 502-gap |
@@ -603,7 +595,7 @@ it never removes them. To "un-mark" a wallet, delete its row.
 
 #### Leaderboard snapshots (`leaderboard_snapshots` table)
 
-Persists weekly leaderboard state in `wallet_cache.db`. One row-set per `pe-bootstrap` run (live path uses `as_of = NOW()`; historical seed path uses each date in `PE_SEED_AS_OF_DATES`). Read by `pe-backtest` at simulation startup to constrain the candidate-wallet pool at each weekly boundary.
+Persists weekly leaderboard state in `wallet_cache.db`. One row-set per `pe-bootstrap` run, stamped `as_of = NOW()`. Read by `pe-backtest` at simulation startup to constrain the candidate-wallet pool at each weekly boundary.
 
 Schema:
 ```sql
@@ -613,8 +605,6 @@ CREATE TABLE leaderboard_snapshots (
     PRIMARY KEY (snapshot_at_unix, wallet_hex)
 );
 ```
-
-**Look-ahead invariant.** The Dune wallet-discovery SQL is parameterized with an `as_of` cutoff that fences three forward-looking surfaces: the `resolved` CTE (resolutions before `as_of` only), the `recently_active` CTE (trades in `[as_of - active_window, as_of)`), and the `wallet_condition` join (trades before `as_of` only). Without all three, a snapshot taken "as of" a past date would still leak future market outcomes through the win-rate computation. Verified by `tests::rendered_sql_fences_all_three_forward_surfaces` and `tests::rendered_sql_contains_no_now_call` in `crates/bootstrap/src/dune.rs`.
 
 **Backtest semantics.** At each simulated day `D`, the simulation looks up the most-recent snapshot ≤ `D` and filters reconstructed `TraderLedger`s to that wallet set before the ranker scores them. The filter is wallet-level: a wallet absent from the snapshot that week does not contribute to any score because we wouldn't have known about it then. When the table is empty the simulation falls back to "all wallets in trade history" with a single warning at start (legacy behavior; survivorship-biased).
 

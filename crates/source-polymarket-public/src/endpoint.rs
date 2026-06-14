@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Sort dimension for the `/v1/leaderboard` endpoint.
+/// Sort dimension for the `/v1/leaderboard` endpoint (API `orderBy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaderboardSort {
@@ -10,24 +10,101 @@ pub enum LeaderboardSort {
     Volume,
 }
 
-/// Time window for the `/v1/leaderboard` endpoint.
+impl LeaderboardSort {
+    /// API `orderBy` query value.
+    pub fn as_order_by(self) -> &'static str {
+        match self {
+            Self::Profit => "PNL",
+            Self::Volume => "VOL",
+        }
+    }
+}
+
+/// Time window for the `/v1/leaderboard` endpoint (API `timePeriod`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LeaderboardWindow {
+    Day,
+    Week,
     Monthly,
     AllTime,
+}
+
+impl LeaderboardWindow {
+    /// API `timePeriod` query value.
+    pub fn as_time_period(self) -> &'static str {
+        match self {
+            Self::Day => "DAY",
+            Self::Week => "WEEK",
+            Self::Monthly => "MONTH",
+            Self::AllTime => "ALL",
+        }
+    }
+}
+
+/// Category filter for the `/v1/leaderboard` endpoint (API `category`).
+///
+/// All ten values return HTTP 200 live (verified 2026-06-14). A bad value yields
+/// HTTP 400 with no fallback, so callers iterating categories must skip + `warn!` on 4xx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum LeaderboardCategory {
+    Overall,
+    Politics,
+    Sports,
+    Crypto,
+    Culture,
+    Mentions,
+    Weather,
+    Economics,
+    Tech,
+    Finance,
+}
+
+impl LeaderboardCategory {
+    /// All ten categories in API order — the default sweep set.
+    pub const ALL: [LeaderboardCategory; 10] = [
+        Self::Overall,
+        Self::Politics,
+        Self::Sports,
+        Self::Crypto,
+        Self::Culture,
+        Self::Mentions,
+        Self::Weather,
+        Self::Economics,
+        Self::Tech,
+        Self::Finance,
+    ];
+
+    /// API `category` query value.
+    pub fn as_param(self) -> &'static str {
+        match self {
+            Self::Overall => "OVERALL",
+            Self::Politics => "POLITICS",
+            Self::Sports => "SPORTS",
+            Self::Crypto => "CRYPTO",
+            Self::Culture => "CULTURE",
+            Self::Mentions => "MENTIONS",
+            Self::Weather => "WEATHER",
+            Self::Economics => "ECONOMICS",
+            Self::Tech => "TECH",
+            Self::Finance => "FINANCE",
+        }
+    }
 }
 
 /// The Polymarket public REST API endpoints polled by this source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketEndpoint {
-    /// Leaderboard endpoint — top traders by `sort` within `window`.
+    /// Leaderboard endpoint — top traders by `sort` within `window` for `category`.
     ///
-    /// `limit`: entries per request (capped by the API; 500 is the practical max).
+    /// `limit`: entries per request. The API hard-caps this at 50; larger values are
+    /// silently truncated server-side (verified live 2026-06-14).
     Leaderboard {
         sort: LeaderboardSort,
         window: LeaderboardWindow,
+        category: LeaderboardCategory,
         limit: u32,
     },
     /// Cursor-based trade history for a single wallet via `/activity?type=TRADE`.
@@ -74,17 +151,15 @@ impl PolymarketEndpoint {
             Self::Leaderboard {
                 sort,
                 window,
+                category,
                 limit,
             } => {
-                let sort_str = match sort {
-                    LeaderboardSort::Profit => "profit",
-                    LeaderboardSort::Volume => "volume",
-                };
-                let window_str = match window {
-                    LeaderboardWindow::Monthly => "monthly",
-                    LeaderboardWindow::AllTime => "allTime",
-                };
-                format!("{base}/v1/leaderboard?sort={sort_str}&window={window_str}&limit={limit}")
+                format!(
+                    "{base}/v1/leaderboard?orderBy={}&timePeriod={}&category={}&limit={limit}",
+                    sort.as_order_by(),
+                    window.as_time_period(),
+                    category.as_param(),
+                )
             }
             Self::UserTradeActivity { user, end, start } => {
                 let mut url = format!("{base}/activity?user={user}&type=TRADE&limit=500&offset=0");
@@ -134,26 +209,41 @@ mod tests {
         let ep = PolymarketEndpoint::Leaderboard {
             sort: LeaderboardSort::Profit,
             window: LeaderboardWindow::Monthly,
-            limit: 500,
+            category: LeaderboardCategory::Overall,
+            limit: 50,
         };
         assert_eq!(ep.key(), "leaderboard");
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?sort=profit&window=monthly&limit=500"
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=MONTH&category=OVERALL&limit=50"
         );
     }
 
     #[test]
-    fn leaderboard_volume_alltime() {
+    fn leaderboard_volume_alltime_crypto() {
         let ep = PolymarketEndpoint::Leaderboard {
             sort: LeaderboardSort::Volume,
             window: LeaderboardWindow::AllTime,
-            limit: 100,
+            category: LeaderboardCategory::Crypto,
+            limit: 50,
         };
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?sort=volume&window=allTime&limit=100"
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=VOL&timePeriod=ALL&category=CRYPTO&limit=50"
         );
+    }
+
+    #[test]
+    fn leaderboard_param_mappings() {
+        assert_eq!(LeaderboardSort::Profit.as_order_by(), "PNL");
+        assert_eq!(LeaderboardSort::Volume.as_order_by(), "VOL");
+        assert_eq!(LeaderboardWindow::Day.as_time_period(), "DAY");
+        assert_eq!(LeaderboardWindow::Week.as_time_period(), "WEEK");
+        assert_eq!(LeaderboardWindow::Monthly.as_time_period(), "MONTH");
+        assert_eq!(LeaderboardWindow::AllTime.as_time_period(), "ALL");
+        assert_eq!(LeaderboardCategory::ALL.len(), 10);
+        assert_eq!(LeaderboardCategory::Overall.as_param(), "OVERALL");
+        assert_eq!(LeaderboardCategory::Finance.as_param(), "FINANCE");
     }
 
     #[test]

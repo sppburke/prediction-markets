@@ -1,10 +1,6 @@
 use pe_bootstrap::{
-    BootstrapConfig, backfill,
-    cache::WalletCache,
-    config, coverage, discovery, enumerate,
-    error::BootstrapError,
-    fetch, fetch_resolutions_and_schedules, infra_probe, migrate, pile, run_schedule_backfill,
-    seed_historical::{self, parse_seed_as_of_env},
+    BootstrapConfig, backfill, cache::WalletCache, config, coverage, error::BootstrapError, fetch,
+    fetch_resolutions_and_schedules, infra_probe, migrate, pile, run_schedule_backfill,
     watchlist_phase, winner_discovery,
 };
 use tracing_subscriber::EnvFilter;
@@ -33,14 +29,11 @@ async fn main() {
         first_arg,
         Some(
             "all"
-                | "enumerate"
                 | "fetch"
                 | "watchlist"
                 | "resolutions"
                 | "schedules"
                 | "events"
-                | "seed-historical"
-                | "discovery"
                 | "backfill"
                 | "classify-infra"
                 | "coverage"
@@ -57,7 +50,6 @@ async fn main() {
         let mut dry_run = false;
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
         let mut stage: Option<&str> = None;
-        let mut as_of_arg: Option<&str> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -79,12 +71,6 @@ async fn main() {
                 stage = Some(rest[i]);
             } else if let Some(v) = a.strip_prefix("--stage=") {
                 stage = Some(v);
-            } else if a == "--as-of" && i + 1 < rest.len() {
-                i += 1;
-                flag_values.insert(rest[i]);
-                as_of_arg = Some(rest[i]);
-            } else if let Some(v) = a.strip_prefix("--as-of=") {
-                as_of_arg = Some(v);
             }
             i += 1;
         }
@@ -137,23 +123,6 @@ async fn main() {
         let exit = match sub {
             // ── New decomposed subcommands ───────────────────────────────────
             "all" => handle_all(&bootstrap_config, &mut cache, strict).await,
-
-            "enumerate" => match enumerate::run_enumerate(&bootstrap_config, &mut cache).await {
-                Ok(r) => {
-                    tracing::info!(
-                        wallets_discovered = r.wallets_discovered,
-                        chunks_scanned = r.chunks_scanned,
-                        topics_completed = r.topics_completed,
-                        skipped = r.skipped,
-                        "enumerate: complete"
-                    );
-                    0
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "enumerate: fatal");
-                    1
-                }
-            },
 
             "fetch" => {
                 let wallets = match wallets_from_cache(&mut cache) {
@@ -280,82 +249,6 @@ async fn main() {
                 }
             }
 
-            "seed-historical" => {
-                let dates = if let Some(as_of) = as_of_arg {
-                    match parse_seed_as_of_env(as_of) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!(error = %e, "--as-of parse error");
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    // Fall back to PE_SEED_AS_OF_DATES env var (legacy path).
-                    let env = std::env::var("PE_SEED_AS_OF_DATES").unwrap_or_default();
-                    match parse_seed_as_of_env(&env) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                env_var = "PE_SEED_AS_OF_DATES",
-                                "bootstrap: env-var parse error"
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                };
-                if dates.is_empty() {
-                    tracing::warn!(
-                        "seed-historical: no dates specified — pass --as-of YYYY-MM-DD,... \
-                         or set PE_SEED_AS_OF_DATES"
-                    );
-                    std::process::exit(0);
-                }
-                match seed_historical::run_seed_historical(&bootstrap_config, &mut cache, &dates)
-                    .await
-                {
-                    Ok(r) => {
-                        tracing::info!(
-                            dates_attempted = r.dates_attempted,
-                            dates_skipped = r.dates_skipped,
-                            rows_inserted = r.rows_inserted,
-                            "seed-historical: complete"
-                        );
-                        0
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "seed-historical: fatal");
-                        1
-                    }
-                }
-            }
-
-            // ── Existing subcommands (UNCHANGED names) ───────────────────────
-            "discovery" => {
-                if !bootstrap_config.discovery_enabled {
-                    tracing::warn!(
-                        "discovery: disabled (PE_BOOTSTRAP_DISCOVERY_ENABLED not set) \
-                         — use winner-discovery instead"
-                    );
-                    std::process::exit(0);
-                }
-                match discovery::run_discovery(&bootstrap_config, &mut cache).await {
-                    Ok(r) => {
-                        tracing::info!(
-                            uploaded = r.uploaded,
-                            new_wallets = r.new_wallets,
-                            activated = r.activated,
-                            "discovery: complete"
-                        );
-                        0
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "discovery: fatal");
-                        1
-                    }
-                }
-            }
-
             "backfill" => match backfill::run_backfill(&bootstrap_config, &mut cache).await {
                 Ok(r) => {
                     tracing::info!(
@@ -444,7 +337,6 @@ async fn main() {
     }
 
     // ── No-arg / positional TOML path → default "all" ───────────────────────
-    // When PE_SEED_AS_OF_DATES is set, treat as `seed-historical` (legacy path).
     let config_path = first_arg.map(std::path::PathBuf::from);
     let bootstrap_config = match config::load(config_path.as_deref()) {
         Ok(c) => c,
@@ -453,42 +345,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    let seed_env = std::env::var("PE_SEED_AS_OF_DATES").unwrap_or_default();
-    if !seed_env.trim().is_empty() {
-        let dates = match parse_seed_as_of_env(&seed_env) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    env_var = "PE_SEED_AS_OF_DATES",
-                    "bootstrap: env-var parse error"
-                );
-                std::process::exit(1);
-            }
-        };
-        let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "bootstrap: cache open failed");
-                std::process::exit(1);
-            }
-        };
-        match seed_historical::run_seed_historical(&bootstrap_config, &mut cache, &dates).await {
-            Ok(r) => {
-                tracing::info!(
-                    snapshots = r.dates_attempted,
-                    rows = r.rows_inserted,
-                    "bootstrap: historical seed complete"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "bootstrap: historical seed fatal");
-                std::process::exit(1);
-            }
-        }
-    }
 
     // No-arg → run "all" with strict=false (soft-fail default).
     let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
@@ -513,10 +369,21 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
         return 1;
     }
 
-    // Step 1: enumerate wallets.
-    if let Err(e) = enumerate::run_enumerate(config, cache).await {
-        tracing::error!(error = %e, "all: enumerate fatal");
-        return 1;
+    // Step 1: discover wallets via the Polymarket leaderboard (all categories)
+    // + Radion (when activated). Replaces the retired Dune `enumerate` (#335).
+    match winner_discovery::run_winner_discovery(config, cache).await {
+        Ok(r) => {
+            tracing::info!(
+                leaderboard_unique = r.leaderboard_unique,
+                leaderboard_activated = r.leaderboard_activated,
+                radion_unique = r.radion_unique,
+                "all: winner-discovery complete"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "all: winner-discovery fatal");
+            return 1;
+        }
     }
 
     let wallets = match wallets_from_cache(cache) {
