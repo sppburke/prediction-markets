@@ -186,10 +186,17 @@ def main() -> int:
               reverse=True)
 
     ranked_path = os.path.join(a.out_dir, "latency_shift_ranked.csv")
+    # Static fieldnames: never index rows[0] (empty when candidates had no positions
+    # overlapping the positions CSV — still write a header-only file, don't crash).
+    fields = ["wallet", "n_total", "n_filled", "fill_rate", "active_months",
+              "mean_net_ls", "tstat_net_ls", "survives"]
     with open(ranked_path, "w", newline="") as f:
-        wcsv = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        wcsv = csv.DictWriter(f, fieldnames=fields)
         wcsv.writeheader()
         wcsv.writerows(rows)
+    if not rows:
+        log("no candidate positions overlapped the positions CSV — wrote empty ranking")
+        return 0
     survivors = [r for r in rows if r["survives"]]
     log(f"latency-shifted survivors (fill_rate>={a.min_fill_rate}, t>={a.floor_tstat}, "
         f"mean>0, >={a.min_active_months}mo, >={a.min_avg_per_month}/mo): {len(survivors)}")

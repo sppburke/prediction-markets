@@ -77,8 +77,9 @@ def main() -> int:
     try:
         st, rep = _req("POST", f"{url}/rest/v1/ranking_batches", key, body=batch,
                        prefer="return=representation")
-    except urllib.error.HTTPError as e:
-        print(f"FATAL: batch insert failed {e.code}: {e.read().decode()[:300]}", file=sys.stderr)
+    except (urllib.error.URLError, OSError) as e:
+        detail = e.read().decode()[:300] if isinstance(e, urllib.error.HTTPError) else str(e)
+        print(f"FATAL: batch insert failed: {detail}", file=sys.stderr)
         return 1
     batch_id = rep[0]["batch_id"]
     print(f"created batch_id={batch_id} ({st})")
@@ -98,13 +99,22 @@ def main() -> int:
         })
     # PostgREST accepts a JSON array for bulk insert; chunk to stay under limits.
     CHUNK = 500
-    for j in range(0, len(entries), CHUNK):
-        try:
+    try:
+        for j in range(0, len(entries), CHUNK):
             _req("POST", f"{url}/rest/v1/ranking_entries", key, body=entries[j:j + CHUNK],
                  prefer="return=minimal")
-        except urllib.error.HTTPError as e:
-            print(f"FATAL: entries insert failed {e.code}: {e.read().decode()[:300]}", file=sys.stderr)
-            return 1
+    except (urllib.error.URLError, OSError) as e:
+        # HTTPError carries a body; URLError/OSError (incl. ConnectionReset mid-read) don't.
+        detail = e.read().decode()[:300] if isinstance(e, urllib.error.HTTPError) else str(e)
+        print(f"FATAL: entries insert failed: {detail}; deleting orphaned batch {batch_id}",
+              file=sys.stderr)
+        try:
+            _req("DELETE", f"{url}/rest/v1/ranking_batches?batch_id=eq.{batch_id}", key,
+                 prefer="return=minimal")
+        except (urllib.error.URLError, OSError):
+            print(f"WARNING: could not delete orphaned batch {batch_id} — clean up manually",
+                  file=sys.stderr)
+        return 1
     print(f"inserted {len(entries)} entries into batch {batch_id}")
     return 0
 
