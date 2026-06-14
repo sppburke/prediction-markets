@@ -55,6 +55,7 @@ class Params:
     win_start: int          # unix, inclusive (entry date)
     win_end: int            # unix, exclusive
     ttr_secs: int
+    min_ttr_secs: int       # lower TTR bound: drop first-buys entered < this close to resolution (copyability floor)
     min_avg_per_month: float
     min_active_months: int
     target_n: int
@@ -62,6 +63,8 @@ class Params:
     floor_tstat: float      # Stage-4 net-edge floor: keep wallets with net t-stat >= this
     scheduled_only: bool    # if True, TTR ref = scheduled end_date_unix ONLY (no resolved_at fallback = no look-ahead)
     limit_wallets: int      # 0 = all
+    price_min: float        # entry-price band lower bound (inclusive)
+    price_max: float        # entry-price band upper bound (inclusive)
 
 
 def parse_args() -> Params:
@@ -73,6 +76,14 @@ def parse_args() -> Params:
     p.add_argument("--win-start", default="2025-12-01")
     p.add_argument("--win-end", default="2026-06-01")
     p.add_argument("--ttr-hours", type=float, default=72.0)
+    p.add_argument("--min-ttr-hours", type=float, default=30.0 / 3600.0,
+                   help="lower TTR bound: drop first-buys entered < this many hours before "
+                        "resolution. Default 30s = physical-feasibility floor: end-to-end "
+                        "copy latency is ~10-20s (/activity indexes in ~1-4s + ~5s poll + "
+                        "~5s fill; measured 2026-06-14, docs/29). Inclusion below ~1min is "
+                        "only honest when paired with latency-shifted fill pricing "
+                        "(scripts/latency_shift_rerank.py) which scores each copy at the "
+                        "price we'd actually get, not the leader's.")
     p.add_argument("--min-avg-per-month", type=float, default=20.0)
     p.add_argument("--min-active-months", type=int, default=3)
     p.add_argument("--target-n", type=int, default=250)
@@ -83,6 +94,10 @@ def parse_args() -> Params:
     p.add_argument("--scheduled-only", action="store_true",
                    help="TTR ref = scheduled end_date_unix ONLY; drop the resolved_at fallback (removes look-ahead leakage)")
     p.add_argument("--limit-wallets", type=int, default=0)
+    p.add_argument("--price-min", type=float, default=0.15,
+                   help="entry-price band lower bound (inclusive); first-buys below are dropped")
+    p.add_argument("--price-max", type=float, default=0.85,
+                   help="entry-price band upper bound (inclusive); first-buys above are dropped")
     a = p.parse_args()
 
     def to_unix(d: str) -> int:
@@ -92,6 +107,7 @@ def parse_args() -> Params:
         db=a.db, universe=a.universe, out_dir=a.out_dir,
         win_start=to_unix(a.win_start), win_end=to_unix(a.win_end),
         ttr_secs=int(a.ttr_hours * 3600),
+        min_ttr_secs=int(a.min_ttr_hours * 3600),
         min_avg_per_month=a.min_avg_per_month,
         min_active_months=a.min_active_months,
         target_n=a.target_n,
@@ -99,6 +115,8 @@ def parse_args() -> Params:
         floor_tstat=a.floor_tstat,
         scheduled_only=a.scheduled_only,
         limit_wallets=a.limit_wallets,
+        price_min=a.price_min,
+        price_max=a.price_max,
     )
 
 
@@ -139,7 +157,7 @@ def extract_positions(conn, wallets, res, sched, prm: Params) -> pd.DataFrame:
     """One qualifying first-buy position per (wallet, market). Per-wallet indexed query."""
     rows = []
     diag = dict(wallets_seen=0, first_buys=0, no_ref=0, ttr_fail=0, unresolved=0,
-                bad_price=0, out_of_window=0, qualified=0)
+                bad_price=0, out_of_band=0, out_of_window=0, qualified=0)
     t0 = time.time()
     for i, w in enumerate(wallets):
         diag["wallets_seen"] += 1
@@ -171,7 +189,7 @@ def extract_positions(conn, wallets, res, sched, prm: Params) -> pd.DataFrame:
                 diag["no_ref"] += 1
                 continue
             ttr = ref - ts
-            if not (0 < ttr < prm.ttr_secs):
+            if ttr < max(prm.min_ttr_secs, 1) or ttr >= prm.ttr_secs:
                 diag["ttr_fail"] += 1
                 continue
             if r is None:
@@ -184,6 +202,10 @@ def extract_positions(conn, wallets, res, sched, prm: Params) -> pd.DataFrame:
                 continue
             if not (0.0 < price < 1.0):
                 diag["bad_price"] += 1
+                continue
+            # entry-price band filter: copy-trade only mid-priced first-buys
+            if not (prm.price_min <= price <= prm.price_max):
+                diag["out_of_band"] += 1
                 continue
             win_oid, resolved_at = r
             payoff = 1.0 if int(oid) == int(win_oid) else 0.0
