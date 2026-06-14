@@ -1,14 +1,11 @@
-//! Scenario: Dune-arm CacheMutationLock symmetry (issue #193).
+//! Scenario: `CacheMutationLock` symmetry (issue #193).
 //!
-//! PR #192 added `CacheMutationLock::acquire` at the top of the OnChain
-//! enumeration arm but left the Dune arm bypassing the lock, creating a
-//! window where a concurrent `--backfill-v1-attribution` subcommand could
-//! be silently undone by a Dune-mode sweep's end-of-arm `save_enum_state`.
-//!
-//! PR #193 (this) adds the same lock-acquire to the Dune arm. The test
-//! below pins the symmetry: if either enumeration arm is "running"
-//! (modelled by holding the lock manually), the backfill subcommand's
-//! lock-acquire fails fast with the documented operator-facing error.
+//! The wallet-mutating subcommands (`winner-discovery`, `backfill`, and the
+//! `--backfill-v1-attribution` migration) must not run concurrently against the
+//! same cache — each acquires `CacheMutationLock` first. This test pins the
+//! contract: if a sweep is "running" (modelled by holding the lock manually), a
+//! second cache-mutating subcommand's lock-acquire fails fast with the
+//! documented operator-facing error.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

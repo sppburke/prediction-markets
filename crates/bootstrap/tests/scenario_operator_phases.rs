@@ -1,8 +1,9 @@
 //! Operator-level scenario tests for the decomposed pe-bootstrap phases (issue #195).
 //!
-//! Verifies the independent invocability and correctness of the new phase
-//! functions: `enumerate`, `fetch`, `watchlist_phase`, `seed_historical`, and
-//! the `weekly` exit-code fix. No network calls; deterministic.
+//! Verifies the independent invocability and correctness of the phase functions
+//! `fetch`, `watchlist_phase`, and the `weekly` exit-code arm. No network calls;
+//! deterministic. (The Dune `enumerate` / `seed-historical` phases were removed
+//! in #335; their scenarios went with them.)
 //!
 //! PASS criteria are stated inline above each test.
 
@@ -13,13 +14,10 @@ use std::collections::HashMap;
 
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::config::BootstrapConfig;
-use pe_bootstrap::enumerate;
 use pe_bootstrap::error::BootstrapError;
 use pe_bootstrap::fetch;
-use pe_bootstrap::migrate;
 use pe_bootstrap::pile::SRC_WALLET_SET_JSON;
 use pe_bootstrap::polymarket::PolymarketBulkFetcher;
-use pe_bootstrap::seed_historical::parse_seed_as_of_env;
 use pe_bootstrap::watchlist_phase;
 use pe_core_types::WalletAddress;
 use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
@@ -78,60 +76,6 @@ fn config_with_dir(dir: &TempDir) -> BootstrapConfig {
         post_filter_max_avg_hours_to_resolution: 1_000_000,
         ..BootstrapConfig::default()
     }
-}
-
-// ── Scenario 1: run_enumerate skips when all enumeration already done ─────────
-//
-// PASS: EnumerateReport::skipped == true; wallets_discovered reflects existing cache.
-// FAIL: re-runs enumeration or returns skipped=false.
-
-#[tokio::test]
-async fn scenario_enumerate_skips_when_state_is_complete() {
-    use pe_bootstrap::chain::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
-
-    let dir = TempDir::new().unwrap();
-    let config = config_with_dir(&dir);
-    let mut cache = WalletCache::open(&config.cache_path).unwrap();
-
-    // Seed a wallet directly so wallets_discovered > 0.
-    cache
-        .upsert_wallets_bulk(&[(
-            wallet(0xAA).to_string(),
-            SRC_WALLET_SET_JSON,
-            false,
-            None,
-            None,
-            None,
-            0,
-        )])
-        .unwrap();
-
-    // Mark all contracts and all topics as fully enumerated.
-    let all_contracts: Vec<String> = ALL_EXCHANGE_CONTRACTS
-        .iter()
-        .map(|c| format!("0x{c:x}"))
-        .collect();
-    let all_topics: Vec<String> = ALL_ORDER_FILLED_TOPICS
-        .iter()
-        .map(|h| format!("{h}"))
-        .collect();
-    migrate::save_enum_state(&mut cache, &all_contracts, &all_topics).unwrap();
-
-    let report = enumerate::run_enumerate(&config, &mut cache).await.unwrap();
-
-    assert!(
-        report.skipped,
-        "expected skipped=true when all topics/contracts already enumerated"
-    );
-    assert_eq!(
-        report.chunks_scanned, 0,
-        "no chunks should be scanned when skipped"
-    );
-    assert_eq!(
-        report.topics_completed, 0,
-        "no topics completed when skipped"
-    );
-    assert_eq!(report.wallets_discovered, 1, "should count existing wallet");
 }
 
 // ── Scenario 2: run_fetch honours skip_trade_fetch=true ──────────────────────
@@ -289,47 +233,6 @@ async fn scenario_watchlist_empty_wallets_writes_empty_json() {
     );
 }
 
-// ── Scenario 6: parse_seed_as_of_env edge cases ──────────────────────────────
-//
-// PASS: Parses valid ISO-8601 dates; returns empty on empty input; rejects bad input.
-// FAIL: panics, returns wrong dates, or ignores trailing whitespace.
-
-#[test]
-fn scenario_parse_seed_as_of_env_valid() {
-    let dates = parse_seed_as_of_env("2024-01-15,2024-06-30").unwrap();
-    assert_eq!(dates.len(), 2);
-    assert_eq!(dates[0].year(), 2024);
-    assert_eq!(dates[0].month() as u8, 1);
-    assert_eq!(dates[0].day(), 15);
-    assert_eq!(dates[1].month() as u8, 6);
-    assert_eq!(dates[1].day(), 30);
-}
-
-#[test]
-fn scenario_parse_seed_as_of_env_empty_is_empty_vec() {
-    let dates = parse_seed_as_of_env("").unwrap();
-    assert!(dates.is_empty());
-}
-
-#[test]
-fn scenario_parse_seed_as_of_env_whitespace_trimmed() {
-    let dates = parse_seed_as_of_env("  2024-03-01 , 2024-04-01  ").unwrap();
-    assert_eq!(dates.len(), 2);
-}
-
-#[test]
-fn scenario_parse_seed_as_of_env_trailing_comma_skipped() {
-    let dates = parse_seed_as_of_env("2024-01-01,").unwrap();
-    assert_eq!(dates.len(), 1);
-}
-
-#[test]
-fn scenario_parse_seed_as_of_env_invalid_returns_error() {
-    let result = parse_seed_as_of_env("not-a-date");
-    assert!(result.is_err(), "invalid date must produce an error");
-    assert!(matches!(result, Err(BootstrapError::Parse { .. })));
-}
-
 // ── Scenario 7: weekly exit-2 logic — PartialFetch error variant ─────────────
 //
 // PASS: BootstrapError::PartialFetch { failed_wallets: N } matches the arm that
@@ -349,66 +252,5 @@ fn scenario_weekly_partial_error_matches_exit2_arm() {
     assert_eq!(
         exit_code, 2,
         "PartialFetch must map to exit 2 in caller dispatch"
-    );
-}
-
-// ── Scenario 8: run_enumerate with no-op config (skip_trade_fetch irrelevant) ─
-//
-// PASS: When enum state is complete and a wallet already exists, wallets_discovered
-//       counts only the pre-existing valid wallet. The skipped flag is set.
-// FAIL: wallets_discovered is wrong, or skipped is false.
-
-#[tokio::test]
-async fn scenario_enumerate_wallets_discovered_counts_source_bit_wallets() {
-    use pe_bootstrap::chain::{ALL_EXCHANGE_CONTRACTS, ALL_ORDER_FILLED_TOPICS};
-
-    let dir = TempDir::new().unwrap();
-    let config = config_with_dir(&dir);
-    let mut cache = WalletCache::open(&config.cache_path).unwrap();
-
-    // Insert 3 wallets with SRC_WALLET_SET_JSON bit and 1 with a different bit.
-    for i in 0u8..3 {
-        cache
-            .upsert_wallets_bulk(&[(
-                wallet(i).to_string(),
-                SRC_WALLET_SET_JSON,
-                false,
-                None,
-                None,
-                None,
-                0,
-            )])
-            .unwrap();
-    }
-    // This wallet has a different source bit and must NOT be counted.
-    cache
-        .upsert_wallets_bulk(&[(
-            wallet(0xFF).to_string(),
-            pe_bootstrap::pile::SRC_LEADERBOARD,
-            false,
-            None,
-            None,
-            None,
-            0,
-        )])
-        .unwrap();
-
-    // Mark enumeration complete so the phase skips without network.
-    let all_contracts: Vec<String> = ALL_EXCHANGE_CONTRACTS
-        .iter()
-        .map(|c| format!("0x{c:x}"))
-        .collect();
-    let all_topics: Vec<String> = ALL_ORDER_FILLED_TOPICS
-        .iter()
-        .map(|h| format!("{h}"))
-        .collect();
-    migrate::save_enum_state(&mut cache, &all_contracts, &all_topics).unwrap();
-
-    let report = enumerate::run_enumerate(&config, &mut cache).await.unwrap();
-
-    assert!(report.skipped);
-    assert_eq!(
-        report.wallets_discovered, 3,
-        "only SRC_WALLET_SET_JSON wallets are counted"
     );
 }

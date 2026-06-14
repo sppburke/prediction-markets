@@ -164,8 +164,9 @@ CREATE TABLE IF NOT EXISTS source_cursor (
 
 -- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
 -- `WalletAddress::Display`: `\"0x\" + 40 lowercase hex chars`.
--- `source_bits`: bit0=wallet_set_json, bit1=trades, bit2=dune_csv,
--- bit3=dune_incr, bit4=leaderboard, bit5=radion, bit6=gap502.
+-- `source_bits`: bit0=wallet_set_json, bit1=trades, bit4=leaderboard,
+-- bit5=radion, bit6=gap502. (bit2/bit3 were dune_csv/dune_incr, removed in
+-- #335; the gap is intentional — `source_bits` is persisted, do not renumber.)
 -- `is_active` is sticky 0→1; `is_infra` is also sticky once set.
 CREATE TABLE IF NOT EXISTS wallets (
     wallet_hex               TEXT    PRIMARY KEY NOT NULL,
@@ -687,8 +688,9 @@ impl WalletCache {
     /// Same idempotency contract as [`Self::insert_resolution`] (`INSERT OR IGNORE` on
     /// `market_id`). The `source` column was added in the multi-source pipeline migration
     /// (issue #149) and lets the cache distinguish rows by their origin:
-    /// `"polygon"` (on-chain `eth_getLogs`), `"clob"` (Polymarket CLOB), `"dune"`
-    /// (Dune Analytics fallback). Gamma-sourced rows continue to flow through the
+    /// `"polygon"` (on-chain `eth_getLogs`) and `"clob"` (Polymarket CLOB).
+    /// (`"dune"` rows written before #335 may still exist in deployed caches; the
+    /// source is no longer produced.) Gamma-sourced rows continue to flow through the
     /// existing [`Self::insert_resolution`] method, which omits `source` from the
     /// INSERT and lets the schema-level `DEFAULT 'gamma'` tag the row.
     pub fn insert_resolution_with_source(
@@ -989,7 +991,7 @@ impl WalletCache {
     /// `INSERT OR REPLACE` because an event's market list can grow (neg-risk
     /// bundles gain markets), so a later sweep overwrites an earlier row. The
     /// caller must pass `condition_id` already normalized to the
-    /// `trades.market_id` form (via `dune::normalise_condition_id`).
+    /// `trades.market_id` form (via `chain::normalise_condition_id`).
     pub fn upsert_market_events(
         &mut self,
         condition_id: &str,
@@ -1543,8 +1545,7 @@ impl WalletCache {
     ///
     /// Issue #186: this 6-arg API passes `polymarket_contracts_seen = 0`
     /// internally (no V1/V2 attribution available). Callers that need to set
-    /// the bit use [`Self::upsert_wallets_bulk`] with the 7-tuple shape — see
-    /// `lib.rs::run()`'s `WalletSource::OnChain` arm for the canonical caller.
+    /// the bit use [`Self::upsert_wallets_bulk`] with the 7-tuple shape.
     pub fn upsert_wallet(
         &mut self,
         wallet_hex: &str,
@@ -1915,8 +1916,7 @@ impl WalletCache {
         usize::try_from(n).map_err(|_| BootstrapError::Internal)
     }
 
-    /// Return every `wallet_hex` in the pile — used by `run_discovery` for the
-    /// Dune known-wallets upload (anti-join input).
+    /// Return every `wallet_hex` in the pile (full `wallets`-table scan).
     pub fn all_pile_wallet_hexes(&self) -> Result<Vec<String>, BootstrapError> {
         let mut stmt = self.conn.prepare("SELECT wallet_hex FROM wallets")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;

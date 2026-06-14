@@ -35,8 +35,8 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use crate::cache::WalletCache;
+use crate::chain::normalise_condition_id;
 use crate::config::BootstrapConfig;
-use crate::dune::normalise_condition_id;
 use crate::error::BootstrapError;
 
 /// `source_cursor` key holding the next `/events` page offset to fetch.

@@ -9,8 +9,8 @@
 //! |---:|---:|---|
 //! | 0 | 0b0000001 | `wallet_set.json` |
 //! | 1 | 0b0000010 | `trades` table (DB-resident) |
-//! | 2 | 0b0000100 | Dune CSV (generic) |
-//! | 3 | 0b0001000 | Dune incremental discovery |
+//! | 2 | 0b0000100 | _(removed #335 — was Dune CSV; gap kept, persisted)_ |
+//! | 3 | 0b0001000 | _(removed #335 — was Dune incremental; gap kept, persisted)_ |
 //! | 4 | 0b0010000 | Polymarket leaderboard |
 //! | 5 | 0b0100000 | Radion |
 //! | 6 | 0b1000000 | 502-gap |
@@ -32,8 +32,9 @@ pub const WEEKLY_STALENESS_SECS: i64 = 7 * 86_400; // 7 days
 // Source bit masks (kept as `i64` so they line up with the SQLite column type).
 pub const SRC_WALLET_SET_JSON: i64 = 0b0000001;
 pub const SRC_TRADES: i64 = 0b0000010;
-pub const SRC_DUNE_CSV: i64 = 0b0000100;
-pub const SRC_DUNE_INCREMENTAL: i64 = 0b0001000;
+// bit2 (0b0000100) and bit3 (0b0001000) were SRC_DUNE_CSV / SRC_DUNE_INCREMENTAL,
+// removed in #335. The gap is intentional — `source_bits` is persisted in the
+// live `wallet_cache.db`; do not renumber the surviving bits.
 pub const SRC_LEADERBOARD: i64 = 0b0010000;
 pub const SRC_RADION: i64 = 0b0100000;
 pub const SRC_GAP502: i64 = 0b1000000;
@@ -139,7 +140,7 @@ mod tests {
     fn activation_by_dune_closed_markets_before_db_backfill() {
         let (_dir, mut cache) = tmp_cache();
         cache
-            .upsert_wallet(&hex(2), SRC_DUNE_CSV, false, None, Some(150), None)
+            .upsert_wallet(&hex(2), SRC_WALLET_SET_JSON, false, None, Some(150), None)
             .unwrap();
         // trade_count is 0 (no DB trades yet) but dune_closed_markets satisfies.
         let activated = apply_activation_rules(&mut cache).unwrap();
@@ -206,7 +207,7 @@ mod tests {
     fn upsert_is_infra_is_sticky() {
         let (_dir, mut cache) = tmp_cache();
         cache
-            .upsert_wallet(&hex(7), SRC_DUNE_CSV, true, None, None, None)
+            .upsert_wallet(&hex(7), SRC_WALLET_SET_JSON, true, None, None, None)
             .unwrap();
         cache
             .upsert_wallet(&hex(7), SRC_LEADERBOARD, false, None, None, None)

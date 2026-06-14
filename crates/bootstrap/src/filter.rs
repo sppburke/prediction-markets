@@ -1,9 +1,8 @@
 //! Bootstrap post-filter: selects wallets with strong win-rate, recency, and
 //! timing characteristics derived from the local `TraderLedger`.
 //!
-//! The four conditions mirror the Dune SQL query applied at wallet-discovery
-//! time (see `dune::WALLET_DISCOVERY_SQL`). Applying them here provides a
-//! second, independent quality gate on local ledger data.
+//! The four conditions apply a win-rate/recency/timing quality gate on local
+//! ledger data, independent of how the wallet first entered the pile.
 //!
 //! Canonical thresholds in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 
@@ -53,8 +52,8 @@ impl Default for FilterConfig {
 ///    `snapshot_at_unix`.
 /// 4. Average hold duration on winning trades (opened_at → closed_at) is
 ///    `< max_avg_hours_to_resolution` hours. Only winning trades where
-///    `closed_at_unix > opened_at_unix` contribute (mirrors Dune's
-///    `resolved_at > first_trade_time` guard).
+///    `closed_at_unix > opened_at_unix` contribute (the historical
+///    `resolved_at > first_trade_time` quality guard).
 ///
 /// # Precondition
 /// `min_win_rate_pct` must be in 0–100; values above 100 always return `false`.

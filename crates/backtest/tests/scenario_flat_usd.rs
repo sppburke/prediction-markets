@@ -119,8 +119,6 @@ fn base_config(dir: &TempDir, flat_usd: Option<Decimal>, bankroll: Decimal) -> B
         output_dir: dir.path().join("output"),
         bankroll_usd: bankroll,
         step_days: 1,
-        dune_api_key: None,
-        dune_namespace: None,
         max_hours_to_expiry: None,
         audit_window_days: 365,
         ranker_min_quality: 0,

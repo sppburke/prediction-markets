@@ -122,8 +122,6 @@ fn base_config(dir: &TempDir, cap: Option<NonZeroU32>) -> BacktestConfig {
         output_dir: dir.path().join("output"),
         bankroll_usd: Decimal::from(10_000u32),
         step_days: 1,
-        dune_api_key: None,
-        dune_namespace: None,
         max_hours_to_expiry: None,
         audit_window_days: 365,
         ranker_min_quality: 0,

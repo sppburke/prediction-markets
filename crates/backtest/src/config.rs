@@ -74,16 +74,6 @@ pub struct BacktestConfig {
     #[serde(default = "default_step_days")]
     pub step_days: u32,
 
-    /// Dune Analytics API key for on-chain resolution fetch.
-    /// `PE_DUNE_API_KEY` overrides. Never commit this value in TOML.
-    #[serde(default)]
-    pub dune_api_key: Option<String>,
-
-    /// Dune username for server-side JOIN (reduces credit cost).
-    /// `PE_DUNE_NAMESPACE` overrides.
-    #[serde(default)]
-    pub dune_namespace: Option<String>,
-
     /// Only copy trades where the market resolves within this many hours.
     /// `None` = no filter. `PE_BACKTEST_MAX_HOURS_TO_EXPIRY` overrides.
     #[serde(default)]
@@ -379,8 +369,6 @@ impl Default for BacktestConfig {
             output_dir: PathBuf::from("./pe-backtest-output"),
             bankroll_usd: default_bankroll(),
             step_days: default_step_days(),
-            dune_api_key: None,
-            dune_namespace: None,
             max_hours_to_expiry: None,
             audit_window_days: default_audit_window_days(),
             ranker_min_quality: default_min_quality(),

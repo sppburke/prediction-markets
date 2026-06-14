@@ -6,10 +6,10 @@ use figment::{
     Figment,
     providers::{Env, Format, Toml},
 };
+use pe_source_polymarket_public::LeaderboardCategory;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    WalletSource,
     error::BootstrapError,
     filter::{
         DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_AVG_HOURS_TO_RESOLUTION, DEFAULT_MIN_CLOSED_TRADES,
@@ -18,10 +18,6 @@ use crate::{
 };
 
 // Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
-const DEFAULT_DUNE_MIN_CLOSED_MARKETS: u32 = 15;
-const DEFAULT_DUNE_MIN_WIN_RATE_PCT: u32 = 95;
-const DEFAULT_DUNE_ACTIVE_WINDOW_DAYS: u32 = 30;
-const DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION: u32 = 72;
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_POLYMARKET_CONCURRENCY: usize = 16;
 const DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS: u64 = 300;
@@ -31,7 +27,7 @@ const DEFAULT_CLOB_CONCURRENCY: usize = 8;
 const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
 // Issue #324: winner-discovery pipeline defaults.
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
-const DEFAULT_LEADERBOARD_TOP_N: u32 = 500;
+const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
 const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
@@ -44,7 +40,6 @@ const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
 ///
 /// ## TOML structure
 /// ```toml
-/// wallet_source = "dune"             # "onchain"/"etherscan" accepted as aliases
 /// polygon_rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/<KEY>"  # resolution scan
 /// output_path = "/home/user/watchlist.json"
 /// cache_path = "/home/user/backtest-data/wallet_cache.db"
@@ -53,18 +48,6 @@ const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
 /// Run `pe-bootstrap --print-config` to emit the full default configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
-    /// `PE_WALLET_SOURCE` — `"dune"` (default). `"onchain"` / `"etherscan"` are accepted aliases.
-    #[serde(default = "default_wallet_source")]
-    pub wallet_source: WalletSource,
-
-    /// Required when `wallet_source = "dune"`. `PE_DUNE_API_KEY` overrides.
-    #[serde(default)]
-    pub dune_api_key: Option<String>,
-
-    /// Dune username for server-side JOIN. `PE_DUNE_NAMESPACE` overrides.
-    #[serde(default)]
-    pub dune_namespace: Option<String>,
-
     /// Output path for the watchlist JSON. **Required.**
     ///
     /// Set via TOML `output_path = "..."` or env `PE_BOOTSTRAP_OUTPUT`.
@@ -82,40 +65,6 @@ pub struct BootstrapConfig {
         alias = "bootstrap_wallet_set_path"
     )]
     pub wallet_set_path: PathBuf,
-
-    /// Minimum distinct resolved markets for Dune discovery.
-    /// `PE_BOOTSTRAP_DUNE_MIN_MARKETS` overrides.
-    #[serde(
-        default = "default_dune_min_closed_markets",
-        alias = "dune_min_markets",
-        alias = "bootstrap_dune_min_markets"
-    )]
-    pub dune_min_closed_markets: u32,
-
-    /// Minimum win-rate percent for Dune discovery.
-    /// `PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT` overrides.
-    #[serde(
-        default = "default_dune_min_win_rate_pct",
-        alias = "bootstrap_dune_min_win_rate_pct"
-    )]
-    pub dune_min_win_rate_pct: u32,
-
-    /// Recency window in days for Dune discovery. `PE_BOOTSTRAP_DUNE_ACTIVE_DAYS` overrides.
-    #[serde(
-        default = "default_dune_active_window_days",
-        alias = "dune_active_days",
-        alias = "bootstrap_dune_active_days"
-    )]
-    pub dune_active_window_days: u32,
-
-    /// Maximum average hours to resolution for Dune discovery.
-    /// `PE_BOOTSTRAP_DUNE_MAX_AVG_HOURS` overrides.
-    #[serde(
-        default = "default_dune_max_avg_hours",
-        alias = "dune_max_avg_hours",
-        alias = "bootstrap_dune_max_avg_hours"
-    )]
-    pub dune_max_avg_hours_to_resolution: u32,
 
     /// Trade lookback in days (`None` = unlimited).
     /// Env `PE_BOOTSTRAP_AUDIT_WINDOW_DAYS`: integer, `"unlimited"`, or `"none"`.
@@ -213,9 +162,6 @@ pub struct BootstrapConfig {
     /// Polygon JSON-RPC URL used by:
     /// - the CTF `eth_getLogs` resolution scan (issue #149; optional)
     /// - the daily delta-backfill scan (issue #176; optional)
-    /// - **the OnChain wallet-enumeration sweep (issue #186; required)** — required
-    ///   because `WalletSource::OnChain` (the default since #186) calls
-    ///   `provider.get_block_number()` and `enumerate_chunk` against this URL.
     ///
     /// Sources, in priority order (later overrides earlier):
     /// 1. `PE_POLYGON_HTTP_URL` — shared with `pe-service` and
@@ -286,9 +232,7 @@ pub struct BootstrapConfig {
     /// (Field is named `write_snapshot` rather than `write_live_snapshot` so
     /// the `PE_BOOTSTRAP_WRITE_SNAPSHOT` env var resolves to a key that
     /// matches the field name after the loader strips its `PE_BOOTSTRAP_`
-    /// prefix — see `load()`.) Historical snapshot seeding via
-    /// `PE_SEED_AS_OF_DATES` is unaffected — `seed_historical_snapshots`
-    /// always writes its target rows independent of this flag.
+    /// prefix — see `load()`.)
     #[serde(
         default,
         alias = "bootstrap_write_snapshot",
@@ -343,15 +287,6 @@ pub struct BootstrapConfig {
     pub funder_block_chunk: u64,
 
     // ── Wallet pile (issue #166) ─────────────────────────────────────────────
-    /// Cold-start lookback (days) for Dune incremental discovery when the
-    /// `source_cursor.dune_discovery_last_run` row is absent. Default 2 (= 48h
-    /// timer interval). `PE_BOOTSTRAP_DISCOVERY_LOOKBACK_DAYS` overrides.
-    #[serde(
-        default = "default_discovery_lookback_days",
-        alias = "bootstrap_discovery_lookback_days"
-    )]
-    pub discovery_lookback_days: u32,
-
     /// Per-run cap on `pe-bootstrap backfill`. `0` = no limit (process every
     /// due wallet in the queue). Initial deployment runs with `0`; steady-state
     /// daily timers set a positive value. `PE_BOOTSTRAP_BACKFILL_LIMIT` overrides.
@@ -362,15 +297,6 @@ pub struct BootstrapConfig {
     /// `PE_BOOTSTRAP_WEEKLY_LIMIT` overrides.
     #[serde(default = "default_weekly_limit", alias = "bootstrap_weekly_limit")]
     pub weekly_limit: usize,
-
-    /// Dune user-table name (under `dune_namespace`) where `pe-bootstrap
-    /// discovery` uploads the current pile for the anti-join.
-    /// `PE_BOOTSTRAP_KNOWN_WALLETS_DUNE_TABLE` overrides.
-    #[serde(
-        default = "default_known_wallets_dune_table",
-        alias = "bootstrap_known_wallets_dune_table"
-    )]
-    pub known_wallets_dune_table: String,
 
     // ── Winner-discovery (issue #324) ─────────────────────────────────────────
     /// Base URL for the Polymarket leaderboard endpoint. When absent, falls back
@@ -387,7 +313,9 @@ pub struct BootstrapConfig {
     )]
     pub leaderboard_request_interval_ms: u64,
 
-    /// Top-N entries requested per leaderboard (sort × window) slice. Default 500.
+    /// Top-N entries requested per leaderboard (category × sort × window) slice.
+    /// Default 50 — the `/v1/leaderboard` API hard-caps `limit` at 50; larger
+    /// values are silently truncated server-side (verified live 2026-06-14).
     /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_LEADERBOARD_TOP_N` overrides.
     #[serde(
@@ -395,6 +323,16 @@ pub struct BootstrapConfig {
         alias = "bootstrap_leaderboard_top_n"
     )]
     pub leaderboard_top_n: u32,
+
+    /// Leaderboard categories to sweep. Default = all ten. Each category is
+    /// crossed with {PNL,VOL} × {DAY,WEEK,MONTH,ALL}; results are deduped before
+    /// the pile upsert. `PE_BOOTSTRAP_LEADERBOARD_CATEGORIES` overrides (a TOML
+    /// array of category names, e.g. `["OVERALL", "CRYPTO"]`).
+    #[serde(
+        default = "default_leaderboard_categories",
+        alias = "bootstrap_leaderboard_categories"
+    )]
+    pub leaderboard_categories: Vec<LeaderboardCategory>,
 
     /// Radion REST API base URL. When absent, Radion discovery is skipped silently.
     /// `PE_BOOTSTRAP_RADION_API_URL` overrides.
@@ -413,24 +351,9 @@ pub struct BootstrapConfig {
         alias = "bootstrap_radion_request_interval_ms"
     )]
     pub radion_request_interval_ms: u64,
-
-    /// When `true`, the legacy `discovery` subcommand (Dune incremental) runs normally.
-    /// When `false` (default), `discovery` exits with a warning directing operators to
-    /// use `winner-discovery` instead. Does not gate `winner-discovery`.
-    /// `PE_BOOTSTRAP_DISCOVERY_ENABLED` overrides.
-    #[serde(
-        default,
-        alias = "bootstrap_discovery_enabled",
-        deserialize_with = "deserialize_bool_or_01"
-    )]
-    pub discovery_enabled: bool,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
-
-fn default_wallet_source() -> WalletSource {
-    WalletSource::Dune
-}
 
 fn default_cache_path() -> PathBuf {
     PathBuf::from("wallet_cache.db")
@@ -438,22 +361,6 @@ fn default_cache_path() -> PathBuf {
 
 fn default_wallet_set_path() -> PathBuf {
     PathBuf::from("wallet_set.json")
-}
-
-const fn default_dune_min_closed_markets() -> u32 {
-    DEFAULT_DUNE_MIN_CLOSED_MARKETS
-}
-
-const fn default_dune_min_win_rate_pct() -> u32 {
-    DEFAULT_DUNE_MIN_WIN_RATE_PCT
-}
-
-const fn default_dune_active_window_days() -> u32 {
-    DEFAULT_DUNE_ACTIVE_WINDOW_DAYS
-}
-
-const fn default_dune_max_avg_hours() -> u32 {
-    DEFAULT_DUNE_MAX_AVG_HOURS_TO_RESOLUTION
 }
 
 fn default_min_closed_trades() -> usize {
@@ -519,11 +426,6 @@ const fn default_polygon_ctf_chunk_blocks() -> u64 {
 
 // ── Wallet pile (issue #166) ──────────────────────────────────────────────────
 
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
-const fn default_discovery_lookback_days() -> u32 {
-    2
-}
-
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults". `0` = unlimited.
 const fn default_backfill_limit() -> usize {
     0
@@ -532,10 +434,6 @@ const fn default_backfill_limit() -> usize {
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
 const fn default_weekly_limit() -> usize {
     200
-}
-
-fn default_known_wallets_dune_table() -> String {
-    "apexurellc.known_wallets".to_owned()
 }
 
 fn default_clob_base_url() -> String {
@@ -554,6 +452,11 @@ const fn default_leaderboard_top_n() -> u32 {
     DEFAULT_LEADERBOARD_TOP_N
 }
 
+/// Default leaderboard sweep set — all ten categories.
+fn default_leaderboard_categories() -> Vec<LeaderboardCategory> {
+    LeaderboardCategory::ALL.to_vec()
+}
+
 const fn default_radion_request_interval_ms() -> u64 {
     DEFAULT_RADION_REQUEST_INTERVAL_MS
 }
@@ -563,16 +466,9 @@ const fn default_radion_request_interval_ms() -> u64 {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            wallet_source: default_wallet_source(),
-            dune_api_key: None,
-            dune_namespace: None,
             output_path: PathBuf::from("./watchlist.json"),
             cache_path: default_cache_path(),
             wallet_set_path: default_wallet_set_path(),
-            dune_min_closed_markets: default_dune_min_closed_markets(),
-            dune_min_win_rate_pct: default_dune_min_win_rate_pct(),
-            dune_active_window_days: default_dune_active_window_days(),
-            dune_max_avg_hours_to_resolution: default_dune_max_avg_hours(),
             audit_window_days: None,
             min_closed_trades: default_min_closed_trades(),
             min_win_rate_pct: default_min_win_rate_pct(),
@@ -596,17 +492,15 @@ impl Default for BootstrapConfig {
             funder_rate_limit_rps: default_funder_rate_limit_rps(),
             funder_topic_batch_size: default_funder_topic_batch_size(),
             funder_block_chunk: default_funder_block_chunk(),
-            discovery_lookback_days: default_discovery_lookback_days(),
             backfill_limit: default_backfill_limit(),
             weekly_limit: default_weekly_limit(),
-            known_wallets_dune_table: default_known_wallets_dune_table(),
             leaderboard_base_url: None,
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
+            leaderboard_categories: default_leaderboard_categories(),
             radion_api_url: None,
             radion_api_key: None,
             radion_request_interval_ms: default_radion_request_interval_ms(),
-            discovery_enabled: false,
         }
     }
 }
@@ -621,10 +515,9 @@ impl Default for BootstrapConfig {
 /// `PE_BOOTSTRAP_*` env vars take priority over `PE_*` env vars; both are supported.
 /// Loads config from an optional TOML file plus the `PE_*` / `PE_BOOTSTRAP_*`
 /// env overlay, then applies the `PE_POLYGON_HTTP_URL` → `polygon_rpc_url`
-/// fallback. The Dune API key needed for wallet enumeration is checked at the
-/// enumeration call site (`enumerate::run_enumerate`), not here, so the
-/// non-enumerating subcommands (`backfill`, `events`, `coverage`, …) load
-/// without requiring it.
+/// fallback. No API key is required to load config: wallet discovery now runs
+/// against the public Polymarket leaderboard (keyless) via
+/// `winner_discovery::run_winner_discovery`.
 pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
     let mut fig = Figment::new();
     if let Some(p) = path {
@@ -828,8 +721,6 @@ mod tests {
     fn write_snapshot_set_via_env_var() {
         figment::Jail::expect_with(|jail| {
             jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
-            // `wallet_source` defaults to OnChain, which needs an RPC URL to
-            // pass `validate()`. The value is opaque to this test.
             jail.set_env(
                 "PE_BOOTSTRAP_POLYGON_RPC_URL",
                 "https://example.invalid/rpc",

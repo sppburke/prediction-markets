@@ -9,7 +9,7 @@
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
 use pe_source_polymarket_public::{
-    LeaderboardSort, LeaderboardWindow, PageFetcher, PolymarketEndpoint,
+    LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PageFetcher, PolymarketEndpoint,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -89,7 +89,8 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
         let url = PolymarketEndpoint::Leaderboard {
             sort: LeaderboardSort::Profit,
             window: LeaderboardWindow::AllTime,
-            limit: self.config.watchlist_size as u32,
+            category: LeaderboardCategory::Overall,
+            limit: u32::try_from(self.config.watchlist_size).unwrap_or(u32::MAX),
         }
         .url(&self.config.base_url);
         let bytes =

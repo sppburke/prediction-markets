@@ -11,5 +11,5 @@ pub mod fetcher;
 
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
-pub use endpoint::{LeaderboardSort, LeaderboardWindow, PolymarketEndpoint};
+pub use endpoint::{LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint};
 pub use fetcher::{FixtureFetcher, PageFetcher, ReqwestFetcher};
