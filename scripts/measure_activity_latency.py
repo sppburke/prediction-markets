@@ -135,7 +135,17 @@ def main() -> int:
             for t in d if isinstance(d, list) else []:
                 tx = t.get("transactionHash")
                 ts = t.get("timestamp")
-                if not tx or ts is None or tx in seen_tx or ts <= baseline:
+                if not tx or ts is None or tx in seen_tx:
+                    continue
+                ts = int(ts)
+                # Polymarket /activity sometimes returns millisecond timestamps;
+                # normalise to seconds (matches crates/service/src/trade_parser.rs:97,
+                # 10-digit max = 9_999_999_999). Without this a ms response would
+                # produce large negative lags and silently corrupt the stats. This
+                # run's data was already seconds (verified against the Date header).
+                if ts > 9_999_999_999:
+                    ts //= 1000
+                if ts <= baseline:
                     continue
                 seen_tx.add(tx)
                 upper = recv - ts
@@ -149,7 +159,10 @@ def main() -> int:
                     "condition_id": t.get("conditionId"),
                 })
             last_poll_srv[w] = recv
-        except (urllib.error.URLError, ValueError, TimeoutError):
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            # OSError covers ConnectionResetError / RemoteDisconnected / socket
+            # errors that urllib can raise un-wrapped mid-stream; a single reset
+            # must not crash the whole measurement run (errors are counted).
             errors += 1
         time.sleep(interval)
         if polls and polls % 300 == 0:

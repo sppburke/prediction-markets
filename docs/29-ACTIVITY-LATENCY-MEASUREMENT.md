@@ -55,7 +55,9 @@ typical, < ~30s at the tail.**
 - Sub-minute breaks down (a 30s-TTR trade observed at +15–20s leaves too little to fill).
 
 → The 72h buy-and-hold ranking uses **`--min-ttr-hours 0.0167` (60s)** as the reliability
-floor (was an unjustified 6h). The *capturable* edge near resolution is governed separately
+floor. (An earlier exploratory re-run this session passed a 6h floor on the command line —
+before this latency was measured — which is far stricter than the ~10–20s copy latency
+warrants; the script default has always been 60s.) The *capturable* edge near resolution is governed separately
 by latency-shifted fill pricing in the ranking, not by this floor.
 
 ## Caveats
