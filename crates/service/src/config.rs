@@ -177,6 +177,8 @@ pub struct ServiceConfig {
     // ── Paper-trade Supabase sink (issue #343) ───────────────────────────────
     /// Enable the best-effort paper-fill / settlement sink to Supabase. Off by default;
     /// the sink is spawned only when this is `true` **and** `supabase_url` is non-empty.
+    /// Requires the service-role `supabase_secret_key` — under RLS the anon key can only
+    /// read, so anon-only writes 403 (the sink would never persist anything).
     /// `PE_SUPABASE_SINK_ENABLED`. See `docs/_GLOSSARY.md`: `supabase_sink_enabled`.
     #[serde(default)]
     pub supabase_sink_enabled: bool,

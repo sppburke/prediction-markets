@@ -335,6 +335,13 @@ async fn main() -> Result<()> {
     // Supabase analytics sink (issue #343): best-effort dual-write of fills + settlements.
     // Spawned only when enabled and a Supabase URL is configured; otherwise `None` (no-op).
     let (sink_handle, sink_task) = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
+        if cfg.supabase_secret_key.is_empty() {
+            tracing::warn!(
+                "supabase_sink_enabled but supabase_secret_key is empty; the sink writes with \
+                 the anon key, which RLS allows only to read — all upserts will 403. Set \
+                 PE_SUPABASE_SECRET_KEY to enable sink writes."
+            );
+        }
         let (handle, rx) = SinkHandle::channel(cfg.supabase_sink_channel_capacity);
         let writer = SupabaseWriter::new(
             reqwest::Client::new(),
