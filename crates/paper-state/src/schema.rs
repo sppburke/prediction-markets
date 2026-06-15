@@ -76,4 +76,16 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY NOT NULL,
     value INTEGER NOT NULL
 );
+
+-- Durable settled-markets set: the double-credit guard for resolution crediting
+-- (issue #343 step 0). Mirrors paper-pnl's `SettledMarket`. `outcome_prices` is a
+-- caller-owned JSON-encoded vector of text decimals (this crate stores it verbatim);
+-- `credit_applied` follows the existing text-decimal convention. Additive table —
+-- materialises on the live v1 DB via `IF NOT EXISTS` with SCHEMA_VERSION held at 1.
+CREATE TABLE IF NOT EXISTS settled_markets (
+    market_id       TEXT    PRIMARY KEY NOT NULL,
+    outcome_prices  TEXT    NOT NULL,
+    credit_applied  TEXT    NOT NULL,
+    settled_at_unix INTEGER NOT NULL
+);
 ";

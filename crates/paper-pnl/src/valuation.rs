@@ -264,11 +264,15 @@ mod tests {
     }
 
     /// A store seeded with the given settled markets (price arrays + recorded credit).
+    /// The store owns its SQLite-backed `PaperStateDb` (held in the returned `TempDir`).
     fn store_with(
         settled: &[(&str, Vec<Decimal>, Decimal)],
     ) -> (tempfile::TempDir, ResolutionStore) {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = ResolutionStore::load(&dir.path().join("res.json")).unwrap();
+        let db = std::sync::Arc::new(
+            pe_paper_state::PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap(),
+        );
+        let mut store = ResolutionStore::load(db, &dir.path().join("res.json")).unwrap();
         for (m, prices, credit) in settled {
             store
                 .mark_settled(mid(m), prices.clone(), *credit, 1_700_000_000)

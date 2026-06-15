@@ -486,11 +486,13 @@ fn run_rebuild_state() -> Result<()> {
 /// Print P&L report from the existing paper-state DB and exit.
 fn run_report() -> Result<()> {
     let cfg = load_config()?;
-    let paper_state = PaperStateDb::open(&cfg.paper_state_db_path)
-        .with_context(|| format!("open paper-state {}", cfg.paper_state_db_path.display()))?;
+    let paper_state = Arc::new(
+        PaperStateDb::open(&cfg.paper_state_db_path)
+            .with_context(|| format!("open paper-state {}", cfg.paper_state_db_path.display()))?,
+    );
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
-    let store = ResolutionStore::load(&cfg.paper_resolutions_path)
+    let store = ResolutionStore::load(Arc::clone(&paper_state), &cfg.paper_resolutions_path)
         .with_context(|| format!("load resolutions {}", cfg.paper_resolutions_path.display()))?;
     // `--report` is offline (no live mids): value open positions at $0, matching
     // the prior report semantics.
@@ -552,11 +554,12 @@ fn spawn_resolution_task(
 }
 
 async fn tick_resolution(
-    paper_state: &PaperStateDb,
+    paper_state: &Arc<PaperStateDb>,
     fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
     resolutions_path: &std::path::Path,
 ) -> Result<()> {
-    let mut store = ResolutionStore::load(resolutions_path).context("load resolution store")?;
+    let mut store = ResolutionStore::load(Arc::clone(paper_state), resolutions_path)
+        .context("load resolution store")?;
 
     let positions = paper_state.paper_positions().context("read positions")?;
 
@@ -586,9 +589,10 @@ async fn tick_resolution(
             .cloned()
             .collect();
         let credit = PnlLedger::resolution_credit(&market_positions, &res.outcome_prices);
-        // Write sidecar before crediting bankroll: a crash after sidecar but before SQLite
-        // means the market is already marked settled, so the next poll skips it (under-credit,
-        // not over-credit). The reverse order would double-credit on restart.
+        // Mark settled (SQLite-authoritative, JSON dual-write) before crediting the bankroll:
+        // a crash after `mark_settled` but before `credit_bankroll` leaves the market marked
+        // settled, so the next poll skips it (under-credit, not over-credit). The reverse order
+        // would double-credit on restart.
         store
             .mark_settled(
                 res.market_id.clone(),

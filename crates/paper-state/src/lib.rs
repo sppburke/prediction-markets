@@ -11,6 +11,7 @@
 //! - `bankroll` — single-row drawdown-aware current bankroll.
 //! - `poll_cursors` — per-wallet last-seen `observed_at` unix timestamp.
 //! - `meta` — `last_applied_event_seq` reconciliation cursor.
+//! - `settled_markets` — durable settled-markets set; the resolution double-credit guard.
 //!
 //! Two write shapes are exposed, each a single transaction:
 //! [`PaperStateDb::commit_seen_no_fill`] (a processed trade that produced no order)
@@ -104,6 +105,18 @@ pub struct FillRow {
     pub contracts: u64,
     pub fill_price: Price,
     pub event_seq: i64,
+}
+
+/// One settled market, read back from the `settled_markets` table to hydrate the
+/// resolution double-credit guard (issue #343 step 0). `outcome_prices_json` is the
+/// caller-owned JSON-encoded vector of text decimals, returned verbatim — this crate
+/// does not interpret it. `credit_applied` follows the crate's text-decimal convention.
+#[derive(Debug, Clone)]
+pub struct SettledMarketRow {
+    pub market_id: MarketId,
+    pub outcome_prices_json: String,
+    pub credit_applied: Decimal,
+    pub settled_at_unix: i64,
 }
 
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
@@ -440,6 +453,64 @@ impl PaperStateDb {
             params![wallet.to_string(), ts_unix],
         )?;
         Ok(())
+    }
+
+    // ── Settled markets (resolution double-credit guard) ──────────────────────
+
+    /// Record a settled market, **idempotent** on `market_id` (`ON CONFLICT DO NOTHING`):
+    /// a second call for the same market is a no-op and never overwrites the first
+    /// settlement. `outcome_prices_json` is stored verbatim (the caller owns the
+    /// encoding); `credit_applied` is persisted as text per the crate's decimal convention.
+    pub fn record_settled_market(
+        &self,
+        market_id: &MarketId,
+        outcome_prices_json: &str,
+        credit_applied: Decimal,
+        settled_at_unix: i64,
+    ) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO settled_markets \
+                (market_id, outcome_prices, credit_applied, settled_at_unix) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(market_id) DO NOTHING",
+            params![
+                market_id.to_string(),
+                outcome_prices_json,
+                credit_applied.to_string(),
+                settled_at_unix,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All settled markets, for hydrating the resolution store's double-credit guard
+    /// on restart. Unordered (the guard is a set lookup, not a sequence).
+    pub fn list_settled_markets(&self) -> Result<Vec<SettledMarketRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT market_id, outcome_prices, credit_applied, settled_at_unix \
+             FROM settled_markets",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (market, prices_json, credit_str, settled_at_unix) = row?;
+            out.push(SettledMarketRow {
+                market_id: MarketId(VenueMarketId(market)),
+                outcome_prices_json: prices_json,
+                credit_applied: parse_decimal(&credit_str)?,
+                settled_at_unix,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -938,5 +1009,44 @@ mod tests {
         // Reopen: init must NOT reset the drawn-down bankroll.
         let db = PaperStateDb::open(&path).unwrap();
         assert_eq!(db.init_bankroll(dec!(5000)).unwrap(), dec!(4995.0));
+    }
+
+    #[test]
+    fn settled_markets_round_trip_and_idempotent() {
+        let (_dir, db) = db();
+        assert!(db.list_settled_markets().unwrap().is_empty());
+
+        db.record_settled_market(&market(), "[\"1\",\"0\"]", dec!(12.50), 1_700_000_000)
+            .unwrap();
+        let rows = db.list_settled_markets().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].market_id, market());
+        assert_eq!(rows[0].outcome_prices_json, "[\"1\",\"0\"]");
+        assert_eq!(rows[0].credit_applied, dec!(12.50));
+        assert_eq!(rows[0].settled_at_unix, 1_700_000_000);
+
+        // ON CONFLICT(market_id) DO NOTHING: a re-record never overwrites the first.
+        db.record_settled_market(&market(), "[\"0\",\"1\"]", dec!(99), 1_700_000_999)
+            .unwrap();
+        let rows = db.list_settled_markets().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome_prices_json, "[\"1\",\"0\"]");
+        assert_eq!(rows[0].credit_applied, dec!(12.50));
+    }
+
+    #[test]
+    fn settled_markets_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper_state.db");
+        {
+            let db = PaperStateDb::open(&path).unwrap();
+            db.record_settled_market(&market(), "[\"1\",\"0\"]", dec!(5), 1_700_000_000)
+                .unwrap();
+        }
+        // Additive table materialises on reopen; the row persists.
+        let db = PaperStateDb::open(&path).unwrap();
+        let rows = db.list_settled_markets().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].market_id, market());
     }
 }

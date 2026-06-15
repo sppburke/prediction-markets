@@ -309,7 +309,12 @@ fn default_gamma_base_url() -> String {
 }
 
 const fn default_gamma_resolution_poll_interval_secs() -> u64 {
-    3600
+    // 2 minutes (issue #343 step 12): settled markets and "just resolved" wins lag
+    // actual resolution by ≤2 min instead of ≤1 h. The poll is gated to markets with
+    // open unsettled positions and rate-limited (50 ms min-interval), so the ~30×
+    // frequency rise is bounded by the open-position set, not the full universe.
+    // Canonical default lives in `docs/_GLOSSARY.md`.
+    120
 }
 
 // ── Default impl ──────────────────────────────────────────────────────────────
