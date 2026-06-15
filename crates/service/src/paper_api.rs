@@ -53,7 +53,8 @@ pub async fn pnl(
 pub async fn positions(
     Extension(state): Extension<Arc<PaperApiState>>,
 ) -> Result<Json<Vec<PositionDto>>, (StatusCode, Json<ErrorBody>)> {
-    let store = ResolutionStore::load(&state.resolutions_path).map_err(internal_err)?;
+    let store = ResolutionStore::load(Arc::clone(&state.paper_state), &state.resolutions_path)
+        .map_err(internal_err)?;
     let rows = state.paper_state.paper_positions().map_err(internal_err)?;
     let dtos = rows
         .into_iter()
@@ -128,7 +129,8 @@ pub async fn dashboard(
 async fn build_dashboard(
     state: &PaperApiState,
 ) -> Result<(PortfolioSnapshot, Vec<TradeView>), (StatusCode, Json<ErrorBody>)> {
-    let store = ResolutionStore::load(&state.resolutions_path).map_err(internal_err)?;
+    let store = ResolutionStore::load(Arc::clone(&state.paper_state), &state.resolutions_path)
+        .map_err(internal_err)?;
     let fills = state.paper_state.list_fills().map_err(internal_err)?;
     let positions = state.paper_state.paper_positions().map_err(internal_err)?;
     let current_bankroll = state
