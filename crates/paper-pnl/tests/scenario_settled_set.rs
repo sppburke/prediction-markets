@@ -1,12 +1,12 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Scenario: the settled-markets double-credit guard survives restart and the
-//! JSON→SQLite cutover (issue #343 step 0 / PR1).
+//! Scenario: the settled-markets double-credit guard survives a restart with SQLite as
+//! the sole durable store (issue #343 — the JSON sidecar has been removed).
 //!
 //! Deterministic — fixed timestamps, no network, no `SystemTime::now()`. Proves the
-//! trade-path invariant PR1 exists to protect: a still-closed market is credited to the
-//! bankroll exactly once, across a restart and across the cutover from the JSON sidecar
-//! to the SQLite `settled_markets` table.
+//! trade-path invariant the guard exists to protect: a still-closed market is credited to
+//! the bankroll exactly once, across a restart that re-hydrates the settled-set from the
+//! SQLite `settled_markets` table.
 
 use std::sync::Arc;
 
@@ -86,7 +86,6 @@ fn restart_does_not_recredit() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-    let res_path = dir.path().join("resolutions.json");
     db.init_bankroll(dec!(1000)).unwrap();
 
     // BUY 100 YES @ 0.40 → bankroll 960; the market then resolves YES → credit 100.
@@ -99,7 +98,7 @@ fn restart_does_not_recredit() {
         dec!(0.40),
     );
 
-    let mut store = ResolutionStore::load(db.clone(), &res_path).unwrap();
+    let mut store = ResolutionStore::load(db.clone()).unwrap();
     assert!(
         resolve_once(&db, &mut store, &mkt, &[dec!(1), dec!(0)], dec!(100)),
         "first resolve must credit"
@@ -109,7 +108,7 @@ fn restart_does_not_recredit() {
     drop(store);
 
     // Restart: fresh store hydrated from SQLite; re-poll the same still-closed market.
-    let mut store2 = ResolutionStore::load(db.clone(), &res_path).unwrap();
+    let mut store2 = ResolutionStore::load(db.clone()).unwrap();
     let credited_again = resolve_once(&db, &mut store2, &mkt, &[dec!(1), dec!(0)], dec!(100));
     let final_bankroll = db.bankroll().unwrap().unwrap();
 
@@ -122,65 +121,4 @@ fn restart_does_not_recredit() {
         "bankroll must be unchanged on the restart re-poll"
     );
     println!("PASS: restart does not re-credit (bankroll {final_bankroll})");
-}
-
-/// Scenario B — the PR1 cutover back-fills the JSON-only settled-set so nothing is
-/// re-credited on the first SQLite-backed startup.
-/// PASS: with the settled-set present only in the legacy JSON sidecar (SQLite empty), the
-///       bankroll already reflecting that credit, and the position row still present, the
-///       first `load` back-fills the market and the next resolve pass credits nothing.
-/// FAIL: the cutover treats the market as unsettled and re-credits it.
-#[test]
-fn cutover_backfill_does_not_recredit() {
-    println!("Scenario: settled_set — cutover back-fill does not re-credit");
-
-    let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-    let res_path = dir.path().join("resolutions.json");
-
-    // Reconstruct the live pre-step-0 state: the prior (JSON-only) binary already settled
-    // and credited this market. Bankroll = 1000 − 40 (entry) + 100 (credit) = 1060; the
-    // position row is kept; the settled-set lives ONLY in the JSON sidecar (SQLite empty).
-    db.init_bankroll(dec!(1000)).unwrap();
-    let mkt = market("0xcutover");
-    enter(
-        &db,
-        &mkt,
-        "wf|0xL|tx1|0xcutover|0|buy|1700000000",
-        100,
-        dec!(0.40),
-    );
-    db.credit_bankroll(dec!(100)).unwrap();
-    assert_eq!(db.bankroll().unwrap().unwrap(), dec!(1060));
-
-    let sidecar = serde_json::json!({
-        "settlements": [{
-            "market_id": "0xcutover",
-            "outcome_prices": ["1", "0"],
-            "credit_applied": "100",
-            "settled_at_unix": SETTLED_AT
-        }]
-    });
-    std::fs::write(&res_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
-    assert_eq!(
-        db.list_settled_markets().unwrap().len(),
-        0,
-        "SQLite settled-set must be empty pre-cutover"
-    );
-
-    // First step-0 startup: load back-fills JSON→SQLite before hydrating the guard.
-    let mut store = ResolutionStore::load(db.clone(), &res_path).unwrap();
-    let credited_again = resolve_once(&db, &mut store, &mkt, &[dec!(1), dec!(0)], dec!(100));
-    let final_bankroll = db.bankroll().unwrap().unwrap();
-
-    assert!(
-        !credited_again,
-        "a cutover-back-filled market must not be re-credited"
-    );
-    assert_eq!(
-        final_bankroll,
-        dec!(1060),
-        "bankroll must be unchanged at the cutover"
-    );
-    println!("PASS: cutover back-fill does not re-credit (bankroll {final_bankroll})");
 }

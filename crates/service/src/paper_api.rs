@@ -1,15 +1,11 @@
-//! HTTP handlers for paper-trader P&L, positions, fills, and dashboard endpoints.
+//! HTTP handlers for paper-trader P&L, positions, and fills endpoints.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{Json, extract::Extension, http::StatusCode, response::Html};
+use axum::{Json, extract::Extension, http::StatusCode};
 use pe_core_types::{MarketId, Side};
-use pe_paper_pnl::{
-    FillOutcome, PortfolioSnapshot, ResolutionStore, TradeView, render_dashboard_html,
-    value_portfolio,
-};
+use pe_paper_pnl::{FillOutcome, PortfolioSnapshot, ResolutionStore, TradeView, value_portfolio};
 use pe_paper_state::PaperStateDb;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -22,9 +18,8 @@ use crate::mid_price_cache::MidPriceCache;
 #[derive(Clone)]
 pub struct PaperApiState {
     pub paper_state: Arc<PaperStateDb>,
-    pub resolutions_path: PathBuf,
     pub initial_bankroll: Decimal,
-    /// Shared with the orchestrator so dashboard expiration lookups reuse the cache.
+    /// Shared with the orchestrator so expiration lookups reuse the cache.
     pub market_end_cache: MarketEndCache,
     /// 60 s-TTL cache of live Gamma mids for marking open positions to market.
     pub mid_price_cache: MidPriceCache,
@@ -53,8 +48,7 @@ pub async fn pnl(
 pub async fn positions(
     Extension(state): Extension<Arc<PaperApiState>>,
 ) -> Result<Json<Vec<PositionDto>>, (StatusCode, Json<ErrorBody>)> {
-    let store = ResolutionStore::load(Arc::clone(&state.paper_state), &state.resolutions_path)
-        .map_err(internal_err)?;
+    let store = ResolutionStore::load(Arc::clone(&state.paper_state)).map_err(internal_err)?;
     let rows = state.paper_state.paper_positions().map_err(internal_err)?;
     let dtos = rows
         .into_iter()
@@ -107,14 +101,6 @@ pub async fn status(
     })))
 }
 
-/// `GET /dashboard` — embedded HTML dashboard with per-trade detail.
-pub async fn dashboard(
-    Extension(state): Extension<Arc<PaperApiState>>,
-) -> Result<Html<String>, (StatusCode, Json<ErrorBody>)> {
-    let (snapshot, trades) = build_dashboard(&state).await?;
-    Ok(Html(render_dashboard_html(&snapshot, &trades)))
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// One valuation pass behind every paper endpoint. Loads the resolution store and
@@ -129,8 +115,7 @@ pub async fn dashboard(
 async fn build_dashboard(
     state: &PaperApiState,
 ) -> Result<(PortfolioSnapshot, Vec<TradeView>), (StatusCode, Json<ErrorBody>)> {
-    let store = ResolutionStore::load(Arc::clone(&state.paper_state), &state.resolutions_path)
-        .map_err(internal_err)?;
+    let store = ResolutionStore::load(Arc::clone(&state.paper_state)).map_err(internal_err)?;
     let fills = state.paper_state.list_fills().map_err(internal_err)?;
     let positions = state.paper_state.paper_positions().map_err(internal_err)?;
     let current_bankroll = state

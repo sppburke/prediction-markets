@@ -103,11 +103,6 @@ pub struct ServiceConfig {
     #[serde(default = "default_paper_fill_slippage_bps")]
     pub paper_fill_slippage_bps: u32,
 
-    /// Path to the JSON sidecar that tracks settled-market resolutions.
-    /// See `docs/_GLOSSARY.md`: `paper_resolutions_path`.
-    #[serde(default = "default_paper_resolutions_path")]
-    pub paper_resolutions_path: PathBuf,
-
     // ── Gamma / resolution polling ───────────────────────────────────────────
     /// Gamma API base URL (no trailing slash). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_gamma_base_url")]
@@ -329,10 +324,6 @@ fn default_clob_base_url() -> String {
     "https://clob.polymarket.com".to_string()
 }
 
-fn default_paper_resolutions_path() -> PathBuf {
-    PathBuf::from("./paper_resolutions.json")
-}
-
 fn default_gamma_base_url() -> String {
     "https://gamma-api.polymarket.com".to_string()
 }
@@ -365,7 +356,6 @@ impl Default for ServiceConfig {
             paper_state_db_path: default_paper_state_db_path(),
             paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
             paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
-            paper_resolutions_path: default_paper_resolutions_path(),
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
@@ -437,7 +427,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "paper_state_db_path",
         "paper_fill_haircut_bps",
         "paper_fill_slippage_bps",
-        "paper_resolutions_path",
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",

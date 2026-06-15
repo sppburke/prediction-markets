@@ -272,7 +272,7 @@ mod tests {
         let db = std::sync::Arc::new(
             pe_paper_state::PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap(),
         );
-        let mut store = ResolutionStore::load(db, &dir.path().join("res.json")).unwrap();
+        let mut store = ResolutionStore::load(db).unwrap();
         for (m, prices, credit) in settled {
             store
                 .mark_settled(mid(m), prices.clone(), *credit, 1_700_000_000)

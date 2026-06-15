@@ -52,7 +52,9 @@ strategy thresholds (which live in `_GLOSSARY.md` / `19-`).
 
 ## Status / follow-ups
 
-- PR1 (durable settled-set) + PR2 (sink/schema/RLS) shipped; PR3 is this site.
-- PR4 retires the `paper_resolutions.json` sidecar and the legacy
-  `render_dashboard_html` SSR path once the site is proven.
+- PR1 (durable settled-set) + PR2 (sink/schema/RLS) + PR3 (this site) shipped.
+- PR4 (final) removed the `paper_resolutions.json` sidecar and the legacy
+  `render_dashboard_html` SSR path: the settled-set double-credit guard is now
+  SQLite-only (`settled_markets`), and this site is the dashboard. The
+  `paper_resolutions_path` config key and the `/dashboard` route are gone.
 - Per-wallet category breakdown is deferred to a follow-up issue.

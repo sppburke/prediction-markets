@@ -392,7 +392,6 @@ async fn main() -> Result<()> {
         paper_state.clone(),
         cfg.gamma_base_url.clone(),
         cfg.gamma_resolution_poll_interval_secs,
-        cfg.paper_resolutions_path.clone(),
         sink_handle,
     );
 
@@ -416,7 +415,6 @@ async fn main() -> Result<()> {
     // Shared state for paper API handlers.
     let paper_api_state = Arc::new(PaperApiState {
         paper_state: paper_state.clone(),
-        resolutions_path: cfg.paper_resolutions_path.clone(),
         initial_bankroll: configured_bankroll,
         market_end_cache,
         mid_price_cache,
@@ -430,7 +428,6 @@ async fn main() -> Result<()> {
         .route("/paper/positions", get(pe_service::paper_api::positions))
         .route("/paper/fills", get(pe_service::paper_api::fills))
         .route("/paper/status", get(pe_service::paper_api::status))
-        .route("/dashboard", get(pe_service::paper_api::dashboard))
         .with_state(health)
         .layer(axum::Extension(paper_api_state));
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
@@ -512,12 +509,6 @@ fn run_rebuild_state() -> Result<()> {
     println!("  fills replayed:  {applied}");
     println!("  bankroll:        {bankroll}");
     println!("  NOT rebuilt:     seen_trades, leader_positions, poll_cursors (not in event log)");
-    if cfg.paper_resolutions_path.exists() {
-        println!(
-            "  resolutions:     {} (untouched — re-apply via resolution poller on next start)",
-            cfg.paper_resolutions_path.display()
-        );
-    }
     std::process::exit(0);
 }
 
@@ -530,8 +521,7 @@ fn run_report() -> Result<()> {
     );
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
-    let store = ResolutionStore::load(Arc::clone(&paper_state), &cfg.paper_resolutions_path)
-        .with_context(|| format!("load resolutions {}", cfg.paper_resolutions_path.display()))?;
+    let store = ResolutionStore::load(Arc::clone(&paper_state)).context("load resolutions")?;
     // `--report` is offline (no live mids): value open positions at $0, matching
     // the prior report semantics.
     let snapshot = PnlLedger::snapshot(
@@ -575,7 +565,6 @@ fn spawn_resolution_task(
     paper_state: Arc<PaperStateDb>,
     gamma_base_url: String,
     poll_interval_secs: u64,
-    resolutions_path: std::path::PathBuf,
     sink: Option<SinkHandle>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -585,9 +574,7 @@ fn spawn_resolution_task(
         );
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
-            if let Err(e) =
-                tick_resolution(&paper_state, &fetcher, &resolutions_path, sink.as_ref()).await
-            {
+            if let Err(e) = tick_resolution(&paper_state, &fetcher, sink.as_ref()).await {
                 tracing::warn!(error = %e, "resolution poll error");
             }
         }
@@ -597,11 +584,10 @@ fn spawn_resolution_task(
 async fn tick_resolution(
     paper_state: &Arc<PaperStateDb>,
     fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
-    resolutions_path: &std::path::Path,
     sink: Option<&SinkHandle>,
 ) -> Result<()> {
-    let mut store = ResolutionStore::load(Arc::clone(paper_state), resolutions_path)
-        .context("load resolution store")?;
+    let mut store =
+        ResolutionStore::load(Arc::clone(paper_state)).context("load resolution store")?;
 
     let positions = paper_state.paper_positions().context("read positions")?;
 
@@ -632,7 +618,7 @@ async fn tick_resolution(
             .cloned()
             .collect();
         let credit = PnlLedger::resolution_credit(&market_positions, &res.outcome_prices);
-        // Mark settled (SQLite-authoritative, JSON dual-write) before crediting the bankroll:
+        // Mark settled (SQLite-authoritative) before crediting the bankroll:
         // a crash after `mark_settled` but before `credit_bankroll` leaves the market marked
         // settled, so the next poll skips it (under-credit, not over-credit). The reverse order
         // would double-credit on restart.
