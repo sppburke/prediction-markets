@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "Historical-vs-live paper-trade analytics site (issue #343 PR3). Reads the Supabase wallet_live_stats view via the anon key + read-only RLS.",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
