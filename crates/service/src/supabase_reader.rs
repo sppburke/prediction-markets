@@ -135,11 +135,26 @@ fn to_watchlist(rows: &[RankingRow]) -> Watchlist {
     }
 }
 
+/// Select the single API token to send in BOTH the `apikey` and `Authorization: Bearer`
+/// headers.
+///
+/// Supabase's modern `sb_publishable_`/`sb_secret_` keys are NOT JWTs, and PostgREST rejects
+/// a request whose two headers carry *different* tokens — it tries to parse the Bearer as a
+/// 3-part JWT and fails (`PGRST301: Expected 3 parts in JWT; got 1`). So both headers must
+/// use one token. Prefer the service-role secret (bypasses RLS for the server-side read);
+/// fall back to the publishable/anon key when no secret is configured.
+fn auth_token<'a>(anon_key: &'a str, secret_key: &'a str) -> &'a str {
+    if secret_key.is_empty() {
+        anon_key
+    } else {
+        secret_key
+    }
+}
+
 /// Fetch the latest ranking from Supabase and map it to a [`Watchlist`].
 ///
-/// `GET {base_url}/rest/v1/latest_ranking?order=rank&limit={limit}` with `apikey`
-/// (publishable/anon) and `Authorization: Bearer` (service-role secret) headers; either
-/// key falls back to the other if one is empty.
+/// `GET {base_url}/rest/v1/latest_ranking?order=rank&limit={limit}` with the SAME token in
+/// both the `apikey` and `Authorization: Bearer` headers (see [`auth_token`]).
 pub async fn fetch(
     client: &reqwest::Client,
     base_url: &str,
@@ -152,21 +167,12 @@ pub async fn fetch(
         base_url.trim_end_matches('/'),
         limit
     );
-    let apikey = if anon_key.is_empty() {
-        secret_key
-    } else {
-        anon_key
-    };
-    let bearer = if secret_key.is_empty() {
-        anon_key
-    } else {
-        secret_key
-    };
+    let token = auth_token(anon_key, secret_key);
 
     let resp = client
         .get(&url)
-        .header("apikey", apikey)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header("apikey", token)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
         .send()
         .await
         .map_err(SupabaseError::Transport)?;
@@ -257,5 +263,15 @@ mod tests {
         assert_eq!(wl.entries.len(), 1);
         assert_eq!(wl.active_count, 1);
         assert_eq!(wl.incubator_count, 0);
+    }
+
+    #[test]
+    fn auth_token_prefers_secret_for_both_headers() {
+        // Both set -> secret (sent in BOTH apikey + Bearer; mixing 401s with `sb_` keys).
+        assert_eq!(auth_token("anon", "secret"), "secret");
+        // No secret -> fall back to the publishable/anon key for both headers.
+        assert_eq!(auth_token("anon", ""), "anon");
+        assert_eq!(auth_token("", "secret"), "secret");
+        assert_eq!(auth_token("", ""), "");
     }
 }
