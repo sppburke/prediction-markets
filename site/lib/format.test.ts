@@ -5,6 +5,7 @@ import {
   formatInt,
   formatPct,
   formatPrice,
+  formatQty,
   formatTstat,
   formatUsd,
   shortWallet,
@@ -70,6 +71,13 @@ describe("formatter precision contract (the PR3 AC)", () => {
     }
   });
 
+  it("share quantity keeps 2 dp and never rounds fractional contracts to int", () => {
+    // Polymarket fills are fractional ($25 / 0.525 ≈ 47.62 shares).
+    expect(formatQty("47.61904761904762")).toBe("47.62");
+    expect(formatQty("0.4")).toBe("0.40"); // a small fill must NOT collapse to "0"
+    expect(decimals(formatQty("47.61904761904762"))).toBe(PRECISION.qty);
+  });
+
   it("integers carry no decimals and group thousands", () => {
     expect(formatInt("449")).toBe("449");
     expect(formatInt(12345)).toBe("12,345");
@@ -79,7 +87,7 @@ describe("formatter precision contract (the PR3 AC)", () => {
 
 describe("null / empty handling", () => {
   it("renders an em dash for null / undefined / empty", () => {
-    for (const fn of [formatUsd, formatPct, formatEdge, formatTstat, formatPrice, formatInt]) {
+    for (const fn of [formatUsd, formatPct, formatEdge, formatTstat, formatPrice, formatQty, formatInt]) {
       expect(fn(null)).toBe("—");
       expect(fn(undefined)).toBe("—");
       expect(fn("")).toBe("—");

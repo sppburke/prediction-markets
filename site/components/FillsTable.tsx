@@ -1,4 +1,4 @@
-import { formatInt, formatPrice } from "@/lib/format";
+import { formatPrice, formatQty } from "@/lib/format";
 import type { PaperFill } from "@/lib/types";
 
 function ts(unixOrIso: number | string | null): string {
@@ -33,7 +33,7 @@ export function FillsTable({ fills }: { fills: PaperFill[] }) {
               <td className="px-3 py-2 font-mono text-[11px]">{f.market_id}</td>
               <td className="px-3 py-2 text-right">{f.outcome_id}</td>
               <td className={`px-3 py-2 text-right ${f.side === "buy" ? "text-pos" : "text-neg"}`}>{f.side}</td>
-              <td className="px-3 py-2 text-right">{formatInt(f.contracts)}</td>
+              <td className="px-3 py-2 text-right">{formatQty(f.contracts)}</td>
               <td className="px-3 py-2 text-right">{formatPrice(f.fill_price)}</td>
             </tr>
           ))}

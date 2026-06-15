@@ -22,6 +22,8 @@ export const PRECISION = {
   tstat: 2,
   /** Mid prices in [0,1] — avg_price. */
   price: 3,
+  /** Share quantities (contracts) — fractional on Polymarket, e.g. 47.62. */
+  qty: 2,
 } as const;
 
 export type Numeric = number | string | null | undefined;
@@ -74,6 +76,16 @@ export function formatPrice(v: Numeric): string {
   const n = toNum(v);
   if (n === null) return EM_DASH;
   return n.toFixed(PRECISION.price);
+}
+
+/** Share quantity (contracts) at PRECISION.qty — fractional, never rounded to int. */
+export function formatQty(v: Numeric): string {
+  const n = toNum(v);
+  if (n === null) return EM_DASH;
+  return n.toLocaleString("en-US", {
+    minimumFractionDigits: PRECISION.qty,
+    maximumFractionDigits: PRECISION.qty,
+  });
 }
 
 /** Counts / ranks — integers with a thousands separator. */
