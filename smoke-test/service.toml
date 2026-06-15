@@ -23,16 +23,23 @@ jsonl_log_path                   = "smoke-test/paper.jsonl"
 bankroll_usd                     = "10000"
 mode                             = "paper"
 
-# Copy-entry gate (issue #290): align live copies with the band-cohort selection —
-# first-ever entry into a market, leader entry price in [0.40, 0.80], <72h to
-# resolution. Hold-to-resolution is enforced by the orchestrator's filled-positions set.
+# Copy-entry gate (issues #290, #339): copy only a leader's first-ever entry into a
+# market that resolves within [min, max] of now. The leader-price band was removed in
+# #339 — live sizing is re-based on the current market price instead. Hold-to-resolution
+# is enforced by the orchestrator's filled-positions set.
 wallet_market_history_path       = "smoke-test/wallet_market_history.json"
-entry_gate_price_band_lo         = "0.40"
-entry_gate_price_band_hi         = "0.80"
 # fail-open: a wallet whose history could not be fetched (first-run API failure) is
 # treated as new (copies allowed); the loader warns per absent wallet. Set true to block.
 entry_gate_fail_closed           = false
 max_resolution_horizon_secs      = 259200  # 72 h
+min_resolution_horizon_secs      = 60      # docs/29 copy floor; sub-minute breaks down
+max_fill_price                   = "0.85"  # #142 parity: skip BUYs at/above this current price
+
+# Live wallet source (#339): Supabase ranking handoff. Empty url => fall back to
+# seed_watchlist_path. Secrets (PE_SUPABASE_ANON_KEY / PE_SUPABASE_SECRET_KEY) come from
+# .env, never this file.
+supabase_url                     = ""
+supabase_refresh_interval_secs   = 300
 
 # Flat sizing: bypasses Kelly. The n13 watchlist DOES carry real win_rate_bps
 # (6316–8750), so Kelly is now available — remove flat_usd_per_trade to enable it.

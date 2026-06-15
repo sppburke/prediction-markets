@@ -31,28 +31,51 @@ impl WinnerFollowStrategy {
         Self { config }
     }
 
-    /// Evaluate a leader signal and produce an `OrderIntent` if all gates pass.
+    /// Evaluate a leader signal at the leader's own entry price.
+    ///
+    /// Thin wrapper over [`Self::evaluate_at_price`] that sizes against
+    /// `signal.leader_price` — the historical/replay basis. The live copy path calls
+    /// [`Self::evaluate_at_price`] with the *current* market price instead (issue #339);
+    /// backtest/replay keep this leader-price basis so their output is unchanged.
+    pub fn evaluate(
+        &self,
+        signal: &LeaderSignal,
+        p: Probability,
+        snapshot: RiskSnapshot,
+        bankroll: Decimal,
+        mode: ExecutionMode,
+    ) -> Result<OrderIntent, WinnerFollowError> {
+        self.evaluate_at_price(signal, signal.leader_price, p, snapshot, bankroll, mode)
+    }
+
+    /// Evaluate a leader signal at an explicit `current_price` and produce an `OrderIntent`
+    /// if all gates pass.
     ///
     /// Steps:
     /// 1. Gate Flip actions on `flip_human_approved`.
     /// 2. Use the requested `mode` directly as the effective mode (no signal-kind clamping).
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Size contracts: flat (`config.flat_usd_per_trade` is `Some`) or fractional Kelly.
-    ///    Flat path: `max(1, floor(flat / leader_price))` — bypasses Kelly fraction and `p`.
+    ///    Flat path: `max(1, floor(flat / current_price))` — bypasses Kelly fraction and `p`.
     ///    Kelly path: select fraction for the mode, compute cost-adjusted `c`, call `size_contracts`.
     /// 5. Clamp contracts to `per_trade_cap`; return `NoEdge` if clamped to 0.
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
+    /// `current_price` — the price the copy is sized and cost-adjusted against (the leader's
+    /// entry price in replay; the live market price on the copy path). The emitted
+    /// `limit_price` stays at `signal.leader_price` regardless (don't-chase).
+    ///
     /// `p` — empirical win rate supplied by caller. Used only on the Kelly path; ignored
     /// when `config.flat_usd_per_trade` is set.
     ///
-    /// `c` — computed internally as `leader_price + taker fee + slippage` for BUY orders.
-    /// `fee_per_share = price × fee_rate`; `slippage_per_share = price × slippage_rate`.
+    /// `c` — computed internally as `current_price + taker fee + slippage` for BUY orders.
+    /// `fee_per_share = current_price × fee_rate`; `slippage_per_share = current_price × slippage_rate`.
     /// SELL orders pay neither. See `_GLOSSARY.md` `polymarket_fee_rate`, `slippage_rate`.
-    pub fn evaluate(
+    pub fn evaluate_at_price(
         &self,
         signal: &LeaderSignal,
+        current_price: Price,
         p: Probability,
         mut snapshot: RiskSnapshot,
         bankroll: Decimal,
@@ -76,7 +99,7 @@ impl WinnerFollowStrategy {
         let raw_contracts: u64 = if let Some(flat) = self.config.flat_usd_per_trade {
             // Flat path: bypass Kelly fraction + size_contracts.
             // Per-trade cap (5b) and risk gate (6) remain active below.
-            (flat / signal.leader_price.0)
+            (flat / current_price.0)
                 .floor()
                 .to_u64()
                 .unwrap_or(1)
@@ -87,20 +110,20 @@ impl WinnerFollowStrategy {
             let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
 
             // 5. Size contracts.
-            // c = leader_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
-            // fee_per_share = price × fee_rate (flat taker fee on notional).
-            // slippage_per_share = price × slippage_rate (proportional fill impact on BUY).
+            // c = current_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
+            // fee_per_share = current_price × fee_rate (flat taker fee on notional).
+            // slippage_per_share = current_price × slippage_rate (proportional fill impact on BUY).
             let fee_per_share = if signal.leader_side == Side::Buy {
-                signal.leader_price.0 * self.config.polymarket_fee_rate
+                current_price.0 * self.config.polymarket_fee_rate
             } else {
                 Decimal::ZERO
             };
             let slippage_per_share = if signal.leader_side == Side::Buy {
-                signal.leader_price.0 * self.config.slippage_rate
+                current_price.0 * self.config.slippage_rate
             } else {
                 Decimal::ZERO
             };
-            let c_raw = signal.leader_price.0 + fee_per_share + slippage_per_share;
+            let c_raw = current_price.0 + fee_per_share + slippage_per_share;
             let c = Price::new(c_raw).map_err(|_| WinnerFollowError::NoEdge)?;
 
             let kelly_input = KellyInput {
@@ -118,8 +141,7 @@ impl WinnerFollowStrategy {
 
         // 5b. Clamp to per-trade cap.
         let cap_bps = self.config.per_trade_cap.resolve_bps(trading_mode);
-        let clamped =
-            clamp_contracts_to_cap(raw_contracts, signal.leader_price.0, bankroll, cap_bps);
+        let clamped = clamp_contracts_to_cap(raw_contracts, current_price.0, bankroll, cap_bps);
         // Guard: clamp returns 0 when available_bankroll < price (no fractional contracts).
         if clamped == 0 {
             return Err(WinnerFollowError::NoEdge);
@@ -127,7 +149,7 @@ impl WinnerFollowStrategy {
 
         // 6. Risk gate.
         snapshot.trading_mode = trading_mode;
-        snapshot.proposed_trade_bps = proposed_trade_bps(clamped, signal.leader_price.0, bankroll);
+        snapshot.proposed_trade_bps = proposed_trade_bps(clamped, current_price.0, bankroll);
         snapshot.per_trade_cap_bps = cap_bps;
 
         match evaluate_risk(&snapshot) {

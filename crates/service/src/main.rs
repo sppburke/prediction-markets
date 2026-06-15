@@ -15,22 +15,25 @@ use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
+use pe_trader_index::Watchlist;
 use pe_trader_index::fetcher::{WatchlistFetchConfig, WatchlistFetcher};
 use pe_venue_polymarket::{PolymarketCredentials, PolymarketVenueAdapter, ReqwestCLOBClient};
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use pe_core_types::Price;
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
+use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::seed;
+use pe_service::supabase_reader;
+use pe_service::supabase_refresh::run_supabase_refresh_loop;
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
 use time::OffsetDateTime;
@@ -73,60 +76,67 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Parse the copy-entry price band eagerly so a malformed/inverted band fails
-    // fast before any I/O (mirrors the parse_mode / kelly validation pattern).
-    let band_lo = Price::new(
-        Decimal::from_str(&cfg.entry_gate_price_band_lo).with_context(|| {
-            format!(
-                "parse entry_gate_price_band_lo '{}'",
-                cfg.entry_gate_price_band_lo
-            )
-        })?,
-    )
-    .with_context(|| {
-        format!(
-            "entry_gate_price_band_lo '{}' out of [0,1]",
-            cfg.entry_gate_price_band_lo
-        )
-    })?;
-    let band_hi = Price::new(
-        Decimal::from_str(&cfg.entry_gate_price_band_hi).with_context(|| {
-            format!(
-                "parse entry_gate_price_band_hi '{}'",
-                cfg.entry_gate_price_band_hi
-            )
-        })?,
-    )
-    .with_context(|| {
-        format!(
-            "entry_gate_price_band_hi '{}' out of [0,1]",
-            cfg.entry_gate_price_band_hi
-        )
-    })?;
-    anyhow::ensure!(
-        band_lo < band_hi,
-        "entry_gate_price_band_lo ({}) must be < entry_gate_price_band_hi ({})",
-        band_lo.0,
-        band_hi.0
-    );
+    // Copy-entry gate posture. The leader-price band was removed in #339 — live sizing
+    // is re-based on the current market price instead (see the orchestrator copy path).
     let entry_gate_config = CopyEntryGateConfig {
-        price_band_lo: band_lo,
-        price_band_hi: band_hi,
         fail_closed: cfg.entry_gate_fail_closed,
     };
 
-    // Bootstrap watchlist from live Polymarket leaderboard.
-    let fetch_config = WatchlistFetchConfig {
-        base_url: cfg.polymarket_base_url.clone(),
-        watchlist_size: cfg.watchlist_size,
-    };
-    let mut watchlist_fetcher =
-        WatchlistFetcher::new(fetch_config, ReqwestFetcher::new(reqwest::Client::new()));
-    let watchlist = watchlist_fetcher
-        .fetch_watchlist()
+    // Parse the max-fill price cap eagerly so a malformed value fails fast before any I/O.
+    let max_fill_price = Decimal::from_str(&cfg.max_fill_price)
+        .with_context(|| format!("parse max_fill_price '{}'", cfg.max_fill_price))?;
+
+    // Bootstrap the initial wallet set. The Supabase live ranking handoff (#339) is primary
+    // when `supabase_url` is configured; otherwise fall back to the live leaderboard merged
+    // with the on-disk bootstrap seed. An empty/failed Supabase fetch also falls back.
+    let initial_watchlist = if cfg.supabase_url.is_empty() {
+        bootstrap_from_leaderboard_and_seed(&cfg).await?
+    } else {
+        match supabase_reader::fetch(
+            &reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+            supabase_reader::SUPABASE_FETCH_LIMIT,
+        )
         .await
-        .context("bootstrap watchlist")?;
-    info!(active = watchlist.active_count, "watchlist bootstrapped");
+        {
+            Ok(wl) if !wl.entries.is_empty() => {
+                info!(
+                    active = wl.active_count,
+                    total = wl.entries.len(),
+                    "watchlist bootstrapped from supabase"
+                );
+                wl
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "supabase returned an empty ranking; falling back to leaderboard + seed"
+                );
+                bootstrap_from_leaderboard_and_seed(&cfg).await?
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "supabase bootstrap failed; falling back to leaderboard + seed");
+                bootstrap_from_leaderboard_and_seed(&cfg).await?
+            }
+        }
+    };
+
+    // Fail fast if there is nothing to copy (no Supabase rows, no seed, no leaderboard).
+    anyhow::ensure!(
+        !initial_watchlist.entries.is_empty(),
+        "no wallets to copy: set `supabase_url` (live ranking) or `seed_watchlist_path` (bootstrap seed)"
+    );
+
+    let live_watchlist = LiveWatchlist::new(initial_watchlist);
+    // One-time snapshot driving the startup position seed and wallet-history backfill.
+    // Refresh-admitted wallets are not retro-seeded/backfilled (acceptable for v1; #3).
+    let wallets: Vec<_> = live_watchlist
+        .snapshot()
+        .entries
+        .iter()
+        .map(|e| e.wallet)
+        .collect();
 
     // Crash-safe paper-state mirror. Open, initialise bankroll (idempotent), then
     // reconcile any event-log fills whose SQLite commit was lost to a crash, and
@@ -223,29 +233,6 @@ async fn main() -> Result<()> {
     // Bounded channel per _GLOSSARY.md defaults.
     let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
-    // Merge leaderboard with optional bootstrap seed. The merged Watchlist
-    // carries full WatchlistEntry metadata for every wallet so the Orchestrator
-    // can look up tier and scores for seed-only wallets.
-    let seed_wl = seed::load_seed_watchlist(&cfg.seed_watchlist_path)?;
-    let watchlist = seed::merge_watchlist(&watchlist, seed_wl.as_ref());
-    if seed_wl.is_some() {
-        info!(
-            total = watchlist.entries.len(),
-            active = watchlist.active_count,
-            incubator = watchlist.incubator_count,
-            "seed watchlist merged with leaderboard"
-        );
-        if watchlist.entries.len() > cfg.watchlist_size {
-            tracing::warn!(
-                merged = watchlist.entries.len(),
-                watchlist_size = cfg.watchlist_size,
-                "merged wallet count exceeds watchlist_size; trade poller rate-limit budget was sized for watchlist_size"
-            );
-        }
-    }
-    // Wallets feed the Polymarket trade poller and the position seeder.
-    let wallets: Vec<_> = watchlist.entries.iter().map(|e| e.wallet).collect();
-
     // Startup seed: fetch current positions from the API for each watchlisted wallet,
     // overlay onto the leader ledger, then advance each wallet's poll cursor to now so
     // the trade poller skips the downtime backlog. Must run before wallets is moved into
@@ -322,14 +309,14 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Polymarket trade poller task.
+    // Polymarket trade poller task. Reads the live wallet set per poll round (#339).
     let trade_task = tokio::spawn(
         TradePoller::new(
             TradePollerConfig {
                 base_url: cfg.polymarket_base_url.clone(),
                 poll_interval_secs: cfg.trade_poll_interval_secs,
             },
-            wallets,
+            live_watchlist.clone(),
             ReqwestFetcher::new(reqwest::Client::new()),
             trade_tx,
             paper_state.clone(),
@@ -344,12 +331,14 @@ async fn main() -> Result<()> {
     let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone());
     let orch = Orchestrator::new(
         trade_rx,
-        watchlist,
+        live_watchlist.clone(),
         OrchestratorConfig {
             bankroll,
             mode,
             signal_config: Default::default(),
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
+            min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
+            max_fill_price,
             entry_gate_config,
         },
         history_map,
@@ -359,6 +348,7 @@ async fn main() -> Result<()> {
         leader_ledger,
         health.clone(),
         market_end_cache.clone(),
+        mid_price_cache.clone(),
         reseed_rx,
     )
     .context("build orchestrator")?;
@@ -370,6 +360,23 @@ async fn main() -> Result<()> {
         cfg.gamma_resolution_poll_interval_secs,
         cfg.paper_resolutions_path.clone(),
     );
+
+    // Live-watchlist refresh task (#339): poll Supabase on the configured interval and
+    // additively merge fresh rankings into the live set. Spawned only when configured.
+    let supabase_task = if !cfg.supabase_url.is_empty() && cfg.supabase_refresh_interval_secs > 0 {
+        Some(tokio::spawn(run_supabase_refresh_loop(
+            live_watchlist.clone(),
+            reqwest::Client::new(),
+            cfg.supabase_url.clone(),
+            cfg.supabase_anon_key.clone(),
+            cfg.supabase_secret_key.clone(),
+            supabase_reader::SUPABASE_FETCH_LIMIT,
+            supabase_reader::SUPABASE_LIVE_CAP,
+            cfg.supabase_refresh_interval_secs,
+        )))
+    } else {
+        None
+    };
 
     // Shared state for paper API handlers.
     let paper_api_state = Arc::new(PaperApiState {
@@ -413,6 +420,9 @@ async fn main() -> Result<()> {
     http_task.abort();
     resolution_task.abort();
     if let Some(t) = reseed_task {
+        t.abort();
+    }
+    if let Some(t) = supabase_task {
         t.abort();
     }
     info!("pe-service stopped");
@@ -595,6 +605,48 @@ async fn tick_resolution(
         tracing::info!(market = %res.market_id, %credit, "resolution applied");
     }
     Ok(())
+}
+
+/// Bootstrap the initial watchlist from the live Polymarket leaderboard merged with the
+/// optional on-disk bootstrap seed (the pre-#339 path; the Supabase live source is primary
+/// when configured).
+async fn bootstrap_from_leaderboard_and_seed(cfg: &ServiceConfig) -> Result<Watchlist> {
+    let fetch_config = WatchlistFetchConfig {
+        base_url: cfg.polymarket_base_url.clone(),
+        watchlist_size: cfg.watchlist_size,
+    };
+    let mut watchlist_fetcher =
+        WatchlistFetcher::new(fetch_config, ReqwestFetcher::new(reqwest::Client::new()));
+    let watchlist = watchlist_fetcher
+        .fetch_watchlist()
+        .await
+        .context("bootstrap watchlist")?;
+    info!(
+        active = watchlist.active_count,
+        "watchlist bootstrapped from leaderboard"
+    );
+
+    // Merge leaderboard with the optional bootstrap seed. The merged Watchlist carries
+    // full WatchlistEntry metadata for every wallet so the orchestrator can look up tier
+    // and scores for seed-only wallets.
+    let seed_wl = seed::load_seed_watchlist(&cfg.seed_watchlist_path)?;
+    let merged = seed::merge_watchlist(&watchlist, seed_wl.as_ref());
+    if seed_wl.is_some() {
+        info!(
+            total = merged.entries.len(),
+            active = merged.active_count,
+            incubator = merged.incubator_count,
+            "seed watchlist merged with leaderboard"
+        );
+        if merged.entries.len() > cfg.watchlist_size {
+            tracing::warn!(
+                merged = merged.entries.len(),
+                watchlist_size = cfg.watchlist_size,
+                "merged wallet count exceeds watchlist_size; trade poller rate-limit budget was sized for watchlist_size"
+            );
+        }
+    }
+    Ok(merged)
 }
 
 fn parse_mode(s: &str) -> Result<ExecutionMode> {

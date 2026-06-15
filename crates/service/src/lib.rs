@@ -5,6 +5,7 @@
 pub mod config;
 pub mod entry_gate;
 pub mod health;
+pub mod live_watchlist;
 pub mod logging;
 pub mod market_end_cache;
 pub mod mid_price_cache;
@@ -13,6 +14,8 @@ pub mod paper_api;
 pub mod paper_recovery;
 pub mod position_seeder;
 pub mod seed;
+pub mod supabase_reader;
+pub mod supabase_refresh;
 pub mod trade_parser;
 pub mod trade_poller;
 pub mod wallet_history;

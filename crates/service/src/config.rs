@@ -124,27 +124,55 @@ pub struct ServiceConfig {
     #[serde(default = "default_max_resolution_horizon_secs")]
     pub max_resolution_horizon_secs: u64,
 
-    // ── Copy-entry gate (band-cohort alignment, issue #290) ───────────────────
+    /// Drop entry signals whose market resolves *sooner* than this many seconds from
+    /// now — a copy cannot realistically fill and hold a market about to resolve. Set
+    /// to 0 to disable. Default: 60 (docs/29: the 1-minute copy floor; sub-minute
+    /// "breaks down"). See `docs/_GLOSSARY.md`: `min_resolution_horizon_secs`.
+    #[serde(default = "default_min_resolution_horizon_secs")]
+    pub min_resolution_horizon_secs: u64,
+
+    // ── Copy-entry gate (first-ever-entry; issues #290, #339) ─────────────────
     /// Path to the JSON sidecar tracking each leader's previously-entered markets,
     /// used by the first-entry gate. See `docs/_GLOSSARY.md`: `wallet_market_history_path`.
     #[serde(default = "default_wallet_market_history_path")]
     pub wallet_market_history_path: PathBuf,
-
-    /// Inclusive lower bound on the leader's entry price for a copy. Decimal string.
-    /// See `docs/_GLOSSARY.md`: `entry_gate_price_band_lo`.
-    #[serde(default = "default_entry_gate_price_band_lo")]
-    pub entry_gate_price_band_lo: String,
-
-    /// Inclusive upper bound on the leader's entry price for a copy. Decimal string.
-    /// See `docs/_GLOSSARY.md`: `entry_gate_price_band_hi`.
-    #[serde(default = "default_entry_gate_price_band_hi")]
-    pub entry_gate_price_band_hi: String,
 
     /// First-entry gate posture for wallets whose history could not be loaded:
     /// `false` (default) fails open (copies allowed), `true` fails closed (blocked).
     /// See `docs/_GLOSSARY.md`: `entry_gate_fail_closed`.
     #[serde(default)]
     pub entry_gate_fail_closed: bool,
+
+    /// Maximum *current* market price at which a BUY copy will fill, as a decimal string.
+    /// Mirrors the issue-#142 backtest `max_signal_price` cap so live sizing matches
+    /// backtest: a BUY whose current price is `>=` this is skipped (catastrophic payoff
+    /// geometry near $1). Set to `"0"` to disable. See `docs/_GLOSSARY.md`: `max_fill_price`.
+    #[serde(default = "default_max_fill_price")]
+    pub max_fill_price: String,
+
+    // ── Live wallet source (Supabase ranking handoff, issue #339) ─────────────
+    /// Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). Empty (the
+    /// default) disables the live source; the service falls back to `seed_watchlist_path`.
+    /// Set via `PE_SUPABASE_URL`. See `docs/_GLOSSARY.md`: `supabase_url`.
+    #[serde(default)]
+    pub supabase_url: String,
+
+    /// Supabase anon (publishable) API key — sent as the `apikey` header. Injected via
+    /// `PE_SUPABASE_ANON_KEY` from `.env`; never committed, never logged.
+    #[serde(default)]
+    pub supabase_anon_key: String,
+
+    /// Supabase service-role (secret) API key — sent as the `Authorization: Bearer`
+    /// token, bypassing RLS for the server-side read. Injected via `PE_SUPABASE_SECRET_KEY`
+    /// from `.env`; never committed, never logged.
+    #[serde(default)]
+    pub supabase_secret_key: String,
+
+    /// Seconds between live-watchlist refresh polls against Supabase. The refresh loop is
+    /// spawned only when `supabase_url` is non-empty and this is `> 0`. Default: 300.
+    /// See `docs/_GLOSSARY.md`: `supabase_refresh_interval_secs`.
+    #[serde(default = "default_supabase_refresh_interval_secs")]
+    pub supabase_refresh_interval_secs: u64,
 
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to `Decimal` at startup.
@@ -216,12 +244,16 @@ fn default_wallet_market_history_path() -> PathBuf {
     PathBuf::from("./wallet_market_history.json")
 }
 
-fn default_entry_gate_price_band_lo() -> String {
-    "0.40".to_string()
+const fn default_min_resolution_horizon_secs() -> u64 {
+    60 // docs/29: the 1-minute copy floor; sub-minute "breaks down"
 }
 
-fn default_entry_gate_price_band_hi() -> String {
-    "0.80".to_string()
+fn default_max_fill_price() -> String {
+    "0.85".to_string()
+}
+
+const fn default_supabase_refresh_interval_secs() -> u64 {
+    300
 }
 
 const fn default_position_reseed_interval_secs() -> u64 {
@@ -303,10 +335,14 @@ impl Default for ServiceConfig {
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
+            min_resolution_horizon_secs: default_min_resolution_horizon_secs(),
             wallet_market_history_path: default_wallet_market_history_path(),
-            entry_gate_price_band_lo: default_entry_gate_price_band_lo(),
-            entry_gate_price_band_hi: default_entry_gate_price_band_hi(),
             entry_gate_fail_closed: false,
+            max_fill_price: default_max_fill_price(),
+            supabase_url: String::new(),
+            supabase_anon_key: String::new(),
+            supabase_secret_key: String::new(),
+            supabase_refresh_interval_secs: default_supabase_refresh_interval_secs(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
@@ -368,10 +404,14 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
+        "min_resolution_horizon_secs",
         "wallet_market_history_path",
-        "entry_gate_price_band_lo",
-        "entry_gate_price_band_hi",
         "entry_gate_fail_closed",
+        "max_fill_price",
+        "supabase_url",
+        "supabase_anon_key",
+        "supabase_secret_key",
+        "supabase_refresh_interval_secs",
         "bankroll_usd",
         "mode",
         "strategy",
@@ -409,13 +449,17 @@ mod tests {
         assert_eq!(cfg.position_page_limit, 500);
         assert_eq!(cfg.position_size_threshold, 1);
         assert_eq!(cfg.max_resolution_horizon_secs, 259_200);
+        assert_eq!(cfg.min_resolution_horizon_secs, 60);
         assert_eq!(
             cfg.wallet_market_history_path,
             PathBuf::from("./wallet_market_history.json")
         );
-        assert_eq!(cfg.entry_gate_price_band_lo, "0.40");
-        assert_eq!(cfg.entry_gate_price_band_hi, "0.80");
         assert!(!cfg.entry_gate_fail_closed);
+        assert_eq!(cfg.max_fill_price, "0.85");
+        assert_eq!(cfg.supabase_url, "");
+        assert_eq!(cfg.supabase_anon_key, "");
+        assert_eq!(cfg.supabase_secret_key, "");
+        assert_eq!(cfg.supabase_refresh_interval_secs, 300);
     }
 
     #[test]
