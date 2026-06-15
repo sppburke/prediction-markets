@@ -143,7 +143,7 @@ fn to_watchlist(rows: &[RankingRow]) -> Watchlist {
 /// 3-part JWT and fails (`PGRST301: Expected 3 parts in JWT; got 1`). So both headers must
 /// use one token. Prefer the service-role secret (bypasses RLS for the server-side read);
 /// fall back to the publishable/anon key when no secret is configured.
-fn auth_token<'a>(anon_key: &'a str, secret_key: &'a str) -> &'a str {
+pub(crate) fn auth_token<'a>(anon_key: &'a str, secret_key: &'a str) -> &'a str {
     if secret_key.is_empty() {
         anon_key
     } else {

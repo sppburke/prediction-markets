@@ -206,6 +206,7 @@ async fn run_gate_capped(
         MarketEndCache::new(String::new()),
         mid_price_cache,
         dead_reseed_rx(),
+        None,
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;

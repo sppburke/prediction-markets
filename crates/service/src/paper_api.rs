@@ -229,14 +229,14 @@ fn side_str(side: Side) -> &'static str {
 /// `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{observed_at}`.
 /// (Format defined in `strategy-winner-follow::evaluate::build_idempotency_key`.)
 #[derive(Default)]
-struct ParsedKey {
-    leader: Option<String>,
-    source_trade_id: Option<String>,
-    entry_unix: Option<i64>,
+pub(crate) struct ParsedKey {
+    pub(crate) leader: Option<String>,
+    pub(crate) source_trade_id: Option<String>,
+    pub(crate) entry_unix: Option<i64>,
 }
 
 impl ParsedKey {
-    fn from_key(key: &str) -> Self {
+    pub(crate) fn from_key(key: &str) -> Self {
         let parts: Vec<&str> = key.split('|').collect();
         // Index 0 is the "wf" tag; 1=leader, 2=source_trade_id, 6=observed_at bucket.
         // Anything shorter is a legacy/foreign key — leave fields empty rather than guess.

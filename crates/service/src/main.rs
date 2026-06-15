@@ -4,6 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
@@ -34,6 +35,7 @@ use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::seed;
 use pe_service::supabase_reader;
 use pe_service::supabase_refresh::run_supabase_refresh_loop;
+use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
 use time::OffsetDateTime;
@@ -329,6 +331,30 @@ async fn main() -> Result<()> {
     let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
     // Mid-price cache for marking open dashboard positions to market (own rate gate).
     let mid_price_cache = MidPriceCache::new(cfg.gamma_base_url.clone());
+
+    // Supabase analytics sink (issue #343): best-effort dual-write of fills + settlements.
+    // Spawned only when enabled and a Supabase URL is configured; otherwise `None` (no-op).
+    let (sink_handle, sink_task) = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
+        let (handle, rx) = SinkHandle::channel(cfg.supabase_sink_channel_capacity);
+        let writer = SupabaseWriter::new(
+            reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        );
+        let dropped = handle.dropped_counter();
+        let task = tokio::spawn(run_sink(
+            writer,
+            paper_state.clone(),
+            rx,
+            Duration::from_secs(cfg.supabase_sink_reconcile_interval_secs),
+            dropped,
+        ));
+        (Some(handle), Some(task))
+    } else {
+        (None, None)
+    };
+
     let orch = Orchestrator::new(
         trade_rx,
         live_watchlist.clone(),
@@ -350,6 +376,7 @@ async fn main() -> Result<()> {
         market_end_cache.clone(),
         mid_price_cache.clone(),
         reseed_rx,
+        sink_handle.clone(),
     )
     .context("build orchestrator")?;
 
@@ -359,6 +386,7 @@ async fn main() -> Result<()> {
         cfg.gamma_base_url.clone(),
         cfg.gamma_resolution_poll_interval_secs,
         cfg.paper_resolutions_path.clone(),
+        sink_handle,
     );
 
     // Live-watchlist refresh task (#339): poll Supabase on the configured interval and
@@ -423,6 +451,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     if let Some(t) = supabase_task {
+        t.abort();
+    }
+    if let Some(t) = sink_task {
         t.abort();
     }
     info!("pe-service stopped");
@@ -538,6 +569,7 @@ fn spawn_resolution_task(
     gamma_base_url: String,
     poll_interval_secs: u64,
     resolutions_path: std::path::PathBuf,
+    sink: Option<SinkHandle>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let fetcher = GammaResolutionFetcher::new(
@@ -546,7 +578,9 @@ fn spawn_resolution_task(
         );
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
-            if let Err(e) = tick_resolution(&paper_state, &fetcher, &resolutions_path).await {
+            if let Err(e) =
+                tick_resolution(&paper_state, &fetcher, &resolutions_path, sink.as_ref()).await
+            {
                 tracing::warn!(error = %e, "resolution poll error");
             }
         }
@@ -557,6 +591,7 @@ async fn tick_resolution(
     paper_state: &Arc<PaperStateDb>,
     fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
     resolutions_path: &std::path::Path,
+    sink: Option<&SinkHandle>,
 ) -> Result<()> {
     let mut store = ResolutionStore::load(Arc::clone(paper_state), resolutions_path)
         .context("load resolution store")?;
@@ -582,6 +617,7 @@ async fn tick_resolution(
         .context("fetch resolutions")?;
 
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+    let any_settled = !resolved.is_empty();
     for res in resolved {
         let market_positions: Vec<_> = positions
             .iter()
@@ -607,6 +643,10 @@ async fn tick_resolution(
                 .context("credit bankroll")?;
         }
         tracing::info!(market = %res.market_id, %credit, "resolution applied");
+    }
+    // Nudge the Supabase sink once per tick to re-upsert the settled set (canonical JSON).
+    if any_settled && let Some(sink) = sink {
+        sink.send_resolution();
     }
     Ok(())
 }

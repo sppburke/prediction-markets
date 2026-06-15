@@ -174,6 +174,25 @@ pub struct ServiceConfig {
     #[serde(default = "default_supabase_refresh_interval_secs")]
     pub supabase_refresh_interval_secs: u64,
 
+    // ── Paper-trade Supabase sink (issue #343) ───────────────────────────────
+    /// Enable the best-effort paper-fill / settlement sink to Supabase. Off by default;
+    /// the sink is spawned only when this is `true` **and** `supabase_url` is non-empty.
+    /// `PE_SUPABASE_SINK_ENABLED`. See `docs/_GLOSSARY.md`: `supabase_sink_enabled`.
+    #[serde(default)]
+    pub supabase_sink_enabled: bool,
+
+    /// Bounded capacity of the trade-path → sink event channel. Drop-on-full (the periodic
+    /// reconcile heals drops). Default: 256. See `docs/_GLOSSARY.md`:
+    /// `supabase_sink_channel_capacity`.
+    #[serde(default = "default_supabase_sink_channel_capacity")]
+    pub supabase_sink_channel_capacity: usize,
+
+    /// Seconds between periodic sink reconciles (fill HWM catch-up + full settled re-upsert,
+    /// healing any dropped/failed live writes). Default: 300. See `docs/_GLOSSARY.md`:
+    /// `supabase_sink_reconcile_interval_secs`.
+    #[serde(default = "default_supabase_sink_reconcile_interval_secs")]
+    pub supabase_sink_reconcile_interval_secs: u64,
+
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to `Decimal` at startup.
     #[serde(default = "default_bankroll_usd")]
@@ -253,6 +272,14 @@ fn default_max_fill_price() -> String {
 }
 
 const fn default_supabase_refresh_interval_secs() -> u64 {
+    300
+}
+
+const fn default_supabase_sink_channel_capacity() -> usize {
+    256
+}
+
+const fn default_supabase_sink_reconcile_interval_secs() -> u64 {
     300
 }
 
@@ -348,6 +375,9 @@ impl Default for ServiceConfig {
             supabase_anon_key: String::new(),
             supabase_secret_key: String::new(),
             supabase_refresh_interval_secs: default_supabase_refresh_interval_secs(),
+            supabase_sink_enabled: false,
+            supabase_sink_channel_capacity: default_supabase_sink_channel_capacity(),
+            supabase_sink_reconcile_interval_secs: default_supabase_sink_reconcile_interval_secs(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
@@ -417,6 +447,9 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "supabase_anon_key",
         "supabase_secret_key",
         "supabase_refresh_interval_secs",
+        "supabase_sink_enabled",
+        "supabase_sink_channel_capacity",
+        "supabase_sink_reconcile_interval_secs",
         "bankroll_usd",
         "mode",
         "strategy",

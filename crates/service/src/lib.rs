@@ -16,6 +16,7 @@ pub mod position_seeder;
 pub mod seed;
 pub mod supabase_reader;
 pub mod supabase_refresh;
+pub mod supabase_sink;
 pub mod trade_parser;
 pub mod trade_poller;
 pub mod wallet_history;

@@ -12,7 +12,7 @@ use pe_core_types::{
     SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
-use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
+use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
@@ -30,6 +30,7 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
+use crate::supabase_sink::SinkHandle;
 
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
@@ -78,6 +79,8 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
     reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
+    // Best-effort Supabase analytics sink (issue #343). `None` when disabled.
+    sink: Option<SinkHandle>,
 }
 
 impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
@@ -95,6 +98,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
         market_end_cache: MarketEndCache,
         mid_price_cache: MidPriceCache<F>,
         reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
+        sink: Option<SinkHandle>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
@@ -128,6 +132,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
             reseed_rx,
+            sink,
         })
     }
 
@@ -435,7 +440,21 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             .paper_state
             .commit_fill(&trade.source_trade_id, leader, &record, seq)
         {
-            Ok(new_bankroll) => self.bankroll = new_bankroll,
+            Ok(new_bankroll) => {
+                self.bankroll = new_bankroll;
+                // Best-effort mirror to Supabase (issue #343). Never blocks the trade path.
+                if let Some(sink) = &self.sink {
+                    sink.send_fill(FillRow {
+                        idempotency_key: record.idempotency_key,
+                        market_id: record.market_id,
+                        outcome_id: record.outcome_id,
+                        side: record.side,
+                        contracts: record.contracts,
+                        fill_price: record.fill_price,
+                        event_seq: i64::try_from(seq.0).unwrap_or(i64::MAX),
+                    });
+                }
+            }
             Err(e) => error!(error = %e, "paper-state commit_fill failed"),
         }
     }
