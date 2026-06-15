@@ -60,3 +60,7 @@ venv/
 
 # macOS
 .DS_Store
+
+# Next.js analytics site (issue #343 PR3) — first Node surface in the repo.
+site/node_modules/
+site/.next/

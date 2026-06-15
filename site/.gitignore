@@ -1,0 +1,16 @@
+# Next.js / Node
+/node_modules
+/.next
+/out
+/build
+next-env.d.ts
+*.tsbuildinfo
+
+# Local env (never commit the anon key file; see .env.example)
+.env
+.env.local
+.env*.local
+
+# Misc
+.DS_Store
+npm-debug.log*
