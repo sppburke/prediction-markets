@@ -1,4 +1,4 @@
-//! Portfolio snapshot type and embedded HTML dashboard renderer.
+//! Portfolio-snapshot and trade-view types for the paper-trader JSON endpoints.
 
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -66,8 +66,8 @@ impl PortfolioSnapshot {
     }
 
     /// Realized bankroll delta (`total_pnl`) as a percentage of initial bankroll.
-    /// Retained for `/paper/pnl` backward-compatibility; the dashboard headline
-    /// uses [`displayed_total_pct`](Self::displayed_total_pct).
+    /// Retained for `/paper/pnl` backward-compatibility; the headline P&L uses
+    /// [`displayed_total_pct`](Self::displayed_total_pct).
     pub fn pnl_pct(&self) -> Decimal {
         pct_of(self.total_pnl, self.initial_bankroll)
     }
@@ -83,7 +83,8 @@ fn pct_of(value: Decimal, basis: Decimal) -> Decimal {
 
 /// One entered paper trade (a recorded fill), enriched with the leader, entry
 /// time and market expiration parsed/resolved by the service tier. Raw Unix
-/// timestamps are carried here; the renderer derives the UTC/Central-time strings.
+/// timestamps are carried here; [`to_json`](Self::to_json) derives the
+/// UTC/Central-time strings.
 #[derive(Debug, Clone)]
 pub struct TradeView {
     pub market_id: String,
@@ -122,8 +123,8 @@ impl TradeView {
     }
 
     /// Full per-trade detail as a JSON object, including derived notional and
-    /// UTC + US-Central timestamp strings. Shared by the dashboard raw-JSON blob
-    /// and the `/paper/fills` endpoint so time formatting lives in one place.
+    /// UTC + US-Central timestamp strings. Backs the `/paper/fills` endpoint, so
+    /// time formatting lives in one place.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "market_id": self.market_id,
@@ -146,140 +147,6 @@ impl TradeView {
             "realized_pnl": self.realized_pnl,
             "current_mid": self.current_mid,
         })
-    }
-}
-
-/// Render the HTML dashboard: summary cards, a per-trade table, and a raw JSON
-/// blob carrying the full `{summary, trades}` payload.
-pub fn render_dashboard_html(snapshot: &PortfolioSnapshot, trades: &[TradeView]) -> String {
-    let raw = serde_json::json!({
-        "summary": snapshot,
-        "trades": trades.iter().map(TradeView::to_json).collect::<Vec<_>>(),
-    });
-    let json = serde_json::to_string_pretty(&raw).unwrap_or_else(|_| "{}".to_string());
-
-    // Headline P&L is the mark-to-market total (realized + unrealized); colour and
-    // sign follow it, not the open-at-$0 bankroll delta.
-    let total = snapshot.displayed_total();
-    let pnl_color = if total >= Decimal::ZERO {
-        "#2ecc71"
-    } else {
-        "#e74c3c"
-    };
-    let total_sign = sign_of(total);
-    let realized_sign = sign_of(snapshot.realized_pnl);
-    let unrealized_sign = sign_of(snapshot.unrealized_pnl);
-    let total_pct = snapshot.displayed_total_pct();
-    let trade_rows = render_trade_rows(trades);
-
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Paper Trader Dashboard</title>
-<style>
-body{{font-family:monospace;background:#1a1a2e;color:#eee;padding:2rem;}}
-h1,h2{{color:#a29bfe;}}
-.card{{background:#16213e;border-radius:8px;padding:1.5rem;margin:1rem 0;}}
-.stat{{display:inline-block;margin:0.5rem 1rem;}}
-.label{{color:#74b9ff;font-size:.85rem;}}
-.value{{font-size:1.4rem;font-weight:bold;}}
-.pnl{{color:{pnl_color};}}
-table{{width:100%;border-collapse:collapse;font-size:.8rem;}}
-th,td{{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #0f3460;white-space:nowrap;}}
-th{{color:#74b9ff;}}
-td.num{{text-align:right;}}
-pre{{background:#0f3460;padding:1rem;border-radius:6px;overflow:auto;font-size:.8rem;}}
-</style>
-</head>
-<body>
-<h1>Paper Trader Dashboard</h1>
-<div class="card">
-  <div class="stat"><div class="label">Bankroll</div><div class="value">${current_bankroll}</div></div>
-  <div class="stat"><div class="label">Realized</div><div class="value">{realized_sign}{realized_pnl}</div></div>
-  <div class="stat"><div class="label">Unrealized</div><div class="value">{unrealized_sign}{unrealized_pnl}</div></div>
-  <div class="stat"><div class="label">Total P&amp;L</div><div class="value pnl">{total_sign}{total} ({total_pct}%)</div></div>
-  <div class="stat"><div class="label">Resolution Credits</div><div class="value">${resolution_credits}</div></div>
-  <div class="stat"><div class="label">Settled Markets</div><div class="value">{settled_markets}</div></div>
-  <div class="stat"><div class="label">Open Positions</div><div class="value">{open_position_count}</div></div>
-  <div class="stat"><div class="label">Total Fills</div><div class="value">{fills_count}</div></div>
-</div>
-<div class="card">
-  <h2>Entered Trades ({fills_count})</h2>
-  <table>
-    <thead><tr>
-      <th>Entry (CT)</th><th>Market</th><th>Out</th><th>Side</th>
-      <th class="num">Contracts</th><th class="num">Fill</th><th class="num">Notional</th>
-      <th>Status</th><th>Outcome</th><th class="num">Realized</th>
-      <th>Leader</th><th>Resolves (CT)</th>
-    </tr></thead>
-    <tbody>{trade_rows}</tbody>
-  </table>
-</div>
-<div class="card"><details><summary>Raw JSON</summary><pre>{json}</pre></details></div>
-</body></html>"#,
-        current_bankroll = snapshot.current_bankroll,
-        realized_pnl = snapshot.realized_pnl,
-        unrealized_pnl = snapshot.unrealized_pnl,
-        resolution_credits = snapshot.resolution_credits,
-        settled_markets = snapshot.settled_markets,
-        open_position_count = snapshot.open_position_count,
-        fills_count = snapshot.fills_count,
-    )
-}
-
-/// `"+"` for non-negative, `""` otherwise (negatives carry their own `-`).
-fn sign_of(value: Decimal) -> &'static str {
-    if value >= Decimal::ZERO { "+" } else { "" }
-}
-
-fn render_trade_rows(trades: &[TradeView]) -> String {
-    if trades.is_empty() {
-        return "<tr><td colspan=\"12\">No trades yet.</td></tr>".to_string();
-    }
-    trades
-        .iter()
-        .map(|t| {
-            let entry = t
-                .entry_unix
-                .and_then(tz::fmt_ct)
-                .unwrap_or_else(|| "—".into());
-            let resolves = t
-                .resolution_unix
-                .and_then(tz::fmt_ct)
-                .unwrap_or_else(|| "—".into());
-            let status = t.resolution_status.as_deref().unwrap_or("open");
-            let outcome = t.outcome.as_deref().unwrap_or("—");
-            let realized = match t.realized_pnl {
-                Some(p) => format!("{}{p}", sign_of(p)),
-                None => "—".to_string(),
-            };
-            format!(
-                "<tr><td>{entry}</td><td title=\"{market_full}\">{market}</td><td>{outcome_id}</td>\
-                 <td>{side}</td><td class=\"num\">{contracts}</td><td class=\"num\">{price}</td>\
-                 <td class=\"num\">{notional}</td><td>{status}</td><td>{outcome}</td>\
-                 <td class=\"num\">{realized}</td><td title=\"{leader_full}\">{leader}</td>\
-                 <td>{resolves}</td></tr>",
-                market_full = t.market_id,
-                market = short_id(&t.market_id),
-                outcome_id = t.outcome_id,
-                side = t.side,
-                contracts = t.contracts,
-                price = t.fill_price,
-                notional = t.notional(),
-                leader_full = t.leader,
-                leader = short_id(&t.leader),
-            )
-        })
-        .collect()
-}
-
-/// Abbreviate a long hex id (`0xabcd…1234`) for table display. ASCII-safe.
-fn short_id(s: &str) -> String {
-    if s.len() > 14 {
-        format!("{}…{}", &s[..6], &s[s.len() - 4..])
-    } else {
-        s.to_string()
     }
 }
 
@@ -398,38 +265,24 @@ mod tests {
     }
 
     #[test]
-    fn raw_json_includes_trades_with_expiration_and_notional() {
-        let snap = snapshot(Decimal::new(8152, 2), Decimal::new(-1646, 2));
-        let html = render_dashboard_html(&snap, &[trade(Some(1_705_320_000), Some(1_730_700_000))]);
-        // Trade detail and derived fields are present in the page.
-        assert!(html.contains("\"notional\""));
-        assert!(html.contains("\"resolution_ct\""));
-        assert!(html.contains("\"entry_ct\": \"2024-01-15 06:00:00 CST\""));
-        assert!(html.contains("Entered Trades (1)"));
-        // New mark-to-market fields surface in the per-trade JSON.
-        assert!(html.contains("\"outcome\""));
-        assert!(html.contains("\"realized_pnl\""));
-        assert!(html.contains("\"current_mid\""));
+    fn to_json_exposes_trade_detail_and_derived_fields() {
+        // `TradeView::to_json` is the per-trade payload the `/paper/fills` endpoint serves.
+        let json = trade(Some(1_705_320_000), Some(1_730_700_000)).to_json();
+        let obj = json
+            .as_object()
+            .expect("trade view serializes to an object");
+        assert!(obj.contains_key("notional"));
+        assert!(obj.contains_key("resolution_ct"));
+        assert_eq!(json["entry_ct"], "2024-01-15 06:00:00 CST");
+        assert!(obj.contains_key("outcome"));
+        assert!(obj.contains_key("realized_pnl"));
+        assert!(obj.contains_key("current_mid"));
     }
 
     #[test]
-    fn summary_shows_realized_unrealized_and_total() {
+    fn displayed_total_is_realized_plus_unrealized() {
         // realized +81.52, unrealized −16.46 → total +65.06.
         let snap = snapshot(Decimal::new(8152, 2), Decimal::new(-1646, 2));
-        let html = render_dashboard_html(&snap, &[]);
-        assert!(html.contains(">Realized<"));
-        assert!(html.contains(">Unrealized<"));
-        assert!(html.contains(">Total P&amp;L<"));
-        assert!(html.contains("+65.06"));
         assert_eq!(snap.displayed_total(), Decimal::new(6506, 2));
-    }
-
-    #[test]
-    fn empty_trades_render_placeholder_row() {
-        let snap = snapshot(Decimal::ZERO, Decimal::ZERO);
-        let html = render_dashboard_html(&snap, &[]);
-        assert!(html.contains("No trades yet."));
-        // Placeholder colspan matches the 12-column header.
-        assert!(html.contains("colspan=\"12\""));
     }
 }

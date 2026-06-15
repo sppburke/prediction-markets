@@ -55,7 +55,6 @@ fn snapshot_matches_expected_after_resolution() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("paper.db");
-    let res_path = dir.path().join("resolutions.json");
 
     let db = Arc::new(PaperStateDb::open(&db_path).unwrap());
     let initial = dec!(1000);
@@ -96,7 +95,7 @@ fn snapshot_matches_expected_after_resolution() {
 
     db.credit_bankroll(credit).unwrap();
 
-    let mut store = ResolutionStore::load(db.clone(), &res_path).unwrap();
+    let mut store = ResolutionStore::load(db.clone()).unwrap();
     store
         .mark_settled(mkt_a.clone(), vec![dec!(1), dec!(0)], credit, 1_700_000_000)
         .unwrap();
@@ -130,7 +129,6 @@ fn replay_equals_snapshot() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("paper.db");
-    let res_path = dir.path().join("resolutions.json");
 
     let db = Arc::new(PaperStateDb::open(&db_path).unwrap());
     let initial = dec!(500);
@@ -154,7 +152,7 @@ fn replay_equals_snapshot() {
     let credit = PnlLedger::resolution_credit(&positions, &[dec!(1), dec!(0)]);
     db.credit_bankroll(credit).unwrap();
 
-    let mut store = ResolutionStore::load(db.clone(), &res_path).unwrap();
+    let mut store = ResolutionStore::load(db.clone()).unwrap();
     store
         .mark_settled(mkt, vec![dec!(1), dec!(0)], credit, 1_700_000_000)
         .unwrap();
@@ -162,7 +160,7 @@ fn replay_equals_snapshot() {
     let snap1 = PnlLedger::snapshot(&db, &store, initial, &HashMap::new()).unwrap();
 
     // Reload store to simulate restart.
-    let store2 = ResolutionStore::load(db.clone(), &res_path).unwrap();
+    let store2 = ResolutionStore::load(db.clone()).unwrap();
     let snap2 = PnlLedger::snapshot(&db, &store2, initial, &HashMap::new()).unwrap();
 
     assert_eq!(
@@ -191,7 +189,6 @@ fn open_position_marked_to_market() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("paper.db");
-    let res_path = dir.path().join("resolutions.json");
 
     let db = Arc::new(PaperStateDb::open(&db_path).unwrap());
     let initial = dec!(1000);
@@ -209,7 +206,7 @@ fn open_position_marked_to_market() {
     assert_eq!(db.bankroll().unwrap(), Some(dec!(960)));
 
     // No settlement; supply a live mid of 0.55 for the open market.
-    let store = ResolutionStore::load(db.clone(), &res_path).unwrap();
+    let store = ResolutionStore::load(db.clone()).unwrap();
     let mut mids = HashMap::new();
     mids.insert(mkt.clone(), vec![dec!(0.55), dec!(0.45)]);
 
