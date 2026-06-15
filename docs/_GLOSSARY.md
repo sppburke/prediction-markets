@@ -299,19 +299,33 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `paper_resolutions_path` | `./paper_resolutions.json` | Path to the JSON sidecar tracking settled-market resolution prices and bankroll credits. Loaded by `PnlLedger` and the `--report` flag; crash-safe atomic write |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
 | `gamma_resolution_poll_interval_secs` | 3600 | Seconds between Gamma resolution poll rounds in the live service. 1-hour cadence is sufficient because market resolution propagates on a minutes-to-hours timescale |
-| `max_resolution_horizon_secs` | 259_200 (72 h) | `ServiceConfig` field. Drop entry signals whose market `endDate` is further than this many seconds into the future. 0 disables the gate. Aligned with the band-cohort "<72 h before resolution" selection criterion (issue #290); guards against locking capital in months-long markets. |
+| `max_resolution_horizon_secs` | 259_200 (72 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. |
+| `min_resolution_horizon_secs` | 60 | `ServiceConfig` field. Drop entry signals whose market resolves *sooner* than this many seconds from now — a copy cannot realistically fill and hold a market about to resolve. 0 disables the lower bound. `docs/29`: the 1-minute copy floor; sub-minute "breaks down" (issue #339). |
 
-### Copy-entry gate (band-cohort alignment, issue #290)
+### Copy-entry gate (first-ever-entry; issues #290, #339)
 
-Aligns the live copy path with the 13-wallet "72hr buy-and-hold band" cohort selection criteria. See `docs/19-WINNER-FOLLOW-STRATEGY.md` "Copy-scope gates" for the full gate sequence and fail posture.
+Copies only a leader's first-ever entry into a market that resolves within the configured horizon. The leader-price band was removed in #339 — live sizing is re-based on the current market price instead (see `max_fill_price` below and `docs/19-WINNER-FOLLOW-STRATEGY.md` "Copy-scope gates" for the full gate sequence and fail posture).
 
 | Key | Default | Meaning |
 |---|---:|---|
 | `wallet_market_history_path` | `./wallet_market_history.json` | `ServiceConfig` field. Path to the JSON sidecar tracking each leader's previously-entered markets (loaded/merged/persisted at startup by `crate::wallet_history`). Drives the first-entry gate. |
-| `entry_gate_price_band_lo` | `0.40` | `ServiceConfig` field (decimal string). **Inclusive** lower bound on the leader's entry price for a copy. Checked against `signal.leader_price`. |
-| `entry_gate_price_band_hi` | `0.80` | `ServiceConfig` field (decimal string). **Inclusive** upper bound on the leader's entry price for a copy. Must be `> entry_gate_price_band_lo` (validated at startup). |
+| `max_fill_price` | `0.85` | `ServiceConfig` field (decimal string). Skip a BUY copy whose **current** market price is `>=` this (catastrophic payoff geometry near $1). `0` disables. Mirrors the issue-#142 backtest `max_signal_price` cap so live sizing matches backtest. A safety rail, not the old leader-price band; adjustable up to ~0.90–0.95 (issue #339). |
 | `entry_gate_fail_closed` | `false` | `ServiceConfig` field. Posture for a wallet absent from the history map (fetch failed, no stale sidecar): `false` fails open (copies allowed, treat as new), `true` fails closed (blocked). The loader warns per absent wallet either way. |
 | `history_max_pages` | 200 | **Module const** in `crates/service/src/wallet_history.rs` (not a TOML/env key). Safety backstop: per-wallet history pagination stops after this many 500-trade pages; a `warn!` is emitted if hit (older markets may be missed → possible false first-entry). |
+
+### Live wallet source (Supabase ranking handoff, issue #339)
+
+The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval and additively swaps in the live wallet set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`). When `supabase_url` is empty the service falls back to `seed_watchlist_path`. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged).
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `supabase_url` | `""` | `ServiceConfig` field. Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). Empty disables the live source. `PE_SUPABASE_URL`. |
+| `supabase_anon_key` | `""` | `ServiceConfig` field (secret). Sent as the `apikey` header. `PE_SUPABASE_ANON_KEY` from `.env`. |
+| `supabase_secret_key` | `""` | `ServiceConfig` field (secret). Sent as the `Authorization: Bearer` token (bypasses RLS for the server-side read). `PE_SUPABASE_SECRET_KEY` from `.env`. |
+| `supabase_refresh_interval_secs` | 300 | `ServiceConfig` field. Seconds between live-watchlist refresh polls. The refresh loop is spawned only when `supabase_url` is non-empty and this is `> 0`. |
+| `SUPABASE_FETCH_LIMIT` | 25 | **Module const** in `crates/service/src/supabase_reader.rs`. Top-N wallets fetched per refresh (the live copy set; `?limit=`). The ranker pushes a deeper top-200 batch; #3 widens the fetch. |
+| `SUPABASE_LIVE_CAP` | 200 | **Module const** in `supabase_reader.rs`. Upper bound on the accumulated (additive, never-evicted) live set across refreshes; matches the ranker's top-200 push. Eviction/demotion is deferred to the online policy (#3). |
+| `LS_TSTAT_BPS_SCALE` | 1_000 | **Module const** in `supabase_reader.rs`. t-stat → `leader_score_bps` scale (ordering only, not a gate). A t-stat of 2.5 maps to 2500 bps. |
 
 ### Wallet enumeration and relocated chain primitives
 

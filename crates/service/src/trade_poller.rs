@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pe_copy_signal_engine::IncomingTrade;
-use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
 use time::OffsetDateTime;
@@ -17,6 +16,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::health::SharedHealth;
+use crate::live_watchlist::LiveWatchlist;
 use crate::trade_parser;
 
 /// Configuration for the trade poller.
@@ -32,7 +32,7 @@ pub struct TradePollerConfig {
 /// A live trade poller that drives a [`PageFetcher`] per wallet.
 pub struct TradePoller<F: PageFetcher> {
     config: TradePollerConfig,
-    wallets: Vec<WalletAddress>,
+    live_watchlist: LiveWatchlist,
     fetcher: F,
     tx: mpsc::Sender<IncomingTrade>,
     paper_state: Arc<PaperStateDb>,
@@ -42,7 +42,7 @@ pub struct TradePoller<F: PageFetcher> {
 impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     pub fn new(
         config: TradePollerConfig,
-        wallets: Vec<WalletAddress>,
+        live_watchlist: LiveWatchlist,
         fetcher: F,
         tx: mpsc::Sender<IncomingTrade>,
         paper_state: Arc<PaperStateDb>,
@@ -50,7 +50,7 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     ) -> Self {
         Self {
             config,
-            wallets,
+            live_watchlist,
             fetcher,
             tx,
             paper_state,
@@ -60,11 +60,14 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
 
     /// Run the polling loop until the channel is closed (i.e. orchestrator dropped).
     ///
-    /// Each round fetches trades for every wallet in sequence, then sleeps for
+    /// Each round re-reads the live wallet set (so Supabase refreshes take effect without
+    /// a restart, #339), fetches trades for every wallet in sequence, then sleeps for
     /// `poll_interval_secs`. Returns when the downstream channel is closed.
     pub async fn run(self) {
         loop {
-            for &wallet in &self.wallets {
+            let watchlist = self.live_watchlist.snapshot();
+            for entry in &watchlist.entries {
+                let wallet = entry.wallet;
                 // Timestamp cursor: the stored cursor is the newest observed_at (whole
                 // seconds) seen for this wallet. The endpoint's `start` is *exclusive*
                 // (`timestamp > start`), so we fetch from `cursor - 1` to re-include the

@@ -36,6 +36,7 @@ pe-paper-state              = { path = "../paper-state",                version 
 pe-paper-pnl                = { path = "../paper-pnl",                  version = "0.1.0" }
 
 anyhow          = { workspace = true }
+arc-swap        = { workspace = true }
 axum            = { workspace = true }
 figment         = { workspace = true }
 futures         = { workspace = true }

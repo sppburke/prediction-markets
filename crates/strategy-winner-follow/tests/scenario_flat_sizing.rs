@@ -121,6 +121,57 @@ fn scenario_flat_sizing_correct_contract_count() {
     );
 }
 
+// ─── scenario F1b: current-price sizing basis (#339) ──────────────────────────
+
+/// `evaluate_at_price` sizes at the CURRENT price, not the leader's, while the emitted
+/// `limit_price` stays at the leader's price (don't-chase). The leader-price wrapper
+/// `evaluate` keeps sizing at the leader's price.
+///
+/// PASS: current-price order = 250 contracts (100/0.40), leader-price order = 125
+///       (100/0.80), and the current-price order's `limit_price` == 0.80.
+#[test]
+fn scenario_evaluate_at_price_sizes_at_current_keeps_leader_limit() {
+    let leader_price = price(dec!(0.80));
+    let signal = make_signal_at_price(0xF9, LeaderAction::Entry, leader_price);
+    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
+
+    let at_current = strategy
+        .evaluate_at_price(
+            &signal,
+            price(dec!(0.40)),
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("current-price sizing should produce order");
+    assert_eq!(
+        at_current.contracts.0, 250,
+        "sized at current price 0.40 → floor(100/0.40)"
+    );
+    assert_eq!(
+        at_current.limit_price, leader_price,
+        "limit_price stays at the leader's price (don't-chase)"
+    );
+
+    let at_leader = strategy
+        .evaluate(
+            &signal,
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("leader-price sizing should produce order");
+    assert_eq!(
+        at_leader.contracts.0, 125,
+        "wrapper sizes at the leader price 0.80 → floor(100/0.80)"
+    );
+    println!(
+        "PASS: evaluate_at_price sizes at current (250) vs leader (125); limit stays at leader"
+    );
+}
+
 // ─── scenario F2 ─────────────────────────────────────────────────────────────
 
 /// flat=$100, price=$0.01 → floor(100/0.01)=10 000 contracts.

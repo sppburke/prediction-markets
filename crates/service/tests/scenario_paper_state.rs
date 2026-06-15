@@ -35,9 +35,12 @@ use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
+use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
+use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
+use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
 };
@@ -126,14 +129,24 @@ fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, Posi
     mpsc::channel(1).1
 }
 
-/// Copy-entry gate disabled for these correctness tests: full [0,1] band,
-/// fail-open. Paired with an empty history map so every first Entry is admitted.
+/// Copy-entry gate disabled for these correctness tests: fail-open (no band since #339).
+/// Paired with an empty history map so every first Entry is admitted.
 fn disabled_entry_gate() -> CopyEntryGateConfig {
-    CopyEntryGateConfig {
-        price_band_lo: Price::ZERO,
-        price_band_hi: Price::ONE,
-        fail_closed: false,
+    CopyEntryGateConfig { fail_closed: false }
+}
+
+/// Mid-price cache fixture quoting `price` for both outcomes of every market in `markets`,
+/// so an admitted signal can fetch a current price and reach a fill (#339).
+fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetcher> {
+    const BASE: &str = "http://gamma.test";
+    let mut fx = HashMap::new();
+    for m in markets {
+        let url = format!("{BASE}/markets?condition_ids={m}");
+        let body =
+            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        fx.insert(url, body.into_bytes());
     }
+    MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
 
 fn paper_state_at(dir: &TempDir) -> Arc<PaperStateDb> {
@@ -150,6 +163,10 @@ async fn run_trades(
     strategy_cfg: WinnerFollowConfig,
     trades: Vec<IncomingTrade>,
 ) {
+    // Quote every traded market at 0.50 so an admitted signal can fetch a current price.
+    let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
+    let mid_price_cache = mid_cache_for(&markets, "0.50");
+
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
         trade_tx.send(t).await.unwrap();
@@ -158,12 +175,14 @@ async fn run_trades(
 
     let orch = Orchestrator::new(
         trade_rx,
-        make_watchlist(leader_wallet()),
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode,
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0, // disabled in tests
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
             entry_gate_config: disabled_entry_gate(),
         },
         HashMap::new(),
@@ -173,6 +192,7 @@ async fn run_trades(
         leader_ledger,
         new_shared_health(false),
         MarketEndCache::new(String::new()),
+        mid_price_cache,
         dead_reseed_rx(),
     )
     .unwrap();

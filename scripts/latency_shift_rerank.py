@@ -54,6 +54,11 @@ def parse_args():
     p.add_argument("--latency-shift-secs", type=float, default=20.0,
                    help="Δ: re-price at the first same-(market,outcome) trade at >= entry+Δ "
                         "(default 20s ~ p95 end-to-end copy latency, docs/29)")
+    p.add_argument("--fill-window-secs", type=float, default=120.0,
+                   help="the next same-(market,outcome) trade must fall within entry+Δ .. "
+                        "entry+Δ+this; later => UNFILLABLE (illiquid, no realistic copy). "
+                        "Prevents stale fills (minutes/days later, near resolution) from "
+                        "inflating edge/fill-rate. 0 = no cap.")
     p.add_argument("--slip-cents", type=float, default=1.0,
                    help="entry slippage in cents on the latency-shifted fill price")
     p.add_argument("--floor-tstat", type=float, default=2.0,
@@ -123,8 +128,10 @@ def main() -> int:
     months: dict[str, set] = {}             # active months among FILLED positions
     n_total: dict[str, int] = {}
     n_filled: dict[str, int] = {}
+    payoffs: dict[str, list[float]] = {}    # payoff (1/0) per FILLED position -> hit_rate (Kelly p)
     fill_delays: list[float] = []
     shift = a.latency_shift_secs
+    fill_window = a.fill_window_secs
 
     for i, ((mid, oid), positions) in enumerate(by_mo.items()):
         cur = conn.execute(
@@ -141,7 +148,8 @@ def main() -> int:
             target = pos["entry_ts"] + shift
             idx = bisect.bisect_left(ts_arr, target)
             filled = False
-            if idx < len(ts_arr) and ts_arr[idx] < pos["resolved_at"]:
+            within_window = fill_window <= 0 or (idx < len(ts_arr) and ts_arr[idx] <= target + fill_window)
+            if idx < len(ts_arr) and ts_arr[idx] < pos["resolved_at"] and within_window:
                 try:
                     fill_price = float(px_arr[idx])
                 except (TypeError, ValueError):
@@ -153,6 +161,7 @@ def main() -> int:
                     g = time.gmtime(pos["entry_ts"])
                     months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
                     n_filled[w] = n_filled.get(w, 0) + 1
+                    payoffs.setdefault(w, []).append(pos["payoff"])
                     fill_delays.append(ts_arr[idx] - target)
                     filled = True
             if not filled:
@@ -169,6 +178,7 @@ def main() -> int:
         fr = nf / n_total[w] if n_total[w] else 0.0
         t = tstat(nets) if nf > 1 else float("nan")
         mean = statistics.fmean(nets) if nets else float("nan")
+        hr = statistics.fmean(payoffs.get(w, [])) if payoffs.get(w) else float("nan")
         eligible = (
             nf > 1 and am >= a.min_active_months
             and (nf / am if am else 0) >= a.min_avg_per_month
@@ -180,6 +190,7 @@ def main() -> int:
             "fill_rate": round(fr, 4), "active_months": am,
             "mean_net_ls": round(mean, 6) if not math.isnan(mean) else "",
             "tstat_net_ls": round(t, 4) if not math.isnan(t) else "",
+            "hit_rate": round(hr, 4) if not math.isnan(hr) else "",
             "survives": eligible,
         })
     rows.sort(key=lambda r: (r["survives"], r["tstat_net_ls"] if r["tstat_net_ls"] != "" else -9),
@@ -189,7 +200,7 @@ def main() -> int:
     # Static fieldnames: never index rows[0] (empty when candidates had no positions
     # overlapping the positions CSV — still write a header-only file, don't crash).
     fields = ["wallet", "n_total", "n_filled", "fill_rate", "active_months",
-              "mean_net_ls", "tstat_net_ls", "survives"]
+              "mean_net_ls", "tstat_net_ls", "hit_rate", "survives"]
     with open(ranked_path, "w", newline="") as f:
         wcsv = csv.DictWriter(f, fieldnames=fields)
         wcsv.writeheader()

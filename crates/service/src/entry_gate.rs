@@ -1,19 +1,20 @@
-//! Pure copy-entry gate aligning the live copy path with the band-cohort
-//! selection criteria (issue #290).
+//! Pure copy-entry gate: copy only a leader's *first-ever entry* into a market
+//! (issues #290, #339).
 //!
-//! The "72hr buy-and-hold band" cohort was selected on wallets whose copied
-//! trades were *first-ever entries* into a market at a price in `[0.40, 0.80]`.
-//! [`CopyEntryGate`] enforces those two criteria (the 72 h horizon and the
-//! hold-to-resolution behaviour are enforced elsewhere — see
+//! The original band-cohort also constrained the leader's entry price to `[0.40, 0.80]`;
+//! that band was removed in #339 — the latency-shifted ranker applies no band, and live
+//! sizing is re-based on the current market price instead (see `evaluate_at_price`).
+//! [`CopyEntryGate`] now enforces only the first-entry criterion (the resolution horizon
+//! and hold-to-resolution behaviour are enforced elsewhere — see
 //! `docs/19-WINNER-FOLLOW-STRATEGY.md`). It is pure and synchronous so it can be
-//! unit-tested in isolation; the per-wallet market history it consults is
-//! populated at startup by [`crate::wallet_history`].
+//! unit-tested in isolation; the per-wallet market history it consults is populated at
+//! startup by [`crate::wallet_history`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use pe_copy_signal_engine::LeaderSignal;
-use pe_core_types::{LeaderAction, MarketId, Price, WalletAddress};
+use pe_core_types::{LeaderAction, MarketId, WalletAddress};
 
 /// Typed reason a [`LeaderSignal`] was rejected by [`CopyEntryGate::admit`].
 ///
@@ -22,10 +23,6 @@ use pe_core_types::{LeaderAction, MarketId, Price, WalletAddress};
 pub enum GateReject {
     /// Action is not a first-position entry (`Add`/`Trim`/`Exit`/`Flip`/`Unknown`).
     NotAnEntry,
-    /// Leader entry price is below the band minimum.
-    PriceBelowBand,
-    /// Leader entry price is above the band maximum.
-    PriceAboveBand,
     /// The leader has already entered this market before (a re-entry, not a first entry).
     NotFirstEntry,
     /// The leader's market history could not be loaded and the gate is fail-closed.
@@ -36,8 +33,6 @@ impl fmt::Display for GateReject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::NotAnEntry => "not a first-position entry",
-            Self::PriceBelowBand => "leader price below band minimum",
-            Self::PriceAboveBand => "leader price above band maximum",
             Self::NotFirstEntry => "leader already entered this market",
             Self::WalletHistoryMissing => "leader market history missing (fail-closed)",
         };
@@ -45,16 +40,11 @@ impl fmt::Display for GateReject {
     }
 }
 
-/// Configuration for [`CopyEntryGate`]. Band bounds are inclusive.
+/// Configuration for [`CopyEntryGate`].
 ///
-/// Defaults (`entry_gate_price_band_lo` = 0.40, `entry_gate_price_band_hi` = 0.80,
-/// `entry_gate_fail_closed` = false) live in `docs/_GLOSSARY.md`.
+/// Default (`entry_gate_fail_closed` = false) lives in `docs/_GLOSSARY.md`.
 #[derive(Debug, Clone)]
 pub struct CopyEntryGateConfig {
-    /// Inclusive lower bound on the leader's entry price.
-    pub price_band_lo: Price,
-    /// Inclusive upper bound on the leader's entry price.
-    pub price_band_hi: Price,
     /// When a wallet is absent from the history map: `false` admits the entry
     /// (fail-open, treat as new), `true` rejects it (fail-closed).
     pub fail_closed: bool,
@@ -82,24 +72,16 @@ impl CopyEntryGate {
 
     /// Returns `None` to admit the signal, or `Some(reason)` to reject it.
     ///
-    /// Checks, in order: the action is an `Entry` → price ≥ `price_band_lo` →
-    /// price ≤ `price_band_hi` → first-entry (the leader has not entered this
-    /// market before). A wallet absent from the history map is admitted when
-    /// `fail_closed` is false (treat as new) and rejected otherwise.
+    /// Checks, in order: the action is an `Entry` → first-entry (the leader has not
+    /// entered this market before). A wallet absent from the history map is admitted
+    /// when `fail_closed` is false (treat as new) and rejected otherwise.
     ///
     /// The wallet is resolved as `signal.leader.0` (`LeaderSignal.leader` is a
     /// `TraderId(WalletAddress)`), equal to the `trade.wallet` used elsewhere in
-    /// the copy path. The band is checked against `signal.leader_price` — the
-    /// leader's entry price, which is the selection criterion.
+    /// the copy path.
     pub fn admit(&self, signal: &LeaderSignal) -> Option<GateReject> {
         if signal.action != LeaderAction::Entry {
             return Some(GateReject::NotAnEntry);
-        }
-        if signal.leader_price < self.config.price_band_lo {
-            return Some(GateReject::PriceBelowBand);
-        }
-        if signal.leader_price > self.config.price_band_hi {
-            return Some(GateReject::PriceAboveBand);
         }
         let wallet = signal.leader.0;
         match self.history.get(&wallet) {
@@ -173,17 +155,13 @@ mod tests {
         }
     }
 
-    /// Default band [0.40, 0.80], fail-open.
+    /// Fail-open gate config (first-entry only; no band since #339).
     fn band_config() -> CopyEntryGateConfig {
-        CopyEntryGateConfig {
-            price_band_lo: Price(dec!(0.40)),
-            price_band_hi: Price(dec!(0.80)),
-            fail_closed: false,
-        }
+        CopyEntryGateConfig { fail_closed: false }
     }
 
     #[test]
-    fn admits_first_entry_in_band() {
+    fn admits_first_entry() {
         let gate = CopyEntryGate::new(band_config(), HashMap::new());
         let s = signal(LeaderAction::Entry, market("0xnew"), Price(dec!(0.60)));
         assert_eq!(gate.admit(&s), None);
@@ -202,29 +180,6 @@ mod tests {
             let s = signal(action, market("0xnew"), Price(dec!(0.60)));
             assert_eq!(gate.admit(&s), Some(GateReject::NotAnEntry), "{action:?}");
         }
-    }
-
-    #[test]
-    fn rejects_below_band() {
-        let gate = CopyEntryGate::new(band_config(), HashMap::new());
-        let s = signal(LeaderAction::Entry, market("0xnew"), Price(dec!(0.39)));
-        assert_eq!(gate.admit(&s), Some(GateReject::PriceBelowBand));
-    }
-
-    #[test]
-    fn rejects_above_band() {
-        let gate = CopyEntryGate::new(band_config(), HashMap::new());
-        let s = signal(LeaderAction::Entry, market("0xnew"), Price(dec!(0.81)));
-        assert_eq!(gate.admit(&s), Some(GateReject::PriceAboveBand));
-    }
-
-    #[test]
-    fn band_bounds_inclusive() {
-        let gate = CopyEntryGate::new(band_config(), HashMap::new());
-        let lo = signal(LeaderAction::Entry, market("0xa"), Price(dec!(0.40)));
-        let hi = signal(LeaderAction::Entry, market("0xb"), Price(dec!(0.80)));
-        assert_eq!(gate.admit(&lo), None);
-        assert_eq!(gate.admit(&hi), None);
     }
 
     #[test]
@@ -249,10 +204,7 @@ mod tests {
 
     #[test]
     fn fail_open_admits_absent_wallet() {
-        let cfg = CopyEntryGateConfig {
-            fail_closed: false,
-            ..band_config()
-        };
+        let cfg = CopyEntryGateConfig { fail_closed: false };
         let gate = CopyEntryGate::new(cfg, HashMap::new());
         let s = signal(LeaderAction::Entry, market("0xnew"), Price(dec!(0.60)));
         assert_eq!(gate.admit(&s), None);
@@ -260,10 +212,7 @@ mod tests {
 
     #[test]
     fn fail_closed_rejects_absent_wallet() {
-        let cfg = CopyEntryGateConfig {
-            fail_closed: true,
-            ..band_config()
-        };
+        let cfg = CopyEntryGateConfig { fail_closed: true };
         let gate = CopyEntryGate::new(cfg, HashMap::new());
         let s = signal(LeaderAction::Entry, market("0xnew"), Price(dec!(0.60)));
         assert_eq!(gate.admit(&s), Some(GateReject::WalletHistoryMissing));

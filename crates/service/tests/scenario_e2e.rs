@@ -41,9 +41,12 @@ use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
+use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
+use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_core::SourceStatus;
+use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, PerTradeCap, WinnerFollowConfig, WinnerFollowStrategy,
 };
@@ -125,14 +128,16 @@ fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, Posi
     mpsc::channel(1).1
 }
 
-/// Copy-entry gate disabled for lifecycle tests: full [0,1] band, fail-open.
+/// Copy-entry gate disabled for lifecycle tests: fail-open (no band since #339).
 /// Paired with an empty history map so every first Entry is admitted.
 fn disabled_entry_gate() -> CopyEntryGateConfig {
-    CopyEntryGateConfig {
-        price_band_lo: Price::ZERO,
-        price_band_hi: Price::ONE,
-        fail_closed: false,
-    }
+    CopyEntryGateConfig { fail_closed: false }
+}
+
+/// Mid-price cache with no fixtures: every fetch misses → the current-price gate
+/// fails closed, so no fill is produced (these lifecycle tests assert no fills).
+fn empty_mid_cache() -> MidPriceCache<FixtureFetcher> {
+    MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new())
 }
 
 /// A risk snapshot with no exposure, healthy source, and headroom under every cap,
@@ -174,12 +179,14 @@ async fn scenario_e2e_clean_exit() {
 
     let orch = Orchestrator::new(
         trade_rx,
-        make_watchlist(wallet),
+        LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0, // disabled in tests
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
             entry_gate_config: disabled_entry_gate(),
         },
         HashMap::new(),
@@ -189,6 +196,7 @@ async fn scenario_e2e_clean_exit() {
         PositionLedger::new(),
         new_shared_health(false),
         MarketEndCache::new(String::new()),
+        empty_mid_cache(),
         dead_reseed_rx(),
     )
     .unwrap();
@@ -230,12 +238,14 @@ async fn scenario_graceful_shutdown() {
 
     let orch = Orchestrator::new(
         trade_rx,
-        make_watchlist(wallet),
+        LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0, // disabled in tests
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
             entry_gate_config: disabled_entry_gate(),
         },
         HashMap::new(),
@@ -245,6 +255,7 @@ async fn scenario_graceful_shutdown() {
         PositionLedger::new(),
         new_shared_health(false),
         MarketEndCache::new(String::new()),
+        empty_mid_cache(),
         dead_reseed_rx(),
     )
     .unwrap();

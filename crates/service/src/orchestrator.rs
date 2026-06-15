@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, SignalConfig, classify_trade};
 use pe_core_types::{
-    EventSeq, MarketId, MarketOutcomeId, Probability, ReconstructionQuality, SourceTimestamp,
-    TraderId, VenueId, WalletAddress,
+    EventSeq, MarketId, MarketOutcomeId, Price, Probability, ReconstructionQuality, Side,
+    SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
+use pe_source_polymarket_public::PageFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperFill, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::CLOBClient;
@@ -26,7 +27,9 @@ use tracing::{error, info};
 
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::health::SharedHealth;
+use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
+use crate::mid_price_cache::MidPriceCache;
 
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
@@ -34,17 +37,23 @@ pub struct OrchestratorConfig {
     pub mode: ExecutionMode,
     pub signal_config: SignalConfig,
     /// Drop signals whose market `endDate` is further than this many seconds into
-    /// the future. 0 disables the filter. Default: 72 h (259_200 s).
+    /// the future. 0 disables the upper bound. Default: 72 h (259_200 s).
     pub max_resolution_horizon_secs: u64,
-    /// Copy-entry gate config (price band + fail-closed posture). The per-wallet
+    /// Drop signals whose market resolves sooner than this many seconds from now.
+    /// 0 disables the lower bound. Default: 60 s (docs/29 copy floor).
+    pub min_resolution_horizon_secs: u64,
+    /// Maximum current price at which a BUY copy will fill (issue #142 parity).
+    /// `Decimal::ZERO` disables the cap.
+    pub max_fill_price: Decimal,
+    /// Copy-entry gate config (first-entry/fail-closed posture). The per-wallet
     /// market history is supplied separately to [`Orchestrator::new`].
     pub entry_gate_config: CopyEntryGateConfig,
 }
 
-pub struct Orchestrator<C: CLOBClient> {
+pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
     trade_rx: mpsc::Receiver<IncomingTrade>,
     position_ledger: PositionLedger,
-    watchlist: Watchlist,
+    live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
     dispatcher: ExecutionDispatcher<C>,
@@ -53,12 +62,17 @@ pub struct Orchestrator<C: CLOBClient> {
     paper_state: Arc<PaperStateDb>,
     health: SharedHealth,
     market_end_cache: MarketEndCache,
+    // Live current-price source (Gamma mids) for the post-latency sizing basis (#339).
+    mid_price_cache: MidPriceCache<F>,
     max_resolution_horizon_secs: u64,
+    min_resolution_horizon_secs: u64,
+    // Skip BUYs whose current price is >= this (issue #142 parity). ZERO disables.
+    max_fill_price: Decimal,
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
-    // Copy-entry gate: admits only first-ever entries into a market within the
-    // price band (band-cohort alignment, issue #290).
+    // Copy-entry gate: admits only a leader's first-ever entry into a market
+    // (#290; price band removed in #339).
     entry_gate: CopyEntryGate,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
@@ -66,11 +80,11 @@ pub struct Orchestrator<C: CLOBClient> {
     reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
 }
 
-impl<C: CLOBClient> Orchestrator<C> {
+impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         trade_rx: mpsc::Receiver<IncomingTrade>,
-        watchlist: Watchlist,
+        live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         history_map: HashMap<WalletAddress, HashSet<MarketId>>,
         strategy: WinnerFollowStrategy,
@@ -79,6 +93,7 @@ impl<C: CLOBClient> Orchestrator<C> {
         leader_ledger: PositionLedger,
         health: SharedHealth,
         market_end_cache: MarketEndCache,
+        mid_price_cache: MidPriceCache<F>,
         reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
@@ -96,7 +111,7 @@ impl<C: CLOBClient> Orchestrator<C> {
         Ok(Self {
             trade_rx,
             position_ledger: leader_ledger,
-            watchlist,
+            live_watchlist,
             signal_config: config.signal_config,
             strategy,
             dispatcher,
@@ -105,7 +120,10 @@ impl<C: CLOBClient> Orchestrator<C> {
             paper_state,
             health,
             market_end_cache,
+            mid_price_cache,
             max_resolution_horizon_secs: config.max_resolution_horizon_secs,
+            min_resolution_horizon_secs: config.min_resolution_horizon_secs,
+            max_fill_price: config.max_fill_price,
             filled_positions,
             entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
@@ -180,8 +198,12 @@ impl<C: CLOBClient> Orchestrator<C> {
             }
         }
 
+        // One consistent watchlist snapshot for this event (ArcSwap hot path): every
+        // watchlist lookup below reads the same generation.
+        let watchlist = self.live_watchlist.snapshot();
+
         // Look up wallet in watchlist; skip non-watchlisted wallets.
-        let quality = self.quality_for(&trade.wallet);
+        let quality = self.quality_for(&watchlist, &trade.wallet);
 
         // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
         // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
@@ -198,7 +220,7 @@ impl<C: CLOBClient> Orchestrator<C> {
         let Some(signal) = classify_trade(
             &trade,
             position.as_ref(),
-            &self.watchlist,
+            &watchlist,
             quality,
             VenueId::polymarket(),
             &self.signal_config,
@@ -221,8 +243,8 @@ impl<C: CLOBClient> Orchestrator<C> {
             return;
         }
 
-        // Copy-entry gate: copy only first-ever entries into a market within the
-        // price band (band-cohort alignment, issue #290).
+        // Copy-entry gate: copy only a leader's first-ever entry into a market
+        // (#290; price band removed in #339).
         if let Some(reason) = self.entry_gate.admit(&signal) {
             info!(
                 reason = %reason,
@@ -238,50 +260,88 @@ impl<C: CLOBClient> Orchestrator<C> {
         self.entry_gate
             .record_entry(signal.leader.0, &signal.market_id);
 
-        // Resolution-horizon gate: only copy markets whose resolution time
-        // (umaEndDate, else the always-present endDate) is known AND within the
-        // horizon.
-        // Fail closed — skip when the resolution time is unknown (None) or too far
-        // out. An unknown resolution means we cannot confirm a <72h expiry, so we
-        // do not enter.
-        if self.max_resolution_horizon_secs > 0 {
+        // Resolution-horizon gate (#290, #339): copy only markets whose resolution time
+        // (umaEndDate, else the always-present endDate) is known AND sits within
+        // [min, max] seconds from now. Too far out locks capital for months; too soon
+        // cannot be filled and held. Fail closed when the resolution time is unknown —
+        // we cannot confirm the horizon, so we do not enter. One lookup serves both
+        // bounds.
+        if self.max_resolution_horizon_secs > 0 || self.min_resolution_horizon_secs > 0 {
             let resolution_unix = self
                 .market_end_cache
                 .resolution_unix(&signal.market_id)
                 .await;
-            let horizon = OffsetDateTime::now_utc().unix_timestamp()
-                + self.max_resolution_horizon_secs as i64;
-            match resolution_unix {
-                Some(unix) if unix <= horizon => { /* within horizon — allow */ }
-                Some(unix) => {
-                    info!(
-                        reason = "market resolves too far out",
-                        market = %signal.market_id,
-                        resolution_unix = unix,
-                        max_horizon_secs = self.max_resolution_horizon_secs,
-                        "signal did not produce order",
-                    );
-                    self.commit_no_fill(&trade, &leader_row);
-                    return;
-                }
+            let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+            if let Some(reason) = check_resolution_horizon(
+                resolution_unix,
+                now_unix,
+                self.max_resolution_horizon_secs,
+                self.min_resolution_horizon_secs,
+            ) {
+                info!(
+                    reason,
+                    market = %signal.market_id,
+                    resolution_unix = ?resolution_unix,
+                    "signal did not produce order",
+                );
+                self.commit_no_fill(&trade, &leader_row);
+                return;
+            }
+        }
+
+        // Post-latency price basis (#339): size the copy against the CURRENT market
+        // price (the copy fills now, not when the leader entered). Fail closed when the
+        // current price is unavailable — we cannot size or cost-adjust without it.
+        let current_price = {
+            let mids = self
+                .mid_price_cache
+                .fetch_mids(std::slice::from_ref(&signal.market_id))
+                .await;
+            let px = mids
+                .get(&signal.market_id)
+                .and_then(|prices| prices.get(usize::from(signal.outcome_id.0)).copied());
+            match px.and_then(|d| Price::new(d).ok()) {
+                Some(p) => p,
                 None => {
                     info!(
-                        reason = "market resolution time unknown",
+                        reason = "current market price unavailable",
                         market = %signal.market_id,
+                        outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
                     self.commit_no_fill(&trade, &leader_row);
                     return;
                 }
             }
+        };
+
+        // max_fill_price safety rail (#142 parity): skip BUYs whose current price is at
+        // or above the cap (catastrophic payoff geometry near $1). ZERO disables.
+        if signal.leader_side == Side::Buy
+            && self.max_fill_price > Decimal::ZERO
+            && current_price.0 >= self.max_fill_price
+        {
+            info!(
+                reason = "current price at or above max_fill_price",
+                market = %signal.market_id,
+                current_price = %current_price.0,
+                max_fill_price = %self.max_fill_price,
+                "signal did not produce order",
+            );
+            self.commit_no_fill(&trade, &leader_row);
+            return;
         }
 
-        let p = self.win_rate_p_for(&signal.leader);
+        let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
-        match self
-            .strategy
-            .evaluate(&signal, p, snapshot, self.bankroll, self.mode)
-        {
+        match self.strategy.evaluate_at_price(
+            &signal,
+            current_price,
+            p,
+            snapshot,
+            self.bankroll,
+            self.mode,
+        ) {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");
                 self.commit_no_fill(&trade, &leader_row);
@@ -380,8 +440,8 @@ impl<C: CLOBClient> Orchestrator<C> {
         }
     }
 
-    fn quality_for(&self, wallet: &WalletAddress) -> ReconstructionQuality {
-        self.watchlist
+    fn quality_for(&self, watchlist: &Watchlist, wallet: &WalletAddress) -> ReconstructionQuality {
+        watchlist
             .entries
             .iter()
             .find(|e| &e.wallet == wallet)
@@ -392,9 +452,8 @@ impl<C: CLOBClient> Orchestrator<C> {
     /// Empirical win-rate probability for a leader, sourced from the watchlist's
     /// `win_rate_bps` (wins / closed_trades × 10 000). Falls back to `Probability::ZERO`
     /// if the leader is not in the watchlist (signal will produce no edge → NoEdge error).
-    fn win_rate_p_for(&self, leader: &TraderId) -> Probability {
-        let bps = self
-            .watchlist
+    fn win_rate_p_for(&self, watchlist: &Watchlist, leader: &TraderId) -> Probability {
+        let bps = watchlist
             .entries
             .iter()
             .find(|e| e.wallet == leader.0)
@@ -405,6 +464,34 @@ impl<C: CLOBClient> Orchestrator<C> {
         // Infallible after clamping to [0, 10_000]: p_raw is in [0, 1].
         Probability::new(p_raw).unwrap_or(Probability::ZERO)
     }
+}
+
+/// Resolution-horizon gate decision (#290, #339). Returns `Some(reason)` to reject the
+/// copy, `None` to allow it.
+///
+/// `max_secs` rejects markets resolving more than that many seconds out (0 disables the
+/// upper bound); `min_secs` rejects markets resolving sooner than that (0 disables the
+/// lower bound). An unknown resolution time (`None`) always fails closed — the horizon
+/// cannot be confirmed, so the copy is skipped.
+fn check_resolution_horizon(
+    resolution_unix: Option<i64>,
+    now_unix: i64,
+    max_secs: u64,
+    min_secs: u64,
+) -> Option<&'static str> {
+    let Some(unix) = resolution_unix else {
+        return Some("market resolution time unknown");
+    };
+    let secs_until = unix - now_unix;
+    let max = i64::try_from(max_secs).unwrap_or(i64::MAX);
+    let min = i64::try_from(min_secs).unwrap_or(i64::MAX);
+    if max_secs > 0 && secs_until > max {
+        return Some("market resolves too far out");
+    }
+    if min_secs > 0 && secs_until < min {
+        return Some("market resolves too soon");
+    }
+    None
 }
 
 // ── Stub risk snapshot ────────────────────────────────────────────────────────
@@ -430,5 +517,76 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny, // overridden by evaluate()
         proposed_trade_bps: BasisPoints(0),  // overridden by evaluate()
         per_trade_cap_bps: 0,                // overridden by evaluate()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::check_resolution_horizon;
+
+    const NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn unknown_resolution_fails_closed() {
+        // Both bounds active: a missing resolution time is always rejected.
+        assert_eq!(
+            check_resolution_horizon(None, NOW, 259_200, 60),
+            Some("market resolution time unknown")
+        );
+    }
+
+    #[test]
+    fn rejects_too_far_out() {
+        // Resolves 72h + 1s out, max = 72h → rejected.
+        let unix = NOW + 259_200 + 1;
+        assert_eq!(
+            check_resolution_horizon(Some(unix), NOW, 259_200, 60),
+            Some("market resolves too far out")
+        );
+    }
+
+    #[test]
+    fn rejects_too_soon() {
+        // Resolves 59s out, min = 60s → rejected.
+        let unix = NOW + 59;
+        assert_eq!(
+            check_resolution_horizon(Some(unix), NOW, 259_200, 60),
+            Some("market resolves too soon")
+        );
+    }
+
+    #[test]
+    fn admits_within_both_bounds() {
+        // Resolves 1h out — inside [60s, 72h].
+        let unix = NOW + 3_600;
+        assert_eq!(check_resolution_horizon(Some(unix), NOW, 259_200, 60), None);
+    }
+
+    #[test]
+    fn bounds_are_inclusive_at_edges() {
+        // Exactly max out and exactly min out are both allowed (strict >/< rejects).
+        assert_eq!(
+            check_resolution_horizon(Some(NOW + 259_200), NOW, 259_200, 60),
+            None
+        );
+        assert_eq!(
+            check_resolution_horizon(Some(NOW + 60), NOW, 259_200, 60),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_disables_each_bound_independently() {
+        // max=0 disables the upper bound; a far-future market is allowed.
+        assert_eq!(
+            check_resolution_horizon(Some(NOW + 10_000_000), NOW, 0, 60),
+            None
+        );
+        // min=0 disables the lower bound; an imminent market is allowed.
+        assert_eq!(
+            check_resolution_horizon(Some(NOW + 1), NOW, 259_200, 0),
+            None
+        );
     }
 }

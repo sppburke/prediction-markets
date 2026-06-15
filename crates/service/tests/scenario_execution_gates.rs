@@ -35,8 +35,11 @@ use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
+use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
+use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
 };
@@ -101,13 +104,23 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-/// Gate with the cohort band [0.40, 0.80] and the given fail-closed posture.
+/// First-entry gate with the given fail-closed posture (no band since #339).
 fn band_config(fail_closed: bool) -> CopyEntryGateConfig {
-    CopyEntryGateConfig {
-        price_band_lo: Price(dec!(0.40)),
-        price_band_hi: Price(dec!(0.80)),
-        fail_closed,
+    CopyEntryGateConfig { fail_closed }
+}
+
+/// Mid-price cache fixture quoting `price` for both outcomes of every market in `markets`,
+/// so an admitted signal can fetch a current price and reach a fill (#339).
+fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetcher> {
+    const BASE: &str = "http://gamma.test";
+    let mut fx = HashMap::new();
+    for m in markets {
+        let url = format!("{BASE}/markets?condition_ids={m}");
+        let body =
+            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        fx.insert(url, body.into_bytes());
     }
+    MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
 
 fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
@@ -146,8 +159,25 @@ async fn run_gate(
     history: HashMap<WalletAddress, HashSet<MarketId>>,
     trades: Vec<IncomingTrade>,
 ) -> usize {
+    // Max-fill cap disabled; markets quoted at 0.60 (in flat-fill range).
+    run_gate_capped(dir, gate_config, history, trades, Decimal::ZERO, "0.60").await
+}
+
+/// Like [`run_gate`] but with an explicit `max_fill_price` cap and `mid_price` quote, to
+/// exercise the #339 current-price cap gate.
+async fn run_gate_capped(
+    dir: &TempDir,
+    gate_config: CopyEntryGateConfig,
+    history: HashMap<WalletAddress, HashSet<MarketId>>,
+    trades: Vec<IncomingTrade>,
+    max_fill_price: Decimal,
+    mid_price: &str,
+) -> usize {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+
+    let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
+    let mid_price_cache = mid_cache_for(&markets, mid_price);
 
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
@@ -157,12 +187,14 @@ async fn run_gate(
 
     let orch = Orchestrator::new(
         trade_rx,
-        make_watchlist(leader_wallet()),
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
             max_resolution_horizon_secs: 0, // horizon gate disabled; isolate the entry gate
+            min_resolution_horizon_secs: 0,
+            max_fill_price,
             entry_gate_config: gate_config,
         },
         history,
@@ -172,6 +204,7 @@ async fn run_gate(
         PositionLedger::new(),
         new_shared_health(false),
         MarketEndCache::new(String::new()),
+        mid_price_cache,
         dead_reseed_rx(),
     )
     .unwrap();
@@ -187,56 +220,6 @@ fn history_with(
     let mut map = HashMap::new();
     map.insert(wallet, markets.iter().cloned().collect());
     map
-}
-
-// ── Price-band scenarios ──────────────────────────────────────────────────────
-
-/// PASS: an in-band first entry (price 0.60 ∈ [0.40, 0.80]) produces exactly one fill.
-/// FAIL: zero fills (gate wrongly blocked) or more than one.
-#[tokio::test]
-async fn price_band_admits_in_band_entry() {
-    let dir = TempDir::new().unwrap();
-    let fills = run_gate(
-        &dir,
-        band_config(false),
-        HashMap::new(),
-        vec![entry_trade("in-band", market("0xnew"), dec!(0.60))],
-    )
-    .await;
-    assert_eq!(fills, 1);
-    println!("PASS: price band admits an in-band first entry (1 fill)");
-}
-
-/// PASS: an entry below the band (price 0.30 < 0.40) produces zero fills.
-/// FAIL: any fill (gate failed to block a below-band entry).
-#[tokio::test]
-async fn price_band_blocks_below_band() {
-    let dir = TempDir::new().unwrap();
-    let fills = run_gate(
-        &dir,
-        band_config(false),
-        HashMap::new(),
-        vec![entry_trade("below", market("0xnew"), dec!(0.30))],
-    )
-    .await;
-    assert_eq!(fills, 0);
-    println!("PASS: price band blocks a below-band entry (0 fills)");
-}
-
-/// PASS: an entry above the band (price 0.90 > 0.80) produces zero fills.
-/// FAIL: any fill (gate failed to block an above-band entry).
-#[tokio::test]
-async fn price_band_blocks_above_band() {
-    let dir = TempDir::new().unwrap();
-    let fills = run_gate(
-        &dir,
-        band_config(false),
-        HashMap::new(),
-        vec![entry_trade("above", market("0xnew"), dec!(0.90))],
-    )
-    .await;
-    assert_eq!(fills, 0);
-    println!("PASS: price band blocks an above-band entry (0 fills)");
 }
 
 // ── First-entry scenarios ─────────────────────────────────────────────────────
@@ -310,4 +293,43 @@ async fn fail_closed_blocks_absent_wallet() {
     .await;
     assert_eq!(fills, 0);
     println!("PASS: fail-closed blocks an entry from a wallet absent from history (0 fills)");
+}
+
+// ── Current-price cap scenarios (#339) ────────────────────────────────────────
+
+/// PASS: a first entry whose CURRENT market price (0.60) is at/above `max_fill_price`
+///       (0.50) produces zero fills — the BUY cap suppresses it.
+/// FAIL: any fill (the max_fill_price cap failed to fire).
+#[tokio::test]
+async fn max_fill_price_blocks_high_current_price() {
+    let dir = TempDir::new().unwrap();
+    let fills = run_gate_capped(
+        &dir,
+        band_config(false),
+        HashMap::new(),
+        vec![entry_trade("capped", market("0xnew"), dec!(0.60))],
+        dec!(0.50), // cap below the 0.60 current price
+        "0.60",
+    )
+    .await;
+    assert_eq!(fills, 0);
+    println!("PASS: max_fill_price caps a BUY whose current price is at/above the cap (0 fills)");
+}
+
+/// PASS: the same entry with the cap ABOVE the current price (0.70 > 0.60) fills.
+/// FAIL: zero fills (the cap wrongly suppressed an in-range BUY).
+#[tokio::test]
+async fn max_fill_price_admits_below_cap() {
+    let dir = TempDir::new().unwrap();
+    let fills = run_gate_capped(
+        &dir,
+        band_config(false),
+        HashMap::new(),
+        vec![entry_trade("under-cap", market("0xnew"), dec!(0.60))],
+        dec!(0.70), // cap above the 0.60 current price
+        "0.60",
+    )
+    .await;
+    assert_eq!(fills, 1);
+    println!("PASS: max_fill_price admits a BUY whose current price is below the cap (1 fill)");
 }
