@@ -21,3 +21,4 @@ pub mod supabase_sink;
 pub mod trade_parser;
 pub mod trade_poller;
 pub mod wallet_history;
+pub mod watchlist_maintenance;

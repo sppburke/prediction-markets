@@ -40,6 +40,7 @@ use pe_service::supabase_refresh::{
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
+use pe_service::watchlist_maintenance::{MaintenanceConfig, run_maintenance_loop};
 use time::OffsetDateTime;
 
 #[tokio::main]
@@ -133,6 +134,10 @@ async fn main() -> Result<()> {
     );
 
     let live_watchlist = LiveWatchlist::new(initial_watchlist);
+
+    // Shared writer mutex (#350 WS1 PR-D): serializes the score-update refresh loop and the
+    // maintenance tick's evict+backfill on the live watchlist's ArcSwap (readers stay lock-free).
+    let watchlist_writer_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     // Publish the initial watched-count so the analytics site reflects it within seconds of
     // start (the refresh loop's first publish is one interval away). Best-effort; needs the
@@ -452,6 +457,35 @@ async fn main() -> Result<()> {
             cfg.supabase_secret_key.clone(),
             supabase_reader::SUPABASE_FETCH_LIMIT,
             cfg.supabase_refresh_interval_secs,
+            watchlist_writer_lock.clone(),
+        )))
+    } else {
+        None
+    };
+
+    // Watchlist maintenance tick (#350 WS1 PR-D): inactivity + underperformance knockout +
+    // atomic backfill. Spawned only when Supabase is configured and the interval is non-zero.
+    let maintenance_task = if !cfg.supabase_url.is_empty() && cfg.maintenance_interval_secs > 0 {
+        let demotion_cb_alpha = Decimal::from_str(&cfg.demotion_cb_alpha)
+            .with_context(|| format!("parse demotion_cb_alpha '{}'", cfg.demotion_cb_alpha))?;
+        let maint_cfg = MaintenanceConfig {
+            interval_secs: cfg.maintenance_interval_secs,
+            inactivity_threshold_secs: cfg.inactivity_threshold_secs,
+            inactivity_hard_cap_secs: cfg.inactivity_hard_cap_secs,
+            demotion_min_trades: cfg.demotion_min_trades,
+            demotion_cb_alpha,
+            bench_overfetch: cfg.bench_overfetch,
+            cap: supabase_reader::MAINTAINED_SET_SIZE,
+        };
+        Some(tokio::spawn(run_maintenance_loop(
+            live_watchlist.clone(),
+            paper_state.clone(),
+            reqwest::Client::new(),
+            cfg.supabase_url.clone(),
+            cfg.supabase_anon_key.clone(),
+            cfg.supabase_secret_key.clone(),
+            watchlist_writer_lock.clone(),
+            maint_cfg,
         )))
     } else {
         None
@@ -500,6 +534,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     if let Some(t) = supabase_task {
+        t.abort();
+    }
+    if let Some(t) = maintenance_task {
         t.abort();
     }
     if let Some(t) = sink_task {

@@ -178,6 +178,11 @@ grant select on ranking_entries to anon;
 -- Writer-only cursor: RLS enabled with NO anon policy and NO grant — anon cannot touch it.
 alter table supabase_sink_hwm enable row level security;
 
+-- Writer-only audit trail (#350 WS1 PR-D): pe-service appends demote/promote rows with the
+-- service-role key (bypasses RLS). RLS enabled with NO anon policy and NO grant — anon cannot
+-- touch it, matching the supabase_sink_hwm precedent above.
+alter table wallet_lifecycle_events enable row level security;
+
 -- The site reads the live watchlist size for the "N watched" KPI; pe-service writes it with
 -- the service-role key (bypasses RLS). Anon read-only; no anon write policy.
 alter table service_runtime enable row level security;
