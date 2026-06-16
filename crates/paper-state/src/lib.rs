@@ -12,6 +12,7 @@
 //! - `poll_cursors` — per-wallet last-seen `observed_at` unix timestamp.
 //! - `meta` — `last_applied_event_seq` reconciliation cursor.
 //! - `settled_markets` — durable settled-markets set; the resolution double-credit guard.
+//! - `fill_market_snapshots` — best-effort fill-time market-liquidity snapshots (WS2, issue #350).
 //!
 //! Two write shapes are exposed, each a single transaction:
 //! [`PaperStateDb::commit_seen_no_fill`] (a processed trade that produced no order)
@@ -117,6 +118,25 @@ pub struct SettledMarketRow {
     pub outcome_prices_json: String,
     pub credit_applied: Decimal,
     pub settled_at_unix: i64,
+}
+
+/// A fill-time market-liquidity snapshot row in the `fill_market_snapshots` table
+/// (WS2 of issue #350): one best-effort row per BUY fill, keyed by the fill's
+/// `idempotency_key`. `liquidity`/`volume` are the Gamma scalars; the CLOB-derived
+/// `absorbable_usd_100bps` and raw `ask_levels_json` are `None` on a `/book` failure
+/// (a partial, Gamma-only row). Serves as both the
+/// [`upsert`](PaperStateDb::upsert_fill_market_snapshot) input and the
+/// [`list`](PaperStateDb::list_fill_snapshots) read-back row. Decimals follow the
+/// crate's text-decimal convention; `ask_levels_json` is the caller-owned raw `/book`
+/// ask side, stored verbatim — this crate does not interpret it.
+#[derive(Debug, Clone)]
+pub struct FillMarketSnapshot {
+    pub idempotency_key: String,
+    pub liquidity: Option<Decimal>,
+    pub volume: Option<Decimal>,
+    pub absorbable_usd_100bps: Option<Decimal>,
+    pub ask_levels_json: Option<String>,
+    pub captured_at_unix: i64,
 }
 
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
@@ -508,6 +528,84 @@ impl PaperStateDb {
                 outcome_prices_json: prices_json,
                 credit_applied: parse_decimal(&credit_str)?,
                 settled_at_unix,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Upsert a fill-time market-liquidity snapshot, keyed by `idempotency_key`
+    /// (`ON CONFLICT DO UPDATE`: a later snapshot for the same fill — e.g. a `/book`
+    /// retry that fills in a previously-partial row — replaces the earlier one).
+    /// `liquidity`/`volume` and the CLOB-derived `absorbable_usd_100bps`/`ask_levels_json`
+    /// are each optional; `None` is stored as SQL `NULL` (a partial row when `/book`
+    /// failed). Decimals are persisted as text per the crate's exactness convention.
+    ///
+    /// # Precondition
+    /// `snapshot.idempotency_key` should reference a committed `fills` row. The mirror
+    /// is documentary: `fill_market_snapshots` declares no SQL foreign key (the bundled
+    /// SQLite enforces FKs by default, and this write must never fail on referential
+    /// grounds), so referential integrity is the caller's responsibility, not a checked
+    /// invariant.
+    pub fn upsert_fill_market_snapshot(
+        &self,
+        snapshot: &FillMarketSnapshot,
+    ) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        let liquidity = snapshot.liquidity.map(|d| d.to_string());
+        let volume = snapshot.volume.map(|d| d.to_string());
+        let absorbable = snapshot.absorbable_usd_100bps.map(|d| d.to_string());
+        conn.execute(
+            "INSERT INTO fill_market_snapshots \
+                (idempotency_key, liquidity, volume, absorbable_usd_100bps, \
+                 ask_levels_json, captured_at_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(idempotency_key) DO UPDATE SET \
+                liquidity = excluded.liquidity, \
+                volume = excluded.volume, \
+                absorbable_usd_100bps = excluded.absorbable_usd_100bps, \
+                ask_levels_json = excluded.ask_levels_json, \
+                captured_at_unix = excluded.captured_at_unix",
+            params![
+                snapshot.idempotency_key,
+                liquidity,
+                volume,
+                absorbable,
+                snapshot.ask_levels_json,
+                snapshot.captured_at_unix,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All fill-market snapshots, unordered (keyed lookups and capacity analysis, not
+    /// a sequence). Optional Gamma/CLOB scalars surface as `None` when the stored cell
+    /// is `NULL` (a partial row).
+    pub fn list_fill_snapshots(&self) -> Result<Vec<FillMarketSnapshot>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT idempotency_key, liquidity, volume, absorbable_usd_100bps, \
+             ask_levels_json, captured_at_unix FROM fill_market_snapshots",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, liquidity, volume, absorbable, ask_levels_json, captured_at_unix) = row?;
+            out.push(FillMarketSnapshot {
+                idempotency_key: key,
+                liquidity: liquidity.map(|s| parse_decimal(&s)).transpose()?,
+                volume: volume.map(|s| parse_decimal(&s)).transpose()?,
+                absorbable_usd_100bps: absorbable.map(|s| parse_decimal(&s)).transpose()?,
+                ask_levels_json,
+                captured_at_unix,
             });
         }
         Ok(out)
@@ -1048,5 +1146,102 @@ mod tests {
         let rows = db.list_settled_markets().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].market_id, market());
+    }
+
+    fn snapshot(key: &str) -> FillMarketSnapshot {
+        FillMarketSnapshot {
+            idempotency_key: key.to_string(),
+            liquidity: Some(dec!(6434.84)),
+            volume: Some(dec!(120000)),
+            absorbable_usd_100bps: Some(dec!(512.25)),
+            ask_levels_json: Some("[[\"0.51\",\"100\"],[\"0.52\",\"900\"]]".to_string()),
+            captured_at_unix: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn fill_snapshot_round_trip() {
+        let (_dir, db) = db();
+        assert!(db.list_fill_snapshots().unwrap().is_empty());
+
+        db.upsert_fill_market_snapshot(&snapshot("k1")).unwrap();
+        let rows = db.list_fill_snapshots().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idempotency_key, "k1");
+        assert_eq!(rows[0].liquidity, Some(dec!(6434.84)));
+        assert_eq!(rows[0].volume, Some(dec!(120000)));
+        assert_eq!(rows[0].absorbable_usd_100bps, Some(dec!(512.25)));
+        assert_eq!(
+            rows[0].ask_levels_json.as_deref(),
+            Some("[[\"0.51\",\"100\"],[\"0.52\",\"900\"]]")
+        );
+        assert_eq!(rows[0].captured_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn fill_snapshot_partial_row_keeps_gamma_scalars_only() {
+        // A `/book` failure: Gamma scalars present, CLOB-derived fields NULL.
+        let (_dir, db) = db();
+        let partial = FillMarketSnapshot {
+            idempotency_key: "k2".to_string(),
+            liquidity: Some(dec!(42)),
+            volume: Some(dec!(7)),
+            absorbable_usd_100bps: None,
+            ask_levels_json: None,
+            captured_at_unix: 1_700_000_111,
+        };
+        db.upsert_fill_market_snapshot(&partial).unwrap();
+        let rows = db.list_fill_snapshots().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].liquidity, Some(dec!(42)));
+        assert_eq!(rows[0].volume, Some(dec!(7)));
+        assert_eq!(rows[0].absorbable_usd_100bps, None);
+        assert_eq!(rows[0].ask_levels_json, None);
+    }
+
+    #[test]
+    fn fill_snapshot_upsert_overwrites_partial_with_full() {
+        // DO UPDATE: a later `/book`-success snapshot replaces the earlier partial row.
+        let (_dir, db) = db();
+        let partial = FillMarketSnapshot {
+            idempotency_key: "k3".to_string(),
+            liquidity: Some(dec!(1)),
+            volume: None,
+            absorbable_usd_100bps: None,
+            ask_levels_json: None,
+            captured_at_unix: 1,
+        };
+        db.upsert_fill_market_snapshot(&partial).unwrap();
+        db.upsert_fill_market_snapshot(&snapshot("k3")).unwrap();
+        let rows = db.list_fill_snapshots().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].liquidity, Some(dec!(6434.84)));
+        assert_eq!(rows[0].absorbable_usd_100bps, Some(dec!(512.25)));
+        assert_eq!(rows[0].captured_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn fill_snapshot_does_not_require_a_fills_row() {
+        // `fill_market_snapshots` declares no SQL foreign key (bundled SQLite enforces
+        // FKs by default, so the column is left unconstrained), so a snapshot for a key
+        // with no committed fill still inserts — the documentary mirror is best-effort.
+        let (_dir, db) = db();
+        db.upsert_fill_market_snapshot(&snapshot("orphan")).unwrap();
+        assert_eq!(db.list_fill_snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fill_snapshots_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper_state.db");
+        {
+            let db = PaperStateDb::open(&path).unwrap();
+            db.upsert_fill_market_snapshot(&snapshot("k4")).unwrap();
+        }
+        // Additive table materialises on reopen; the row persists.
+        let db = PaperStateDb::open(&path).unwrap();
+        let rows = db.list_fill_snapshots().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idempotency_key, "k4");
     }
 }
