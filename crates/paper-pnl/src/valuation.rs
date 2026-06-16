@@ -23,7 +23,7 @@ use pe_core_types::{MarketId, Side};
 use pe_paper_state::{FillRow, PaperPositionRow};
 use rust_decimal::Decimal;
 
-use crate::resolution::ResolutionStore;
+use crate::resolution::{ResolutionStore, SettlementInfo};
 
 /// Settled-fill outcome, for the per-trade display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +188,37 @@ fn mid_for(
         .and_then(|prices| prices.get(usize::from(outcome_id)).copied())
 }
 
+/// Realized P&L of a single **settled** fill — `side_sign × (resolved − fill_price)
+/// × contracts`, where `resolved` is the settled price of the fill's outcome (`0` if
+/// the outcome index is out of range, matching the prior inline behaviour).
+///
+/// This is the settled branch of [`value_fill`]; `value_fill` calls it so the
+/// dashboard's realized P&L and the underperformance-knockout statistic (#350 WS1)
+/// share a single definition rather than two formulas that can silently drift.
+/// Returns `0` on any decimal-overflow step (the same saturating behaviour
+/// `value_fill` had).
+///
+/// The per-share edge — `realized_edge / contracts = side_sign × (resolved −
+/// fill_price)` — is bounded in `[-1, 1]` for binary settlement (`resolved ∈ {0,1}`,
+/// `fill_price ∈ [0,1]`); the demotion statistic relies on that bound.
+pub fn realized_edge(f: &FillRow, info: &SettlementInfo) -> Decimal {
+    let resolved = info
+        .outcome_prices
+        .get(usize::from(f.outcome_id.0))
+        .copied()
+        .unwrap_or(Decimal::ZERO);
+    let diff = resolved
+        .checked_sub(f.fill_price.0)
+        .unwrap_or(Decimal::ZERO);
+    let magnitude = diff
+        .checked_mul(Decimal::from(f.contracts))
+        .unwrap_or(Decimal::ZERO);
+    match f.side {
+        Side::Buy => magnitude,
+        Side::Sell => -magnitude,
+    }
+}
+
 /// Value a single fill: settled → realized P&L + Won/Lost from the resolved price;
 /// open → the live mid as the current mark (or `None` if unpriced).
 fn value_fill(
@@ -201,17 +232,7 @@ fn value_fill(
             .get(usize::from(f.outcome_id.0))
             .copied()
             .unwrap_or(Decimal::ZERO);
-        // realized = side_sign × (resolved − fill_price) × contracts.
-        let diff = resolved
-            .checked_sub(f.fill_price.0)
-            .unwrap_or(Decimal::ZERO);
-        let magnitude = diff
-            .checked_mul(Decimal::from(f.contracts))
-            .unwrap_or(Decimal::ZERO);
-        let realized = match f.side {
-            Side::Buy => magnitude,
-            Side::Sell => -magnitude,
-        };
+        let realized = realized_edge(f, &info);
         let outcome = if realized > Decimal::ZERO {
             FillOutcome::Won
         } else {
@@ -446,5 +467,38 @@ mod tests {
             dec!(10000),
         );
         assert_eq!(v.reconciliation_drift, dec!(10));
+    }
+
+    #[test]
+    fn realized_edge_matches_value_fill_realized_pnl() {
+        // Structural-reuse guarantee (#350 WS1): value_fill calls realized_edge, so
+        // for any settled fill the standalone primitive equals the per-trade realized
+        // P&L the dashboard shows. A drift between the two would be a logic bug.
+        let (_d, store) = store_with(&[("0xm", vec![dec!(1), dec!(0)], dec!(100))]);
+        let info = store.settlement_info(&mid("0xm")).unwrap();
+
+        // BUY YES @ 0.40, YES resolves to 1 → (1 − 0.40) × 100 = +60.
+        let buy = fill("0xm", 0, Side::Buy, 100, dec!(0.40));
+        let via_value_fill = value_portfolio(
+            std::slice::from_ref(&buy),
+            &[pos("0xm", 0, 100, 0)],
+            &store,
+            &HashMap::new(),
+            dec!(10060),
+            dec!(10000),
+        )
+        .trades[0]
+            .realized_pnl
+            .unwrap();
+        assert_eq!(realized_edge(&buy, &info), via_value_fill);
+        assert_eq!(realized_edge(&buy, &info), dec!(60));
+
+        // SELL flips the sign: (1 − 0.40) × 100, negated → −60.
+        let sell = fill("0xm", 0, Side::Sell, 100, dec!(0.40));
+        assert_eq!(realized_edge(&sell, &info), dec!(-60));
+
+        // Out-of-range outcome index resolves to price 0 (no panic, matches inline).
+        let oob = fill("0xm", 9, Side::Buy, 100, dec!(0.40));
+        assert_eq!(realized_edge(&oob, &info), dec!(-40)); // (0 − 0.40) × 100
     }
 }
