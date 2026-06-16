@@ -27,7 +27,9 @@ const LS_TSTAT_BPS_SCALE: i64 = 1_000;
 /// (`?limit=`). Equals [`MAINTAINED_SET_SIZE`]: the refresh fetches exactly the maintained
 /// working set. The ranker pushes a deeper top-200 bench; only the live set is capped.
 /// See `docs/_GLOSSARY.md`: `SUPABASE_FETCH_LIMIT`.
-pub const SUPABASE_FETCH_LIMIT: usize = 25;
+// Defined in terms of `MAINTAINED_SET_SIZE` so the "fetch exactly the maintained set"
+// coupling is machine-enforced, not just documented (const refs are order-independent).
+pub const SUPABASE_FETCH_LIMIT: usize = MAINTAINED_SET_SIZE;
 
 /// Fixed size of the maintained live working set (issue #350 WS1; replaces `SUPABASE_LIVE_CAP`
 /// = 200). The live set is held at this width: the periodic refresh is score-update-only (no
