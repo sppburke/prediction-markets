@@ -314,7 +314,7 @@ Copies only a leader's first-ever entry into a market that resolves within the c
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
 
-The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval and additively swaps in the live wallet set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`). When `supabase_url` is empty the service falls back to `seed_watchlist_path`. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged).
+The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval and additively swaps in the live wallet set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`). When `supabase_url` is empty the service falls back to `seed_watchlist_path`. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged). After each refresh (and once at bootstrap) the service best-effort publishes its current live-set size to the `service_runtime` table so the analytics site can show "N watched" — the count is in-memory only and the site cannot derive it from `latest_ranking` (it does not know `SUPABASE_FETCH_LIMIT`). The publish needs `supabase_secret_key`; it is skipped when absent and never blocks the refresh.
 
 | Key | Default | Meaning |
 |---|---:|---|

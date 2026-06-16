@@ -34,7 +34,9 @@ use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::seed;
 use pe_service::supabase_reader;
-use pe_service::supabase_refresh::run_supabase_refresh_loop;
+use pe_service::supabase_refresh::{
+    HttpWatchlistPublisher, WatchlistSizePublisher, run_supabase_refresh_loop,
+};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
@@ -131,6 +133,23 @@ async fn main() -> Result<()> {
     );
 
     let live_watchlist = LiveWatchlist::new(initial_watchlist);
+
+    // Publish the initial watched-count so the analytics site reflects it within seconds of
+    // start (the refresh loop's first publish is one interval away). Best-effort; needs the
+    // service-role secret (anon is read-only under RLS).
+    if !cfg.supabase_url.is_empty() && !cfg.supabase_secret_key.is_empty() {
+        let publisher = HttpWatchlistPublisher::new(
+            reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        );
+        let size = live_watchlist.snapshot().entries.len();
+        if let Err(e) = publisher.publish(size).await {
+            tracing::warn!(error = %e, "initial watchlist-size publish failed");
+        }
+    }
+
     // One-time snapshot driving the startup position seed and wallet-history backfill.
     // Refresh-admitted wallets are not retro-seeded/backfilled (acceptable for v1; #3).
     let wallets: Vec<_> = live_watchlist

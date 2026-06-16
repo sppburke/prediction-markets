@@ -3,8 +3,21 @@ import type { WalletLiveStats } from "@/lib/types";
 import { Panel } from "./Panel";
 import { Stat } from "./Stat";
 
-/** Portfolio-level KPIs aggregated from the per-wallet view rows. */
-export function KpiCards({ rows }: { rows: WalletLiveStats[] }) {
+/**
+ * Portfolio-level KPIs aggregated from the per-wallet view rows.
+ *
+ * `watched` is pe-service's current live watchlist size (the wallets it actually copies),
+ * published to `service_runtime`; `null` until the service has published once. It is the
+ * headline because the view's row count is the far larger *ranked* universe — shown as
+ * context, not as the followed set.
+ */
+export function KpiCards({
+  rows,
+  watched,
+}: {
+  rows: WalletLiveStats[];
+  watched: number | null;
+}) {
   let realized = 0;
   let openFills = 0;
   let settled = 0;
@@ -24,7 +37,11 @@ export function KpiCards({ rows }: { rows: WalletLiveStats[] }) {
   return (
     <Panel title="Live paper portfolio">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-        <Stat label="Wallets" value={formatInt(rows.length)} sub={`${formatInt(tradedWallets)} live`} />
+        <Stat
+          label="Watched"
+          value={watched === null ? "—" : formatInt(watched)}
+          sub={`${formatInt(tradedWallets)} live · ${formatInt(rows.length)} ranked`}
+        />
         <Stat label="Realized P&L" value={formatUsd(realized, { sign: true })} tone="signed" signOf={realized} />
         <Stat label="Settled fills" value={formatInt(settled)} />
         <Stat label="Open fills" value={formatInt(openFills)} />

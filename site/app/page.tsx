@@ -5,11 +5,13 @@ import { KpiCards } from "@/components/KpiCards";
 import { Panel, StateNotice } from "@/components/Panel";
 import { PnlBarChart } from "@/components/PnlBarChart";
 import { WalletTable } from "@/components/WalletTable";
-import { fetchWalletStats, NotConfiguredError } from "@/lib/data";
+import { fetchServiceRuntime, fetchWalletStats, NotConfiguredError } from "@/lib/data";
+import { toNum } from "@/lib/format";
 import type { WalletLiveStats } from "@/lib/types";
 
 export default function OverviewPage() {
   const [rows, setRows] = useState<WalletLiveStats[] | null>(null);
+  const [watched, setWatched] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -25,6 +27,15 @@ export default function OverviewPage() {
             ? "Supabase not configured — copy site/.env.example to site/.env.local."
             : `Failed to load: ${(e as Error).message}`,
         );
+      });
+    // Secondary: the live watched-count. A failure here must not blank the page, so it is
+    // swallowed and the KPI falls back to "—".
+    fetchServiceRuntime()
+      .then((rt) => {
+        if (active) setWatched(rt ? toNum(rt.watchlist_size) : null);
+      })
+      .catch(() => {
+        if (active) setWatched(null);
       });
     return () => {
       active = false;
@@ -43,7 +54,7 @@ export default function OverviewPage() {
           Per-wallet historical (ranker) vs live (paper) stats. Click a wallet for detail.
         </p>
       </div>
-      <KpiCards rows={rows} />
+      <KpiCards rows={rows} watched={watched} />
       <Panel title="Live realized P&L by wallet">
         <PnlBarChart rows={rows} />
       </Panel>

@@ -1,5 +1,5 @@
 import { getSupabase } from "./supabase";
-import type { PaperFill, WalletLiveStats } from "./types";
+import type { PaperFill, ServiceRuntime, WalletLiveStats } from "./types";
 
 export class NotConfiguredError extends Error {
   constructor() {
@@ -18,6 +18,19 @@ export async function fetchWalletStats(): Promise<WalletLiveStats[]> {
     .order("live_realized_pnl", { ascending: false, nullsFirst: false });
   if (error) throw new Error(error.message);
   return (data ?? []) as WalletLiveStats[];
+}
+
+/** pe-service's current live watchlist size ("N watched"), or null if not yet published. */
+export async function fetchServiceRuntime(): Promise<ServiceRuntime | null> {
+  const sb = getSupabase();
+  if (!sb) throw new NotConfiguredError();
+  const { data, error } = await sb
+    .from("service_runtime")
+    .select("watchlist_size, updated_at")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as ServiceRuntime | null) ?? null;
 }
 
 /** One wallet's historical-vs-live row (wallet keys are lowercase in the view). */

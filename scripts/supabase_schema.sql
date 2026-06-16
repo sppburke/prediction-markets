@@ -90,6 +90,19 @@ create table if not exists supabase_sink_hwm (
 insert into supabase_sink_hwm (id, last_event_seq) values (1, 0)
   on conflict (id) do nothing;
 
+-- Service runtime telemetry: the size of pe-service's current live watchlist (the wallets
+-- it actually copies = top-`supabase_fetch_limit` of latest_ranking, accumulated up to
+-- `supabase_live_cap`). The count lives only in service memory, so the analytics site
+-- cannot derive it from latest_ranking (it does not know the limit) — pe-service publishes
+-- it here every refresh. Single row (id = 1). Anon-readable (see RLS below).
+create table if not exists service_runtime (
+  id             integer     primary key default 1 check (id = 1),
+  watchlist_size integer     not null default 0,
+  updated_at     timestamptz not null default now()
+);
+insert into service_runtime (id, watchlist_size) values (1, 0)
+  on conflict (id) do nothing;
+
 -- Per-wallet historical (ranker) vs live (paper) stats. `security_invoker = true` so the
 -- view executes with the *querying* role's privileges and the anon RLS below applies.
 -- Live realized P&L mirrors `crates/paper-pnl` `value_fill`: for a settled fill,
@@ -163,6 +176,13 @@ grant select on ranking_entries to anon;
 
 -- Writer-only cursor: RLS enabled with NO anon policy and NO grant — anon cannot touch it.
 alter table supabase_sink_hwm enable row level security;
+
+-- The site reads the live watchlist size for the "N watched" KPI; pe-service writes it with
+-- the service-role key (bypasses RLS). Anon read-only; no anon write policy.
+alter table service_runtime enable row level security;
+drop policy if exists "service_runtime_anon_read" on service_runtime;
+create policy "service_runtime_anon_read" on service_runtime for select to anon using (true);
+grant select on service_runtime to anon;
 
 -- Views are not RLS-bearing; the anon role still needs an explicit grant to read them.
 grant select on latest_ranking to anon;
