@@ -328,6 +328,8 @@ The local latency-shift ranker pushes append-only ranking batches to Supabase (`
 | `SUPABASE_FETCH_LIMIT` | 25 | **Module const** in `crates/service/src/supabase_reader.rs`. Top-N wallets fetched per refresh (the live copy set; `?limit=`). The ranker pushes a deeper top-200 batch; #3 widens the fetch. |
 | `SUPABASE_LIVE_CAP` | 200 | **Module const** in `supabase_reader.rs`. Upper bound on the accumulated (additive, never-evicted) live set across refreshes; matches the ranker's top-200 push. Eviction/demotion is deferred to the online policy (#3). |
 | `LS_TSTAT_BPS_SCALE` | 1_000 | **Module const** in `supabase_reader.rs`. t-stat → `leader_score_bps` scale (ordering only, not a gate). A t-stat of 2.5 maps to 2500 bps. |
+| `upload_active_window_hours` | 72 | `--active-window-hours` in `scripts/push_ranking_to_supabase.py` (issue #350 WS3). The ranking push drops wallets with no cached trade (`wallet_cache.db`) in the last N hours so idle wallets never reach the live set. Off unless `--db` is given; `scripts/rank_and_push.sh` always passes it. Drift-guarded by `scripts/test_push_ranking_filter.py`. |
+| `upload_max_cache_staleness_hours` | 24 | `--max-cache-staleness-hours` in `scripts/push_ranking_to_supabase.py` (issue #350 WS3). The push aborts (non-zero exit, no Supabase write) when the cache's global `MAX(timestamp_unix)` is older than N hours — a stale cache would spuriously filter out *every* wallet. Backfill before pushing (docs/26). Drift-guarded by `scripts/test_push_ranking_filter.py`. |
 
 ### Wallet enumeration and relocated chain primitives
 

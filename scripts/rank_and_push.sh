@@ -15,6 +15,12 @@
 #
 # Requirements: .env with SUPABASE_URL + SUPABASE_SECRET_KEY; data/wallet_cache.db present.
 # Re-push only (skip ranking, reuse existing CSVs): add --skip-rank.
+#
+# BACKFILL FIRST (issue #350 WS3): the push drops wallets idle > --active-window-hours (72)
+# and ABORTS if the cache's newest trade is > 24h old, so run docs/26 Part 1 (backfill)
+# immediately before this. A stale cache would otherwise filter out every wallet.
+# A re-push (--skip-rank) still filters against the cache; if it runs >24h after the
+# backfill, re-backfill first or pass --max-cache-staleness-hours to relax the guard.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,6 +39,10 @@ FLOOR_TSTAT="2.0"
 LATENCY_SHIFT_SECS="20"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
+# Active-only upload filter (issue #350 WS3). Empty => use push_ranking_to_supabase.py's
+# canonical defaults (72 / 24, docs/_GLOSSARY), so the thresholds live in exactly one place.
+ACTIVE_WINDOW_HOURS=""
+MAX_CACHE_STALENESS_HOURS=""
 NOTES=""
 SKIP_RANK="0"
 
@@ -51,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --latency-shift-secs) LATENCY_SHIFT_SECS="$2"; shift 2;;
     --fill-window-secs) FILL_WINDOW_SECS="$2"; shift 2;;
     --top-n) TOP_N="$2"; shift 2;;
+    --active-window-hours) ACTIVE_WINDOW_HOURS="$2"; shift 2;;
+    --max-cache-staleness-hours) MAX_CACHE_STALENESS_HOURS="$2"; shift 2;;
     --notes) NOTES="$2"; shift 2;;
     --skip-rank) SKIP_RANK="1"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
@@ -94,10 +106,17 @@ fi
 [[ -s "$LATENCY_CSV" ]] || { echo "FATAL: ranking produced no $LATENCY_CSV" >&2; exit 1; }
 
 echo "── Stage 3/3: push to Supabase (the previously-missing step) ──────────────────"
+# Active-only upload filter args (issue #350 WS3): always pass --db; window/staleness only
+# when explicitly overridden, so the canonical defaults stay solely in the push script.
+FILTER_ARGS=(--db "$DB")
+[[ -n "$ACTIVE_WINDOW_HOURS" ]] && FILTER_ARGS+=(--active-window-hours "$ACTIVE_WINDOW_HOURS")
+[[ -n "$MAX_CACHE_STALENESS_HOURS" ]] && FILTER_ARGS+=(--max-cache-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
+
 python3 scripts/push_ranking_to_supabase.py \
   --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N" \
   --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX" \
   --latency-shift-secs "$LATENCY_SHIFT_SECS" \
+  "${FILTER_ARGS[@]}" \
   --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
 
 echo "── Verify: Supabase latest_ranking is now populated ──────────────────────────"

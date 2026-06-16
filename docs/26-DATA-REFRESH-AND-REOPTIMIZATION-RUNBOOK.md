@@ -130,6 +130,22 @@ sqlite3 data/wallet_cache.db "
 `newest_trade` should be within the last day or two. If `resolved_mkts` is low
 relative to the markets your wallets traded, re-run step 3 with an RPC URL set.
 
+> **Backfill before pushing (issue #350 WS3).** The Supabase upload
+> (`scripts/push_ranking_to_supabase.py`, invoked by `scripts/rank_and_push.sh`)
+> now enforces this freshness. With `--db data/wallet_cache.db` (always passed by
+> `rank_and_push.sh`) it:
+> - **aborts the push** (non-zero exit, no Supabase write) when the cache's global
+>   `MAX(timestamp_unix)` is older than `--max-cache-staleness-hours`
+>   (`upload_max_cache_staleness_hours` = 24); and
+> - **drops wallets** with no cached trade in the last `--active-window-hours`
+>   (`upload_active_window_hours` = 72) so idle wallets never reach the live set
+>   (the dropped count is logged; the comparison is case-insensitive).
+>
+> Because both checks read `wallet_cache.db`, **run Part 1 (backfill) immediately
+> before Part 2's ranking push.** A stale cache would otherwise filter out every
+> wallet, leaving the live ranking empty — the abort guard turns that silent
+> failure into a loud one.
+
 ---
 
 ## Part 2 — Re-optimize the followed wallets
