@@ -23,6 +23,14 @@ export interface WalletLiveStats {
   avg_price: Numeric; // mid price 0..1
 }
 
+// The single `service_runtime` row: pe-service's current live watchlist size (the wallets
+// it actually copies). Published by the service because the count is in-memory only and the
+// site cannot derive it from the ranking. Absent/0 until the service has published once.
+export interface ServiceRuntime {
+  watchlist_size: Numeric;
+  updated_at: string;
+}
+
 // One row of the anon-readable `paper_fills` table (per-wallet detail tape).
 export interface PaperFill {
   idempotency_key: string;
