@@ -22,8 +22,9 @@ use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 /// Hot-swappable handle to the current [`Watchlist`].
 ///
 /// Clones share one underlying cell. Reads ([`Self::snapshot`]) are wait-free; the
-/// single-writer [`Self::apply_refresh`] performs a load-modify-store and must not be
-/// called concurrently with itself (one refresh task owns it).
+/// single-writer mutators ([`Self::apply_refresh`] and [`Self::replace`]) each perform a
+/// load-modify-store and must not run concurrently with one another or themselves (a
+/// later PR serializes them with a writer mutex).
 #[derive(Clone)]
 pub struct LiveWatchlist {
     inner: Arc<ArcSwap<Watchlist>>,
@@ -158,6 +159,11 @@ impl LiveWatchlist {
 
         // Maintain the `Watchlist` invariant: entries sorted descending by score.
         entries.sort_by_key(|e| std::cmp::Reverse(e.leader_score_bps.0));
+        // Enforce the working-set cap. The backfill loop above only blocks *new*
+        // admissions; if the survivor set itself already exceeds `cap` (e.g. a live set
+        // that accumulated past the working-set size before this primitive was wired),
+        // keep the highest-scored `cap` and drop the rest.
+        entries.truncate(cap);
         let active_count = entries
             .iter()
             .filter(|e| e.tier == WatchlistTier::Active)
@@ -415,6 +421,28 @@ mod tests {
             scores,
             vec![90, 70, 50],
             "entries sorted descending by score"
+        );
+    }
+
+    #[test]
+    fn replace_truncates_survivors_over_cap() {
+        // Survivor set already exceeds cap with no backfill offered: the result is trimmed
+        // to the highest-scored `cap` entries (the deploy-time over-accumulation case).
+        let live = LiveWatchlist::new(watchlist(vec![
+            entry(wallet(1), 100, 5000),
+            entry(wallet(2), 90, 4000),
+            entry(wallet(3), 80, 3000),
+        ]));
+        let n = live.replace(&HashSet::new(), &[], 2);
+        assert_eq!(n, 2, "result trimmed down to cap");
+        let snap = live.snapshot();
+        assert!(
+            has(&snap, wallet(1)) && has(&snap, wallet(2)),
+            "top two by score kept"
+        );
+        assert!(
+            !has(&snap, wallet(3)),
+            "lowest-scored survivor dropped to enforce the cap"
         );
     }
 
