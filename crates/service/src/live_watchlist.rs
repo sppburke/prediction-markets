@@ -6,8 +6,9 @@
 //! same underlying cell, so every consumer (orchestrator, trade poller, refresh loop)
 //! observes the same swaps.
 //!
-//! [`Self::apply_refresh`] is *additive*: it updates the scores of wallets already
-//! present, appends new wallets up to `live_cap`, and never evicts.
+//! [`Self::apply_refresh`] is *score-update-only* (issue #350 WS1): it refreshes the scores
+//! of wallets already present and never adds or evicts — the live set is a fixed maintained
+//! working set whose membership is changed only by [`Self::replace`].
 //! [`Self::replace`] is the eviction+backfill primitive (issue #350 WS1): it atomically
 //! drops a set of wallets and backfills replacements up to a cap. It is not yet wired —
 //! the maintenance tick that calls it lands in a later PR of the same workstream.
@@ -46,39 +47,31 @@ impl LiveWatchlist {
         self.inner.load_full()
     }
 
-    /// Additively merge `fresh` into the live set and atomically publish the result;
-    /// returns the new total entry count.
+    /// Refresh the scores of wallets already in the live set from `fresh`, atomically publish
+    /// the result, and return the (unchanged) entry count.
     ///
-    /// Semantics (all four are unit-tested):
-    /// - **update-scores**: a wallet present in both is replaced by its `fresh` entry.
-    /// - **backfill-up-to-cap**: a wallet only in `fresh` is appended while
-    ///   `len < live_cap`.
-    /// - **never-exceed-cap**: once `len == live_cap`, further new wallets are dropped.
-    /// - **never-remove**: a wallet absent from `fresh` is retained unchanged.
+    /// Score-update-only (issue #350 WS1): the live set is a fixed maintained working set, so
+    /// a refresh **never adds** a wallet present only in `fresh` and **never removes** a wallet
+    /// absent from it — membership is changed solely by [`Self::replace`] (the maintenance
+    /// tick). Both behaviours are unit-tested.
     ///
     /// # Precondition
-    /// Single-writer: must not be called concurrently with itself. One refresh task owns
-    /// the write side; the hot path only reads via [`Self::snapshot`].
-    pub fn apply_refresh(&self, fresh: &Watchlist, live_cap: usize) -> usize {
+    /// Single-writer: must not be called concurrently with itself or [`Self::replace`]. One
+    /// refresh task owns the write side; the hot path only reads via [`Self::snapshot`].
+    pub fn apply_refresh(&self, fresh: &Watchlist) -> usize {
         let current = self.inner.load_full();
         let mut entries: Vec<WatchlistEntry> = current.entries.clone();
-        let mut index: HashMap<WalletAddress, usize> = entries
+        let index: HashMap<WalletAddress, usize> = entries
             .iter()
             .enumerate()
             .map(|(i, e)| (e.wallet, i))
             .collect();
 
         for fe in &fresh.entries {
-            match index.get(&fe.wallet) {
-                Some(&i) => entries[i] = fe.clone(), // update scores; never remove
-                None => {
-                    if entries.len() < live_cap {
-                        index.insert(fe.wallet, entries.len());
-                        entries.push(fe.clone());
-                    }
-                    // else: at cap — drop the new wallet (never-evict; #3 adds eviction).
-                }
+            if let Some(&i) = index.get(&fe.wallet) {
+                entries[i] = fe.clone(); // update scores in place; never add, never remove
             }
+            // else: a wallet only in `fresh` is ignored — membership changes only via `replace`.
         }
 
         // Maintain the `Watchlist` invariant: entries sorted descending by score.
@@ -236,7 +229,7 @@ mod tests {
     #[test]
     fn apply_refresh_updates_scores_in_place() {
         let live = LiveWatchlist::new(watchlist(vec![entry(wallet(1), 100, 5000)]));
-        let n = live.apply_refresh(&watchlist(vec![entry(wallet(1), 200, 6300)]), 10);
+        let n = live.apply_refresh(&watchlist(vec![entry(wallet(1), 200, 6300)]));
         assert_eq!(n, 1, "no new wallet added");
         let snap = live.snapshot();
         assert_eq!(snap.entries.len(), 1);
@@ -248,34 +241,29 @@ mod tests {
     }
 
     #[test]
-    fn apply_refresh_backfills_up_to_cap() {
+    fn apply_refresh_ignores_new_wallets() {
+        // Score-update-only: a wallet present only in `fresh` is NOT admitted — membership
+        // changes solely via `replace` (the maintenance tick). Replaces the old additive
+        // backfill/cap tests removed in #350 WS1.
         let live = LiveWatchlist::new(watchlist(vec![entry(wallet(1), 100, 5000)]));
-        let n = live.apply_refresh(
-            &watchlist(vec![entry(wallet(2), 90, 4000), entry(wallet(3), 80, 3000)]),
-            3,
-        );
-        assert_eq!(n, 3, "both new wallets appended within cap");
-        let snap = live.snapshot();
-        for w in [wallet(1), wallet(2), wallet(3)] {
-            assert!(snap.entries.iter().any(|e| e.wallet == w));
-        }
-    }
-
-    #[test]
-    fn apply_refresh_never_exceeds_cap() {
-        let live = LiveWatchlist::new(watchlist(vec![
-            entry(wallet(1), 100, 5000),
+        let n = live.apply_refresh(&watchlist(vec![
+            entry(wallet(1), 110, 5500),
             entry(wallet(2), 90, 4000),
         ]));
-        let n = live.apply_refresh(&watchlist(vec![entry(wallet(3), 80, 3000)]), 2);
-        assert_eq!(n, 2, "new wallet dropped at cap");
+        assert_eq!(
+            n, 1,
+            "new wallet not admitted by a score-update-only refresh"
+        );
         let snap = live.snapshot();
         assert!(
-            !snap.entries.iter().any(|e| e.wallet == wallet(3)),
-            "wallet 3 not admitted past cap"
+            !snap.entries.iter().any(|e| e.wallet == wallet(2)),
+            "wallet 2 absent — refresh never adds"
         );
-        assert!(snap.entries.iter().any(|e| e.wallet == wallet(1)));
-        assert!(snap.entries.iter().any(|e| e.wallet == wallet(2)));
+        assert_eq!(
+            find_win_rate(&snap, wallet(1)),
+            Some(5500),
+            "present wallet's score still updated in place"
+        );
     }
 
     #[test]
@@ -285,7 +273,7 @@ mod tests {
             entry(wallet(2), 90, 4000),
         ]));
         // fresh omits wallet 2.
-        let n = live.apply_refresh(&watchlist(vec![entry(wallet(1), 110, 5500)]), 10);
+        let n = live.apply_refresh(&watchlist(vec![entry(wallet(1), 110, 5500)]));
         assert_eq!(n, 2, "absent wallet retained");
         let snap = live.snapshot();
         assert_eq!(

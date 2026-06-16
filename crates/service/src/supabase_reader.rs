@@ -23,15 +23,22 @@ use time::OffsetDateTime;
 /// it is not a gate. A t-stat of 2.5 maps to 2500 bps. See `docs/_GLOSSARY.md`.
 const LS_TSTAT_BPS_SCALE: i64 = 1_000;
 
-/// Number of top-ranked wallets fetched per refresh — the live copy set (`?limit=`).
-/// The ranker pushes a deeper top-200 batch; #3 (online policy) widens the fetch.
-/// See `docs/_GLOSSARY.md`: `supabase_fetch_limit`.
-pub const SUPABASE_FETCH_LIMIT: usize = 25;
+/// Number of top-ranked wallets fetched per refresh — bounds the `latest_ranking` query
+/// (`?limit=`). Equals [`MAINTAINED_SET_SIZE`]: the refresh fetches exactly the maintained
+/// working set. The ranker pushes a deeper top-200 bench; only the live set is capped.
+/// See `docs/_GLOSSARY.md`: `SUPABASE_FETCH_LIMIT`.
+// Defined in terms of `MAINTAINED_SET_SIZE` so the "fetch exactly the maintained set"
+// coupling is machine-enforced, not just documented (const refs are order-independent).
+pub const SUPABASE_FETCH_LIMIT: usize = MAINTAINED_SET_SIZE;
 
-/// Upper bound on the accumulated (additive, never-evicted) live set across refreshes;
-/// matches the ranker's top-200 push. Eviction/demotion is deferred to the online policy
-/// (#3). See `docs/_GLOSSARY.md`: `supabase_live_cap`.
-pub const SUPABASE_LIVE_CAP: usize = 200;
+/// Fixed size of the maintained live working set (issue #350 WS1; replaces `SUPABASE_LIVE_CAP`
+/// = 200). The live set is held at this width: the periodic refresh is score-update-only (no
+/// add/evict — see [`crate::live_watchlist::LiveWatchlist::apply_refresh`]), and the
+/// maintenance tick (#350 WS1 PR-D) evicts inactive/underperforming wallets and backfills
+/// freed slots from the Supabase bench up to this cap. The bench (`latest_ranking`) still
+/// holds the ranker's deeper top-200 push; only the live set is capped here.
+/// See `docs/_GLOSSARY.md`: `MAINTAINED_SET_SIZE`.
+pub const MAINTAINED_SET_SIZE: usize = 25;
 
 /// Reconstruction quality assigned to Supabase-sourced wallets. The ranker has already
 /// applied its own data-quality gates, so these wallets are treated as fully reconstructed
@@ -151,6 +158,30 @@ pub(crate) fn auth_token<'a>(anon_key: &'a str, secret_key: &'a str) -> &'a str 
     }
 }
 
+/// Issue an authenticated `GET {url}` against PostgREST and map the ranking rows to a
+/// [`Watchlist`]. Shared by [`fetch`] and [`fetch_candidates`]: the same `token` goes in BOTH
+/// the `apikey` and `Authorization: Bearer` headers (see [`auth_token`]).
+async fn get_ranking(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<Watchlist, SupabaseError> {
+    let resp = client
+        .get(url)
+        .header("apikey", token)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(SupabaseError::Transport)?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(SupabaseError::Status(status.as_u16()));
+    }
+    let rows: Vec<RankingRow> = resp.json().await.map_err(SupabaseError::Decode)?;
+    Ok(to_watchlist(&rows))
+}
+
 /// Fetch the latest ranking from Supabase and map it to a [`Watchlist`].
 ///
 /// `GET {base_url}/rest/v1/latest_ranking?order=rank&limit={limit}` with the SAME token in
@@ -167,22 +198,51 @@ pub async fn fetch(
         base_url.trim_end_matches('/'),
         limit
     );
-    let token = auth_token(anon_key, secret_key);
+    get_ranking(client, &url, auth_token(anon_key, secret_key)).await
+}
 
-    let resp = client
-        .get(&url)
-        .header("apikey", token)
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(SupabaseError::Transport)?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(SupabaseError::Status(status.as_u16()));
+/// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` `latest_ranking`
+/// rows excluding `exclude`, ordered by rank. Pure (no network) so the `not.in.` filter is
+/// unit-testable. Excluded wallets render as canonical lowercase `0x` hex (matching
+/// `latest_ranking.wallet_hex`) and are sorted + deduped for a deterministic, cache-friendly
+/// URL. An empty `exclude` omits the filter (PostgREST rejects an empty `in.()` list).
+fn candidates_query(exclude: &[WalletAddress], n: usize) -> String {
+    if exclude.is_empty() {
+        return format!("order=rank&limit={n}");
     }
-    let rows: Vec<RankingRow> = resp.json().await.map_err(SupabaseError::Decode)?;
-    Ok(to_watchlist(&rows))
+    let mut hexes: Vec<String> = exclude.iter().map(ToString::to_string).collect();
+    hexes.sort_unstable();
+    hexes.dedup();
+    format!(
+        "wallet_hex=not.in.({})&order=rank&limit={n}",
+        hexes.join(",")
+    )
+}
+
+/// Fetch the top-`n` on-deck candidate wallets from `latest_ranking`, excluding any wallet in
+/// `exclude` (the current live ∪ evicted set), ordered by rank. Used by the maintenance tick
+/// (issue #350 WS1 PR-D) to backfill freed live slots from the Supabase bench.
+///
+/// `GET {base_url}/rest/v1/latest_ranking?wallet_hex=not.in.(<exclude>)&order=rank&limit={n}`
+/// with the same token in both headers (see [`auth_token`]). The server-side `not.in.` filter
+/// is an over-fetch optimisation, not a correctness boundary: it is matched case-sensitively
+/// against `latest_ranking.wallet_hex` (canonical lowercase), and
+/// [`crate::live_watchlist::LiveWatchlist::replace`] independently dedups the results against
+/// the live and evicted sets by byte-equality, so a casing miss cannot re-admit a wallet.
+pub async fn fetch_candidates(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    exclude: &[WalletAddress],
+    n: usize,
+) -> Result<Watchlist, SupabaseError> {
+    let url = format!(
+        "{}/rest/v1/latest_ranking?{}",
+        base_url.trim_end_matches('/'),
+        candidates_query(exclude, n)
+    );
+    get_ranking(client, &url, auth_token(anon_key, secret_key)).await
 }
 
 #[cfg(test)]
@@ -273,5 +333,24 @@ mod tests {
         assert_eq!(auth_token("anon", ""), "anon");
         assert_eq!(auth_token("", "secret"), "secret");
         assert_eq!(auth_token("", ""), "");
+    }
+
+    #[test]
+    fn candidates_query_empty_exclude_omits_filter() {
+        // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
+        assert_eq!(candidates_query(&[], 5), "order=rank&limit=5");
+    }
+
+    #[test]
+    fn candidates_query_excludes_sorted_lowercase_deduped() {
+        let a = WalletAddress::from_hex("0x00000000000000000000000000000000000000AA").unwrap();
+        let b = WalletAddress::from_hex("0x0000000000000000000000000000000000000001").unwrap();
+        // Out of order + a duplicate + upper-case input -> sorted, deduped, lowercase output.
+        let q = candidates_query(&[a, b, a], 3);
+        assert_eq!(
+            q,
+            "wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
+             0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
+        );
     }
 }

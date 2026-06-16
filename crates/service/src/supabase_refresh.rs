@@ -8,7 +8,7 @@
 //!
 //! After each refresh the loop best-effort publishes the live-set size to Supabase's
 //! `service_runtime` row (the count lives only in service memory; the site cannot derive it
-//! from `latest_ranking` because it does not know `supabase_fetch_limit`). A publish failure
+//! from `latest_ranking` because it does not know `SUPABASE_FETCH_LIMIT`). A publish failure
 //! never affects the refresh — the analytics write is strictly downstream of copy decisions.
 
 use std::future::Future;
@@ -79,30 +79,29 @@ pub(crate) fn runtime_upsert_body(size: usize) -> serde_json::Value {
     serde_json::json!([{ "id": 1, "watchlist_size": size }])
 }
 
-/// Merge `fresh` into `live` (additive, never-evict, up to `live_cap`) and best-effort
-/// publish the resulting live-set size. Returns the live-set size; a publish failure is
-/// logged, never propagated — the refresh must not depend on the analytics write.
+/// Apply a score-update-only refresh of `live` from `fresh` (issue #350 WS1: never adds or
+/// evicts — membership is changed only by the maintenance tick) and best-effort publish the
+/// resulting live-set size. Returns the live-set size; a publish failure is logged, never
+/// propagated — the refresh must not depend on the analytics write.
 pub async fn refresh_and_publish(
     live: &LiveWatchlist,
     fresh: &Watchlist,
-    live_cap: usize,
     publisher: &impl WatchlistSizePublisher,
 ) -> usize {
-    let live_total = live.apply_refresh(fresh, live_cap);
+    let live_total = live.apply_refresh(fresh);
     if let Err(e) = publisher.publish(live_total).await {
         warn!(error = %e, "failed to publish watchlist size to supabase");
     }
     live_total
 }
 
-/// Refresh `live` from Supabase every `interval_secs`, merging additively up to `live_cap`,
-/// and publishing the live-set size after each refresh.
+/// Refresh `live` from Supabase every `interval_secs` (score-update-only — see
+/// [`LiveWatchlist::apply_refresh`]) and publish the live-set size after each refresh.
 ///
-/// `fetch_limit` bounds the `latest_ranking` query (`?limit=`); `live_cap` bounds the
-/// accumulated live set across refreshes (additive, never-evict — see
-/// [`LiveWatchlist::apply_refresh`]). Publishing needs the service-role secret; when it is
-/// absent the loop still refreshes but skips the publish.
-#[allow(clippy::too_many_arguments)]
+/// `fetch_limit` bounds the `latest_ranking` query (`?limit=`). The refresh never changes
+/// membership (issue #350 WS1): the maintenance tick is the sole evictor/backfiller.
+/// Publishing needs the service-role secret; when it is absent the loop still refreshes but
+/// skips the publish.
 pub async fn run_supabase_refresh_loop(
     live: LiveWatchlist,
     client: reqwest::Client,
@@ -110,7 +109,6 @@ pub async fn run_supabase_refresh_loop(
     anon_key: String,
     secret_key: String,
     fetch_limit: usize,
-    live_cap: usize,
     interval_secs: u64,
 ) {
     // The watched-count write needs the service-role key (anon is read-only under RLS).
@@ -128,8 +126,8 @@ pub async fn run_supabase_refresh_loop(
             Ok(fresh) => {
                 let fetched = fresh.entries.len();
                 let live_total = match &publisher {
-                    Some(p) => refresh_and_publish(&live, &fresh, live_cap, p).await,
-                    None => live.apply_refresh(&fresh, live_cap),
+                    Some(p) => refresh_and_publish(&live, &fresh, p).await,
+                    None => live.apply_refresh(&fresh),
                 };
                 info!(
                     fetched,

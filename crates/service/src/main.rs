@@ -441,8 +441,8 @@ async fn main() -> Result<()> {
         sink_handle,
     );
 
-    // Live-watchlist refresh task (#339): poll Supabase on the configured interval and
-    // additively merge fresh rankings into the live set. Spawned only when configured.
+    // Live-watchlist refresh task (#339): poll Supabase on the configured interval and refresh
+    // the scores of the live set (score-update-only, #350 WS1). Spawned only when configured.
     let supabase_task = if !cfg.supabase_url.is_empty() && cfg.supabase_refresh_interval_secs > 0 {
         Some(tokio::spawn(run_supabase_refresh_loop(
             live_watchlist.clone(),
@@ -451,7 +451,6 @@ async fn main() -> Result<()> {
             cfg.supabase_anon_key.clone(),
             cfg.supabase_secret_key.clone(),
             supabase_reader::SUPABASE_FETCH_LIMIT,
-            supabase_reader::SUPABASE_LIVE_CAP,
             cfg.supabase_refresh_interval_secs,
         )))
     } else {
