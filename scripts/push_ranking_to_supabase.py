@@ -136,6 +136,7 @@ def main() -> int:
 
     # Read pass-2 ranking; keep survivors first, then by latency-shifted t-stat desc.
     rows = list(csv.DictReader(open(a.ranked_csv, newline="")))
+    universe_count = len(rows)  # full ranked universe, recorded before the active filter
 
     # Active-only upload filter (issue #350 WS3): when a cache is provided, drop ranked
     # wallets with no trade in the last --active-window-hours and abort outright if the
@@ -172,7 +173,7 @@ def main() -> int:
         "band_lo": a.band_lo, "band_hi": a.band_hi,
         "ttr_floor_secs": a.ttr_floor_secs, "ttr_max_secs": a.ttr_max_secs,
         "latency_shift_secs": a.latency_shift_secs,
-        "universe_size": a.universe_size or len(rows),
+        "universe_size": a.universe_size or universe_count,
         "notes": a.notes or None,
     }
     try:
