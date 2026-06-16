@@ -207,10 +207,15 @@ struct MidMarketRaw {
     /// Gamma `volume` (USD cumulative). Same encoding and leniency as `liquidity`.
     #[serde(default, deserialize_with = "deserialize_decimal_lenient")]
     volume: Option<Decimal>,
-    /// Gamma `clobTokenIds`: a stringified JSON array of decimal token ids ordered
-    /// by outcome, e.g. `"[\"123\",\"456\"]"`. Parsed via [`parse_clob_token_ids`].
-    #[serde(rename = "clobTokenIds", default)]
-    clob_token_ids: Option<String>,
+    /// Gamma `clobTokenIds`, outcome-ordered, e.g. the stringified JSON array
+    /// `"[\"123\",\"456\"]"` (the live `/markets` form; a native array is also
+    /// accepted). Decoded to outcome-aligned ids via [`deserialize_clob_token_ids`].
+    #[serde(
+        rename = "clobTokenIds",
+        default,
+        deserialize_with = "deserialize_clob_token_ids"
+    )]
+    clob_token_ids: Vec<String>,
 }
 
 /// Parse a Gamma open-market response into its mids and liquidity snapshot,
@@ -236,46 +241,55 @@ fn parse_market_row(
     let snapshot = MidMarketSnapshot {
         liquidity: m.liquidity,
         volume: m.volume,
-        clob_token_ids: parse_clob_token_ids(m.clob_token_ids.as_deref()),
+        clob_token_ids: m.clob_token_ids.clone(),
     };
     Some((mids, snapshot))
 }
 
-/// Parse Gamma's `clobTokenIds` (a stringified JSON array of decimal token ids)
-/// into the contained ids, preserving outcome order. Returns empty on `None`,
-/// malformed JSON, or a non-array — token mapping is best-effort and must never
-/// drop a market's mids. Blank ids are dropped.
-fn parse_clob_token_ids(raw: Option<&str>) -> Vec<String> {
-    let Some(raw) = raw else {
-        return Vec::new();
-    };
-    match serde_json::from_str::<Vec<String>>(raw) {
-        Ok(ids) => ids.into_iter().filter(|t| !t.is_empty()).collect(),
-        Err(_) => Vec::new(),
-    }
+/// Decode Gamma's `clobTokenIds` into outcome-ordered token ids. Gamma sends a
+/// stringified JSON array (`"[\"id0\",\"id1\"]"` — the live `/markets` form); a
+/// native JSON array is also accepted. Any other shape, malformed inner JSON, a
+/// null, or a missing field yields an empty vec — token mapping is best-effort and
+/// must never drop a market's mids. **Positions are preserved** (no compaction or
+/// blank-dropping) so `clob_token_ids[outcome_id]` stays aligned with the outcome.
+fn deserialize_clob_token_ids<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+
+    Ok(match Option::<Value>::deserialize(d)? {
+        // Stringified JSON array — the live `/markets` encoding.
+        Some(Value::String(s)) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
+        // Native JSON array; coerce each entry to its string form, order preserved.
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|v| match v {
+                Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Deserialize Gamma's `liquidity`/`volume` whether they arrive as a JSON string
-/// (`"6434.84"` — the live `/markets` form) or a JSON number. A null, a missing
-/// field, or an unparseable string yields `None`, so a malformed depth scalar
-/// never fails the row and drops its mids.
+/// (`"6434.84"` — the live `/markets` form) or a JSON number. Any other shape — a
+/// null, bool, array, object, missing field, or unparseable string — yields
+/// `None`, so a malformed depth scalar can never fail the row and drop its mids.
 fn deserialize_decimal_lenient<'de, D>(d: D) -> Result<Option<Decimal>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use rust_decimal::prelude::FromPrimitive;
+    use serde_json::Value;
 
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Flex {
-        Str(String),
-        Num(f64),
-    }
-
-    Ok(match Option::<Flex>::deserialize(d)? {
-        Some(Flex::Str(s)) => s.trim().parse::<Decimal>().ok(),
-        Some(Flex::Num(f)) => Decimal::from_f64(f),
-        None => None,
+    // Capture as an untyped value first: `Value` deserialization is total over any
+    // JSON shape, so an unexpected type degrades to `None` instead of erroring.
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::String(s)) => s.trim().parse::<Decimal>().ok(),
+        Some(Value::Number(n)) => n.as_f64().and_then(Decimal::from_f64),
+        _ => None,
     })
 }
 
@@ -462,6 +476,62 @@ mod tests {
         assert_eq!(
             snap.clob_token_ids,
             vec!["t0".to_string(), "t1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn clob_token_ids_preserve_blank_positions() {
+        // A blank id must NOT be compacted away — `clob_token_ids[outcome_id]` is
+        // indexed positionally, so dropping index 0 would misalign every outcome.
+        let mut fx = HashMap::new();
+        fx.insert(
+            url(BASE, "0xcond"),
+            br#"[{"conditionId":"0xcond","outcomePrices":"[\"0.5\",\"0.5\"]","clobTokenIds":"[\"\",\"222\"]"}]"#.to_vec(),
+        );
+        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string());
+        let snaps = cache.fetch_snapshots(&[mid("0xcond")]).await;
+        assert_eq!(
+            snaps.get(&mid("0xcond")).unwrap().clob_token_ids,
+            vec![String::new(), "222".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn clob_token_ids_accept_native_json_array() {
+        // Robustness: a native JSON array (not the stringified form) is accepted.
+        let mut fx = HashMap::new();
+        fx.insert(
+            url(BASE, "0xcond"),
+            br#"[{"conditionId":"0xcond","outcomePrices":"[\"0.5\",\"0.5\"]","clobTokenIds":["111","222"]}]"#.to_vec(),
+        );
+        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string());
+        let snaps = cache.fetch_snapshots(&[mid("0xcond")]).await;
+        assert_eq!(
+            snaps.get(&mid("0xcond")).unwrap().clob_token_ids,
+            vec!["111".to_string(), "222".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_json_types_do_not_drop_mids() {
+        // bool liquidity, object volume, native-array-of-numbers token ids — all
+        // unexpected types. None must fail the row: scalars → None, and the mids
+        // still parse (the zero-fill-path-risk guarantee, for any JSON shape).
+        let mut fx = HashMap::new();
+        fx.insert(
+            url(BASE, "0xcond"),
+            br#"[{"conditionId":"0xcond","outcomePrices":"[\"0.4\",\"0.6\"]","liquidity":true,"volume":{"x":1},"clobTokenIds":42}]"#.to_vec(),
+        );
+        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string());
+        let snaps = cache.fetch_snapshots(&[mid("0xcond")]).await;
+        let snap = snaps.get(&mid("0xcond")).unwrap();
+        assert_eq!(snap.liquidity, None);
+        assert_eq!(snap.volume, None);
+        assert!(snap.clob_token_ids.is_empty());
+        let mids = cache.fetch_mids(&[mid("0xcond")]).await;
+        assert_eq!(
+            mids.get(&mid("0xcond")).unwrap(),
+            &vec![Decimal::new(4, 1), Decimal::new(6, 1)]
         );
     }
 }
