@@ -245,10 +245,112 @@ pub async fn fetch_candidates(
     get_ranking(client, &url, auth_token(anon_key, secret_key)).await
 }
 
+/// Fetch the current (max) `batch_id` from `ranking_batches`, or `None` when no batch exists.
+///
+/// The maintenance tick (#350 WS1 PR-D) calls this each round to detect a fresh ranking push:
+/// when the batch id changes it clears its in-memory evicted-set, so a wallet evicted under the
+/// previous batch can be re-admitted once the ranker re-promotes it on new information. On any
+/// error the caller keeps its current batch marker (no spurious clear).
+///
+/// `GET {base_url}/rest/v1/ranking_batches?select=batch_id&order=batch_id.desc&limit=1`.
+pub async fn fetch_latest_batch_id(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+) -> Result<Option<i64>, SupabaseError> {
+    let url = format!(
+        "{}/rest/v1/ranking_batches?select=batch_id&order=batch_id.desc&limit=1",
+        base_url.trim_end_matches('/')
+    );
+    let token = auth_token(anon_key, secret_key);
+    let resp = client
+        .get(&url)
+        .header("apikey", token)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(SupabaseError::Transport)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(SupabaseError::Status(status.as_u16()));
+    }
+    #[derive(Deserialize)]
+    struct BatchRow {
+        batch_id: i64,
+    }
+    let rows: Vec<BatchRow> = resp.json().await.map_err(SupabaseError::Decode)?;
+    Ok(rows.first().map(|r| r.batch_id))
+}
+
+/// Build the single-row PostgREST insert body for a `wallet_lifecycle_events` `demote` row.
+/// Pure (no network) so the payload shape is unit-testable. `live_pnl` is emitted as a decimal
+/// *string* — Postgres coerces text → `numeric`, so no `f64` ever touches the money column — and
+/// `from_batch_id` is always `null` (the demotion is driven by live P&L, not a ranking batch).
+fn lifecycle_demote_body(
+    wallet_hex: &str,
+    reason: &str,
+    live_pnl: Option<Decimal>,
+    trades_observed: i64,
+) -> serde_json::Value {
+    serde_json::json!([{
+        "wallet_hex": wallet_hex,
+        "event": "demote",
+        "reason": reason,
+        "live_pnl": live_pnl.map(|d| d.to_string()),
+        "trades_observed": trades_observed,
+        "from_batch_id": serde_json::Value::Null,
+    }])
+}
+
+/// Append a best-effort `demote` audit row to `wallet_lifecycle_events`.
+///
+/// The service-role secret bypasses RLS (the table is RLS-enabled with no anon policy — see
+/// `scripts/supabase_schema.sql`); with only the anon key this POST is rejected and the caller
+/// logs + continues, since the eviction itself is already durable in the live set.
+///
+/// `POST {base_url}/rest/v1/wallet_lifecycle_events`.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_lifecycle_event(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    wallet_hex: &str,
+    reason: &str,
+    live_pnl: Option<Decimal>,
+    trades_observed: i64,
+) -> Result<(), SupabaseError> {
+    let url = format!(
+        "{}/rest/v1/wallet_lifecycle_events",
+        base_url.trim_end_matches('/')
+    );
+    let token = auth_token(anon_key, secret_key);
+    let resp = client
+        .post(&url)
+        .header("apikey", token)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&lifecycle_demote_body(
+            wallet_hex,
+            reason,
+            live_pnl,
+            trades_observed,
+        ))
+        .send()
+        .await
+        .map_err(SupabaseError::Transport)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(SupabaseError::Status(status.as_u16()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use serde_json::json;
 
     const HEX_A: &str = "0x0000000000000000000000000000000000000001";
@@ -351,6 +453,33 @@ mod tests {
             q,
             "wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
              0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
+        );
+    }
+
+    #[test]
+    fn lifecycle_body_is_single_row_demote_with_null_batch() {
+        let body = lifecycle_demote_body(HEX_A, "inactive>72h", Some(dec!(-12.5)), 14);
+        let arr = body.as_array().expect("body is a JSON array");
+        assert_eq!(arr.len(), 1, "single-row insert");
+        let entry = &arr[0];
+        assert_eq!(entry["wallet_hex"], json!(HEX_A));
+        assert_eq!(entry["event"], json!("demote"));
+        assert_eq!(entry["reason"], json!("inactive>72h"));
+        // Money serialized as a decimal string (text -> numeric coercion), never f64.
+        assert_eq!(entry["live_pnl"], json!("-12.5"));
+        assert_eq!(entry["trades_observed"], json!(14));
+        assert!(
+            entry["from_batch_id"].is_null(),
+            "from_batch_id is always null"
+        );
+    }
+
+    #[test]
+    fn lifecycle_body_emits_null_pnl_when_absent() {
+        let body = lifecycle_demote_body(HEX_A, "inactive>72h", None, 0);
+        assert!(
+            body.as_array().unwrap()[0]["live_pnl"].is_null(),
+            "absent realized P&L serializes as null, not 0"
         );
     }
 }

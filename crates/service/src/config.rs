@@ -190,6 +190,46 @@ pub struct ServiceConfig {
     #[serde(default = "default_supabase_sink_reconcile_interval_secs")]
     pub supabase_sink_reconcile_interval_secs: u64,
 
+    // ── Watchlist maintenance (#350 WS1 PR-D) ─────────────────────────────────
+    /// Seconds between maintenance ticks (inactivity + underperformance knockout + atomic
+    /// backfill). `0` disables the tick entirely (skipped, not a zero-duration loop).
+    /// Default: 600. See `docs/_GLOSSARY.md`: `maintenance_interval_secs`.
+    #[serde(default = "default_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
+
+    /// A live wallet idle (no observed trade) for at least this many seconds is evicted,
+    /// unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`). The
+    /// clock is the admission clock — `max(admission_time, last_observed_trade)` — because
+    /// the poll cursor is seeded to `now` at admission. Default: 259_200 (72 h). See
+    /// `docs/_GLOSSARY.md`: `inactivity_threshold_secs`.
+    #[serde(default = "default_inactivity_threshold_secs")]
+    pub inactivity_threshold_secs: u64,
+
+    /// Hard ceiling on sparing a proven winner from inactivity eviction: past this idle
+    /// span the wallet is evicted unconditionally (a winner silent for a week is more
+    /// likely abandoned than patient). Default: 604_800 (7 d). See `docs/_GLOSSARY.md`:
+    /// `inactivity_hard_cap_secs`.
+    #[serde(default = "default_inactivity_hard_cap_secs")]
+    pub inactivity_hard_cap_secs: u64,
+
+    /// Extra bench candidates fetched beyond the freed-slot count when backfilling, so a
+    /// server-side casing/dedup miss still leaves enough rows to refill the set. Default:
+    /// 10. See `docs/_GLOSSARY.md`: `bench_overfetch`.
+    #[serde(default = "default_bench_overfetch")]
+    pub bench_overfetch: usize,
+
+    /// Minimum settled fills before either the underperformance demotion or the
+    /// proven-winner inactivity exception applies (no judgement on small samples).
+    /// Default: 10. See `docs/_GLOSSARY.md`: `demotion_min_trades`.
+    #[serde(default = "default_demotion_min_trades")]
+    pub demotion_min_trades: usize,
+
+    /// Empirical-Bernstein confidence level α for the demotion upper-CB and the
+    /// proven-winner lower-CB, as a decimal string (parsed to `Decimal` at startup; never
+    /// `f64`). Default: `"0.10"`. See `docs/_GLOSSARY.md`: `demotion_cb_alpha`.
+    #[serde(default = "default_demotion_cb_alpha")]
+    pub demotion_cb_alpha: String,
+
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to `Decimal` at startup.
     #[serde(default = "default_bankroll_usd")]
@@ -278,6 +318,30 @@ const fn default_supabase_sink_channel_capacity() -> usize {
 
 const fn default_supabase_sink_reconcile_interval_secs() -> u64 {
     300
+}
+
+const fn default_maintenance_interval_secs() -> u64 {
+    600
+}
+
+const fn default_inactivity_threshold_secs() -> u64 {
+    259_200 // 72 h
+}
+
+const fn default_inactivity_hard_cap_secs() -> u64 {
+    604_800 // 7 d
+}
+
+const fn default_bench_overfetch() -> usize {
+    10
+}
+
+const fn default_demotion_min_trades() -> usize {
+    10
+}
+
+fn default_demotion_cb_alpha() -> String {
+    "0.10".to_string()
 }
 
 const fn default_position_reseed_interval_secs() -> u64 {
@@ -370,6 +434,12 @@ impl Default for ServiceConfig {
             supabase_sink_enabled: false,
             supabase_sink_channel_capacity: default_supabase_sink_channel_capacity(),
             supabase_sink_reconcile_interval_secs: default_supabase_sink_reconcile_interval_secs(),
+            maintenance_interval_secs: default_maintenance_interval_secs(),
+            inactivity_threshold_secs: default_inactivity_threshold_secs(),
+            inactivity_hard_cap_secs: default_inactivity_hard_cap_secs(),
+            bench_overfetch: default_bench_overfetch(),
+            demotion_min_trades: default_demotion_min_trades(),
+            demotion_cb_alpha: default_demotion_cb_alpha(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
@@ -489,6 +559,12 @@ mod tests {
         assert_eq!(cfg.supabase_anon_key, "");
         assert_eq!(cfg.supabase_secret_key, "");
         assert_eq!(cfg.supabase_refresh_interval_secs, 300);
+        assert_eq!(cfg.maintenance_interval_secs, 600);
+        assert_eq!(cfg.inactivity_threshold_secs, 259_200);
+        assert_eq!(cfg.inactivity_hard_cap_secs, 604_800);
+        assert_eq!(cfg.bench_overfetch, 10);
+        assert_eq!(cfg.demotion_min_trades, 10);
+        assert_eq!(cfg.demotion_cb_alpha, "0.10");
     }
 
     #[test]

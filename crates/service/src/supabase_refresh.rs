@@ -12,9 +12,11 @@
 //! never affects the refresh — the analytics write is strictly downstream of copy decisions.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pe_trader_index::Watchlist;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live_watchlist::LiveWatchlist;
@@ -102,6 +104,7 @@ pub async fn refresh_and_publish(
 /// membership (issue #350 WS1): the maintenance tick is the sole evictor/backfiller.
 /// Publishing needs the service-role secret; when it is absent the loop still refreshes but
 /// skips the publish.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_supabase_refresh_loop(
     live: LiveWatchlist,
     client: reqwest::Client,
@@ -110,6 +113,7 @@ pub async fn run_supabase_refresh_loop(
     secret_key: String,
     fetch_limit: usize,
     interval_secs: u64,
+    writer_lock: Arc<Mutex<()>>,
 ) {
     // The watched-count write needs the service-role key (anon is read-only under RLS).
     let publisher = (!secret_key.is_empty())
@@ -125,6 +129,9 @@ pub async fn run_supabase_refresh_loop(
         {
             Ok(fresh) => {
                 let fetched = fresh.entries.len();
+                // Serialize the ArcSwap write against the maintenance tick's `replace`
+                // (#350 WS1 PR-D); readers stay lock-free.
+                let _writer = writer_lock.lock().await;
                 let live_total = match &publisher {
                     Some(p) => refresh_and_publish(&live, &fresh, p).await,
                     None => live.apply_refresh(&fresh),
