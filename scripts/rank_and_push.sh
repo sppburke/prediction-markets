@@ -15,6 +15,10 @@
 #
 # Requirements: .env with SUPABASE_URL + SUPABASE_SECRET_KEY; data/wallet_cache.db present.
 # Re-push only (skip ranking, reuse existing CSVs): add --skip-rank.
+#
+# BACKFILL FIRST (issue #350 WS3): the push drops wallets idle > --active-window-hours (72)
+# and ABORTS if the cache's newest trade is > 24h old, so run docs/26 Part 1 (backfill)
+# immediately before this. A stale cache would otherwise filter out every wallet.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,6 +37,7 @@ FLOOR_TSTAT="2.0"
 LATENCY_SHIFT_SECS="20"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
+ACTIVE_WINDOW_HOURS="72"   # drop wallets idle beyond this from the upload (issue #350 WS3)
 NOTES=""
 SKIP_RANK="0"
 
@@ -51,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --latency-shift-secs) LATENCY_SHIFT_SECS="$2"; shift 2;;
     --fill-window-secs) FILL_WINDOW_SECS="$2"; shift 2;;
     --top-n) TOP_N="$2"; shift 2;;
+    --active-window-hours) ACTIVE_WINDOW_HOURS="$2"; shift 2;;
     --notes) NOTES="$2"; shift 2;;
     --skip-rank) SKIP_RANK="1"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
@@ -98,6 +104,7 @@ python3 scripts/push_ranking_to_supabase.py \
   --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N" \
   --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX" \
   --latency-shift-secs "$LATENCY_SHIFT_SECS" \
+  --db "$DB" --active-window-hours "$ACTIVE_WINDOW_HOURS" \
   --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
 
 echo "── Verify: Supabase latest_ranking is now populated ──────────────────────────"

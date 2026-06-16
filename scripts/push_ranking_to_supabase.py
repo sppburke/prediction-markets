@@ -14,9 +14,74 @@ import argparse
 import csv
 import json
 import os
+import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
+
+
+class CacheStaleError(Exception):
+    """The trade cache's newest trade is older than the staleness bound, i.e. the
+    backfill-before-push contract (docs/26) was not honoured. Pushing anyway would
+    filter out *every* wallet (none look "active"), so we abort instead."""
+
+
+def _newest_trade_unix(con: sqlite3.Connection) -> int | None:
+    """Global ``MAX(timestamp_unix)`` over the whole trade cache (the freshness probe).
+    Scans the covering index ``idx_trades_wallet_ts`` (~1 min on the production cache;
+    no index leads with ``timestamp_unix``, so a full index scan is unavoidable)."""
+    row = con.execute("SELECT MAX(timestamp_unix) FROM trades").fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dict[str, int]:
+    """Map lowercased ``wallet_hex`` -> its most recent ``timestamp_unix`` in the cache.
+
+    ``wallet_hex`` is stored lowercase (verified 2026-06-16), so the IN-list is matched
+    against the raw column and served by the covering index ``idx_trades_wallet_ts``.
+    Wrapping ``lower(wallet_hex)`` would defeat that index and force a full-table scan of
+    ~269M rows. Chunked to stay under SQLite's bound-parameter limit.
+    """
+    out: dict[str, int] = {}
+    chunk_size = 500
+    for i in range(0, len(wallets_lower), chunk_size):
+        chunk = wallets_lower[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        q = (
+            f"SELECT wallet_hex, MAX(timestamp_unix) FROM trades "
+            f"WHERE wallet_hex IN ({placeholders}) GROUP BY wallet_hex"
+        )
+        for hexv, ts in con.execute(q, chunk):
+            if ts is not None:
+                out[hexv.lower()] = int(ts)
+    return out
+
+
+def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, now):
+    """Drop ranked rows whose wallet has no cached trade within ``active_window_hours``.
+
+    Aborts with :class:`CacheStaleError` when the cache's global newest trade is older
+    than ``max_staleness_hours`` — a stale cache would spuriously drop every wallet, so we
+    refuse to push rather than silently empty the ranking. The ``wallet_hex`` comparison is
+    case-insensitive (both sides lowercased). Returns ``(kept_rows, dropped_count)``.
+    """
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        newest = _newest_trade_unix(con)
+        if newest is None or now - newest > max_staleness_hours * 3600:
+            age = "unknown" if newest is None else f"{(now - newest) / 3600:.1f}"
+            raise CacheStaleError(
+                f"cache {db_path!r} newest trade is {age}h old "
+                f"(> {max_staleness_hours}h bound) — backfill before pushing (docs/26)"
+            )
+        wallets_lower = sorted({r["wallet"].lower() for r in rows})
+        last = _wallet_last_trade(con, wallets_lower)
+    finally:
+        con.close()
+    cutoff = now - active_window_hours * 3600
+    kept = [r for r in rows if last.get(r["wallet"].lower(), -1) >= cutoff]
+    return kept, len(rows) - len(kept)
 
 
 def _req(method: str, url: str, key: str, body=None, prefer: str | None = None):
@@ -34,7 +99,7 @@ def _req(method: str, url: str, key: str, body=None, prefer: str | None = None):
         return r.status, (json.loads(raw) if raw else None)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ranked-csv", required=True, help="pass-2 latency_shift_ranked.csv")
     ap.add_argument("--top-n", type=int, default=200)
@@ -46,7 +111,21 @@ def main() -> int:
     ap.add_argument("--universe-size", type=int, default=0)
     ap.add_argument("--git-sha", default="")
     ap.add_argument("--notes", default="")
-    a = ap.parse_args()
+    # Active-only upload filter (issue #350 WS3). Off unless --db is given.
+    ap.add_argument("--db", default=None,
+                    help="wallet_cache.db; when set, drop ranked wallets idle beyond "
+                         "--active-window-hours and abort if the cache itself is stale")
+    ap.add_argument("--active-window-hours", type=int, default=72,
+                    help="drop ranked wallets with no cached trade in the last N hours "
+                         "(docs/_GLOSSARY upload_active_window_hours; default 72)")
+    ap.add_argument("--max-cache-staleness-hours", type=int, default=24,
+                    help="abort the push if the cache's newest trade is older than N hours "
+                         "(docs/_GLOSSARY upload_max_cache_staleness_hours; default 24)")
+    return ap
+
+
+def main() -> int:
+    a = build_parser().parse_args()
 
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SECRET_KEY")
@@ -57,13 +136,35 @@ def main() -> int:
 
     # Read pass-2 ranking; keep survivors first, then by latency-shifted t-stat desc.
     rows = list(csv.DictReader(open(a.ranked_csv, newline="")))
+
+    # Active-only upload filter (issue #350 WS3): when a cache is provided, drop ranked
+    # wallets with no trade in the last --active-window-hours and abort outright if the
+    # cache itself is stale (a stale cache would otherwise filter out *everyone*). Runs
+    # before the Supabase write so a stale cache never creates an orphaned batch. Filtering
+    # before the top-N cut fills the uploaded bench with active wallets rather than padding
+    # it with idle ones.
+    if a.db:
+        try:
+            rows, dropped = filter_active_rows(
+                rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, int(time.time())
+            )
+        except CacheStaleError as e:
+            print(f"FATAL: {e}", file=sys.stderr)
+            return 1
+        except (sqlite3.Error, OSError) as e:
+            print(f"FATAL: could not read cache {a.db!r}: {e}", file=sys.stderr)
+            return 1
+        print(f"active-filter: dropped {dropped} wallet(s) idle > {a.active_window_hours}h "
+              f"per {a.db}; {len(rows)} remain")
+
     def key_fn(r):
         t = r.get("tstat_net_ls", "")
         return (r.get("survives", "").lower() == "true", float(t) if t not in ("", None) else -9.0)
     rows.sort(key=key_fn, reverse=True)
     top = rows[: a.top_n]
     if not top:
-        print("FATAL: no rows in ranked CSV", file=sys.stderr)
+        print("FATAL: no rows to push (empty CSV, or the active filter removed all)",
+              file=sys.stderr)
         return 1
 
     batch = {
