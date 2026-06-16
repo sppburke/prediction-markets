@@ -91,10 +91,11 @@ insert into supabase_sink_hwm (id, last_event_seq) values (1, 0)
   on conflict (id) do nothing;
 
 -- Service runtime telemetry: the size of pe-service's current live watchlist (the wallets
--- it actually copies = top-`supabase_fetch_limit` of latest_ranking, accumulated up to
--- `supabase_live_cap`). The count lives only in service memory, so the analytics site
--- cannot derive it from latest_ranking (it does not know the limit) — pe-service publishes
--- it here every refresh. Single row (id = 1). Anon-readable (see RLS below).
+-- it actually copies = the maintained working set of `MAINTAINED_SET_SIZE` wallets, held by
+-- a score-update-only refresh and the maintenance tick — issue #350 WS1). The count lives
+-- only in service memory, so the analytics site cannot derive it from latest_ranking (it
+-- does not know the limit) — pe-service publishes it here every refresh. Single row
+-- (id = 1). Anon-readable (see RLS below).
 create table if not exists service_runtime (
   id             integer     primary key default 1 check (id = 1),
   watchlist_size integer     not null default 0,
