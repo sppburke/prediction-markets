@@ -3,6 +3,7 @@
 //! Production code lives in `main.rs`.
 
 pub mod config;
+pub mod demotion_stat;
 pub mod entry_gate;
 pub mod health;
 pub mod live_watchlist;

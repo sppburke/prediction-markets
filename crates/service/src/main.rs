@@ -277,8 +277,35 @@ async fn main() -> Result<()> {
                 tracing::warn!(wallet = %wallet, error = %e, "failed to advance startup cursor");
             }
         }
+        // Zero-position startup wallets are absent from the position-seed map, so their
+        // poll cursor stays `None`; the poller's first round would then do a full-history
+        // fetch and write the wallet's real (possibly days-old) last-trade ts into the
+        // cursor — which the #350 maintenance tick would read as ">72h inactive" and
+        // evict on the next tick, defeating the 72h admission grace. Seed each such
+        // wallet's cursor to `now`, but only when it has no cursor row yet, so an
+        // advanced cursor carried over from a prior run is never reset.
+        let mut zero_position_seeded = 0usize;
+        for wallet in &wallets {
+            if snapshot_map.contains_key(wallet) {
+                continue; // already seeded above with its position snapshot.
+            }
+            match paper_state.cursor(wallet) {
+                Ok(Some(_)) => {} // existing cursor (prior run); leave it untouched.
+                Ok(None) => {
+                    if let Err(e) = paper_state.set_cursor(wallet, now_unix) {
+                        tracing::warn!(wallet = %wallet, error = %e, "failed to seed zero-position startup cursor");
+                    } else {
+                        zero_position_seeded += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(wallet = %wallet, error = %e, "failed to read cursor for zero-position startup wallet");
+                }
+            }
+        }
         info!(
             seeded,
+            zero_position_seeded,
             total = wallets.len(),
             "startup position seed complete"
         );
