@@ -10,8 +10,8 @@
 //! of wallets already present and never adds or evicts — the live set is a fixed maintained
 //! working set whose membership is changed only by [`Self::replace`].
 //! [`Self::replace`] is the eviction+backfill primitive (issue #350 WS1): it atomically
-//! drops a set of wallets and backfills replacements up to a cap. It is not yet wired —
-//! the maintenance tick that calls it lands in a later PR of the same workstream.
+//! drops a set of wallets and backfills replacements up to a cap. It is driven by the
+//! maintenance tick in [`crate::watchlist_maintenance`] (issue #350 WS1 PR-D).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,8 +24,8 @@ use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 ///
 /// Clones share one underlying cell. Reads ([`Self::snapshot`]) are wait-free; the
 /// single-writer mutators ([`Self::apply_refresh`] and [`Self::replace`]) each perform a
-/// load-modify-store and must not run concurrently with one another or themselves (a
-/// later PR serializes them with a writer mutex).
+/// load-modify-store and must not run concurrently with one another or themselves — the
+/// service serializes them with a shared writer mutex (see [`crate::watchlist_maintenance`]).
 #[derive(Clone)]
 pub struct LiveWatchlist {
     inner: Arc<ArcSwap<Watchlist>>,
@@ -116,7 +116,8 @@ impl LiveWatchlist {
     ///
     /// # Precondition
     /// Single-writer: must not run concurrently with itself or [`Self::apply_refresh`].
-    /// A later PR serializes the maintenance tick and the refresh loop with a writer mutex.
+    /// The service serializes the maintenance tick and the refresh loop with a shared writer
+    /// mutex (see [`crate::watchlist_maintenance`]).
     pub fn replace(
         &self,
         removed: &HashSet<WalletAddress>,
