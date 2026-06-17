@@ -32,6 +32,10 @@ create table if not exists ranking_entries (
   primary key (batch_id, rank)
 );
 create index if not exists idx_ranking_entries_wallet on ranking_entries (wallet_hex);
+-- Real last-trade clock (#357): push-time snapshot of MAX(timestamp_unix) per wallet.
+-- Nullable + idempotent so an existing project gains the column with no rebuild; the VPS
+-- seeds each admitted wallet's poll cursor (the inactivity clock) from this value.
+alter table ranking_entries add column if not exists last_trade_unix bigint;
 
 create table if not exists wallet_lifecycle_events (
   id              bigserial primary key,       -- VPS writes the demotion/promotion audit trail
@@ -44,6 +48,8 @@ create table if not exists wallet_lifecycle_events (
   from_batch_id   bigint references ranking_batches(batch_id)
 );
 create index if not exists idx_lifecycle_wallet on wallet_lifecycle_events (wallet_hex, ts);
+-- Demote audit records the wallet's real last trade at eviction time (#357); nullable + idempotent.
+alter table wallet_lifecycle_events add column if not exists last_trade_unix bigint;
 
 -- Convenience read for the VPS: the current bench = entries of the most recent batch.
 create or replace view latest_ranking as
