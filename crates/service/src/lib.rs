@@ -2,6 +2,7 @@
 //! Library target for `pe-service` — exposes internal modules for scenario tests.
 //! Production code lives in `main.rs`.
 
+pub mod clob_book;
 pub mod config;
 pub mod demotion_stat;
 pub mod entry_gate;
