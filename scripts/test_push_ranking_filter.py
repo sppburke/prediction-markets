@@ -56,7 +56,7 @@ class ActiveFilterTest(unittest.TestCase):
         kept, dropped, last = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
         self.assertEqual([r["wallet"] for r in kept], ["0xaaa"])
         self.assertEqual(dropped, 1)
-        # last_trade_map carries EVERY queried wallet's real last trade (#357), incl. dropped.
+        # both wallets have a cached trade, so both appear in the map (#357) — incl. the dropped one.
         self.assertEqual(last, {"0xaaa": NOW - 1 * HOUR, "0xbbb": NOW - 100 * HOUR})
 
     def test_case_insensitive_match(self) -> None:

@@ -66,7 +66,8 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
     refuse to push rather than silently empty the ranking. The ``wallet_hex`` comparison is
     case-insensitive (both sides lowercased). Returns ``(kept_rows, dropped_count, last_trade_map)``
     where ``last_trade_map`` is lowercased ``wallet_hex`` -> last ``timestamp_unix`` for every
-    queried wallet (reused to stamp each pushed entry with its real last trade, #357).
+    queried wallet that has a cached trade (reused to stamp each pushed entry with its real last
+    trade, #357; a wallet with no cached trade is absent -> its entry's last_trade_unix is NULL).
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
