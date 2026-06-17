@@ -213,7 +213,8 @@ pub async fn apply_evictions_and_backfill(
 /// Run the maintenance tick loop until the process exits.
 ///
 /// `cfg.interval_secs == 0` disables the tick (returns immediately). The first tick fires one
-/// interval after startup, giving bootstrap-seeded wallets their full admission grace.
+/// interval after startup, so the poller has advanced each bootstrap-seeded cursor forward from
+/// its real last trade (#357) before the first inactivity check — there is no admission grace.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_maintenance_loop(
     live: LiveWatchlist,

@@ -82,8 +82,8 @@ struct RankingRow {
     #[serde(default)]
     n_trades: Option<i64>,
     /// Wallet's real last on-chain trade time (unix seconds), stamped by the ranker (#357).
-    /// Absent column or JSON `null` → `None`. Drives the candidate freshness filter and (in a
-    /// later PR) seeds the poll cursor / inactivity clock; it never affects the row→entry map.
+    /// Absent column or JSON `null` → `None`. Drives the candidate freshness filter and seeds the
+    /// poll cursor / inactivity clock (#357 PR-3); it never affects the row→entry map.
     #[serde(default)]
     last_trade_unix: Option<i64>,
 }
@@ -144,8 +144,8 @@ fn map_row(row: &RankingRow) -> Option<WatchlistEntry> {
 ///
 /// The map is keyed by the same validated [`WalletAddress`] that enters the watchlist — a
 /// bad-hex row is skipped from BOTH — and holds only rows that carry a `last_trade_unix`
-/// (absent → omitted, never a sentinel). PR-2 returns it unused; the cursor-seeding consumer
-/// lands in #357 PR-3.
+/// (absent → omitted, never a sentinel). #357 PR-3 consumes it to seed each wallet's poll cursor
+/// (the inactivity clock) at bootstrap (`main.rs`) and backfill admission.
 fn to_watchlist(rows: &[RankingRow]) -> (Watchlist, HashMap<WalletAddress, i64>) {
     let mut entries: Vec<WatchlistEntry> = Vec::with_capacity(rows.len());
     let mut last_trade: HashMap<WalletAddress, i64> = HashMap::new();
