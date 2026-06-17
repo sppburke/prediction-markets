@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import {
+  formatAge,
+  formatDate,
   formatEdge,
   formatInt,
   formatPct,
@@ -48,6 +50,14 @@ const COLUMNS: Col[] = [
   { key: "hit_rate", label: "Hist win%", group: "hist", sort: (r) => num(r.hit_rate), cell: (r) => formatPct(r.hit_rate) },
   { key: "ls_edge", label: "Hist edge", group: "hist", sort: (r) => num(r.ls_edge), cell: (r) => formatEdge(r.ls_edge) },
   { key: "ls_tstat", label: "Hist t", group: "hist", sort: (r) => num(r.ls_tstat), cell: (r) => formatTstat(r.ls_tstat) },
+  {
+    key: "last_trade_unix",
+    label: "Last trade",
+    group: "hist",
+    sort: (r) => num(r.last_trade_unix),
+    // Relative age is the at-a-glance inactivity read (#357); the absolute UTC date sits in the title.
+    cell: (r) => <span title={formatDate(r.last_trade_unix)}>{formatAge(r.last_trade_unix)}</span>,
+  },
   { key: "live_total_fills", label: "Live fills", group: "live", sort: (r) => num(r.live_total_fills), cell: (r) => formatInt(r.live_total_fills) },
   { key: "live_settled_count", label: "Settled", group: "live", sort: (r) => num(r.live_settled_count), cell: (r) => formatInt(r.live_settled_count) },
   { key: "live_open_fills", label: "Open", group: "live", sort: (r) => num(r.live_open_fills), cell: (r) => formatInt(r.live_open_fills) },

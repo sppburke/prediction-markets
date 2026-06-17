@@ -107,3 +107,33 @@ export function shortWallet(wallet: string): string {
   if (wallet.length <= 12) return wallet;
   return `${wallet.slice(0, 6)}…${wallet.slice(-4)}`;
 }
+
+/**
+ * Epoch *seconds* → absolute UTC calendar date "YYYY-MM-DD". Deterministic
+ * (depends only on the input), so it is safe to assert directly in tests. The
+ * wallet's real last on-chain trade time (#357 `last_trade_unix`) renders here.
+ */
+export function formatDate(v: Numeric): string {
+  const n = toNum(v);
+  if (n === null) return EM_DASH;
+  const d = new Date(n * 1000);
+  if (Number.isNaN(d.getTime())) return EM_DASH;
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Epoch *seconds* → coarse relative age ("just now", "5m ago", "3h ago",
+ * "8d ago") — the at-a-glance inactivity signal for #357. `nowSec` (epoch
+ * seconds) is injectable so the output is deterministic in tests; it defaults
+ * to the wall clock for live rendering. Future timestamps (clock skew) clamp
+ * to "just now".
+ */
+export function formatAge(v: Numeric, nowSec: number = Date.now() / 1000): string {
+  const n = toNum(v);
+  if (n === null) return EM_DASH;
+  const secs = nowSec - n;
+  if (secs < 60) return "just now";
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  return `${Math.floor(secs / 86400)}d ago`;
+}

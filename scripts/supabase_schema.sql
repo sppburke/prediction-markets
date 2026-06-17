@@ -169,7 +169,11 @@ create or replace view wallet_live_stats
     case when coalesce(fs.live_settled_count, 0) > 0
          then fs.live_realized_pnl / fs.live_settled_count end        as live_edge,
     -- historical (ranker) stats from the current batch
-    r.rank, r.ls_edge, r.ls_tstat, r.fill_rate, r.n_trades, r.hit_rate, r.avg_price
+    r.rank, r.ls_edge, r.ls_tstat, r.fill_rate, r.n_trades, r.hit_rate, r.avg_price,
+    -- the wallet's real last on-chain trade time (epoch seconds), captured at the
+    -- rank push (#357); null for aged-out wallets (fills-only, not in latest_ranking)
+    -- or pre-#357 batches that predate the column.
+    r.last_trade_unix
   from fill_stats fs
   full outer join latest_ranking r on fs.wallet = lower(r.wallet_hex);
 

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   PRECISION,
+  formatAge,
+  formatDate,
   formatEdge,
   formatInt,
   formatPct,
@@ -123,5 +125,36 @@ describe("wallet abbreviation", () => {
   });
   it("leaves short strings intact", () => {
     expect(shortWallet("0xabcd")).toBe("0xabcd");
+  });
+});
+
+describe("last-trade date / age formatting (#357 PR4)", () => {
+  // Fixed UTC anchor. Date.UTC is a pure function of its arguments (no wall
+  // clock), so every assertion below is deterministic.
+  const T = Date.UTC(2026, 5, 17, 0, 0, 0) / 1000; // 2026-06-17T00:00:00Z, in seconds
+
+  it("formats epoch seconds as a UTC calendar date", () => {
+    expect(formatDate(T)).toBe("2026-06-17");
+    expect(formatDate(String(T))).toBe("2026-06-17"); // supabase may return bigint as a string
+  });
+
+  it("renders coarse relative-age buckets from an injected clock", () => {
+    expect(formatAge(T, T + 30)).toBe("just now");
+    expect(formatAge(T, T + 5 * 60)).toBe("5m ago");
+    expect(formatAge(T, T + 3 * 3600)).toBe("3h ago");
+    expect(formatAge(T, T + 8 * 86400)).toBe("8d ago");
+  });
+
+  it("clamps a future timestamp (clock skew) to just now", () => {
+    expect(formatAge(T, T - 100)).toBe("just now");
+  });
+
+  it("renders an em dash for null / undefined / empty", () => {
+    expect(formatDate(null)).toBe("—");
+    expect(formatDate(undefined)).toBe("—");
+    expect(formatDate("")).toBe("—");
+    expect(formatAge(null, T)).toBe("—");
+    expect(formatAge(undefined, T)).toBe("—");
+    expect(formatAge("", T)).toBe("—");
   });
 });
