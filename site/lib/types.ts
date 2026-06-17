@@ -21,6 +21,7 @@ export interface WalletLiveStats {
   n_trades: Numeric;
   hit_rate: Numeric; // fraction 0..1 — historical win-rate (no win_rate_bps column)
   avg_price: Numeric; // mid price 0..1
+  last_trade_unix: Numeric; // epoch s of the wallet's real last on-chain trade at the last rank push (#357); null if aged out / pre-#357 batch
 }
 
 // The single `service_runtime` row: pe-service's current live watchlist size (the wallets
