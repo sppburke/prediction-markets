@@ -199,6 +199,7 @@ async fn scenario_e2e_clean_exit() {
         empty_mid_cache(),
         dead_reseed_rx(),
         None,
+        None,
     )
     .unwrap();
 
@@ -258,6 +259,7 @@ async fn scenario_graceful_shutdown() {
         MarketEndCache::new(String::new()),
         empty_mid_cache(),
         dead_reseed_rx(),
+        None,
         None,
     )
     .unwrap();

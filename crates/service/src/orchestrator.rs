@@ -30,6 +30,7 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
+use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::SinkHandle;
 
 /// Orchestrator configuration.
@@ -81,6 +82,9 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
     reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
     // Best-effort Supabase analytics sink (issue #343). `None` when disabled.
     sink: Option<SinkHandle>,
+    // Liquidity-at-fill snapshot enqueue handle (issue #350 WS2 PR-H). `None` when capture is
+    // disabled. Buy-only; enqueue is non-blocking (drop-on-full), off the trade hot path.
+    snapshot_sink: Option<SnapshotHandle>,
 }
 
 impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
@@ -99,6 +103,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
         mid_price_cache: MidPriceCache<F>,
         reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
         sink: Option<SinkHandle>,
+        snapshot_sink: Option<SnapshotHandle>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
@@ -133,6 +138,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             min_quality,
             reseed_rx,
             sink,
+            snapshot_sink,
         })
     }
 
@@ -454,6 +460,17 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
                         event_seq: i64::try_from(seq.0).unwrap_or(i64::MAX),
                     });
                 }
+                // Liquidity-at-fill capture (issue #350 WS2 PR-H): enqueue a snapshot request
+                // for BUY fills only, off the hot path. Non-blocking (drop-on-full); `record`
+                // is moved into `FillRow` above, so read the still-borrowed `fill.intent`.
+                enqueue_if_buy(
+                    self.snapshot_sink.as_ref(),
+                    fill.intent.side,
+                    &fill.intent.idempotency_key,
+                    &fill.intent.market_id,
+                    fill.intent.outcome_id,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                );
             }
             Err(e) => error!(error = %e, "paper-state commit_fill failed"),
         }

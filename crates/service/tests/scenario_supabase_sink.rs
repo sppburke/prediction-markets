@@ -30,7 +30,9 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
-use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb, SettledMarketRow};
+use pe_paper_state::{
+    FillMarketSnapshot, FillRecord, FillRow, LeaderPositionRow, PaperStateDb, SettledMarketRow,
+};
 use pe_service::supabase_sink::{
     SinkError, SinkHandle, SinkWriter, SupabaseFillRow, reconcile_fills, reconcile_settled,
     supabase_fill_from,
@@ -63,6 +65,9 @@ impl SinkWriter for FakeWriter {
     }
     async fn upsert_settled(&self, row: &SettledMarketRow) -> Result<(), SinkError> {
         self.settled.lock().unwrap().push(row.market_id.0.0.clone());
+        Ok(())
+    }
+    async fn upsert_snapshot(&self, _row: &FillMarketSnapshot) -> Result<(), SinkError> {
         Ok(())
     }
     async fn read_hwm(&self) -> Result<i64, SinkError> {

@@ -16,6 +16,7 @@ pub mod paper_api;
 pub mod paper_recovery;
 pub mod position_seeder;
 pub mod seed;
+pub mod snapshot_worker;
 pub mod supabase_reader;
 pub mod supabase_refresh;
 pub mod supabase_sink;
