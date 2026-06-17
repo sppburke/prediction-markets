@@ -284,6 +284,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_base_url` | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL for order submission and status polling |
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
+| `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for the public CLOB `/book` liquidity-capture fetch (issue #350 WS2). Deliberately shorter than `polymarket_request_timeout_secs` (10) — the fetch runs off the fill hot path, so a slow book degrades to a partial snapshot rather than blocking a trade. Reuses the existing `polymarket_clob_min_interval_ms` (200) gate. |
 | `position_reseed_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic leader-ledger reseeds from the positions API. 0 disables periodic reseeds (startup seed still runs). |
 | `position_page_limit` | 500 | `ServiceConfig` field. Maximum positions to fetch per page when seeding the leader ledger. |
 | `position_size_threshold` | 1 | `ServiceConfig` field. Minimum position size (contracts) to include; positions below this are treated as dust. |

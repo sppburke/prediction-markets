@@ -29,10 +29,11 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 /// (`polymarket_clob_min_interval_ms` = 200; "Venue rate limits" table). Mirrors
 /// `ReqwestCLOBClient::MIN_INTERVAL_MS` in `crates/venue-polymarket`.
 const CLOB_MIN_INTERVAL_MS: u64 = 200;
-/// Per-request timeout for the `/book` call. Shorter than the order-submission
-/// client's 10s because the fetch runs off the fill hot path (PR-H's snapshot
-/// worker), so a slow book is dropped to a partial snapshot rather than blocking
-/// a trade.
+/// Per-request timeout for the `/book` call — `clob_book_request_timeout_secs`
+/// in `docs/_GLOSSARY.md`. Shorter than the order-submission client's 10s
+/// (`polymarket_request_timeout_secs`) because the fetch runs off the fill hot
+/// path (PR-H's snapshot worker), so a slow book is dropped to a partial
+/// snapshot rather than blocking a trade.
 const CLOB_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// Errors from a `/book` fetch or parse.
@@ -161,9 +162,11 @@ impl ReqwestClobBookFetcher {
         self
     }
 
-    /// Block until `min_interval` since the last request has elapsed, then
-    /// reserve the next slot. Serializes concurrent callers via the interior
-    /// mutex (poison-safe). Mirrors `ReqwestCLOBClient::rate_limit_gate`
+    /// Reserve the next request slot at `min_interval` past the later of the
+    /// last reserved slot and now, then sleep until it. Successive `/book` calls
+    /// are spaced ≥ `min_interval` apart and concurrent callers are serialized
+    /// via the interior mutex (poison-safe); the very first call (no prior slot)
+    /// fires immediately. Mirrors `ReqwestCLOBClient::rate_limit_gate`
     /// (`crates/venue-polymarket/src/clob_client.rs`).
     async fn rate_limit_gate(&self) {
         let sleep_for = {
