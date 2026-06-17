@@ -88,4 +88,27 @@ CREATE TABLE IF NOT EXISTS settled_markets (
     credit_applied  TEXT    NOT NULL,
     settled_at_unix INTEGER NOT NULL
 );
+
+-- Fill-time market-liquidity snapshot (WS2 of issue #350): one best-effort row per
+-- BUY fill, written off the hot path by the snapshot worker after the fill commits.
+-- `liquidity`/`volume` are the Gamma scalars (text decimals, this crate's convention);
+-- `absorbable_usd_100bps` and the raw `ask_levels_json` come from the CLOB `/book`
+-- call and are NULL on a `/book` failure (a partial, Gamma-only row).
+--
+-- `idempotency_key` mirrors `fills(idempotency_key)` but is deliberately NOT declared
+-- as a SQL foreign key. Although schema.rs sets no `PRAGMA foreign_keys`, the bundled
+-- SQLite (libsqlite3-sys, `SQLITE_DEFAULT_FOREIGN_KEYS=1`) enforces FK constraints by
+-- default — verified at runtime: a `REFERENCES` clause raises SQLITE_CONSTRAINT_FOREIGNKEY
+-- for an orphan key, it is NOT inert. The snapshot write is best-effort and must never
+-- fail on referential grounds, so the relationship is documentary (column unconstrained);
+-- `fills` is append-only so there is nothing to cascade regardless. Additive table —
+-- materialises on the live DB via `IF NOT EXISTS` with SCHEMA_VERSION held at 1.
+CREATE TABLE IF NOT EXISTS fill_market_snapshots (
+    idempotency_key       TEXT    PRIMARY KEY NOT NULL,
+    liquidity             TEXT,
+    volume                TEXT,
+    absorbable_usd_100bps TEXT,
+    ask_levels_json       TEXT,
+    captured_at_unix      INTEGER NOT NULL
+);
 ";
