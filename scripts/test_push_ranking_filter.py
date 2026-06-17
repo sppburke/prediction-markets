@@ -53,22 +53,25 @@ class ActiveFilterTest(unittest.TestCase):
             ("0xbbb", NOW - 100 * HOUR),   # idle 100h > 72h -> drop
         ])
         rows = [{"wallet": "0xaaa"}, {"wallet": "0xbbb"}]
-        kept, dropped = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+        kept, dropped, last = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
         self.assertEqual([r["wallet"] for r in kept], ["0xaaa"])
         self.assertEqual(dropped, 1)
+        # both wallets have a cached trade, so both appear in the map (#357) — incl. the dropped one.
+        self.assertEqual(last, {"0xaaa": NOW - 1 * HOUR, "0xbbb": NOW - 100 * HOUR})
 
     def test_case_insensitive_match(self) -> None:
         # DB stores lowercase; the ranked CSV may carry mixed/upper case.
         _make_cache(self.db, [("0xabc", NOW - 1 * HOUR)])
         rows = [{"wallet": "0xABC"}]
-        kept, dropped = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+        kept, dropped, last = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 0)
+        self.assertEqual(last, {"0xabc": NOW - 1 * HOUR})  # map keyed by lowercase wallet
 
     def test_wallet_absent_from_cache_is_dropped(self) -> None:
         _make_cache(self.db, [("0xaaa", NOW - 1 * HOUR)])
         rows = [{"wallet": "0xaaa"}, {"wallet": "0xnotincache"}]
-        kept, dropped = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+        kept, dropped, _ = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
         self.assertEqual([r["wallet"] for r in kept], ["0xaaa"])
         self.assertEqual(dropped, 1)
 
@@ -80,7 +83,7 @@ class ActiveFilterTest(unittest.TestCase):
             ("0xaaa", NOW - 72 * HOUR),
         ])
         rows = [{"wallet": "0xaaa"}]
-        kept, dropped = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+        kept, dropped, _ = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped, 0)
 
@@ -107,6 +110,24 @@ class DefaultsDriftTest(unittest.TestCase):
         self.assertEqual(a.active_window_hours, 72)       # upload_active_window_hours
         self.assertEqual(a.max_cache_staleness_hours, 24)  # upload_max_cache_staleness_hours
         self.assertIsNone(a.db)                            # filter off unless --db given
+
+
+class BuildEntriesTest(unittest.TestCase):
+    """`build_entries` stamps each pushed row with the wallet's real last trade (#357)."""
+
+    def test_entries_carry_last_trade_unix(self) -> None:
+        top = [
+            {"wallet": "0xAAA", "mean_net_ls": "0.1", "tstat_net_ls": "2.0",
+             "fill_rate": "0.5", "n_filled": "10", "hit_rate": "0.6", "avg_price": "0.4"},
+            {"wallet": "0xbbb"},  # missing numerics + absent from the map
+        ]
+        entries = pr.build_entries(top, batch_id=42, last_trade_map={"0xaaa": NOW - 5 * HOUR})
+        self.assertEqual(entries[0]["last_trade_unix"], NOW - 5 * HOUR)  # keyed by lowercase
+        self.assertIsNone(entries[1]["last_trade_unix"])                 # absent -> NULL
+        self.assertEqual(entries[0]["rank"], 1)
+        self.assertEqual(entries[0]["wallet_hex"], "0xAAA")             # original case preserved
+        self.assertEqual(entries[0]["batch_id"], 42)
+        self.assertIsNone(entries[1]["ls_edge"])                        # blank numeric -> NULL
 
 
 if __name__ == "__main__":

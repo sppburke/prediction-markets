@@ -64,7 +64,10 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
     Aborts with :class:`CacheStaleError` when the cache's global newest trade is older
     than ``max_staleness_hours`` — a stale cache would spuriously drop every wallet, so we
     refuse to push rather than silently empty the ranking. The ``wallet_hex`` comparison is
-    case-insensitive (both sides lowercased). Returns ``(kept_rows, dropped_count)``.
+    case-insensitive (both sides lowercased). Returns ``(kept_rows, dropped_count, last_trade_map)``
+    where ``last_trade_map`` is lowercased ``wallet_hex`` -> last ``timestamp_unix`` for every
+    queried wallet that has a cached trade (reused to stamp each pushed entry with its real last
+    trade, #357; a wallet with no cached trade is absent -> its entry's last_trade_unix is NULL).
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -81,7 +84,7 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
         con.close()
     cutoff = now - active_window_hours * 3600
     kept = [r for r in rows if last.get(r["wallet"].lower(), -1) >= cutoff]
-    return kept, len(rows) - len(kept)
+    return kept, len(rows) - len(kept), last
 
 
 def _req(method: str, url: str, key: str, body=None, prefer: str | None = None):
@@ -97,6 +100,32 @@ def _req(method: str, url: str, key: str, body=None, prefer: str | None = None):
     with urllib.request.urlopen(req, timeout=30) as r:
         raw = r.read()
         return r.status, (json.loads(raw) if raw else None)
+
+
+def _num(r, k):
+    """Parse a CSV cell to float, mapping blank/missing to ``None`` (SQL NULL)."""
+    v = r.get(k, "")
+    return float(v) if v not in ("", None) else None
+
+
+def build_entries(top, batch_id, last_trade_map):
+    """Build the `ranking_entries` rows for one batch.
+
+    Each entry carries the wallet's real last-trade timestamp (#357) from ``last_trade_map``
+    (lowercased ``wallet_hex`` -> ``timestamp_unix``); ``None`` when no cache was supplied or
+    the wallet had no cached trade. The VPS seeds each admitted wallet's poll cursor — the
+    inactivity clock — from this value, so it must be keyed by the lowercased wallet."""
+    entries = []
+    for i, r in enumerate(top, start=1):
+        entries.append({
+            "batch_id": batch_id, "rank": i, "wallet_hex": r["wallet"],
+            "ls_edge": _num(r, "mean_net_ls"), "ls_tstat": _num(r, "tstat_net_ls"),
+            "fill_rate": _num(r, "fill_rate"),
+            "n_trades": int(float(r["n_filled"])) if r.get("n_filled") else None,
+            "hit_rate": _num(r, "hit_rate"), "avg_price": _num(r, "avg_price"),
+            "last_trade_unix": last_trade_map.get(r["wallet"].lower()),
+        })
+    return entries
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     a = build_parser().parse_args()
+    process_now = int(time.time())  # single time anchor: active filter + last-trade stamps
 
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SECRET_KEY")
@@ -144,10 +174,11 @@ def main() -> int:
     # before the Supabase write so a stale cache never creates an orphaned batch. Filtering
     # before the top-N cut fills the uploaded bench with active wallets rather than padding
     # it with idle ones.
+    last_trade_map: dict[str, int] = {}
     if a.db:
         try:
-            rows, dropped = filter_active_rows(
-                rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, int(time.time())
+            rows, dropped, last_trade_map = filter_active_rows(
+                rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, process_now
             )
         except CacheStaleError as e:
             print(f"FATAL: {e}", file=sys.stderr)
@@ -186,19 +217,7 @@ def main() -> int:
     batch_id = rep[0]["batch_id"]
     print(f"created batch_id={batch_id} ({st})")
 
-    def num(r, k):
-        v = r.get(k, "")
-        return float(v) if v not in ("", None) else None
-
-    entries = []
-    for i, r in enumerate(top, start=1):
-        entries.append({
-            "batch_id": batch_id, "rank": i, "wallet_hex": r["wallet"],
-            "ls_edge": num(r, "mean_net_ls"), "ls_tstat": num(r, "tstat_net_ls"),
-            "fill_rate": num(r, "fill_rate"),
-            "n_trades": int(float(r["n_filled"])) if r.get("n_filled") else None,
-            "hit_rate": num(r, "hit_rate"), "avg_price": num(r, "avg_price"),
-        })
+    entries = build_entries(top, batch_id, last_trade_map)
     # PostgREST accepts a JSON array for bulk insert; chunk to stay under limits.
     CHUNK = 500
     try:
