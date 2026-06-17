@@ -5,17 +5,19 @@
 //! tempfile-backed [`PaperStateDb`], no live network.
 //!
 //! Scenarios:
-//!   backfilled-stale-history-wallet-immune-72h — a backfilled wallet whose real on-chain last
-//!       trade is ancient is seeded to `now` at admission and is immune to inactivity eviction
-//!       for a full 72h from admission.
+//!   backfilled-wallet-seeded-from-real-last-trade — a backfilled candidate is seeded from its
+//!       real `last_trade_unix` (#357), NOT `now`; a freshly-traded one (idle < 72h) is kept.
+//!   stale-seeded-wallet-no-admission-grace    — a wallet seeded with a ≥72h-old real last trade
+//!       is eviction-eligible immediately (#357 removes the old admission grace).
 //!   proven-winner-spared-under-72h            — a proven winner idle >72h (<7d) is spared.
 //!   proven-winner-evicted-past-7d-cap         — a proven winner idle ≥7d is evicted (hard cap).
 //!   negative-edge-evicted-at-72h              — a not-proven, not-demotable wallet idle ≥72h is
-//!       evicted for inactivity.
+//!       evicted for inactivity, and the eviction carries its real last-trade time for the audit.
 //!   realized-pnl≥0-never-demoted              — realized P&L ≥ 0 is never demoted, even with a
 //!       confidently-negative upper CB.
 //!   writer-mutex-safety                       — concurrent refresh + replace serialized by the
-//!       shared writer mutex never lose an update (evicted stay out, backfill stays in).
+//!       shared writer mutex never lose an update (evicted stay out, backfill seeded from real
+//!       last trade stays in).
 //!
 //! Run with: cargo nextest run -p pe-service --features scenario
 
@@ -172,7 +174,13 @@ fn negative_edge_evicted_at_72h() {
     assert_eq!(
         ev[0].reason,
         KnockoutReason::Inactivity,
-        "PASS: evicted via the inactivity trigger, not demotion"
+        "evicted via the inactivity trigger, not demotion"
+    );
+    // The eviction records the wallet's real last-trade time (its cursor) for the audit (#357).
+    assert_eq!(
+        ev[0].last_trade_unix,
+        Some(NOW - H72),
+        "PASS: the demote audit carries the real last-trade time, not `now`"
     );
     println!("PASS: negative-edge-evicted-at-72h");
 }
@@ -199,64 +207,109 @@ fn realized_pnl_nonneg_never_demoted() {
     println!("PASS: realized-pnl≥0-never-demoted");
 }
 
-// ── backfilled-stale-history-wallet-immune-72h ──────────────────────────────────
+// ── backfilled-wallet-seeded-from-real-last-trade ───────────────────────────────
 #[tokio::test]
-async fn backfilled_stale_history_wallet_immune_72h() {
+async fn backfilled_wallet_seeded_from_real_last_trade() {
     let (_dir, db) = temp_db();
     let lock = Mutex::new(());
 
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
-    // A backfill candidate whose real on-chain last trade is ancient — but no cursor exists yet.
-    let neww = wallet(2);
+    // A backfill candidate that passed the `gte.{now-72h}` freshness filter: its real last trade
+    // is recent (idle ~1000s). The maintenance tick seeds its cursor from that real last-trade
+    // time (carried in the candidate side-map), NOT from `now` — there is no admission clock (#357).
+    let fresh = wallet(2);
+    let fresh_last_trade = NOW - 1_000;
     assert_eq!(
-        db.cursor(&neww).unwrap(),
+        db.cursor(&fresh).unwrap(),
         None,
         "no cursor before admission (a brand-new wallet)"
     );
 
-    let candidates = vec![entry(neww, 150)];
+    let candidates = vec![entry(fresh, 150)];
+    let mut candidate_last_trade = HashMap::new();
+    candidate_last_trade.insert(fresh, fresh_last_trade);
     let size = apply_evictions_and_backfill(
         &live,
         &db,
         &lock,
         &HashSet::new(),
         &candidates,
+        &candidate_last_trade,
         cfg().cap,
         NOW,
     )
     .await;
     assert_eq!(size, 2, "backfilled into the live set");
 
-    // Admission seeded the cursor to `now` (the admission clock), NOT the stale on-chain history.
+    // Cursor seeded from the REAL last trade, not `now` (#357 reverses the admission clock).
     assert_eq!(
-        db.cursor(&neww).unwrap(),
-        Some(NOW),
-        "cursor seeded to `now` at admission, inside the writer-locked section"
+        db.cursor(&fresh).unwrap(),
+        Some(fresh_last_trade),
+        "cursor seeded from real last_trade_unix at admission, inside the writer-locked section"
     );
 
-    // Build the next tick's cursor map from durable state.
+    // idle = now − real_last_trade = 1000s < 72h → kept (it just traded).
     let snap = live.snapshot();
     let mut cur = HashMap::new();
     for w in snap.entries.iter().map(|e| e.wallet) {
         cur.insert(w, db.cursor(&w).unwrap());
     }
-
-    // Just under 72h from admission → immune.
-    let under = decide_evictions(&snap, &HashMap::new(), &cur, &cfg(), NOW + H72 - 1);
+    let ev = decide_evictions(&snap, &HashMap::new(), &cur, &cfg(), NOW);
     assert!(
-        !under.iter().any(|e| e.wallet == neww),
-        "immune to inactivity eviction for a full 72h from admission"
+        !ev.iter().any(|e| e.wallet == fresh),
+        "PASS: a freshly-traded backfill (idle < 72h) is kept"
+    );
+    println!("PASS: backfilled-wallet-seeded-from-real-last-trade");
+}
+
+// ── stale-seeded-wallet-no-admission-grace ──────────────────────────────────────
+#[tokio::test]
+async fn stale_seeded_wallet_no_admission_grace() {
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    let existing = wallet(1);
+    let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
+
+    // A wallet admitted with a real last trade already 72h old (e.g. a stale bootstrap admission
+    // that slipped the candidate freshness filter). #357 seeds the cursor from that real time, so
+    // there is NO admission grace: it is eviction-eligible on the very next tick.
+    let stale = wallet(2);
+    let stale_last_trade = NOW - H72;
+    let candidates = vec![entry(stale, 150)];
+    let mut candidate_last_trade = HashMap::new();
+    candidate_last_trade.insert(stale, stale_last_trade);
+    apply_evictions_and_backfill(
+        &live,
+        &db,
+        &lock,
+        &HashSet::new(),
+        &candidates,
+        &candidate_last_trade,
+        cfg().cap,
+        NOW,
+    )
+    .await;
+    assert_eq!(
+        db.cursor(&stale).unwrap(),
+        Some(stale_last_trade),
+        "cursor seeded from the stale real last trade, not `now`"
     );
 
-    // At 72h from admission with no observed trade → now evicted.
-    let at = decide_evictions(&snap, &HashMap::new(), &cur, &cfg(), NOW + H72);
+    // At admission time `now`, idle == 72h with no stats → evicted immediately (no grace window).
+    let snap = live.snapshot();
+    let mut cur = HashMap::new();
+    for w in snap.entries.iter().map(|e| e.wallet) {
+        cur.insert(w, db.cursor(&w).unwrap());
+    }
+    let ev = decide_evictions(&snap, &HashMap::new(), &cur, &cfg(), NOW);
     assert!(
-        at.iter().any(|e| e.wallet == neww),
-        "PASS: evicted only once 72h elapses from admission (not from stale history)"
+        ev.iter().any(|e| e.wallet == stale),
+        "PASS: a wallet with a ≥72h-old real last trade is evicted on the first tick (no admission grace)"
     );
-    println!("PASS: backfilled-stale-history-wallet-immune-72h");
+    println!("PASS: stale-seeded-wallet-no-admission-grace");
 }
 
 // ── writer-mutex-safety ─────────────────────────────────────────────────────────
@@ -295,7 +348,22 @@ async fn writer_mutex_serializes_refresh_and_replace() {
         let candidates: Vec<WatchlistEntry> = (26..=30u8)
             .map(|n| entry(wallet(n), 50 + i32::from(n)))
             .collect();
-        apply_evictions_and_backfill(&live_m, &db_m, &lock_m, &removed, &candidates, cap, NOW).await
+        // Each backfill candidate carries its real last-trade time (#357); the admission seed
+        // must use that value, not `now`. Distinct per wallet so the assertion below is exact.
+        let candidate_last_trade: HashMap<WalletAddress, i64> = (26..=30u8)
+            .map(|n| (wallet(n), NOW - 100 - i64::from(n)))
+            .collect();
+        apply_evictions_and_backfill(
+            &live_m,
+            &db_m,
+            &lock_m,
+            &removed,
+            &candidates,
+            &candidate_last_trade,
+            cap,
+            NOW,
+        )
+        .await
     });
 
     let (_r, _m) = (refresh.await.unwrap(), maint.await.unwrap());
@@ -319,8 +387,8 @@ async fn writer_mutex_serializes_refresh_and_replace() {
         );
         assert_eq!(
             db.cursor(&wallet(n)).unwrap(),
-            Some(NOW),
-            "backfilled wallet {n} cursor seeded at admission"
+            Some(NOW - 100 - i64::from(n)),
+            "backfilled wallet {n} cursor seeded from its real last trade (#357), not `now`"
         );
     }
     println!("PASS: writer-mutex-safety");

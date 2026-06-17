@@ -333,11 +333,16 @@ pub async fn fetch_latest_batch_id(
 /// Pure (no network) so the payload shape is unit-testable. `live_pnl` is emitted as a decimal
 /// *string* — Postgres coerces text → `numeric`, so no `f64` ever touches the money column — and
 /// `from_batch_id` is always `null` (the demotion is driven by live P&L, not a ranking batch).
+///
+/// `last_trade_unix` (#357) is the wallet's real last-trade time (its poll cursor at eviction =
+/// the inactivity clock), recorded for the audit row; `None` (a never-polled wallet evicted on
+/// another trigger) serializes as JSON `null`, never a sentinel.
 fn lifecycle_demote_body(
     wallet_hex: &str,
     reason: &str,
     live_pnl: Option<Decimal>,
     trades_observed: i64,
+    last_trade_unix: Option<i64>,
 ) -> serde_json::Value {
     serde_json::json!([{
         "wallet_hex": wallet_hex,
@@ -346,6 +351,7 @@ fn lifecycle_demote_body(
         "live_pnl": live_pnl.map(|d| d.to_string()),
         "trades_observed": trades_observed,
         "from_batch_id": serde_json::Value::Null,
+        "last_trade_unix": last_trade_unix,
     }])
 }
 
@@ -366,6 +372,7 @@ pub async fn write_lifecycle_event(
     reason: &str,
     live_pnl: Option<Decimal>,
     trades_observed: i64,
+    last_trade_unix: Option<i64>,
 ) -> Result<(), SupabaseError> {
     let url = format!(
         "{}/rest/v1/wallet_lifecycle_events",
@@ -381,6 +388,7 @@ pub async fn write_lifecycle_event(
             reason,
             live_pnl,
             trades_observed,
+            last_trade_unix,
         ))
         .send()
         .await
@@ -556,7 +564,13 @@ mod tests {
 
     #[test]
     fn lifecycle_body_is_single_row_demote_with_null_batch() {
-        let body = lifecycle_demote_body(HEX_A, "inactive>72h", Some(dec!(-12.5)), 14);
+        let body = lifecycle_demote_body(
+            HEX_A,
+            "inactive>72h",
+            Some(dec!(-12.5)),
+            14,
+            Some(1_700_000_000),
+        );
         let arr = body.as_array().expect("body is a JSON array");
         assert_eq!(arr.len(), 1, "single-row insert");
         let entry = &arr[0];
@@ -570,14 +584,21 @@ mod tests {
             entry["from_batch_id"].is_null(),
             "from_batch_id is always null"
         );
+        // The real last-trade time (the inactivity clock) is recorded for the audit (#357).
+        assert_eq!(entry["last_trade_unix"], json!(1_700_000_000));
     }
 
     #[test]
-    fn lifecycle_body_emits_null_pnl_when_absent() {
-        let body = lifecycle_demote_body(HEX_A, "inactive>72h", None, 0);
+    fn lifecycle_body_emits_null_pnl_and_last_trade_when_absent() {
+        let body = lifecycle_demote_body(HEX_A, "inactive>72h", None, 0, None);
+        let entry = &body.as_array().unwrap()[0];
         assert!(
-            body.as_array().unwrap()[0]["live_pnl"].is_null(),
+            entry["live_pnl"].is_null(),
             "absent realized P&L serializes as null, not 0"
+        );
+        assert!(
+            entry["last_trade_unix"].is_null(),
+            "absent last-trade time serializes as null, not a sentinel (#357)"
         );
     }
 }
