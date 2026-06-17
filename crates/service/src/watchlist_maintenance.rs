@@ -8,11 +8,14 @@
 //!   2. **Underperformance** — [`WalletEdgeStats::should_demote`]: upper-CB edge < 0 AND
 //!      realized P&L < 0 AND ≥ `demotion_min_trades` settled fills.
 //!
-//! The idle clock is the *admission clock*: the poll cursor is seeded to `now` at admission —
-//! here, for each backfilled wallet, inside the writer-locked critical section — and advanced only
-//! forward by the [`crate::trade_poller`], so `idle = now − cursor = now − max(admission,
-//! last_observed_trade)`. A `cursor == None` wallet (not yet polled) is treated as idle 0: it
-//! self-heals to "now" rather than being read as inactive-forever.
+//! The idle clock is the wallet's *real last-trade time* (#357): the poll cursor is seeded from
+//! `ranking_entries.last_trade_unix` at admission — here, for each backfilled wallet, inside the
+//! writer-locked critical section — and advanced forward by the [`crate::trade_poller`], so
+//! `idle = now − cursor = now − real_last_trade`. There is no admission grace: a wallet whose real
+//! last trade is already > `inactivity_threshold_secs` ago is eviction-eligible on the next tick
+//! (candidates are pre-filtered to < 72h at fetch, so this bites only stale bootstrap admissions).
+//! A `cursor == None` wallet (not yet polled and no seed value) is treated as idle 0: it self-heals
+//! to "now" rather than being read as inactive-forever, until the poller writes its real last trade.
 //!
 //! Freed slots are atomically backfilled via [`LiveWatchlist::replace`] from the top of
 //! `latest_ranking`, excluding the live ∪ evicted sets. The refresh loop and this tick are
@@ -91,6 +94,9 @@ pub struct Eviction {
     pub live_pnl: Option<Decimal>,
     /// Settled-fill count observed for the wallet (`0` when no stats exist).
     pub trades_observed: usize,
+    /// The wallet's real last-trade time (its poll cursor = the inactivity clock) at eviction
+    /// (#357); `None` for a never-polled wallet evicted on a non-inactivity trigger.
+    pub last_trade_unix: Option<i64>,
 }
 
 /// Decide whether a single live wallet is knocked out this tick. Pure.
@@ -99,8 +105,9 @@ pub struct Eviction {
 /// signal and its realized-P&L AND-gate is the safety net for the (unvalidated) CB constants.
 ///
 /// # Precondition
-/// `last_ts` is the wallet's poll cursor (the admission clock). `None` means the wallet has not
-/// yet been polled and is treated as just-admitted (idle 0) — never inactive-evicted this tick.
+/// `last_ts` is the wallet's poll cursor (its real last-trade time, #357). `None` means the wallet
+/// has not yet been polled and is treated as just-admitted (idle 0) — never inactive-evicted this
+/// tick.
 #[must_use]
 pub fn knockout_decision(
     last_ts: Option<i64>,
@@ -155,6 +162,8 @@ pub fn decide_evictions(
                 reason,
                 live_pnl: s.map(|st| st.realized_pnl),
                 trades_observed: s.map_or(0, |st| st.settled_count),
+                // The poll cursor IS the real last-trade time (#357) — record it for the audit.
+                last_trade_unix: last_ts,
             })
         })
         .collect()
@@ -164,16 +173,20 @@ pub fn decide_evictions(
 ///
 /// Inside the single writer-locked critical section: snapshot the live set, [`LiveWatchlist::replace`]
 /// (evict `removed`, backfill `candidates`, cap to `cap`), then seed the poll cursor of each
-/// *newly admitted* wallet to `now_unix` so its admission clock starts at admission — before the
-/// poller's next round can write the wallet's stale on-chain last-trade ts. The poller snapshots
-/// the live set once per round, so a wallet admitted here is invisible to the in-flight round and
-/// this seed always lands first. Returns the new live-set size.
+/// *newly admitted* wallet from its real last-trade time in `candidate_last_trade` (#357), so its
+/// inactivity clock starts at the real last trade — before the poller's next round advances it
+/// forward. The poller snapshots the live set once per round, so a wallet admitted here is invisible
+/// to the in-flight round and this seed always lands first. A candidate absent from
+/// `candidate_last_trade` (should not happen: the freshness filter requires a non-NULL
+/// `last_trade_unix`) falls back to `now_unix`. Returns the new live-set size.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_evictions_and_backfill(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
     writer_lock: &Mutex<()>,
     removed: &HashSet<WalletAddress>,
     candidates: &[WatchlistEntry],
+    candidate_last_trade: &HashMap<WalletAddress, i64>,
     cap: usize,
     now_unix: i64,
 ) -> usize {
@@ -182,8 +195,14 @@ pub async fn apply_evictions_and_backfill(
     let total = live.replace(removed, candidates, cap);
     for entry in &live.snapshot().entries {
         if !before.contains(&entry.wallet) {
-            // Newly admitted via backfill: seed the admission clock to `now`.
-            if let Err(e) = paper_state.set_cursor(&entry.wallet, now_unix) {
+            // Newly admitted via backfill: seed the inactivity clock from the wallet's real
+            // last-trade time (#357), not `now`. `now_unix` is only a defensive fallback —
+            // a freshness-filtered candidate always carries a `last_trade_unix`.
+            let seed = candidate_last_trade
+                .get(&entry.wallet)
+                .copied()
+                .unwrap_or(now_unix);
+            if let Err(e) = paper_state.set_cursor(&entry.wallet, seed) {
                 warn!(wallet = %entry.wallet, error = %e, "failed to seed backfill cursor");
             }
         }
@@ -194,7 +213,8 @@ pub async fn apply_evictions_and_backfill(
 /// Run the maintenance tick loop until the process exits.
 ///
 /// `cfg.interval_secs == 0` disables the tick (returns immediately). The first tick fires one
-/// interval after startup, giving bootstrap-seeded wallets their full admission grace.
+/// interval after startup, so the poller has advanced each bootstrap-seeded cursor forward from
+/// its real last trade (#357) before the first inactivity check — there is no admission grace.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_maintenance_loop(
     live: LiveWatchlist,
@@ -310,7 +330,7 @@ async fn maintenance_tick(
     // 6. Fetch bench candidates for freed slots, excluding (live ∪ evicted), then atomic replace.
     let survivors = live_wallets.len().saturating_sub(evictions.len());
     let freed = cfg.cap.saturating_sub(survivors);
-    let candidates = if freed > 0 {
+    let (candidates, candidate_last_trade) = if freed > 0 {
         let exclude: Vec<WalletAddress> = live_wallets
             .iter()
             .copied()
@@ -327,24 +347,24 @@ async fn maintenance_tick(
         )
         .await
         {
-            // The candidate last-trade side-map (#357) is unused until PR-3 seeds each admitted
-            // wallet's cursor from it; destructure now for the tuple return.
-            Ok((w, _candidate_last_trade)) => {
+            // The candidate last-trade side-map (#357) seeds each admitted wallet's poll cursor
+            // (its inactivity clock) from the wallet's real last trade in the apply step.
+            Ok((w, candidate_last_trade)) => {
                 if w.entries.is_empty() {
                     warn!(
                         "maintenance: freshness-filtered candidate fetch returned 0; backfill \
                          paused (bench may predate the last_trade_unix populate push)"
                     );
                 }
-                w.entries
+                (w.entries, candidate_last_trade)
             }
             Err(e) => {
                 warn!(error = %e, "maintenance: candidate fetch failed; evicting without backfill");
-                Vec::new()
+                (Vec::new(), HashMap::new())
             }
         }
     } else {
-        Vec::new()
+        (Vec::new(), HashMap::new())
     };
 
     let removed: HashSet<WalletAddress> = evicted.iter().copied().collect();
@@ -354,6 +374,7 @@ async fn maintenance_tick(
         writer_lock,
         &removed,
         &candidates,
+        &candidate_last_trade,
         cfg.cap,
         now_unix,
     )
@@ -370,6 +391,7 @@ async fn maintenance_tick(
             ev.reason.reason_text(),
             ev.live_pnl,
             i64::try_from(ev.trades_observed).unwrap_or(i64::MAX),
+            ev.last_trade_unix,
         )
         .await
         {

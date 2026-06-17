@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr as _;
@@ -96,8 +97,19 @@ async fn main() -> Result<()> {
     // Bootstrap the initial wallet set. The Supabase live ranking handoff (#339) is primary
     // when `supabase_url` is configured; otherwise fall back to the live leaderboard merged
     // with the on-disk bootstrap seed. An empty/failed Supabase fetch also falls back.
-    let initial_watchlist = if cfg.supabase_url.is_empty() {
-        bootstrap_from_leaderboard_and_seed(&cfg).await?
+    //
+    // The Supabase path also returns the last-trade side-map (#357) — each wallet's real last
+    // on-chain trade time — used below to seed the poll cursor (the inactivity clock). The
+    // leaderboard fallback has no such data, so its map is empty and those wallets keep their
+    // persisted cursor (the poller re-warms it organically).
+    let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) = if cfg
+        .supabase_url
+        .is_empty()
+    {
+        (
+            bootstrap_from_leaderboard_and_seed(&cfg).await?,
+            HashMap::new(),
+        )
     } else {
         match supabase_reader::fetch(
             &reqwest::Client::new(),
@@ -108,25 +120,29 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            // The last-trade side-map (#357) is unused here until PR-3 wires the bootstrap
-            // cursor-seed; destructure it now so the tuple return type lines up.
-            Ok((wl, _last_trade)) if !wl.entries.is_empty() => {
+            Ok((wl, last_trade)) if !wl.entries.is_empty() => {
                 info!(
                     active = wl.active_count,
                     total = wl.entries.len(),
                     "watchlist bootstrapped from supabase"
                 );
-                wl
+                (wl, last_trade)
             }
             Ok(_) => {
                 tracing::warn!(
                     "supabase returned an empty ranking; falling back to leaderboard + seed"
                 );
-                bootstrap_from_leaderboard_and_seed(&cfg).await?
+                (
+                    bootstrap_from_leaderboard_and_seed(&cfg).await?,
+                    HashMap::new(),
+                )
             }
             Err(e) => {
                 tracing::warn!(error = %e, "supabase bootstrap failed; falling back to leaderboard + seed");
-                bootstrap_from_leaderboard_and_seed(&cfg).await?
+                (
+                    bootstrap_from_leaderboard_and_seed(&cfg).await?,
+                    HashMap::new(),
+                )
             }
         }
     };
@@ -263,11 +279,12 @@ async fn main() -> Result<()> {
     // Bounded channel per _GLOSSARY.md defaults.
     let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
-    // Startup seed: fetch current positions from the API for each watchlisted wallet,
-    // overlay onto the leader ledger, then advance each wallet's poll cursor to now so
-    // the trade poller skips the downtime backlog. Must run before wallets is moved into
-    // TradePoller::new so the borrow of wallets is valid, and before the cursor is
-    // advanced after the poller has already started consuming it.
+    // Startup seed: fetch current positions from the API for each watchlisted wallet and overlay
+    // them onto the leader ledger, then seed each wallet's poll cursor from its real last-trade
+    // time (#357) so the inactivity clock and the poller's first forward sweep both start at the
+    // real last trade — reconstructing any trades that happened while the service was down rather
+    // than skipping them. Must run before `wallets` is moved into TradePoller::new so the borrow
+    // stays valid, and before the poller starts consuming cursors.
     {
         let seed_fetcher = ReqwestFetcher::new(reqwest::Client::new());
         let snapshot_map = seed_all(
@@ -280,41 +297,23 @@ async fn main() -> Result<()> {
         .await;
         let seeded = snapshot_map.len();
         leader_ledger.overlay(snapshot_map.clone());
-        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-        for wallet in snapshot_map.keys() {
-            if let Err(e) = paper_state.set_cursor(wallet, now_unix) {
-                tracing::warn!(wallet = %wallet, error = %e, "failed to advance startup cursor");
-            }
-        }
-        // Zero-position startup wallets are absent from the position-seed map, so their
-        // poll cursor stays `None`; the poller's first round would then do a full-history
-        // fetch and write the wallet's real (possibly days-old) last-trade ts into the
-        // cursor — which the #350 maintenance tick would read as ">72h inactive" and
-        // evict on the next tick, defeating the 72h admission grace. Seed each such
-        // wallet's cursor to `now`, but only when it has no cursor row yet, so an
-        // advanced cursor carried over from a prior run is never reset.
-        let mut zero_position_seeded = 0usize;
-        for wallet in &wallets {
-            if snapshot_map.contains_key(wallet) {
-                continue; // already seeded above with its position snapshot.
-            }
-            match paper_state.cursor(wallet) {
-                Ok(Some(_)) => {} // existing cursor (prior run); leave it untouched.
-                Ok(None) => {
-                    if let Err(e) = paper_state.set_cursor(wallet, now_unix) {
-                        tracing::warn!(wallet = %wallet, error = %e, "failed to seed zero-position startup cursor");
-                    } else {
-                        zero_position_seeded += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(wallet = %wallet, error = %e, "failed to read cursor for zero-position startup wallet");
-                }
+        // Seed the poll cursor from each bootstrapped wallet's real last-trade time (#357),
+        // UNCONDITIONALLY: this establishes the inactivity clock at the real last trade
+        // (idle = now − cursor) and repairs any corrupted `now`-seed left by a prior build. A
+        // wallet absent from the side-map (leaderboard fallback, or a NULL `last_trade_unix`
+        // column) keeps its persisted cursor; a never-seeded `None` cursor self-heals via the
+        // poller's first unbounded fetch and is never reset to `now` (no admission grace).
+        let mut cursor_seeded = 0usize;
+        for (wallet, last_trade_unix) in &bootstrap_last_trade {
+            if let Err(e) = paper_state.set_cursor(wallet, *last_trade_unix) {
+                tracing::warn!(wallet = %wallet, error = %e, "failed to seed startup cursor from last_trade_unix");
+            } else {
+                cursor_seeded += 1;
             }
         }
         info!(
             seeded,
-            zero_position_seeded,
+            cursor_seeded,
             total = wallets.len(),
             "startup position seed complete"
         );
