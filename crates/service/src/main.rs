@@ -108,7 +108,9 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(wl) if !wl.entries.is_empty() => {
+            // The last-trade side-map (#357) is unused here until PR-3 wires the bootstrap
+            // cursor-seed; destructure it now so the tuple return type lines up.
+            Ok((wl, _last_trade)) if !wl.entries.is_empty() => {
                 info!(
                     active = wl.active_count,
                     total = wl.entries.len(),

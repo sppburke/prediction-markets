@@ -323,10 +323,21 @@ async fn maintenance_tick(
             secret_key,
             &exclude,
             freed + cfg.bench_overfetch,
+            now_unix,
         )
         .await
         {
-            Ok(w) => w.entries,
+            // The candidate last-trade side-map (#357) is unused until PR-3 seeds each admitted
+            // wallet's cursor from it; destructure now for the tuple return.
+            Ok((w, _candidate_last_trade)) => {
+                if w.entries.is_empty() {
+                    warn!(
+                        "maintenance: freshness-filtered candidate fetch returned 0; backfill \
+                         paused (bench may predate the last_trade_unix populate push)"
+                    );
+                }
+                w.entries
+            }
             Err(e) => {
                 warn!(error = %e, "maintenance: candidate fetch failed; evicting without backfill");
                 Vec::new()
