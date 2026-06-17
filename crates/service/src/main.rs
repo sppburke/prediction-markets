@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
+use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -33,6 +34,7 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::seed;
+use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{
     HttpWatchlistPublisher, WatchlistSizePublisher, run_supabase_refresh_loop,
@@ -413,6 +415,35 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
+    // Liquidity-at-fill capture (issue #350 WS2 PR-H): off-hot-path Gamma + CLOB /book snapshot
+    // per BUY fill, written to SQLite (canonical) + a best-effort Supabase mirror. Spawned under
+    // the same gate as the sink (the mirror reuses the Supabase writer); the worker shares the
+    // orchestrator's mid-price cache so a fill rarely incurs an extra Gamma fetch. The
+    // empty-secret-key warning is emitted once by the sink block above (identical gate) and
+    // covers this writer too — keep the blocks ordered so it is not duplicated.
+    let (snapshot_handle, snapshot_task) =
+        if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
+            let (handle, rx) = SnapshotHandle::channel(cfg.snapshot_channel_capacity);
+            let writer = SupabaseWriter::new(
+                reqwest::Client::new(),
+                &cfg.supabase_url,
+                &cfg.supabase_anon_key,
+                &cfg.supabase_secret_key,
+            );
+            let dropped = handle.dropped_counter();
+            let task = tokio::spawn(run_snapshot_worker(
+                rx,
+                mid_price_cache.clone(),
+                ReqwestClobBookFetcher::new(reqwest::Client::new()),
+                paper_state.clone(),
+                Some(writer),
+                dropped,
+            ));
+            (Some(handle), Some(task))
+        } else {
+            (None, None)
+        };
+
     let orch = Orchestrator::new(
         trade_rx,
         live_watchlist.clone(),
@@ -435,6 +466,7 @@ async fn main() -> Result<()> {
         mid_price_cache.clone(),
         reseed_rx,
         sink_handle.clone(),
+        snapshot_handle,
     )
     .context("build orchestrator")?;
 
@@ -540,6 +572,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     if let Some(t) = sink_task {
+        t.abort();
+    }
+    if let Some(t) = snapshot_task {
         t.abort();
     }
     info!("pe-service stopped");

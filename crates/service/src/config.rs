@@ -190,6 +190,15 @@ pub struct ServiceConfig {
     #[serde(default = "default_supabase_sink_reconcile_interval_secs")]
     pub supabase_sink_reconcile_interval_secs: u64,
 
+    // ── Liquidity-at-fill capture (#350 WS2 PR-H) ─────────────────────────────
+    /// Bounded capacity of the trade-path → liquidity-snapshot worker channel. Drop-on-full:
+    /// a full channel drops the snapshot request so the BUY fill path never blocks (capture
+    /// is best-effort analytics). The snapshot worker is spawned under the same gate as the
+    /// Supabase sink (`supabase_sink_enabled` + non-empty `supabase_url`). Default: 256.
+    /// `PE_SNAPSHOT_CHANNEL_CAPACITY`. See `docs/_GLOSSARY.md`: `snapshot_channel_capacity`.
+    #[serde(default = "default_snapshot_channel_capacity")]
+    pub snapshot_channel_capacity: usize,
+
     // ── Watchlist maintenance (#350 WS1 PR-D) ─────────────────────────────────
     /// Seconds between maintenance ticks (inactivity + underperformance knockout + atomic
     /// backfill). `0` disables the tick entirely (skipped, not a zero-duration loop).
@@ -320,6 +329,10 @@ const fn default_supabase_sink_reconcile_interval_secs() -> u64 {
     300
 }
 
+const fn default_snapshot_channel_capacity() -> usize {
+    256
+}
+
 const fn default_maintenance_interval_secs() -> u64 {
     600
 }
@@ -434,6 +447,7 @@ impl Default for ServiceConfig {
             supabase_sink_enabled: false,
             supabase_sink_channel_capacity: default_supabase_sink_channel_capacity(),
             supabase_sink_reconcile_interval_secs: default_supabase_sink_reconcile_interval_secs(),
+            snapshot_channel_capacity: default_snapshot_channel_capacity(),
             maintenance_interval_secs: default_maintenance_interval_secs(),
             inactivity_threshold_secs: default_inactivity_threshold_secs(),
             inactivity_hard_cap_secs: default_inactivity_hard_cap_secs(),

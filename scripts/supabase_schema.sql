@@ -81,6 +81,21 @@ create table if not exists settled_markets (
   inserted_at     timestamptz not null default now()
 );
 
+-- Liquidity-at-fill capture (issue #350 WS2 PR-H): one row per BUY fill carrying the Gamma
+-- depth scalars plus the filled outcome's CLOB ask-side depth. `idempotency_key` mirrors
+-- `paper_fills(idempotency_key)` but declares NO foreign key — the relationship is documentary
+-- (the canonical SQLite sidecar likewise has no FK; `paper_fills` is append-only). A `/book`
+-- failure yields a partial row: `absorbable_usd_100bps`/`ask_levels_json` are null.
+create table if not exists fill_market_snapshots (
+  idempotency_key       text        primary key,
+  liquidity             numeric,                  -- Gamma order-book depth (USD), nullable
+  volume                numeric,                  -- Gamma cumulative volume (USD), nullable
+  absorbable_usd_100bps numeric,                  -- Σ price·size within 100 bps of best ask
+  ask_levels_json       jsonb,                    -- raw ask levels [{price,size}], nullable
+  captured_at_unix      bigint      not null,
+  inserted_at           timestamptz not null default now()
+);
+
 -- Writer-only fill catch-up cursor: the contiguous-prefix `event_seq` confirmed in
 -- Supabase. Single row (id = 1). No anon access (see RLS below).
 create table if not exists supabase_sink_hwm (
@@ -166,6 +181,13 @@ alter table settled_markets enable row level security;
 drop policy if exists "settled_markets_anon_read" on settled_markets;
 create policy "settled_markets_anon_read" on settled_markets for select to anon using (true);
 grant select on settled_markets to anon;
+
+-- Liquidity-at-fill snapshots (#350 WS2 PR-H): anon read-only, writer (service-role) inserts
+-- bypass RLS. No anon write policy → anon insert is rejected (42501), matching paper_fills.
+alter table fill_market_snapshots enable row level security;
+drop policy if exists "fill_market_snapshots_anon_read" on fill_market_snapshots;
+create policy "fill_market_snapshots_anon_read" on fill_market_snapshots for select to anon using (true);
+grant select on fill_market_snapshots to anon;
 
 -- The site is the first anon reader of ranking_entries. The anon read policy preserves
 -- the existing service-role readers (secret key bypasses RLS) and the latest_ranking

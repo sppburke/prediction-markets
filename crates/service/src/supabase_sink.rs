@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pe_core_types::Side;
-use pe_paper_state::{FillRow, PaperStateDb, PaperStateError, SettledMarketRow};
+use pe_paper_state::{
+    FillMarketSnapshot, FillRow, PaperStateDb, PaperStateError, SettledMarketRow,
+};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -149,6 +151,12 @@ pub trait SinkWriter: Send + Sync + 'static {
         &self,
         row: &SettledMarketRow,
     ) -> impl Future<Output = Result<(), SinkError>> + Send;
+    /// Upsert a fill's liquidity-at-fill snapshot (issue #350 WS2 PR-H). Best-effort: the
+    /// canonical row already lives in SQLite, so a failure here is logged, never fatal.
+    fn upsert_snapshot(
+        &self,
+        row: &FillMarketSnapshot,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send;
     fn read_hwm(&self) -> impl Future<Output = Result<i64, SinkError>> + Send;
     fn write_hwm(&self, last_event_seq: i64) -> impl Future<Output = Result<(), SinkError>> + Send;
 }
@@ -237,6 +245,26 @@ impl SinkWriter for SupabaseWriter {
             "settled_at_unix": row.settled_at_unix,
         }]);
         self.post_upsert("settled_markets", "market_id", &body)
+            .await
+    }
+
+    async fn upsert_snapshot(&self, row: &FillMarketSnapshot) -> Result<(), SinkError> {
+        // Decimals as strings (no f64); Postgres coerces text → numeric. `ask_levels_json`
+        // is a JSON array text → re-embed as a jsonb value (a SQL null when absent).
+        let ask_levels: Option<serde_json::Value> = row
+            .ask_levels_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        let body = serde_json::json!([{
+            "idempotency_key": row.idempotency_key,
+            "liquidity": row.liquidity.map(|d| d.to_string()),
+            "volume": row.volume.map(|d| d.to_string()),
+            "absorbable_usd_100bps": row.absorbable_usd_100bps.map(|d| d.to_string()),
+            "ask_levels_json": ask_levels,
+            "captured_at_unix": row.captured_at_unix,
+        }]);
+        self.post_upsert("fill_market_snapshots", "idempotency_key", &body)
             .await
     }
 
