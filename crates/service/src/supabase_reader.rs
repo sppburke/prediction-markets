@@ -9,6 +9,7 @@
 //! JSON number or a string, so they are parsed through [`serde_json::Value`] →
 //! [`Decimal`] (via the exact decimal literal), never through `f64`.
 
+use std::collections::HashMap;
 use std::str::FromStr as _;
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
@@ -39,6 +40,13 @@ pub const SUPABASE_FETCH_LIMIT: usize = MAINTAINED_SET_SIZE;
 /// holds the ranker's deeper top-200 push; only the live set is capped here.
 /// See `docs/_GLOSSARY.md`: `MAINTAINED_SET_SIZE`.
 pub const MAINTAINED_SET_SIZE: usize = 25;
+
+/// Candidate freshness window in hours (#357): a benched wallet is an eligible backfill
+/// candidate only if its real last trade (`last_trade_unix`) is within this window. Mirrors
+/// the canonical `upload_active_window_hours` = 72 in `docs/_GLOSSARY.md` (the ranker drops
+/// wallets idle > 72h at upload; this is the read-side gate for the same window). Typed `i64`
+/// for direct unix-second arithmetic with the poll clock — no narrowing cast.
+pub const ACTIVE_WINDOW_HOURS: i64 = 72;
 
 /// Reconstruction quality assigned to Supabase-sourced wallets. The ranker has already
 /// applied its own data-quality gates, so these wallets are treated as fully reconstructed
@@ -73,6 +81,11 @@ struct RankingRow {
     /// Number of filled positions in the eligibility window. → `closed_trades_in_window`.
     #[serde(default)]
     n_trades: Option<i64>,
+    /// Wallet's real last on-chain trade time (unix seconds), stamped by the ranker (#357).
+    /// Absent column or JSON `null` → `None`. Drives the candidate freshness filter and (in a
+    /// later PR) seeds the poll cursor / inactivity clock; it never affects the row→entry map.
+    #[serde(default)]
+    last_trade_unix: Option<i64>,
 }
 
 /// Parse a PostgREST numeric cell (JSON number or string) into a [`Decimal`] without f64.
@@ -126,20 +139,35 @@ fn map_row(row: &RankingRow) -> Option<WatchlistEntry> {
     })
 }
 
-/// Assemble fetched rows into a [`Watchlist`] (all tier `Active`, snapshot stamped now).
-fn to_watchlist(rows: &[RankingRow]) -> Watchlist {
-    let entries: Vec<WatchlistEntry> = rows.iter().filter_map(map_row).collect();
+/// Assemble fetched rows into a [`Watchlist`] (all tier `Active`, snapshot stamped now) plus
+/// the side-map of each valid wallet's real last-trade time (#357).
+///
+/// The map is keyed by the same validated [`WalletAddress`] that enters the watchlist — a
+/// bad-hex row is skipped from BOTH — and holds only rows that carry a `last_trade_unix`
+/// (absent → omitted, never a sentinel). PR-2 returns it unused; the cursor-seeding consumer
+/// lands in #357 PR-3.
+fn to_watchlist(rows: &[RankingRow]) -> (Watchlist, HashMap<WalletAddress, i64>) {
+    let mut entries: Vec<WatchlistEntry> = Vec::with_capacity(rows.len());
+    let mut last_trade: HashMap<WalletAddress, i64> = HashMap::new();
+    for row in rows {
+        let Some(entry) = map_row(row) else { continue };
+        if let Some(ts) = row.last_trade_unix {
+            last_trade.insert(entry.wallet, ts);
+        }
+        entries.push(entry);
+    }
     let active_count = entries
         .iter()
         .filter(|e| e.tier == WatchlistTier::Active)
         .count();
     let total = entries.len();
-    Watchlist {
+    let watchlist = Watchlist {
         entries,
         snapshot_at: SourceTimestamp(OffsetDateTime::now_utc()),
         active_count,
         incubator_count: total - active_count,
-    }
+    };
+    (watchlist, last_trade)
 }
 
 /// Select the single API token to send in BOTH the `apikey` and `Authorization: Bearer`
@@ -165,7 +193,7 @@ async fn get_ranking(
     client: &reqwest::Client,
     url: &str,
     token: &str,
-) -> Result<Watchlist, SupabaseError> {
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
     let resp = client
         .get(url)
         .header("apikey", token)
@@ -182,17 +210,21 @@ async fn get_ranking(
     Ok(to_watchlist(&rows))
 }
 
-/// Fetch the latest ranking from Supabase and map it to a [`Watchlist`].
+/// Fetch the latest ranking from Supabase and map it to a [`Watchlist`] plus the last-trade
+/// side-map (#357).
 ///
 /// `GET {base_url}/rest/v1/latest_ranking?order=rank&limit={limit}` with the SAME token in
-/// both the `apikey` and `Authorization: Bearer` headers (see [`auth_token`]).
+/// both the `apikey` and `Authorization: Bearer` headers (see [`auth_token`]). This is the
+/// bootstrap + score-refresh path: it is intentionally NOT freshness-filtered (the bootstrap
+/// admits the top-`limit` by rank; freshness for live wallets is enforced by the poll cursor +
+/// maintenance tick, and the refresh must not drop live members). See [`fetch_candidates`].
 pub async fn fetch(
     client: &reqwest::Client,
     base_url: &str,
     anon_key: &str,
     secret_key: &str,
     limit: usize,
-) -> Result<Watchlist, SupabaseError> {
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
     let url = format!(
         "{}/rest/v1/latest_ranking?order=rank&limit={}",
         base_url.trim_end_matches('/'),
@@ -202,33 +234,45 @@ pub async fn fetch(
 }
 
 /// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` `latest_ranking`
-/// rows excluding `exclude`, ordered by rank. Pure (no network) so the `not.in.` filter is
-/// unit-testable. Excluded wallets render as canonical lowercase `0x` hex (matching
-/// `latest_ranking.wallet_hex`) and are sorted + deduped for a deterministic, cache-friendly
-/// URL. An empty `exclude` omits the filter (PostgREST rejects an empty `in.()` list).
-fn candidates_query(exclude: &[WalletAddress], n: usize) -> String {
-    if exclude.is_empty() {
-        return format!("order=rank&limit={n}");
+/// rows excluding `exclude`, optionally freshness-filtered, ordered by rank. Pure (no network)
+/// so the `not.in.` and `gte` filters are unit-testable. Excluded wallets render as canonical
+/// lowercase `0x` hex (matching `latest_ranking.wallet_hex`) and are sorted + deduped for a
+/// deterministic, cache-friendly URL. An empty `exclude` omits that filter (PostgREST rejects
+/// an empty `in.()` list).
+///
+/// `freshness_cutoff` (#357), when `Some(cutoff)`, appends `last_trade_unix=gte.{cutoff}` so
+/// only wallets that traded at/after `cutoff` are returned. NULL `last_trade_unix` fails `gte`
+/// and is excluded — a not-yet-populated bench pauses backfill, it never empties the live set.
+fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Option<i64>) -> String {
+    let mut filters: Vec<String> = Vec::new();
+    if !exclude.is_empty() {
+        let mut hexes: Vec<String> = exclude.iter().map(ToString::to_string).collect();
+        hexes.sort_unstable();
+        hexes.dedup();
+        filters.push(format!("wallet_hex=not.in.({})", hexes.join(",")));
     }
-    let mut hexes: Vec<String> = exclude.iter().map(ToString::to_string).collect();
-    hexes.sort_unstable();
-    hexes.dedup();
-    format!(
-        "wallet_hex=not.in.({})&order=rank&limit={n}",
-        hexes.join(",")
-    )
+    if let Some(cutoff) = freshness_cutoff {
+        filters.push(format!("last_trade_unix=gte.{cutoff}"));
+    }
+    filters.push(format!("order=rank&limit={n}"));
+    filters.join("&")
 }
 
 /// Fetch the top-`n` on-deck candidate wallets from `latest_ranking`, excluding any wallet in
 /// `exclude` (the current live ∪ evicted set), ordered by rank. Used by the maintenance tick
 /// (issue #350 WS1 PR-D) to backfill freed live slots from the Supabase bench.
 ///
-/// `GET {base_url}/rest/v1/latest_ranking?wallet_hex=not.in.(<exclude>)&order=rank&limit={n}`
+/// `GET {base_url}/rest/v1/latest_ranking?wallet_hex=not.in.(<exclude>)&last_trade_unix=gte.<cutoff>&order=rank&limit={n}`
 /// with the same token in both headers (see [`auth_token`]). The server-side `not.in.` filter
 /// is an over-fetch optimisation, not a correctness boundary: it is matched case-sensitively
 /// against `latest_ranking.wallet_hex` (canonical lowercase), and
 /// [`crate::live_watchlist::LiveWatchlist::replace`] independently dedups the results against
 /// the live and evicted sets by byte-equality, so a casing miss cannot re-admit a wallet.
+///
+/// `now_unix` (unix seconds) anchors the candidate freshness gate (#357): only wallets whose
+/// real last trade is within [`ACTIVE_WINDOW_HOURS`] of `now_unix` are returned, so a stale
+/// bench wallet is never backfilled into the live set. Returns the [`Watchlist`] plus the
+/// last-trade side-map (consumed by the PR-3 admission cursor-seed).
 pub async fn fetch_candidates(
     client: &reqwest::Client,
     base_url: &str,
@@ -236,11 +280,13 @@ pub async fn fetch_candidates(
     secret_key: &str,
     exclude: &[WalletAddress],
     n: usize,
-) -> Result<Watchlist, SupabaseError> {
+    now_unix: i64,
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
+    let freshness_cutoff = now_unix - ACTIVE_WINDOW_HOURS * 3600;
     let url = format!(
         "{}/rest/v1/latest_ranking?{}",
         base_url.trim_end_matches('/'),
-        candidates_query(exclude, n)
+        candidates_query(exclude, n, Some(freshness_cutoff))
     );
     get_ranking(client, &url, auth_token(anon_key, secret_key)).await
 }
@@ -354,6 +400,7 @@ mod tests {
     use serde_json::json;
 
     const HEX_A: &str = "0x0000000000000000000000000000000000000001";
+    const HEX_B: &str = "0x0000000000000000000000000000000000000002";
 
     fn row(
         wallet_hex: &str,
@@ -366,6 +413,7 @@ mod tests {
             hit_rate: Some(hit),
             ls_tstat: Some(tstat),
             n_trades: n,
+            last_trade_unix: None,
         }
     }
 
@@ -421,10 +469,12 @@ mod tests {
             row(HEX_A, json!(0.6), json!(2.0), Some(10)),
             row("bad", json!(0.6), json!(2.0), Some(10)),
         ];
-        let wl = to_watchlist(&rows);
+        let (wl, last_trade) = to_watchlist(&rows);
         assert_eq!(wl.entries.len(), 1);
         assert_eq!(wl.active_count, 1);
         assert_eq!(wl.incubator_count, 0);
+        // No row carried a last_trade_unix, so the side-map is empty (#357).
+        assert!(last_trade.is_empty());
     }
 
     #[test]
@@ -440,7 +490,7 @@ mod tests {
     #[test]
     fn candidates_query_empty_exclude_omits_filter() {
         // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
-        assert_eq!(candidates_query(&[], 5), "order=rank&limit=5");
+        assert_eq!(candidates_query(&[], 5, None), "order=rank&limit=5");
     }
 
     #[test]
@@ -448,12 +498,60 @@ mod tests {
         let a = WalletAddress::from_hex("0x00000000000000000000000000000000000000AA").unwrap();
         let b = WalletAddress::from_hex("0x0000000000000000000000000000000000000001").unwrap();
         // Out of order + a duplicate + upper-case input -> sorted, deduped, lowercase output.
-        let q = candidates_query(&[a, b, a], 3);
+        let q = candidates_query(&[a, b, a], 3, None);
         assert_eq!(
             q,
             "wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
              0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
         );
+    }
+
+    #[test]
+    fn candidates_query_appends_freshness_filter() {
+        // No exclude + a cutoff -> the gte filter precedes order/limit (#357).
+        assert_eq!(
+            candidates_query(&[], 5, Some(1_000)),
+            "last_trade_unix=gte.1000&order=rank&limit=5"
+        );
+    }
+
+    #[test]
+    fn candidates_query_combines_exclude_and_freshness() {
+        let a = WalletAddress::from_hex(HEX_A).unwrap();
+        assert_eq!(
+            candidates_query(&[a], 3, Some(1_000)),
+            "wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
+             &last_trade_unix=gte.1000&order=rank&limit=3"
+        );
+    }
+
+    #[test]
+    fn ranking_row_last_trade_unix_deser_int_null_absent() {
+        // PostgREST sends the column as an int, JSON null, or omits it (serde default) → None.
+        let present: RankingRow = serde_json::from_value(
+            json!({"wallet_hex": HEX_A, "last_trade_unix": 1_700_000_000_i64}),
+        )
+        .unwrap();
+        assert_eq!(present.last_trade_unix, Some(1_700_000_000));
+        let null: RankingRow =
+            serde_json::from_value(json!({"wallet_hex": HEX_A, "last_trade_unix": null})).unwrap();
+        assert_eq!(null.last_trade_unix, None);
+        let absent: RankingRow = serde_json::from_value(json!({"wallet_hex": HEX_A})).unwrap();
+        assert_eq!(absent.last_trade_unix, None);
+    }
+
+    #[test]
+    fn to_watchlist_builds_last_trade_map_for_valid_rows_with_ts() {
+        let mut with_ts = row(HEX_A, json!(0.6), json!(2.0), Some(10));
+        with_ts.last_trade_unix = Some(1_700_000_000);
+        let no_ts = row(HEX_B, json!(0.6), json!(2.0), Some(10)); // valid hex, no last_trade_unix
+        let mut bad = row("bad", json!(0.6), json!(2.0), Some(10));
+        bad.last_trade_unix = Some(999); // bad hex -> excluded from BOTH entries and the map
+        let (wl, last_trade) = to_watchlist(&[with_ts, no_ts, bad]);
+        assert_eq!(wl.entries.len(), 2); // HEX_A + HEX_B valid; bad skipped
+        assert_eq!(last_trade.len(), 1); // only the valid row carrying a ts
+        let wa = WalletAddress::from_hex(HEX_A).unwrap();
+        assert_eq!(last_trade.get(&wa), Some(&1_700_000_000)); // keyed by the validated wallet
     }
 
     #[test]

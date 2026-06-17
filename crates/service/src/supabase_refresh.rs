@@ -127,7 +127,9 @@ pub async fn run_supabase_refresh_loop(
         tokio::time::sleep(interval).await;
         match supabase_reader::fetch(&client, &base_url, &anon_key, &secret_key, fetch_limit).await
         {
-            Ok(fresh) => {
+            // Score-update-only refresh: the last-trade side-map (#357) is unused here (the
+            // refresh never adds/evicts, so it seeds no cursors); destructure for the tuple.
+            Ok((fresh, _last_trade)) => {
                 let fetched = fresh.entries.len();
                 // Serialize the ArcSwap write against the maintenance tick's `replace`
                 // (#350 WS1 PR-D); readers stay lock-free.
