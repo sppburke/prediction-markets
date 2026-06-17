@@ -418,7 +418,9 @@ async fn main() -> Result<()> {
     // Liquidity-at-fill capture (issue #350 WS2 PR-H): off-hot-path Gamma + CLOB /book snapshot
     // per BUY fill, written to SQLite (canonical) + a best-effort Supabase mirror. Spawned under
     // the same gate as the sink (the mirror reuses the Supabase writer); the worker shares the
-    // orchestrator's mid-price cache so a fill rarely incurs an extra Gamma fetch.
+    // orchestrator's mid-price cache so a fill rarely incurs an extra Gamma fetch. The
+    // empty-secret-key warning is emitted once by the sink block above (identical gate) and
+    // covers this writer too — keep the blocks ordered so it is not duplicated.
     let (snapshot_handle, snapshot_task) =
         if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
             let (handle, rx) = SnapshotHandle::channel(cfg.snapshot_channel_capacity);
