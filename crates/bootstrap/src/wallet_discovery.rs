@@ -12,6 +12,9 @@ use pe_source_polymarket_public::ReqwestFetcher;
 
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
+use crate::datadash_discovery::{
+    DatadashDiscoveryReport, ReqwestCohortFetcher, run_datadash_discovery,
+};
 use crate::error::BootstrapError;
 use crate::leaderboard_discovery::{
     LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery,
@@ -23,6 +26,7 @@ use crate::lock::CacheMutationLock;
 pub enum WalletDiscoverySource {
     Leaderboard,
     Radion,
+    Datadash,
 }
 
 /// Aggregate per-source counts returned by [`run_source_discovery`].
@@ -76,6 +80,46 @@ pub async fn run_source_discovery(
             let _lock = CacheMutationLock::acquire(&config.cache_path)?;
             crate::radion::run_radion_discovery().await?;
             Ok(SourceDiscoveryResult::default())
+        }
+        WalletDiscoverySource::Datadash => {
+            // Datadash is on by default; an empty/unset URL disables it.
+            let Some(base_url) = config.datadash_api_url.as_deref() else {
+                tracing::debug!("wallet_discovery: Datadash skipped — datadash_api_url not set");
+                return Ok(SourceDiscoveryResult::default());
+            };
+            // Every error in this arm maps to `BootstrapError::Datadash` so the
+            // caller's soft-fail (`winner_discovery`) catches every datadash
+            // failure (client build, lock, and the run itself). A genuine DB
+            // failure inside `run_datadash_discovery` still propagates as its
+            // native `Sqlite`/`Cache` variant (fatal) — see that function's docs.
+            let client = reqwest::Client::builder()
+                .pool_idle_timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|e| BootstrapError::Datadash {
+                    message: format!("client build: {e}"),
+                })?;
+            let fetcher = ReqwestCohortFetcher::new(
+                base_url.to_owned(),
+                client,
+                config.datadash_request_interval_ms,
+            );
+            let _lock = CacheMutationLock::acquire(&config.cache_path).map_err(|e| {
+                BootstrapError::Datadash {
+                    message: format!("lock: {e}"),
+                }
+            })?;
+            let r: DatadashDiscoveryReport = run_datadash_discovery(
+                &fetcher,
+                &config.datadash_exclude_ids,
+                &config.datadash_exclude_titles,
+                config.datadash_max_cohort_wallets,
+                cache,
+            )
+            .await?;
+            Ok(SourceDiscoveryResult {
+                unique_wallets: r.unique_wallets,
+                activated: r.activated,
+            })
         }
     }
 }

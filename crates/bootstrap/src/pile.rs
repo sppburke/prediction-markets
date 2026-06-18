@@ -14,6 +14,7 @@
 //! | 4 | 0b0010000 | Polymarket leaderboard |
 //! | 5 | 0b0100000 | Radion |
 //! | 6 | 0b1000000 | 502-gap |
+//! | 7 | 0b10000000 | datadash.xyz cohorts (#365) |
 //!
 //! Canonical `wallet_hex` form: `"0x" + 40 lowercase hex chars` (matches
 //! `WalletAddress::Display`). All callers must normalise before inserting.
@@ -38,6 +39,9 @@ pub const SRC_TRADES: i64 = 0b0000010;
 pub const SRC_LEADERBOARD: i64 = 0b0010000;
 pub const SRC_RADION: i64 = 0b0100000;
 pub const SRC_GAP502: i64 = 0b1000000;
+/// datadash.xyz cohort discovery (issue #365). Bypasses the activation gate like
+/// the other curation-list sources.
+pub const SRC_DATADASH: i64 = 0b10000000;
 
 /// Apply the activation rule. Sticky 0→1; `is_infra = 0` gates every branch.
 ///
