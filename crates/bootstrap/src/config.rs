@@ -28,6 +28,9 @@ const DEFAULT_CLOB_CONCURRENCY: usize = 8;
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
 const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
+// Issue #373: Radion trader-analysis discovery defaults.
+const DEFAULT_RADION_API_URL: &str = "https://api.radion.app";
+const DEFAULT_RADION_MAX_REQUESTS_PER_RUN: u32 = 8;
 // Issue #365: datadash.xyz cohort-discovery defaults.
 const DEFAULT_DATADASH_API_URL: &str = "https://api.datadash.xyz";
 const DEFAULT_DATADASH_REQUEST_INTERVAL_MS: u64 = 500;
@@ -316,13 +319,27 @@ pub struct BootstrapConfig {
     )]
     pub leaderboard_categories: Vec<LeaderboardCategory>,
 
-    /// Radion REST API base URL. When absent, Radion discovery is skipped silently.
+    /// Radion REST API base URL. Defaults to `https://api.radion.app` (the source
+    /// is **on by default**). Set to `""` (or null) to disable it. Because the API
+    /// mandates a key, "on" means *enabled but inert until `radion_api_key` is set*.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_RADION_API_URL` overrides.
-    #[serde(default)]
+    #[serde(
+        default = "default_radion_api_url",
+        alias = "bootstrap_radion_api_url",
+        deserialize_with = "deserialize_opt_string_empty_none"
+    )]
     pub radion_api_url: Option<String>,
 
-    /// Radion API key. `PE_BOOTSTRAP_RADION_API_KEY` overrides.
-    #[serde(default)]
+    /// Radion API key. Skipped silently when unset/empty — an empty
+    /// `PE_BOOTSTRAP_RADION_API_KEY` collapses to `None` (rather than sending an
+    /// empty `X-API-Key` and 401-soft-failing every run).
+    /// `PE_BOOTSTRAP_RADION_API_KEY` overrides.
+    #[serde(
+        default,
+        alias = "bootstrap_radion_api_key",
+        deserialize_with = "deserialize_opt_string_empty_none"
+    )]
     pub radion_api_key: Option<String>,
 
     /// Minimum interval (ms) between Radion HTTP requests. Default 500.
@@ -333,6 +350,17 @@ pub struct BootstrapConfig {
         alias = "bootstrap_radion_request_interval_ms"
     )]
     pub radion_request_interval_ms: u64,
+
+    /// Max `traders/analysis` requests per discovery run — the Free-tier budget
+    /// cap. Default 8 → 8×30 = 240/mo, under the Free 300/mo account cap; at ≤10
+    /// wallets/request that is ≤80 wallets/run. Canonical default in
+    /// `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_RADION_MAX_REQUESTS_PER_RUN` overrides.
+    #[serde(
+        default = "default_radion_max_requests_per_run",
+        alias = "bootstrap_radion_max_requests_per_run"
+    )]
+    pub radion_max_requests_per_run: u32,
 
     // ── datadash.xyz cohort discovery (issue #365) ────────────────────────────
     /// datadash cohort API base URL. Defaults to `https://api.datadash.xyz`
@@ -490,6 +518,14 @@ const fn default_radion_request_interval_ms() -> u64 {
     DEFAULT_RADION_REQUEST_INTERVAL_MS
 }
 
+fn default_radion_api_url() -> Option<String> {
+    Some(DEFAULT_RADION_API_URL.to_owned())
+}
+
+const fn default_radion_max_requests_per_run() -> u32 {
+    DEFAULT_RADION_MAX_REQUESTS_PER_RUN
+}
+
 fn default_datadash_api_url() -> Option<String> {
     Some(DEFAULT_DATADASH_API_URL.to_owned())
 }
@@ -548,9 +584,10 @@ impl Default for BootstrapConfig {
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
             leaderboard_categories: default_leaderboard_categories(),
-            radion_api_url: None,
+            radion_api_url: default_radion_api_url(),
             radion_api_key: None,
             radion_request_interval_ms: default_radion_request_interval_ms(),
+            radion_max_requests_per_run: default_radion_max_requests_per_run(),
             datadash_api_url: default_datadash_api_url(),
             datadash_request_interval_ms: default_datadash_request_interval_ms(),
             datadash_exclude_ids: default_datadash_exclude_ids(),

@@ -1,0 +1,15 @@
+{
+  "data": [
+    {"traderId": "0xf405d51c138ebb968236a34d28e82b74945d9df2", "venue": "polymarket", "traderScore": 98.7, "totalPnl": 1234567.89},
+    {"traderId": "0x1111111111111111111111111111111111111111", "venue": "polymarket", "traderScore": 95.1},
+    {"traderId": "0x2222222222222222222222222222222222222222", "venue": "polymarket", "traderScore": 94.0},
+    {"traderId": "0x3333333333333333333333333333333333333333", "venue": "polymarket", "traderScore": 93.2},
+    {"traderId": "0x4444444444444444444444444444444444444444", "venue": "polymarket", "traderScore": 92.8},
+    {"traderId": "0x5555555555555555555555555555555555555555", "venue": "polymarket", "traderScore": 91.5},
+    {"traderId": "0x6666666666666666666666666666666666666666", "venue": "polymarket", "traderScore": 90.0},
+    {"traderId": "0x7777777777777777777777777777777777777777", "venue": "polymarket", "traderScore": 89.9},
+    {"traderId": "0x8888888888888888888888888888888888888888", "venue": "polymarket", "traderScore": 88.1},
+    {"traderId": "0x9999999999999999999999999999999999999999", "venue": "polymarket", "traderScore": 87.3}
+  ],
+  "nextCursor": "eyJ0cmFkZXJfc2NvcmUiOjg3LjN9"
+}
