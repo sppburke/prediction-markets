@@ -65,7 +65,9 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     * tstat = wmean / wstd · √n_eff.
 
     NaN guards mirror the legacy `tstat`: any of `n ≤ 1`, `W ≤ 0`, `W² − V2 ≤ 0`,
-    `wstd ≤ 0`, `n_eff ≤ 1` ⇒ `wstd`/`tstat` are NaN (wmean still returned when defined).
+    `wstd ≤ 0`, `n_eff ≤ 1` ⇒ `tstat` is NaN (wmean still returned when defined). `wstd`
+    is NaN in those cases too, EXCEPT the flat zero-variance path, which returns
+    `wstd = 0.0` for bitwise parity with the legacy `np.std(ddof=1)`.
 
     Uniform-weight short-circuit: when every weight is equal (the flat `half_life ≤ 0`
     path, or all trades sharing a timestamp) delegate to `np.mean` / `np.std(ddof=1)`

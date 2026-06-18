@@ -178,7 +178,9 @@ def main() -> int:
 
     # Shared decay anchor: explicit --as-of (parsed identically to pass-1), else the
     # latest filled entry, so every wallet decays against one anchor. half_life <= 0
-    # -> flat weights -> weighted_stats is bitwise-identical to the legacy stdlib t-stat.
+    # -> flat weights -> weighted_stats matches the legacy stdlib t-stat after this pass's
+    # 4dp/6dp output rounding (the flat short-circuit is exactly np.mean/np.std(ddof=1),
+    # which differs from the old statistics.stdev only at sub-ULP, absorbed by the rounding).
     as_of = parse_as_of(a.as_of)
     if as_of is None:
         all_entry = [t for lst in entry_ts_ls.values() for t in lst]
