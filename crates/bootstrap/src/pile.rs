@@ -172,6 +172,29 @@ mod tests {
     }
 
     #[test]
+    fn activation_datadash_membership_bypasses_count_gate() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(8), SRC_DATADASH, false, None, None, None)
+            .unwrap();
+        let activated = apply_activation_rules(&mut cache).unwrap();
+        assert_eq!(
+            activated, 1,
+            "datadash membership bypasses the trade-count gate"
+        );
+    }
+
+    #[test]
+    fn activation_datadash_blocked_by_infra() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(9), SRC_DATADASH, true, None, None, None)
+            .unwrap();
+        let activated = apply_activation_rules(&mut cache).unwrap();
+        assert_eq!(activated, 0, "infra datadash wallets must never activate");
+    }
+
+    #[test]
     fn activation_is_sticky_zero_to_one_only() {
         let (_dir, mut cache) = tmp_cache();
         cache
@@ -203,6 +226,25 @@ mod tests {
             bits,
             SRC_WALLET_SET_JSON | SRC_TRADES | SRC_LEADERBOARD,
             "expected bits 0b0010011, got 0b{:07b}",
+            bits
+        );
+    }
+
+    #[test]
+    fn upsert_accumulates_datadash_source_bit() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(60), SRC_LEADERBOARD, false, None, None, None)
+            .unwrap();
+        cache
+            .upsert_wallet(&hex(60), SRC_DATADASH, false, None, None, None)
+            .unwrap();
+        let bits = cache.conn_for_test_source_bits(&hex(60));
+        assert_eq!(
+            bits,
+            SRC_LEADERBOARD | SRC_DATADASH,
+            "expected leaderboard|datadash 0b{:08b}, got 0b{:08b}",
+            SRC_LEADERBOARD | SRC_DATADASH,
             bits
         );
     }

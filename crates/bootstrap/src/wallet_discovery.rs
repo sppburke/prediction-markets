@@ -87,11 +87,13 @@ pub async fn run_source_discovery(
                 tracing::debug!("wallet_discovery: Datadash skipped — datadash_api_url not set");
                 return Ok(SourceDiscoveryResult::default());
             };
-            // Every error in this arm maps to `BootstrapError::Datadash` so the
+            // Network-facing failures in this arm map to
+            // `BootstrapError::Datadash` (client build, lock acquire, and every
+            // fetch/parse/empty path inside `run_datadash_discovery`) so the
             // caller's soft-fail (`winner_discovery`) catches every datadash
-            // failure (client build, lock, and the run itself). A genuine DB
-            // failure inside `run_datadash_discovery` still propagates as its
-            // native `Sqlite`/`Cache` variant (fatal) — see that function's docs.
+            // *outage*. A genuine DB failure (upsert/activation) still propagates
+            // as its native `Sqlite`/`Cache` variant (fatal) — see that
+            // function's docs.
             let client = reqwest::Client::builder()
                 .pool_idle_timeout(Duration::from_secs(15))
                 .build()
