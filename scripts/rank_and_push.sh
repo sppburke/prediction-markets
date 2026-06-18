@@ -29,8 +29,17 @@ cd "$(dirname "$0")/.."
 DB="data/wallet_cache.db"
 UNIVERSE=""
 OUT_DIR=""
-WIN_START="2025-12-01"
-WIN_END="2026-06-01"
+# Empty window => the Python ranker's RELATIVE defaults apply (win_end = today UTC-midnight,
+# win_start = win_end - ranker_window_days(180)); override with --win-start/--win-end (issue #366).
+WIN_START=""
+WIN_END=""
+# Recency decay (issue #366). The WRAPPER defaults to FLAT (0) so a merge is a no-op for the
+# live Supabase ranking: decay only reaches live when the operator opts in with --half-life-days N
+# after sweeping. The Python scripts default to ranker_half_life_days(30) for standalone sweeps.
+HALF_LIFE_DAYS="0"
+# Shared decay age anchor for BOTH passes; empty => resolved below to UTC-midnight today (= the
+# relative win_end) so the two passes weight every trade against the identical anchor.
+AS_OF=""
 TTR_HOURS="72"
 TARGET_N="25"
 PRICE_MIN="0.15"
@@ -53,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     --out-dir) OUT_DIR="$2"; shift 2;;
     --win-start) WIN_START="$2"; shift 2;;
     --win-end) WIN_END="$2"; shift 2;;
+    --half-life-days) HALF_LIFE_DAYS="$2"; shift 2;;
+    --as-of) AS_OF="$2"; shift 2;;
     --ttr-hours) TTR_HOURS="$2"; shift 2;;
     --target-n) TARGET_N="$2"; shift 2;;
     --price-min) PRICE_MIN="$2"; shift 2;;
@@ -83,13 +94,27 @@ POSITIONS_CSV="$OUT_DIR/qualifying_positions_72hr.csv"
 LATENCY_CSV="$OUT_DIR/latency_shift_ranked.csv"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+# Window args only when explicitly overridden (mirror FILTER_ARGS below); empty => the Python
+# ranker's relative defaults apply. Pass the IDENTICAL conditional set to both passes.
+WIN_ARGS=()
+[[ -n "$WIN_START" ]] && WIN_ARGS+=(--win-start "$WIN_START")
+[[ -n "$WIN_END" ]] && WIN_ARGS+=(--win-end "$WIN_END")
+
+# Resolve a concrete shared decay anchor once and thread it to BOTH passes so they weight every
+# trade against the identical as_of: explicit --as-of wins; else an explicit --win-end; else
+# UTC-midnight today (= the ranker's relative win_end via today_midnight_unix()).
+if [[ -z "$AS_OF" ]]; then
+  AS_OF="${WIN_END:-$(date -u +%Y-%m-%d)}"
+fi
+
 if [[ "$SKIP_RANK" == "0" ]]; then
   [[ -n "$UNIVERSE" ]] || { echo "FATAL: --universe is required unless --skip-rank" >&2; exit 2; }
 
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
   python3 scripts/rank_72hr_buyandhold.py \
     --db "$DB" --universe "$UNIVERSE" --out-dir "$OUT_DIR" \
-    --win-start "$WIN_START" --win-end "$WIN_END" --ttr-hours "$TTR_HOURS" \
+    "${WIN_ARGS[@]}" --ttr-hours "$TTR_HOURS" \
+    --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --target-n "$TARGET_N" --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --floor-tstat "$FLOOR_TSTAT" --scheduled-only
 
@@ -98,6 +123,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
+    --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --floor-tstat "$FLOOR_TSTAT"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"

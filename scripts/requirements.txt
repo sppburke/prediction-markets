@@ -1,0 +1,10 @@
+# Python analytics-scripts dependencies (issue #366).
+#
+# Pinned so the CI Python drift-guard job (.github/workflows/ci.yml) and local runs use the
+# same versions as the .venv-analysis env (Python 3.11). The ranking passes
+# (rank_72hr_buyandhold.py, latency_shift_rerank.py via ranker_decay.py) and the new
+# math test (test_ranker_decay.py) need numpy; the pandas-based passes also need pandas.
+# The drift-guard test imports only ranker_decay (numpy); pandas is installed for the full
+# analytics env. CI installs this wholesale before running the drift-guard tests.
+numpy==2.4.4
+pandas==3.0.3

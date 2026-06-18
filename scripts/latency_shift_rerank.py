@@ -31,17 +31,16 @@ import statistics
 import sys
 import time
 
+from ranker_decay import (
+    DEFAULT_HALF_LIFE_DAYS,
+    decay_weights,
+    parse_as_of,
+    weighted_stats,
+)
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def tstat(xs: list[float]) -> float:
-    n = len(xs)
-    if n <= 1:
-        return float("nan")
-    sd = statistics.stdev(xs)  # sample stdev (ddof=1), matches pass-1 np.std(ddof=1)
-    return (statistics.fmean(xs) / sd * math.sqrt(n)) if sd > 0 else float("nan")
 
 
 def parse_args():
@@ -61,6 +60,12 @@ def parse_args():
                         "inflating edge/fill-rate. 0 = no cap.")
     p.add_argument("--slip-cents", type=float, default=1.0,
                    help="entry slippage in cents on the latency-shifted fill price")
+    p.add_argument("--half-life-days", type=float, default=DEFAULT_HALF_LIFE_DAYS,
+                   help="exponential recency-decay half-life in days for the net edge/t-stat "
+                        "(a fill one half-life old weighs 0.5). <= 0 disables decay (flat = legacy). "
+                        "fill_rate / hit_rate / activity gates stay raw. Same weight as pass-1.")
+    p.add_argument("--as-of", default=None,
+                   help="decay age anchor (ISO date/datetime or unix epoch). Default: max filled entry_ts.")
     p.add_argument("--floor-tstat", type=float, default=2.0,
                    help="pass-1 candidate floor AND pass-2 survival floor on net t-stat")
     p.add_argument("--min-fill-rate", type=float, default=0.5,
@@ -125,6 +130,7 @@ def main() -> int:
 
     # Per-wallet accumulators
     net_ls: dict[str, list[float]] = {}     # latency-shifted net per filled position
+    entry_ts_ls: dict[str, list[int]] = {}  # entry_ts per FILLED position (parallel to net_ls) -> decay weight
     months: dict[str, set] = {}             # active months among FILLED positions
     n_total: dict[str, int] = {}
     n_filled: dict[str, int] = {}
@@ -158,6 +164,7 @@ def main() -> int:
                     eff = min(fill_price + slip, 0.999)
                     net = (pos["payoff"] - eff) / eff
                     net_ls.setdefault(w, []).append(net)
+                    entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
                     g = time.gmtime(pos["entry_ts"])
                     months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
                     n_filled[w] = n_filled.get(w, 0) + 1
@@ -169,15 +176,27 @@ def main() -> int:
         if (i + 1) % 2000 == 0:
             log(f"  {i+1}/{len(by_mo)} market-outcomes processed")
 
+    # Shared decay anchor: explicit --as-of (parsed identically to pass-1), else the
+    # latest filled entry, so every wallet decays against one anchor. half_life <= 0
+    # -> flat weights -> weighted_stats matches the legacy stdlib t-stat after this pass's
+    # 4dp/6dp output rounding (the flat short-circuit is exactly np.mean/np.std(ddof=1),
+    # which differs from the old statistics.stdev only at sub-ULP, absorbed by the rounding).
+    as_of = parse_as_of(a.as_of)
+    if as_of is None:
+        all_entry = [t for lst in entry_ts_ls.values() for t in lst]
+        as_of = max(all_entry) if all_entry else 0
+    decay = "flat (no decay)" if a.half_life_days <= 0 else f"half_life={a.half_life_days}d"
+    log(f"scoring: {decay}, as_of={as_of}")
+
     # Per-wallet latency-shifted stats + survival gate
     rows = []
     for w in n_total:
         nf = n_filled.get(w, 0)
         nets = net_ls.get(w, [])
+        ets = entry_ts_ls.get(w, [])
         am = len(months.get(w, set()))
         fr = nf / n_total[w] if n_total[w] else 0.0
-        t = tstat(nets) if nf > 1 else float("nan")
-        mean = statistics.fmean(nets) if nets else float("nan")
+        mean, _, n_eff, t = weighted_stats(nets, decay_weights(ets, as_of, a.half_life_days))
         hr = statistics.fmean(payoffs.get(w, [])) if payoffs.get(w) else float("nan")
         eligible = (
             nf > 1 and am >= a.min_active_months
@@ -190,6 +209,7 @@ def main() -> int:
             "fill_rate": round(fr, 4), "active_months": am,
             "mean_net_ls": round(mean, 6) if not math.isnan(mean) else "",
             "tstat_net_ls": round(t, 4) if not math.isnan(t) else "",
+            "n_eff": round(n_eff, 4),
             "hit_rate": round(hr, 4) if not math.isnan(hr) else "",
             "survives": eligible,
         })
@@ -200,7 +220,7 @@ def main() -> int:
     # Static fieldnames: never index rows[0] (empty when candidates had no positions
     # overlapping the positions CSV — still write a header-only file, don't crash).
     fields = ["wallet", "n_total", "n_filled", "fill_rate", "active_months",
-              "mean_net_ls", "tstat_net_ls", "hit_rate", "survives"]
+              "mean_net_ls", "tstat_net_ls", "n_eff", "hit_rate", "survives"]
     with open(ranked_path, "w", newline="") as f:
         wcsv = csv.DictWriter(f, fieldnames=fields)
         wcsv.writeheader()
@@ -215,7 +235,8 @@ def main() -> int:
     basket_path = os.path.join(a.out_dir, "latency_shift_basket.txt")
     with open(basket_path, "w") as f:
         f.write(f"# latency_shift_basket — Δ={shift}s slip={slip} floor_t={a.floor_tstat} "
-                f"min_fill_rate={a.min_fill_rate} candidates={len(cand)} survivors={len(survivors)}\n")
+                f"half_life={a.half_life_days}d min_fill_rate={a.min_fill_rate} "
+                f"candidates={len(cand)} survivors={len(survivors)}\n")
         for r in basket:
             f.write(r["wallet"] + "\n")
     if fill_delays:
