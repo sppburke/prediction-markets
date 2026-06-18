@@ -306,6 +306,7 @@ async fn main() {
                             leaderboard_unique = r.leaderboard_unique,
                             leaderboard_activated = r.leaderboard_activated,
                             radion_unique = r.radion_unique,
+                            radion_activated = r.radion_activated,
                             datadash_unique = r.datadash_unique,
                             datadash_activated = r.datadash_activated,
                             "winner-discovery: complete"
@@ -379,6 +380,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
                 leaderboard_unique = r.leaderboard_unique,
                 leaderboard_activated = r.leaderboard_activated,
                 radion_unique = r.radion_unique,
+                radion_activated = r.radion_activated,
                 datadash_unique = r.datadash_unique,
                 datadash_activated = r.datadash_activated,
                 "all: winner-discovery complete"
