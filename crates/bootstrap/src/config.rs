@@ -29,6 +29,10 @@ const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
 const DEFAULT_RADION_REQUEST_INTERVAL_MS: u64 = 500;
+// Issue #365: datadash.xyz cohort-discovery defaults.
+const DEFAULT_DATADASH_API_URL: &str = "https://api.datadash.xyz";
+const DEFAULT_DATADASH_REQUEST_INTERVAL_MS: u64 = 500;
+const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -351,6 +355,57 @@ pub struct BootstrapConfig {
         alias = "bootstrap_radion_request_interval_ms"
     )]
     pub radion_request_interval_ms: u64,
+
+    // ── datadash.xyz cohort discovery (issue #365) ────────────────────────────
+    /// datadash cohort API base URL. Defaults to `https://api.datadash.xyz`
+    /// (the source is **on by default**). Set to `""` (or null) to disable it.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_DATADASH_API_URL` overrides.
+    #[serde(
+        default = "default_datadash_api_url",
+        alias = "bootstrap_datadash_api_url",
+        deserialize_with = "deserialize_opt_string_empty_none"
+    )]
+    pub datadash_api_url: Option<String>,
+
+    /// Minimum interval (ms) between datadash HTTP requests. Default 500.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_DATADASH_REQUEST_INTERVAL_MS` overrides.
+    #[serde(
+        default = "default_datadash_request_interval_ms",
+        alias = "bootstrap_datadash_request_interval_ms"
+    )]
+    pub datadash_request_interval_ms: u64,
+
+    /// Cohort ids excluded from ingest (exact match, never substring). Default
+    /// drops the ~103k-wallet `Polymarket Twitter/X Linked Traders` cohort.
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_DATADASH_EXCLUDE_IDS` overrides (a TOML array of ids).
+    #[serde(
+        default = "default_datadash_exclude_ids",
+        alias = "bootstrap_datadash_exclude_ids"
+    )]
+    pub datadash_exclude_ids: Vec<String>,
+
+    /// Cohort titles excluded from ingest (exact match, never substring). Default
+    /// drops `Polymarket Twitter/X Linked Traders` while keeping the distinct
+    /// `… with PnL >$100k` cohort. Canonical default in `docs/_GLOSSARY.md`.
+    /// `PE_BOOTSTRAP_DATADASH_EXCLUDE_TITLES` overrides (a TOML array of titles).
+    #[serde(
+        default = "default_datadash_exclude_titles",
+        alias = "bootstrap_datadash_exclude_titles"
+    )]
+    pub datadash_exclude_titles: Vec<String>,
+
+    /// Skip any cohort whose advertised `numWallets` exceeds this cap — a
+    /// magnitude safety net so a recreated/misnamed mega-cohort cannot flood the
+    /// pile even if the id/title guards drift. Default 10_000. Canonical default
+    /// in `docs/_GLOSSARY.md`. `PE_BOOTSTRAP_DATADASH_MAX_COHORT_WALLETS` overrides.
+    #[serde(
+        default = "default_datadash_max_cohort_wallets",
+        alias = "bootstrap_datadash_max_cohort_wallets"
+    )]
+    pub datadash_max_cohort_wallets: u64,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -461,6 +516,29 @@ const fn default_radion_request_interval_ms() -> u64 {
     DEFAULT_RADION_REQUEST_INTERVAL_MS
 }
 
+fn default_datadash_api_url() -> Option<String> {
+    Some(DEFAULT_DATADASH_API_URL.to_owned())
+}
+
+const fn default_datadash_request_interval_ms() -> u64 {
+    DEFAULT_DATADASH_REQUEST_INTERVAL_MS
+}
+
+/// Default datadash cohort-id exclusions — the ~103k-wallet linked-traders cohort.
+fn default_datadash_exclude_ids() -> Vec<String> {
+    vec!["07NQHFRAGB6HV".to_owned()]
+}
+
+/// Default datadash cohort-title exclusions — the exact linked-traders title (the
+/// distinct `… with PnL >$100k` cohort is kept).
+fn default_datadash_exclude_titles() -> Vec<String> {
+    vec!["Polymarket Twitter/X Linked Traders".to_owned()]
+}
+
+const fn default_datadash_max_cohort_wallets() -> u64 {
+    DEFAULT_DATADASH_MAX_COHORT_WALLETS
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BootstrapConfig {
@@ -501,6 +579,11 @@ impl Default for BootstrapConfig {
             radion_api_url: None,
             radion_api_key: None,
             radion_request_interval_ms: default_radion_request_interval_ms(),
+            datadash_api_url: default_datadash_api_url(),
+            datadash_request_interval_ms: default_datadash_request_interval_ms(),
+            datadash_exclude_ids: default_datadash_exclude_ids(),
+            datadash_exclude_titles: default_datadash_exclude_titles(),
+            datadash_max_cohort_wallets: default_datadash_max_cohort_wallets(),
         }
     }
 }
@@ -652,6 +735,49 @@ where
     d.deserialize_any(V)
 }
 
+/// Deserialize an `Option<String>` where an empty/whitespace string (or null)
+/// becomes `None`. Mirrors [`deserialize_audit_window`]'s empty-disables
+/// convention so `PE_BOOTSTRAP_DATADASH_API_URL=""` disables the datadash source.
+fn deserialize_opt_string_empty_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct V;
+
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string, null, or empty string")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<String>, E> {
+            let t = v.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(t.to_owned()))
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Option<String>, E> {
+            self.visit_str(&v)
+        }
+    }
+
+    d.deserialize_any(V)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -660,6 +786,57 @@ where
 )]
 mod tests {
     use super::*;
+
+    /// datadash defaults: the source is on by default (`Some(url)`), the magnitude
+    /// cap and exclusions match the canonical `_GLOSSARY.md` values.
+    #[test]
+    fn datadash_defaults() {
+        let cfg = BootstrapConfig::default();
+        assert_eq!(
+            cfg.datadash_api_url.as_deref(),
+            Some("https://api.datadash.xyz"),
+            "datadash is on by default"
+        );
+        assert_eq!(cfg.datadash_request_interval_ms, 500);
+        assert_eq!(cfg.datadash_max_cohort_wallets, 10_000);
+        assert_eq!(cfg.datadash_exclude_ids, vec!["07NQHFRAGB6HV".to_owned()]);
+        assert_eq!(
+            cfg.datadash_exclude_titles,
+            vec!["Polymarket Twitter/X Linked Traders".to_owned()]
+        );
+    }
+
+    /// An empty `datadash_api_url` (TOML) deserializes to `None`, disabling the
+    /// source — the kill switch.
+    #[test]
+    fn datadash_empty_url_disables_via_toml() {
+        let toml = r#"
+            output_path = "/tmp/watchlist.json"
+            datadash_api_url = ""
+        "#;
+        let cfg: BootstrapConfig = Figment::new().merge(Toml::string(toml)).extract().unwrap();
+        assert!(
+            cfg.datadash_api_url.is_none(),
+            "empty datadash_api_url must disable the source"
+        );
+    }
+
+    /// **Env-var integration**: `PE_BOOTSTRAP_DATADASH_API_URL=""` disables the
+    /// source through the production `load()` path (the documented kill switch).
+    #[test]
+    fn datadash_empty_url_disables_via_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+            jail.set_env("PE_BOOTSTRAP_DATADASH_API_URL", "");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert!(
+                cfg.datadash_api_url.is_none(),
+                "PE_BOOTSTRAP_DATADASH_API_URL=\"\" must disable the source"
+            );
+            Ok(())
+        });
+    }
 
     /// Default config has the snapshot write gate OFF — keeps ad-hoc bootstrap
     /// runs from polluting `leaderboard_snapshots`. The Sunday weekly refresh

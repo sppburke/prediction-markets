@@ -1891,7 +1891,8 @@ impl WalletCache {
              OR COALESCE(dune_closed_markets, 0) >= ?1 \
              OR (source_bits & 16) != 0 \
              OR (source_bits & 32) != 0 \
-             OR (source_bits & 64) != 0\
+             OR (source_bits & 64) != 0 \
+             OR (source_bits & 128) != 0\
              )",
             params![min_trades],
         )?;

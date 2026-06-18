@@ -14,6 +14,7 @@
 //! | 4 | 0b0010000 | Polymarket leaderboard |
 //! | 5 | 0b0100000 | Radion |
 //! | 6 | 0b1000000 | 502-gap |
+//! | 7 | 0b10000000 | datadash.xyz cohorts (#365) |
 //!
 //! Canonical `wallet_hex` form: `"0x" + 40 lowercase hex chars` (matches
 //! `WalletAddress::Display`). All callers must normalise before inserting.
@@ -38,6 +39,9 @@ pub const SRC_TRADES: i64 = 0b0000010;
 pub const SRC_LEADERBOARD: i64 = 0b0010000;
 pub const SRC_RADION: i64 = 0b0100000;
 pub const SRC_GAP502: i64 = 0b1000000;
+/// datadash.xyz cohort discovery (issue #365). Bypasses the activation gate like
+/// the other curation-list sources.
+pub const SRC_DATADASH: i64 = 0b10000000;
 
 /// Apply the activation rule. Sticky 0→1; `is_infra = 0` gates every branch.
 ///
@@ -168,6 +172,29 @@ mod tests {
     }
 
     #[test]
+    fn activation_datadash_membership_bypasses_count_gate() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(8), SRC_DATADASH, false, None, None, None)
+            .unwrap();
+        let activated = apply_activation_rules(&mut cache).unwrap();
+        assert_eq!(
+            activated, 1,
+            "datadash membership bypasses the trade-count gate"
+        );
+    }
+
+    #[test]
+    fn activation_datadash_blocked_by_infra() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(9), SRC_DATADASH, true, None, None, None)
+            .unwrap();
+        let activated = apply_activation_rules(&mut cache).unwrap();
+        assert_eq!(activated, 0, "infra datadash wallets must never activate");
+    }
+
+    #[test]
     fn activation_is_sticky_zero_to_one_only() {
         let (_dir, mut cache) = tmp_cache();
         cache
@@ -199,6 +226,25 @@ mod tests {
             bits,
             SRC_WALLET_SET_JSON | SRC_TRADES | SRC_LEADERBOARD,
             "expected bits 0b0010011, got 0b{:07b}",
+            bits
+        );
+    }
+
+    #[test]
+    fn upsert_accumulates_datadash_source_bit() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(60), SRC_LEADERBOARD, false, None, None, None)
+            .unwrap();
+        cache
+            .upsert_wallet(&hex(60), SRC_DATADASH, false, None, None, None)
+            .unwrap();
+        let bits = cache.conn_for_test_source_bits(&hex(60));
+        assert_eq!(
+            bits,
+            SRC_LEADERBOARD | SRC_DATADASH,
+            "expected leaderboard|datadash 0b{:08b}, got 0b{:08b}",
+            SRC_LEADERBOARD | SRC_DATADASH,
             bits
         );
     }

@@ -34,6 +34,8 @@ pub enum BootstrapError {
     Leaderboard { message: String },
     #[error("radion: {message}")]
     Radion { message: String },
+    #[error("datadash: {message}")]
+    Datadash { message: String },
     #[error("polygon_ctf: {message}")]
     PolygonCtf { message: String },
     #[error("funder: {message}")]

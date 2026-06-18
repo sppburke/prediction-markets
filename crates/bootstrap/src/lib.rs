@@ -16,6 +16,7 @@ pub mod chain;
 pub mod clob;
 pub mod config;
 pub mod coverage;
+pub mod datadash_discovery;
 pub mod error;
 pub mod events;
 pub mod fetch;
