@@ -84,9 +84,6 @@
 | Link | Last checked | Re-verify by |
 |---|---|---|
 | https://polygon.technology/ | 2026-05-07 | 2026-08-05 |
-| Polygon JSON-RPC / archive provider docs (selected by impl) | 2026-05-07 | 2026-08-05 |
-| Polygon JSON-RPC `eth_getLogs` for CTF `ConditionResolution` events (issue #149) | 2026-05-12 | 2026-08-10 |
-| https://polygonscan.com/address/0x4D97DCd97eC945f40cF65F87097ACe5EA0476045 (CTF contract page) | 2026-05-12 | 2026-08-10 |
 | https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts | 2026-05-04 | 2026-08-04 |
 | https://www.weather.gov/ | — | — |
 | https://aviationweather.gov/data/api/ | — | — |
@@ -157,3 +154,4 @@ Treat as research inspiration; not a production decision input unless an authori
 - 2026-05-02: Checked CrowdIntel public pages for funding-network methodology. Treat as research inspiration only unless an authorized replayable API/export exists.
 - 2026-05-12: Verified CTF deploy block (4_023_686, Sep-03-2020) on PolygonScan and computed `TOPIC_CONDITION_RESOLUTION` keccak hash via `alloy::primitives::keccak256` of the canonical signature for issue #149 multi-source pipeline. Verified CLOB `/markets?closed=true` paginated listing endpoint exists; confirmed `next_cursor=LTE=` terminator convention from Polymarket CLOB documentation.
 - 2026-06-18: Re-verified CLOB `/markets?closed=true` live (issue #369 PR1) — response shape `{count, limit, next_cursor, data:[{condition_id, closed, end_date_iso, tokens:[{outcome, price, token_id, winner}]}]}`, `LTE=` terminator. Found `tokens[].winner` is unset on old (≈2022–2023) markets (winner encoded only in terminal price); see the CLOB `/markets` correction note above. Reconciled 848,098 traded markets vs `source='polygon'`: 0 winner contradictions, benign 202 CLOB-null all pre-2024, 0 traded multi-outcome markets.
+- 2026-06-18: Retired the Polygon JSON-RPC market-resolution scan (issue #369 PR2). CLOB `/markets?closed=true` is now the **sole** market-resolution source; the Polygon JSON-RPC / `eth_getLogs` CTF-`ConditionResolution` source entries and the CTF contract-page reference are removed (their constants/scan were deleted from `pe-bootstrap`). Existing `source='polygon'` rows are retained, so historical resolution accuracy is unchanged.

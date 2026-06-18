@@ -27,7 +27,6 @@ pub mod leaderboard_discovery;
 pub mod lock;
 pub mod migrate;
 pub mod pile;
-pub mod polygon_ctf;
 pub mod polymarket;
 pub mod radion;
 pub mod wallet_discovery;
@@ -43,7 +42,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use cache::WalletCache;
-use chain::CTF_DEPLOY_BLOCK;
 use error::BootstrapError;
 
 // Upper-bound block for funder discovery — both endpoints finalized, result is time-invariant.
@@ -51,11 +49,12 @@ pub const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 
 /// Outcome of [`fetch_resolutions_and_schedules`] (issue #201).
 ///
-/// The optional fallback stages (CLOB, Gamma, null-rewrite, schedule-backfill)
-/// soft-fail independently: a failure logs a warning and records the stage name
-/// here rather than aborting the pipeline. The primary Polygon stage hard-fails
-/// (propagates `Err`). A non-empty `stages_failed` ⇒ the caller should treat
-/// the run as partial (exit 2), matching the backfill/weekly convention.
+/// The optional Gamma stages (schedules/liquidity, null-rewrite,
+/// schedule-backfill) soft-fail independently: a failure logs a warning and
+/// records the stage name here rather than aborting the pipeline. The primary
+/// CLOB stage hard-fails (propagates `Err`) — see [`fetch_resolutions_and_schedules`].
+/// A non-empty `stages_failed` ⇒ the caller should treat the run as partial
+/// (exit 2), matching the backfill/weekly convention.
 #[derive(Debug, Default, Clone)]
 pub struct ResolutionsReport {
     /// Names of optional stages that soft-failed this run (e.g. `"clob"`).
@@ -71,25 +70,32 @@ impl ResolutionsReport {
 
 /// Multi-source resolution + schedule pipeline (issue #149, extracted in #166).
 ///
-/// Stage ordering puts precision sources first so `INSERT OR IGNORE` keeps the
-/// most accurate `resolved_at_unix`:
+/// CLOB is the **primary, sole** market-resolution source (issue #369): the
+/// on-chain Polygon RPC scan was removed. Existing `source='polygon'` rows are
+/// retained (`INSERT OR IGNORE` never overwrites them), so CLOB is authoritative
+/// for markets polygon never resolved and for all future markets —
+/// "primary-for-new", not a rewrite of history.
 ///
-/// - 6a. Polygon RPC CTF scan → `source='polygon'` (block timestamp).
-/// - 6c. CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
-/// - 6d. Gamma schedules → `source='gamma'` (open markets only).
-/// - 6e. Gamma liquidity → only Gamma exposes liquidity (open markets).
-/// - 6f. Gamma null-schedule rewrite pass (issue #137 Sub-PR 2).
-/// - 6g. Gamma schedule backfill for resolved-but-unscheduled markets (issue #137
+/// - CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
+///   **Primary; hard-fails** so a CLOB outage aborts the run rather than silently
+///   producing a resolutions pass missing the gold source.
+/// - Gamma schedules → `source='gamma'` (open markets only).
+/// - Gamma liquidity → only Gamma exposes liquidity (open markets).
+/// - Gamma null-schedule rewrite pass (issue #137 Sub-PR 2).
+/// - Gamma schedule backfill for resolved-but-unscheduled markets (issue #137
 ///   durable follow-up): inserts a `market_schedules` row for resolved markets that
 ///   never had their schedule fetched while open.
 ///
-/// `open_ids` is computed AFTER 6a/6c so Gamma only fetches truly-still-open
+/// `open_ids` is computed AFTER CLOB so Gamma only fetches truly-still-open
 /// markets. `market_ids` scopes the run — pass `cache.all_market_ids()` for the
 /// full pipeline or just the wallets-newly-fetched market set for targeted backfill.
 ///
 /// `config.rebuild_resolutions = true` drops every imprecise-source row
-/// (`'gamma'`, `'clob'`) up front so the precision stages can re-populate them
-/// with block-timestamp accuracy. Idempotent — safe on every run.
+/// (`'gamma'`, `'clob'`) up front so the CLOB stage re-populates the `'clob'`
+/// rows. Retained `source='polygon'` rows are NOT deleted — they keep their exact
+/// block-timestamp `resolved_at_unix`. With the on-chain scan gone there is no
+/// precise re-derivation, so a rebuild re-fetches `'clob'` rows from CLOB only.
+/// Idempotent — safe on every run.
 pub async fn fetch_resolutions_and_schedules(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -105,19 +111,15 @@ pub async fn fetch_resolutions_and_schedules(
 
     let mut stages_failed: Vec<&'static str> = Vec::new();
 
-    // 6a. Polygon RPC scan — primary precise source; hard-fail (propagate).
-    // An Alchemy outage aborts the run rather than silently producing a
-    // resolutions pass missing the gold source.
-    run_polygon_resolutions(config, cache).await?;
+    // CLOB closed-market pagination — primary resolution source; hard-fail
+    // (propagate). A CLOB outage aborts the run rather than silently producing a
+    // resolutions pass missing the gold source (issue #369).
+    run_clob_closed_markets(config, cache).await?;
 
-    // 6c-6g are fallback/auxiliary sources (issue #201): a failure in one
-    // (e.g. a CLOB pagination hiccup) must NOT abort the others. Each is
-    // soft-failed — logged and recorded in the report — and the pipeline
-    // continues. A non-empty `stages_failed` makes the caller exit 2 (partial).
-    if let Err(e) = run_clob_closed_markets(config, cache).await {
-        tracing::warn!(error = %e, stage = "clob", "resolutions: stage soft-failed, continuing");
-        stages_failed.push("clob");
-    }
+    // The Gamma stages are fallback/auxiliary sources (issue #201): a failure in
+    // one must NOT abort the others. Each is soft-failed — logged and recorded in
+    // the report — and the pipeline continues. A non-empty `stages_failed` makes
+    // the caller exit 2 (partial).
     if let Err(e) = run_gamma_schedules_liquidity(config, cache, market_ids).await {
         tracing::warn!(error = %e, stage = "gamma", "resolutions: stage soft-failed, continuing");
         stages_failed.push("gamma");
@@ -134,35 +136,8 @@ pub async fn fetch_resolutions_and_schedules(
     Ok(ResolutionsReport { stages_failed })
 }
 
-/// 6a. Polygon RPC CTF scan → `source='polygon'` (block timestamp). No-op when
-/// `polygon_rpc_url` is unset.
-async fn run_polygon_resolutions(
-    config: &BootstrapConfig,
-    cache: &mut WalletCache,
-) -> Result<(), BootstrapError> {
-    if let Some(rpc_url) = config.polygon_rpc_url.as_deref() {
-        let from_block = cache
-            .get_source_cursor(polygon_ctf::POLYGON_CTF_CURSOR_KEY)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(CTF_DEPLOY_BLOCK);
-        let inserted = polygon_ctf::scan_resolutions(
-            rpc_url,
-            from_block,
-            None,
-            config.polygon_ctf_chunk_blocks,
-            cache,
-        )
-        .await?;
-        tracing::info!(
-            inserted,
-            from_block,
-            "bootstrap: polygon_ctf resolutions fetched"
-        );
-    }
-    Ok(())
-}
-
-/// 6c. CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
+/// CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
+/// Primary, sole market-resolution source (issue #369).
 async fn run_clob_closed_markets(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -185,8 +160,8 @@ async fn run_clob_closed_markets(
     Ok(())
 }
 
-/// 6d/e. Gamma schedules + liquidity for still-open markets (computed AFTER the
-/// precision stages so only truly-open markets are fetched).
+/// Gamma schedules + liquidity for still-open markets (computed AFTER the CLOB
+/// stage so only truly-open markets are fetched).
 async fn run_gamma_schedules_liquidity(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -219,7 +194,7 @@ async fn run_gamma_schedules_liquidity(
     Ok(())
 }
 
-/// 6f. Gamma null-schedule rewrite pass (issue #137 Sub-PR 2). Scoped to the
+/// Gamma null-schedule rewrite pass (issue #137 Sub-PR 2). Scoped to the
 /// trade-set ∩ null-schedule markets.
 async fn run_gamma_null_rewrite(
     config: &BootstrapConfig,
@@ -251,9 +226,10 @@ async fn run_gamma_null_rewrite(
     Ok(())
 }
 
-/// 6g. Gamma schedule backfill for resolved-but-unscheduled markets (issue #137
-/// durable follow-up). Stage 6d fetches open markets only and stage 6f rewrites
-/// only existing NULL rows, so a market that resolved before its schedule was ever
+/// Gamma schedule backfill for resolved-but-unscheduled markets (issue #137
+/// durable follow-up). The Gamma schedules stage fetches open markets only and the
+/// null-rewrite stage rewrites only existing NULL rows, so a market that resolved
+/// before its schedule was ever
 /// fetched is left with NO `market_schedules` row forever. This stage fetches
 /// `endDate` for those markets via Gamma's `&closed=true` variant (RPC-independent)
 /// and INSERTs a row — even when `endDate` is absent — so the market is marked

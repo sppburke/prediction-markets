@@ -722,11 +722,13 @@ impl WalletCache {
     ///
     /// Designed for the `PE_BOOTSTRAP_REBUILD_RESOLUTIONS` rebuild flow: the
     /// pre-issue-#149 Gamma path wrote rows with `closedTime`
-    /// (oracle-settlement-time approximation), and Cycle 2's CLOB path
-    /// writes rows with `end_date_iso` (scheduled-close-time approximation).
-    /// Both are imprecise relative to Dune's `evt_block_time` /
-    /// Polygon RPC's block timestamp. Deleting them lets the precision
-    /// sources (Dune, Polygon) re-populate on the next stage-6 pass.
+    /// (oracle-settlement-time approximation), and the CLOB path writes rows
+    /// with `end_date_iso` (scheduled-close-time approximation). Deleting these
+    /// imprecise rows lets the CLOB stage re-populate the `'clob'` rows on the
+    /// next stage-6 pass. The rebuild caller passes only `['gamma', 'clob']`
+    /// (`lib.rs`), so retained `source='polygon'` rows — which keep their exact
+    /// block-timestamp `resolved_at_unix` — are never deleted (#369: the on-chain
+    /// scan is gone, so polygon rows are the only exact-timestamp corpus left).
     ///
     /// # Precondition
     /// Returns `Ok(0)` when `sources` is empty — caller-provided empty input
@@ -3254,7 +3256,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = tmp_cache(&dir);
         assert!(cache.get_source_cursor("clob_closed").is_none());
-        assert!(cache.get_source_cursor("polygon_ctf_last_block").is_none());
+        assert!(cache.get_source_cursor("other_source").is_none());
     }
 
     #[test]
@@ -3262,15 +3264,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cache = tmp_cache(&dir);
         cache.set_source_cursor("clob_closed", "LTE=").unwrap();
-        cache
-            .set_source_cursor("polygon_ctf_last_block", "55000000")
-            .unwrap();
+        cache.set_source_cursor("other_source", "55000000").unwrap();
         assert_eq!(
             cache.get_source_cursor("clob_closed").as_deref(),
             Some("LTE=")
         );
         assert_eq!(
-            cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
+            cache.get_source_cursor("other_source").as_deref(),
             Some("55000000")
         );
     }
@@ -3279,14 +3279,10 @@ mod tests {
     fn source_cursor_set_overwrites_prior_value() {
         let dir = TempDir::new().unwrap();
         let mut cache = tmp_cache(&dir);
-        cache
-            .set_source_cursor("polygon_ctf_last_block", "33605403")
-            .unwrap();
-        cache
-            .set_source_cursor("polygon_ctf_last_block", "33615403")
-            .unwrap();
+        cache.set_source_cursor("other_source", "33605403").unwrap();
+        cache.set_source_cursor("other_source", "33615403").unwrap();
         assert_eq!(
-            cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
+            cache.get_source_cursor("other_source").as_deref(),
             Some("33615403"),
             "later set must replace earlier value"
         );
@@ -3297,9 +3293,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cache = tmp_cache(&dir);
         cache.set_source_cursor("clob_closed", "abc").unwrap();
-        cache
-            .set_source_cursor("polygon_ctf_last_block", "1")
-            .unwrap();
+        cache.set_source_cursor("other_source", "1").unwrap();
         // Updating one key must not affect the other.
         cache.set_source_cursor("clob_closed", "def").unwrap();
         assert_eq!(
@@ -3307,7 +3301,7 @@ mod tests {
             Some("def")
         );
         assert_eq!(
-            cache.get_source_cursor("polygon_ctf_last_block").as_deref(),
+            cache.get_source_cursor("other_source").as_deref(),
             Some("1")
         );
     }
@@ -3378,6 +3372,48 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(cache.resolved_market_ids().len(), 1);
+    }
+
+    /// PASS (issue #369, Resolved Q2 — "CLOB primary-for-new"): a `source='clob'`
+    /// insert for a market polygon already resolved is dropped by `INSERT OR
+    /// IGNORE`, so the original polygon row (source tag, winner, exact block
+    /// timestamp) survives untouched. This is why retaining the ~1.19M legacy
+    /// polygon rows keeps the historical corpus exact while CLOB owns new markets.
+    /// FAIL: the CLOB insert overwrites any field of the existing polygon row.
+    #[test]
+    fn existing_polygon_rows_survive_clob_insert() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+
+        // Polygon resolves the market first, with an exact block timestamp.
+        let polygon_resolved_at = 1_700_000_000;
+        cache
+            .insert_resolution_with_source("0xmkt", Some(0), polygon_resolved_at, 10, "polygon")
+            .unwrap();
+
+        // CLOB later attempts the same market with a DIFFERENT winner and a
+        // coarser `end_date_iso` timestamp — INSERT OR IGNORE must drop it.
+        cache
+            .insert_resolution_with_source(
+                "0xmkt",
+                Some(1),
+                polygon_resolved_at + 999_999,
+                20,
+                "clob",
+            )
+            .unwrap();
+
+        let (winner, resolved_at, _fetched, source) =
+            cache.resolution_record("0xmkt").expect("row must exist");
+        assert_eq!(
+            source, "polygon",
+            "CLOB insert must not overwrite the polygon source tag"
+        );
+        assert_eq!(winner, Some(0), "original polygon winner must be preserved");
+        assert_eq!(
+            resolved_at, polygon_resolved_at,
+            "exact polygon block timestamp must be preserved"
+        );
     }
 
     // ── snapshot_appearances_up_to ───────────────────────────────────────────

@@ -24,7 +24,6 @@ const DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
-const DEFAULT_POLYGON_CTF_CHUNK_BLOCKS: u64 = 10_000;
 // Issue #324: winner-discovery pipeline defaults.
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
@@ -44,7 +43,6 @@ const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
 ///
 /// ## TOML structure
 /// ```toml
-/// polygon_rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/<KEY>"  # resolution scan
 /// output_path = "/home/user/watchlist.json"
 /// cache_path = "/home/user/backtest-data/wallet_cache.db"
 /// ```
@@ -147,10 +145,15 @@ pub struct BootstrapConfig {
     pub fetch_resolutions: bool,
 
     /// One-shot retroactive rebuild of `market_resolutions` rows tagged with
-    /// imprecise sources (`'gamma'`, `'clob'`). When `true`, the stage-6
-    /// pipeline deletes those rows before any fetcher runs so the precision
-    /// sources (Polygon RPC, Dune) re-populate with block-timestamp
-    /// `resolved_at_unix` values. Idempotent — safe to set on every run.
+    /// imprecise sources (`'gamma'`, `'clob'`). When `true`, the resolution
+    /// pipeline deletes those rows before any fetcher runs so the CLOB stage
+    /// re-populates the `'clob'` rows. Retained `source='polygon'` rows are NOT
+    /// deleted — they keep their exact block-timestamp `resolved_at_unix`.
+    ///
+    /// **Warning (issue #369):** with the on-chain Polygon scan removed, CLOB is
+    /// the only source that re-derives `'clob'` rows — there is no precise
+    /// on-chain backfill safety net, so a rebuild re-fetches them from CLOB with
+    /// `end_date_iso`-approximate timestamps. Idempotent — safe to set on every run.
     /// Env `PE_BOOTSTRAP_REBUILD_RESOLUTIONS`: `"1"` or `"true"` to enable.
     #[serde(
         default,
@@ -162,30 +165,6 @@ pub struct BootstrapConfig {
     /// Gamma API base URL. `PE_GAMMA_BASE_URL` overrides.
     #[serde(default = "default_gamma_base_url")]
     pub gamma_base_url: String,
-
-    /// Polygon JSON-RPC URL used by:
-    /// - the CTF `eth_getLogs` resolution scan (issue #149; optional)
-    /// - the daily delta-backfill scan (issue #176; optional)
-    ///
-    /// Sources, in priority order (later overrides earlier):
-    /// 1. `PE_POLYGON_HTTP_URL` — shared with `pe-service` and
-    ///    `pe-source-onchain-polygon::live`. Issue #188 Item 1: read manually
-    ///    after figment extraction rather than via `#[serde(alias)]` so that
-    ///    setting both env vars doesn't trigger a "duplicate field" error.
-    /// 2. TOML `polygon_rpc_url = "..."`.
-    /// 3. `PE_BOOTSTRAP_POLYGON_RPC_URL` — bootstrap-specific override.
-    #[serde(default, alias = "bootstrap_polygon_rpc_url")]
-    pub polygon_rpc_url: Option<String>,
-
-    /// Block-range chunk size for the Polygon CTF scan. Larger chunks issue
-    /// fewer RPC calls but are more likely to hit provider response-size caps
-    /// and trigger the bisect-on-cap fallback. Set via
-    /// `PE_BOOTSTRAP_POLYGON_CTF_CHUNK_BLOCKS`.
-    #[serde(
-        default = "default_polygon_ctf_chunk_blocks",
-        alias = "bootstrap_polygon_ctf_chunk_blocks"
-    )]
-    pub polygon_ctf_chunk_blocks: u64,
 
     /// Polymarket CLOB API base URL. Override via `PE_CLOB_BASE_URL` (useful
     /// for testing against a stub).
@@ -281,9 +260,8 @@ pub struct BootstrapConfig {
     pub funder_topic_batch_size: usize,
 
     /// Block-range chunk size for the batched `eth_getLogs` funder scan
-    /// (issue #203). Independent of `polygon_ctf_chunk_blocks`; the
-    /// bisect-on-cap fallback subdivides dense ranges that exceed the
-    /// provider response cap. `PE_BOOTSTRAP_FUNDER_BLOCK_CHUNK` overrides.
+    /// (issue #203). The bisect-on-cap fallback subdivides dense ranges that
+    /// exceed the provider response cap. `PE_BOOTSTRAP_FUNDER_BLOCK_CHUNK` overrides.
     #[serde(
         default = "default_funder_block_chunk",
         alias = "bootstrap_funder_block_chunk"
@@ -475,10 +453,6 @@ fn default_gamma_base_url() -> String {
     crate::gamma::DEFAULT_GAMMA_BASE_URL.to_owned()
 }
 
-const fn default_polygon_ctf_chunk_blocks() -> u64 {
-    DEFAULT_POLYGON_CTF_CHUNK_BLOCKS
-}
-
 // ── Wallet pile (issue #166) ──────────────────────────────────────────────────
 
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults". `0` = unlimited.
@@ -558,8 +532,6 @@ impl Default for BootstrapConfig {
             fetch_resolutions: false,
             rebuild_resolutions: false,
             gamma_base_url: default_gamma_base_url(),
-            polygon_rpc_url: None,
-            polygon_ctf_chunk_blocks: default_polygon_ctf_chunk_blocks(),
             clob_base_url: default_clob_base_url(),
             clob_concurrency: default_clob_concurrency(),
             fetch_funder_graph: false,
@@ -597,8 +569,7 @@ impl Default for BootstrapConfig {
 ///
 /// `PE_BOOTSTRAP_*` env vars take priority over `PE_*` env vars; both are supported.
 /// Loads config from an optional TOML file plus the `PE_*` / `PE_BOOTSTRAP_*`
-/// env overlay, then applies the `PE_POLYGON_HTTP_URL` → `polygon_rpc_url`
-/// fallback. No API key is required to load config: wallet discovery now runs
+/// env overlay. No API key is required to load config: wallet discovery now runs
 /// against the public Polymarket leaderboard (keyless) via
 /// `winner_discovery::run_winner_discovery`.
 pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
@@ -606,7 +577,7 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
     if let Some(p) = path {
         fig = fig.merge(Toml::file(p));
     }
-    let mut cfg: BootstrapConfig = fig
+    let cfg: BootstrapConfig = fig
         .merge(
             Env::prefixed("PE_")
                 .lowercase(true)
@@ -614,20 +585,6 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
         )
         .merge(Env::prefixed("PE_BOOTSTRAP_").lowercase(true))
         .extract()?;
-    // Issue #188 Item 1: PE_POLYGON_HTTP_URL fallback. The workspace's other
-    // crates (`pe-service`, `pe-source-onchain-polygon::live`) bind to
-    // `PE_POLYGON_HTTP_URL`; the bootstrap historically used the longer
-    // `PE_BOOTSTRAP_POLYGON_RPC_URL`. `#[serde(alias)]` can't bridge the two
-    // because figment's env layers would contribute both keys when both vars
-    // are set, and serde rejects with "duplicate field". Manual fallback
-    // honours `PE_POLYGON_HTTP_URL` only when nothing else populated the
-    // field — bootstrap-specific override + TOML config still win.
-    if cfg.polygon_rpc_url.is_none()
-        && let Ok(url) = std::env::var("PE_POLYGON_HTTP_URL")
-        && !url.is_empty()
-    {
-        cfg.polygon_rpc_url = Some(url);
-    }
     Ok(cfg)
 }
 

@@ -347,16 +347,17 @@ The local latency-shift ranker pushes append-only ranking batches to Supabase (`
 Wallet discovery is now the **all-category Polymarket leaderboard** sweep
 (#335). The Dune client was deleted in #335; the on-chain `eth_getLogs`
 enumeration path, the delta scan, and funder discovery were deleted with the
-`pe-source-onchain-polygon` crate in #326 — see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`. The
-small set of Polygon-RPC primitives the surviving paths still need was relocated
-into `crates/bootstrap/src/chain.rs` (each constant keeps its `verified <date>
-from <source>` comment and a self-validating keccak test):
+`pe-source-onchain-polygon` crate in #326 — see `docs/28-OPERATOR-GRAPH-ARCHIVE.md`.
+The on-chain CTF market-resolution scan and its `eth_getLogs` bisect primitive
+were removed in #369 when CLOB became the **sole** market-resolution source. The
+few Polygon PoS contract constants the surviving migration/events paths still
+need were relocated into `crates/bootstrap/src/chain.rs` (each keeps its
+`verified <date> from <source>` comment and a self-validating keccak test):
 
 | Symbol (`pe_bootstrap::chain::*`) | Purpose |
 |---|---|
-| `CTF`, `CTF_DEPLOY_BLOCK`, `TOPIC_CONDITION_RESOLUTION` | Precise market-resolution scan (`polygon_ctf::scan_resolutions`, issue #149). |
-| `ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, `TOPIC_ORDER_FILLED_V1` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy` and the Dune-arm enumeration completion marker. |
-| `eth_get_logs_bisect` | Bisect-on-cap helper with a transient-error retry classifier (`TransientErrorKind`: rate-limit / decode / transport, exponential backoff, max 6 attempts) used by the resolution scan. |
+| `ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, `TOPIC_ORDER_FILLED_V1`, `TOPIC_ORDER_FILLED_V2` | Legacy enum-state synthesis in `migrate::auto_migrate_legacy`. |
+| `normalise_condition_id` | `0x` condition-id canonicalisation shared by the Gamma `/events` sweep (relocated from `dune.rs` in #335). |
 
 Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
 
@@ -564,7 +565,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_wallet_cache_path` | `"wallet_cache.db"` | SQLite trade cache. WAL mode provides per-commit durability — at most one in-flight wallet's transaction is lost on crash. Set via `PE_BOOTSTRAP_CACHE_PATH`. |
 | `bootstrap_wallet_set_path` | `"wallet_set.json"` | Path to a legacy enumerated wallet address list. Consumed once by `migrate::auto_migrate_legacy` (ingested into the pile, then deleted). Not produced by any current path; set via `PE_BOOTSTRAP_WALLET_SET_PATH` |
 | `bootstrap_fetch_resolutions` | `false` | When `true`, `pe-bootstrap` fetches resolution data from the Polymarket Gamma API after the trade-fetch phase and stores it in `market_resolutions`. Set `PE_BOOTSTRAP_FETCH_RESOLUTIONS=1` to enable. |
-| `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs. Stage 6a (Polygon RPC, if configured) then re-populates those markets with block-timestamp `resolved_at_unix` values via `INSERT OR IGNORE`. Idempotent — safe to set on every run; once all rows are precision-sourced subsequent runs delete 0 rows and skip the re-fetch. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
+| `bootstrap_rebuild_resolutions` | `false` | One-shot retroactive correction (issue #149 follow-up): when `true`, stage 6 deletes every `market_resolutions` row tagged with an imprecise source (`'gamma'`, `'clob'`) before any fetcher runs; the CLOB stage then re-populates the `'clob'` rows via `INSERT OR IGNORE`. Retained `'polygon'` rows are **not** deleted — they keep their exact block-timestamp `resolved_at_unix`. **#369:** with the on-chain scan removed, CLOB is the only source that re-derives `'clob'` rows (with `end_date_iso`-approximate timestamps); there is no precise on-chain backfill. Idempotent — safe to set on every run. Set `PE_BOOTSTRAP_REBUILD_RESOLUTIONS=1` to enable. |
 | `bootstrap_skip_trade_fetch` | `false` | When `true`, `pe-bootstrap` skips the Polymarket trade-fetch step entirely. Safe when the trade cache is already fully populated and only subsequent steps (resolutions, filters) need to run. Emits a warn-level log. Set `PE_BOOTSTRAP_SKIP_TRADE_FETCH=1` to enable. |
 | `infra_probe_span_secs` | `3600` | Maximum span (newest − oldest, seconds) across the first 500 trades of a cold-start wallet for it to be classified as infrastructure (issue #197). 500 trades in < 1 h ⇒ > 8 trades/min ⇒ market-maker / treasury / arbitrage bot. Below threshold: wallet is flagged `is_infra = 1`, the probe page is discarded, and downstream consumers skip via the `active_tradeable_wallets` view. The same threshold drives the `pe-bootstrap classify-infra` retroactive sweep over already-cached trades. Override via `PE_BOOTSTRAP_INFRA_SPAN_SECS`; canonical const lives in `pe_bootstrap::infra_probe::DEFAULT_INFRA_SPAN_SECS`. |
 | `bootstrap_write_snapshot` | `false` | When `true`, the main `pe-bootstrap` pipeline persists a `(snapshot_at_unix, wallet)` row-set to `leaderboard_snapshots` at run time, stamped with the current `snapshot_at`. Default `false` keeps ad-hoc bootstrap runs (resolutions watchdog retries, dev shells) from polluting the snapshot timeline with near-duplicate intra-day rows — only the official weekly refresh path should opt in. Set `PE_BOOTSTRAP_WRITE_SNAPSHOT=1` to enable. |
@@ -574,9 +575,7 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_event_orphan_warn_pct` | 99 | `pe-bootstrap events` coverage gate (issue #206): warn if more than 99% of distinct traded markets are orphans (self-mapped). Gamma's /events covers only a curated subset of all condition IDs; a 90–99% orphan rate on a large historical cache is expected and correct. The format-break hard-fail (abort if `events_seen > 0` but `conditions_mapped == 0`) replaces the old percentage-based abort. Const `ORPHAN_WARN_PCT` in `pe_bootstrap::events`. |
 | `market_fee_missing_default_bps` | 0 | Default fee in bps when Gamma sets `feesEnabled = false`, omits `feeSchedule`, or omits `feeSchedule.rate`. Zero is the safe sentinel: it never over-discounts PnL and treats pre-fee-era markets correctly. Used by `fees_for_market` / `rate_to_bps` in `pe_bootstrap::events`. |
 | `market_fee_max_bps` | 10_000 | Upper clamp for `market_fees.taker_base_fee_bps` / `maker_base_fee_bps`. Polymarket's live `feeSchedule.rate` is `0.04` (= 400 bps); the 10 000 bps ceiling (100%) is a hard guard against malformed API responses, not a normal value. |
-| `bootstrap_polygon_rpc_url` | `None` | Polygon JSON-RPC URL for the CTF `eth_getLogs` resolution scan (issue #149 multi-source pipeline). When unset the Polygon stage is skipped — daily backfills then rely on CLOB + Gamma. Set via `PE_BOOTSTRAP_POLYGON_RPC_URL`. |
-| `bootstrap_polygon_ctf_chunk_blocks` | 10_000 | Block-range chunk size for the Polygon CTF scan. Larger chunks issue fewer RPC calls but are more likely to hit provider response-size caps and trigger the bisect-on-cap fallback. Set via `PE_BOOTSTRAP_POLYGON_CTF_CHUNK_BLOCKS`. |
-| `bootstrap_clob_base_url` | `https://clob.polymarket.com` | Base URL for the Polymarket CLOB API (`/markets?closed=true` paginated listing). Override via `PE_CLOB_BASE_URL` for testing against a stub. |
+| `bootstrap_clob_base_url` | `https://clob.polymarket.com` | Base URL for the Polymarket CLOB API (`/markets?closed=true` paginated listing) — the **sole** market-resolution source (#369). Override via `PE_CLOB_BASE_URL` for testing against a stub. |
 | `bootstrap_clob_concurrency` | 8 | Number of in-flight CLOB requests issued concurrently per fetch loop, mirroring the Gamma `buffer_unordered` pattern. Set via `PE_BOOTSTRAP_CLOB_CONCURRENCY`. |
 | `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / Radion / 502-gap / datadash) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. Initial deployment runs with `0` to drain the bulk catch-up queue; steady-state daily timers may set a positive value if daily run time grows unmanageable. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |

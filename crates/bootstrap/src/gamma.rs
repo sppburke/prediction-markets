@@ -394,7 +394,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
 /// Serde DTO for a single element of the `/markets` response array.
 ///
 /// Only the fields needed for schedule and liquidity detection are mapped
-/// (resolution data has moved to Polygon RPC + CLOB per issue #149).
+/// (resolution data is sourced from CLOB per issue #149 / #369).
 /// Extra fields are ignored by serde.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -498,9 +498,8 @@ fn parse_end_date(s: &str) -> Result<i64, String> {
 }
 
 // (`parse_closed_time` was removed in issue #149 Cycle 2 — its only caller
-// `fetch_resolutions` is gone now that Polygon RPC + CLOB own resolution
-// data, and Polygon's block-timestamp / CLOB's `end_date_iso` are richer
-// than Gamma's `closedTime` ever was.)
+// `fetch_resolutions` is gone now that CLOB owns resolution data (#369), and
+// CLOB's `end_date_iso` is richer than Gamma's `closedTime` ever was.)
 
 // ── Convenience: build a ResolutionIndex without running a full bootstrap ─────
 

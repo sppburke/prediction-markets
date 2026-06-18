@@ -1,21 +1,22 @@
 //! Polymarket CLOB paginated client — closed markets only.
 //!
-//! Issue #149: the CLOB `/markets?closed=true` endpoint exposes every
-//! closed Polymarket market with its `tokens[].winner` flag and
-//! `end_date_iso`. Unlike Gamma it does not purge resolved markets, so it
-//! serves as the gap-filler for resolutions that Polygon RPC missed
-//! (multi-outcome markets, oracle redirections, etc.).
+//! Issue #149 / #369: the CLOB `/markets?closed=true` endpoint exposes every
+//! closed Polymarket market with its `tokens[].winner` flag and `end_date_iso`.
+//! Unlike Gamma it does not purge resolved markets, so since #369 it is the
+//! **sole, primary** market-resolution source (the on-chain Polygon RPC scan was
+//! removed). Existing `source='polygon'` rows are retained — `INSERT OR IGNORE`
+//! never overwrites them — so CLOB is authoritative for markets polygon never
+//! resolved and for all new markets ("primary-for-new").
 //!
 //! Pagination is sequential because each page returns the cursor for the
 //! next; `buffer_unordered` does not apply. The `source_cursor.clob_closed`
 //! row persists the cursor so daily re-runs resume from the last page
 //! instead of re-walking ~200 pages each tick.
 //!
-//! **Approximation:** `resolved_at_unix` is set to the parsed
-//! `end_date_iso` because CLOB does not expose a block-timestamp
-//! resolution time. Polygon RPC provides the authoritative value and wins
-//! on `INSERT OR IGNORE` ordering, so CLOB's approximation only sticks for
-//! markets Polygon RPC doesn't catch.
+//! **Approximation:** `resolved_at_unix` is set to the parsed `end_date_iso`
+//! because CLOB does not expose a block-timestamp resolution time. The retained
+//! legacy `source='polygon'` rows keep their exact block timestamps (and win on
+//! `INSERT OR IGNORE` ordering); only new markets carry the CLOB approximation.
 
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
@@ -72,7 +73,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     ///
     /// Returns `(schedules_inserted, resolutions_inserted)`. Counts
     /// reflect only newly-inserted rows; rows already present (e.g.
-    /// from an earlier Polygon RPC pass) silently no-op.
+    /// a retained `source='polygon'` row) silently no-op.
     pub async fn fetch_closed_markets(
         &self,
         cache: &mut WalletCache,
@@ -149,8 +150,9 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 // have (the API does not expose a block-timestamp resolution
                 // time), so a malformed value would otherwise stamp the row
                 // with `resolved_at = now()`, lying about when the market
-                // actually settled. Skipping leaves the market unresolved so
-                // Polygon RPC can fill in an accurate timestamp later.
+                // actually settled. Skipping leaves the market unresolved until a
+                // later run parses a clean `end_date_iso` (issue #369: CLOB is the
+                // sole resolution source — there is no on-chain backfill).
                 let winner = winner_index(&market.tokens);
                 if market.closed
                     && let Some(resolved_at) = end_date_unix
@@ -282,8 +284,8 @@ mod tests {
 
     #[test]
     fn winner_index_two_winners_is_none() {
-        // Should never happen in production but guard against the
-        // first-non-zero pitfall analogous to polygon_ctf's tied case.
+        // Should never happen in production but guard against the first-non-zero
+        // pitfall: two `winner=true` tokens must yield None, not the first index.
         let tokens = vec![ClobToken { winner: true }, ClobToken { winner: true }];
         assert_eq!(winner_index(&tokens), None);
     }

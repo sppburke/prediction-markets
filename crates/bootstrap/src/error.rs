@@ -36,8 +36,6 @@ pub enum BootstrapError {
     Radion { message: String },
     #[error("datadash: {message}")]
     Datadash { message: String },
-    #[error("polygon_ctf: {message}")]
-    PolygonCtf { message: String },
     #[error("funder: {message}")]
     Funder { message: String },
     #[error("url parse: {0}")]

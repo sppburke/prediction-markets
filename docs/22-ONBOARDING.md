@@ -30,9 +30,8 @@ All three are also installed automatically in CI via `taiki-e/install-action`.
 | Account | Purpose | Free tier |
 |---|---|---|
 | [Dune Analytics](https://dune.com) | Wallet discovery SQL | 2,500 credits/month |
-| Polygon RPC provider (e.g. Alchemy, Infura, QuickNode) | Market-resolution scan (on-chain) | ~30M CU/month free |
 
-Polymarket CLOB credentials are only needed for live order submission (not backtest or bootstrap).
+Polymarket CLOB credentials are only needed for live order submission (not backtest or bootstrap). Market resolutions come from the public CLOB `/markets?closed=true` endpoint (key-free, #369) — no Polygon RPC / Alchemy account is required.
 
 ## Environment configuration
 
@@ -57,8 +56,6 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 
 | Variable | Description | Required | Default |
 |---|---|:---:|---|
-| `PE_POLYGON_HTTP_URL` | Polygon JSON-RPC HTTP endpoint | **[req]** | — |
-| `PE_POLYGON_WS_URL` | Polygon JSON-RPC WebSocket endpoint | **[req]** | — |
 | `PE_WALLET_SOURCE` | Wallet discovery source (`dune`) | **[req]** | — |
 | `PE_DUNE_API_KEY` | Dune Analytics API key | **[req]** | — |
 | `PE_DUNE_NAMESPACE` | Dune query namespace (your username) | **[req]** | — |
@@ -139,7 +136,7 @@ Runs the full walk-forward simulation on historical data. No live credentials ne
 
 ```bash
 # 1. Set required bootstrap vars in .env
-#    PE_POLYGON_HTTP_URL, PE_POLYGON_WS_URL, PE_DUNE_API_KEY, PE_DUNE_NAMESPACE,
+#    PE_DUNE_API_KEY, PE_DUNE_NAMESPACE,
 #    PE_ETHERSCAN_API_KEY, PE_BOOTSTRAP_OUTPUT, PE_BOOTSTRAP_CACHE_PATH,
 #    PE_BOOTSTRAP_WALLET_SET_PATH, PE_BOOTSTRAP_FETCH_RESOLUTIONS=1,
 #    PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1, PE_BACKTEST_OUTPUT_DIR

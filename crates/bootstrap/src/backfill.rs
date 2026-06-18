@@ -7,9 +7,9 @@
 //!    with per-wallet `last_polymarket_fetch_at` stamping. Returns a
 //!    [`FetchOutcome`] with the failed list AND a `new_trades` map of
 //!    wallets with at least one new inserted row.
-//! 3. `fetch_resolutions_and_schedules` — multi-source pipeline (Polygon RPC →
-//!    CLOB → Gamma) on the full cache market set so newly-discovered
-//!    market_ids get their resolution / schedule rows.
+//! 3. `fetch_resolutions_and_schedules` — resolution pipeline (CLOB → Gamma) on
+//!    the full cache market set so newly-discovered market_ids get their
+//!    resolution / schedule rows.
 //! 4. `refresh_trade_counts` + `apply_activation_rules` — newly-qualifying
 //!    wallets flip to `is_active=1`.
 //! 5. Return `Err(PartialFetch)` at the very end so `pe-bootstrap` exits
@@ -97,8 +97,8 @@ pub async fn run_backfill(
     // ── 4. Resolutions + activation tail ───────────────────────────────────────
     if config.fetch_resolutions {
         let market_ids = cache.all_market_ids();
-        // Issue #201: optional resolution stages soft-fail; a partial result is
-        // logged but does not change backfill's own exit accounting (a Polygon
+        // Issue #201: optional Gamma stages soft-fail; a partial result is
+        // logged but does not change backfill's own exit accounting (a CLOB
         // primary failure still propagates as Err via `?`).
         let report = fetch_resolutions_and_schedules(config, cache, &market_ids).await?;
         if report.has_failures() {
