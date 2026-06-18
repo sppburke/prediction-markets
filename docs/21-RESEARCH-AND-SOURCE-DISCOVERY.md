@@ -46,17 +46,13 @@ Before coding trader-copy logic, verify:
 - whether the proxy/funder/collateral mapping is derivable from public chain data and official docs for representative historical examples;
 - whether any third-party data source has an authorized replayable API/export, or is only an opaque UI product.
 
-## Polygon resolution-scan source checks
+## Polygon resolution-scan source checks (removed — #369)
 
-Before coding the Polygon resolution scan (`pe_bootstrap::chain` / `polygon_ctf`), verify:
-
-- official Polymarket contract addresses and deployment/factory docs;
-- public event signatures for proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral flows;
-- chain provider archive access, rate limits, reorg behavior, and allowed trading use;
-- exchange/bridge/hot-wallet label source and versioning policy;
-- strict versus transitive cluster rule version and replay determinism;
-- anti-gaming flags and whether each is computable from public data at time `t` (thresholds in `_GLOSSARY.md`);
-- degradation behavior when the on-chain source is stale or unavailable (`onchain_block_lag_warn` / `onchain_block_lag_block`).
+The on-chain Polygon resolution scan (`polygon_ctf` and the `pe_bootstrap::chain`
+RPC primitives) was removed in #369: the Polymarket CLOB `/markets?closed=true`
+listing is now the **sole** market-resolution source (key-free). Resolution-source
+vetting therefore folds into the venue/CLOB checks above — there is no Polygon RPC
+provider to verify (archive access, rate limits, reorg behavior, etc.).
 
 ## Documentation output
 

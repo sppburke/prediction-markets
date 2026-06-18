@@ -25,10 +25,10 @@ cargo build --release -p pe-bootstrap -p pe-skill-select
   so either pass a config TOML with `cache_path = "data/wallet_cache.db"` or set
   `PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db`. `pe-skill-select` uses
   `PE_SKILL_CACHE_PATH`.
-- **Polygon RPC (optional but recommended).** `PE_BOOTSTRAP_POLYGON_RPC_URL`
-  improves resolution coverage (the resolution pipeline tries Polygon RPC → Dune →
-  CLOB → Gamma; without RPC it falls through to Gamma). Backfill of *trades* works
-  without it.
+- **Market resolutions (no RPC).** The resolution pipeline is CLOB → Gamma:
+  the Polymarket CLOB `/markets?closed=true` listing is the sole resolution
+  source (#369; key-free), with Gamma supplying open-market schedules/liquidity.
+  No Polygon RPC / Alchemy provider is required.
 - **Python analysis venv.** The ranking scripts run under `.venv-analysis/bin/python3`.
 
 ---
@@ -46,9 +46,8 @@ any new wallets.
   than 1 day (`backfill_limit = 0` = all due wallets).
 - Incremental two-phase cursor walk per wallet — it appends new trades, it does not
   re-download history already in the cache.
-- Refreshes `market_resolutions` / `market_schedules` for the cache's market set.
-- Runs in `DeltaMode::Shadow` by default (`crates/bootstrap/src/lib.rs:88`): the
-  on-chain delta scan is audit-only and **does not change the fetch set**.
+- Refreshes `market_resolutions` (CLOB) / `market_schedules` (Gamma) for the
+  cache's market set.
 
 It does **not** add wallets via chain enumeration or Dune. Those are the
 `enumerate` and `discovery` subcommands — **do not run them** for a pure backfill.
@@ -61,8 +60,6 @@ not new discovery.)
 ```bash
 # 1. Refresh trades + resolutions for all stale active wallets (incremental).
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
-PE_BOOTSTRAP_POLYGON_RPC_URL=<polygon-rpc-url> \   # optional; improves resolution coverage
-PE_BOOTSTRAP_POLYMARKET_DELTA_MODE=off \           # REQUIRED on free-tier RPC — see Delta-mode note below
   ./target/release/pe-bootstrap backfill
 
 # 2. Refresh condition→event + fee mappings (needed by the ranker's
@@ -70,8 +67,7 @@ PE_BOOTSTRAP_POLYMARKET_DELTA_MODE=off \           # REQUIRED on free-tier RPC �
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap events
 
-# 3. (Only if step 1 ran without RPC and you need fuller resolution coverage)
-#    Run the resolution pipeline explicitly.
+# 3. (Optional) Run the resolution pipeline (CLOB → Gamma) explicitly.
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 \
   ./target/release/pe-bootstrap resolutions
@@ -83,20 +79,6 @@ PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 \
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap schedules
 ```
-
-> **Delta-mode note (important on a free-tier Polygon RPC).** `backfill` defaults to
-> `DeltaMode::Shadow` (`crates/bootstrap/src/lib.rs:88`), which runs an audit-only
-> on-chain `eth_getLogs` scan over the CTF block range *before* fetching any trades.
-> Free-tier Polygon RPC providers cap `eth_getLogs` at a **10-block** range, so that
-> scan bisects down to 10-block windows and is impractical across the ~900k-block gap —
-> it stalls the run before a single trade is fetched, while adding **no** wallets and
-> **no** trades (the scan is audit-only; in Shadow it never changes the fetch set —
-> `backfill.rs:108-112`). For a pure backfill on a free-tier RPC, set
-> `PE_BOOTSTRAP_POLYMARKET_DELTA_MODE=off`: this skips the scan and fetches every due
-> wallet directly, which is still "no new wallets". Reserve Shadow/Delta for a paid RPC
-> that allows wide `getLogs` ranges. (Verified 2026-06-04: a Shadow run logged
-> thousands of `response cap hit, bisecting` warnings and never reached trade-fetch;
-> the `off` run started fetching immediately.)
 
 > **end_date coverage note (look-ahead safety).** Any "time-to-resolution" / expiry
 > analysis must reference the *scheduled* `market_schedules.end_date_unix` (known at

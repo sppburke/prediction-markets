@@ -39,11 +39,15 @@ was purged.
 | `pe-funding-graph` | Time-ordered funding-edge accumulator (`FunderGraphTimeline`) for walk-forward operator reconstruction. |
 
 Their last live state is at the commit immediately before #326 PR5
-(`origin/main` history). The minimal Polygon-RPC primitives still needed by the
-surviving market-resolution scan were relocated into
-`crates/bootstrap/src/chain.rs` in #326 PR4 (`CTF`, `CTF_DEPLOY_BLOCK`,
-`TOPIC_CONDITION_RESOLUTION`, `ALL_EXCHANGE_CONTRACTS`,
-`ALL_ORDER_FILLED_TOPICS`, `eth_get_logs_bisect`).
+(`origin/main` history). The minimal Polygon-RPC primitives needed by the
+market-resolution scan were relocated into `crates/bootstrap/src/chain.rs` in
+#326 PR4 (`CTF`, `CTF_DEPLOY_BLOCK`, `TOPIC_CONDITION_RESOLUTION`,
+`ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, `eth_get_logs_bisect`).
+**#369 update:** the on-chain resolution scan was later removed (CLOB became the
+sole resolution source), so `CTF`, `CTF_DEPLOY_BLOCK`, `TOPIC_CONDITION_RESOLUTION`,
+and `eth_get_logs_bisect` were deleted; only the exchange/order-filled constants
+(`ALL_EXCHANGE_CONTRACTS`, `ALL_ORDER_FILLED_TOPICS`, plus the V1/V2 contract/topic
+constants) and `normalise_condition_id` remain in `chain.rs`.
 
 Removed `core-types` types (#326 PR5): `OperatorId`, `FunderRootId`,
 `FundingHopCount`, `WalletAgeSeconds`, `ClusterSize`, `InheritedPriorPpm`,

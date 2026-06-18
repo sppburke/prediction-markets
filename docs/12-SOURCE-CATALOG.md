@@ -110,9 +110,8 @@ pub enum SourceDisagreementPolicy {
 
 - Polymarket proxy-wallet, pUSD, USDC/USDC.e, deposit/onramp, and collateral-flow event logs where publicly derivable.
 - Publicly versioned exchange/bridge/hot-wallet boundary labels.
-- Polygon JSON-RPC/archive node or equivalent licensed public-chain provider.
 
-These sources support the Polygon resolution scan and on-chain timing verification. They are not venue execution APIs and must remain replayable from raw logs plus parser/config versions.
+These sources are not venue execution APIs and must remain replayable from raw logs plus parser/config versions. (The Polygon JSON-RPC market-resolution scan was removed in #369 — CLOB `/markets?closed=true` is now the sole resolution source — so no public-chain RPC provider is required.)
 
 ### Kalshi trader/flow sources
 

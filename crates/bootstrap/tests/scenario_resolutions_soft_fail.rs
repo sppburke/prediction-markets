@@ -1,13 +1,17 @@
-//! Scenario: resolutions per-stage soft-fail (issue #201).
+//! Scenario: post-#369 resolution-stage failure modes.
 //!
-//! PASS: when the optional CLOB and Gamma stages are unreachable (refused port),
-//!       `fetch_resolutions_and_schedules` returns `Ok(report)` with those stages
-//!       recorded in `report.stages_failed` — it does NOT propagate `Err` and
-//!       abort the pipeline.
-//! FAIL: the function returns `Err`, or `stages_failed` is empty.
+//! After issue #369, CLOB is the **primary, hard-fail** resolution source and
+//! the Gamma stages remain soft-fail. Two cases:
 //!
-//! Polygon is disabled (`polygon_rpc_url: None`) so the test is deterministic with
-//! no live network calls; the soft-fail logic is identical across stages.
+//! 1. CLOB unreachable (refused port) ⇒ `fetch_resolutions_and_schedules`
+//!    propagates `Err` and aborts the pipeline (hard-fail).
+//! 2. CLOB succeeds while Gamma is unreachable ⇒ the function returns `Ok` with
+//!    only `"gamma"` recorded in `stages_failed` (soft-fail).
+//!
+//! Deterministic, no live network: case 1 hits a refused port; case 2 makes the
+//! CLOB stage a no-op by persisting the `LTE=` pagination terminator (so
+//! `fetch_closed_markets` returns `Ok((0, 0))` before issuing any HTTP request),
+//! leaving only the refused Gamma stage to soft-fail.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -16,19 +20,54 @@ use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::{BootstrapConfig, fetch_resolutions_and_schedules};
 use tempfile::TempDir;
 
+/// PASS: an unreachable CLOB endpoint makes the primary stage hard-fail, so
+/// `fetch_resolutions_and_schedules` returns `Err` and aborts the run.
+/// FAIL: the function returns `Ok` despite CLOB being unreachable.
 #[tokio::test]
-async fn resolutions_soft_fails_unreachable_optional_stages() {
+async fn resolutions_hard_fail_when_clob_unreachable() {
     let dir = TempDir::new().unwrap();
     let cache_path = dir.path().join("cache.db");
     let mut cache = WalletCache::open(&cache_path).unwrap();
 
-    // CLOB + Gamma point at a port with no listener → connection refused.
-    // Dune + Polygon disabled (None) so only the two refused stages run.
+    // CLOB points at a port with no listener → connection refused → hard-fail.
     let config = BootstrapConfig {
         cache_path,
         clob_base_url: "http://127.0.0.1:1".to_owned(),
         gamma_base_url: "http://127.0.0.1:1".to_owned(),
-        polygon_rpc_url: None,
+        ..BootstrapConfig::default()
+    };
+
+    let market_ids = vec!["0xmarket0001".to_owned()];
+
+    let result = fetch_resolutions_and_schedules(&config, &mut cache, &market_ids).await;
+
+    assert!(
+        result.is_err(),
+        "an unreachable CLOB primary stage must hard-fail (propagate Err), got Ok"
+    );
+    println!("PASS: CLOB unreachable ⇒ fetch_resolutions_and_schedules returns Err");
+}
+
+/// PASS: with CLOB a no-op (cursor at the `LTE=` terminator ⇒ early `Ok`, no
+/// HTTP) and Gamma unreachable, the function returns `Ok` with exactly `["gamma"]`
+/// in `stages_failed`.
+/// FAIL: the function returns `Err`, or `stages_failed` is not exactly `["gamma"]`.
+#[tokio::test]
+async fn gamma_only_soft_fails_when_clob_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&cache_path).unwrap();
+
+    // Persist the CLOB pagination terminator so `fetch_closed_markets` returns
+    // early with Ok((0, 0)) and issues zero HTTP requests — a deterministic CLOB
+    // success without a mock server.
+    cache.set_source_cursor("clob_closed", "LTE=").unwrap();
+
+    // Gamma points at a refused port; the CLOB base URL is never contacted.
+    let config = BootstrapConfig {
+        cache_path,
+        clob_base_url: "http://127.0.0.1:1".to_owned(),
+        gamma_base_url: "http://127.0.0.1:1".to_owned(),
         ..BootstrapConfig::default()
     };
 
@@ -38,20 +77,13 @@ async fn resolutions_soft_fails_unreachable_optional_stages() {
 
     let report = fetch_resolutions_and_schedules(&config, &mut cache, &market_ids)
         .await
-        .expect("soft-fail must return Ok, not propagate Err");
+        .expect("CLOB no-op + Gamma soft-fail must return Ok, not propagate Err");
 
-    assert!(
-        report.has_failures(),
-        "expected optional stages to soft-fail, got none"
+    assert_eq!(
+        report.stages_failed,
+        vec!["gamma"],
+        "only the refused Gamma stage may soft-fail; CLOB no-ops and the empty \
+         null-rewrite / schedule-backfill stages issue no request"
     );
-    assert!(
-        report.stages_failed.contains(&"clob"),
-        "clob should soft-fail against a refused port; stages_failed={:?}",
-        report.stages_failed
-    );
-    assert!(
-        report.stages_failed.contains(&"gamma"),
-        "gamma should soft-fail against a refused port; stages_failed={:?}",
-        report.stages_failed
-    );
+    println!("PASS: CLOB no-op + Gamma refused ⇒ Ok with stages_failed == [\"gamma\"]");
 }
