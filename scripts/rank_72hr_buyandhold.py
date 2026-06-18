@@ -39,6 +39,16 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from ranker_decay import (
+    DEFAULT_HALF_LIFE_DAYS,
+    DEFAULT_WINDOW_DAYS,
+    decay_weights,
+    parse_as_of,
+    today_midnight_unix,
+    weighted_stats,
+    window_start_unix,
+)
+
 SECS_PER_DAY = 86_400
 WEEK_SECS = 7 * SECS_PER_DAY
 
@@ -65,6 +75,8 @@ class Params:
     limit_wallets: int      # 0 = all
     price_min: float        # entry-price band lower bound (inclusive)
     price_max: float        # entry-price band upper bound (inclusive)
+    half_life_days: float   # recency-decay half-life in days; <= 0 disables decay (flat = legacy)
+    as_of: int              # decay age anchor (unix); trades older than this decay, future clip to weight 1.0
 
 
 def parse_args() -> Params:
@@ -73,8 +85,17 @@ def parse_args() -> Params:
     p.add_argument("--universe",
                    default="data/archive/research-2026-05/watchlist-20260528T194034Z-gbm_bhq_intersection_3.txt")
     p.add_argument("--out-dir", default="data/eval-results")
-    p.add_argument("--win-start", default="2025-12-01")
-    p.add_argument("--win-end", default="2026-06-01")
+    p.add_argument("--win-start", default=None,
+                   help="entry-date window start (ISO). Default: win_end - "
+                        f"{DEFAULT_WINDOW_DAYS}d (relative).")
+    p.add_argument("--win-end", default=None,
+                   help="entry-date window end (ISO), exclusive. Default: today UTC-midnight (relative).")
+    p.add_argument("--half-life-days", type=float, default=DEFAULT_HALF_LIFE_DAYS,
+                   help="exponential recency-decay half-life in days for the edge/t-stat score "
+                        "(a trade one half-life old weighs 0.5). <= 0 disables decay (flat = legacy). "
+                        "Eligibility/activity counts and hit_rate stay raw.")
+    p.add_argument("--as-of", default=None,
+                   help="decay age anchor (ISO date/datetime or unix epoch). Default: win_end.")
     p.add_argument("--ttr-hours", type=float, default=72.0)
     p.add_argument("--min-ttr-hours", type=float, default=30.0 / 3600.0,
                    help="lower TTR bound: drop first-buys entered < this many hours before "
@@ -103,9 +124,17 @@ def parse_args() -> Params:
     def to_unix(d: str) -> int:
         return int(pd.Timestamp(d, tz="UTC").timestamp())
 
+    # Relative window defaults (overridable): win_end -> today UTC-midnight;
+    # win_start -> win_end - DEFAULT_WINDOW_DAYS. Anchor decay at as_of (default win_end).
+    win_end = to_unix(a.win_end) if a.win_end else today_midnight_unix()
+    win_start = to_unix(a.win_start) if a.win_start else window_start_unix(win_end, DEFAULT_WINDOW_DAYS)
+    as_of = parse_as_of(a.as_of)
+    if as_of is None:
+        as_of = win_end
+
     return Params(
         db=a.db, universe=a.universe, out_dir=a.out_dir,
-        win_start=to_unix(a.win_start), win_end=to_unix(a.win_end),
+        win_start=win_start, win_end=win_end,
         ttr_secs=int(a.ttr_hours * 3600),
         min_ttr_secs=int(a.min_ttr_hours * 3600),
         min_avg_per_month=a.min_avg_per_month,
@@ -117,6 +146,8 @@ def parse_args() -> Params:
         limit_wallets=a.limit_wallets,
         price_min=a.price_min,
         price_max=a.price_max,
+        half_life_days=a.half_life_days,
+        as_of=as_of,
     )
 
 
@@ -234,27 +265,27 @@ def rank_wallets(df: pd.DataFrame, prm: Params) -> pd.DataFrame:
     df = df.copy()
     df["month"] = pd.to_datetime(df["entry_ts"], unit="s").dt.to_period("M").astype(str)
 
-    def tstat(x: np.ndarray) -> float:
-        n = len(x)
-        sd = float(x.std(ddof=1)) if n > 1 else float("nan")
-        m = float(x.mean())
-        return (m / sd * np.sqrt(n)) if (sd and sd > 0 and n > 1) else float("nan")
-
     def agg(g: pd.DataFrame) -> pd.Series:
         n = len(g)
         gross = g["gross"].to_numpy()
         net = g["net"].to_numpy()
+        # Recency-decay weights (a function only of entry_ts, as_of, half_life).
+        # half_life <= 0 -> all-ones -> weighted_stats is bitwise-identical to legacy.
+        w = decay_weights(g["entry_ts"].to_numpy(), prm.as_of, prm.half_life_days)
+        mean_gross, std_gross, _, tstat_gross = weighted_stats(gross, w)
+        mean_net, std_net, n_eff, tstat_net = weighted_stats(net, w)
         active_months = g["month"].nunique()
         return pd.Series({
             "n": n,
             "active_months": active_months,
             "avg_per_active_month": n / active_months,
-            "mean_gross": float(gross.mean()),
-            "std_gross": float(gross.std(ddof=1)) if n > 1 else float("nan"),
-            "tstat_gross": tstat(gross),
-            "mean_net": float(net.mean()),
-            "std_net": float(net.std(ddof=1)) if n > 1 else float("nan"),
-            "tstat_net": tstat(net),
+            "mean_gross": mean_gross,
+            "std_gross": std_gross,
+            "tstat_gross": tstat_gross,
+            "mean_net": mean_net,
+            "std_net": std_net,
+            "tstat_net": tstat_net,
+            "n_eff": n_eff,
             "hit_rate": float(g["payoff"].mean()),
             "avg_price": float(g["price"].mean()),
             "avg_ttr_hours": float(g["ttr_secs"].mean() / 3600.0),
@@ -354,6 +385,8 @@ def main() -> int:
     df.to_csv(pos_path, index=False)
     log(f"wrote {pos_path}")
 
+    decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"
+    log(f"scoring: {decay}, as_of={prm.as_of} (window [{prm.win_start},{prm.win_end}))")
     stats = rank_wallets(df, prm)
     n_elig = int(stats["eligible"].sum())
     log(f"eligible wallets (avg>={prm.min_avg_per_month}/mo, >={prm.min_active_months} active months): {n_elig}")
