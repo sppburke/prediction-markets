@@ -578,13 +578,18 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_polygon_ctf_chunk_blocks` | 10_000 | Block-range chunk size for the Polygon CTF scan. Larger chunks issue fewer RPC calls but are more likely to hit provider response-size caps and trigger the bisect-on-cap fallback. Set via `PE_BOOTSTRAP_POLYGON_CTF_CHUNK_BLOCKS`. |
 | `bootstrap_clob_base_url` | `https://clob.polymarket.com` | Base URL for the Polymarket CLOB API (`/markets?closed=true` paginated listing). Override via `PE_CLOB_BASE_URL` for testing against a stub. |
 | `bootstrap_clob_concurrency` | 8 | Number of in-flight CLOB requests issued concurrently per fetch loop, mirroring the Gamma `buffer_unordered` pattern. Set via `PE_BOOTSTRAP_CLOB_CONCURRENCY`. |
-| `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / Radion / 502-gap) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
+| `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / Radion / 502-gap / datadash) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. Initial deployment runs with `0` to drain the bulk catch-up queue; steady-state daily timers may set a positive value if daily run time grows unmanageable. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
 | `bootstrap_backfill_staleness_secs` | 86_400 (1 day) | Per-wallet staleness window for `pe-bootstrap backfill` (issue #166). A wallet is eligible for re-fetch when `last_polymarket_fetch_at IS NULL OR < now - 86_400`. Hardcoded as `pe_bootstrap::pile::BACKFILL_STALENESS_SECS`; matches the daily systemd timer cadence. |
 | `bootstrap_leaderboard_request_interval_ms` | 500 | Minimum milliseconds between Polymarket leaderboard API requests during `pe-bootstrap winner-discovery` (issue #324). Applied per-fetch via `ReqwestFetcher::with_min_interval_ms`. Set via `PE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS`. |
 | `bootstrap_leaderboard_top_n` | 50 | Maximum wallets fetched per leaderboard slice during `pe-bootstrap winner-discovery` (#324; all-category in #335). The `/v1/leaderboard` API hard-caps `limit` at 50; larger values are silently truncated server-side (verified live 2026-06-14). Set via `PE_BOOTSTRAP_LEADERBOARD_TOP_N`. |
 | `bootstrap_leaderboard_categories` | all 10 | Leaderboard categories swept by `winner-discovery` (#335). Default = `OVERALL, POLITICS, SPORTS, CRYPTO, CULTURE, MENTIONS, WEATHER, ECONOMICS, TECH, FINANCE`. Each is crossed with `{PNL,VOL} × {DAY,WEEK,MONTH,ALL}` (≤ 80 slices); a category the API rejects (4xx) is skipped with a `warn!`. Results dedupe before the pile upsert. Set via `PE_BOOTSTRAP_LEADERBOARD_CATEGORIES` (TOML array of category names). |
 | `bootstrap_radion_request_interval_ms` | 500 | Minimum milliseconds between Radion REST API requests during `pe-bootstrap winner-discovery` (issue #324). Stub only until the Radion REST contract is finalised; ignored when `radion_api_url` is unset. Set via `PE_BOOTSTRAP_RADION_REQUEST_INTERVAL_MS`. |
+| `bootstrap_datadash_api_url` | `https://api.datadash.xyz` | datadash.xyz cohort API base URL — third wallet-discovery source for `winner-discovery` (issue #365). **On by default.** Set to `""` (or null) to disable the source (the kill switch). Set via `PE_BOOTSTRAP_DATADASH_API_URL`. |
+| `bootstrap_datadash_request_interval_ms` | 500 | Minimum milliseconds between datadash Connect-RPC requests during `pe-bootstrap winner-discovery` (issue #365). Applied per-fetch via the `ReqwestCohortFetcher` rate-limit gate. Set via `PE_BOOTSTRAP_DATADASH_REQUEST_INTERVAL_MS`. |
+| `bootstrap_datadash_exclude_ids` | `["07NQHFRAGB6HV"]` | datadash cohort ids excluded from ingest, matched **exactly** (never substring; issue #365). Default drops the ~103k-wallet `Polymarket Twitter/X Linked Traders` cohort. Set via `PE_BOOTSTRAP_DATADASH_EXCLUDE_IDS` (TOML array of ids). |
+| `bootstrap_datadash_exclude_titles` | `["Polymarket Twitter/X Linked Traders"]` | datadash cohort titles excluded from ingest, matched **exactly** (issue #365). Default drops `Polymarket Twitter/X Linked Traders` while keeping the distinct `Polymarket Twitter/X Linked with PnL >$100k` cohort. Set via `PE_BOOTSTRAP_DATADASH_EXCLUDE_TITLES` (TOML array of titles). |
+| `bootstrap_datadash_max_cohort_wallets` | 10_000 | Magnitude cap: any datadash cohort whose advertised `numWallets` exceeds this is skipped with a `warn!` before its wallets are fetched (issue #365). Belt-and-braces safety net so a recreated/misnamed mega-cohort cannot flood the pile even if the id/title guards drift (largest legitimate cohort is currently 706). Set via `PE_BOOTSTRAP_DATADASH_MAX_COHORT_WALLETS`. |
 
 #### Wallet pile (`wallets` table, issue #166)
 
@@ -603,6 +608,7 @@ hex chars` (matches `WalletAddress::Display` in `crates/core-types`).
 | 4 | 0b0010000 | Polymarket leaderboard |
 | 5 | 0b0100000 | Radion |
 | 6 | 0b1000000 | 502-gap |
+| 7 | 0b10000000 | datadash.xyz cohorts (#365) |
 
 Activation rule (`is_infra = 0` gates every branch — a wallet listed in both
 the infra CSV and a curation list stays inactive):
@@ -615,6 +621,7 @@ WHERE is_active = 0 AND is_infra = 0 AND (
  OR (source_bits & 16) != 0   -- in_leaderboard
  OR (source_bits & 32) != 0   -- in_radion
  OR (source_bits & 64) != 0   -- in_502_gap
+ OR (source_bits & 128) != 0  -- in_datadash (#365)
 )
 ```
 

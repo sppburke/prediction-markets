@@ -1,0 +1,23 @@
+{
+  "cohorts": [
+    {
+      "id": "07J038ZMM0R67",
+      "title": "High Win Rate Millionaire",
+      "lastExecutionStatusResponse": null,
+      "createdBy": "datadash",
+      "createdAt": "2026-01-01T00:00:00Z",
+      "updatedAt": "2026-06-17T00:00:00Z",
+      "isStatic": false,
+      "isActive": true,
+      "numWallets": "46"
+    },
+    { "id": "07P45109C2190", "title": "Soccer Whales", "isStatic": false, "isActive": true, "numWallets": "62" },
+    { "id": "0760R43001TWZ", "title": "Millionaire Gainers", "isStatic": false, "isActive": true, "numWallets": "131" },
+    { "id": "07NRZ3Y60B1VT", "title": "Polymarket Twitter/X Linked with PnL >$100k", "isStatic": false, "isActive": true, "numWallets": "102" },
+    { "id": "07J6997W040MN", "title": "High Stakes Traders", "isStatic": false, "isActive": true, "numWallets": "63" },
+    { "id": "07AF0GJ3G516H", "title": "Top Sports Winners", "isStatic": false, "isActive": true, "numWallets": "706" },
+    { "id": "07M132T7M0JPE", "title": "$100 to $100k PnL in  1 Year", "isStatic": false, "isActive": true, "numWallets": "20" },
+    { "id": "075YAENQ484HA", "title": "Followed Wallets", "isStatic": false, "isActive": true, "numWallets": "7" },
+    { "id": "07NQHFRAGB6HV", "title": "Polymarket Twitter/X Linked Traders", "isStatic": false, "isActive": true, "numWallets": "102871" }
+  ]
+}
