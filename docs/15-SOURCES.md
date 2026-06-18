@@ -50,6 +50,8 @@
 > **`/activity` indexing latency measured (2026-06-14).** The REST `data-api.polymarket.com/activity` feed (the only *wallet-attributed* trade source) indexes a trade within **~1–4s of its `timestamp`** — proven lower bound p50 1.2s / p95 3.8s / p99 5.2s / max 23s, from 4,655 live trades (`scripts/measure_activity_latency.py`, jitter-free lower-bound method). End-to-end copy latency (indexing + a 5–10s poll + order placement) ≈ **~10–20s**, so a **1-minute** TTR floor is reliably copyable for near-resolution first-bets. Full methodology + run record: `docs/29-ACTIVITY-LATENCY-MEASUREMENT.md`.
 >
 > **CLOB `/book` is public/no-auth (2026-06-16, issue #350 WS2 PR-G live re-confirm).** `GET https://clob.polymarket.com/book?token_id=<id>` returns HTTP **200 with no auth header**; a bogus token id returns **404** `{"error":"No orderbook exists for the requested token id"}`. Body shape: `asks`/`bids` are arrays of `{price, size}` where **both fields are strings** (Decimal-safe), plus scalar string meta (`market`, `asset_id`, `tick_size`, `min_order_size`, `last_trade_price`, `timestamp`, `hash`) and `neg_risk` (bool). Asks are returned **high→low price** (best/lowest ask is not at index 0). `crates/service/src/clob_book.rs` parses the ask side only (liquidity capture is buy-only) into `Decimal`, deriving `best_ask` as the minimum price.
+>
+> **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
 | Link | Last checked | Re-verify by |
 |---|---|---|
@@ -73,7 +75,7 @@
 | https://docs.polymarket.com/developers/contracts | — | — |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
 | https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-05-09 | 2026-07-08 |
-| https://clob.polymarket.com/markets?closed=true | 2026-05-12 | 2026-07-11 |
+| https://clob.polymarket.com/markets?closed=true | 2026-06-18 | 2026-08-17 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-06-16 | 2026-08-15 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
@@ -154,3 +156,4 @@ Treat as research inspiration; not a production decision input unless an authori
 - 2026-05-02: Checked Polymarket official docs for public Data/Gamma/CLOB read endpoints, proxy wallets, signature type/funder behavior, and bridge deposit/pUSD collateral flow.
 - 2026-05-02: Checked CrowdIntel public pages for funding-network methodology. Treat as research inspiration only unless an authorized replayable API/export exists.
 - 2026-05-12: Verified CTF deploy block (4_023_686, Sep-03-2020) on PolygonScan and computed `TOPIC_CONDITION_RESOLUTION` keccak hash via `alloy::primitives::keccak256` of the canonical signature for issue #149 multi-source pipeline. Verified CLOB `/markets?closed=true` paginated listing endpoint exists; confirmed `next_cursor=LTE=` terminator convention from Polymarket CLOB documentation.
+- 2026-06-18: Re-verified CLOB `/markets?closed=true` live (issue #369 PR1) — response shape `{count, limit, next_cursor, data:[{condition_id, closed, end_date_iso, tokens:[{outcome, price, token_id, winner}]}]}`, `LTE=` terminator. Found `tokens[].winner` is unset on old (≈2022–2023) markets (winner encoded only in terminal price); see the CLOB `/markets` correction note above. Reconciled 848,098 traded markets vs `source='polygon'`: 0 winner contradictions, benign 202 CLOB-null all pre-2024, 0 traded multi-outcome markets.

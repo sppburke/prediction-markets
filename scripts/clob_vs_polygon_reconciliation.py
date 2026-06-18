@@ -184,11 +184,11 @@ def load_or_fetch(
 def reconcile(conn: sqlite3.Connection, clob_markets: dict[str, int | None]) -> dict:
     """Compare CLOB winners to ``source='polygon'`` rows over the traded overlap.
 
-    Loads the CLOB walk into a TEMP table (writable even on a read-only main connection),
-    then a null-safe (``IS``/``IS NOT``) join over the polygon-resolved ∩ CLOB-closed ∩
-    traded overlap.  ``EXISTS(... trades ...)`` restricts to markets actually traded.
+    Loads the CLOB winner projection into a TEMP table (writable even on a read-only main
+    connection), then a null-safe (``IS``/``IS NOT``) join over the polygon-resolved ∩
+    CLOB-closed ∩ traded overlap.  ``EXISTS(... trades ...)`` restricts to markets actually traded.
 
-    Mismatches are split into two materially different classes:
+    Mismatches are split into three materially different classes:
 
     * ``winner_contradictions`` — both sides assert a winner and they DIFFER.  This is the
       safety-critical failure: CLOB would write a *wrong* resolution.  The gate that
