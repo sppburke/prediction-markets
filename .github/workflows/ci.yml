@@ -60,3 +60,4 @@ jobs:
           python3 scripts/test_portfolio_constructor.py
           python3 scripts/test_push_ranking_filter.py
           python3 scripts/test_ranker_decay.py
+          python3 scripts/test_clob_reconciliation.py
