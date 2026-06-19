@@ -4,7 +4,7 @@
 //! [`run_source_discovery`] acquires [`CacheMutationLock`] for the DB-mutation
 //! window, dispatches to the appropriate source, and returns aggregate counts.
 //! The lock is RAII-dropped before returning — callers may shell out to long
-//! subprocesses (backfill, skill-select) without holding it.
+//! subprocesses (e.g. backfill) without holding it.
 
 use std::time::Duration;
 

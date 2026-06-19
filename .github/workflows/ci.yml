@@ -56,8 +56,6 @@ jobs:
 
       - name: Python drift-guard tests
         run: |
-          python3 scripts/test_haircut_constants.py
-          python3 scripts/test_portfolio_constructor.py
           python3 scripts/test_push_ranking_filter.py
           python3 scripts/test_ranker_decay.py
           python3 scripts/test_rank_72hr_consolidated.py

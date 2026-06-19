@@ -7,7 +7,7 @@ Covers the pure logic of `clob_vs_polygon_reconciliation.py` and
 is the production proof recorded in the PR body; this guards the logic in CI.
 
 Imports the two scripts as top-level modules via sys.path.insert (same pattern as
-test_portfolio_constructor.py / test_haircut_constants.py / test_ranker_decay.py).
+test_ranker_decay.py / test_rank_72hr_consolidated.py).
 
 Run: `python3 scripts/test_clob_reconciliation.py`
   or: `pytest scripts/test_clob_reconciliation.py -v`

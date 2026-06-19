@@ -4,8 +4,8 @@
 //! `run_winner_discovery` runs all enabled discovery sources in sequence and
 //! returns aggregate counts. [`CacheMutationLock`] is scoped inside each
 //! [`crate::wallet_discovery::run_source_discovery`] call and released before
-//! this function returns — callers may safely invoke `pe-bootstrap backfill` and
-//! `pe-skill-select` afterwards without a lock conflict.
+//! this function returns — callers may safely invoke `pe-bootstrap backfill`
+//! afterwards without a lock conflict.
 //!
 //! Failure policy: the leaderboard source propagates errors (fatal to
 //! `pe-bootstrap all`). The **Radion and datadash** sources **soft-fail** — a

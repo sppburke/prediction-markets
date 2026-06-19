@@ -1928,10 +1928,9 @@ impl WalletCache {
     }
 
     /// Return every `wallet_hex` in the `active_tradeable_wallets` view
-    /// (`is_active = 1 AND is_infra = 0`) — the ~182k candidate universe for the
-    /// skill-selection pipeline (issue #212). Unfiltered, unlike
-    /// `select_backfill_due` which adds staleness/limit clauses; mirrors
-    /// [`Self::all_pile_wallet_hexes`].
+    /// (`is_active = 1 AND is_infra = 0`) — the active candidate universe.
+    /// Unfiltered, unlike `select_backfill_due` which adds staleness/limit
+    /// clauses; mirrors [`Self::all_pile_wallet_hexes`].
     pub fn active_tradeable_wallet_hexes(&self) -> Result<Vec<String>, BootstrapError> {
         let mut stmt = self
             .conn

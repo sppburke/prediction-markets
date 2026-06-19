@@ -3306,27 +3306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pe-skill-select"
-version = "0.1.0"
-dependencies = [
- "figment",
- "pe-bootstrap",
- "pe-core-types",
- "pe-trader-index",
- "rayon",
- "rusqlite",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "time",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "pe-source-core"
 version = "0.1.0"
 dependencies = [
