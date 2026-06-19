@@ -1,35 +1,38 @@
 # 26 — Data Refresh and Re-optimization Runbook
 
 Step-by-step operational procedures for (1) backfilling trade data for the wallets
-already in the pile and (2) re-optimizing which wallets the paper trader follows.
+already in the pile and (2) re-ranking the universe and publishing the result the
+paper trader follows.
 
-This is the **operational how-to**. For the *policy* — when to re-evaluate, what
-cohort size to target at each capital tier, when to drop a wallet — see
-[`25-WALLET-EVALUATION-AND-SCALING.md`](25-WALLET-EVALUATION-AND-SCALING.md).
+This is the **operational how-to** for the single ranking pipeline (issue #370):
+`scripts/rank_and_push.sh` refreshes data, ranks the full trade universe, reranks,
+and publishes to Supabase `latest_ranking`, which `pe-service` reads.
 
 > **Golden rule — this all runs on the machine that holds `wallet_cache.db`.**
 > The cache is multi-GB (≈360 GB) and lives on the local/analysis box, not the
-> paper-trading VPS. The VPS only ever consumes the small output JSON
-> (`data/watchlist-production-n<N>.json`), which you `scp` over at the end of
-> Part 2. Do not attempt either procedure on the VPS.
+> paper-trading VPS. The pipeline publishes its result to Supabase `latest_ranking`;
+> the VPS `pe-service` reads that table on an interval — there is **no** watchlist file
+> to `scp`, and `pe-service` has **no** seed/leaderboard fallback (Supabase is the sole
+> wallet source, #370/#379). Do not run these procedures on the VPS.
 
 ## Prerequisites
 
 ```bash
-# Build the two binaries used below (from repo root).
-cargo build --release -p pe-bootstrap -p pe-skill-select
+# Build the bootstrap binary used below (from repo root).
+cargo build --release -p pe-bootstrap
 ```
 
 - **DB path.** Every command points at `data/wallet_cache.db`. `pe-bootstrap`
   defaults `cache_path` to `wallet_cache.db` (`crates/bootstrap/src/config.rs:469`),
   so either pass a config TOML with `cache_path = "data/wallet_cache.db"` or set
-  `PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db`. `pe-skill-select` uses
-  `PE_SKILL_CACHE_PATH`.
+  `PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db` (`rank_and_push.sh` exports this for you).
 - **Market resolutions (no RPC).** The resolution pipeline is CLOB → Gamma:
   the Polymarket CLOB `/markets?closed=true` listing is the sole resolution
   source (#369; key-free), with Gamma supplying open-market schedules/liquidity.
   No Polygon RPC / Alchemy provider is required.
-- **Python analysis venv.** The ranking scripts run under `.venv-analysis/bin/python3`.
+- **Supabase + Python.** `.env` must carry `SUPABASE_URL` + `SUPABASE_SECRET_KEY`
+  (the push reads them). The ranking scripts run under `.venv-analysis/bin/python3`.
+  The Radion discovery source needs `PE_BOOTSTRAP_RADION_API_KEY` (#373).
 
 ---
 
@@ -123,6 +126,12 @@ relative to the markets your wallets traded, re-run step 3 with an RPC URL set.
 >   (`upload_active_window_hours` = 72) so idle wallets never reach the live set
 >   (the dropped count is logged; the comparison is case-insensitive).
 >
+> Each ranking row also carries `last_trade_unix` — the wallet's real last on-chain
+> trade time — which `pe-service` uses both as the inactivity clock and as the
+> candidate-freshness filter (`ACTIVE_WINDOW_HOURS = 72`, #357). It is a push-time
+> snapshot of the cache, so a stale cache yields stale clocks; backfilling immediately
+> before the push is mandatory.
+>
 > Because both checks read `wallet_cache.db`, **run Part 1 (backfill) immediately
 > before Part 2's ranking push.** A stale cache would otherwise filter out every
 > wallet, leaving the live ranking empty — the abort guard turns that silent
@@ -130,146 +139,73 @@ relative to the markets your wallets traded, re-run step 3 with an RPC URL set.
 
 ---
 
-## Part 2 — Re-optimize the followed wallets
+## Part 2 — Rank and publish (the one command)
 
-**Goal:** recompute per-wallet skill features at a fresh cutoff, re-rank the
-universe, validate a cohort, and produce the `watchlist-production-n<N>.json` the
-paper trader consumes — **with real `win_rate_bps`** so Kelly sizing works (the
-deployed leaderboard-derived watchlist has `win_rate_bps = 0`, which forces the
-flat-sizing fallback).
-
-Run Part 1 first so the features are computed on current data.
-
-Pick the cutoff: `<cutoff_unix>` is the UTC second at the boundary between the
-training window and the forward window — normally the end of the most recently
-completed month.
-
-### Step 1 — Extract features
+**Goal:** re-rank the universe and publish the result to Supabase `latest_ranking`,
+which `pe-service` reads. There is exactly one ranker
+(`scripts/rank_72hr_buyandhold.py`); pass-2 (`latency_shift_rerank.py`) reranks; the
+push (`scripts/push_ranking_to_supabase.py`) publishes (#370).
 
 ```bash
-PE_SKILL_CACHE_PATH=data/wallet_cache.db \
-PE_SKILL_CUTOFF_UNIX=<cutoff_unix> \
-PE_SKILL_EXTRACT_CLEAN_PRIOR=1 \
-  ./target/release/pe-skill-select extract
+# The single, cron-ready entry point. Zero args. Runs on the cache box.
+bash scripts/rank_and_push.sh
 ```
 
-Writes the `wallet_features` table at `cutoff_unix` (`crates/skill-select/src/db.rs`):
-`win_rate_bps`, `sharpe_bps`, `hold_to_resolution_rate_bps`, `skill_pvalue_bps`, etc.
-`PE_SKILL_EXTRACT_CLEAN_PRIOR=1` clears stale rows from a previous extract at the
-same cutoff.
+In order it runs: **Step 0** data refresh — `winner-discovery` (leaderboard +
+datadash + radion → new wallets) → `backfill` → `events` → `resolutions` →
+`schedules`; **Stage 1** rank the full trade universe (`--universe-from-trades` —
+have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
+there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** push
+to Supabase and verify `latest_ranking` is populated.
 
-### Step 2 — Rank the universe (GBM)
+Production defaults are baked in (override via flags): `--universe-from-trades`,
+`HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
+mid-price band 0.15–0.85, TTR 72h, `--scheduled-only` (no resolved-at look-ahead),
+`floor_tstat=2.0`, `top_n=200`.
 
-```bash
-.venv-analysis/bin/python3 scripts/monthly_rerank_gbm.py \
-  --db-path data/wallet_cache.db \
-  --strategy gbm_throughput_single \
-  --top-n 5000 \
-  --out data/production-watchlist-gbm.txt
+> **First full-universe run — stage the half-life.** For the first run after moving to
+> the full trade universe, override with `--half-life-days 0` (decay off) so a
+> surprising cohort shift is attributable to the wider universe rather than the decay;
+> drop the override on subsequent runs (#370).
+
+> **Backfill is built in.** Step 0 backfills before ranking, and the push aborts if the
+> cache's newest trade is >24 h old (the issue #350 WS3 freshness guard above). A
+> standalone Part-1 run is only needed for a faster iteration loop or to debug.
+
+### Overrides (research / re-push)
+
+- `--universe <file>` — rank a curated wallet file instead of all-trade-wallets.
+- `--half-life-days N` — override the production decay half-life.
+- `--skip-discovery` / `--skip-backfill` — skip Step-0 stages.
+- `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push.
+- Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
+
+### Cron (operator-installed)
+
+```cron
+# daily 06:00 UTC on the box holding wallet_cache.db (NOT the VPS):
+0 6 * * *  cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
 ```
 
-Reads `wallet_features` at the latest cutoff; emits a ranked `.txt` of wallet hex
-addresses (the candidate pool for the constructor).
-
-### Step 3 — Construct + validate the cohort (PBO)
-
-```bash
-.venv-analysis/bin/python3 scripts/portfolio_constructor/cli.py \
-  --db-path data/wallet_cache.db \
-  --watchlist data/production-watchlist-gbm.txt \
-  --max-n <target N from the scaling table in doc 25> \
-  --haircut-bps 500 \
-  --fwd-days 7 \
-  --n-seeds 5 \
-  --pbo-perms 100 \
-  --output-dir data/eval-results
-```
-
-The tool greedily selects the cohort that maximizes net forward edge subject to the
-PBO gates, prints a `Deploy watchlist: <path>` line pointing at the selected-wallet
-`.txt`, and writes the eval JSON under `data/eval-results/`.
-(`scripts/overnight_pipeline.sh` is a turnkey wrapper around this step.)
-
-> Flag note: the constructor takes `--max-n` (cap) and `--output-dir`, **not**
-> `--target-n`/`--out`. Earlier drafts of doc 25 listed the wrong flags.
-
-### Step 4 — Review the gates
-
-Open the eval JSON in `data/eval-results/` and confirm:
-
-| Metric | Gate | Meaning |
-|---|---|---|
-| `credible` | `true` | PBO ≤ 0.5 AND 0 negative anchors |
-| `mean_of_mean_edge` | ≥ $0.01/pos (net of haircut) | Below this the edge is noise |
-| `n_anchors_negative` | `0` | Any negative anchor = regime risk |
-| `pbo.pbo` | ≤ 0.5 | Above 0.5 = overfit; do not deploy |
-
-If gating fails, try a smaller `--max-n`, or — if only the most recent anchor is
-negative — hold the existing cohort and re-check in two weeks (possible regime
-shift). Never force a size that fails gating.
-
-### Step 5 — Export the service watchlist (populates `win_rate_bps`)
-
-```bash
-PE_SKILL_CACHE_PATH=data/wallet_cache.db \
-PE_SKILL_CUTOFF_UNIX=<cutoff_unix> \
-PE_SKILL_EXPORT_WATCHLIST_INPUT_PATH=<Deploy-watchlist .txt from step 3> \
-PE_SKILL_EXPORT_WATCHLIST_OUTPUT_PATH=data/watchlist-production-n<N>.json \
-  ./target/release/pe-skill-select export-watchlist
-```
-
-This is the **Rust** `export-watchlist` subcommand
-(`crates/skill-select/src/export_watchlist.rs`). It looks up each wallet's features
-at `cutoff_unix` and writes a valid `pe_trader_index::Watchlist` JSON with
-`win_rate_bps` populated from the DB. Wallets missing from `wallet_features` at the
-cutoff are skipped with a warning (re-run Part 1 + Step 1 if any are unexpectedly
-missing).
-
-### Step 6 — Deploy to the VPS
-
-```bash
-# From the local box:
-scp data/watchlist-production-n<N>.json sean@<vps-ip>:~/prediction-markets/data/
-```
-
-On the VPS, point the config at the new file and restart:
-
-```toml
-# smoke-test/service.toml
-seed_watchlist_path = "data/watchlist-production-n<N>.json"
-```
-
-```bash
-sudo systemctl restart pe-service
-```
-
-Once the exported watchlist carries real `win_rate_bps`, remove the
-`flat_usd_per_trade` override from `[strategy]` in `service.toml` so Kelly sizing
-takes over. The startup position seeder corrects each leader's ledger baseline
-automatically on restart.
+`pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
+(score-update-only; the maintenance tick handles eviction/backfill of live-set
+membership).
 
 ---
 
-## Artifact naming
+## Output artifacts
 
-See doc 25's "Artifact naming convention". Retire superseded artifacts to
-`data/archive/`; never delete eval JSONs (they are the audit trail for why a cohort
-was deployed).
+`rank_and_push.sh` writes each run's ranked CSVs under an auto-timestamped
+`data/eval-results/cron-<UTC>/` (override with `--out-dir`). Retire superseded
+artifacts to `data/archive/`; never delete eval outputs — they are the audit trail
+for what was published to `latest_ranking` and when.
 
 ---
 
-## Adding new wallets — winner-discovery pipeline
+## Adding new wallets
 
-The runbook above operates on the **current pile** (no new wallet ingest).  To
-discover new candidate wallets from the Polymarket leaderboard, use the
-winner-discovery pipeline documented in
-`docs/27-WINNER-DISCOVERY-RUNBOOK.md`.  That pipeline:
-
-1. Fetches 4 leaderboard slices via `pe-bootstrap winner-discovery`.
-2. Backfills trade history for newly-activated wallets.
-3. Runs the full extract → composite → export-watchlist chain.
-4. Emits `data/winner_discovery_candidates.json` for manual review.
-
-The production watchlist is **not** auto-updated — a human reviews the
-candidates JSON and runs `portfolio_constructor` on the merged set before any
-VPS deploy.
+New-wallet discovery is **Step 0** of `rank_and_push.sh` (`pe-bootstrap
+winner-discovery`: Polymarket leaderboard + datadash + radion). Discovered wallets
+are ingested, backfilled, and ranked in the same run — there is no separate
+manual-review gate. See `docs/27-WINNER-DISCOVERY-RUNBOOK.md` for the discovery
+sources and their configuration.

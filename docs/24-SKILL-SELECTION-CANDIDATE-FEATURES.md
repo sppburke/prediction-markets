@@ -1,6 +1,11 @@
-# 24 — Skill-Selection Candidate Features (implementation plan for #205)
+# 24 — Skill-Selection Candidate Features (archived — removed in #370)
 
-**Status:** design — first-PR scope frozen; subsequent slices outlined.
+> **Status: ARCHIVE.** Nothing here describes live code. This was the implementation
+> plan for the `pe-skill-select` crate and the `wallet_features` candidate-feature
+> catalogue, both removed end-to-end in issue #370 (PR3 deleted `crates/skill-select`
+> and the Python GBM/PBO pipeline). The 72hr buy-and-hold ranker
+> (`scripts/rank_and_push.sh` → Supabase `latest_ranking`) is now the sole ranking
+> pipeline — see `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`. Retained for design history.
 **Scope:** bridge the [#205 reference issue](https://github.com/sppburke/prediction-markets/issues/205) (research / parking) into concrete `skill-select` PRs.
 **Anchors:** SSRN 6617059 (Gómez-Cram et al., sign-randomization); Bailey & López de Prado (PSR, DSR, PBO); Akey et al. (SSRN 6443103, fee-era + persistence risk); [[project_skill_selection_research]].
 **Authority order:** this doc is below `_BASELINE.md` / `_GLOSSARY.md` / `19-WINNER-FOLLOW-STRATEGY.md`; any numeric default it introduces is mirrored into `_GLOSSARY.md` "Skill-selection defaults" in the same PR.
