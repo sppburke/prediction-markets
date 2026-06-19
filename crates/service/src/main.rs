@@ -270,8 +270,8 @@ async fn main() -> Result<()> {
         // Seed the poll cursor from each bootstrapped wallet's real last-trade time (#357),
         // UNCONDITIONALLY: this establishes the inactivity clock at the real last trade
         // (idle = now − cursor) and repairs any corrupted `now`-seed left by a prior build. A
-        // wallet absent from the side-map (leaderboard fallback, or a NULL `last_trade_unix`
-        // column) keeps its persisted cursor; a never-seeded `None` cursor self-heals via the
+        // wallet absent from the side-map (a NULL `last_trade_unix` column in the ranking)
+        // keeps its persisted cursor; a never-seeded `None` cursor self-heals via the
         // poller's first unbounded fetch and is never reset to `now` (no admission grace).
         let mut cursor_seeded = 0usize;
         for (wallet, last_trade_unix) in &bootstrap_last_trade {

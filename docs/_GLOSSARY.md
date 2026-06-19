@@ -320,7 +320,7 @@ The local latency-shift ranker pushes append-only ranking batches to Supabase (`
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `supabase_url` | `""` | `ServiceConfig` field. Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). Empty disables the live source. `PE_SUPABASE_URL`. |
+| `supabase_url` | `""` | `ServiceConfig` field. Supabase project REST base URL (e.g. `https://<ref>.supabase.co`); the **sole** wallet source (#370). If it resolves empty or unreachable the service hard-fails at boot (no fallback). Set via `PE_SUPABASE_URL`. |
 | `supabase_secret_key` | `""` | `ServiceConfig` field (secret). The service-role key, sent in **both** the `apikey` and `Authorization: Bearer` headers — Supabase's `sb_` keys are not JWTs, so PostgREST 401s (`PGRST301`) if the two headers differ. Bypasses RLS for the server-side read. `PE_SUPABASE_SECRET_KEY` from `.env`. |
 | `supabase_anon_key` | `""` | `ServiceConfig` field (secret). Publishable/anon fallback used for both headers **only when `supabase_secret_key` is empty**; ignored otherwise. `PE_SUPABASE_ANON_KEY` from `.env`. |
 | `supabase_refresh_interval_secs` | 300 | `ServiceConfig` field. Seconds between live-watchlist refresh polls. The refresh loop is spawned only when `supabase_url` is non-empty and this is `> 0`. |
