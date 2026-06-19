@@ -58,7 +58,9 @@ WIN_START=""
 WIN_END=""
 # Recency decay (issue #366). Production default is 30-day half-life (issue #370, the sweep
 # adopted it). Override with --half-life-days N; 0 = flat (legacy, bitwise-identical to no decay).
-HALF_LIFE_DAYS="0"
+# Staging note (#370): for the first full-universe run, override with --half-life-days 0 so a
+# surprising cohort shift is attributable to the wider universe vs decay; drop the override after.
+HALF_LIFE_DAYS="30"
 # Shared decay age anchor for BOTH passes; empty => resolved below to UTC-midnight today (= the
 # relative win_end) so the two passes weight every trade against the identical anchor.
 AS_OF=""

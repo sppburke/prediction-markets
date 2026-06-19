@@ -38,7 +38,7 @@ WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
 # Production half-life default baked into the wrapper. Pinned here so an intentional change
 # co-updates the wrapper literal AND this constant in the same commit (issue #370 PR2 lands
 # the 0→30 flip as its own commit).
-EXPECTED_DEFAULT_HALF_LIFE = "0"
+EXPECTED_DEFAULT_HALF_LIFE = "30"
 
 
 class _SupabaseStub(BaseHTTPRequestHandler):
