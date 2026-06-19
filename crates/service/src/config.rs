@@ -45,17 +45,7 @@ pub struct ServiceConfig {
     #[serde(default = "default_channel_capacity")]
     pub polymarket_channel_capacity: usize,
 
-    // ── Watchlist ────────────────────────────────────────────────────────────
-    /// Top-N leaderboard entries to include in the watchlist.
-    /// See `docs/_GLOSSARY.md`: `watchlist_size`.
-    #[serde(default = "default_watchlist_size")]
-    pub watchlist_size: usize,
-
-    /// Path to the pe-bootstrap-generated Watchlist JSON file.
-    /// Empty string means disabled. See `docs/_GLOSSARY.md`: `seed_watchlist_path`.
-    #[serde(default)]
-    pub seed_watchlist_path: String,
-
+    // ── Wallet polling & position seeding ─────────────────────────────────────
     /// Seconds between Polymarket trade poll rounds.
     /// See `docs/_GLOSSARY.md`: `trade_poll_interval_secs`.
     #[serde(default = "default_trade_poll_interval_secs")]
@@ -145,10 +135,11 @@ pub struct ServiceConfig {
     #[serde(default = "default_max_fill_price")]
     pub max_fill_price: String,
 
-    // ── Live wallet source (Supabase ranking handoff, issue #339) ─────────────
-    /// Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). Empty (the
-    /// default) disables the live source; the service falls back to `seed_watchlist_path`.
-    /// Set via `PE_SUPABASE_URL`. See `docs/_GLOSSARY.md`: `supabase_url`.
+    // ── Live wallet source (Supabase ranking handoff, issues #339, #370) ──────
+    /// Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). This is the
+    /// **sole** wallet source (#370): there is no leaderboard/seed fallback, so the service
+    /// hard-fails at boot if it resolves empty or unreachable. Set via `PE_SUPABASE_URL`.
+    /// See `docs/_GLOSSARY.md`: `supabase_url`.
     #[serde(default)]
     pub supabase_url: String,
 
@@ -293,10 +284,6 @@ fn default_polymarket_base_url() -> String {
     "https://data-api.polymarket.com".to_string()
 }
 
-const fn default_watchlist_size() -> usize {
-    20
-}
-
 const fn default_trade_poll_interval_secs() -> u64 {
     30
 }
@@ -422,8 +409,6 @@ impl Default for ServiceConfig {
             bind: default_bind(),
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
-            watchlist_size: default_watchlist_size(),
-            seed_watchlist_path: String::new(),
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
             position_reseed_interval_secs: default_position_reseed_interval_secs(),
             position_page_limit: default_position_page_limit(),
@@ -500,8 +485,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "bind",
         "polymarket_base_url",
         "polymarket_channel_capacity",
-        "watchlist_size",
-        "seed_watchlist_path",
         "trade_poll_interval_secs",
         "position_reseed_interval_secs",
         "position_page_limit",
@@ -551,7 +534,6 @@ mod tests {
         let cfg = ServiceConfig::default();
         assert_eq!(cfg.bind, "127.0.0.1:8080");
         assert_eq!(cfg.polymarket_channel_capacity, 256);
-        assert_eq!(cfg.watchlist_size, 20);
         assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.bankroll_usd, "10000");
         assert_eq!(cfg.mode, "paper");
@@ -597,5 +579,22 @@ mode = "shadow"
         assert_eq!(cfg.bind, "0.0.0.0:9000");
         assert_eq!(cfg.bankroll_usd, "5000");
         assert_eq!(cfg.mode, "shadow");
+    }
+
+    #[test]
+    fn retired_watchlist_keys_are_rejected() {
+        use std::io::Write as _;
+        // #370: `watchlist_size` and `seed_watchlist_path` were removed when Supabase became
+        // the sole wallet source. `deny_unknown_fields` makes a stale config carrying either
+        // key fail loudly at load — a deploy that forgets to drop them from the live TOML
+        // hard-fails fast instead of silently ignoring a now-meaningless setting.
+        for stale in ["watchlist_size = 0", "seed_watchlist_path = \"x.json\""] {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            writeln!(f, "{stale}").unwrap();
+            assert!(
+                load(Some(f.path())).is_err(),
+                "stale key must be rejected by deny_unknown_fields: {stale}"
+            );
+        }
     }
 }

@@ -7,15 +7,7 @@ bind                             = "0.0.0.0:8080"
 polymarket_base_url              = "https://data-api.polymarket.com"
 polymarket_channel_capacity      = 256
 
-# Seed-only cohort: 0 means the live leaderboard contributes no wallets, so the
-# watchlist is exactly the seed file below. Startup always fetches + merges the
-# leaderboard, so this is the only way to follow ONLY the validated cohort.
-watchlist_size                   = 0
 trade_poll_interval_secs         = 30
-# 13-wallet 72hr buy-and-hold BAND cohort (mid-price 0.40-0.80; leak-free, copy-and-hold
-# validated, no exit adverse-selection). Supersedes the N=10 longshot list.
-# NOTE: this JSON lives under gitignored data/ — scp it to the VPS; `git pull` won't deliver it.
-seed_watchlist_path              = "data/watchlist-72hr-buyhold-band-n13.json"
 
 event_log_path                   = "smoke-test/paper.log"
 jsonl_log_path                   = "smoke-test/paper.jsonl"
@@ -35,9 +27,10 @@ max_resolution_horizon_secs      = 259200  # 72 h
 min_resolution_horizon_secs      = 60      # docs/29 copy floor; sub-minute breaks down
 max_fill_price                   = "0.85"  # #142 parity: skip BUYs at/above this current price
 
-# Live wallet source (#339): Supabase ranking handoff. Empty url => fall back to
-# seed_watchlist_path. Secrets (PE_SUPABASE_ANON_KEY / PE_SUPABASE_SECRET_KEY) come from
-# .env, never this file.
+# Live wallet source (#339, #370): Supabase ranking handoff — the SOLE wallet source.
+# The url is empty here; the live box overrides it via PE_SUPABASE_URL from .env (figment
+# env-wins). With no fallback, the service hard-fails at boot if Supabase resolves empty.
+# Secrets (PE_SUPABASE_ANON_KEY / PE_SUPABASE_SECRET_KEY) come from .env, never this file.
 supabase_url                     = ""
 supabase_refresh_interval_secs   = 300
 
