@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pass 2: latency-shifted re-rank of the 72h buy-and-hold edge-floor candidates.
 
-The pass-1 ranker (`rank_72hr_buyandhold_streaming.py`) scores each first-buy at the
+The pass-1 ranker (`rank_72hr_buyandhold.py`) scores each first-buy at the
 LEADER's entry price. But when we copy, we observe the leader's trade ~Δ seconds late
 (/activity indexes in ~1-4s + 5-10s poll + ~5s fill ≈ 10-20s; measured docs/29) and
 enter at whatever the market is then. Near resolution the price has moved toward the
@@ -107,8 +107,8 @@ def main() -> int:
     with open(a.positions_csv, newline="") as f:
         rd = csv.DictReader(f)
         if "outcome_id" not in rd.fieldnames:
-            log("FATAL: positions CSV lacks outcome_id — re-run pass 1 with the updated "
-                "streaming ranker (it now writes outcome_id).")
+            log("FATAL: positions CSV lacks outcome_id — re-run pass 1 with the "
+                "rank_72hr_buyandhold.py ranker (it writes outcome_id).")
             return 1
         for r in rd:
             w = r["wallet"]
