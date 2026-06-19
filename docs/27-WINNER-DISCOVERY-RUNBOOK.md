@@ -1,11 +1,12 @@
 # 27 — Winner-Discovery Runbook
 
 Automates the ingest of new candidate wallets from the Polymarket leaderboard
-(plus the datadash.xyz cohorts and the Radion trader-analysis API) and runs them through the full
-eval pipeline.  The pipeline emits a candidate watchlist at
-`data/winner_discovery_candidates.json` for **manual review** before any VPS
-deployment.  This is the only sanctioned path for adding new wallets; see
-`AGENTS.md` "Do not add wallets" rule.
+(plus the datadash.xyz cohorts and the Radion trader-analysis API). The
+`pe-bootstrap winner-discovery` subcommand upserts each discovered wallet into the
+local `wallet_cache.db` and activates the eligible ones; they then flow into the
+ranking pipeline (Step 0 of `scripts/rank_and_push.sh`) and reach the live set only
+via Supabase `latest_ranking` and the maintenance tick — never directly. This is the
+only sanctioned path for adding new wallets; see `AGENTS.md` "Do not add wallets" rule.
 
 ## Required environment
 
@@ -25,38 +26,26 @@ PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on 
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db
 ```
 
-## One-shot invocation
+## Invocation
+
+`winner-discovery` is **Step 0** of `scripts/rank_and_push.sh` (run automatically
+before each rank). To run it standalone:
 
 ```bash
-# Build release binaries first if not already built:
-cargo build --release -p pe-bootstrap -p pe-skill-select
+# Build the bootstrap binary first if not already built:
+cargo build --release -p pe-bootstrap
 
-# Then run the pipeline:
-PE_BOOTSTRAP_DISCOVERY_ENABLED=1 ./scripts/winner_discovery.sh
+# Discover + activate new wallets into the cache:
+PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
+  ./target/release/pe-bootstrap winner-discovery
 ```
 
-The script runs five stages in sequence:
-
-| Stage | Binary | Subcommand | Purpose |
-|---|---|---|---|
-| 1 | `pe-bootstrap` | `winner-discovery` | Fetch leaderboard slices, upsert new wallets with `SRC_LEADERBOARD` source bit, activate eligible |
-| 2 | `pe-bootstrap` | `backfill` | Fetch trade history for newly-activated wallets |
-| 3 | `pe-skill-select` | `extract` | Extract wallet features |
-| 4 | `pe-skill-select` | `composite` | Composite ranking |
-| 5 | `pe-skill-select` | `export-watchlist` | Emit `data/winner_discovery_candidates.json` |
-
-## Manual review gate
-
-Inspect `data/winner_discovery_candidates.json` before deploying to VPS.
-Minimum checks:
-
-1. `pbo_p_value` ≥ 0.10 (credible out-of-sample edge).
-2. At least 3 wallets have `edge_mean_usd` > 0 across all 4 anchors.
-3. No wallet is already in the production watchlist
-   (`data/watchlist-production-n10.json`).
-
-If the checks pass, run `portfolio_constructor` on the merged set per the
-runbook in `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`.
+There is no separate eval/export stage or candidates JSON: `winner-discovery` fetches
+the leaderboard + datadash + radion slices and upserts new wallets (recording the
+source bit, activating eligible ones) straight into the cache. `rank_and_push.sh` then
+backfills their trade history and ranks them alongside the rest of the universe — the
+ranker's own eligibility filters decide which discovered wallets make the published
+cohort.
 
 ## Leaderboard slices
 
@@ -109,8 +98,10 @@ PE_BOOTSTRAP_RADION_MAX_REQUESTS_PER_RUN=8  # 8×30=240/mo, under the 300/mo Fre
 
 ## Operational notes
 
-- **No auto-deploy.** The pipeline writes only to the local SQLite cache and
-  the candidates JSON.  VPS promotion is always a manual step.
+- **No direct auto-deploy to live.** Discovery writes only to the local SQLite
+  cache. A discovered wallet reaches the live set only after the ranking pipeline
+  publishes it to Supabase `latest_ranking` and the maintenance tick admits it —
+  never directly from discovery.
 - **Idempotent.** Re-running with the same leaderboard snapshot is safe:
   `INSERT OR IGNORE` on `wallet_hex` is a no-op for already-known wallets.
 - **`CacheMutationLock`** is held only during the DB-write window inside

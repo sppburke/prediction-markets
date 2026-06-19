@@ -1,4 +1,11 @@
-# 25 — Wallet Evaluation and Scaling
+# 25 — Wallet Evaluation and Scaling (archived — removed in #370)
+
+> **Status: ARCHIVE.** Nothing here describes live code. The GBM / `portfolio_constructor`
+> evaluation-and-scaling methodology this documents was removed in issue #370 (PR3). The
+> followed-wallet cohort is now produced by the 72hr ranker's own eligibility filters over
+> the full trade universe (`scripts/rank_and_push.sh` → Supabase `latest_ranking`), not a
+> curated greedy-selected list — see `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`.
+> Retained for history.
 
 How to decide which wallets to follow, how many, and when to re-evaluate as capital grows.
 

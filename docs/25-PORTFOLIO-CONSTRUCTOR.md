@@ -1,7 +1,13 @@
-# 25 — Stage-2 Portfolio Constructor
+# 25 — Stage-2 Portfolio Constructor (archived — removed in #370)
+
+> **Status: ARCHIVE.** Nothing here describes live code. The `scripts/portfolio_constructor/`
+> package and the GBM walk-forward it consumed were removed in issue #370 (PR3). Cohort
+> selection is now the 72hr ranker's own eligibility filters over the full trade universe
+> (`scripts/rank_and_push.sh` → Supabase `latest_ranking`) — see
+> `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`. Retained for design history.
 
 **Issue:** #276  
-**Status:** v1 shipped (greedy max-edge / min-overlap)
+**Status:** v1 shipped (greedy max-edge / min-overlap) — superseded; see banner above.
 
 ## Why
 
