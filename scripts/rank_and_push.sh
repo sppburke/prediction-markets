@@ -1,41 +1,63 @@
 #!/usr/bin/env bash
-# Rank the copy-trade wallet universe AND publish the result to Supabase — as ONE
-# command, so "done ranking" always means "in Supabase".
+# rank_and_push.sh — THE single, cron-ready entry point for the copy-trade ranking
+# pipeline. ONE command, ZERO arguments: it refreshes data, ranks, reranks, and
+# publishes the result to Supabase, so "done ranking" always means "in Supabase".
 #
-# THE BUG THIS FIXES: the ranking pipeline (pass-1 rank_72hr_buyandhold.py -> pass-2
-# latency_shift_rerank.py) ended by writing latency_shift_ranked.csv to disk and
-# STOPPED. push_ranking_to_supabase.py had no caller anywhere, so Supabase stayed
-# empty and pe-service fell back to its static seed. This wrapper makes the push a
-# non-optional final stage: if ranking succeeds, the push runs; if the push fails,
-# the whole command fails loudly (set -e), so it can never be silently skipped again.
+# THERE IS EXACTLY ONE RANKER: scripts/rank_72hr_buyandhold.py (72h buy-and-hold,
+# decay-aware, memory-safe inline scan over the full trade universe). pass-2
+# (latency_shift_rerank.py) reranks and adds hit_rate; push_ranking_to_supabase.py
+# publishes the `latest_ranking` table that pe-service reads. No second ranker, no
+# curated-universe pre-gate — the ranker's own filters decide the cohort (#370).
 #
-# Usage (from repo root):
-#   bash scripts/rank_and_push.sh --universe data/eval-results/<run>/universe_eligible.txt \
-#        --out-dir data/eval-results/<run> [--notes "monthly refresh"]
+# What `bash scripts/rank_and_push.sh` does (no args), in order:
+#   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
+#     discover     pe-bootstrap winner-discovery  leaderboard + datadash + radion → new wallets
+#     backfill     pe-bootstrap backfill          trade history for every active wallet
+#     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
+#     resolutions  pe-bootstrap resolutions       CLOB→Gamma market resolutions (payoff)
+#     schedules    pe-bootstrap schedules         scheduled end_date (the --scheduled-only TTR clock)
+#   Stage 1  rank    rank_72hr_buyandhold.py  --universe-from-trades  (every wallet w/ trade data)
+#   Stage 2  rerank  latency_shift_rerank.py  (adds hit_rate)
+#   Stage 3  push    push_ranking_to_supabase.py → Supabase latest_ranking
+#   Verify           latest_ranking is now populated.
 #
-# Requirements: .env with SUPABASE_URL + SUPABASE_SECRET_KEY; data/wallet_cache.db present.
-# Re-push only (skip ranking, reuse existing CSVs): add --skip-rank.
+# Production defaults are baked in (override via flags): --universe-from-trades,
+# HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 72h, --scheduled-only
+# (drops the resolved-at look-ahead fallback), floor_tstat 2.0, top_n 200.
 #
-# BACKFILL FIRST (issue #350 WS3): the push drops wallets idle > --active-window-hours (72)
-# and ABORTS if the cache's newest trade is > 24h old, so run docs/26 Part 1 (backfill)
-# immediately before this. A stale cache would otherwise filter out every wallet.
-# A re-push (--skip-rank) still filters against the cache; if it runs >24h after the
-# backfill, re-backfill first or pass --max-cache-staleness-hours to relax the guard.
+# Cron (example — daily 06:00 UTC on the box holding wallet_cache.db; NOT the VPS):
+#   0 6 * * *  cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
+#
+# Requirements on the box:
+#   - .env with SUPABASE_URL + SUPABASE_SECRET_KEY (sourced below).
+#   - data/wallet_cache.db present (the ranker reads it; Step 0 refreshes it).
+#   - target/release/pe-bootstrap built, with its env config — incl.
+#     PE_BOOTSTRAP_RADION_API_KEY for the Radion source (#373).
+#     Build: cargo build --release -p pe-bootstrap
+#
+# Research / re-push overrides:
+#   --universe <file>     rank a curated wallet file instead of all-trade-wallets.
+#   --half-life-days N    override the production decay half-life.
+#   --out-dir <dir>       override the auto-timestamped output dir.
+#   --bootstrap-config T  pass a BootstrapConfig TOML positional to each Step-0 stage.
+#   --skip-discovery      skip Step-0 winner-discovery (new-wallet ingest).
+#   --skip-backfill       skip Step-0 backfill + market-data refresh (events/resolutions/schedules).
+#   --skip-rank           reuse existing CSVs in --out-dir; just (re-)push.
+#   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# ── Defaults match the 2026-06-14 production run (override via flags) ──────────────────────
+# ── Defaults (override via flags) ────────────────────────────────────────────────────────
 DB="data/wallet_cache.db"
-UNIVERSE=""
-OUT_DIR=""
+UNIVERSE=""                       # empty => --universe-from-trades (the #370 production default)
+OUT_DIR=""                        # empty => auto-timestamped data/eval-results/cron-<UTC>
 # Empty window => the Python ranker's RELATIVE defaults apply (win_end = today UTC-midnight,
 # win_start = win_end - ranker_window_days(180)); override with --win-start/--win-end (issue #366).
 WIN_START=""
 WIN_END=""
-# Recency decay (issue #366). The WRAPPER defaults to FLAT (0) so a merge is a no-op for the
-# live Supabase ranking: decay only reaches live when the operator opts in with --half-life-days N
-# after sweeping. The Python scripts default to ranker_half_life_days(30) for standalone sweeps.
+# Recency decay (issue #366). Production default is 30-day half-life (issue #370, the sweep
+# adopted it). Override with --half-life-days N; 0 = flat (legacy, bitwise-identical to no decay).
 HALF_LIFE_DAYS="0"
 # Shared decay age anchor for BOTH passes; empty => resolved below to UTC-midnight today (= the
 # relative win_end) so the two passes weight every trade against the identical anchor.
@@ -54,6 +76,10 @@ ACTIVE_WINDOW_HOURS=""
 MAX_CACHE_STALENESS_HOURS=""
 NOTES=""
 SKIP_RANK="0"
+SKIP_DISCOVERY="0"
+SKIP_BACKFILL="0"
+BOOTSTRAP_CONFIG=""               # optional BootstrapConfig TOML positional for Step-0 stages
+PE_BOOTSTRAP_BIN="target/release/pe-bootstrap"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -75,24 +101,63 @@ while [[ $# -gt 0 ]]; do
     --active-window-hours) ACTIVE_WINDOW_HOURS="$2"; shift 2;;
     --max-cache-staleness-hours) MAX_CACHE_STALENESS_HOURS="$2"; shift 2;;
     --notes) NOTES="$2"; shift 2;;
+    --bootstrap-config) BOOTSTRAP_CONFIG="$2"; shift 2;;
     --skip-rank) SKIP_RANK="1"; shift;;
+    --skip-discovery) SKIP_DISCOVERY="1"; shift;;
+    --skip-backfill) SKIP_BACKFILL="1"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
 
-[[ -n "$OUT_DIR" ]] || { echo "FATAL: --out-dir is required" >&2; exit 2; }
 [[ -f .env ]] || { echo "FATAL: .env not found (need SUPABASE_URL + SUPABASE_SECRET_KEY)" >&2; exit 2; }
+
+# Zero-arg cron: default OUT_DIR to a timestamped dir so no flag is ever required.
+if [[ -z "$OUT_DIR" ]]; then
+  OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 
 # Load secrets up front so EVERY stage (incl. the push + verify, which read SUPABASE_URL /
 # SUPABASE_SECRET_KEY from the environment) sees them. Sourcing only before the verify step
 # would leave the push stage without credentials.
 set -a; source .env; set +a
+
+# ── Single-run lock (PID-based) ──────────────────────────────────────────────────────────
+# A full run (≈496K wallets, 30–90 min) must never overlap the next cron tick. A live holder
+# aborts the new run; a stale lock from a crashed run (PID not alive) is reclaimed. The trap
+# is set only AFTER we own the lock, so a held-lock abort never deletes the other run's file.
+LOCK_FILE="data/eval-results/.rank_and_push.lock"
+mkdir -p "$(dirname "$LOCK_FILE")"
+if [[ -e "$LOCK_FILE" ]]; then
+  LOCK_PID="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+  if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
+    echo "FATAL: another rank_and_push.sh is already running (PID $LOCK_PID). Aborting." >&2
+    exit 3
+  fi
+  echo "WARN: reclaiming stale lock (PID ${LOCK_PID:-unknown} not alive)." >&2
+fi
+echo "$$" > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
 mkdir -p "$OUT_DIR"
 
 RANKED_CSV="$OUT_DIR/ranked_72hr_buyandhold.csv"
 POSITIONS_CSV="$OUT_DIR/qualifying_positions_72hr.csv"
 LATENCY_CSV="$OUT_DIR/latency_shift_ranked.csv"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+# Universe source: explicit --universe <file>, else the production default --universe-from-trades
+# (every wallet with trade history; #370). The ranker enforces "exactly one of these", so pass
+# exactly one (mirror the WIN_ARGS conditional-array pattern below).
+UNIVERSE_ARGS=()
+if [[ -n "$UNIVERSE" ]]; then
+  UNIVERSE_ARGS+=(--universe "$UNIVERSE")
+else
+  UNIVERSE_ARGS+=(--universe-from-trades)
+fi
+
+# Optional BootstrapConfig TOML positional, threaded to every Step-0 pe-bootstrap stage.
+BOOTSTRAP_CONFIG_ARGS=()
+[[ -n "$BOOTSTRAP_CONFIG" ]] && BOOTSTRAP_CONFIG_ARGS+=("$BOOTSTRAP_CONFIG")
 
 # Window args only when explicitly overridden (mirror FILTER_ARGS below); empty => the Python
 # ranker's relative defaults apply. Pass the IDENTICAL conditional set to both passes.
@@ -107,12 +172,74 @@ if [[ -z "$AS_OF" ]]; then
   AS_OF="${WIN_END:-$(date -u +%Y-%m-%d)}"
 fi
 
-if [[ "$SKIP_RANK" == "0" ]]; then
-  [[ -n "$UNIVERSE" ]] || { echo "FATAL: --universe is required unless --skip-rank" >&2; exit 2; }
+# ── Step 0: data refresh ─────────────────────────────────────────────────────────────────
+# Run one pe-bootstrap stage with the uniform exit-code convention
+# (crates/bootstrap/src/main.rs:21-25): 0 = clean, 2 = partial soft-fail (cache durable,
+# failures retried next run) → WARN + continue, 1/other = fatal → abort the whole run.
+# NEVER pass --strict: it turns a tolerable partial (2) into a fatal (1). backfill and
+# resolutions routinely return 2 at full scale, so swallowing 2 is load-bearing for cron.
+run_refresh_stage() {
+  local label="$1"; shift
+  echo "   [$label] running: $*"
+  local rc=0
+  "$@" || rc=$?
+  case "$rc" in
+    0) echo "   [$label] ok" ;;
+    2) echo "   [$label] WARN exit 2 (partial); cache durable, continuing" >&2 ;;
+    *) echo "   [$label] FATAL exit $rc — aborting run" >&2; exit "$rc" ;;
+  esac
+}
 
+# Always-on data refresh (discover → backfill → events → resolutions → schedules). Each half is
+# independently bypassable; when both are skipped the whole step is a no-op (no binary needed).
+refresh_data() {
+  if [[ "$SKIP_DISCOVERY" == "1" && "$SKIP_BACKFILL" == "1" ]]; then
+    echo "── Step 0: data refresh fully skipped (--skip-discovery --skip-backfill) ─────────"
+    return 0
+  fi
+
+  [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
+    echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
+    exit 2
+  }
+
+  # Step 0 and the ranker MUST read the SAME cache. pe-bootstrap's config default for
+  # cache_path is bare "wallet_cache.db" (crates/bootstrap/src/config.rs:419-420), so force it
+  # onto $DB (default data/wallet_cache.db) to prevent Step 0 refreshing a different file than
+  # the ranker reads.
+  export PE_BOOTSTRAP_CACHE_PATH="$DB"
+
+  echo "── Step 0: data refresh (discover → backfill → events → resolutions → schedules) ──"
+
+  if [[ "$SKIP_DISCOVERY" == "1" ]]; then
+    echo "   discovery skipped (--skip-discovery)"
+  else
+    # winner-discovery hits all three sources: leaderboard (errors propagate → fatal),
+    # datadash + radion (soft-fail internally → still exit 0). #324/#365/#373.
+    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  fi
+
+  if [[ "$SKIP_BACKFILL" == "1" ]]; then
+    echo "   backfill + market-data skipped (--skip-backfill)"
+  else
+    run_refresh_stage "backfill" "$PE_BOOTSTRAP_BIN" backfill "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    run_refresh_stage "events" "$PE_BOOTSTRAP_BIN" events "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    # The explicit `resolutions` subcommand runs the CLOB→Gamma pipeline unconditionally
+    # (main.rs:187-218); PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 matches docs/26's canonical invocation
+    # and is scoped to this stage so `backfill` above does not also re-run the pipeline.
+    export PE_BOOTSTRAP_FETCH_RESOLUTIONS=1
+    run_refresh_stage "resolutions" "$PE_BOOTSTRAP_BIN" resolutions "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    unset PE_BOOTSTRAP_FETCH_RESOLUTIONS
+    run_refresh_stage "schedules" "$PE_BOOTSTRAP_BIN" schedules "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  fi
+}
+
+refresh_data
+
+if [[ "$SKIP_RANK" == "0" ]]; then
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
   python3 scripts/rank_72hr_buyandhold.py \
-    --db "$DB" --universe "$UNIVERSE" --out-dir "$OUT_DIR" \
+    --db "$DB" "${UNIVERSE_ARGS[@]}" --out-dir "$OUT_DIR" \
     "${WIN_ARGS[@]}" --ttr-hours "$TTR_HOURS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --target-n "$TARGET_N" --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
