@@ -42,7 +42,9 @@
 #   --bootstrap-config T  pass a BootstrapConfig TOML positional to each Step-0 stage.
 #   --skip-discovery      skip Step-0 winner-discovery (new-wallet ingest).
 #   --skip-backfill       skip Step-0 backfill + market-data refresh (events/resolutions/schedules).
-#   --skip-rank           reuse existing CSVs in --out-dir; just (re-)push.
+#   --skip-rank           reuse existing CSVs in --out-dir; just (re-)push. The push still
+#                         filters against the cache and ABORTS if its newest trade is >24h old
+#                         (issue #350 WS3); re-backfill first, or pass --max-cache-staleness-hours.
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
 
 set -euo pipefail

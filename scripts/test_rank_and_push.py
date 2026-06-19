@@ -180,6 +180,13 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNotNone(self._log("rank.log"), "ranking did not run after a partial backfill")
         print("PASS: backfill exit 2 (partial) → run continues to ranking")
 
+    def test_resolutions_partial_exit2_does_not_abort(self):
+        # resolutions is the other Step-0 stage that returns 2 routinely at scale.
+        r = self._run(exit_env={"STUB_EXIT_resolutions": "2"})
+        self.assertEqual(r.returncode, 0, f"exit 2 aborted the run\nstderr={r.stderr}")
+        self.assertIsNotNone(self._log("rank.log"), "ranking did not run after a partial resolutions")
+        print("PASS: resolutions exit 2 (partial) → run continues to ranking")
+
     def test_backfill_fatal_exit1_aborts_before_ranking(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "1"})
         self.assertNotEqual(r.returncode, 0, "fatal backfill should abort the run")
