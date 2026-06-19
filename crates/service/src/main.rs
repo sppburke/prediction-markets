@@ -18,7 +18,6 @@ use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
-use pe_trader_index::fetcher::{WatchlistFetchConfig, WatchlistFetcher};
 use pe_venue_polymarket::{PolymarketCredentials, PolymarketVenueAdapter, ReqwestCLOBClient};
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
@@ -34,7 +33,6 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
-use pe_service::seed;
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{
@@ -94,24 +92,15 @@ async fn main() -> Result<()> {
     let max_fill_price = Decimal::from_str(&cfg.max_fill_price)
         .with_context(|| format!("parse max_fill_price '{}'", cfg.max_fill_price))?;
 
-    // Bootstrap the initial wallet set. The Supabase live ranking handoff (#339) is primary
-    // when `supabase_url` is configured; otherwise fall back to the live leaderboard merged
-    // with the on-disk bootstrap seed. An empty/failed Supabase fetch also falls back.
-    //
-    // The Supabase path also returns the last-trade side-map (#357) — each wallet's real last
-    // on-chain trade time — used below to seed the poll cursor (the inactivity clock). The
-    // leaderboard fallback has no such data, so its map is empty and those wallets keep their
-    // persisted cursor (the poller re-warms it organically).
-    let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) = if cfg
-        .supabase_url
-        .is_empty()
-    {
-        (
-            bootstrap_from_leaderboard_and_seed(&cfg).await?,
-            HashMap::new(),
-        )
-    } else {
-        match supabase_reader::fetch(
+    // Bootstrap the initial wallet set from Supabase `latest_ranking` — the sole wallet
+    // source (#339, #370). The fetch also returns the last-trade side-map (#357): each
+    // wallet's real last on-chain trade time, used below to seed the poll cursor (the
+    // inactivity clock). There is no leaderboard/seed fallback — the service hard-fails fast
+    // if Supabase is empty or unreachable at boot, chosen over running an unvalidated set.
+    // Deploy precondition: the authoritative `rank_and_push` cron must already be populating
+    // `latest_ranking`.
+    let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
+        supabase_reader::fetch(
             &reqwest::Client::new(),
             &cfg.supabase_url,
             &cfg.supabase_anon_key,
@@ -119,38 +108,19 @@ async fn main() -> Result<()> {
             supabase_reader::SUPABASE_FETCH_LIMIT,
         )
         .await
-        {
-            Ok((wl, last_trade)) if !wl.entries.is_empty() => {
-                info!(
-                    active = wl.active_count,
-                    total = wl.entries.len(),
-                    "watchlist bootstrapped from supabase"
-                );
-                (wl, last_trade)
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    "supabase returned an empty ranking; falling back to leaderboard + seed"
-                );
-                (
-                    bootstrap_from_leaderboard_and_seed(&cfg).await?,
-                    HashMap::new(),
-                )
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "supabase bootstrap failed; falling back to leaderboard + seed");
-                (
-                    bootstrap_from_leaderboard_and_seed(&cfg).await?,
-                    HashMap::new(),
-                )
-            }
-        }
-    };
+        .context("bootstrap watchlist from Supabase (the sole wallet source)")?;
+    info!(
+        active = initial_watchlist.active_count,
+        total = initial_watchlist.entries.len(),
+        "watchlist bootstrapped from supabase"
+    );
 
-    // Fail fast if there is nothing to copy (no Supabase rows, no seed, no leaderboard).
+    // Fail fast if Supabase returned no wallets — there is no fallback source (#370). An empty
+    // `latest_ranking` means the authoritative `rank_and_push` cron has not populated it yet;
+    // refuse to boot rather than run with an empty watchlist.
     anyhow::ensure!(
         !initial_watchlist.entries.is_empty(),
-        "no wallets to copy: set `supabase_url` (live ranking) or `seed_watchlist_path` (bootstrap seed)"
+        "no wallets to copy: Supabase `latest_ranking` is empty (is the rank_and_push cron populating it?)"
     );
 
     let live_watchlist = LiveWatchlist::new(initial_watchlist);
@@ -300,8 +270,8 @@ async fn main() -> Result<()> {
         // Seed the poll cursor from each bootstrapped wallet's real last-trade time (#357),
         // UNCONDITIONALLY: this establishes the inactivity clock at the real last trade
         // (idle = now − cursor) and repairs any corrupted `now`-seed left by a prior build. A
-        // wallet absent from the side-map (leaderboard fallback, or a NULL `last_trade_unix`
-        // column) keeps its persisted cursor; a never-seeded `None` cursor self-heals via the
+        // wallet absent from the side-map (a NULL `last_trade_unix` column in the ranking)
+        // keeps its persisted cursor; a never-seeded `None` cursor self-heals via the
         // poller's first unbounded fetch and is never reset to `now` (no admission grace).
         let mut cursor_seeded = 0usize;
         for (wallet, last_trade_unix) in &bootstrap_last_trade {
@@ -760,48 +730,6 @@ async fn tick_resolution(
         sink.send_resolution();
     }
     Ok(())
-}
-
-/// Bootstrap the initial watchlist from the live Polymarket leaderboard merged with the
-/// optional on-disk bootstrap seed (the pre-#339 path; the Supabase live source is primary
-/// when configured).
-async fn bootstrap_from_leaderboard_and_seed(cfg: &ServiceConfig) -> Result<Watchlist> {
-    let fetch_config = WatchlistFetchConfig {
-        base_url: cfg.polymarket_base_url.clone(),
-        watchlist_size: cfg.watchlist_size,
-    };
-    let mut watchlist_fetcher =
-        WatchlistFetcher::new(fetch_config, ReqwestFetcher::new(reqwest::Client::new()));
-    let watchlist = watchlist_fetcher
-        .fetch_watchlist()
-        .await
-        .context("bootstrap watchlist")?;
-    info!(
-        active = watchlist.active_count,
-        "watchlist bootstrapped from leaderboard"
-    );
-
-    // Merge leaderboard with the optional bootstrap seed. The merged Watchlist carries
-    // full WatchlistEntry metadata for every wallet so the orchestrator can look up tier
-    // and scores for seed-only wallets.
-    let seed_wl = seed::load_seed_watchlist(&cfg.seed_watchlist_path)?;
-    let merged = seed::merge_watchlist(&watchlist, seed_wl.as_ref());
-    if seed_wl.is_some() {
-        info!(
-            total = merged.entries.len(),
-            active = merged.active_count,
-            incubator = merged.incubator_count,
-            "seed watchlist merged with leaderboard"
-        );
-        if merged.entries.len() > cfg.watchlist_size {
-            tracing::warn!(
-                merged = merged.entries.len(),
-                watchlist_size = cfg.watchlist_size,
-                "merged wallet count exceeds watchlist_size; trade poller rate-limit budget was sized for watchlist_size"
-            );
-        }
-    }
-    Ok(merged)
 }
 
 fn parse_mode(s: &str) -> Result<ExecutionMode> {
