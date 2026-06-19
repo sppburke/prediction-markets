@@ -12,8 +12,9 @@ to qualifying_positions_72hr.csv on disk (including `outcome_id`, which pass-2
 `latency_shift_rerank.py` requires); and compact per-wallet arrays are retained in
 RAM ONLY for wallets that clear eligibility + the edge floor (a few hundred) — all
 the group-Sharpe stage needs. Peak RAM ~= market maps + per-wallet summaries
-(~1 GB) instead of the ~14 GB an all-positions DataFrame would need over the full
-~496 K-wallet universe, so it scales to the entire trade history.
+(~1 GB), roughly flat in the universe size, instead of the tens of GB an
+all-positions DataFrame would need over the full ~496 K-wallet universe (which
+OOMs at production scale), so it scales to the entire trade history.
 
 Pipeline (see docs/26 and docs/_GLOSSARY.md):
 
