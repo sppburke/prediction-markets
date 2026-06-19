@@ -31,6 +31,7 @@ import statistics
 import sys
 import time
 
+import ranker_duck
 from ranker_decay import (
     DEFAULT_HALF_LIFE_DAYS,
     decay_weights,
@@ -139,15 +140,30 @@ def main() -> int:
     shift = a.latency_shift_secs
     fill_window = a.fill_window_secs
 
+    # DuckDB read-layer (#375): load every candidate (market,outcome) tape from the
+    # Parquet snapshot in one query (price returned as RAW strings, so the float()/
+    # 0<p<1 fill logic below is byte-identical); else per-pair SQLite scan. The
+    # bisect + fill loop is unchanged regardless of engine.
+    engine = ranker_duck.get_engine()
+    if engine is not None:
+        log("tape engine: DuckDB (Parquet read-layer, #375)")
+        duck_tapes = ranker_duck.duck_load_tapes(engine, list(by_mo.keys()))
+    else:
+        log("tape engine: SQLite (per-(market,outcome) scan)")
+        duck_tapes = None
+
     for i, ((mid, oid), positions) in enumerate(by_mo.items()):
-        cur = conn.execute(
-            "SELECT timestamp_unix, price_str FROM trades "
-            "WHERE market_id = ? AND outcome_id = ? ORDER BY timestamp_unix ASC",
-            (mid, oid),
-        )
-        tape = cur.fetchall()
-        ts_arr = [row[0] for row in tape]
-        px_arr = [row[1] for row in tape]
+        if duck_tapes is not None:
+            ts_arr, px_arr = duck_tapes.get((mid, oid), ([], []))
+        else:
+            cur = conn.execute(
+                "SELECT timestamp_unix, price_str FROM trades "
+                "WHERE market_id = ? AND outcome_id = ? ORDER BY timestamp_unix ASC",
+                (mid, oid),
+            )
+            tape = cur.fetchall()
+            ts_arr = [row[0] for row in tape]
+            px_arr = [row[1] for row in tape]
         for pos in positions:
             w = pos["wallet"]
             n_total[w] = n_total.get(w, 0) + 1

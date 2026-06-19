@@ -61,6 +61,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+import ranker_duck
 from ranker_decay import (
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_WINDOW_DAYS,
@@ -276,6 +277,153 @@ def greedy_max_group_sharpe(sumg: np.ndarray, npos: np.ndarray, target_n: int,
     return selected
 
 
+def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
+    """Score one wallet's QUALIFYING first-buy positions and emit its CSV rows +
+    summary + floor entry. Shared by the SQLite and DuckDB extraction paths so
+    `eff`/`gross`/`net` and the decayed `weighted_stats` run through exactly one code
+    path (issue #375 bit-parity). `positions` is a list of dicts with keys market_id,
+    outcome_id, entry_ts, ttr, price (float), contracts, payoff (float), resolved_at —
+    already filtered. Returns the number of positions scored.
+
+    # Precondition: positions are pre-filtered (window / ttr / resolved / price / band).
+    """
+    if not positions:
+        return 0
+    nets: list[float] = []
+    grosses: list[float] = []
+    payoffs: list[float] = []
+    prices: list[float] = []
+    ttrs: list[int] = []
+    resolveds: list[int] = []
+    entry_tss: list[int] = []  # raw entry timestamps -> recency-decay weights (#366)
+    months: set[tuple[int, int]] = set()
+    rows_out: list[tuple] = []
+    for p in positions:
+        price = p["price"]
+        payoff = p["payoff"]
+        gross = (payoff - price) / price
+        # realistic price-aware entry slippage (module docstring Stage 2): cross the
+        # spread by up to `slip`, never paying more than ~$1; hold-to-resolution has
+        # no exit cost (settles at $1/$0).
+        eff = min(price + prm.slip, 0.999)
+        net = (payoff - eff) / eff
+        nets.append(net)
+        grosses.append(gross)
+        payoffs.append(payoff)
+        prices.append(price)
+        ttrs.append(p["ttr"])
+        resolveds.append(p["resolved_at"])
+        entry_tss.append(p["entry_ts"])
+        g = time.gmtime(p["entry_ts"])
+        months.add((g.tm_year, g.tm_mon))
+        rows_out.append((w, p["market_id"], p["outcome_id"], p["entry_ts"], p["ttr"],
+                         price, int(p["contracts"]), payoff, gross, net, p["resolved_at"]))
+
+    writer.writerows(rows_out)
+
+    n = len(nets)
+    net_arr = np.asarray(nets, dtype=float)
+    gross_arr = np.asarray(grosses, dtype=float)
+    active_months = len(months)
+    # Recency-decay weights (a function only of entry_ts, as_of, half_life).
+    # half_life <= 0 -> all-ones -> weighted_stats is bitwise-identical to legacy.
+    wdecay = decay_weights(np.asarray(entry_tss, dtype=float), prm.as_of, prm.half_life_days)
+    mean_gross, std_gross, _, tstat_gross = weighted_stats(gross_arr, wdecay)
+    mean_net, std_net, n_eff, tstat_net = weighted_stats(net_arr, wdecay)
+    summaries.append({
+        "wallet": w,
+        "n": n,
+        "active_months": active_months,
+        "avg_per_active_month": n / active_months,
+        "mean_gross": mean_gross,
+        "std_gross": std_gross,
+        "tstat_gross": tstat_gross,
+        "mean_net": mean_net,
+        "std_net": std_net,
+        "tstat_net": tstat_net,
+        "n_eff": n_eff,
+        "hit_rate": float(np.asarray(payoffs).mean()),
+        "avg_price": float(np.asarray(prices).mean()),
+        "avg_ttr_hours": float(np.asarray(ttrs, dtype=float).mean() / 3600.0),
+    })
+
+    # Inline floor-retention uses the SAME decayed tstat_net/mean_net as the
+    # DataFrame floor below, so the two can never diverge.
+    eligible = (
+        (n / active_months >= prm.min_avg_per_month)
+        and (active_months >= prm.min_active_months)
+        and (n > 1)
+        and not math.isnan(tstat_net)
+    )
+    if eligible and (tstat_net >= prm.floor_tstat) and (mean_net > 0):
+        floor_pos[w] = (net_arr, np.asarray(resolveds, dtype=np.int64))
+    return n
+
+
+def scan_and_filter_sqlite(conn, w, prm, res, sched, diag):
+    """SQLite path: per-wallet first-buy scan + the qualification filters, returning
+    the list of qualifying position dicts that `process_wallet_positions` consumes.
+    Identical filtering to the pre-#375 inline loop — the only change is that the
+    qualifying rows are collected into a list instead of being scored in place."""
+    cur = conn.execute(
+        "SELECT market_id, outcome_id, price_str, contracts, timestamp_unix "
+        "FROM trades WHERE wallet_hex = ? AND side = 'buy' ORDER BY timestamp_unix ASC",
+        (w,),
+    )
+    # first-ever buy per market
+    first: dict = {}
+    for mid, oid, price_str, contracts, ts in cur:
+        if mid not in first:
+            first[mid] = (oid, price_str, contracts, ts)
+    diag["first_buys"] += len(first)
+
+    positions: list[dict] = []
+    for mid, (oid, price_str, contracts, ts) in first.items():
+        # entry date must be in window
+        if not (prm.win_start <= ts < prm.win_end):
+            diag["out_of_window"] += 1
+            continue
+        end = sched.get(mid)
+        r = res.get(mid)
+        # TTR reference. scheduled_only=True uses ONLY the scheduled end (known at entry);
+        # the resolved_at fallback is look-ahead (actual resolution time is unknown at entry).
+        if prm.scheduled_only:
+            ref = end
+        else:
+            ref = end if end is not None else (r[1] if r is not None else None)
+        if ref is None:
+            diag["no_ref"] += 1
+            continue
+        ttr = ref - ts
+        if ttr < max(prm.min_ttr_secs, 1) or ttr >= prm.ttr_secs:
+            diag["ttr_fail"] += 1
+            continue
+        if r is None:
+            diag["unresolved"] += 1
+            continue
+        try:
+            price = float(price_str)
+        except (TypeError, ValueError):
+            diag["bad_price"] += 1
+            continue
+        if not (0.0 < price < 1.0):
+            diag["bad_price"] += 1
+            continue
+        # entry-price band filter: copy-trade only mid-priced first-buys
+        if not (prm.price_min <= price <= prm.price_max):
+            diag["out_of_band"] += 1
+            continue
+        win_oid, resolved_at = r
+        payoff = 1.0 if int(oid) == int(win_oid) else 0.0
+        positions.append({
+            "market_id": mid, "outcome_id": oid, "entry_ts": ts, "ttr": ttr,
+            "price": price, "contracts": contracts, "payoff": payoff,
+            "resolved_at": resolved_at,
+        })
+        diag["qualified"] += 1
+    return positions
+
+
 def main() -> int:
     prm = parse_args()
     os.makedirs(prm.out_dir, exist_ok=True)
@@ -294,7 +442,11 @@ def main() -> int:
         universe_label = os.path.basename(prm.universe)
         log(f"universe: {len(wallets)} wallets ({universe_label})")
 
-    res, sched = load_market_maps(conn)
+    # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
+    # Market maps (resolutions + schedules) are only needed by the SQLite path; the
+    # DuckDB path joins them in SQL over the Parquet snapshot.
+    engine = ranker_duck.get_engine()
+    res, sched = (None, None) if engine is not None else load_market_maps(conn)
 
     decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"
     log(f"scoring: {decay}, as_of={prm.as_of} (window [{prm.win_start},{prm.win_end}))")
@@ -312,136 +464,40 @@ def main() -> int:
     t0 = time.time()
     total_qualified = 0
 
-    for i, w in enumerate(wallets):
-        diag["wallets_seen"] += 1
-        cur = conn.execute(
-            "SELECT market_id, outcome_id, price_str, contracts, timestamp_unix "
-            "FROM trades WHERE wallet_hex = ? AND side = 'buy' ORDER BY timestamp_unix ASC",
-            (w,),
+    if engine is not None:
+        # DuckDB read-layer (#375): the heavy scan + first-buy dedup + filters run in
+        # SQL over the Parquet snapshot; the SHARED Python tail scores every wallet, so
+        # eff/gross/net + weighted_stats are byte-identical to the SQLite path.
+        log("extraction engine: DuckDB (Parquet read-layer, #375)")
+        ttr_lo = max(prm.min_ttr_secs, 1)
+        df = ranker_duck.duck_extract_positions(
+            engine, wallets, prm.win_start, prm.win_end, ttr_lo, prm.ttr_secs,
+            prm.scheduled_only, prm.price_min, prm.price_max,
         )
-        # first-ever buy per market
-        first: dict = {}
-        for mid, oid, price_str, contracts, ts in cur:
-            if mid not in first:
-                first[mid] = (oid, price_str, contracts, ts)
-        diag["first_buys"] += len(first)
-
-        nets: list[float] = []
-        grosses: list[float] = []
-        payoffs: list[float] = []
-        prices: list[float] = []
-        ttrs: list[int] = []
-        resolveds: list[int] = []
-        entry_tss: list[int] = []  # raw entry timestamps -> recency-decay weights (#366)
-        months: set[tuple[int, int]] = set()
-        rows_out: list[tuple] = []
-
-        for mid, (oid, price_str, contracts, ts) in first.items():
-            # entry date must be in window
-            if not (prm.win_start <= ts < prm.win_end):
-                diag["out_of_window"] += 1
-                continue
-            end = sched.get(mid)
-            r = res.get(mid)
-            # TTR reference. scheduled_only=True uses ONLY the scheduled end (known at entry);
-            # the resolved_at fallback is look-ahead (actual resolution time is unknown at entry).
-            if prm.scheduled_only:
-                ref = end
-            else:
-                ref = end if end is not None else (r[1] if r is not None else None)
-            if ref is None:
-                diag["no_ref"] += 1
-                continue
-            ttr = ref - ts
-            if ttr < max(prm.min_ttr_secs, 1) or ttr >= prm.ttr_secs:
-                diag["ttr_fail"] += 1
-                continue
-            if r is None:
-                diag["unresolved"] += 1
-                continue
-            try:
-                price = float(price_str)
-            except (TypeError, ValueError):
-                diag["bad_price"] += 1
-                continue
-            if not (0.0 < price < 1.0):
-                diag["bad_price"] += 1
-                continue
-            # entry-price band filter: copy-trade only mid-priced first-buys
-            if not (prm.price_min <= price <= prm.price_max):
-                diag["out_of_band"] += 1
-                continue
-            win_oid, resolved_at = r
-            payoff = 1.0 if int(oid) == int(win_oid) else 0.0
-            gross = (payoff - price) / price
-            # realistic price-aware entry slippage: you cross the spread by up to
-            # `slip`, but can never pay more than ~$1 (favorites pay only the headroom).
-            # Buy-and-hold-to-resolution has NO exit cost (settles at $1/$0).
-            eff = min(price + prm.slip, 0.999)
-            net = (payoff - eff) / eff
-
-            nets.append(net)
-            grosses.append(gross)
-            payoffs.append(payoff)
-            prices.append(price)
-            ttrs.append(ttr)
-            resolveds.append(resolved_at)
-            entry_tss.append(ts)
-            g = time.gmtime(ts)
-            months.add((g.tm_year, g.tm_mon))
-            rows_out.append((w, mid, oid, ts, ttr, price, int(contracts), payoff,
-                             gross, net, resolved_at))
-            diag["qualified"] += 1
-
-        n = len(nets)
-        if n == 0:
+        diag["wallets_seen"] = len(wallets)
+        diag["qualified"] = len(df)
+        # Stable per-wallet order so summation is deterministic run-to-run; the stats
+        # are order-invariant beyond sub-ULP FP (absorbed by the parity rtol).
+        df = df.sort_values(["wallet", "entry_ts"], kind="stable")
+        for w, grp in df.groupby("wallet", sort=True):
+            positions = [{
+                "market_id": row.market_id, "outcome_id": int(row.outcome_id),
+                "entry_ts": int(row.entry_ts), "ttr": int(row.ttr_secs),
+                "price": float(row.price), "contracts": int(row.contracts),
+                "payoff": float(row.payoff), "resolved_at": int(row.resolved_at),
+            } for row in grp.itertuples(index=False)]
+            total_qualified += process_wallet_positions(
+                w, positions, prm, writer, summaries, floor_pos)
+    else:
+        log("extraction engine: SQLite (per-wallet inline scan)")
+        for i, w in enumerate(wallets):
+            diag["wallets_seen"] += 1
+            positions = scan_and_filter_sqlite(conn, w, prm, res, sched, diag)
+            total_qualified += process_wallet_positions(
+                w, positions, prm, writer, summaries, floor_pos)
             if (i + 1) % 5000 == 0:
                 log(f"  {i+1}/{len(wallets)} wallets ({time.time()-t0:.0f}s, "
                     f"{total_qualified:,} qualifying, {len(floor_pos)} floor)")
-            continue
-
-        writer.writerows(rows_out)
-        total_qualified += n
-
-        net_arr = np.asarray(nets, dtype=float)
-        gross_arr = np.asarray(grosses, dtype=float)
-        active_months = len(months)
-        # Recency-decay weights (a function only of entry_ts, as_of, half_life).
-        # half_life <= 0 -> all-ones -> weighted_stats is bitwise-identical to legacy.
-        wdecay = decay_weights(np.asarray(entry_tss, dtype=float), prm.as_of, prm.half_life_days)
-        mean_gross, std_gross, _, tstat_gross = weighted_stats(gross_arr, wdecay)
-        mean_net, std_net, n_eff, tstat_net = weighted_stats(net_arr, wdecay)
-        summaries.append({
-            "wallet": w,
-            "n": n,
-            "active_months": active_months,
-            "avg_per_active_month": n / active_months,
-            "mean_gross": mean_gross,
-            "std_gross": std_gross,
-            "tstat_gross": tstat_gross,
-            "mean_net": mean_net,
-            "std_net": std_net,
-            "tstat_net": tstat_net,
-            "n_eff": n_eff,
-            "hit_rate": float(np.asarray(payoffs).mean()),
-            "avg_price": float(np.asarray(prices).mean()),
-            "avg_ttr_hours": float(np.asarray(ttrs, dtype=float).mean() / 3600.0),
-        })
-
-        # Inline floor-retention uses the SAME decayed tstat_net/mean_net as the
-        # DataFrame floor below, so the two can never diverge.
-        eligible = (
-            (n / active_months >= prm.min_avg_per_month)
-            and (active_months >= prm.min_active_months)
-            and (n > 1)
-            and not math.isnan(tstat_net)
-        )
-        if eligible and (tstat_net >= prm.floor_tstat) and (mean_net > 0):
-            floor_pos[w] = (net_arr, np.asarray(resolveds, dtype=np.int64))
-
-        if (i + 1) % 5000 == 0:
-            log(f"  {i+1}/{len(wallets)} wallets ({time.time()-t0:.0f}s, "
-                f"{total_qualified:,} qualifying, {len(floor_pos)} floor)")
 
     pos_fh.close()
     log(f"extraction done in {time.time()-t0:.0f}s")

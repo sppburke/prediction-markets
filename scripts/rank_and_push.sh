@@ -16,6 +16,8 @@
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma market resolutions (payoff)
 #     schedules    pe-bootstrap schedules         scheduled end_date (the --scheduled-only TTR clock)
+#   Step 0a export  export_trades_parquet.py       trades+maps → Parquet for the DuckDB read-layer
+#                                                  (#375; auto/duck engines only; --skip-export bypass)
 #   Stage 1  rank    rank_72hr_buyandhold.py  --universe-from-trades  (every wallet w/ trade data)
 #   Stage 2  rerank  latency_shift_rerank.py  (adds hit_rate)
 #   Stage 3  push    push_ranking_to_supabase.py → Supabase latest_ranking
@@ -45,6 +47,9 @@
 #   --skip-rank           reuse existing CSVs in --out-dir; just (re-)push. The push still
 #                         filters against the cache and ABORTS if its newest trade is >24h old
 #                         (issue #350 WS3); re-backfill first, or pass --max-cache-staleness-hours.
+#   --engine E            ranker engine: auto (default) | duck | sqlite. auto uses the DuckDB
+#                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
+#   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
 
 set -euo pipefail
@@ -74,6 +79,13 @@ FLOOR_TSTAT="2.0"
 LATENCY_SHIFT_SECS="20"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
+# DuckDB read-layer (issue #375). Empty => resolved after .env (flag > .env > default).
+# ENGINE: auto (DuckDB over a fresh Parquet snapshot, else SQLite) | duck (require it) |
+# sqlite (force SQLite, skip the export). SKIP_EXPORT bypasses the Step-0a rewrite.
+ENGINE=""
+PARQUET_DIR=""
+PARQUET_MAX_AGE_HOURS=""
+SKIP_EXPORT="0"
 # Active-only upload filter (issue #350 WS3). Empty => use push_ranking_to_supabase.py's
 # canonical defaults (72 / 24, docs/_GLOSSARY), so the thresholds live in exactly one place.
 ACTIVE_WINDOW_HOURS=""
@@ -109,6 +121,10 @@ while [[ $# -gt 0 ]]; do
     --skip-rank) SKIP_RANK="1"; shift;;
     --skip-discovery) SKIP_DISCOVERY="1"; shift;;
     --skip-backfill) SKIP_BACKFILL="1"; shift;;
+    --engine) ENGINE="$2"; shift 2;;
+    --parquet-dir) PARQUET_DIR="$2"; shift 2;;
+    --parquet-max-age-hours) PARQUET_MAX_AGE_HOURS="$2"; shift 2;;
+    --skip-export) SKIP_EXPORT="1"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -124,6 +140,15 @@ fi
 # SUPABASE_SECRET_KEY from the environment) sees them. Sourcing only before the verify step
 # would leave the push stage without credentials.
 set -a; source .env; set +a
+
+# DuckDB read-layer settings (#375): flag > .env (PE_RANKER_*) > default. Exported so
+# BOTH ranker passes (via ranker_duck.get_engine) AND Step-0a below see one source of truth.
+ENGINE="${ENGINE:-${PE_RANKER_ENGINE:-auto}}"
+PARQUET_DIR="${PARQUET_DIR:-${PE_RANKER_PARQUET_DIR:-data/parquet}}"
+PARQUET_MAX_AGE_HOURS="${PARQUET_MAX_AGE_HOURS:-${PE_RANKER_PARQUET_MAX_AGE_HOURS:-4}}"
+export PE_RANKER_ENGINE="$ENGINE"
+export PE_RANKER_PARQUET_DIR="$PARQUET_DIR"
+export PE_RANKER_PARQUET_MAX_AGE_HOURS="$PARQUET_MAX_AGE_HOURS"
 
 # ── Single-run lock (PID-based) ──────────────────────────────────────────────────────────
 # A full run (≈496K wallets, 30–90 min) must never overlap the next cron tick. A live holder
@@ -239,6 +264,24 @@ refresh_data() {
 }
 
 refresh_data
+
+# ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
+# Full atomic rewrite from the just-refreshed cache (so the snapshot is fresh for this run).
+# Skipped when ranking is skipped, export is skipped, or the engine is forced to sqlite. In
+# auto mode an export failure (e.g. duckdb not installed) is non-fatal — get_engine() then
+# returns None and both passes fall back to SQLite; with --engine duck it is fatal.
+if [[ "$SKIP_RANK" == "0" && "$SKIP_EXPORT" == "0" && "$ENGINE" != "sqlite" ]]; then
+  echo "── Step 0a: export Parquet snapshot ($PARQUET_DIR) for the DuckDB read-layer ──"
+  if python3 scripts/export_trades_parquet.py --db "$DB" --out-dir "$PARQUET_DIR"; then
+    echo "   export ok"
+  elif [[ "$ENGINE" == "duck" ]]; then
+    echo "FATAL: --engine duck but the Parquet export failed" >&2; exit 1
+  else
+    echo "   WARN: Parquet export failed (engine=auto) — ranker will use SQLite" >&2
+  fi
+else
+  echo "── Step 0a: Parquet export skipped (engine=$ENGINE skip_rank=$SKIP_RANK skip_export=$SKIP_EXPORT) ──"
+fi
 
 if [[ "$SKIP_RANK" == "0" ]]; then
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
