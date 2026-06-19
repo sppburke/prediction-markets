@@ -113,7 +113,8 @@ sqlite3 data/wallet_cache.db "
 ```
 
 `newest_trade` should be within the last day or two. If `resolved_mkts` is low
-relative to the markets your wallets traded, re-run step 3 with an RPC URL set.
+relative to the markets your wallets traded, re-run step 3 (the CLOB → Gamma
+resolution pipeline — no RPC required, #369/#372).
 
 > **Backfill before pushing (issue #350 WS3).** The Supabase upload
 > (`scripts/push_ranking_to_supabase.py`, invoked by `scripts/rank_and_push.sh`)
