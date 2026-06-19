@@ -45,7 +45,7 @@ async fn main() -> Result<(), BacktestError> {
         if actual > limit {
             return Err(BacktestError::Internal(format!(
                 "cache has {actual} trades which exceeds max_trade_count={}; \
-                 pe-skill-select handles full-cohort analysis. \
+                 the 72hr ranker (scripts/rank_72hr_buyandhold.py) handles full-cohort analysis. \
                  Set PE_BACKTEST_MAX_TRADE_COUNT=0 to disable this guard.",
                 config.max_trade_count
             )));

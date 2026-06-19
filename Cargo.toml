@@ -18,7 +18,6 @@ members = [
     "crates/backtest",
     "crates/venue-polymarket",
     "crates/execution-core",
-    "crates/skill-select",
     "crates/paper-state",
     "crates/paper-pnl",
     "crates/crypto-shadow",
