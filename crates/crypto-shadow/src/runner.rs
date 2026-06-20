@@ -662,7 +662,15 @@ pub async fn resolve(config: &ShadowConfig) -> Result<usize, Error> {
         info!("shadow: no observed markets to resolve");
         return Ok(0);
     }
-    let fetcher = ReqwestFetcher::new(reqwest::Client::new());
+    // Defensive self-identifying UA on the `&closed=true` resolution client (issue #382),
+    // matching the bootstrap Gamma clients. The Phase-0 probe showed a bare client is not
+    // 403'd here, so this is hardening, not a correctness fix; `BtcMarketFetcher`'s
+    // `closed=false` enumeration (gamma.rs) keeps the bare client.
+    let gamma_client = reqwest::Client::builder()
+        .user_agent(pe_source_polymarket_public::GAMMA_BROWSER_UA)
+        .build()
+        .map_err(|e| crate::resolve::ResolveError::Fetch(e.to_string()))?;
+    let fetcher = ReqwestFetcher::new(gamma_client);
     let resolver = BtcResolutionFetcher::new(config.gamma_base_url.clone(), fetcher);
     let resolutions = resolver.fetch_resolutions(&condition_ids).await?;
     let now = now_unix_ms();

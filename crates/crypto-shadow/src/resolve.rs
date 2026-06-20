@@ -6,19 +6,20 @@
 //! resolved `outcomePrices` once a market closes, so the winning side is
 //! readable for free: `GET /markets?condition_ids={ID}&closed=true` →
 //! `outcomePrices[0]` is the Up/YES token's settled value (`"1"` = Up won, `"0"`
-//! = Down won), and `clobTokenIds[0]` is exactly the harness's `yes_token_id`.
-//! Verified live 2026-06-09 against a resolved `btc-updown-5m` market. Mirrors
-//! `pe-paper-pnl::GammaResolutionFetcher` (`closed=true` is required — the plain
-//! endpoint returns an empty list for resolved markets).
+//! = Down won). Verified live 2026-06-09 against a resolved `btc-updown-5m`
+//! market. As of issue #382 Phase 4 this delegates to the shared batched
+//! [`GammaMarketsClient`](pe_source_polymarket_public::GammaMarketsClient)
+//! (`ClosedOnly`) — like `pe-paper-pnl::GammaResolutionFetcher`, many
+//! condition_ids per request, demuxed by `conditionId`. `closed=true` is required
+//! — the plain endpoint returns an empty list for resolved markets.
 
-use std::str::FromStr as _;
-
-use pe_source_polymarket_public::PageFetcher;
+use pe_source_polymarket_public::{GammaMarketsClient, MarketFilter, PageFetcher};
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use tracing::warn;
 
-/// Error fetching/parsing resolutions.
+/// Error fetching resolutions. Retained as the public error surface
+/// (`crate::Error::Resolve`); [`BtcResolutionFetcher::fetch_resolutions`] itself
+/// is resilient and returns `Ok` even when a batch fails (see its docs).
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("fetch: {0}")]
@@ -32,94 +33,78 @@ pub struct MarketResolution {
     pub yes_won: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct GammaMarket {
-    #[serde(rename = "conditionId")]
-    condition_id: String,
-    closed: bool,
-    /// JSON-encoded decimal-string array, e.g. `"[\"1\",\"0\"]"` (resolved).
-    #[serde(rename = "outcomePrices")]
-    outcome_prices: Option<String>,
-}
-
-/// Parse Gamma's `outcomePrices` field — a JSON-encoded decimal-string array
-/// such as `"[\"1\",\"0\"]"` — into `Vec<Decimal>`. `None` on malformed JSON or
-/// a non-decimal entry.
-pub fn parse_outcome_prices(s: &str) -> Option<Vec<Decimal>> {
-    let raw: Vec<String> = serde_json::from_str(s).ok()?;
-    raw.iter().map(|x| Decimal::from_str(x).ok()).collect()
-}
-
-/// Parse a `/markets?condition_ids=…&closed=true` body for `condition_id`.
-/// Returns the resolution iff a row matches that exact `condition_id`, is
-/// `closed`, and has a parseable `outcomePrices`. The YES/Up side wins when the
-/// first settled price is the decisive `1` (resolved markets settle to exactly
-/// `1`/`0`; the `> 0.5` test is robust to either encoding). Pure.
-///
-/// Limitation: a closed market that settled non-decisively (e.g. a 50/50 void,
-/// `["0.5","0.5"]`) would be classified as a YES loss rather than excluded. No
-/// such settlement has been observed for these binary BTC up/down markets
-/// (live-verified shape is exactly `1`/`0`); since this is a shadow-only
-/// measurement harness that places no orders, the YES-side classification is an
-/// accepted, documented limitation, not a trading risk.
-pub fn parse_resolution(bytes: &[u8], condition_id: &str) -> Option<MarketResolution> {
-    let markets: Vec<GammaMarket> = serde_json::from_slice(bytes).ok()?;
-    let m = markets.iter().find(|m| m.condition_id == condition_id)?;
-    if !m.closed {
-        return None;
-    }
-    let prices = parse_outcome_prices(m.outcome_prices.as_deref()?)?;
-    let yes = prices.first().copied()?;
-    Some(MarketResolution {
-        condition_id: condition_id.to_string(),
-        yes_won: yes > Decimal::new(5, 1), // > 0.5
-    })
-}
-
-/// Fetches closed-market resolutions for the harness's observed markets.
+/// Fetches closed-market resolutions for the harness's observed markets via the
+/// shared batched Gamma client.
 pub struct BtcResolutionFetcher<F: PageFetcher> {
-    base_url: String,
-    fetcher: F,
+    client: GammaMarketsClient<F>,
 }
 
 impl<F: PageFetcher + Send + Sync> BtcResolutionFetcher<F> {
     /// `base_url` is the Gamma API root, e.g. `https://gamma-api.polymarket.com`.
     pub fn new(base_url: String, fetcher: F) -> Self {
-        Self { base_url, fetcher }
+        Self {
+            client: GammaMarketsClient::new(base_url, fetcher),
+        }
     }
 
-    fn url(&self, condition_id: &str) -> String {
-        format!(
-            "{}/markets?condition_ids={}&closed=true",
-            self.base_url, condition_id
-        )
-    }
-
-    /// Fetch resolutions for `condition_ids` (sequential — the per-run market
-    /// count is small). Markets that are not yet closed (or unparseable) are
-    /// silently skipped, so an in-progress 5m market simply yields no row yet.
+    /// Fetch resolutions for `condition_ids` via one batched `&closed=true` pass.
+    /// Returns only markets that are **closed** with parseable `outcomePrices`;
+    /// open markets, unknown markets (Gamma `200` without the id), and ids in a
+    /// 4xx chunk are skipped, so an in-progress 5m market simply yields no row yet.
     ///
-    /// Per-market resilience (mirrors `pe-paper-pnl::GammaResolutionFetcher`): a
-    /// transient fetch failure on one market is logged and skipped, never
-    /// discarding the resolutions already gathered this run. `resolve` is
-    /// re-runnable (idempotent upsert), so the failed market is retried next
-    /// time. The `Result` is retained for the public error surface.
+    /// Resilient by design (mirrors `pe-paper-pnl::GammaResolutionFetcher`): a
+    /// batch-level failure (a transient fetch error or a corrupt response) logs and
+    /// yields an empty result for this run rather than erroring — `resolve` is a
+    /// re-runnable idempotent upsert, so the markets are retried next time. The
+    /// `Result`/[`ResolveError`] is retained for the public error surface.
+    ///
+    /// The YES/Up side wins when the first settled price exceeds `0.5` (resolved
+    /// markets settle to exactly `1`/`0`). Limitation (unchanged, shadow-only): a
+    /// non-decisive settlement (`["0.5","0.5"]`) classifies as a YES loss; no such
+    /// settlement has been observed for these binary BTC up/down markets. Since
+    /// issue #382 Phase 4 the shared `outcomePrices` parser is lenient — a
+    /// non-decimal entry falls back to `0` rather than skipping the market — which
+    /// is harmless here as live prices are exactly `1`/`0`, and shadow-only besides.
     pub async fn fetch_resolutions(
         &self,
         condition_ids: &[String],
     ) -> Result<Vec<MarketResolution>, ResolveError> {
+        if condition_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fetched = match self
+            .client
+            .fetch_markets(condition_ids, MarketFilter::ClosedOnly)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "shadow: batch resolution fetch error, skipping this run");
+                return Ok(Vec::new());
+            }
+        };
+
         let mut out = Vec::new();
         for cid in condition_ids {
-            match self.fetcher.fetch_page(&self.url(cid)).await {
-                Ok(bytes) => {
-                    if let Some(r) = parse_resolution(&bytes, cid) {
-                        out.push(r);
-                    }
-                }
-                Err(e) => {
-                    warn!(condition_id = %cid, error = %e, "shadow: resolution fetch error, skipping");
-                }
+            // Demux by the echoed `conditionId`: a hit is structurally the requested
+            // market, so a cross-market row (keyed under its own id) is never
+            // attributed here.
+            let Some(m) = fetched.markets.get(cid) else {
+                continue;
+            };
+            if !m.closed {
+                continue;
             }
+            let Some(prices) = m.outcome_prices.as_ref() else {
+                continue;
+            };
+            let Some(yes) = prices.first().copied() else {
+                continue;
+            };
+            out.push(MarketResolution {
+                condition_id: cid.clone(),
+                yes_won: yes > Decimal::new(5, 1), // > 0.5
+            });
         }
         Ok(out)
     }
@@ -129,88 +114,137 @@ impl<F: PageFetcher + Send + Sync> BtcResolutionFetcher<F> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
+    use pe_source_polymarket_public::FixtureFetcher;
+    use std::collections::HashMap;
 
-    // Captured shape (verified live 2026-06-09): Up=0,Down=1 ⇒ Down won.
-    const DOWN_WON: &str = r#"[{"conditionId":"0xc","closed":true,
-        "outcomePrices":"[\"0\", \"1\"]","outcomes":"[\"Up\", \"Down\"]"}]"#;
-    const UP_WON: &str = r#"[{"conditionId":"0xc","closed":true,
-        "outcomePrices":"[\"1\", \"0\"]","outcomes":"[\"Up\", \"Down\"]"}]"#;
+    const BASE: &str = "https://g.test";
 
-    #[test]
-    fn parses_outcome_prices_array() {
-        assert_eq!(
-            parse_outcome_prices(r#"["1","0"]"#),
-            Some(vec![dec!(1), dec!(0)])
-        );
-        assert_eq!(parse_outcome_prices("not json"), None);
+    /// The exact `&closed=true&limit=500` batch URL the shared client builds for
+    /// `ids` (repeat-key, input order preserved).
+    fn closed_url(ids: &[&str]) -> String {
+        let keys: Vec<String> = ids.iter().map(|id| format!("condition_ids={id}")).collect();
+        format!("{BASE}/markets?{}&closed=true&limit=500", keys.join("&"))
     }
 
-    #[test]
-    fn up_won_is_yes_won() {
-        let r = parse_resolution(UP_WON.as_bytes(), "0xc").unwrap();
-        assert_eq!(r.condition_id, "0xc");
-        assert!(r.yes_won);
-    }
-
-    #[test]
-    fn down_won_is_not_yes_won() {
-        let r = parse_resolution(DOWN_WON.as_bytes(), "0xc").unwrap();
-        assert!(!r.yes_won);
-    }
-
-    #[test]
-    fn unmatched_condition_id_is_none() {
-        assert!(parse_resolution(UP_WON.as_bytes(), "0xother").is_none());
-    }
-
-    #[test]
-    fn open_market_is_not_resolved() {
-        let open =
-            r#"[{"conditionId":"0xc","closed":false,"outcomePrices":"[\"0.55\",\"0.45\"]"}]"#;
-        assert!(parse_resolution(open.as_bytes(), "0xc").is_none());
-    }
-
-    #[test]
-    fn empty_list_is_none() {
-        assert!(parse_resolution(b"[]", "0xc").is_none());
+    fn fetcher(fx: HashMap<String, Vec<u8>>) -> BtcResolutionFetcher<FixtureFetcher> {
+        BtcResolutionFetcher::new(BASE.to_string(), FixtureFetcher::new(fx))
     }
 
     #[tokio::test]
-    async fn fetcher_hits_closed_url_and_parses() {
-        use pe_source_polymarket_public::FixtureFetcher;
-        use std::collections::HashMap;
+    async fn up_won_is_yes_won() {
         let mut fx = HashMap::new();
         fx.insert(
-            "https://g.test/markets?condition_ids=0xc&closed=true".to_string(),
-            UP_WON.as_bytes().to_vec(),
+            closed_url(&["0xc"]),
+            br#"[{"conditionId":"0xc","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#.to_vec(),
         );
-        let f = BtcResolutionFetcher::new("https://g.test".to_string(), FixtureFetcher::new(fx));
-        let res = f.fetch_resolutions(&["0xc".to_string()]).await.unwrap();
-        assert_eq!(res.len(), 1);
-        assert!(res[0].yes_won);
-    }
-
-    // A transient fetch failure on one market (no fixture → `fetch_page` errors)
-    // is skipped, not fatal: the other market still resolves in the same run.
-    #[tokio::test]
-    async fn one_fetch_error_does_not_discard_the_batch() {
-        use pe_source_polymarket_public::FixtureFetcher;
-        use std::collections::HashMap;
-        let good = r#"[{"conditionId":"0xgood","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#;
-        let mut fx = HashMap::new();
-        fx.insert(
-            "https://g.test/markets?condition_ids=0xgood&closed=true".to_string(),
-            good.as_bytes().to_vec(),
-        );
-        // `0xbad` has no fixture → `FixtureFetcher` returns a fatal error.
-        let f = BtcResolutionFetcher::new("https://g.test".to_string(), FixtureFetcher::new(fx));
-        let res = f
-            .fetch_resolutions(&["0xbad".to_string(), "0xgood".to_string()])
+        let res = fetcher(fx)
+            .fetch_resolutions(&["0xc".to_string()])
             .await
             .unwrap();
-        assert_eq!(res.len(), 1, "the failed market is skipped, not fatal");
-        assert_eq!(res[0].condition_id, "0xgood");
-        assert!(res[0].yes_won);
+        assert_eq!(
+            res,
+            vec![MarketResolution {
+                condition_id: "0xc".to_string(),
+                yes_won: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn down_won_is_not_yes_won() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            closed_url(&["0xc"]),
+            br#"[{"conditionId":"0xc","closed":true,"outcomePrices":"[\"0\",\"1\"]"}]"#.to_vec(),
+        );
+        let res = fetcher(fx)
+            .fetch_resolutions(&["0xc".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert!(!res[0].yes_won);
+    }
+
+    #[tokio::test]
+    async fn open_market_yields_no_resolution() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            closed_url(&["0xc"]),
+            br#"[{"conditionId":"0xc","closed":false,"outcomePrices":"[\"0.55\",\"0.45\"]"}]"#
+                .to_vec(),
+        );
+        let res = fetcher(fx)
+            .fetch_resolutions(&["0xc".to_string()])
+            .await
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_market_is_skipped() {
+        // Gamma returns `200 []` for an id it does not know → no row, skipped.
+        let mut fx = HashMap::new();
+        fx.insert(closed_url(&["0xc"]), b"[]".to_vec());
+        let res = fetcher(fx)
+            .fetch_resolutions(&["0xc".to_string()])
+            .await
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_input_returns_empty() {
+        let res = fetcher(HashMap::new())
+            .fetch_resolutions(&[])
+            .await
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_batch_is_skipped_not_error() {
+        // No fixture for the batch URL → FixtureFetcher returns a fatal (4xx) error →
+        // the chunk's ids are reported unfetched → empty result, but the call still
+        // returns Ok (resilient; the markets are retried on the next run).
+        let res = fetcher(HashMap::new())
+            .fetch_resolutions(&["0xabsent".to_string()])
+            .await
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_id_batch_demuxes_and_rejects_cross_market_row() {
+        // All ids batch into ONE request; the response arrives out of order and
+        // carries an unrelated row. Each requested market resolves to its own
+        // outcome; the intruder (`0xZ`) and the still-open `0xopen` yield no row.
+        let mut fx = HashMap::new();
+        fx.insert(
+            closed_url(&["0xA", "0xB", "0xopen"]),
+            br#"[{"conditionId":"0xB","closed":true,"outcomePrices":"[\"0\",\"1\"]"},
+                 {"conditionId":"0xZ","closed":true,"outcomePrices":"[\"1\",\"0\"]"},
+                 {"conditionId":"0xopen","closed":false,"outcomePrices":"[\"0.5\",\"0.5\"]"},
+                 {"conditionId":"0xA","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#
+                .to_vec(),
+        );
+        let res = fetcher(fx)
+            .fetch_resolutions(&["0xA".to_string(), "0xB".to_string(), "0xopen".to_string()])
+            .await
+            .unwrap();
+        let by_id: HashMap<&str, bool> = res
+            .iter()
+            .map(|r| (r.condition_id.as_str(), r.yes_won))
+            .collect();
+        assert_eq!(by_id.len(), 2);
+        assert_eq!(by_id.get("0xA"), Some(&true));
+        assert_eq!(by_id.get("0xB"), Some(&false));
+        assert!(
+            !by_id.contains_key("0xZ"),
+            "an unrequested cross-market row must not be attributed"
+        );
+        assert!(
+            !by_id.contains_key("0xopen"),
+            "an open market yields no resolution"
+        );
     }
 }
