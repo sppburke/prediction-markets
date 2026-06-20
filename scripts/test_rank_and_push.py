@@ -318,6 +318,44 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("WARN", r.stderr)
         print("PASS: purge exit 1 → WARN, run still succeeds (push already published)")
 
+    def test_auto_prune_removes_positions_csv(self):
+        # After pass-2 consumes it, the multi-GB qualifying_positions_72hr.csv is pruned; the ranked
+        # (purge decision/audit) and latency (push input) CSVs are kept.
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        crons = list((self.root / "data" / "eval-results").glob("cron-*"))
+        self.assertEqual(len(crons), 1, f"expected one auto out-dir, got {crons}")
+        out = crons[0]
+        self.assertFalse((out / "qualifying_positions_72hr.csv").exists(),
+                         "pass-1 positions intermediate was not auto-pruned")
+        self.assertTrue((out / "ranked_72hr_buyandhold.csv").exists(),
+                        "ranked CSV (purge decision/audit) must be kept")
+        self.assertTrue((out / "latency_shift_ranked.csv").exists(),
+                        "latency CSV (push input) must be kept")
+        self.assertIn("Pruned pass-1 intermediate", r.stdout)
+        print("PASS: auto-prune removes qualifying_positions_72hr.csv, keeps ranked + latency CSVs")
+
+    def test_keep_intermediates_retains_positions(self):
+        r = self._run("--keep-intermediates")
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        out = list((self.root / "data" / "eval-results").glob("cron-*"))[0]
+        self.assertTrue((out / "qualifying_positions_72hr.csv").exists(),
+                        "--keep-intermediates must retain the positions intermediate")
+        self.assertNotIn("Pruned pass-1 intermediate", r.stdout)
+        print("PASS: --keep-intermediates retains qualifying_positions_72hr.csv")
+
+    def test_skip_rank_does_not_prune_positions(self):
+        # A pure re-push didn't generate the positions file this run, so it must not be pruned.
+        out = self.root / "data" / "eval-results" / "prior"
+        out.mkdir()
+        (out / "latency_shift_ranked.csv").write_text("wallet\n0xabc\n")
+        (out / "qualifying_positions_72hr.csv").write_text("wallet,outcome_id\n0xabc,1\n")
+        r = self._run("--skip-discovery", "--skip-backfill", "--skip-rank", "--out-dir", str(out))
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
+        self.assertTrue((out / "qualifying_positions_72hr.csv").exists(),
+                        "--skip-rank must not prune a positions file it did not generate")
+        print("PASS: --skip-rank leaves a reused positions file untouched")
+
     def test_wrapper_passes_bash_syntax_check(self):
         r = subprocess.run(["bash", "-n", str(WRAPPER)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"bash -n failed: {r.stderr}")
