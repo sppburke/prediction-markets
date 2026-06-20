@@ -330,7 +330,7 @@ struct GammaFeeSchedule {
     /// float, or int via the shared decimal deserializer.
     #[serde(
         default,
-        deserialize_with = "crate::gamma::deserialize_decimal_flexible"
+        deserialize_with = "pe_source_polymarket_public::gamma_markets::deserialize_decimal_flexible"
     )]
     rate: Option<rust_decimal::Decimal>,
     /// When `true`, only the taker pays — maker fee is `0`. Default `false` is the
