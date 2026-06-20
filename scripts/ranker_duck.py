@@ -19,6 +19,9 @@ Engine selection (env, overridable by the caller):
   PE_RANKER_PARQUET_DIR          snapshot dir            (default data/parquet)
   PE_RANKER_PARQUET_MAX_AGE_HOURS staleness cap, 0=off   (default 4)
   PE_RANKER_DUCKDB_MEMORY_LIMIT  DuckDB memory cap       (default 8GB)
+  PE_RANKER_DUCKDB_THREADS       DuckDB thread cap       (default 4; ''/0 = uncapped). Caps the
+                                 first-buy hash-aggregate's peak memory so it fits the memory
+                                 cap at full-universe scale (#387).
 """
 from __future__ import annotations
 
@@ -112,6 +115,17 @@ def get_engine(force: str | None = None,
     con = duckdb.connect()
     mem = os.environ.get("PE_RANKER_DUCKDB_MEMORY_LIMIT", "8GB")
     con.execute(f"SET memory_limit='{_q(mem)}';")
+    # This read-layer never depends on DuckDB row order (results go straight to pandas; pass-2
+    # sorts tapes explicitly), so disable insertion-order preservation — it lets the big
+    # first-buy GROUP BY spill to disk instead of OOM-ing (#387).
+    con.execute("SET preserve_insertion_order=false;")
+    # Cap threads: the full-universe first-buy hash aggregate's peak memory scales with thread
+    # count, so DuckDB's default (all cores) OOMs the memory cap even when spilling is enabled.
+    # Default 4 fits the 8GB cap at 496K-wallet scale; ''/0 leaves it uncapped (only safe with a
+    # much larger PE_RANKER_DUCKDB_MEMORY_LIMIT) (#387).
+    threads = os.environ.get("PE_RANKER_DUCKDB_THREADS", "4")
+    if threads.strip() not in ("", "0"):
+        con.execute(f"SET threads={int(threads)};")
     tmp = os.path.join(parquet_dir, ".duckdb_tmp")
     os.makedirs(tmp, exist_ok=True)
     con.execute(f"SET temp_directory='{_q(tmp)}';")
@@ -124,7 +138,7 @@ def get_engine(force: str | None = None,
     ):
         path = _q(os.path.join(parquet_dir, name))
         con.execute(f"CREATE VIEW {tbl} AS SELECT * FROM read_parquet('{path}');")
-    log(f"engine=duck over {parquet_dir} (memory_limit={mem})")
+    log(f"engine=duck over {parquet_dir} (memory_limit={mem}, threads={threads or 'default'})")
     return con
 
 
@@ -146,7 +160,9 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
 
     The universe is registered as a typed relation and INNER-joined, so the DuckDB
     universe is identical to the SQLite `wallets` list by construction (case/validation
-    quirks can't diverge).
+    quirks can't diverge). First-buy dedup is a hash `GROUP BY ... arg_min(struct_pack,
+    timestamp_unix)` (NOT a `ROW_NUMBER` window) so it spills to disk instead of OOM-ing on
+    the full-universe scan (#387); `struct_pack` keeps the chosen row's columns atomic.
     """
     import pandas as pd
 
@@ -157,18 +173,30 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     ref = "s.end_date_unix" if scheduled_only else "COALESCE(s.end_date_unix, r.resolved_at_unix)"
     try:
         sql = f"""
-        WITH u_buys AS (
-            SELECT t.wallet_hex, t.market_id, t.outcome_id, t.price_str,
-                   t.contracts, t.timestamp_unix
+        WITH fb0 AS (
+            -- First buy per (wallet, market) via a HASH GROUP BY, NOT a ROW_NUMBER window:
+            -- at full-universe scale u_buys is ~every buy-trade and the window's full sort
+            -- OOMs (#387), whereas DuckDB spills hash aggregates to disk. arg_min over a
+            -- struct_pack keeps the picked outcome_id/price_str/contracts ATOMIC (all from the
+            -- one min-timestamp row) — matching the window's single-row pick; an exact tie on
+            -- timestamp resolves arbitrarily in both engines (documented sub-1e-9 residual).
+            SELECT t.wallet_hex, t.market_id,
+                   min(t.timestamp_unix) AS timestamp_unix,
+                   arg_min(struct_pack(outcome_id := t.outcome_id,
+                                       price_str  := t.price_str,
+                                       contracts  := t.contracts),
+                           t.timestamp_unix) AS firstbuy
             FROM trades t
             JOIN universe u ON u.wallet_hex = t.wallet_hex
             WHERE t.side = 'buy'
+            GROUP BY t.wallet_hex, t.market_id
         ),
         fb AS (
-            SELECT *, ROW_NUMBER() OVER (
-                        PARTITION BY wallet_hex, market_id ORDER BY timestamp_unix
-                     ) AS rn
-            FROM u_buys
+            SELECT wallet_hex, market_id, timestamp_unix,
+                   firstbuy.outcome_id AS outcome_id,
+                   firstbuy.price_str  AS price_str,
+                   firstbuy.contracts  AS contracts
+            FROM fb0
         )
         SELECT fb.wallet_hex                                   AS wallet,
                fb.market_id                                   AS market_id,
@@ -184,8 +212,7 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
           ON r.market_id = fb.market_id AND r.winning_outcome_id IS NOT NULL
         LEFT JOIN market_schedules s
           ON s.market_id = fb.market_id AND s.end_date_unix IS NOT NULL
-        WHERE fb.rn = 1
-          AND fb.timestamp_unix >= ? AND fb.timestamp_unix < ?
+        WHERE fb.timestamp_unix >= ? AND fb.timestamp_unix < ?
           AND {ref} IS NOT NULL
           AND ({ref} - fb.timestamp_unix) >= ? AND ({ref} - fb.timestamp_unix) < ?
           AND TRY_CAST(fb.price_str AS DOUBLE) IS NOT NULL

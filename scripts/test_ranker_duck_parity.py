@@ -268,6 +268,41 @@ class DuckParityTest(unittest.TestCase):
             self.assertTrue(ls_ok, "pass-2 stats diverge beyond rtol 1e-9")
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_duck_firstbuy_tie_is_atomic(self) -> None:
+        """Two buys for the SAME (wallet, market) at the SAME timestamp but DIFFERENT
+        outcome_id/price/contracts: the GROUP BY `arg_min(struct_pack(...))` dedup (#387) must
+        return ONE source row's columns ATOMICALLY — never a frankenrow mixing columns across
+        the tied rows (which a column-independent `arg_min` per column would risk). Either valid
+        whole row passes (the pick is arbitrary on an exact tie, as in the SQLite path), so this
+        is deterministic; a mixed row fails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "tie.db")
+            pq = str(Path(tmp) / "pq")
+            t = ts(2026, 2, 10)
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
+                         "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER)")
+            conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
+                         "resolved_at_unix INTEGER)")
+            conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
+            conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)", (W("a"), "buy", "M1", 0, "0.30", 100, t))
+            conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)", (W("a"), "buy", "M1", 1, "0.70", 200, t))
+            conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", ("M1", 1, t + 7200))
+            conn.execute("INSERT INTO market_schedules VALUES (?,?)", ("M1", t + 3600))
+            conn.commit()
+            conn.close()
+            export(db, pq)
+            con = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0)
+            df = ranker_duck.duck_extract_positions(
+                con, [W("a")], ts(2026, 1, 1), ts(2026, 4, 1), 30, 259200, True, 0.0, 1.0)
+            self.assertEqual(len(df), 1, "expected exactly one first-buy position")
+            row = df.iloc[0]
+            got = (int(row["outcome_id"]), round(float(row["price"]), 9), int(row["contracts"]))
+            valid = {(0, 0.30, 100), (1, 0.70, 200)}
+            print(f"{'PASS' if got in valid else 'FAIL'}: duck_firstbuy_tie_atomic (picked {got})")
+            self.assertIn(got, valid, f"frankenrow {got} mixes columns across tied rows")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_autodetect_falls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             empty = str(Path(tmp) / "no_parquet")
