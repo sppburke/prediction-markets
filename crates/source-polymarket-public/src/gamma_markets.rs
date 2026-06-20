@@ -62,8 +62,8 @@ impl MarketFilter {
 /// A demuxed Gamma `/markets` row.
 ///
 /// Carries the fields the bootstrap schedule/liquidity passes and the paper-pnl resolution poller
-/// need (issue #382 Phase 2/3a). The mid-cache snapshot fields (`volume` / `clob_token_ids`) are
-/// added in Phase 3b.
+/// need (issue #382 Phase 2/3a), plus the service mid-price cache + WS2 liquidity-snapshot fields
+/// (`volume` / `clob_token_ids`, added in Phase 3b).
 #[derive(Clone, Debug)]
 pub struct GammaMarket {
     /// The market's condition id (the demux key — echoed by Gamma as `conditionId`).
@@ -71,7 +71,8 @@ pub struct GammaMarket {
     /// Scheduled close time as unix seconds, parsed from `endDate`. `None` when Gamma omits or
     /// returns an unparseable `endDate` (the caller writes a NULL schedule row in that case).
     pub end_date_unix: Option<i64>,
-    /// Current order-book depth indicator (USD). `None` when Gamma omits the field.
+    /// Current order-book depth indicator (USD). `None` when Gamma omits the field or sends an
+    /// unparseable value (lenient decode — a bad scalar never fails the row).
     pub liquidity: Option<Decimal>,
     /// Whether Gamma reports the market as resolved (`closed`). `false` when the field is omitted.
     pub closed: bool,
@@ -80,6 +81,13 @@ pub struct GammaMarket {
     /// mids. `None` when Gamma omits the field or the array is malformed. Individual non-decimal
     /// entries fall back to `0` (the lenient paper-pnl semantic, issue #382 Q7).
     pub outcome_prices: Option<Vec<Decimal>>,
+    /// Cumulative traded volume (USD). `None` when Gamma omits or sends an unparseable value.
+    /// Consumed by the service mid-price cache's WS2 liquidity snapshot (issue #382 Phase 3b).
+    pub volume: Option<Decimal>,
+    /// Gamma `clobTokenIds`, ordered by `outcome_id` so `clob_token_ids[outcome_id]` is that
+    /// outcome's CLOB token. Empty when Gamma omits the field or it is malformed. **Positions are
+    /// preserved** (no compaction) so the index stays aligned with the outcome (issue #382 Phase 3b).
+    pub clob_token_ids: Vec<String>,
 }
 
 /// The result of a [`GammaMarketsClient::fetch_markets`] call.
@@ -215,6 +223,8 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                         liquidity: m.liquidity,
                         closed: m.closed,
                         outcome_prices,
+                        volume: m.volume,
+                        clob_token_ids: m.clob_token_ids,
                     },
                 );
             }
@@ -256,15 +266,22 @@ fn parse_end_date_unix(s: &str) -> Option<i64> {
 }
 
 /// Serde DTO for one element of the `/markets` response array. Extra fields are ignored.
+///
+/// `#[serde(rename_all = "camelCase")]` maps the snake_case fields to Gamma's camelCase keys
+/// (`condition_id → conditionId`, `end_date → endDate`, `outcome_prices → outcomePrices`,
+/// `clob_token_ids → clobTokenIds`).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarketRaw {
     condition_id: String,
     /// Scheduled close date, RFC 3339. Present on open and closed markets; `None` only when omitted.
     end_date: Option<String>,
-    /// Order-book depth indicator (USD). Gamma sends a JSON number; fixtures may use a string —
-    /// [`deserialize_decimal_flexible`] accepts both.
-    #[serde(default, deserialize_with = "deserialize_decimal_flexible")]
+    /// Order-book depth indicator (USD). Gamma may send a JSON number or a decimal string;
+    /// [`deserialize_decimal_lenient`] accepts both and yields `None` on anything unparseable, so a
+    /// bad scalar never fails the row (issue #382 Phase 3b — the mid-price cache requires this
+    /// leniency, and a malformed value no longer aborts the bootstrap batch the way the stricter
+    /// [`deserialize_decimal_flexible`] did).
+    #[serde(default, deserialize_with = "deserialize_decimal_lenient")]
     liquidity: Option<Decimal>,
     /// Whether the market is resolved. Defaults `false` when omitted (open markets / lean fixtures).
     #[serde(default)]
@@ -272,6 +289,14 @@ struct GammaMarketRaw {
     /// Resolved/mid prices as a JSON-encoded decimal-string array, e.g. `"[\"1\",\"0\"]"`. Parsed in
     /// the demux via [`parse_outcome_prices`].
     outcome_prices: Option<String>,
+    /// Cumulative traded volume (USD). Same encoding and leniency as `liquidity` (issue #382 Phase 3b).
+    #[serde(default, deserialize_with = "deserialize_decimal_lenient")]
+    volume: Option<Decimal>,
+    /// `clobTokenIds`, outcome-ordered. Gamma sends a stringified JSON array (`"[\"a\",\"b\"]"`); a
+    /// native array is also accepted. Decoded via [`deserialize_clob_token_ids`]; any other shape
+    /// yields an empty vec (issue #382 Phase 3b).
+    #[serde(default, deserialize_with = "deserialize_clob_token_ids")]
+    clob_token_ids: Vec<String>,
 }
 
 /// Deserialize a JSON value (number or string) into `Option<Decimal>`.
@@ -304,6 +329,55 @@ where
             .ok_or_else(|| DeError::custom(format!("decimal f64 {f} → Decimal failed"))),
         Flex::Int(i) => Ok(Some(Decimal::from(i))),
     }
+}
+
+/// Deserialize Gamma's `liquidity`/`volume` whether they arrive as a JSON string (`"6434.84"` — the
+/// live `/markets` form) or a JSON number. Any other shape — a null, bool, array, object, missing
+/// field, or unparseable string — yields `None`, so a malformed depth scalar can never fail the row
+/// and drop its mids. This is the lenient counterpart of [`deserialize_decimal_flexible`] (which
+/// *errors* on a malformed value); the service mid-price cache requires this leniency (issue #382
+/// Phase 3b), and adopting it for `liquidity`/`volume` also stops a malformed scalar from aborting a
+/// whole bootstrap batch.
+fn deserialize_decimal_lenient<'de, D>(d: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use rust_decimal::prelude::FromPrimitive;
+    use serde_json::Value;
+
+    // Capture as an untyped value first: `Value` deserialization is total over any JSON shape, so an
+    // unexpected type degrades to `None` instead of erroring.
+    Ok(match Option::<Value>::deserialize(d)? {
+        Some(Value::String(s)) => s.trim().parse::<Decimal>().ok(),
+        Some(Value::Number(n)) => n.as_f64().and_then(Decimal::from_f64),
+        _ => None,
+    })
+}
+
+/// Decode Gamma's `clobTokenIds` into outcome-ordered token ids. Gamma sends a stringified JSON array
+/// (`"[\"id0\",\"id1\"]"` — the live `/markets` form); a native JSON array is also accepted. Any other
+/// shape, malformed inner JSON, a null, or a missing field yields an empty vec — token mapping is
+/// best-effort and must never drop a market's mids. **Positions are preserved** (no compaction or
+/// blank-dropping) so `clob_token_ids[outcome_id]` stays aligned with the outcome (issue #382 Phase 3b).
+fn deserialize_clob_token_ids<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+
+    Ok(match Option::<Value>::deserialize(d)? {
+        // Stringified JSON array — the live `/markets` encoding.
+        Some(Value::String(s)) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
+        // Native JSON array; coerce each entry to its string form, order preserved.
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|v| match v {
+                Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Parse Gamma's `outcomePrices` field — a JSON-encoded decimal-string array such as
@@ -420,5 +494,45 @@ mod tests {
         // The lenient paper-pnl semantic (issue #382 Q7): a bad entry → 0, the array still parses.
         let parsed = parse_outcome_prices(r#"["x","0.5"]"#).unwrap();
         assert_eq!(parsed, vec![Decimal::ZERO, Decimal::new(5, 1)]);
+    }
+
+    #[test]
+    fn gamma_market_raw_parses_volume_and_clob_token_ids() {
+        // Phase 3b mid-cache fields: volume (string or number) + clobTokenIds (stringified or native
+        // array), order preserved. Omitted fields default to None / empty.
+        let json = r#"[{"conditionId":"0xA","volume":"99995.018095","clobTokenIds":"[\"111\",\"222\"]"},
+                       {"conditionId":"0xB","volume":6434,"clobTokenIds":["333","444"]},
+                       {"conditionId":"0xC"}]"#;
+        let raws: Vec<GammaMarketRaw> = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(raws[0].volume, Some(Decimal::new(99_995_018_095, 6)));
+        assert_eq!(
+            raws[0].clob_token_ids,
+            vec!["111".to_string(), "222".to_string()]
+        );
+        assert_eq!(raws[1].volume, Some(Decimal::from(6434)));
+        assert_eq!(
+            raws[1].clob_token_ids,
+            vec!["333".to_string(), "444".to_string()]
+        );
+        assert_eq!(raws[2].volume, None);
+        assert!(raws[2].clob_token_ids.is_empty());
+    }
+
+    #[test]
+    fn lenient_liquidity_tolerates_malformed_without_aborting_batch() {
+        // Phase 3b: the liquidity decoder is now lenient, so a malformed value yields `None` and the
+        // *whole array still parses* — `fetch_markets` will not abort the batch on it (the pre-3b
+        // flexible decoder errored here, which would have failed the bootstrap pass). Well-formed
+        // siblings (string + number) are unaffected.
+        let json = r#"[{"conditionId":"0xA","liquidity":"not-a-number"},
+                       {"conditionId":"0xB","liquidity":"7.5"},
+                       {"conditionId":"0xC","liquidity":12345.6},
+                       {"conditionId":"0xD","liquidity":true}]"#;
+        let raws: Vec<GammaMarketRaw> = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(raws.len(), 4, "array parses despite a malformed liquidity");
+        assert_eq!(raws[0].liquidity, None);
+        assert_eq!(raws[1].liquidity, Some(Decimal::new(75, 1)));
+        assert_eq!(raws[2].liquidity, Some(Decimal::new(123_456, 1)));
+        assert_eq!(raws[3].liquidity, None);
     }
 }

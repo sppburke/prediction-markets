@@ -39,7 +39,7 @@ fn mid(s: &str) -> MarketId {
 fn snapshot_cache() -> MidPriceCache<FixtureFetcher> {
     let mut fx = HashMap::new();
     fx.insert(
-        format!("{GAMMA_BASE}/markets?condition_ids=0xcond"),
+        format!("{GAMMA_BASE}/markets?condition_ids=0xcond&limit=500"),
         br#"[{"conditionId":"0xcond","outcomePrices":"[\"0.62\",\"0.38\"]","liquidity":"6434.84","volume":"99995.018095","clobTokenIds":"[\"111\",\"222\"]"}]"#.to_vec(),
     );
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), GAMMA_BASE.to_string())
