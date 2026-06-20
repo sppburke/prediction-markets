@@ -171,6 +171,7 @@ async fn run_gamma_schedules_liquidity(
     let open_ids: Vec<String> = unresolved_market_ids(market_ids, &cache.resolved_market_ids());
     let gamma_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
+        .user_agent(pe_source_polymarket_public::GAMMA_BROWSER_UA)
         .build()
         .map_err(|_| BootstrapError::Internal)?;
     let gamma_fetcher = gamma::GammaFetcher::new(
@@ -208,6 +209,7 @@ async fn run_gamma_null_rewrite(
     if !rewrite_targets.is_empty() {
         let gamma_client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(15))
+            .user_agent(pe_source_polymarket_public::GAMMA_BROWSER_UA)
             .build()
             .map_err(|_| BootstrapError::Internal)?;
         let gamma_fetcher = gamma::GammaFetcher::new(
@@ -254,6 +256,7 @@ pub async fn run_schedule_backfill(
     }
     let gamma_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
+        .user_agent(pe_source_polymarket_public::GAMMA_BROWSER_UA)
         .build()
         .map_err(|_| BootstrapError::Internal)?;
     let gamma_fetcher = gamma::GammaFetcher::new(
