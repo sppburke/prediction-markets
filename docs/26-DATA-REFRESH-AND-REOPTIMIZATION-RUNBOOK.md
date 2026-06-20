@@ -97,6 +97,24 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 > residual ~10% are markets Gamma no longer lists (exclude them — never fall back to
 > `resolved_at`).
 
+> **Gamma/CLOB UA + batching (issue #382 Phase-0 live probe, `scripts/probe_gamma_ua.py`, 2026-06-20).**
+> Tier-1 matrix against live Gamma `/markets` and CLOB `/markets`:
+> - **The 403 gate is the literal `Python-urllib/*` default User-Agent, not "missing browser UA".**
+>   `&closed=true` returned 200 for a *headerless* request (a bare `reqwest::Client`, = the shipped
+>   Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and 403
+>   **only** for `Python-urllib/3.11`. So `pe-bootstrap`'s CLOB closed walk and the paper-pnl
+>   resolution poller (both UA-less) do **not** 403; resolution ingestion is fine. The proven
+>   scripts' "browser UA required (else 403)" note is correct only because `urllib` auto-injects the
+>   blocklisted `Python-urllib` UA — any non-bot UA (or none) works.
+> - **Repeat-key batching works for BOTH variants.** `?condition_ids=A&condition_ids=B…&limit=500`
+>   returned 50/50 (open, plain) and 100/100 (open) with clean demux-by-`conditionId` and no
+>   cross-market leak; the `&closed=true` variant likewise (35/50, the 15 omitted are markets Gamma
+>   no longer lists, not truncation). Comma-separated joining returns 0 — repeat-key is mandatory.
+>   Observed cap ≥ 100; default `gamma_batch_size` stays 50 (`_GLOSSARY.md`).
+> - This unblocks a shared batched Gamma client (~60× the per-ID ~20 req/s) across `pe-bootstrap`,
+>   `pe-service`, and `pe-paper-pnl` — including the *open* passes, which the stale
+>   `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" comment wrongly excludes.
+
 **Exit codes** (all `pe-bootstrap` subcommands): `0` = success, `1` = fatal,
 `2` = partial (some wallets failed — safe to re-run; it retries the failures).
 Add `--strict` to turn a partial into a fatal if you want CI-style hard failure.

@@ -62,3 +62,4 @@ jobs:
           python3 scripts/test_clob_reconciliation.py
           python3 scripts/test_rank_and_push.py
           python3 scripts/test_ranker_duck_parity.py
+          python3 scripts/test_probe_gamma_ua.py
