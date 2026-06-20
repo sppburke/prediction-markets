@@ -23,6 +23,10 @@
 #   Stage 2  rerank  latency_shift_rerank.py  (adds hit_rate)
 #   Stage 3  push    push_ranking_to_supabase.py → Supabase latest_ranking
 #   Verify           latest_ranking is now populated.
+#   Stage 4  purge   pe-bootstrap purge (#385)  delete proven-loser & dead-weight wallets from
+#                    the local cache (DELETE is a no-op unless purge_enabled=true; always reports).
+#                    Final + non-fatal (the push already published); --skip-purge to bypass,
+#                    auto-skipped under --skip-backfill / --skip-rank (needs a fresh backfill+verdict).
 #
 # Production defaults are baked in (override via flags): --universe-from-trades,
 # HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 72h, --scheduled-only
@@ -51,6 +55,7 @@
 #   --engine E            ranker engine: auto (default) | duck | sqlite. auto uses the DuckDB
 #                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
 #   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
+#   --skip-purge          skip the final Stage-4 cache purge (#385).
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
 
 set -euo pipefail
