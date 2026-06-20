@@ -11,7 +11,10 @@ network (localhost only), no real DB, deterministic.
 What it locks (the things that would silently break cron if wired wrong):
   - default universe source is `--universe-from-trades`, never `--universe ""` (the ranker
     hard-errors on neither/both);
-  - Step 0 runs discover → backfill → events → resolutions → schedules, in that order;
+  - Step 0 runs discover → backfill → events → resolutions, in that order (issue #383 removed
+    the redundant trailing `schedules` stage — fetch_resolutions_and_schedules already covers it);
+  - PE_BOOTSTRAP_FETCH_RESOLUTIONS is unset for `backfill` (trades-only) and =1 for `resolutions`,
+    so the CLOB→Gamma refresh runs exactly once, not twice (issue #383);
   - a pe-bootstrap stage exiting 2 (partial soft-fail) does NOT abort the run — backfill
     and resolutions return 2 routinely at full scale;
   - a stage exiting 1 (fatal) DOES abort, before ranking;
@@ -89,11 +92,15 @@ class RankAndPushScenario(unittest.TestCase):
         )
 
         # Fake pe-bootstrap: log argv to ./pe_bootstrap.log (cwd is the repo root the wrapper
-        # cd's into); exit code per subcommand via STUB_EXIT_<sub_with_underscores> (default 0).
+        # cd's into) and the per-invocation PE_BOOTSTRAP_FETCH_RESOLUTIONS value to a sibling
+        # pe_bootstrap_env.log (same line order as the argv log, so they zip by index — issue
+        # #383 asserts the var is unset for `backfill`, =1 for `resolutions`). Exit code per
+        # subcommand via STUB_EXIT_<sub_with_underscores> (default 0).
         _write_exec(
             self.root / "target" / "release" / "pe-bootstrap",
             '#!/usr/bin/env bash\n'
             'echo "$*" >> pe_bootstrap.log\n'
+            'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -161,8 +168,8 @@ class RankAndPushScenario(unittest.TestCase):
         subs = [ln.split()[0] for ln in boot.splitlines() if ln.strip()]
         self.assertEqual(
             subs,
-            ["winner-discovery", "backfill", "events", "resolutions", "schedules"],
-            "Step-0 stages ran out of canonical order",
+            ["winner-discovery", "backfill", "events", "resolutions"],
+            "Step-0 stages ran out of canonical order (issue #383 dropped trailing `schedules`)",
         )
 
         rank = self._log("rank.log")
@@ -173,6 +180,31 @@ class RankAndPushScenario(unittest.TestCase):
         crons = list((self.root / "data" / "eval-results").glob("cron-*"))
         self.assertEqual(len(crons), 1, f"expected one auto out-dir, got {crons}")
         print("PASS: happy path — default --universe-from-trades, Step-0 order, auto out-dir")
+
+    def test_fetch_resolutions_env_scoped_to_resolutions_only(self):
+        # Issue #383: PE_BOOTSTRAP_FETCH_RESOLUTIONS must be UNSET (empty) when `backfill` runs
+        # (trades-only) and =1 only when `resolutions` runs, so the CLOB→Gamma refresh executes
+        # exactly once, not twice. The stub logs argv (pe_bootstrap.log) and the env value
+        # (pe_bootstrap_env.log) one line per invocation in the same order → zip by index.
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
+        envs = (self._log("pe_bootstrap_env.log") or "").splitlines()
+        self.assertEqual(len(subs), len(envs), f"argv/env logs misaligned: {subs} vs {envs}")
+        pairs = list(zip(subs, envs))
+        self.assertEqual(
+            [e for s, e in pairs if s == "backfill"], [""],
+            "backfill must run exactly once, trades-only (FETCH_RESOLUTIONS unset)",
+        )
+        self.assertEqual(
+            [e for s, e in pairs if s == "resolutions"], ["1"],
+            "resolutions must run exactly once with FETCH_RESOLUTIONS=1",
+        )
+        # winner-discovery + events run between the top-level unset and the resolutions export,
+        # so neither should see a leaked refresh var.
+        self.assertEqual([e for s, e in pairs if s == "winner-discovery"], [""], "discovery saw a leaked var")
+        self.assertEqual([e for s, e in pairs if s == "events"], [""], "events saw a leaked var")
+        print("PASS: FETCH_RESOLUTIONS unset for discovery/backfill/events, =1 only for resolutions")
 
     def test_backfill_partial_exit2_does_not_abort(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "2"})
@@ -193,7 +225,9 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNone(self._log("rank.log"), "ranking ran despite a fatal backfill")
         boot = self._log("pe_bootstrap.log").splitlines()
         self.assertTrue(any(l.startswith("backfill") for l in boot))
-        self.assertFalse(any(l.startswith("schedules") for l in boot), "continued past a fatal stage")
+        # `events` is the stage immediately after backfill; a fatal backfill must abort before it.
+        self.assertFalse(any(l.startswith("events") for l in boot), "continued past a fatal stage")
+        self.assertFalse(any(l.startswith("resolutions") for l in boot), "continued past a fatal stage")
         print("PASS: backfill exit 1 (fatal) → run aborts before ranking")
 
     def test_discovery_fatal_exit1_aborts_before_backfill(self):
