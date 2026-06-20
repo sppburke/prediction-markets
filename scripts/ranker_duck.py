@@ -122,10 +122,19 @@ def get_engine(force: str | None = None,
     # Cap threads: the full-universe first-buy hash aggregate's peak memory scales with thread
     # count, so DuckDB's default (all cores) OOMs the memory cap even when spilling is enabled.
     # Default 4 fits the 8GB cap at 496K-wallet scale; ''/0 leaves it uncapped (only safe with a
-    # much larger PE_RANKER_DUCKDB_MEMORY_LIMIT) (#387).
-    threads = os.environ.get("PE_RANKER_DUCKDB_THREADS", "4")
-    if threads.strip() not in ("", "0"):
-        con.execute(f"SET threads={int(threads)};")
+    # much larger PE_RANKER_DUCKDB_MEMORY_LIMIT) (#387). A non-integer value (operator typo) falls
+    # back to the default rather than crashing the rank — this runs before any SQLite fallback.
+    threads = os.environ.get("PE_RANKER_DUCKDB_THREADS", "4").strip()
+    if threads in ("", "0"):
+        threads_desc = "uncapped"
+    else:
+        try:
+            n_threads = int(threads)
+        except ValueError:
+            log(f"PE_RANKER_DUCKDB_THREADS={threads!r} is not an integer; using 4")
+            n_threads = 4
+        con.execute(f"SET threads={n_threads};")
+        threads_desc = str(n_threads)
     tmp = os.path.join(parquet_dir, ".duckdb_tmp")
     os.makedirs(tmp, exist_ok=True)
     con.execute(f"SET temp_directory='{_q(tmp)}';")
@@ -138,7 +147,7 @@ def get_engine(force: str | None = None,
     ):
         path = _q(os.path.join(parquet_dir, name))
         con.execute(f"CREATE VIEW {tbl} AS SELECT * FROM read_parquet('{path}');")
-    log(f"engine=duck over {parquet_dir} (memory_limit={mem}, threads={threads or 'default'})")
+    log(f"engine=duck over {parquet_dir} (memory_limit={mem}, threads={threads_desc})")
     return con
 
 

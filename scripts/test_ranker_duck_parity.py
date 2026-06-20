@@ -303,6 +303,21 @@ class DuckParityTest(unittest.TestCase):
             self.assertIn(got, valid, f"frankenrow {got} mixes columns across tied rows")
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_bad_threads_env_falls_back(self) -> None:
+        """A non-integer PE_RANKER_DUCKDB_THREADS (operator typo) must NOT crash get_engine —
+        it falls back to the default thread cap, since this runs before any SQLite fallback
+        (#387)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "c.db")
+            pq = str(Path(tmp) / "pq")
+            build_parity_cache(db)
+            export(db, pq)
+            with mock.patch.dict(os.environ, {"PE_RANKER_DUCKDB_THREADS": "auto"}):
+                con = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0)
+            print(f"{'PASS' if con is not None else 'FAIL'}: bad_threads_env_falls_back")
+            self.assertIsNotNone(con, "get_engine crashed on non-integer PE_RANKER_DUCKDB_THREADS")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_autodetect_falls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             empty = str(Path(tmp) / "no_parquet")
