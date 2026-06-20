@@ -43,6 +43,15 @@ pub const SRC_GAP502: i64 = 0b1000000;
 /// the other curation-list sources.
 pub const SRC_DATADASH: i64 = 0b10000000;
 
+/// Sources whose re-discovery of a tombstoned wallet *lifts* the tombstone and
+/// re-admits it (issue #385): the Polymarket leaderboard and Radion only. The
+/// lift decision is read from each `upsert_wallets_bulk` row's own `source_bits`
+/// — `bits & TOMBSTONE_OVERRIDE_SOURCES != 0` lifts (leaderboard 16 / radion 32),
+/// any other bit (datadash 128, 502-gap 64, trades 2, wallet-set-json 1) leaves
+/// the tombstone intact (`bits & 48 == 0`). No caller passes this explicitly; the
+/// discrimination is automatic because each source tags rows with exactly its bit.
+pub const TOMBSTONE_OVERRIDE_SOURCES: i64 = SRC_LEADERBOARD | SRC_RADION;
+
 /// Apply the activation rule. Sticky 0→1; `is_infra = 0` gates every branch.
 ///
 /// Returns the number of newly-activated wallets.

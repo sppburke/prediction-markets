@@ -35,6 +35,10 @@ const DEFAULT_RADION_MAX_REQUESTS_PER_RUN: u32 = 8;
 const DEFAULT_DATADASH_API_URL: &str = "https://api.datadash.xyz";
 const DEFAULT_DATADASH_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
+// Issue #385: `pe-bootstrap purge` defaults.
+const DEFAULT_PURGE_INACTIVITY_SECS: i64 = 1_209_600; // 14 days
+const DEFAULT_PURGE_LOSER_TSTAT_MAX: f64 = -2.0;
+const DEFAULT_PURGE_LOSER_NEFF_MIN: f64 = 20.0;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -412,6 +416,59 @@ pub struct BootstrapConfig {
         alias = "bootstrap_datadash_max_cohort_wallets"
     )]
     pub datadash_max_cohort_wallets: u64,
+
+    // ── pe-bootstrap purge (issue #385) ───────────────────────────────────────
+    /// Arm the `pe-bootstrap purge` DELETE. Default `false` keeps the stage
+    /// report-only (a dry-run that deletes nothing); the would-purge report still
+    /// runs each cycle. Set `PE_BOOTSTRAP_PURGE_ENABLED=1` to arm. Canonical
+    /// default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    #[serde(
+        default,
+        alias = "bootstrap_purge_enabled",
+        deserialize_with = "deserialize_bool_or_01"
+    )]
+    pub purge_enabled: bool,
+
+    /// Rule-B dormancy threshold (seconds): a not-eligible active wallet is dead
+    /// weight when its newest trade is older than this. Default 1_209_600 (14 d).
+    /// Canonical default in `docs/_GLOSSARY.md`. `PE_BOOTSTRAP_PURGE_INACTIVITY_SECS`.
+    #[serde(
+        default = "default_purge_inactivity_secs",
+        alias = "bootstrap_purge_inactivity_secs"
+    )]
+    pub purge_inactivity_secs: i64,
+
+    /// Rule-A proven-loser net t-stat ceiling: an eligible wallet is a loser when
+    /// `tstat_net <= this` (with `mean_net < 0` and `n_eff >= purge_loser_neff_min`).
+    /// Default -2.0. This is the first `f64` config field — a t-stat is a statistic,
+    /// outside the "no raw f64" money/price/probability rule; `f64` is the natural
+    /// type for comparing the CSV's float `tstat_net`. Canonical default in
+    /// `docs/_GLOSSARY.md`. `PE_BOOTSTRAP_PURGE_LOSER_TSTAT_MAX`.
+    #[serde(
+        default = "default_purge_loser_tstat_max",
+        alias = "bootstrap_purge_loser_tstat_max"
+    )]
+    pub purge_loser_tstat_max: f64,
+
+    /// Rule-A minimum effective sample size (`n_eff`) for a proven-loser verdict —
+    /// guards against tombstoning on a tiny sample. Default 20. Canonical default in
+    /// `docs/_GLOSSARY.md`. `PE_BOOTSTRAP_PURGE_LOSER_NEFF_MIN`.
+    #[serde(
+        default = "default_purge_loser_neff_min",
+        alias = "bootstrap_purge_loser_neff_min"
+    )]
+    pub purge_loser_neff_min: f64,
+
+    /// Decision CSV (`ranked_72hr_buyandhold.csv`) for the purge verdict. When
+    /// unset, the newest `data/eval-results/cron-*/` run is resolved. The pipeline
+    /// passes the run's CSV explicitly via `PE_BOOTSTRAP_PURGE_DECISION_CSV`.
+    /// `""` (or null) collapses to `None`.
+    #[serde(
+        default,
+        alias = "bootstrap_purge_decision_csv",
+        deserialize_with = "deserialize_opt_string_empty_none"
+    )]
+    pub purge_decision_csv: Option<String>,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -549,6 +606,18 @@ const fn default_datadash_max_cohort_wallets() -> u64 {
     DEFAULT_DATADASH_MAX_COHORT_WALLETS
 }
 
+const fn default_purge_inactivity_secs() -> i64 {
+    DEFAULT_PURGE_INACTIVITY_SECS
+}
+
+const fn default_purge_loser_tstat_max() -> f64 {
+    DEFAULT_PURGE_LOSER_TSTAT_MAX
+}
+
+const fn default_purge_loser_neff_min() -> f64 {
+    DEFAULT_PURGE_LOSER_NEFF_MIN
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BootstrapConfig {
@@ -593,6 +662,11 @@ impl Default for BootstrapConfig {
             datadash_exclude_ids: default_datadash_exclude_ids(),
             datadash_exclude_titles: default_datadash_exclude_titles(),
             datadash_max_cohort_wallets: default_datadash_max_cohort_wallets(),
+            purge_enabled: false,
+            purge_inactivity_secs: default_purge_inactivity_secs(),
+            purge_loser_tstat_max: default_purge_loser_tstat_max(),
+            purge_loser_neff_min: default_purge_loser_neff_min(),
+            purge_decision_csv: None,
         }
     }
 }

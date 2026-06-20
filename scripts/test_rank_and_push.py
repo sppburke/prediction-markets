@@ -101,6 +101,7 @@ class RankAndPushScenario(unittest.TestCase):
             '#!/usr/bin/env bash\n'
             'echo "$*" >> pe_bootstrap.log\n'
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
+            'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -168,8 +169,8 @@ class RankAndPushScenario(unittest.TestCase):
         subs = [ln.split()[0] for ln in boot.splitlines() if ln.strip()]
         self.assertEqual(
             subs,
-            ["winner-discovery", "backfill", "events", "resolutions"],
-            "Step-0 stages ran out of canonical order (issue #383 dropped trailing `schedules`)",
+            ["winner-discovery", "backfill", "events", "resolutions", "purge"],
+            "Step-0 stages ran out of canonical order, or the final purge stage (#385) is missing",
         )
 
         rank = self._log("rank.log")
@@ -282,6 +283,40 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, "missing pe-bootstrap should be fatal")
         self.assertIn("pe-bootstrap", r.stderr)
         print("PASS: missing pe-bootstrap binary → fatal before any stage")
+
+    def test_purge_runs_after_push_with_decision_csv(self):
+        # Issue #385: the final purge stage runs after the push, last in pe_bootstrap.log,
+        # with PE_BOOTSTRAP_PURGE_DECISION_CSV pointing at this run's ranked CSV.
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
+        self.assertEqual(subs[-1], "purge", f"purge was not the final pe-bootstrap stage: {subs}")
+        self.assertIsNotNone(self._log("push.log"), "push must run before purge")
+        # The purge invocation saw the run's RANKED_CSV via env (last non-empty line).
+        csvs = [ln for ln in (self._log("pe_bootstrap_purge_csv.log") or "").splitlines() if ln.strip()]
+        self.assertTrue(csvs, "purge never saw PE_BOOTSTRAP_PURGE_DECISION_CSV")
+        self.assertTrue(
+            csvs[-1].endswith("ranked_72hr_buyandhold.csv") and "cron-" in csvs[-1],
+            f"purge decision CSV not the cron run's ranked CSV: {csvs[-1]}",
+        )
+        print("PASS: purge runs last, after push, with the run's RANKED_CSV as the decision CSV")
+
+    def test_skip_purge_bypasses_purge(self):
+        r = self._run("--skip-purge")
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
+        self.assertNotIn("purge", subs, "purge ran despite --skip-purge")
+        self.assertIsNotNone(self._log("push.log"), "push must still run with --skip-purge")
+        print("PASS: --skip-purge bypasses the purge stage; push still runs")
+
+    def test_purge_failure_is_non_fatal(self):
+        # purge runs after the (already-complete) push, so a purge failure must not fail the run.
+        r = self._run(exit_env={"STUB_EXIT_purge": "1"})
+        self.assertEqual(r.returncode, 0, f"a failing purge aborted the run\nstderr={r.stderr}")
+        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
+        self.assertIn("purge", subs, "purge stage did not run")
+        self.assertIn("WARN", r.stderr)
+        print("PASS: purge exit 1 → WARN, run still succeeds (push already published)")
 
     def test_wrapper_passes_bash_syntax_check(self):
         r = subprocess.run(["bash", "-n", str(WRAPPER)], capture_output=True, text=True)

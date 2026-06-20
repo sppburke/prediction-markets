@@ -28,6 +28,7 @@ pub mod lock;
 pub mod migrate;
 pub mod pile;
 pub mod polymarket;
+pub mod purge;
 pub mod radion;
 pub mod wallet_discovery;
 pub mod wallet_set;
