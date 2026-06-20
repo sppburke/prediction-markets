@@ -476,24 +476,24 @@ async fn scenario_realized_edge_join() {
         "resolve targets every observed market"
     );
 
-    // Injected Gamma resolutions: condA Up-won, condB & condD Down-won, condC
-    // still open (empty list ⇒ skipped, mirroring an in-progress 5m market).
+    // Injected Gamma resolutions, batched into ONE `&closed=true` request (issue #382 Phase 4):
+    // condA Up-won, condB & condD Down-won; condC is omitted from the response (still open ⇒
+    // skipped, mirroring an in-progress 5m market). The URL is built from `cids` exactly as the
+    // shared GammaMarketsClient does (repeat-key, input order preserved, then `&closed=true&limit=500`).
+    let batch_url = format!(
+        "https://gamma.test/markets?{}&closed=true&limit=500",
+        cids.iter()
+            .map(|c| format!("condition_ids={c}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    );
     let mut fx = HashMap::new();
     fx.insert(
-        "https://gamma.test/markets?condition_ids=0xcondA&closed=true".to_string(),
-        br#"[{"conditionId":"0xcondA","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#.to_vec(),
-    );
-    fx.insert(
-        "https://gamma.test/markets?condition_ids=0xcondB&closed=true".to_string(),
-        br#"[{"conditionId":"0xcondB","closed":true,"outcomePrices":"[\"0\",\"1\"]"}]"#.to_vec(),
-    );
-    fx.insert(
-        "https://gamma.test/markets?condition_ids=0xcondC&closed=true".to_string(),
-        b"[]".to_vec(),
-    );
-    fx.insert(
-        "https://gamma.test/markets?condition_ids=0xcondD&closed=true".to_string(),
-        br#"[{"conditionId":"0xcondD","closed":true,"outcomePrices":"[\"0\",\"1\"]"}]"#.to_vec(),
+        batch_url,
+        br#"[{"conditionId":"0xcondA","closed":true,"outcomePrices":"[\"1\",\"0\"]"},
+             {"conditionId":"0xcondB","closed":true,"outcomePrices":"[\"0\",\"1\"]"},
+             {"conditionId":"0xcondD","closed":true,"outcomePrices":"[\"0\",\"1\"]"}]"#
+            .to_vec(),
     );
 
     let resolver =
