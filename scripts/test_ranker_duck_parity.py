@@ -268,6 +268,32 @@ class DuckParityTest(unittest.TestCase):
             self.assertTrue(ls_ok, "pass-2 stats diverge beyond rtol 1e-9")
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_pass2_duck_batching_matches_sqlite(self) -> None:
+        """Pass-2's duck tape load is chunked (#391). With a tiny DUCK_TAPE_BATCH_PAIRS that splits
+        the candidate pairs across MANY batches, the latency-shift ranking must still equal the
+        SQLite (single-stream) result — batching across pair boundaries never changes a fill."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            pq = str(Path(tmp) / "parquet")
+            out_sql = str(Path(tmp) / "sql")
+            out_duck = str(Path(tmp) / "duck")
+            build_parity_cache(db)
+            self.assertEqual(run_pass1(db, out_sql, "sqlite", pq), 0)
+            export(db, pq)
+            self.assertEqual(run_pass1(db, out_duck, "duck", pq), 0)
+            self.assertEqual(run_pass2(db, out_sql, "sqlite", pq), 0)
+            # batch size 2 over the fixture's 13 candidate (market,outcome) pairs => ~7 batches
+            with mock.patch.object(ls, "DUCK_TAPE_BATCH_PAIRS", 2):
+                self.assertEqual(run_pass2(db, out_duck, "duck", pq), 0)
+            l_sql = {r["wallet"]: r for r in read_rows(str(Path(out_sql) / "latency_shift_ranked.csv"))}
+            l_duck = {r["wallet"]: r for r in read_rows(str(Path(out_duck) / "latency_shift_ranked.csv"))}
+            self.assertEqual(set(l_sql), set(l_duck), "pass-2 wallet sets differ under batching")
+            ok = all(_num_eq(l_sql[w][c], l_duck[w][c]) for w in l_sql for c in LS_NUMERIC)
+            print(f"{'PASS' if ok else 'FAIL'}: pass2_duck_batching_matches_sqlite "
+                  f"(batch=2 over {len(l_sql)} wallets, multi-batch)")
+            self.assertTrue(ok, "pass-2 duck batched output diverges from SQLite")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_duck_firstbuy_tie_is_atomic(self) -> None:
         """Two buys for the SAME (wallet, market) at the SAME timestamp but DIFFERENT
         outcome_id/price/contracts: the GROUP BY `arg_min(struct_pack(...))` dedup (#387) must
