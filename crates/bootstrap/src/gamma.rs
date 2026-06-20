@@ -258,6 +258,82 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         );
         Ok(inserted)
     }
+
+    /// Fused open-market pass: fetch schedules **and** liquidity for `market_ids` in a single
+    /// batched `OpenOnly` request (issue #382 — the deferred schedule/liquidity fusion). Gamma's
+    /// open `/markets` row already carries both `endDate` and `liquidity`, so the two separate passes
+    /// ([`Self::fetch_schedules`] + [`Self::fetch_market_liquidity`]) refetch the same overlapping
+    /// markets twice on a cold cache; fusing them halves the open-pass request volume.
+    ///
+    /// Each field is written **conditionally**, guarded by its own skip-set, so the cache writes are
+    /// identical to running the two passes separately on a clean run: a market already scheduled but
+    /// not yet liquid receives only its liquidity row, and vice-versa. Returns
+    /// `(schedule_rows, liquidity_rows)` — the same counts the two passes report. Under a 4xx chunk
+    /// both fields are skipped for those ids (retry next run), exactly as each separate pass does.
+    pub async fn fetch_schedules_and_liquidity(
+        &self,
+        market_ids: &[String],
+        cache: &mut WalletCache,
+    ) -> Result<(usize, usize), BootstrapError> {
+        let already_scheduled = cache.scheduled_market_ids();
+        let already_liquid = cache.liquid_market_ids();
+
+        // Fetch the union of the two passes' work — a market missing from *either* skip-set. Each
+        // field is still written only when its own skip-set lacks the id (below), so the writes match
+        // the separate passes; this only collapses the two fetches of the overlapping ids into one.
+        let to_fetch: Vec<String> = market_ids
+            .iter()
+            .filter(|id| !already_scheduled.contains(*id) || !already_liquid.contains(*id))
+            .cloned()
+            .collect();
+
+        info!(
+            total = to_fetch.len(),
+            already_scheduled = already_scheduled.len(),
+            already_liquid = already_liquid.len(),
+            "gamma: starting fused schedule+liquidity fetch (batched)"
+        );
+
+        let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let res = self
+            .client
+            .fetch_markets(&to_fetch, MarketFilter::OpenOnly)
+            .await
+            .map_err(gamma_err)?;
+        let unfetched: HashSet<&str> = res.unfetched.iter().map(String::as_str).collect();
+
+        let mut schedule_rows = 0usize;
+        let mut liquidity_rows = 0usize;
+        for id in &to_fetch {
+            // A 4xx-skipped chunk's ids are left untouched for both fields (no schedule NULL row, no
+            // liquidity row) so they retry next run — matching each separate pass's `Fatal → skip`.
+            if unfetched.contains(id.as_str()) {
+                continue;
+            }
+            let market = res.markets.get(id);
+            // Schedule (`INSERT OR IGNORE`, NULL row included) — only for ids not already scheduled.
+            if !already_scheduled.contains(id) {
+                let end_date_unix = market.and_then(|m| m.end_date_unix);
+                cache.insert_schedule(id, end_date_unix, fetched_at)?;
+                schedule_rows += 1;
+            }
+            // Liquidity (`INSERT OR REPLACE`) — only for ids not already liquid AND with a value.
+            if !already_liquid.contains(id)
+                && let Some(liquidity_usd) = market.and_then(|m| m.liquidity)
+            {
+                cache.upsert_market_liquidity(id, liquidity_usd, fetched_at)?;
+                liquidity_rows += 1;
+            }
+        }
+
+        info!(
+            schedule_rows,
+            liquidity_rows,
+            total = to_fetch.len(),
+            "gamma: fused schedule+liquidity fetch complete"
+        );
+        Ok((schedule_rows, liquidity_rows))
+    }
 }
 
 // ── Convenience: build indexes without running a full bootstrap ───────────────
@@ -543,5 +619,55 @@ mod tests {
             "12345.5",
             "the upserted row carries 0xliq's parsed liquidity"
         );
+    }
+
+    #[test]
+    fn fused_pass_writes_each_field_only_for_its_skip_set() {
+        use rust_decimal_macros::dec;
+
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        // 0xb is already scheduled (needs only liquidity); 0xc is already liquid (needs only a
+        // schedule); 0xa needs both. The fused pass serves all three from ONE batched OpenOnly
+        // request, writing each field only where its own skip-set lacks the id.
+        cache
+            .insert_schedule("0xb", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+        cache
+            .upsert_market_liquidity("0xc", dec!(50), 1_700_000_001)
+            .unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("{BASE}/markets?condition_ids=0xa&condition_ids=0xb&condition_ids=0xc&limit=500"),
+            fixture_bytes(
+                r#"[{"conditionId":"0xa","closed":false,"endDate":"2026-07-31T12:00:00Z","liquidity":111},
+                    {"conditionId":"0xb","closed":false,"endDate":"2026-07-31T12:00:00Z","liquidity":222},
+                    {"conditionId":"0xc","closed":false,"endDate":"2026-07-31T12:00:00Z","liquidity":333}]"#,
+            ),
+        );
+        let gamma = gamma(responses);
+
+        let (schedule_rows, liquidity_rows) = rt()
+            .block_on(gamma.fetch_schedules_and_liquidity(
+                &["0xa".to_owned(), "0xb".to_owned(), "0xc".to_owned()],
+                &mut cache,
+            ))
+            .unwrap();
+
+        // Schedule written for the not-yet-scheduled (0xa, 0xc); 0xb suppressed by its skip-set.
+        assert_eq!(schedule_rows, 2, "schedule written for 0xa + 0xc, not 0xb");
+        // Liquidity written for the not-yet-liquid (0xa, 0xb); 0xc suppressed by its skip-set.
+        assert_eq!(
+            liquidity_rows, 2,
+            "liquidity written for 0xa + 0xb, not 0xc"
+        );
+
+        // All three end up scheduled (0xa, 0xc new + 0xb pre-existing) and liquid (0xa, 0xb new + 0xc
+        // pre-existing). 0xc's liquidity was NOT re-upserted — had the skip-set been ignored,
+        // `liquidity_rows` would be 3 and 0xc's value would have moved from 50 to 333.
+        assert_eq!(cache.load_all_schedules().unwrap().len(), 3);
+        assert_eq!(cache.load_all_liquidity().unwrap().len(), 3);
     }
 }

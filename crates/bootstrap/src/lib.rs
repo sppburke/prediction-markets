@@ -179,19 +179,16 @@ async fn run_gamma_schedules_liquidity(
         config.gamma_base_url.clone(),
         ReqwestFetcher::new(gamma_client).with_min_interval_ms(gamma::GAMMA_MIN_INTERVAL_MS),
     );
-    let schedule_rows = gamma_fetcher.fetch_schedules(&open_ids, cache).await?;
-    tracing::info!(
-        schedule_rows,
-        open_markets = open_ids.len(),
-        "bootstrap: gamma schedules fetched (open markets only)"
-    );
-    let liquidity_rows = gamma_fetcher
-        .fetch_market_liquidity(&open_ids, cache)
+    // Fused open pass (#382): one batched `OpenOnly` request serves both schedule and liquidity,
+    // halving the open-pass request volume vs the two separate passes on a cold cache.
+    let (schedule_rows, liquidity_rows) = gamma_fetcher
+        .fetch_schedules_and_liquidity(&open_ids, cache)
         .await?;
     tracing::info!(
+        schedule_rows,
         liquidity_rows,
         open_markets = open_ids.len(),
-        "bootstrap: gamma liquidity fetched (open markets only)"
+        "bootstrap: gamma schedules + liquidity fetched (open markets only, fused)"
     );
     Ok(())
 }
