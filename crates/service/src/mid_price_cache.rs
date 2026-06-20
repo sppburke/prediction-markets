@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use pe_core_types::MarketId;
-use pe_paper_pnl::parse_outcome_prices;
-use pe_source_polymarket_public::{PageFetcher, ReqwestFetcher};
+use pe_source_polymarket_public::{PageFetcher, ReqwestFetcher, parse_outcome_prices};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::Mutex;

@@ -16,5 +16,5 @@ pub use endpoint::{LeaderboardCategory, LeaderboardSort, LeaderboardWindow, Poly
 pub use fetcher::{FixtureFetcher, PageFetcher, ReqwestFetcher};
 pub use gamma_markets::{
     GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarkets, GammaMarketsClient,
-    GammaMarketsError, MarketFilter,
+    GammaMarketsError, MarketFilter, parse_outcome_prices,
 };

@@ -17,7 +17,6 @@ pe-paper-state              = { path = "../paper-state",                version 
 pe-source-core              = { path = "../source-core",                version = "0.1.0" }
 pe-source-polymarket-public = { path = "../source-polymarket-public",   version = "0.1.0" }
 
-futures      = { workspace = true }
 rust_decimal = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
