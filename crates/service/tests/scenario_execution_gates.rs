@@ -115,7 +115,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     const BASE: &str = "http://gamma.test";
     let mut fx = HashMap::new();
     for m in markets {
-        let url = format!("{BASE}/markets?condition_ids={m}");
+        // Single-id `OpenOnly` batch URL the shared GammaMarketsClient builds (#382 Phase 3b);
+        // the orchestrator fetches one market per signal, so each is a batch-of-one.
+        let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
         let body =
             format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
         fx.insert(url, body.into_bytes());

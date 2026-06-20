@@ -3,10 +3,11 @@
 //! Sibling to [`MarketEndCache`](crate::market_end_cache), but for *mutable* mids:
 //! the end-date cache is write-once because a resolution time is immutable, whereas
 //! mids move, so entries here expire after [`TTL`] and the dashboard mark-to-market
-//! tracks the live mid. Fetches go through their own rate-limited [`ReqwestFetcher`]
-//! (per-instance ≤ 20 req/s, matching the other Gamma fetchers in this binary); a
-//! market whose fetch fails or lacks `outcomePrices` is simply omitted, so the
-//! caller marks that position's unrealized P&L as null.
+//! tracks the live mid. Fetches delegate to the shared batched
+//! [`GammaMarketsClient`](pe_source_polymarket_public::GammaMarketsClient) over a rate-limited
+//! [`ReqwestFetcher`](pe_source_polymarket_public::ReqwestFetcher) (per-instance ≤ 20 req/s,
+//! matching the other Gamma fetchers in this binary); a market whose fetch fails or lacks
+//! `outcomePrices` is simply omitted, so the caller marks that position's unrealized P&L as null.
 //!
 //! Open vs settled classification is the caller's job (via the resolution store) —
 //! this cache only fetches mids for the open markets it is handed.
@@ -15,19 +16,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::stream::{self, StreamExt};
 use pe_core_types::MarketId;
-use pe_source_polymarket_public::{PageFetcher, ReqwestFetcher, parse_outcome_prices};
+use pe_source_polymarket_public::{GammaMarketsClient, MarketFilter, PageFetcher, ReqwestFetcher};
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 /// How long a cached mid stays fresh before a refetch.
 const TTL: Duration = Duration::from_secs(60);
-/// Concurrent in-flight fetches; the rate gate (below) bounds actual throughput.
-const FETCH_CONCURRENCY: usize = 10;
 /// Min spacing between requests on this fetcher: 50 ms ⇒ ≤ 20 req/s. See `_GLOSSARY`.
+/// (Batch concurrency is the client's `GAMMA_CONCURRENCY`; this gate still bounds actual throughput.)
 const GAMMA_MIN_INTERVAL_MS: u64 = 50;
 
 /// Per-market Gamma liquidity metadata captured alongside the mids, for the
@@ -58,20 +56,20 @@ struct CachedEntry {
 
 /// Thread-safe TTL cache of open-market mid prices. Generic over the fetcher so
 /// tests can inject a `FixtureFetcher`; production uses [`ReqwestFetcher`].
-pub struct MidPriceCache<F = ReqwestFetcher> {
+pub struct MidPriceCache<F: PageFetcher = ReqwestFetcher> {
     inner: Arc<Mutex<HashMap<MarketId, CachedEntry>>>,
-    fetcher: Arc<F>,
-    gamma_base_url: String,
+    /// Shared batched Gamma `/markets` client. Held behind an `Arc` so the cache stays `Clone`
+    /// even though the underlying [`ReqwestFetcher`] (rate-limit `Mutex`) is not `Clone`.
+    client: Arc<GammaMarketsClient<F>>,
 }
 
-// Manual Clone: `Arc<F>` is cloneable regardless of whether `F: Clone`
-// (`ReqwestFetcher` is not — it holds a `Mutex`).
-impl<F> Clone for MidPriceCache<F> {
+// Manual Clone: the `Arc`s clone regardless of whether `F: Clone` (`ReqwestFetcher` is not — it
+// holds a `Mutex`), so all clones share one rate-gated client.
+impl<F: PageFetcher> Clone for MidPriceCache<F> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            fetcher: self.fetcher.clone(),
-            gamma_base_url: self.gamma_base_url.clone(),
+            client: self.client.clone(),
         }
     }
 }
@@ -91,8 +89,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     pub fn with_fetcher(fetcher: F, gamma_base_url: String) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
-            fetcher: Arc::new(fetcher),
-            gamma_base_url,
+            client: Arc::new(GammaMarketsClient::new(gamma_base_url, fetcher)),
         }
     }
 
@@ -124,11 +121,18 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             .collect()
     }
 
-    /// Serve fresh [`CachedEntry`]s for `market_ids` from the cache and fetch the
-    /// stale/missing ones concurrently through the rate gate, storing the results.
-    /// Both [`fetch_mids`](Self::fetch_mids) and
-    /// [`fetch_snapshots`](Self::fetch_snapshots) project from this single fetch
-    /// path, so the mids surface is byte-identical whether or not snapshots are read.
+    /// Serve fresh [`CachedEntry`]s for `market_ids` from the cache and fetch the stale/missing ones
+    /// via the shared batched [`GammaMarketsClient`] (one `OpenOnly` `/markets` request per
+    /// [`GAMMA_BATCH_SIZE`](pe_source_polymarket_public::GAMMA_BATCH_SIZE)-id chunk, demuxed by
+    /// `conditionId`), storing the results. Both [`fetch_mids`](Self::fetch_mids) and
+    /// [`fetch_snapshots`](Self::fetch_snapshots) project from this single fetch path, so the mids
+    /// surface is byte-identical whether or not snapshots are read.
+    ///
+    /// Best-effort: a client error (transient fetch / corrupt response) is logged and this tick
+    /// serves only what was cached — coarser than the pre-#382 per-ID skip, but the orchestrator
+    /// fetches one market per call (so a single failing market still omits only itself) and the
+    /// dashboard self-heals on the next [`TTL`] refresh. A market that is unknown, in a 4xx chunk,
+    /// or lacks `outcomePrices` is omitted, so the caller marks its unrealized P&L null.
     async fn ensure_entries(&self, market_ids: &[MarketId]) -> HashMap<MarketId, CachedEntry> {
         let mut out: HashMap<MarketId, CachedEntry> = HashMap::new();
         let mut stale: Vec<MarketId> = Vec::new();
@@ -151,32 +155,38 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             return out;
         }
 
-        let fetcher = self.fetcher.clone();
-        let base = self.gamma_base_url.clone();
-        let fetched: Vec<(MarketId, (Vec<Decimal>, MidMarketSnapshot))> = stream::iter(stale)
-            .map(|id| {
-                let fetcher = fetcher.clone();
-                let base = base.clone();
-                async move {
-                    // Open query (no `&closed=true`) → live mids in `outcomePrices`.
-                    let url = format!("{base}/markets?condition_ids={id}");
-                    match fetcher.fetch_page(&url).await {
-                        Ok(bytes) => parse_market_row(&bytes, &id).map(|row| (id, row)),
-                        Err(e) => {
-                            warn!(market_id = %id, error = %e, "mid-cache: fetch error, omitting");
-                            None
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(FETCH_CONCURRENCY)
-            .filter_map(|r| async move { r })
-            .collect()
-            .await;
+        // Open query (no `&closed=true`) → live mids in `outcomePrices`. The client batches and
+        // demuxes by `conditionId`; the whole call is best-effort (see method doc).
+        let ids: Vec<String> = stale.iter().map(|m| m.to_string()).collect();
+        let markets = match self
+            .client
+            .fetch_markets(&ids, MarketFilter::OpenOnly)
+            .await
+        {
+            Ok(fetched) => fetched.markets,
+            Err(e) => {
+                warn!(error = %e, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
+                return out;
+            }
+        };
 
         let now = Instant::now();
         let mut map = self.inner.lock().await;
-        for (id, (mids, snapshot)) in fetched {
+        for id in stale {
+            // Demux by the echoed `conditionId`: a hit is structurally the requested market, so a
+            // cross-market row (keyed under its own id) can never be attributed here.
+            let Some(m) = markets.get(&id.to_string()) else {
+                continue; // unknown / 4xx-unfetched / absent → omit (P&L stays null)
+            };
+            // No / malformed `outcomePrices` → skip rather than mis-value the market.
+            let Some(mids) = m.outcome_prices.clone() else {
+                continue;
+            };
+            let snapshot = MidMarketSnapshot {
+                liquidity: m.liquidity,
+                volume: m.volume,
+                clob_token_ids: m.clob_token_ids.clone(),
+            };
             let entry = CachedEntry {
                 mids,
                 snapshot,
@@ -189,109 +199,6 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     }
 }
 
-/// Minimal view of a Gamma `/markets` row — the fields the mid cache needs plus
-/// the WS2 liquidity-snapshot scalars (`liquidity`/`volume`/`clobTokenIds`), which
-/// are free on the same fetch.
-#[derive(Deserialize)]
-struct MidMarketRaw {
-    #[serde(rename = "conditionId")]
-    condition_id: String,
-    #[serde(rename = "outcomePrices")]
-    outcome_prices: Option<String>,
-    /// Gamma `liquidity` (USD). Live `/markets` sends it as a decimal string; the
-    /// lenient decoder also accepts a number and yields `None` on anything
-    /// unparseable, so a bad scalar never fails the row and drops its mids.
-    #[serde(default, deserialize_with = "deserialize_decimal_lenient")]
-    liquidity: Option<Decimal>,
-    /// Gamma `volume` (USD cumulative). Same encoding and leniency as `liquidity`.
-    #[serde(default, deserialize_with = "deserialize_decimal_lenient")]
-    volume: Option<Decimal>,
-    /// Gamma `clobTokenIds`, outcome-ordered, e.g. the stringified JSON array
-    /// `"[\"123\",\"456\"]"` (the live `/markets` form; a native array is also
-    /// accepted). Decoded to outcome-aligned ids via [`deserialize_clob_token_ids`].
-    #[serde(
-        rename = "clobTokenIds",
-        default,
-        deserialize_with = "deserialize_clob_token_ids"
-    )]
-    clob_token_ids: Vec<String>,
-}
-
-/// Parse a Gamma open-market response into its mids and liquidity snapshot,
-/// reusing the shared decimal-string decoder for the mids. Returns `None`
-/// (logged) on a parse error, missing prices, or a condition-id mismatch (Gamma
-/// may return unrelated rows). The snapshot scalars/token-ids are best-effort — a
-/// missing or malformed one yields `None`/empty without dropping the row, so this
-/// never regresses the mids path.
-fn parse_market_row(
-    bytes: &[u8],
-    market_id: &MarketId,
-) -> Option<(Vec<Decimal>, MidMarketSnapshot)> {
-    let markets: Vec<MidMarketRaw> = serde_json::from_slice(bytes)
-        .map_err(|e| warn!(market_id = %market_id, error = %e, "mid-cache: response parse error"))
-        .ok()?;
-    let m = markets.first()?;
-    if m.condition_id != market_id.to_string() {
-        warn!(market_id = %market_id, returned = %m.condition_id, "mid-cache: condition_id mismatch");
-        return None;
-    }
-    let prices_str = m.outcome_prices.as_deref()?;
-    let mids = parse_outcome_prices(prices_str)?;
-    let snapshot = MidMarketSnapshot {
-        liquidity: m.liquidity,
-        volume: m.volume,
-        clob_token_ids: m.clob_token_ids.clone(),
-    };
-    Some((mids, snapshot))
-}
-
-/// Decode Gamma's `clobTokenIds` into outcome-ordered token ids. Gamma sends a
-/// stringified JSON array (`"[\"id0\",\"id1\"]"` — the live `/markets` form); a
-/// native JSON array is also accepted. Any other shape, malformed inner JSON, a
-/// null, or a missing field yields an empty vec — token mapping is best-effort and
-/// must never drop a market's mids. **Positions are preserved** (no compaction or
-/// blank-dropping) so `clob_token_ids[outcome_id]` stays aligned with the outcome.
-fn deserialize_clob_token_ids<'de, D>(d: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde_json::Value;
-
-    Ok(match Option::<Value>::deserialize(d)? {
-        // Stringified JSON array — the live `/markets` encoding.
-        Some(Value::String(s)) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
-        // Native JSON array; coerce each entry to its string form, order preserved.
-        Some(Value::Array(items)) => items
-            .into_iter()
-            .map(|v| match v {
-                Value::String(s) => s,
-                other => other.to_string(),
-            })
-            .collect(),
-        _ => Vec::new(),
-    })
-}
-
-/// Deserialize Gamma's `liquidity`/`volume` whether they arrive as a JSON string
-/// (`"6434.84"` — the live `/markets` form) or a JSON number. Any other shape — a
-/// null, bool, array, object, missing field, or unparseable string — yields
-/// `None`, so a malformed depth scalar can never fail the row and drop its mids.
-fn deserialize_decimal_lenient<'de, D>(d: D) -> Result<Option<Decimal>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use rust_decimal::prelude::FromPrimitive;
-    use serde_json::Value;
-
-    // Capture as an untyped value first: `Value` deserialization is total over any
-    // JSON shape, so an unexpected type degrades to `None` instead of erroring.
-    Ok(match Option::<Value>::deserialize(d)? {
-        Some(Value::String(s)) => s.trim().parse::<Decimal>().ok(),
-        Some(Value::Number(n)) => n.as_f64().and_then(Decimal::from_f64),
-        _ => None,
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -302,8 +209,11 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// The exact URL the shared client builds for a single-id `OpenOnly` batch
+    /// (`condition_ids={id}&limit=500`, no `&closed=true`). The orchestrator/snapshot worker
+    /// fetch one market per call, so every live mid fetch is a batch-of-one keyed like this.
     fn url(base: &str, id: &str) -> String {
-        format!("{base}/markets?condition_ids={id}")
+        format!("{base}/markets?condition_ids={id}&limit=500")
     }
 
     const BASE: &str = "https://gamma-api.polymarket.com";
@@ -531,6 +441,37 @@ mod tests {
         assert_eq!(
             mids.get(&mid("0xcond")).unwrap(),
             &vec![Decimal::new(4, 1), Decimal::new(6, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_id_batch_demuxes_and_rejects_cross_market_row() {
+        // The dashboard path (`paper_api::fetch_mids(&open_markets)`) fetches many markets in one
+        // batch. The client builds a single repeat-key URL; the response arrives out of order and
+        // carries an unrelated row. Each requested market gets its own mids; the intruder (`0xZ`) is
+        // keyed under its own id and never attributed to a requested market.
+        let mut fx = HashMap::new();
+        fx.insert(
+            format!("{BASE}/markets?condition_ids=0xA&condition_ids=0xB&limit=500"),
+            br#"[{"conditionId":"0xB","outcomePrices":"[\"0.3\",\"0.7\"]"},
+                 {"conditionId":"0xZ","outcomePrices":"[\"0.99\",\"0.01\"]"},
+                 {"conditionId":"0xA","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#
+                .to_vec(),
+        );
+        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string());
+        let out = cache.fetch_mids(&[mid("0xA"), mid("0xB")]).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.get(&mid("0xA")).unwrap(),
+            &vec![Decimal::new(6, 1), Decimal::new(4, 1)]
+        );
+        assert_eq!(
+            out.get(&mid("0xB")).unwrap(),
+            &vec![Decimal::new(3, 1), Decimal::new(7, 1)]
+        );
+        assert!(
+            !out.contains_key(&mid("0xZ")),
+            "an unrequested cross-market row must not be attributed"
         );
     }
 }
