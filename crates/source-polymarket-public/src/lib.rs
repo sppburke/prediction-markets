@@ -15,6 +15,6 @@ pub use connector::PolymarketPublicConnector;
 pub use endpoint::{LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint};
 pub use fetcher::{FixtureFetcher, PageFetcher, ReqwestFetcher};
 pub use gamma_markets::{
-    GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarketsClient, GammaMarketsError,
-    MarketFilter,
+    GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarkets, GammaMarketsClient,
+    GammaMarketsError, MarketFilter,
 };

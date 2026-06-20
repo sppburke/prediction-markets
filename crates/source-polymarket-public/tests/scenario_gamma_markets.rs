@@ -82,11 +82,12 @@ async fn chunks_at_batch_boundary_and_merges() {
         .await
         .unwrap();
 
-    assert_eq!(out.len(), 3, "both chunks merged into one map");
-    assert_eq!(out["A"].end_date_unix, Some(1_705_276_800));
-    assert_eq!(out["B"].end_date_unix, None);
-    assert_eq!(out["B"].liquidity.unwrap().to_string(), "12.5");
-    assert!(out.contains_key("C"));
+    assert_eq!(out.markets.len(), 3, "both chunks merged into one map");
+    assert_eq!(out.markets["A"].end_date_unix, Some(1_705_276_800));
+    assert_eq!(out.markets["B"].end_date_unix, None);
+    assert_eq!(out.markets["B"].liquidity.unwrap().to_string(), "12.5");
+    assert!(out.markets.contains_key("C"));
+    assert!(out.unfetched.is_empty(), "no chunk failed");
 }
 
 #[tokio::test]
@@ -106,18 +107,22 @@ async fn id_omitted_from_response_is_absent_from_map() {
         .await
         .unwrap();
 
-    assert_eq!(out.len(), 2);
-    assert!(out.contains_key("A") && out.contains_key("C"));
+    assert_eq!(out.markets.len(), 2);
+    assert!(out.markets.contains_key("A") && out.markets.contains_key("C"));
     assert!(
-        !out.contains_key("B"),
-        "unknown id must be absent (caller treats as NULL/skip)"
+        !out.markets.contains_key("B"),
+        "unknown id must be absent from the map"
+    );
+    assert!(
+        !out.unfetched.contains(&"B".to_owned()),
+        "B is a known-absent 200 omission, NOT an unfetched 4xx — caller writes NULL, not retry"
     );
 }
 
 #[tokio::test]
-async fn fatal_chunk_is_skipped_other_chunks_land() {
+async fn fatal_chunk_is_reported_unfetched_other_chunks_land() {
     // batch_size=2 → chunks [A,B] (mapped) and [C,D] (unmapped → FixtureFetcher Fatal). The call must
-    // return Ok with A,B; C,D are simply absent (not an error).
+    // return Ok with A,B in the map and C,D reported as unfetched (retry-able, NOT a known-absent NULL).
     let mut responses = HashMap::new();
     responses.insert(
         batch_url(&["A", "B"], false),
@@ -133,9 +138,16 @@ async fn fatal_chunk_is_skipped_other_chunks_land() {
         .await
         .expect("a fatal chunk is skipped, not a hard error");
 
-    assert_eq!(out.len(), 2, "only the mapped chunk's markets land");
-    assert!(out.contains_key("A") && out.contains_key("B"));
-    assert!(!out.contains_key("C") && !out.contains_key("D"));
+    assert_eq!(out.markets.len(), 2, "only the mapped chunk's markets land");
+    assert!(out.markets.contains_key("A") && out.markets.contains_key("B"));
+    assert!(!out.markets.contains_key("C") && !out.markets.contains_key("D"));
+    let mut unfetched = out.unfetched.clone();
+    unfetched.sort();
+    assert_eq!(
+        unfetched,
+        vec!["C".to_owned(), "D".to_owned()],
+        "the fatal chunk's ids are reported unfetched so the caller retries them"
+    );
 }
 
 #[tokio::test]
@@ -154,10 +166,10 @@ async fn demux_keys_each_market_by_condition_id() {
         .await
         .unwrap();
 
-    assert_eq!(out["A"].condition_id, "A");
-    assert_eq!(out["B"].condition_id, "B");
-    assert_eq!(out["A"].end_date_unix, Some(1_705_276_800));
-    assert_eq!(out["B"].end_date_unix, Some(1_706_745_600));
+    assert_eq!(out.markets["A"].condition_id, "A");
+    assert_eq!(out.markets["B"].condition_id, "B");
+    assert_eq!(out.markets["A"].end_date_unix, Some(1_705_276_800));
+    assert_eq!(out.markets["B"].end_date_unix, Some(1_706_745_600));
 }
 
 #[tokio::test]
@@ -175,6 +187,6 @@ async fn closed_filter_uses_closed_true_url() {
         .await
         .unwrap();
 
-    assert_eq!(out.len(), 1, "&closed=true URL must be used");
-    assert_eq!(out["A"].end_date_unix, Some(1_705_276_800));
+    assert_eq!(out.markets.len(), 1, "&closed=true URL must be used");
+    assert_eq!(out.markets["A"].end_date_unix, Some(1_705_276_800));
 }

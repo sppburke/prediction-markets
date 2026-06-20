@@ -19,6 +19,8 @@
 //! `200 []`) is treated exactly as the pre-#382 per-ID path treated an empty response: a NULL schedule
 //! row (schedule passes) or a skip (liquidity pass).
 
+use std::collections::HashSet;
+
 use pe_source_polymarket_public::{
     GammaMarketsClient, GammaMarketsError, MarketFilter, PageFetcher,
 };
@@ -82,15 +84,22 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         );
 
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-        let markets = self
+        let res = self
             .client
             .fetch_markets(&to_fetch, MarketFilter::OpenOnly)
             .await
             .map_err(gamma_err)?;
+        let unfetched: HashSet<&str> = res.unfetched.iter().map(String::as_str).collect();
 
         let mut inserted = 0usize;
         for id in &to_fetch {
-            let end_date_unix = markets.get(id).and_then(|m| m.end_date_unix);
+            // A 4xx-skipped chunk's ids are left untouched (no NULL row) so they retry next run,
+            // matching the pre-#382 per-ID `Fatal → skip`. An id Gamma omits from a 200 (unknown
+            // market) is absent from `markets` → NULL row, as the per-ID empty response produced.
+            if unfetched.contains(id.as_str()) {
+                continue;
+            }
+            let end_date_unix = res.markets.get(id).and_then(|m| m.end_date_unix);
             cache.insert_schedule(id, end_date_unix, fetched_at)?;
             inserted += 1;
         }
@@ -122,7 +131,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         );
 
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-        let markets = self
+        let res = self
             .client
             .fetch_markets(market_ids, MarketFilter::ClosedOnly)
             .await
@@ -130,8 +139,10 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
 
         let mut rewritten = 0usize;
         for id in market_ids {
-            // Absent (Gamma doesn't list it) or present-without-endDate → leave the row NULL.
-            let Some(end_date_unix) = markets.get(id).and_then(|m| m.end_date_unix) else {
+            // Unfetched (4xx chunk), absent (Gamma doesn't list it), or present-without-endDate → no
+            // UPDATE (row stays NULL), matching the per-ID `Fatal/None → continue`. UPDATE-only, so
+            // an unfetched id is harmless either way (no row written).
+            let Some(end_date_unix) = res.markets.get(id).and_then(|m| m.end_date_unix) else {
                 continue;
             };
             if cache.update_schedule_end_date(id, end_date_unix, fetched_at)? {
@@ -166,15 +177,20 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         );
 
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-        let markets = self
+        let res = self
             .client
             .fetch_markets(market_ids, MarketFilter::ClosedOnly)
             .await
             .map_err(gamma_err)?;
+        let unfetched: HashSet<&str> = res.unfetched.iter().map(String::as_str).collect();
 
         let mut inserted = 0usize;
         for id in market_ids {
-            let end_date_unix = markets.get(id).and_then(|m| m.end_date_unix);
+            // A 4xx-skipped chunk's ids are left untouched (no row) so they retry next run.
+            if unfetched.contains(id.as_str()) {
+                continue;
+            }
+            let end_date_unix = res.markets.get(id).and_then(|m| m.end_date_unix);
             cache.insert_schedule(id, end_date_unix, fetched_at)?;
             if end_date_unix.is_some() {
                 inserted += 1;
@@ -218,7 +234,7 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         );
 
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-        let markets = self
+        let res = self
             .client
             .fetch_markets(&to_fetch, MarketFilter::OpenOnly)
             .await
@@ -226,7 +242,9 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
 
         let mut inserted = 0usize;
         for id in &to_fetch {
-            let Some(liquidity_usd) = markets.get(id).and_then(|m| m.liquidity) else {
+            // Unfetched (4xx chunk) or no-liquidity → skip (no upsert), matching the per-ID path
+            // (upsert-only on Some, so an unfetched id is harmless — no row written).
+            let Some(liquidity_usd) = res.markets.get(id).and_then(|m| m.liquidity) else {
                 continue;
             };
             cache.upsert_market_liquidity(id, liquidity_usd, fetched_at)?;

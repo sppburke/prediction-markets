@@ -75,11 +75,24 @@ pub struct GammaMarket {
     pub liquidity: Option<Decimal>,
 }
 
+/// The result of a [`GammaMarketsClient::fetch_markets`] call.
+pub struct GammaMarkets {
+    /// `conditionId → GammaMarket` for every market Gamma returned across the successful batches.
+    pub markets: HashMap<String, GammaMarket>,
+    /// Ids whose batch hit a `4xx` ([`SourceError::Fatal`]) and were skipped — *not fetched*, so the
+    /// caller should leave them untouched and retry next run (the pre-#382 per-ID `Fatal → skip`
+    /// behaviour). This is deliberately distinct from an id merely absent from `markets` because
+    /// Gamma returned `200` without it: that is a definitive unknown market (Gamma's `200 []`), which
+    /// the caller treats as the empty-response case (e.g. a NULL schedule row).
+    pub unfetched: Vec<String>,
+}
+
 /// Errors from [`GammaMarketsClient::fetch_markets`].
 ///
-/// A per-chunk HTTP `4xx` (`SourceError::Fatal`) is **not** an error: those ids are skipped (absent
-/// from the returned map), mirroring the pre-#382 per-ID `Fatal → skip` behaviour. Only non-fatal
-/// fetch failures (transient/5xx after retries, or rate-limited) and gross response corruption abort.
+/// A per-chunk HTTP `4xx` (`SourceError::Fatal`) is **not** an error: those ids are reported in
+/// [`GammaMarkets::unfetched`] so the caller can retry them (mirroring the pre-#382 per-ID
+/// `Fatal → skip`). Only non-fatal fetch failures (transient/5xx after retries, or rate-limited) and
+/// gross response corruption abort.
 #[derive(Debug, thiserror::Error)]
 pub enum GammaMarketsError {
     /// A non-fatal fetch failure (transient/5xx after retries, or rate-limited). The pass should
@@ -121,22 +134,24 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         self
     }
 
-    /// Fetch every id in `ids` under `filter`, returning `conditionId → GammaMarket` for each market
-    /// Gamma returns. Ids Gamma omits (unknown markets — Gamma answers `200 []`) are simply absent
-    /// from the map; the caller decides what a miss means (e.g. write a NULL schedule row).
+    /// Fetch every id in `ids` under `filter`. Returns [`GammaMarkets`]: a `conditionId → GammaMarket`
+    /// map for the markets Gamma returned, plus the [`GammaMarkets::unfetched`] ids whose batch hit a
+    /// `4xx` (skipped, retry-able). An id that is *known-absent* (Gamma returned `200` without it) is
+    /// simply missing from the map and is **not** in `unfetched` — the caller treats that as the
+    /// empty-response case (e.g. a NULL schedule row).
     ///
     /// Input order is preserved through dedup and chunking so the batch URLs are deterministic
     /// (important for `FixtureFetcher` exact-URL keying).
     ///
     /// # Errors
     /// Returns [`GammaMarketsError::Fetch`] on a non-fatal source error (transient/rate-limited) and
-    /// [`GammaMarketsError::Parse`] on a malformed batch array. A per-chunk `4xx` is skipped, not an
-    /// error (its ids are absent from the map).
+    /// [`GammaMarketsError::Parse`] on a malformed batch array. A per-chunk `4xx` is not an error — it
+    /// is reported via `unfetched`.
     pub async fn fetch_markets(
         &self,
         ids: &[String],
         filter: MarketFilter,
-    ) -> Result<HashMap<String, GammaMarket>, GammaMarketsError> {
+    ) -> Result<GammaMarkets, GammaMarketsError> {
         // Dedup preserving first-seen order — deterministic batch URLs, no sort.
         let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
         let unique: Vec<&str> = ids
@@ -164,12 +179,16 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             .buffer_unordered(self.concurrency);
 
         let mut out: HashMap<String, GammaMarket> = HashMap::new();
+        let mut unfetched: Vec<String> = Vec::new();
         while let Some((chunk, result)) = stream.next().await {
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
-                    // 4xx on the whole chunk — skip its ids (absent from map), as the per-ID path did.
-                    tracing::warn!(chunk_len = chunk.len(), error = %message, "gamma_markets: batch fatal, skipping chunk");
+                    // 4xx on the whole chunk — report its ids as unfetched (retry-able), as the per-ID
+                    // path skipped a Fatal id without writing a row. Distinct from a 200 that omits an
+                    // id (an unknown market), which the caller treats as the empty-response case.
+                    tracing::warn!(chunk_len = chunk.len(), error = %message, "gamma_markets: batch fatal, marking chunk unfetched");
+                    unfetched.extend(chunk);
                     continue;
                 }
                 Err(e) => return Err(GammaMarketsError::Fetch(e.to_string())),
@@ -189,7 +208,10 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 );
             }
         }
-        Ok(out)
+        Ok(GammaMarkets {
+            markets: out,
+            unfetched,
+        })
     }
 }
 
