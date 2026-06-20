@@ -54,6 +54,11 @@ pub type WalletUpsertRow = (
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
 pub(crate) const INCREMENTAL_STOP_THRESHOLD: usize = 3;
 
+/// Wallets deleted per transaction in [`WalletCache::purge_wallets`] (issue #385).
+/// Bounds WAL growth + lock-hold time per commit; a chunk-boundary crash leaves a
+/// consistent partial state a re-run completes idempotently.
+const PURGE_CHUNK: usize = 1_000;
+
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -216,6 +221,19 @@ CREATE TABLE IF NOT EXISTS first_mover_rank_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_fmrc_cutoff
     ON first_mover_rank_cache(cutoff_unix);
+
+-- Tombstones for wallets hard-deleted by `pe-bootstrap purge` (issue #385).
+-- Only rule-A `proven_loser` deletions write a row here; rule-B `dead_weight`
+-- deletions write NO row (discovery may freely re-find them). The
+-- `upsert_wallets_bulk` gate skips re-inserting any wallet listed here UNLESS the
+-- incoming row carries an override bit (leaderboard/radion = `source_bits & 48`),
+-- which DELETEs the row (lifts the tombstone) and re-admits the wallet. `reason`
+-- is kept as TEXT for forward-compat / auditing.
+CREATE TABLE IF NOT EXISTS purged_wallets (
+    wallet_hex     TEXT    PRIMARY KEY NOT NULL,
+    purged_at_unix INTEGER NOT NULL,
+    reason         TEXT    NOT NULL
+);
 ";
 
 /// Result of `classify_infra_retroactive` (issue #197).
@@ -250,6 +268,59 @@ impl CoverageReport {
     pub fn is_clean(&self) -> bool {
         self.fetch_incomplete == 0 && self.missing_resolution == 0 && self.missing_schedule == 0
     }
+}
+
+/// Why a wallet was selected for deletion by `pe-bootstrap purge` (issue #385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeReason {
+    /// Eligible per the ranker CSV but a proven money-loser (rule A). Deleted
+    /// **and tombstoned** so a non-override discovery source cannot silently
+    /// re-ingest it.
+    ProvenLoser,
+    /// Active, not eligible, and long-dormant dead weight (rule B). Deleted with
+    /// **no tombstone** — discovery may re-find it.
+    DeadWeight,
+}
+
+impl PurgeReason {
+    /// Tag string stored in `purged_wallets.reason` (proven losers only).
+    const fn as_str(self) -> &'static str {
+        match self {
+            PurgeReason::ProvenLoser => "proven_loser",
+            PurgeReason::DeadWeight => "dead_weight",
+        }
+    }
+
+    /// Whether a `purged_wallets` tombstone is written for this reason.
+    const fn tombstoned(self) -> bool {
+        matches!(self, PurgeReason::ProvenLoser)
+    }
+}
+
+/// One wallet selected for deletion by [`WalletCache::purge_wallets`] (issue #385).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeRow {
+    pub wallet_hex: String,
+    pub reason: PurgeReason,
+}
+
+/// Outcome of [`WalletCache::purge_wallets`] (issue #385). In `dry_run` mode the
+/// `*_deleted` counts are estimates (trades via `wallets.trade_count`, snapshots
+/// via `COUNT`) of what an armed run *would* remove; nothing is written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeReport {
+    /// Rule-A (proven-loser) wallets deleted + tombstoned (would-delete in dry-run).
+    pub proven_losers_deleted: usize,
+    /// Rule-B (dead-weight) wallets deleted, no tombstone (would-delete in dry-run).
+    pub dead_weight_deleted: usize,
+    /// `trades` rows deleted across all purged wallets (estimate in dry-run).
+    pub trades_deleted: usize,
+    /// `leaderboard_snapshots` rows deleted across all purged wallets.
+    pub snapshots_deleted: usize,
+    /// Tombstones written to `purged_wallets` (== `proven_losers_deleted`).
+    pub tombstones_written: usize,
+    /// True when this was a preview (`dry_run`) — nothing was written.
+    pub dry_run: bool,
 }
 
 /// Per-market fee schedule row loaded from `market_fees` (issue #23).
@@ -1589,6 +1660,14 @@ impl WalletCache {
     /// pass `0` when V1/V2 attribution is unavailable; the enumeration path
     /// passes the bit from `topic_to_contract_version_bit`.
     pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
+        // Issue #385 tombstone gate. Load the purged set once; for a tombstoned
+        // wallet, an incoming row carrying an override bit (leaderboard/radion =
+        // `source_bits & TOMBSTONE_OVERRIDE_SOURCES`) LIFTS the tombstone (DELETE
+        // the `purged_wallets` row, then upsert normally — re-admit); any other
+        // source bit (datadash/trades/wallet-set-json) SKIPS the row, leaving the
+        // tombstone intact and the wallet un-inserted. An empty `purged_wallets`
+        // makes this a no-op, so behaviour is identical to pre-#385.
+        let mut purged = self.load_purged_set()?;
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -1605,7 +1684,18 @@ impl WalletCache {
                     dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps), \
                     polymarket_contracts_seen = polymarket_contracts_seen | excluded.polymarket_contracts_seen",
             )?;
+            let mut lift = tx.prepare("DELETE FROM purged_wallets WHERE wallet_hex = ?1")?;
             for (wallet, bits, infra, first_seen, closed, win_rate, version_bits) in rows {
+                if purged.contains(wallet) {
+                    if (bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0 {
+                        // Override source (leaderboard/radion) → lift + re-admit.
+                        lift.execute(params![wallet])?;
+                        purged.remove(wallet);
+                    } else {
+                        // Non-override source → keep the tombstone, skip the row.
+                        continue;
+                    }
+                }
                 let is_infra_int: i64 = i64::from(*infra);
                 stmt.execute(params![
                     wallet,
@@ -1619,6 +1709,160 @@ impl WalletCache {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Load the tombstone set (`purged_wallets.wallet_hex`) into memory (issue #385).
+    pub fn load_purged_set(&self) -> Result<std::collections::HashSet<String>, BootstrapError> {
+        let mut stmt = self.conn.prepare("SELECT wallet_hex FROM purged_wallets")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<std::collections::HashSet<_>, _>>()?)
+    }
+
+    /// Whether a wallet is currently tombstoned (issue #385).
+    pub fn is_purged(&self, wallet_hex: &str) -> Result<bool, BootstrapError> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM purged_wallets WHERE wallet_hex = ?1)",
+            params![wallet_hex],
+            |r| r.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Global `MAX(timestamp_unix)` over the whole `trades` table — the cache
+    /// freshness probe (issue #385). `None` when the cache holds no trades.
+    pub fn newest_trade_unix(&self) -> Result<Option<i64>, BootstrapError> {
+        let ts: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(timestamp_unix) FROM trades", [], |r| r.get(0))?;
+        Ok(ts)
+    }
+
+    /// Rule-B dead-weight candidates (issue #385): `is_active = 1`, non-infra
+    /// wallets that were **refreshed this run** (`last_polymarket_fetch_at` within
+    /// `staleness_secs` — so a soft-failed backfill's stale recency cannot trigger
+    /// a delete) whose newest trade is older than `inactivity_secs`. A wallet with
+    /// no trades (`MAX(timestamp_unix) IS NULL`) is NOT matched (`NULL < x` is
+    /// NULL) — zero trades means zero disk to reclaim. Eligibility filtering is the
+    /// caller's job (the eligible set comes from the ranker CSV, not the cache).
+    pub fn select_dead_weight_candidates(
+        &self,
+        now_unix: i64,
+        inactivity_secs: i64,
+        staleness_secs: i64,
+    ) -> Result<Vec<String>, BootstrapError> {
+        let fresh_cutoff = now_unix - staleness_secs;
+        let inactivity_cutoff = now_unix - inactivity_secs;
+        let mut stmt = self.conn.prepare(
+            "SELECT v.wallet_hex FROM active_tradeable_wallets v \
+             WHERE v.last_polymarket_fetch_at IS NOT NULL \
+               AND v.last_polymarket_fetch_at >= ?1 \
+               AND (SELECT MAX(t.timestamp_unix) FROM trades t \
+                    WHERE t.wallet_hex = v.wallet_hex) < ?2",
+        )?;
+        let rows = stmt.query_map(params![fresh_cutoff, inactivity_cutoff], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Hard-delete `rows` from `trades` + `leaderboard_snapshots` + `wallets`
+    /// (issue #385). Rule-A (`ProvenLoser`) rows additionally get a `purged_wallets`
+    /// tombstone written **in the same chunk transaction** as their row deletions,
+    /// so a mid-purge crash can never leave a proven loser deleted-but-untombstoned
+    /// (which a non-override source would then silently re-ingest). Rule-B
+    /// (`DeadWeight`) rows are deleted with no tombstone.
+    ///
+    /// In `dry_run` mode nothing is written: the report's `*_deleted` counts are
+    /// estimates (trades via `wallets.trade_count`, snapshots via `COUNT`).
+    ///
+    /// # Precondition
+    /// Empty `rows` returns a zero [`PurgeReport`] (no no-WHERE mass delete).
+    pub fn purge_wallets(
+        &mut self,
+        rows: &[PurgeRow],
+        now_unix: i64,
+        dry_run: bool,
+    ) -> Result<PurgeReport, BootstrapError> {
+        let proven = rows.iter().filter(|r| r.reason.tombstoned()).count();
+        let dead = rows.len() - proven;
+        let mut report = PurgeReport {
+            dry_run,
+            ..PurgeReport::default()
+        };
+        if rows.is_empty() {
+            return Ok(report);
+        }
+
+        if dry_run {
+            let mut trades_est: i64 = 0;
+            let mut snaps: i64 = 0;
+            for chunk in rows.chunks(PURGE_CHUNK) {
+                let placeholders = (1..=chunk.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let params_vec: Vec<&dyn rusqlite::ToSql> = chunk
+                    .iter()
+                    .map(|r| &r.wallet_hex as &dyn rusqlite::ToSql)
+                    .collect();
+                let tq = format!(
+                    "SELECT COALESCE(SUM(trade_count), 0) FROM wallets WHERE wallet_hex IN ({placeholders})"
+                );
+                trades_est += self
+                    .conn
+                    .query_row(&tq, &params_vec[..], |r| r.get::<_, i64>(0))?;
+                let sq = format!(
+                    "SELECT COUNT(*) FROM leaderboard_snapshots WHERE wallet_hex IN ({placeholders})"
+                );
+                snaps += self
+                    .conn
+                    .query_row(&sq, &params_vec[..], |r| r.get::<_, i64>(0))?;
+            }
+            report.proven_losers_deleted = proven;
+            report.dead_weight_deleted = dead;
+            report.tombstones_written = proven;
+            report.trades_deleted = usize::try_from(trades_est).unwrap_or(usize::MAX);
+            report.snapshots_deleted = usize::try_from(snaps).unwrap_or(usize::MAX);
+            return Ok(report);
+        }
+
+        // Armed: delete per chunk in ONE transaction so each rule-A wallet's
+        // tombstone and its row deletions commit atomically (crash-safety).
+        for chunk in rows.chunks(PURGE_CHUNK) {
+            let tx = self.conn.transaction()?;
+            {
+                let mut del_trades = tx.prepare("DELETE FROM trades WHERE wallet_hex = ?1")?;
+                let mut del_snaps =
+                    tx.prepare("DELETE FROM leaderboard_snapshots WHERE wallet_hex = ?1")?;
+                let mut del_wallet = tx.prepare("DELETE FROM wallets WHERE wallet_hex = ?1")?;
+                let mut tomb = tx.prepare(
+                    "INSERT OR REPLACE INTO purged_wallets (wallet_hex, purged_at_unix, reason) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for r in chunk {
+                    report.trades_deleted += del_trades.execute(params![r.wallet_hex])?;
+                    report.snapshots_deleted += del_snaps.execute(params![r.wallet_hex])?;
+                    del_wallet.execute(params![r.wallet_hex])?;
+                    if r.reason.tombstoned() {
+                        tomb.execute(params![r.wallet_hex, now_unix, r.reason.as_str()])?;
+                        report.tombstones_written += 1;
+                        report.proven_losers_deleted += 1;
+                    } else {
+                        report.dead_weight_deleted += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(report)
+    }
+
+    /// `VACUUM` the database to reclaim freed pages (issue #385). Must run OUTSIDE
+    /// any transaction — the purge orchestrator calls this after the chunked
+    /// deletes commit.
+    pub fn vacuum(&mut self) -> Result<(), BootstrapError> {
+        self.conn.execute_batch("VACUUM")?;
         Ok(())
     }
 
@@ -1885,10 +2129,17 @@ impl WalletCache {
     /// Sticky semantics: only `is_active = 0` rows are considered. `is_infra = 0`
     /// gates **every** activation branch — a wallet listed in both the infra CSV
     /// and a curation list (leaderboard/radion/502-gap) stays inactive.
+    ///
+    /// Issue #385 defense-in-depth: a tombstoned wallet (`purged_wallets`) is
+    /// never activated even if a stray row exists. The primary guard is the
+    /// `upsert_wallets_bulk` gate (a tombstoned wallet has no row to activate
+    /// unless re-admitted by an override source, which deletes the tombstone
+    /// first); this clause blocks the activation path regardless.
     pub fn apply_activation_rules(&mut self, min_trades: i64) -> Result<usize, BootstrapError> {
         let affected = self.conn.execute(
             "UPDATE wallets SET is_active = 1 \
-             WHERE is_active = 0 AND is_infra = 0 AND (\
+             WHERE is_active = 0 AND is_infra = 0 \
+             AND wallet_hex NOT IN (SELECT wallet_hex FROM purged_wallets) AND (\
                 COALESCE(trade_count, 0) >= ?1 \
              OR COALESCE(dune_closed_markets, 0) >= ?1 \
              OR (source_bits & 16) != 0 \
@@ -2031,6 +2282,54 @@ impl WalletCache {
                 |r| r.get(0),
             )
             .expect("test-only direct SQL must succeed")
+    }
+
+    /// Insert one minimal `trades` row (issue #385 scenarios) so a wallet has a
+    /// controllable newest-trade timestamp without going through the fetch path.
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_insert_trade(
+        &mut self,
+        wallet_hex: &str,
+        source_trade_id: &str,
+        timestamp_unix: i64,
+    ) {
+        self.conn
+            .execute(
+                "INSERT INTO trades \
+                 (source_trade_id, wallet_hex, market_id, outcome_id, side, price_str, contracts, timestamp_unix) \
+                 VALUES (?1, ?2, 'm', 0, 'buy', '0.5', 1, ?3)",
+                params![source_trade_id, wallet_hex, timestamp_unix],
+            )
+            .expect("test-only direct SQL must succeed");
+    }
+
+    /// Insert one `leaderboard_snapshots` row (issue #385 scenarios).
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_insert_snapshot(&mut self, wallet_hex: &str, snapshot_at_unix: i64) {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO leaderboard_snapshots (snapshot_at_unix, wallet_hex) \
+                 VALUES (?1, ?2)",
+                params![snapshot_at_unix, wallet_hex],
+            )
+            .expect("test-only direct SQL must succeed");
+    }
+
+    /// Whether a `wallets` row exists for `wallet_hex` (issue #385 scenarios).
+    #[cfg(any(test, feature = "scenario"))]
+    #[allow(clippy::expect_used)]
+    pub fn conn_for_test_wallet_exists(&self, wallet_hex: &str) -> bool {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM wallets WHERE wallet_hex = ?1)",
+                params![wallet_hex],
+                |r| r.get(0),
+            )
+            .expect("test-only direct SQL must succeed");
+        n != 0
     }
 }
 

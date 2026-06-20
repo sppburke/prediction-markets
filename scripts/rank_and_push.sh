@@ -95,6 +95,7 @@ NOTES=""
 SKIP_RANK="0"
 SKIP_DISCOVERY="0"
 SKIP_BACKFILL="0"
+SKIP_PURGE="0"
 BOOTSTRAP_CONFIG=""               # optional BootstrapConfig TOML positional for Step-0 stages
 PE_BOOTSTRAP_BIN="target/release/pe-bootstrap"
 
@@ -122,6 +123,7 @@ while [[ $# -gt 0 ]]; do
     --skip-rank) SKIP_RANK="1"; shift;;
     --skip-discovery) SKIP_DISCOVERY="1"; shift;;
     --skip-backfill) SKIP_BACKFILL="1"; shift;;
+    --skip-purge) SKIP_PURGE="1"; shift;;
     --engine) ENGINE="$2"; shift 2;;
     --parquet-dir) PARQUET_DIR="$2"; shift 2;;
     --parquet-max-age-hours) PARQUET_MAX_AGE_HOURS="$2"; shift 2;;
@@ -347,3 +349,24 @@ print(f"latest_ranking rows: {n}")
 raise SystemExit(0 if n.isdigit() and int(n)>0 else 1)
 PY
 echo "✓ rank_and_push complete — Supabase populated. pe-service picks it up within one refresh interval."
+
+# ── Stage 4/4 (final): purge proven-loser & dead-weight wallets from the local cache (issue #385) ──
+# Opt-in: the DELETE is a no-op unless purge_enabled=true in .env; the stage still emits a would-purge
+# report every run. Runs AFTER the push/verify so a purge failure can never block the (already-complete)
+# Supabase publish — hence non-fatal here. Skipped when --skip-purge, or when this run did not produce a
+# fresh backfill + verdict CSV (--skip-backfill / --skip-rank): purge relies on a fresh backfill (it
+# refuses an armed run on a stale cache) and the current run's RANKED_CSV verdict.
+if [[ "$SKIP_PURGE" == "1" ]]; then
+  echo "── Stage 4/4: purge skipped (--skip-purge) ───────────────────────────────────"
+elif [[ "$SKIP_BACKFILL" == "1" || "$SKIP_RANK" == "1" ]]; then
+  echo "── Stage 4/4: purge skipped (needs a fresh backfill + verdict this run) ───────"
+else
+  echo "── Stage 4/4: purge proven-loser & dead-weight wallets (issue #385) ───────────"
+  prc=0
+  PE_BOOTSTRAP_CACHE_PATH="$DB" PE_BOOTSTRAP_PURGE_DECISION_CSV="$RANKED_CSV" \
+    "$PE_BOOTSTRAP_BIN" purge "${BOOTSTRAP_CONFIG_ARGS[@]}" || prc=$?
+  case "$prc" in
+    0) echo "   [purge] ok" ;;
+    *) echo "   [purge] WARN exit $prc — purge stage failed; Supabase publish already complete, continuing" >&2 ;;
+  esac
+fi
