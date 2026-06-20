@@ -39,6 +39,13 @@ from ranker_decay import (
     weighted_stats,
 )
 
+# Pass-2 loads candidate (market,outcome) price tapes in batches of this many pairs (dropping each
+# batch before loading the next) so the DuckDB path never materialises every tape at once: a
+# full-universe basket is ~256K pairs whose tapes total tens of GB and OOM-kill a single
+# `duck_load_tapes` fetch (#391). A memory-bounding plumbing knob, not a strategy threshold; the
+# SQLite path is unaffected (it already streams one pair at a time). ~10K pairs ≈ <1GB of tapes.
+DUCK_TAPE_BATCH_PAIRS = 10000
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -140,57 +147,65 @@ def main() -> int:
     shift = a.latency_shift_secs
     fill_window = a.fill_window_secs
 
-    # DuckDB read-layer (#375): load every candidate (market,outcome) tape from the
-    # Parquet snapshot in one query (price returned as RAW strings, so the float()/
-    # 0<p<1 fill logic below is byte-identical); else per-pair SQLite scan. The
-    # bisect + fill loop is unchanged regardless of engine.
+    # DuckDB read-layer (#375): tape prices come back as RAW strings, so the float()/0<p<1 fill
+    # logic below is byte-identical to the SQLite per-pair scan, and the bisect+fill loop is the
+    # same for both engines. Tapes are loaded in bounded batches (not one fetch) — see #391 below.
     engine = ranker_duck.get_engine()
-    if engine is not None:
-        log("tape engine: DuckDB (Parquet read-layer, #375)")
-        duck_tapes = ranker_duck.duck_load_tapes(engine, list(by_mo.keys()))
-    else:
-        log("tape engine: SQLite (per-(market,outcome) scan)")
-        duck_tapes = None
+    use_duck = engine is not None
+    log("tape engine: DuckDB (Parquet read-layer, #375)" if use_duck
+        else "tape engine: SQLite (per-(market,outcome) scan)")
 
-    for i, ((mid, oid), positions) in enumerate(by_mo.items()):
-        if duck_tapes is not None:
-            ts_arr, px_arr = duck_tapes.get((mid, oid), ([], []))
-        else:
-            cur = conn.execute(
-                "SELECT timestamp_unix, price_str FROM trades "
-                "WHERE market_id = ? AND outcome_id = ? ORDER BY timestamp_unix ASC",
-                (mid, oid),
-            )
-            tape = cur.fetchall()
-            ts_arr = [row[0] for row in tape]
-            px_arr = [row[1] for row in tape]
-        for pos in positions:
-            w = pos["wallet"]
-            n_total[w] = n_total.get(w, 0) + 1
-            target = pos["entry_ts"] + shift
-            idx = bisect.bisect_left(ts_arr, target)
-            filled = False
-            within_window = fill_window <= 0 or (idx < len(ts_arr) and ts_arr[idx] <= target + fill_window)
-            if idx < len(ts_arr) and ts_arr[idx] < pos["resolved_at"] and within_window:
-                try:
-                    fill_price = float(px_arr[idx])
-                except (TypeError, ValueError):
-                    fill_price = None
-                if fill_price is not None and 0.0 < fill_price < 1.0:
-                    eff = min(fill_price + slip, 0.999)
-                    net = (pos["payoff"] - eff) / eff
-                    net_ls.setdefault(w, []).append(net)
-                    entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
-                    g = time.gmtime(pos["entry_ts"])
-                    months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
-                    n_filled[w] = n_filled.get(w, 0) + 1
-                    payoffs.setdefault(w, []).append(pos["payoff"])
-                    fill_delays.append(ts_arr[idx] - target)
-                    filled = True
-            if not filled:
-                pass  # unfillable: no same-outcome trade between entry+Δ and resolution
-        if (i + 1) % 2000 == 0:
-            log(f"  {i+1}/{len(by_mo)} market-outcomes processed")
+    # Duck loads tapes in bounded batches of (market,outcome) pairs and drops each batch before the
+    # next, so pass-2 never holds every candidate tape at once (#391). SQLite already streams one
+    # pair at a time, so it runs as a single batch. The bisect/fill loop is identical for both.
+    mo_items = list(by_mo.items())
+    batches = ([mo_items[k:k + DUCK_TAPE_BATCH_PAIRS] for k in range(0, len(mo_items), DUCK_TAPE_BATCH_PAIRS)]
+               if use_duck else [mo_items])
+
+    i = 0
+    for batch in batches:
+        duck_tapes = ranker_duck.duck_load_tapes(engine, [k for k, _ in batch]) if use_duck else None
+        for (mid, oid), positions in batch:
+            if duck_tapes is not None:
+                ts_arr, px_arr = duck_tapes.get((mid, oid), ([], []))
+            else:
+                cur = conn.execute(
+                    "SELECT timestamp_unix, price_str FROM trades "
+                    "WHERE market_id = ? AND outcome_id = ? ORDER BY timestamp_unix ASC",
+                    (mid, oid),
+                )
+                tape = cur.fetchall()
+                ts_arr = [row[0] for row in tape]
+                px_arr = [row[1] for row in tape]
+            for pos in positions:
+                w = pos["wallet"]
+                n_total[w] = n_total.get(w, 0) + 1
+                target = pos["entry_ts"] + shift
+                idx = bisect.bisect_left(ts_arr, target)
+                filled = False
+                within_window = fill_window <= 0 or (idx < len(ts_arr) and ts_arr[idx] <= target + fill_window)
+                if idx < len(ts_arr) and ts_arr[idx] < pos["resolved_at"] and within_window:
+                    try:
+                        fill_price = float(px_arr[idx])
+                    except (TypeError, ValueError):
+                        fill_price = None
+                    if fill_price is not None and 0.0 < fill_price < 1.0:
+                        eff = min(fill_price + slip, 0.999)
+                        net = (pos["payoff"] - eff) / eff
+                        net_ls.setdefault(w, []).append(net)
+                        entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
+                        g = time.gmtime(pos["entry_ts"])
+                        months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
+                        n_filled[w] = n_filled.get(w, 0) + 1
+                        payoffs.setdefault(w, []).append(pos["payoff"])
+                        fill_delays.append(ts_arr[idx] - target)
+                        filled = True
+                if not filled:
+                    pass  # unfillable: no same-outcome trade between entry+Δ and resolution
+            i += 1
+            if i % 2000 == 0:
+                log(f"  {i}/{len(by_mo)} market-outcomes processed")
+        duck_tapes = None  # drop this batch's tapes before loading the next (bounds peak memory)
 
     # Shared decay anchor: explicit --as-of (parsed identically to pass-1), else the
     # latest filled entry, so every wallet decays against one anchor. half_life <= 0
