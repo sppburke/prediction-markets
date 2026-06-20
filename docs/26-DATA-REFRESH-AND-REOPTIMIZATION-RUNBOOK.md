@@ -153,8 +153,11 @@ bash scripts/rank_and_push.sh
 ```
 
 In order it runs: **Step 0** data refresh — `winner-discovery` (leaderboard +
-datadash + radion → new wallets) → `backfill` → `events` → `resolutions` →
-`schedules`; **Stage 1** rank the full trade universe (`--universe-from-trades` —
+datadash + radion → new wallets) → `backfill` (trades only) → `events` →
+`resolutions` (which also backfills missing schedule `end_date`s — the
+`resolutions` subcommand runs the full `fetch_resolutions_and_schedules`, so no
+separate `schedules` stage is needed, #383); **Stage 1** rank the full trade
+universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
 there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** push
 to Supabase and verify `latest_ranking` is populated.

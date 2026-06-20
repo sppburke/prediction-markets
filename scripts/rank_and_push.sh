@@ -12,10 +12,11 @@
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
 #     discover     pe-bootstrap winner-discovery  leaderboard + datadash + radion → new wallets
-#     backfill     pe-bootstrap backfill          trade history for every active wallet
+#     backfill     pe-bootstrap backfill          trade history for every active wallet (trades only)
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
-#     resolutions  pe-bootstrap resolutions       CLOB→Gamma market resolutions (payoff)
-#     schedules    pe-bootstrap schedules         scheduled end_date (the --scheduled-only TTR clock)
+#     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run
+#                                                  ONCE (fetch_resolutions_and_schedules; the latter
+#                                                  is the --scheduled-only TTR clock)
 #   Step 0a export  export_trades_parquet.py       trades+maps → Parquet for the DuckDB read-layer
 #                                                  (#375; auto/duck engines only; --skip-export bypass)
 #   Stage 1  rank    rank_72hr_buyandhold.py  --universe-from-trades  (every wallet w/ trade data)
@@ -43,7 +44,7 @@
 #   --out-dir <dir>       override the auto-timestamped output dir.
 #   --bootstrap-config T  pass a BootstrapConfig TOML positional to each Step-0 stage.
 #   --skip-discovery      skip Step-0 winner-discovery (new-wallet ingest).
-#   --skip-backfill       skip Step-0 backfill + market-data refresh (events/resolutions/schedules).
+#   --skip-backfill       skip Step-0 backfill + market-data refresh (events/resolutions).
 #   --skip-rank           reuse existing CSVs in --out-dir; just (re-)push. The push still
 #                         filters against the cache and ABORTS if its newest trade is >24h old
 #                         (issue #350 WS3); re-backfill first, or pass --max-cache-staleness-hours.
@@ -141,6 +142,16 @@ fi
 # would leave the push stage without credentials.
 set -a; source .env; set +a
 
+# Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
+# it =1 (.env:30) and the `set -a; source .env` above exports it GLOBALLY, so without this unset
+# the `backfill` stage's gate (backfill.rs:98 `if config.fetch_resolutions`) fires and runs the
+# entire CLOB→Gamma resolutions/schedules refresh — which the explicit `resolutions` stage then
+# runs AGAIN unconditionally (main.rs:199), doubling a multi-hour pipeline. Unsetting here makes
+# `backfill` trades-only; the `resolutions` stage re-exports the var (parity signal) and runs the
+# refresh exactly once. The two refresh call sites are identical (same fetch_resolutions_and_schedules
+# over the same cache.all_market_ids), so dropping backfill's copy is byte-for-byte behavior-preserving.
+unset PE_BOOTSTRAP_FETCH_RESOLUTIONS
+
 # DuckDB read-layer settings (#375): flag > .env (PE_RANKER_*) > default. Exported so
 # BOTH ranker passes (via ranker_duck.get_engine) AND Step-0a below see one source of truth.
 ENGINE="${ENGINE:-${PE_RANKER_ENGINE:-auto}}"
@@ -219,7 +230,7 @@ run_refresh_stage() {
   esac
 }
 
-# Always-on data refresh (discover → backfill → events → resolutions → schedules). Each half is
+# Always-on data refresh (discover → backfill → events → resolutions). Each half is
 # independently bypassable; when both are skipped the whole step is a no-op (no binary needed).
 refresh_data() {
   if [[ "$SKIP_DISCOVERY" == "1" && "$SKIP_BACKFILL" == "1" ]]; then
@@ -238,7 +249,7 @@ refresh_data() {
   # the ranker reads.
   export PE_BOOTSTRAP_CACHE_PATH="$DB"
 
-  echo "── Step 0: data refresh (discover → backfill → events → resolutions → schedules) ──"
+  echo "── Step 0: data refresh (discover → backfill → events → resolutions) ──"
 
   if [[ "$SKIP_DISCOVERY" == "1" ]]; then
     echo "   discovery skipped (--skip-discovery)"
@@ -253,13 +264,17 @@ refresh_data() {
   else
     run_refresh_stage "backfill" "$PE_BOOTSTRAP_BIN" backfill "${BOOTSTRAP_CONFIG_ARGS[@]}"
     run_refresh_stage "events" "$PE_BOOTSTRAP_BIN" events "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    # The explicit `resolutions` subcommand runs the CLOB→Gamma pipeline unconditionally
-    # (main.rs:187-218); PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 matches docs/26's canonical invocation
-    # and is scoped to this stage so `backfill` above does not also re-run the pipeline.
+    # The explicit `resolutions` subcommand runs the CLOB→Gamma resolutions+schedules pipeline
+    # UNCONDITIONALLY (main.rs:199) — it does NOT gate on PE_BOOTSTRAP_FETCH_RESOLUTIONS. `backfill`
+    # above runs trades-only because the var was unset right after `source .env` (issue #383); THAT
+    # top-level unset is what prevents the double refresh, not the export below. The export is kept
+    # only as a docs/26 canonical-invocation parity signal (operator "explicit env" preference) and
+    # is bounded by the matching unset so it never leaks past this stage. fetch_resolutions_and_schedules
+    # already runs run_schedule_backfill internally (lib.rs:131), so there is no separate `schedules`
+    # stage: after `resolutions`, resolved−scheduled is empty and a standalone pass would be a no-op.
     export PE_BOOTSTRAP_FETCH_RESOLUTIONS=1
     run_refresh_stage "resolutions" "$PE_BOOTSTRAP_BIN" resolutions "${BOOTSTRAP_CONFIG_ARGS[@]}"
     unset PE_BOOTSTRAP_FETCH_RESOLUTIONS
-    run_refresh_stage "schedules" "$PE_BOOTSTRAP_BIN" schedules "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
 }
 
