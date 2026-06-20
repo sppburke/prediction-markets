@@ -61,9 +61,9 @@ impl MarketFilter {
 
 /// A demuxed Gamma `/markets` row.
 ///
-/// Minimal fields for the bootstrap schedule + liquidity passes. Extended in issue #382 Phase 3
-/// (`outcome_prices` / `clob_token_ids`) when `pe-service` / `pe-paper-pnl` / `pe-crypto-shadow`
-/// migrate onto this client.
+/// Carries the fields the bootstrap schedule/liquidity passes and the paper-pnl resolution poller
+/// need (issue #382 Phase 2/3a). The mid-cache snapshot fields (`volume` / `clob_token_ids`) are
+/// added in Phase 3b.
 #[derive(Clone, Debug)]
 pub struct GammaMarket {
     /// The market's condition id (the demux key — echoed by Gamma as `conditionId`).
@@ -73,6 +73,13 @@ pub struct GammaMarket {
     pub end_date_unix: Option<i64>,
     /// Current order-book depth indicator (USD). `None` when Gamma omits the field.
     pub liquidity: Option<Decimal>,
+    /// Whether Gamma reports the market as resolved (`closed`). `false` when the field is omitted.
+    pub closed: bool,
+    /// Outcome prices indexed by `outcome_id`, parsed from Gamma's `outcomePrices` JSON-string array
+    /// via [`parse_outcome_prices`] — resolved markets give `[1,0]`/`[0,1]`, open markets give live
+    /// mids. `None` when Gamma omits the field or the array is malformed. Individual non-decimal
+    /// entries fall back to `0` (the lenient paper-pnl semantic, issue #382 Q7).
+    pub outcome_prices: Option<Vec<Decimal>>,
 }
 
 /// The result of a [`GammaMarketsClient::fetch_markets`] call.
@@ -198,12 +205,15 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 .map_err(|e| GammaMarketsError::Parse(e.to_string()))?;
             for m in markets {
                 let end_date_unix = m.end_date.as_deref().and_then(parse_end_date_unix);
+                let outcome_prices = m.outcome_prices.as_deref().and_then(parse_outcome_prices);
                 out.insert(
                     m.condition_id.clone(),
                     GammaMarket {
                         condition_id: m.condition_id,
                         end_date_unix,
                         liquidity: m.liquidity,
+                        closed: m.closed,
+                        outcome_prices,
                     },
                 );
             }
@@ -255,6 +265,12 @@ struct GammaMarketRaw {
     /// [`deserialize_decimal_flexible`] accepts both.
     #[serde(default, deserialize_with = "deserialize_decimal_flexible")]
     liquidity: Option<Decimal>,
+    /// Whether the market is resolved. Defaults `false` when omitted (open markets / lean fixtures).
+    #[serde(default)]
+    closed: bool,
+    /// Resolved/mid prices as a JSON-encoded decimal-string array, e.g. `"[\"1\",\"0\"]"`. Parsed in
+    /// the demux via [`parse_outcome_prices`].
+    outcome_prices: Option<String>,
 }
 
 /// Deserialize a JSON value (number or string) into `Option<Decimal>`.
@@ -287,6 +303,25 @@ where
             .ok_or_else(|| DeError::custom(format!("decimal f64 {f} → Decimal failed"))),
         Flex::Int(i) => Ok(Some(Decimal::from(i))),
     }
+}
+
+/// Parse Gamma's `outcomePrices` field — a JSON-encoded decimal-string array such as
+/// `"[\"0.62\",\"0.38\"]"` (open-market mids) or `"[\"1\",\"0\"]"` (resolved) — into `Vec<Decimal>`
+/// indexed by `outcome_id`.
+///
+/// Returns `None` on malformed JSON (logged), so callers skip the market rather than mis-valuing it.
+/// Individual non-decimal entries fall back to `Decimal::ZERO` — the lenient semantic shared by the
+/// resolution poller (`pe-paper-pnl`) and the service mid-price cache (issue #382 Q7), kept so the
+/// decimal decoding lives in one place. Relocated here from `pe-paper-pnl::gamma` in Phase 3a.
+pub fn parse_outcome_prices(prices_str: &str) -> Option<Vec<Decimal>> {
+    let raw: Vec<String> = serde_json::from_str(prices_str)
+        .map_err(|e| tracing::warn!(error = %e, "gamma: outcomePrices parse error"))
+        .ok()?;
+    Some(
+        raw.iter()
+            .map(|s| s.parse::<Decimal>().unwrap_or(Decimal::ZERO))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -349,5 +384,40 @@ mod tests {
         assert_eq!(raws[1].liquidity, Some(Decimal::new(75, 1)));
         assert_eq!(raws[2].liquidity, None);
         assert_eq!(raws[2].end_date, None);
+    }
+
+    #[test]
+    fn gamma_market_raw_parses_closed_and_outcome_prices() {
+        let json = r#"[{"conditionId":"0xA","closed":true,"outcomePrices":"[\"1\",\"0\"]"},
+                       {"conditionId":"0xB"}]"#;
+        let raws: Vec<GammaMarketRaw> = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert!(raws[0].closed);
+        assert_eq!(raws[0].outcome_prices.as_deref(), Some(r#"["1","0"]"#));
+        assert!(!raws[1].closed, "closed defaults false when omitted");
+        assert_eq!(raws[1].outcome_prices, None);
+    }
+
+    #[test]
+    fn parse_outcome_prices_decodes_open_mids() {
+        let parsed = parse_outcome_prices(r#"["0.62","0.38"]"#).unwrap();
+        assert_eq!(parsed, vec![Decimal::new(62, 2), Decimal::new(38, 2)]);
+    }
+
+    #[test]
+    fn parse_outcome_prices_decodes_resolved() {
+        let parsed = parse_outcome_prices(r#"["1","0"]"#).unwrap();
+        assert_eq!(parsed, vec![Decimal::ONE, Decimal::ZERO]);
+    }
+
+    #[test]
+    fn parse_outcome_prices_none_on_malformed_json() {
+        assert!(parse_outcome_prices("not-json").is_none());
+    }
+
+    #[test]
+    fn parse_outcome_prices_non_decimal_entry_falls_back_to_zero() {
+        // The lenient paper-pnl semantic (issue #382 Q7): a bad entry → 0, the array still parses.
+        let parsed = parse_outcome_prices(r#"["x","0.5"]"#).unwrap();
+        assert_eq!(parsed, vec![Decimal::ZERO, Decimal::new(5, 1)]);
     }
 }

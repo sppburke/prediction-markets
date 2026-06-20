@@ -13,7 +13,7 @@ pub mod resolution;
 pub mod valuation;
 
 pub use dashboard::{PortfolioSnapshot, TradeView};
-pub use gamma::{GammaError, GammaResolutionFetcher, MarketResolution, parse_outcome_prices};
+pub use gamma::{GammaError, GammaResolutionFetcher, MarketResolution};
 pub use pnl::{PnlError, PnlLedger};
 pub use resolution::{ResolutionStore, ResolutionStoreError, SettlementInfo};
 pub use valuation::{FillOutcome, TradeValuation, ValuationOutput, realized_edge, value_portfolio};
