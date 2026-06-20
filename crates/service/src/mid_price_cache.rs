@@ -129,10 +129,11 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     /// surface is byte-identical whether or not snapshots are read.
     ///
     /// Best-effort: a client error (transient fetch / corrupt response) is logged and this tick
-    /// serves only what was cached — coarser than the pre-#382 per-ID skip, but the orchestrator
-    /// fetches one market per call (so a single failing market still omits only itself) and the
-    /// dashboard self-heals on the next [`TTL`] refresh. A market that is unknown, in a 4xx chunk,
-    /// or lacks `outcomePrices` is omitted, so the caller marks its unrealized P&L null.
+    /// serves only what was cached — coarser than the pre-#382 per-ID skip. The live Kelly path
+    /// (`orchestrator`) fetches one market per call, so a failing market omits only itself; the
+    /// multi-market dashboard call (`paper_api`) instead drops every stale market for that tick,
+    /// self-healing on the next [`TTL`] refresh. A market that is unknown, in a 4xx chunk, or lacks
+    /// `outcomePrices` is omitted, so the caller marks its unrealized P&L null.
     async fn ensure_entries(&self, market_ids: &[MarketId]) -> HashMap<MarketId, CachedEntry> {
         let mut out: HashMap<MarketId, CachedEntry> = HashMap::new();
         let mut stale: Vec<MarketId> = Vec::new();
