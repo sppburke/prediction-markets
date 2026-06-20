@@ -147,10 +147,9 @@ def main() -> int:
     shift = a.latency_shift_secs
     fill_window = a.fill_window_secs
 
-    # DuckDB read-layer (#375): load every candidate (market,outcome) tape from the
-    # Parquet snapshot in one query (price returned as RAW strings, so the float()/
-    # 0<p<1 fill logic below is byte-identical); else per-pair SQLite scan. The
-    # bisect + fill loop is unchanged regardless of engine.
+    # DuckDB read-layer (#375): tape prices come back as RAW strings, so the float()/0<p<1 fill
+    # logic below is byte-identical to the SQLite per-pair scan, and the bisect+fill loop is the
+    # same for both engines. Tapes are loaded in bounded batches (not one fetch) — see #391 below.
     engine = ranker_duck.get_engine()
     use_duck = engine is not None
     log("tape engine: DuckDB (Parquet read-layer, #375)" if use_duck
