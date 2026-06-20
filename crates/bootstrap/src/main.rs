@@ -1,6 +1,6 @@
 use pe_bootstrap::{
     BootstrapConfig, backfill, cache::WalletCache, config, coverage, error::BootstrapError, fetch,
-    fetch_resolutions_and_schedules, infra_probe, migrate, pile, run_schedule_backfill,
+    fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge, run_schedule_backfill,
     watchlist_phase, winner_discovery,
 };
 use tracing_subscriber::EnvFilter;
@@ -38,6 +38,7 @@ async fn main() {
                 | "classify-infra"
                 | "coverage"
                 | "winner-discovery"
+                | "purge"
         )
     );
 
@@ -319,6 +320,25 @@ async fn main() {
                     }
                 }
             }
+
+            "purge" => match purge::run_purge(&bootstrap_config, &mut cache, dry_run) {
+                Ok(r) => {
+                    tracing::info!(
+                        proven_losers = r.proven_losers_deleted,
+                        dead_weight = r.dead_weight_deleted,
+                        trades = r.trades_deleted,
+                        snapshots = r.snapshots_deleted,
+                        tombstones = r.tombstones_written,
+                        dry_run = r.dry_run,
+                        "purge: complete"
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "purge: fatal");
+                    1
+                }
+            },
 
             _ => unreachable!("known_sub filter restricts to known subcommand names"),
         };
