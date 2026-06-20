@@ -102,8 +102,9 @@ pub struct GammaMarkets {
 /// gross response corruption abort.
 #[derive(Debug, thiserror::Error)]
 pub enum GammaMarketsError {
-    /// A non-fatal fetch failure (transient/5xx after retries, or rate-limited). The pass should
-    /// abort — the pre-#382 per-ID loops likewise returned `Err` on any non-`Fatal` source error.
+    /// A non-fatal fetch failure (transient/5xx after retries, or rate-limited). Callers decide how to
+    /// react: `pe-bootstrap`'s cold passes abort (the pre-#382 per-ID loops also returned `Err` on a
+    /// non-`Fatal` source error), while `pe-paper-pnl`'s resolution poller logs and skips the tick.
     #[error("gamma batch fetch: {0}")]
     Fetch(String),
     /// A batch response was not a valid `/markets` JSON array — surfaced rather than silently

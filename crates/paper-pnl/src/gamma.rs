@@ -40,9 +40,11 @@ impl<F: PageFetcher + Send + Sync> GammaResolutionFetcher<F> {
     /// that are **closed** with valid `outcomePrices`; open markets, unknown markets, and markets
     /// with malformed prices are skipped.
     ///
-    /// Resilient by design: a batch fetch failure logs and yields an empty result for this tick (the
-    /// 2-minute poller retries) rather than propagating — `fetch_closed` never returns `Err`,
-    /// matching the pre-#382 per-ID loop that skipped every failed market and always returned `Ok`.
+    /// Resilient by design: `fetch_closed` never returns `Err` (the always-`Ok` contract the pre-#382
+    /// per-ID loop also upheld). A batch-level failure (a transient fetch error or a corrupt response)
+    /// logs and yields an empty result for this whole tick — coarser than the old per-market skip, but
+    /// the 2-minute poller retries so no resolution is lost. Ids in a 4xx chunk are likewise skipped
+    /// and retried; their count is surfaced via `unfetched` in the completion log.
     pub async fn fetch_closed(
         &self,
         market_ids: &[MarketId],
@@ -61,8 +63,9 @@ impl<F: PageFetcher + Send + Sync> GammaResolutionFetcher<F> {
         {
             Ok(f) => f,
             Err(e) => {
-                // The poller must never abort on a fetch failure — skip this tick, retry next.
-                warn!(error = %e, "gamma-pnl: batch fetch failed, skipping this tick");
+                // The poller must never abort — skip this tick, retry next. `e` is either a transient
+                // fetch failure or a corrupt-response parse error; both are non-fatal here.
+                warn!(error = %e, "gamma-pnl: batch resolution fetch error, skipping this tick");
                 return Ok(vec![]);
             }
         };
@@ -91,7 +94,9 @@ impl<F: PageFetcher + Send + Sync> GammaResolutionFetcher<F> {
 
         info!(
             resolved = results.len(),
-            total, "gamma-pnl: resolution fetch done"
+            unfetched = fetched.unfetched.len(),
+            total,
+            "gamma-pnl: resolution fetch done"
         );
         Ok(results)
     }
