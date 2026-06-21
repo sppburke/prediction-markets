@@ -12,10 +12,11 @@
 //! per field when a KV cell is absent or unparseable, so a Supabase outage or a single bad
 //! admin edit never reverts a field to its serde default.
 //!
-//! ## Born carrying `flat_usd_per_trade` (WS1 ↔ WS2 handoff)
-//! `WinnerFollowConfig.sizing_mode` does not exist until WS2; WS1's `RuntimeConfig` carries the
-//! existing `flat_usd_per_trade`, and WS2 migrates `RuntimeConfig`/`parse_config`/
-//! [`RuntimeConfig::winner_follow_config`] to the `sizing_mode` keys in lockstep.
+//! ## Sizing mode (WS2)
+//! `WinnerFollowConfig.sizing_mode` is stored as three flat `service_config` keys —
+//! `sizing_mode` (`kelly` | `dollar` | `contract`), `sizing_dollar_usd`, `sizing_contracts` —
+//! reassembled into the [`SizingMode`] enum here; the `[strategy]` TOML boot default uses the
+//! enum's `kind`/`value` serde form. (This replaced the WS1-era `flat_usd_per_trade` in lockstep.)
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -23,7 +24,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use pe_core_types::KellyFraction;
-use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, WinnerFollowConfig};
+use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::warn;
@@ -88,7 +89,7 @@ pub struct RuntimeConfig {
     pub kelly_fraction_override: Option<KellyFraction>,
     pub per_trade_cap: PerTradeCap,
     pub slippage_rate: Decimal,
-    pub flat_usd_per_trade: Option<Decimal>,
+    pub sizing_mode: SizingMode,
 }
 
 impl RuntimeConfig {
@@ -129,7 +130,7 @@ impl RuntimeConfig {
             kelly_fraction_override: cfg.strategy.kelly_fraction_override,
             per_trade_cap: cfg.strategy.per_trade_cap,
             slippage_rate: cfg.strategy.slippage_rate,
-            flat_usd_per_trade: cfg.strategy.flat_usd_per_trade,
+            sizing_mode: cfg.strategy.sizing_mode,
         }
     }
 
@@ -145,7 +146,7 @@ impl RuntimeConfig {
             kelly_fraction_override: self.kelly_fraction_override,
             per_trade_cap: self.per_trade_cap,
             slippage_rate: self.slippage_rate,
-            flat_usd_per_trade: self.flat_usd_per_trade,
+            sizing_mode: self.sizing_mode,
         }
     }
 }
@@ -278,8 +279,9 @@ pub fn parse_config(
     apply_decimal_string(&map, "max_fill_price", &mut out.max_fill_price);
     apply_decimal_string(&map, "demotion_cb_alpha", &mut out.demotion_cb_alpha);
 
-    // Optional decimal: empty/none/null -> None.
-    apply_optional_decimal(&map, "flat_usd_per_trade", &mut out.flat_usd_per_trade);
+    // Sizing mode: reassemble the three flat KV keys into SizingMode (#398 WS2). An absent
+    // `sizing_mode` key or an invalid/missing param keeps the last-known-good mode.
+    out.sizing_mode = parse_sizing_mode(&map, last_good.sizing_mode);
 
     // Per-trade cap enum.
     if let Some(raw) = map.get("per_trade_cap") {
@@ -412,18 +414,42 @@ fn apply_decimal_string(map: &HashMap<&str, &str>, key: &str, slot: &mut String)
     }
 }
 
-fn apply_optional_decimal(map: &HashMap<&str, &str>, key: &str, slot: &mut Option<Decimal>) {
-    if let Some(raw) = map.get(key) {
-        if raw.is_empty() || raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("null") {
-            *slot = None;
-        } else if let Ok(d) = Decimal::from_str(raw) {
-            *slot = Some(d);
-        } else {
-            warn!(
-                key,
-                value = %raw,
-                "service_config: non-decimal value; keeping last-known-good"
-            );
+/// Reassemble the three flat sizing KV keys into [`SizingMode`] (#398 WS2). An absent
+/// `sizing_mode` key, an unknown kind, or a missing/invalid param for the chosen kind keeps
+/// `last_good` — never a silent revert to the serde default.
+fn parse_sizing_mode(map: &HashMap<&str, &str>, last_good: SizingMode) -> SizingMode {
+    let Some(kind) = map.get("sizing_mode") else {
+        return last_good;
+    };
+    match kind.trim().to_lowercase().as_str() {
+        "kelly" => SizingMode::Kelly,
+        "dollar" => match map
+            .get("sizing_dollar_usd")
+            .and_then(|v| Decimal::from_str(v.trim()).ok())
+        {
+            Some(usd) => SizingMode::Dollar { usd },
+            None => {
+                warn!(
+                    "service_config: sizing_mode=dollar but sizing_dollar_usd is missing/invalid; keeping last-known-good"
+                );
+                last_good
+            }
+        },
+        "contract" => match map
+            .get("sizing_contracts")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(contracts) => SizingMode::Contract { contracts },
+            None => {
+                warn!(
+                    "service_config: sizing_mode=contract but sizing_contracts is missing/invalid; keeping last-known-good"
+                );
+                last_good
+            }
+        },
+        other => {
+            warn!(value = %other, "service_config: unknown sizing_mode; keeping last-known-good");
+            last_good
         }
     }
 }
@@ -543,7 +569,7 @@ mod tests {
             kelly_fraction_override: Some(KellyFraction::new(dec!(0.40)).unwrap()),
             per_trade_cap: PerTradeCap::Bps(42),
             slippage_rate: dec!(0.03),
-            flat_usd_per_trade: Some(dec!(99)),
+            sizing_mode: SizingMode::Dollar { usd: dec!(99) },
         };
         let cfg = ServiceConfig {
             strategy: strat.clone(),
@@ -558,8 +584,8 @@ mod tests {
     #[test]
     fn seed_reconstructs_boot_strategy() {
         // The committed seed, parsed through load_initial, reconstructs the live boot strategy:
-        // flat $25 (never Kelly), fee 0.04, slippage 0.01, approvals off; per_trade_cap and
-        // kelly_fraction_override are not seeded, so they fall through to the compiled defaults.
+        // sizing dollar-$25 (never Kelly), fee 0.04, slippage 0.01, approvals off; per_trade_cap
+        // and kelly_fraction_override are not seeded, so they fall through to the compiled defaults.
         let rc = load_initial_runtime_config(&seed_rows(), &ServiceConfig::default(), false);
         let expected = WinnerFollowConfig {
             flip_human_approved: false,
@@ -568,7 +594,7 @@ mod tests {
             kelly_fraction_override: None,
             per_trade_cap: PerTradeCap::ModeDefault,
             slippage_rate: dec!(0.01),
-            flat_usd_per_trade: Some(dec!(25)),
+            sizing_mode: SizingMode::Dollar { usd: dec!(25) },
         };
         assert_eq!(rc.winner_follow_config(), expected);
         // Service-level knobs reconstruct too (spot-check the risk-engine gate inputs).
@@ -576,6 +602,45 @@ mod tests {
         assert_eq!(rc.max_fill_price, "0.85");
         assert_eq!(rc.bankroll_usd, "10000");
         assert_eq!(rc.min_resolution_horizon_secs, 60);
+    }
+
+    #[test]
+    fn sizing_mode_kv_reassembly_and_last_known_good() {
+        let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        assert_eq!(boot.sizing_mode, SizingMode::Kelly); // compiled default
+        // dollar: kind + sizing_dollar_usd
+        let dollar = parse_config(
+            &[
+                row("sizing_mode", "dollar", "text"),
+                row("sizing_dollar_usd", "25", "decimal"),
+            ],
+            &boot,
+            false,
+        );
+        assert_eq!(dollar.sizing_mode, SizingMode::Dollar { usd: dec!(25) });
+        // contract: kind + sizing_contracts
+        let contract = parse_config(
+            &[
+                row("sizing_mode", "contract", "text"),
+                row("sizing_contracts", "7", "integer"),
+            ],
+            &boot,
+            false,
+        );
+        assert_eq!(contract.sizing_mode, SizingMode::Contract { contracts: 7 });
+        // A `dollar` edit missing its param, or an unknown kind, keeps the last-known-good mode.
+        let last = RuntimeConfig {
+            sizing_mode: SizingMode::Contract { contracts: 3 },
+            ..boot.clone()
+        };
+        assert_eq!(
+            parse_config(&[row("sizing_mode", "dollar", "text")], &last, false).sizing_mode,
+            SizingMode::Contract { contracts: 3 }
+        );
+        assert_eq!(
+            parse_config(&[row("sizing_mode", "bogus", "text")], &last, false).sizing_mode,
+            SizingMode::Contract { contracts: 3 }
+        );
     }
 
     #[test]

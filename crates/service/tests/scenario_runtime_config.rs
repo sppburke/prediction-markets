@@ -41,7 +41,7 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
@@ -128,7 +128,7 @@ fn paper_fill_count(dir: &TempDir) -> usize {
 /// different where it matters, to prove the per-event rebuild reads the snapshot, not boot.
 fn flat_snapshot(max_fill_price: &str, bankroll_usd: &str) -> RuntimeConfig {
     let mut rc = RuntimeConfig::from_service_config(&ServiceConfig::default());
-    rc.flat_usd_per_trade = Some(dec!(100));
+    rc.sizing_mode = SizingMode::Dollar { usd: dec!(100) };
     rc.max_resolution_horizon_secs = 0;
     rc.min_resolution_horizon_secs = 0;
     rc.max_fill_price = max_fill_price.to_string();
@@ -171,7 +171,7 @@ async fn run_with(
         },
         HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig {
-            flat_usd_per_trade: Some(dec!(100)),
+            sizing_mode: SizingMode::Dollar { usd: dec!(100) },
             ..WinnerFollowConfig::default()
         }),
         make_dispatcher(dir),

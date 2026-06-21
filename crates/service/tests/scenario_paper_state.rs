@@ -42,7 +42,7 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_core::OrderIntent;
@@ -104,7 +104,7 @@ fn trade(source_trade_id: &str, side: Side, contracts: u64, observed_unix: i64) 
 /// Strategy config that deterministically fills via the flat sizing path.
 fn flat_fill_config() -> WinnerFollowConfig {
     WinnerFollowConfig {
-        flat_usd_per_trade: Some(dec!(100)),
+        sizing_mode: SizingMode::Dollar { usd: dec!(100) },
         ..WinnerFollowConfig::default()
     }
 }

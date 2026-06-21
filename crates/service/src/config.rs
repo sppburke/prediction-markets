@@ -689,17 +689,10 @@ mode = "shadow"
         map
     }
 
-    /// The live `flat_usd_per_trade` boot value from the committed smoke-test TOML ("25").
-    fn flat_usd_per_trade_from_smoke_toml(manifest: &str) -> String {
-        let toml =
-            std::fs::read_to_string(format!("{manifest}/../../smoke-test/service.toml")).unwrap();
-        toml.lines()
-            .map(str::trim)
-            .find(|t| t.starts_with("flat_usd_per_trade"))
-            .and_then(|t| t.split('"').nth(1))
-            .expect("flat_usd_per_trade not found in smoke-test/service.toml")
-            .to_string()
-    }
+    /// The three sizing KV keys are enum-shaped (`SizingMode`), not flat scalars, so this test
+    /// (which compares flat seed values to flat boot fields) excludes them; their reconstruction
+    /// against the boot strategy is validated in `runtime_config::tests::seed_reconstructs_boot_strategy`.
+    const SIZING_KEYS: [&str; 3] = ["sizing_mode", "sizing_dollar_usd", "sizing_contracts"];
 
     #[test]
     fn service_config_seed_matches_boot_defaults() {
@@ -707,9 +700,8 @@ mode = "shadow"
         // config defaults. WS1 polls this table with precedence KV > env > compiled, so a WRONG
         // seeded value would silently win over env on the first poll and revert a risk-engine
         // input to a bad value. A MISSING key is safe (it falls through to env/compiled), so this
-        // test pins every seeded key to its boot default and forbids unexpected keys.
-        // flat_usd_per_trade carries the live smoke-test/service.toml override ("25") so sizing
-        // stays $25 flat (never Kelly) before the first poll and during any Supabase outage.
+        // test pins every seeded flat-scalar key to its boot default and forbids unexpected keys
+        // (except the enum-shaped sizing keys — see SIZING_KEYS).
         let manifest = env!("CARGO_MANIFEST_DIR");
         let sql = std::fs::read_to_string(format!("{manifest}/../../scripts/supabase_schema.sql"))
             .unwrap();
@@ -801,10 +793,6 @@ mode = "shadow"
                 d.strategy.polymarket_fee_rate.to_string(),
             ),
             ("slippage_rate", d.strategy.slippage_rate.to_string()),
-            (
-                "flat_usd_per_trade",
-                flat_usd_per_trade_from_smoke_toml(manifest),
-            ),
         ];
 
         for (k, v) in &expected {
@@ -818,8 +806,19 @@ mode = "shadow"
                 "service_config seed `{k}` must equal boot default"
             );
         }
-        let expected_keys: std::collections::HashSet<&str> =
-            expected.iter().map(|(k, _)| *k).collect();
+        // The three sizing keys must be present (validated for value elsewhere); all other seed
+        // keys must be in the flat boot-default set.
+        for k in SIZING_KEYS {
+            assert!(
+                seed.contains_key(k),
+                "service_config seed is missing key `{k}`"
+            );
+        }
+        let expected_keys: std::collections::HashSet<&str> = expected
+            .iter()
+            .map(|(k, _)| *k)
+            .chain(SIZING_KEYS)
+            .collect();
         for k in seed.keys() {
             assert!(
                 expected_keys.contains(k.as_str()),

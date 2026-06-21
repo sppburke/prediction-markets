@@ -41,7 +41,7 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
@@ -99,7 +99,7 @@ fn entry_trade(id: &str, market_id: MarketId, price: Decimal) -> IncomingTrade {
 /// Strategy config that deterministically fills via the flat sizing path.
 fn flat_fill_config() -> WinnerFollowConfig {
     WinnerFollowConfig {
-        flat_usd_per_trade: Some(dec!(100)),
+        sizing_mode: SizingMode::Dollar { usd: dec!(100) },
         ..WinnerFollowConfig::default()
     }
 }
