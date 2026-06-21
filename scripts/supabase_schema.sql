@@ -270,7 +270,7 @@ create policy "fill_market_snapshots_anon_read" on fill_market_snapshots for sel
 grant select on fill_market_snapshots to anon;
 
 -- The site is the first anon reader of ranking_entries. Because `latest_ranking` and
--- `wallet_live_stats` are now `security_invoker` views (Supabase lint 0010), an anon read of
+-- `wallet_live_stats` are both `security_invoker` views (Supabase lint 0010), an anon read of
 -- either runs the underlying scans as `anon`, so anon needs an explicit read policy on every
 -- base table those views touch. Service-role readers/writers (secret key) bypass RLS, so the
 -- ranker push and pe-service refresh are unaffected. No anon write policy is created.
