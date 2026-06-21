@@ -50,6 +50,18 @@ export function formatUsd(v: Numeric, opts?: { sign?: boolean }): string {
   return opts?.sign && n > 0 ? `+${s}` : s;
 }
 
+/**
+ * A USD-per-trade amount rendered in cents, e.g. `0.0436` → `"4.36¢"` (#398 WS3 overall edge).
+ * `opts.sign` prefixes a `+` on positive values.
+ */
+export function formatCents(v: Numeric, opts?: { sign?: boolean }): string {
+  const n = toNum(v);
+  if (n === null) return EM_DASH;
+  const cents = n * 100;
+  const s = `${cents.toFixed(PRECISION.usd)}¢`;
+  return opts?.sign && cents > 0 ? `+${s}` : s;
+}
+
 /** A fraction in [0,1] rendered as a percentage with PRECISION.pct decimals. */
 export function formatPct(frac: Numeric): string {
   const n = toNum(frac);

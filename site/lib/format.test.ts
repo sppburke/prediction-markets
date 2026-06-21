@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   PRECISION,
   formatAge,
+  formatCents,
   formatDate,
   formatEdge,
   formatInt,
@@ -156,5 +157,25 @@ describe("last-trade date / age formatting (#357 PR4)", () => {
     expect(formatAge(null, T)).toBe("—");
     expect(formatAge(undefined, T)).toBe("—");
     expect(formatAge("", T)).toBe("—");
+  });
+});
+
+describe("formatCents (#398 WS3 overall edge — ¢/trade)", () => {
+  it("renders a USD-per-trade value in cents at usd precision", () => {
+    expect(formatCents(0.0436)).toBe("4.36¢");
+    expect(formatCents("0.0436")).toBe("4.36¢"); // supabase NUMERIC string
+    expect(formatCents(0)).toBe("0.00¢");
+  });
+
+  it("prefixes + on positives only when sign requested", () => {
+    expect(formatCents(0.0436, { sign: true })).toBe("+4.36¢");
+    expect(formatCents(-0.0212, { sign: true })).toBe("-2.12¢");
+    expect(formatCents(0, { sign: true })).toBe("0.00¢");
+  });
+
+  it("renders null/undefined/empty as em-dash", () => {
+    expect(formatCents(null)).toBe("—");
+    expect(formatCents(undefined)).toBe("—");
+    expect(formatCents("")).toBe("—");
   });
 });

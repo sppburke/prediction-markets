@@ -1,4 +1,4 @@
-import { formatInt, formatPct, formatUsd, toNum } from "@/lib/format";
+import { formatCents, formatInt, formatUsd, toNum } from "@/lib/format";
 import type { WalletLiveStats } from "@/lib/types";
 import { Panel } from "./Panel";
 import { Stat } from "./Stat";
@@ -32,7 +32,8 @@ export function KpiCards({
     wins += toNum(r.live_wins) ?? 0;
     if ((toNum(r.live_total_fills) ?? 0) > 0) tradedWallets += 1;
   }
-  const winRate = settled > 0 ? wins / settled : null;
+  // Overall edge (#398 WS3 Feature A): portfolio realized P&L per settled trade, in ¢/trade.
+  const overallEdge = settled > 0 ? realized / settled : null;
 
   return (
     <Panel title="Live paper portfolio">
@@ -46,7 +47,13 @@ export function KpiCards({
         <Stat label="Settled fills" value={formatInt(settled)} />
         <Stat label="Open fills" value={formatInt(openFills)} />
         <Stat label="Wins" value={formatInt(wins)} />
-        <Stat label="Win rate" value={formatPct(winRate)} />
+        <Stat
+          label="Overall edge"
+          value={formatCents(overallEdge, { sign: true })}
+          tone="signed"
+          signOf={overallEdge}
+          sub="¢ / settled trade"
+        />
       </div>
     </Panel>
   );

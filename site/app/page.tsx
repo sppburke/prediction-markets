@@ -1,8 +1,14 @@
 import { KpiCards } from "@/components/KpiCards";
 import { Panel, StateNotice } from "@/components/Panel";
 import { PnlBarChart } from "@/components/PnlBarChart";
-import { WalletTable } from "@/components/WalletTable";
-import { fetchServiceRuntime, fetchWalletStats, NotConfiguredError } from "@/lib/data";
+import { WalletTabs } from "@/components/WalletTabs";
+import {
+  fetchOpenFills,
+  fetchServiceRuntime,
+  fetchWalletStats,
+  fetchWatchedSet,
+  NotConfiguredError,
+} from "@/lib/data";
 import { toNum } from "@/lib/format";
 
 // Server-rendered with ISR: the wallet_live_stats_mv read runs on the server and the result is
@@ -35,6 +41,10 @@ export default async function OverviewPage() {
     watched = null;
   }
 
+  // Secondary (soft-fail): the watched set drives the Live tab; open fills drive unrealized P&L.
+  const watchedSet = await fetchWatchedSet().catch(() => new Set<string>());
+  const openFills = await fetchOpenFills().catch(() => []);
+
   return (
     <div className="space-y-6">
       <div>
@@ -48,7 +58,7 @@ export default async function OverviewPage() {
         <PnlBarChart rows={rows} />
       </Panel>
       <Panel title="Wallets — historical vs live">
-        <WalletTable rows={rows} />
+        <WalletTabs rows={rows} watchedSet={[...watchedSet]} openFills={openFills} />
       </Panel>
     </div>
   );

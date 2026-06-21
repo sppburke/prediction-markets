@@ -1,4 +1,5 @@
 import {
+  formatCents,
   formatDate,
   formatEdge,
   formatInt,
@@ -33,7 +34,7 @@ function Row({
 /**
  * Side-by-side historical (ranker) vs live (paper) comparison — the PR3 headline
  * the legacy portfolio-only SSR dashboard never showed. Edge units differ across
- * regimes (historical ls_edge is dimensionless; live edge is $/settled-trade), so
+ * regimes (historical ls_edge is dimensionless; live edge is ¢/settled-trade), so
  * they are labelled, not naively diffed.
  */
 export function HistVsLivePanel({ row }: { row: WalletLiveStats }) {
@@ -45,7 +46,7 @@ export function HistVsLivePanel({ row }: { row: WalletLiveStats }) {
         <div className="text-right text-text">Live</div>
       </div>
       <Row label="Win rate" hist={formatPct(row.hit_rate)} live={formatPct(row.live_win_rate)} />
-      <Row label="Edge" hist={formatEdge(row.ls_edge)} live={formatUsd(row.live_edge, { sign: true })} />
+      <Row label="Edge (hist · live ¢/trade)" hist={formatEdge(row.ls_edge)} live={formatCents(row.live_edge, { sign: true })} />
       <Row label="Trades" hist={formatInt(row.n_trades)} live={formatInt(row.live_total_fills)} />
       <Row label="Settled" hist="—" live={formatInt(row.live_settled_count)} />
       <Row label="Open" hist="—" live={formatInt(row.live_open_fills)} />
