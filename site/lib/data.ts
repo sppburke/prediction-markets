@@ -61,13 +61,15 @@ export async function fetchWatchedSet(): Promise<Set<string>> {
 }
 
 /** Market ids that have resolved (have a `settled_markets` row) — used to split open vs settled
- * fills for the unrealized-PnL feature. Soft-fails to empty. */
+ * fills for the unrealized-PnL feature. Fail-CLOSED (throws on read error, not soft-fail): a silent
+ * empty set would mislabel already-settled fills as open and double-count realized P&L as
+ * unrealized. The caller (`fetchOpenFills` → page `.catch`) degrades to "no unrealized" instead. */
 export async function fetchSettledMarketIds(): Promise<Set<string>> {
   const sb = getSupabase();
-  if (!sb) return new Set();
+  if (!sb) throw new NotConfiguredError();
   const { data, error } = await sb.from("settled_markets").select("market_id");
-  if (error || !data) return new Set();
-  return new Set(data.map((r) => String(r.market_id)));
+  if (error) throw new Error(error.message);
+  return new Set((data ?? []).map((r) => String(r.market_id)));
 }
 
 /** All OPEN (not-yet-settled) paper fills, newest first, capped — the unrealized-PnL basis

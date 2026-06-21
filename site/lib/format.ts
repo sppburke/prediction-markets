@@ -12,7 +12,7 @@
 
 /** Declared display precision (decimal places) per value class. */
 export const PRECISION = {
-  /** USD amounts — realized P&L, $/trade live edge. */
+  /** USD amounts (realized P&L, unrealized P&L) and the cent rendering of ¢/trade edge. */
   usd: 2,
   /** Fractions rendered as a percentage (0..1 → "62.3%"). */
   pct: 1,
