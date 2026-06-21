@@ -186,6 +186,7 @@ async fn run_trades(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             entry_gate_config: disabled_entry_gate(),
+            runtime_config: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(strategy_cfg),

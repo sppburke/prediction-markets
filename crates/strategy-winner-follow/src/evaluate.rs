@@ -31,6 +31,12 @@ impl WinnerFollowStrategy {
         Self { config }
     }
 
+    /// Replace the strategy config in place. The orchestrator calls this per event to apply the
+    /// latest Supabase-authoritative runtime config (#398 WS1) without reconstructing the strategy.
+    pub fn set_config(&mut self, config: WinnerFollowConfig) {
+        self.config = config;
+    }
+
     /// Evaluate a leader signal at the leader's own entry price.
     ///
     /// Thin wrapper over [`Self::evaluate_at_price`] that sizes against

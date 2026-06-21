@@ -324,6 +324,7 @@ The local latency-shift ranker pushes append-only ranking batches to Supabase (`
 | `supabase_secret_key` | `""` | `ServiceConfig` field (secret). The service-role key, sent in **both** the `apikey` and `Authorization: Bearer` headers — Supabase's `sb_` keys are not JWTs, so PostgREST 401s (`PGRST301`) if the two headers differ. Bypasses RLS for the server-side read. `PE_SUPABASE_SECRET_KEY` from `.env`. |
 | `supabase_anon_key` | `""` | `ServiceConfig` field (secret). Publishable/anon fallback used for both headers **only when `supabase_secret_key` is empty**; ignored otherwise. `PE_SUPABASE_ANON_KEY` from `.env`. |
 | `supabase_refresh_interval_secs` | 300 | `ServiceConfig` field. Seconds between live-watchlist refresh polls. The refresh loop is spawned only when `supabase_url` is non-empty and this is `> 0`. |
+| `config_poll_interval_secs` | 60 | Seconds between `service_config` runtime-config polls (issue #398 WS1, `config_poller::CONFIG_POLL_INTERVAL_SECS`). Boot-frozen const (the poll cadence cannot govern itself); the loop is spawned only when `supabase_url` is non-empty. A config edit takes effect within this window with no restart. |
 | `supabase_sink_enabled` | `false` | `ServiceConfig` field. Enables the best-effort paper-fill/settlement sink to Supabase (issue #343). The sink task is spawned only when this is `true` **and** `supabase_url` is non-empty. Requires `supabase_secret_key` — under RLS the anon key can only read, so anon-only writes 403. `PE_SUPABASE_SINK_ENABLED`. |
 | `supabase_sink_channel_capacity` | 256 | `ServiceConfig` field. Bounded mpsc capacity for the trade-path → sink event channel. Backpressure: drop-on-full (the periodic reconcile re-derives dropped fills/settlements from `paper_state`, so a drop self-heals). `PE_SUPABASE_SINK_CHANNEL_CAPACITY`. |
 | `supabase_sink_reconcile_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic sink reconciles: a contiguous-prefix fill HWM catch-up over `list_fills()` plus a full re-upsert of `list_settled_markets()`, healing any dropped or failed live writes. `PE_SUPABASE_SINK_RECONCILE_INTERVAL_SECS`. |
@@ -506,10 +507,10 @@ Incubator tier:
 
 Two flags are first-class:
 
-- `flip_human_approved: bool` — must be set in config (and audit-logged) before `LeaderAction::Flip` becomes a copy-eligible action.
+- `flip_human_approved: bool` — must be set before `LeaderAction::Flip` becomes a copy-eligible action.
 - `kelly_fraction_above_default_human_approved: bool` — must be set before any mode's `kelly_fraction` exceeds the table in `19-WINNER-FOLLOW-STRATEGY.md` (cap 0.50 absolute).
 
-Both are read by `risk-engine` as part of its pure inputs; flipping them at runtime requires a signed config change.
+Both are read by `risk-engine` as part of its pure inputs. As of issue #398 (Decision #2) they are **admin-mutable at runtime** via the Supabase `service_config` table (the single-email-gated admin panel), default-deny, with each edit audit-logged in `service_config.updated_by`/`updated_at` and applied on the next ≤60s config poll. This reverses the prior "signed config change only" rule. `kelly_fraction_above_default_human_approved` is re-checked against the mode ceiling on every poll in `runtime_config::parse_config`, so an above-ceiling override without the flag is cleared rather than applied.
 
 ### Promotion criteria — quantified
 

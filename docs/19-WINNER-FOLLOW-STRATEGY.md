@@ -371,7 +371,7 @@ These five gates live in `crates/strategy-winner-follow/src/evaluate.rs` and fir
 
 | # | Gate | Condition | Source | `WinnerFollowError` | Rationale |
 |---|---|---|---|---|---|
-| 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:62–64` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and require a manual signed config change. The flag prevents automated flip copying until an operator explicitly approves it. |
+| 1 | Flip not approved | `signal.action == Flip && !config.flip_human_approved` | `evaluate.rs:62–64` | `FlipNotApproved` | Position flips (exit + re-enter opposite side) are high-risk and default-deny. The flag prevents automated flip copying until an operator approves it via the audit-logged Supabase admin panel (`service_config`, #398 Decision #2). |
 | 2 | Shadow mode | `effective_mode == Shadow` | `evaluate.rs:70–72` | `ShadowMode` | Shadow is record-only; no order is emitted. Returned as `Err` (not a hard failure) so callers can distinguish "intentionally suppressed" from "legitimately blocked". |
 | 3 | Price invalid after fee | `Price::new(leader_price + fee_per_share)` fails | `evaluate.rs:104` | `NoEdge` | `c` (cost = leader price + taker fee) must be a valid `Price` in `(0, 1)`. If the leader traded at a price that after fees would round to ≥ $1.00 there is no upside — the trade has no edge. |
 | 4 | Kelly sizes to zero | `size_contracts(kelly_input) == 0` | `evaluate.rs:112–114` | `NoEdge` | Kelly sizing returned zero contracts — the bankroll is too small to buy even one contract at this price with the configured fraction. Not an error; the signal is valid but unsizeable. |

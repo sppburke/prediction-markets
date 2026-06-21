@@ -4,6 +4,7 @@
 
 pub mod clob_book;
 pub mod config;
+pub mod config_poller;
 pub mod demotion_stat;
 pub mod entry_gate;
 pub mod health;

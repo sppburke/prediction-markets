@@ -107,7 +107,7 @@ Promotion of one mode never promotes another (`docs/19-` "Promotion ladder").
 - **Kalshi public trades are anonymous**. Never attribute a public Kalshi trade to a leaderboard trader. Kalshi copy-trading is enabled only for explicitly authorized portfolio access or future official trader-level endpoints.
 - **CrowdIntel** is research inspiration, not a production input. UI scraping or opaque scores are forbidden in live decisions.
 - **Idempotency key**: `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)` (1-second buckets). Cluster-coordination signals add `operator_id`. Defined in `_GLOSSARY.md`.
-- **Approval flags**: `flip_human_approved` and `kelly_fraction_above_default_human_approved` are first-class inputs to `risk-engine`. They require a signed config change; flipping them at runtime is forbidden.
+- **Approval flags**: `flip_human_approved` and `kelly_fraction_above_default_human_approved` are first-class inputs to `risk-engine`. They default-deny and are **admin-mutable at runtime via the Supabase `service_config` table** (issue #398 Decision #2 — reverses the prior "signed config change only" rule). Edits are audit-logged (`service_config.updated_by`/`updated_at`) and applied on the next ≤60s poll; `kelly_fraction_above_default_human_approved` still gates the Kelly-override mode ceiling in `runtime_config::parse_config`.
 - **Kelly sizing**: `c` is the **net** price (after fees, expected slippage, adverse-selection buffer). Reject trades where `f_live > 0` only because `p` is stale.
 - **Resolver card is mandatory** before trading any market. Sub-types and a fully populated example are in `_GLOSSARY.md`.
 

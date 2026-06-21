@@ -70,6 +70,12 @@ impl CopyEntryGate {
         Self { config, history }
     }
 
+    /// Update the absent-wallet fail-closed posture from a runtime-config poll (#398 WS1). The
+    /// accumulated per-wallet history is preserved; only the posture changes.
+    pub fn set_fail_closed(&mut self, fail_closed: bool) {
+        self.config.fail_closed = fail_closed;
+    }
+
     /// Returns `None` to admit the signal, or `Some(reason)` to reject it.
     ///
     /// Checks, in order: the action is an `Entry` → first-entry (the leader has not

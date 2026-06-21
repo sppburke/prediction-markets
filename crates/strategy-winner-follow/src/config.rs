@@ -2,8 +2,8 @@
 //!
 //! Numeric thresholds live in `_GLOSSARY.md` and `19-WINNER-FOLLOW-STRATEGY.md`;
 //! they are stored in the downstream risk/sizing crates. This config holds the
-//! approval flags that require a signed config change to flip, plus the fee-rate
-//! and slippage-rate constants used to compute net cost `c` in Kelly sizing.
+//! approval flags (admin-mutable at runtime via Supabase `service_config` since #398), plus the
+//! fee-rate and slippage-rate constants used to compute net cost `c` in Kelly sizing.
 
 use pe_core_types::KellyFraction;
 use pe_risk_engine::snapshot::TradingMode;
@@ -43,8 +43,9 @@ impl PerTradeCap {
 
 /// Configuration for the Winner-Follow strategy.
 ///
-/// Approval flags default to `false` (deny) and require an audit-logged signed
-/// config change to flip; they cannot be changed at runtime.
+/// Approval flags default to `false` (deny). Since #398 (Decision #2) they are admin-mutable at
+/// runtime via the Supabase `service_config` table (audit-logged via `updated_by`/`updated_at`),
+/// applied on the next ≤60s config poll — reversing the prior "signed config change only" rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WinnerFollowConfig {
     /// Allow `LeaderAction::Flip` trades. Default: false.
