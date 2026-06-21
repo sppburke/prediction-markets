@@ -11,6 +11,15 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// `meta` key under which the event-log reconciliation cursor is stored.
 pub(crate) const META_LAST_APPLIED_EVENT_SEQ: &str = "last_applied_event_seq";
 
+/// `meta` key under which the Supabase authoritative catch-up watermark is stored
+/// (issue #397): the highest event-log `seq` whose fill has been applied to the
+/// authoritative Supabase `commit_fill` RPC. Parallel to [`META_LAST_APPLIED_EVENT_SEQ`]
+/// (the local SQLite reconciliation cursor) but kept **separate** so a SQLite-only
+/// reconcile never advances it; on SQLite loss it resets to 0 → a safe full idempotent
+/// replay (the RPC gate debits each fill at most once). Local-only state — the event log,
+/// whose frames it counts, is itself local.
+pub(crate) const META_LAST_SUPABASE_APPLIED_EVENT_SEQ: &str = "last_supabase_applied_event_seq";
+
 /// Single-row `bankroll` table primary key.
 pub(crate) const BANKROLL_ROW_ID: i64 = 0;
 

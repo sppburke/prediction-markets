@@ -134,6 +134,51 @@ impl ResolutionStore {
         Ok(())
     }
 
+    /// Atomically settle `market_id` **and** credit the bankroll in one SQLite transaction,
+    /// the local mirror of the authoritative Supabase `apply_resolution` RPC (issue #397).
+    /// Idempotent — a market already settled (in-memory or on disk) credits **zero** and
+    /// returns the current bankroll. Returns the resulting bankroll.
+    ///
+    /// Used only on the authoritative path, where the resolution tick calls the RPC first
+    /// and then this to mirror Supabase into SQLite. The non-authoritative path keeps the
+    /// two-step [`mark_settled`](Self::mark_settled) + `credit_bankroll`.
+    pub fn settle_and_credit(
+        &mut self,
+        market_id: MarketId,
+        outcome_prices: Vec<Decimal>,
+        credit_applied: Decimal,
+        settled_at_unix: i64,
+    ) -> Result<Decimal, ResolutionStoreError> {
+        if self.settled.contains_key(&market_id) {
+            // Already settled locally: no double-credit; return the current bankroll.
+            return Ok(self.db.bankroll()?.unwrap_or(Decimal::ZERO));
+        }
+        let prices_json = serde_json::to_string(
+            &outcome_prices
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
+        )?;
+        // The DB transaction gates the credit on the settled-row insert, so even if the
+        // in-memory guard above is stale (a fresh `load`), the credit applies at most once.
+        let new_bankroll =
+            self.db
+                .settle_and_credit(&market_id, &prices_json, credit_applied, settled_at_unix)?;
+        self.total_credits = self
+            .total_credits
+            .checked_add(credit_applied)
+            .unwrap_or(self.total_credits);
+        self.settled.insert(
+            market_id,
+            Entry {
+                outcome_prices,
+                credit_applied,
+                settled_at_unix,
+            },
+        );
+        Ok(new_bankroll)
+    }
+
     /// Sum of all credits applied to the bankroll by settled markets.
     pub fn total_credits(&self) -> Decimal {
         self.total_credits
@@ -250,6 +295,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.total_credits(), dec!(10)); // no double-count
+    }
+
+    #[test]
+    fn settle_and_credit_applies_once_and_returns_bankroll() {
+        // Authoritative mirror (issue #397): atomic settle + credit, idempotent.
+        let (_dir, db) = db_and_dir();
+        db.init_bankroll(dec!(100)).unwrap();
+        let mut store = ResolutionStore::load(db.clone()).unwrap();
+        let b1 = store
+            .settle_and_credit(
+                mid("0xcond1"),
+                vec![dec!(1), dec!(0)],
+                dec!(7.25),
+                1_700_000_000,
+            )
+            .unwrap();
+        assert_eq!(b1, dec!(107.25));
+        assert!(store.is_settled(&mid("0xcond1")));
+        assert_eq!(store.total_credits(), dec!(7.25));
+        // Re-settle: credit-zero, returns the current bankroll, no double-count.
+        let b2 = store
+            .settle_and_credit(
+                mid("0xcond1"),
+                vec![dec!(1), dec!(0)],
+                dec!(7.25),
+                1_700_000_999,
+            )
+            .unwrap();
+        assert_eq!(b2, dec!(107.25));
+        assert_eq!(store.total_credits(), dec!(7.25));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(107.25)));
+    }
+
+    #[test]
+    fn settle_and_credit_is_idempotent_across_fresh_load() {
+        // A second store loaded from the same DB (in-memory guard reset) must still not
+        // double-credit — the DB transaction's insert-gate is the real guard.
+        let (_dir, db) = db_and_dir();
+        db.init_bankroll(dec!(50)).unwrap();
+        {
+            let mut store = ResolutionStore::load(db.clone()).unwrap();
+            store
+                .settle_and_credit(mid("0xc"), vec![dec!(1), dec!(0)], dec!(10), 1_700_000_000)
+                .unwrap();
+        }
+        let mut store2 = ResolutionStore::load(db.clone()).unwrap();
+        let b = store2
+            .settle_and_credit(mid("0xc"), vec![dec!(1), dec!(0)], dec!(10), 1_700_000_001)
+            .unwrap();
+        assert_eq!(b, dec!(60)); // credited once across the two loads
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(60)));
     }
 
     #[test]

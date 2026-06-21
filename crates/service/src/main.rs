@@ -34,11 +34,15 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
+use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
 use pe_service::supabase_refresh::{
     HttpWatchlistPublisher, WatchlistSizePublisher, run_supabase_refresh_loop,
 };
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
+use pe_service::supabase_state::{
+    SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
+};
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, run_maintenance_loop};
@@ -53,6 +57,11 @@ async fn main() -> Result<()> {
     // --rebuild-state: wipe paper-state DB (after backup) and replay event log, exit.
     if env::args().any(|a| a == "--rebuild-state") {
         return run_rebuild_state();
+    }
+    // --backfill-supabase: one-time SQLite → Supabase push for the authoritative cutover
+    // (issue #397). Run once with the service stopped, before flipping the flag. Exits.
+    if env::args().any(|a| a == "--backfill-supabase") {
+        return run_backfill_supabase().await;
     }
 
     let cfg = load_config()?;
@@ -172,6 +181,39 @@ async fn main() -> Result<()> {
             "replayed uncommitted fills from event log on startup"
         );
     }
+
+    // Supabase authoritative client (issue #397): built only when the flag is set. It is the
+    // sole writer of `paper_fills`/`settled_markets` (the best-effort `run_sink` is not spawned
+    // below), and runs the boot catch-up-then-pull so the bankroll/positions read just after
+    // reflect the Supabase source of truth. Fail-closed: requires the service-role secret, and
+    // a catch-up/pull error aborts boot (refuse to run authoritative without the authority).
+    let supabase_state = if cfg.supabase_authoritative {
+        anyhow::ensure!(
+            !cfg.supabase_url.is_empty(),
+            "PE_SUPABASE_AUTHORITATIVE=1 requires PE_SUPABASE_URL"
+        );
+        anyhow::ensure!(
+            !cfg.supabase_secret_key.is_empty(),
+            "PE_SUPABASE_AUTHORITATIVE=1 requires the service-role PE_SUPABASE_SECRET_KEY \
+             (RLS blocks anon writes)"
+        );
+        let client = SupabaseStateClient::new(
+            reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        );
+        supabase_authoritative_boot(&client, &paper_state)
+            .await
+            .context("supabase authoritative boot (catch-up then pull)")?;
+        info!(
+            "supabase authoritative mode active: paper-state writes through to Supabase (system of record)"
+        );
+        Some(client)
+    } else {
+        None
+    };
+
     let bankroll = paper_state
         .bankroll()
         .context("read paper-state bankroll")?
@@ -358,33 +400,40 @@ async fn main() -> Result<()> {
 
     // Supabase analytics sink (issue #343): best-effort dual-write of fills + settlements.
     // Spawned only when enabled and a Supabase URL is configured; otherwise `None` (no-op).
-    let (sink_handle, sink_task) = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
-        if cfg.supabase_secret_key.is_empty() {
-            tracing::warn!(
-                "supabase_sink_enabled but supabase_secret_key is empty; the sink writes with \
+    // NOT spawned in authoritative mode (issue #397): the `commit_fill`/`apply_resolution`
+    // RPCs are the sole writer of `paper_fills`/`settled_markets`, so a best-effort
+    // `merge-duplicates` upsert from `run_sink` must not race them. With `sink_handle = None`
+    // the orchestrator's `send_fill` and `tick_resolution`'s `send_resolution` are suppressed
+    // automatically; the liquidity-snapshot worker (#350) keeps its own gate and stays alive.
+    let (sink_handle, sink_task) =
+        if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() && !cfg.supabase_authoritative
+        {
+            if cfg.supabase_secret_key.is_empty() {
+                tracing::warn!(
+                    "supabase_sink_enabled but supabase_secret_key is empty; the sink writes with \
                  the anon key, which RLS allows only to read — all upserts will 403. Set \
                  PE_SUPABASE_SECRET_KEY to enable sink writes."
+                );
+            }
+            let (handle, rx) = SinkHandle::channel(cfg.supabase_sink_channel_capacity);
+            let writer = SupabaseWriter::new(
+                reqwest::Client::new(),
+                &cfg.supabase_url,
+                &cfg.supabase_anon_key,
+                &cfg.supabase_secret_key,
             );
-        }
-        let (handle, rx) = SinkHandle::channel(cfg.supabase_sink_channel_capacity);
-        let writer = SupabaseWriter::new(
-            reqwest::Client::new(),
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-        );
-        let dropped = handle.dropped_counter();
-        let task = tokio::spawn(run_sink(
-            writer,
-            paper_state.clone(),
-            rx,
-            Duration::from_secs(cfg.supabase_sink_reconcile_interval_secs),
-            dropped,
-        ));
-        (Some(handle), Some(task))
-    } else {
-        (None, None)
-    };
+            let dropped = handle.dropped_counter();
+            let task = tokio::spawn(run_sink(
+                writer,
+                paper_state.clone(),
+                rx,
+                Duration::from_secs(cfg.supabase_sink_reconcile_interval_secs),
+                dropped,
+            ));
+            (Some(handle), Some(task))
+        } else {
+            (None, None)
+        };
 
     // Liquidity-at-fill capture (issue #350 WS2 PR-H): off-hot-path Gamma + CLOB /book snapshot
     // per BUY fill, written to SQLite (canonical) + a best-effort Supabase mirror. Spawned under
@@ -438,15 +487,19 @@ async fn main() -> Result<()> {
         reseed_rx,
         sink_handle.clone(),
         snapshot_handle,
+        supabase_state.clone(),
     )
     .context("build orchestrator")?;
 
-    // Resolution polling task: periodically fetch Gamma for closed markets.
+    // Resolution polling task: periodically fetch Gamma for closed markets. In authoritative
+    // mode (issue #397) it credits via the `apply_resolution` RPC; `sink_handle` is `None`,
+    // so the best-effort `send_resolution` nudge is suppressed.
     let resolution_task = spawn_resolution_task(
         paper_state.clone(),
         cfg.gamma_base_url.clone(),
         cfg.gamma_resolution_poll_interval_secs,
         sink_handle,
+        supabase_state,
     );
 
     // Live-watchlist refresh task (#339): poll Supabase on the configured interval and refresh
@@ -600,6 +653,51 @@ fn run_rebuild_state() -> Result<()> {
     std::process::exit(0);
 }
 
+/// One-time SQLite → Supabase backfill for the authoritative cutover (issue #397), then exit.
+///
+/// Reconciles the local paper-state from the event log (so its scalars are complete), then
+/// pushes `paper_bankroll` + `paper_positions`, completes the `paper_fills` tail, and seeds
+/// the catch-up watermark to the event-log head. Run with the service stopped, after the
+/// schema is applied and before flipping `PE_SUPABASE_AUTHORITATIVE`.
+async fn run_backfill_supabase() -> Result<()> {
+    let cfg = load_config()?;
+    anyhow::ensure!(
+        !cfg.supabase_url.is_empty(),
+        "--backfill-supabase requires PE_SUPABASE_URL"
+    );
+    anyhow::ensure!(
+        !cfg.supabase_secret_key.is_empty(),
+        "--backfill-supabase requires the service-role PE_SUPABASE_SECRET_KEY (RLS blocks anon writes)"
+    );
+
+    let paper_state = PaperStateDb::open(&cfg.paper_state_db_path)
+        .with_context(|| format!("open paper-state {}", cfg.paper_state_db_path.display()))?;
+    let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
+        .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
+    paper_state
+        .init_bankroll(configured_bankroll)
+        .context("init bankroll")?;
+    let reconciled = reconcile_paper_state(&cfg.event_log_path, &paper_state)
+        .context("reconcile paper-state from event log")?;
+
+    let counts = backfill_supabase(
+        &paper_state,
+        &cfg.supabase_url,
+        &cfg.supabase_anon_key,
+        &cfg.supabase_secret_key,
+    )
+    .await
+    .context("backfill supabase")?;
+
+    println!("Supabase backfill complete (SQLite → Supabase):");
+    println!("  event-log fills reconciled: {reconciled}");
+    println!("  paper_bankroll set:         {}", counts.bankroll_set);
+    println!("  paper_positions upserted:   {}", counts.positions);
+    println!("  paper_fills HWM:            {}", counts.fills_hwm);
+    println!("  supabase watermark (head):  {}", counts.watermark);
+    std::process::exit(0);
+}
+
 /// Print P&L report from the existing paper-state DB and exit.
 fn run_report() -> Result<()> {
     let cfg = load_config()?;
@@ -654,6 +752,7 @@ fn spawn_resolution_task(
     gamma_base_url: String,
     poll_interval_secs: u64,
     sink: Option<SinkHandle>,
+    supabase_state: Option<SupabaseStateClient>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let fetcher = GammaResolutionFetcher::new(
@@ -662,7 +761,14 @@ fn spawn_resolution_task(
         );
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
-            if let Err(e) = tick_resolution(&paper_state, &fetcher, sink.as_ref()).await {
+            if let Err(e) = tick_resolution(
+                &paper_state,
+                &fetcher,
+                sink.as_ref(),
+                supabase_state.as_ref(),
+            )
+            .await
+            {
                 tracing::warn!(error = %e, "resolution poll error");
             }
         }
@@ -673,6 +779,7 @@ async fn tick_resolution(
     paper_state: &Arc<PaperStateDb>,
     fetcher: &GammaResolutionFetcher<ReqwestFetcher>,
     sink: Option<&SinkHandle>,
+    supabase_state: Option<&SupabaseStateClient>,
 ) -> Result<()> {
     let mut store =
         ResolutionStore::load(Arc::clone(paper_state)).context("load resolution store")?;
@@ -706,22 +813,45 @@ async fn tick_resolution(
             .cloned()
             .collect();
         let credit = PnlLedger::resolution_credit(&market_positions, &res.outcome_prices);
-        // Mark settled (SQLite-authoritative) before crediting the bankroll:
-        // a crash after `mark_settled` but before `credit_bankroll` leaves the market marked
-        // settled, so the next poll skips it (under-credit, not over-credit). The reverse order
-        // would double-credit on restart.
-        store
-            .mark_settled(
-                res.market_id.clone(),
-                res.outcome_prices.clone(),
+        if let Some(sup) = supabase_state {
+            // Authoritative (issue #397): apply the `apply_resolution` RPC FIRST (atomic
+            // settled-guard + bankroll credit, exactly-once), then mirror to SQLite. On RPC
+            // error, leave the market unsettled locally so the next tick retries (fail-closed).
+            if let Err(e) = apply_resolution_authoritative(
+                sup,
+                &mut store,
+                &res.market_id,
+                &res.outcome_prices,
                 credit,
                 now_unix,
             )
-            .context("mark settled")?;
-        if credit > rust_decimal::Decimal::ZERO {
-            paper_state
-                .credit_bankroll(credit)
-                .context("credit bankroll")?;
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    market = %res.market_id,
+                    "authoritative apply_resolution failed; leaving unsettled for next-tick retry"
+                );
+                continue;
+            }
+        } else {
+            // Legacy (SQLite-authoritative): mark settled before crediting the bankroll, so a
+            // crash after `mark_settled` but before `credit_bankroll` leaves the market marked
+            // settled — the next poll skips it (under-credit, not over-credit). The reverse
+            // order would double-credit on restart.
+            store
+                .mark_settled(
+                    res.market_id.clone(),
+                    res.outcome_prices.clone(),
+                    credit,
+                    now_unix,
+                )
+                .context("mark settled")?;
+            if credit > rust_decimal::Decimal::ZERO {
+                paper_state
+                    .credit_bankroll(credit)
+                    .context("credit bankroll")?;
+            }
         }
         tracing::info!(market = %res.market_id, %credit, "resolution applied");
     }

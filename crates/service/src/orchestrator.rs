@@ -31,7 +31,8 @@ use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
-use crate::supabase_sink::SinkHandle;
+use crate::supabase_sink::{SinkHandle, supabase_fill_from};
+use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
 
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
@@ -80,11 +81,17 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
     reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
-    // Best-effort Supabase analytics sink (issue #343). `None` when disabled.
+    // Best-effort Supabase analytics sink (issue #343). `None` when disabled — and always
+    // `None` in authoritative mode (issue #397), where `run_sink` is not spawned, so the
+    // best-effort `send_fill` below is suppressed automatically.
     sink: Option<SinkHandle>,
     // Liquidity-at-fill snapshot enqueue handle (issue #350 WS2 PR-H). `None` when capture is
     // disabled. Buy-only; enqueue is non-blocking (drop-on-full), off the trade hot path.
     snapshot_sink: Option<SnapshotHandle>,
+    // Authoritative Supabase paper-state client (issue #397). `Some` when
+    // `PE_SUPABASE_AUTHORITATIVE=1`: a paper fill writes the `commit_fill` RPC first
+    // (fail-closed), then mirrors to SQLite. `None` → the legacy SQLite-authoritative path.
+    supabase_state: Option<SupabaseStateClient>,
 }
 
 impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
@@ -104,6 +111,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
         reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
         sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
+        supabase_state: Option<SupabaseStateClient>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
@@ -139,6 +147,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             reseed_rx,
             sink,
             snapshot_sink,
+            supabase_state,
         })
     }
 
@@ -369,16 +378,23 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
                             fill.intent.market_id.clone(),
                             fill.intent.outcome_id,
                         );
-                        self.commit_paper_fill(&trade, &leader_row, &fill, seq);
-                        self.filled_positions.insert(filled_key);
-                        info!(
-                            kind = "paper_fill",
-                            idempotency_key = %fill.intent.idempotency_key,
-                            market = %fill.intent.market_id,
-                            side = ?fill.intent.side,
-                            contracts = fill.intent.contracts.0,
-                            fill_price = %fill.simulated_fill_price.0,
-                        );
+                        // `false` = authoritative fail-closed skip: the Supabase RPC failed, so
+                        // neither the position nor the dedup advanced (the event log holds the
+                        // fill and replays on restart). Do not mark the contract filled.
+                        if self
+                            .commit_paper_fill(&trade, &leader_row, &fill, seq)
+                            .await
+                        {
+                            self.filled_positions.insert(filled_key);
+                            info!(
+                                kind = "paper_fill",
+                                idempotency_key = %fill.intent.idempotency_key,
+                                market = %fill.intent.market_id,
+                                side = ?fill.intent.side,
+                                contracts = fill.intent.contracts.0,
+                                fill_price = %fill.simulated_fill_price.0,
+                            );
+                        }
                     }
                     Ok(DispatchResult::Live(result)) => {
                         // Live execution is out of paper-state's fill scope; still mark
@@ -425,15 +441,24 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
         }
     }
 
-    /// Commit dedup + leader-ledger mirror + fill accounting in one transaction, and
-    /// update the in-memory bankroll to the new persisted value (drawdown-aware sizing).
-    fn commit_paper_fill(
+    /// Commit dedup + leader-ledger mirror + fill accounting, and update the in-memory
+    /// bankroll to the new persisted value (drawdown-aware sizing). Returns `true` when the
+    /// fill committed (the caller then marks the contract filled); `false` only on an
+    /// authoritative fail-closed skip.
+    ///
+    /// Authoritative mode (issue #397, `self.supabase_state.is_some()`): the `commit_fill` RPC
+    /// is awaited FIRST (fail-closed — on RPC error, log + return `false`; the event log holds
+    /// the fill and replays on restart), then SQLite is mirrored and `self.bankroll` is set to
+    /// the RPC return. The RPC `.await` completes before the SQLite mutex is taken (inside
+    /// `PaperStateDb::commit_fill`), so the lock is never held across the await. Legacy mode:
+    /// SQLite stays authoritative with a best-effort Supabase sink mirror — behaviour unchanged.
+    async fn commit_paper_fill(
         &mut self,
         trade: &IncomingTrade,
         leader: &LeaderPositionRow,
         fill: &PaperFill,
         seq: EventSeq,
-    ) {
+    ) -> bool {
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
             market_id: fill.intent.market_id.clone(),
@@ -442,6 +467,65 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             contracts: fill.intent.contracts.0,
             fill_price: fill.simulated_fill_price,
         };
+
+        // Authoritative path (issue #397): Supabase RPC first, then SQLite mirror. The client
+        // and Arc are cloned (cheap) so neither borrows `self` across the `.await`.
+        if let Some(supabase) = self.supabase_state.clone() {
+            let event_seq = i64::try_from(seq.0).unwrap_or(i64::MAX);
+            let fill_row = FillRow {
+                idempotency_key: record.idempotency_key.clone(),
+                market_id: record.market_id.clone(),
+                outcome_id: record.outcome_id,
+                side: record.side,
+                contracts: record.contracts,
+                fill_price: record.fill_price,
+                event_seq,
+            };
+            // Every Winner-Follow fill is `wf|`-keyed; a non-`wf` key has no leader and cannot
+            // satisfy `paper_fills.leader_wallet` (NOT NULL) — skip it fail-closed.
+            let Some(sup_row) = supabase_fill_from(&fill_row) else {
+                error!(
+                    key = %record.idempotency_key,
+                    "authoritative fill: non-winner-follow key has no leader; skipping (fail-closed)"
+                );
+                return false;
+            };
+            let paper_state = self.paper_state.clone();
+            match commit_fill_authoritative(
+                &supabase,
+                &paper_state,
+                &trade.source_trade_id,
+                leader,
+                &record,
+                seq,
+                &sup_row,
+            )
+            .await
+            {
+                Ok(new_bankroll) => self.bankroll = new_bankroll,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "authoritative fill: Supabase commit_fill RPC failed; fail-closed skip \
+                         (event log holds the fill, replays on restart)"
+                    );
+                    return false;
+                }
+            }
+            // Liquidity-at-fill capture (#350) stays alive in authoritative mode (its sink is a
+            // separate worker, not gated off with `run_sink`).
+            enqueue_if_buy(
+                self.snapshot_sink.as_ref(),
+                fill.intent.side,
+                &fill.intent.idempotency_key,
+                &fill.intent.market_id,
+                fill.intent.outcome_id,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            );
+            return true;
+        }
+
+        // Legacy path: SQLite authoritative + best-effort Supabase sink mirror.
         match self
             .paper_state
             .commit_fill(&trade.source_trade_id, leader, &record, seq)
@@ -474,6 +558,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             }
             Err(e) => error!(error = %e, "paper-state commit_fill failed"),
         }
+        true
     }
 
     fn quality_for(&self, watchlist: &Watchlist, wallet: &WalletAddress) -> ReconstructionQuality {
