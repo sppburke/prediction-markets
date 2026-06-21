@@ -45,7 +45,7 @@ impl PerTradeCap {
 ///
 /// Approval flags default to `false` (deny) and require an audit-logged signed
 /// config change to flip; they cannot be changed at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WinnerFollowConfig {
     /// Allow `LeaderAction::Flip` trades. Default: false.
     #[serde(default)]
