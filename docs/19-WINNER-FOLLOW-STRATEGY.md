@@ -290,11 +290,11 @@ Dollar { usd }         → contracts = max(1, floor(usd / current_price))   # th
 Contract { contracts } → contracts = exactly N
 ```
 
-Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap, risk gate) — and (WS2 step 5c) the price-impact book cap — remain active in all modes. This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
+Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap, risk gate) remain active in all modes (the WS2 step-5c price-impact book cap joins them once it lands in a later PR). This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
-Default: `Kelly`. The live boot default is `Dollar { usd = 25 }`. Canonical: `_GLOSSARY.md` `sizing_mode_default`. The Supabase KV layer stores three flat keys (`sizing_mode`/`sizing_dollar_usd`/`sizing_contracts`) reassembled in `runtime_config::parse_config`.
+Default: `Kelly`; the live boot default is `Dollar` (the USD amount is canonical in `_GLOSSARY.md` `sizing_mode_default`). The Supabase KV layer stores three flat keys (`sizing_mode`/`sizing_dollar_usd`/`sizing_contracts`) reassembled in `runtime_config::parse_config`.
 
 ## Anti-gaming flags
 
