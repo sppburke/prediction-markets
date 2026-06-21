@@ -1,7 +1,8 @@
 //! Event dispatch loop: routes decoded trade events to the copy-signal-engine,
 //! then gates signals through strategy evaluation and execution dispatch.
 //!
-//! The orchestrator is pure dispatch: it owns no I/O except through `ExecutionDispatcher`.
+//! The orchestrator is dispatch + sizing: its I/O is the `ExecutionDispatcher`, the mid-price
+//! cache (Gamma), and — when the price-impact gate is on — the CLOB `/book` fetcher (#398 WS2).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;

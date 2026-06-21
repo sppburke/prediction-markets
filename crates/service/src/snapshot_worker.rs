@@ -332,9 +332,10 @@ mod tests {
     }
 
     #[test]
-    fn absorbable_contracts_zero_when_no_level_within_band() {
-        // best 0.50 → ceiling 0.505; the only other level (0.60) is outside the band → just the
-        // best level's size. With a tiny band (1 bps → ceiling 0.50005) only the best counts.
+    fn absorbable_contracts_counts_only_levels_within_band() {
+        // best 0.50 → tiny 1 bps band (ceiling 0.50005): only the best level (size 7) is within
+        // the band; the 0.60 level is excluded. The best ask is always within its own band, so a
+        // non-empty book never sums to 0 — 0 absorbable arises only from an empty book.
         let b = book(&[(dec!(0.50), dec!(7)), (dec!(0.60), dec!(1000))]);
         assert_eq!(absorbable_contracts_within_bps(&b, 1), Some(dec!(7)));
     }

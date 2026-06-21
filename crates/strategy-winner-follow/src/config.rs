@@ -54,11 +54,11 @@ pub enum SizingMode {
     #[default]
     Kelly,
     /// Fixed USD notional: `max(1, floor(usd / current_price))` contracts. Bypasses only the Kelly
-    /// fraction + price-derived math; the per-trade cap and risk gate still apply (plus the WS2
-    /// price-impact book cap once it lands). The migration target for the legacy `flat_usd_per_trade`.
+    /// fraction + price-derived math; the per-trade cap, price-impact book cap, and risk gate still
+    /// apply. The migration target for the legacy `flat_usd_per_trade`.
     Dollar { usd: Decimal },
-    /// Fixed contract count, then clamped by the per-trade cap and risk gate (and the WS2 book cap
-    /// once it lands).
+    /// Fixed contract count, then clamped by the per-trade cap, price-impact book cap, and risk
+    /// gate.
     Contract { contracts: u64 },
 }
 

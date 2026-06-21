@@ -78,8 +78,8 @@ pub struct RuntimeConfig {
     pub inactivity_hard_cap_secs: u64,
     pub bench_overfetch: usize,
     pub demotion_min_trades: usize,
-    /// Price-impact gate cap in basis points; `0` disables it. Carried here in WS1 (no consumer
-    /// yet); the WS2 gate reads it. Not seeded yet, so it falls through to this default.
+    /// Price-impact gate cap in basis points; `0` disables it (fail-open). Consumed by the
+    /// orchestrator's per-event `/book` gate (#398 WS2) and seeded in `service_config` at `0`.
     pub price_impact_cap_bps: i32,
 
     // ── Strategy (WinnerFollowConfig-derived) ────────────────────────────────
