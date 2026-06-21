@@ -1,50 +1,39 @@
-"use client";
-
-import { useEffect, useState } from "react";
 import { KpiCards } from "@/components/KpiCards";
 import { Panel, StateNotice } from "@/components/Panel";
 import { PnlBarChart } from "@/components/PnlBarChart";
 import { WalletTable } from "@/components/WalletTable";
 import { fetchServiceRuntime, fetchWalletStats, NotConfiguredError } from "@/lib/data";
 import { toNum } from "@/lib/format";
-import type { WalletLiveStats } from "@/lib/types";
 
-export default function OverviewPage() {
-  const [rows, setRows] = useState<WalletLiveStats[] | null>(null);
-  const [watched, setWatched] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
+// Server-rendered with ISR: the wallet_live_stats_mv read runs on the server and the result is
+// cached + shared across all viewers for up to `revalidate` seconds, instead of re-querying
+// Supabase from every browser on every page view.
+export const revalidate = 60;
 
-  useEffect(() => {
-    let active = true;
-    fetchWalletStats()
-      .then((data) => {
-        if (active) setRows(data);
-      })
-      .catch((e: unknown) => {
-        if (!active) return;
-        setError(
-          e instanceof NotConfiguredError
-            ? "Supabase not configured — copy site/.env.example to site/.env.local."
-            : `Failed to load: ${(e as Error).message}`,
-        );
-      });
-    // Secondary: the live watched-count. A failure here must not blank the page, so it is
-    // swallowed and the KPI falls back to "—".
-    fetchServiceRuntime()
-      .then((rt) => {
-        if (active) setWatched(rt ? toNum(rt.watchlist_size) : null);
-      })
-      .catch(() => {
-        if (active) setWatched(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
+export default async function OverviewPage() {
+  let rows;
+  try {
+    rows = await fetchWalletStats();
+  } catch (e: unknown) {
+    const message =
+      e instanceof NotConfiguredError
+        ? "Supabase not configured — copy site/.env.example to site/.env.local."
+        : `Failed to load: ${(e as Error).message}`;
+    return <StateNotice kind="error" message={message} />;
+  }
+  if (rows.length === 0) {
+    return <StateNotice kind="empty" message="No wallets in wallet_live_stats yet." />;
+  }
 
-  if (error) return <StateNotice kind="error" message={error} />;
-  if (rows === null) return <StateNotice kind="loading" message="Loading wallets…" />;
-  if (rows.length === 0) return <StateNotice kind="empty" message="No wallets in wallet_live_stats yet." />;
+  // Secondary: the live watched-count. A failure here must not blank the page, so it falls
+  // back to "—".
+  let watched: number | null = null;
+  try {
+    const rt = await fetchServiceRuntime();
+    watched = rt ? toNum(rt.watchlist_size) : null;
+  } catch {
+    watched = null;
+  }
 
   return (
     <div className="space-y-6">

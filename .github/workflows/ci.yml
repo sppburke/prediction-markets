@@ -91,6 +91,9 @@ jobs:
           psql "$PGURL" -v ON_ERROR_STOP=1 -c "create role anon nologin; create role authenticated nologin; create role service_role nologin;"
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_paper_state_schema.sql
+          # Matview SQL must load on vanilla Postgres too (its pg_cron block self-skips when the
+          # extension is absent, as it is here); validates the DDL + the wallet_live_stats_mv index/grant.
+          psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_wallet_live_stats_mv.sql
 
       - name: Postgres RPC parity + concurrency test (issue #397)
         env:
