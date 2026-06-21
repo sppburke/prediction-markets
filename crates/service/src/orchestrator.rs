@@ -220,6 +220,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             }
             self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
+            self.entry_gate.set_fail_closed(rc.entry_gate_fail_closed);
         }
 
         // Mark polymarket freshness.

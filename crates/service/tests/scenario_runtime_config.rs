@@ -238,3 +238,22 @@ async fn config_bankroll_baseline_never_becomes_running_bankroll() {
         "PASS: config bankroll_usd baseline never re-credits the running bankroll ({bankroll})"
     );
 }
+
+/// PASS: a snapshot `entry_gate_fail_closed = true` blocks an entry from a wallet absent from the
+///       history map, even though the BOOT gate is fail-open — proving the per-event rebuild
+///       hot-reloads the entry-gate posture (not just strategy/mode/price knobs).
+/// FAIL: a fill (the snapshot's fail-closed posture was ignored; boot fail-open governed).
+#[tokio::test]
+async fn snapshot_entry_gate_fail_closed_blocks_absent_wallet() {
+    let dir = TempDir::new().unwrap();
+    let mut rc = flat_snapshot("0.90", "10000");
+    rc.entry_gate_fail_closed = true;
+    let live = LiveRuntimeConfig::new(rc);
+    // Boot gate is fail-open (run_with hardcodes fail_closed: false) and the history map is empty,
+    // so the leader is absent → without the rebuild this BUY would fill. The snapshot flips it.
+    let (fills, _) = run_with(&dir, Some(live), dec!(0.90), "0.60").await;
+    assert_eq!(fills, 0);
+    println!(
+        "PASS: per-event rebuild hot-reloads entry_gate_fail_closed=true (absent wallet blocked, 0 fills)"
+    );
+}

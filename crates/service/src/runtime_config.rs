@@ -609,8 +609,9 @@ mod tests {
             false,
         );
         assert_eq!(rejected.kelly_fraction_override, None);
-        // With the approval flag set at the boot baseline (approval is boot-frozen in WS1, not
-        // KV-mutable yet), the same above-ceiling override is accepted.
+        // With the approval flag already true at the baseline, the same above-ceiling override is
+        // accepted. (Setting the flag via KV in the same poll is covered by
+        // `approval_flags_are_kv_mutable`.)
         let approved_boot = RuntimeConfig {
             kelly_fraction_above_default_human_approved: true,
             ..boot.clone()
