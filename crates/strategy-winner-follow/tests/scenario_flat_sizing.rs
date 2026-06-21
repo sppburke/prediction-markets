@@ -144,6 +144,7 @@ fn scenario_evaluate_at_price_sizes_at_current_keeps_leader_limit() {
             clean_snapshot(),
             dec!(10_000),
             ExecutionMode::LiveTiny,
+            None,
         )
         .expect("current-price sizing should produce order");
     assert_eq!(
@@ -510,4 +511,77 @@ fn scenario_contract_sizing_is_clamped_by_per_trade_cap() {
         intent.contracts.0
     );
     assert!(intent.contracts.0 < 1000, "capped count must be < N");
+}
+
+// ─── scenario F9: price-impact book cap (#398 WS2 step 5c) ─────────────────────
+
+/// `book_cap_contracts = None` (gate off / fail-open) leaves the size unchanged: $100/0.50 = 200.
+///
+/// PASS: `intent.contracts.0 == 200`.
+#[test]
+fn scenario_book_cap_none_is_fail_open_passthrough() {
+    let signal = make_signal(0xF9, LeaderAction::Entry); // price $0.50
+    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
+    let intent = strategy
+        .evaluate_at_price(
+            &signal,
+            price(dec!(0.50)),
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+            None,
+        )
+        .expect("fail-open should produce order");
+    assert_eq!(
+        intent.contracts.0, 200,
+        "None book cap must not change the size"
+    );
+}
+
+/// `book_cap_contracts = Some(40)` caps the 200-contract size down to 40 (the absorbable depth).
+///
+/// PASS: `intent.contracts.0 == 40` (< 200).
+#[test]
+fn scenario_book_cap_some_reduces_size() {
+    let signal = make_signal(0xF9, LeaderAction::Entry);
+    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
+    let intent = strategy
+        .evaluate_at_price(
+            &signal,
+            price(dec!(0.50)),
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+            Some(40),
+        )
+        .expect("capped size should still produce order");
+    assert_eq!(
+        intent.contracts.0, 40,
+        "book cap must min the size to absorbable depth"
+    );
+}
+
+/// `book_cap_contracts = Some(0)` (a successful /book with nothing absorbable within bps) skips the
+/// trade — distinct from the fail-open `None` path.
+///
+/// PASS: `Err(NoEdge)`.
+#[test]
+fn scenario_book_cap_zero_skips_trade() {
+    let signal = make_signal(0xF9, LeaderAction::Entry);
+    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
+    let result = strategy.evaluate_at_price(
+        &signal,
+        price(dec!(0.50)),
+        p_high(),
+        clean_snapshot(),
+        dec!(10_000),
+        ExecutionMode::LiveTiny,
+        Some(0),
+    );
+    assert!(
+        matches!(result, Err(WinnerFollowError::NoEdge)),
+        "Some(0) book cap must skip the trade (NoEdge); got {result:?}"
+    );
 }

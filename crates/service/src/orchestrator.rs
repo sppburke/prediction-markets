@@ -1,13 +1,17 @@
 //! Event dispatch loop: routes decoded trade events to the copy-signal-engine,
 //! then gates signals through strategy evaluation and execution dispatch.
 //!
-//! The orchestrator is pure dispatch: it owns no I/O except through `ExecutionDispatcher`.
+//! The orchestrator is dispatch + sizing: its I/O is the `ExecutionDispatcher`, the mid-price
+//! cache (Gamma), and — when the price-impact gate is on — the CLOB `/book` fetcher (#398 WS2).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::time::Duration;
 
-use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, SignalConfig, classify_trade};
+use pe_copy_signal_engine::{
+    IncomingTrade, LeaderSignal, PositionSnapshot, SignalConfig, classify_trade,
+};
 use pe_core_types::{
     EventSeq, MarketId, MarketOutcomeId, Price, Probability, ReconstructionQuality, Side,
     SourceTimestamp, TraderId, VenueId, WalletAddress,
@@ -22,19 +26,26 @@ use pe_strategy_winner_follow::{ExecutionMode, PaperFill, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::CLOBClient;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive as _;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::clob_book::ClobBookFetcher;
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
 use crate::runtime_config::{self, LiveRuntimeConfig};
-use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
+use crate::snapshot_worker::{SnapshotHandle, absorbable_contracts_within_bps, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, supabase_fill_from};
 use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
+
+/// Hot-path `/book` fetch timeout for the price-impact gate (#398 WS2). Tighter than the worker's
+/// 5 s per-request timeout so a slow book fails open (no cap) without stalling the trade.
+/// Canonical default in `docs/_GLOSSARY.md`: `clob_book_hot_path_timeout_secs`.
+const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
 
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
@@ -59,7 +70,7 @@ pub struct OrchestratorConfig {
     pub runtime_config: Option<LiveRuntimeConfig>,
 }
 
-pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
+pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     trade_rx: mpsc::Receiver<IncomingTrade>,
     position_ledger: PositionLedger,
     live_watchlist: LiveWatchlist,
@@ -101,9 +112,15 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
     // Supabase-authoritative runtime config (#398 WS1). `Some` in production; the per-event
     // rebuild at the top of `handle_trade` reads one snapshot. `None` in tests (boot config).
     runtime_config: Option<LiveRuntimeConfig>,
+    // Live CLOB /book fetcher for the price-impact gate (#398 WS2). Shared `Arc` with the snapshot
+    // worker so the 5 rps rate gate is global. Consulted only when `price_impact_cap_bps != 0`.
+    book_fetcher: Arc<B>,
+    // Price-impact gate cap in bps, rebuilt per event from the runtime-config snapshot. `0`
+    // disables the gate (fail-open; no `/book` fetch).
+    price_impact_cap_bps: i32,
 }
 
-impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
+impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<C, F, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         trade_rx: mpsc::Receiver<IncomingTrade>,
@@ -121,6 +138,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
         sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
         supabase_state: Option<SupabaseStateClient>,
+        book_fetcher: Arc<B>,
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
@@ -158,6 +176,8 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             snapshot_sink,
             supabase_state,
             runtime_config: config.runtime_config,
+            book_fetcher,
+            price_impact_cap_bps: 0,
         })
     }
 
@@ -206,6 +226,55 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
 
     // ── Private handlers ──────────────────────────────────────────────────────
 
+    /// Contracts absorbable within `price_impact_cap_bps` of best ask from the live `/book`
+    /// (#398 WS2 step 5c). Returns:
+    /// - `None` — gate disabled, missing CLOB token, or a `/book` fetch error/timeout: **fail-open**
+    ///   (no cap, risk #4), or an implausibly deep book whose contract count overflows `u64`.
+    /// - `Some(0)` — a successful read with nothing absorbable within the band (empty ask book, or
+    ///   no level within `bps`): the trade is **skipped** (distinct from fail-open).
+    /// - `Some(n)` — cap the size at `n` contracts.
+    async fn book_cap_contracts(&self, signal: &LeaderSignal) -> Option<u64> {
+        let cap_bps = self.price_impact_cap_bps;
+        if cap_bps <= 0 {
+            return None; // gate disabled → fail-open
+        }
+        let bps = u64::try_from(cap_bps).ok()?;
+        // The outcome's CLOB token id (served from the mid cache, warm from the price fetch above).
+        let snaps = self
+            .mid_price_cache
+            .fetch_snapshots(std::slice::from_ref(&signal.market_id))
+            .await;
+        let Some(token_id) = snaps.get(&signal.market_id).and_then(|s| {
+            s.clob_token_ids
+                .get(usize::from(signal.outcome_id.0))
+                .cloned()
+        }) else {
+            return None; // missing token → fail-open (risk #4)
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
+            self.book_fetcher.fetch_book(&token_id),
+        )
+        .await
+        {
+            Ok(Ok(book)) => match absorbable_contracts_within_bps(&book, bps) {
+                Some(d) => Some(d.floor().to_u64().unwrap_or(u64::MAX)),
+                // `None` = no best ask (empty asks → 0 absorbable → skip) or a Decimal overflow on
+                // a non-empty (implausibly deep) book → fail-open.
+                None if book.asks.is_empty() => Some(0),
+                None => None,
+            },
+            Ok(Err(e)) => {
+                info!(error = %e, market = %signal.market_id, "price-impact /book fetch failed; gate fails open");
+                None
+            }
+            Err(_) => {
+                info!(market = %signal.market_id, "price-impact /book fetch timed out; gate fails open");
+                None
+            }
+        }
+    }
+
     async fn handle_trade(&mut self, trade: IncomingTrade) {
         // #398 WS1: rebuild the runtime-mutable knobs from the latest Supabase config snapshot,
         // once per event, so an admin edit takes effect within one poll with no restart. Reads
@@ -221,6 +290,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
             self.entry_gate.set_fail_closed(rc.entry_gate_fail_closed);
+            self.price_impact_cap_bps = rc.price_impact_cap_bps;
         }
 
         // Mark polymarket freshness.
@@ -378,6 +448,10 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             return;
         }
 
+        // Price-impact gate (#398 WS2 step 5c): when enabled, cap the size at the contracts
+        // absorbable within `price_impact_cap_bps` of best ask from the live /book.
+        let book_cap_contracts = self.book_cap_contracts(&signal).await;
+
         let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
         match self.strategy.evaluate_at_price(
@@ -387,6 +461,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             snapshot,
             self.bankroll,
             self.mode,
+            book_cap_contracts,
         ) {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");

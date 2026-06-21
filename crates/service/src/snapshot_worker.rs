@@ -131,6 +131,27 @@ pub fn absorbable_usd_within_bps(book: &OrderBook, bps: u64) -> Option<Decimal> 
     Some(total)
 }
 
+/// Σ size (contract count) over ask levels priced within `bps` of the best (lowest) ask — the
+/// number of contracts absorbable without moving the price more than `bps`. Preferred over
+/// `absorbable_usd_within_bps / fill_price` (which blends levels at differing prices) for the
+/// price-impact book cap (#398 WS2). Returns `None` when the book has no asks or the running sum
+/// overflows `Decimal`.
+#[must_use]
+pub fn absorbable_contracts_within_bps(book: &OrderBook, bps: u64) -> Option<Decimal> {
+    let best = book.best_ask()?;
+    let numerator = Decimal::from(BPS_DENOMINATOR.checked_add(bps)?);
+    let ceiling = best
+        .checked_mul(numerator)?
+        .checked_div(Decimal::from(BPS_DENOMINATOR))?;
+    let mut total = Decimal::ZERO;
+    for level in &book.asks {
+        if level.price <= ceiling {
+            total = total.checked_add(level.size)?;
+        }
+    }
+    Some(total)
+}
+
 /// Serialize the ask side as a compact JSON array of `{price, size}` string-decimals for
 /// ad-hoc capacity queries. `None` only on a serialization failure (unreachable for this
 /// shape — the worker degrades rather than panics).
@@ -229,7 +250,7 @@ where
 pub async fn run_snapshot_worker<F, B, W>(
     mut rx: mpsc::Receiver<SnapshotRequest>,
     mid_cache: MidPriceCache<F>,
-    book_fetcher: B,
+    book_fetcher: Arc<B>,
     paper_state: Arc<PaperStateDb>,
     sink: Option<W>,
     dropped: Arc<AtomicU64>,
@@ -249,7 +270,7 @@ pub async fn run_snapshot_worker<F, B, W>(
         if let Err(e) = capture_snapshot(
             &req,
             &mid_cache,
-            &book_fetcher,
+            book_fetcher.as_ref(),
             paper_state.as_ref(),
             sink.as_ref(),
         )
@@ -295,6 +316,28 @@ mod tests {
     #[test]
     fn absorbable_empty_book_is_none() {
         assert_eq!(absorbable_usd_within_bps(&book(&[]), 100), None);
+        assert_eq!(absorbable_contracts_within_bps(&book(&[]), 100), None);
+    }
+
+    #[test]
+    fn absorbable_contracts_sums_sizes_within_band() {
+        // best ask = 0.50 → ceiling = 0.505. Sizes at 0.50 and 0.505 count (140); 0.51 excluded.
+        // Contract count, NOT USD: the price-impact book cap (#398 WS2) caps the contract size.
+        let b = book(&[
+            (dec!(0.50), dec!(100)),
+            (dec!(0.505), dec!(40)),
+            (dec!(0.51), dec!(1000)),
+        ]);
+        assert_eq!(absorbable_contracts_within_bps(&b, 100), Some(dec!(140)));
+    }
+
+    #[test]
+    fn absorbable_contracts_counts_only_levels_within_band() {
+        // best 0.50 → tiny 1 bps band (ceiling 0.50005): only the best level (size 7) is within
+        // the band; the 0.60 level is excluded. The best ask is always within its own band, so a
+        // non-empty book never sums to 0 — 0 absorbable arises only from an empty book.
+        let b = book(&[(dec!(0.50), dec!(7)), (dec!(0.60), dec!(1000))]);
+        assert_eq!(absorbable_contracts_within_bps(&b, 1), Some(dec!(7)));
     }
 
     #[test]

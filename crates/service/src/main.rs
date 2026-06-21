@@ -465,6 +465,11 @@ async fn main() -> Result<()> {
     // orchestrator's mid-price cache so a fill rarely incurs an extra Gamma fetch. The
     // empty-secret-key warning is emitted once by the sink block above (identical gate) and
     // covers this writer too — keep the blocks ordered so it is not duplicated.
+    // One shared CLOB /book fetcher (#398 WS2): its 5 rps rate gate is global across the snapshot
+    // worker and the orchestrator's price-impact hot path. Built unconditionally so the
+    // orchestrator always has it; the worker clones it only when the snapshot block runs.
+    let book_fetcher = Arc::new(ReqwestClobBookFetcher::new(reqwest::Client::new()));
+
     let (snapshot_handle, snapshot_task) =
         if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
             let (handle, rx) = SnapshotHandle::channel(cfg.snapshot_channel_capacity);
@@ -478,7 +483,7 @@ async fn main() -> Result<()> {
             let task = tokio::spawn(run_snapshot_worker(
                 rx,
                 mid_price_cache.clone(),
-                ReqwestClobBookFetcher::new(reqwest::Client::new()),
+                book_fetcher.clone(),
                 paper_state.clone(),
                 Some(writer),
                 dropped,
@@ -513,6 +518,7 @@ async fn main() -> Result<()> {
         sink_handle.clone(),
         snapshot_handle,
         supabase_state.clone(),
+        book_fetcher,
     )
     .context("build orchestrator")?;
 

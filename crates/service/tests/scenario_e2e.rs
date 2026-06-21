@@ -39,6 +39,7 @@ use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
+use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -202,6 +203,7 @@ async fn scenario_e2e_clean_exit() {
         None,
         None,
         None,
+        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .unwrap();
 
@@ -265,6 +267,7 @@ async fn scenario_graceful_shutdown() {
         None,
         None,
         None,
+        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .unwrap();
 

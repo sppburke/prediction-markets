@@ -689,10 +689,16 @@ mode = "shadow"
         map
     }
 
-    /// The three sizing KV keys are enum-shaped (`SizingMode`), not flat scalars, so this test
-    /// (which compares flat seed values to flat boot fields) excludes them; their reconstruction
-    /// against the boot strategy is validated in `runtime_config::tests::seed_reconstructs_boot_strategy`.
-    const SIZING_KEYS: [&str; 3] = ["sizing_mode", "sizing_dollar_usd", "sizing_contracts"];
+    /// Seed keys that are NOT flat `ServiceConfig` scalars, so this test (which compares flat seed
+    /// values to flat boot fields) excludes them. The enum-shaped sizing keys and the
+    /// RuntimeConfig-only `price_impact_cap_bps` are validated against the boot defaults in
+    /// `runtime_config::tests::seed_reconstructs_boot_strategy`.
+    const SIZING_KEYS: [&str; 4] = [
+        "sizing_mode",
+        "sizing_dollar_usd",
+        "sizing_contracts",
+        "price_impact_cap_bps",
+    ];
 
     #[test]
     fn service_config_seed_matches_boot_defaults() {

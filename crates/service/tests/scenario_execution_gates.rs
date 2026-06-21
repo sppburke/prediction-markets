@@ -33,6 +33,7 @@ use pe_event_log::{Reader, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
+use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -212,6 +213,7 @@ async fn run_gate_capped(
         None,
         None,
         None,
+        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
