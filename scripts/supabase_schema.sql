@@ -52,7 +52,13 @@ create index if not exists idx_lifecycle_wallet on wallet_lifecycle_events (wall
 alter table wallet_lifecycle_events add column if not exists last_trade_unix bigint;
 
 -- Convenience read for the VPS: the current bench = entries of the most recent batch.
-create or replace view latest_ranking as
+-- `security_invoker = true` (Supabase lint 0010_security_definer_view): the view executes
+-- with the *querying* role's privileges, not the owner's, so it cannot bypass RLS. Readers
+-- therefore need read access to BOTH base tables it touches (`ranking_entries` and the
+-- `ranking_batches` subquery) — see the RLS block below. Service-role readers (secret key)
+-- bypass RLS regardless, so pe-service's refresh and the ranker push are unaffected.
+create or replace view latest_ranking
+  with (security_invoker = true) as
   select e.* from ranking_entries e
   where e.batch_id = (select max(batch_id) from ranking_batches)
   order by e.rank;
@@ -263,13 +269,25 @@ drop policy if exists "fill_market_snapshots_anon_read" on fill_market_snapshots
 create policy "fill_market_snapshots_anon_read" on fill_market_snapshots for select to anon using (true);
 grant select on fill_market_snapshots to anon;
 
--- The site is the first anon reader of ranking_entries. The anon read policy preserves
--- the existing service-role readers (secret key bypasses RLS) and the latest_ranking
--- view (owner-rights, RLS-bypassing); no anon write policy is created.
+-- The site is the first anon reader of ranking_entries. Because `latest_ranking` and
+-- `wallet_live_stats` are now `security_invoker` views (Supabase lint 0010), an anon read of
+-- either runs the underlying scans as `anon`, so anon needs an explicit read policy on every
+-- base table those views touch. Service-role readers/writers (secret key) bypass RLS, so the
+-- ranker push and pe-service refresh are unaffected. No anon write policy is created.
 alter table ranking_entries enable row level security;
 drop policy if exists "ranking_entries_anon_read" on ranking_entries;
 create policy "ranking_entries_anon_read" on ranking_entries for select to anon using (true);
 grant select on ranking_entries to anon;
+
+-- `latest_ranking` evaluates `(select max(batch_id) from ranking_batches)`; under
+-- security_invoker the anon caller runs that subquery, so anon needs read access here too.
+-- RLS on + an anon read policy mirrors the ranking_entries block above (and clears the
+-- rls_disabled_in_public lint on this table). The ranker push writes with the service-role
+-- key, which bypasses RLS — identical to the ranking_entries precedent.
+alter table ranking_batches enable row level security;
+drop policy if exists "ranking_batches_anon_read" on ranking_batches;
+create policy "ranking_batches_anon_read" on ranking_batches for select to anon using (true);
+grant select on ranking_batches to anon;
 
 -- Writer-only cursor: RLS enabled with NO anon policy and NO grant — anon cannot touch it.
 alter table supabase_sink_hwm enable row level security;
