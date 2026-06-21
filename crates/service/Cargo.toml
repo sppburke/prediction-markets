@@ -55,3 +55,6 @@ tracing-subscriber = { workspace = true }
 base64.workspace = true
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
+# Live-Postgres parity + AC9 concurrency harness (issue #397 follow-up), `scenario` feature;
+# the test self-skips when PE_TEST_PG_URL is unset (CI sets it to the postgres service).
+tokio-postgres = { workspace = true }
