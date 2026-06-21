@@ -15,6 +15,7 @@ pub mod orchestrator;
 pub mod paper_api;
 pub mod paper_recovery;
 pub mod position_seeder;
+pub mod runtime_config;
 pub mod snapshot_worker;
 pub mod status_writer;
 pub mod supabase_backfill;
