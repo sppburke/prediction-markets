@@ -31,7 +31,7 @@ use pe_event_log::{Reader, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
-use pe_service::clob_book::FixtureClobBookFetcher;
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
@@ -42,7 +42,7 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
@@ -94,8 +94,10 @@ fn mid_cache_for(hex: &str, price: &str) -> MidPriceCache<FixtureFetcher> {
     const BASE: &str = "http://gamma.test";
     let mut fx = HashMap::new();
     let url = format!("{BASE}/markets?condition_ids={hex}&limit=500");
-    let body =
-        format!(r#"[{{"conditionId":"{hex}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+    // clobTokenIds (outcome i → "{hex}-{i}") lets the price-impact gate resolve the /book token.
+    let body = format!(
+        r#"[{{"conditionId":"{hex}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{hex}-0\",\"{hex}-1\"]"}}]"#
+    );
     fx.insert(url, body.into_bytes());
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
@@ -258,4 +260,120 @@ async fn snapshot_entry_gate_fail_closed_blocks_absent_wallet() {
     println!(
         "PASS: per-event rebuild hot-reloads entry_gate_fail_closed=true (absent wallet blocked, 0 fills)"
     );
+}
+
+// ── Price-impact gate (#398 WS2) — orchestrator /book end-to-end ──────────────────
+// Folded into this binary (not a separate test file) to avoid adding another heavy link target.
+
+const GATE_COND: &str = "0xpig";
+const GATE_TOKEN: &str = "0xpig-0"; // outcome 0's token (mid_cache_for emits "{hex}-{i}")
+
+/// Snapshot that dollar-sizes to 200 ($100 / 0.50), per-trade cap removed so the BOOK cap is the
+/// only binding constraint, with the price-impact gate at `cap_bps`.
+fn gate_snapshot(cap_bps: i32) -> RuntimeConfig {
+    let mut rc = RuntimeConfig::from_service_config(&ServiceConfig::default());
+    rc.sizing_mode = SizingMode::Dollar { usd: dec!(100) };
+    rc.per_trade_cap = PerTradeCap::Unlimited;
+    rc.price_impact_cap_bps = cap_bps;
+    rc.max_resolution_horizon_secs = 0;
+    rc.min_resolution_horizon_secs = 0;
+    rc.max_fill_price = "0.90".to_string();
+    rc
+}
+
+fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
+    OrderBook {
+        asks: asks
+            .iter()
+            .map(|&(price, size)| BookLevel { price, size })
+            .collect(),
+    }
+}
+
+/// Run one BUY through an orchestrator wired with `books` (token → /book) and the gate at
+/// `cap_bps`. Returns (fill count, filled contracts).
+async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32) -> (usize, u64) {
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+
+    let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
+    tx.send(entry_trade("pig-1", GATE_COND, dec!(0.50)))
+        .await
+        .unwrap();
+    drop(tx);
+
+    let orch = Orchestrator::new(
+        rx,
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            bankroll: Decimal::from(10_000u32),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: Decimal::ZERO,
+            entry_gate_config: CopyEntryGateConfig { fail_closed: false },
+            runtime_config: Some(LiveRuntimeConfig::new(gate_snapshot(cap_bps))),
+        },
+        HashMap::new(),
+        WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+        make_dispatcher(dir),
+        paper_state.clone(),
+        PositionLedger::new(),
+        new_shared_health(false),
+        MarketEndCache::new(String::new()),
+        mid_cache_for(GATE_COND, "0.50"),
+        mpsc::channel(1).1,
+        None,
+        None,
+        None,
+        Arc::new(FixtureClobBookFetcher::new(books)),
+    )
+    .unwrap();
+    orch.run(std::future::pending::<()>()).await;
+
+    let contracts = paper_state
+        .paper_positions()
+        .unwrap()
+        .first()
+        .map(|p| p.long_contracts)
+        .unwrap_or(0);
+    (paper_fill_count(dir), contracts)
+}
+
+/// PASS: a shallow book (3 contracts at best ask) caps the dollar-sized 200 down to 3.
+#[tokio::test]
+async fn price_impact_shallow_book_caps_the_fill() {
+    let dir = TempDir::new().unwrap();
+    let books = HashMap::from([(GATE_TOKEN.to_string(), book(&[(dec!(0.50), dec!(3))]))]);
+    let (fills, contracts) = run_gate(&dir, books, 100).await;
+    assert_eq!(fills, 1);
+    assert_eq!(
+        contracts, 3,
+        "book cap must reduce the fill to the absorbable depth"
+    );
+    println!("PASS: shallow /book caps the dollar-sized 200 to absorbable depth 3");
+}
+
+/// PASS: an empty book (0 absorbable) yields Some(0) and skips the trade (distinct from fail-open).
+#[tokio::test]
+async fn price_impact_empty_book_skips_trade() {
+    let dir = TempDir::new().unwrap();
+    let books = HashMap::from([(GATE_TOKEN.to_string(), book(&[]))]);
+    let (fills, _) = run_gate(&dir, books, 100).await;
+    assert_eq!(fills, 0, "Some(0) book cap must skip the trade");
+    println!("PASS: empty /book (0 absorbable) skips the trade (Some(0), not fail-open)");
+}
+
+/// PASS: a /book fetch error (token absent) FAILS OPEN — the full dollar-sized 200 fills.
+#[tokio::test]
+async fn price_impact_book_fetch_error_fails_open() {
+    let dir = TempDir::new().unwrap();
+    let (fills, contracts) = run_gate(&dir, HashMap::new(), 100).await;
+    assert_eq!(fills, 1);
+    assert_eq!(
+        contracts, 200,
+        "a /book error must fail open (full dollar size)"
+    );
+    println!("PASS: /book fetch error fails open (full size 200, no cap)");
 }
