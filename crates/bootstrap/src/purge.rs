@@ -56,7 +56,9 @@ struct Decisions {
 
 /// Run the purge stage (issue #385). `dry_run` (the CLI `--dry-run`) forces a
 /// report-only pass; an armed delete additionally requires `purge_enabled`.
-/// Returns the [`PurgeReport`] for the caller to log.
+/// The bulk index-drop + VACUUM (issue #401) run only when the delete-set is at
+/// least `purge_bulk_min_wallets`; a smaller armed purge deletes incrementally
+/// with the indexes live and no VACUUM. Returns the [`PurgeReport`] to log.
 pub fn run_purge(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -126,18 +128,28 @@ pub fn run_purge(
         });
     }
 
-    let report = if armed {
-        // Fast bulk delete (issue #401): drop the two non-lookup `trades`
-        // secondary indexes so the per-wallet delete only churns the
-        // `wallet_hex` lookup index + PK, then rebuild them once on the
-        // compacted table. Ordering: drop → delete → VACUUM → recreate.
-        // Recreate-then-propagate: bind (never `?`) the delete/VACUUM AND the
-        // rebuild results, so the rebuild ALWAYS runs in this same invocation,
-        // then surface errors in priority order delete → VACUUM → rebuild. The
-        // ORIGINAL delete/VACUUM error therefore wins over a rebuild error, and
-        // no mid-run failure leaves a slow-query DB waiting on the next `open`'s
-        // SCHEMA backstop. Nothing is deleted before the drop, so the drop's own
-        // `?` early-return is safe.
+    // Issue #401: gate the bulk index-drop + VACUUM on delete-set size. A small
+    // daily armed purge (delete-set < `purge_bulk_min_wallets`) stays cheap —
+    // indexes live, no VACUUM; only a genuine backlog clear pays the O(table)
+    // index rebuild + full VACUUM. `rows.len()` is the cheap free-of-query proxy
+    // for trades deleted (more wallets ≈ more trades); the purge outcome is
+    // identical either way — only cost differs. `try_from`/`unwrap_or(MAX)`
+    // avoids a narrowing cast; on a 64-bit `usize` it is infallible, and the
+    // dead `MAX` arm would (safely) pick the bulk path for an impossible set.
+    let bulk =
+        armed && u64::try_from(rows.len()).unwrap_or(u64::MAX) >= config.purge_bulk_min_wallets;
+    let report = if bulk {
+        // Bulk mode (issue #401): the #403 fast-delete sequence. Drop the two
+        // non-lookup `trades` secondary indexes so the per-wallet delete only
+        // churns the `wallet_hex` lookup index + PK, VACUUM the compacted table,
+        // then rebuild the two indexes once. Ordering: drop → delete → VACUUM →
+        // recreate. Recreate-then-propagate: bind (never `?`) the delete/VACUUM
+        // AND the rebuild results, so the rebuild ALWAYS runs in this same
+        // invocation, then surface errors in priority order delete → VACUUM →
+        // rebuild. The ORIGINAL delete/VACUUM error therefore wins over a rebuild
+        // error, and no mid-run failure leaves a slow-query DB waiting on the next
+        // `open`'s SCHEMA backstop. Nothing is deleted before the drop, so the
+        // drop's own `?` early-return is safe.
         cache.drop_trades_bulk_delete_indexes()?;
         let purge_res = cache.purge_wallets(&rows, now_unix, false);
         let vacuum_res = if purge_res.is_ok() {
@@ -149,7 +161,14 @@ pub fn run_purge(
         let report = purge_res?;
         vacuum_res?;
         recreate_res?;
-        tracing::info!("purge: VACUUM complete; dropped + rebuilt 2 trades indexes");
+        tracing::info!("purge: bulk mode — dropped + rebuilt 2 trades indexes + VACUUM complete");
+        report
+    } else if armed {
+        // Incremental mode (issue #401): indexes stay live (a cheap per-wallet
+        // indexed delete for a small set), no drop/rebuild, no VACUUM. Freed
+        // pages are reused by the next backfill's inserts; the file plateaus.
+        let report = cache.purge_wallets(&rows, now_unix, false)?;
+        tracing::info!("purge: incremental mode — indexes live, no VACUUM");
         report
     } else {
         // Dry-run / disabled: report-only, no index ops (deletes nothing).
@@ -158,6 +177,9 @@ pub fn run_purge(
     tracing::info!(
         csv = %csv_path.display(),
         armed,
+        bulk,
+        bulk_threshold = config.purge_bulk_min_wallets,
+        delete_set = rows.len(),
         eligible = decisions.eligible.len(),
         proven_losers = report.proven_losers_deleted,
         dead_weight = report.dead_weight_deleted,

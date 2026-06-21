@@ -58,6 +58,24 @@ fn index_columns(cache: &WalletCache, index: &str) -> Vec<String> {
         .collect()
 }
 
+/// `PRAGMA freelist_count` — free (unused) pages in the main DB file (issue #401).
+/// VACUUM drains this to 0; a plain DELETE (no `auto_vacuum`) only grows it.
+fn freelist_count(cache: &WalletCache) -> i64 {
+    cache
+        .raw_conn_for_test()
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// `PRAGMA page_count` — total pages in the main DB file (issue #401). Only VACUUM
+/// shrinks it; a plain DELETE leaves it unchanged (freed pages go to the freelist).
+fn page_count(cache: &WalletCache) -> i64 {
+    cache
+        .raw_conn_for_test()
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap()
+}
+
 /// Upsert a fresh row (bulk path, so the tombstone gate is exercised on re-admit).
 fn upsert(cache: &mut WalletCache, w: &str, bits: i64) {
     cache
@@ -315,12 +333,42 @@ fn cfg(csv: String, enabled: bool) -> BootstrapConfig {
     }
 }
 
+/// Like [`cfg`] but pins `purge_bulk_min_wallets` (issue #401) so a scenario can
+/// force the bulk path (low threshold) or the incremental path (huge threshold)
+/// regardless of the small delete-set sizes these deterministic fixtures use.
+fn cfg_with_bulk_min(csv: String, enabled: bool, bulk_min: u64) -> BootstrapConfig {
+    BootstrapConfig {
+        purge_decision_csv: Some(csv),
+        purge_enabled: enabled,
+        purge_bulk_min_wallets: bulk_min,
+        ..BootstrapConfig::default()
+    }
+}
+
 /// Set up an active wallet with a fresh fetch + one trade at `trade_ts`.
 fn active_with_trade(cache: &mut WalletCache, w: &str, fetch_ts: i64, trade_ts: i64) {
     upsert(cache, w, SRC_LEADERBOARD);
     cache.conn_for_test_set_active(w, 1);
     cache.update_last_polymarket_fetch(w, fetch_ts).unwrap();
     cache.conn_for_test_insert_trade(w, &format!("{w}-t"), trade_ts);
+}
+
+/// An active, freshly-fetched, dormant (rule-B) wallet carrying `n` trades (issue
+/// #401). Sized so its delete frees ≥1 full page (page_size 4096, `auto_vacuum`
+/// OFF) — otherwise the freelist/page-count assertions would be vacuous.
+fn dead_weight_with_n_trades(
+    cache: &mut WalletCache,
+    w: &str,
+    fetch_ts: i64,
+    trade_ts: i64,
+    n: usize,
+) {
+    upsert(cache, w, SRC_LEADERBOARD);
+    cache.conn_for_test_set_active(w, 1);
+    cache.update_last_polymarket_fetch(w, fetch_ts).unwrap();
+    for i in 0..n {
+        cache.conn_for_test_insert_trade(w, &format!("{w}-{i}"), trade_ts);
+    }
 }
 
 #[test]
@@ -456,9 +504,11 @@ fn drop_then_create_trades_indexes_roundtrips() {
 
 #[test]
 fn armed_run_purge_keeps_trades_indexes_intact() {
-    // PASS: after a full armed run_purge (drop → delete → VACUUM → recreate) all
-    // three trades indexes are present and the covering index keeps its 5-column
-    // order — the drop/rebuild dance leaves a correct schema.
+    // PASS: after a full armed run_purge in BULK mode (drop → delete → VACUUM →
+    // recreate) all three trades indexes are present and the covering index keeps
+    // its 5-column order — the drop/rebuild dance leaves a correct schema. Forced
+    // bulk via threshold=1 (issue #401), since the 2-wallet delete-set would
+    // otherwise take the incremental path that never drops an index.
     let dir = TempDir::new().unwrap();
     let mut cache = open_cache(&dir);
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -476,7 +526,7 @@ fn armed_run_purge_keeps_trades_indexes_intact() {
          0x000000000000000000000000000000000000000a,-3.0,-0.5,50,True\n\
          0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
     );
-    run_purge(&cfg(csv, true), &mut cache, false).unwrap();
+    run_purge(&cfg_with_bulk_min(csv, true, 1), &mut cache, false).unwrap();
 
     let idx = trades_index_names(&cache);
     assert!(idx.contains("idx_trades_wallet_ts"), "lookup index intact");
@@ -542,5 +592,113 @@ fn schema_on_open_heals_dropped_trades_indexes() {
     );
     println!(
         "PASS: SCHEMA-on-open recreates the two dropped trades indexes with the covering index's exact column order"
+    );
+}
+
+// ── #401: size-gated bulk vs incremental purge ───────────────────────────────
+
+#[test]
+fn run_purge_bulk_mode_vacuums_and_reclaims() {
+    // PASS: an armed purge whose delete-set >= purge_bulk_min_wallets runs in BULK
+    // mode — the two non-lookup indexes are dropped+rebuilt (present afterward) AND
+    // VACUUM reclaims the freed pages (freelist_count == 0 and page_count shrinks).
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let wfresh = wallet_hex(0xb); // eligible winner: recent trade keeps cache fresh, spared
+    let wd = wallet_hex(0xd); // dead weight (rule B): many dormant trades → the delete set
+    active_with_trade(&mut cache, &wfresh, now, now - 3_600);
+    dead_weight_with_n_trades(&mut cache, &wd, now, now - 30 * DAY, 1_000);
+
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
+    );
+
+    let pages_before = page_count(&cache);
+    // threshold 1 ⇒ the 1-wallet delete-set forces bulk mode.
+    let report = run_purge(&cfg_with_bulk_min(csv, true, 1), &mut cache, false).unwrap();
+
+    assert_eq!(report.dead_weight_deleted, 1, "rule-B dead weight deleted");
+    assert!(
+        !cache.conn_for_test_wallet_exists(&wd),
+        "dead weight removed"
+    );
+    assert!(
+        cache.conn_for_test_wallet_exists(&wfresh),
+        "fresh winner spared"
+    );
+    // Dropped-then-rebuilt: the two secondary indexes are present again.
+    let idx = trades_index_names(&cache);
+    assert!(idx.contains("idx_trades_market_id"), "market_id rebuilt");
+    assert!(
+        idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "covering index rebuilt"
+    );
+    // VACUUM ran: freelist drained to zero and the file shrank.
+    assert_eq!(freelist_count(&cache), 0, "bulk VACUUM drains the freelist");
+    let pages_after = page_count(&cache);
+    assert!(
+        pages_after < pages_before,
+        "bulk VACUUM shrinks the file (after {pages_after} !< before {pages_before})"
+    );
+    println!(
+        "PASS: bulk-mode run_purge rebuilds both indexes and VACUUM reclaims (freelist 0, file shrank {pages_before}→{pages_after} pages)"
+    );
+}
+
+#[test]
+fn run_purge_incremental_mode_keeps_indexes_no_vacuum() {
+    // PASS: an armed purge whose delete-set < purge_bulk_min_wallets runs in
+    // INCREMENTAL mode — the two secondary indexes are never dropped (present) and
+    // NO VACUUM runs (freelist_count > 0 and page_count unchanged).
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let wfresh = wallet_hex(0xb);
+    let wd = wallet_hex(0xd);
+    active_with_trade(&mut cache, &wfresh, now, now - 3_600);
+    dead_weight_with_n_trades(&mut cache, &wd, now, now - 30 * DAY, 1_000);
+
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
+    );
+
+    let pages_before = page_count(&cache);
+    // threshold 1_000_000 ⇒ the 1-wallet delete-set stays under it ⇒ incremental.
+    let report = run_purge(&cfg_with_bulk_min(csv, true, 1_000_000), &mut cache, false).unwrap();
+
+    assert_eq!(
+        report.dead_weight_deleted, 1,
+        "rule-B dead weight still deleted"
+    );
+    assert!(
+        !cache.conn_for_test_wallet_exists(&wd),
+        "dead weight removed"
+    );
+    // Indexes never dropped: incremental keeps them live.
+    let idx = trades_index_names(&cache);
+    assert!(idx.contains("idx_trades_market_id"), "market_id index live");
+    assert!(
+        idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "covering index live"
+    );
+    // No VACUUM: freed pages sit on the freelist and the file does not shrink.
+    assert!(
+        freelist_count(&cache) > 0,
+        "incremental delete frees pages to the freelist (no VACUUM)"
+    );
+    assert_eq!(
+        page_count(&cache),
+        pages_before,
+        "incremental mode does not VACUUM ⇒ page_count unchanged"
+    );
+    println!(
+        "PASS: incremental-mode run_purge keeps both indexes live and skips VACUUM (freelist > 0, file unchanged at {pages_before} pages)"
     );
 }
