@@ -1,0 +1,23 @@
+# systemd unit for the pe-analytics-site Next.js dashboard (#398 WS3, step 21).
+# Install on the VPS: copy to /etc/systemd/system/pe-site.service (adjust User/WorkingDirectory),
+# then: sudo systemctl daemon-reload && sudo systemctl enable --now pe-site
+[Unit]
+Description=pe-analytics-site (Next.js dashboard, single-email SSO) — issue #398 WS3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sean
+# Adjust to the checkout path on the VPS (e.g. /home/sean/prediction-markets/site).
+WorkingDirectory=/home/sean/prediction-markets/site
+# Server-only secrets (chmod 600): AUTH_SECRET, AUTH_GOOGLE_CLIENT_ID/SECRET, AUTH_URL,
+# SUPABASE_SERVICE_ROLE_KEY, NEXT_PUBLIC_SUPABASE_URL/ANON_KEY.
+EnvironmentFile=/home/sean/prediction-markets/site/.env.production
+# Run the pre-built Node server on localhost; nginx terminates TLS and reverse-proxies to it.
+ExecStart=/usr/bin/npm run start -- -p 3000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

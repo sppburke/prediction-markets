@@ -32,6 +32,17 @@ export interface ServiceRuntime {
   updated_at: string;
 }
 
+// One `service_config` KV row (#398 WS1). `value_type` drives the admin panel's typed input.
+export type ConfigValueType = "bool" | "integer" | "decimal" | "text";
+export interface ServiceConfigRow {
+  key: string;
+  value: string;
+  value_type: ConfigValueType;
+  description: string | null;
+  updated_by: string | null;
+  updated_at: string;
+}
+
 // One row of the anon-readable `paper_fills` table (per-wallet detail tape).
 export interface PaperFill {
   idempotency_key: string;
