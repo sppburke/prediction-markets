@@ -131,11 +131,13 @@ pub fn run_purge(
         // secondary indexes so the per-wallet delete only churns the
         // `wallet_hex` lookup index + PK, then rebuild them once on the
         // compacted table. Ordering: drop → delete → VACUUM → recreate.
-        // Recreate-then-propagate: bind the delete/VACUUM results, ALWAYS
-        // rebuild the indexes in this same invocation, *then* surface the
-        // first error — so a mid-run failure never leaves a slow-query DB
-        // waiting on the next `open`'s SCHEMA backstop. Nothing is deleted
-        // before the drop, so the drop's own `?` early-return is safe.
+        // Recreate-then-propagate: bind (never `?`) the delete/VACUUM AND the
+        // rebuild results, so the rebuild ALWAYS runs in this same invocation,
+        // then surface errors in priority order delete → VACUUM → rebuild. The
+        // ORIGINAL delete/VACUUM error therefore wins over a rebuild error, and
+        // no mid-run failure leaves a slow-query DB waiting on the next `open`'s
+        // SCHEMA backstop. Nothing is deleted before the drop, so the drop's own
+        // `?` early-return is safe.
         cache.drop_trades_bulk_delete_indexes()?;
         let purge_res = cache.purge_wallets(&rows, now_unix, false);
         let vacuum_res = if purge_res.is_ok() {
@@ -143,9 +145,10 @@ pub fn run_purge(
         } else {
             Ok(())
         };
-        cache.create_trades_bulk_delete_indexes()?;
+        let recreate_res = cache.create_trades_bulk_delete_indexes();
         let report = purge_res?;
         vacuum_res?;
+        recreate_res?;
         tracing::info!("purge: VACUUM complete; dropped + rebuilt 2 trades indexes");
         report
     } else {
