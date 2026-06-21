@@ -622,4 +622,168 @@ mode = "shadow"
             );
         }
     }
+
+    /// Parse the `service_config` seed rows from the committed schema SQL into key -> value.
+    /// Seed values carry no apostrophes, so splitting each row on `'` yields the key at index
+    /// 1 and the value at index 3 regardless of the (comma-bearing) description that follows.
+    fn parse_service_config_seed(sql: &str) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        let mut in_block = false;
+        for line in sql.lines() {
+            let t = line.trim();
+            if t.starts_with("insert into service_config") {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if t.starts_with("on conflict") {
+                    break;
+                }
+                if t.starts_with("('") {
+                    let parts: Vec<&str> = t.split('\'').collect();
+                    if parts.len() >= 4 {
+                        map.insert(parts[1].to_string(), parts[3].to_string());
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    /// The live `flat_usd_per_trade` boot value from the committed smoke-test TOML ("25").
+    fn flat_usd_per_trade_from_smoke_toml(manifest: &str) -> String {
+        let toml =
+            std::fs::read_to_string(format!("{manifest}/../../smoke-test/service.toml")).unwrap();
+        toml.lines()
+            .map(str::trim)
+            .find(|t| t.starts_with("flat_usd_per_trade"))
+            .and_then(|t| t.split('"').nth(1))
+            .expect("flat_usd_per_trade not found in smoke-test/service.toml")
+            .to_string()
+    }
+
+    #[test]
+    fn service_config_seed_matches_boot_defaults() {
+        // #398 round-5 step-1 (Blocking): the committed service_config seed must equal the boot
+        // config defaults. WS1 polls this table with precedence KV > env > compiled, so a WRONG
+        // seeded value would silently win over env on the first poll and revert a risk-engine
+        // input to a bad value. A MISSING key is safe (it falls through to env/compiled), so this
+        // test pins every seeded key to its boot default and forbids unexpected keys.
+        // flat_usd_per_trade carries the live smoke-test/service.toml override ("25") so sizing
+        // stays $25 flat (never Kelly) before the first poll and during any Supabase outage.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let sql = std::fs::read_to_string(format!("{manifest}/../../scripts/supabase_schema.sql"))
+            .unwrap();
+        let seed = parse_service_config_seed(&sql);
+        assert!(
+            !seed.is_empty(),
+            "no service_config seed rows parsed from schema"
+        );
+
+        let d = ServiceConfig::default();
+        let expected: Vec<(&str, String)> = vec![
+            ("mode", d.mode.clone()),
+            ("bankroll_usd", d.bankroll_usd.clone()),
+            ("max_fill_price", d.max_fill_price.clone()),
+            (
+                "min_resolution_horizon_secs",
+                d.min_resolution_horizon_secs.to_string(),
+            ),
+            (
+                "max_resolution_horizon_secs",
+                d.max_resolution_horizon_secs.to_string(),
+            ),
+            (
+                "entry_gate_fail_closed",
+                d.entry_gate_fail_closed.to_string(),
+            ),
+            (
+                "trade_poll_interval_secs",
+                d.trade_poll_interval_secs.to_string(),
+            ),
+            (
+                "position_reseed_interval_secs",
+                d.position_reseed_interval_secs.to_string(),
+            ),
+            ("position_page_limit", d.position_page_limit.to_string()),
+            (
+                "position_size_threshold",
+                d.position_size_threshold.to_string(),
+            ),
+            (
+                "paper_fill_haircut_bps",
+                d.paper_fill_haircut_bps.to_string(),
+            ),
+            (
+                "paper_fill_slippage_bps",
+                d.paper_fill_slippage_bps.to_string(),
+            ),
+            (
+                "gamma_resolution_poll_interval_secs",
+                d.gamma_resolution_poll_interval_secs.to_string(),
+            ),
+            (
+                "supabase_refresh_interval_secs",
+                d.supabase_refresh_interval_secs.to_string(),
+            ),
+            (
+                "supabase_sink_reconcile_interval_secs",
+                d.supabase_sink_reconcile_interval_secs.to_string(),
+            ),
+            (
+                "maintenance_interval_secs",
+                d.maintenance_interval_secs.to_string(),
+            ),
+            (
+                "inactivity_threshold_secs",
+                d.inactivity_threshold_secs.to_string(),
+            ),
+            (
+                "inactivity_hard_cap_secs",
+                d.inactivity_hard_cap_secs.to_string(),
+            ),
+            ("bench_overfetch", d.bench_overfetch.to_string()),
+            ("demotion_min_trades", d.demotion_min_trades.to_string()),
+            ("demotion_cb_alpha", d.demotion_cb_alpha.clone()),
+            (
+                "flip_human_approved",
+                d.strategy.flip_human_approved.to_string(),
+            ),
+            (
+                "kelly_fraction_above_default_human_approved",
+                d.strategy
+                    .kelly_fraction_above_default_human_approved
+                    .to_string(),
+            ),
+            (
+                "polymarket_fee_rate",
+                d.strategy.polymarket_fee_rate.to_string(),
+            ),
+            ("slippage_rate", d.strategy.slippage_rate.to_string()),
+            (
+                "flat_usd_per_trade",
+                flat_usd_per_trade_from_smoke_toml(manifest),
+            ),
+        ];
+
+        for (k, v) in &expected {
+            assert!(
+                seed.contains_key(*k),
+                "service_config seed is missing key `{k}`"
+            );
+            assert_eq!(
+                seed.get(*k),
+                Some(v),
+                "service_config seed `{k}` must equal boot default"
+            );
+        }
+        let expected_keys: std::collections::HashSet<&str> =
+            expected.iter().map(|(k, _)| *k).collect();
+        for k in seed.keys() {
+            assert!(
+                expected_keys.contains(k.as_str()),
+                "service_config seed has unexpected key `{k}` not in the boot-default set"
+            );
+        }
+    }
 }
