@@ -39,6 +39,7 @@ const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
 const DEFAULT_PURGE_INACTIVITY_SECS: i64 = 1_209_600; // 14 days
 const DEFAULT_PURGE_LOSER_TSTAT_MAX: f64 = -2.0;
 const DEFAULT_PURGE_LOSER_NEFF_MIN: f64 = 20.0;
+const DEFAULT_PURGE_BULK_MIN_WALLETS: u64 = 20_000;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -459,6 +460,18 @@ pub struct BootstrapConfig {
     )]
     pub purge_loser_neff_min: f64,
 
+    /// Delete-set size (wallet count) at/above which an armed `pe-bootstrap purge`
+    /// runs in **bulk mode** — drop the two non-lookup `trades` indexes, delete,
+    /// VACUUM, rebuild (issue #401). Below it, an armed purge runs **incremental**:
+    /// indexes stay live and no VACUUM runs, so cheap daily purges plateau the
+    /// file. Default 20_000. Canonical default in `docs/_GLOSSARY.md`.
+    /// `PE_BOOTSTRAP_PURGE_BULK_MIN_WALLETS`.
+    #[serde(
+        default = "default_purge_bulk_min_wallets",
+        alias = "bootstrap_purge_bulk_min_wallets"
+    )]
+    pub purge_bulk_min_wallets: u64,
+
     /// Decision CSV (`ranked_72hr_buyandhold.csv`) for the purge verdict. When
     /// unset, the newest `data/eval-results/cron-*/` run is resolved. The pipeline
     /// passes the run's CSV explicitly via `PE_BOOTSTRAP_PURGE_DECISION_CSV`.
@@ -618,6 +631,10 @@ const fn default_purge_loser_neff_min() -> f64 {
     DEFAULT_PURGE_LOSER_NEFF_MIN
 }
 
+const fn default_purge_bulk_min_wallets() -> u64 {
+    DEFAULT_PURGE_BULK_MIN_WALLETS
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BootstrapConfig {
@@ -666,6 +683,7 @@ impl Default for BootstrapConfig {
             purge_inactivity_secs: default_purge_inactivity_secs(),
             purge_loser_tstat_max: default_purge_loser_tstat_max(),
             purge_loser_neff_min: default_purge_loser_neff_min(),
+            purge_bulk_min_wallets: default_purge_bulk_min_wallets(),
             purge_decision_csv: None,
         }
     }
