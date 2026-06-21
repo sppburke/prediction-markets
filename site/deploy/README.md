@@ -47,5 +47,6 @@ sudo certbot --nginx -d <your-domain>
 
 ## Lockout recovery (risk #9)
 
-There is no auth bypass. To change the allowed email, edit `ALLOWED_EMAIL` in `site/lib/auth.ts`
-and redeploy, or edit the `service_config` directly via `psql`.
+There is no auth bypass. The allowed email is the compile-time constant `ALLOWED_EMAIL` in
+`site/lib/auth.ts` (NOT stored in the database), so the only recovery is to edit that constant and
+redeploy the site. (A `psql` edit to `service_config` changes trader knobs, not the auth gate.)
