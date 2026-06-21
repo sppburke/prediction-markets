@@ -15,7 +15,7 @@ pub mod evaluate;
 pub mod mode;
 pub mod paper;
 
-pub use config::{PerTradeCap, WinnerFollowConfig};
+pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig};
 pub use error::{PaperExecutionError, WinnerFollowError};
 pub use evaluate::WinnerFollowStrategy;
 pub use mode::ExecutionMode;

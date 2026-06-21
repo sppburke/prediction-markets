@@ -141,12 +141,12 @@ create table if not exists service_config (
   updated_by text                                    -- admin email (WS3 PATCH); null for the seed
 );
 
--- Seed every non-secret knob with its compiled boot default (flat_usd_per_trade carries the live
--- smoke-test/service.toml override, "25", so the pre-first-poll window and any Supabase outage
--- size at $25 flat, never Kelly -- #398 round-5 Blocking). `do nothing` never clobbers a live
--- admin edit. A Rust test (crates/service config.rs `service_config_seed_matches_boot_defaults`)
--- asserts these values equal the boot ServiceConfig / WinnerFollowConfig defaults, so a stale
--- seed cannot silently win over env on the first poll (precedence KV > env > compiled).
+-- Seed every non-secret knob with its compiled boot default. The sizing keys carry the live
+-- smoke-test/service.toml override (sizing_mode=dollar, sizing_dollar_usd=25), so the pre-first-poll
+-- window and any Supabase outage size at $25 flat, never Kelly (#398 WS2 cutover safety). `do
+-- nothing` never clobbers a live admin edit. Rust tests assert these match the boot defaults: the
+-- flat-scalar keys in crates/service config.rs `service_config_seed_matches_boot_defaults`, and the
+-- three sizing keys (reassembled into SizingMode) in runtime_config `seed_reconstructs_boot_strategy`.
 insert into service_config (key, value, value_type, description) values
   ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
   ('bankroll_usd',                          '10000',  'decimal', 'Starting-capital baseline (dashboard denominator); never re-credits the running bankroll'),
@@ -175,7 +175,9 @@ insert into service_config (key, value, value_type, description) values
   ('kelly_fraction_above_default_human_approved', 'false', 'bool', 'Approval flag: allow a Kelly fraction above the mode default'),
   ('polymarket_fee_rate',                   '0.04',   'decimal', 'Polymarket BUY taker fee rate for net cost c'),
   ('slippage_rate',                         '0.01',   'decimal', 'Expected fill slippage rate added to c'),
-  ('flat_usd_per_trade',                    '25',     'decimal', 'Flat USD per trade (bypasses Kelly); live boot default')
+  ('sizing_mode',                           'dollar', 'text',    'Sizing mode: kelly | dollar | contract (#398 WS2); live boot default = dollar'),
+  ('sizing_dollar_usd',                     '25',     'decimal', 'USD per trade when sizing_mode=dollar (the $25-flat live default)'),
+  ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)')
   on conflict (key) do nothing;
 
 -- Operator watchlist (issue #398): the wallets pe-service copies, written by the service-role

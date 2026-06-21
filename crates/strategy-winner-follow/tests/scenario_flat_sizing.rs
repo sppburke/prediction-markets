@@ -17,7 +17,8 @@ use pe_core_types::{
 use pe_risk_engine::{RiskBlock, RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{
-    ExecutionMode, WinnerFollowConfig, WinnerFollowError, WinnerFollowStrategy, config::PerTradeCap,
+    ExecutionMode, SizingMode, WinnerFollowConfig, WinnerFollowError, WinnerFollowStrategy,
+    config::PerTradeCap,
 };
 use rust_decimal_macros::dec;
 use time::macros::datetime;
@@ -88,7 +89,7 @@ fn clean_snapshot() -> RiskSnapshot {
 
 fn flat_config(flat_usd: rust_decimal::Decimal) -> WinnerFollowConfig {
     WinnerFollowConfig {
-        flat_usd_per_trade: Some(flat_usd),
+        sizing_mode: SizingMode::Dollar { usd: flat_usd },
         per_trade_cap: PerTradeCap::Unlimited, // remove cap so flat count comes through
         ..WinnerFollowConfig::default()
     }
@@ -211,7 +212,7 @@ fn scenario_flat_sizing_low_price_large_count() {
 fn scenario_flat_sizing_per_trade_cap_still_clamps() {
     let signal = make_signal(0xF3, LeaderAction::Entry);
     let config = WinnerFollowConfig {
-        flat_usd_per_trade: Some(dec!(10_000)),
+        sizing_mode: SizingMode::Dollar { usd: dec!(10_000) },
         per_trade_cap: PerTradeCap::Bps(25),
         ..WinnerFollowConfig::default()
     };
@@ -318,7 +319,7 @@ fn scenario_flat_sizing_flip_gate_still_fires() {
 
 // ─── scenario F7 ─────────────────────────────────────────────────────────────
 
-/// `flat_usd_per_trade = None` → Kelly path is used (existing behaviour unchanged).
+/// `sizing_mode = Kelly` → Kelly path is used (existing behaviour unchanged).
 ///
 /// p=0.40 == price=0.40, fee raises c_net above p → NoEdge (same as before #161).
 ///
@@ -327,7 +328,7 @@ fn scenario_flat_sizing_flip_gate_still_fires() {
 fn scenario_kelly_path_used_when_flat_none() {
     let signal = make_signal_at_price(0xF7, LeaderAction::Entry, price(dec!(0.40)));
     let config = WinnerFollowConfig {
-        flat_usd_per_trade: None,
+        sizing_mode: SizingMode::Kelly,
         ..WinnerFollowConfig::default()
     };
     let strategy = WinnerFollowStrategy::new(config);
@@ -427,7 +428,7 @@ fn scenario_flat_sizing_is_deterministic() {
 fn scenario_flat_sizing_bankroll_below_price_yields_no_edge() {
     let signal = make_signal(0xFA, LeaderAction::Entry);
     let config = WinnerFollowConfig {
-        flat_usd_per_trade: Some(dec!(100)),
+        sizing_mode: SizingMode::Dollar { usd: dec!(100) },
         per_trade_cap: PerTradeCap::Unlimited,
         ..WinnerFollowConfig::default()
     };
@@ -445,4 +446,68 @@ fn scenario_flat_sizing_bankroll_below_price_yields_no_edge() {
         matches!(result, Err(WinnerFollowError::NoEdge)),
         "bankroll < price must yield NoEdge even on flat path; got {result:?}"
     );
+}
+
+// ─── scenario F8: contract sizing mode (#398 WS2) ─────────────────────────────
+
+/// `sizing_mode = Contract { contracts: 5 }` with the per-trade cap removed → exactly 5
+/// contracts (the uncapped case).
+///
+/// PASS: `intent.contracts.0 == 5`.
+#[test]
+fn scenario_contract_sizing_uncapped_yields_exact_n() {
+    let signal = make_signal(0xF8, LeaderAction::Entry); // price $0.50
+    let config = WinnerFollowConfig {
+        sizing_mode: SizingMode::Contract { contracts: 5 },
+        per_trade_cap: PerTradeCap::Unlimited,
+        ..WinnerFollowConfig::default()
+    };
+    let strategy = WinnerFollowStrategy::new(config);
+
+    let intent = strategy
+        .evaluate(
+            &signal,
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("contract sizing should produce order");
+    assert_eq!(
+        intent.contracts.0, 5,
+        "contract mode must yield exactly N=5 uncapped, got {}",
+        intent.contracts.0
+    );
+}
+
+/// `sizing_mode = Contract { contracts: 1000 }` with a 25 bps per-trade cap and a $10 000
+/// bankroll at price $0.50 → cap_usd = 25, max = floor(25/0.50) = 50, so 1000 is clamped to 50
+/// (the capped < N case).
+///
+/// PASS: `intent.contracts.0 == 50` (< 1000).
+#[test]
+fn scenario_contract_sizing_is_clamped_by_per_trade_cap() {
+    let signal = make_signal(0xF8, LeaderAction::Entry); // price $0.50
+    let config = WinnerFollowConfig {
+        sizing_mode: SizingMode::Contract { contracts: 1000 },
+        per_trade_cap: PerTradeCap::Bps(25),
+        ..WinnerFollowConfig::default()
+    };
+    let strategy = WinnerFollowStrategy::new(config);
+
+    let intent = strategy
+        .evaluate(
+            &signal,
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("contract sizing should produce order");
+    assert_eq!(
+        intent.contracts.0, 50,
+        "contract N=1000 must clamp to the 25 bps per-trade cap (50), got {}",
+        intent.contracts.0
+    );
+    assert!(intent.contracts.0 < 1000, "capped count must be < N");
 }

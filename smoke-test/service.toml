@@ -34,8 +34,9 @@ max_fill_price                   = "0.85"  # #142 parity: skip BUYs at/above thi
 supabase_url                     = ""
 supabase_refresh_interval_secs   = 300
 
-# Flat sizing: bypasses Kelly. The n13 watchlist DOES carry real win_rate_bps
-# (6316–8750), so Kelly is now available — remove flat_usd_per_trade to enable it.
-# Kept flat ($25/trade) for now as a safe, comparable paper baseline.
+# Sizing mode (#398 WS2): dollar = fixed $25/trade (bypasses Kelly), a safe comparable paper
+# baseline. Switch to `{ kind = "kelly" }` to enable Kelly, or `{ kind = "contract", value = {
+# contracts = N } }` for a fixed contract count. Env `PE_STRATEGY__SIZING_*` is NOT honored
+# (figment has no `.split("__")`); set the boot default here and seed `service_config` to match.
 [strategy]
-flat_usd_per_trade               = "25"
+sizing_mode = { kind = "dollar", value = { usd = "25" } }

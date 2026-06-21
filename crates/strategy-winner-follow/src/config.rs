@@ -41,6 +41,27 @@ impl PerTradeCap {
     }
 }
 
+/// How each BUY copy is sized (#398 WS2; replaces the former `flat_usd_per_trade` toggle).
+///
+/// Canonical default: `Kelly`. See `docs/_GLOSSARY.md` `sizing_mode_default`. The KV layer stores
+/// this as three flat `service_config` keys (`sizing_mode` / `sizing_dollar_usd` /
+/// `sizing_contracts`) reassembled in `runtime_config::parse_config`; the `[strategy]` TOML boot
+/// default uses this enum's `kind`/`value` serde form.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum SizingMode {
+    /// Fractional-Kelly sizing (the full `c` / `p` / bankroll math). Default.
+    #[default]
+    Kelly,
+    /// Fixed USD notional: `max(1, floor(usd / current_price))` contracts. Bypasses only the Kelly
+    /// fraction + price-derived math; the per-trade cap and risk gate still apply (plus the WS2
+    /// price-impact book cap once it lands). The migration target for the legacy `flat_usd_per_trade`.
+    Dollar { usd: Decimal },
+    /// Fixed contract count, then clamped by the per-trade cap and risk gate (and the WS2 book cap
+    /// once it lands).
+    Contract { contracts: u64 },
+}
+
 /// Configuration for the Winner-Follow strategy.
 ///
 /// Approval flags default to `false` (deny). Since #398 (Decision #2) they are admin-mutable at
@@ -72,16 +93,12 @@ pub struct WinnerFollowConfig {
     /// Canonical default: `slippage_rate = 0.01` (100 bps). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_slippage_rate")]
     pub slippage_rate: Decimal,
-    /// When `Some(usd)`, bypasses Kelly sizing (steps 4–5 of `evaluate`) and sizes
-    /// each BUY as `max(1, floor(usd / leader_price))` contracts instead.
-    /// Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap,
-    /// risk gate) remain active in both paths.
-    ///
-    /// Canonical default: `None` (Kelly sizing). See `docs/_GLOSSARY.md`
-    /// `flat_usd_per_trade_default`. Use only when the Kelly `p` input is mis-specified
-    /// (issue #161).
+    /// How each BUY copy is sized (Kelly / Dollar / Contract). Default: `Kelly`. Replaces the
+    /// former `flat_usd_per_trade` toggle (#398 WS2); `Dollar { usd }` is the equivalent of the
+    /// old flat path. The orchestrator's per-event config rebuild (WS1) keeps this live.
+    /// Canonical default: `docs/_GLOSSARY.md` `sizing_mode_default`.
     #[serde(default)]
-    pub flat_usd_per_trade: Option<Decimal>,
+    pub sizing_mode: SizingMode,
 }
 
 fn default_polymarket_fee_rate() -> Decimal {
@@ -101,7 +118,7 @@ impl Default for WinnerFollowConfig {
             kelly_fraction_override: None,
             per_trade_cap: PerTradeCap::default(),
             slippage_rate: default_slippage_rate(),
-            flat_usd_per_trade: None,
+            sizing_mode: SizingMode::default(),
         }
     }
 }

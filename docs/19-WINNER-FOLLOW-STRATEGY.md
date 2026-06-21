@@ -280,19 +280,21 @@ The risk engine retains `PerTradeSizeExceeded` as a defense-in-depth gate. Under
 
 Backtest override: `PE_BACKTEST_PER_TRADE_CAP=unlimited` (or `bps:N` / `mode_default`). Canonical defaults: `per_trade_cap_default` and `per_trade_cap_unlimited_resolved_bps` in `_GLOSSARY.md`.
 
-### Flat sizing (issue #161)
+### Sizing modes (issue #161, #398 WS2)
 
-When `WinnerFollowConfig.flat_usd_per_trade` is `Some(usd)`, `evaluate()` replaces steps 4–5 (Kelly fraction + `size_contracts`) with:
+`WinnerFollowConfig.sizing_mode` (a `SizingMode` enum; replaced `flat_usd_per_trade` in #398 WS2) selects how `evaluate()` performs steps 4–5:
 
 ```text
-contracts = max(1, floor(flat_usd_per_trade / leader_price))
+Kelly                  → fractional-Kelly (the full c/p/bankroll math)
+Dollar { usd }         → contracts = max(1, floor(usd / current_price))   # the former flat path
+Contract { contracts } → contracts = exactly N
 ```
 
-Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap, risk gate) remain active in both paths. This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
+Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap, risk gate) remain active in all modes (the WS2 step-5c price-impact book cap joins them once it lands in a later PR). This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
 
-**When to use:** Only when the Kelly `p` input is a per-leader-constant with no per-trade information (e.g. blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge. Flat sizing eliminates this noise and also eliminates bankroll compounding — position size does not grow with bankroll.
+**When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
-Default: `None` (Kelly path). Canonical: `_GLOSSARY.md` `flat_usd_per_trade_default`.
+Default: `Kelly`; the live boot default is `Dollar` (the USD amount is canonical in `_GLOSSARY.md` `sizing_mode_default`). The Supabase KV layer stores three flat keys (`sizing_mode`/`sizing_dollar_usd`/`sizing_contracts`) reassembled in `runtime_config::parse_config`.
 
 ## Anti-gaming flags
 

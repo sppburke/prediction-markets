@@ -12,7 +12,7 @@ use pe_risk_engine::{RiskDecision, RiskSnapshot, clamp_contracts_to_cap, evaluat
 use pe_venue_core::OrderIntent;
 
 use crate::{
-    WinnerFollowConfig, WinnerFollowError,
+    SizingMode, WinnerFollowConfig, WinnerFollowError,
     mode::{ExecutionMode, to_risk_trading_mode},
 };
 
@@ -61,9 +61,10 @@ impl WinnerFollowStrategy {
     /// 1. Gate Flip actions on `flip_human_approved`.
     /// 2. Use the requested `mode` directly as the effective mode (no signal-kind clamping).
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
-    /// 4. Size contracts: flat (`config.flat_usd_per_trade` is `Some`) or fractional Kelly.
-    ///    Flat path: `max(1, floor(flat / current_price))` — bypasses Kelly fraction and `p`.
-    ///    Kelly path: select fraction for the mode, compute cost-adjusted `c`, call `size_contracts`.
+    /// 4. Size contracts by `config.sizing_mode`:
+    ///    `Dollar { usd }` → `max(1, floor(usd / current_price))` (bypasses Kelly + `p`);
+    ///    `Contract { contracts }` → exactly `contracts` (bypasses Kelly + price math);
+    ///    `Kelly` → select the mode fraction, compute cost-adjusted `c`, call `size_contracts`.
     /// 5. Clamp contracts to `per_trade_cap`; return `NoEdge` if clamped to 0.
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
@@ -72,8 +73,7 @@ impl WinnerFollowStrategy {
     /// entry price in replay; the live market price on the copy path). The emitted
     /// `limit_price` stays at `signal.leader_price` regardless (don't-chase).
     ///
-    /// `p` — empirical win rate supplied by caller. Used only on the Kelly path; ignored
-    /// when `config.flat_usd_per_trade` is set.
+    /// `p` — empirical win rate supplied by caller. Used only when `sizing_mode` is `Kelly`.
     ///
     /// `c` — computed internally as `current_price + taker fee + slippage` for BUY orders.
     /// `fee_per_share = current_price × fee_rate`; `slippage_per_share = current_price × slippage_rate`.
@@ -100,49 +100,52 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::ShadowMode);
         }
 
-        // 4–5. Size contracts: flat path or fractional Kelly.
+        // 4–5. Size contracts by sizing mode.
         let trading_mode = to_risk_trading_mode(effective_mode);
-        let raw_contracts: u64 = if let Some(flat) = self.config.flat_usd_per_trade {
-            // Flat path: bypass Kelly fraction + size_contracts.
-            // Per-trade cap (5b) and risk gate (6) remain active below.
-            (flat / current_price.0)
-                .floor()
-                .to_u64()
-                .unwrap_or(1)
-                .max(1)
-        } else {
-            // Kelly path.
-            // 4. Kelly fraction.
-            let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
-
-            // 5. Size contracts.
-            // c = current_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
-            // fee_per_share = current_price × fee_rate (flat taker fee on notional).
-            // slippage_per_share = current_price × slippage_rate (proportional fill impact on BUY).
-            let fee_per_share = if signal.leader_side == Side::Buy {
-                current_price.0 * self.config.polymarket_fee_rate
-            } else {
-                Decimal::ZERO
-            };
-            let slippage_per_share = if signal.leader_side == Side::Buy {
-                current_price.0 * self.config.slippage_rate
-            } else {
-                Decimal::ZERO
-            };
-            let c_raw = current_price.0 + fee_per_share + slippage_per_share;
-            let c = Price::new(c_raw).map_err(|_| WinnerFollowError::NoEdge)?;
-
-            let kelly_input = KellyInput {
-                p,
-                c,
-                kelly_fraction: kf,
-                bankroll,
-            };
-            let contracts = size_contracts(&kelly_input)?;
-            if contracts.0 == 0 {
-                return Err(WinnerFollowError::NoEdge);
+        let raw_contracts: u64 = match self.config.sizing_mode {
+            SizingMode::Dollar { usd } => {
+                // Fixed USD notional: bypass Kelly fraction + size_contracts. The per-trade cap
+                // (5b), book cap (5c), and risk gate (6) remain active below.
+                (usd / current_price.0).floor().to_u64().unwrap_or(1).max(1)
             }
-            contracts.0
+            SizingMode::Contract { contracts } => {
+                // Exactly N contracts: bypass Kelly + price math. Downstream caps still apply; a
+                // configured 0 falls through to the clamped==0 skip below.
+                contracts
+            }
+            SizingMode::Kelly => {
+                // 4. Kelly fraction.
+                let kf = kelly_fraction(effective_mode, self.config.kelly_fraction_override);
+
+                // 5. Size contracts.
+                // c = current_price + Polymarket BUY taker fee + expected fill slippage (SELL pays neither).
+                // fee_per_share = current_price × fee_rate (flat taker fee on notional).
+                // slippage_per_share = current_price × slippage_rate (proportional fill impact on BUY).
+                let fee_per_share = if signal.leader_side == Side::Buy {
+                    current_price.0 * self.config.polymarket_fee_rate
+                } else {
+                    Decimal::ZERO
+                };
+                let slippage_per_share = if signal.leader_side == Side::Buy {
+                    current_price.0 * self.config.slippage_rate
+                } else {
+                    Decimal::ZERO
+                };
+                let c_raw = current_price.0 + fee_per_share + slippage_per_share;
+                let c = Price::new(c_raw).map_err(|_| WinnerFollowError::NoEdge)?;
+
+                let kelly_input = KellyInput {
+                    p,
+                    c,
+                    kelly_fraction: kf,
+                    bankroll,
+                };
+                let contracts = size_contracts(&kelly_input)?;
+                if contracts.0 == 0 {
+                    return Err(WinnerFollowError::NoEdge);
+                }
+                contracts.0
+            }
         };
 
         // 5b. Clamp to per-trade cap.

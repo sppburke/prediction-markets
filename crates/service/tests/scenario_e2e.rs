@@ -48,7 +48,7 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, PerTradeCap, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
@@ -314,7 +314,9 @@ fn scenario_normal_leader_follow_order_intent_equivalence() {
     // 2. Evaluate with a flat-sizing config so the OrderIntent is fully determined
     //    (flat path bypasses Kelly and `p`; clean snapshot → risk-approved).
     let config = WinnerFollowConfig {
-        flat_usd_per_trade: Some(Decimal::from(50u32)),
+        sizing_mode: SizingMode::Dollar {
+            usd: Decimal::from(50u32),
+        },
         per_trade_cap: PerTradeCap::Unlimited,
         ..WinnerFollowConfig::default()
     };
