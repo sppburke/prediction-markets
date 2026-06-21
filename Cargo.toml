@@ -84,6 +84,7 @@ url = "2"
 toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }
 trybuild = "1"
