@@ -46,6 +46,11 @@ pub enum SupabaseStateError {
     /// The RPC returned SQL `NULL` (e.g. an uninitialised `paper_bankroll`).
     #[error("supabase returned NULL for {0}")]
     Null(&'static str),
+    /// An authoritative read found an absent singleton — the authority is not seeded.
+    #[error(
+        "supabase {0} not initialised; run --backfill-supabase before enabling PE_SUPABASE_AUTHORITATIVE"
+    )]
+    Uninitialised(&'static str),
     #[error("corrupt supabase value: {0}")]
     Corrupt(String),
     #[error("paper-state: {0}")]
@@ -71,8 +76,16 @@ fn decimal_from_rpc(
         serde_json::Value::String(s) => {
             Decimal::from_str(s.trim()).map_err(|_| SupabaseStateError::Corrupt(s.clone()))
         }
-        serde_json::Value::Number(n) => Decimal::from_str(&n.to_string())
-            .map_err(|_| SupabaseStateError::Corrupt(n.to_string())),
+        // The RPCs `RETURN text`, so a bare number is unexpected. Accept an exact integer
+        // without ever touching `f64` (CLAUDE.md: no f64 for money); refuse a float rather
+        // than round-trip it lossily.
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(Decimal::from)
+            .or_else(|| n.as_u64().map(Decimal::from))
+            .ok_or_else(|| {
+                SupabaseStateError::Corrupt(format!("{what}: non-integer numeric RPC return {n}"))
+            }),
         serde_json::Value::Null => Err(SupabaseStateError::Null(what)),
         other => Err(SupabaseStateError::Corrupt(other.to_string())),
     }
@@ -383,15 +396,19 @@ pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
 /// Catch up Supabase from the local fills beyond `watermark` (issue #397 boot step 3):
 /// replay each `list_fills()` row with `event_seq > watermark` through the idempotent
 /// `commit_fill` RPC, advancing the watermark along the confirmed prefix and **halting at
-/// the first failed apply** (the tail retries next boot). Returns the new watermark.
-/// Re-applying a fill already in `paper_fills` is a no-op debit (the RPC's insert gate), so
-/// a reset watermark replays safely.
+/// the first failed apply** (the tail retries next boot). Returns `(new_watermark,
+/// fully_caught_up)` — `fully_caught_up` is `false` when the loop broke early on a failed
+/// apply, so the caller knows Supabase is incomplete (its bankroll is then *overstated* —
+/// missing un-applied debits — and must not be pulled back into SQLite). Re-applying a fill
+/// already in `paper_fills` is a no-op debit (the RPC's insert gate), so a reset watermark
+/// replays safely.
 pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
     watermark: i64,
-) -> Result<i64, SupabaseStateError> {
+) -> Result<(i64, bool), SupabaseStateError> {
     let mut new_wm = watermark;
+    let mut fully_caught_up = true;
     for row in paper_state
         .list_fills()?
         .into_iter()
@@ -406,6 +423,7 @@ pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
                         event_seq = row.event_seq,
                         "supabase authoritative catch-up: commit_fill failed; halting at last confirmed prefix"
                     );
+                    fully_caught_up = false;
                     break;
                 }
             },
@@ -420,7 +438,7 @@ pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
             }
         }
     }
-    Ok(new_wm)
+    Ok((new_wm, fully_caught_up))
 }
 
 /// Issue #397 authoritative boot: catch up Supabase from the local event-log fills, persist
@@ -438,21 +456,36 @@ pub async fn supabase_authoritative_boot(
 ) -> Result<(), SupabaseStateError> {
     // 3. Catch up Supabase from local fills beyond the dedicated watermark.
     let wm = i64::try_from(paper_state.last_supabase_applied_event_seq()?.0).unwrap_or(i64::MAX);
-    let new_wm = catch_up_supabase(client, paper_state, wm).await?;
+    let (new_wm, fully_caught_up) = catch_up_supabase(client, paper_state, wm).await?;
     if new_wm > wm {
         paper_state.set_supabase_applied_event_seq(EventSeq(u64::try_from(new_wm).unwrap_or(0)))?;
     }
 
-    // 4. Pull authoritative bankroll + positions Supabase → local.
+    // If catch-up halted before completing, Supabase is missing some debits (its bankroll is
+    // overstated), so the pull below must NOT overwrite the event-log-reconciled SQLite value.
+    // Keep the local state; the next boot retries catch-up. Not fatal — the local cache is
+    // self-consistent with the local fills, and the un-applied tail is durable in the event log.
+    if !fully_caught_up {
+        warn!(
+            "supabase authoritative boot: catch-up halted before completing; skipping the \
+             bankroll/positions pull (Supabase incomplete). Retaining local SQLite state; the \
+             next boot completes catch-up."
+        );
+        return Ok(());
+    }
+
+    // 4. Pull authoritative bankroll + positions Supabase → local (catch-up complete, so the
+    //    Supabase values are the authority).
     match client.fetch_bankroll().await? {
         Some(bankroll) => {
             paper_state.set_bankroll(bankroll)?;
             info!(bankroll = %bankroll, "supabase authoritative boot: pulled bankroll");
         }
-        None => warn!(
-            "supabase authoritative boot: paper_bankroll empty; keeping local bankroll \
-             (did --backfill-supabase run?)"
-        ),
+        // Fail-closed: an authoritative boot with no `paper_bankroll` row cannot establish the
+        // authority. Refuse to boot rather than warn-and-trade with a stale local balance (an
+        // un-backfilled deploy: flag on without `--backfill-supabase`). Mirrors the existing
+        // "hard-fail if Supabase empty" boot precedent for the watchlist.
+        None => return Err(SupabaseStateError::Uninitialised("paper_bankroll")),
     }
     let positions = client.fetch_positions().await?;
     let n = positions.len();

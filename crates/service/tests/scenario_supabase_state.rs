@@ -265,12 +265,13 @@ async fn ac_catchup_replays_and_is_idempotent() {
     }
     let fake = FakeSupabaseState::new(dec!(1000));
 
-    let wm1 = catch_up_supabase(&fake, &db, 0).await.unwrap();
-    let wm2 = catch_up_supabase(&fake, &db, wm1).await.unwrap();
+    let (wm1, full1) = catch_up_supabase(&fake, &db, 0).await.unwrap();
+    let (wm2, full2) = catch_up_supabase(&fake, &db, wm1).await.unwrap();
 
     // PASS: the first pass applies all three and advances to 14; re-running from 14 applies
     //       nothing new, and the fake's bankroll equals SQLite's (RPC↔Rust parity over catch-up).
     assert_eq!((wm1, wm2), (14, 14));
+    assert!(full1 && full2, "no failures → fully caught up both passes");
     assert_eq!(*fake.commit_calls.lock().unwrap(), vec![5, 9, 14]);
     assert_eq!(Some(fake.bankroll()), db.bankroll().unwrap());
     println!("PASS: AC-CATCHUP — replayed [5,9,14] once, re-run from 14 applied nothing");
@@ -294,11 +295,13 @@ async fn ac_catchup_halts_at_first_failure() {
         ..FakeSupabaseState::new(dec!(1000))
     };
 
-    let wm = catch_up_supabase(&fake, &db, 0).await.unwrap();
+    let (wm, fully) = catch_up_supabase(&fake, &db, 0).await.unwrap();
 
     // PASS: the watermark advances only over the confirmed prefix (5) and halts at 9; 14 is
-    //       left for the next boot. Not integer adjacency.
+    //       left for the next boot. Not integer adjacency. `fully` is false so the boot skips
+    //       the (now-incomplete) Supabase pull.
     assert_eq!(wm, 5);
+    assert!(!fully, "halted before completing → not fully caught up");
     assert_eq!(*fake.commit_calls.lock().unwrap(), vec![5]);
     println!("PASS: AC-HALT — applied [5], halted at 9, watermark=5 (14 deferred)");
 }
