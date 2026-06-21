@@ -2,8 +2,17 @@
 
 The historical-vs-live analytics stack for the live paper copy-trader (issue
 #343). It projects paper trading into Supabase and renders a per-wallet
-historical-vs-live view. The local trade path is unaffected: `paper_state.db`
-stays authoritative and the event log stays the durable write-ahead.
+historical-vs-live view. In the default (analytics-only) mode the local trade
+path is unaffected: `paper_state.db` stays authoritative and the event log stays
+the durable write-ahead.
+
+When `supabase_authoritative` is set (issue #397) the authority flips: Supabase
+becomes the system of record for the money + book (`paper_bankroll`,
+`paper_positions`, `paper_fills`, `settled_markets`), SQLite is demoted to a
+write-through read cache, and `run_sink` is not spawned (the `commit_fill` /
+`apply_resolution` RPCs are the sole writer of `paper_fills`/`settled_markets`).
+The event log stays the local crash-recovery WAL. See `_GLOSSARY.md`:
+`supabase_authoritative` and `scripts/supabase_paper_state_schema.sql`.
 
 ## Data flow
 

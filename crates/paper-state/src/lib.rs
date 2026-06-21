@@ -41,7 +41,9 @@ use pe_core_types::{
 };
 
 pub use schema::SCHEMA_VERSION;
-use schema::{BANKROLL_ROW_ID, META_LAST_APPLIED_EVENT_SEQ, SCHEMA};
+use schema::{
+    BANKROLL_ROW_ID, META_LAST_APPLIED_EVENT_SEQ, META_LAST_SUPABASE_APPLIED_EVENT_SEQ, SCHEMA,
+};
 
 /// Errors from the paper-state store.
 #[derive(Debug, thiserror::Error)]
@@ -339,6 +341,22 @@ impl PaperStateDb {
         Ok(new)
     }
 
+    /// Overwrite the bankroll to `value` unconditionally (issue #397 boot pull): the
+    /// authoritative Supabase value becomes the local-cache value. Unlike
+    /// [`credit_bankroll`](Self::credit_bankroll) (a delta) or
+    /// [`init_bankroll`](Self::init_bankroll) (insert-or-ignore), this is a direct setter
+    /// for mirroring the authoritative store into SQLite. Not used on the non-authoritative
+    /// path, where the bankroll only ever moves through `commit_fill`/`credit_bankroll`.
+    pub fn set_bankroll(&self, value: Decimal) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
+            params![BANKROLL_ROW_ID, value.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Number of fills recorded in the `fills` table.
     pub fn fills_count(&self) -> Result<usize, PaperStateError> {
         let conn = self.lock();
@@ -388,6 +406,36 @@ impl PaperStateDb {
     pub fn last_applied_event_seq(&self) -> Result<EventSeq, PaperStateError> {
         let conn = self.lock();
         Ok(EventSeq(read_last_applied(&conn)?.unwrap_or(0)))
+    }
+
+    /// The highest event-log `seq` whose fill has been applied to the **authoritative
+    /// Supabase** `commit_fill` RPC (issue #397). Defaults to `EventSeq(0)` before any
+    /// fill has been applied (or after a SQLite loss, forcing a safe full idempotent
+    /// replay). Kept separate from [`last_applied_event_seq`](Self::last_applied_event_seq)
+    /// so a local-only reconcile never advances the Supabase catch-up cursor.
+    pub fn last_supabase_applied_event_seq(&self) -> Result<EventSeq, PaperStateError> {
+        let conn = self.lock();
+        let raw: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![META_LAST_SUPABASE_APPLIED_EVENT_SEQ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(EventSeq(raw.map(parse_u64).transpose()?.unwrap_or(0)))
+    }
+
+    /// Persist the Supabase authoritative catch-up watermark (issue #397). Set to the
+    /// event-log head at cutover (so the first authoritative boot's catch-up is a no-op)
+    /// and advanced as boot catch-up confirms each fill against Supabase.
+    pub fn set_supabase_applied_event_seq(&self, seq: EventSeq) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_LAST_SUPABASE_APPLIED_EVENT_SEQ, to_i64(seq.0)?],
+        )?;
+        Ok(())
     }
 
     // ── Restore readers ──────────────────────────────────────────────────────
@@ -449,6 +497,34 @@ impl PaperStateDb {
         Ok(out)
     }
 
+    /// Upsert one of our own net paper positions (issue #397 boot pull): mirror an
+    /// authoritative Supabase `paper_positions` row into the local cache. On the
+    /// non-authoritative path positions only move through `commit_fill`; this setter
+    /// exists solely so the boot pull can overwrite the cache with the Supabase value.
+    pub fn upsert_position(
+        &self,
+        market_id: &MarketId,
+        outcome_id: OutcomeId,
+        long_contracts: u64,
+        short_contracts: u64,
+    ) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO positions (market_id, outcome_id, long_contracts, short_contracts) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
+                long_contracts = excluded.long_contracts, \
+                short_contracts = excluded.short_contracts",
+            params![
+                market_id.to_string(),
+                i64::from(outcome_id.0),
+                to_i64(long_contracts)?,
+                to_i64(short_contracts)?,
+            ],
+        )?;
+        Ok(())
+    }
+
     // ── Poll cursors ─────────────────────────────────────────────────────────
 
     /// Last-seen `observed_at` unix timestamp for `wallet`, or `None`.
@@ -502,6 +578,55 @@ impl PaperStateDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// Atomically record a settled market (guard-insert) and, **only when the row is
+    /// newly inserted**, credit the bankroll — one transaction, mirroring the Supabase
+    /// `apply_resolution` RPC (issue #397). Returns the resulting bankroll (unchanged
+    /// when the market was already settled, so a retry credits **zero**).
+    ///
+    /// This is the local mirror of the authoritative `apply_resolution`: the resolution
+    /// tick calls the RPC first, then this. Gating the credit on the settled-row insert
+    /// (not just `ON CONFLICT DO NOTHING` on the marker) is what makes a reload-then-retry
+    /// idempotent — the marker no-ops but the credit must not re-run.
+    pub fn settle_and_credit(
+        &self,
+        market_id: &MarketId,
+        outcome_prices_json: &str,
+        credit: Decimal,
+        settled_at_unix: i64,
+    ) -> Result<Decimal, PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT INTO settled_markets \
+                (market_id, outcome_prices, credit_applied, settled_at_unix) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(market_id) DO NOTHING",
+            params![
+                market_id.to_string(),
+                outcome_prices_json,
+                credit.to_string(),
+                settled_at_unix,
+            ],
+        )? > 0;
+        let bankroll = if inserted {
+            let current = tx_read_bankroll(&tx)?;
+            let new = current
+                .checked_add(credit)
+                .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
+            tx.execute(
+                "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
+                params![BANKROLL_ROW_ID, new.to_string()],
+            )?;
+            new
+        } else {
+            // Already settled: no double-credit; return the existing bankroll.
+            tx_read_bankroll(&tx)?
+        };
+        tx.commit()?;
+        Ok(bankroll)
     }
 
     /// All settled markets, for hydrating the resolution store's double-credit guard
@@ -1146,6 +1271,68 @@ mod tests {
         let rows = db.list_settled_markets().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].market_id, market());
+    }
+
+    #[test]
+    fn set_bankroll_overwrites_unconditionally() {
+        // Boot pull (issue #397): the authoritative value overwrites the local cache.
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(1000)).unwrap();
+        db.set_bankroll(dec!(4242.50)).unwrap();
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(4242.50)));
+        // A second set overwrites again (unlike init_bankroll's insert-or-ignore).
+        db.set_bankroll(dec!(7)).unwrap();
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(7)));
+    }
+
+    #[test]
+    fn upsert_position_round_trips_and_overwrites() {
+        let (_dir, db) = db();
+        db.upsert_position(&market(), OutcomeId(0), 10, 3).unwrap();
+        let pos = db.paper_positions().unwrap();
+        assert_eq!(pos.len(), 1);
+        assert_eq!(pos[0].long_contracts, 10);
+        assert_eq!(pos[0].short_contracts, 3);
+        // Same key overwrites (ON CONFLICT DO UPDATE).
+        db.upsert_position(&market(), OutcomeId(0), 0, 5).unwrap();
+        let pos = db.paper_positions().unwrap();
+        assert_eq!(pos.len(), 1);
+        assert_eq!(pos[0].long_contracts, 0);
+        assert_eq!(pos[0].short_contracts, 5);
+    }
+
+    #[test]
+    fn settle_and_credit_is_idempotent_credit_once() {
+        // Mirrors the apply_resolution RPC: the credit applies only on the first
+        // (newly-inserted) settlement; a retry returns the existing bankroll, no double-credit.
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(100)).unwrap();
+        let b1 = db
+            .settle_and_credit(&market(), "[\"1\",\"0\"]", dec!(25.50), 1_700_000_000)
+            .unwrap();
+        assert_eq!(b1, dec!(125.50));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(125.50)));
+        // Re-settle the same market: no credit, returns the current bankroll.
+        let b2 = db
+            .settle_and_credit(&market(), "[\"1\",\"0\"]", dec!(25.50), 1_700_000_999)
+            .unwrap();
+        assert_eq!(b2, dec!(125.50));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(125.50)));
+        // The first settlement row is preserved (DO NOTHING).
+        let rows = db.list_settled_markets().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].settled_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn supabase_watermark_round_trips_and_defaults_zero() {
+        let (_dir, db) = db();
+        // Defaults to 0 before any set (or after a SQLite loss → safe full replay).
+        assert_eq!(db.last_supabase_applied_event_seq().unwrap(), EventSeq(0));
+        db.set_supabase_applied_event_seq(EventSeq(42)).unwrap();
+        assert_eq!(db.last_supabase_applied_event_seq().unwrap(), EventSeq(42));
+        // Independent of the local reconciliation cursor.
+        assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(0));
     }
 
     fn snapshot(key: &str) -> FillMarketSnapshot {

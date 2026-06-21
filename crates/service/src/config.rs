@@ -181,6 +181,19 @@ pub struct ServiceConfig {
     #[serde(default = "default_supabase_sink_reconcile_interval_secs")]
     pub supabase_sink_reconcile_interval_secs: u64,
 
+    // ── Supabase authoritative paper-state (issue #397) ───────────────────────
+    /// Make Supabase the authoritative system of record for paper-state (issue #397).
+    /// When `true`: a paper fill writes the `commit_fill` RPC first (fail-closed — on error
+    /// the trade is skipped, the event log holds the fill and replays on restart), then
+    /// mirrors to SQLite; resolutions go through the `apply_resolution` RPC; boot does a
+    /// catch-up-then-pull against Supabase; and the best-effort `run_sink` is NOT spawned
+    /// (the RPCs are the sole writer of `paper_fills`/`settled_markets`). When `false`
+    /// (default) SQLite stays authoritative and the existing best-effort sink runs.
+    /// Requires the service-role `supabase_secret_key`. Off by default; set explicitly in
+    /// `.env`. `PE_SUPABASE_AUTHORITATIVE`. See `docs/_GLOSSARY.md`: `supabase_authoritative`.
+    #[serde(default)]
+    pub supabase_authoritative: bool,
+
     // ── Liquidity-at-fill capture (#350 WS2 PR-H) ─────────────────────────────
     /// Bounded capacity of the trade-path → liquidity-snapshot worker channel. Drop-on-full:
     /// a full channel drops the snapshot request so the BUY fill path never blocks (capture
@@ -432,6 +445,7 @@ impl Default for ServiceConfig {
             supabase_sink_enabled: false,
             supabase_sink_channel_capacity: default_supabase_sink_channel_capacity(),
             supabase_sink_reconcile_interval_secs: default_supabase_sink_reconcile_interval_secs(),
+            supabase_authoritative: false,
             snapshot_channel_capacity: default_snapshot_channel_capacity(),
             maintenance_interval_secs: default_maintenance_interval_secs(),
             inactivity_threshold_secs: default_inactivity_threshold_secs(),
@@ -508,6 +522,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "supabase_sink_enabled",
         "supabase_sink_channel_capacity",
         "supabase_sink_reconcile_interval_secs",
+        "supabase_authoritative",
         "bankroll_usd",
         "mode",
         "strategy",
@@ -555,6 +570,7 @@ mod tests {
         assert_eq!(cfg.supabase_anon_key, "");
         assert_eq!(cfg.supabase_secret_key, "");
         assert_eq!(cfg.supabase_refresh_interval_secs, 300);
+        assert!(!cfg.supabase_authoritative);
         assert_eq!(cfg.maintenance_interval_secs, 600);
         assert_eq!(cfg.inactivity_threshold_secs, 259_200);
         assert_eq!(cfg.inactivity_hard_cap_secs, 604_800);
@@ -579,6 +595,15 @@ mode = "shadow"
         assert_eq!(cfg.bind, "0.0.0.0:9000");
         assert_eq!(cfg.bankroll_usd, "5000");
         assert_eq!(cfg.mode, "shadow");
+    }
+
+    #[test]
+    fn supabase_authoritative_flag_loads_from_toml() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "supabase_authoritative = true").unwrap();
+        let cfg = load(Some(f.path())).unwrap();
+        assert!(cfg.supabase_authoritative);
     }
 
     #[test]

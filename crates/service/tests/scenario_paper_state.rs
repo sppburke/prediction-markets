@@ -198,6 +198,7 @@ async fn run_trades(
         dead_reseed_rx(),
         None,
         None,
+        None,
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
