@@ -25,6 +25,13 @@
 //! `apply_activation_rules` at its tail) earlier in the same pipeline run; nothing
 //! between backfill and purge mutates them. An armed purge on a globally stale
 //! cache (no fresh backfill) is refused.
+//!
+//! **Bulk-delete index dance (issue #401).** An armed run drops the two
+//! non-lookup `trades` secondary indexes around the chunked delete and rebuilds
+//! them once on the VACUUM-compacted table (`drop → delete → VACUUM → recreate`),
+//! so per-row index churn becomes a single bulk build. The recreate runs even on
+//! a mid-run delete/VACUUM error (recreate-then-propagate). The lookup index
+//! `idx_trades_wallet_ts` and the PK are kept. Dry runs touch no indexes.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -119,7 +126,35 @@ pub fn run_purge(
         });
     }
 
-    let report = cache.purge_wallets(&rows, now_unix, !armed)?;
+    let report = if armed {
+        // Fast bulk delete (issue #401): drop the two non-lookup `trades`
+        // secondary indexes so the per-wallet delete only churns the
+        // `wallet_hex` lookup index + PK, then rebuild them once on the
+        // compacted table. Ordering: drop → delete → VACUUM → recreate.
+        // Recreate-then-propagate: bind (never `?`) the delete/VACUUM AND the
+        // rebuild results, so the rebuild ALWAYS runs in this same invocation,
+        // then surface errors in priority order delete → VACUUM → rebuild. The
+        // ORIGINAL delete/VACUUM error therefore wins over a rebuild error, and
+        // no mid-run failure leaves a slow-query DB waiting on the next `open`'s
+        // SCHEMA backstop. Nothing is deleted before the drop, so the drop's own
+        // `?` early-return is safe.
+        cache.drop_trades_bulk_delete_indexes()?;
+        let purge_res = cache.purge_wallets(&rows, now_unix, false);
+        let vacuum_res = if purge_res.is_ok() {
+            cache.vacuum()
+        } else {
+            Ok(())
+        };
+        let recreate_res = cache.create_trades_bulk_delete_indexes();
+        let report = purge_res?;
+        vacuum_res?;
+        recreate_res?;
+        tracing::info!("purge: VACUUM complete; dropped + rebuilt 2 trades indexes");
+        report
+    } else {
+        // Dry-run / disabled: report-only, no index ops (deletes nothing).
+        cache.purge_wallets(&rows, now_unix, true)?
+    };
     tracing::info!(
         csv = %csv_path.display(),
         armed,
@@ -132,11 +167,6 @@ pub fn run_purge(
         dry_run = report.dry_run,
         "purge: report"
     );
-
-    if armed {
-        cache.vacuum()?;
-        tracing::info!("purge: VACUUM complete");
-    }
     Ok(report)
 }
 

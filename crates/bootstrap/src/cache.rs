@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
+use const_format::concatcp;
 use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -59,7 +60,20 @@ pub(crate) const INCREMENTAL_STOP_THRESHOLD: usize = 3;
 /// consistent partial state a re-run completes idempotently.
 const PURGE_CHUNK: usize = 1_000;
 
-const SCHEMA: &str = "
+/// DDL for the two non-lookup `trades` secondary indexes that an armed
+/// `pe-bootstrap purge` drops before its bulk delete and rebuilds after VACUUM
+/// (issue #401). Shared by `SCHEMA` (assembled via `concatcp!` below) and
+/// [`WalletCache::create_trades_bulk_delete_indexes`] so the on-open definition
+/// and the rebuild physically cannot diverge — the `CREATE INDEX IF NOT EXISTS`
+/// SCHEMA-on-open backstop heals an *absent* index, never a *divergent* one.
+const IDX_TRADES_MARKET_ID_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);";
+const IDX_TRADES_BUY_MARKET_OUTCOME_WALLET_TS_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_trades_buy_market_outcome_wallet_ts
+    ON trades(side, market_id, outcome_id, wallet_hex, timestamp_unix);";
+
+const SCHEMA: &str = concatcp!(
+    "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
@@ -80,7 +94,9 @@ CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades(wallet_hex, timestamp_
 -- DISTINCT scan instead of a ~100 GB heap scan. Costs one extra B-tree
 -- update per trade insert; worth it given the scan runs every resolutions
 -- and `all` invocation.
-CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
+",
+    IDX_TRADES_MARKET_ID_DDL,
+    "
 -- Sub-task #3 (first_mover_percentile_bps): covering index for the
 -- cross-wallet rank-index build query (`SELECT market_id, outcome_id,
 -- wallet_hex, MIN(timestamp_unix) FROM trades WHERE side='buy' AND
@@ -89,8 +105,9 @@ CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id);
 -- for GROUP BY (>22 min on the live 269M-row trades table). With it
 -- the planner does an index-only scan in the proper order, finding
 -- each group's MIN(timestamp_unix) from the first matching entry.
-CREATE INDEX IF NOT EXISTS idx_trades_buy_market_outcome_wallet_ts
-    ON trades(side, market_id, outcome_id, wallet_hex, timestamp_unix);
+",
+    IDX_TRADES_BUY_MARKET_OUTCOME_WALLET_TS_DDL,
+    "
 
 CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
     snapshot_at_unix INTEGER NOT NULL,
@@ -234,7 +251,8 @@ CREATE TABLE IF NOT EXISTS purged_wallets (
     purged_at_unix INTEGER NOT NULL,
     reason         TEXT    NOT NULL
 );
-";
+"
+);
 
 /// Result of `classify_infra_retroactive` (issue #197).
 #[derive(Debug, Default, Clone, Copy)]
@@ -1863,6 +1881,39 @@ impl WalletCache {
     /// deletes commit.
     pub fn vacuum(&mut self) -> Result<(), BootstrapError> {
         self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    /// Drop the two non-lookup `trades` secondary indexes (`idx_trades_market_id`
+    /// and `idx_trades_buy_market_outcome_wallet_ts`) before an armed bulk delete
+    /// (issue #401). The per-wallet `DELETE FROM trades WHERE wallet_hex = ?`
+    /// then maintains only `idx_trades_wallet_ts` (the lookup index it needs) and
+    /// the `source_trade_id` PK — turning ~5 random B-tree writes per row into 3,
+    /// so the dropped indexes are rebuilt once on the compacted table afterward
+    /// instead of being churned per row. Idempotent (`DROP INDEX IF EXISTS`).
+    ///
+    /// # Precondition
+    /// Pair with [`Self::create_trades_bulk_delete_indexes`] (`run_purge` calls
+    /// both around the delete). A hard crash between drop and rebuild leaves the
+    /// two indexes *absent*, and the next [`Self::open`] recreates them from the
+    /// shared `SCHEMA` DDL — never *divergent* (see [`IDX_TRADES_MARKET_ID_DDL`]).
+    pub fn drop_trades_bulk_delete_indexes(&mut self) -> Result<(), BootstrapError> {
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_trades_market_id;\n\
+             DROP INDEX IF EXISTS idx_trades_buy_market_outcome_wallet_ts;",
+        )?;
+        Ok(())
+    }
+
+    /// Rebuild the two indexes dropped by [`Self::drop_trades_bulk_delete_indexes`]
+    /// from the SAME shared `const` DDL that `SCHEMA` uses (issue #401), so the
+    /// on-open definition and this rebuild cannot diverge. Idempotent
+    /// (`CREATE INDEX IF NOT EXISTS`); each build is a single sequential scan +
+    /// external sort over the post-delete `trades` table.
+    pub fn create_trades_bulk_delete_indexes(&mut self) -> Result<(), BootstrapError> {
+        self.conn.execute_batch(IDX_TRADES_MARKET_ID_DDL)?;
+        self.conn
+            .execute_batch(IDX_TRADES_BUY_MARKET_OUTCOME_WALLET_TS_DDL)?;
         Ok(())
     }
 
