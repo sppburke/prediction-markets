@@ -160,6 +160,8 @@ insert into service_config (key, value, value_type, description) values
   ('position_size_threshold',               '1',      'integer', 'Min contracts to treat a position as held'),
   ('paper_fill_haircut_bps',                '500',    'integer', 'Paper-fill conservative haircut (bps)'),
   ('paper_fill_slippage_bps',               '100',    'integer', 'Paper-fill slippage (bps)'),
+  ('status_interval_secs',                   '30',     'integer', 'status.json snapshot interval (seconds); 0 disables'),
+  ('log_retention_days',                     '7',      'integer', 'Daily-rotated JSONL files kept per sink'),
   ('gamma_resolution_poll_interval_secs',   '120',    'integer', 'Settled-market resolution poll interval (seconds)'),
   ('supabase_refresh_interval_secs',        '300',    'integer', 'Watchlist refresh interval (seconds)'),
   ('supabase_sink_reconcile_interval_secs', '300',    'integer', 'Analytics sink reconcile interval (seconds)'),

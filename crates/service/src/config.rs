@@ -757,6 +757,8 @@ mode = "shadow"
                 "paper_fill_slippage_bps",
                 d.paper_fill_slippage_bps.to_string(),
             ),
+            ("status_interval_secs", d.status_interval_secs.to_string()),
+            ("log_retention_days", d.log_retention_days.to_string()),
             (
                 "gamma_resolution_poll_interval_secs",
                 d.gamma_resolution_poll_interval_secs.to_string(),
