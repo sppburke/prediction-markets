@@ -37,9 +37,17 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   P&L mirrors `paper-pnl::value_fill`: `side_sign · (resolved_price − fill_price)
   · contracts`. The FULL OUTER join keeps both admitted-but-not-yet-traded and
   aged-out wallets visible.
+- **`wallet_live_stats_mv` materialized view** (`scripts/supabase_wallet_live_stats_mv.sql`):
+  a periodically-refreshed cache of `wallet_live_stats` (the aggregation is expensive and was
+  recomputed on every page view). `pg_cron` runs `refresh materialized view concurrently`
+  every 2 min; a unique index on `wallet` enables the concurrent refresh. The site reads the
+  matview. Apply the SQL to Supabase, then deploy the site. (The pg_cron block self-skips on a
+  Postgres without the extension, so the file also loads in CI.)
 - **Site** (`site/`, PR3): thin read-only Next.js viewer (App Router + Tailwind +
   Recharts + `@supabase/supabase-js`). Overview + per-wallet historical-vs-live
-  panels and charts. Self-hosted locally on :3000; reads the anon key under RLS.
+  panels and charts; the two pages are **server-rendered with ISR** (`export const
+  revalidate = 60`), so the `wallet_live_stats_mv` read is fetched server-side and shared
+  across viewers rather than re-queried from every browser. Self-hosted on :3000; anon key.
 
 ## Numeric precision
 

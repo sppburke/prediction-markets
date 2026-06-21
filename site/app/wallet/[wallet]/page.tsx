@@ -1,8 +1,4 @@
-"use client";
-
 import Link from "next/link";
-import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
 import { FillsTable } from "@/components/FillsTable";
 import { HistVsLivePanel } from "@/components/HistVsLivePanel";
 import { Panel, StateNotice } from "@/components/Panel";
@@ -10,35 +6,29 @@ import { WinRateCompareChart } from "@/components/WinRateCompareChart";
 import { fetchFills, fetchWalletStat, NotConfiguredError } from "@/lib/data";
 import type { PaperFill, WalletLiveStats } from "@/lib/types";
 
-export default function WalletDetailPage() {
-  const params = useParams<{ wallet: string }>();
-  const wallet = (params.wallet ?? "").toLowerCase();
+// Server-rendered with ISR (see app/page.tsx): the wallet_live_stats_mv read + fills read run
+// on the server and are cached for up to `revalidate` seconds per wallet.
+export const revalidate = 60;
 
-  const [row, setRow] = useState<WalletLiveStats | null | "missing">(null);
-  const [fills, setFills] = useState<PaperFill[]>([]);
-  const [error, setError] = useState<string | null>(null);
+export default async function WalletDetailPage({
+  params,
+}: {
+  params: Promise<{ wallet: string }>;
+}) {
+  const { wallet: raw } = await params;
+  const wallet = (raw ?? "").toLowerCase();
 
-  useEffect(() => {
-    if (!wallet) return;
-    let active = true;
-    Promise.all([fetchWalletStat(wallet), fetchFills(wallet)])
-      .then(([stat, f]) => {
-        if (!active) return;
-        setRow(stat ?? "missing");
-        setFills(f);
-      })
-      .catch((e: unknown) => {
-        if (!active) return;
-        setError(
-          e instanceof NotConfiguredError
-            ? "Supabase not configured — copy site/.env.example to site/.env.local."
-            : `Failed to load: ${(e as Error).message}`,
-        );
-      });
-    return () => {
-      active = false;
-    };
-  }, [wallet]);
+  let row: WalletLiveStats | null = null;
+  let fills: PaperFill[] = [];
+  let error: string | null = null;
+  try {
+    [row, fills] = await Promise.all([fetchWalletStat(wallet), fetchFills(wallet)]);
+  } catch (e: unknown) {
+    error =
+      e instanceof NotConfiguredError
+        ? "Supabase not configured — copy site/.env.example to site/.env.local."
+        : `Failed to load: ${(e as Error).message}`;
+  }
 
   return (
     <div className="space-y-6">
@@ -53,8 +43,6 @@ export default function WalletDetailPage() {
       {error ? (
         <StateNotice kind="error" message={error} />
       ) : row === null ? (
-        <StateNotice kind="loading" message="Loading wallet…" />
-      ) : row === "missing" ? (
         <StateNotice kind="empty" message="No stats for this wallet in wallet_live_stats." />
       ) : (
         <>
