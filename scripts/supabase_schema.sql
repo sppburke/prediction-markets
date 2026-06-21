@@ -125,6 +125,68 @@ create table if not exists service_runtime (
 insert into service_runtime (id, watchlist_size) values (1, 0)
   on conflict (id) do nothing;
 
+-- ── Operator runtime config (issue #398 WS1) ─────────────────────────────────
+-- Supabase is authoritative for all non-secret runtime knobs. pe-service polls this table
+-- (WS1, 60 s) into an ArcSwap snapshot and rebuilds the strategy config per event; the admin
+-- panel (WS3) edits rows with the service-role key. Secrets, paths, bind, channel caps, and
+-- supabase_authoritative stay env/boot-frozen and are NOT here. KV layout (one row per knob)
+-- so old binaries ignore unknown keys and new keys land additively. value_type drives the
+-- admin panel's typed input (bool | integer | decimal | text).
+create table if not exists service_config (
+  key        text        primary key,
+  value      text        not null,
+  value_type text        not null check (value_type in ('bool', 'integer', 'decimal', 'text')),
+  description text,
+  updated_at timestamptz not null default now(),
+  updated_by text                                    -- admin email (WS3 PATCH); null for the seed
+);
+
+-- Seed every non-secret knob with its compiled boot default (flat_usd_per_trade carries the live
+-- smoke-test/service.toml override, "25", so the pre-first-poll window and any Supabase outage
+-- size at $25 flat, never Kelly -- #398 round-5 Blocking). `do nothing` never clobbers a live
+-- admin edit. A Rust test (crates/service config.rs `service_config_seed_matches_boot_defaults`)
+-- asserts these values equal the boot ServiceConfig / WinnerFollowConfig defaults, so a stale
+-- seed cannot silently win over env on the first poll (precedence KV > env > compiled).
+insert into service_config (key, value, value_type, description) values
+  ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
+  ('bankroll_usd',                          '10000',  'decimal', 'Starting-capital baseline (dashboard denominator); never re-credits the running bankroll'),
+  ('max_fill_price',                        '0.85',   'decimal', 'Skip BUYs at or above this current price'),
+  ('min_resolution_horizon_secs',           '60',     'integer', 'Min time-to-resolution copy floor (seconds)'),
+  ('max_resolution_horizon_secs',           '259200', 'integer', 'Max time-to-resolution, 72 h (seconds)'),
+  ('entry_gate_fail_closed',                'false',  'bool',    'Block copies for wallets whose market history could not be fetched'),
+  ('trade_poll_interval_secs',              '30',     'integer', 'Leader trade poll interval (seconds)'),
+  ('position_reseed_interval_secs',         '300',    'integer', 'Held-position reseed interval (seconds)'),
+  ('position_page_limit',                   '500',    'integer', 'Position fetch page size'),
+  ('position_size_threshold',               '1',      'integer', 'Min contracts to treat a position as held'),
+  ('paper_fill_haircut_bps',                '500',    'integer', 'Paper-fill conservative haircut (bps)'),
+  ('paper_fill_slippage_bps',               '100',    'integer', 'Paper-fill slippage (bps)'),
+  ('status_interval_secs',                   '30',     'integer', 'status.json snapshot interval (seconds); 0 disables'),
+  ('log_retention_days',                     '7',      'integer', 'Daily-rotated JSONL files kept per sink'),
+  ('gamma_resolution_poll_interval_secs',   '120',    'integer', 'Settled-market resolution poll interval (seconds)'),
+  ('supabase_refresh_interval_secs',        '300',    'integer', 'Watchlist refresh interval (seconds)'),
+  ('supabase_sink_reconcile_interval_secs', '300',    'integer', 'Analytics sink reconcile interval (seconds)'),
+  ('maintenance_interval_secs',             '600',    'integer', 'Watchlist maintenance tick interval (seconds)'),
+  ('inactivity_threshold_secs',             '259200', 'integer', 'Soft inactivity threshold, 72 h (seconds)'),
+  ('inactivity_hard_cap_secs',              '604800', 'integer', 'Hard inactivity cap, 7 d (seconds)'),
+  ('bench_overfetch',                       '10',     'integer', 'Bench overfetch count'),
+  ('demotion_min_trades',                   '10',     'integer', 'Min settled trades before the demotion test'),
+  ('demotion_cb_alpha',                     '0.10',   'decimal', 'Empirical-Bernstein demotion confidence alpha'),
+  ('flip_human_approved',                   'false',  'bool',    'Approval flag: allow Flip trades (admin-editable, audit-logged)'),
+  ('kelly_fraction_above_default_human_approved', 'false', 'bool', 'Approval flag: allow a Kelly fraction above the mode default'),
+  ('polymarket_fee_rate',                   '0.04',   'decimal', 'Polymarket BUY taker fee rate for net cost c'),
+  ('slippage_rate',                         '0.01',   'decimal', 'Expected fill slippage rate added to c'),
+  ('flat_usd_per_trade',                    '25',     'decimal', 'Flat USD per trade (bypasses Kelly); live boot default')
+  on conflict (key) do nothing;
+
+-- Operator watchlist (issue #398): the wallets pe-service copies, written by the service-role
+-- key. Anon-readable so the dashboard's Live tab can compute watched-set membership. Distinct
+-- from latest_ranking (the full bench); this is the live maintained working set.
+create table if not exists service_watchlist (
+  wallet_hex text        primary key,
+  rank       integer,
+  updated_at timestamptz not null default now()
+);
+
 -- Per-wallet historical (ranker) vs live (paper) stats. `security_invoker = true` so the
 -- view executes with the *querying* role's privileges and the anon RLS below applies.
 -- Live realized P&L mirrors `crates/paper-pnl` `value_fill`: for a settled fill,
@@ -221,6 +283,20 @@ alter table service_runtime enable row level security;
 drop policy if exists "service_runtime_anon_read" on service_runtime;
 create policy "service_runtime_anon_read" on service_runtime for select to anon using (true);
 grant select on service_runtime to anon;
+
+-- Operator runtime config (#398): the dashboard reads current values (anon); the admin panel
+-- writes with the service-role key (bypasses RLS). Anon read-only, no anon write policy.
+alter table service_config enable row level security;
+drop policy if exists "service_config_anon_read" on service_config;
+create policy "service_config_anon_read" on service_config for select to anon using (true);
+grant select on service_config to anon;
+
+-- Operator watchlist (#398): the dashboard reads (anon) for Live-tab membership; pe-service
+-- writes with the service-role key. Anon read-only, no anon write policy.
+alter table service_watchlist enable row level security;
+drop policy if exists "service_watchlist_anon_read" on service_watchlist;
+create policy "service_watchlist_anon_read" on service_watchlist for select to anon using (true);
+grant select on service_watchlist to anon;
 
 -- Views are not RLS-bearing; the anon role still needs an explicit grant to read them.
 grant select on latest_ranking to anon;
