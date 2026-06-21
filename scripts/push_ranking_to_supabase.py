@@ -6,7 +6,10 @@ test (project_copytrade_knockout_policy).
 
 REST-only (PostgREST) via the SUPABASE_SECRET_KEY in env — no DB driver, no committed
 secret. Idempotent batches are NOT enforced (append-only by design: every run = a new
-epoch, so the "wholesale-swap-at-frequency-X" replay has full history).
+epoch). After a successful push the script prunes `ranking_batches` to the newest
+`--keep-batches` (default 180 ≈ 6 months; CASCADE drops their entries), bounding the
+append-only growth while retaining enough epochs for the wholesale-swap-at-frequency-X
+replay (#411). `--keep-batches 0` disables the prune.
 """
 from __future__ import annotations
 
@@ -140,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--universe-size", type=int, default=0)
     ap.add_argument("--git-sha", default="")
     ap.add_argument("--notes", default="")
+    # Batch retention (#411): after a successful push, prune ranking_batches to the newest
+    # N (CASCADE drops their entries), bounding the append-only history. 0 disables it.
+    ap.add_argument("--keep-batches", type=int, default=180,
+                    help="keep only the newest N ranking_batches after a successful push "
+                         "(0 disables; docs/_GLOSSARY ranking_batches_retention; default 180)")
     # Active-only upload filter (issue #350 WS3). Off unless --db is given.
     ap.add_argument("--db", default=None,
                     help="wallet_cache.db; when set, drop ranked wallets idle beyond "
@@ -151,6 +159,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="abort the push if the cache's newest trade is older than N hours "
                          "(docs/_GLOSSARY upload_max_cache_staleness_hours; default 24)")
     return ap
+
+
+def prune_old_batches(url: str, key: str, keep: int) -> int | None:
+    """Prune `ranking_batches` to the newest `keep` rows (CASCADE drops their entries),
+    bounding the append-only history (#411). Returns the deleted cutoff `batch_id`, or
+    ``None`` when nothing was pruned (``keep <= 0`` disables it, or ≤ keep batches exist).
+
+    Count-based, not id-range: `batch_id` is `bigserial` with possible gaps from orphan-delete
+    rollbacks, so the cutoff is the (keep+1)-th newest id — ordering desc and skipping the
+    newest `keep` means the live `max(batch_id)` (what `latest_ranking` reads) is never in the
+    delete range. PostgREST cannot express ``NOT IN (SELECT … LIMIT N)``, hence GET-cutoff +
+    DELETE-below-it. Raises on transport/HTTP error; the caller treats prune as best-effort
+    (the push already succeeded)."""
+    if keep <= 0:
+        return None  # disabled — history-preserving research re-push
+    _, rows = _req(
+        "GET",
+        f"{url}/rest/v1/ranking_batches?select=batch_id&order=batch_id.desc&offset={keep}&limit=1",
+        key,
+    )
+    if not rows:  # PostgREST returns [] (not null) when the offset is past the end
+        return None  # ≤ keep batches exist; nothing to prune
+    cutoff = rows[0]["batch_id"]
+    _req("DELETE", f"{url}/rest/v1/ranking_batches?batch_id=lte.{cutoff}", key,
+         prefer="return=minimal")
+    return cutoff
 
 
 def main() -> int:
@@ -237,6 +271,22 @@ def main() -> int:
                   file=sys.stderr)
         return 1
     print(f"inserted {len(entries)} entries into batch {batch_id}")
+
+    # Bound the append-only ranking_batches history (#411): keep the newest N, CASCADE drops
+    # their entries. Best-effort — the push already succeeded, so a prune failure warns (with
+    # HTTP status + body, so e.g. a future from_batch_id FK conflict is visible) and does not
+    # fail the run; growth stays bounded and self-heals on the next successful push.
+    try:
+        cutoff = prune_old_batches(url, key, a.keep_batches)
+        if cutoff is not None:
+            print(f"pruned ranking_batches with batch_id <= {cutoff} (kept newest {a.keep_batches})")
+    except (urllib.error.URLError, OSError) as e:
+        if isinstance(e, urllib.error.HTTPError):
+            detail = f"HTTP {e.code}: {e.read().decode()[:300]}"
+        else:
+            detail = str(e)
+        print(f"WARNING: ranking_batches prune failed ({detail}); history not trimmed this "
+              f"run — bounded and self-heals on the next successful push", file=sys.stderr)
     return 0
 
 

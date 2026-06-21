@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Import the push script as a module (its work is guarded behind `if __name__`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -109,6 +110,7 @@ class DefaultsDriftTest(unittest.TestCase):
         a = pr.build_parser().parse_args(["--ranked-csv", "x.csv"])
         self.assertEqual(a.active_window_hours, 72)       # upload_active_window_hours
         self.assertEqual(a.max_cache_staleness_hours, 24)  # upload_max_cache_staleness_hours
+        self.assertEqual(a.keep_batches, 180)             # ranking_batches_retention (#411)
         self.assertIsNone(a.db)                            # filter off unless --db given
 
 
@@ -128,6 +130,61 @@ class BuildEntriesTest(unittest.TestCase):
         self.assertEqual(entries[0]["wallet_hex"], "0xAAA")             # original case preserved
         self.assertEqual(entries[0]["batch_id"], 42)
         self.assertIsNone(entries[1]["ls_edge"])                        # blank numeric -> NULL
+
+
+class PruneOldBatchesTest(unittest.TestCase):
+    """`prune_old_batches` (#411): cutoff GET + `lte` DELETE shaping, the ≤N no-op, the
+    disable switch, and the never-delete-latest guarantee. Mocks `_req` — no live network."""
+
+    URL = "https://x.supabase.co"
+    KEY = "secret"
+    GET = (
+        f"{URL}/rest/v1/ranking_batches"
+        "?select=batch_id&order=batch_id.desc&offset=180&limit=1"
+    )
+
+    def test_prunes_when_over_keep(self) -> None:
+        # GET yields the (keep+1)-th newest batch_id -> one DELETE lte that id, CASCADE drops entries.
+        with mock.patch.object(pr, "_req", return_value=(200, [{"batch_id": 12345}])) as m:
+            cutoff = pr.prune_old_batches(self.URL, self.KEY, 180)
+        self.assertEqual(cutoff, 12345)
+        self.assertEqual(m.call_count, 2)
+        self.assertEqual(m.call_args_list[0].args[0], "GET")
+        self.assertEqual(m.call_args_list[0].args[1], self.GET)
+        self.assertEqual(m.call_args_list[1].args[0], "DELETE")
+        self.assertEqual(
+            m.call_args_list[1].args[1],
+            f"{self.URL}/rest/v1/ranking_batches?batch_id=lte.12345",
+        )
+        self.assertEqual(m.call_args_list[1].kwargs.get("prefer"), "return=minimal")
+
+    def test_noop_when_at_or_below_keep(self) -> None:
+        # PostgREST returns [] (not null) past the end -> GET only, no DELETE.
+        with mock.patch.object(pr, "_req", return_value=(200, [])) as m:
+            cutoff = pr.prune_old_batches(self.URL, self.KEY, 180)
+        self.assertIsNone(cutoff)
+        self.assertEqual(m.call_count, 1)
+        self.assertEqual(m.call_args_list[0].args[0], "GET")
+
+    def test_disabled_when_keep_zero(self) -> None:
+        with mock.patch.object(pr, "_req") as m:
+            cutoff = pr.prune_old_batches(self.URL, self.KEY, 0)
+        self.assertIsNone(cutoff)
+        m.assert_not_called()  # no GET, no DELETE when disabled
+
+    def test_never_deletes_latest(self) -> None:
+        # The cutoff is taken from offset=keep on a desc order, so the newest `keep` ids
+        # (incl. max, what latest_ranking reads) are excluded by construction; the DELETE
+        # only ever targets <= that cutoff. Assert the GET skips exactly `keep`, desc.
+        with mock.patch.object(pr, "_req", return_value=(200, [{"batch_id": 999}])) as m:
+            pr.prune_old_batches(self.URL, self.KEY, 25)
+        get_url = m.call_args_list[0].args[1]
+        self.assertIn("order=batch_id.desc", get_url)
+        self.assertIn("offset=25", get_url)
+        self.assertEqual(
+            m.call_args_list[1].args[1],
+            f"{self.URL}/rest/v1/ranking_batches?batch_id=lte.999",
+        )
 
 
 if __name__ == "__main__":

@@ -45,11 +45,23 @@ create table if not exists wallet_lifecycle_events (
   reason          text,                         -- e.g. 'upper_cb_edge<0 & realized_pnl<0'
   live_pnl        numeric,
   trades_observed integer,
-  from_batch_id   bigint references ranking_batches(batch_id)
+  from_batch_id   bigint references ranking_batches(batch_id) on delete set null
 );
 create index if not exists idx_lifecycle_wallet on wallet_lifecycle_events (wallet_hex, ts);
 -- Demote audit records the wallet's real last trade at eviction time (#357); nullable + idempotent.
 alter table wallet_lifecycle_events add column if not exists last_trade_unix bigint;
+-- #411: keep `from_batch_id` ON DELETE SET NULL so the ranker push can prune old
+-- `ranking_batches` (keep newest N) without RESTRICT-blocking on a referencing audit row.
+-- It is provenance only (the wallet's admission batch); nulling it on prune preserves the
+-- demote/promote audit row while letting the batch be reclaimed. The inline FK above covers
+-- fresh DBs; this drop+add (idempotent, mirrors the `drop policy if exists` idiom below)
+-- migrates an existing DB. Today every `from_batch_id` is null (the demote writer emits null),
+-- so this is a no-op on current data and forward-proofs a future promote writer.
+alter table wallet_lifecycle_events
+  drop constraint if exists wallet_lifecycle_events_from_batch_id_fkey;
+alter table wallet_lifecycle_events
+  add constraint wallet_lifecycle_events_from_batch_id_fkey
+  foreign key (from_batch_id) references ranking_batches(batch_id) on delete set null;
 
 -- Convenience read for the VPS: the current bench = entries of the most recent batch.
 -- `security_invoker = true` (Supabase lint 0010_security_definer_view): the view executes

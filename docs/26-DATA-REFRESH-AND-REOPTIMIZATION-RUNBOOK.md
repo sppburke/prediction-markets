@@ -222,6 +222,19 @@ membership).
 artifacts to `data/archive/`; never delete eval outputs — they are the audit trail
 for what was published to `latest_ranking` and when.
 
+### Supabase batch retention (#411)
+
+The push appends one `ranking_batches` epoch (+ its `ranking_entries`) per run, so the
+table grows unbounded. After a successful push, `push_ranking_to_supabase.py` prunes
+`ranking_batches` to the newest `--keep-batches` rows (default **180** ≈ 6 months at the
+~daily cadence — the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; CASCADE
+removes their entries). `latest_ranking` reads only `max(batch_id)`, so pruning older
+epochs never touches the live read path or the `wallet_live_stats_mv` matview — it is
+storage hygiene, and it keeps enough epochs for the wholesale-swap-at-frequency-X replay.
+The prune is best-effort: a failure logs a warning and does not fail the push (growth
+stays bounded and self-heals on the next run). `--keep-batches 0` disables it for a
+history-preserving research re-push.
+
 ---
 
 ## Adding new wallets
