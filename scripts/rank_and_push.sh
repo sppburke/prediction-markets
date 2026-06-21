@@ -21,6 +21,9 @@
 #                                                  (#375; auto/duck engines only; --skip-export bypass)
 #   Stage 1  rank    rank_72hr_buyandhold.py  --universe-from-trades  (every wallet w/ trade data)
 #   Stage 2  rerank  latency_shift_rerank.py  (adds hit_rate)
+#            prune   delete the multi-GB qualifying_positions_72hr.csv once pass-2 has consumed it
+#                    (kept: the .txt deliverables, ranked_72hr_buyandhold.csv, latency_shift_ranked.csv;
+#                    --keep-intermediates to retain it; only prunes when this run generated it)
 #   Stage 3  push    push_ranking_to_supabase.py → Supabase latest_ranking
 #   Verify           latest_ranking is now populated.
 #   Stage 4  purge   pe-bootstrap purge (#385)  delete proven-loser & dead-weight wallets from
@@ -56,6 +59,8 @@
 #                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
 #   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
 #   --skip-purge          skip the final Stage-4 cache purge (#385).
+#   --keep-intermediates  retain qualifying_positions_72hr.csv (the >5 GB pass-1 intermediate) instead
+#                         of auto-pruning it after pass-2; useful for debugging the raw position set.
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
 
 set -euo pipefail
@@ -101,6 +106,7 @@ SKIP_RANK="0"
 SKIP_DISCOVERY="0"
 SKIP_BACKFILL="0"
 SKIP_PURGE="0"
+KEEP_INTERMEDIATES="0"            # 1 => retain the multi-GB qualifying_positions_72hr.csv after pass-2
 BOOTSTRAP_CONFIG=""               # optional BootstrapConfig TOML positional for Step-0 stages
 PE_BOOTSTRAP_BIN="target/release/pe-bootstrap"
 
@@ -129,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --skip-discovery) SKIP_DISCOVERY="1"; shift;;
     --skip-backfill) SKIP_BACKFILL="1"; shift;;
     --skip-purge) SKIP_PURGE="1"; shift;;
+    --keep-intermediates) KEEP_INTERMEDIATES="1"; shift;;
     --engine) ENGINE="$2"; shift 2;;
     --parquet-dir) PARQUET_DIR="$2"; shift 2;;
     --parquet-max-age-hours) PARQUET_MAX_AGE_HOURS="$2"; shift 2;;
@@ -326,6 +333,18 @@ else
 fi
 
 [[ -s "$LATENCY_CSV" ]] || { echo "FATAL: ranking produced no $LATENCY_CSV" >&2; exit 1; }
+
+# Auto-prune the multi-GB pass-1 intermediate now that pass-2 has consumed it. qualifying_positions_72hr.csv
+# (often >5 GB) is the raw per-(wallet,market) first-buy extraction read ONLY by latency_shift_rerank.py
+# (`--positions-csv` above); nothing downstream — push, purge, or a later --skip-rank re-push — reads it.
+# The small .txt deliverables, ranked_72hr_buyandhold.csv (the purge decision + per-wallet audit), and
+# latency_shift_ranked.csv (the push input, needed for re-push) are kept. Only prune when this run actually
+# generated it (SKIP_RANK=0); --keep-intermediates retains it for debugging.
+if [[ "$SKIP_RANK" == "0" && "$KEEP_INTERMEDIATES" == "0" && -f "$POSITIONS_CSV" ]]; then
+  pos_sz="$(du -h "$POSITIONS_CSV" 2>/dev/null | cut -f1)"
+  rm -f "$POSITIONS_CSV"
+  echo "── Pruned pass-1 intermediate: $POSITIONS_CSV (${pos_sz:-?} freed; --keep-intermediates to retain) ──"
+fi
 
 echo "── Stage 3/3: push to Supabase (the previously-missing step) ──────────────────"
 # Active-only upload filter args (issue #350 WS3): always pass --db; window/staleness only
