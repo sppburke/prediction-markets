@@ -1,8 +1,8 @@
 //! Supabase-authoritative runtime configuration (issue #398 WS1).
 //!
 //! The `service_config` KV table is authoritative for every non-secret, runtime-mutable knob.
-//! pe-service polls it into a [`LiveRuntimeConfig`] `ArcSwap` snapshot (the poller lands in a
-//! later PR) and rebuilds the strategy config per event. Secrets, paths, bind, channel caps,
+//! pe-service polls it (`config_poller`) into a [`LiveRuntimeConfig`] `ArcSwap` snapshot and the
+//! orchestrator rebuilds the strategy/mode/gate knobs per event. Secrets, paths, bind, channel caps,
 //! `supabase_sink_enabled`, and `supabase_authoritative` stay env/boot-frozen — this module
 //! never carries them.
 //!
@@ -262,13 +262,16 @@ pub fn parse_config(
     apply_parsed(&map, "price_impact_cap_bps", &mut out.price_impact_cap_bps);
     apply_parsed(&map, "polymarket_fee_rate", &mut out.polymarket_fee_rate);
     apply_parsed(&map, "slippage_rate", &mut out.slippage_rate);
-
-    // Approval flags (flip_human_approved, kelly_fraction_above_default_human_approved) stay
-    // BOOT-FROZEN here — they are NOT overlaid from KV. #398 Decision #2 makes them admin-mutable,
-    // but only "in lockstep" with reversing the canonical 'signed config change' rule
-    // (_GLOSSARY / 19- / CLAUDE.md) and wiring the admin panel + poller; that lands in the WS1
-    // wiring PR, not this data-layer PR. Until then the current docs ("cannot be changed at
-    // runtime") remain accurate.
+    // Approval flags are admin-mutable via service_config (#398 Decision #2 — reverses the old
+    // "signed config change only" rule, in lockstep with the doc updates in _GLOSSARY / 19- /
+    // CLAUDE.md). kelly_fraction_above_default_human_approved gates the override ceiling below, so
+    // it is applied BEFORE that check.
+    apply_parsed(&map, "flip_human_approved", &mut out.flip_human_approved);
+    apply_parsed(
+        &map,
+        "kelly_fraction_above_default_human_approved",
+        &mut out.kelly_fraction_above_default_human_approved,
+    );
 
     // Decimal-valued strings: validate as Decimal, store the string shape consumers expect.
     apply_decimal_string(&map, "bankroll_usd", &mut out.bankroll_usd);
@@ -450,8 +453,9 @@ fn kelly_override_ceiling(mode: &str) -> Decimal {
     }
 }
 
-/// `service_config.mode` string → [`ExecutionMode`], mirroring `main.rs::parse_mode`.
-fn parse_execution_mode(s: &str) -> Option<ExecutionMode> {
+/// `service_config.mode` string → [`ExecutionMode`], mirroring `main.rs::parse_mode`. Public so
+/// the orchestrator can parse the per-event snapshot's `mode` string into an `ExecutionMode`.
+pub fn parse_execution_mode(s: &str) -> Option<ExecutionMode> {
     match s.trim().to_lowercase().replace('-', "_").as_str() {
         "shadow" => Some(ExecutionMode::Shadow),
         "paper" => Some(ExecutionMode::Paper),
@@ -645,6 +649,34 @@ mod tests {
         // No override edit in this poll; the carried 0.40 violates the paper ceiling sans approval.
         let out = parse_config(&[], &elevated, false);
         assert_eq!(out.kelly_fraction_override, None);
+    }
+
+    #[test]
+    fn approval_flags_are_kv_mutable() {
+        // #398 Decision #2: approval flags are admin-mutable via service_config. The flag is
+        // applied before the override-ceiling check, so setting it in the SAME poll admits an
+        // above-ceiling override.
+        let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        assert!(!boot.flip_human_approved);
+        let out = parse_config(
+            &[
+                row("flip_human_approved", "true", "bool"),
+                row(
+                    "kelly_fraction_above_default_human_approved",
+                    "true",
+                    "bool",
+                ),
+                row("kelly_fraction_override", "0.40", "decimal"),
+            ],
+            &boot,
+            false,
+        );
+        assert!(out.flip_human_approved);
+        assert!(out.kelly_fraction_above_default_human_approved);
+        assert_eq!(
+            out.kelly_fraction_override,
+            Some(KellyFraction::new(dec!(0.40)).unwrap())
+        );
     }
 
     #[test]

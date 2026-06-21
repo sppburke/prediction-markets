@@ -25,6 +25,9 @@ use tracing::info;
 
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::clob_book::ReqwestClobBookFetcher;
+use pe_service::config_poller::{
+    CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, fetch_service_config, run_config_poll_loop,
+};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -33,6 +36,7 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
+use pe_service::runtime_config::{LiveRuntimeConfig, load_initial_runtime_config};
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
@@ -76,23 +80,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
     let mode = parse_mode(&cfg.mode)?;
 
-    // Fail fast: a kelly_fraction_override above the mode default requires the approval flag.
-    if let Some(kf) = &cfg.strategy.kelly_fraction_override {
-        let mode_default = match mode {
-            ExecutionMode::Shadow | ExecutionMode::Paper | ExecutionMode::LiveTiny => {
-                Decimal::new(25, 2)
-            }
-            ExecutionMode::Promoted => Decimal::new(50, 2),
-        };
-        anyhow::ensure!(
-            kf.0 <= mode_default || cfg.strategy.kelly_fraction_above_default_human_approved,
-            "kelly_fraction_override ({}) exceeds mode '{}' default ({}); \
-             set kelly_fraction_above_default_human_approved = true to allow this",
-            kf.0,
-            cfg.mode,
-            mode_default
-        );
-    }
+    // (#398 step 8) The boot-time Kelly approval guard was removed: its invariant now lives in
+    // `runtime_config::parse_config` and is re-enforced on every poll (and at boot via
+    // `load_initial_runtime_config`), so a runtime override change is governed too — not just the
+    // boot value. An above-ceiling override without the approval flag is cleared, not a hard-fail.
 
     // Copy-entry gate posture. The leader-price band was removed in #339 — live sizing
     // is re-based on the current market price instead (see the orchestrator copy path).
@@ -103,6 +94,36 @@ async fn main() -> Result<()> {
     // Parse the max-fill price cap eagerly so a malformed value fails fast before any I/O.
     let max_fill_price = Decimal::from_str(&cfg.max_fill_price)
         .with_context(|| format!("parse max_fill_price '{}'", cfg.max_fill_price))?;
+
+    // #398 WS1: Supabase `service_config` is authoritative for the non-secret runtime knobs.
+    // Fetch it once at boot (best-effort; fall back to env/compiled on any error) and seed the
+    // `LiveRuntimeConfig` ArcSwap that the config poller refreshes and the orchestrator reads per
+    // event. `clob_creds_present` gates live-mode transitions (paper stays paper without creds).
+    let clob_creds_present = !cfg.polymarket_funder_address.is_empty()
+        && !cfg.polymarket_private_key.is_empty()
+        && !cfg.polymarket_clob_api_key.is_empty()
+        && !cfg.polymarket_clob_api_secret.is_empty()
+        && !cfg.polymarket_clob_api_passphrase.is_empty();
+    let initial_config_rows = if cfg.supabase_url.is_empty() {
+        Vec::new()
+    } else {
+        fetch_service_config(
+            &reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "initial service_config fetch failed; using env/compiled defaults");
+            Vec::new()
+        })
+    };
+    let live_runtime_config = LiveRuntimeConfig::new(load_initial_runtime_config(
+        &initial_config_rows,
+        &cfg,
+        clob_creds_present,
+    ));
 
     // Bootstrap the initial wallet set from Supabase `latest_ranking` — the sole wallet
     // source (#339, #370). The fetch also returns the last-trade side-map (#357): each
@@ -478,6 +499,7 @@ async fn main() -> Result<()> {
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_fill_price,
             entry_gate_config,
+            runtime_config: Some(live_runtime_config.clone()),
         },
         history_map,
         WinnerFollowStrategy::new(cfg.strategy.clone()),
@@ -554,6 +576,26 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Service-config poll task (#398 WS1): every CONFIG_POLL_INTERVAL_SECS, refresh the
+    // LiveRuntimeConfig the orchestrator reads per event. Spawned only when Supabase is
+    // configured; fail-soft (keeps last-known-good on any fetch error). No writer lock needed —
+    // the poller is the sole writer of this ArcSwap (the watchlist lock guards a different cell).
+    let config_poll_task = if cfg.supabase_url.is_empty() {
+        None
+    } else {
+        Some(tokio::spawn(run_config_poll_loop(
+            live_runtime_config.clone(),
+            SupabaseConfigFetcher::new(
+                reqwest::Client::new(),
+                cfg.supabase_url.clone(),
+                cfg.supabase_anon_key.clone(),
+                cfg.supabase_secret_key.clone(),
+            ),
+            CONFIG_POLL_INTERVAL_SECS,
+            clob_creds_present,
+        )))
+    };
+
     // Status snapshot task (issue #184 follow-up): every `status_interval_secs`, atomically
     // rewrite `status.json` with current health (bankroll, counts, watchlist size, Supabase RPC
     // count, uptime) — the agent-friendly "how is it doing?" file. `0` disables it.
@@ -626,6 +668,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     if let Some(t) = status_task {
+        t.abort();
+    }
+    if let Some(t) = config_poll_task {
         t.abort();
     }
     info!("pe-service stopped");

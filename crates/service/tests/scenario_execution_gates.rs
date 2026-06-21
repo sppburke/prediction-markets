@@ -198,6 +198,7 @@ async fn run_gate_capped(
             min_resolution_horizon_secs: 0,
             max_fill_price,
             entry_gate_config: gate_config,
+            runtime_config: None,
         },
         history,
         WinnerFollowStrategy::new(flat_fill_config()),

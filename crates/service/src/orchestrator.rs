@@ -4,6 +4,7 @@
 //! The orchestrator is pure dispatch: it owns no I/O except through `ExecutionDispatcher`.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, SignalConfig, classify_trade};
@@ -30,6 +31,7 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
+use crate::runtime_config::{self, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, supabase_fill_from};
 use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
@@ -51,6 +53,10 @@ pub struct OrchestratorConfig {
     /// Copy-entry gate config (first-entry/fail-closed posture). The per-wallet
     /// market history is supplied separately to [`Orchestrator::new`].
     pub entry_gate_config: CopyEntryGateConfig,
+    /// Supabase-authoritative runtime config (#398 WS1). `Some` in production: `handle_trade`
+    /// rebuilds the strategy/mode/gate knobs from its snapshot per event. `None` (tests) keeps the
+    /// boot config — the per-event rebuild is skipped.
+    pub runtime_config: Option<LiveRuntimeConfig>,
 }
 
 pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
@@ -92,6 +98,9 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync> {
     // `PE_SUPABASE_AUTHORITATIVE=1`: a paper fill writes the `commit_fill` RPC first
     // (fail-closed), then mirrors to SQLite. `None` → the legacy SQLite-authoritative path.
     supabase_state: Option<SupabaseStateClient>,
+    // Supabase-authoritative runtime config (#398 WS1). `Some` in production; the per-event
+    // rebuild at the top of `handle_trade` reads one snapshot. `None` in tests (boot config).
+    runtime_config: Option<LiveRuntimeConfig>,
 }
 
 impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
@@ -148,6 +157,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
             sink,
             snapshot_sink,
             supabase_state,
+            runtime_config: config.runtime_config,
         })
     }
 
@@ -197,6 +207,21 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync> Orchestrator<C, F> {
     // ── Private handlers ──────────────────────────────────────────────────────
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
+        // #398 WS1: rebuild the runtime-mutable knobs from the latest Supabase config snapshot,
+        // once per event, so an admin edit takes effect within one poll with no restart. Reads
+        // only — the running `self.bankroll` (owned by the fill-commit path, #397) is untouched.
+        if let Some(rc) = self.runtime_config.as_ref().map(|live| live.snapshot()) {
+            self.strategy.set_config(rc.winner_follow_config());
+            if let Some(m) = runtime_config::parse_execution_mode(&rc.mode) {
+                self.mode = m;
+            }
+            if let Ok(price) = Decimal::from_str(&rc.max_fill_price) {
+                self.max_fill_price = price;
+            }
+            self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
+            self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
+        }
+
         // Mark polymarket freshness.
         {
             let mut h = self
