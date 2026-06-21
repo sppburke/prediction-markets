@@ -172,6 +172,13 @@ class PruneOldBatchesTest(unittest.TestCase):
         self.assertIsNone(cutoff)
         m.assert_not_called()  # no GET, no DELETE when disabled
 
+    def test_malformed_response_raises_for_caller_to_swallow(self) -> None:
+        # A row missing batch_id raises; main()'s best-effort except swallows it so a
+        # succeeded push never fails on a prune hiccup (#411 — pins the contract).
+        with mock.patch.object(pr, "_req", return_value=(200, [{}])):
+            with self.assertRaises(KeyError):
+                pr.prune_old_batches(self.URL, self.KEY, 180)
+
     def test_never_deletes_latest(self) -> None:
         # The cutoff is taken from offset=keep on a desc order, so the newest `keep` ids
         # (incl. max, what latest_ranking reads) are excluded by construction; the DELETE

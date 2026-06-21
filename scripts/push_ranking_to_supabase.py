@@ -166,8 +166,9 @@ def prune_old_batches(url: str, key: str, keep: int) -> int | None:
     bounding the append-only history (#411). Returns the deleted cutoff `batch_id`, or
     ``None`` when nothing was pruned (``keep <= 0`` disables it, or ≤ keep batches exist).
 
-    Count-based, not id-range: `batch_id` is `bigserial` with possible gaps from orphan-delete
-    rollbacks, so the cutoff is the (keep+1)-th newest id — ordering desc and skipping the
+    Count-based, not id-range: `batch_id` is `bigserial` with possible gaps from orphan-batch
+    deletes (a failed entries-insert deletes its just-created batch), so the cutoff is the
+    (keep+1)-th newest id — ordering desc and skipping the
     newest `keep` means the live `max(batch_id)` (what `latest_ranking` reads) is never in the
     delete range. PostgREST cannot express ``NOT IN (SELECT … LIMIT N)``, hence GET-cutoff +
     DELETE-below-it. Raises on transport/HTTP error; the caller treats prune as best-effort
@@ -273,18 +274,18 @@ def main() -> int:
     print(f"inserted {len(entries)} entries into batch {batch_id}")
 
     # Bound the append-only ranking_batches history (#411): keep the newest N, CASCADE drops
-    # their entries. Best-effort — the push already succeeded, so a prune failure warns (with
-    # HTTP status + body, so e.g. a future from_batch_id FK conflict is visible) and does not
-    # fail the run; growth stays bounded and self-heals on the next successful push.
+    # their entries. Best-effort — the push already succeeded, so ANY prune failure (transport,
+    # PostgREST error, or a malformed response) only warns (with HTTP status + body when
+    # available) and never fails the run; growth stays bounded and self-heals on the next push.
     try:
         cutoff = prune_old_batches(url, key, a.keep_batches)
         if cutoff is not None:
             print(f"pruned ranking_batches with batch_id <= {cutoff} (kept newest {a.keep_batches})")
-    except (urllib.error.URLError, OSError) as e:
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup must never fail a succeeded push
         if isinstance(e, urllib.error.HTTPError):
             detail = f"HTTP {e.code}: {e.read().decode()[:300]}"
         else:
-            detail = str(e)
+            detail = f"{type(e).__name__}: {e}"
         print(f"WARNING: ranking_batches prune failed ({detail}); history not trimmed this "
               f"run — bounded and self-heals on the next successful push", file=sys.stderr)
     return 0
