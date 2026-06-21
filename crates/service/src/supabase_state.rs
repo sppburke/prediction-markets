@@ -18,6 +18,8 @@
 
 use std::future::Future;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Side, SourceTradeId, VenueMarketId};
 use pe_paper_pnl::ResolutionStore;
@@ -118,6 +120,10 @@ pub struct SupabaseStateClient {
     client: reqwest::Client,
     base_url: String,
     token: String,
+    /// Cumulative count of authoritative RPC calls (`commit_fill` + `apply_resolution`),
+    /// surfaced in `status.json` so an agent can see the steady-state Supabase write rate.
+    /// `Arc` so every clone (one per fill, in the orchestrator) shares the same counter.
+    calls: Arc<AtomicU64>,
 }
 
 impl SupabaseStateClient {
@@ -126,7 +132,14 @@ impl SupabaseStateClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             token: auth_token(anon_key, secret_key).to_string(),
+            calls: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A handle to the cumulative RPC-call counter (for the status writer). All clones of this
+    /// client share it.
+    pub fn call_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.calls)
     }
 
     /// `POST {base}/rest/v1/rpc/{func}` with a JSON args object; decode the scalar return.
@@ -135,6 +148,9 @@ impl SupabaseStateClient {
         func: &'static str,
         body: &serde_json::Value,
     ) -> Result<Decimal, SupabaseStateError> {
+        // Count every authoritative RPC (both RPCs route through here); fetch/upsert (boot pull
+        // + one-time backfill) deliberately do not, so the counter reflects the recurring rate.
+        self.calls.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/rest/v1/rpc/{}", self.base_url, func);
         let resp = self
             .client

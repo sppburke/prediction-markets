@@ -399,9 +399,27 @@ call count.
 |---|---:|---|
 | `source_freshness_window_seconds` | 60 | Seconds without an event before a source is considered stale in `/health/ready` |
 
+### Agent-friendly log layout
+
+pe-service writes three bounded JSONL artifacts (so an agent reads one tiny file for health,
+a focused file for problems, and a bounded stream for detail — never an unbounded firehose):
+
+| Artifact | Shape | Use |
+|---|---|---|
+| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — `updated_at, uptime_secs, mode, authoritative, bankroll, open_positions, fills_total, settled_total, last_event_seq, watchlist_size, supabase_rpc_calls`. Read this first; no grep. |
+| `<stem>.<date>.jsonl` (from `jsonl_log_path`) | full stream, rotated **daily**, keeps `log_retention_days` | full detail; grep one day's file |
+| `errors.<date>.jsonl` (same dir) | **WARN+ERROR only**, rotated daily | the clean "what broke" tape (no INFO chatter) |
+
+| Config | Default | Description |
+|---|---|---|
+| `status_path` | `./status.json` | `ServiceConfig` field. Path of the health snapshot. `PE_STATUS_PATH`. |
+| `status_interval_secs` | 30 | `ServiceConfig` field. Seconds between `status.json` writes; `0` disables. `PE_STATUS_INTERVAL_SECS`. |
+| `log_retention_days` | 7 | `ServiceConfig` field. Dated JSONL files kept per sink (full + errors); bounds disk. `PE_LOG_RETENTION_DAYS`. |
+
 ### JSONL observability sidecar schema
 
-Written to `jsonl_log_path` (default: `./paper.jsonl`). One JSON object per line.
+Written to the rolling full-stream files derived from `jsonl_log_path` (default base:
+`./paper.jsonl` → `paper.<date>.jsonl`). One JSON object per line.
 
 **Required fields on every line:**
 
