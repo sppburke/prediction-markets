@@ -73,9 +73,27 @@ pub struct ServiceConfig {
     #[serde(default = "default_event_log_path")]
     pub event_log_path: PathBuf,
 
-    /// Path to the JSONL observability sidecar.
+    /// Base path for the rolling JSONL observability logs. Its directory + file stem name the
+    /// full-stream files (`<stem>.<date>.jsonl`); an `errors.<date>.jsonl` (WARN+ERROR only) is
+    /// written alongside. Both rotate daily, keeping `log_retention_days` files.
     #[serde(default = "default_jsonl_log_path")]
     pub jsonl_log_path: PathBuf,
+
+    /// Path to the atomically-rewritten `status.json` health snapshot (current bankroll,
+    /// positions/fills/settled counts, watchlist size, Supabase RPC count, uptime). The
+    /// agent-friendly "how is it doing?" file. See `docs/_GLOSSARY.md`: `status_path`.
+    #[serde(default = "default_status_path")]
+    pub status_path: PathBuf,
+
+    /// Seconds between `status.json` snapshots. `0` disables the writer. Default: 30.
+    /// See `docs/_GLOSSARY.md`: `status_interval_secs`.
+    #[serde(default = "default_status_interval_secs")]
+    pub status_interval_secs: u64,
+
+    /// Daily-rotated JSONL files kept per sink (full stream + errors). Bounds disk; older
+    /// files are deleted. Default: 7. See `docs/_GLOSSARY.md`: `log_retention_days`.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: usize,
 
     // ── Paper trading state ──────────────────────────────────────────────────
     /// Path to the crash-safe paper-state SQLite database.
@@ -377,6 +395,18 @@ fn default_jsonl_log_path() -> PathBuf {
     PathBuf::from("./paper.jsonl")
 }
 
+fn default_status_path() -> PathBuf {
+    PathBuf::from("./status.json")
+}
+
+const fn default_status_interval_secs() -> u64 {
+    30
+}
+
+const fn default_log_retention_days() -> usize {
+    7
+}
+
 fn default_paper_state_db_path() -> PathBuf {
     PathBuf::from("./paper_state.db")
 }
@@ -428,6 +458,9 @@ impl Default for ServiceConfig {
             position_size_threshold: default_position_size_threshold(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
+            status_path: default_status_path(),
+            status_interval_secs: default_status_interval_secs(),
+            log_retention_days: default_log_retention_days(),
             paper_state_db_path: default_paper_state_db_path(),
             paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
             paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
@@ -505,6 +538,9 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "position_size_threshold",
         "event_log_path",
         "jsonl_log_path",
+        "status_path",
+        "status_interval_secs",
+        "log_retention_days",
         "paper_state_db_path",
         "paper_fill_haircut_bps",
         "paper_fill_slippage_bps",
@@ -548,6 +584,9 @@ mod tests {
     fn default_values() {
         let cfg = ServiceConfig::default();
         assert_eq!(cfg.bind, "127.0.0.1:8080");
+        assert_eq!(cfg.status_path, PathBuf::from("./status.json"));
+        assert_eq!(cfg.status_interval_secs, 30);
+        assert_eq!(cfg.log_retention_days, 7);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
         assert_eq!(cfg.trade_poll_interval_secs, 30);
         assert_eq!(cfg.bankroll_usd, "10000");

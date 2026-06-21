@@ -66,7 +66,10 @@ async fn main() -> Result<()> {
 
     let cfg = load_config()?;
 
-    pe_service::logging::setup(&cfg.jsonl_log_path, "info")?;
+    // Hold the rolling-log worker guards for the whole process; dropping them flushes the
+    // non-blocking writers (losing buffered lines), so keep `_log_guards` alive until exit.
+    let _log_guards =
+        pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
     info!("pe-service starting");
 
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
@@ -491,6 +494,10 @@ async fn main() -> Result<()> {
     )
     .context("build orchestrator")?;
 
+    // Cumulative authoritative-RPC counter for status.json — grabbed before `supabase_state`
+    // is moved into the resolution task below; `None` when not in authoritative mode.
+    let supabase_rpc_calls = supabase_state.as_ref().map(|c| c.call_counter());
+
     // Resolution polling task: periodically fetch Gamma for closed markets. In authoritative
     // mode (issue #397) it credits via the `apply_resolution` RPC; `sink_handle` is `None`,
     // so the best-effort `send_resolution` nudge is suppressed.
@@ -542,6 +549,23 @@ async fn main() -> Result<()> {
             cfg.supabase_secret_key.clone(),
             watchlist_writer_lock.clone(),
             maint_cfg,
+        )))
+    } else {
+        None
+    };
+
+    // Status snapshot task (issue #184 follow-up): every `status_interval_secs`, atomically
+    // rewrite `status.json` with current health (bankroll, counts, watchlist size, Supabase RPC
+    // count, uptime) — the agent-friendly "how is it doing?" file. `0` disables it.
+    let status_task = if cfg.status_interval_secs > 0 {
+        Some(tokio::spawn(pe_service::status_writer::run_status_writer(
+            cfg.status_path.clone(),
+            Duration::from_secs(cfg.status_interval_secs),
+            paper_state.clone(),
+            live_watchlist.clone(),
+            cfg.mode.clone(),
+            cfg.supabase_authoritative,
+            supabase_rpc_calls,
         )))
     } else {
         None
@@ -599,6 +623,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     if let Some(t) = snapshot_task {
+        t.abort();
+    }
+    if let Some(t) = status_task {
         t.abort();
     }
     info!("pe-service stopped");

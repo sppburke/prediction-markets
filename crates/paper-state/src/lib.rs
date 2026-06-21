@@ -365,6 +365,25 @@ impl PaperStateDb {
             .map_err(|_| PaperStateError::Internal(format!("fills_count {n} exceeds usize::MAX")))
     }
 
+    /// Number of open net-position rows. Cheap `COUNT(*)` for the status snapshot, avoiding
+    /// loading every row via [`paper_positions`](Self::paper_positions).
+    pub fn positions_count(&self) -> Result<usize, PaperStateError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |row| row.get(0))?;
+        usize::try_from(n).map_err(|_| {
+            PaperStateError::Internal(format!("positions_count {n} exceeds usize::MAX"))
+        })
+    }
+
+    /// Number of settled-market rows. Cheap `COUNT(*)` for the status snapshot.
+    pub fn settled_count(&self) -> Result<usize, PaperStateError> {
+        let conn = self.lock();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM settled_markets", [], |row| row.get(0))?;
+        usize::try_from(n)
+            .map_err(|_| PaperStateError::Internal(format!("settled_count {n} exceeds usize::MAX")))
+    }
+
     /// All recorded fills in chronological (event-log) order, newest last.
     pub fn list_fills(&self) -> Result<Vec<FillRow>, PaperStateError> {
         let conn = self.lock();
@@ -1212,6 +1231,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.fills_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn positions_and_settled_counts() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(1000)).unwrap();
+        assert_eq!(db.positions_count().unwrap(), 0);
+        assert_eq!(db.settled_count().unwrap(), 0);
+        db.commit_fill(
+            &SourceTradeId("a".to_string()),
+            &leader(10, 0),
+            &fill("k1", Side::Buy, 10, dec!(0.50)),
+            EventSeq(1),
+        )
+        .unwrap();
+        db.record_settled_market(&market(), "[\"1\",\"0\"]", dec!(5), 1_700_000_000)
+            .unwrap();
+        assert_eq!(db.positions_count().unwrap(), 1);
+        assert_eq!(db.settled_count().unwrap(), 1);
     }
 
     #[test]
