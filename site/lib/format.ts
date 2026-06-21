@@ -12,7 +12,7 @@
 
 /** Declared display precision (decimal places) per value class. */
 export const PRECISION = {
-  /** USD amounts — realized P&L, $/trade live edge. */
+  /** USD amounts (realized P&L, unrealized P&L) and the cent rendering of ¢/trade edge. */
   usd: 2,
   /** Fractions rendered as a percentage (0..1 → "62.3%"). */
   pct: 1,
@@ -48,6 +48,18 @@ export function formatUsd(v: Numeric, opts?: { sign?: boolean }): string {
     maximumFractionDigits: PRECISION.usd,
   });
   return opts?.sign && n > 0 ? `+${s}` : s;
+}
+
+/**
+ * A USD-per-trade amount rendered in cents, e.g. `0.0436` → `"4.36¢"` (#398 WS3 overall edge).
+ * `opts.sign` prefixes a `+` on positive values.
+ */
+export function formatCents(v: Numeric, opts?: { sign?: boolean }): string {
+  const n = toNum(v);
+  if (n === null) return EM_DASH;
+  const cents = n * 100;
+  const s = `${cents.toFixed(PRECISION.usd)}¢`;
+  return opts?.sign && cents > 0 ? `+${s}` : s;
 }
 
 /** A fraction in [0,1] rendered as a percentage with PRECISION.pct decimals. */

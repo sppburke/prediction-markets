@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import {
   formatAge,
+  formatCents,
   formatDate,
   formatEdge,
   formatInt,
@@ -16,6 +17,7 @@ import {
   type Numeric,
 } from "@/lib/format";
 import type { WalletLiveStats } from "@/lib/types";
+import { UnrealizedPnlCell } from "./UnrealizedPnlCell";
 
 type Col = {
   key: string;
@@ -73,7 +75,7 @@ const COLUMNS: Col[] = [
       </span>
     ),
   },
-  { key: "live_edge", label: "Live $/trade", group: "live", sort: (r) => num(r.live_edge), cell: (r) => formatUsd(r.live_edge, { sign: true }) },
+  { key: "live_edge", label: "Live ¢/trade", group: "live", sort: (r) => num(r.live_edge), cell: (r) => formatCents(r.live_edge, { sign: true }) },
 ];
 
 const GROUP_TONE: Record<Col["group"], string> = {
@@ -82,12 +84,32 @@ const GROUP_TONE: Record<Col["group"], string> = {
   live: "text-text",
 };
 
-export function WalletTable({ rows }: { rows: WalletLiveStats[] }) {
+export function WalletTable({
+  rows,
+  unrealized,
+}: {
+  rows: WalletLiveStats[];
+  /** Lowercase wallet → unrealized P&L (USD). When provided (Live tab), an Unrealized column is
+   * appended; absent for the Historical/Bench tabs. */
+  unrealized?: Map<string, number>;
+}) {
   const [sortKey, setSortKey] = useState<string>("live_realized_pnl");
   const [asc, setAsc] = useState(false);
 
+  const columns = useMemo<Col[]>(() => {
+    if (!unrealized) return COLUMNS;
+    const unrealizedCol: Col = {
+      key: "unrealized",
+      label: "Unrealized",
+      group: "live",
+      sort: (r) => unrealized.get(r.wallet.toLowerCase()) ?? null,
+      cell: (r) => <UnrealizedPnlCell value={unrealized.get(r.wallet.toLowerCase())} />,
+    };
+    return [...COLUMNS, unrealizedCol];
+  }, [unrealized]);
+
   const sorted = useMemo(() => {
-    const col = COLUMNS.find((c) => c.key === sortKey);
+    const col = columns.find((c) => c.key === sortKey);
     if (!col) return rows;
     const dir = asc ? 1 : -1;
     return [...rows].sort((a, b) => {
@@ -98,7 +120,7 @@ export function WalletTable({ rows }: { rows: WalletLiveStats[] }) {
       if (bv === null) return -1;
       return (av - bv) * dir;
     });
-  }, [rows, sortKey, asc]);
+  }, [rows, sortKey, asc, columns]);
 
   function onSort(key: string) {
     if (key === "wallet") return;
@@ -115,7 +137,7 @@ export function WalletTable({ rows }: { rows: WalletLiveStats[] }) {
       <table className="w-full min-w-[820px] border-collapse text-xs">
         <thead>
           <tr className="bg-panelAlt text-left text-muted">
-            {COLUMNS.map((c) => (
+            {columns.map((c) => (
               <th
                 key={c.key}
                 onClick={() => onSort(c.key)}
@@ -133,7 +155,7 @@ export function WalletTable({ rows }: { rows: WalletLiveStats[] }) {
         <tbody>
           {sorted.map((r) => (
             <tr key={r.wallet} className="border-t border-border tabular-nums hover:bg-panelAlt">
-              {COLUMNS.map((c) => (
+              {columns.map((c) => (
                 <td
                   key={c.key}
                   className={`whitespace-nowrap px-3 py-2 ${
