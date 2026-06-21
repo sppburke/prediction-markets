@@ -13,6 +13,21 @@ jobs:
   gate:
     name: rustc 1.95.0 acceptance gate
     runs-on: ubuntu-latest
+    # Postgres for the issue #397 authoritative-RPC parity + concurrency test
+    # (crates/service/tests/pg_parity.rs). The main nextest gate self-skips that test
+    # (PE_TEST_PG_URL unset); the dedicated step below loads the schema and runs it for real.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -63,3 +78,21 @@ jobs:
           python3 scripts/test_rank_and_push.py
           python3 scripts/test_ranker_duck_parity.py
           python3 scripts/test_probe_gamma_ua.py
+
+      # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
+      # Load both Supabase schema files into the Postgres service (creating the Supabase
+      # roles the grants reference), then run the pg_parity test against the real PL/pgSQL.
+      # This is the only check of the live SQL execution + the B-E self-referencing-UPDATE
+      # lost-update safety; the workspace nextest above self-skips it (no PE_TEST_PG_URL).
+      - name: Load Supabase schema into Postgres
+        env:
+          PGURL: postgres://postgres:postgres@localhost:5432/postgres
+        run: |
+          psql "$PGURL" -v ON_ERROR_STOP=1 -c "create role anon nologin; create role authenticated nologin; create role service_role nologin;"
+          psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
+          psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_paper_state_schema.sql
+
+      - name: Postgres RPC parity + concurrency test (issue #397)
+        env:
+          PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: cargo nextest run -p pe-service --features scenario pg_parity
