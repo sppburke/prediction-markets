@@ -31,6 +31,33 @@ fn open_cache(dir: &TempDir) -> WalletCache {
     WalletCache::open(&dir.path().join("cache.db")).unwrap()
 }
 
+/// Names of every index on the `trades` table (issue #401), via the same PRAGMA
+/// family the `crypto-shadow` index-assertion precedent uses. Includes SQLite's
+/// auto-index for the `source_trade_id` PK, so assert presence/absence of named
+/// indexes rather than exact set equality.
+fn trades_index_names(cache: &WalletCache) -> HashSet<String> {
+    let conn = cache.raw_conn_for_test();
+    let mut stmt = conn.prepare("PRAGMA index_list(trades)").unwrap();
+    // index_list columns: (seq, name, unique, origin, partial) — name is col 1.
+    stmt.query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Key columns of `index`, in index order (issue #401). `PRAGMA index_info`
+/// returns one row per key column in `seqno` order; `name` is col 2.
+fn index_columns(cache: &WalletCache, index: &str) -> Vec<String> {
+    let conn = cache.raw_conn_for_test();
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA index_info({index})"))
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(2))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 /// Upsert a fresh row (bulk path, so the tombstone gate is exercised on re-admit).
 fn upsert(cache: &mut WalletCache, w: &str, bits: i64) {
     cache
@@ -366,4 +393,154 @@ fn run_purge_dry_run_reports_without_deleting() {
         "rule-A loser reported as would-delete"
     );
     println!("PASS: dry-run run_purge reports the rule-A loser but deletes nothing");
+}
+
+// ── #401: bulk-delete index drop/rebuild + SCHEMA-on-open backstop ────────────
+
+#[test]
+fn drop_then_create_trades_indexes_roundtrips() {
+    // PASS: drop removes exactly the two non-lookup `trades` indexes (the
+    // `wallet_hex` lookup index is kept), and create rebuilds them — the covering
+    // index with its exact 5-column order.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+
+    let base = trades_index_names(&cache);
+    assert!(
+        base.contains("idx_trades_wallet_ts"),
+        "lookup index present at open"
+    );
+    assert!(base.contains("idx_trades_market_id"));
+    assert!(base.contains("idx_trades_buy_market_outcome_wallet_ts"));
+
+    cache.drop_trades_bulk_delete_indexes().unwrap();
+    let dropped = trades_index_names(&cache);
+    assert!(
+        dropped.contains("idx_trades_wallet_ts"),
+        "lookup index must survive the drop"
+    );
+    assert!(
+        !dropped.contains("idx_trades_market_id"),
+        "market_id index must be dropped"
+    );
+    assert!(
+        !dropped.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "covering index must be dropped"
+    );
+
+    cache.create_trades_bulk_delete_indexes().unwrap();
+    let rebuilt = trades_index_names(&cache);
+    assert!(
+        rebuilt.contains("idx_trades_market_id"),
+        "market_id index rebuilt"
+    );
+    assert!(
+        rebuilt.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "covering index rebuilt"
+    );
+    assert_eq!(
+        index_columns(&cache, "idx_trades_buy_market_outcome_wallet_ts"),
+        [
+            "side",
+            "market_id",
+            "outcome_id",
+            "wallet_hex",
+            "timestamp_unix"
+        ],
+        "covering index rebuilt with its exact 5-column order"
+    );
+    println!(
+        "PASS: drop keeps the lookup index + removes the two non-lookup indexes; create rebuilds them with the exact 5-column order"
+    );
+}
+
+#[test]
+fn armed_run_purge_keeps_trades_indexes_intact() {
+    // PASS: after a full armed run_purge (drop → delete → VACUUM → recreate) all
+    // three trades indexes are present and the covering index keeps its 5-column
+    // order — the drop/rebuild dance leaves a correct schema.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let wa = wallet_hex(0xa); // eligible loser (rule A)
+    let wb = wallet_hex(0xb); // eligible winner (spared) + keeps cache fresh
+    let wc = wallet_hex(0xc); // dead weight (rule B)
+    active_with_trade(&mut cache, &wa, now, now - 2 * DAY);
+    active_with_trade(&mut cache, &wb, now, now - 3_600);
+    active_with_trade(&mut cache, &wc, now, now - 30 * DAY);
+
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000a,-3.0,-0.5,50,True\n\
+         0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
+    );
+    run_purge(&cfg(csv, true), &mut cache, false).unwrap();
+
+    let idx = trades_index_names(&cache);
+    assert!(idx.contains("idx_trades_wallet_ts"), "lookup index intact");
+    assert!(
+        idx.contains("idx_trades_market_id"),
+        "market_id index rebuilt"
+    );
+    assert!(
+        idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "covering index rebuilt"
+    );
+    assert_eq!(
+        index_columns(&cache, "idx_trades_buy_market_outcome_wallet_ts"),
+        [
+            "side",
+            "market_id",
+            "outcome_id",
+            "wallet_hex",
+            "timestamp_unix"
+        ],
+    );
+    println!(
+        "PASS: armed run_purge leaves all three trades indexes present with the covering index's 5-column order intact"
+    );
+}
+
+#[test]
+fn schema_on_open_heals_dropped_trades_indexes() {
+    // PASS: if a crash leaves the two non-lookup indexes dropped, the next
+    // WalletCache::open recreates them from SCHEMA (the absent-index backstop).
+    let dir = TempDir::new().unwrap();
+    {
+        let mut cache = open_cache(&dir);
+        cache.drop_trades_bulk_delete_indexes().unwrap();
+        let dropped = trades_index_names(&cache);
+        assert!(
+            !dropped.contains("idx_trades_market_id")
+                && !dropped.contains("idx_trades_buy_market_outcome_wallet_ts"),
+            "setup: both indexes dropped before reopen"
+        );
+    }
+    // Reopen the same DB file → execute_batch(SCHEMA) runs again on open.
+    let cache = open_cache(&dir);
+    let healed = trades_index_names(&cache);
+    assert!(
+        healed.contains("idx_trades_market_id"),
+        "SCHEMA-on-open recreated market_id"
+    );
+    assert!(
+        healed.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "SCHEMA-on-open recreated covering index"
+    );
+    assert_eq!(
+        index_columns(&cache, "idx_trades_buy_market_outcome_wallet_ts"),
+        [
+            "side",
+            "market_id",
+            "outcome_id",
+            "wallet_hex",
+            "timestamp_unix"
+        ],
+        "healed covering index keeps its 5-column order"
+    );
+    println!(
+        "PASS: SCHEMA-on-open recreates the two dropped trades indexes with the covering index's exact column order"
+    );
 }

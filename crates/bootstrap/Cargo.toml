@@ -29,6 +29,7 @@ pe-trader-index               = { path = "../trader-index",                 vers
 
 alloy           = { workspace = true }
 anyhow          = { workspace = true }
+const_format    = { workspace = true }
 figment         = { workspace = true }
 futures         = { workspace = true }
 reqwest         = { workspace = true }

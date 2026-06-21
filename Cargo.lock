@@ -3199,6 +3199,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "const_format",
  "figment",
  "futures",
  "pe-core-types",
