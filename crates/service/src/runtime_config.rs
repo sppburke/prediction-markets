@@ -602,6 +602,8 @@ mod tests {
         assert_eq!(rc.max_fill_price, "0.85");
         assert_eq!(rc.bankroll_usd, "10000");
         assert_eq!(rc.min_resolution_horizon_secs, 60);
+        // price_impact_cap_bps is seeded at 0 (gate disabled / fail-open) — #398 WS2.
+        assert_eq!(rc.price_impact_cap_bps, 0);
     }
 
     #[test]

@@ -177,7 +177,8 @@ insert into service_config (key, value, value_type, description) values
   ('slippage_rate',                         '0.01',   'decimal', 'Expected fill slippage rate added to c'),
   ('sizing_mode',                           'dollar', 'text',    'Sizing mode: kelly | dollar | contract (#398 WS2); live boot default = dollar'),
   ('sizing_dollar_usd',                     '25',     'decimal', 'USD per trade when sizing_mode=dollar (the $25-flat live default)'),
-  ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)')
+  ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)'),
+  ('price_impact_cap_bps',                  '0',      'integer', 'Price-impact gate cap (bps of best ask); 0 disables (fail-open). #398 WS2')
   on conflict (key) do nothing;
 
 -- Operator watchlist (issue #398): the wallets pe-service copies, written by the service-role

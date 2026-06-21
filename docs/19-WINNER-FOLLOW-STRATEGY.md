@@ -290,7 +290,7 @@ Dollar { usd }         → contracts = max(1, floor(usd / current_price))   # th
 Contract { contracts } → contracts = exactly N
 ```
 
-Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–6 (per-trade cap, risk gate) remain active in all modes (the WS2 step-5c price-impact book cap joins them once it lands in a later PR). This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
+Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–5c–6 (per-trade cap, price-impact book cap `price_impact_cap_bps`, risk gate) remain active in all modes. The book cap (#398 WS2) `min`s the size to the live CLOB `/book` contracts absorbable within `price_impact_cap_bps` of best ask; `0` disables it, a `/book` error fails open, and 0 absorbable skips the trade. This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 

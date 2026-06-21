@@ -256,7 +256,7 @@ async fn ac_loop_drains_all_then_exits_on_close() {
     run_snapshot_worker(
         rx,
         cache,
-        FixtureClobBookFetcher::new(books_for_222()),
+        std::sync::Arc::new(FixtureClobBookFetcher::new(books_for_222())),
         db.clone(),
         None::<RecordingWriter>,
         dropped,

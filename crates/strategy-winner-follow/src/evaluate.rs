@@ -51,7 +51,16 @@ impl WinnerFollowStrategy {
         bankroll: Decimal,
         mode: ExecutionMode,
     ) -> Result<OrderIntent, WinnerFollowError> {
-        self.evaluate_at_price(signal, signal.leader_price, p, snapshot, bankroll, mode)
+        // The leader-price wrapper (replay/backtest) applies no price-impact book cap.
+        self.evaluate_at_price(
+            signal,
+            signal.leader_price,
+            p,
+            snapshot,
+            bankroll,
+            mode,
+            None,
+        )
     }
 
     /// Evaluate a leader signal at an explicit `current_price` and produce an `OrderIntent`
@@ -65,7 +74,9 @@ impl WinnerFollowStrategy {
     ///    `Dollar { usd }` → `max(1, floor(usd / current_price))` (bypasses Kelly + `p`);
     ///    `Contract { contracts }` → exactly `contracts` (bypasses Kelly + price math);
     ///    `Kelly` → select the mode fraction, compute cost-adjusted `c`, call `size_contracts`.
-    /// 5. Clamp contracts to `per_trade_cap`; return `NoEdge` if clamped to 0.
+    /// 5. Clamp to `per_trade_cap`, then `min` with `book_cap_contracts` (the price-impact book
+    ///    cap, #398 WS2). Return `NoEdge` if the result is 0 (per-trade cap exhausted, or a
+    ///    `Some(0)` book cap → trade skipped).
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
@@ -75,9 +86,15 @@ impl WinnerFollowStrategy {
     ///
     /// `p` — empirical win rate supplied by caller. Used only when `sizing_mode` is `Kelly`.
     ///
+    /// `book_cap_contracts` — contracts absorbable within `price_impact_cap_bps` of best ask, from
+    /// the live `/book` (#398 WS2). `None` = no book result / gate disabled (fail-open passthrough);
+    /// `Some(0)` = a successful read with nothing absorbable (the trade is skipped, distinct from
+    /// fail-open). The orchestrator computes it; replay/backtest pass `None`.
+    ///
     /// `c` — computed internally as `current_price + taker fee + slippage` for BUY orders.
     /// `fee_per_share = current_price × fee_rate`; `slippage_per_share = current_price × slippage_rate`.
     /// SELL orders pay neither. See `_GLOSSARY.md` `polymarket_fee_rate`, `slippage_rate`.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate_at_price(
         &self,
         signal: &LeaderSignal,
@@ -86,6 +103,7 @@ impl WinnerFollowStrategy {
         mut snapshot: RiskSnapshot,
         bankroll: Decimal,
         mode: ExecutionMode,
+        book_cap_contracts: Option<u64>,
     ) -> Result<OrderIntent, WinnerFollowError> {
         // 1. Flip gate.
         if signal.action == LeaderAction::Flip && !self.config.flip_human_approved {
@@ -150,8 +168,15 @@ impl WinnerFollowStrategy {
 
         // 5b. Clamp to per-trade cap.
         let cap_bps = self.config.per_trade_cap.resolve_bps(trading_mode);
-        let clamped = clamp_contracts_to_cap(raw_contracts, current_price.0, bankroll, cap_bps);
-        // Guard: clamp returns 0 when available_bankroll < price (no fractional contracts).
+        let capped = clamp_contracts_to_cap(raw_contracts, current_price.0, bankroll, cap_bps);
+        // 5c. Price-impact book cap (#398 WS2): `min` with the contracts absorbable within
+        // `price_impact_cap_bps` of best ask. `None` = no `/book` result / gate off (fail-open
+        // passthrough); `Some(0)` = a successful read with nothing absorbable → clamp to 0 → skip.
+        let clamped = match book_cap_contracts {
+            Some(n) => capped.min(n),
+            None => capped,
+        };
+        // Guard: 0 from the per-trade cap (available_bankroll < price) OR a Some(0) book cap → skip.
         if clamped == 0 {
             return Err(WinnerFollowError::NoEdge);
         }
