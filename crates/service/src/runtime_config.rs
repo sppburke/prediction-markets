@@ -262,12 +262,13 @@ pub fn parse_config(
     apply_parsed(&map, "price_impact_cap_bps", &mut out.price_impact_cap_bps);
     apply_parsed(&map, "polymarket_fee_rate", &mut out.polymarket_fee_rate);
     apply_parsed(&map, "slippage_rate", &mut out.slippage_rate);
-    apply_parsed(&map, "flip_human_approved", &mut out.flip_human_approved);
-    apply_parsed(
-        &map,
-        "kelly_fraction_above_default_human_approved",
-        &mut out.kelly_fraction_above_default_human_approved,
-    );
+
+    // Approval flags (flip_human_approved, kelly_fraction_above_default_human_approved) stay
+    // BOOT-FROZEN here — they are NOT overlaid from KV. #398 Decision #2 makes them admin-mutable,
+    // but only "in lockstep" with reversing the canonical 'signed config change' rule
+    // (_GLOSSARY / 19- / CLAUDE.md) and wiring the admin panel + poller; that lands in the WS1
+    // wiring PR, not this data-layer PR. Until then the current docs ("cannot be changed at
+    // runtime") remain accurate.
 
     // Decimal-valued strings: validate as Decimal, store the string shape consumers expect.
     apply_decimal_string(&map, "bankroll_usd", &mut out.bankroll_usd);
@@ -297,8 +298,12 @@ pub fn parse_config(
         }
     }
 
-    // Kelly-override invariant (relocated from the boot guard): an override above the proposed
-    // mode's ceiling needs the approval flag, else reject the field and keep last-known-good.
+    // Kelly-override invariant (relocated from the boot guard): an override above the mode's
+    // ceiling needs the approval flag. Enforced on the RESULT — a KV edit OR a value carried
+    // from last-known-good (e.g. after a mode change lowers the ceiling) — so an above-ceiling
+    // override without approval can never take effect. A parse failure or absent cell keeps
+    // last-known-good (then re-validated here); rejection drops to None, so mode-default Kelly
+    // applies rather than silently preserving a now-disallowed elevated value.
     let mut proposed_override = last_good.kelly_fraction_override;
     if let Some(raw) = map.get("kelly_fraction_override") {
         let t = raw.trim();
@@ -327,9 +332,9 @@ pub fn parse_config(
                 override_value = %kf.0,
                 mode = %out.mode,
                 "service_config: kelly_fraction_override exceeds the mode ceiling without \
-                 kelly_fraction_above_default_human_approved; rejecting (last-known-good)"
+                 kelly_fraction_above_default_human_approved; rejecting (override cleared)"
             );
-            last_good.kelly_fraction_override
+            None
         }
         other => other,
     };
@@ -593,24 +598,22 @@ mod tests {
     #[test]
     fn kelly_override_rejected_without_approval_but_accepted_with() {
         let boot = RuntimeConfig::from_service_config(&ServiceConfig::default()); // mode=paper, ceiling 0.25
-        // 0.40 > 0.25 ceiling, no approval -> rejected, keep last-known-good (None).
+        // 0.40 > 0.25 ceiling, approval false -> rejected -> override cleared (None).
         let rejected = parse_config(
             &[row("kelly_fraction_override", "0.40", "decimal")],
             &boot,
             false,
         );
         assert_eq!(rejected.kelly_fraction_override, None);
-        // Same override WITH the approval flag in the same poll -> accepted.
+        // With the approval flag set at the boot baseline (approval is boot-frozen in WS1, not
+        // KV-mutable yet), the same above-ceiling override is accepted.
+        let approved_boot = RuntimeConfig {
+            kelly_fraction_above_default_human_approved: true,
+            ..boot.clone()
+        };
         let accepted = parse_config(
-            &[
-                row(
-                    "kelly_fraction_above_default_human_approved",
-                    "true",
-                    "bool",
-                ),
-                row("kelly_fraction_override", "0.40", "decimal"),
-            ],
-            &boot,
+            &[row("kelly_fraction_override", "0.40", "decimal")],
+            &approved_boot,
             false,
         );
         assert_eq!(
@@ -627,6 +630,21 @@ mod tests {
             ok.kelly_fraction_override,
             Some(KellyFraction::new(dec!(0.20)).unwrap())
         );
+    }
+
+    #[test]
+    fn carried_above_ceiling_override_is_dropped_not_preserved() {
+        // Regression guard: an above-ceiling override already in last-known-good (e.g. carried
+        // from a higher-ceiling mode, or set when approval was true) must be DROPPED to None when
+        // it no longer satisfies the invariant — never silently preserved (a risk-control bypass).
+        let elevated = RuntimeConfig {
+            kelly_fraction_override: Some(KellyFraction::new(dec!(0.40)).unwrap()),
+            kelly_fraction_above_default_human_approved: false,
+            ..RuntimeConfig::from_service_config(&ServiceConfig::default()) // mode=paper, ceiling 0.25
+        };
+        // No override edit in this poll; the carried 0.40 violates the paper ceiling sans approval.
+        let out = parse_config(&[], &elevated, false);
+        assert_eq!(out.kelly_fraction_override, None);
     }
 
     #[test]
