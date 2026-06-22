@@ -19,10 +19,15 @@ class EBShrinkageSkill:
     Shrink each wallet's net-edge mean toward the cross-sectional prior by precision, score by
     the posterior tail probability. Net edge per position = ``(payoff - _eff) / _eff``.
 
-    # Precondition: ``ss`` is already filtered to ``resolved_at <= as_of`` (LANDMINE-2) and to
-    # the active criteria/MinTRL by the harness; ``weights`` is a positional ndarray aligned to
-    # ``ss``'s RangeIndex. Wallets with < 2 effective observations have an undefined posterior
-    # SD and are dropped from the ranking (MinTRL handles this upstream).
+    # Preconditions (the harness guarantees these; this is the reference template):
+    #   * ``ss`` is already filtered to ``resolved_at <= as_of`` (LANDMINE-2) and to the active
+    #     criteria / MinTRL.
+    #   * ``weights`` is a positional ndarray aligned to the ORIGINAL (un-sliced) suff_stats
+    #     RangeIndex; ``ss`` MAY be a label-preserving row-slice of it, so ``weights[g.index]``
+    #     stays correct. Do NOT ``reset_index`` after slicing ``ss`` (that would mis-align it).
+    #   * >= 2 candidate wallets — the cross-sectional EB prior is otherwise undefined (a single
+    #     candidate degenerates to rank 1). Wallets with < 2 effective observations have an
+    #     undefined posterior SD and are dropped from the ranking.
     """
 
     name = "eb_shrinkage_skill"
@@ -35,7 +40,11 @@ class EBShrinkageSkill:
             rows.append((wallet, mean, sd, max(n_eff, 1.0)))
         df = pd.DataFrame(rows, columns=["wallet", "mean", "sd", "n_eff"]).set_index("wallet")
         se2 = (df["sd"] ** 2) / df["n_eff"]                      # sampling variance of the mean
-        tau2 = max(df["mean"].var(ddof=1) - se2.mean(), 1e-9)    # EB prior var (normal-normal)
+        # EB prior var (normal-normal). `var(ddof=1)` is NaN for < 2 wallets, and
+        # `max(NaN, 1e-9)` keeps the NaN — which would silently empty the result; floor
+        # explicitly so a degenerate <2-candidate input stays deterministic.
+        prior_var = df["mean"].var(ddof=1) - se2.mean()
+        tau2 = max(prior_var, 1e-9) if np.isfinite(prior_var) else 1e-9
         mu0 = df["mean"].mean()                                  # EB prior mean
         shrink = tau2 / (tau2 + se2)
         post_mean = mu0 + shrink * (df["mean"] - mu0)

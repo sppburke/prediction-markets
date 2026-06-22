@@ -68,6 +68,15 @@ class EBShrinkageTest(unittest.TestCase):
                            self.scores.loc["low_n", "score"])
 
 
+class DegenerateInputTest(unittest.TestCase):
+    def test_single_candidate_returns_rank_one_not_empty(self) -> None:
+        # < 2 candidates -> prior var is NaN; the floor must keep it deterministic (not empty).
+        ss = _suff_stats([("solo", 3, 2)])
+        out = EBShrinkageSkill().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out.loc["solo", "rank"], 1)
+
+
 class RegistryTest(unittest.TestCase):
     def test_eb_shrinkage_registered_by_name(self) -> None:
         self.assertIs(REGISTRY[EBShrinkageSkill.name], EBShrinkageSkill)

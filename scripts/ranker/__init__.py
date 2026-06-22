@@ -33,7 +33,9 @@ FollowSet = pd.DataFrame      # {wallet, weight}: hard top-k -> 1.0, soft/online
 @runtime_checkable
 class Estimator(Protocol):
     """Per-wallet skill score. MUST read only rows with ``resolved_at <= as_of`` (LANDMINE-2
-    look-ahead guard; enforced by PR2's ``oos_validation``)."""
+    look-ahead guard; enforced by PR2's ``oos_validation``). ``weights`` is a positional ndarray
+    aligned to the ORIGINAL (un-sliced) suff_stats RangeIndex (e.g. ``concurrency_uniqueness_weights``);
+    ``ss`` may be a label-preserving row-slice of it (do NOT ``reset_index`` after slicing)."""
 
     name: str
 
