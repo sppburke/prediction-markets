@@ -81,6 +81,8 @@ jobs:
           python3 scripts/test_ranker_interfaces.py
           python3 scripts/test_ranker_suff_stats.py
           python3 scripts/test_ranker_estimators.py
+          python3 scripts/test_ranker_deflation.py
+          python3 scripts/test_ranker_oos_validation.py
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase
