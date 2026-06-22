@@ -14,3 +14,7 @@
 numpy==2.4.4
 pandas==3.0.3
 duckdb==1.3.2
+# scipy (issue #421) powers the ranker bake-off harness (scripts/ranker/): the reference
+# estimator eb_shrinkage_skill uses scipy.stats.norm for the empirical-Bayes posterior tail.
+# Pinned to a version whose cp311 wheel resolves against numpy 2.4 / pandas 3.0.
+scipy==1.17.1
