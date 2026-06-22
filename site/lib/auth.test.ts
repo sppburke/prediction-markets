@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { ALLOWED_EMAIL, isAllowedEmail, passwordMatches } from "./auth";
+import { ALLOWED_EMAIL, isAllowedEmail } from "./auth";
 
 describe("isAllowedEmail (#398 WS3 single-email gate)", () => {
   it("admits exactly the allowlisted email", () => {
@@ -21,39 +21,5 @@ describe("isAllowedEmail (#398 WS3 single-email gate)", () => {
   it("rejects missing/null/undefined", () => {
     expect(isAllowedEmail(null)).toBe(false);
     expect(isAllowedEmail(undefined)).toBe(false);
-  });
-});
-
-describe("passwordMatches (#398 WS3 bare-IP password login)", () => {
-  afterEach(() => {
-    delete process.env.SITE_PASSWORD;
-  });
-
-  it("admits the exact configured password", () => {
-    process.env.SITE_PASSWORD = "s3cret-pw";
-    expect(passwordMatches("s3cret-pw")).toBe(true);
-  });
-
-  it("rejects a wrong password (and is case-sensitive)", () => {
-    process.env.SITE_PASSWORD = "s3cret-pw";
-    expect(passwordMatches("wrong")).toBe(false);
-    expect(passwordMatches("S3CRET-PW")).toBe(false);
-  });
-
-  it("rejects everything when SITE_PASSWORD is unset (no accidental open access)", () => {
-    expect(passwordMatches("anything")).toBe(false);
-    expect(passwordMatches("")).toBe(false);
-  });
-
-  it("rejects an empty configured password (treated as unset)", () => {
-    process.env.SITE_PASSWORD = "";
-    expect(passwordMatches("")).toBe(false);
-  });
-
-  it("rejects non-string input", () => {
-    process.env.SITE_PASSWORD = "s3cret-pw";
-    expect(passwordMatches(undefined)).toBe(false);
-    expect(passwordMatches(null)).toBe(false);
-    expect(passwordMatches(12345)).toBe(false);
   });
 });
