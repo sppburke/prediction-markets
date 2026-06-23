@@ -3,9 +3,10 @@
 (issue #375).
 
 FULL ATOMIC REWRITE each run: `trades` + `market_resolutions` + `market_schedules`
--> zstd Parquet under `--out-dir` (default data/parquet), via DuckDB's
-`sqlite_scanner`. Each file is written to `<name>.parquet.tmp` then `os.replace`-d
-into place, so a concurrent reader never sees a half-written file.
+(+ `market_price_history` when present, issue #421 PR4) -> zstd Parquet under
+`--out-dir` (default data/parquet), via DuckDB's `sqlite_scanner`. Each file is
+written to `<name>.parquet.tmp` then `os.replace`-d into place, so a concurrent
+reader never sees a half-written file.
 
 SQLite stays the system-of-record; this is a read-only snapshot. sqlite_scanner
 preserves the declared column types (INTEGER->BIGINT, TEXT->VARCHAR), so the DuckDB
@@ -26,7 +27,13 @@ import sys
 import time
 
 # The three tables the ranker reads. Order is irrelevant (independent files).
+# `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
+# `SELECT *`, so no change is needed here for that column.
 TABLES = ("trades", "market_resolutions", "market_schedules")
+# OPTIONAL tables (issue #421 PR4 — the CLV price series). Absent on a pre-migration cache (the
+# export attaches READ_ONLY and does not run schema), so each is skipped with a warning rather than
+# aborting the whole export. `ranker_duck.py` registers its view conditionally to match.
+OPTIONAL_TABLES = ("market_price_history",)
 
 
 def log(msg: str) -> None:
@@ -35,6 +42,29 @@ def log(msg: str) -> None:
 
 def _q(s: str) -> str:
     return s.replace("'", "''")
+
+
+def _table_exists(con, tbl: str) -> bool:
+    """True iff `src.{tbl}` is queryable. Used to skip optional tables absent on an older cache."""
+    try:
+        con.execute(f"SELECT 1 FROM src.{tbl} LIMIT 0;")
+        return True
+    except Exception:  # noqa: BLE001 — only failure mode here is "table absent"
+        return False
+
+
+def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> None:
+    """Atomically export `src.{tbl}` to `{out_dir}/{tbl}.parquet` (zstd) via tmp + os.replace."""
+    final = os.path.join(out_dir, f"{tbl}.parquet")
+    tmp = final + ".tmp"
+    con.execute(
+        f"COPY (SELECT * FROM src.{tbl}) TO '{_q(tmp)}' "
+        f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});"
+    )
+    os.replace(tmp, final)
+    n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
+    size_gb = os.path.getsize(final) / 1e9
+    log(f"{tbl}: {n:,} rows -> {final} ({size_gb:.2f} GB)")
 
 
 def main() -> int:
@@ -55,18 +85,12 @@ def main() -> int:
 
     t0 = time.time()
     for tbl in TABLES:
-        final = os.path.join(a.out_dir, f"{tbl}.parquet")
-        tmp = final + ".tmp"
-        con.execute(
-            f"COPY (SELECT * FROM src.{tbl}) TO '{_q(tmp)}' "
-            f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(a.row_group_size)});"
-        )
-        os.replace(tmp, final)
-        n = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')"
-        ).fetchone()[0]
-        size_gb = os.path.getsize(final) / 1e9
-        log(f"{tbl}: {n:,} rows -> {final} ({size_gb:.2f} GB)")
+        _export_table(con, a.out_dir, tbl, a.row_group_size)
+    for tbl in OPTIONAL_TABLES:
+        if _table_exists(con, tbl):
+            _export_table(con, a.out_dir, tbl, a.row_group_size)
+        else:
+            log(f"{tbl}: table absent (pre-migration cache) -> skipped")
 
     log(f"export complete in {time.time() - t0:.0f}s -> {a.out_dir}")
     return 0

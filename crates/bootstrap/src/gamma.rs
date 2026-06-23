@@ -205,6 +205,50 @@ impl<F: PageFetcher + Send + Sync> GammaFetcher<F> {
         Ok(inserted)
     }
 
+    /// Backfill `start_date_unix` (Gamma `createdAt`) on existing schedule rows whose value is NULL,
+    /// by re-fetching with the `&closed=true` batched variant and UPDATEing each row via
+    /// [`WalletCache::update_schedule_start_date`] (issue #421 PR4 — the entry-timing CLV feature).
+    ///
+    /// Mirrors [`Self::rewrite_null_schedules`] (the `endDate` analogue): UPDATE-only with a
+    /// `WHERE start_date_unix IS NULL` guard, so an unfetched/4xx id, a market Gamma no longer lists,
+    /// or one returning no `createdAt` leaves the row NULL and contributes 0. Caller scopes
+    /// `market_ids` to the missing-start-date ∩ resolved set. Returns the count of rows populated.
+    pub async fn backfill_start_dates(
+        &self,
+        market_ids: &[String],
+        cache: &mut WalletCache,
+    ) -> Result<usize, BootstrapError> {
+        info!(
+            total = market_ids.len(),
+            "gamma: starting createdAt → start_date backfill pass (batched)"
+        );
+
+        let res = self
+            .client
+            .fetch_markets(market_ids, MarketFilter::ClosedOnly)
+            .await
+            .map_err(gamma_err)?;
+
+        let mut updated = 0usize;
+        for id in market_ids {
+            // Unfetched (4xx chunk), absent (Gamma doesn't list it), or present-without-createdAt →
+            // no UPDATE (row stays NULL). UPDATE-only, so an unfetched id is harmless.
+            let Some(created_at_unix) = res.markets.get(id).and_then(|m| m.created_at_unix) else {
+                continue;
+            };
+            if cache.update_schedule_start_date(id, created_at_unix)? {
+                updated += 1;
+            }
+        }
+
+        info!(
+            updated,
+            total = market_ids.len(),
+            "gamma: createdAt → start_date backfill complete"
+        );
+        Ok(updated)
+    }
+
     /// Fetch Gamma `liquidity` (current order-book depth indicator) for every market ID not already
     /// present in `cache`.
     ///
@@ -530,6 +574,60 @@ mod tests {
         assert_eq!(
             rewritten, 1,
             "&closed=true URL must be used; rewritten=0 here would indicate a regression to the plain URL"
+        );
+    }
+
+    fn closed_with_created_at_fixture() -> Vec<u8> {
+        // issue #421 PR4: a closed market carrying both createdAt and endDate.
+        fixture_bytes(
+            r#"[{"conditionId":"0xcond","closed":true,"createdAt":"2024-01-10T00:00:00Z","endDate":"2024-01-15T00:00:00Z","outcomes":"[\"Yes\",\"No\"]"}]"#,
+        )
+    }
+
+    #[test]
+    fn backfill_start_dates_populates_via_closed_endpoint() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        // Existing schedule row; start_date_unix is NULL after a plain insert.
+        cache
+            .insert_schedule("0xcond", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+        assert!(cache.market_ids_missing_start_date().contains("0xcond"));
+
+        let mut responses = HashMap::new();
+        responses.insert(closed_url("0xcond"), closed_with_created_at_fixture());
+        let gamma = gamma(responses);
+
+        let updated = rt()
+            .block_on(gamma.backfill_start_dates(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(updated, 1, "createdAt present → start_date populated");
+        assert!(
+            !cache.market_ids_missing_start_date().contains("0xcond"),
+            "start_date_unix must no longer be NULL after backfill"
+        );
+    }
+
+    #[test]
+    fn backfill_start_dates_leaves_null_when_no_created_at() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        cache
+            .insert_schedule("0xcond", Some(1_700_000_000), 1_700_000_001)
+            .unwrap();
+
+        // closed_with_end_date_fixture has endDate but NO createdAt.
+        let mut responses = HashMap::new();
+        responses.insert(closed_url("0xcond"), closed_with_end_date_fixture());
+        let gamma = gamma(responses);
+
+        let updated = rt()
+            .block_on(gamma.backfill_start_dates(&["0xcond".to_owned()], &mut cache))
+            .unwrap();
+        assert_eq!(updated, 0, "no createdAt → no update");
+        assert!(
+            cache.market_ids_missing_start_date().contains("0xcond"),
+            "start_date_unix must remain NULL when Gamma returns no createdAt"
         );
     }
 

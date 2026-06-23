@@ -133,6 +133,21 @@ CREATE TABLE IF NOT EXISTS market_schedules (
     source          TEXT    NOT NULL DEFAULT 'gamma'
 );
 
+-- Coarse pre-resolution CLOB price series per (market, token) for the ranker CLV bake-off
+-- (issue #421 PR4). `market_id` is the `0x` condition id (join key to trades.market_id); `token_id`
+-- is the decimal-string CLOB asset id (the `prices-history?market=` query param); `t` is the sample
+-- unix second; `price` is the mid stored as a decimal string (TEXT, like trades.price_str — no f64
+-- round-trip). Populated by the `prices-history` subcommand; `INSERT OR IGNORE` on the PK makes the
+-- backfill resumable. The PK's (market_id, token_id) prefix also serves the per-token resume check,
+-- so no secondary index is needed.
+CREATE TABLE IF NOT EXISTS market_price_history (
+    market_id TEXT    NOT NULL,
+    token_id  TEXT    NOT NULL,
+    t         INTEGER NOT NULL,
+    price     TEXT    NOT NULL,
+    PRIMARY KEY (market_id, token_id, t)
+);
+
 -- Maps Polymarket conditionId → Gamma event (issue #206). One condition belongs
 -- to exactly one event; events group multiple markets (e.g. neg-risk bundles),
 -- which is the unit the sign-randomization skill test randomizes over. Populated
@@ -349,6 +364,19 @@ pub struct MarketFeeRow {
 }
 
 /// Permanent wallet trade-history cache backed by SQLite.
+/// One `(market, token)` work item for the `prices-history` CLOB backfill (issue #421 PR4), with the
+/// per-market close reference the pre-resolution window is anchored on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PriceBackfillTarget {
+    /// `0x` condition id (= `trades.market_id`).
+    pub market_id: String,
+    /// CLOB token/asset id (the `prices-history?market=` query param).
+    pub token_id: String,
+    /// Close reference, unix seconds: `market_schedules.end_date_unix` when known, else
+    /// `market_resolutions.resolved_at_unix`. The fetch window is `[close_ref − window, close_ref]`.
+    pub close_ref_unix: i64,
+}
+
 pub struct WalletCache {
     conn: Connection,
 }
@@ -376,8 +404,23 @@ impl WalletCache {
         // Migration: add `source` column to market_resolutions / market_schedules. DBs
         // created before this change keep `DEFAULT 'gamma'` — correct since every
         // pre-migration row was inserted by the Gamma fetcher.
-        add_source_column_if_missing(&conn, "market_resolutions")?;
-        add_source_column_if_missing(&conn, "market_schedules")?;
+        add_column_if_missing(
+            &conn,
+            "market_resolutions",
+            "source",
+            "TEXT NOT NULL DEFAULT 'gamma'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "market_schedules",
+            "source",
+            "TEXT NOT NULL DEFAULT 'gamma'",
+        )?;
+        // Migration (issue #421 PR4): add `start_date_unix` (Gamma `createdAt`) to market_schedules
+        // for the entry-timing CLV feature. Existing rows stay NULL until the `prices-history`
+        // subcommand backfills them; an unfetched market remaining NULL is the honest "unknown
+        // creation time" sentinel (no downstream gate treats NULL as eligible).
+        add_column_if_missing(&conn, "market_schedules", "start_date_unix", "INTEGER NULL")?;
         // Migration (issue #176): add `last_polymarket_full_at` if absent. DBs
         // created before this change keep NULL — picked up by the weekly
         // paranoia full-fetch on first delta-mode run, which then stamps each
@@ -977,6 +1020,50 @@ impl WalletCache {
         Ok(changes > 0)
     }
 
+    /// Set `start_date_unix` (Gamma `createdAt`) on an existing schedule row, only if it was NULL
+    /// (issue #421 PR4). The `WHERE start_date_unix IS NULL` guard makes the createdAt backfill
+    /// idempotent and never overwrites a populated value — the same hard guard as
+    /// [`Self::update_schedule_end_date`]. Returns `Ok(true)` when a row was updated, `Ok(false)`
+    /// when none matched (market absent from `market_schedules`, or its `start_date_unix` already
+    /// populated). `fetched_at_unix` is left untouched — it tracks the endDate fetch, not this pass.
+    pub fn update_schedule_start_date(
+        &mut self,
+        market_id: &str,
+        start_date_unix: i64,
+    ) -> Result<bool, BootstrapError> {
+        let changes = self.conn.execute(
+            "UPDATE market_schedules \
+             SET start_date_unix = ?1 \
+             WHERE market_id = ?2 AND start_date_unix IS NULL",
+            params![start_date_unix, market_id],
+        )?;
+        Ok(changes > 0)
+    }
+
+    /// Market IDs in `market_schedules` whose `start_date_unix` is NULL — the candidate set for the
+    /// Gamma `createdAt` backfill (issue #421 PR4). The caller scopes this to the resolved/bake-off
+    /// universe (∩ [`Self::resolved_market_ids`]) before issuing network requests, mirroring how the
+    /// null-endDate rewrite scopes [`Self::null_schedule_market_ids`] to the trade-set. Markets with
+    /// no schedule row at all are not covered (they also lack `end_date_unix`), consistent with the
+    /// endDate handling.
+    ///
+    /// # Precondition
+    /// Returns an empty set when no schedules have been fetched.
+    pub fn market_ids_missing_start_date(&self) -> HashSet<String> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT market_id FROM market_schedules WHERE start_date_unix IS NULL")
+        {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
     /// Load all schedule rows into a [`ScheduleIndex`] keyed by [`MarketId`].
     ///
     /// Includes rows where `end_date_unix IS NULL` (Gamma had no `endDate`). The
@@ -1003,6 +1090,83 @@ impl WalletCache {
             );
         }
         Ok(index)
+    }
+
+    // ── market_price_history (issue #421 PR4 — CLV bake-off) ─────────────────────
+
+    /// Insert a batch of coarse pre-resolution price points into `market_price_history` in one
+    /// transaction. Rows are `(market_id, token_id, t, price_str)` where `price_str` is the decimal
+    /// mid as produced by [`Decimal::to_string`] (TEXT — no `f64` round-trip). `INSERT OR IGNORE` on
+    /// the `(market_id, token_id, t)` PK makes re-runs idempotent and the backfill resumable.
+    ///
+    /// # Precondition
+    /// Returns immediately without writing when `rows` is empty.
+    pub fn insert_price_history_batch(
+        &mut self,
+        rows: &[(String, String, i64, String)],
+    ) -> Result<(), BootstrapError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO market_price_history \
+                 (market_id, token_id, t, price) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (market_id, token_id, t, price) in rows {
+                stmt.execute(params![market_id, token_id, t, price])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The `(market, token)` price-history backfill targets (issue #421 PR4): every resolved
+    /// market's mapped CLOB tokens that have no `market_price_history` row yet, paired with the
+    /// per-market close reference (`end_date_unix` when known, else `resolved_at_unix`). The
+    /// `NOT EXISTS` guard keys on the `(market_id, token_id)` PK prefix, so a re-run after a partial
+    /// backfill cheaply skips already-fetched tokens (resumable). `limit = 0` means unbounded; a
+    /// positive `limit` bounds one run's memory/time (re-run to continue).
+    ///
+    /// Only markets present in `token_conditions` (the `events` sweep's token→condition map) are
+    /// returned — a token id is required to query CLOB `/prices-history`.
+    ///
+    /// # Precondition
+    /// Returns an empty vec when no resolved markets have mapped tokens.
+    pub fn price_history_backfill_targets(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PriceBackfillTarget>, BootstrapError> {
+        let base = "SELECT tc.condition_id, tc.token_id, \
+                    COALESCE(ms.end_date_unix, mr.resolved_at_unix) AS close_ref \
+             FROM token_conditions tc \
+             JOIN market_resolutions mr ON mr.market_id = tc.condition_id \
+             LEFT JOIN market_schedules ms ON ms.market_id = tc.condition_id \
+             WHERE mr.winning_outcome_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM market_price_history mph \
+                   WHERE mph.market_id = tc.condition_id AND mph.token_id = tc.token_id \
+               )";
+        let sql = if limit > 0 {
+            format!("{base} LIMIT {limit}")
+        } else {
+            base.to_owned()
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PriceBackfillTarget {
+                market_id: r.get::<_, String>(0)?,
+                token_id: r.get::<_, String>(1)?,
+                close_ref_unix: r.get::<_, i64>(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // ── market_liquidity ───────────────────────────────────────────────────────
@@ -2552,25 +2716,31 @@ fn row_to_trade(
     })
 }
 
-/// Add a `source TEXT NOT NULL DEFAULT 'gamma'` column to `table` if it doesn't
-/// already exist. Idempotent: safe to call on every `WalletCache::open`.
+/// Add column `col` with full SQL declaration `decl` (e.g. `"INTEGER NULL"` or
+/// `"TEXT NOT NULL DEFAULT 'gamma'"`) to `table` if it is not already present. Idempotent: safe to
+/// call on every [`WalletCache::open`].
 ///
-/// Used for the issue #149 multi-source-pipeline migration. SQLite ALTER TABLE
-/// ADD COLUMN with a constant DEFAULT is supported and back-fills the column
-/// for existing rows — every pre-migration `market_resolutions` /
-/// `market_schedules` row was written by Gamma, so `'gamma'` is the correct
-/// retroactive tag.
-fn add_source_column_if_missing(conn: &Connection, table: &str) -> Result<(), BootstrapError> {
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, so existence is probed via `pragma_table_info`;
+/// `ALTER TABLE … ADD COLUMN` with a constant DEFAULT back-fills existing rows. Used for the additive
+/// migrations: the issue #149 `source` column on `market_resolutions`/`market_schedules` (every
+/// pre-migration row was Gamma-written, so `'gamma'` is the correct retroactive tag), and the issue
+/// #421 PR4 `start_date_unix` column on `market_schedules`.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    col: &str,
+    decl: &str,
+) -> Result<(), BootstrapError> {
     let col_exists: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='source'",
-            params![table],
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, col],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0)
         > 0;
     if !col_exists {
-        let sql = format!("ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'gamma'");
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {col} {decl}");
         conn.execute_batch(&sql)?;
     }
     Ok(())

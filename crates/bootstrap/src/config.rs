@@ -188,6 +188,29 @@ pub struct BootstrapConfig {
     )]
     pub clob_concurrency: usize,
 
+    /// CLV price-history backfill (issue #421 PR4): the pre-resolution window fetched per market, in
+    /// seconds. The CLOB series is pulled over `[close_ref − this, close_ref]` so CLV can be measured
+    /// at 1h/6h/24h before close. Default 72h. Env `PE_BOOTSTRAP_PRICES_HISTORY_WINDOW_SECS`.
+    #[serde(default = "default_prices_history_window_secs")]
+    pub prices_history_window_secs: i64,
+
+    /// CLV price-history series granularity in minutes (issue #421 PR4). Default 60 (hourly, coarse).
+    /// Env `PE_BOOTSTRAP_PRICES_HISTORY_FIDELITY_MINUTES`.
+    #[serde(default = "default_prices_history_fidelity_minutes")]
+    pub prices_history_fidelity_minutes: u32,
+
+    /// Minimum interval (ms) between CLOB `/prices-history` requests for the dedicated fetcher
+    /// (issue #421 PR4). Default ~10ms (≈100 req/s, under the 1000 req/10s limit) — kept separate
+    /// from the 50ms Data-API gate. Env `PE_BOOTSTRAP_PRICES_HISTORY_MIN_INTERVAL_MS`.
+    #[serde(default = "default_prices_history_min_interval_ms")]
+    pub prices_history_min_interval_ms: u64,
+
+    /// Max `(market, token)` targets fetched in one `prices-history` run (issue #421 PR4); `0` =
+    /// unbounded. Bounds one run's memory/time on the ~1.4M-market universe; the backfill is
+    /// resumable, so re-run to continue. Env `PE_BOOTSTRAP_PRICES_HISTORY_TOKEN_LIMIT`.
+    #[serde(default = "default_prices_history_token_limit")]
+    pub prices_history_token_limit: usize,
+
     /// Fetch funder edges via Etherscan after trade fetch (off by default).
     /// Env `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH`: `"1"` or `"true"` to enable.
     #[serde(
@@ -571,6 +594,26 @@ const fn default_clob_concurrency() -> usize {
     DEFAULT_CLOB_CONCURRENCY
 }
 
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults": 72h pre-resolution CLV window.
+const fn default_prices_history_window_secs() -> i64 {
+    72 * 60 * 60
+}
+
+/// References the canonical `clob_prices_history_fidelity_minutes` constant (no duplicate default).
+fn default_prices_history_fidelity_minutes() -> u32 {
+    pe_source_polymarket_public::CLOB_PRICES_HISTORY_FIDELITY_MINUTES
+}
+
+/// References the canonical `clob_prices_history_min_interval_ms` constant (no duplicate default).
+fn default_prices_history_min_interval_ms() -> u64 {
+    pe_source_polymarket_public::CLOB_PRICES_HISTORY_MIN_INTERVAL_MS
+}
+
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults": `0` = unbounded per-run targets.
+const fn default_prices_history_token_limit() -> usize {
+    0
+}
+
 const fn default_leaderboard_request_interval_ms() -> u64 {
     DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS
 }
@@ -656,6 +699,10 @@ impl Default for BootstrapConfig {
             gamma_base_url: default_gamma_base_url(),
             clob_base_url: default_clob_base_url(),
             clob_concurrency: default_clob_concurrency(),
+            prices_history_window_secs: default_prices_history_window_secs(),
+            prices_history_fidelity_minutes: default_prices_history_fidelity_minutes(),
+            prices_history_min_interval_ms: default_prices_history_min_interval_ms(),
+            prices_history_token_limit: default_prices_history_token_limit(),
             fetch_funder_graph: false,
             skip_trade_fetch: false,
             write_snapshot: false,

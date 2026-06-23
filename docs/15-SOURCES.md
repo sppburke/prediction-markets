@@ -79,6 +79,8 @@
 | https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-05-09 | 2026-07-08 |
 | https://clob.polymarket.com/markets?closed=true | 2026-06-20 | 2026-08-19 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-06-16 | 2026-08-15 |
+| https://clob.polymarket.com/prices-history?market={tokenId} | 2026-06-23 | 2026-08-22 |
+| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-06-23 | 2026-08-22 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id} | 2026-06-20 | 2026-08-19 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 

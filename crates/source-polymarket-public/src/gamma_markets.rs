@@ -71,6 +71,11 @@ pub struct GammaMarket {
     /// Scheduled close time as unix seconds, parsed from `endDate`. `None` when Gamma omits or
     /// returns an unparseable `endDate` (the caller writes a NULL schedule row in that case).
     pub end_date_unix: Option<i64>,
+    /// Market creation time as unix seconds, parsed from `createdAt` (issue #421 PR4 — the
+    /// `entry_timing_vs_creation` CLV-bake-off feature). `None` when Gamma omits or returns an
+    /// unparseable `createdAt` (nullable upstream), so a missing creation time degrades to "unknown"
+    /// rather than failing the row.
+    pub created_at_unix: Option<i64>,
     /// Current order-book depth indicator (USD). `None` when Gamma omits the field or sends an
     /// unparseable value (lenient decode — a bad scalar never fails the row).
     pub liquidity: Option<Decimal>,
@@ -213,13 +218,15 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             let markets: Vec<GammaMarketRaw> = serde_json::from_slice(&bytes)
                 .map_err(|e| GammaMarketsError::Parse(e.to_string()))?;
             for m in markets {
-                let end_date_unix = m.end_date.as_deref().and_then(parse_end_date_unix);
+                let end_date_unix = m.end_date.as_deref().and_then(parse_rfc3339_unix);
+                let created_at_unix = m.created_at.as_deref().and_then(parse_rfc3339_unix);
                 let outcome_prices = m.outcome_prices.as_deref().and_then(parse_outcome_prices);
                 out.insert(
                     m.condition_id.clone(),
                     GammaMarket {
                         condition_id: m.condition_id,
                         end_date_unix,
+                        created_at_unix,
                         liquidity: m.liquidity,
                         closed: m.closed,
                         outcome_prices,
@@ -257,9 +264,10 @@ pub(crate) fn build_batch_url(base: &str, ids: &[String], closed: &str, limit: u
     url
 }
 
-/// Parse Gamma's `endDate` (RFC 3339, e.g. `"2024-11-04T00:00:00Z"`) to unix seconds. `None` on any
-/// parse failure — the caller treats an unparseable `endDate` the same as a missing one (NULL row).
-fn parse_end_date_unix(s: &str) -> Option<i64> {
+/// Parse a Gamma RFC 3339 timestamp (e.g. `"2024-11-04T00:00:00Z"`) to unix seconds. `None` on any
+/// parse failure. Shared by `endDate` (scheduled close) and `createdAt` (market creation, issue #421
+/// PR4); the caller treats an unparseable value the same as a missing one.
+fn parse_rfc3339_unix(s: &str) -> Option<i64> {
     time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .map(|dt| dt.unix_timestamp())
         .ok()
@@ -276,6 +284,9 @@ struct GammaMarketRaw {
     condition_id: String,
     /// Scheduled close date, RFC 3339. Present on open and closed markets; `None` only when omitted.
     end_date: Option<String>,
+    /// Market creation date, RFC 3339. Nullable upstream (issue #421 PR4); `None` when omitted or
+    /// unparseable. Parsed in the demux via [`parse_rfc3339_unix`].
+    created_at: Option<String>,
     /// Order-book depth indicator (USD). Gamma may send a JSON number or a decimal string;
     /// [`deserialize_decimal_lenient`] accepts both and yields `None` on anything unparseable, so a
     /// bad scalar never fails the row (issue #382 Phase 3b — the mid-price cache requires this
@@ -439,13 +450,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_end_date_unix_rfc3339() {
+    fn parse_rfc3339_unix_basic() {
         // 2020-11-04T00:00:00Z = 1604448000
         assert_eq!(
-            parse_end_date_unix("2020-11-04T00:00:00Z"),
+            parse_rfc3339_unix("2020-11-04T00:00:00Z"),
             Some(1_604_448_000)
         );
-        assert_eq!(parse_end_date_unix("not-a-date"), None);
+        assert_eq!(parse_rfc3339_unix("not-a-date"), None);
+    }
+
+    #[test]
+    fn gamma_market_raw_parses_created_at() {
+        // issue #421 PR4: `createdAt` feeds the entry_timing_vs_creation feature. Nullable upstream,
+        // so an omitted field → None; a present RFC 3339 value parses to unix seconds in the demux.
+        let json = r#"[{"conditionId":"0xA","createdAt":"2024-01-15T00:00:00Z"},
+                       {"conditionId":"0xB"}]"#;
+        let raws: Vec<GammaMarketRaw> = serde_json::from_slice(json.as_bytes()).unwrap();
+        assert_eq!(raws[0].created_at.as_deref(), Some("2024-01-15T00:00:00Z"));
+        assert_eq!(
+            raws[0].created_at.as_deref().and_then(parse_rfc3339_unix),
+            Some(1_705_276_800)
+        );
+        assert_eq!(raws[1].created_at, None, "createdAt absent → None");
     }
 
     #[test]
