@@ -18,3 +18,9 @@ duckdb==1.3.2
 # estimator eb_shrinkage_skill uses scipy.stats.norm for the empirical-Bayes posterior tail.
 # Pinned to a version whose cp311 wheel resolves against numpy 2.4 / pandas 3.0.
 scipy==1.17.1
+# arch (issue #421 PR2) provides Hansen-SPA (arch.bootstrap.SPA) and Romano-Wolf stepwise
+# (arch.bootstrap.StepM) for grid-level deflation in scripts/ranker/oos_validation.py — used
+# instead of hand-rolling the bootstrap multiple-testing. statsmodels is arch's dependency;
+# both are pinned. cp311 wheels resolve against numpy 2.4 / pandas 3.0 / scipy 1.17.
+arch==8.0.0
+statsmodels==0.14.6
