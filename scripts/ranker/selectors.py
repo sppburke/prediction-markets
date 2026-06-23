@@ -40,8 +40,8 @@ class OnlineExpWeights:
     ``state`` is the ``dict[wallet -> smoothed_score]`` carried between steps (a fresh wallet
     seeds at its current score). This is the selector that ``policy_online_weighting`` IS.
 
-    # Note: a simplified, parameter-free stand-in for the full BOA / sleeping-experts members
-    # (those remain menu items). Deterministic — no RNG.
+    # Note: a simplified stand-in (its two knobs eta/alpha aside) for the full BOA /
+    # sleeping-experts members, which remain menu items. Deterministic — no RNG.
     """
 
     name = "online_exp_weights"

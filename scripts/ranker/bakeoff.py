@@ -282,7 +282,7 @@ def _churn(prev: FollowSet, follow: FollowSet) -> int:
 
 
 def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points: list,
-                   train_secs: int, horizon_secs: int, k: int, n_grid: int,
+                   train_secs: int, horizon_secs: int, k: int,
                    displacement_margin: int, demoter_kwargs: "dict | None" = None,
                    flat_usd: float = 25.0) -> pd.Series:
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
@@ -307,7 +307,9 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
             continue
         weights = uniqueness_weights(in_sample)                      # full-frame, aligned index
         scores = estimator.score(candidates, as_of=as_of, weights=weights)
-        scores = apply_deflation_gate(scores, in_sample, grid_point.deflator, n_trials=n_grid)
+        # Per-wallet deflation: n_trials = the CANDIDATE count being selected among (deflation.py
+        # contract), NOT N_GRID — the grid trial count is the grid-level Validators' bar (8c).
+        scores = apply_deflation_gate(scores, in_sample, grid_point.deflator, n_trials=len(scores))
         if scores.empty:
             returns.append(0.0)
             continue
@@ -338,8 +340,7 @@ def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
 def run_trajectories(grid: list, ss: SuffStats, runner, **kwargs) -> pd.DataFrame:
     """8c — run every grid point's trajectory into a per-period return matrix (index = ``as_of``,
     columns = config keys) for the grid-level Validators."""
-    return pd.DataFrame({gp.key: run_trajectory(gp, ss, runner, n_grid=len(grid), **kwargs)
-                         for gp in grid})
+    return pd.DataFrame({gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid})
 
 
 # ───────────────────────── leaderboard + winner / NO-GO ─────────────────────────

@@ -341,9 +341,12 @@ def fcr_selected_ci(estimates, ses, selected, *, q: float = 0.05,
                     m: "int | None" = None) -> pd.DataFrame:
     """False-Coverage-Rate-adjusted CIs for a SELECTED set (Benjamini-Yekutieli, JASA 2005) —
     issue #421 ``fcr_selected_ci``. Reporting a CI only for the ``R`` selected of ``m`` candidates
-    inflates non-coverage; the FCR fix widens each selected CI to level ``1 - R*q/m`` (so more
-    selections -> wider intervals). ``selected`` is a boolean mask or an index array; ``m`` defaults
-    to ``len(estimates)``. Returns ``{index, estimate, ci_lo, ci_hi, fcr_level}`` per selected.
+    inflates non-coverage; the FCR fix sets each selected CI to level ``1 - R*q/m``, always at or
+    above the nominal ``1 - q`` (so each is at least as WIDE as the unadjusted interval). The
+    correction is harshest for the single cherry-picked pick (``R=1`` is widest) and relaxes toward
+    the nominal as ``R -> m`` (selecting everything is no selection). ``selected`` is a boolean mask
+    or an index array; ``m`` defaults to ``len(estimates)``. Returns the per-selected
+    ``{index, estimate, ci_lo, ci_hi, fcr_level}``.
     """
     estimates = np.asarray(estimates, dtype=float)
     ses = np.asarray(ses, dtype=float)

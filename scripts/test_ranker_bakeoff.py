@@ -190,7 +190,7 @@ class TrajectoryTest(unittest.TestCase):
     def test_returns_series_shape_and_determinism(self) -> None:
         runner = _FakeRunner(self.value, self.points, self.horizon)
         kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
-                      k=5, n_grid=4, displacement_margin=5)
+                      k=5, displacement_margin=5)
         a = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs)
         b = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs)
         self.assertEqual(list(a.index), self.points)
@@ -199,7 +199,7 @@ class TrajectoryTest(unittest.TestCase):
     def test_churn_cost_reduces_return_when_set_changes(self) -> None:
         runner = _FakeRunner(self.value, self.points, self.horizon)
         kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
-                      k=5, n_grid=4, displacement_margin=5)
+                      k=5, displacement_margin=5)
         free = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs)
         costed = bo.run_trajectory(self._gp("policy_full_rerank", 10.0), self.ss, runner, **kwargs)
         admissions = (free - costed) / 10.0                      # difference == churn_cost x admits
