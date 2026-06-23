@@ -10,8 +10,8 @@
 //!
 //! Deterministic, no live network: case 1 hits a refused port; case 2 makes the
 //! CLOB stage a no-op by persisting the `LTE=` pagination terminator (so
-//! `fetch_closed_markets` returns `Ok((0, 0))` before issuing any HTTP request),
-//! leaving only the refused Gamma stage to soft-fail.
+//! `fetch_closed_markets` returns an empty `ClobReport` before issuing any HTTP
+//! request), leaving only the refused Gamma stage to soft-fail.
 
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -59,8 +59,8 @@ async fn gamma_only_soft_fails_when_clob_is_noop() {
     let mut cache = WalletCache::open(&cache_path).unwrap();
 
     // Persist the CLOB pagination terminator so `fetch_closed_markets` returns
-    // early with Ok((0, 0)) and issues zero HTTP requests — a deterministic CLOB
-    // success without a mock server.
+    // early with an empty `ClobReport` and issues zero HTTP requests — a
+    // deterministic CLOB success without a mock server.
     cache.set_source_cursor("clob_closed", "LTE=").unwrap();
 
     // Gamma points at a refused port; the CLOB base URL is never contacted.

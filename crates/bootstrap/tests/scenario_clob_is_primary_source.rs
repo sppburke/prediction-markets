@@ -50,16 +50,16 @@ async fn clob_closed_market_writes_clob_sourced_resolution() {
     responses.insert(page_url(), page_body());
     let clob = ClobFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
 
-    let (schedules, resolutions) = clob
+    let report = clob
         .fetch_closed_markets(&mut cache)
         .await
         .expect("CLOB closed-markets fetch must succeed on the fixture page");
     assert_eq!(
-        resolutions, 1,
+        report.resolutions, 1,
         "the single winning market must insert one resolution"
     );
     assert_eq!(
-        schedules, 1,
+        report.schedules, 1,
         "the closed market must also insert one schedule"
     );
 

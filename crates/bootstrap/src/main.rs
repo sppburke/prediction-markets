@@ -52,6 +52,7 @@ async fn main() {
         let mut dry_run = false;
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
         let mut stage: Option<&str> = None;
+        let mut reset_clob_cursor = false;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -59,6 +60,8 @@ async fn main() {
             let a = rest[i];
             if a == "--strict" {
                 strict = true;
+            } else if a == "--reset-clob-cursor" {
+                reset_clob_cursor = true;
             } else if a == "--dry-run" {
                 dry_run = true;
             } else if a == "--dump-ledgers" && i + 1 < rest.len() {
@@ -187,6 +190,23 @@ async fn main() {
             }
 
             "resolutions" => {
+                // `--reset-clob-cursor` (issue #429): clear the CLOB closed-market
+                // pagination checkpoint so the next run re-walks every page,
+                // mapping the full-universe token→condition map. This is a long
+                // operator run; use it once after deploying the token-map change,
+                // not on the cron `all` path.
+                if reset_clob_cursor {
+                    if let Err(e) =
+                        cache.set_source_cursor(pe_bootstrap::clob::CLOB_CLOSED_CURSOR_KEY, "")
+                    {
+                        tracing::error!(error = %e, "resolutions: failed to reset CLOB cursor");
+                        std::process::exit(1);
+                    }
+                    tracing::info!(
+                        "resolutions: --reset-clob-cursor → cleared source_cursor.clob_closed; \
+                         CLOB will re-walk all closed-market pages (issue #429)"
+                    );
+                }
                 let all_ids = cache.all_market_ids();
                 let ids: Vec<String> = match stage {
                     // When --stage is given, filter to a specific resolution source.
@@ -198,13 +218,20 @@ async fn main() {
                     }
                     None => all_ids,
                 };
-                match fetch_resolutions_and_schedules(&bootstrap_config, &mut cache, &ids).await {
-                    Ok(report) if report.has_failures() => {
-                        // Issue #201: optional stages soft-failed; surface as
-                        // partial (exit 2) so the skip is visible to operators.
+                let result =
+                    fetch_resolutions_and_schedules(&bootstrap_config, &mut cache, &ids).await;
+                // Coverage of the CLOB token→condition map (issue #429) — a DB-state
+                // metric, logged after the run regardless of the stage outcome.
+                log_token_coverage(&cache, bootstrap_config.clob_token_coverage_warn_pct);
+                match result {
+                    Ok(report) if report.has_failures() || report.clob_order_mismatches > 0 => {
+                        // Issue #201: optional stages soft-failed; or #429: CLOB
+                        // token-order divergences quarantined markets. Surface as
+                        // partial (exit 2) so the anomaly is visible to operators.
                         tracing::warn!(
                             stages_failed = ?report.stages_failed,
-                            "resolutions: partial — some optional stages soft-failed; re-run to retry"
+                            clob_order_mismatches = report.clob_order_mismatches,
+                            "resolutions: partial — soft-failed stages and/or CLOB token-order divergences; re-run to retry"
                         );
                         2
                     }
@@ -478,13 +505,17 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     // Step 4: resolutions (optional).
     if config.fetch_resolutions {
         let ids = cache.all_market_ids();
-        match fetch_resolutions_and_schedules(config, cache, &ids).await {
-            Ok(report) if report.has_failures() => {
-                // Issue #201: optional stages soft-failed → partial (exit 2),
-                // not fatal. Polygon (primary) failures still propagate as Err.
+        let result = fetch_resolutions_and_schedules(config, cache, &ids).await;
+        log_token_coverage(cache, config.clob_token_coverage_warn_pct);
+        match result {
+            Ok(report) if report.has_failures() || report.clob_order_mismatches > 0 => {
+                // Issue #201: optional stages soft-failed; or #429: CLOB token-order
+                // divergences quarantined markets → partial (exit 2), not fatal.
+                // The primary CLOB fetch still propagates failures as Err.
                 tracing::warn!(
                     stages_failed = ?report.stages_failed,
-                    "all: resolutions partial — optional stages soft-failed"
+                    clob_order_mismatches = report.clob_order_mismatches,
+                    "all: resolutions partial — soft-failed stages and/or CLOB token-order divergences"
                 );
                 soft_fail = true;
             }
@@ -497,6 +528,35 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     }
 
     if soft_fail { 2 } else { 0 }
+}
+
+/// Log the CLOB token→condition coverage of resolved-with-winner markets and
+/// warn when it falls below `warn_pct` (issue #429). Coverage is a DB-state
+/// metric, so it is queried after the resolutions run. Integer percentage —
+/// the workspace lints `float_arithmetic`, so no `f64` is used.
+fn log_token_coverage(cache: &WalletCache, warn_pct: u8) {
+    let (total, mapped) = cache.token_coverage_report();
+    if total == 0 {
+        return;
+    }
+    let pct = mapped.saturating_mul(100) / total;
+    if warn_pct > 0 && pct < i64::from(warn_pct) {
+        tracing::warn!(
+            mapped,
+            total,
+            coverage_pct = pct,
+            warn_pct,
+            "resolutions: CLOB token→condition coverage below threshold — run \
+             `pe-bootstrap resolutions --reset-clob-cursor` to re-walk and map the full universe (issue #429)"
+        );
+    } else {
+        tracing::info!(
+            mapped,
+            total,
+            coverage_pct = pct,
+            "resolutions: CLOB token→condition coverage"
+        );
+    }
 }
 
 /// Parse the `SRC_WALLET_SET_JSON`-bit wallet list from `cache` into `Vec<WalletAddress>`.

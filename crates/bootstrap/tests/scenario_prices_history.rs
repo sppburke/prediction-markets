@@ -35,10 +35,10 @@ fn backfill_targets_join_close_ref_and_resume() {
     cache
         .upsert_token_conditions_batch(
             &[
-                ("t1".to_owned(), "0xm1".to_owned()),
-                ("t2".to_owned(), "0xm1".to_owned()),
-                ("t3".to_owned(), "0xm2".to_owned()),
-                ("t9".to_owned(), "0xm3".to_owned()),
+                ("t1".to_owned(), "0xm1".to_owned(), 0),
+                ("t2".to_owned(), "0xm1".to_owned(), 1),
+                ("t3".to_owned(), "0xm2".to_owned(), 0),
+                ("t9".to_owned(), "0xm3".to_owned(), 0),
             ],
             9,
         )

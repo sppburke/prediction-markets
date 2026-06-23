@@ -61,6 +61,11 @@ pub const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
 pub struct ResolutionsReport {
     /// Names of optional stages that soft-failed this run (e.g. `"clob"`).
     pub stages_failed: Vec<&'static str>,
+    /// CLOB markets quarantined this run because their `tokens[]` order diverged
+    /// from the stored authoritative Gamma `clob_token_ids` order (issue #429).
+    /// Non-zero is a data-integrity anomaly the caller surfaces as partial (exit
+    /// 2); the quarantined markets' token rows were skipped, never mispriced.
+    pub clob_order_mismatches: usize,
 }
 
 impl ResolutionsReport {
@@ -116,7 +121,7 @@ pub async fn fetch_resolutions_and_schedules(
     // CLOB closed-market pagination — primary resolution source; hard-fail
     // (propagate). A CLOB outage aborts the run rather than silently producing a
     // resolutions pass missing the gold source (issue #369).
-    run_clob_closed_markets(config, cache).await?;
+    let clob_report = run_clob_closed_markets(config, cache).await?;
 
     // The Gamma stages are fallback/auxiliary sources (issue #201): a failure in
     // one must NOT abort the others. Each is soft-failed — logged and recorded in
@@ -135,15 +140,19 @@ pub async fn fetch_resolutions_and_schedules(
         stages_failed.push("schedule_backfill");
     }
 
-    Ok(ResolutionsReport { stages_failed })
+    Ok(ResolutionsReport {
+        stages_failed,
+        clob_order_mismatches: clob_report.order_mismatches,
+    })
 }
 
 /// CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
-/// Primary, sole market-resolution source (issue #369).
+/// Primary, sole market-resolution source (issue #369). Also maps the
+/// full-universe token→condition map with positional `outcome_index` (issue #429).
 async fn run_clob_closed_markets(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
-) -> Result<(), BootstrapError> {
+) -> Result<clob::ClobReport, BootstrapError> {
     use pe_source_polymarket_public::ReqwestFetcher;
     let clob_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
@@ -153,13 +162,24 @@ async fn run_clob_closed_markets(
         config.clob_base_url.clone(),
         ReqwestFetcher::new(clob_client),
     );
-    let (clob_schedules, clob_resolutions) = clob_fetcher.fetch_closed_markets(cache).await?;
+    let report = clob_fetcher.fetch_closed_markets(cache).await?;
+    if report.order_mismatches > 0 {
+        // Quarantined markets' token rows were skipped (never mispriced); surface
+        // loudly so a real CLOB-order ≠ Gamma-order divergence is investigated
+        // before trusting true_clv coverage (issue #429).
+        tracing::error!(
+            order_mismatches = report.order_mismatches,
+            "bootstrap: CLOB token-order divergence vs Gamma map — markets quarantined (token rows skipped)"
+        );
+    }
     tracing::info!(
-        clob_schedules,
-        clob_resolutions,
+        clob_schedules = report.schedules,
+        clob_resolutions = report.resolutions,
+        clob_tokens_mapped = report.tokens_mapped,
+        clob_order_mismatches = report.order_mismatches,
         "bootstrap: clob closed markets fetched"
     );
-    Ok(())
+    Ok(report)
 }
 
 /// Gamma schedules + liquidity for still-open markets (computed AFTER the CLOB

@@ -137,9 +137,10 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                 break; // exhausted
             }
 
-            // `(token_id, condition_id)` rows for this page's markets, flushed in
-            // one transaction below (issue #207). A market carries 0..n tokens.
-            let mut token_rows: Vec<(String, String)> = Vec::new();
+            // `(token_id, condition_id, outcome_index)` rows for this page's
+            // markets, flushed in one transaction below (issue #207; outcome_index
+            // added in #429). A market carries 0..n tokens.
+            let mut token_rows: Vec<(String, String, u16)> = Vec::new();
             // `(condition_id, taker_bps, maker_bps, _)` rows for market_fees (issue #23).
             let mut fee_rows: Vec<(String, i32, i32, i64)> = Vec::new();
             for event in &page {
@@ -164,8 +165,16 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                         fetched_at,
                     )?;
                     conditions_mapped += 1;
-                    for token_id in parse_clob_token_ids(market.clob_token_ids.as_deref()) {
-                        token_rows.push((token_id, cond.clone()));
+                    for (idx, token_id) in parse_clob_token_ids(market.clob_token_ids.as_deref())
+                        .into_iter()
+                        .enumerate()
+                    {
+                        // The Gamma `clobTokenIds` array position IS the
+                        // outcome_index (0=YES,1=NO for binary) — the authoritative
+                        // outcome→token order the CLOB cross-check validates (#429).
+                        let outcome_index =
+                            u16::try_from(idx).map_err(|_| BootstrapError::Internal)?;
+                        token_rows.push((token_id, cond.clone(), outcome_index));
                     }
                     let (taker_bps, maker_bps) = fees_for_market(market);
                     fee_rows.push((cond, taker_bps, maker_bps, fetched_at));
