@@ -69,9 +69,11 @@ pub struct ResolutionsReport {
 }
 
 impl ResolutionsReport {
-    /// True when at least one optional stage soft-failed.
+    /// True when the run needs operator attention: an optional stage soft-failed,
+    /// or a CLOB token-order divergence quarantined a market (issue #429). Callers
+    /// surface this as an exit-2 partial.
     pub fn has_failures(&self) -> bool {
-        !self.stages_failed.is_empty()
+        !self.stages_failed.is_empty() || self.clob_order_mismatches > 0
     }
 }
 

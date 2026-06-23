@@ -1161,8 +1161,10 @@ impl WalletCache {
     /// backfill cheaply skips already-fetched tokens (resumable). `limit = 0` means unbounded; a
     /// positive `limit` bounds one run's memory/time (re-run to continue).
     ///
-    /// Only markets present in `token_conditions` (the `events` sweep's token→condition map) are
-    /// returned — a token id is required to query CLOB `/prices-history`.
+    /// Only markets present in `token_conditions` (the token→condition map written by the CLOB
+    /// closed-markets sweep over the full resolved universe, and the Gamma `events` sweep over its
+    /// curated slice — issue #429) are returned — a token id is required to query CLOB
+    /// `/prices-history`.
     ///
     /// # Precondition
     /// Returns an empty vec when no resolved markets have mapped tokens.

@@ -224,10 +224,11 @@ async fn main() {
                 // metric, logged after the run regardless of the stage outcome.
                 log_token_coverage(&cache, bootstrap_config.clob_token_coverage_warn_pct);
                 match result {
-                    Ok(report) if report.has_failures() || report.clob_order_mismatches > 0 => {
+                    Ok(report) if report.has_failures() => {
                         // Issue #201: optional stages soft-failed; or #429: CLOB
-                        // token-order divergences quarantined markets. Surface as
-                        // partial (exit 2) so the anomaly is visible to operators.
+                        // token-order divergences quarantined markets (both folded
+                        // into has_failures). Surface as partial (exit 2) so the
+                        // anomaly is visible to operators.
                         tracing::warn!(
                             stages_failed = ?report.stages_failed,
                             clob_order_mismatches = report.clob_order_mismatches,
@@ -508,10 +509,11 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
         let result = fetch_resolutions_and_schedules(config, cache, &ids).await;
         log_token_coverage(cache, config.clob_token_coverage_warn_pct);
         match result {
-            Ok(report) if report.has_failures() || report.clob_order_mismatches > 0 => {
+            Ok(report) if report.has_failures() => {
                 // Issue #201: optional stages soft-failed; or #429: CLOB token-order
-                // divergences quarantined markets → partial (exit 2), not fatal.
-                // The primary CLOB fetch still propagates failures as Err.
+                // divergences quarantined markets (both folded into has_failures) →
+                // partial (exit 2), not fatal. The primary CLOB fetch still
+                // propagates failures as Err.
                 tracing::warn!(
                     stages_failed = ?report.stages_failed,
                     clob_order_mismatches = report.clob_order_mismatches,
