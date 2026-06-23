@@ -137,9 +137,10 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                 break; // exhausted
             }
 
-            // `(token_id, condition_id)` rows for this page's markets, flushed in
-            // one transaction below (issue #207). A market carries 0..n tokens.
-            let mut token_rows: Vec<(String, String)> = Vec::new();
+            // `(token_id, condition_id, outcome_index)` rows for this page's
+            // markets, flushed in one transaction below (issue #207; outcome_index
+            // added in #429). A market carries 0..n tokens.
+            let mut token_rows: Vec<(String, String, u16)> = Vec::new();
             // `(condition_id, taker_bps, maker_bps, _)` rows for market_fees (issue #23).
             let mut fee_rows: Vec<(String, i32, i32, i64)> = Vec::new();
             for event in &page {
@@ -164,8 +165,21 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                         fetched_at,
                     )?;
                     conditions_mapped += 1;
-                    for token_id in parse_clob_token_ids(market.clob_token_ids.as_deref()) {
-                        token_rows.push((token_id, cond.clone()));
+                    for (idx, token_id) in parse_clob_token_ids(market.clob_token_ids.as_deref())
+                        .into_iter()
+                        .enumerate()
+                    {
+                        // The Gamma `clobTokenIds` array position IS the
+                        // outcome_index (0=YES,1=NO for binary) — the authoritative
+                        // outcome→token order the CLOB cross-check validates (#429).
+                        // Skip blank placeholders but keep `idx` so the indices of
+                        // later outcomes stay aligned with that order.
+                        if token_id.is_empty() {
+                            continue;
+                        }
+                        let outcome_index =
+                            u16::try_from(idx).map_err(|_| BootstrapError::Internal)?;
+                        token_rows.push((token_id, cond.clone(), outcome_index));
                     }
                     let (taker_bps, maker_bps) = fees_for_market(market);
                     fee_rows.push((cond, taker_bps, maker_bps, fetched_at));
@@ -340,17 +354,18 @@ struct GammaFeeSchedule {
 }
 
 /// Parse Gamma's `clobTokenIds` (a stringified JSON array of decimal token ids)
-/// into the contained ids. Returns empty on `None`, malformed JSON, or a
-/// non-array — token mapping is best-effort and must never abort the sweep.
-/// Blank ids are dropped.
+/// into the contained ids, **preserving array position** so the index can serve
+/// as the `outcome_index` (issue #429). A blank entry is kept as an empty-string
+/// placeholder and the consumer skips it while retaining the index, so a mid-array
+/// blank does not shift the outcomes after it (which would otherwise misalign
+/// `outcome_index` vs the CLOB sweep's positional map and spuriously quarantine
+/// the market). Returns empty on `None`, malformed JSON, or a non-array — token
+/// mapping is best-effort and must never abort the sweep.
 fn parse_clob_token_ids(raw: Option<&str>) -> Vec<String> {
     let Some(raw) = raw else {
         return Vec::new();
     };
-    match serde_json::from_str::<Vec<String>>(raw) {
-        Ok(ids) => ids.into_iter().filter(|t| !t.is_empty()).collect(),
-        Err(_) => Vec::new(),
-    }
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 /// Convert a `feeSchedule.rate` fraction to basis points.
@@ -453,10 +468,17 @@ mod tests {
         assert!(parse_clob_token_ids(None).is_empty());
         assert!(parse_clob_token_ids(Some("")).is_empty()); // malformed → empty
         assert!(parse_clob_token_ids(Some("not json")).is_empty());
-        // Blank ids are dropped.
+        // Blank ids are PRESERVED positionally (issue #429): the consumer skips
+        // them while keeping the index so a mid-array blank does not shift the
+        // outcome_index of later outcomes.
         assert_eq!(
             parse_clob_token_ids(Some(r#"["123",""]"#)),
-            vec!["123".to_string()]
+            vec!["123".to_string(), String::new()]
+        );
+        assert_eq!(
+            parse_clob_token_ids(Some(r#"["","456"]"#)),
+            vec![String::new(), "456".to_string()],
+            "a leading blank keeps 456 at index 1 (its true outcome_index)"
         );
     }
 

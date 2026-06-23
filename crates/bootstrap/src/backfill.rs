@@ -104,7 +104,8 @@ pub async fn run_backfill(
         if report.has_failures() {
             tracing::warn!(
                 stages_failed = ?report.stages_failed,
-                "backfill: resolutions partial — optional stages soft-failed"
+                clob_order_mismatches = report.clob_order_mismatches,
+                "backfill: resolutions partial — soft-failed stages and/or CLOB token-order divergences"
             );
         }
     }

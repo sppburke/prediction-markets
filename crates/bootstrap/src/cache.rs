@@ -168,6 +168,8 @@ CREATE INDEX IF NOT EXISTS idx_market_events_event_id ON market_events(event_id)
 -- normalise to decimal before joining). condition_id is the `0x`-prefixed form
 -- shared with trades.market_id / market_events. Lets the on-chain OrderFilled
 -- legs (keyed by token id) be resolved to a market.
+-- `outcome_index` (0-based positional outcome ordinal: 0=YES,1=NO for binary)
+-- is added by migration in `open()` (issue #429); legacy rows stay NULL.
 CREATE TABLE IF NOT EXISTS token_conditions (
     token_id        TEXT    PRIMARY KEY NOT NULL,
     condition_id    TEXT    NOT NULL,
@@ -421,6 +423,13 @@ impl WalletCache {
         // subcommand backfills them; an unfetched market remaining NULL is the honest "unknown
         // creation time" sentinel (no downstream gate treats NULL as eligible).
         add_column_if_missing(&conn, "market_schedules", "start_date_unix", "INTEGER NULL")?;
+        // Migration (issue #429): add `outcome_index` (0-based positional outcome
+        // ordinal: 0=YES,1=NO for binary) to `token_conditions` so the trades /
+        // price-series join can map `trades.outcome_id` → token. Existing rows
+        // (events-sourced before this change) stay NULL until a re-run; the
+        // downstream true_clv join skips NULL. Mirrors the `start_date_unix`
+        // nullable-migration precedent above.
+        add_column_if_missing(&conn, "token_conditions", "outcome_index", "INTEGER NULL")?;
         // Migration (issue #176): add `last_polymarket_full_at` if absent. DBs
         // created before this change keep NULL — picked up by the weekly
         // paranoia full-fetch on first delta-mode run, which then stamps each
@@ -1152,8 +1161,10 @@ impl WalletCache {
     /// backfill cheaply skips already-fetched tokens (resumable). `limit = 0` means unbounded; a
     /// positive `limit` bounds one run's memory/time (re-run to continue).
     ///
-    /// Only markets present in `token_conditions` (the `events` sweep's token→condition map) are
-    /// returned — a token id is required to query CLOB `/prices-history`.
+    /// Only markets present in `token_conditions` (the token→condition map written by the CLOB
+    /// closed-markets sweep over the full resolved universe, and the Gamma `events` sweep over its
+    /// curated slice — issue #429) are returned — a token id is required to query CLOB
+    /// `/prices-history`.
     ///
     /// # Precondition
     /// Returns an empty vec when no resolved markets have mapped tokens.
@@ -1285,27 +1296,36 @@ impl WalletCache {
         Ok(())
     }
 
-    /// Upsert a batch of `(token_id, condition_id)` rows into `token_conditions`
-    /// in one transaction (issue #207, Slice 0).
+    /// Upsert a batch of `(token_id, condition_id, outcome_index)` rows into
+    /// `token_conditions` in one transaction (issue #207, Slice 0; `outcome_index`
+    /// added in issue #429).
     ///
-    /// `token_id` is the decimal-string uint256 form from Gamma `clobTokenIds`;
-    /// `condition_id` is the normalised `0x`-prefixed market id. `INSERT OR
-    /// REPLACE` keyed on `token_id` — a token belongs to exactly one condition,
-    /// and a re-sweep refreshes `fetched_at_unix` without duplicating rows.
+    /// `token_id` is the decimal-string uint256 form from Gamma `clobTokenIds` (or
+    /// CLOB `/markets` `tokens[].token_id` — the same on-chain CTF positionId);
+    /// `condition_id` is the normalised `0x`-prefixed market id; `outcome_index`
+    /// is the 0-based positional outcome ordinal (0=YES,1=NO for binary). `INSERT
+    /// OR REPLACE` keyed on `token_id` — a token belongs to exactly one condition,
+    /// and a re-sweep refreshes `fetched_at_unix`/`outcome_index` without
+    /// duplicating rows.
     pub fn upsert_token_conditions_batch(
         &mut self,
-        rows: &[(String, String)],
+        rows: &[(String, String, u16)],
         fetched_at_unix: i64,
     ) -> Result<(), BootstrapError> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO token_conditions \
-                 (token_id, condition_id, fetched_at_unix) \
-                 VALUES (?1, ?2, ?3)",
+                 (token_id, condition_id, outcome_index, fetched_at_unix) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for (token_id, condition_id) in rows {
-                stmt.execute(params![token_id, condition_id, fetched_at_unix])?;
+            for (token_id, condition_id, outcome_index) in rows {
+                stmt.execute(params![
+                    token_id,
+                    condition_id,
+                    outcome_index,
+                    fetched_at_unix
+                ])?;
             }
         }
         tx.commit()?;
@@ -1320,6 +1340,59 @@ impl WalletCache {
         self.conn
             .query_row("SELECT COUNT(*) FROM token_conditions", [], |r| r.get(0))
             .unwrap_or(0)
+    }
+
+    /// Resolve a token id to its stored `(condition_id, outcome_index)` row.
+    ///
+    /// `outcome_index` is `None` for legacy/events-sourced rows written before the
+    /// issue #429 migration and never repopulated. The CLOB closed-markets
+    /// ingestion cross-check (issue #429) uses this to detect a CLOB `tokens[]`
+    /// array order that diverges from the authoritative Gamma `clob_token_ids`
+    /// order *before* `upsert_token_conditions_batch`'s `INSERT OR REPLACE`
+    /// overwrites the prior row.
+    ///
+    /// # Precondition
+    /// Returns `None` when the token has not been mapped.
+    pub fn token_condition_outcome(&self, token_id: &str) -> Option<(String, Option<i64>)> {
+        self.conn
+            .query_row(
+                "SELECT condition_id, outcome_index FROM token_conditions WHERE token_id = ?1",
+                params![token_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .ok()
+    }
+
+    /// Coverage of the CLOB token→condition map over resolved-with-winner markets
+    /// (issue #429): `(resolved_with_winner, mapped)` where `mapped` counts those
+    /// markets carrying at least one `token_conditions` row. The downstream
+    /// `price_history_backfill_targets` join requires both a winner and a token
+    /// map, so this is the realistic ceiling for that backfill.
+    ///
+    /// # Precondition
+    /// Returns `(0, 0)` on an empty cache.
+    pub fn token_coverage_report(&self) -> (i64, i64) {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_resolutions WHERE winning_outcome_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let mapped: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_resolutions mr \
+                 WHERE mr.winning_outcome_id IS NOT NULL \
+                   AND EXISTS ( \
+                       SELECT 1 FROM token_conditions tc WHERE tc.condition_id = mr.market_id \
+                   )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        (total, mapped)
     }
 
     /// Resolve a single ERC-1155 `token_id` (decimal string) to its `condition_id`.
@@ -2846,17 +2919,22 @@ mod tests {
         cache
             .upsert_token_conditions_batch(
                 &[
-                    ("111".to_string(), "0xaa".to_string()),
-                    ("222".to_string(), "0xaa".to_string()),
-                    ("333".to_string(), "0xbb".to_string()),
+                    ("111".to_string(), "0xaa".to_string(), 0),
+                    ("222".to_string(), "0xaa".to_string(), 1),
+                    ("333".to_string(), "0xbb".to_string(), 0),
                 ],
                 100,
             )
             .unwrap();
         assert_eq!(cache.token_condition_count(), 3);
+        // outcome_index round-trips (issue #429): 222 is the NO leg (index 1).
+        assert_eq!(
+            cache.token_condition_outcome("222"),
+            Some(("0xaa".to_string(), Some(1)))
+        );
         // INSERT OR REPLACE keyed on token_id: re-mapping a token updates, not dupes.
         cache
-            .upsert_token_conditions_batch(&[("111".to_string(), "0xcc".to_string())], 200)
+            .upsert_token_conditions_batch(&[("111".to_string(), "0xcc".to_string(), 0)], 200)
             .unwrap();
         assert_eq!(cache.token_condition_count(), 3);
         let cond: String = cache
@@ -2876,6 +2954,60 @@ mod tests {
         let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
         cache.upsert_token_conditions_batch(&[], 100).unwrap();
         assert_eq!(cache.token_condition_count(), 0);
+    }
+
+    #[test]
+    fn token_condition_outcome_reads_back_and_misses_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .upsert_token_conditions_batch(&[("t0".to_string(), "0xc".to_string(), 0)], 9)
+            .unwrap();
+        assert_eq!(
+            cache.token_condition_outcome("t0"),
+            Some(("0xc".to_string(), Some(0)))
+        );
+        // Unmapped token → None (the cross-check treats this as "nothing to compare").
+        assert_eq!(cache.token_condition_outcome("missing"), None);
+    }
+
+    #[test]
+    fn token_condition_outcome_surfaces_null_index() {
+        // A legacy/events-sourced row written before the issue #429 migration has
+        // a NULL outcome_index. The accessor must surface it as `Some((cond, None))`
+        // so the CLOB cross-check's `stored_idx.is_some_and(..)` skips it (no
+        // divergence verdict) and overwrites it with the CLOB position on re-walk.
+        let dir = TempDir::new().unwrap();
+        let cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO token_conditions (token_id, condition_id, outcome_index, fetched_at_unix) \
+                 VALUES ('legacy', '0xc', NULL, 9)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            cache.token_condition_outcome("legacy"),
+            Some(("0xc".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn token_coverage_report_counts_resolved_with_winner_and_mapped() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        assert_eq!(cache.token_coverage_report(), (0, 0));
+        // Two resolved-with-winner markets; one voided (winner NULL) → excluded.
+        cache.insert_resolution("0xm1", Some(0), 2000, 9).unwrap();
+        cache.insert_resolution("0xm2", Some(1), 2000, 9).unwrap();
+        cache.insert_resolution("0xvoid", None, 2000, 9).unwrap();
+        // Only 0xm1 has a token map.
+        cache
+            .upsert_token_conditions_batch(&[("t1".to_string(), "0xm1".to_string(), 0)], 9)
+            .unwrap();
+        // total = 2 winner markets; mapped = 1.
+        assert_eq!(cache.token_coverage_report(), (2, 1));
     }
 
     #[test]

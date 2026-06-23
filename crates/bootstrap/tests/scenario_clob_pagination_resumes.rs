@@ -68,11 +68,18 @@ async fn clob_first_run_walks_both_pages_advances_cursor_to_terminator() {
     responses.insert(page2_url(), page2_body());
     let clob = ClobFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
 
-    let (schedules, resolutions) = clob.fetch_closed_markets(&mut cache).await.unwrap();
-    assert_eq!(schedules, 4, "all four markets must insert schedules");
+    let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
     assert_eq!(
-        resolutions, 4,
+        report.schedules, 4,
+        "all four markets must insert schedules"
+    );
+    assert_eq!(
+        report.resolutions, 4,
         "all four markets must insert resolutions (each has a winner)"
+    );
+    assert_eq!(
+        report.tokens_mapped, 0,
+        "these fixture tokens carry no token_id, so none map (issue #429)"
     );
     // After the second page, the cursor is the terminator.
     assert_eq!(
@@ -107,12 +114,12 @@ async fn clob_resume_after_partial_run_skips_page1() {
     responses.insert(page2_url(), page2_body());
     let clob = ClobFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses));
 
-    let (schedules, resolutions) = clob.fetch_closed_markets(&mut cache).await.unwrap();
+    let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
     assert_eq!(
-        schedules, 2,
+        report.schedules, 2,
         "only page 2's 2 schedules must be newly inserted"
     );
-    assert_eq!(resolutions, 2, "only page 2's 2 resolutions");
+    assert_eq!(report.resolutions, 2, "only page 2's 2 resolutions");
 
     // After the resume, the cursor is the terminator and all 4 markets are present.
     assert_eq!(

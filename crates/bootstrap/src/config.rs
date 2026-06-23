@@ -24,6 +24,8 @@ const DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
+// Issue #429: CLOB token→condition coverage warn floor (percent).
+const DEFAULT_CLOB_TOKEN_COVERAGE_WARN_PCT: u8 = 90;
 // Issue #324: winner-discovery pipeline defaults.
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
@@ -187,6 +189,19 @@ pub struct BootstrapConfig {
         alias = "bootstrap_clob_concurrency"
     )]
     pub clob_concurrency: usize,
+
+    /// Warn when the CLOB token→condition coverage of resolved-with-winner
+    /// markets falls below this percent after a `resolutions` run (issue #429).
+    /// Default 90: a full CLOB closed-markets re-walk maps ~94%+ of winner
+    /// markets, so a value below 90 flags genuine token-map starvation (e.g. a
+    /// pre-re-walk cache — run `resolutions --reset-clob-cursor`). `0` disables
+    /// the warn. Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// `PE_BOOTSTRAP_CLOB_TOKEN_COVERAGE_WARN_PCT` overrides.
+    #[serde(
+        default = "default_clob_token_coverage_warn_pct",
+        alias = "bootstrap_clob_token_coverage_warn_pct"
+    )]
+    pub clob_token_coverage_warn_pct: u8,
 
     /// CLV price-history backfill (issue #421 PR4): the pre-resolution window fetched per market, in
     /// seconds. The CLOB series is pulled over `[close_ref − this, close_ref]` so CLV can be measured
@@ -594,6 +609,11 @@ const fn default_clob_concurrency() -> usize {
     DEFAULT_CLOB_CONCURRENCY
 }
 
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #429).
+const fn default_clob_token_coverage_warn_pct() -> u8 {
+    DEFAULT_CLOB_TOKEN_COVERAGE_WARN_PCT
+}
+
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults": 72h pre-resolution CLV window.
 const fn default_prices_history_window_secs() -> i64 {
     72 * 60 * 60
@@ -699,6 +719,7 @@ impl Default for BootstrapConfig {
             gamma_base_url: default_gamma_base_url(),
             clob_base_url: default_clob_base_url(),
             clob_concurrency: default_clob_concurrency(),
+            clob_token_coverage_warn_pct: default_clob_token_coverage_warn_pct(),
             prices_history_window_secs: default_prices_history_window_secs(),
             prices_history_fidelity_minutes: default_prices_history_fidelity_minutes(),
             prices_history_min_interval_ms: default_prices_history_min_interval_ms(),
@@ -967,6 +988,21 @@ mod tests {
                 cfg.datadash_api_url.is_none(),
                 "PE_BOOTSTRAP_DATADASH_API_URL=\"\" must disable the source"
             );
+            Ok(())
+        });
+    }
+
+    /// CLOB token-coverage warn floor defaults to 90% (issue #429) and round-trips
+    /// from `PE_BOOTSTRAP_CLOB_TOKEN_COVERAGE_WARN_PCT`.
+    #[test]
+    fn clob_token_coverage_warn_pct_default_and_env() {
+        assert_eq!(BootstrapConfig::default().clob_token_coverage_warn_pct, 90);
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+            jail.set_env("PE_BOOTSTRAP_CLOB_TOKEN_COVERAGE_WARN_PCT", "75");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert_eq!(cfg.clob_token_coverage_warn_pct, 75);
             Ok(())
         });
     }

@@ -22,7 +22,7 @@ use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
 use serde::Deserialize;
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::cache::WalletCache;
 use crate::error::BootstrapError;
@@ -45,6 +45,22 @@ const CLOB_END_CURSOR: &str = "LTE=";
 /// Page size requested from the CLOB `/markets` endpoint. The API caps
 /// `limit` at 1000.
 const CLOB_PAGE_LIMIT: usize = 1000;
+
+/// Outcome of a CLOB closed-markets sweep.
+///
+/// `tokens_mapped` counts `token_conditions` rows written this run (issue #429).
+/// A market whose CLOB `tokens[]` order diverges from the authoritative Gamma
+/// `clob_token_ids` order is **quarantined** — its token rows are skipped (never
+/// written) and counted in `order_mismatches` — so a real divergence cannot
+/// silently misprice the downstream `true_clv` outcome→token join. Counts reflect
+/// only this run's newly-processed pages.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClobReport {
+    pub schedules: usize,
+    pub resolutions: usize,
+    pub tokens_mapped: usize,
+    pub order_mismatches: usize,
+}
 
 /// Paginated client for the Polymarket CLOB `/markets` endpoint.
 ///
@@ -71,13 +87,20 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     /// a crash mid-page replays that page on restart, idempotent via
     /// `INSERT OR IGNORE`.
     ///
-    /// Returns `(schedules_inserted, resolutions_inserted)`. Counts
-    /// reflect only newly-inserted rows; rows already present (e.g.
-    /// a retained `source='polygon'` row) silently no-op.
+    /// Also maps every market's CLOB `tokens[]` into `token_conditions`
+    /// (`token_id → condition_id`, with the positional `outcome_index`) so the
+    /// trades / price-series join can resolve outcome → token (issue #429). The
+    /// closed-markets sweep is the only full-universe token source — Gamma
+    /// `events` covers a curated slice — so this maps the universe at zero extra
+    /// network cost. See [`ClobReport`] for the order-divergence quarantine.
+    ///
+    /// Returns a [`ClobReport`]. Schedule/resolution counts reflect only
+    /// newly-inserted rows; rows already present (e.g. a retained
+    /// `source='polygon'` row) silently no-op.
     pub async fn fetch_closed_markets(
         &self,
         cache: &mut WalletCache,
-    ) -> Result<(usize, usize), BootstrapError> {
+    ) -> Result<ClobReport, BootstrapError> {
         let mut cursor: Option<String> = cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY);
 
         // Early-out when the stored cursor is already the terminator: a prior
@@ -92,12 +115,14 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 "clob: stored cursor is at terminator — skipping closed-market fetch \
                  (clear source_cursor.clob_closed to re-walk)"
             );
-            return Ok((0, 0));
+            return Ok(ClobReport::default());
         }
 
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
         let mut schedules = 0usize;
         let mut resolutions = 0usize;
+        let mut tokens_mapped = 0usize;
+        let mut order_mismatches = 0usize;
         let mut page_count = 0usize;
 
         info!(
@@ -129,6 +154,10 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 })?;
             page_count += 1;
             let markets_in_page = page.data.len();
+
+            // `(token_id, condition_id, outcome_index)` rows for this page,
+            // flushed in one transaction after the per-market loop (issue #429).
+            let mut page_token_rows: Vec<(String, String, u16)> = Vec::new();
 
             for market in page.data {
                 let Some(condition_id) = market.condition_id else {
@@ -166,6 +195,64 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                     )?;
                     resolutions += 1;
                 }
+
+                // Map this market's CLOB tokens (token_id → condition_id, with the
+                // positional outcome_index) so the trades / price-series join can
+                // resolve outcome → token (issue #429).
+                //
+                // Order cross-check: the join's correctness rests on CLOB
+                // `tokens[]` order matching the authoritative Gamma
+                // `clob_token_ids` order. `token_id` is the on-chain CTF
+                // positionId — a globally-unique (condition, outcome) anchor — so
+                // if a token already mapped by the Gamma `events` sweep carries an
+                // `outcome_index` that differs from its CLOB array position, the
+                // two orderings disagree. Quarantine the whole market (write none
+                // of its tokens) so a real divergence fails loudly instead of
+                // silently mispricing the true_clv join. Checked against the prior
+                // stored row *before* the batch's `INSERT OR REPLACE` overwrites it.
+                let mut market_tokens: Vec<(String, String, u16)> = Vec::new();
+                let mut quarantined = false;
+                for (idx, token) in market.tokens.iter().enumerate() {
+                    let Some(token_id) = token.token_id.as_deref() else {
+                        continue; // no token id to map (≈5% of markets)
+                    };
+                    let Ok(pos) = u16::try_from(idx) else {
+                        // Outcome cardinality > u16::MAX is impossible for a real
+                        // market; skip rather than truncate.
+                        continue;
+                    };
+                    if let Some((stored_cond, stored_idx)) = cache.token_condition_outcome(token_id)
+                    {
+                        let cond_mismatch = stored_cond != condition_id;
+                        let order_mismatch = stored_idx.is_some_and(|s| s != i64::from(pos));
+                        if cond_mismatch || order_mismatch {
+                            error!(
+                                condition_id = condition_id.as_str(),
+                                token_id,
+                                clob_position = pos,
+                                stored_condition = stored_cond.as_str(),
+                                stored_outcome_index = ?stored_idx,
+                                "clob: token order/condition divergence vs stored Gamma map — \
+                                 quarantining market (token rows skipped to avoid mispricing the \
+                                 true_clv join, issue #429)"
+                            );
+                            quarantined = true;
+                            break;
+                        }
+                    }
+                    market_tokens.push((token_id.to_owned(), condition_id.clone(), pos));
+                }
+                if quarantined {
+                    order_mismatches += 1;
+                } else {
+                    page_token_rows.extend(market_tokens);
+                }
+            }
+
+            // Flush this page's token map in one transaction (issue #429).
+            if !page_token_rows.is_empty() {
+                cache.upsert_token_conditions_batch(&page_token_rows, fetched_at)?;
+                tokens_mapped += page_token_rows.len();
             }
 
             // Advance cursor. Treat empty/missing/terminator as end-of-pages.
@@ -173,7 +260,11 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             if next.is_empty() || next == CLOB_END_CURSOR {
                 info!(
                     page_count,
-                    schedules, resolutions, "clob: reached end of pages"
+                    schedules,
+                    resolutions,
+                    tokens_mapped,
+                    order_mismatches,
+                    "clob: reached end of pages"
                 );
                 // Persist terminator so the next daily run knows we're caught up.
                 cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, next)?;
@@ -185,12 +276,22 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             if page_count.is_multiple_of(10) {
                 info!(
                     page_count,
-                    markets_in_page, schedules, resolutions, "clob: pagination progress"
+                    markets_in_page,
+                    schedules,
+                    resolutions,
+                    tokens_mapped,
+                    order_mismatches,
+                    "clob: pagination progress"
                 );
             }
         }
 
-        Ok((schedules, resolutions))
+        Ok(ClobReport {
+            schedules,
+            resolutions,
+            tokens_mapped,
+            order_mismatches,
+        })
     }
 }
 
@@ -254,6 +355,12 @@ struct ClobMarket {
 
 #[derive(Deserialize)]
 struct ClobToken {
+    /// ERC-1155 CTF positionId (decimal-string uint256) — the same id Gamma
+    /// returns in `clobTokenIds` and the on-chain `OrderFilled` logs carry.
+    /// Absent on ~5% of markets (issue #429 live probe); those tokens are skipped
+    /// for mapping but the market's resolution/schedule still insert.
+    #[serde(default)]
+    token_id: Option<String>,
     #[serde(default)]
     winner: bool,
 }
@@ -266,19 +373,46 @@ mod tests {
 
     #[test]
     fn winner_index_yes_picks_zero() {
-        let tokens = vec![ClobToken { winner: true }, ClobToken { winner: false }];
+        let tokens = vec![
+            ClobToken {
+                winner: true,
+                token_id: None,
+            },
+            ClobToken {
+                winner: false,
+                token_id: None,
+            },
+        ];
         assert_eq!(winner_index(&tokens), Some(0));
     }
 
     #[test]
     fn winner_index_no_picks_one() {
-        let tokens = vec![ClobToken { winner: false }, ClobToken { winner: true }];
+        let tokens = vec![
+            ClobToken {
+                winner: false,
+                token_id: None,
+            },
+            ClobToken {
+                winner: true,
+                token_id: None,
+            },
+        ];
         assert_eq!(winner_index(&tokens), Some(1));
     }
 
     #[test]
     fn winner_index_voided_is_none() {
-        let tokens = vec![ClobToken { winner: false }, ClobToken { winner: false }];
+        let tokens = vec![
+            ClobToken {
+                winner: false,
+                token_id: None,
+            },
+            ClobToken {
+                winner: false,
+                token_id: None,
+            },
+        ];
         assert_eq!(winner_index(&tokens), None);
     }
 
@@ -286,7 +420,16 @@ mod tests {
     fn winner_index_two_winners_is_none() {
         // Should never happen in production but guard against the first-non-zero
         // pitfall: two `winner=true` tokens must yield None, not the first index.
-        let tokens = vec![ClobToken { winner: true }, ClobToken { winner: true }];
+        let tokens = vec![
+            ClobToken {
+                winner: true,
+                token_id: None,
+            },
+            ClobToken {
+                winner: true,
+                token_id: None,
+            },
+        ];
         assert_eq!(winner_index(&tokens), None);
     }
 
@@ -342,13 +485,68 @@ mod tests {
         let fetcher = pe_source_polymarket_public::FixtureFetcher::new(HashMap::new());
         let clob = ClobFetcher::new("https://clob.example".to_owned(), fetcher);
 
-        let (schedules, resolutions) = clob.fetch_closed_markets(&mut cache).await.unwrap();
-        assert_eq!(schedules, 0);
-        assert_eq!(resolutions, 0);
+        let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
+        assert_eq!(report.schedules, 0);
+        assert_eq!(report.resolutions, 0);
         // Cursor stays at the terminator — caller controls re-walk by clearing it.
         assert_eq!(
             cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
             Some(CLOB_END_CURSOR)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_closed_markets_writes_token_conditions_with_outcome_index() {
+        // Parser/ingestion fixture (issue #429): a CLOB page carrying `token_id`s
+        // writes `token_conditions` rows with the correct positional
+        // `outcome_index` for BOTH a binary and a multi-outcome market, and the
+        // schedule/resolution rows still insert.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = crate::cache::WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        let page = br#"{
+          "data": [
+            {"condition_id":"0xbin","end_date_iso":"2024-01-15T00:00:00Z","closed":true,
+             "tokens":[{"token_id":"100","winner":true},{"token_id":"200","winner":false}]},
+            {"condition_id":"0xmulti","end_date_iso":"2024-02-01T00:00:00Z","closed":true,
+             "tokens":[{"token_id":"300","winner":false},{"token_id":"400","winner":true},{"token_id":"500","winner":false}]}
+          ],
+          "next_cursor":"LTE="
+        }"#.to_vec();
+        let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+            page,
+        );
+        let clob = ClobFetcher::new(
+            "https://clob.example".to_owned(),
+            pe_source_polymarket_public::FixtureFetcher::new(responses),
+        );
+
+        let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
+        assert_eq!(report.tokens_mapped, 5, "2 binary + 3 multi tokens mapped");
+        assert_eq!(report.order_mismatches, 0, "no prior map ⇒ no divergence");
+
+        // Binary: YES=0, NO=1. Multi-outcome: positional 0/1/2.
+        assert_eq!(
+            cache.token_condition_outcome("100"),
+            Some(("0xbin".to_owned(), Some(0)))
+        );
+        assert_eq!(
+            cache.token_condition_outcome("200"),
+            Some(("0xbin".to_owned(), Some(1)))
+        );
+        assert_eq!(
+            cache.token_condition_outcome("300"),
+            Some(("0xmulti".to_owned(), Some(0)))
+        );
+        assert_eq!(
+            cache.token_condition_outcome("400"),
+            Some(("0xmulti".to_owned(), Some(1)))
+        );
+        assert_eq!(
+            cache.token_condition_outcome("500"),
+            Some(("0xmulti".to_owned(), Some(2)))
         );
     }
 }
