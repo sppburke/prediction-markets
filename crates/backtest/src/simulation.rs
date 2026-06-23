@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
-use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex};
+use pe_bootstrap::cache::{
+    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
+};
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, KellyFraction, LeaderAction, MarketId, OutcomeId, Probability, ProbabilityPpm,
@@ -24,6 +26,8 @@ use pe_trader_index::snapshot::RawTrade;
 use pe_trader_index::{IncrementalLedger, RankerConfig, build_watchlist};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
+use serde::Serialize;
+use serde::ser::Error as _;
 use time::{Date, OffsetDateTime};
 use tracing::info;
 
@@ -220,8 +224,22 @@ impl ExposureTracker {
 /// covers both paths and the slice can be borrowed across rayon workers.
 /// Violating the precondition fires `debug_assert!` in debug builds; release
 /// builds will produce incorrect results without panicking.
+///
+/// # Injected-set mode (#421 bake-off)
+///
+/// When `injected` is `Some(set)`, the ranker (`build_watchlist`) and the
+/// leaderboard-snapshot machinery are bypassed: the followed watchlist IS
+/// `set`, every step. `all_trades` must then contain only those wallets'
+/// trades (the caller bounded-loads via [`load_injected_trades`]). The copy
+/// path is the `flat_usd` short-circuit, which reads only set membership, so
+/// the (empty) ledger/quality/snapshot maps are never consulted — callers MUST
+/// set `config.flat_usd` (enforced here and in `main`). On this path the run also emits
+/// `pnl_by_period.ndjson` (per-period, per-wallet copy P&L) when `write_output`.
+///
+/// This is the ranker-or-injected entry point. The 9-argument [`run_simulation`]
+/// wrapper forwards `injected = None` for the (unchanged) ranker-only callers.
 #[allow(clippy::too_many_arguments)]
-pub fn run_simulation(
+pub fn run_simulation_with(
     config: &BacktestConfig,
     all_trades: &[RawTrade],
     snapshots: &LeaderboardSnapshots,
@@ -231,6 +249,7 @@ pub fn run_simulation(
     ranker_config: &RankerConfig,
     strategy: &WinnerFollowStrategy,
     write_output: bool,
+    injected: Option<&HashSet<WalletAddress>>,
 ) -> Result<WinnerFollowReport, BacktestError> {
     debug_assert!(
         all_trades.is_sorted_by_key(|t| t.timestamp.0),
@@ -239,6 +258,18 @@ pub fn run_simulation(
 
     if all_trades.is_empty() {
         return Err(BacktestError::Internal("no trades in cache".to_owned()));
+    }
+
+    // Injected-set mode copies via the flat-USD short-circuit, which is the only
+    // copy path that reads set membership alone (the ranker/quality/ledger maps
+    // are empty here). Without `flat_usd`, the Kelly path would read the empty
+    // quality map and silently drop every copy — fail loudly instead. `main`
+    // also enforces this, but the guard belongs with the precondition.
+    if injected.is_some() && config.flat_usd.is_none() {
+        return Err(BacktestError::Internal(
+            "injected-set mode requires config.flat_usd (the copy path is the flat-USD short-circuit)"
+                .to_owned(),
+        ));
     }
 
     // Backwards-compatibility fallback. Caches predating the snapshots feature
@@ -303,6 +334,15 @@ pub fn run_simulation(
     let mut last_intraday_reset: Option<Date> = None;
 
     let mut fills_writer = maybe_open_trades_ndjson(&config.output_dir, write_output)?;
+
+    // Per-period (UTC calendar day), per-wallet copy P&L for the #421
+    // injected-set handoff (emitted as `pnl_by_period.ndjson`). Only accumulated
+    // on the injected path; the full-cache ranker run leaves it empty to avoid
+    // O(wallets × days) memory on the 25M-trade cache. Realized P&L is keyed to
+    // the day a position closes (resolution or leader sell); `n_fills`/`notional`
+    // to the day a copy opens.
+    let emit_period_pnl = injected.is_some() && write_output;
+    let mut period_pnl: HashMap<(WalletAddress, Date), PeriodAccum> = HashMap::new();
 
     // Tracks leaderboard snapshot transitions for the log gate (replaces the
     // misleading `day_idx % 30` gate that fired every 30 array indices, not days).
@@ -396,6 +436,10 @@ pub fn run_simulation(
 
             pnl_accum.record(pnl);
 
+            if emit_period_pnl {
+                period_pnl.entry((leader, sim_date)).or_default().realized += pnl;
+            }
+
             let fill = TradeFill {
                 simulated_at: sim_date.midnight().assume_utc(),
                 leader_wallet: leader.to_string(),
@@ -425,59 +469,81 @@ pub fn run_simulation(
             continue;
         }
 
-        // Skip days before the first leaderboard snapshot — filtered_ledgers
-        // would be empty regardless and the trade-filter and ledger build below
-        // are pure CPU waste on those days. The full-history fallback
-        // (snapshots.is_empty()) keeps its prior behaviour.
-        if !snapshots.is_empty() && snapshots.for_date(sim_date_unix).is_none() {
-            continue;
-        }
+        // Resolve the followed set + supporting maps for this step. Two paths:
+        //  - Injected (#421 bake-off): follow exactly `injected`, bypassing the
+        //    ranker, leaderboard snapshots, and ledger build. The flat-USD copy
+        //    path below reads only set membership, so the ledger / quality /
+        //    snapshot maps are intentionally empty here (and never consulted).
+        //  - Ranker (default): build the watchlist from the leaderboard pool.
+        let filtered_ledgers: Vec<TraderLedger>;
+        let watchlisted: HashSet<WalletAddress>;
+        let quality_by_wallet: HashMap<WalletAddress, ReconstructionQuality>;
+        let snapshots_have_data: bool;
 
-        // Resolve the leaderboard pool. When snapshots are absent (test
-        // fixtures or pre-snapshot cache), build for all wallets (filter = None).
-        let pool = if snapshots.is_empty() {
-            None
+        if let Some(inj) = injected {
+            filtered_ledgers = Vec::new();
+            watchlisted = inj.iter().copied().collect();
+            quality_by_wallet = HashMap::new();
+            snapshots_have_data = false;
         } else {
-            match snapshots.for_date(sim_date_unix) {
-                Some(p) => Some(p),
-                // Simulation date precedes the first seeded snapshot — no candidates yet.
-                None => continue,
+            // Skip days before the first leaderboard snapshot — filtered_ledgers
+            // would be empty regardless and the trade-filter and ledger build below
+            // are pure CPU waste on those days. The full-history fallback
+            // (snapshots.is_empty()) keeps its prior behaviour.
+            if !snapshots.is_empty() && snapshots.for_date(sim_date_unix).is_none() {
+                continue;
             }
-        };
 
-        let snapshot_at = SourceTimestamp(sim_date.midnight().assume_utc());
-        let filtered_ledgers = incr.build_ledgers(pool, config.audit_window_days);
+            // Resolve the leaderboard pool. When snapshots are absent (test
+            // fixtures or pre-snapshot cache), build for all wallets (filter = None).
+            let pool = if snapshots.is_empty() {
+                None
+            } else {
+                match snapshots.for_date(sim_date_unix) {
+                    Some(p) => Some(p),
+                    // Simulation date precedes the first seeded snapshot — no candidates yet.
+                    None => continue,
+                }
+            };
 
-        if filtered_ledgers.is_empty() {
-            continue;
+            let snapshot_at = SourceTimestamp(sim_date.midnight().assume_utc());
+            filtered_ledgers = incr.build_ledgers(pool, config.audit_window_days);
+
+            if filtered_ledgers.is_empty() {
+                continue;
+            }
+
+            let watchlist = build_watchlist(&filtered_ledgers, snapshot_at.clone(), ranker_config);
+
+            // Log on leaderboard snapshot transitions (replaces misleading day_idx % 30 gate).
+            let snapshot_unix = snapshots.snapshot_at_for_date(sim_date_unix);
+            if snapshot_unix != last_logged_snapshot_unix {
+                info!(
+                    date = %sim_date,
+                    snapshot_unix,
+                    filtered_ledgers = filtered_ledgers.len(),
+                    active = watchlist.active_count,
+                    incubator = watchlist.incubator_count,
+                    "watchlist snapshot transition"
+                );
+                last_logged_snapshot_unix = snapshot_unix;
+            }
+
+            // Reconstruction quality map from watchlist entries.
+            quality_by_wallet = watchlist
+                .entries
+                .iter()
+                .map(|e| (e.wallet, e.reconstruction_quality))
+                .collect();
+            // Watchlisted wallets (Active + Incubator).
+            watchlisted = watchlist.entries.iter().map(|e| e.wallet).collect();
+            snapshots_have_data = !snapshots.is_empty();
         }
 
-        let watchlist = build_watchlist(&filtered_ledgers, snapshot_at.clone(), ranker_config);
-
-        // Log on leaderboard snapshot transitions (replaces misleading day_idx % 30 gate).
-        let snapshot_unix = snapshots.snapshot_at_for_date(sim_date_unix);
-        if snapshot_unix != last_logged_snapshot_unix {
-            info!(
-                date = %sim_date,
-                snapshot_unix,
-                filtered_ledgers = filtered_ledgers.len(),
-                active = watchlist.active_count,
-                incubator = watchlist.incubator_count,
-                "watchlist snapshot transition"
-            );
-            last_logged_snapshot_unix = snapshot_unix;
-        }
-
-        // Build wallet → ledger map for O(1) win-rate lookup.
+        // Build wallet → ledger map for O(1) win-rate lookup. Empty on the
+        // injected path; the flat-USD copy path does not consult it.
         let ledger_by_wallet: HashMap<WalletAddress, &TraderLedger> =
             filtered_ledgers.iter().map(|l| (l.wallet, l)).collect();
-
-        // Build wallet → reconstruction quality map from watchlist entries.
-        let quality_by_wallet: HashMap<WalletAddress, ReconstructionQuality> = watchlist
-            .entries
-            .iter()
-            .map(|e| (e.wallet, e.reconstruction_quality))
-            .collect();
 
         // Build wallet → snapshot-appearance count for the snapshot-aware prior
         // (issue #129). Pre-built per snapshot transition so the O(S) scan in
@@ -487,7 +553,6 @@ pub fn run_simulation(
         // `snapshots_have_data` gate at the call site — otherwise `unwrap_or(0)`
         // would feed `n_snaps = 0` to `saturating_sub`, producing the maximum
         // `extra` for every signal (the opposite of "no data → no penalty").
-        let snapshots_have_data = !snapshots.is_empty();
         let snapshot_counts: HashMap<WalletAddress, u32> = if snapshots_have_data {
             filtered_ledgers
                 .iter()
@@ -501,10 +566,6 @@ pub fn run_simulation(
         } else {
             HashMap::new()
         };
-
-        // Watchlisted wallets (Active + Incubator).
-        let watchlisted: HashSet<WalletAddress> =
-            watchlist.entries.iter().map(|e| e.wallet).collect();
 
         // New signals: trades happening exactly on sim_date from watchlisted leaders.
         let Some(todays_trades) = trades_by_date.get(&sim_date) else {
@@ -641,6 +702,12 @@ pub fn run_simulation(
                                 bought_on: sim_date,
                             },
                         );
+
+                        if emit_period_pnl {
+                            let acc = period_pnl.entry((leader, sim_date)).or_default();
+                            acc.n_fills += 1;
+                            acc.notional += notional;
+                        }
 
                         let fill = TradeFill {
                             simulated_at: sim_date.midnight().assume_utc(),
@@ -845,6 +912,10 @@ pub fn run_simulation(
 
                     pnl_accum.record(pnl);
 
+                    if emit_period_pnl {
+                        period_pnl.entry((leader, sim_date)).or_default().realized += pnl;
+                    }
+
                     let fill = TradeFill {
                         simulated_at: sim_date.midnight().assume_utc(),
                         leader_wallet: leader.to_string(),
@@ -911,6 +982,10 @@ pub fn run_simulation(
         std::fs::rename(&tmp, &report_path)?;
     }
 
+    if emit_period_pnl {
+        write_period_pnl(&config.output_dir, &period_pnl)?;
+    }
+
     info!(
         total_copies = report.total_copies,
         total_pnl_usd = %report.total_pnl_usd,
@@ -920,6 +995,37 @@ pub fn run_simulation(
     );
 
     Ok(report)
+}
+
+/// Backward-compatible 9-argument entry point: run the walk-forward simulation
+/// in ranker mode (no injected set). Delegates to [`run_simulation_with`] with
+/// `injected = None`. Existing callers (the scenario tests and the Kelly sweep)
+/// use this; only the #421 injected-set path in `main` calls
+/// [`run_simulation_with`] directly.
+#[allow(clippy::too_many_arguments)]
+pub fn run_simulation(
+    config: &BacktestConfig,
+    all_trades: &[RawTrade],
+    snapshots: &LeaderboardSnapshots,
+    resolutions: &ResolutionIndex,
+    schedules: &ScheduleIndex,
+    liq_index: &LiquidityIndex,
+    ranker_config: &RankerConfig,
+    strategy: &WinnerFollowStrategy,
+    write_output: bool,
+) -> Result<WinnerFollowReport, BacktestError> {
+    run_simulation_with(
+        config,
+        all_trades,
+        snapshots,
+        resolutions,
+        schedules,
+        liq_index,
+        ranker_config,
+        strategy,
+        write_output,
+        None,
+    )
 }
 
 // ── Kelly-fraction sweep parallelism ──────────────────────────────────────────
@@ -1166,6 +1272,104 @@ fn write_fill(writer: Option<&mut std::fs::File>, fill: &TradeFill) -> Result<()
     Ok(())
 }
 
+/// Per-(wallet, UTC day) copy-P&L accumulator for the #421 injected-set handoff.
+/// Realized P&L lands on the day a position closes; `n_fills`/`notional` on the
+/// day a copy opens (so a buy and its eventual settlement can fall in different
+/// rows — the harness sums across periods).
+#[derive(Debug, Default, Clone)]
+struct PeriodAccum {
+    realized: Decimal,
+    n_fills: u64,
+    notional: Decimal,
+}
+
+/// One emitted row of `pnl_by_period.ndjson` (the #421 `pe-backtest` → Python
+/// policy handoff). One row per (wallet, period). `period_end` is the unix
+/// second at the END of the UTC calendar day the activity fell in (next
+/// midnight). `unrealized_pnl` is a documented `0.0` sentinel: true
+/// mark-to-market needs the PR4 `market_price_history` price series, and under
+/// bounded-load there is no price for still-open positions — marking to the
+/// future resolution would be look-ahead. The money fields serialize as JSON
+/// numbers so the Python harness reads them as floats.
+#[derive(Debug, Serialize)]
+struct PeriodPnlRow {
+    wallet: String,
+    period_end: i64,
+    #[serde(serialize_with = "serialize_decimal_as_f64")]
+    realized_pnl: Decimal,
+    #[serde(serialize_with = "serialize_decimal_as_f64")]
+    unrealized_pnl: Decimal,
+    n_fills: u64,
+    #[serde(serialize_with = "serialize_decimal_as_f64")]
+    notional: Decimal,
+}
+
+/// Serialize a `Decimal` as a JSON float at the output boundary (the Python
+/// harness schema is `…:float`). The conversion never feeds back into P&L math,
+/// so it does not violate the no-`f64`-for-money rule; an out-of-range value is
+/// a hard error rather than a silent truncation.
+fn serialize_decimal_as_f64<S>(d: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let v = d
+        .to_f64()
+        .ok_or_else(|| S::Error::custom(format!("decimal {d} not representable as f64")))?;
+    serializer.serialize_f64(v)
+}
+
+/// Bounded trade load for the #421 injected-set path: returns ONLY the trades
+/// belonging to `wallets` (deduped), never scanning the full cache. This is what
+/// makes running with `max_trade_count = 0` safe — the bake-off harness sets that
+/// to disable the global `cache.trade_count()` backstop, so the load itself must
+/// be self-bounding.
+///
+/// The returned trades are in wallet-then-cache order, NOT sorted by timestamp —
+/// the caller MUST sort by `t.timestamp.0` before passing them to
+/// [`run_simulation_with`] (its documented precondition). `main` does exactly this.
+pub fn load_injected_trades(cache: &WalletCache, wallets: &[WalletAddress]) -> Vec<RawTrade> {
+    let mut seen: HashSet<WalletAddress> = HashSet::new();
+    let mut trades: Vec<RawTrade> = Vec::new();
+    for wallet in wallets {
+        if !seen.insert(*wallet) {
+            continue; // de-dup: a repeated wallet must not double-load its trades
+        }
+        trades.extend(cache.trades_for(&wallet.to_string()));
+    }
+    trades
+}
+
+/// Write `pnl_by_period.ndjson` to `output_dir` — one NDJSON line per
+/// (wallet, period), sorted by (wallet bytes, day) for byte-stable output. See
+/// [`PeriodPnlRow`] for the schema and the `unrealized_pnl` sentinel.
+fn write_period_pnl(
+    output_dir: &Path,
+    period_pnl: &HashMap<(WalletAddress, Date), PeriodAccum>,
+) -> Result<(), BacktestError> {
+    std::fs::create_dir_all(output_dir)?;
+    let path = output_dir.join("pnl_by_period.ndjson");
+    let mut file = std::fs::File::create(path)?;
+
+    // Deterministic order: wallet bytes, then calendar day.
+    let mut rows: Vec<(&(WalletAddress, Date), &PeriodAccum)> = period_pnl.iter().collect();
+    rows.sort_by(|a, b| a.0.0.0.cmp(&b.0.0.0).then(a.0.1.cmp(&b.0.1)));
+
+    for ((wallet, day), acc) in rows {
+        let period_end = day.midnight().assume_utc().unix_timestamp() + 86_400;
+        let row = PeriodPnlRow {
+            wallet: wallet.to_string(),
+            period_end,
+            realized_pnl: acc.realized,
+            unrealized_pnl: Decimal::ZERO,
+            n_fills: acc.n_fills,
+            notional: acc.notional,
+        };
+        let line = serde_json::to_string(&row)?;
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1190,6 +1394,75 @@ mod tests {
 
     fn wallet(b: u8) -> WalletAddress {
         WalletAddress::from_hex(&format!("0x{:040x}", b)).unwrap()
+    }
+
+    // ── injected-set bounded load (#421 PR3) ───────────────────────────────────
+
+    fn raw_buy(w: WalletAddress, mkt: &str, id: &str, ts: i64) -> RawTrade {
+        use pe_core_types::{ContractQty, Price, SourceTradeId};
+        RawTrade {
+            wallet: w,
+            market_id: market(mkt),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price(rust_decimal_macros::dec!(0.50)),
+            contracts: ContractQty(10),
+            timestamp: SourceTimestamp(OffsetDateTime::from_unix_timestamp(ts).unwrap()),
+            source_trade_id: SourceTradeId(id.to_owned()),
+        }
+    }
+
+    // The injected-set path runs with `max_trade_count = 0` (guard disabled), so
+    // the loader MUST be self-bounding: it may pull ONLY the injected wallets'
+    // trades, never the full cache. (Issue #421 PR3 bounded-load AC.)
+    #[test]
+    fn load_injected_trades_loads_only_requested_wallets() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let (a, b, c) = (wallet(0xa1), wallet(0xb2), wallet(0xc3));
+        cache
+            .insert_new(
+                &a.to_string(),
+                vec![
+                    raw_buy(a, "mkt-a", "a-1", 1_700_000_000),
+                    raw_buy(a, "mkt-a2", "a-2", 1_700_000_100),
+                ],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                &b.to_string(),
+                vec![raw_buy(b, "mkt-b", "b-1", 1_700_000_050)],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                &c.to_string(),
+                vec![
+                    raw_buy(c, "mkt-c", "c-1", 1_700_000_200),
+                    raw_buy(c, "mkt-c2", "c-2", 1_700_000_300),
+                ],
+            )
+            .unwrap();
+
+        // Inject {A, B}; A repeated to exercise the de-dup guard. C must be
+        // excluded — proving the load is bounded to the injected wallets.
+        let loaded = load_injected_trades(&cache, &[a, b, a]);
+
+        assert_eq!(
+            loaded.len(),
+            3,
+            "A(2) + B(1); C excluded; A not double-loaded"
+        );
+        assert!(
+            loaded.iter().all(|t| t.wallet == a || t.wallet == b),
+            "only injected wallets' trades may be loaded"
+        );
+        assert!(
+            !loaded.iter().any(|t| t.wallet == c),
+            "non-injected wallet C must not be loaded"
+        );
     }
 
     // ── ExposureTracker: leader and market caps ───────────────────────────────

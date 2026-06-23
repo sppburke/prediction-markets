@@ -140,6 +140,7 @@ fn base_config(dir: &TempDir, flat_usd: Option<Decimal>, bankroll: Decimal) -> B
         max_positions_per_market: None,
         max_signal_price: None,
         max_trade_count: 0,
+        injected_wallets_path: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

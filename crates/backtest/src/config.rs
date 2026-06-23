@@ -262,6 +262,23 @@ pub struct BacktestConfig {
     #[serde(default = "default_max_trade_count")]
     pub max_trade_count: u64,
 
+    /// Path to a newline-delimited file of lowercase-hex wallet addresses
+    /// (`0x…`, one per line; blank lines and `#` comments ignored) to follow
+    /// directly, bypassing the ranker (`build_watchlist`). Drives the #421
+    /// bake-off harness.
+    ///
+    /// When set, `pe-backtest` (a) **bounded-loads ONLY these wallets' trades**
+    /// (never the full cache), (b) treats exactly this set as the followed
+    /// watchlist — no ranker selection, eligibility, or quality gating (the
+    /// `ranker_*` fields are ignored), and (c) emits `pnl_by_period.ndjson`
+    /// (per-period, per-wallet copy P&L). Requires `flat_usd` (the bake-off
+    /// uses flat sizing) and is incompatible with `kelly_sweep_fractions`.
+    /// Set `PE_BACKTEST_MAX_TRADE_COUNT=0` so the global trade-count guard does
+    /// not reject the production cache before the bounded load runs.
+    /// `PE_BACKTEST_INJECTED_WALLETS_PATH` overrides.
+    #[serde(default)]
+    pub injected_wallets_path: Option<PathBuf>,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -390,6 +407,7 @@ impl Default for BacktestConfig {
             max_positions_per_market: default_max_positions_per_market(),
             max_signal_price: default_max_signal_price(),
             max_trade_count: default_max_trade_count(),
+            injected_wallets_path: None,
             strategy: WinnerFollowConfig::default(),
         }
     }

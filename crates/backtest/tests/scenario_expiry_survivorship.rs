@@ -154,6 +154,7 @@ fn base_config_with(
         max_positions_per_market: None,
         max_signal_price: None,
         max_trade_count: 0,
+        injected_wallets_path: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

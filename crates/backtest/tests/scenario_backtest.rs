@@ -106,6 +106,7 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         max_positions_per_market: None,
         max_signal_price: None,
         max_trade_count: 0,
+        injected_wallets_path: None,
         strategy: WinnerFollowConfig::default(),
     }
 }
