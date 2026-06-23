@@ -31,6 +31,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Rust target/ plus the (#397) redundant `pe-service --features scenario` re-link can
+      # exhaust the runner root fs; that surfaces as `ld ... signal 7 [Bus error]` while linking
+      # (a full-fs mmap fault, not OOM). Adding the #421 Python deps (arch/statsmodels) tipped it
+      # over, so reclaim the preinstalled SDKs this job never uses (~tens of GB). df -h is kept as
+      # a diagnostic so disk headroom is visible in the log.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+          df -h /
+
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
