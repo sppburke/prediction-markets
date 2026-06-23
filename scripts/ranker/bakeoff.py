@@ -559,7 +559,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ``suff_stats.materialize`` needs a live DuckDB connection — there is no SQLite fallback for it.
     ``--cache`` is the ``wallet_cache.db`` path forwarded to ``pe-backtest`` as the trade cache,
     NOT the engine selector (the original ``main`` passed ``--cache`` into ``get_engine``'s
-    ``force`` argument, which silently fell back to SQLite and crashed ``materialize``)."""
+    ``force`` argument, which fell back to SQLite and crashed ``materialize(None)``)."""
     ap = argparse.ArgumentParser(description="issue #421 ranker bake-off (operator run)")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--pe-backtest", required=True, help="path to the pe-backtest binary")
@@ -580,12 +580,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _open_engine(args: argparse.Namespace):
-    """Open the DuckDB/Parquet engine the bake-off requires (``--engine`` mode, default ``duck``;
-    ``--parquet-dir`` optional). Passes the engine MODE to ``ranker_duck.get_engine`` — never the
-    ``--cache`` path (issue #421 regression guard)."""
+    """Open the DuckDB/Parquet engine the bake-off requires (``--engine`` is ``ranker_duck``'s
+    ``force`` mode, default ``duck``; ``--parquet-dir`` optional). Passes the engine MODE to
+    ``ranker_duck.get_engine`` — never the ``--cache`` path (issue #421 regression guard).
+
+    ``get_engine`` returns ``None`` for ``--engine sqlite`` (always) or ``--engine auto`` with a
+    stale/absent snapshot; the bake-off has no SQLite path (``suff_stats.materialize`` needs a live
+    connection), so fail loudly here rather than crash later in ``materialize(None)``."""
     import ranker_duck  # lazy: duckdb is not on every dev box (issue #421 runtime note)
 
-    return ranker_duck.get_engine(args.engine, args.parquet_dir)
+    con = ranker_duck.get_engine(args.engine, args.parquet_dir)
+    if con is None:
+        raise SystemExit(
+            f"bake-off requires a DuckDB/Parquet engine but --engine={args.engine} yielded none "
+            "(SQLite has no suff_stats path); use --engine duck after running "
+            "scripts/export_trades_parquet.py to (re)build the snapshot"
+        )
+    return con
 
 
 def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage functions)

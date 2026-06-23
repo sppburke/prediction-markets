@@ -285,8 +285,8 @@ class EndToEndTest(unittest.TestCase):
 class CliEngineTest(unittest.TestCase):
     """Regression guard (issue #421): ``main`` must pass the engine MODE to
     ``ranker_duck.get_engine`` (default ``duck``), never the ``--cache`` path — the original code
-    fed ``--cache`` into the ``force`` argument, which silently fell back to SQLite and crashed
-    ``materialize``."""
+    fed ``--cache`` into the ``force`` argument, which fell back to SQLite and crashed
+    ``materialize(None)``."""
 
     def test_parser_defaults(self) -> None:
         ns = bo._build_arg_parser().parse_args(
@@ -309,8 +309,24 @@ class CliEngineTest(unittest.TestCase):
         finally:
             ranker_duck.get_engine = orig
         self.assertEqual(con, "CON")
-        self.assertEqual(captured["args"][0], "duck")          # engine MODE, not a path
+        self.assertEqual(captured["args"][0], "duck")          # arg 0 = engine MODE, not a path
+        self.assertIsNone(captured["args"][1])                 # arg 1 = parquet_dir (guards swap)
         self.assertNotIn("data/wallet_cache.db", captured["args"])
+
+    def test_open_engine_raises_loudly_when_engine_yields_none(self) -> None:
+        # --engine sqlite/auto can return None; the bake-off has no SQLite path, so fail loudly
+        # instead of crashing later in materialize(None).
+        import ranker_duck
+        ns = bo._build_arg_parser().parse_args(
+            ["--out-dir", "o", "--pe-backtest", "b", "--cache", "c",
+             "--engine", "sqlite", "--start-unix", "0"])
+        orig = ranker_duck.get_engine
+        ranker_duck.get_engine = lambda *a, **k: None
+        try:
+            with self.assertRaises(SystemExit):
+                bo._open_engine(ns)
+        finally:
+            ranker_duck.get_engine = orig
 
 
 if __name__ == "__main__":
