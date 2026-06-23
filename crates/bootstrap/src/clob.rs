@@ -160,7 +160,12 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             let mut page_token_rows: Vec<(String, String, u16)> = Vec::new();
 
             for market in page.data {
-                let Some(condition_id) = market.condition_id else {
+                let Some(condition_id) = market.condition_id.filter(|c| !c.is_empty()) else {
+                    // CLOB returns draft/undeployed entries with an empty (or
+                    // absent) conditionId; skip them entirely — a non-market has no
+                    // schedule, resolution, or token map. Mirrors events.rs's
+                    // empty-cond skip; an empty id would otherwise write junk rows
+                    // and (issue #429) collide every empty token on the `""` PK.
                     continue;
                 };
                 let end_date_unix = market.end_date_iso.as_deref().and_then(parse_iso_8601);
@@ -213,8 +218,13 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 let mut market_tokens: Vec<(String, String, u16)> = Vec::new();
                 let mut quarantined = false;
                 for (idx, token) in market.tokens.iter().enumerate() {
-                    let Some(token_id) = token.token_id.as_deref() else {
-                        continue; // no token id to map (≈5% of markets)
+                    let Some(token_id) = token.token_id.as_deref().filter(|t| !t.is_empty()) else {
+                        // No usable token id — absent (≈5% of markets) or empty `""`
+                        // (draft outcomes). Skip this outcome but keep `idx` so later
+                        // outcomes stay aligned with the authoritative order, and so
+                        // empty ids never collide on the `""` PK / trip the cross-check
+                        // (issue #429 follow-up).
+                        continue;
                     };
                     let Ok(pos) = u16::try_from(idx) else {
                         // Outcome cardinality > u16::MAX is impossible for a real
@@ -547,6 +557,73 @@ mod tests {
         assert_eq!(
             cache.token_condition_outcome("500"),
             Some(("0xmulti".to_owned(), Some(2)))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_closed_markets_skips_empty_ids_without_quarantine() {
+        // Issue #429 PR1 follow-up: CLOB returns draft/undeployed entries with an
+        // empty condition_id and outcomes with an empty token_id. Empties must be
+        // SKIPPED — never treated as valid ids that collide on the `""` PK and trip
+        // the order cross-check (which produced a spurious ~5.6% quarantine storm
+        // on the live re-walk before this fix).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = crate::cache::WalletCache::open(&dir.path().join("cache.db")).unwrap();
+
+        let page = br#"{
+          "data": [
+            {"condition_id":"0xreal","end_date_iso":"2024-01-15T00:00:00Z","closed":true,
+             "tokens":[{"token_id":"R0","winner":true},{"token_id":"","winner":false}]},
+            {"condition_id":"","end_date_iso":"2024-02-01T00:00:00Z","closed":true,
+             "tokens":[{"token_id":"X","winner":true},{"token_id":"Y","winner":false}]},
+            {"condition_id":"0xreal2","end_date_iso":"2024-03-01T00:00:00Z","closed":true,
+             "tokens":[{"token_id":"","winner":false},{"token_id":"S1","winner":true}]}
+          ],
+          "next_cursor":"LTE="
+        }"#
+        .to_vec();
+        let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+            page,
+        );
+        let clob = ClobFetcher::new(
+            "https://clob.example".to_owned(),
+            pe_source_polymarket_public::FixtureFetcher::new(responses),
+        );
+
+        let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
+
+        // Empty ids skipped ⇒ no `""`-PK collision ⇒ no spurious quarantine.
+        assert_eq!(
+            report.order_mismatches, 0,
+            "empty ids must be skipped, not quarantined"
+        );
+        // Only the two real tokens map (R0, S1); the stray empty tokens and the
+        // entire empty-condition market are skipped.
+        assert_eq!(report.tokens_mapped, 2);
+        // R0 keeps index 0; S1 keeps index 1 even though a leading empty token was
+        // skipped (position preserved).
+        assert_eq!(
+            cache.token_condition_outcome("R0"),
+            Some(("0xreal".to_owned(), Some(0)))
+        );
+        assert_eq!(
+            cache.token_condition_outcome("S1"),
+            Some(("0xreal2".to_owned(), Some(1)))
+        );
+        // The empty token id is never written (no `""` PK row), and the
+        // empty-condition market is skipped entirely (its tokens never map).
+        assert_eq!(cache.token_condition_outcome(""), None);
+        assert_eq!(
+            cache.token_condition_outcome("X"),
+            None,
+            "empty-condition market is skipped entirely"
+        );
+        // The empty-condition market also writes no schedule.
+        assert_eq!(
+            report.schedules, 2,
+            "only the two real markets insert schedules"
         );
     }
 }
