@@ -1,14 +1,17 @@
 //! `pe-backtest` binary entry point.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use pe_backtest::config::{BacktestConfig, load};
 use pe_backtest::error::BacktestError;
 use pe_backtest::report::{KellySweepReport, KellySweepRun};
 use pe_backtest::simulation;
 use pe_bootstrap::cache::WalletCache;
+use pe_core_types::WalletAddress;
 use pe_strategy_winner_follow::WinnerFollowStrategy;
 use pe_trader_index::RankerConfig;
+use pe_trader_index::snapshot::RawTrade;
 use rayon::prelude::*;
 use time::OffsetDateTime;
 use tracing::info;
@@ -52,8 +55,40 @@ async fn main() -> Result<(), BacktestError> {
         }
     }
 
-    let all_wallet_addresses = cache.all_wallet_addresses();
-    let mut all_trades = cache.all_trades();
+    // Injected-set bake-off path (#421): follow an explicit wallet list, bypass
+    // the ranker, and bounded-load ONLY those wallets' trades. See
+    // `BacktestConfig::injected_wallets_path`.
+    let injected_wallets: Option<Vec<WalletAddress>> = match &config.injected_wallets_path {
+        Some(path) => Some(load_wallet_list(path)?),
+        None => None,
+    };
+    if let Some(inj) = &injected_wallets {
+        if config.flat_usd.is_none() {
+            return Err(BacktestError::Internal(
+                "injected_wallets_path requires flat_usd (the bake-off uses flat sizing)"
+                    .to_owned(),
+            ));
+        }
+        if config.kelly_sweep_fractions.is_some() {
+            return Err(BacktestError::Internal(
+                "injected_wallets_path is incompatible with kelly_sweep_fractions".to_owned(),
+            ));
+        }
+        info!(injected_wallets = inj.len(), "backtest: injected-set mode");
+    }
+
+    // Bounded load on the injected path (only the followed wallets' trades);
+    // full-cache scan otherwise. `all_wallet_addresses` is only used for the
+    // log line below, so it too is derived from the injected set to avoid a
+    // full-table `DISTINCT wallet_hex` scan of the 136GB cache.
+    let (all_wallet_addresses, mut all_trades): (Vec<String>, Vec<RawTrade>) =
+        match &injected_wallets {
+            Some(inj) => (
+                inj.iter().map(ToString::to_string).collect(),
+                simulation::load_injected_trades(&cache, inj),
+            ),
+            None => (cache.all_wallet_addresses(), cache.all_trades()),
+        };
     let snapshots = cache.load_all_snapshots()?;
 
     // Resolutions come from the bootstrap pipeline's Polygon CTF + CLOB/Gamma
@@ -198,7 +233,10 @@ async fn main() -> Result<(), BacktestError> {
     } else {
         // ── Single-run mode (default) ────────────────────────────────────────
         let strategy = WinnerFollowStrategy::new(config.strategy.clone());
-        let mut report = simulation::run_simulation(
+        let injected_set: Option<HashSet<WalletAddress>> = injected_wallets
+            .as_ref()
+            .map(|v| v.iter().copied().collect());
+        let mut report = simulation::run_simulation_with(
             &config,
             &all_trades,
             &snapshots,
@@ -208,6 +246,7 @@ async fn main() -> Result<(), BacktestError> {
             &ranker_config,
             &strategy,
             true, // write report.json + trades.ndjson
+            injected_set.as_ref(),
         )?;
         report.resolved_config = Some(config.clone());
 
@@ -228,4 +267,34 @@ async fn main() -> Result<(), BacktestError> {
     }
 
     Ok(())
+}
+
+/// Parse a newline-delimited file of lowercase-hex wallet addresses (`0x…`),
+/// skipping blank lines and `#` comments. Drives the #421 injected-set path.
+/// Errors loudly on a malformed address or an effectively-empty file rather
+/// than silently following nothing.
+fn load_wallet_list(path: &Path) -> Result<Vec<WalletAddress>, BacktestError> {
+    let text = std::fs::read_to_string(path)?;
+    let mut wallets = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let wallet = WalletAddress::from_hex(line).map_err(|e| {
+            BacktestError::Internal(format!(
+                "injected_wallets_path {} line {}: invalid wallet '{line}': {e}",
+                path.display(),
+                idx + 1,
+            ))
+        })?;
+        wallets.push(wallet);
+    }
+    if wallets.is_empty() {
+        return Err(BacktestError::Internal(format!(
+            "injected_wallets_path {} contains no wallet addresses",
+            path.display(),
+        )));
+    }
+    Ok(wallets)
 }
