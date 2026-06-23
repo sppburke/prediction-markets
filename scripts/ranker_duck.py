@@ -33,6 +33,10 @@ TRADES_PARQUET = "trades.parquet"
 RESOLUTIONS_PARQUET = "market_resolutions.parquet"
 SCHEDULES_PARQUET = "market_schedules.parquet"
 REQUIRED_PARQUET = (TRADES_PARQUET, RESOLUTIONS_PARQUET, SCHEDULES_PARQUET)
+# OPTIONAL snapshot (issue #421 PR4 — the CLV price series). Absent until the prices-history
+# backfill + export run, so it is deliberately NOT in REQUIRED_PARQUET: the proxy-CLV and non-CLV
+# bake-off axes must run without it. Registered as a view only when its parquet is present.
+MARKET_PRICE_HISTORY_PARQUET = "market_price_history.parquet"
 
 DEFAULT_PARQUET_DIR = "data/parquet"
 DEFAULT_MAX_AGE_HOURS = 4.0
@@ -147,6 +151,14 @@ def get_engine(force: str | None = None,
     ):
         path = _q(os.path.join(parquet_dir, name))
         con.execute(f"CREATE VIEW {tbl} AS SELECT * FROM read_parquet('{path}');")
+    # Optional CLV view (issue #421 PR4) — registered only when its parquet exists, so the engine
+    # stays usable for proxy-CLV / non-CLV runs before the prices-history backfill has run.
+    mph_path = os.path.join(parquet_dir, MARKET_PRICE_HISTORY_PARQUET)
+    if os.path.exists(mph_path):
+        con.execute(
+            f"CREATE VIEW market_price_history AS SELECT * FROM read_parquet('{_q(mph_path)}');"
+        )
+        log(f"registered optional view market_price_history ({MARKET_PRICE_HISTORY_PARQUET})")
     log(f"engine=duck over {parquet_dir} (memory_limit={mem}, threads={threads_desc})")
     return con
 

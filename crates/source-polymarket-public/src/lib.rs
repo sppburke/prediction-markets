@@ -4,12 +4,17 @@
 //! current positions, closed positions, user activity) on a configurable
 //! interval, emitting raw `SourceEvent` payloads for downstream parsing.
 
+pub mod clob_prices_history;
 pub mod config;
 pub mod connector;
 pub mod endpoint;
 pub mod fetcher;
 pub mod gamma_markets;
 
+pub use clob_prices_history::{
+    CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS,
+    ClobPricesHistoryClient, ClobPricesHistoryError, PricePoint,
+};
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
 pub use endpoint::{LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint};

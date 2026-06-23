@@ -38,6 +38,7 @@ async fn main() {
                 | "classify-infra"
                 | "coverage"
                 | "winner-discovery"
+                | "prices-history"
                 | "purge"
         )
     );
@@ -316,6 +317,32 @@ async fn main() {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "winner-discovery: fatal");
+                        1
+                    }
+                }
+            }
+
+            "prices-history" => {
+                match pe_bootstrap::prices_history::run_prices_history(
+                    &bootstrap_config,
+                    &mut cache,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        tracing::info!(
+                            start_dates_updated = r.start_dates_updated,
+                            tokens_fetched = r.tokens_fetched,
+                            tokens_failed = r.tokens_failed,
+                            points_written = r.points_written,
+                            "prices-history: complete"
+                        );
+                        // Per-token soft-fails (non-fatal fetch errors) → partial (exit 2): the run
+                        // is durable + resumable, re-run to retry the skipped tokens.
+                        if r.tokens_failed > 0 { 2 } else { 0 }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "prices-history: fatal");
                         1
                     }
                 }
