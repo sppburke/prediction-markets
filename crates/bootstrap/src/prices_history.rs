@@ -54,8 +54,10 @@ pub async fn run_prices_history(
     let mut report = PricesHistoryReport::default();
 
     // ── Pass 1: Gamma createdAt → start_date_unix ────────────────────────────────
+    // Scope to decided-outcome markets (same filter as pass 2's price-series targets): a voided
+    // market yields no qualifying first-buy positions, so fetching its createdAt would be wasted.
     let missing_start = cache.market_ids_missing_start_date();
-    let resolved = cache.resolved_market_ids();
+    let resolved = cache.resolved_market_ids_with_winner();
     let start_targets: Vec<String> = missing_start.intersection(&resolved).cloned().collect();
     if start_targets.is_empty() {
         tracing::info!("prices-history: no markets missing start_date — skipping createdAt pass");

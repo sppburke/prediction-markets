@@ -904,6 +904,28 @@ impl WalletCache {
         }
     }
 
+    /// Resolved markets with a **decided** outcome (`winning_outcome_id IS NOT NULL`) — i.e.
+    /// excluding voided/non-binary markets (issue #421 PR4). This is the universe the createdAt
+    /// backfill (pass 1) scopes to, so it matches the price-series backfill (pass 2, which filters
+    /// the same way in [`Self::price_history_backfill_targets`]): a voided market yields no
+    /// qualifying first-buy positions, so its `start_date_unix` would never be consumed.
+    ///
+    /// # Precondition
+    /// Returns an empty set when no resolutions have been fetched.
+    pub fn resolved_market_ids_with_winner(&self) -> HashSet<String> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT market_id FROM market_resolutions WHERE winning_outcome_id IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(Result::ok).collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
     // ── market_schedules ──────────────────────────────────────────────────────
 
     /// Insert a scheduled endDate for a market. Idempotent: `INSERT OR IGNORE` silently
@@ -1041,11 +1063,11 @@ impl WalletCache {
     }
 
     /// Market IDs in `market_schedules` whose `start_date_unix` is NULL — the candidate set for the
-    /// Gamma `createdAt` backfill (issue #421 PR4). The caller scopes this to the resolved/bake-off
-    /// universe (∩ [`Self::resolved_market_ids`]) before issuing network requests, mirroring how the
-    /// null-endDate rewrite scopes [`Self::null_schedule_market_ids`] to the trade-set. Markets with
-    /// no schedule row at all are not covered (they also lack `end_date_unix`), consistent with the
-    /// endDate handling.
+    /// Gamma `createdAt` backfill (issue #421 PR4). The caller scopes this to the decided-outcome
+    /// universe (∩ [`Self::resolved_market_ids_with_winner`]) before issuing network requests,
+    /// mirroring how the null-endDate rewrite scopes [`Self::null_schedule_market_ids`] to the
+    /// trade-set. Markets with no schedule row at all are not covered (they also lack
+    /// `end_date_unix`), consistent with the endDate handling.
     ///
     /// # Precondition
     /// Returns an empty set when no schedules have been fetched.

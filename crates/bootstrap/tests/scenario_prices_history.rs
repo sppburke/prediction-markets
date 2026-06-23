@@ -116,3 +116,28 @@ fn start_date_update_and_null_guard() {
 
     println!("PASS: start_date_update_and_null_guard");
 }
+
+// PASS: the createdAt pass-1 universe (decided-outcome markets) excludes voided markets, matching
+//       pass-2's price-series target filter — so a voided market's createdAt is never fetched.
+// FAIL: a voided (winning_outcome_id NULL) market appears in resolved_market_ids_with_winner.
+#[test]
+fn resolved_with_winner_excludes_voided() {
+    let (_dir, mut cache) = open();
+    cache.insert_resolution("0xwin", Some(0), 100, 9).unwrap();
+    cache.insert_resolution("0xvoid", None, 200, 9).unwrap(); // voided / non-binary
+
+    let all = cache.resolved_market_ids();
+    assert!(
+        all.contains("0xwin") && all.contains("0xvoid"),
+        "all-resolutions set keeps both"
+    );
+
+    let decided = cache.resolved_market_ids_with_winner();
+    assert!(decided.contains("0xwin"));
+    assert!(
+        !decided.contains("0xvoid"),
+        "a voided market must be excluded from the decided-outcome set"
+    );
+
+    println!("PASS: resolved_with_winner_excludes_voided");
+}
