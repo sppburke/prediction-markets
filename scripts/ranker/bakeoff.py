@@ -20,6 +20,7 @@ permissive (``active_within_secs=0`` -> no recency gate; ``min_trl=0`` -> no len
 default-constructed grid point does not silently drop candidates; the canonical defaults land in
 PR6's ``_GLOSSARY``.
 """
+import argparse
 import itertools
 import json
 import os
@@ -551,30 +552,54 @@ def _baseline_key(axes: BakeoffAxes) -> str:
     return key
 
 
-def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage functions)
-    """Operator entry: materialize suff_stats from the cache, run the bake-off against the real
-    ``pe-backtest``, write the leaderboard / manifest / decision, cross-check ``paper_fills``."""
-    import argparse
-    import time
-
-    import ranker_duck  # lazy: duckdb is not on every dev box (issue #421 runtime note)
-
-    from . import suff_stats as suff_stats_mod
-
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """The operator-run CLI, extracted from ``main`` so a drift guard can assert the engine
+    wiring (issue #421 PR6 follow-up). ``--engine`` is the ``ranker_duck`` engine MODE and
+    defaults to ``duck``: the bake-off requires the Parquet engine because
+    ``suff_stats.materialize`` needs a live DuckDB connection — there is no SQLite fallback for it.
+    ``--cache`` is the ``wallet_cache.db`` path forwarded to ``pe-backtest`` as the trade cache,
+    NOT the engine selector (the original ``main`` passed ``--cache`` into ``get_engine``'s
+    ``force`` argument, which silently fell back to SQLite and crashed ``materialize``)."""
     ap = argparse.ArgumentParser(description="issue #421 ranker bake-off (operator run)")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--pe-backtest", required=True, help="path to the pe-backtest binary")
-    ap.add_argument("--cache", required=True, help="path to wallet_cache.db / parquet root")
+    ap.add_argument("--cache", required=True,
+                    help="path to wallet_cache.db (forwarded to pe-backtest as the trade cache)")
+    ap.add_argument("--engine", default="duck", choices=("duck", "auto", "sqlite"),
+                    help="ranker_duck engine mode for the suff_stats snapshot (default: duck — the "
+                         "bake-off requires the Parquet engine)")
+    ap.add_argument("--parquet-dir", default=None,
+                    help="Parquet snapshot directory (default: ranker_duck's data/parquet, "
+                         "overridable via PE_RANKER_PARQUET_DIR)")
     ap.add_argument("--train-days", type=int, default=180)
     ap.add_argument("--horizon-days", type=int, default=30)
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--step-days", type=int, default=30)
     ap.add_argument("--start-unix", type=int, required=True)
-    args = ap.parse_args()
+    return ap
+
+
+def _open_engine(args: argparse.Namespace):
+    """Open the DuckDB/Parquet engine the bake-off requires (``--engine`` mode, default ``duck``;
+    ``--parquet-dir`` optional). Passes the engine MODE to ``ranker_duck.get_engine`` — never the
+    ``--cache`` path (issue #421 regression guard)."""
+    import ranker_duck  # lazy: duckdb is not on every dev box (issue #421 runtime note)
+
+    return ranker_duck.get_engine(args.engine, args.parquet_dir)
+
+
+def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage functions)
+    """Operator entry: materialize suff_stats from the cache, run the bake-off against the real
+    ``pe-backtest``, write the leaderboard / manifest / decision, cross-check ``paper_fills``."""
+    import time
+
+    from . import suff_stats as suff_stats_mod
+
+    args = _build_arg_parser().parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    con = ranker_duck.get_engine(args.cache)
+    con = _open_engine(args)
     ss = suff_stats_mod.materialize(con)
 
     day = 86_400

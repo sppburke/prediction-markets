@@ -282,5 +282,36 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(a["decision"]["status"], b["decision"]["status"])
 
 
+class CliEngineTest(unittest.TestCase):
+    """Regression guard (issue #421): ``main`` must pass the engine MODE to
+    ``ranker_duck.get_engine`` (default ``duck``), never the ``--cache`` path — the original code
+    fed ``--cache`` into the ``force`` argument, which silently fell back to SQLite and crashed
+    ``materialize``."""
+
+    def test_parser_defaults(self) -> None:
+        ns = bo._build_arg_parser().parse_args(
+            ["--out-dir", "o", "--pe-backtest", "b", "--cache", "data/wallet_cache.db",
+             "--start-unix", "0"])
+        self.assertEqual(ns.engine, "duck")          # bake-off requires the Parquet engine
+        self.assertIsNone(ns.parquet_dir)            # -> ranker_duck default (data/parquet)
+        self.assertEqual(ns.cache, "data/wallet_cache.db")
+
+    def test_open_engine_passes_mode_not_cache_path(self) -> None:
+        import ranker_duck
+        ns = bo._build_arg_parser().parse_args(
+            ["--out-dir", "o", "--pe-backtest", "b", "--cache", "data/wallet_cache.db",
+             "--start-unix", "0"])
+        captured: dict = {}
+        orig = ranker_duck.get_engine
+        ranker_duck.get_engine = lambda *a, **k: captured.update(args=a) or "CON"
+        try:
+            con = bo._open_engine(ns)
+        finally:
+            ranker_duck.get_engine = orig
+        self.assertEqual(con, "CON")
+        self.assertEqual(captured["args"][0], "duck")          # engine MODE, not a path
+        self.assertNotIn("data/wallet_cache.db", captured["args"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
