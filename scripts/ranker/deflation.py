@@ -17,6 +17,8 @@ from scipy.stats import norm
 _EULER_MASCHERONI = 0.577_215_664_901_532_9
 # Floor for the SR sampling-variance denominator (guards extreme skew/kurtosis -> non-positive).
 _VAR_FLOOR = 1e-12
+# DeflatedSharpe operates on Sharpe-moment rows, NOT a bare score/rank WalletScores.
+_DSR_REQUIRED_COLS = ("sr", "n_obs", "skew", "kurt")
 
 
 def expected_max_sharpe(n_trials: int, sr_variance: float) -> float:
@@ -63,6 +65,11 @@ class DeflatedSharpe:
     name = "deflated_sharpe"
 
     def deflate(self, scores: pd.DataFrame, *, n_trials: int, as_of: int) -> pd.DataFrame:
+        missing = [c for c in _DSR_REQUIRED_COLS if c not in scores.columns]
+        if missing:
+            raise ValueError(
+                f"DeflatedSharpe.deflate requires Sharpe-moment columns {_DSR_REQUIRED_COLS}; "
+                f"missing {missing} (pass a per-config/per-wallet SR frame, not bare score/rank)")
         sr_var = float(scores["sr"].var(ddof=1)) if len(scores) > 1 else 0.0
         sr0 = expected_max_sharpe(n_trials, sr_var)
         out = scores.copy()

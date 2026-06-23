@@ -33,9 +33,11 @@ FollowSet = pd.DataFrame      # {wallet, weight}: hard top-k -> 1.0, soft/online
 @runtime_checkable
 class Estimator(Protocol):
     """Per-wallet skill score. MUST read only rows with ``resolved_at <= as_of`` (LANDMINE-2
-    look-ahead guard; enforced by PR2's ``oos_validation``). ``weights`` is a positional ndarray
-    aligned to the ORIGINAL (un-sliced) suff_stats RangeIndex (e.g. ``concurrency_uniqueness_weights``);
-    ``ss`` may be a label-preserving row-slice of it (do NOT ``reset_index`` after slicing)."""
+    look-ahead guard; enforced by PR2's ``oos_validation``). ``weights[i]`` is the weight for the
+    ``ss`` row with index label ``i`` (so ``weights[g.index]`` is valid). Compute
+    ``uniqueness_weights`` on the EXACT frame passed to ``score`` — e.g. a ``split_walkforward``
+    reset-index slice (per-step weights) — or pass full-frame weights with a label-preserving slice
+    of that full frame. Do not mix the two."""
 
     name: str
 

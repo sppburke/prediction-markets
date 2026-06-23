@@ -37,6 +37,9 @@ def uniqueness_weights(ss: SuffStats) -> np.ndarray:
     # frame or a ``reset_index(drop=True)`` slice (e.g. ``split_walkforward`` output). Per-wallet
     # cost is O(labels x segments); cap pathological whale wallets if memory-bound (#421 note).
     """
+    if len(ss) and not ss.index.equals(pd.RangeIndex(len(ss))):
+        raise ValueError("uniqueness_weights requires a contiguous RangeIndex (0..n-1); call on "
+                         "the full materialized frame or a reset_index(drop=True) slice")
     w = np.empty(len(ss))
     for _, g in ss.groupby("wallet", sort=False):
         idx = g.index.to_numpy()
@@ -215,9 +218,11 @@ def brown_goetzmann_cpr(period1: pd.Series, period2: pd.Series) -> dict:
     lw = int((~w1 & w2).sum())
     result = {"ww": ww, "wl": wl, "lw": lw, "ll": ll}
     if wl == 0 or lw == 0 or ww == 0 or ll == 0:
+        # Degenerate contingency table: the z-test is undefined (no p-value). cpr is +inf for
+        # zero reversals (wl=lw=0 -> maximal persistence -> go) or 0 for a zero same-state cell;
+        # `cpr > 1.0` is correct for both (inf > 1 is True), so do NOT gate `go` on isfinite.
         cpr = (ww * ll) / (wl * lw) if wl > 0 and lw > 0 else float("inf")
-        result.update(cpr=cpr, z=float("nan"), p_value=float("nan"),
-                      go=bool(np.isfinite(cpr) and cpr > 1.0))
+        result.update(cpr=cpr, z=float("nan"), p_value=float("nan"), go=bool(cpr > 1.0))
         return result
     cpr = (ww * ll) / (wl * lw)
     sigma = math.sqrt(1.0 / ww + 1.0 / wl + 1.0 / lw + 1.0 / ll)

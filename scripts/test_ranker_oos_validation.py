@@ -43,6 +43,12 @@ class UniquenessWeightsTest(unittest.TestCase):
         self.assertAlmostEqual(float(w.mean()), 1.0, places=9)         # normalised to mean 1
         self.assertLess(w[:3].mean(), w[3:].mean())                    # overlap down-weighted
 
+    def test_requires_rangeindex(self) -> None:
+        ss = pd.DataFrame({"wallet": ["a", "a"], "entry_ts": [0, 1], "ttr_ref": [5, 6]},
+                          index=[3, 7])                                # non-contiguous index
+        with self.assertRaises(ValueError):
+            uniqueness_weights(ss)
+
 
 class LookAheadGuardTest(unittest.TestCase):
     def test_assert_no_lookahead(self) -> None:
@@ -152,6 +158,14 @@ class BrownGoetzmannTest(unittest.TestCase):
         p1 = pd.Series(rng.normal(0, 1, n), index=idx)
         p2 = pd.Series(rng.normal(0, 1, n), index=idx)               # independent
         self.assertFalse(brown_goetzmann_cpr(p1, p2)["go"])
+
+    def test_perfect_persistence_is_go(self) -> None:
+        # zero reversals (identical ordering) -> wl=lw=0 -> cpr=inf; go must be True, not False.
+        idx = [f"w{i}" for i in range(10)]
+        p = pd.Series(range(10), index=idx, dtype=float)
+        res = brown_goetzmann_cpr(p, p.copy())
+        self.assertEqual((res["wl"], res["lw"]), (0, 0))
+        self.assertTrue(res["go"])
 
 
 class PaperFillsCrosscheckTest(unittest.TestCase):

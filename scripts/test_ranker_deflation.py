@@ -69,6 +69,11 @@ class DeflatorProtocolTest(unittest.TestCase):
         self.assertGreater(out.loc["a", "dsr"], out.loc["c", "dsr"])
         self.assertTrue(((out["dsr"] >= 0) & (out["dsr"] <= 1)).all())
 
+    def test_missing_columns_raises(self) -> None:
+        bare = pd.DataFrame({"score": [0.9], "rank": [1]})            # not a Sharpe-moment frame
+        with self.assertRaises(ValueError):
+            DeflatedSharpe().deflate(bare, n_trials=10, as_of=0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
