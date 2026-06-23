@@ -1319,9 +1319,14 @@ where
 }
 
 /// Bounded trade load for the #421 injected-set path: returns ONLY the trades
-/// belonging to `wallets` (deduped), never scanning the full cache. This is the
-/// guard that makes `max_trade_count = 0` safe — the global `cache.trade_count()`
-/// backstop is disabled in injected mode, so the load must be self-bounding.
+/// belonging to `wallets` (deduped), never scanning the full cache. This is what
+/// makes running with `max_trade_count = 0` safe — the bake-off harness sets that
+/// to disable the global `cache.trade_count()` backstop, so the load itself must
+/// be self-bounding.
+///
+/// The returned trades are in wallet-then-cache order, NOT sorted by timestamp —
+/// the caller MUST sort by `t.timestamp.0` before passing them to
+/// [`run_simulation_with`] (its documented precondition). `main` does exactly this.
 pub fn load_injected_trades(cache: &WalletCache, wallets: &[WalletAddress]) -> Vec<RawTrade> {
     let mut seen: HashSet<WalletAddress> = HashSet::new();
     let mut trades: Vec<RawTrade> = Vec::new();
