@@ -36,7 +36,7 @@ Each axis is a `typing.Protocol` in `scripts/ranker/__init__.py`; every concrete
 |---|---|---|---|
 | **Estimator** (per-wallet skill) | `Estimator.score` | `eb_shrinkage_skill`, `t_stat_baseline` (the winner's-curse baseline every challenger must beat), `gu_koenker_npmle`, `proxy_clv` | r-value, Brier/CRPS, and the rest of the §menu drop-ins |
 | **Signal combiner** | `SignalCombiner.combine` | *(none — single-signal in v1)* | multi-signal blends |
-| **Deflation / calibration** | `Deflator.deflate` | `deflated_sharpe`, `"none"` (passthrough) | — |
+| **Deflation / calibration** | `Deflator.deflate` | `deflated_sharpe` (the deflation axis also accepts the literal `"none"` passthrough sentinel — a bypass recognised by the driver, not a `*_REGISTRY` class) | — |
 | **Selector** | `Selector.select` | `top_k`, `online_exp_weights` | corr-aware, weighted-conformal, TTTS-online, full BOA |
 | **Set-transition policy** | `SetTransitionPolicy.step` | `policy_full_rerank` (baseline), `policy_knockout_backfill` (the current live behaviour), `policy_hybrid_displacement`, `policy_online_weighting` | — |
 | **Integrity filter** | `IntegrityFilter.mask` | *(none)* — overlap is handled continuously by the uniqueness weights (§Honesty), not a threshold | overlap-ratio / wash / coordination filters |
