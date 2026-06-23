@@ -252,6 +252,115 @@ def paper_fills_crosscheck(leaderboard: pd.DataFrame, realized_pnl: pd.DataFrame
     return out
 
 
+def _truncated_normal_cdf(y: float, theta: float, sigma: float, lower: float) -> float:
+    """CDF at ``y`` of ``N(theta, sigma^2)`` truncated to ``[lower, inf)``. Monotonically
+    DECREASING in ``theta`` (more skill shifts mass right), which is what makes the conditional
+    estimate/CI invertible by a 1-D root find. The degenerate ``0/0`` (winner essentially
+    impossible absent truncation) returns 1.0, keeping the root bracket's low end positive."""
+    a = (lower - theta) / sigma
+    den = 1.0 - float(norm.cdf(a))
+    if den <= 0.0:
+        return 1.0
+    return (float(norm.cdf((y - theta) / sigma)) - float(norm.cdf(a))) / den
+
+
+def akm_inference_on_winners(estimates, ses, *, alpha: float = 0.05) -> dict:
+    """Winner's-curse-corrected inference on the SELECTED winner (Andrews-Kitagawa-McCloskey,
+    QJE 2024) — issue #421 ``akm_inference_on_winners``.
+
+    The naive estimate of the argmax is upward-biased (the winner's curse this harness exists to
+    kill). Conditioning the winner's estimate on having been selected (``Y_w >= max_{k != w} Y_k``)
+    gives a truncated-normal law with lower truncation = the runner-up estimate; the
+    median-unbiased point estimate and the equal-tailed conditional CI invert it. Treats the
+    per-candidate estimates as approximately independent ``N(theta_k, se_k^2)`` (the conditional
+    variant; the full hybrid is a pluggable menu extension).
+
+    Returns ``{winner, naive_estimate, median_unbiased, ci_lo, ci_hi, truncation}``.
+    """
+    estimates = np.asarray(estimates, dtype=float)
+    ses = np.asarray(ses, dtype=float)
+    if estimates.size == 0:
+        raise ValueError("akm_inference_on_winners needs >= 1 estimate")
+    w = int(np.argmax(estimates))
+    y, s = float(estimates[w]), float(ses[w])
+    z = float(norm.ppf(1.0 - alpha / 2.0))
+    if estimates.size == 1:                                     # no competitors -> no truncation
+        return {"winner": w, "naive_estimate": y, "median_unbiased": y,
+                "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": float("-inf")}
+    from scipy.optimize import brentq
+
+    lower = float(np.max(np.delete(estimates, w)))             # runner-up = truncation bound
+    lo_b, hi_b = y - 20.0 * s, y + 20.0 * s
+
+    def solve(target: float) -> float:                         # F decreasing in theta -> bracketed
+        return float(brentq(lambda th: _truncated_normal_cdf(y, th, s, lower) - target,
+                            lo_b, hi_b, maxiter=200, xtol=1e-10))
+
+    return {"winner": w, "naive_estimate": y,
+            "median_unbiased": solve(0.5),
+            "ci_lo": solve(1.0 - alpha / 2.0), "ci_hi": solve(alpha / 2.0),
+            "truncation": lower}
+
+
+def mrsw_rank_cs(estimates, ses, *, tau: int, alpha: float = 0.05) -> pd.DataFrame:
+    """Top-``tau`` rank confidence set (Mogstad-Romano-Shaikh-Wilhelm, ReStud 2024) — issue #421
+    ``mrsw_rank_cs``. A wallet ``j`` is in the top-``tau`` CS iff we cannot conclude that ``tau`` or
+    more others are strictly better: it stays in unless ``n_sig_better >= tau``, where a competitor
+    ``k`` counts as significantly better when ``(est_k - est_j)/sqrt(se_k^2+se_j^2)`` exceeds a
+    Bonferroni one-sided critical value over the ``m-1`` comparisons. Guards against hard-cutting a
+    candidate whose rank is statistically indistinct from the top (issue #421: "if the top-25 CS
+    holds 400 wallets -> widen/weight, don't hard-cut").
+
+    Returns one row per candidate ``{index, point_rank, n_sig_better, in_top_tau_cs}``.
+
+    # Note: the marginal CS, implemented directly from the MRSW construction — the cited
+    # ``csranks`` package is not available on PyPI, so there is no bridge to reproduce.
+    """
+    est = np.asarray(estimates, dtype=float)
+    se = np.asarray(ses, dtype=float)
+    m = est.size
+    if m == 0:
+        return pd.DataFrame(columns=["index", "point_rank", "n_sig_better", "in_top_tau_cs"])
+    crit = float(norm.ppf(1.0 - alpha / max(m - 1, 1)))
+    point_rank = np.empty(m, dtype=int)
+    n_better = np.empty(m, dtype=int)
+    in_cs = np.empty(m, dtype=bool)
+    for j in range(m):
+        sd = np.sqrt(se ** 2 + se[j] ** 2)
+        sd[j] = np.inf                                          # exclude self (z_jj = 0)
+        z = (est - est[j]) / sd
+        n_sig = int((z > crit).sum())
+        point_rank[j] = 1 + int((est > est[j]).sum())
+        n_better[j] = n_sig
+        in_cs[j] = n_sig < tau
+    return pd.DataFrame({"index": np.arange(m), "point_rank": point_rank,
+                         "n_sig_better": n_better, "in_top_tau_cs": in_cs})
+
+
+def fcr_selected_ci(estimates, ses, selected, *, q: float = 0.05,
+                    m: "int | None" = None) -> pd.DataFrame:
+    """False-Coverage-Rate-adjusted CIs for a SELECTED set (Benjamini-Yekutieli, JASA 2005) —
+    issue #421 ``fcr_selected_ci``. Reporting a CI only for the ``R`` selected of ``m`` candidates
+    inflates non-coverage; the FCR fix widens each selected CI to level ``1 - R*q/m`` (so more
+    selections -> wider intervals). ``selected`` is a boolean mask or an index array; ``m`` defaults
+    to ``len(estimates)``. Returns ``{index, estimate, ci_lo, ci_hi, fcr_level}`` per selected.
+    """
+    estimates = np.asarray(estimates, dtype=float)
+    ses = np.asarray(ses, dtype=float)
+    sel = np.asarray(selected)
+    idx = np.where(sel)[0] if sel.dtype == bool else sel.astype(int)
+    m = estimates.size if m is None else m
+    r = idx.size
+    if r == 0:
+        return pd.DataFrame(columns=["index", "estimate", "ci_lo", "ci_hi", "fcr_level"])
+    level = 1.0 - (r * q) / m
+    z = float(norm.ppf(1.0 - (1.0 - level) / 2.0))
+    return pd.DataFrame({"index": idx, "estimate": estimates[idx],
+                         "ci_lo": estimates[idx] - z * ses[idx],
+                         "ci_hi": estimates[idx] + z * ses[idx],
+                         "fcr_level": level})
+
+
 # Registered by `.name` (issue #421 "Architecture" — each module registered by .name).
 VALIDATOR_REGISTRY: "dict[str, type]" = {
     PBO.name: PBO, RomanoWolf.name: RomanoWolf, HansenSPA.name: HansenSPA,

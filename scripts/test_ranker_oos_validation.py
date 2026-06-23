@@ -23,12 +23,16 @@ from ranker.oos_validation import (  # noqa: E402
     HansenSPA,
     PBO,
     RomanoWolf,
+    akm_inference_on_winners,
     assert_no_lookahead,
     brown_goetzmann_cpr,
+    fcr_selected_ci,
+    mrsw_rank_cs,
     paper_fills_crosscheck,
     split_walkforward,
     uniqueness_weights,
 )
+from scipy.stats import norm  # noqa: E402
 
 
 class UniquenessWeightsTest(unittest.TestCase):
@@ -176,6 +180,64 @@ class PaperFillsCrosscheckTest(unittest.TestCase):
         self.assertEqual(set(out["wallet"]), {"b", "c"})              # overlap only
         self.assertTrue(bool(out.loc[out.wallet == "c", "disagree"].iloc[0]))   # c lost live
         self.assertFalse(bool(out.loc[out.wallet == "b", "disagree"].iloc[0]))
+
+
+class AKMWinnersTest(unittest.TestCase):
+    def test_corrects_winners_curse(self) -> None:
+        # 60 pure-null arms; the naive max is upward-biased -> the conditional estimate shrinks it.
+        rng = np.random.default_rng(0)
+        est = rng.normal(0.0, 1.0, 60)
+        out = akm_inference_on_winners(est, np.ones(60))
+        self.assertEqual(out["winner"], int(np.argmax(est)))
+        self.assertLess(out["median_unbiased"], out["naive_estimate"])
+        self.assertLessEqual(out["ci_lo"], out["median_unbiased"] + 1e-9)
+        self.assertGreaterEqual(out["ci_hi"], out["median_unbiased"] - 1e-9)
+
+    def test_single_arm_is_naive(self) -> None:
+        out = akm_inference_on_winners([2.0], [0.5])
+        self.assertEqual(out["median_unbiased"], 2.0)
+        self.assertEqual(out["truncation"], float("-inf"))
+
+    def test_empty_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            akm_inference_on_winners([], [])
+
+
+class MRSWRankCSTest(unittest.TestCase):
+    def test_clear_leader_in_cs_losers_excluded(self) -> None:
+        est = np.array([5.0, 1.0, 1.0, -3.0, -3.0])
+        cs = mrsw_rank_cs(est, np.full(5, 0.3), tau=1)
+        in_cs = set(cs.index[cs["in_top_tau_cs"]])
+        self.assertIn(0, in_cs)                                  # the clear leader could be rank 1
+        self.assertNotIn(3, in_cs)                              # a clear loser cannot
+        self.assertNotIn(4, in_cs)
+        self.assertEqual(cs.loc[0, "point_rank"], 1)
+
+    def test_indistinct_top_widens_cs(self) -> None:
+        # near-tied leaders with wide SEs -> several share the top-1 CS (don't hard-cut).
+        cs = mrsw_rank_cs(np.array([1.0, 0.95, 0.9]), np.full(3, 1.0), tau=1)
+        self.assertGreaterEqual(int(cs["in_top_tau_cs"].sum()), 2)
+
+
+class FCRSelectedCITest(unittest.TestCase):
+    def test_wider_than_unadjusted_and_widest_at_r1(self) -> None:
+        est = np.array([2.0, 1.5, 1.0, 0.5])
+        ses = np.ones(4)
+        naive = 2.0 * float(norm.ppf(0.975))                    # unadjusted 95% width
+        r1 = fcr_selected_ci(est, ses, np.array([True, False, False, False]))
+        r4 = fcr_selected_ci(est, ses, np.array([True, True, True, True]))
+        w1 = float((r1["ci_hi"] - r1["ci_lo"]).iloc[0])
+        w4 = float((r4["ci_hi"] - r4["ci_lo"]).iloc[0])
+        self.assertGreater(w1, naive - 1e-9)                    # FCR >= nominal
+        self.assertGreater(w1, w4)                              # R=1 (worst selection) widest
+        self.assertAlmostEqual(float(r4["fcr_level"].iloc[0]), 0.95)  # R=m -> nominal 1-q
+
+    def test_accepts_index_array_and_empty(self) -> None:
+        est, ses = np.array([1.0, 2.0, 3.0]), np.ones(3)
+        out = fcr_selected_ci(est, ses, np.array([2]))          # index form
+        self.assertEqual(list(out["index"]), [2])
+        empty = fcr_selected_ci(est, ses, np.array([], dtype=int))
+        self.assertTrue(empty.empty)
 
 
 if __name__ == "__main__":

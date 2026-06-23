@@ -42,8 +42,10 @@ def _make_con():
             ("0xa", "M2", 1, 2000, "buy", "0.60", 5),
             # 0xa / M4: VOIDED market (winning_outcome_id NULL) -> excluded.
             ("0xa", "M4", 1, 2500, "buy", "0.50", 8),
-            # 0xb / M3: BUY, won.
+            # 0xb / M3: BUY, won. A later pre-resolution trade (t=3000 < resolved 3400) moves the
+            # close proxy to 0.80 while the FIRST buy (t=1500) stays the entry.
             ("0xb", "M3", 1, 1500, "buy", "0.55", 20),
+            ("0xb", "M3", 1, 3000, "buy", "0.80", 5),
             # 0xb / M5: invalid price (>1) -> excluded by the valid-price filter.
             ("0xb", "M5", 1, 1600, "buy", "1.50", 3),
         ],
@@ -113,6 +115,13 @@ class MaterializeEndToEndTest(unittest.TestCase):
         self.assertEqual(self.ss.loc["M2", "c_t"], 2.0)
         self.assertEqual(self.ss.loc["M3", "c_t"], 1.0)
 
+    def test_close_proxy_is_last_pre_resolution_price(self) -> None:
+        # M1/M2: single buy each -> proxy == entry. M3: a later t=3000 trade at 0.80 (< resolved
+        # 3400) moves the proxy off the 0.55 first-buy entry. proxy_clv reads this column.
+        self.assertAlmostEqual(self.ss.loc["M1", "close_proxy"], 0.40)
+        self.assertAlmostEqual(self.ss.loc["M2", "close_proxy"], 0.60)
+        self.assertAlmostEqual(self.ss.loc["M3", "close_proxy"], 0.80)
+
 
 def _raw() -> pd.DataFrame:
     """A hand-built 9-column frame in the shape ``duck_extract_positions`` returns."""
@@ -141,6 +150,19 @@ class DeriveColumnsTest(unittest.TestCase):
     def test_with_concurrency_false_is_nan(self) -> None:
         ss = suff_stats.derive_columns(_raw(), with_concurrency=False)
         self.assertTrue(ss["c_t"].isna().all())
+
+    def test_close_proxy_defaults_nan_without_merge(self) -> None:
+        # derive_columns is pure; a raw frame WITHOUT the materialize-side close_proxy merge gets
+        # all-NaN close_proxy (proxy_clv then yields no scores rather than crashing).
+        ss = suff_stats.derive_columns(_raw())
+        self.assertIn("close_proxy", ss.columns)
+        self.assertTrue(ss["close_proxy"].isna().all())
+
+    def test_close_proxy_propagates_when_present(self) -> None:
+        raw = _raw()
+        raw["close_proxy"] = [0.7, 0.3]
+        ss = suff_stats.derive_columns(raw)
+        self.assertEqual(list(ss["close_proxy"]), [0.7, 0.3])
 
     def test_custom_slip(self) -> None:
         ss = suff_stats.derive_columns(_raw(), slip=0.05)
