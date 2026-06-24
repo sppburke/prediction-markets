@@ -57,9 +57,17 @@ const CLOB_PAGE_LIMIT: usize = 1000;
 const CLOB_PAGE_MAX_RETRIES: u32 = 5;
 
 /// Base backoff (ms) for the page-level retry; exponential (`base · 2^attempt`),
-/// capped at 30s. With the default 5 retries the walk rides ~31s of sustained
-/// flakiness per page before giving up. Canonical default in `docs/_GLOSSARY.md`.
+/// capped at 30s. With the default 5 retries the inter-attempt backoff sums to
+/// ~31s (1+2+4+8+16) before giving up; total wall-time per page is higher because
+/// each attempt also spends `ReqwestFetcher`'s own retries/timeout. Canonical
+/// default in `docs/_GLOSSARY.md`.
 const CLOB_PAGE_RETRY_BASE_MS: u64 = 1_000;
+
+/// Floor (seconds) applied to a `RateLimited` `retry_after` so a `0`/missing
+/// value cannot busy-loop the page retry. Mirrors the
+/// `bootstrap_polymarket_min_retry_after_secs` floor — a defensive bound (like
+/// the 30s `clob_retry_backoff` cap), not a separately tuned threshold.
+const CLOB_RATE_LIMIT_MIN_WAIT_SECS: u64 = 1;
 
 /// Outcome of a CLOB closed-markets sweep.
 ///
@@ -100,8 +108,9 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     /// transient blips internally; this rides through *sustained* flakiness so a
     /// single bad page (e.g. a minute of `error decoding response body`) does not
     /// abort a ~1,457-page walk. `Fatal` errors abort immediately (a 4xx is not
-    /// retryable); `Transient` backs off exponentially and `RateLimited` honours
-    /// the server's `retry_after`. After [`CLOB_PAGE_MAX_RETRIES`] the error
+    /// retryable); `Transient` backs off exponentially and `RateLimited` waits the
+    /// server's `retry_after` (floored at [`CLOB_RATE_LIMIT_MIN_WAIT_SECS`]). Both
+    /// retryable arms share one budget: after [`CLOB_PAGE_MAX_RETRIES`] the error
     /// propagates so a genuinely persistent failure still surfaces.
     async fn fetch_page_with_retry(&self, url: &str) -> Result<Vec<u8>, BootstrapError> {
         let mut attempt: u32 = 0;
@@ -121,9 +130,9 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                         });
                     }
                     let wait = match &e {
-                        SourceError::RateLimited { retry_after_secs } => {
-                            Duration::from_secs(u64::from((*retry_after_secs).max(1)))
-                        }
+                        SourceError::RateLimited { retry_after_secs } => Duration::from_secs(
+                            u64::from(*retry_after_secs).max(CLOB_RATE_LIMIT_MIN_WAIT_SECS),
+                        ),
                         _ => clob_retry_backoff(attempt),
                     };
                     attempt += 1;

@@ -22,13 +22,23 @@ use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
 use tempfile::TempDir;
 
-/// A `PageFetcher` whose first `fail_n` calls fail; thereafter it serves `body`.
-/// `fatal = true` fails with the non-retryable `Fatal` variant (a 4xx); else
-/// `Transient` (network/decode). `calls` is shared so the test can assert how
-/// many fetch attempts the walk made.
+/// How the fetcher fails for its first `fail_n` calls.
+#[derive(Clone, Copy)]
+enum FailKind {
+    /// Network/decode blip — retryable with backoff.
+    Transient,
+    /// 4xx — non-retryable, aborts immediately.
+    Fatal,
+    /// HTTP 429 — retryable, waits `retry_after`.
+    RateLimited,
+}
+
+/// A `PageFetcher` whose first `fail_n` calls fail with `kind`; thereafter it
+/// serves `body`. `calls` is shared so the test can assert how many fetch
+/// attempts the walk made.
 struct FlakyFetcher {
     fail_n: u32,
-    fatal: bool,
+    kind: FailKind,
     calls: Arc<AtomicU32>,
     body: Vec<u8>,
 }
@@ -37,11 +47,16 @@ impl PageFetcher for FlakyFetcher {
     async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, SourceError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n < self.fail_n {
-            let message = "error decoding response body".to_owned();
-            return Err(if self.fatal {
-                SourceError::Fatal { message }
-            } else {
-                SourceError::Transient { message }
+            return Err(match self.kind {
+                FailKind::Transient => SourceError::Transient {
+                    message: "error decoding response body".to_owned(),
+                },
+                FailKind::Fatal => SourceError::Fatal {
+                    message: "http 404".to_owned(),
+                },
+                FailKind::RateLimited => SourceError::RateLimited {
+                    retry_after_secs: 2,
+                },
             });
         }
         Ok(self.body.clone())
@@ -68,7 +83,7 @@ async fn clob_walk_rides_through_transient_errors() {
     let calls = Arc::new(AtomicU32::new(0));
     let fetcher = FlakyFetcher {
         fail_n: 2,
-        fatal: false,
+        kind: FailKind::Transient,
         calls: Arc::clone(&calls),
         body: one_page_body(),
     };
@@ -89,6 +104,35 @@ async fn clob_walk_rides_through_transient_errors() {
     println!("PASS: CLOB walk rode through 2 transient fetch errors and mapped the page");
 }
 
+// PASS: a page that returns HTTP 429 twice (within the budget) then succeeds ⇒
+//       the walk waits `retry_after` and completes.
+// FAIL: a RateLimited response aborts the walk.
+#[tokio::test(start_paused = true)]
+async fn clob_walk_rides_through_rate_limited() {
+    let (_dir, mut cache) = open_cache();
+    let calls = Arc::new(AtomicU32::new(0));
+    let fetcher = FlakyFetcher {
+        fail_n: 2,
+        kind: FailKind::RateLimited,
+        calls: Arc::clone(&calls),
+        body: one_page_body(),
+    };
+    let clob = ClobFetcher::new("https://clob.example".to_owned(), fetcher);
+
+    let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
+    assert_eq!(
+        report.resolutions, 1,
+        "walk survived 2 rate-limited responses"
+    );
+    assert_eq!(report.tokens_mapped, 2);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "2 rate-limited responses + 1 success"
+    );
+    println!("PASS: CLOB walk rode through 2 RateLimited responses (honoured retry_after)");
+}
+
 // PASS: a persistently transient page aborts (Err) after the retry budget — but
 //       only after retrying more than the single initial attempt.
 // FAIL: it aborts on the first attempt, or never aborts.
@@ -98,7 +142,7 @@ async fn clob_walk_aborts_after_exhausting_retries() {
     let calls = Arc::new(AtomicU32::new(0));
     let fetcher = FlakyFetcher {
         fail_n: u32::MAX,
-        fatal: false,
+        kind: FailKind::Transient,
         calls: Arc::clone(&calls),
         body: Vec::new(),
     };
@@ -124,7 +168,7 @@ async fn clob_walk_aborts_immediately_on_fatal() {
     let calls = Arc::new(AtomicU32::new(0));
     let fetcher = FlakyFetcher {
         fail_n: u32::MAX,
-        fatal: true,
+        kind: FailKind::Fatal,
         calls: Arc::clone(&calls),
         body: Vec::new(),
     };
