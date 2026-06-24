@@ -48,3 +48,6 @@ url             = { workspace = true }
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
 tempfile            = { workspace = true }
+# `test-util` enables tokio's paused virtual clock (`start_paused`) so the CLOB
+# retry scenarios assert backoff behaviour without real wall-clock delay.
+tokio               = { workspace = true, features = ["test-util"] }
