@@ -18,6 +18,8 @@
 //! legacy `source='polygon'` rows keep their exact block timestamps (and win on
 //! `INSERT OR IGNORE` ordering); only new markets carry the CLOB approximation.
 
+use std::time::Duration;
+
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
 use serde::Deserialize;
@@ -45,6 +47,19 @@ const CLOB_END_CURSOR: &str = "LTE=";
 /// Page size requested from the CLOB `/markets` endpoint. The API caps
 /// `limit` at 1000.
 const CLOB_PAGE_LIMIT: usize = 1000;
+
+/// Max page-level retries on a transient / rate-limited CLOB fetch error before
+/// aborting the walk (issue #429 follow-up). This sits *on top of*
+/// [`pe_source_polymarket_public::ReqwestFetcher`]'s internal fast retries — it
+/// rides through *sustained* flakiness (e.g. a minute of `error decoding
+/// response body`) so one bad page does not abort a ~1,457-page walk. Canonical
+/// default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+const CLOB_PAGE_MAX_RETRIES: u32 = 5;
+
+/// Base backoff (ms) for the page-level retry; exponential (`base · 2^attempt`),
+/// capped at 30s. With the default 5 retries the walk rides ~31s of sustained
+/// flakiness per page before giving up. Canonical default in `docs/_GLOSSARY.md`.
+const CLOB_PAGE_RETRY_BASE_MS: u64 = 1_000;
 
 /// Outcome of a CLOB closed-markets sweep.
 ///
@@ -76,6 +91,53 @@ pub struct ClobFetcher<F: PageFetcher> {
 impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     pub fn new(base_url: String, fetcher: F) -> Self {
         Self { base_url, fetcher }
+    }
+
+    /// Fetch one page, retrying transient / rate-limited errors with backoff
+    /// before giving up (issue #429 follow-up).
+    ///
+    /// [`pe_source_polymarket_public::ReqwestFetcher`] already retries fast
+    /// transient blips internally; this rides through *sustained* flakiness so a
+    /// single bad page (e.g. a minute of `error decoding response body`) does not
+    /// abort a ~1,457-page walk. `Fatal` errors abort immediately (a 4xx is not
+    /// retryable); `Transient` backs off exponentially and `RateLimited` honours
+    /// the server's `retry_after`. After [`CLOB_PAGE_MAX_RETRIES`] the error
+    /// propagates so a genuinely persistent failure still surfaces.
+    async fn fetch_page_with_retry(&self, url: &str) -> Result<Vec<u8>, BootstrapError> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self.fetcher.fetch_page(url).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(SourceError::Fatal { message }) => {
+                    warn!(%url, error = %message, "clob: fatal fetch error — aborting page");
+                    return Err(BootstrapError::Clob {
+                        message: format!("fetch {url}: {message}"),
+                    });
+                }
+                Err(e) => {
+                    if attempt >= CLOB_PAGE_MAX_RETRIES {
+                        return Err(BootstrapError::Clob {
+                            message: format!("fetch {url}: {e} (after {attempt} page retries)"),
+                        });
+                    }
+                    let wait = match &e {
+                        SourceError::RateLimited { retry_after_secs } => {
+                            Duration::from_secs(u64::from((*retry_after_secs).max(1)))
+                        }
+                        _ => clob_retry_backoff(attempt),
+                    };
+                    attempt += 1;
+                    warn!(
+                        %url,
+                        error = %e,
+                        attempt,
+                        backoff = ?wait,
+                        "clob: transient fetch error — retrying page"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
     }
 
     /// Paginate `/markets?closed=true` and insert every market's schedule
@@ -133,20 +195,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
 
         loop {
             let url = build_page_url(&self.base_url, cursor.as_deref());
-            let bytes = match self.fetcher.fetch_page(&url).await {
-                Ok(b) => b,
-                Err(SourceError::Fatal { message }) => {
-                    warn!(%url, error = %message, "clob: fatal fetch error — aborting page");
-                    return Err(BootstrapError::Clob {
-                        message: format!("fetch {url}: {message}"),
-                    });
-                }
-                Err(e) => {
-                    return Err(BootstrapError::Clob {
-                        message: format!("fetch {url}: {e}"),
-                    });
-                }
-            };
+            let bytes = self.fetch_page_with_retry(&url).await?;
 
             let page: ClobMarketsPage =
                 serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Clob {
@@ -303,6 +352,13 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             order_mismatches,
         })
     }
+}
+
+/// Exponential page-retry backoff: `CLOB_PAGE_RETRY_BASE_MS · 2^attempt`, capped
+/// at 30s. `attempt` is 0-based (first retry waits the base interval).
+fn clob_retry_backoff(attempt: u32) -> Duration {
+    let ms = CLOB_PAGE_RETRY_BASE_MS.saturating_mul(1u64 << attempt.min(10));
+    Duration::from_millis(ms.min(30_000))
 }
 
 fn build_page_url(base_url: &str, cursor: Option<&str>) -> String {
