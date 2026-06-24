@@ -137,14 +137,19 @@ CREATE TABLE IF NOT EXISTS market_schedules (
 -- (issue #421 PR4). `market_id` is the `0x` condition id (join key to trades.market_id); `token_id`
 -- is the decimal-string CLOB asset id (the `prices-history?market=` query param); `t` is the sample
 -- unix second; `price` is the mid stored as a decimal string (TEXT, like trades.price_str — no f64
--- round-trip). Populated by the `prices-history` subcommand; `INSERT OR IGNORE` on the PK makes the
--- backfill resumable. The PK's (market_id, token_id) prefix also serves the per-token resume check,
--- so no secondary index is needed.
+-- round-trip). `source` is the series provenance (issue #429 PR3): `'clob'` for the CLOB
+-- `/prices-history` backfill, the only writer today (PR2's `clob_only` verdict dropped the trades
+-- pass). Populated by the `prices-history` subcommand; `INSERT OR IGNORE` on the PK makes the
+-- backfill resumable and **write-once** — a later re-run, or a future second source, never overwrites
+-- a captured point, so a `purge` that hard-deletes trades cannot shift an already-written series. The
+-- PK's (market_id, token_id) prefix also serves the per-token resume check, so no secondary index is
+-- needed.
 CREATE TABLE IF NOT EXISTS market_price_history (
     market_id TEXT    NOT NULL,
     token_id  TEXT    NOT NULL,
     t         INTEGER NOT NULL,
     price     TEXT    NOT NULL,
+    source    TEXT    NOT NULL DEFAULT 'clob',
     PRIMARY KEY (market_id, token_id, t)
 );
 
@@ -379,6 +384,24 @@ pub struct PriceBackfillTarget {
     pub close_ref_unix: i64,
 }
 
+/// Minimum points in a `(market, token)` series for it to count as "usable" in
+/// [`WalletCache::price_series_coverage_report`] (issue #429 PR3). Matches the ≥3-point bar PR2's
+/// `clv_source_comparison` memo measured, so the reported coverage is comparable to that memo's
+/// ~63.6% CLOB usable-series ceiling. Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+const MIN_USABLE_SERIES_POINTS: i64 = 3;
+
+/// CLOB price-series coverage over the resolved-with-winner universe (issue #429 PR3), returned by
+/// [`WalletCache::price_series_coverage_report`] and logged after a `prices-history` backfill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PriceSeriesCoverage {
+    /// Resolved-with-winner markets — the coverage denominator.
+    pub total: i64,
+    /// Of `total`, markets with ≥1 `market_price_history` row (any series, even below the usable bar).
+    pub with_series: i64,
+    /// Of `total`, markets with ≥1 token carrying ≥ `MIN_USABLE_SERIES_POINTS` points (a usable series).
+    pub usable: i64,
+}
+
 pub struct WalletCache {
     conn: Connection,
 }
@@ -430,6 +453,17 @@ impl WalletCache {
         // downstream true_clv join skips NULL. Mirrors the `start_date_unix`
         // nullable-migration precedent above.
         add_column_if_missing(&conn, "token_conditions", "outcome_index", "INTEGER NULL")?;
+        // Migration (issue #429 PR3): add `source` provenance to market_price_history so the CLV
+        // bake-off can distinguish CLOB-derived points from a future trades-derived series. DBs
+        // created before this change keep `DEFAULT 'clob'` — correct since every pre-migration row
+        // was written by the CLOB `/prices-history` backfill (the only writer). Mirrors the
+        // market_resolutions / market_schedules `source` precedent above.
+        add_column_if_missing(
+            &conn,
+            "market_price_history",
+            "source",
+            "TEXT NOT NULL DEFAULT 'clob'",
+        )?;
         // Migration (issue #176): add `last_polymarket_full_at` if absent. DBs
         // created before this change keep NULL — picked up by the weekly
         // paranoia full-fetch on first delta-mode run, which then stamps each
@@ -1126,15 +1160,20 @@ impl WalletCache {
     // ── market_price_history (issue #421 PR4 — CLV bake-off) ─────────────────────
 
     /// Insert a batch of coarse pre-resolution price points into `market_price_history` in one
-    /// transaction. Rows are `(market_id, token_id, t, price_str)` where `price_str` is the decimal
-    /// mid as produced by [`Decimal::to_string`] (TEXT — no `f64` round-trip). `INSERT OR IGNORE` on
-    /// the `(market_id, token_id, t)` PK makes re-runs idempotent and the backfill resumable.
+    /// transaction, all tagged with the same `source` provenance (issue #429 PR3: `'clob'` for the
+    /// CLOB `/prices-history` backfill — the only writer today). Rows are
+    /// `(market_id, token_id, t, price_str)` where `price_str` is the decimal mid as produced by
+    /// [`Decimal::to_string`] (TEXT — no `f64` round-trip). `INSERT OR IGNORE` on the
+    /// `(market_id, token_id, t)` PK makes re-runs idempotent, the backfill resumable, and the write
+    /// **write-once**: a re-run, or a future second `source`, never overwrites a captured point, so a
+    /// later `purge` (which hard-deletes `trades` by wallet) cannot shift an already-written series.
     ///
     /// # Precondition
     /// Returns immediately without writing when `rows` is empty.
     pub fn insert_price_history_batch(
         &mut self,
         rows: &[(String, String, i64, String)],
+        source: &str,
     ) -> Result<(), BootstrapError> {
         if rows.is_empty() {
             return Ok(());
@@ -1143,11 +1182,11 @@ impl WalletCache {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO market_price_history \
-                 (market_id, token_id, t, price) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                 (market_id, token_id, t, price, source) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for (market_id, token_id, t, price) in rows {
-                stmt.execute(params![market_id, token_id, t, price])?;
+                stmt.execute(params![market_id, token_id, t, price, source])?;
             }
         }
         tx.commit()?;
@@ -1393,6 +1432,61 @@ impl WalletCache {
             )
             .unwrap_or(0);
         (total, mapped)
+    }
+
+    /// Coverage of the CLOB price series over the resolved-with-winner universe (issue #429 PR3) —
+    /// the operator health metric logged after a `prices-history` backfill, analogous to
+    /// [`token_coverage_report`](Self::token_coverage_report). `total` = resolved-with-winner
+    /// markets; `with_series` = those with ≥1 `market_price_history` row; `usable` = those with ≥1
+    /// token carrying ≥ `MIN_USABLE_SERIES_POINTS` points (the bar PR2's source-comparison memo
+    /// measured, so `usable / total` is comparable to that memo's ~63.6% CLOB ceiling). A market in
+    /// the legacy-`polygon` gap (no CLOB token mapped → no series) contributes 0, by design.
+    ///
+    /// # Precondition
+    /// Returns `PriceSeriesCoverage::default()` (all zero) before any resolution is ingested; the
+    /// caller skips the warn when `total == 0`.
+    pub fn price_series_coverage_report(&self) -> PriceSeriesCoverage {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM market_resolutions WHERE winning_outcome_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let with_series: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT mph.market_id) FROM market_price_history mph \
+                 JOIN market_resolutions mr ON mr.market_id = mph.market_id \
+                 WHERE mr.winning_outcome_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        // A market is "usable" when ≥1 of its tokens carries ≥ MIN_USABLE_SERIES_POINTS points.
+        // The inner GROUP BY emits one row per qualifying (market, token); COUNT(DISTINCT market_id)
+        // then collapses a 2-token market to a single usable market.
+        let usable: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT market_id) FROM ( \
+                     SELECT mph.market_id AS market_id \
+                     FROM market_price_history mph \
+                     JOIN market_resolutions mr ON mr.market_id = mph.market_id \
+                     WHERE mr.winning_outcome_id IS NOT NULL \
+                     GROUP BY mph.market_id, mph.token_id \
+                     HAVING COUNT(*) >= ?1 \
+                 )",
+                params![MIN_USABLE_SERIES_POINTS],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        PriceSeriesCoverage {
+            total,
+            with_series,
+            usable,
+        }
     }
 
     /// Resolve a single ERC-1155 `token_id` (decimal string) to its `condition_id`.
@@ -3008,6 +3102,70 @@ mod tests {
             .unwrap();
         // total = 2 winner markets; mapped = 1.
         assert_eq!(cache.token_coverage_report(), (2, 1));
+    }
+
+    #[test]
+    fn price_series_coverage_report_counts_total_with_series_and_usable() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        assert_eq!(
+            cache.price_series_coverage_report(),
+            PriceSeriesCoverage::default(),
+            "empty cache → all zero"
+        );
+        // Two resolved-with-winner markets + one voided (excluded from the denominator).
+        cache.insert_resolution("0xm1", Some(0), 2000, 9).unwrap();
+        cache.insert_resolution("0xm2", Some(1), 2000, 9).unwrap();
+        cache.insert_resolution("0xvoid", None, 2000, 9).unwrap();
+        // 0xm1: one token with 3 points → usable. 0xm2: one token with 2 points → with_series, NOT usable.
+        cache
+            .insert_price_history_batch(
+                &[
+                    ("0xm1".to_owned(), "t1".to_owned(), 100, "0.4".to_owned()),
+                    ("0xm1".to_owned(), "t1".to_owned(), 200, "0.5".to_owned()),
+                    ("0xm1".to_owned(), "t1".to_owned(), 300, "0.6".to_owned()),
+                    ("0xm2".to_owned(), "t2".to_owned(), 100, "0.7".to_owned()),
+                    ("0xm2".to_owned(), "t2".to_owned(), 200, "0.8".to_owned()),
+                ],
+                "clob",
+            )
+            .unwrap();
+        let cov = cache.price_series_coverage_report();
+        assert_eq!(cov.total, 2, "two winner markets");
+        assert_eq!(cov.with_series, 2, "both have ≥1 point");
+        assert_eq!(cov.usable, 1, "only 0xm1 has a ≥3-point token");
+    }
+
+    #[test]
+    fn price_history_write_once_across_sources() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        // A clob point is written first.
+        cache
+            .insert_price_history_batch(
+                &[("0xm".to_owned(), "t".to_owned(), 100, "0.40".to_owned())],
+                "clob",
+            )
+            .unwrap();
+        // A later trades-sourced write at the SAME PK must be IGNORED (write-once): neither the price
+        // nor the source changes. Guards the purge-durability invariant (#429 PR3 step 6).
+        cache
+            .insert_price_history_batch(
+                &[("0xm".to_owned(), "t".to_owned(), 100, "0.99".to_owned())],
+                "trades",
+            )
+            .unwrap();
+        let (price, source): (String, String) = cache
+            .conn
+            .query_row(
+                "SELECT price, source FROM market_price_history \
+                 WHERE market_id = '0xm' AND token_id = 't' AND t = 100",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(price, "0.40", "the original clob price survives");
+        assert_eq!(source, "clob", "the original clob provenance survives");
     }
 
     #[test]

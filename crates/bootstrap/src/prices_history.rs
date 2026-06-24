@@ -14,6 +14,16 @@
 //!
 //! The heavy second pass is bounded by `prices_history_token_limit` (0 = unbounded) and is resumable
 //! — a re-run skips `(market, token)` pairs that already have rows.
+//!
+//! Every pass-2 row is stamped `source = 'clob'` (issue #429 PR3); the CLOB `/prices-history` series
+//! is the only writer today (PR2's `clob_only` verdict dropped the planned trades pass). `source`
+//! exists so a future trades-derived series can be distinguished and so the coverage ledger
+//! (`price_series_coverage_report`) can attribute points.
+//!
+//! **Run before `purge`, never after.** `pe-bootstrap purge` hard-deletes `trades` by wallet. The
+//! CLOB series is purge-independent (it never reads `trades`), so today the ordering is moot — but
+//! the `INSERT OR IGNORE` write-once guarantee plus this ordering rule are what keep a captured
+//! series stable if a trades-derived `source` is ever added (#429 PR3 step 6).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,13 +164,13 @@ pub async fn run_prices_history(
         }
         if batch.len() >= PRICE_FLUSH_BATCH {
             report.points_written += batch.len();
-            cache.insert_price_history_batch(&batch)?;
+            cache.insert_price_history_batch(&batch, "clob")?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
         report.points_written += batch.len();
-        cache.insert_price_history_batch(&batch)?;
+        cache.insert_price_history_batch(&batch, "clob")?;
     }
 
     tracing::info!(

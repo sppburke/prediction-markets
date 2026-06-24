@@ -64,7 +64,10 @@ fn backfill_targets_join_close_ref_and_resume() {
 
     // Resume: writing one token's series removes only that (market, token) from the next pass.
     cache
-        .insert_price_history_batch(&[("0xm1".to_owned(), "t1".to_owned(), 1700, "0.5".to_owned())])
+        .insert_price_history_batch(
+            &[("0xm1".to_owned(), "t1".to_owned(), 1700, "0.5".to_owned())],
+            "clob",
+        )
         .unwrap();
     let after: HashSet<(String, String)> = cache
         .price_history_backfill_targets(0)
@@ -140,4 +143,69 @@ fn resolved_with_winner_excludes_voided() {
     );
 
     println!("PASS: resolved_with_winner_excludes_voided");
+}
+
+// PASS: price_series_coverage_report() counts (total, with_series, usable) over the
+//       resolved-with-winner universe — `usable` needs ≥3 points on a token — a voided market is
+//       excluded, a same-PK re-insert (different source) is a no-op (write-once), and a genuinely new
+//       3rd point flips a thin market to usable.
+// FAIL: a voided market is counted, the usable bar is wrong, a same-PK re-insert moves the ledger, or
+//       the ledger is stale after a new point.
+#[test]
+fn price_series_coverage_ledger_and_write_once() {
+    let (_dir, mut cache) = open();
+    // Two resolved-with-winner markets + one voided (excluded from the denominator).
+    cache.insert_resolution("0xm1", Some(0), 2000, 9).unwrap();
+    cache.insert_resolution("0xm2", Some(1), 2000, 9).unwrap();
+    cache.insert_resolution("0xvoid", None, 2000, 9).unwrap();
+
+    // 0xm1/t1: 3 points → usable. 0xm2/t2: 2 points → with_series, NOT usable.
+    cache
+        .insert_price_history_batch(
+            &[
+                ("0xm1".to_owned(), "t1".to_owned(), 100, "0.40".to_owned()),
+                ("0xm1".to_owned(), "t1".to_owned(), 200, "0.50".to_owned()),
+                ("0xm1".to_owned(), "t1".to_owned(), 300, "0.60".to_owned()),
+                ("0xm2".to_owned(), "t2".to_owned(), 100, "0.70".to_owned()),
+                ("0xm2".to_owned(), "t2".to_owned(), 200, "0.80".to_owned()),
+            ],
+            "clob",
+        )
+        .unwrap();
+    let cov = cache.price_series_coverage_report();
+    assert_eq!(
+        (cov.total, cov.with_series, cov.usable),
+        (2, 2, 1),
+        "0xvoid excluded; 0xm1 usable (3 pts), 0xm2 has a series but <3 pts"
+    );
+
+    // Write-once: a same-PK re-insert with a different price AND source adds no row → ledger stable.
+    cache
+        .insert_price_history_batch(
+            &[("0xm1".to_owned(), "t1".to_owned(), 100, "0.99".to_owned())],
+            "trades",
+        )
+        .unwrap();
+    let cov2 = cache.price_series_coverage_report();
+    assert_eq!(
+        (cov2.total, cov2.with_series, cov2.usable),
+        (2, 2, 1),
+        "a same-PK re-insert must not change the ledger (write-once)"
+    );
+
+    // A genuinely new 3rd point flips the thin market to usable.
+    cache
+        .insert_price_history_batch(
+            &[("0xm2".to_owned(), "t2".to_owned(), 300, "0.85".to_owned())],
+            "clob",
+        )
+        .unwrap();
+    let cov3 = cache.price_series_coverage_report();
+    assert_eq!(
+        (cov3.total, cov3.with_series, cov3.usable),
+        (2, 2, 2),
+        "a real new point flips 0xm2 to usable"
+    );
+
+    println!("PASS: price_series_coverage_ledger_and_write_once");
 }
