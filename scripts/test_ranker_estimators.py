@@ -22,6 +22,7 @@ from ranker.estimators import (  # noqa: E402
     EBShrinkageSkill,
     GuKoenkerNPMLE,
     ProxyCLV,
+    TrueCLV,
     TStatBaseline,
 )
 
@@ -127,10 +128,12 @@ class GuKoenkerNPMLETest(unittest.TestCase):
         self.assertEqual(out.loc["solo", "rank"], 1)
 
 
-def _clv_ss(specs) -> pd.DataFrame:
-    """specs: list of (wallet, [(price, close_proxy), ...]). NaN close_proxy = no pre-res trade."""
+def _clv_ss(specs, col: str = "close_proxy") -> pd.DataFrame:
+    """specs: list of (wallet, [(price, close), ...]). NaN close = no covering price. ``col`` is the
+    close column the CLV estimator reads (``close_proxy`` for proxy_clv, ``true_clv_close`` for
+    true_clv) — both estimators share the same weighted-CLV t-stat logic."""
     rows = [(w, p, cp) for w, positions in specs for p, cp in positions]
-    return pd.DataFrame(rows, columns=["wallet", "price", "close_proxy"])
+    return pd.DataFrame(rows, columns=["wallet", "price", col])
 
 
 class ProxyCLVTest(unittest.TestCase):
@@ -158,9 +161,34 @@ class ProxyCLVTest(unittest.TestCase):
         self.assertEqual(list(out.columns), ["score", "rank"])
 
 
+class TrueCLVTest(unittest.TestCase):
+    def test_positive_clv_outranks_negative(self) -> None:
+        ss = _clv_ss([
+            ("good", [(0.4, 0.60), (0.4, 0.65), (0.4, 0.55), (0.4, 0.62)]),   # close > entry
+            ("bad", [(0.4, 0.30), (0.4, 0.35), (0.4, 0.32), (0.4, 0.28)]),    # close < entry
+        ], col="true_clv_close")
+        out = TrueCLV().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertLess(out.loc["good", "rank"], out.loc["bad", "rank"])
+
+    def test_nan_and_thin_wallets_dropped(self) -> None:
+        ss = _clv_ss([
+            ("good", [(0.4, 0.6), (0.4, 0.55), (0.4, 0.62)]),
+            ("nodata", [(0.4, float("nan")), (0.4, float("nan"))]),           # no CLOB series
+            ("thin", [(0.4, 0.6), (0.4, float("nan"))]),                      # only 1 valid
+        ], col="true_clv_close")
+        out = TrueCLV().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertEqual(set(out.index), {"good"})
+
+    def test_all_nan_yields_empty(self) -> None:
+        ss = _clv_ss([("w", [(0.4, float("nan")), (0.4, float("nan"))])], col="true_clv_close")
+        out = TrueCLV().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertTrue(out.empty)
+        self.assertEqual(list(out.columns), ["score", "rank"])
+
+
 class RegistryTest(unittest.TestCase):
     def test_all_estimators_registered_by_name(self) -> None:
-        for cls in (EBShrinkageSkill, TStatBaseline, GuKoenkerNPMLE, ProxyCLV):
+        for cls in (EBShrinkageSkill, TStatBaseline, GuKoenkerNPMLE, ProxyCLV, TrueCLV):
             self.assertIs(REGISTRY[cls.name], cls)
 
 

@@ -3,8 +3,9 @@
 (issue #375).
 
 FULL ATOMIC REWRITE each run: `trades` + `market_resolutions` + `market_schedules`
-(+ `market_price_history` when present, issue #421 PR4) -> zstd Parquet under
-`--out-dir` (default data/parquet), via DuckDB's `sqlite_scanner`. Each file is
+(+ optional `market_price_history`, issue #421 PR4, and `token_conditions`, issue #429 PR4,
+when present) -> zstd Parquet under `--out-dir` (default data/parquet), via DuckDB's
+`sqlite_scanner`. Each file is
 written to `<name>.parquet.tmp` then `os.replace`-d into place, so a concurrent
 reader never sees a half-written file.
 
@@ -30,10 +31,11 @@ import time
 # `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
 # `SELECT *`, so no change is needed here for that column.
 TABLES = ("trades", "market_resolutions", "market_schedules")
-# OPTIONAL tables (issue #421 PR4 — the CLV price series). Absent on a pre-migration cache (the
-# export attaches READ_ONLY and does not run schema), so each is skipped with a warning rather than
-# aborting the whole export. `ranker_duck.py` registers its view conditionally to match.
-OPTIONAL_TABLES = ("market_price_history",)
+# OPTIONAL tables (issue #421 PR4 — the CLV price series; #429 PR4 — its token→outcome map).
+# Absent on a pre-migration cache (the export attaches READ_ONLY and does not run schema), so each
+# is skipped with a warning rather than aborting the whole export. `ranker_duck.py` registers each
+# view conditionally to match. `true_clv` needs both `market_price_history` and `token_conditions`.
+OPTIONAL_TABLES = ("market_price_history", "token_conditions")
 
 
 def log(msg: str) -> None:

@@ -33,10 +33,13 @@ TRADES_PARQUET = "trades.parquet"
 RESOLUTIONS_PARQUET = "market_resolutions.parquet"
 SCHEDULES_PARQUET = "market_schedules.parquet"
 REQUIRED_PARQUET = (TRADES_PARQUET, RESOLUTIONS_PARQUET, SCHEDULES_PARQUET)
-# OPTIONAL snapshot (issue #421 PR4 — the CLV price series). Absent until the prices-history
-# backfill + export run, so it is deliberately NOT in REQUIRED_PARQUET: the proxy-CLV and non-CLV
-# bake-off axes must run without it. Registered as a view only when its parquet is present.
+# OPTIONAL snapshots (issue #421 PR4 / #429 PR4 — the CLV price series + its token→outcome map).
+# Absent until the prices-history backfill + export run, so deliberately NOT in REQUIRED_PARQUET:
+# the proxy-CLV and non-CLV bake-off axes must run without them. Registered as views only when
+# their parquet is present. `true_clv` needs BOTH (it joins the series to the bought outcome via
+# token_conditions.outcome_index).
 MARKET_PRICE_HISTORY_PARQUET = "market_price_history.parquet"
+TOKEN_CONDITIONS_PARQUET = "token_conditions.parquet"
 
 DEFAULT_PARQUET_DIR = "data/parquet"
 DEFAULT_MAX_AGE_HOURS = 4.0
@@ -159,6 +162,14 @@ def get_engine(force: str | None = None,
             f"CREATE VIEW market_price_history AS SELECT * FROM read_parquet('{_q(mph_path)}');"
         )
         log(f"registered optional view market_price_history ({MARKET_PRICE_HISTORY_PARQUET})")
+    # Optional token→outcome map (issue #429 PR4) — the true_clv join maps the bought outcome_id to
+    # a CLOB token_id via token_conditions.outcome_index. Registered only when its parquet exists.
+    tc_path = os.path.join(parquet_dir, TOKEN_CONDITIONS_PARQUET)
+    if os.path.exists(tc_path):
+        con.execute(
+            f"CREATE VIEW token_conditions AS SELECT * FROM read_parquet('{_q(tc_path)}');"
+        )
+        log(f"registered optional view token_conditions ({TOKEN_CONDITIONS_PARQUET})")
     log(f"engine=duck over {parquet_dir} (memory_limit={mem}, threads={threads_desc})")
     return con
 
