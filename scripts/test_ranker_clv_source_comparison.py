@@ -179,6 +179,29 @@ class DecidePolicyTest(unittest.TestCase):
         )
         self.assertEqual(d.policy, "clob_only")
 
+    def test_trades_dominates_but_biased_is_not_trades_only(self) -> None:
+        # The bias guard must gate the trades_dominates branch too: heavy coverage cannot
+        # promote a biased trades-last series to a standalone source.
+        d = decide_policy(
+            clob_coverage_pct=10.0,
+            trades_coverage_pct=45.0,  # dominates by 35pp...
+            clob_plus_trades_coverage_pct=46.0,
+            median_abs_diff=0.20,  # ...but biased
+            true_vs_proxy_spearman=0.4,
+        )
+        self.assertEqual(d.policy, "clob_only")
+
+    def test_clob_only_when_no_intersection_nan_diff(self) -> None:
+        # No overlap to verify trades against -> unverified -> not a sound source -> clob_only.
+        d = decide_policy(
+            clob_coverage_pct=20.0,
+            trades_coverage_pct=50.0,  # would dominate...
+            clob_plus_trades_coverage_pct=55.0,
+            median_abs_diff=float("nan"),  # ...but no intersection to verify
+            true_vs_proxy_spearman=0.4,
+        )
+        self.assertEqual(d.policy, "clob_only")
+
 
 class RenderMemoTest(unittest.TestCase):
     def test_renders_policy_and_table(self) -> None:

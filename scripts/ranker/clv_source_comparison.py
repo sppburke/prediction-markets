@@ -55,7 +55,18 @@ FIDELITY_MIN = 60  # clob_prices_history_fidelity_minutes (hourly buckets)
 BUCKET_SECS = FIDELITY_MIN * 60
 MIN_SERIES_POINTS = 3  # PR2(a): a "usable" series needs >=3 points
 MIN_TRADES_FLOOR = 3  # PR2(d): "<3 trades" is the unrecoverable floor
-MID_BIAS_FLAG = 0.05  # PR2(c): median abs diff above this flags trade-vs-mid bias
+MID_BIAS_FLAG = (
+    0.05  # clv_compare_mid_bias_max: median abs diff above this = trade-vs-mid bias
+)
+PROXY_SUFFICES_SPEARMAN = (
+    0.95  # clv_compare_proxy_suffices_spearman: true~=proxy => skip building
+)
+TRADES_DOMINATES_PP = (
+    20.0  # clv_compare_trades_dominates_pp: trades>>CLOB coverage => trades_only
+)
+TRADES_FILL_MIN_PP = (
+    5.0  # clv_compare_trades_fill_min_pp: min trades coverage uplift to add a fill
+)
 MIN_WALLET_POSITIONS = 2  # mirror ProxyCLV: a wallet needs >=2 CLV positions to rank
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
 DEFAULT_SAMPLE_SIZE = 10_000
@@ -179,33 +190,44 @@ def decide_policy(
 
     Order of questions:
       1. Does true_clv even differ from proxy_clv? If the wallet ranking is near-identical
-         (Spearman >= 0.95), the CLOB series buys ~nothing over the proxy_clv we already have ->
-         ``proxy_clv_suffices`` (PR3's price series is low priority).
-      2. If it differs: does the trades-bucket series add usable coverage CLOB lacks (>= 5pp)
-         AND is it a sound proxy (median abs diff <= MID_BIAS_FLAG)? -> include the trades fill.
-      3. If trades dominates CLOB by a wide margin (>= 20pp) -> ``trades_only``.
-      4. Otherwise -> ``clob_only`` (build the CLOB series, skip the trades pass — the issue's
-         expected outcome).
+         (Spearman >= ``PROXY_SUFFICES_SPEARMAN``), the CLOB series buys ~nothing over the
+         proxy_clv we already have -> ``proxy_clv_suffices`` (PR3's price series is low priority).
+      2. **Bias guard (precondition for using trades AT ALL):** trades-last is a usable SOURCE
+         only if it tracks the CLOB series — ``median_abs_diff <= MID_BIAS_FLAG``. A NaN diff (no
+         intersection to verify against) counts as unverified, i.e. not sound. This gates BOTH
+         trades branches below, so a biased/unverified trades series is never recommended even if
+         it has more coverage.
+      3. If trades is sound AND dominates CLOB by a wide margin (>= ``TRADES_DOMINATES_PP``) ->
+         ``trades_only``.
+      4. If trades is sound AND adds usable coverage CLOB lacks (>= ``TRADES_FILL_MIN_PP``) ->
+         ``clob_primary_with_trades_fill``.
+      5. Otherwise -> ``clob_only`` (build the CLOB series, skip the trades pass — the issue's
+         expected outcome; also the verdict when trades is biased/unverified).
     """
     near_identical = (
         not np.isnan(true_vs_proxy_spearman)
-    ) and true_vs_proxy_spearman >= 0.95
+    ) and true_vs_proxy_spearman >= PROXY_SUFFICES_SPEARMAN
     if near_identical:
         return PolicyDecision(
             "proxy_clv_suffices",
-            f"true_clv vs proxy_clv wallet-rank Spearman={true_vs_proxy_spearman:.3f} >= 0.95: the "
-            "CLOB series barely changes the ranking proxy_clv already produces, so building the "
-            "price-series pipeline is low-value — keep proxy_clv as the CLV signal.",
+            f"true_clv vs proxy_clv wallet-rank Spearman={true_vs_proxy_spearman:.3f} >= "
+            f"{PROXY_SUFFICES_SPEARMAN}: the CLOB series barely changes the ranking proxy_clv "
+            "already produces, so building the price-series pipeline is low-value — keep proxy_clv "
+            "as the CLV signal.",
         )
     trades_uplift = clob_plus_trades_coverage_pct - clob_coverage_pct
-    trades_dominates = trades_coverage_pct - clob_coverage_pct >= 20.0
-    if trades_dominates:
+    trades_dominates = trades_coverage_pct - clob_coverage_pct >= TRADES_DOMINATES_PP
+    # Bias guard FIRST: trades is a usable source only if it tracks CLOB (and there was an
+    # intersection to check). NaN diff -> unverified -> not sound. Gates both trades branches.
+    trades_sound = (not np.isnan(median_abs_diff)) and median_abs_diff <= MID_BIAS_FLAG
+    if trades_sound and trades_dominates:
         return PolicyDecision(
             "trades_only",
             f"trades-bucket coverage ({trades_coverage_pct:.1f}%) exceeds CLOB "
-            f"({clob_coverage_pct:.1f}%) by >=20pp; build the trades hourly-bucket series.",
+            f"({clob_coverage_pct:.1f}%) by >={TRADES_DOMINATES_PP}pp and tracks the CLOB series "
+            f"(median abs diff={median_abs_diff:.4f} <= {MID_BIAS_FLAG}); build the trades series.",
         )
-    if trades_uplift >= 5.0 and median_abs_diff <= MID_BIAS_FLAG:
+    if trades_sound and trades_uplift >= TRADES_FILL_MIN_PP:
         return PolicyDecision(
             "clob_primary_with_trades_fill",
             f"CLOB covers {clob_coverage_pct:.1f}%; the trades fill adds {trades_uplift:.1f}pp "
@@ -213,11 +235,13 @@ def decide_policy(
             f"diff={median_abs_diff:.4f} <= {MID_BIAS_FLAG}). Build CLOB-primary + trades fill.",
         )
     reason = f"CLOB covers {clob_coverage_pct:.1f}%; the trades fill adds only {trades_uplift:.1f}pp"
-    if median_abs_diff > MID_BIAS_FLAG:
-        reason += (
-            f" and trades-last diverges from the CLOB series (median abs "
-            f"diff={median_abs_diff:.4f} > {MID_BIAS_FLAG}, a biased proxy)"
+    if not trades_sound:
+        diff_s = (
+            "no overlap"
+            if np.isnan(median_abs_diff)
+            else f"median abs diff={median_abs_diff:.4f}"
         )
+        reason += f" and trades-last is not a verified CLV proxy ({diff_s}; needs <= {MID_BIAS_FLAG})"
     reason += ". Build the CLOB series only; skip PR3's trades pass."
     return PolicyDecision("clob_only", reason)
 
@@ -232,12 +256,15 @@ class RateLimiter:
         self._next = 0.0
 
     def wait(self) -> None:
+        # Reserve this request's slot under the lock (fast), then sleep OUTSIDE it so concurrent
+        # workers don't serialize on the sleep — starts stay spaced by `min_interval`, HTTP
+        # requests overlap.
         with self._lock:
-            now = time.monotonic()
-            if now < self._next:
-                time.sleep(self._next - now)
-                now = time.monotonic()
-            self._next = now + self._min
+            start = max(time.monotonic(), self._next)
+            self._next = start + self._min
+        delay = start - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
 
 
 def fetch_clob_series(
@@ -649,7 +676,7 @@ def _summarize(
         clob_coverage_pct=clob_cov,
         trades_coverage_pct=trades_cov,
         clob_plus_trades_coverage_pct=either_cov,
-        median_abs_diff=0.0 if np.isnan(median_abs_diff) else median_abs_diff,
+        median_abs_diff=median_abs_diff,
         true_vs_proxy_spearman=rank["spearman"],
     )
     return {
