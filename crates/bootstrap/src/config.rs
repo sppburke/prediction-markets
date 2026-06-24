@@ -26,6 +26,10 @@ const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
 // Issue #429: CLOB token→condition coverage warn floor (percent).
 const DEFAULT_CLOB_TOKEN_COVERAGE_WARN_PCT: u8 = 90;
+// Issue #429 PR3: usable CLOB price-series coverage warn floor (percent). 60 sits just under the
+// ~63.6% usable-series ceiling PR2's source-comparison memo measured, so a complete CLOB-only
+// backfill clears it while a starved/partial run trips it.
+const DEFAULT_PRICES_HISTORY_COVERAGE_WARN_PCT: u8 = 60;
 // Issue #324: winner-discovery pipeline defaults.
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
@@ -225,6 +229,18 @@ pub struct BootstrapConfig {
     /// resumable, so re-run to continue. Env `PE_BOOTSTRAP_PRICES_HISTORY_TOKEN_LIMIT`.
     #[serde(default = "default_prices_history_token_limit")]
     pub prices_history_token_limit: usize,
+
+    /// Warn when the usable CLOB price-series coverage of resolved-with-winner markets falls below
+    /// this percent after a `prices-history` run (issue #429 PR3). "Usable" = ≥1 token with
+    /// ≥`MIN_USABLE_SERIES_POINTS` points. Default 60: just under the ~63.6% ceiling PR2's
+    /// source-comparison memo measured, so a complete CLOB-only backfill clears it and a
+    /// starved/partial one flags. `0` disables the warn. Canonical default in `docs/_GLOSSARY.md`
+    /// "Bootstrap defaults". Env `PE_BOOTSTRAP_PRICES_HISTORY_COVERAGE_WARN_PCT`.
+    #[serde(
+        default = "default_prices_history_coverage_warn_pct",
+        alias = "bootstrap_prices_history_coverage_warn_pct"
+    )]
+    pub prices_history_coverage_warn_pct: u8,
 
     /// Fetch funder edges via Etherscan after trade fetch (off by default).
     /// Env `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH`: `"1"` or `"true"` to enable.
@@ -634,6 +650,12 @@ const fn default_prices_history_token_limit() -> usize {
     0
 }
 
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #429 PR3): usable
+/// price-series coverage warn floor, just under PR2's measured ~63.6% CLOB ceiling.
+const fn default_prices_history_coverage_warn_pct() -> u8 {
+    DEFAULT_PRICES_HISTORY_COVERAGE_WARN_PCT
+}
+
 const fn default_leaderboard_request_interval_ms() -> u64 {
     DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS
 }
@@ -724,6 +746,7 @@ impl Default for BootstrapConfig {
             prices_history_fidelity_minutes: default_prices_history_fidelity_minutes(),
             prices_history_min_interval_ms: default_prices_history_min_interval_ms(),
             prices_history_token_limit: default_prices_history_token_limit(),
+            prices_history_coverage_warn_pct: default_prices_history_coverage_warn_pct(),
             fetch_funder_graph: false,
             skip_trade_fetch: false,
             write_snapshot: false,
@@ -1003,6 +1026,24 @@ mod tests {
             let cfg = load(Some(std::path::Path::new("config.toml")))
                 .map_err(|e| figment::Error::from(e.to_string()))?;
             assert_eq!(cfg.clob_token_coverage_warn_pct, 75);
+            Ok(())
+        });
+    }
+
+    /// Price-series coverage warn floor defaults to 60% (issue #429 PR3) and round-trips from
+    /// `PE_BOOTSTRAP_PRICES_HISTORY_COVERAGE_WARN_PCT`.
+    #[test]
+    fn prices_history_coverage_warn_pct_default_and_env() {
+        assert_eq!(
+            BootstrapConfig::default().prices_history_coverage_warn_pct,
+            60
+        );
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+            jail.set_env("PE_BOOTSTRAP_PRICES_HISTORY_COVERAGE_WARN_PCT", "55");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert_eq!(cfg.prices_history_coverage_warn_pct, 55);
             Ok(())
         });
     }

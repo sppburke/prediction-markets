@@ -365,6 +365,12 @@ async fn main() {
                             points_written = r.points_written,
                             "prices-history: complete"
                         );
+                        // Price-series coverage of the resolved-with-winner universe (issue #429
+                        // PR3) — a DB-state metric, logged after the backfill regardless of soft-fails.
+                        log_price_series_coverage(
+                            &cache,
+                            bootstrap_config.prices_history_coverage_warn_pct,
+                        );
                         // Per-token soft-fails (non-fatal fetch errors) → partial (exit 2): the run
                         // is durable + resumable, re-run to retry the skipped tokens.
                         if r.tokens_failed > 0 { 2 } else { 0 }
@@ -557,6 +563,41 @@ fn log_token_coverage(cache: &WalletCache, warn_pct: u8) {
             total,
             coverage_pct = pct,
             "resolutions: CLOB token→condition coverage"
+        );
+    }
+}
+
+/// Log the CLOB price-series coverage (issue #429 PR3) after a `prices-history` run: warn when the
+/// usable-series share of resolved-with-winner markets falls below `warn_pct`, else info. Integer
+/// math only (the workspace lints `float_arithmetic`). A partial backfill or a starved token map
+/// trips the warn; a complete CLOB-only backfill clears it near the ~63.6% usable-series ceiling PR2
+/// measured.
+fn log_price_series_coverage(cache: &WalletCache, warn_pct: u8) {
+    let cov = cache.price_series_coverage_report();
+    if cov.total == 0 {
+        return;
+    }
+    let usable_pct = cov.usable.saturating_mul(100) / cov.total;
+    let with_series_pct = cov.with_series.saturating_mul(100) / cov.total;
+    if warn_pct > 0 && usable_pct < i64::from(warn_pct) {
+        tracing::warn!(
+            usable = cov.usable,
+            with_series = cov.with_series,
+            total = cov.total,
+            usable_pct,
+            with_series_pct,
+            warn_pct,
+            "prices-history: usable CLOB price-series coverage below threshold — re-run \
+             `pe-bootstrap prices-history` to backfill missing series (issue #429 PR3)"
+        );
+    } else {
+        tracing::info!(
+            usable = cov.usable,
+            with_series = cov.with_series,
+            total = cov.total,
+            usable_pct,
+            with_series_pct,
+            "prices-history: CLOB price-series coverage"
         );
     }
 }
