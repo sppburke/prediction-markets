@@ -200,7 +200,7 @@ def _log_true_clv_coverage(raw: pd.DataFrame) -> None:
 
 def derive_columns(raw: pd.DataFrame, *,
                    slip: float = DEFAULT_SLIP, with_concurrency: bool = True) -> SuffStats:
-    """Pure tail: the raw ``duck_extract_positions`` columns -> the 12-col suff_stats schema.
+    """Pure tail: the raw ``duck_extract_positions`` columns -> the 13-col suff_stats schema.
 
     Pure (no DuckDB / no I/O) so it is unit-testable on a hand-built frame. ``close_proxy`` is
     read from ``raw`` when present (``materialize`` merges it in) else defaulted to NaN. Returns a

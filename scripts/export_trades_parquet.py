@@ -3,8 +3,9 @@
 (issue #375).
 
 FULL ATOMIC REWRITE each run: `trades` + `market_resolutions` + `market_schedules`
-(+ `market_price_history` when present, issue #421 PR4) -> zstd Parquet under
-`--out-dir` (default data/parquet), via DuckDB's `sqlite_scanner`. Each file is
+(+ optional `market_price_history`, issue #421 PR4, and `token_conditions`, issue #429 PR4,
+when present) -> zstd Parquet under `--out-dir` (default data/parquet), via DuckDB's
+`sqlite_scanner`. Each file is
 written to `<name>.parquet.tmp` then `os.replace`-d into place, so a concurrent
 reader never sees a half-written file.
 
