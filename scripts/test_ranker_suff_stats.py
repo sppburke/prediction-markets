@@ -70,6 +70,37 @@ def _make_con():
     return con
 
 
+def _make_clv_con():
+    """``_make_con()`` plus the OPTIONAL CLOB views the true_clv path joins (issue #429 PR4):
+    ``token_conditions`` (token→outcome map) + ``market_price_history`` (the CLOB series). Built as
+    TABLEs under the production view names — ``information_schema`` lists both tables and views, so
+    ``suff_stats._relation_exists`` finds them."""
+    con = _make_con()
+    con.execute("CREATE TABLE token_conditions(token_id VARCHAR, condition_id VARCHAR, "
+                "outcome_index BIGINT, fetched_at_unix BIGINT)")
+    con.executemany(
+        "INSERT INTO token_conditions VALUES (?,?,?,?)",
+        [
+            ("tokY", "M3", 1, 9),     # M3 bought outcome 1 -> tokY
+            ("tokN", "M2", None, 9),  # M2 token mapped but NULL outcome_index -> skipped
+        ],
+    )
+    # M3 close_ref = COALESCE(end_date 3300, resolved_at 3400) = 3300.
+    con.execute("CREATE TABLE market_price_history(market_id VARCHAR, token_id VARCHAR, "
+                "t BIGINT, price VARCHAR, source VARCHAR)")
+    con.executemany(
+        "INSERT INTO market_price_history VALUES (?,?,?,?,?)",
+        [
+            ("M3", "tokY", 3000, "0.70", "clob"),
+            ("M3", "tokY", 3100, "0.85", "clob"),    # last clob <= close_ref -> the true close 0.85
+            ("M3", "tokY", 3300, "0.10", "trades"),  # latest t but source!='clob' -> excluded
+            ("M3", "tokY", 4000, "0.99", "clob"),    # after close -> excluded by t <= close_ref
+            ("M2", "tokN", 3000, "0.50", "clob"),    # M2 outcome_index NULL -> excluded by the join
+        ],
+    )
+    return con
+
+
 class MaterializeEndToEndTest(unittest.TestCase):
     def setUp(self) -> None:
         self.ss = suff_stats.materialize(_make_con(), ["0xa", "0xb"]).set_index("market")
@@ -122,6 +153,29 @@ class MaterializeEndToEndTest(unittest.TestCase):
         self.assertAlmostEqual(self.ss.loc["M2", "close_proxy"], 0.60)
         self.assertAlmostEqual(self.ss.loc["M3", "close_proxy"], 0.80)
 
+    def test_true_clv_close_all_nan_when_clob_views_absent(self) -> None:
+        # _make_con() registers no CLOB views -> the true_clv merge is all-NaN (graceful: true_clv
+        # then degrades to an empty ranking, never crashes / mis-prices).
+        self.assertIn("true_clv_close", self.ss.columns)
+        self.assertTrue(self.ss["true_clv_close"].isna().all())
+
+
+class TrueClvMaterializeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ss = suff_stats.materialize(_make_clv_con(), ["0xa", "0xb"]).set_index("market")
+
+    def test_true_clv_close_is_clob_close_pinned(self) -> None:
+        # M3/tokY: arg_max over source='clob' points with t <= close_ref(=end_date 3300) -> the
+        # t=3100 mid 0.85 — NOT the trades@3300 (source filter) nor the clob@4000 (after close).
+        # Distinct from close_proxy=0.80 (last trade) -> the two columns compute independently.
+        self.assertAlmostEqual(self.ss.loc["M3", "true_clv_close"], 0.85)
+        self.assertAlmostEqual(self.ss.loc["M3", "close_proxy"], 0.80)
+
+    def test_null_outcome_index_and_unmapped_are_nan(self) -> None:
+        # M2 has a token row but NULL outcome_index -> skipped; M1 has no token map -> NaN.
+        self.assertTrue(np.isnan(self.ss.loc["M2", "true_clv_close"]))
+        self.assertTrue(np.isnan(self.ss.loc["M1", "true_clv_close"]))
+
 
 def _raw() -> pd.DataFrame:
     """A hand-built 9-column frame in the shape ``duck_extract_positions`` returns."""
@@ -163,6 +217,19 @@ class DeriveColumnsTest(unittest.TestCase):
         raw["close_proxy"] = [0.7, 0.3]
         ss = suff_stats.derive_columns(raw)
         self.assertEqual(list(ss["close_proxy"]), [0.7, 0.3])
+
+    def test_true_clv_close_defaults_nan_without_merge(self) -> None:
+        # Pure derive_columns: a raw frame WITHOUT the materialize-side true_clv merge gets all-NaN
+        # true_clv_close (true_clv then yields no scores rather than crashing).
+        ss = suff_stats.derive_columns(_raw())
+        self.assertIn("true_clv_close", ss.columns)
+        self.assertTrue(ss["true_clv_close"].isna().all())
+
+    def test_true_clv_close_propagates_when_present(self) -> None:
+        raw = _raw()
+        raw["true_clv_close"] = [0.9, 0.2]
+        ss = suff_stats.derive_columns(raw)
+        self.assertEqual(list(ss["true_clv_close"]), [0.9, 0.2])
 
     def test_custom_slip(self) -> None:
         ss = suff_stats.derive_columns(_raw(), slip=0.05)

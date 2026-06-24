@@ -30,10 +30,11 @@ import time
 # `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
 # `SELECT *`, so no change is needed here for that column.
 TABLES = ("trades", "market_resolutions", "market_schedules")
-# OPTIONAL tables (issue #421 PR4 — the CLV price series). Absent on a pre-migration cache (the
-# export attaches READ_ONLY and does not run schema), so each is skipped with a warning rather than
-# aborting the whole export. `ranker_duck.py` registers its view conditionally to match.
-OPTIONAL_TABLES = ("market_price_history",)
+# OPTIONAL tables (issue #421 PR4 — the CLV price series; #429 PR4 — its token→outcome map).
+# Absent on a pre-migration cache (the export attaches READ_ONLY and does not run schema), so each
+# is skipped with a warning rather than aborting the whole export. `ranker_duck.py` registers each
+# view conditionally to match. `true_clv` needs both `market_price_history` and `token_conditions`.
+OPTIONAL_TABLES = ("market_price_history", "token_conditions")
 
 
 def log(msg: str) -> None:

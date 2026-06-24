@@ -24,9 +24,11 @@ set_t  →  pe-backtest(set_t)  →  live_pnl_t  →  policy.step(...)  →  set
 
 ## The shared substrate — `suff_stats`
 
-Every module reads one materialized frame, `scripts/ranker/suff_stats.py`, so no module can drift from the production position definition: `materialize` calls `ranker_duck.duck_extract_positions` (the same first-buy join the live ranker uses) over a permissive superset, and the criteria slice happens downstream in pandas. One row per qualifying first-buy position, twelve columns: `wallet`, `market`, `outcome_id`, `entry_ts`, `ttr_ref` (absolute per-market scheduled close), `resolved_at`, `price`, `payoff`, `dollar_size`, `_eff` (slip-adjusted effective entry), `c_t` (entry-instant concurrency), and `close_proxy` (last pre-resolution trade price on the bought outcome — added in PR5 for the CLV estimator; `NaN` when the outcome never traded pre-resolution).
+Every module reads one materialized frame, `scripts/ranker/suff_stats.py`, so no module can drift from the production position definition: `materialize` calls `ranker_duck.duck_extract_positions` (the same first-buy join the live ranker uses) over a permissive superset, and the criteria slice happens downstream in pandas. One row per qualifying first-buy position, thirteen columns: `wallet`, `market`, `outcome_id`, `entry_ts`, `ttr_ref` (absolute per-market scheduled close), `resolved_at`, `price`, `payoff`, `dollar_size`, `_eff` (slip-adjusted effective entry), `c_t` (entry-instant concurrency), `close_proxy` (last pre-resolution trade price on the bought outcome — added in PR5 for the CLV estimator; `NaN` when the outcome never traded pre-resolution), and `true_clv_close` (CLOB mid at/just-before market close on the bought outcome — issue #429 PR4; `NaN` when no CLOB series covers it or the optional CLOB views are absent).
 
 `close_proxy` is derived in SQL (`arg_max(price, timestamp)` over `trades` strictly before `resolved_at`) and left-joined on; the `proxy_clv` estimator reads it as a column and never touches the database. The slip default and effective-entry cap mirror `rank_72hr_buyandhold.py`.
+
+`true_clv_close` (issue #429 PR4) is the same shape but sourced from the CLOB price series instead of the trade tape: `arg_max(price, t)` over `market_price_history` (`source='clob'`) where `t ≤ COALESCE(end_date_unix, resolved_at_unix)`, with the bought `outcome_id` mapped to a CLOB `token_id` via `token_conditions.outcome_index` (rows with NULL `outcome_index` skipped). It pins to the market **close**, intentionally distinct from `proxy_clv`'s last pre-resolution **trade** price, so `true_clv = close − entry` re-ranks vs `proxy_clv` (PR2 measured a wallet-rank Spearman of only 0.21). `market_price_history` + `token_conditions` are OPTIONAL views (registered only after the prices-history backfill + export); absent them, `true_clv_close` is all-`NaN` and the `true_clv` estimator degrades to an empty ranking, eliminated in the bake-off — so the non-CLV axes run unaffected. Coverage is logged in `materialize`, warning under `true_clv_coverage_warn_pct` (default 30).
 
 ## The modular menu
 
@@ -34,7 +36,7 @@ Each axis is a `typing.Protocol` in `scripts/ranker/__init__.py`; every concrete
 
 | Axis | Protocol | Implemented in v1 (`.name`) | Reserved seams |
 |---|---|---|---|
-| **Estimator** (per-wallet skill) | `Estimator.score` | `eb_shrinkage_skill`, `t_stat_baseline` (the winner's-curse baseline every challenger must beat), `gu_koenker_npmle`, `proxy_clv` | r-value, Brier/CRPS, and the rest of the §menu drop-ins |
+| **Estimator** (per-wallet skill) | `Estimator.score` | `eb_shrinkage_skill`, `t_stat_baseline` (the winner's-curse baseline every challenger must beat), `gu_koenker_npmle`, `proxy_clv`, `true_clv` (CLOB close-pinned CLV — #429 PR4) | r-value, Brier/CRPS, and the rest of the §menu drop-ins |
 | **Signal combiner** | `SignalCombiner.combine` | *(none — single-signal in v1)* | multi-signal blends |
 | **Deflation / calibration** | `Deflator.deflate` | `deflated_sharpe` (the deflation axis also accepts the literal `"none"` passthrough sentinel — a bypass recognised by the driver, not a `*_REGISTRY` class) | — |
 | **Selector** | `Selector.select` | `top_k`, `online_exp_weights` | corr-aware, weighted-conformal, TTTS-online, full BOA |

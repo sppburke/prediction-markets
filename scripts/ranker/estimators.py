@@ -143,12 +143,40 @@ class GuKoenkerNPMLE:
         return df[["score", "rank"]]
 
 
+def _weighted_clv_tstat(
+    ss: pd.DataFrame, weights: np.ndarray, close_col: str
+) -> pd.DataFrame:
+    """Shared per-wallet weighted-CLV t-stat ranking for the CLV estimators (``proxy_clv`` /
+    ``true_clv``). ``CLV = close - entry`` on the bought outcome, ``close`` read from ``close_col``.
+
+    Positions with a NaN ``close`` are dropped; wallets with < 2 valid positions or zero dispersion
+    are skipped — so an all-NaN ``close_col`` (the close source absent for the run) yields an empty
+    ranking, not a crash. ``score`` = ``mean·√n_eff / sd`` (the weighted t-statistic; higher =
+    better). CLV reaches significance in TENS of trades vs THOUSANDS for the realized $1/$0 payoff,
+    so it directly attacks the small-sample winner's-curse.
+    """
+    rows = []
+    for wallet, g in ss.groupby("wallet", sort=False):
+        valid = g[close_col].notna().to_numpy()
+        if valid.sum() < 2:
+            continue
+        clv = (g[close_col] - g["price"]).to_numpy()[valid]
+        mean, sd, n_eff, _ = weighted_stats(clv, weights[g.index.to_numpy()][valid])
+        if not (n_eff >= 2 and sd > 0):
+            continue
+        rows.append((wallet, mean * np.sqrt(n_eff) / sd))
+    df = pd.DataFrame(rows, columns=["wallet", "score"]).set_index("wallet")
+    if df.empty:
+        df["rank"] = []
+        return df[["score", "rank"]]
+    df["rank"] = df["score"].rank(ascending=False, method="first").astype(int)
+    return df[["score", "rank"]]
+
+
 class ProxyCLV:
     """Closing-Line-Value skill per wallet (issue #421 ``proxy_clv``): ``CLV = close - entry`` on
     the bought outcome, where ``close`` is the last pre-resolution trade price (the suff_stats
-    ``close_proxy`` column). CLV reaches significance in TENS of trades vs THOUSANDS for the
-    realized $1/$0 payoff, so it directly attacks the small-sample winner's-curse. ``score`` = the
-    weighted-mean-CLV t-statistic (higher = better).
+    ``close_proxy`` column).
 
     # Precondition: ``ss`` carries ``close_proxy`` (from suff_stats.materialize). Positions whose
     # outcome never traded pre-resolution (NaN close_proxy) and wallets with < 2 valid CLV
@@ -159,26 +187,29 @@ class ProxyCLV:
     name = "proxy_clv"
 
     def score(self, ss: pd.DataFrame, *, as_of: int, weights: np.ndarray) -> pd.DataFrame:
-        rows = []
-        for wallet, g in ss.groupby("wallet", sort=False):
-            valid = g["close_proxy"].notna().to_numpy()
-            if valid.sum() < 2:
-                continue
-            clv = (g["close_proxy"] - g["price"]).to_numpy()[valid]
-            mean, sd, n_eff, _ = weighted_stats(clv, weights[g.index.to_numpy()][valid])
-            if not (n_eff >= 2 and sd > 0):
-                continue
-            rows.append((wallet, mean * np.sqrt(n_eff) / sd))
-        df = pd.DataFrame(rows, columns=["wallet", "score"]).set_index("wallet")
-        if df.empty:
-            df["rank"] = []
-            return df[["score", "rank"]]
-        df["rank"] = df["score"].rank(ascending=False, method="first").astype(int)
-        return df[["score", "rank"]]
+        return _weighted_clv_tstat(ss, weights, "close_proxy")
+
+
+class TrueCLV:
+    """True closing-line-value skill per wallet (issue #429 PR4): ``CLV = close - entry`` on the
+    bought outcome, where ``close`` is the CLOB mid at/just-before the market CLOSE (the suff_stats
+    ``true_clv_close`` column) — pinned to ``t ≤ COALESCE(end_date_unix, resolved_at_unix)`` rather
+    than ``proxy_clv``'s last pre-resolution *trade* price. The CLOB series is best-effort (PR2's
+    measured ~63.6% ceiling), so positions with no series get a NaN ``true_clv_close`` and are
+    dropped; an all-NaN column (CLOB views absent / pre-backfill) yields an empty ranking,
+    eliminated downstream — not a crash.
+
+    # Precondition: ``ss`` carries ``true_clv_close`` (from suff_stats.materialize).
+    """
+
+    name = "true_clv"
+
+    def score(self, ss: pd.DataFrame, *, as_of: int, weights: np.ndarray) -> pd.DataFrame:
+        return _weighted_clv_tstat(ss, weights, "true_clv_close")
 
 
 # Registered by `.name` (issue #421 "Architecture" — each module registered by .name).
 REGISTRY: "dict[str, type]" = {
     cls.name: cls
-    for cls in (EBShrinkageSkill, TStatBaseline, GuKoenkerNPMLE, ProxyCLV)
+    for cls in (EBShrinkageSkill, TStatBaseline, GuKoenkerNPMLE, ProxyCLV, TrueCLV)
 }
