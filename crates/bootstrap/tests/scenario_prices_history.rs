@@ -146,11 +146,11 @@ fn resolved_with_winner_excludes_voided() {
 }
 
 // PASS: price_series_coverage_report() counts (total, with_series, usable) over the
-//       resolved-with-winner universe — `usable` needs ≥3 points on a token — a voided market is
-//       excluded, a same-PK re-insert (different source) is a no-op (write-once), and a genuinely new
-//       3rd point flips a thin market to usable.
-// FAIL: a voided market is counted, the usable bar is wrong, a same-PK re-insert moves the ledger, or
-//       the ledger is stale after a new point.
+//       resolved-with-winner universe — `usable` needs ≥3 CLOB points on a token — a voided market is
+//       excluded, a same-PK re-insert (different source) is a no-op (write-once), a genuinely new 3rd
+//       point flips a thin market to usable, and a trades-sourced series is excluded (CLOB-only).
+// FAIL: a voided/trades market is counted, the usable bar is wrong, a same-PK re-insert moves the
+//       ledger, or the ledger is stale after a new point.
 #[test]
 fn price_series_coverage_ledger_and_write_once() {
     let (_dir, mut cache) = open();
@@ -205,6 +205,27 @@ fn price_series_coverage_ledger_and_write_once() {
         (cov3.total, cov3.with_series, cov3.usable),
         (2, 2, 2),
         "a real new point flips 0xm2 to usable"
+    );
+
+    // A non-CLOB (trades) series is excluded from the CLOB-specific ledger: 0xm3 is a resolved
+    // winner with a fresh 3-point `source='trades'` series → `total` rises to 3 but with_series /
+    // usable stay 2, because the report filters `source='clob'`.
+    cache.insert_resolution("0xm3", Some(0), 2000, 9).unwrap();
+    cache
+        .insert_price_history_batch(
+            &[
+                ("0xm3".to_owned(), "t3".to_owned(), 100, "0.10".to_owned()),
+                ("0xm3".to_owned(), "t3".to_owned(), 200, "0.20".to_owned()),
+                ("0xm3".to_owned(), "t3".to_owned(), 300, "0.30".to_owned()),
+            ],
+            "trades",
+        )
+        .unwrap();
+    let cov4 = cache.price_series_coverage_report();
+    assert_eq!(
+        (cov4.total, cov4.with_series, cov4.usable),
+        (3, 2, 2),
+        "a trades-sourced series is excluded from the CLOB coverage ledger"
     );
 
     println!("PASS: price_series_coverage_ledger_and_write_once");

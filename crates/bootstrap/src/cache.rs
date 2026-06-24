@@ -1437,10 +1437,12 @@ impl WalletCache {
     /// Coverage of the CLOB price series over the resolved-with-winner universe (issue #429 PR3) —
     /// the operator health metric logged after a `prices-history` backfill, analogous to
     /// [`token_coverage_report`](Self::token_coverage_report). `total` = resolved-with-winner
-    /// markets; `with_series` = those with ≥1 `market_price_history` row; `usable` = those with ≥1
-    /// token carrying ≥ `MIN_USABLE_SERIES_POINTS` points (the bar PR2's source-comparison memo
-    /// measured, so `usable / total` is comparable to that memo's ~63.6% CLOB ceiling). A market in
-    /// the legacy-`polygon` gap (no CLOB token mapped → no series) contributes 0, by design.
+    /// markets; `with_series` = those with ≥1 `source='clob'` row; `usable` = those with ≥1 token
+    /// carrying ≥ `MIN_USABLE_SERIES_POINTS` `source='clob'` points (the bar PR2's source-comparison
+    /// memo measured, so `usable / total` is comparable to that memo's ~63.6% CLOB ceiling). Both
+    /// counts filter `source = 'clob'` so the metric stays CLOB-specific even if a second source is
+    /// ever added. A market in the legacy-`polygon` gap (no CLOB token mapped → no series)
+    /// contributes 0, by design.
     ///
     /// # Precondition
     /// Returns `PriceSeriesCoverage::default()` (all zero) before any resolution is ingested; the
@@ -1459,12 +1461,12 @@ impl WalletCache {
             .query_row(
                 "SELECT COUNT(DISTINCT mph.market_id) FROM market_price_history mph \
                  JOIN market_resolutions mr ON mr.market_id = mph.market_id \
-                 WHERE mr.winning_outcome_id IS NOT NULL",
+                 WHERE mr.winning_outcome_id IS NOT NULL AND mph.source = 'clob'",
                 [],
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        // A market is "usable" when ≥1 of its tokens carries ≥ MIN_USABLE_SERIES_POINTS points.
+        // A market is "usable" when ≥1 of its tokens carries ≥ MIN_USABLE_SERIES_POINTS CLOB points.
         // The inner GROUP BY emits one row per qualifying (market, token); COUNT(DISTINCT market_id)
         // then collapses a 2-token market to a single usable market.
         let usable: i64 = self
@@ -1474,7 +1476,7 @@ impl WalletCache {
                      SELECT mph.market_id AS market_id \
                      FROM market_price_history mph \
                      JOIN market_resolutions mr ON mr.market_id = mph.market_id \
-                     WHERE mr.winning_outcome_id IS NOT NULL \
+                     WHERE mr.winning_outcome_id IS NOT NULL AND mph.source = 'clob' \
                      GROUP BY mph.market_id, mph.token_id \
                      HAVING COUNT(*) >= ?1 \
                  )",
