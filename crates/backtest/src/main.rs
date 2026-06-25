@@ -7,8 +7,8 @@ use pe_backtest::config::{BacktestConfig, load};
 use pe_backtest::error::BacktestError;
 use pe_backtest::report::{KellySweepReport, KellySweepRun};
 use pe_backtest::simulation;
-use pe_bootstrap::cache::WalletCache;
-use pe_core_types::WalletAddress;
+use pe_bootstrap::cache::{ClobMarkIndex, WalletCache};
+use pe_core_types::{MarketId, WalletAddress};
 use pe_strategy_winner_follow::WinnerFollowStrategy;
 use pe_trader_index::RankerConfig;
 use pe_trader_index::snapshot::RawTrade;
@@ -236,6 +236,29 @@ async fn main() -> Result<(), BacktestError> {
         let injected_set: Option<HashSet<WalletAddress>> = injected_wallets
             .as_ref()
             .map(|v| v.iter().copied().collect());
+
+        // Forward mark-to-market index (issue #436 Phase E): only when the
+        // injected path is run with a window end. Bounded to the markets the
+        // injected wallets actually traded (mirrors the bounded trade load), and
+        // pruned to `t <= mtm_window_end_unix`. `None` keeps the legacy
+        // `unrealized_pnl = 0.0` behaviour for every other run.
+        let clob_marks: Option<ClobMarkIndex> =
+            match (injected_set.as_ref(), config.mtm_window_end_unix) {
+                (Some(_), Some(max_t)) => {
+                    let markets: HashSet<MarketId> =
+                        all_trades.iter().map(|t| t.market_id.clone()).collect();
+                    let marks = cache.load_clob_marks(&markets, max_t)?;
+                    info!(
+                        markets = markets.len(),
+                        series = marks.len(),
+                        max_t,
+                        "backtest: CLOB forward-MTM index loaded"
+                    );
+                    Some(marks)
+                }
+                _ => None,
+            };
+
         let mut report = simulation::run_simulation_with(
             &config,
             &all_trades,
@@ -247,6 +270,7 @@ async fn main() -> Result<(), BacktestError> {
             &strategy,
             true, // write report.json + trades.ndjson
             injected_set.as_ref(),
+            clob_marks.as_ref(),
         )?;
         report.resolved_config = Some(config.clone());
 

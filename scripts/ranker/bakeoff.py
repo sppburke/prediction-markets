@@ -53,7 +53,13 @@ from .oos_validation import (
 from .policies import FullRerank, HybridDisplacement, KnockoutBackfill, OnlineWeighting
 from .selectors import OnlineExpWeights
 
-_PNL_COLUMNS = ["wallet", "period_end", "realized_pnl", "unrealized_pnl", "n_fills", "notional"]
+# issue #436 Phase E: `is_horizon_mtm` flags the single per-wallet forward-MTM row
+# (`unrealized_pnl` = the window flow; realized day rows carry `is_horizon_mtm=False`,
+# `unrealized_pnl=0`). `open_at_horizon`/`marked_at_horizon` are MTM coverage counts on
+# the MTM row (0 on day rows). The objective sums realized+unrealized over the window;
+# the realized-only demoter/live_pnl path filters `~is_horizon_mtm`.
+_PNL_COLUMNS = ["wallet", "period_end", "realized_pnl", "unrealized_pnl", "n_fills", "notional",
+                "is_horizon_mtm", "open_at_horizon", "marked_at_horizon"]
 # The §Acceptance benchmark estimator + baseline policy (issue #421: beat t_stat_baseline).
 BASELINE_ESTIMATOR = "t_stat_baseline"
 BASELINE_POLICY = "policy_full_rerank"
@@ -285,7 +291,8 @@ class SubprocessBacktestRunner:
         self.output_dir = Path(output_dir)
         self.extra_env = extra_env or {}
 
-    def run(self, wallets: list, *, flat_usd: float) -> pd.DataFrame:
+    def run(self, wallets: list, *, flat_usd: float,
+            window: "tuple | None" = None) -> pd.DataFrame:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         wallet_file = self.output_dir / "injected_wallets.txt"
         wallet_file.write_text("\n".join(wallets) + "\n")
@@ -298,6 +305,13 @@ class SubprocessBacktestRunner:
             "PE_BOOTSTRAP_CACHE_PATH": self.cache_path,
             **self.extra_env,
         }
+        # issue #436 Phase E: pass the forward-MTM window (as_of, horizon) so the
+        # binary marks still-open positions at the horizon (PE_BACKTEST_MTM_WINDOW_*).
+        # Without it the binary keeps the unrealized_pnl=0.0 sentinel.
+        if window is not None:
+            as_of, horizon_end = window
+            env["PE_BACKTEST_MTM_WINDOW_START_UNIX"] = str(int(as_of))
+            env["PE_BACKTEST_MTM_WINDOW_END_UNIX"] = str(int(horizon_end))
         subprocess.run([self.binary], env=env, check=True)
         return parse_pnl_by_period(self.output_dir / "pnl_by_period.ndjson")
 
@@ -316,13 +330,17 @@ def parse_pnl_by_period(path) -> pd.DataFrame:
 
 class MemoizingBacktestRunner:
     """D2 (#436): an in-run memo over an inner ``BacktestRunner``, keyed on
-    ``(tuple(sorted(wallets)), flat_usd)``. The injected-set backtest is a deterministic,
-    order-independent pure function of the followed SET (the Rust path reads a wallet file and emits
-    per-(wallet, day) P&L), and the per-``as_of`` window slice + churn deduction happen in Python
-    AFTER (``run_trajectory``) — so two grid points sharing a followed set at the same step re-run the
-    SAME backtest. That is GUARANTEED for the two churn-cost levels (churn never changes the set,
-    only the post-hoc subtraction) and common across estimators/deflators/criteria, so caching it
-    collapses the churn axis exactly 2× plus every repeated followed set within ONE bake-off run.
+    ``(tuple(sorted(wallets)), flat_usd, window)``. The injected-set backtest is a deterministic,
+    order-independent pure function of the followed SET and the forward-MTM ``window`` (issue #436
+    Phase E: the Rust path marks still-open positions at the window's horizon, so the emitted
+    ``unrealized_pnl`` flow depends on ``(as_of, horizon)`` — hence ``window`` is part of the key; the
+    churn deduction still happens in Python AFTER). Two grid points sharing a followed set AT THE SAME
+    STEP re-run the SAME backtest: GUARANTEED for the two churn-cost levels (churn never changes the
+    set or the window, only the post-hoc subtraction) and common across estimators/deflators, so
+    caching collapses the churn axis exactly 2× plus every repeated (followed set, window) within ONE
+    bake-off run. (Pre-E the output was window-agnostic so identical sets deduped across steps too;
+    adding ``window`` trades that rare cross-step coincidence for the per-step horizon mark — the
+    churn-axis 2× win is preserved.)
 
     Per-run only — instantiated fresh in ``run_bakeoff`` with NO persistence or eviction. The
     persistent cross-run cache is the exact key/version/eviction-correctness risk this epic guards,
@@ -337,12 +355,13 @@ class MemoizingBacktestRunner:
         self.calls = 0
         self.lookups = 0
 
-    def run(self, wallets: list, *, flat_usd: float) -> pd.DataFrame:
+    def run(self, wallets: list, *, flat_usd: float,
+            window: "tuple | None" = None) -> pd.DataFrame:
         self.lookups += 1
-        key = (tuple(sorted(wallets)), flat_usd)
+        key = (tuple(sorted(wallets)), flat_usd, window)
         if key not in self._cache:
             self.calls += 1
-            self._cache[key] = self.inner.run(list(wallets), flat_usd=flat_usd)
+            self._cache[key] = self.inner.run(list(wallets), flat_usd=flat_usd, window=window)
         return self._cache[key]
 
 
@@ -447,6 +466,12 @@ class TrajectoryResult:
     returns: pd.Series
     final_follow: FollowSet
     final_scores: WalletScores
+    # E3 (#436): per-period CLOB forward-MTM coverage over the followed set —
+    # index = as_of, columns = [open_at_horizon, marked_at_horizon]. Empty when no
+    # MTM window is run. The harness surfaces coverage = marked / open per (config,
+    # period) so the operator reads the resolution-speed residual beside the winner.
+    coverage: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=["open_at_horizon", "marked_at_horizon"]))
 
 
 def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points: list,
@@ -472,6 +497,7 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     returns = []
     final_follow: FollowSet = pd.DataFrame({"wallet": [], "weight": []})
     final_scores: WalletScores = pd.DataFrame(columns=["score", "rank"])
+    coverage_rows: dict = {}                                          # E3: as_of -> (open, marked)
     for as_of in as_of_points:
         in_sample, _forward = split_walkforward(
             ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
@@ -495,23 +521,44 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
             continue
         turnover = _churn(prev, follow)          # D3 (#436): positive-part L1 weight movement
 
-        pnl = runner.run(list(follow["wallet"]), flat_usd=flat_usd)
+        # E (#436): pass the forward-MTM window so the binary marks still-open positions at
+        # the horizon. The objective sums realized + unrealized (the MTM flow) over the window.
+        pnl = runner.run(list(follow["wallet"]), flat_usd=flat_usd,
+                         window=(as_of, as_of + horizon_secs))
         window = pnl[(pnl["period_end"] > as_of) & (pnl["period_end"] <= as_of + horizon_secs)]
-        gross = _weighted_window_pnl(window, follow)
+        is_mtm = window["is_horizon_mtm"].astype(bool)
+        gross = _weighted_window_pnl(window, follow)                 # realized + unrealized (E2b)
         returns.append(gross - grid_point.churn_cost * turnover)
-        live_pnl = pd.concat([live_pnl, window], ignore_index=True)
+        # E2b: the demoter / live_pnl accumulation stays REALIZED-only (the Maurer-Pontil bound
+        # assumes settled per-period P&L, and counts each row as a period) — drop the MTM rows.
+        live_pnl = pd.concat([live_pnl, window[~is_mtm]], ignore_index=True)
+        # E3: per-period MTM coverage over the followed set (the backtest ran exactly these wallets).
+        mtm_rows = window[is_mtm]
+        coverage_rows[as_of] = {
+            "open_at_horizon": int(mtm_rows["open_at_horizon"].sum()),
+            "marked_at_horizon": int(mtm_rows["marked_at_horizon"].sum()),
+        }
         prev = follow
         final_follow, final_scores = follow, scores                 # A1: most recent real set
+    coverage = pd.DataFrame.from_dict(coverage_rows, orient="index") if coverage_rows else \
+        pd.DataFrame(columns=["open_at_horizon", "marked_at_horizon"])
     return TrajectoryResult(
         returns=pd.Series(returns, index=list(as_of_points), name=grid_point.key, dtype=float),
-        final_follow=final_follow, final_scores=final_scores)
+        final_follow=final_follow, final_scores=final_scores, coverage=coverage)
 
 
 def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
-    """Followed-set forward copy P&L over a window = sum_w weight_w x realized_pnl_w."""
+    """Followed-set forward copy P&L over a window = sum_w weight_w x (realized + unrealized)_w.
+
+    E2b (#436): include ``unrealized_pnl`` — the CLOB forward mark-to-market *flow* the binary
+    emits on the per-wallet horizon row (``is_horizon_mtm``). Day rows carry ``unrealized_pnl=0``
+    and the horizon row carries ``realized_pnl=0``, so summing BOTH columns per wallet adds the
+    marked open-position edge to the realized closes without double-counting. Without the MTM
+    window the horizon rows are absent and ``unrealized_pnl`` is all-zero (realized-only, as before).
+    """
     if window.empty or follow.empty:
         return 0.0
-    per_wallet = window.groupby("wallet")["realized_pnl"].sum()
+    per_wallet = window.groupby("wallet")[["realized_pnl", "unrealized_pnl"]].sum().sum(axis=1)
     weight = follow.set_index("wallet")["weight"]
     common = per_wallet.index.intersection(weight.index)
     if common.empty:
@@ -856,8 +903,27 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         "scores": winner_res.final_scores if winner_res is not None
         else pd.DataFrame(columns=["score", "rank"]),
     }
+    # E3 (#436): CLOB forward-MTM coverage so the resolution-speed residual is reported beside the
+    # winner. Per config: total open-at-horizon vs marked (covered) positions across its trajectory;
+    # plus the WINNER's per-(config, period) detail (coverage thins at older as_of, the depth-coverage
+    # interaction B4 surfaces). A position open at the horizon with no CLOB series contributes 0 to the
+    # MTM and is uncovered here — coverage = marked / open is the fraction of forward edge actually valued.
+    def _cov_total(res, col):
+        return int(res.coverage[col].sum()) if not res.coverage.empty else 0
+    mtm_coverage = {
+        "by_config_overall": {
+            key: {"open_at_horizon": _cov_total(res, "open_at_horizon"),
+                  "marked_at_horizon": _cov_total(res, "marked_at_horizon")}
+            for key, res in results.items()},
+        "winner_by_period": (
+            [{"as_of": int(idx), "open_at_horizon": int(r["open_at_horizon"]),
+              "marked_at_horizon": int(r["marked_at_horizon"])}
+             for idx, r in winner_res.coverage.iterrows()]
+            if winner_res is not None and not winner_res.coverage.empty else []),
+    }
     return {"manifest": manifest, "survivors": survivors, "return_matrix": return_matrix,
             "cpr": cpr, "decision": decision, "deliverable": deliverable,
+            "mtm_coverage": mtm_coverage,
             # D2 (#436): the realized memo speedup — distinct injected-set backtests actually run vs
             # the naive per-(config, step) request count. Lets the operator size the real run.
             "backtest_calls": {"distinct": memo_runner.calls, "total": memo_runner.lookups,
@@ -986,6 +1052,17 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     print(f"compute: {len(axes.criteria)} criteria × {result['manifest']['n_grid']} run-set configs; "
           f"{bc['distinct']} distinct backtests of {bc['total']} requested "
           f"({bc['naive_ceiling']} naive ceiling)")
+
+    # E3 (#436): forward-MTM coverage beside the winner — what fraction of the winner's
+    # open-at-horizon forward edge the CLOB series actually valued (the resolution-speed residual;
+    # an uncovered open position contributes 0 to the MTM). Per-(config, period) detail on disk.
+    (out_dir / "mtm_coverage.json").write_text(json.dumps(result["mtm_coverage"], indent=2))
+    wbp = result["mtm_coverage"]["winner_by_period"]
+    w_open = sum(p["open_at_horizon"] for p in wbp)
+    w_marked = sum(p["marked_at_horizon"] for p in wbp)
+    cov_pct = f"{100.0 * w_marked / w_open:.1f}%" if w_open else "n/a"
+    print(f"MTM coverage (winner): {w_marked}/{w_open} open-at-horizon positions marked "
+          f"({cov_pct}); per-(config, period) detail in mtm_coverage.json")
 
     # Cross-check the deliverable — the WINNING config's frozen final-step followed set (A1, #436;
     # the set the winner actually rode, applying its criteria/eligibility/deflation/policy), NOT a

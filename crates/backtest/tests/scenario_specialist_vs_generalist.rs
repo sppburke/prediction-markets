@@ -112,6 +112,8 @@ fn base_config(dir: &TempDir) -> BacktestConfig {
         max_signal_price: None,
         max_trade_count: 0,
         injected_wallets_path: None,
+        mtm_window_start_unix: None,
+        mtm_window_end_unix: None,
         strategy: WinnerFollowConfig {
             per_trade_cap: PerTradeCap::Unlimited,
             ..WinnerFollowConfig::default()

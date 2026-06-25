@@ -279,6 +279,25 @@ pub struct BacktestConfig {
     #[serde(default)]
     pub injected_wallets_path: Option<PathBuf>,
 
+    /// Forward mark-to-market window START (`as_of`, unix seconds) for the #421
+    /// bake-off injected-set path (issue #436 Phase E). Together with
+    /// `mtm_window_end_unix` this enables CLOB forward MTM: still-open positions
+    /// are valued at the horizon and the per-window flow `Σ(mark_H − cost) −
+    /// Σ(mark_as_of − cost)` is emitted in `unrealized_pnl` (a flow, so summing
+    /// realized + unrealized over the window telescopes with no cross-window
+    /// double-count). `None` (or either bound unset, or no injected set) keeps
+    /// `unrealized_pnl` the documented `0.0` sentinel. Only consulted on the
+    /// injected path; never reaches the live service.
+    /// `PE_BACKTEST_MTM_WINDOW_START_UNIX` overrides.
+    #[serde(default)]
+    pub mtm_window_start_unix: Option<i64>,
+
+    /// Forward mark-to-market window END (`as_of + horizon`, unix seconds) — the
+    /// horizon at which still-open positions are marked. See
+    /// `mtm_window_start_unix`. `PE_BACKTEST_MTM_WINDOW_END_UNIX` overrides.
+    #[serde(default)]
+    pub mtm_window_end_unix: Option<i64>,
+
     /// Strategy configuration — all Winner-Follow parameters.
     ///
     /// TOML sub-table `[strategy]`. When absent, `WinnerFollowConfig::default()` applies:
@@ -408,6 +427,8 @@ impl Default for BacktestConfig {
             max_signal_price: default_max_signal_price(),
             max_trade_count: default_max_trade_count(),
             injected_wallets_path: None,
+            mtm_window_start_unix: None,
+            mtm_window_end_unix: None,
             strategy: WinnerFollowConfig::default(),
         }
     }

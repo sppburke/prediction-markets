@@ -9,7 +9,8 @@ use std::io::Write as _;
 use std::path::Path;
 
 use pe_bootstrap::cache::{
-    LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex, WalletCache,
+    ClobMarkIndex, LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex,
+    WalletCache,
 };
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
@@ -128,10 +129,39 @@ struct OpenPosition {
     /// Calendar date on which the copy was opened. Used by the resolution sweep to
     /// guard against anomalies where a market's resolved_at precedes the bought_on date.
     bought_on: Date,
+    /// Exact open timestamp (unix seconds), used by the forward MTM (issue #436
+    /// Phase E) to decide whether a position was open at a window boundary.
+    open_unix: i64,
 }
 
 /// Position key: (market, outcome, BUY side).
 type PosKey = (MarketId, OutcomeId);
+
+/// A closed-or-still-open copy position recorded for the forward mark-to-market
+/// (issue #436 Phase E). Only accumulated on the injected-set path when an MTM
+/// window is configured; lets the post-loop pass decide whether the position was
+/// open at the window's `as_of` start and/or `horizon` end (`open_unix <= T <
+/// close_unix`) and mark it at each boundary via the [`ClobMarkIndex`].
+#[derive(Debug, Clone)]
+struct PositionLifetime {
+    wallet: WalletAddress,
+    market: MarketId,
+    outcome: OutcomeId,
+    contracts: u64,
+    avg_fill_price: Decimal,
+    open_unix: i64,
+    /// `None` = still open at simulation end (never closed by sell or resolution).
+    close_unix: Option<i64>,
+}
+
+impl PositionLifetime {
+    /// True when the position was open at instant `t` (opened at-or-before `t`,
+    /// not yet closed at `t`). Strict `close_unix > t` so a position closing
+    /// exactly at the boundary is treated as closed there.
+    fn open_at(&self, t: i64) -> bool {
+        self.open_unix <= t && self.close_unix.is_none_or(|c| c > t)
+    }
+}
 
 /// Exposure tracker: per-leader, per-market.
 #[derive(Debug, Default)]
@@ -250,6 +280,7 @@ pub fn run_simulation_with(
     strategy: &WinnerFollowStrategy,
     write_output: bool,
     injected: Option<&HashSet<WalletAddress>>,
+    clob_marks: Option<&ClobMarkIndex>,
 ) -> Result<WinnerFollowReport, BacktestError> {
     debug_assert!(
         all_trades.is_sorted_by_key(|t| t.timestamp.0),
@@ -343,6 +374,24 @@ pub fn run_simulation_with(
     // to the day a copy opens.
     let emit_period_pnl = injected.is_some() && write_output;
     let mut period_pnl: HashMap<(WalletAddress, Date), PeriodAccum> = HashMap::new();
+
+    // Forward mark-to-market (issue #436 Phase E): when the injected path is run
+    // with both window bounds AND a CLOB mark index, value still-open positions at
+    // the `(as_of, horizon]` boundaries. `mtm` is `Some((as_of, horizon, marks))`
+    // only then; otherwise `unrealized_pnl` stays the documented `0.0` sentinel.
+    // `mtm_lifetimes` records each copy's open/close span so the post-loop pass can
+    // mark positions open at either boundary (a position that closes between
+    // boundaries is gone from `open_positions`, so the live map alone is not enough).
+    let mtm: Option<(i64, i64, &ClobMarkIndex)> = match (
+        emit_period_pnl,
+        config.mtm_window_start_unix,
+        config.mtm_window_end_unix,
+        clob_marks,
+    ) {
+        (true, Some(start), Some(end), Some(marks)) if end > start => Some((start, end, marks)),
+        _ => None,
+    };
+    let mut mtm_lifetimes: Vec<PositionLifetime> = Vec::new();
 
     // Tracks leaderboard snapshot transitions for the log gate (replaces the
     // misleading `day_idx % 30` gate that fired every 30 array indices, not days).
@@ -438,6 +487,18 @@ pub fn run_simulation_with(
 
             if emit_period_pnl {
                 period_pnl.entry((leader, sim_date)).or_default().realized += pnl;
+            }
+
+            if mtm.is_some() {
+                mtm_lifetimes.push(PositionLifetime {
+                    wallet: leader,
+                    market: pos_key.0.clone(),
+                    outcome: pos_key.1,
+                    contracts: open.contracts,
+                    avg_fill_price: open.avg_fill_price,
+                    open_unix: open.open_unix,
+                    close_unix: Some(res.resolved_at_unix),
+                });
             }
 
             let fill = TradeFill {
@@ -700,6 +761,7 @@ pub fn run_simulation_with(
                                 contracts,
                                 avg_fill_price: fill_price,
                                 bought_on: sim_date,
+                                open_unix: trade.timestamp.0.unix_timestamp(),
                             },
                         );
 
@@ -863,6 +925,7 @@ pub fn run_simulation_with(
                             contracts: contracts_count,
                             avg_fill_price: fill_price,
                             bought_on: sim_date,
+                            open_unix: trade.timestamp.0.unix_timestamp(),
                         },
                     );
 
@@ -916,6 +979,18 @@ pub fn run_simulation_with(
                         period_pnl.entry((leader, sim_date)).or_default().realized += pnl;
                     }
 
+                    if mtm.is_some() {
+                        mtm_lifetimes.push(PositionLifetime {
+                            wallet: leader,
+                            market: trade.market_id.clone(),
+                            outcome: trade.outcome_id,
+                            contracts: open.contracts,
+                            avg_fill_price: open.avg_fill_price,
+                            open_unix: open.open_unix,
+                            close_unix: Some(trade.timestamp.0.unix_timestamp()),
+                        });
+                    }
+
                     let fill = TradeFill {
                         simulated_at: sim_date.midnight().assume_utc(),
                         leader_wallet: leader.to_string(),
@@ -936,6 +1011,27 @@ pub fn run_simulation_with(
     // value is unknown. Capital remains tied up in the bankroll (cost was deducted at BUY).
     let open_at_horizon = u64::try_from(open_positions.len()).unwrap_or(u64::MAX);
     // Do NOT modify bankroll or record PnL for open positions.
+
+    // Forward mark-to-market rows for the configured bake-off window (issue #436
+    // Phase E). Record the still-open positions (open at sim end) as open-ended
+    // lifetimes, then build the per-wallet flow + coverage rows. Empty when MTM is
+    // not enabled, so `pnl_by_period.ndjson` keeps its `unrealized_pnl = 0.0` shape.
+    let mtm_rows: Vec<PeriodPnlRow> = if let Some((win_start, win_end, marks)) = mtm {
+        for ((wallet, pos_key), open) in &open_positions {
+            mtm_lifetimes.push(PositionLifetime {
+                wallet: *wallet,
+                market: pos_key.0.clone(),
+                outcome: pos_key.1,
+                contracts: open.contracts,
+                avg_fill_price: open.avg_fill_price,
+                open_unix: open.open_unix,
+                close_unix: None,
+            });
+        }
+        build_mtm_rows(&mtm_lifetimes, win_start, win_end, marks)
+    } else {
+        Vec::new()
+    };
 
     daily_bankroll.push(bankroll);
     daily_pnl.push(intraday_realized_pnl);
@@ -983,7 +1079,7 @@ pub fn run_simulation_with(
     }
 
     if emit_period_pnl {
-        write_period_pnl(&config.output_dir, &period_pnl)?;
+        write_period_pnl(&config.output_dir, &period_pnl, mtm_rows)?;
     }
 
     info!(
@@ -1024,6 +1120,7 @@ pub fn run_simulation(
         ranker_config,
         strategy,
         write_output,
+        None,
         None,
     )
 }
@@ -1284,13 +1381,23 @@ struct PeriodAccum {
 }
 
 /// One emitted row of `pnl_by_period.ndjson` (the #421 `pe-backtest` → Python
-/// policy handoff). One row per (wallet, period). `period_end` is the unix
-/// second at the END of the UTC calendar day the activity fell in (next
-/// midnight). `unrealized_pnl` is a documented `0.0` sentinel: true
-/// mark-to-market needs the PR4 `market_price_history` price series, and under
-/// bounded-load there is no price for still-open positions — marking to the
-/// future resolution would be look-ahead. The money fields serialize as JSON
-/// numbers so the Python harness reads them as floats.
+/// policy handoff). `period_end` is the unix second at the END of the UTC
+/// calendar day the activity fell in (next midnight) for realized day rows.
+///
+/// Two row kinds (issue #436 Phase E):
+/// - **Realized day row** (`is_horizon_mtm = false`): per (wallet, UTC day),
+///   carrying `realized_pnl` / `n_fills` / `notional`. `unrealized_pnl = 0`.
+/// - **Horizon MTM row** (`is_horizon_mtm = true`): per wallet, stamped at
+///   `period_end = mtm_window_end_unix`, carrying the forward mark-to-market
+///   *flow* in `unrealized_pnl` (`Σ(mark_H − cost) − Σ(mark_as_of − cost)`) and
+///   the `(open_at_horizon, marked_at_horizon)` coverage counts. `realized_pnl =
+///   0`. The Python harness sums `realized_pnl + unrealized_pnl` over the window
+///   for the objective, and filters `~is_horizon_mtm` for the realized-only
+///   demoter/`live_pnl` accumulation.
+///
+/// When no MTM window is configured, only realized day rows are emitted and
+/// `unrealized_pnl` stays the documented `0.0` sentinel. The money fields
+/// serialize as JSON numbers so the Python harness reads them as floats.
 #[derive(Debug, Serialize)]
 struct PeriodPnlRow {
     wallet: String,
@@ -1302,6 +1409,78 @@ struct PeriodPnlRow {
     n_fills: u64,
     #[serde(serialize_with = "serialize_decimal_as_f64")]
     notional: Decimal,
+    /// `true` only for the forward MTM horizon row (issue #436 Phase E); the
+    /// realized-only demoter/`live_pnl` path filters these out.
+    is_horizon_mtm: bool,
+    /// Count of this wallet's positions still open at the horizon (MTM rows only).
+    open_at_horizon: u64,
+    /// Of `open_at_horizon`, how many had a CLOB mark at-or-before the horizon
+    /// (the rest are uncovered → contribute `0`). Coverage = marked / open.
+    marked_at_horizon: u64,
+}
+
+/// Build the forward mark-to-market rows for one bake-off window (issue #436
+/// Phase E). Per wallet, `unrealized_pnl` is the window *flow*
+/// `Σ_{open at horizon}(mark_H − cost) − Σ_{open at as_of}(mark_as_of − cost)` —
+/// a flow (not a stock `mark − cost`), so summing realized + unrealized across
+/// the trajectory's adjacent windows telescopes to each position's true lifecycle
+/// P&L with no double-count, and the realized day rows stay untouched. A position
+/// open at a boundary with no CLOB mark there contributes `0` (coverage-bounded,
+/// E3). One row per wallet that carried a boundary position (all-zero rows are
+/// dropped), stamped at `period_end = win_end` so the Python window slice
+/// `(as_of, horizon]` includes it.
+fn build_mtm_rows(
+    lifetimes: &[PositionLifetime],
+    win_start: i64,
+    win_end: i64,
+    marks: &ClobMarkIndex,
+) -> Vec<PeriodPnlRow> {
+    #[derive(Default)]
+    struct WalletMtm {
+        unreal_start: Decimal,
+        unreal_end: Decimal,
+        open_at_horizon: u64,
+        marked_at_horizon: u64,
+    }
+    let mut by_wallet: HashMap<WalletAddress, WalletMtm> = HashMap::new();
+    for lt in lifetimes {
+        let contracts = Decimal::from(lt.contracts);
+        if lt.open_at(win_start)
+            && let Some(mark) = marks.mark_at_or_before(&lt.market, lt.outcome, win_start)
+        {
+            by_wallet.entry(lt.wallet).or_default().unreal_start +=
+                (mark - lt.avg_fill_price) * contracts;
+        }
+        if lt.open_at(win_end) {
+            let entry = by_wallet.entry(lt.wallet).or_default();
+            entry.open_at_horizon += 1;
+            if let Some(mark) = marks.mark_at_or_before(&lt.market, lt.outcome, win_end) {
+                entry.unreal_end += (mark - lt.avg_fill_price) * contracts;
+                entry.marked_at_horizon += 1;
+            }
+        }
+    }
+    by_wallet
+        .into_iter()
+        .filter_map(|(wallet, m)| {
+            let flow = m.unreal_end - m.unreal_start;
+            // Drop pure-noise rows (no flow and no horizon exposure to report).
+            if flow.is_zero() && m.open_at_horizon == 0 {
+                return None;
+            }
+            Some(PeriodPnlRow {
+                wallet: wallet.to_string(),
+                period_end: win_end,
+                realized_pnl: Decimal::ZERO,
+                unrealized_pnl: flow,
+                n_fills: 0,
+                notional: Decimal::ZERO,
+                is_horizon_mtm: true,
+                open_at_horizon: m.open_at_horizon,
+                marked_at_horizon: m.marked_at_horizon,
+            })
+        })
+        .collect()
 }
 
 /// Serialize a `Decimal` as a JSON float at the output boundary (the Python
@@ -1345,26 +1524,41 @@ pub fn load_injected_trades(cache: &WalletCache, wallets: &[WalletAddress]) -> V
 fn write_period_pnl(
     output_dir: &Path,
     period_pnl: &HashMap<(WalletAddress, Date), PeriodAccum>,
+    mtm_rows: Vec<PeriodPnlRow>,
 ) -> Result<(), BacktestError> {
     std::fs::create_dir_all(output_dir)?;
     let path = output_dir.join("pnl_by_period.ndjson");
     let mut file = std::fs::File::create(path)?;
 
-    // Deterministic order: wallet bytes, then calendar day.
-    let mut rows: Vec<(&(WalletAddress, Date), &PeriodAccum)> = period_pnl.iter().collect();
-    rows.sort_by(|a, b| a.0.0.0.cmp(&b.0.0.0).then(a.0.1.cmp(&b.0.1)));
-
-    for ((wallet, day), acc) in rows {
-        let period_end = day.midnight().assume_utc().unix_timestamp() + 86_400;
-        let row = PeriodPnlRow {
+    // Assemble realized day rows (is_horizon_mtm = false) + the forward MTM
+    // horizon rows (issue #436 Phase E) into one set.
+    let mut rows: Vec<PeriodPnlRow> = period_pnl
+        .iter()
+        .map(|((wallet, day), acc)| PeriodPnlRow {
             wallet: wallet.to_string(),
-            period_end,
+            period_end: day.midnight().assume_utc().unix_timestamp() + 86_400,
             realized_pnl: acc.realized,
             unrealized_pnl: Decimal::ZERO,
             n_fills: acc.n_fills,
             notional: acc.notional,
-        };
-        let line = serde_json::to_string(&row)?;
+            is_horizon_mtm: false,
+            open_at_horizon: 0,
+            marked_at_horizon: 0,
+        })
+        .collect();
+    rows.extend(mtm_rows);
+
+    // Deterministic order: wallet hex, then period_end, then row kind (realized
+    // day rows before the horizon MTM row when they share a period_end).
+    rows.sort_by(|a, b| {
+        a.wallet
+            .cmp(&b.wallet)
+            .then(a.period_end.cmp(&b.period_end))
+            .then(a.is_horizon_mtm.cmp(&b.is_horizon_mtm))
+    });
+
+    for row in &rows {
+        let line = serde_json::to_string(row)?;
         writeln!(file, "{line}")?;
     }
     Ok(())

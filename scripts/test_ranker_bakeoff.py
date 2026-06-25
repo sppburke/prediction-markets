@@ -62,12 +62,39 @@ class _FakeRunner:
         self.points = points
         self.horizon = horizon
 
-    def run(self, wallets, *, flat_usd):
+    def run(self, wallets, *, flat_usd, window=None):
+        # Realized-only fake (no forward MTM): is_horizon_mtm=False so the objective is realized-only
+        # and live_pnl keeps every row, exactly as pre-E. `window` is accepted and ignored.
         rows = [{"wallet": w, "period_end": t + self.horizon // 2,
                  "realized_pnl": self.value.get(w, 0.0) * flat_usd, "unrealized_pnl": 0.0,
-                 "n_fills": 2, "notional": flat_usd * 2}
+                 "n_fills": 2, "notional": flat_usd * 2,
+                 "is_horizon_mtm": False, "open_at_horizon": 0, "marked_at_horizon": 0}
                 for w in wallets for t in self.points]
         return pd.DataFrame(rows, columns=bo._PNL_COLUMNS)
+
+
+class _MtmRunner(_FakeRunner):
+    """``_FakeRunner`` plus ONE forward-MTM horizon row per wallet (issue #436 Phase E): the SAME
+    realized day rows, plus an ``is_horizon_mtm=True`` row at the window horizon carrying the
+    unrealized flow + coverage counts. So a plain vs MTM run feed the demoter/live_pnl IDENTICAL
+    realized rows (the MTM rows are filtered out), but the MTM run's objective gains the flow."""
+
+    def __init__(self, value, points, horizon, *, unrealized, open_n, marked_n):
+        super().__init__(value, points, horizon)
+        self.unrealized = unrealized
+        self.open_n = open_n
+        self.marked_n = marked_n
+
+    def run(self, wallets, *, flat_usd, window=None):
+        df = super().run(wallets, flat_usd=flat_usd, window=window)
+        if window is None:
+            return df
+        _as_of, horizon_end = window
+        mtm = [{"wallet": w, "period_end": horizon_end, "realized_pnl": 0.0,
+                "unrealized_pnl": self.unrealized.get(w, 0.0), "n_fills": 0, "notional": 0.0,
+                "is_horizon_mtm": True, "open_at_horizon": self.open_n.get(w, 0),
+                "marked_at_horizon": self.marked_n.get(w, 0)} for w in wallets]
+        return pd.concat([df, pd.DataFrame(mtm, columns=bo._PNL_COLUMNS)], ignore_index=True)
 
 
 class GridTest(unittest.TestCase):
@@ -146,11 +173,20 @@ class ParseTest(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "pnl_by_period.ndjson"
+            # A realized day row (is_horizon_mtm=false) + a forward-MTM horizon row
+            # (is_horizon_mtm=true, the flow in unrealized_pnl + coverage counts) — issue #436 E.
             p.write_text('{"wallet":"0xa","period_end":100,"realized_pnl":1.5,'
-                         '"unrealized_pnl":0.0,"n_fills":3,"notional":30.0}\n\n')
+                         '"unrealized_pnl":0.0,"n_fills":3,"notional":30.0,'
+                         '"is_horizon_mtm":false,"open_at_horizon":0,"marked_at_horizon":0}\n'
+                         '{"wallet":"0xa","period_end":200,"realized_pnl":0.0,'
+                         '"unrealized_pnl":2.25,"n_fills":0,"notional":0.0,'
+                         '"is_horizon_mtm":true,"open_at_horizon":2,"marked_at_horizon":1}\n\n')
             df = bo.parse_pnl_by_period(p)
             self.assertEqual(list(df.columns), bo._PNL_COLUMNS)
             self.assertEqual(df.loc[0, "realized_pnl"], 1.5)
+            self.assertEqual(df.loc[1, "unrealized_pnl"], 2.25)
+            self.assertTrue(bool(df.loc[1, "is_horizon_mtm"]))
+            self.assertEqual(int(df.loc[1, "open_at_horizon"]), 2)
 
     def test_parse_missing_file_is_empty(self) -> None:
         df = bo.parse_pnl_by_period(Path("/nonexistent/pnl.ndjson"))
@@ -210,6 +246,54 @@ class TrajectoryTest(unittest.TestCase):
         admissions = (free - costed) / 10.0                      # difference == churn_cost x admits
         self.assertTrue((admissions >= -1e-9).all())
         self.assertGreater(admissions.sum(), 0)                  # full-rerank churns -> paid a cost
+
+
+class MtmObjectiveTest(unittest.TestCase):
+    """E2b/E3 (#436): the CLOB forward-MTM flow enters the objective, the demoter/live_pnl stay
+    realized-only, and per-period coverage is surfaced."""
+
+    def setUp(self) -> None:
+        self.ss, self.skill = _population(2)
+        self.points = [3_000_000 + i * 1_000_000 for i in range(8)]
+        self.horizon = 1_000_000
+        self.value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in self.skill.items()}
+
+    def _gp(self, policy, churn):
+        return bo.GridPoint("eb_shrinkage_skill", bo.NO_DEFLATION, policy,
+                            Criteria(0, 72.0, 0.0, 1.0, 0.0, 0), churn)
+
+    def test_weighted_window_sums_realized_and_unrealized(self) -> None:
+        window = pd.DataFrame([
+            {"wallet": "w1", "realized_pnl": 3.0, "unrealized_pnl": 0.0},
+            {"wallet": "w1", "realized_pnl": 0.0, "unrealized_pnl": 2.0},   # the horizon MTM row
+            {"wallet": "w2", "realized_pnl": 1.0, "unrealized_pnl": -0.5},
+        ])
+        follow = pd.DataFrame({"wallet": ["w1", "w2"], "weight": [1.0, 2.0]})
+        # w1: (3+2)=5 x1 ; w2: (1-0.5)=0.5 x2 = 1 -> 6
+        self.assertAlmostEqual(bo._weighted_window_pnl(window, follow), 6.0)
+
+    def test_flow_enters_objective_demoter_realized_only_coverage_surfaced(self) -> None:
+        kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
+                      k=5, displacement_margin=5, demoter_kwargs={"min_periods": 2})
+        plain = _FakeRunner(self.value, self.points, self.horizon)
+        mtm = _MtmRunner(self.value, self.points, self.horizon,
+                         unrealized={w: 0.5 for w in self.value},
+                         open_n={w: 2 for w in self.value}, marked_n={w: 1 for w in self.value})
+        a = bo.run_trajectory(self._gp("policy_knockout_backfill", 0.0), self.ss, plain, **kwargs)
+        b = bo.run_trajectory(self._gp("policy_knockout_backfill", 0.0), self.ss, mtm, **kwargs)
+        # Demoter is realized-only: the MTM rows never enter live_pnl (they carry realized=0 and the
+        # demoter counts each row as a period), so the followed set is identical with/without them —
+        # it would diverge if the rows polluted live_pnl.
+        self.assertEqual(set(a.final_follow["wallet"]), set(b.final_follow["wallet"]))
+        # The unrealized flow enters the objective: each ran period's return rises by the weighted flow.
+        diff = b.returns.fillna(0.0) - a.returns.fillna(0.0)
+        self.assertTrue((diff >= -1e-9).all())
+        self.assertGreater(diff.sum(), 0.0)
+        # E3: per-period coverage surfaced for the MTM run; the plain run emits no MTM rows.
+        self.assertIn("open_at_horizon", b.coverage.columns)
+        self.assertGreater(int(b.coverage["open_at_horizon"].sum()), 0)
+        self.assertGreater(int(b.coverage["marked_at_horizon"].sum()), 0)
+        self.assertEqual(int(a.coverage["open_at_horizon"].sum()), 0)
 
 
 class DecisionTest(unittest.TestCase):
@@ -744,6 +828,17 @@ class MemoRunnerTest(unittest.TestCase):
         memo.run(["w1", "w2"], flat_usd=25.0)                  # different set
         memo.run(["w1"], flat_usd=50.0)                        # different flat_usd
         self.assertEqual(memo.calls, 3)
+
+    def test_window_is_part_of_the_key(self) -> None:
+        # E (#436): the emitted unrealized_pnl flow depends on the MTM window (as_of, horizon), so
+        # the same set at different windows must NOT share a cached frame; the churn-axis 2× win
+        # (same set, same window) still holds.
+        memo = bo.MemoizingBacktestRunner(self._inner())
+        memo.run(["w1", "w2"], flat_usd=25.0, window=(0, 100))
+        memo.run(["w1", "w2"], flat_usd=25.0, window=(0, 200))  # same SET, different window
+        self.assertEqual(memo.calls, 2)
+        memo.run(["w1", "w2"], flat_usd=25.0, window=(0, 100))  # repeat -> cached
+        self.assertEqual((memo.lookups, memo.calls), (3, 2))
 
     def test_run_bakeoff_memo_collapses_churn_axis(self) -> None:
         # the two churn-cost levels produce IDENTICAL followed-set sequences (churn is a post-hoc

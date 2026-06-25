@@ -138,6 +138,7 @@ fn run_fixture() -> (Vec<PnlRow>, String, String, String) {
         &strategy,
         true,
         Some(&injected_set),
+        None, // no forward-MTM window in this scenario (unrealized stays the 0.0 sentinel)
     )
     .unwrap();
 
