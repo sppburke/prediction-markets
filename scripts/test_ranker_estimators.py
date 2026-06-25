@@ -25,8 +25,10 @@ from ranker.estimators import (  # noqa: E402
     ProxyCLV,
     TrueCLV,
     TStatBaseline,
+    _npmle_scores,
 )
 from ranker_decay import weighted_stats  # noqa: E402
+from scipy.stats import norm  # noqa: E402
 
 PRICE = 0.50            # _eff = 0.51 for every synthetic position
 _EFF = min(PRICE + 0.01, 0.999)
@@ -86,6 +88,38 @@ class DegenerateInputTest(unittest.TestCase):
         self.assertEqual(out.loc["solo", "rank"], 1)
 
 
+class EBTau2RobustnessTest(unittest.TestCase):
+    """#436 C1: short-track (n<=4, huge se^2) wallets must not drive the EB prior variance tau^2
+    negative and flatten the ranking. The old `Var(means) - mean(se^2)` MoM subtracts the UNWEIGHTED
+    mean sampling variance, which several noisy n=2 wallets inflate until prior_var < 0; `max(., 1e-9)`
+    then collapses shrink to ~0 and EVERY posterior saturates to ~`norm.cdf(mu0 / sqrt(1e-9))` == 1.0,
+    so the ranking degenerates to insertion order. The DerSimonian-Laird precision-weighted tau^2
+    weights each wallet by 1/se^2, so the noisy wallets cannot drag it down and EDGE wins. (Skilled are
+    inserted LAST here, so the old insertion-order collapse would rank them at the BOTTOM.)"""
+
+    def setUp(self) -> None:
+        noisy = [(f"noisy{i}", 2, 1) for i in range(10)]    # n=2, 1 win: mean ~ overall mean, huge se^2
+        specs = (noisy + [("precise_null", 400, 200)]       # high-n zero-edge: tiny se, no edge
+                 + [(w, 50, 25) for w in NULLS]              # 50% baseline
+                 + [(w, 50, 35) for w in SKILLED])           # 70% real edge, inserted LAST
+        self.ss = _suff_stats(specs)
+        self.scores = EBShrinkageSkill().score(self.ss, as_of=0, weights=np.ones(len(self.ss)))
+
+    def test_skilled_outrank_a_high_precision_null(self) -> None:
+        # The collapse ranks purely by 1/se (precision), so a high-n zero-edge null beats real edge.
+        null_rank = self.scores.loc["precise_null", "rank"]
+        self.assertTrue((self.scores.loc[SKILLED, "rank"] < null_rank).all())
+
+    def test_skilled_take_the_top_ranks_despite_noisy_wallets(self) -> None:
+        self.assertEqual(set(self.scores.nsmallest(4, "rank").index), set(SKILLED))
+
+    def test_ranking_not_flattened(self) -> None:
+        # Not collapsed: skilled posteriors clear the zero-edge null by a wide margin (the old collapse
+        # saturated every score to ~1.0, so this gap would vanish).
+        self.assertGreater(self.scores.loc[SKILLED, "score"].min(), 0.9)
+        self.assertLess(self.scores.loc["precise_null", "score"], 0.8)
+
+
 class TStatBaselineTest(unittest.TestCase):
     """The §Acceptance benchmark: raw net-edge t-stat ranks skilled above null; drops < 2 obs."""
 
@@ -128,6 +162,53 @@ class GuKoenkerNPMLETest(unittest.TestCase):
     def test_single_candidate_is_rank_one(self) -> None:
         out = GuKoenkerNPMLE().score(_suff_stats([("solo", 6, 5)]), as_of=0, weights=np.ones(6))
         self.assertEqual(out.loc["solo", "rank"], 1)
+
+
+class GuKoenkerNumericsTest(unittest.TestCase):
+    """#436 C2: log-space EM/scoring (no underflow of a far-from-grid precise wallet), a deterministic
+    `grid == 0` boundary (split mass), monotone EM log-likelihood, and a verdict invariant to the
+    iteration cap."""
+
+    def test_loglik_monotone_non_decreasing(self) -> None:
+        # The EM marginal log-likelihood never falls (catches a broken E/M step).
+        x = np.array([-0.5, -0.2, 0.0, 0.3, 0.8, 1.2])
+        se = np.array([0.3, 0.2, 0.25, 0.15, 0.2, 0.1])
+        grid = np.linspace(x.min(), x.max(), 64)
+        _, ll = _npmle_scores(x, se, grid, max_iter=2000, tol=1e-8)
+        self.assertTrue(np.all(np.diff(np.asarray(ll)) >= -1e-9), "EM log-likelihood decreased")
+
+    def test_far_from_grid_precise_wallet_not_underflowed(self) -> None:
+        # A precise wallet (tiny se) whose mean falls BETWEEN grid nodes: the LINEAR likelihood row
+        # underflows to all-zero, so the old EM scored it 0.0 regardless of skill. Log space keeps the
+        # responsibilities finite, so this strongly-positive precise wallet scores ~1, not 0.
+        x = np.concatenate([np.linspace(-1.0, 1.0, 20), [0.5 + 0.5 / 63 / 2]])
+        se = np.concatenate([np.full(20, 0.3), [3e-4]])
+        grid = np.linspace(x.min(), x.max(), 64)
+        i = len(x) - 1
+        linear_row = norm.pdf((x[i] - grid) / se[i]) / se[i]
+        self.assertTrue(bool((linear_row == 0).all()))      # the underflow the linear EM hit
+        scores, _ = _npmle_scores(x, se, grid, max_iter=2000, tol=1e-8)
+        self.assertGreater(scores[i], 0.99)                 # not 0.0
+
+    def test_grid_zero_boundary_mass_is_split(self) -> None:
+        # A grid node landing exactly on 0 splits its mass 0.5/0.5, so a wallet at 0 in symmetric data
+        # scores ~0.5 deterministically (not flipped by a strict `grid > 0`).
+        x = np.array([0.0, -0.5, 0.5])
+        se = np.full(3, 0.2)
+        grid = np.linspace(-0.5, 0.5, 3)                    # [-0.5, 0.0, 0.5] -> a node exactly at 0
+        self.assertIn(0.0, grid.tolist())
+        scores, _ = _npmle_scores(x, se, grid, max_iter=2000, tol=1e-8)
+        self.assertAlmostEqual(scores[0], 0.5, places=6)
+
+    def test_ranking_stable_to_iteration_cap(self) -> None:
+        ss = _suff_stats([(w, 60, 42) for w in SKILLED] + [(w, 60, 30) for w in NULLS]
+                         + [("low_n", 8, 6)])
+
+        def ranking(max_iter: int) -> list:
+            out = GuKoenkerNPMLE(max_iter=max_iter).score(ss, as_of=0, weights=np.ones(len(ss)))
+            return list(out.sort_values("rank").index)
+
+        self.assertEqual(ranking(500), ranking(4000))       # verdict invariant to the cap
 
 
 def _clv_ss(specs, col: str = "close_proxy") -> pd.DataFrame:

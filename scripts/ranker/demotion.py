@@ -24,6 +24,18 @@ class EmpiricalBernsteinDemoter:
 
     ``upper = mean + sqrt(2 V ln(2/delta) / n) + 3 R ln(2/delta) / n`` (V = sample variance,
     R = observed range). Demotion requires ``upper < 0`` — the optimistic estimate is still a loss.
+
+    # Optional-stopping caveat (#436 C4, accept-and-document): this is a FIXED-n Maurer-Pontil bound,
+    # but ``should_demote`` is queried every walk-forward step on a GROWING n. Re-checking a fixed-n
+    # bound at each step is an optional-stopping / multiple-testing problem, so the nominal ``delta``
+    # is NOT a time-uniform ("anytime-valid") error guarantee over the whole trajectory — the
+    # family-wise false-demotion rate inflates with the number of checks. This is accepted rather than
+    # fixed here: (1) demotion is AND-gated by ``cumulative realized P&L < 0`` and ``min_periods``, so
+    # a single optimistic-CB excursion cannot demote a wallet that is actually making money; (2) a
+    # delayed demotion is low-cost (the wallet keeps a small flat stake until the evidence is
+    # unambiguous); and (3) a time-uniform / stitched confidence sequence (Howard et al.) would be a
+    # live knockout-policy behaviour change, out of scope for this bake-off-harness phase. A
+    # confidence-sequence upgrade is the principled future fix.
     """
 
     name = "empirical_bernstein"

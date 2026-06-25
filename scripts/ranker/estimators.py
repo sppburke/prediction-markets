@@ -8,6 +8,7 @@ remaining menu estimators are pluggable drop-ins behind the same Protocol (issue
 """
 import numpy as np
 import pandas as pd
+from scipy.special import logsumexp
 from scipy.stats import norm
 
 from ranker_decay import weighted_stats  # reuse #366 weighted statistics — no drift
@@ -20,6 +21,17 @@ from ranker_decay import weighted_stats  # reuse #366 weighted statistics — no
 # scored maximal), extending the deliberate n=5 zero-dispersion drop to the n>=6 float-noise case
 # uniformly across all five estimators (#436 A10 follow-up).
 _SD_FLOOR = 1e-9
+
+# Empirical-Bayes prior-variance floors for eb_shrinkage_skill (#436 C1).
+# `ranker_eb_prior_var_floor` is the ABSOLUTE degenerate fallback (a <2-valid-candidate input has an
+# undefined cross-section). `ranker_eb_tau2_floor_frac` floors the DerSimonian-Laird tau^2 estimate to
+# a small positive FRACTION of the cross-sectional Var(wallet means) so that even when the
+# precision-weighted tau^2 collapses to ~0 the shrinkage cannot fully flatten the ranking (the old
+# `max(prior_var, 1e-9)` collapsed shrink to ~0 -> every posterior == the prior mean). 0.05 is a 5%
+# backstop: it binds ONLY when tau^2 ~ 0 (in normal operation the DSL estimate exceeds it and it never
+# binds), and is small enough to preserve aggressive shrinkage.
+_EB_PRIOR_VAR_FLOOR = 1e-9
+_EB_TAU2_FLOOR_FRAC = 0.05
 
 
 class EBShrinkageSkill:
@@ -52,12 +64,35 @@ class EBShrinkageSkill:
         # float noise at n>=6) so its posterior is undefined and it drops, not scores a spurious max
         # (#436 A10 follow-up; same `_SD_FLOOR` drop as t_stat / gu_koenker / clv).
         se2 = ((df["sd"] ** 2) / df["n_eff"]).where(df["sd"] > _SD_FLOOR)  # sampling var of the mean
-        # EB prior var (normal-normal). `var(ddof=1)` is NaN for < 2 wallets, and
-        # `max(NaN, 1e-9)` keeps the NaN — which would silently empty the result; floor
-        # explicitly so a degenerate <2-candidate input stays deterministic.
-        prior_var = df["mean"].var(ddof=1) - se2.mean()
-        tau2 = max(prior_var, 1e-9) if np.isfinite(prior_var) else 1e-9
-        mu0 = df["mean"].mean()                                  # EB prior mean
+        # EB prior variance tau^2 by the DerSimonian-Laird precision-weighted (1/se^2) positive-part
+        # moment estimator (#436 C1), over the VALID (finite-se^2) wallets only — this reconciles the
+        # B-phase se2 NaN-mask: the zero-dispersion wallets that drop downstream must not enter the
+        # tau^2 cross-section either. The old `Var(means) - mean(se^2)` subtracted the UNWEIGHTED mean
+        # sampling variance, which a handful of short-track (n<=4, huge se^2) wallets inflate until it
+        # drives prior_var negative; `max(., 1e-9)` then collapsed shrink to ~0 and flattened the whole
+        # ranking. DSL weights each wallet by its precision so the noisy short-track wallets cannot drag
+        # tau^2 down, and the positive-part keeps it >= 0. Floor to a small fraction of the cross-
+        # sectional Var(means) so a genuine-zero tau^2 still leaves a usable (non-degenerate) ranking;
+        # fall back to the absolute floor for a <2-valid-candidate input (undefined cross-section). mu0
+        # stays the unweighted cross-sectional mean — a location estimate is well-defined for every
+        # candidate; only tau^2 (which needs se^2) restricts to the valid subset.
+        valid = se2.notna().to_numpy()
+        xv = df["mean"].to_numpy()[valid]
+        s2 = se2.to_numpy()[valid]
+        if xv.size >= 2:
+            w = 1.0 / s2                                         # precision weights
+            sw = w.sum()
+            xbar = (w * xv).sum() / sw                           # precision-weighted grand mean
+            q = (w * (xv - xbar) ** 2).sum()                     # weighted SS; E[Q] = k-1 under tau^2=0
+            c = sw - (w ** 2).sum() / sw                         # > 0 for k >= 2
+            tau2_dsl = max((q - (xv.size - 1)) / c, 0.0)         # DerSimonian-Laird positive-part MoM
+            var_means = float(np.var(xv, ddof=1))
+            floor = (_EB_TAU2_FLOOR_FRAC * var_means
+                     if np.isfinite(var_means) and var_means > 0 else _EB_PRIOR_VAR_FLOOR)
+            tau2 = max(tau2_dsl, floor)
+        else:
+            tau2 = _EB_PRIOR_VAR_FLOOR                           # <2 valid -> deterministic fallback
+        mu0 = df["mean"].mean()                                  # EB prior mean (all candidates)
         shrink = tau2 / (tau2 + se2)
         post_mean = mu0 + shrink * (df["mean"] - mu0)
         post_sd = np.sqrt(shrink * se2)            # NaN se2 (zero-dispersion) -> NaN score -> dropped
@@ -103,6 +138,56 @@ class TStatBaseline:
         return df[["score", "rank"]]
 
 
+def _npmle_em(log_like: np.ndarray, *, max_iter: int, tol: float) -> "tuple[np.ndarray, list]":
+    """Kiefer-Wolfowitz NPMLE mixing weights by EM in LOG space (#436 C2).
+
+    ``log_like[i, k] = log N(x_i; grid_k, se_i^2)``. Returns ``(pi, ll_history)`` — the grid mixing
+    distribution and the per-iteration marginal log-likelihood. The E-step normalises via log-sum-exp
+    so a wallet whose mean falls many ``se`` from every grid node keeps well-defined responsibilities
+    instead of underflowing its whole likelihood row to 0.0 (which the old linear EM then scored 0.0
+    regardless of skill). The EM marginal log-likelihood is monotone non-decreasing — the drift guard
+    asserts ``ll_history`` never falls, catching a broken E/M step or iteration-cap truncation.
+    """
+    pi = np.full(log_like.shape[1], 1.0 / log_like.shape[1])
+    ll_history: list = []
+    for _ in range(max_iter):
+        with np.errstate(divide="ignore"):
+            log_pi = np.log(pi)                                  # -inf where pi == 0 (NPMLE is sparse)
+        log_post = log_like + log_pi[None, :]
+        log_row = logsumexp(log_post, axis=1)                   # log marginal per wallet
+        ll_history.append(float(log_row.sum()))
+        resp = np.exp(log_post - log_row[:, None])              # E-step responsibilities
+        new_pi = resp.mean(axis=0)                              # M-step
+        if np.abs(new_pi - pi).max() < tol:
+            pi = new_pi
+            break
+        pi = new_pi
+    return pi, ll_history
+
+
+def _npmle_scores(x: np.ndarray, se: np.ndarray, grid: np.ndarray, *, max_iter: int,
+                  tol: float) -> "tuple[np.ndarray, list]":
+    """Posterior ``P(theta > 0 | data)`` per wallet under the EM-fit NPMLE prior (#436 C2).
+
+    Builds the log-likelihood matrix, fits ``pi`` via ``_npmle_em``, and forms the positive-tail
+    posterior in LOG space (so it never underflows a far-from-grid precise wallet to 0.0). The
+    ``grid == 0`` boundary is made deterministic by SPLITTING its mass 0.5/0.5 across the positive and
+    non-positive sides (``pos_w``), so a grid node landing exactly on 0 cannot silently flip the score.
+    Returns ``(scores, ll_history)``; a wallet with no positive grid mass scores 0, all-positive scores 1.
+    """
+    log_like = norm.logpdf((x[:, None] - grid[None, :]) / se[:, None]) - np.log(se[:, None])
+    pi, ll_history = _npmle_em(log_like, max_iter=max_iter, tol=tol)
+    pos_w = np.where(grid > 0, 1.0, np.where(grid < 0, 0.0, 0.5))   # split boundary mass at grid == 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_pi = np.log(pi)
+        log_posw = np.log(pos_w)                                # -inf where pos_w == 0
+        log_post = log_like + log_pi[None, :]
+        log_marg = logsumexp(log_post, axis=1)                  # finite (pi sums to 1)
+        log_pos = logsumexp(log_post + log_posw[None, :], axis=1)   # -inf if no positive mass
+        scores = np.exp(log_pos - log_marg)                    # in (0, 1]: 0 = no positive mass, 1 = all
+    return scores, ll_history
+
+
 class GuKoenkerNPMLE:
     """NPMLE compound-decision ranking (Gu-Koenker, Econometrica 2023) — issue #421 LIKELY
     HEADLINE. Estimate the latent skill distribution ``G`` non-parametrically (Kiefer-Wolfowitz
@@ -114,6 +199,10 @@ class GuKoenkerNPMLE:
     Per wallet: net-edge mean ``x_i`` with SE ``s_i`` (``x_i ~ N(theta_i, s_i^2)``). The mixing
     weights ``pi`` over the grid are the NPMLE of ``G``; the score is the posterior mass on
     ``theta > 0``: ``sum_k pi_k N(x_i; g_k, s_i^2) [g_k>0] / sum_k pi_k N(x_i; g_k, s_i^2)``.
+    The EM E-step and the posterior are computed in LOG space (log-sum-exp) so a far-from-grid precise
+    wallet is not underflowed to score 0.0, and the ``g_k == 0`` boundary splits its mass 0.5/0.5 so
+    ``[g_k > 0]`` is deterministic (#436 C2). ``max_iter`` is a safety ceiling — the ``tol`` break
+    converges well before it on real data; the drift guard pins the verdict invariant to the cap.
 
     # Precondition: as EBShrinkageSkill. Wallets with < 2 effective obs (undefined SE) drop.
     # Deterministic: fixed data-driven grid + fixed EM iteration cap, no RNG.
@@ -121,7 +210,7 @@ class GuKoenkerNPMLE:
 
     name = "gu_koenker_npmle"
 
-    def __init__(self, grid_size: int = 64, max_iter: int = 500, tol: float = 1e-8):
+    def __init__(self, grid_size: int = 64, max_iter: int = 2000, tol: float = 1e-8):
         self.grid_size = grid_size
         self.max_iter = max_iter
         self.tol = tol
@@ -142,21 +231,8 @@ class GuKoenkerNPMLE:
         se = df["se"].to_numpy()
         # Fixed support grid spanning the observed means (single point for a lone candidate).
         grid = np.linspace(x.min(), x.max(), self.grid_size) if len(df) > 1 else x[:1]
-        # L[i, k] = N(x_i; grid_k, se_i^2).
-        likelihood = norm.pdf((x[:, None] - grid[None, :]) / se[:, None]) / se[:, None]
-        pi = np.full(len(grid), 1.0 / len(grid))
-        for _ in range(self.max_iter):                          # EM for the Kiefer-Wolfowitz MLE
-            num = likelihood * pi[None, :]
-            row_sum = num.sum(axis=1, keepdims=True)
-            new_pi = (num / np.where(row_sum > 0, row_sum, 1.0)).mean(axis=0)
-            if np.abs(new_pi - pi).max() < self.tol:
-                pi = new_pi
-                break
-            pi = new_pi
-        marginal = likelihood @ pi
-        marginal = np.where(marginal > 0, marginal, 1.0)
-        pos_mass = likelihood @ (pi * (grid > 0))
-        df["score"] = pos_mass / marginal
+        scores, _ = _npmle_scores(x, se, grid, max_iter=self.max_iter, tol=self.tol)
+        df["score"] = scores
         df["rank"] = df["score"].rank(ascending=False, method="first").astype(int)
         return df[["score", "rank"]]
 

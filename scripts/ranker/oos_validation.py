@@ -233,19 +233,31 @@ def brown_goetzmann_cpr(period1: pd.Series, period2: pd.Series) -> dict:
     dict; ``go`` is the 1-number premise check (persistence at the 5% level).
     """
     df = pd.concat([period1.rename("p1"), period2.rename("p2")], axis=1).dropna()
-    w1 = df["p1"] > df["p1"].median()
-    w2 = df["p2"] > df["p2"].median()
+    m1, m2 = df["p1"].median(), df["p2"].median()
+    # C3 (#436): drop wallets sitting at EXACTLY either period's median before tabulating. Net-edge
+    # performance has a zero mass-point (many wallets at exactly 0 = the median), and a bare
+    # `> median` lumps every median-tied wallet into the LOSER cell — inflating LL and manufacturing a
+    # spurious persistence GO (in the >50%-at-median case the WINNER cell empties and the table routes
+    # to the `cpr=inf` perfect-persistence path). Dropping the ambiguous tie block balances the W/L
+    # split; on tie-free continuous data it removes <= 1 wallet (the median wallet at odd n, none at
+    # even n) and leaves the verdict unchanged.
+    df = df[(df["p1"] != m1) & (df["p2"] != m2)]
+    w1 = df["p1"] > m1
+    w2 = df["p2"] > m2
     ww = int((w1 & w2).sum())
     ll = int((~w1 & ~w2).sum())
     wl = int((w1 & ~w2).sum())
     lw = int((~w1 & w2).sum())
     result = {"ww": ww, "wl": wl, "lw": lw, "ll": ll}
     if wl == 0 or lw == 0 or ww == 0 or ll == 0:
-        # Degenerate contingency table: the z-test is undefined (no p-value). cpr is +inf for
-        # zero reversals (wl=lw=0 -> maximal persistence -> go) or 0 for a zero same-state cell;
-        # `cpr > 1.0` is correct for both (inf > 1 is True), so do NOT gate `go` on isfinite.
-        cpr = (ww * ll) / (wl * lw) if wl > 0 and lw > 0 else float("inf")
-        result.update(cpr=cpr, z=float("nan"), p_value=float("nan"), go=bool(cpr > 1.0))
+        # Degenerate contingency: the log-CPR z-test is undefined (no p-value). Certify persistence
+        # (go) ONLY for genuine perfect persistence — real winners AND losers with zero reversals
+        # (ww>0, ll>0, wl=lw=0 -> cpr=inf). Any EMPTY winner/loser CLASS (ww==0 or ll==0 — e.g. a
+        # zero-mass-point collapsing one side even after the tie-drop) is no-signal, not persistence,
+        # so go=False; the old `cpr>1` rule manufactured a spurious GO whenever wl==0 OR lw==0 (C3).
+        perfect = ww > 0 and ll > 0 and wl == 0 and lw == 0
+        cpr = float("inf") if perfect else ((ww * ll) / (wl * lw) if wl > 0 and lw > 0 else 0.0)
+        result.update(cpr=cpr, z=float("nan"), p_value=float("nan"), go=bool(perfect))
         return result
     cpr = (ww * ll) / (wl * lw)
     sigma = math.sqrt(1.0 / ww + 1.0 / wl + 1.0 / lw + 1.0 / ll)
