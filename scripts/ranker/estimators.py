@@ -79,6 +79,11 @@ class TStatBaseline:
             rows.append((wallet, mean, sd, n_eff))
         df = pd.DataFrame(rows, columns=["wallet", "mean", "sd", "n_eff"]).set_index("wallet")
         se = df["sd"] / np.sqrt(df["n_eff"])
+        # A10 (#436): zero-dispersion wallets (se==0) are DROPPED here, not ranked #1 with +inf.
+        # This is deliberate and winner's-curse-robust: a constant streak (e.g. 5/5 wins) has an
+        # UNDEFINED — not maximal — t-stat, and admitting it top would reinstate exactly the
+        # small-sample curse this harness exists to kill. The downstream DSR gate mirrors this
+        # (bakeoff._zero_dispersion_positive only force-keeps a wallet an estimator already scored).
         df["score"] = (df["mean"] / se).where((df["n_eff"] >= 2) & (se > 0))
         df = df[df["score"].notna()].copy()
         df["rank"] = df["score"].rank(ascending=False, method="first").astype(int)

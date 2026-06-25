@@ -32,6 +32,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kurtosis, skew
 
+from ranker_decay import weighted_stats  # reuse #366 weighted statistics — gate agrees with ranker
+
 from . import Criteria, FollowSet, SuffStats, WalletScores
 from .demotion import EmpiricalBernsteinDemoter
 from .deflation import DeflatedSharpe
@@ -56,6 +58,18 @@ _PNL_COLUMNS = ["wallet", "period_end", "realized_pnl", "unrealized_pnl", "n_fil
 BASELINE_ESTIMATOR = "t_stat_baseline"
 BASELINE_POLICY = "policy_full_rerank"
 NO_DEFLATION = "none"
+
+# Glossary-canonical selection thresholds (docs/_GLOSSARY.md is the single source of truth; these
+# named constants mirror it so the gate reads a documented name, never a bare literal — issue #436
+# A6, which found `ranker_pbo_max`/`ranker_dsr_min` were glossary'd but hardcoded here and ignored).
+RANKER_FDR_Q = 0.05          # ranker_fdr_q     — family significance / alpha for the winner gate
+RANKER_PBO_MAX = 0.5         # ranker_pbo_max   — leaderboard PBO (overfit) ceiling [HARD GATE]
+RANKER_DSR_MIN = 0.5         # ranker_dsr_min   — per-step per-wallet Deflated-Sharpe gate [HARD]
+# ranker_grid_dsr_min is ADVISORY (reported, not gated): the RW/SPA/PBO panel already deflates the
+# leaderboard, so gating the per-config grid-DSR on top double-counts the correction and rejects
+# genuinely-good configs (a +0.8/period config deflates to DSR≈0.93 at N=20 — below 0.95). The
+# winner's grid-DSR is surfaced + flagged when below this bar so the operator reads it (#436 A6).
+RANKER_GRID_DSR_MIN = 0.95   # ranker_grid_dsr_min — leaderboard grid-DSR advisory floor [REPORT]
 
 
 # ───────────────────────── grid (8b: pre-registration) ─────────────────────────
@@ -100,6 +114,14 @@ def pre_register_grid(axes: BakeoffAxes, *, created_at: int = 0) -> dict:
     ``n_trials`` every grid-level Validator/Deflator is later given; nothing may be added to the
     SCORED grid afterwards (LANDMINE-1)."""
     grid = axes.enumerate_grid()
+    keys = [g.key for g in grid]
+    if len(set(keys)) != len(keys):
+        # A8 (#436): a key collision silently merges two distinct configs into one matrix column,
+        # corrupting N_GRID and every grid-level Validator. Fail loudly at pre-registration.
+        from collections import Counter
+        dupes = sorted(k for k, c in Counter(keys).items() if c > 1)
+        raise ValueError(f"grid key collision: {len(dupes)} duplicate config key(s), e.g. "
+                         f"{dupes[:3]} — distinct GridPoints must produce distinct keys")
     return {
         "created_at": created_at,
         "n_grid": len(grid),
@@ -138,38 +160,66 @@ def eligible_wallets(in_sample: SuffStats, criteria: Criteria, *, as_of: int) ->
 
 
 # ───────────────────────── deflation gate (per-wallet) ─────────────────────────
-def _wallet_sharpe_moments(in_sample: SuffStats, wallets) -> pd.DataFrame:
-    """Per-wallet net-edge Sharpe moments ``[sr, n_obs, skew, kurt]`` (non-excess kurtosis) for
-    the Deflated-Sharpe gate. Wallets with < 2 positions or zero dispersion are omitted."""
+def _wallet_sharpe_moments(in_sample: SuffStats, wallets, weights=None) -> pd.DataFrame:
+    """Per-wallet net-edge Sharpe moments ``[sr, n_obs, skew, kurt]`` (non-excess kurtosis) for the
+    Deflated-Sharpe gate. A4 (#436): the SR mean/sd are the UNIQUENESS-WEIGHTED
+    ``ranker_decay.weighted_stats`` the estimators use (so the gate and the ranker agree on a
+    wallet's edge); ``n_obs`` is the Kish effective sample size; skew/kurt are the (unweighted)
+    shape corrections for the DSR. ``weights`` is positional, aligned to ``in_sample``'s
+    RangeIndex; ``None`` -> uniform (bitwise-identical to the legacy unweighted gate). Wallets with
+    < 2 effective positions or zero dispersion are omitted (zero-dispersion positives are handled by
+    the caller — see A10)."""
     rows = []
     for wallet in wallets:
         g = in_sample[in_sample["wallet"] == wallet]
         net = ((g["payoff"] - g["_eff"]) / g["_eff"]).to_numpy()
         if net.size < 2:
             continue
-        sd = net.std(ddof=1)
-        if sd <= 0:
+        w = np.ones(net.size) if weights is None else weights[g.index.to_numpy()]
+        mean, sd, n_eff, _ = weighted_stats(net, w)
+        if not (n_eff >= 2 and sd > 0):
             continue
-        rows.append((wallet, net.mean() / sd, net.size,
+        rows.append((wallet, mean / sd, n_eff,
                      float(skew(net)), float(kurtosis(net, fisher=False))))
     return pd.DataFrame(rows, columns=["wallet", "sr", "n_obs", "skew", "kurt"]).set_index("wallet")
 
 
+def _zero_dispersion_positive(in_sample: SuffStats, wallets) -> set:
+    """A10 (#436): wallets with >= 2 positions, exactly zero net-edge dispersion, and a positive
+    mean. Their Sharpe is UNDEFINED (not low), so the DSR gate must not silently veto an estimator's
+    pick for one — it bypasses the bar instead of being dropped as sub-threshold. (Rare in practice:
+    sd==0 requires identical net edge across positions, which differing entry prices preclude — so
+    this only ever force-keeps a wallet an estimator already chose to score.)"""
+    keep = set()
+    for wallet in wallets:
+        g = in_sample[in_sample["wallet"] == wallet]
+        net = ((g["payoff"] - g["_eff"]) / g["_eff"]).to_numpy()
+        # isclose, not == 0: a mathematically-constant series can carry ~1e-16 std from float
+        # accumulation (np.std of 6 identical values != 0.0 exactly), so an exact test is fragile.
+        if net.size >= 2 and bool(np.isclose(net.std(ddof=1), 0.0, atol=1e-12)) \
+                and float(net.mean()) > 0.0:
+            keep.add(wallet)
+    return keep
+
+
 def apply_deflation_gate(scores: WalletScores, in_sample: SuffStats, deflator: str, *,
-                         n_trials: int, threshold: float = 0.5) -> WalletScores:
+                         n_trials: int, weights=None,
+                         threshold: float = RANKER_DSR_MIN) -> WalletScores:
     """Per-wallet deflation gate. ``none`` -> passthrough. ``deflated_sharpe`` -> keep only wallets
     whose Deflated Sharpe (``P(true SR > expected-max-null SR)`` at ``n_trials`` candidates) is at
-    least ``threshold`` — the winner's-curse correction applied at selection time."""
+    least ``threshold`` (``ranker_dsr_min``) — the winner's-curse correction applied at selection
+    time. ``weights`` (A4) makes the gate's Sharpe agree with the ranker's uniqueness-weighted edge;
+    zero-dispersion positive wallets bypass the bar rather than being vetoed (A10)."""
     if deflator == NO_DEFLATION or scores.empty:
         return scores
     if deflator != DeflatedSharpe.name:
         raise ValueError(f"unknown deflator {deflator!r}")
-    moments = _wallet_sharpe_moments(in_sample, scores.index)
-    if moments.empty:
-        return scores.iloc[0:0]
-    deflated = DeflatedSharpe().deflate(moments, n_trials=n_trials, as_of=0)
-    keep = deflated.index[deflated["dsr"].fillna(0.0) >= threshold]
-    return scores.loc[scores.index.intersection(keep)]
+    keep = _zero_dispersion_positive(in_sample, scores.index)
+    moments = _wallet_sharpe_moments(in_sample, scores.index, weights)
+    if not moments.empty:
+        deflated = DeflatedSharpe().deflate(moments, n_trials=n_trials, as_of=0)
+        keep |= set(deflated.index[deflated["dsr"].fillna(0.0) >= threshold])
+    return scores.loc[scores.index.intersection(list(keep))]
 
 
 # ───────────────────────── backtest runner seam (8c) ─────────────────────────
@@ -246,22 +296,37 @@ def _forward_copy_pnl(forward: SuffStats, wallets) -> float:
 
 
 def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
-                      train_secs: int, horizon_secs: int, k: int, keep: int) -> list:
+                      train_secs: int, horizon_secs: int, k: int, keep: int,
+                      criteria: "Criteria | None" = None) -> list:
     """8a — rank estimators by mean point-in-time forward copy P&L of their top-k pick and keep the
     best ``keep`` (the §Acceptance benchmark ``t_stat_baseline`` is always retained). Cheap: scores
     once per ``as_of`` and reads the forward net edge directly, eliminating most of the menu before
-    the expensive policy trajectories."""
+    the expensive policy trajectories.
+
+    A3 (#436): the screen runs on the SAME gated universe the trajectories do — the static
+    ``slice_by_criteria`` plus the per-``as_of`` ``eligible_wallets`` recency/MinTRL gate — under the
+    canonical ``criteria`` (the singleton at Phase A; the chosen canonical level once the criteria
+    axis goes plural, D1). Without it the screen ranked estimators on a wider universe than the one
+    they were later scored on. ``criteria=None`` is the fully-permissive no-op default (back-compat).
+    """
+    if criteria is None:
+        criteria = Criteria(0, float("inf"), 0.0, 1.0, 0.0, 0)
+    ss_c = slice_by_criteria(ss, criteria)
     scoreboard = {}
     for name in estimators:
         estimator = ESTIMATOR_REGISTRY[name]()
         fwd_pnls = []
         for as_of in as_of_points:
             in_sample, forward = split_walkforward(
-                ss, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
+                ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
             if in_sample.empty or forward.empty:
                 continue
-            weights = uniqueness_weights(in_sample)
-            scores = estimator.score(in_sample, as_of=as_of, weights=weights)
+            eligible = eligible_wallets(in_sample, criteria, as_of=as_of)
+            candidates = in_sample[in_sample["wallet"].isin(eligible)]   # label-preserving slice
+            if candidates.empty:
+                continue
+            weights = uniqueness_weights(in_sample)                      # full-frame, aligned index
+            scores = estimator.score(candidates, as_of=as_of, weights=weights)
             if scores.empty:
                 continue
             picked = scores.nsmallest(min(k, len(scores)), "rank").index
@@ -282,13 +347,32 @@ def _churn(prev: FollowSet, follow: FollowSet) -> int:
     return len(set(follow["wallet"]) - prev_set)
 
 
+@dataclass
+class TrajectoryResult:
+    """A1 (#436): one config's trajectory output. ``returns`` is the per-period forward copy P&L net
+    of churn; ``final_follow`` / ``final_scores`` are the LAST real (non-empty) followed set and its
+    per-wallet scores — the deliverable substrate. Three of four policies are stateful, so this set
+    is captured DURING the run: it cannot be reproduced by a cold re-application of the policy at the
+    latest ``as_of`` (an empty ``prev`` degenerates knockout/hybrid/online into a memoryless top-k).
+    """
+
+    returns: pd.Series
+    final_follow: FollowSet
+    final_scores: WalletScores
+
+
 def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points: list,
                    train_secs: int, horizon_secs: int, k: int,
                    displacement_margin: int, demoter_kwargs: "dict | None" = None,
-                   flat_usd: float = 25.0) -> pd.Series:
+                   flat_usd: float = 25.0) -> "TrajectoryResult":
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
-    of churn (indexed by ``as_of``). Sequential by construction:
-    ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}`` (issue #421 8c)."""
+    of churn (indexed by ``as_of``) PLUS the final-step followed set (A1). Sequential by
+    construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
+    (issue #421 8c).
+
+    A9 (#436): a period with no eligible set / no surviving signal / an empty followed set yields
+    ``NaN`` (the config held nothing — EXCLUDED from its moments), NOT ``0.0`` (which would be a
+    real, low-variance "traded and made $0" and could out-rank a live config)."""
     demoter = EmpiricalBernsteinDemoter(**(demoter_kwargs or {}))
     policy = build_policy(grid_point.policy, k=k, demoter=demoter,
                           displacement_margin=displacement_margin)
@@ -298,23 +382,29 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     prev: FollowSet = pd.DataFrame({"wallet": [], "weight": []})
     live_pnl = pd.DataFrame(columns=_PNL_COLUMNS)
     returns = []
+    final_follow: FollowSet = pd.DataFrame({"wallet": [], "weight": []})
+    final_scores: WalletScores = pd.DataFrame(columns=["score", "rank"])
     for as_of in as_of_points:
         in_sample, _forward = split_walkforward(
             ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
         eligible = eligible_wallets(in_sample, grid_point.criteria, as_of=as_of)
         candidates = in_sample[in_sample["wallet"].isin(eligible)]   # label-preserving slice
         if candidates.empty:
-            returns.append(0.0)
+            returns.append(np.nan)                                   # A9: no eligible set
             continue
         weights = uniqueness_weights(in_sample)                      # full-frame, aligned index
         scores = estimator.score(candidates, as_of=as_of, weights=weights)
         # Per-wallet deflation: n_trials = the CANDIDATE count being selected among (deflation.py
         # contract), NOT N_GRID — the grid trial count is the grid-level Validators' bar (8c).
-        scores = apply_deflation_gate(scores, in_sample, grid_point.deflator, n_trials=len(scores))
+        scores = apply_deflation_gate(scores, in_sample, grid_point.deflator,
+                                      n_trials=len(scores), weights=weights)
         if scores.empty:
-            returns.append(0.0)
+            returns.append(np.nan)                                   # A9: no surviving signal
             continue
         follow = policy.step(prev, scores, live_pnl, as_of=as_of)
+        if follow.empty:
+            returns.append(np.nan)                                   # A9: policy holds nothing
+            continue
         admissions = _churn(prev, follow)
 
         pnl = runner.run(list(follow["wallet"]), flat_usd=flat_usd)
@@ -323,7 +413,10 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         returns.append(gross - grid_point.churn_cost * admissions)
         live_pnl = pd.concat([live_pnl, window], ignore_index=True)
         prev = follow
-    return pd.Series(returns, index=list(as_of_points), name=grid_point.key)
+        final_follow, final_scores = follow, scores                 # A1: most recent real set
+    return TrajectoryResult(
+        returns=pd.Series(returns, index=list(as_of_points), name=grid_point.key, dtype=float),
+        final_follow=final_follow, final_scores=final_scores)
 
 
 def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
@@ -338,10 +431,13 @@ def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
     return float((per_wallet.loc[common] * weight.loc[common]).sum())
 
 
-def run_trajectories(grid: list, ss: SuffStats, runner, **kwargs) -> pd.DataFrame:
-    """8c — run every grid point's trajectory into a per-period return matrix (index = ``as_of``,
-    columns = config keys) for the grid-level Validators."""
-    return pd.DataFrame({gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid})
+def run_trajectories(grid: list, ss: SuffStats, runner, **kwargs) -> "tuple[pd.DataFrame, dict]":
+    """8c — run every grid point's trajectory. Returns ``(return_matrix, results)`` where
+    ``return_matrix`` is the per-period return matrix (index = ``as_of``, columns = config keys) for
+    the grid-level Validators and ``results`` maps each config key -> its ``TrajectoryResult`` (A1:
+    so the winning config's frozen final-step followed set is selected directly, not re-derived)."""
+    results = {gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid}
+    return pd.DataFrame({key: res.returns for key, res in results.items()}), results
 
 
 # ───────────────────────── leaderboard + winner / NO-GO ─────────────────────────
@@ -363,12 +459,21 @@ def _config_moments(return_matrix: pd.DataFrame) -> pd.DataFrame:
 
 
 def grid_deflate(return_matrix: pd.DataFrame, *, benchmark: str, n_grid: int,
-                 seed: int = 0) -> dict:
-    """Apply the grid-level honesty layer at the pre-registered ``N_GRID`` (LANDMINE-1):
-    Deflated-Sharpe per config, PBO, Romano-Wolf, Hansen-SPA. Returns the assembled results."""
+                 n_trials_dsr: "int | None" = None, seed: int = 0) -> dict:
+    """Apply the grid-level honesty layer (LANDMINE-1): Deflated-Sharpe per config, PBO, Romano-Wolf,
+    Hansen-SPA. Returns the assembled results.
+
+    A2/A8 (#436) — the two trial counts are DIFFERENT by construction, so do not force them equal:
+      * the scalar Deflated-Sharpe ``expected_max_sharpe`` bar takes the FULL pre-screen
+        ``n_trials_dsr`` (every config the menu could have produced, incl. the estimators 8a dropped)
+        — the honest multiplicity of the search;
+      * ``PBO`` / ``RomanoWolf`` / ``HansenSPA`` are bootstrap Validators over the matrix COLUMNS and
+        structurally cannot reflect screened-out / unrun configs, so they take ``n_grid`` (the
+        run-set columns, incl. the benchmark). Documented asymmetry, not a bug (docs/31)."""
+    n_trials_dsr = n_grid if n_trials_dsr is None else n_trials_dsr
     moments = _config_moments(return_matrix)
     deflated = DeflatedSharpe().deflate(
-        moments[["sr", "n_obs", "skew", "kurt"]], n_trials=n_grid, as_of=0)
+        moments[["sr", "n_obs", "skew", "kurt"]], n_trials=n_trials_dsr, as_of=0)
     pbo = PBO().assess(return_matrix, n_configs=n_grid)
     romano = RomanoWolf(benchmark, seed=seed).assess(return_matrix, n_configs=n_grid)
     hansen = HansenSPA(benchmark, seed=seed).assess(return_matrix, n_configs=n_grid)
@@ -390,21 +495,31 @@ def wallet_persistence_cpr(ss: SuffStats, *, split_at: int) -> dict:
     return brown_goetzmann_cpr(p1, p2)
 
 
-def winner_uncertainty(moments: pd.DataFrame, *, top_q: float = 0.05) -> dict:
+def winner_uncertainty(moments: pd.DataFrame, *, winner_config: "str | None" = None,
+                       top_q: float = RANKER_FDR_Q) -> dict:
     """AKM/MRSW/FCR winner's-curse uncertainty on the config leaderboard (each config is an 'arm'
     with estimate = mean per-period return, SE from its dispersion). Reports the conditional
     median-unbiased estimate + CI for the winning config, the top-1 rank confidence set, and
-    FCR-adjusted CIs for the selected (positive-mean) configs."""
-    finite = moments[np.isfinite(moments["se"])]
+    FCR-adjusted CIs for the selected (positive-mean) configs.
+
+    A5 (#436): ``winner_config`` points the AKM block at the config the bake-off actually AWARDED
+    (highest cum-return among RW-superior), which need not be the mean-argmax (default). The caller
+    passes the leaderboard WITH THE BASELINE DROPPED. A config with non-finite SE (zero/degenerate
+    dispersion) cannot carry a conditional CI — handled explicitly rather than crashing."""
+    finite = moments[np.isfinite(moments["se"]) & (moments["se"] > 0)]
     if finite.empty:
         return {"available": False}
+    configs = list(finite.index)
+    if winner_config is not None and winner_config not in configs:
+        return {"available": True, "winner_config": winner_config, "akm": None,
+                "note": "awarded winner has non-finite SE (degenerate dispersion); no conditional CI"}
     estimates = finite["mean"].to_numpy()
     ses = finite["se"].to_numpy()
-    akm = akm_inference_on_winners(estimates, ses)
+    w_idx = configs.index(winner_config) if winner_config is not None else None
+    akm = akm_inference_on_winners(estimates, ses, winner=w_idx)
     mrsw = mrsw_rank_cs(estimates, ses, tau=1)
-    selected = finite["mean"].to_numpy() > 0
+    selected = estimates > 0
     fcr = fcr_selected_ci(estimates, ses, selected, q=top_q)
-    configs = list(finite.index)
     return {
         "available": True,
         "winner_config": configs[akm["winner"]],
@@ -414,23 +529,64 @@ def winner_uncertainty(moments: pd.DataFrame, *, top_q: float = 0.05) -> dict:
     }
 
 
+def _clean_return_matrix(return_matrix: pd.DataFrame, *,
+                         baseline_key: str) -> "tuple[pd.DataFrame | None, dict]":
+    """A9 (#436): exclude no-signal configs/periods before the leaderboard. Drop configs that never
+    produced a signal (all-NaN columns) and make the panel rectangular by dropping periods any
+    surviving config missed — so a dead config is EXCLUDED, not scored a low-variance 0 that
+    out-ranks a live config, and the bootstrap Validators (PBO/RW/SPA) get a dense matrix. Returns
+    ``(clean, info)``, or ``(None, info)`` with a ``reason`` when no verdict is supportable."""
+    non_dead = return_matrix.dropna(axis=1, how="all")
+    info = {"dropped_configs": [c for c in return_matrix.columns if c not in non_dead.columns]}
+    if baseline_key not in non_dead.columns:
+        info["reason"] = "baseline config produced no signal in any period"
+        return None, info
+    clean = non_dead.dropna(axis=0, how="any")
+    info["dropped_periods"] = int(return_matrix.shape[0] - clean.shape[0])
+    if clean.shape[0] < 2:
+        info["reason"] = "insufficient periods after excluding no-signal periods (< 2)"
+        return None, info
+    if clean.shape[1] < 2:
+        info["reason"] = "insufficient configs after excluding no-signal configs (< 2)"
+        return None, info
+    return clean, info
+
+
 def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_grid: int,
-                          cpr: dict, alpha: float = 0.05, seed: int = 0) -> dict:
+                          n_grid_full: "int | None" = None, cpr: dict,
+                          alpha: float = RANKER_FDR_Q, seed: int = 0) -> dict:
     """The §Acceptance bar (issue #421): a config is the recommended winner only if it beats
     ``t_stat_baseline`` on cumulative forward copy P&L net of churn, AND that margin survives
-    grid-deflated significance (low PBO / Romano-Wolf superior / Hansen-SPA at ``N_GRID``), AND the
-    ``brown_goetzmann_cpr`` go-check passes (``cpr``, the wallet-persistence premise). Otherwise the
-    deliverable is an explicit NO-GO."""
-    deflation = grid_deflate(return_matrix, benchmark=baseline_key, n_grid=n_grid, seed=seed)
-    moments = deflation["moments"]
+    grid-deflated significance (Romano-Wolf superior / Hansen-SPA at ``alpha`` / ``PBO`` below
+    ``ranker_pbo_max``), AND the ``brown_goetzmann_cpr`` go-check passes. Otherwise the deliverable
+    is an explicit NO-GO.
 
+    A5/A6/A9/A11 (#436): the verdict iterates challengers by descending cum-return and awards the
+    FIRST that is RW-superior and beats the baseline (not the cum-argmax, which may be an uncertified
+    high-variance config); ``ranker_pbo_max`` / ``ranker_fdr_q`` are wired (were hardcoded); the
+    no-signal panel is cleaned first; and the winner's grid-DSR is reported as an advisory."""
+    n_grid_full = n_grid if n_grid_full is None else n_grid_full
+    clean, info = _clean_return_matrix(return_matrix, baseline_key=baseline_key)
+    base = {"n_grid": n_grid, "n_grid_full_pre_screen": n_grid_full, "baseline_key": baseline_key,
+            "cpr_go": bool(cpr.get("go", False)),
+            "dropped_configs": info.get("dropped_configs", []),
+            "dropped_periods": info.get("dropped_periods", 0)}
+    if clean is None:
+        # Always carry a (here empty) leaderboard so the operator-run output writer is uniform.
+        return {**base, "leaderboard": pd.DataFrame(), "winner": None, "status": "NO-GO",
+                "reason": info["reason"]}
+
+    deflation = grid_deflate(clean, benchmark=baseline_key, n_grid=n_grid,
+                             n_trials_dsr=n_grid_full, seed=seed)
+    moments = deflation["moments"]
+    deflated = deflation["deflated"]
     baseline_cum = float(moments.loc[baseline_key, "cum_return"])
     challengers = moments.drop(index=baseline_key)
+    pbo_val = float(deflation["pbo"]["pbo"].iloc[0])
+    spa_val = float(deflation["hansen_spa"]["spa_pvalue_consistent"].iloc[0])
     decision = {
-        "n_grid": n_grid, "baseline_key": baseline_key, "baseline_cum_return": baseline_cum,
-        "cpr_go": bool(cpr.get("go", False)),
-        "pbo": float(deflation["pbo"]["pbo"].iloc[0]),
-        "hansen_spa_pvalue": float(deflation["hansen_spa"]["spa_pvalue_consistent"].iloc[0]),
+        **base, "baseline_cum_return": baseline_cum,
+        "pbo": pbo_val, "hansen_spa_pvalue": spa_val,
         "leaderboard": moments.sort_values("cum_return", ascending=False),
     }
     if challengers.empty:
@@ -438,24 +594,38 @@ def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_g
 
     superior = set(deflation["romano_wolf"].loc[
         deflation["romano_wolf"]["beats_benchmark"], "config"])
-    best = challengers["cum_return"].idxmax()
-    spa_ok = decision["hansen_spa_pvalue"] < alpha
-    pbo_ok = decision["pbo"] < 0.5
-    beats = float(moments.loc[best, "cum_return"]) > baseline_cum
-    survives = (best in superior) and spa_ok and pbo_ok
-    if beats and survives and decision["cpr_go"]:
-        return {**decision, "winner": best, "status": "WINNER",
-                "uncertainty": winner_uncertainty(moments),
-                "reason": "beats baseline, survives grid deflation, CPR go"}
+    spa_ok = spa_val < alpha
+    pbo_ok = pbo_val < RANKER_PBO_MAX            # NaN < x is False -> degenerate PBO fails safe
+    # A5 (#436): award the highest-cum-return RW-superior config that beats the baseline.
+    winner = None
+    for cfg in challengers.sort_values("cum_return", ascending=False).index:
+        if float(moments.loc[cfg, "cum_return"]) > baseline_cum and cfg in superior:
+            winner = cfg
+            break
+    if winner is not None and spa_ok and pbo_ok and decision["cpr_go"]:
+        est_name = winner.split("|")[0]
+        winner_dsr = float(deflated.loc[winner, "dsr"]) if winner in deflated.index else float("nan")
+        baseline_estimator_win = est_name == BASELINE_ESTIMATOR
+        return {**decision, "winner": winner, "status": "WINNER",
+                "winner_estimator": est_name,
+                # A11 (#436): a baseline-ESTIMATOR config can only win on its policy/criteria/churn.
+                "baseline_estimator_win": bool(baseline_estimator_win),
+                # A6 (#436): grid-DSR is advisory — surfaced + flagged, not gated (see RANKER_*).
+                "winner_grid_dsr": winner_dsr,
+                "grid_dsr_advisory_low": bool(not np.isnan(winner_dsr)
+                                              and winner_dsr < RANKER_GRID_DSR_MIN),
+                "uncertainty": winner_uncertainty(challengers, winner_config=winner),
+                "reason": ("policy/criteria-only win (baseline estimator); RW-superior, "
+                           "PBO/SPA clear, CPR go" if baseline_estimator_win
+                           else "beats baseline, RW-superior, PBO/SPA clear, CPR go")}
     reason = []
-    if not beats:
-        reason.append("does not beat baseline cum return")
-    if best not in superior:
-        reason.append("not Romano-Wolf superior")
+    if winner is None:
+        reason.append("no challenger is Romano-Wolf superior and beats baseline cum return")
     if not spa_ok:
-        reason.append(f"Hansen-SPA p={decision['hansen_spa_pvalue']:.3f} >= {alpha}")
+        reason.append(f"Hansen-SPA p={spa_val:.3f} >= {alpha}")
     if not pbo_ok:
-        reason.append(f"PBO={decision['pbo']:.2f} >= 0.5")
+        reason.append("PBO undefined (degenerate leaderboard dispersion)" if np.isnan(pbo_val)
+                      else f"PBO={pbo_val:.2f} >= {RANKER_PBO_MAX}")
     if not decision["cpr_go"]:
         reason.append("CPR no-go")
     return {**decision, "winner": None, "status": "NO-GO", "reason": "; ".join(reason)}
@@ -516,18 +686,20 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
                 created_at: int = 0, seed: int = 0) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). 8a prunes the estimator
     axis BEFORE ``N_GRID`` is frozen (it only ever shrinks the grid — never grows it post-hoc)."""
+    n_grid_full = len(axes.enumerate_grid())     # A2: FULL pre-screen trial count for the DSR bar
     survivors = screen_estimators(
         ss, list(axes.estimators), as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
-        k=params.k, keep=params.screen_keep)
+        k=params.k, keep=params.screen_keep, criteria=axes.criteria[0])   # A3: canonical criteria
     pruned_axes = BakeoffAxes(
         estimators=tuple(e for e in axes.estimators if e in survivors),
         deflators=axes.deflators, policies=axes.policies,
         criteria=axes.criteria, churn_costs=axes.churn_costs)
     manifest = pre_register_grid(pruned_axes, created_at=created_at)
     grid = pruned_axes.enumerate_grid()
+    grid_by_key = {g.key: g for g in grid}        # A1: thread GridPoints, never re-parse a key
     baseline_key = _baseline_key(pruned_axes)
-    return_matrix = run_trajectories(
+    return_matrix, results = run_trajectories(
         grid, ss, runner, as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
@@ -535,9 +707,23 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     split_at = int(np.median(params.as_of_points))
     cpr = wallet_persistence_cpr(ss, split_at=split_at)
     decision = select_winner_or_nogo(
-        return_matrix, baseline_key=baseline_key, n_grid=manifest["n_grid"], cpr=cpr, seed=seed)
+        return_matrix, baseline_key=baseline_key, n_grid=manifest["n_grid"],
+        n_grid_full=n_grid_full, cpr=cpr, seed=seed)
+    # A1 (#436): the deliverable is the WINNING trajectory's frozen final-step followed set (the set
+    # the winner actually rode), selected directly from the captured results — never a cold re-score
+    # at the latest as_of (which degenerates stateful policies). Falls back to the baseline on NO-GO.
+    winner_key = decision["winner"] or baseline_key
+    winner_res = results.get(winner_key)
+    deliverable = {
+        "winner_key": winner_key,
+        "grid_point": grid_by_key.get(winner_key),
+        "follow": winner_res.final_follow if winner_res is not None
+        else pd.DataFrame({"wallet": [], "weight": []}),
+        "scores": winner_res.final_scores if winner_res is not None
+        else pd.DataFrame(columns=["score", "rank"]),
+    }
     return {"manifest": manifest, "survivors": survivors, "return_matrix": return_matrix,
-            "cpr": cpr, "decision": decision}
+            "cpr": cpr, "decision": decision, "deliverable": deliverable}
 
 
 def _baseline_key(axes: BakeoffAxes) -> str:
@@ -632,19 +818,20 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     (out_dir / "decision.json").write_text(json.dumps(status, indent=2, default=str))
     print(f"bake-off {result['decision']['status']}: {result['decision']['reason']}")
 
-    # Cross-check the recommended wallets (the winning — or baseline — estimator's latest ranking)
-    # against the live cohort's realized P&L from Supabase (issue #421 §Deliverable).
+    # Cross-check the deliverable — the WINNING config's frozen final-step followed set (A1, #436;
+    # the set the winner actually rode, applying its criteria/eligibility/deflation/policy), NOT a
+    # cold re-score on the un-sliced in-sample — against the live cohort's realized P&L from Supabase
+    # (issue #421 §Deliverable). Falls back to the baseline config's set on a NO-GO.
     try:
-        winner = result["decision"]["winner"]
-        est_name = winner.split("|")[0] if winner else BASELINE_ESTIMATOR
-        in_sample, _ = split_walkforward(ss, as_of=as_of_points[-1], train_secs=params.train_secs,
-                                         horizon_secs=params.horizon_secs)
-        scores = ESTIMATOR_REGISTRY[est_name]().score(
-            in_sample, as_of=as_of_points[-1], weights=uniqueness_weights(in_sample))
-        crosscheck = paper_fills_crosscheck(scores.reset_index(), fetch_paper_fills_realized_pnl())
+        deliverable = result["deliverable"]
+        scores, follow = deliverable["scores"], deliverable["follow"]
+        followed = (scores.loc[scores.index.intersection(list(follow["wallet"]))]
+                    if not scores.empty else scores)
+        crosscheck = paper_fills_crosscheck(followed.reset_index(), fetch_paper_fills_realized_pnl())
         crosscheck.to_csv(out_dir / "paper_fills_crosscheck.csv", index=False)
-        print(f"paper_fills cross-check: {int(crosscheck['disagree'].sum())} live-loser flags "
-              f"of {len(crosscheck)} overlapping wallets")
+        print(f"paper_fills cross-check ({deliverable['winner_key']}): "
+              f"{int(crosscheck['disagree'].sum())} live-loser flags of {len(crosscheck)} "
+              "overlapping wallets")
     except Exception as exc:  # advisory: an operator env without Supabase creds must not abort
         print(f"paper_fills cross-check skipped: {exc}")
 

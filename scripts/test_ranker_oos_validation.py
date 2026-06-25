@@ -101,6 +101,23 @@ class PBOTest(unittest.TestCase):
         pbo_gen = PBO(s_groups=8).assess(genuine, n_configs=n)["pbo"].iloc[0]
         self.assertGreater(pbo_noise, pbo_gen)
 
+    def test_flat_matrix_is_degenerate_nan(self) -> None:
+        # A7 (#436): every config identical -> near-zero cross-config dispersion -> PBO undefined.
+        # The old `<=`-rank tie rule silently returned 0.0 (reads as "not overfit").
+        flat = _matrix({f"c{j}": [1.0] * 16 for j in range(5)})
+        out = PBO(s_groups=8).assess(flat, n_configs=5)
+        self.assertTrue(np.isnan(out["pbo"].iloc[0]))
+        self.assertTrue(bool(out["degenerate"].iloc[0]))
+
+    def test_tie_free_matrix_unchanged_by_midrank(self) -> None:
+        # A7 (#436): on tie-free data the strict-better + fractional-tie midrank reduces exactly to
+        # the legacy `worse + 1`, so the genuine-dominant case still scores PBO 0.0 (not degenerate).
+        genuine = _matrix({f"c{j}": ([1.0] * 16 if j == 0 else [float(j) * 0.1] * 16)
+                           for j in range(5)})
+        out = PBO(s_groups=8).assess(genuine, n_configs=5)
+        self.assertFalse(bool(out["degenerate"].iloc[0]))
+        self.assertEqual(out["pbo"].iloc[0], 0.0)
+
 
 def _leaderboard(seed: int, *, with_edge: bool) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
@@ -201,6 +218,23 @@ class AKMWinnersTest(unittest.TestCase):
     def test_empty_raises(self) -> None:
         with self.assertRaises(ValueError):
             akm_inference_on_winners([], [])
+
+    def test_named_winner_that_is_the_max_is_conditional(self) -> None:
+        # A5 (#436): pointing at the actual argmax -> the conditional truncated-normal shrinkage.
+        est = np.array([3.0, 1.0, 0.5])
+        out = akm_inference_on_winners(est, np.ones(3), winner=0)
+        self.assertEqual(out["winner"], 0)
+        self.assertTrue(out["conditional"])
+        self.assertLess(out["median_unbiased"], out["naive_estimate"])
+
+    def test_named_winner_below_max_falls_back_unconditional(self) -> None:
+        # A5 (#436): the awarded winner need not be the argmax; when it is not, the "selected==max"
+        # event does not hold -> report the honest UNCONDITIONAL CI, not a spurious shrinkage.
+        est = np.array([3.0, 1.0, 0.5])
+        out = akm_inference_on_winners(est, np.ones(3), winner=1)
+        self.assertEqual(out["winner"], 1)
+        self.assertFalse(out["conditional"])
+        self.assertEqual(out["median_unbiased"], 1.0)           # naive (no truncation correction)
 
 
 class MRSWRankCSTest(unittest.TestCase):
