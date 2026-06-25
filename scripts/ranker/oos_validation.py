@@ -114,6 +114,15 @@ class PBO:
             s -= 1
         if s < 2:
             raise ValueError("PBO needs >= 2 periods")
+        # A7 (#436): refuse PBO under near-zero cross-config dispersion. When every config performs
+        # ~identically the IS-best / OOS-rank machinery is meaningless, and the old `<=`-rank tie
+        # rule silently returned PBO=0 (reads as "not overfit"). Emit NaN + a `degenerate` flag so
+        # the winner gate fails SAFE (a flat/all-equal leaderboard cannot be certified) rather than
+        # treating an undefined PBO as a pass.
+        degenerate = n_cols < 2 or bool(np.ptp(np.nanmean(matrix, axis=0)) < 1e-12)
+        if degenerate:
+            return pd.DataFrame({"pbo": [float("nan")], "n_combinations": [0],
+                                 "s_groups": [int(s)], "degenerate": [True]})
         groups = np.array_split(np.arange(n_periods), s)
         logits = []
         for is_groups in combinations(range(s), s // 2):
@@ -123,12 +132,20 @@ class PBO:
             is_perf = matrix[is_rows].mean(axis=0)
             oos_perf = matrix[oos_rows].mean(axis=0)
             best = int(np.argmax(is_perf))
-            oos_rank = float((oos_perf <= oos_perf[best]).sum())   # 1 = worst .. n_cols = best
+            # A7 (#436): strict-better + fractional-tie MIDRANK (1 = worst .. n_cols = best). The old
+            # `(oos_perf <= oos_perf[best]).sum()` counted every config TIED with the IS-best as
+            # "beaten", inflating its OOS rank to n_cols and masking overfit on tie-heavy data. A
+            # tie block now shares the average rank (worse + (equal+1)/2); on tie-free data
+            # equal==1 so this reduces exactly to the old `worse + 1`.
+            worse = int((oos_perf < oos_perf[best]).sum())
+            equal = int((oos_perf == oos_perf[best]).sum())       # includes best itself (>= 1)
+            oos_rank = worse + (equal + 1) / 2.0
             omega = min(max(oos_rank / (n_cols + 1.0), 1e-6), 1.0 - 1e-6)
             logits.append(math.log(omega / (1.0 - omega)))
         logits = np.asarray(logits)
         return pd.DataFrame({"pbo": [float((logits < 0).mean())],
-                             "n_combinations": [int(logits.size)], "s_groups": [int(s)]})
+                             "n_combinations": [int(logits.size)], "s_groups": [int(s)],
+                             "degenerate": [False]})
 
 
 class RomanoWolf:
@@ -264,7 +281,8 @@ def _truncated_normal_cdf(y: float, theta: float, sigma: float, lower: float) ->
     return (float(norm.cdf((y - theta) / sigma)) - float(norm.cdf(a))) / den
 
 
-def akm_inference_on_winners(estimates, ses, *, alpha: float = 0.05) -> dict:
+def akm_inference_on_winners(estimates, ses, *, winner: "int | None" = None,
+                             alpha: float = 0.05) -> dict:
     """Winner's-curse-corrected inference on the SELECTED winner (Andrews-Kitagawa-McCloskey,
     QJE 2024) — issue #421 ``akm_inference_on_winners``.
 
@@ -275,21 +293,32 @@ def akm_inference_on_winners(estimates, ses, *, alpha: float = 0.05) -> dict:
     per-candidate estimates as approximately independent ``N(theta_k, se_k^2)`` (the conditional
     variant; the full hybrid is a pluggable menu extension).
 
-    Returns ``{winner, naive_estimate, median_unbiased, ci_lo, ci_hi, truncation}``.
+    ``winner`` selects which arm to condition on (default ``argmax``). Issue #436 A5: the bake-off
+    awards the highest-cumulative-return RW-superior config, which need not be the mean-argmax; when
+    the named winner is NOT the max its selection event is not ``Y_w >= max others``, so the
+    truncated-normal conditioning is ill-posed — this falls back to the honest UNCONDITIONAL normal
+    CI (``conditional=False``) instead of a spurious shrinkage.
+
+    Returns ``{winner, naive_estimate, median_unbiased, ci_lo, ci_hi, truncation, conditional}``.
     """
     estimates = np.asarray(estimates, dtype=float)
     ses = np.asarray(ses, dtype=float)
     if estimates.size == 0:
         raise ValueError("akm_inference_on_winners needs >= 1 estimate")
-    w = int(np.argmax(estimates))
+    w = int(np.argmax(estimates)) if winner is None else int(winner)
     y, s = float(estimates[w]), float(ses[w])
     z = float(norm.ppf(1.0 - alpha / 2.0))
     if estimates.size == 1:                                     # no competitors -> no truncation
         return {"winner": w, "naive_estimate": y, "median_unbiased": y,
-                "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": float("-inf")}
+                "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": float("-inf"),
+                "conditional": False}
+    lower = float(np.max(np.delete(estimates, w)))             # runner-up = truncation bound
+    if y < lower:                                              # A5: named winner is not the max
+        return {"winner": w, "naive_estimate": y, "median_unbiased": y,
+                "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": lower,
+                "conditional": False}
     from scipy.optimize import brentq
 
-    lower = float(np.max(np.delete(estimates, w)))             # runner-up = truncation bound
     lo_b, hi_b = y - 20.0 * s, y + 20.0 * s
 
     def solve(target: float) -> float:                         # F decreasing in theta -> bracketed
@@ -299,7 +328,7 @@ def akm_inference_on_winners(estimates, ses, *, alpha: float = 0.05) -> dict:
     return {"winner": w, "naive_estimate": y,
             "median_unbiased": solve(0.5),
             "ci_lo": solve(1.0 - alpha / 2.0), "ci_hi": solve(alpha / 2.0),
-            "truncation": lower}
+            "truncation": lower, "conditional": True}
 
 
 def mrsw_rank_cs(estimates, ses, *, tau: int, alpha: float = 0.05) -> pd.DataFrame:

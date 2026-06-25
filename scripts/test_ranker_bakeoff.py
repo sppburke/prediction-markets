@@ -193,15 +193,20 @@ class TrajectoryTest(unittest.TestCase):
                       k=5, displacement_margin=5)
         a = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs)
         b = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs)
-        self.assertEqual(list(a.index), self.points)
-        self.assertTrue(a.equals(b))                             # bit-deterministic
+        self.assertEqual(list(a.returns.index), self.points)
+        self.assertTrue(a.returns.equals(b.returns))             # bit-deterministic
+        # A1 (#436): the final-step followed set + scores are captured for the deliverable.
+        self.assertGreater(len(a.final_follow), 0)
+        self.assertEqual(list(a.final_scores.columns), ["score", "rank"])
+        self.assertTrue(set(a.final_follow["wallet"]).issubset(set(a.final_scores.index)))
 
     def test_churn_cost_reduces_return_when_set_changes(self) -> None:
         runner = _FakeRunner(self.value, self.points, self.horizon)
         kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
                       k=5, displacement_margin=5)
-        free = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs)
-        costed = bo.run_trajectory(self._gp("policy_full_rerank", 10.0), self.ss, runner, **kwargs)
+        free = bo.run_trajectory(self._gp("policy_full_rerank", 0.0), self.ss, runner, **kwargs).returns
+        costed = bo.run_trajectory(self._gp("policy_full_rerank", 10.0),
+                                   self.ss, runner, **kwargs).returns
         admissions = (free - costed) / 10.0                      # difference == churn_cost x admits
         self.assertTrue((admissions >= -1e-9).all())
         self.assertGreater(admissions.sum(), 0)                  # full-rerank churns -> paid a cost
@@ -280,6 +285,246 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn(a["decision"]["status"], {"WINNER", "NO-GO"})
         self.assertTrue(a["return_matrix"].equals(b["return_matrix"]))
         self.assertEqual(a["decision"]["status"], b["decision"]["status"])
+
+
+class GridCollisionTest(unittest.TestCase):
+    """A8 (#436): a duplicate axis level (here, the same Criteria twice) yields colliding config
+    keys that would silently merge two matrix columns — pre-registration must fail loudly."""
+
+    def test_duplicate_criteria_level_raises(self) -> None:
+        c = Criteria(0, 72.0, 0.0, 1.0, 0.0, 0)
+        axes = _axes(criteria=(c, c))
+        with self.assertRaises(ValueError):
+            bo.pre_register_grid(axes)
+
+
+class WeightedGateTest(unittest.TestCase):
+    """A4 (#436): the deflation gate's Sharpe is uniqueness-weighted (agrees with the ranker)."""
+
+    def _scores(self):
+        return pd.DataFrame({"score": [0.9], "rank": [1]}, index=["w"])
+
+    def test_gate_respects_uniqueness_weights(self) -> None:
+        # net edge = (payoff - _eff)/_eff = [+1, +1, -1, -1, -1] at _eff=0.5: loss-tilted ->
+        # negative Sharpe under uniform weights, positive once the losers are down-weighted.
+        in_sample = pd.DataFrame({"wallet": ["w"] * 5, "payoff": [1.0, 1.0, 0.0, 0.0, 0.0],
+                                  "_eff": [0.5] * 5})
+        dropped = bo.apply_deflation_gate(self._scores(), in_sample, DeflatedSharpe.name,
+                                          n_trials=5, weights=np.ones(5), threshold=0.5)
+        kept = bo.apply_deflation_gate(self._scores(), in_sample, DeflatedSharpe.name, n_trials=5,
+                                       weights=np.array([2.0, 2.0, 0.5, 0.5, 0.5]), threshold=0.5)
+        self.assertNotIn("w", dropped.index)    # uniform weights -> loss-tilted -> low Sharpe -> drop
+        self.assertIn("w", kept.index)          # down-weighting the losers raises weighted Sharpe
+
+    def test_zero_dispersion_positive_not_vetoed(self) -> None:
+        # A10 (#436): constant positive net edge (sd=0) has an UNDEFINED (not low) Sharpe; the gate
+        # must not silently veto an estimator's pick for one.
+        in_sample = pd.DataFrame({"wallet": ["w"] * 3, "payoff": [1.0, 1.0, 1.0], "_eff": [0.5] * 3})
+        out = bo.apply_deflation_gate(self._scores(), in_sample, DeflatedSharpe.name, n_trials=5,
+                                      weights=np.ones(3), threshold=0.5)
+        self.assertIn("w", out.index)
+
+
+class PreScreenNTest(unittest.TestCase):
+    """A2 (#436): the scalar Deflated-Sharpe bar takes the FULL pre-screen trial count; PBO/RW/SPA
+    take the run-set columns. A larger pre-screen N is a strictly higher (lower-DSR) bar."""
+
+    def _matrix(self):
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, 150)
+        return pd.DataFrame({"baseline": base, "edge": base + 0.6,
+                             "n0": base + rng.normal(0, 1, 150), "n1": base + rng.normal(0, 1, 150)})
+
+    def test_dsr_bar_rises_with_pre_screen_n(self) -> None:
+        m = self._matrix()
+        small = bo.grid_deflate(m, benchmark="baseline", n_grid=4, n_trials_dsr=4)
+        big = bo.grid_deflate(m, benchmark="baseline", n_grid=4, n_trials_dsr=400)
+        self.assertLessEqual(float(big["deflated"]["dsr"].mean()),
+                             float(small["deflated"]["dsr"].mean()) + 1e-9)
+        # PBO/RW/SPA are unchanged by the DSR trial count (they read the matrix columns).
+        self.assertEqual(float(small["pbo"]["pbo"].iloc[0]), float(big["pbo"]["pbo"].iloc[0]))
+
+    def test_run_bakeoff_records_pre_screen_n(self) -> None:
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(10)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        runner = _FakeRunner(value, points, 1_000_000)
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3})
+        axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill", "gu_koenker_npmle"),
+                     deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",))
+        res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
+        # screen_keep=1 prunes >= 1 estimator, so the run grid is smaller than the pre-screen grid.
+        self.assertGreaterEqual(res["decision"]["n_grid_full_pre_screen"], res["manifest"]["n_grid"])
+        self.assertEqual(res["decision"]["n_grid_full_pre_screen"], len(axes.enumerate_grid()))
+
+
+class CleanMatrixTest(unittest.TestCase):
+    """A9 (#436): no-signal configs/periods are EXCLUDED, not scored a low-variance 0."""
+
+    def _matrix(self):
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, 150)
+        return pd.DataFrame({"baseline": base, "challenger": base + 0.8,
+                             "n0": base + rng.normal(0, 1, 150)})
+
+    def test_dead_config_dropped_not_scored_zero(self) -> None:
+        m = self._matrix()
+        m["dead"] = np.nan                       # a config that never produced a signal
+        d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertIn("dead", d["dropped_configs"])
+        self.assertNotIn("dead", d["leaderboard"].index)        # excluded, not a 0-variance arm
+        self.assertEqual(d["winner"], "challenger")
+
+    def test_baseline_no_signal_is_nogo_with_uniform_output(self) -> None:
+        m = pd.DataFrame({"baseline": [np.nan] * 150, "challenger": [1.0] * 150})
+        d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertEqual(d["status"], "NO-GO")
+        self.assertIn("baseline", d["reason"])
+        self.assertIn("leaderboard", d)                         # uniform shape for the output writer
+
+    def test_nan_period_is_excluded_rectangular(self) -> None:
+        m = self._matrix()
+        m.loc[0, "n0"] = np.nan                   # n0 had no signal in period 0
+        d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertEqual(d["dropped_periods"], 1)               # that period dropped for all configs
+        self.assertEqual(d["winner"], "challenger")
+
+    def test_run_trajectory_emits_nan_for_no_signal_period(self) -> None:
+        # An as_of before any in-sample data exists -> no eligible set -> NaN (not a real $0).
+        raw = pd.DataFrame(
+            [("w1", "m1", 1, 5_000_000, 3600, 0.5, 10, 1.0, 5_005_000, 0.55),
+             ("w1", "m2", 1, 5_100_000, 3600, 0.5, 10, 0.0, 5_105_000, 0.45),
+             ("w2", "m3", 1, 5_000_000, 3600, 0.5, 10, 1.0, 5_005_000, 0.55),
+             ("w2", "m4", 1, 5_100_000, 3600, 0.5, 10, 0.0, 5_105_000, 0.45)],
+            columns=["wallet", "market_id", "outcome_id", "entry_ts", "ttr_secs", "price",
+                     "contracts", "payoff", "resolved_at", "close_proxy"])
+        ss = derive_columns(raw)
+        runner = _FakeRunner({"w1": 1.0, "w2": -1.0}, [6_000_000], 1_000_000)
+        gp = bo.GridPoint("t_stat_baseline", bo.NO_DEFLATION, "policy_full_rerank",
+                          Criteria(0, 72.0, 0.0, 1.0, 0.0, 0), 0.0)
+        out = bo.run_trajectory(gp, ss, runner, as_of_points=[1_000_000, 6_000_000],
+                                train_secs=3_000_000, horizon_secs=1_000_000, k=5,
+                                displacement_margin=5)
+        self.assertTrue(np.isnan(out.returns.iloc[0]))           # too early -> no signal -> NaN
+        self.assertFalse(np.isnan(out.returns.iloc[1]))          # populated period -> a real number
+
+
+class A1DeliverableTest(unittest.TestCase):
+    """A1 (#436): the deliverable is the WINNING trajectory's frozen final-step followed set, not a
+    cold re-application (which degenerates stateful policies)."""
+
+    def test_deliverable_matches_decision_winner(self) -> None:
+        ss, skill = _population(4, good=8, bad=12, n_pos=70)
+        points = [3_000_000 + i * 1_000_000 for i in range(12)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        runner = _FakeRunner(value, points, 1_000_000)
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3})
+        axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"), policies=_POLICIES)
+        res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
+        deliverable = res["deliverable"]
+        expected_key = res["decision"]["winner"] or res["decision"]["baseline_key"]
+        self.assertEqual(deliverable["winner_key"], expected_key)
+        self.assertIsNotNone(deliverable["grid_point"])          # threaded GridPoint, not re-parsed
+        self.assertEqual(deliverable["grid_point"].key, expected_key)
+        followed = set(deliverable["follow"]["wallet"])
+        if followed:                                             # came from THAT config's scoring
+            self.assertTrue(followed.issubset(set(deliverable["scores"].index)))
+
+    def test_online_weighting_final_set_is_evolved_not_cold(self) -> None:
+        from ranker.selectors import OnlineExpWeights
+        ss, skill = _population(13, good=5, bad=5, n_pos=60)
+        points = [2_000_000 + i * 900_000 for i in range(8)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        runner = _FakeRunner(value, points, 900_000)
+        gp = bo.GridPoint("eb_shrinkage_skill", bo.NO_DEFLATION, "policy_online_weighting",
+                          Criteria(0, 72.0, 0.0, 1.0, 0.0, 0), 0.0)
+        res = bo.run_trajectory(gp, ss, runner, as_of_points=points, train_secs=2_000_000,
+                                horizon_secs=900_000, k=5, displacement_margin=5)
+        # A cold re-apply of the online selector (empty state) reseeds the EWMA at the final scores;
+        # the captured set is the EWMA-EVOLVED one — they must differ (proves A1 captures the run).
+        cold, _ = OnlineExpWeights().select(res.final_scores, k=5, state=None)
+        self.assertFalse(res.final_follow.reset_index(drop=True).equals(cold.reset_index(drop=True)))
+
+
+class ChallengerIterationTest(unittest.TestCase):
+    """A5 (#436): award the highest-cum-return RW-superior config, not the cum-argmax (which may be
+    an uncertified high-variance config). The RW-superior set is controlled directly here (as the
+    CLI tests control ``get_engine``) so the test exercises A5's ITERATION, not arch's bootstrap —
+    whose shared FWER null is too sensitive to a lucky-noise config to construct deterministically."""
+
+    def test_uncertified_cum_argmax_is_skipped_for_certified_config(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, 60)
+        # lucky has the LARGEST cumulative return; steady is the only RW-certified challenger.
+        m = pd.DataFrame({"baseline": base, "lucky": base + 1.0, "steady": base + 0.5})
+        self.assertGreater(float(m["lucky"].sum()), float(m["steady"].sum()))
+        fake = {
+            "moments": bo._config_moments(m),
+            "deflated": pd.DataFrame({"dsr": [0.9, 0.9, 0.9]},
+                                     index=["baseline", "lucky", "steady"]),
+            "pbo": pd.DataFrame({"pbo": [0.1]}),
+            "hansen_spa": pd.DataFrame({"spa_pvalue_consistent": [0.001]}),
+            "romano_wolf": pd.DataFrame({"config": ["lucky", "steady"],
+                                         "beats_benchmark": [False, True]}),
+        }
+        orig = bo.grid_deflate
+        bo.grid_deflate = lambda *a, **k: fake
+        try:
+            d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        finally:
+            bo.grid_deflate = orig
+        self.assertEqual(d["status"], "WINNER")
+        self.assertEqual(d["winner"], "steady")                 # the certified one, not the argmax
+        self.assertEqual(d["uncertainty"]["winner_config"], "steady")
+
+
+class BaselineEstimatorWinTest(unittest.TestCase):
+    """A11 (#436): a winning config whose ESTIMATOR is the baseline can only have won on its
+    policy/criteria/churn — label it so 'beats baseline' is not read as an estimator lift."""
+
+    def test_baseline_estimator_win_is_labeled(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, 200)
+        baseline_key = "t_stat_baseline|none|policy_full_rerank|crit|churn0.0"
+        winner_key = "t_stat_baseline|none|policy_knockout_backfill|crit|churn0.0"
+        m = pd.DataFrame({baseline_key: base, winner_key: base + 0.8,
+                          "n0": base + rng.normal(0, 1, 200)})
+        d = bo.select_winner_or_nogo(m, baseline_key=baseline_key, n_grid=20, cpr={"go": True})
+        self.assertEqual(d["status"], "WINNER")
+        self.assertEqual(d["winner"], winner_key)
+        self.assertTrue(d["baseline_estimator_win"])
+        self.assertIn("policy/criteria-only", d["reason"])
+
+
+class DegeneratePBOTest(unittest.TestCase):
+    """A7 (#436): a flat leaderboard (near-zero cross-config dispersion) cannot be certified — the
+    winner gate fails SAFE rather than reading an undefined PBO as a pass."""
+
+    def test_flat_leaderboard_is_nogo(self) -> None:
+        flat = pd.DataFrame({"baseline": [1.0] * 200, "c1": [1.0] * 200, "c2": [1.0] * 200})
+        d = bo.select_winner_or_nogo(flat, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertEqual(d["status"], "NO-GO")
+
+
+class ThresholdsWiredTest(unittest.TestCase):
+    """A6 (#436): the glossary thresholds are wired (were hardcoded); grid-DSR is advisory."""
+
+    def test_constants_match_glossary(self) -> None:
+        self.assertEqual(bo.RANKER_PBO_MAX, 0.5)
+        self.assertEqual(bo.RANKER_DSR_MIN, 0.5)
+        self.assertEqual(bo.RANKER_GRID_DSR_MIN, 0.95)
+
+    def test_winner_surfaces_advisory_grid_dsr(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, 200)
+        m = pd.DataFrame({"baseline": base, "challenger": base + 0.8,
+                          "n0": base + rng.normal(0, 1, 200)})
+        d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertEqual(d["status"], "WINNER")
+        self.assertIn("winner_grid_dsr", d)                     # surfaced, not silently ignored
+        self.assertIn("grid_dsr_advisory_low", d)
 
 
 class CliEngineTest(unittest.TestCase):
