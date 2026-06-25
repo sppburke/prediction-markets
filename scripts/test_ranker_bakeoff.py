@@ -635,5 +635,206 @@ class MinPeriodsFloorTest(unittest.TestCase):
         self.assertNotIn("insufficient periods", d.get("reason", ""))
 
 
+class PhaseDConstantsTest(unittest.TestCase):
+    """D1/D2/D3 (#436): the calibrated knobs match the glossary, and the swept criteria grid pins the
+    operator-default level FIRST so criteria[0] stays the canonical 8a-screen / baseline level."""
+
+    def test_constants_match_glossary(self) -> None:
+        self.assertEqual(bo.RANKER_CHURN_COST_USD, 0.75)        # ranker_churn_cost_usd (D3)
+        self.assertEqual(bo.RANKER_BAKEOFF_MAX_BACKTESTS, 30_000)  # ranker_bakeoff_max_backtests (D2)
+
+    def test_default_grid_is_12_levels_canonical_first(self) -> None:
+        grid = bo.build_criteria_grid()
+        self.assertEqual(len(grid), 12)                         # 3 TTR × 2 bands × 2 min_trl
+        self.assertEqual(len(set(grid)), 12)                    # all distinct -> no A8 key collision
+        self.assertEqual(grid[0], bo.OPERATOR_DEFAULT_CRITERIA)
+        self.assertEqual((grid[0].ttr_hours, grid[0].price_min, grid[0].price_max, grid[0].min_trl),
+                         (72.0, 0.15, 0.85, 0))                 # 72h / wide band / no gate = canonical
+
+    def test_custom_levels_first_is_canonical(self) -> None:
+        grid = bo.build_criteria_grid(ttr_hours_levels=(24.0,), price_bands=((0.3, 0.7),),
+                                      min_trl_levels=(5,))
+        self.assertEqual(len(grid), 1)
+        self.assertEqual((grid[0].ttr_hours, grid[0].price_min, grid[0].min_trl), (24.0, 0.3, 5))
+
+    def test_half_life_and_recency_held_constant_not_swept(self) -> None:
+        # half_life is carried-but-inert in v1, so the grid never varies it (sweeping it would only
+        # duplicate columns); active_within is likewise held at the operator default.
+        grid = bo.build_criteria_grid()
+        self.assertEqual({c.half_life_days for c in grid}, {0.0})
+        self.assertEqual({c.active_within_secs for c in grid}, {0})
+
+
+class CriteriaSweepCliTest(unittest.TestCase):
+    """D1 (#436): the criteria-sweep CLI flags parse into the swept grid; bands are lo:hi pairs."""
+
+    def _ns(self, *extra):
+        return bo._build_arg_parser().parse_args(
+            ["--out-dir", "o", "--pe-backtest", "b", "--cache", "c", "--start-unix", "0", *extra])
+
+    def test_default_sweep_flags(self) -> None:
+        ns = self._ns()
+        self.assertEqual(ns.ttr_hours, [72.0, 24.0, 48.0])
+        self.assertEqual(ns.bands, [(0.15, 0.85), (0.30, 0.70)])
+        self.assertEqual(ns.min_trl, [0, 20])
+        self.assertEqual(ns.churn_cost, 0.75)
+
+    def test_band_override_builds_grid(self) -> None:
+        ns = self._ns("--ttr-hours", "72", "--bands", "0.2:0.8", "--min-trl", "0",
+                      "--churn-cost", "0.5")
+        grid = bo.build_criteria_grid(ttr_hours_levels=tuple(ns.ttr_hours),
+                                      price_bands=tuple(ns.bands), min_trl_levels=tuple(ns.min_trl))
+        self.assertEqual(len(grid), 1)
+        self.assertEqual((grid[0].ttr_hours, grid[0].price_min, grid[0].price_max), (72.0, 0.2, 0.8))
+        self.assertEqual(ns.churn_cost, 0.5)
+
+    def test_malformed_band_rejected(self) -> None:
+        with self.assertRaises(SystemExit):                    # argparse wraps ArgumentTypeError
+            self._ns("--bands", "0.20")                        # missing ':hi'
+
+
+class PluralCriteriaEndToEndTest(unittest.TestCase):
+    """D1 (#436): the bake-off runs end-to-end over a PLURAL criteria axis (the singleton was the
+    Phase-A shape), keys stay distinct (A8), and the full pre-screen N_GRID counts every criteria
+    level for the DSR bar (A2)."""
+
+    def test_plural_criteria_sweep_runs_and_counts_full_n(self) -> None:
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(10)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        runner = _FakeRunner(value, points, 1_000_000)
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        criteria = bo.build_criteria_grid(ttr_hours_levels=(72.0, 48.0),
+                                          price_bands=((0.0, 1.0),), min_trl_levels=(0,))
+        self.assertEqual(len(criteria), 2)
+        axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"),
+                     deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",),
+                     criteria=criteria, churn=(0.0, 1.0))
+        manifest = bo.pre_register_grid(axes)                  # A8 holds across the plural criteria axis
+        self.assertEqual(len(manifest["grid_keys"]), len(set(manifest["grid_keys"])))
+        res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
+        self.assertEqual(res["decision"]["n_grid_full_pre_screen"], 2 * 1 * 1 * 2 * 2)  # counts all crit
+        self.assertIn(res["decision"]["status"], {"WINNER", "NO-GO"})
+
+
+class MemoRunnerTest(unittest.TestCase):
+    """D2 (#436): the in-run memo dedups identical followed sets (order-independent, per flat_usd),
+    so the churn axis and repeated sets cost one backtest each within a run."""
+
+    def _inner(self):
+        return _FakeRunner({"w1": 1.0, "w2": -1.0, "w3": 0.5}, [1000], 1000)
+
+    def test_dedups_identical_wallet_sets(self) -> None:
+        memo = bo.MemoizingBacktestRunner(self._inner())
+        a = memo.run(["w1", "w2"], flat_usd=25.0)
+        b = memo.run(["w1", "w2"], flat_usd=25.0)
+        self.assertEqual((memo.lookups, memo.calls), (2, 1))    # inner ran ONCE
+        self.assertIs(a, b)                                     # same cached frame object
+
+    def test_key_is_order_independent(self) -> None:
+        memo = bo.MemoizingBacktestRunner(self._inner())
+        memo.run(["w1", "w2"], flat_usd=25.0)
+        memo.run(["w2", "w1"], flat_usd=25.0)                  # same SET, different order
+        self.assertEqual(memo.calls, 1)
+
+    def test_distinct_sets_and_flat_usd_are_separate_keys(self) -> None:
+        memo = bo.MemoizingBacktestRunner(self._inner())
+        memo.run(["w1"], flat_usd=25.0)
+        memo.run(["w1", "w2"], flat_usd=25.0)                  # different set
+        memo.run(["w1"], flat_usd=50.0)                        # different flat_usd
+        self.assertEqual(memo.calls, 3)
+
+    def test_run_bakeoff_memo_collapses_churn_axis(self) -> None:
+        # the two churn-cost levels produce IDENTICAL followed-set sequences (churn is a post-hoc
+        # subtraction), so the memo runs each backtest once across both -> distinct == the count from
+        # a single-churn run, and strictly fewer than the per-(config, step) request total.
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(10)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        runner = _FakeRunner(value, points, 1_000_000)
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        two = bo.run_bakeoff(ss, runner,
+                             _axes(estimators=("t_stat_baseline",), deflators=(bo.NO_DEFLATION,),
+                                   policies=("policy_full_rerank",), churn=(0.0, 1.0)),
+                             params, created_at=1)["backtest_calls"]
+        one = bo.run_bakeoff(ss, runner,
+                             _axes(estimators=("t_stat_baseline",), deflators=(bo.NO_DEFLATION,),
+                                   policies=("policy_full_rerank",), churn=(0.0,)),
+                             params, created_at=1)["backtest_calls"]
+        self.assertLess(two["distinct"], two["total"])         # memo had hits
+        self.assertEqual(two["distinct"], one["distinct"])     # churn axis is free
+
+
+class ComputeCeilingTest(unittest.TestCase):
+    """D2 (#436): n_grid_full × steps may not exceed ranker_bakeoff_max_backtests — the search
+    surface is a committed number, enforced before any expensive work."""
+
+    def test_oversize_grid_raises(self) -> None:
+        ss, skill = _population(8, good=4, bad=4, n_pos=40)
+        points = [3_000_000 + i * 1_000_000 for i in range(6)]
+        runner = _FakeRunner({w: 1.0 for w in skill}, points, 1_000_000)
+        # n_grid_full = 2 est × 1 defl × 1 pol × 1 crit × 1 churn = 2; × 6 steps = 12 > max_backtests=5.
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=2, min_periods=2, max_backtests=5)
+        axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"),
+                     deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",))
+        with self.assertRaises(ValueError) as cm:
+            bo.run_bakeoff(ss, runner, axes, params, created_at=1)
+        self.assertIn("ranker_bakeoff_max_backtests", str(cm.exception))
+
+    def test_default_operator_grid_within_ceiling(self) -> None:
+        # drift guard: the operator-default full sweep stays under the committed ceiling.
+        full = len(bo.ESTIMATOR_REGISTRY) * 2 * 4 * len(bo.build_criteria_grid()) * 2
+        self.assertEqual(full, 5 * 2 * 4 * 12 * 2)              # 960 configs
+        self.assertLessEqual(full * bo.RANKER_MIN_PERIODS, bo.RANKER_BAKEOFF_MAX_BACKTESTS)  # 23040<=30000
+
+
+class SdFloorMomentsTest(unittest.TestCase):
+    """D2 (#436): _config_moments treats sub-_SD_FLOOR dispersion as UNDEFINED (se=inf, sr=0), not a
+    spurious huge Sharpe — folds the post-#439 float-fragility cleanup onto the deflation surface."""
+
+    def test_near_constant_config_no_spurious_sharpe(self) -> None:
+        # sd ≈ 5e-13 (a sub-1e-9 float-noise perturbation): the old `sd > 0` emitted a ~6e11 SR and a
+        # tiny FINITE SE into the deflators / AKM CI; the floor drops it.
+        mom = bo._config_moments(pd.DataFrame({"c": [0.3, 0.3, 0.3 + 1e-12, 0.3]}))
+        self.assertEqual(mom.loc["c", "sr"], 0.0)
+        self.assertFalse(np.isfinite(mom.loc["c", "se"]))
+
+    def test_real_dispersion_still_finite(self) -> None:
+        mom = bo._config_moments(pd.DataFrame({"c": [0.1, 0.3, 0.5, 0.2]}))  # sd ≈ 0.17 >> floor
+        self.assertTrue(np.isfinite(mom.loc["c", "se"]))
+        self.assertNotEqual(mom.loc["c", "sr"], 0.0)
+
+
+class L1ChurnTest(unittest.TestCase):
+    """D3 (#436): churn = positive-part L1 weight movement. It reduces to the admission count for the
+    hard-set policies (weight 1.0) and additionally charges an OnlineWeighting weight ramp-up that the
+    old admission count ignored."""
+
+    @staticmethod
+    def _fs(weights: dict) -> pd.DataFrame:
+        return pd.DataFrame({"wallet": list(weights), "weight": list(weights.values())})
+
+    def test_hard_set_reduces_to_admission_count(self) -> None:
+        prev = self._fs({"w1": 1.0, "w2": 1.0})
+        follow = self._fs({"w2": 1.0, "w3": 1.0, "w4": 1.0})   # +w3 +w4; w1 evicted; w2 kept
+        self.assertEqual(bo._churn(prev, follow), 2.0)         # == # admissions (w3, w4)
+
+    def test_eviction_alone_is_not_charged(self) -> None:
+        self.assertEqual(bo._churn(self._fs({"w1": 1.0, "w2": 1.0}), self._fs({"w1": 1.0})), 0.0)
+
+    def test_first_step_charges_full_mass(self) -> None:
+        prev = pd.DataFrame({"wallet": [], "weight": []})
+        self.assertEqual(bo._churn(prev, self._fs({"w1": 1.0, "w2": 1.0})), 2.0)
+
+    def test_online_weight_rampup_is_charged(self) -> None:
+        # same membership, weights shift: w1 0.3->0.8 (+0.5), w2 0.7->0.2 (decrease, clamped to 0).
+        # the old admission count was 0 here; the L1 positive part charges the +0.5 ramp.
+        self.assertAlmostEqual(
+            bo._churn(self._fs({"w1": 0.3, "w2": 0.7}), self._fs({"w1": 0.8, "w2": 0.2})), 0.5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
