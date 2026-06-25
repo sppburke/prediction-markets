@@ -1425,9 +1425,10 @@ struct PeriodPnlRow {
     /// horizon (`open_at_horizon`) plus those it closed within `(as_of, horizon]`
     /// (resolved or sold). Denominator for the open-at-horizon fraction
     /// `open_at_horizon / positions_in_window` (issue #436 Phase F / F3a). `0` on
-    /// realized day rows. Conditioned on horizon exposure: a wallet whose every
-    /// window position resolved before the horizon has no MTM row, so its
-    /// fast-resolved positions count toward neither numerator nor denominator.
+    /// realized day rows. Carried only on a SURVIVING MTM row — one with open-at-
+    /// horizon exposure OR a non-zero boundary flow; a wallet whose entire window
+    /// footprint is positions opened AND closed strictly inside the window (no mark at
+    /// either boundary) emits no row, so those count toward neither side.
     positions_in_window: u64,
     /// Per open-at-horizon position, the resolution lag `resolved_at − as_of` in
     /// seconds (issue #436 Phase F / F3a) — how long after the window opened the
@@ -1504,8 +1505,9 @@ fn build_mtm_rows(
             }
         } else if lt.close_unix.is_some_and(|c| c > win_start && c <= win_end) {
             // Closed within the window (resolved or sold): no flow or lag, but it
-            // belongs in the open-fraction denominator. Only reaches a surviving row
-            // when the wallet ALSO holds an open-at-horizon position (filter below).
+            // belongs in the open-fraction denominator. Carried only if the wallet's
+            // row survives the drop filter below (open-at-horizon exposure OR a
+            // non-zero boundary flow — e.g. a position covered at `as_of`).
             by_wallet.entry(lt.wallet).or_default().positions_in_window += 1;
         }
     }
