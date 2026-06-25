@@ -138,6 +138,8 @@ fn base_config(dir: &TempDir, take_fraction: Decimal, min_required_usd: Decimal)
         max_signal_price: None,
         max_trade_count: 0,
         injected_wallets_path: None,
+        mtm_window_start_unix: None,
+        mtm_window_end_unix: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

@@ -1491,6 +1491,61 @@ impl WalletCache {
         }
     }
 
+    /// Build a [`ClobMarkIndex`] for `markets` ONLY (bounded — mirrors the
+    /// injected-set trade load), keeping `source = 'clob'` samples with
+    /// `t <= max_t` (the latest horizon the caller will mark at; later samples
+    /// are pruned to bound memory). Joins `market_price_history` to
+    /// `token_conditions` on `(condition_id, token_id)` so each series is keyed
+    /// by its 0-based `outcome_index` (= [`OutcomeId`]'s inner `u16`), exactly
+    /// like the true-CLV close query (`suff_stats.py` `_TRUE_CLV_SQL`). Rows with
+    /// a NULL `outcome_index` (legacy events-sourced tokens) or an unparseable
+    /// price are skipped.
+    ///
+    /// One prepared statement is reused across `markets`; per market the rows
+    /// arrive ordered by `(outcome_index, t)`, so each per-outcome `Vec` is built
+    /// ascending by `t` (the [`ClobMarkIndex::mark_at_or_before`] binary-search
+    /// precondition) without a re-sort.
+    pub fn load_clob_marks(
+        &self,
+        markets: &HashSet<MarketId>,
+        max_t: i64,
+    ) -> Result<ClobMarkIndex, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tc.outcome_index, mph.t, mph.price \
+             FROM market_price_history mph \
+             JOIN token_conditions tc \
+               ON tc.condition_id = mph.market_id AND tc.token_id = mph.token_id \
+             WHERE mph.market_id = ?1 AND mph.source = 'clob' \
+               AND tc.outcome_index IS NOT NULL AND mph.t <= ?2 \
+             ORDER BY tc.outcome_index, mph.t",
+        )?;
+        let mut series: HashMap<MarketId, HashMap<u16, Vec<(i64, Decimal)>>> = HashMap::new();
+        for market in markets {
+            let rows = stmt.query_map(params![market.0.0, max_t], |r| {
+                let outcome_index: i64 = r.get(0)?;
+                let t: i64 = r.get(1)?;
+                let price_str: String = r.get(2)?;
+                Ok((outcome_index, t, price_str))
+            })?;
+            for row in rows {
+                let (outcome_index, t, price_str) = row?;
+                let Ok(outcome) = u16::try_from(outcome_index) else {
+                    continue; // out-of-range outcome ordinal; skip defensively
+                };
+                let Ok(price) = Decimal::from_str(&price_str) else {
+                    continue; // unparseable price string; skip
+                };
+                series
+                    .entry(market.clone())
+                    .or_default()
+                    .entry(outcome)
+                    .or_default()
+                    .push((t, price));
+            }
+        }
+        Ok(ClobMarkIndex { series })
+    }
+
     /// Resolve a single ERC-1155 `token_id` (decimal string) to its `condition_id`.
     ///
     /// The on-chain `OrderFilled` consumer (issue #207, Slice 1) normalises each
@@ -2785,6 +2840,62 @@ pub type ScheduleIndex = HashMap<MarketId, MarketSchedule>;
 /// and passes through.
 pub type LiquidityIndex = HashMap<MarketId, Decimal>;
 
+/// CLOB mid-price marks for a bounded set of markets, used by the injected-set
+/// backtest's forward mark-to-market (issue #436 Phase E). Built once from
+/// `market_price_history ⋈ token_conditions` (`source = 'clob'`) for ONLY the
+/// markets the injected wallets traded (mirrors [`WalletCache::load_clob_marks`],
+/// itself bounded like the injected-set trade load), then queried by binary
+/// search — no DB access in the simulation hot loop.
+#[derive(Debug, Default, Clone)]
+pub struct ClobMarkIndex {
+    /// `condition market_id → outcome_index → ascending (t_unix, mid_price)`.
+    series: HashMap<MarketId, HashMap<u16, Vec<(i64, Decimal)>>>,
+}
+
+impl ClobMarkIndex {
+    /// Most-recent CLOB mid at-or-before `t_unix` for the `(market, outcome)`
+    /// token, or `None` when no `source = 'clob'` sample exists at-or-before
+    /// `t_unix` — the position is then *uncovered* (it contributes `0` to the
+    /// mark and counts against MTM coverage, issue #436 E3).
+    ///
+    /// Matches the true-CLV close semantics (`suff_stats.py` `_TRUE_CLV_SQL`'s
+    /// `arg_max(price, t WHERE t <= close)`): the latest sample is used however
+    /// old it is — there is no staleness cap (operator decision, issue #436 E).
+    pub fn mark_at_or_before(
+        &self,
+        market: &MarketId,
+        outcome: OutcomeId,
+        t_unix: i64,
+    ) -> Option<Decimal> {
+        let samples = self.series.get(market)?.get(&outcome.0)?;
+        // partition_point: index of the first sample strictly after t_unix; the
+        // latest sample at-or-before t_unix is at idx - 1.
+        let idx = samples.partition_point(|(st, _)| *st <= t_unix);
+        if idx == 0 {
+            None
+        } else {
+            samples.get(idx - 1).map(|(_, p)| *p)
+        }
+    }
+
+    /// True when the index holds at least one CLOB sample for `(market, outcome)`.
+    pub fn covers(&self, market: &MarketId, outcome: OutcomeId) -> bool {
+        self.series
+            .get(market)
+            .is_some_and(|by_outcome| by_outcome.contains_key(&outcome.0))
+    }
+
+    /// Number of `(market, outcome)` token series held. For diagnostics and tests.
+    pub fn len(&self) -> usize {
+        self.series.values().map(HashMap::len).sum()
+    }
+
+    /// True when no series are held (no CLOB coverage for any injected market).
+    pub fn is_empty(&self) -> bool {
+        self.series.is_empty()
+    }
+}
+
 /// In-memory index of every leaderboard snapshot in the cache, sorted ascending.
 ///
 /// Built once via [`WalletCache::load_all_snapshots`]; the backtest then queries
@@ -3136,6 +3247,79 @@ mod tests {
         assert_eq!(cov.total, 2, "two winner markets");
         assert_eq!(cov.with_series, 2, "both have ≥1 point");
         assert_eq!(cov.usable, 1, "only 0xm1 has a ≥3-point token");
+    }
+
+    #[test]
+    fn load_clob_marks_binary_searches_at_or_before() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        // 0xm1: outcome 0 (token t0, two samples) + outcome 1 (token t1); 0xm2: outcome 0 (token u0).
+        cache
+            .upsert_token_conditions_batch(
+                &[
+                    ("t0".to_string(), "0xm1".to_string(), 0),
+                    ("t1".to_string(), "0xm1".to_string(), 1),
+                    ("u0".to_string(), "0xm2".to_string(), 0),
+                ],
+                9,
+            )
+            .unwrap();
+        cache
+            .insert_price_history_batch(
+                &[
+                    ("0xm1".to_owned(), "t0".to_owned(), 100, "0.30".to_owned()),
+                    ("0xm1".to_owned(), "t0".to_owned(), 200, "0.55".to_owned()),
+                    ("0xm1".to_owned(), "t1".to_owned(), 150, "0.45".to_owned()),
+                    ("0xm2".to_owned(), "u0".to_owned(), 100, "0.90".to_owned()),
+                ],
+                "clob",
+            )
+            .unwrap();
+
+        let m1 = MarketId(VenueMarketId("0xm1".to_owned()));
+        let m2 = MarketId(VenueMarketId("0xm2".to_owned()));
+        let m_absent = MarketId(VenueMarketId("0xabsent".to_owned()));
+        let markets: HashSet<MarketId> = [m1.clone(), m2.clone(), m_absent.clone()]
+            .into_iter()
+            .collect();
+
+        // max_t = 199 prunes the t=200 sample on (0xm1, t0).
+        let idx = cache.load_clob_marks(&markets, 199).unwrap();
+        assert_eq!(
+            idx.mark_at_or_before(&m1, OutcomeId(0), 250),
+            Some(dec!(0.30))
+        );
+        assert_eq!(
+            idx.mark_at_or_before(&m1, OutcomeId(0), 100),
+            Some(dec!(0.30))
+        );
+        // Before the first sample → None (uncovered at that instant).
+        assert_eq!(idx.mark_at_or_before(&m1, OutcomeId(0), 99), None);
+        // Each outcome carries its own series.
+        assert_eq!(
+            idx.mark_at_or_before(&m1, OutcomeId(1), 160),
+            Some(dec!(0.45))
+        );
+        assert_eq!(
+            idx.mark_at_or_before(&m2, OutcomeId(0), 1000),
+            Some(dec!(0.90))
+        );
+        // Absent market / unmapped outcome → None + covers() false.
+        assert_eq!(idx.mark_at_or_before(&m_absent, OutcomeId(0), 1000), None);
+        assert!(!idx.covers(&m_absent, OutcomeId(0)));
+        assert!(idx.covers(&m1, OutcomeId(1)));
+        assert!(!idx.covers(&m2, OutcomeId(1)));
+
+        // Without the max_t prune, the later t=200 sample is the at-or-before mark.
+        let idx_full = cache.load_clob_marks(&markets, 10_000).unwrap();
+        assert_eq!(
+            idx_full.mark_at_or_before(&m1, OutcomeId(0), 250),
+            Some(dec!(0.55))
+        );
+        assert_eq!(
+            idx_full.mark_at_or_before(&m1, OutcomeId(0), 150),
+            Some(dec!(0.30))
+        );
     }
 
     #[test]

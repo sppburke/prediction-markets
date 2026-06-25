@@ -155,6 +155,8 @@ fn base_config_with(
         max_signal_price: None,
         max_trade_count: 0,
         injected_wallets_path: None,
+        mtm_window_start_unix: None,
+        mtm_window_end_unix: None,
         strategy: WinnerFollowConfig::default(),
     }
 }

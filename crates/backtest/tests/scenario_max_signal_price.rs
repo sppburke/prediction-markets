@@ -179,6 +179,8 @@ fn base_config(
         max_signal_price,
         max_trade_count: 0,
         injected_wallets_path: None,
+        mtm_window_start_unix: None,
+        mtm_window_end_unix: None,
         strategy: WinnerFollowConfig {
             slippage_rate,
             ..WinnerFollowConfig::default()
