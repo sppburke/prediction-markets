@@ -201,6 +201,31 @@ class BrownGoetzmannTest(unittest.TestCase):
         self.assertEqual((res["wl"], res["lw"]), (0, 0))
         self.assertTrue(res["go"])
 
+    def test_zero_mass_point_does_not_manufacture_go(self) -> None:
+        # C3 (#436): a large net-edge zero mass-point (60 wallets at exactly 0 = the median) plus a
+        # few non-zero winners. The old `> median` lumped every zero into the LOSER cell with the
+        # winners staying winners -> wl=lw=0 -> cpr=inf -> spurious GO. Dropping the median-tied zeros
+        # leaves no genuine losers (an empty class), so no persistence can be certified -> go=False.
+        idx = [f"z{i}" for i in range(60)] + [f"w{i}" for i in range(10)]
+        p1 = pd.Series([0.0] * 60 + [1.0] * 10, index=idx)
+        p2 = pd.Series([0.0] * 60 + [1.0] * 10, index=idx)
+        res = brown_goetzmann_cpr(p1, p2)
+        self.assertEqual((res["ww"], res["ll"]), (10, 0))   # the 60 median-tied zeros are dropped
+        self.assertFalse(res["go"])
+
+    def test_tie_drop_is_noop_on_tie_free_data(self) -> None:
+        # On continuous data (no exact-median ties) the drop removes <= 1 wallet per period, so a
+        # genuinely persistent population still gets a GO — the tie-drop does not change the verdict.
+        rng = np.random.default_rng(7)
+        n = 200
+        skill = rng.normal(0, 1, n)
+        idx = [f"w{i}" for i in range(n)]
+        p1 = pd.Series(skill + rng.normal(0, 0.3, n), index=idx)
+        p2 = pd.Series(skill + rng.normal(0, 0.3, n), index=idx)
+        res = brown_goetzmann_cpr(p1, p2)
+        self.assertGreater(res["ww"] + res["wl"] + res["lw"] + res["ll"], n - 2)
+        self.assertTrue(res["go"])
+
 
 class PaperFillsCrosscheckTest(unittest.TestCase):
     def test_flags_live_loser(self) -> None:
