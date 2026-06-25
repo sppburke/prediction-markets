@@ -53,6 +53,41 @@ def _population(seed: int, *, good=6, bad=14, n_pos=60, span=9_000_000):
     return derive_columns(raw), skill
 
 
+def _adversarial_short_track(seed: int):
+    """F2 (#436): strong-edge skilled long-track wallets + null long-track + a swarm of short-track
+    noisy wallets + a lucky short-track fluke (n=4, 3 wins) + a deterministic all-win streak (n=3,
+    3 wins → zero dispersion). Returns (frame, skilled, short_track). The two short-track defenses
+    are the C1 EB shrinkage (drops the zero-dispersion streak, rewards precision) and the D1 MinTRL
+    eligibility gate (excludes every short-track wallet outright)."""
+    rng = np.random.default_rng(seed)
+    cols = ["wallet", "market_id", "outcome_id", "entry_ts", "ttr_secs",
+            "price", "contracts", "payoff", "resolved_at", "close_proxy"]
+    rows = []
+
+    def emit(w, n, win_p):
+        for _ in range(n):
+            entry = int(rng.integers(0, 9_000_000))
+            payoff = 1.0 if rng.random() < win_p else 0.0
+            rows.append((w, f"{w}_{entry}", 1, entry, 3600, 0.50, 10, payoff, entry + 5000, 0.55))
+
+    def emit_fixed(w, payoffs):
+        for k, p in enumerate(payoffs):
+            rows.append((w, f"{w}_{k}", 1, 8_000_000 + k, 3600, 0.50, 10, p, 8_005_000 + k, 0.55))
+
+    skilled = [f"skill{i}" for i in range(4)]
+    for w in skilled:
+        emit(w, 80, 0.80)                                # long-track, STRONG real edge (precise)
+    for w in (f"null{i}" for i in range(4)):
+        emit(w, 50, 0.50)                                # long-track, zero edge (realistic prior)
+    swarm = [f"noise{i}" for i in range(6)]
+    for w in swarm:
+        emit(w, 3, 0.50)                                 # short-track noise (n=3, random)
+    emit_fixed("fluke", [1.0, 1.0, 1.0, 0.0])            # short-track LUCKY fluke: 4 positions, 3 wins
+    emit_fixed("streak", [1.0, 1.0, 1.0])                # short-track ALL-WIN streak: zero dispersion
+    raw = pd.DataFrame(rows, columns=cols)
+    return derive_columns(raw), skilled, swarm + ["fluke", "streak"]
+
+
 class _FakeRunner:
     """Deterministic ``BacktestRunner``: pays each followed wallet ``value[w] * flat_usd`` at a
     period_end inside every step window (the trajectory windows it per step)."""
@@ -68,7 +103,8 @@ class _FakeRunner:
         rows = [{"wallet": w, "period_end": t + self.horizon // 2,
                  "realized_pnl": self.value.get(w, 0.0) * flat_usd, "unrealized_pnl": 0.0,
                  "n_fills": 2, "notional": flat_usd * 2,
-                 "is_horizon_mtm": False, "open_at_horizon": 0, "marked_at_horizon": 0}
+                 "is_horizon_mtm": False, "open_at_horizon": 0, "marked_at_horizon": 0,
+                 "positions_in_window": 0, "resolution_lags_secs": []}
                 for w in wallets for t in self.points]
         return pd.DataFrame(rows, columns=bo._PNL_COLUMNS)
 
@@ -79,11 +115,15 @@ class _MtmRunner(_FakeRunner):
     unrealized flow + coverage counts. So a plain vs MTM run feed the demoter/live_pnl IDENTICAL
     realized rows (the MTM rows are filtered out), but the MTM run's objective gains the flow."""
 
-    def __init__(self, value, points, horizon, *, unrealized, open_n, marked_n):
+    def __init__(self, value, points, horizon, *, unrealized, open_n, marked_n,
+                 positions_n=None, lags=None):
         super().__init__(value, points, horizon)
         self.unrealized = unrealized
         self.open_n = open_n
         self.marked_n = marked_n
+        # F3a: positions_in_window denominator (defaults to open_n) + per-wallet resolution lags.
+        self.positions_n = positions_n if positions_n is not None else open_n
+        self.lags = lags or {}
 
     def run(self, wallets, *, flat_usd, window=None):
         df = super().run(wallets, flat_usd=flat_usd, window=window)
@@ -93,7 +133,9 @@ class _MtmRunner(_FakeRunner):
         mtm = [{"wallet": w, "period_end": horizon_end, "realized_pnl": 0.0,
                 "unrealized_pnl": self.unrealized.get(w, 0.0), "n_fills": 0, "notional": 0.0,
                 "is_horizon_mtm": True, "open_at_horizon": self.open_n.get(w, 0),
-                "marked_at_horizon": self.marked_n.get(w, 0)} for w in wallets]
+                "marked_at_horizon": self.marked_n.get(w, 0),
+                "positions_in_window": self.positions_n.get(w, 0),
+                "resolution_lags_secs": list(self.lags.get(w, []))} for w in wallets]
         return pd.concat([df, pd.DataFrame(mtm, columns=bo._PNL_COLUMNS)], ignore_index=True)
 
 
@@ -294,6 +336,126 @@ class MtmObjectiveTest(unittest.TestCase):
         self.assertGreater(int(b.coverage["open_at_horizon"].sum()), 0)
         self.assertGreater(int(b.coverage["marked_at_horizon"].sum()), 0)
         self.assertEqual(int(a.coverage["open_at_horizon"].sum()), 0)
+
+
+class ResolutionLagTest(unittest.TestCase):
+    """F3a (#436): the open-at-horizon resolution-lag distribution + open fraction are aggregated
+    from the MTM rows and surfaced in mtm_coverage — advisory diagnostics, never verdict inputs."""
+
+    def setUp(self) -> None:
+        self.ss, self.skill = _population(2)
+        self.points = [3_000_000 + i * 1_000_000 for i in range(8)]
+        self.horizon = 1_000_000
+        self.value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in self.skill.items()}
+
+    def _gp(self, policy, churn):
+        return bo.GridPoint("eb_shrinkage_skill", bo.NO_DEFLATION, policy,
+                            Criteria(0, 72.0, 0.0, 1.0, 0.0, 0), churn)
+
+    def test_lag_distribution_quantiles(self) -> None:
+        d = bo._lag_distribution([1 * 86_400, 2 * 86_400, 3 * 86_400], censored=1)
+        self.assertEqual(d["n"], 3)
+        self.assertEqual(d["censored"], 1)
+        self.assertAlmostEqual(d["censored_frac"], 0.25)            # 1 of (3 resolved + 1 censored)
+        self.assertAlmostEqual(d["p50_days"], 2.0)
+        self.assertAlmostEqual(d["max_days"], 3.0)
+
+    def test_lag_distribution_all_censored(self) -> None:
+        d = bo._lag_distribution([], censored=2)
+        self.assertEqual(d["n"], 0)
+        self.assertEqual(d["censored"], 2)
+        self.assertEqual(d["censored_frac"], 1.0)
+        self.assertIsNone(d["p50_days"])
+
+    def test_lag_distribution_empty_is_none(self) -> None:
+        d = bo._lag_distribution([], censored=0)
+        self.assertEqual(d["n"], 0)
+        self.assertIsNone(d["censored_frac"])
+        self.assertIsNone(d["p50_days"])
+
+    def test_trajectory_aggregates_lags_open_fraction_and_censored(self) -> None:
+        kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
+                      k=5, displacement_margin=5, demoter_kwargs={"min_periods": 2})
+        # Each followed wallet: 2 positions open at the horizon (one resolves 3d after as_of, one
+        # censored) + 1 closed-in-window position → open=2, positions_in_window=3 (fraction 2/3).
+        mtm = _MtmRunner(self.value, self.points, self.horizon,
+                         unrealized={w: 0.5 for w in self.value},
+                         open_n={w: 2 for w in self.value}, marked_n={w: 1 for w in self.value},
+                         positions_n={w: 3 for w in self.value},
+                         lags={w: [3 * 86_400, -1] for w in self.value})
+        res = bo.run_trajectory(self._gp("policy_knockout_backfill", 0.0), self.ss, mtm, **kwargs)
+        # The denominator strictly exceeds the open count — it includes the closed-in-window positions.
+        self.assertGreater(int(res.coverage["positions_in_window"].sum()),
+                           int(res.coverage["open_at_horizon"].sum()))
+        # Censored (never-resolved) open positions are tallied, not dropped.
+        self.assertGreater(int(res.coverage["censored"].sum()), 0)
+        # The resolved lags are exactly the 3-day lag (the -1 censored entries are excluded from them).
+        flat = [x for lags in res.lags_by_period.values() for x in lags]
+        self.assertTrue(len(flat) > 0 and all(x == 3 * 86_400 for x in flat))
+
+    def test_run_bakeoff_surfaces_resolution_lag(self) -> None:
+        ss, skill = _population(4, good=8, bad=12, n_pos=70)
+        points = [3_000_000 + i * 1_000_000 for i in range(12)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        mtm = _MtmRunner(value, points, 1_000_000,
+                         unrealized={w: 0.5 for w in value},
+                         open_n={w: 2 for w in value}, marked_n={w: 1 for w in value},
+                         positions_n={w: 4 for w in value},
+                         lags={w: [2 * 86_400, 4 * 86_400, -1] for w in value})
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"),
+                     deflators=(bo.NO_DEFLATION,), policies=_POLICIES)
+        cov = bo.run_bakeoff(ss, mtm, axes, params, created_at=1)["mtm_coverage"]
+        # Every config carries the open-fraction + resolution-lag block.
+        for entry in cov["by_config_overall"].values():
+            self.assertIn("open_at_horizon_frac", entry)
+            self.assertIn("resolution_lag", entry)
+        # The winner's per-period detail surfaces the lag distribution (resolved + censored present).
+        self.assertTrue(cov["winner_by_period"])
+        wp = cov["winner_by_period"][0]
+        self.assertIsNotNone(wp["resolution_lag"]["p50_days"])      # 2d / 4d resolved lags present
+        self.assertGreater(wp["resolution_lag"]["censored"], 0)     # the -1 entries are tallied
+        self.assertIsNotNone(wp["open_at_horizon_frac"])
+
+
+class MinTrlEbNoiseTest(unittest.TestCase):
+    """F2 (#436): short-track-wallet noise is neutralized by TWO complementary defenses — the C1 EB
+    shrinkage keeps genuinely-skilled long-track wallets at the top despite a swarm of short-track
+    noise, and the D1 MinTRL sweep excludes short-track wallets outright when min_trl > 0."""
+
+    def setUp(self) -> None:
+        self.ss, self.skilled, self.short_track = _adversarial_short_track(7)
+
+    def test_eb_shrinks_short_track_below_skilled(self) -> None:
+        scores = bo.ESTIMATOR_REGISTRY["eb_shrinkage_skill"]().score(
+            self.ss, as_of=9_000_000, weights=bo.uniqueness_weights(self.ss))
+        # C1: every genuinely-skilled long-track wallet outranks every short-track wallet — EB
+        # shrinks the low-precision short-track scores (incl. the lucky n=4 fluke) below the precise
+        # high-edge long-track ones, so the short-track noise neither collapses nor tops the ranking.
+        present_short = [w for w in self.short_track if w in scores.index]
+        self.assertTrue(present_short)                               # the swarm/fluke were scored
+        worst_skilled = scores.loc[self.skilled, "rank"].max()
+        best_short = scores.loc[present_short, "rank"].min()
+        self.assertLess(worst_skilled, best_short)
+
+    def test_eb_drops_zero_dispersion_streak(self) -> None:
+        scores = bo.ESTIMATOR_REGISTRY["eb_shrinkage_skill"]().score(
+            self.ss, as_of=9_000_000, weights=bo.uniqueness_weights(self.ss))
+        # A10/C1: a short-track all-win streak (constant net edge → zero dispersion) is DROPPED, not
+        # ranked #1 with an undefined-but-huge t — the small-sample curse this harness exists to kill.
+        self.assertNotIn("streak", scores.index)
+
+    def test_mintrl_sweep_excludes_short_track(self) -> None:
+        wide = Criteria(0, 72.0, 0.0, 1.0, 0.0, 0)        # min_trl = 0 (no gate)
+        gated = Criteria(0, 72.0, 0.0, 1.0, 0.0, 20)      # min_trl = 20 (the D1 sweep's other level)
+        elig0 = bo.eligible_wallets(self.ss, wide, as_of=9_000_000)
+        elig20 = bo.eligible_wallets(self.ss, gated, as_of=9_000_000)
+        # Every short-track wallet (n < 20) is present at min_trl=0 and gone at min_trl=20, while the
+        # skilled long-track wallets survive both sweep levels.
+        self.assertTrue(set(self.short_track).issubset(elig0))
+        self.assertTrue(set(self.short_track).isdisjoint(elig20))
+        self.assertTrue(set(self.skilled).issubset(elig20))
 
 
 class DecisionTest(unittest.TestCase):

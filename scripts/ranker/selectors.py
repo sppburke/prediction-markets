@@ -57,8 +57,8 @@ class OnlineExpWeights:
             wallet: self.alpha * float(sc) + (1.0 - self.alpha) * prev.get(wallet, float(sc))
             for wallet, sc in scores["score"].items()
         }
-        if not smoothed:
-            return _follow_set([], np.empty(0)), smoothed
+        if not smoothed or k <= 0:                    # F3 guard (#436 Phase F): k<=0 -> empty top ->
+            return _follow_set([], np.empty(0)), smoothed   # top.to_numpy().max() on [] would raise
         s = pd.Series(smoothed)
         top = s.nlargest(min(k, len(s)))
         z = np.exp(self.eta * (top.to_numpy() - top.to_numpy().max()))

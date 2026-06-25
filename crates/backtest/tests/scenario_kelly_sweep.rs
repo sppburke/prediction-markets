@@ -328,7 +328,7 @@ fn to_markdown_table_covers_all_runs() {
             bankroll_initial: dec!(10_000),
             bankroll_final: dec!(10_100),
             slippage_assumption_bps: 100,
-            open_at_horizon: 0,
+            open_at_sim_end: 0,
             expiry_filter_suppression_pct: dec!(0),
             expiry_suppression_by_quarter: BTreeMap::new(),
             high_price_suppression_pct: dec!(0),
@@ -489,8 +489,8 @@ async fn parallel_sweep_matches_sequential() {
             seq.kelly_fraction.0
         );
         assert_eq!(
-            seq.report.open_at_horizon, par.report.open_at_horizon,
-            "open_at_horizon differs at kf={}",
+            seq.report.open_at_sim_end, par.report.open_at_sim_end,
+            "open_at_sim_end differs at kf={}",
             seq.kelly_fraction.0
         );
     }

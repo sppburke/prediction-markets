@@ -58,8 +58,13 @@ from .selectors import OnlineExpWeights
 # `unrealized_pnl=0`). `open_at_horizon`/`marked_at_horizon` are MTM coverage counts on
 # the MTM row (0 on day rows). The objective sums realized+unrealized over the window;
 # the realized-only demoter/live_pnl path filters `~is_horizon_mtm`.
+# Phase F / F3a: `positions_in_window` (open-at-horizon + closed-in-window) is the
+# open-fraction denominator, and `resolution_lags_secs` (per open-at-horizon position,
+# `resolved_at − as_of`; `-1` = censored) is the resolution-lag distribution — ADVISORY
+# diagnostics carried on the MTM row only, never inputs to the objective or the verdict.
 _PNL_COLUMNS = ["wallet", "period_end", "realized_pnl", "unrealized_pnl", "n_fills", "notional",
-                "is_horizon_mtm", "open_at_horizon", "marked_at_horizon"]
+                "is_horizon_mtm", "open_at_horizon", "marked_at_horizon",
+                "positions_in_window", "resolution_lags_secs"]
 # The §Acceptance benchmark estimator + baseline policy (issue #421: beat t_stat_baseline).
 BASELINE_ESTIMATOR = "t_stat_baseline"
 BASELINE_POLICY = "policy_full_rerank"
@@ -325,7 +330,35 @@ def parse_pnl_by_period(path) -> pd.DataFrame:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if not rows:
         return pd.DataFrame(columns=_PNL_COLUMNS)
-    return pd.DataFrame(rows)[_PNL_COLUMNS]
+    df = pd.DataFrame(rows)
+    # Back-compat (Phase F / F3a): a pre-F3a `pe-backtest` emits no resolution diagnostics. Backfill
+    # safe defaults so the parse never KeyErrors — `positions_in_window` falls back to the open count
+    # and `resolution_lags_secs` to empty (no lags surfaced) rather than fabricating data.
+    if "positions_in_window" not in df.columns:
+        df["positions_in_window"] = df.get("open_at_horizon", 0)
+    if "resolution_lags_secs" not in df.columns:
+        df["resolution_lags_secs"] = [[] for _ in range(len(df))]
+    return df[_PNL_COLUMNS]
+
+
+def _lag_distribution(resolved_secs: list, censored: int) -> dict:
+    """Summarize the open-at-horizon resolution-lag distribution (issue #436 Phase F / F3a): the
+    spread of ``resolved_at − as_of`` (in DAYS) for positions still open at the horizon that
+    eventually settled, plus the ``censored`` count of positions whose market never resolved in the
+    cache. Quantifies *how slow* the unresolved forward edge is — the resolution-speed residual that
+    coverage (``marked / open``) alone does not measure. ADVISORY: never feeds the verdict."""
+    n = len(resolved_secs)
+    total = n + max(int(censored), 0)
+    if n == 0:
+        return {"n": 0, "censored": int(max(censored, 0)),
+                "censored_frac": (1.0 if total > 0 else None),
+                "p50_days": None, "p90_days": None, "max_days": None}
+    a = np.sort(np.asarray(resolved_secs, dtype=float)) / 86_400.0     # seconds → days
+    return {"n": n, "censored": int(max(censored, 0)),
+            "censored_frac": (float(censored / total) if total > 0 else None),
+            "p50_days": float(np.percentile(a, 50)),
+            "p90_days": float(np.percentile(a, 90)),
+            "max_days": float(a[-1])}
 
 
 class MemoizingBacktestRunner:
@@ -466,12 +499,18 @@ class TrajectoryResult:
     returns: pd.Series
     final_follow: FollowSet
     final_scores: WalletScores
-    # E3 (#436): per-period CLOB forward-MTM coverage over the followed set —
-    # index = as_of, columns = [open_at_horizon, marked_at_horizon]. Empty when no
-    # MTM window is run. The harness surfaces coverage = marked / open per (config,
-    # period) so the operator reads the resolution-speed residual beside the winner.
+    # E3 (#436): per-period CLOB forward-MTM coverage over the followed set — index =
+    # as_of, columns = [open_at_horizon, marked_at_horizon, positions_in_window,
+    # censored]. Empty when no MTM window is run. The harness surfaces coverage =
+    # marked / open and (Phase F / F3a) the open-at-horizon fraction
+    # open / positions_in_window per (config, period) beside the winner.
     coverage: pd.DataFrame = field(
-        default_factory=lambda: pd.DataFrame(columns=["open_at_horizon", "marked_at_horizon"]))
+        default_factory=lambda: pd.DataFrame(
+            columns=["open_at_horizon", "marked_at_horizon", "positions_in_window", "censored"]))
+    # Phase F / F3a: per-period resolved lags `resolved_at − as_of` (seconds, ≥ 0; the
+    # censored -1s are tallied in coverage["censored"], not here) for open-at-horizon
+    # positions — the resolution-lag distribution. ADVISORY reporting only.
+    lags_by_period: dict = field(default_factory=dict)
 
 
 def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points: list,
@@ -497,7 +536,8 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     returns = []
     final_follow: FollowSet = pd.DataFrame({"wallet": [], "weight": []})
     final_scores: WalletScores = pd.DataFrame(columns=["score", "rank"])
-    coverage_rows: dict = {}                                          # E3: as_of -> (open, marked)
+    coverage_rows: dict = {}                                          # E3: as_of -> (open, marked, ...)
+    lags_by_period: dict = {}                                         # F3a: as_of -> resolved lags
     for as_of in as_of_points:
         in_sample, _forward = split_walkforward(
             ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
@@ -532,19 +572,29 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         # E2b: the demoter / live_pnl accumulation stays REALIZED-only (the Maurer-Pontil bound
         # assumes settled per-period P&L, and counts each row as a period) — drop the MTM rows.
         live_pnl = pd.concat([live_pnl, window[~is_mtm]], ignore_index=True)
-        # E3: per-period MTM coverage over the followed set (the backtest ran exactly these wallets).
+        # E3 / F3a: per-period MTM coverage + resolution-lag diagnostics over the followed set (the
+        # backtest ran exactly these wallets). `resolution_lags_secs` is a per-row list; flatten it
+        # across the period's MTM rows, then split resolved (≥0) from censored (-1) lags.
         mtm_rows = window[is_mtm]
+        period_lags = [x for arr in mtm_rows["resolution_lags_secs"]
+                       if isinstance(arr, (list, tuple, np.ndarray)) for x in arr]
+        resolved = [int(x) for x in period_lags if x >= 0]
+        censored = sum(1 for x in period_lags if x < 0)
         coverage_rows[as_of] = {
             "open_at_horizon": int(mtm_rows["open_at_horizon"].sum()),
             "marked_at_horizon": int(mtm_rows["marked_at_horizon"].sum()),
+            "positions_in_window": int(mtm_rows["positions_in_window"].sum()),
+            "censored": censored,
         }
+        lags_by_period[as_of] = resolved
         prev = follow
         final_follow, final_scores = follow, scores                 # A1: most recent real set
     coverage = pd.DataFrame.from_dict(coverage_rows, orient="index") if coverage_rows else \
-        pd.DataFrame(columns=["open_at_horizon", "marked_at_horizon"])
+        pd.DataFrame(columns=["open_at_horizon", "marked_at_horizon", "positions_in_window", "censored"])
     return TrajectoryResult(
         returns=pd.Series(returns, index=list(as_of_points), name=grid_point.key, dtype=float),
-        final_follow=final_follow, final_scores=final_scores, coverage=coverage)
+        final_follow=final_follow, final_scores=final_scores, coverage=coverage,
+        lags_by_period=lags_by_period)
 
 
 def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
@@ -909,15 +959,38 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     # interaction B4 surfaces). A position open at the horizon with no CLOB series contributes 0 to the
     # MTM and is uncovered here — coverage = marked / open is the fraction of forward edge actually valued.
     def _cov_total(res, col):
-        return int(res.coverage[col].sum()) if not res.coverage.empty else 0
+        return (int(res.coverage[col].sum())
+                if (not res.coverage.empty and col in res.coverage.columns) else 0)
+
+    def _config_overall(res):
+        # F3a: + open-at-horizon fraction (open / positions_in_window) and the resolution-lag
+        # distribution over the config's whole trajectory.
+        open_n = _cov_total(res, "open_at_horizon")
+        positions = _cov_total(res, "positions_in_window")
+        resolved = [x for lags in res.lags_by_period.values() for x in lags]
+        return {
+            "open_at_horizon": open_n,
+            "marked_at_horizon": _cov_total(res, "marked_at_horizon"),
+            "positions_in_window": positions,
+            "open_at_horizon_frac": (open_n / positions if positions else None),
+            "resolution_lag": _lag_distribution(resolved, _cov_total(res, "censored")),
+        }
+
+    def _period_detail(idx, r, resolved):
+        open_n, positions = int(r["open_at_horizon"]), int(r["positions_in_window"])
+        return {
+            "as_of": int(idx),
+            "open_at_horizon": open_n,
+            "marked_at_horizon": int(r["marked_at_horizon"]),
+            "positions_in_window": positions,
+            "open_at_horizon_frac": (open_n / positions if positions else None),
+            "resolution_lag": _lag_distribution(resolved, int(r["censored"])),
+        }
+
     mtm_coverage = {
-        "by_config_overall": {
-            key: {"open_at_horizon": _cov_total(res, "open_at_horizon"),
-                  "marked_at_horizon": _cov_total(res, "marked_at_horizon")}
-            for key, res in results.items()},
+        "by_config_overall": {key: _config_overall(res) for key, res in results.items()},
         "winner_by_period": (
-            [{"as_of": int(idx), "open_at_horizon": int(r["open_at_horizon"]),
-              "marked_at_horizon": int(r["marked_at_horizon"])}
+            [_period_detail(idx, r, winner_res.lags_by_period.get(int(idx), []))
              for idx, r in winner_res.coverage.iterrows()]
             if winner_res is not None and not winner_res.coverage.empty else []),
     }
@@ -1053,6 +1126,23 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
           f"{bc['distinct']} distinct backtests of {bc['total']} requested "
           f"({bc['naive_ceiling']} naive ceiling)")
 
+    # F1 (#436): survivorship exposure. The bake-off universe is the CURRENT wallet_cache.db snapshot
+    # sliced per-as_of; #385 HARD-DELETES purged wallets (proven losers + dead-weight), so historical
+    # as_of slices are missing them and a point-in-time roster is unreconstructable. The directional
+    # bias is OPTIMISTIC (the losers a copy strategy would have followed-and-bled-on are absent). A
+    # precise purge count is NOT cheaply available from the DuckDB positions view (the purge leaves no
+    # in-extract ledger), so the current universe size is the cheap exposure proxy. See docs/31.
+    surv = {"universe_wallets": int(ss["wallet"].nunique()),
+            "universe_positions": int(len(ss)),
+            "point_in_time_roster": False, "purge_hard_deletes_wallets": True,
+            "directional_bias": "optimistic",
+            "note": "Current-snapshot universe; #385-purged wallets are absent from historical as_of "
+                    "slices. Hard-delete makes a point-in-time roster unreconstructable. See docs/31."}
+    (out_dir / "survivorship.json").write_text(json.dumps(surv, indent=2))
+    print(f"survivorship: universe {surv['universe_wallets']} wallets / {surv['universe_positions']} "
+          f"positions (current snapshot; #385-purged wallets absent at historical as_of → optimistic "
+          f"bias; survivorship.json)")
+
     # E3 (#436): forward-MTM coverage beside the winner — what fraction of the winner's
     # open-at-horizon forward edge the CLOB series actually valued (the resolution-speed residual;
     # an uncovered open position contributes 0 to the MTM). Per-(config, period) detail on disk.
@@ -1063,6 +1153,19 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     cov_pct = f"{100.0 * w_marked / w_open:.1f}%" if w_open else "n/a"
     print(f"MTM coverage (winner): {w_marked}/{w_open} open-at-horizon positions marked "
           f"({cov_pct}); per-(config, period) detail in mtm_coverage.json")
+
+    # F3a (#436): the winner's resolution-lag distribution — how slowly its still-open forward edge
+    # eventually settled (advisory; quantifies the resolution-speed residual coverage alone misses).
+    wco = result["mtm_coverage"]["by_config_overall"].get(result["deliverable"]["winner_key"], {})
+    rl = wco.get("resolution_lag", {})
+    of = wco.get("open_at_horizon_frac")
+    of_str = f"{100.0 * of:.1f}%" if of is not None else "n/a"
+    p50_str = f"{rl['p50_days']:.1f}d" if rl.get("p50_days") is not None else "n/a"
+    p90_str = f"{rl['p90_days']:.1f}d" if rl.get("p90_days") is not None else "n/a"
+    cens = rl.get("censored_frac")
+    cens_str = f"{100.0 * cens:.1f}%" if cens is not None else "n/a"
+    print(f"resolution lag (winner, open-at-horizon): open frac {of_str}; "
+          f"median {p50_str}, p90 {p90_str}, censored {cens_str} — advisory, in mtm_coverage.json")
 
     # Cross-check the deliverable — the WINNING config's frozen final-step followed set (A1, #436;
     # the set the winner actually rode, applying its criteria/eligibility/deflation/policy), NOT a

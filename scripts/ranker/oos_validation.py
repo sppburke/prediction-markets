@@ -336,6 +336,10 @@ def akm_inference_on_winners(estimates, ses, *, winner: "int | None" = None,
         return {"winner": w, "naive_estimate": y, "median_unbiased": y,
                 "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": lower,
                 "conditional": False}
+    if s <= 0.0:                                               # F3 guard (#436 Phase F): a zero-SE
+        return {"winner": w, "naive_estimate": y, "median_unbiased": y,   # winner makes the truncated-
+                "ci_lo": y, "ci_hi": y, "truncation": lower,              # normal law a step function
+                "conditional": False}                                     # (ill-posed for brentq)
     from scipy.optimize import brentq
 
     lo_b, hi_b = y - 20.0 * s, y + 20.0 * s

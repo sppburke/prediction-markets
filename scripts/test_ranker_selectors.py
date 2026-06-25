@@ -59,6 +59,14 @@ class OnlineExpWeightsTest(unittest.TestCase):
         self.assertAlmostEqual(float(fs2["weight"].sum()), 2.0)
         self.assertEqual(set(fs2["wallet"]), {"a", "b"})
 
+    def test_k_zero_returns_empty_not_error(self) -> None:
+        # F3 (#436 Phase F): k<=0 must short-circuit to an empty set; without the guard the empty
+        # top-array's .max() raises ValueError on a zero-size reduction.
+        sel = OnlineExpWeights()
+        fs, state = sel.select(_scores({"a": 1.0, "b": 0.5}), k=0, state=None)
+        self.assertEqual(len(fs), 0)
+        self.assertIsInstance(state, dict)
+
     def test_conforms_to_protocol_and_registry(self) -> None:
         self.assertIsInstance(OnlineExpWeights(), Selector)
         self.assertIs(SELECTOR_REGISTRY["online_exp_weights"], OnlineExpWeights)

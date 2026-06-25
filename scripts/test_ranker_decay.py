@@ -137,6 +137,13 @@ class WeightedStatsNaNGuardTest(unittest.TestCase):
         self.assertEqual(wstd, 0.0)
         self.assertTrue(math.isnan(tstat))
 
+    def test_negative_weight_is_nan(self) -> None:
+        # F3 (#436 Phase F): a negative reliability weight is invalid by contract — fail safe to NaN,
+        # not a silently corrupted weighted statistic.
+        wmean, wstd, n_eff, tstat = rd.weighted_stats([0.3, 0.5, 0.1], [1.0, -0.5, 1.0])
+        self.assertTrue(math.isnan(wmean) and math.isnan(wstd) and math.isnan(tstat))
+        self.assertEqual(n_eff, 0.0)
+
 
 class ParseAsOfTest(unittest.TestCase):
     def test_none_and_empty(self) -> None:

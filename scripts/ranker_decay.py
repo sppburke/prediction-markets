@@ -78,6 +78,11 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     n = int(v.size)
     if n == 0:
         return (float("nan"), float("nan"), 0.0, float("nan"))
+    # F3 guard (#436 Phase F): reliability weights are non-negative by contract (uniqueness / recency
+    # weights). A negative weight is a caller bug that would corrupt wmean/wvar — fail safe to NaN
+    # (the wallet is dropped) rather than emit a silently wrong statistic.
+    if bool(np.any(w < 0.0)):
+        return (float("nan"), float("nan"), 0.0, float("nan"))
 
     # Uniform-weight short-circuit -> bitwise-identical to legacy np.mean/np.std(ddof=1).
     if bool(np.all(w == w[0])):

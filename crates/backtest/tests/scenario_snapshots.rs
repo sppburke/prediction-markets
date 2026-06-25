@@ -294,7 +294,7 @@ async fn wallet_present_throughout_emits_throughout() {
 /// PASS: a position opened during week 1 (when alice is in the snapshot) is NOT
 ///       force-closed when alice falls off in week 2; it remains open until the
 ///       leader sells (or stays open at horizon).
-/// FAIL: open_at_horizon == 0 AND no exit fill exists.
+/// FAIL: open_at_sim_end == 0 AND no exit fill exists.
 #[tokio::test]
 async fn position_opened_in_week1_persists_after_drop() {
     let alice = wallet(ALICE_HEX);

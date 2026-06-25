@@ -274,6 +274,17 @@ class AKMWinnersTest(unittest.TestCase):
         self.assertFalse(out["conditional"])
         self.assertEqual(out["median_unbiased"], 1.0)           # naive (no truncation correction)
 
+    def test_zero_se_winner_is_point_ci(self) -> None:
+        # F3 (#436 Phase F): a zero-SE winner makes the truncated-normal law a step function
+        # (ill-posed for brentq) -> a degenerate point CI [y, y], reported unconditional.
+        est = np.array([3.0, 1.0, 0.5])
+        out = akm_inference_on_winners(est, np.array([0.0, 1.0, 1.0]), winner=0)
+        self.assertEqual(out["winner"], 0)
+        self.assertFalse(out["conditional"])
+        self.assertEqual(out["ci_lo"], 3.0)
+        self.assertEqual(out["ci_hi"], 3.0)
+        self.assertEqual(out["median_unbiased"], 3.0)
+
 
 class MRSWRankCSTest(unittest.TestCase):
     def test_clear_leader_in_cs_losers_excluded(self) -> None:

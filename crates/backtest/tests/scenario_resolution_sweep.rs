@@ -7,7 +7,7 @@
 //! 3. `future_resolution_leaves_position_open` — resolved_at > last sim day → still open at horizon.
 //! 4. `anomaly_guard_preserves_position_with_early_resolution` — resolved_at < bought_on → not closed.
 //! 5. `empty_resolution_index_leaves_all_positions_open` — empty index → sweep is a no-op.
-//! 6. `resolution_data_reduces_open_at_horizon` — with vs without index comparison.
+//! 6. `resolution_data_reduces_open_at_sim_end` — with vs without index comparison.
 //! 7. `sequential_markets_each_swept_independently` — two markets closed sequentially.
 //! 8. `sweep_and_leader_sell_same_day_no_double_close` — simultaneous sweep + leader sell is safe.
 
@@ -184,7 +184,7 @@ fn fills_by_side(output_dir: &std::path::Path, side: &str) -> Vec<serde_json::Va
 // ── Scenario 1 ────────────────────────────────────────────────────────────────
 
 /// PASS: position on outcome 0 swept at close_price=1.0 when outcome 0 wins.
-///       open_at_horizon==0; total_pnl_usd > 0; ≥1 resolution fill in trades.ndjson.
+///       open_at_sim_end==0; total_pnl_usd > 0; ≥1 resolution fill in trades.ndjson.
 /// FAIL: position remains open OR no resolution fill written.
 #[tokio::test]
 async fn resolved_yes_closes_position_at_full_price() {
@@ -201,7 +201,7 @@ async fn resolved_yes_closes_position_at_full_price() {
     let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
-        report.open_at_horizon, 0,
+        report.open_at_sim_end, 0,
         "resolved market must not remain open at horizon"
     );
     assert!(
@@ -219,7 +219,7 @@ async fn resolved_yes_closes_position_at_full_price() {
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
 
 /// PASS: position swept at close_price=0.0 when the opposing outcome wins.
-///       open_at_horizon==0; resolution fill exists with fill_price=0.
+///       open_at_sim_end==0; resolution fill exists with fill_price=0.
 /// FAIL: position remains open OR fill_price is non-zero.
 #[tokio::test]
 async fn resolved_no_closes_position_at_zero() {
@@ -236,7 +236,7 @@ async fn resolved_no_closes_position_at_zero() {
     let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
-        report.open_at_horizon, 0,
+        report.open_at_sim_end, 0,
         "NO-resolved market must not remain open at horizon"
     );
 
@@ -264,7 +264,7 @@ async fn resolved_no_closes_position_at_zero() {
 ///       position remains open at horizon with no resolution fill.
 /// FAIL: position prematurely closed before the resolution date.
 #[tokio::test]
-async fn future_resolution_leaves_position_open_at_horizon() {
+async fn future_resolution_leaves_position_open_at_sim_end() {
     let alice = wallet(ALICE_HEX);
 
     let mut trades = winner_book(alice);
@@ -277,8 +277,8 @@ async fn future_resolution_leaves_position_open_at_horizon() {
     let report = run_sim(&dir, trades, &resolutions);
 
     assert!(
-        report.open_at_horizon > 0,
-        "position must remain open when resolved_at > last sim date; open_at_horizon=0"
+        report.open_at_sim_end > 0,
+        "position must remain open when resolved_at > last sim date; open_at_sim_end=0"
     );
     let fills = fills_by_side(&dir.path().join("output"), "resolution");
     assert!(
@@ -291,7 +291,7 @@ async fn future_resolution_leaves_position_open_at_horizon() {
 // ── Scenario 4 ────────────────────────────────────────────────────────────────
 
 /// PASS: when resolved_at_unix < bought_on_unix the anomaly guard preserves the position.
-///       open_at_horizon > 0 and no resolution fill in trades.ndjson.
+///       open_at_sim_end > 0 and no resolution fill in trades.ndjson.
 /// FAIL: position closed despite the anomaly guard.
 #[tokio::test]
 async fn anomaly_guard_preserves_position_with_early_resolution() {
@@ -309,8 +309,8 @@ async fn anomaly_guard_preserves_position_with_early_resolution() {
     let report = run_sim(&dir, trades, &resolutions);
 
     assert!(
-        report.open_at_horizon > 0,
-        "anomaly guard must prevent close when resolved_at < bought_on; open_at_horizon=0"
+        report.open_at_sim_end > 0,
+        "anomaly guard must prevent close when resolved_at < bought_on; open_at_sim_end=0"
     );
     let fills = fills_by_side(&dir.path().join("output"), "resolution");
     assert!(
@@ -335,7 +335,7 @@ async fn empty_resolution_index_leaves_all_positions_open() {
     let report = run_sim(&dir, trades, &ResolutionIndex::new());
 
     assert!(
-        report.open_at_horizon > 0,
+        report.open_at_sim_end > 0,
         "without resolution data the open position must remain at horizon"
     );
     let fills = fills_by_side(&dir.path().join("output"), "resolution");
@@ -348,10 +348,10 @@ async fn empty_resolution_index_leaves_all_positions_open() {
 
 // ── Scenario 6 ────────────────────────────────────────────────────────────────
 
-/// PASS: with resolution data, open_at_horizon is strictly lower than without it.
-/// FAIL: resolution data does not reduce open_at_horizon.
+/// PASS: with resolution data, open_at_sim_end is strictly lower than without it.
+/// FAIL: resolution data does not reduce open_at_sim_end.
 #[tokio::test]
-async fn resolution_data_reduces_open_at_horizon() {
+async fn resolution_data_reduces_open_at_sim_end() {
     let alice = wallet(ALICE_HEX);
 
     let build_trades = || {
@@ -371,17 +371,17 @@ async fn resolution_data_reduces_open_at_horizon() {
     let without_res = run_sim(&dir_without, build_trades(), &ResolutionIndex::new());
 
     assert!(
-        with_res.open_at_horizon < without_res.open_at_horizon,
-        "resolution data must reduce open_at_horizon: with={} without={}",
-        with_res.open_at_horizon,
-        without_res.open_at_horizon
+        with_res.open_at_sim_end < without_res.open_at_sim_end,
+        "resolution data must reduce open_at_sim_end: with={} without={}",
+        with_res.open_at_sim_end,
+        without_res.open_at_sim_end
     );
 }
 
 // ── Scenario 7 ────────────────────────────────────────────────────────────────
 
 /// PASS: two positions on distinct markets are swept independently in the same sweep pass.
-///       open_at_horizon==0; exactly 2 resolution fills in trades.ndjson.
+///       open_at_sim_end==0; exactly 2 resolution fills in trades.ndjson.
 /// FAIL: one or both positions remain open, or fill count != 2.
 #[tokio::test]
 async fn sequential_markets_each_swept_independently() {
@@ -400,9 +400,9 @@ async fn sequential_markets_each_swept_independently() {
     let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
-        report.open_at_horizon, 0,
-        "both markets must be swept; open_at_horizon={}",
-        report.open_at_horizon
+        report.open_at_sim_end, 0,
+        "both markets must be swept; open_at_sim_end={}",
+        report.open_at_sim_end
     );
     let fills = fills_by_side(&dir.path().join("output"), "resolution");
     assert_eq!(
@@ -435,7 +435,7 @@ async fn sweep_and_leader_sell_same_day_no_double_close() {
     let report = run_sim(&dir, trades, &resolutions);
 
     assert_eq!(
-        report.open_at_horizon, 0,
+        report.open_at_sim_end, 0,
         "position must be closed exactly once"
     );
     assert!(
