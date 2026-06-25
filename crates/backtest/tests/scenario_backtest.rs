@@ -3,8 +3,8 @@
 //! Scenarios:
 //! 1. `winner_wallet_produces_positive_pnl` — a 100%-win-rate wallet is copied and
 //!    generates positive realized PnL after evaluate() routes the signal.
-//! 2. `open_at_horizon_excluded_from_realized_pnl` — positions still open at the end
-//!    of the simulation are counted in `open_at_horizon` and NOT written off as losses.
+//! 2. `open_at_sim_end_excluded_from_realized_pnl` — positions still open at the end
+//!    of the simulation are counted in `open_at_sim_end` and NOT written off as losses.
 //! 3. `per_trader_win_rate_used_as_probability` — the simulation uses the per-leader
 //!    empirical win rate (from TraderLedger) as `p` instead of a flat leader_alpha stub.
 //! 4. `fee_model_reduces_edge` — the Polymarket fee formula increases `c`, reducing
@@ -170,11 +170,11 @@ async fn winner_wallet_produces_positive_pnl() {
 
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
 
-/// PASS: positions still open when the simulation ends appear in `open_at_horizon` and
+/// PASS: positions still open when the simulation ends appear in `open_at_sim_end` and
 ///       are NOT written off as losses — total_pnl_usd does not include them.
-/// FAIL: open_at_horizon == 0, or total_pnl_usd includes a write-off loss for open positions.
+/// FAIL: open_at_sim_end == 0, or total_pnl_usd includes a write-off loss for open positions.
 #[tokio::test]
-async fn open_at_horizon_excluded_from_realized_pnl() {
+async fn open_at_sim_end_excluded_from_realized_pnl() {
     let winner = wallet(WINNER_HEX);
 
     let mut all_trades = generate_winner_trades(winner);
@@ -198,9 +198,9 @@ async fn open_at_horizon_excluded_from_realized_pnl() {
     .unwrap();
 
     assert!(
-        report.open_at_horizon > 0,
-        "expected open_at_horizon > 0; got {}",
-        report.open_at_horizon
+        report.open_at_sim_end > 0,
+        "expected open_at_sim_end > 0; got {}",
+        report.open_at_sim_end
     );
 
     assert!(

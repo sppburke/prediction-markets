@@ -63,6 +63,8 @@ struct PnlRow {
     is_horizon_mtm: bool,
     open_at_horizon: u64,
     marked_at_horizon: u64,
+    positions_in_window: u64,
+    resolution_lags_secs: Vec<i64>,
 }
 
 fn wallet(b: u8) -> WalletAddress {
@@ -447,5 +449,174 @@ fn scenario_mtm_partial_coverage_telescopes_no_double_count() {
     assert!(
         pass,
         "adjacent-window flows must telescope to (mark_H − cost) with no double-count under partial coverage"
+    );
+}
+
+/// Build a fixture for the F3a resolution-lag + open-fraction diagnostics (issue
+/// #436 Phase F). Window `as_of = D10`, `horizon = D30`. No CLOB marks — the rows
+/// survive via `open_at_horizon > 0`; coverage is not under test here, the
+/// resolution lag and the open-fraction denominator are.
+///   - P (0x77): buys `mkt-late` at **D25**; it resolves at **D40** (after the
+///     horizon) → open at the horizon, resolution lag = D40 − as_of(D10) = 30 days.
+///     P's D25 trade also extends the sim's date axis past D20 so R's quick-resolver
+///     is swept.
+///   - Q (0x88): buys `mkt-never` at D15; never resolves → open at horizon,
+///     **censored** lag = −1.
+///   - R (0x99): buys `mkt-r-open` at D12 (never resolves → open at horizon) AND
+///     `mkt-r-closed` at D12 (resolves at **D20**, inside the window → realized,
+///     closed in `(D10, D30]`) → open_at_horizon = 1 but positions_in_window = 2.
+fn run_lag_fixture() -> (Vec<PnlRow>, String, String, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let out_dir = dir.path().join("out");
+
+    let p = wallet(0x77);
+    let q = wallet(0x88);
+    let r = wallet(0x99);
+
+    {
+        let mut cache = WalletCache::open(&cache_path).unwrap();
+        cache
+            .insert_new(
+                &p.to_string(),
+                vec![buy(p, "mkt-late", "p-1", dec!(0.50), T0 + 25 * SEC_PER_DAY)],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                &q.to_string(),
+                vec![buy(
+                    q,
+                    "mkt-never",
+                    "q-1",
+                    dec!(0.50),
+                    T0 + 15 * SEC_PER_DAY,
+                )],
+            )
+            .unwrap();
+        cache
+            .insert_new(
+                &r.to_string(),
+                vec![
+                    buy(r, "mkt-r-open", "r-1", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                    buy(r, "mkt-r-closed", "r-2", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                ],
+            )
+            .unwrap();
+
+        // mkt-late resolves AFTER the horizon (D40) → P stays open at D30, lag = 30d.
+        let late = T0 + 40 * SEC_PER_DAY;
+        cache
+            .insert_resolution("mkt-late", Some(0), late, late)
+            .unwrap();
+        // mkt-r-closed resolves INSIDE the window (D20) → realized, closed-in-window.
+        let early = T0 + 20 * SEC_PER_DAY;
+        cache
+            .insert_resolution("mkt-r-closed", Some(0), early, early)
+            .unwrap();
+        // mkt-never and mkt-r-open have NO resolution rows → censored / open at horizon.
+    }
+
+    let cache = WalletCache::open(&cache_path).unwrap();
+    let injected = vec![p, q, r];
+    let mut all_trades = load_injected_trades(&cache, &injected);
+    all_trades.sort_by_key(|t| t.timestamp.0);
+
+    let resolutions = pe_bootstrap::gamma::load_resolutions(&cache).unwrap();
+    let schedules = pe_bootstrap::gamma::load_schedules(&cache).unwrap();
+    let liq = pe_bootstrap::gamma::load_liquidity(&cache).unwrap();
+    let snapshots = cache.load_all_snapshots().unwrap();
+    let markets: HashSet<MarketId> = all_trades.iter().map(|t| t.market_id.clone()).collect();
+    let marks = cache.load_clob_marks(&markets, HORIZON).unwrap();
+
+    let config = BacktestConfig {
+        bootstrap_cache_path: cache_path.clone(),
+        output_dir: out_dir.clone(),
+        flat_usd: Some(dec!(25)),
+        max_signal_price: None,
+        mtm_window_start_unix: Some(AS_OF),
+        mtm_window_end_unix: Some(HORIZON),
+        strategy: WinnerFollowConfig {
+            slippage_rate: dec!(0),
+            ..WinnerFollowConfig::default()
+        },
+        ..BacktestConfig::default()
+    };
+    let ranker_config = RankerConfig::default();
+    let strategy = WinnerFollowStrategy::new(config.strategy.clone());
+    let injected_set: HashSet<WalletAddress> = injected.iter().copied().collect();
+
+    run_simulation_with(
+        &config,
+        &all_trades,
+        &snapshots,
+        &resolutions,
+        &schedules,
+        &liq,
+        &ranker_config,
+        &strategy,
+        true,
+        Some(&injected_set),
+        Some(&marks),
+    )
+    .unwrap();
+
+    let text = std::fs::read_to_string(out_dir.join("pnl_by_period.ndjson")).unwrap();
+    let rows: Vec<PnlRow> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (rows, p.to_string(), q.to_string(), r.to_string())
+}
+
+#[test]
+fn scenario_mtm_resolution_lag_after_horizon() {
+    // PASS: an open-at-horizon position whose market resolves AFTER the horizon reports the resolution
+    // lag `resolved_at − as_of` = D40 − D10 = 30 days. FAIL otherwise.
+    let (rows, p, _q, _r) = run_lag_fixture();
+    let row = mtm_row(&rows, &p).expect("wallet P must have a horizon MTM row");
+    let want = vec![30 * SEC_PER_DAY];
+    let pass = row.resolution_lags_secs == want && row.open_at_horizon == 1;
+    println!(
+        "PASS={pass} mtm.resolution_lag_after_horizon: P lags={:?} (want {want:?}), open={}",
+        row.resolution_lags_secs, row.open_at_horizon
+    );
+    assert!(
+        pass,
+        "open-at-horizon position must report lag = resolved_at − as_of"
+    );
+}
+
+#[test]
+fn scenario_mtm_resolution_lag_censored_when_unresolved() {
+    // PASS: an open-at-horizon position whose market never resolves is censored (lag = −1). FAIL otherwise.
+    let (rows, _p, q, _r) = run_lag_fixture();
+    let row = mtm_row(&rows, &q).expect("wallet Q must have a horizon MTM row");
+    let pass = row.resolution_lags_secs == vec![-1] && row.open_at_horizon == 1;
+    println!(
+        "PASS={pass} mtm.resolution_lag_censored: Q lags={:?} (want [-1]), open={}",
+        row.resolution_lags_secs, row.open_at_horizon
+    );
+    assert!(
+        pass,
+        "an unresolved open position must be censored with lag = −1"
+    );
+}
+
+#[test]
+fn scenario_mtm_open_fraction_denominator_counts_closed_in_window() {
+    // PASS: the open-fraction denominator counts a wallet's closed-in-window position too — R holds one
+    // position open at the horizon and one that resolved inside the window, so open_at_horizon=1 but
+    // positions_in_window=2 (fraction 1/2). FAIL otherwise.
+    let (rows, _p, _q, r) = run_lag_fixture();
+    let row = mtm_row(&rows, &r).expect("wallet R must have a horizon MTM row");
+    let pass = row.open_at_horizon == 1 && row.positions_in_window == 2;
+    println!(
+        "PASS={pass} mtm.open_fraction_denominator: R open={} (want 1), positions_in_window={} (want 2)",
+        row.open_at_horizon, row.positions_in_window
+    );
+    assert!(
+        pass,
+        "positions_in_window must include closed-in-window positions for a horizon-exposed wallet"
     );
 }

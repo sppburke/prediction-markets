@@ -187,7 +187,7 @@ pub struct BacktestConfig {
 
     /// Suppress new BUY opens when within `N` days of the simulation horizon —
     /// gives existing positions time to close (leader sell or market resolution)
-    /// before the simulation ends, reducing `open_at_horizon` capital lock-up
+    /// before the simulation ends, reducing `open_at_sim_end` capital lock-up
     /// and the "unrealised tail" that distorts PnL/Sharpe interpretation.
     /// `None` disables the gate; sell path is always unaffected.
     /// `PE_BACKTEST_NO_BUY_WITHIN_HORIZON_DAYS` overrides.

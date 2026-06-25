@@ -31,9 +31,12 @@ pub struct WinnerFollowReport {
     /// Slippage applied to each fill, in basis points of the signal price.
     /// Canonical default: `backtest_slippage_bps = 100`.
     pub slippage_assumption_bps: u32,
-    /// Number of copy positions still open at the simulation horizon.
-    /// These are excluded from `total_pnl_usd` because their final PnL is unknown.
-    pub open_at_horizon: u64,
+    /// Number of copy positions still open at the simulation *end* (the terminal
+    /// log line). These are excluded from `total_pnl_usd` because their final PnL
+    /// is unknown. Distinct from the per-window `PeriodPnlRow.open_at_horizon`
+    /// (issue #436 Phase E), which counts positions open at a forward-MTM window's
+    /// horizon — renamed here (Phase F / F3b) so the two cannot be conflated.
+    pub open_at_sim_end: u64,
     /// Fraction (0–1) of buy signals suppressed by `max_hours_to_expiry` because
     /// the market's resolution was too far out or unknown pre-fix. Zero when
     /// `max_hours_to_expiry` is not configured.
@@ -147,7 +150,7 @@ impl KellySweepReport {
     /// Render a markdown comparison table to stdout.
     pub fn to_markdown_table(&self) -> String {
         let mut out = String::new();
-        out.push_str("| Kelly fraction | Total PnL (USD) | Sharpe | Max DD % | Win rate % | Copies | Open at horizon |\n");
+        out.push_str("| Kelly fraction | Total PnL (USD) | Sharpe | Max DD % | Win rate % | Copies | Open at sim end |\n");
         out.push_str("|---:|---:|---:|---:|---:|---:|---:|\n");
         for run in &self.runs {
             let r = &run.report;
@@ -159,7 +162,7 @@ impl KellySweepReport {
                 r.max_drawdown_pct,
                 r.win_rate_pct,
                 r.total_copies,
-                r.open_at_horizon,
+                r.open_at_sim_end,
             ));
         }
         out

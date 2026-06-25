@@ -1007,9 +1007,11 @@ pub fn run_simulation_with(
         }
     }
 
-    // Positions still open at horizon are excluded from realized PnL — their final
-    // value is unknown. Capital remains tied up in the bankroll (cost was deducted at BUY).
-    let open_at_horizon = u64::try_from(open_positions.len()).unwrap_or(u64::MAX);
+    // Positions still open at the simulation END are excluded from realized PnL —
+    // their final value is unknown. Capital remains tied up in the bankroll (cost
+    // was deducted at BUY). Named `open_at_sim_end` (Phase F / F3b) to disambiguate
+    // from the per-window `PeriodPnlRow.open_at_horizon` (Phase E forward MTM).
+    let open_at_sim_end = u64::try_from(open_positions.len()).unwrap_or(u64::MAX);
     // Do NOT modify bankroll or record PnL for open positions.
 
     // Forward mark-to-market rows for the configured bake-off window (issue #436
@@ -1028,7 +1030,7 @@ pub fn run_simulation_with(
                 close_unix: None,
             });
         }
-        build_mtm_rows(&mtm_lifetimes, win_start, win_end, marks)
+        build_mtm_rows(&mtm_lifetimes, win_start, win_end, marks, resolutions)
     } else {
         Vec::new()
     };
@@ -1055,7 +1057,7 @@ pub fn run_simulation_with(
         bankroll_initial,
         bankroll_final: bankroll,
         slippage_assumption_bps,
-        open_at_horizon,
+        open_at_sim_end,
         expiry_filter_suppression_pct: suppression_tracker.suppression_pct_global(),
         expiry_suppression_by_quarter: suppression_tracker.per_quarter_suppression(),
         high_price_suppression_pct: high_price_tracker.suppression_pct_global(),
@@ -1086,7 +1088,7 @@ pub fn run_simulation_with(
         total_copies = report.total_copies,
         total_pnl_usd = %report.total_pnl_usd,
         win_rate_pct = %report.win_rate_pct,
-        open_at_horizon = report.open_at_horizon,
+        open_at_sim_end = report.open_at_sim_end,
         "simulation complete"
     );
 
@@ -1389,11 +1391,13 @@ struct PeriodAccum {
 ///   carrying `realized_pnl` / `n_fills` / `notional`. `unrealized_pnl = 0`.
 /// - **Horizon MTM row** (`is_horizon_mtm = true`): per wallet, stamped at
 ///   `period_end = mtm_window_end_unix`, carrying the forward mark-to-market
-///   *flow* in `unrealized_pnl` (`Σ(mark_H − cost) − Σ(mark_as_of − cost)`) and
-///   the `(open_at_horizon, marked_at_horizon)` coverage counts. `realized_pnl =
-///   0`. The Python harness sums `realized_pnl + unrealized_pnl` over the window
-///   for the objective, and filters `~is_horizon_mtm` for the realized-only
-///   demoter/`live_pnl` accumulation.
+///   *flow* in `unrealized_pnl` (`Σ(mark_H − cost) − Σ(mark_as_of − cost)`), the
+///   `(open_at_horizon, marked_at_horizon)` coverage counts, and the F3a
+///   resolution-lag diagnostics (`positions_in_window`, `resolution_lags_secs`).
+///   `realized_pnl = 0`. The Python harness sums `realized_pnl + unrealized_pnl`
+///   over the window for the objective, and filters `~is_horizon_mtm` for the
+///   realized-only demoter/`live_pnl` accumulation. The F3a fields are advisory
+///   reporting only — they never enter the objective or the verdict.
 ///
 /// When no MTM window is configured, only realized day rows are emitted and
 /// `unrealized_pnl` stays the documented `0.0` sentinel. The money fields
@@ -1417,6 +1421,22 @@ struct PeriodPnlRow {
     /// Of `open_at_horizon`, how many had a CLOB mark at-or-before the horizon
     /// (the rest are uncovered → contribute `0`). Coverage = marked / open.
     marked_at_horizon: u64,
+    /// Positions this wallet held that were *active in the window* — open at the
+    /// horizon (`open_at_horizon`) plus those it closed within `(as_of, horizon]`
+    /// (resolved or sold). Denominator for the open-at-horizon fraction
+    /// `open_at_horizon / positions_in_window` (issue #436 Phase F / F3a). `0` on
+    /// realized day rows. Carried only on a SURVIVING MTM row — one with open-at-
+    /// horizon exposure OR a non-zero boundary flow; a wallet whose entire window
+    /// footprint is positions opened AND closed strictly inside the window (no mark at
+    /// either boundary) emits no row, so those count toward neither side.
+    positions_in_window: u64,
+    /// Per open-at-horizon position, the resolution lag `resolved_at − as_of` in
+    /// seconds (issue #436 Phase F / F3a) — how long after the window opened the
+    /// still-unresolved position eventually settled. `-1` marks a *censored*
+    /// position whose market never resolved in the cache. ADVISORY ONLY: built from
+    /// post-horizon resolution times, it never feeds the bake-off verdict (which is
+    /// realized + MTM-flow). Empty on realized day rows.
+    resolution_lags_secs: Vec<i64>,
 }
 
 /// Build the forward mark-to-market rows for one bake-off window (issue #436
@@ -1447,6 +1467,7 @@ fn build_mtm_rows(
     win_start: i64,
     win_end: i64,
     marks: &ClobMarkIndex,
+    resolutions: &ResolutionIndex,
 ) -> Vec<PeriodPnlRow> {
     #[derive(Default)]
     struct WalletMtm {
@@ -1454,6 +1475,8 @@ fn build_mtm_rows(
         unreal_end: Decimal,
         open_at_horizon: u64,
         marked_at_horizon: u64,
+        positions_in_window: u64,
+        resolution_lags_secs: Vec<i64>,
     }
     let mut by_wallet: HashMap<WalletAddress, WalletMtm> = HashMap::new();
     for lt in lifetimes {
@@ -1467,10 +1490,25 @@ fn build_mtm_rows(
         if lt.open_at(win_end) {
             let entry = by_wallet.entry(lt.wallet).or_default();
             entry.open_at_horizon += 1;
+            entry.positions_in_window += 1;
+            // Resolution lag (advisory diagnostic, issue #436 Phase F / F3a): how long
+            // after `as_of` (= `win_start`) this still-open position eventually settled.
+            // `-1` = the market never resolved in the cache (censored). The resolution
+            // time is post-horizon, so this is REPORTING ONLY and never feeds the verdict.
+            let lag = resolutions
+                .get(&lt.market)
+                .map_or(-1, |r| r.resolved_at_unix - win_start);
+            entry.resolution_lags_secs.push(lag);
             if let Some(mark) = marks.mark_at_or_before(&lt.market, lt.outcome, win_end) {
                 entry.unreal_end += (mark - lt.avg_fill_price) * contracts;
                 entry.marked_at_horizon += 1;
             }
+        } else if lt.close_unix.is_some_and(|c| c > win_start && c <= win_end) {
+            // Closed within the window (resolved or sold): no flow or lag, but it
+            // belongs in the open-fraction denominator. Carried only if the wallet's
+            // row survives the drop filter below (open-at-horizon exposure OR a
+            // non-zero boundary flow — e.g. a position covered at `as_of`).
+            by_wallet.entry(lt.wallet).or_default().positions_in_window += 1;
         }
     }
     by_wallet
@@ -1491,6 +1529,8 @@ fn build_mtm_rows(
                 is_horizon_mtm: true,
                 open_at_horizon: m.open_at_horizon,
                 marked_at_horizon: m.marked_at_horizon,
+                positions_in_window: m.positions_in_window,
+                resolution_lags_secs: m.resolution_lags_secs,
             })
         })
         .collect()
@@ -1557,6 +1597,8 @@ fn write_period_pnl(
             is_horizon_mtm: false,
             open_at_horizon: 0,
             marked_at_horizon: 0,
+            positions_in_window: 0,
+            resolution_lags_secs: Vec::new(),
         })
         .collect();
     rows.extend(mtm_rows);
