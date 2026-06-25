@@ -177,6 +177,45 @@ class TrueClvMaterializeTest(unittest.TestCase):
         self.assertTrue(np.isnan(self.ss.loc["M1", "true_clv_close"]))
 
 
+class TrueClvCloseClampTest(unittest.TestCase):
+    """B5 (#436): the true_clv close is pinned to ``t <= LEAST(end_date, resolved_at)``, so for an
+    EARLY-resolved market (``resolved_at < end_date``) it cannot use a post-resolution — and, for an
+    in-sample position, post-``as_of`` — CLOB tick. Runs ``_TRUE_CLV_SQL`` directly on a hermetic
+    fixture (the only true_clv consumer is in-sample scoring, where ``resolved_at <= as_of``)."""
+
+    @staticmethod
+    def _con():
+        con = duckdb.connect()
+        con.execute("CREATE TABLE market_resolutions(market_id VARCHAR, winning_outcome_id BIGINT, "
+                    "resolved_at_unix BIGINT)")
+        con.executemany("INSERT INTO market_resolutions VALUES (?,?,?)",
+                        [("EARLY", 1, 1000), ("NORMAL", 1, 3000)])
+        con.execute("CREATE TABLE market_schedules(market_id VARCHAR, end_date_unix BIGINT)")
+        con.executemany("INSERT INTO market_schedules VALUES (?,?)",
+                        [("EARLY", 2000), ("NORMAL", 2500)])   # EARLY resolves (1000) BEFORE end (2000)
+        con.execute("CREATE TABLE token_conditions(token_id VARCHAR, condition_id VARCHAR, "
+                    "outcome_index BIGINT, fetched_at_unix BIGINT)")
+        con.executemany("INSERT INTO token_conditions VALUES (?,?,?,?)",
+                        [("tE", "EARLY", 1, 9), ("tN", "NORMAL", 1, 9)])
+        con.execute("CREATE TABLE market_price_history(market_id VARCHAR, token_id VARCHAR, "
+                    "t BIGINT, price VARCHAR, source VARCHAR)")
+        con.executemany("INSERT INTO market_price_history VALUES (?,?,?,?,?)", [
+            ("EARLY", "tE", 900, "0.60", "clob"),    # last clob <= resolved 1000 -> the true close
+            ("EARLY", "tE", 1500, "0.99", "clob"),   # post-resolution: old COALESCE(end 2000) leaked it
+            ("NORMAL", "tN", 2400, "0.70", "clob"),  # last clob <= end 2500 -> the true close
+            ("NORMAL", "tN", 2800, "0.80", "clob"),  # > end 2500 -> excluded (clamp is a no-op here)
+        ])
+        return con
+
+    def test_early_resolution_close_capped_at_resolution(self) -> None:
+        out = suff_stats.true_clv_close_prices(self._con()).set_index("market_id")
+        # EARLY: LEAST(end 2000, resolved 1000) = 1000 -> 0.60, NOT the post-resolution 0.99 the bare
+        # COALESCE(end_date, resolved_at) anchor would have leaked.
+        self.assertAlmostEqual(out.loc["EARLY", "true_clv_close"], 0.60)
+        # NORMAL (resolved 3000 >= end 2500): anchor stays end_date 2500 -> 0.70 (clamp is a no-op).
+        self.assertAlmostEqual(out.loc["NORMAL", "true_clv_close"], 0.70)
+
+
 def _raw() -> pd.DataFrame:
     """A hand-built 9-column frame in the shape ``duck_extract_positions`` returns."""
     return pd.DataFrame({

@@ -90,7 +90,13 @@ class HybridDisplacement:
         worst_rank = (int(fresh["rank"].max()) if len(fresh) else 0) + 1
 
         def n_periods(wallet: str) -> int:
-            return int((live_pnl["wallet"] == wallet).sum()) if len(live_pnl) else 0
+            # B2 (#436): mirror the demoter's as-of filter (demotion.py). live_pnl accumulates each
+            # step's forward horizon window, so by this step it holds rows with period_end > as_of
+            # from PRIOR steps; counting them would let FUTURE periods mark an incumbent "proven" and
+            # shield it from displacement. Only periods closed by as_of count as live evidence.
+            if not len(live_pnl):
+                return 0
+            return int(((live_pnl["wallet"] == wallet) & (live_pnl["period_end"] <= as_of)).sum())
 
         for challenger in fresh.sort_values("rank").index:      # best challengers first
             if challenger in kept:

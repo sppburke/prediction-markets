@@ -19,9 +19,9 @@ NaN when the bought outcome has no pre-resolution trade; ``proxy_clv`` drops tho
 ``true_clv_close`` is the CLOB mid at/just-before the market CLOSE on the bought outcome (issue
 #429 PR4 menu ``true_clv``). It is derived once by ``materialize`` from a DuckDB join over the
 OPTIONAL ``market_price_history`` + ``token_conditions`` views (CLOB ``source='clob'`` series,
-``arg_max(price, t)`` where ``t <= COALESCE(end_date_unix, resolved_at_unix)``), so the
-``true_clv`` estimator reads it as a column. Unlike ``close_proxy`` it pins to the market CLOSE,
-not the last trade. It is NaN when no CLOB series covers the outcome (best-effort: PR2's measured
+``arg_max(price, t)`` where ``t <= LEAST(COALESCE(end_date_unix, resolved_at_unix), resolved_at_unix)``
+— the scheduled close capped at resolution, issue #436 B5), so the ``true_clv`` estimator reads it
+as a column. Unlike ``close_proxy`` it pins to the market CLOSE, not the last trade. It is NaN when no CLOB series covers the outcome (best-effort: PR2's measured
 ceiling) OR when the optional CLOB views are absent (pre-backfill); ``true_clv`` drops those.
 
 The materialized frame is band/window-AGNOSTIC (permissive bands): each ``Criteria`` grid
@@ -82,10 +82,17 @@ GROUP BY t.market_id, t.outcome_id
 # #429 PR4). The bought ``outcome_id`` maps to a CLOB ``token_id`` via ``token_conditions``
 # (positional ``outcome_index``; rows with NULL outcome_index are SKIPPED, never mispriced).
 # ``arg_max(price, t)`` over ``source='clob'`` points with ``t <= close_ref`` returns the last
-# pre-close mid; ``close_ref = COALESCE(end_date_unix, resolved_at_unix)`` mirrors the Rust
-# backfill's window anchor. This pins to the market CLOSE, intentionally distinct from
-# ``close_proxy``'s strict ``< resolved_at_unix`` last-TRADE cutoff. ``price`` is VARCHAR in the
-# series, hence ``TRY_CAST`` (+ NULL guard so a malformed price never wins the arg_max).
+# pre-close mid; ``close_ref = LEAST(COALESCE(end_date_unix, resolved_at_unix), resolved_at_unix)``
+# — the scheduled close, but never LATER than resolution. The plain ``COALESCE(end_date,…)`` anchor
+# leaked: for an EARLY-resolved market (``resolved_at < end_date``) it pinned the close to a tick
+# dated after resolution — and after ``as_of`` for any in-sample position (``resolved_at <= as_of``
+# by the LANDMINE-2 split), a look-ahead the once-materialized window-agnostic column could not clamp
+# per-``as_of`` (issue #436 B5). Capping at ``resolved_at`` closes it for ALL in-sample positions and
+# is also a sounder CLV anchor (post-resolution ticks are 0/1 echoes of the known payoff, not a
+# consensus line). Only early-resolved markets change; the normal case (``resolved_at >= end_date``)
+# still pins to ``end_date``. Pins to the market CLOSE, intentionally distinct from ``close_proxy``'s
+# strict ``< resolved_at_unix`` last-TRADE cutoff. ``price`` is VARCHAR, hence ``TRY_CAST`` (+ NULL
+# guard so a malformed price never wins the arg_max).
 _TRUE_CLV_SQL = """
 SELECT mph.market_id AS market_id, tc.outcome_index AS outcome_id,
        arg_max(TRY_CAST(mph.price AS DOUBLE), mph.t) AS true_clv_close
@@ -96,7 +103,7 @@ JOIN market_resolutions r ON r.market_id = mph.market_id
 LEFT JOIN market_schedules s ON s.market_id = mph.market_id
 WHERE tc.outcome_index IS NOT NULL
   AND mph.source = 'clob'
-  AND mph.t <= COALESCE(s.end_date_unix, r.resolved_at_unix)
+  AND mph.t <= LEAST(COALESCE(s.end_date_unix, r.resolved_at_unix), r.resolved_at_unix)
   AND TRY_CAST(mph.price AS DOUBLE) IS NOT NULL
 GROUP BY mph.market_id, tc.outcome_index
 """

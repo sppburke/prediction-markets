@@ -95,6 +95,21 @@ class HybridDisplacementTest(unittest.TestCase):
         out = pol.step(_follow(["a", "b"]), fresh, live, as_of=100)
         self.assertIn("a", set(out["wallet"]))                   # proven a survives despite x
 
+    def test_future_period_evidence_excluded(self) -> None:
+        # B2 (#436): live_pnl accumulates each step's forward-horizon window, so it holds rows with
+        # period_end > as_of from PRIOR steps. The proven count must mirror the demoter's as_of
+        # filter — a future period must NOT mark an incumbent "proven" and shield it from displacement.
+        live = pd.DataFrame({"wallet": ["a"] * 5,
+                             "period_end": [10, 20, 30, 40, 200],  # only 4 are <= as_of=100
+                             "realized_pnl": [1.0] * 5})
+        pol = HybridDisplacement(2, _FakeDemoter(set(), min_periods=5), displacement_margin=2)
+        fresh = _fresh({"a": 10, "b": 5, "x": 1})
+        out = pol.step(_follow(["a", "b"]), fresh, live, as_of=100)
+        # With the as_of filter a counts 4 periods (< min_periods 5) -> unproven -> x (rank 1) far
+        # outranks it (margin 2 < 10) and displaces it. Without it, a counts 5 -> "proven" -> shielded.
+        self.assertIn("x", set(out["wallet"]))
+        self.assertNotIn("a", set(out["wallet"]))
+
 
 class OnlineWeightingTest(unittest.TestCase):
     def test_soft_weights_and_state_carries(self) -> None:

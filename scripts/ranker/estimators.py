@@ -12,6 +12,15 @@ from scipy.stats import norm
 
 from ranker_decay import weighted_stats  # reuse #366 weighted statistics — no drift
 
+# Per-position net-edge / CLV dispersion floor (ranker_sd_floor, glossary). np.std(ddof=1) of a
+# mathematically-constant net series is exactly 0.0 at n=5 but ~1e-16 at n>=6 (mean-rounding float
+# error), so a bare `sd > 0` admits a 6/6 win streak with a t-stat ~2e16, ranking it #1. A wallet's
+# genuine per-position dispersion is O(1e-3) or larger (>= one price tick), so 1e-9 cleanly separates
+# float noise from real signal: at or below it a wallet has undefined dispersion and is DROPPED (not
+# scored maximal), extending the deliberate n=5 zero-dispersion drop to the n>=6 float-noise case
+# uniformly across all five estimators (#436 A10 follow-up).
+_SD_FLOOR = 1e-9
+
 
 class EBShrinkageSkill:
     """Empirical-Bayes posterior ``P(edge > 0)`` per wallet (Jensen-Kelly-Pedersen).
@@ -39,7 +48,10 @@ class EBShrinkageSkill:
             mean, sd, n_eff, _ = weighted_stats(net, weights[g.index.to_numpy()])
             rows.append((wallet, mean, sd, max(n_eff, 1.0)))
         df = pd.DataFrame(rows, columns=["wallet", "mean", "sd", "n_eff"]).set_index("wallet")
-        se2 = (df["sd"] ** 2) / df["n_eff"]                      # sampling variance of the mean
+        # NaN a zero-dispersion wallet's sampling variance (constant net series -> sd 0, or ~1e-16
+        # float noise at n>=6) so its posterior is undefined and it drops, not scores a spurious max
+        # (#436 A10 follow-up; same `_SD_FLOOR` drop as t_stat / gu_koenker / clv).
+        se2 = ((df["sd"] ** 2) / df["n_eff"]).where(df["sd"] > _SD_FLOOR)  # sampling var of the mean
         # EB prior var (normal-normal). `var(ddof=1)` is NaN for < 2 wallets, and
         # `max(NaN, 1e-9)` keeps the NaN — which would silently empty the result; floor
         # explicitly so a degenerate <2-candidate input stays deterministic.
@@ -48,7 +60,7 @@ class EBShrinkageSkill:
         mu0 = df["mean"].mean()                                  # EB prior mean
         shrink = tau2 / (tau2 + se2)
         post_mean = mu0 + shrink * (df["mean"] - mu0)
-        post_sd = np.sqrt(shrink * se2).replace(0, np.nan)
+        post_sd = np.sqrt(shrink * se2)            # NaN se2 (zero-dispersion) -> NaN score -> dropped
         df["score"] = norm.cdf(post_mean / post_sd)             # P(edge > 0)
         # Drop wallets with an undefined posterior (n_eff <= 1 -> NaN SD): unscoreable, not
         # low-scoring. (Hardening over issue #421's reference snippet, whose `.astype(int)`
@@ -79,12 +91,13 @@ class TStatBaseline:
             rows.append((wallet, mean, sd, n_eff))
         df = pd.DataFrame(rows, columns=["wallet", "mean", "sd", "n_eff"]).set_index("wallet")
         se = df["sd"] / np.sqrt(df["n_eff"])
-        # A10 (#436): zero-dispersion wallets (se==0) are DROPPED here, not ranked #1 with +inf.
-        # This is deliberate and winner's-curse-robust: a constant streak (e.g. 5/5 wins) has an
-        # UNDEFINED — not maximal — t-stat, and admitting it top would reinstate exactly the
-        # small-sample curse this harness exists to kill. The downstream DSR gate mirrors this
-        # (bakeoff._zero_dispersion_positive only force-keeps a wallet an estimator already scored).
-        df["score"] = (df["mean"] / se).where((df["n_eff"] >= 2) & (se > 0))
+        # A10 (#436): zero-dispersion wallets (sd <= _SD_FLOOR) are DROPPED here, not ranked #1 with
+        # +inf. This is deliberate and winner's-curse-robust: a constant streak (5/5 -> sd 0.0, 6/6
+        # -> sd ~1e-16 float noise) has an UNDEFINED — not maximal — t-stat, and admitting it top
+        # would reinstate exactly the small-sample curse this harness exists to kill. `_SD_FLOOR`
+        # (not a bare `> 0`) is what catches the n>=6 float-noise case. The downstream DSR gate
+        # mirrors this (bakeoff._zero_dispersion_positive only force-keeps an already-scored wallet).
+        df["score"] = (df["mean"] / se).where((df["n_eff"] >= 2) & (df["sd"] > _SD_FLOOR))
         df = df[df["score"].notna()].copy()
         df["rank"] = df["score"].rank(ascending=False, method="first").astype(int)
         return df[["score", "rank"]]
@@ -118,7 +131,7 @@ class GuKoenkerNPMLE:
         for wallet, g in ss.groupby("wallet", sort=False):
             net = ((g["payoff"] - g["_eff"]) / g["_eff"]).to_numpy()
             mean, sd, n_eff, _ = weighted_stats(net, weights[g.index.to_numpy()])
-            se = sd / np.sqrt(n_eff) if (n_eff >= 2 and sd > 0) else np.nan
+            se = sd / np.sqrt(n_eff) if (n_eff >= 2 and sd > _SD_FLOOR) else np.nan
             rows.append((wallet, mean, se))
         df = pd.DataFrame(rows, columns=["wallet", "x", "se"]).set_index("wallet")
         df = df[df["se"].notna()].copy()
@@ -167,7 +180,7 @@ def _weighted_clv_tstat(
             continue
         clv = (g[close_col] - g["price"]).to_numpy()[valid]
         mean, sd, n_eff, _ = weighted_stats(clv, weights[g.index.to_numpy()][valid])
-        if not (n_eff >= 2 and sd > 0):
+        if not (n_eff >= 2 and sd > _SD_FLOOR):     # zero-dispersion (constant CLV) -> undefined t
             continue
         rows.append((wallet, mean * np.sqrt(n_eff) / sd))
     df = pd.DataFrame(rows, columns=["wallet", "score"]).set_index("wallet")
@@ -198,8 +211,10 @@ class ProxyCLV:
 class TrueCLV:
     """True closing-line-value skill per wallet (issue #429 PR4): ``CLV = close - entry`` on the
     bought outcome, where ``close`` is the CLOB mid at/just-before the market CLOSE (the suff_stats
-    ``true_clv_close`` column) — pinned to ``t ≤ COALESCE(end_date_unix, resolved_at_unix)`` rather
-    than ``proxy_clv``'s last pre-resolution *trade* price. The CLOB series is best-effort (PR2's
+    ``true_clv_close`` column) — pinned to ``t ≤ LEAST(COALESCE(end_date_unix, resolved_at_unix),
+    resolved_at_unix)`` (issue #436 B5: capped at resolution, so an early-resolved in-sample market
+    cannot pull a post-``as_of`` close) rather than ``proxy_clv``'s last pre-resolution *trade*
+    price. The CLOB series is best-effort (PR2's
     measured ~63.6% ceiling), so positions with no series get a NaN ``true_clv_close`` and are
     dropped; an all-NaN column (CLOB views absent / pre-backfill) yields an empty ranking,
     eliminated downstream — not a crash.

@@ -70,6 +70,10 @@ RANKER_DSR_MIN = 0.5         # ranker_dsr_min   — per-step per-wallet Deflated
 # genuinely-good configs (a +0.8/period config deflates to DSR≈0.93 at N=20 — below 0.95). The
 # winner's grid-DSR is surfaced + flagged when below this bar so the operator reads it (#436 A6).
 RANKER_GRID_DSR_MIN = 0.95   # ranker_grid_dsr_min — leaderboard grid-DSR advisory floor [REPORT]
+# B4 (#436): minimum walk-forward periods (as_of cutoffs) before the CSCV / Romano-Wolf / Hansen-SPA
+# / DSR panel is trustworthy; below it those bootstrap gates degenerate to a SILENT always-NO-GO, so
+# the winner gate emits an EXPLICIT "insufficient periods" verdict and `--steps` defaults to it.
+RANKER_MIN_PERIODS = 24      # ranker_min_periods — min as_of points for a trustworthy verdict [GATE]
 
 
 # ───────────────────────── grid (8b: pre-registration) ─────────────────────────
@@ -554,7 +558,8 @@ def _clean_return_matrix(return_matrix: pd.DataFrame, *,
 
 def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_grid: int,
                           n_grid_full: "int | None" = None, cpr: dict,
-                          alpha: float = RANKER_FDR_Q, seed: int = 0) -> dict:
+                          alpha: float = RANKER_FDR_Q, seed: int = 0,
+                          min_periods: int = RANKER_MIN_PERIODS) -> dict:
     """The §Acceptance bar (issue #421): a config is the recommended winner only if it beats
     ``t_stat_baseline`` on cumulative forward copy P&L net of churn, AND that margin survives
     grid-deflated significance (Romano-Wolf superior / Hansen-SPA at ``alpha`` / ``PBO`` below
@@ -564,8 +569,22 @@ def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_g
     A5/A6/A9/A11 (#436): the verdict iterates challengers by descending cum-return and awards the
     FIRST that is RW-superior and beats the baseline (not the cum-argmax, which may be an uncertified
     high-variance config); ``ranker_pbo_max`` / ``ranker_fdr_q`` are wired (were hardcoded); the
-    no-signal panel is cleaned first; and the winner's grid-DSR is reported as an advisory."""
+    no-signal panel is cleaned first; and the winner's grid-DSR is reported as an advisory.
+
+    B4 (#436): a verdict needs ``>= min_periods`` walk-forward cutoffs (``ranker_min_periods``) or it
+    is an explicit insufficient-periods NO-GO — below that the bootstrap gates degenerate silently."""
     n_grid_full = n_grid if n_grid_full is None else n_grid_full
+    # B4 (#436): the CSCV / Romano-Wolf / Hansen-SPA / DSR panel needs >= min_periods walk-forward
+    # periods to be trustworthy; below it those gates degenerate to a SILENT always-NO-GO. Emit an
+    # EXPLICIT insufficient-periods verdict so the operator raises --steps, not a misleading
+    # "PBO/SPA failed". len(as_of_points) == the return-matrix row count (one row per cutoff).
+    n_periods = int(return_matrix.shape[0])
+    if n_periods < min_periods:
+        return {"n_grid": n_grid, "n_grid_full_pre_screen": n_grid_full, "baseline_key": baseline_key,
+                "cpr_go": bool(cpr.get("go", False)), "dropped_configs": [], "dropped_periods": 0,
+                "leaderboard": pd.DataFrame(), "winner": None, "status": "NO-GO",
+                "reason": f"insufficient periods: {n_periods} < ranker_min_periods={min_periods} "
+                          "(raise --steps)"}
     clean, info = _clean_return_matrix(return_matrix, baseline_key=baseline_key)
     base = {"n_grid": n_grid, "n_grid_full_pre_screen": n_grid_full, "baseline_key": baseline_key,
             "cpr_go": bool(cpr.get("go", False)),
@@ -680,6 +699,20 @@ class BakeoffParams:
     displacement_margin: int = 5
     flat_usd: float = 25.0
     demoter_kwargs: dict = field(default_factory=dict)
+    min_periods: int = RANKER_MIN_PERIODS    # B4: verdict floor passed to select_winner_or_nogo
+
+    def __post_init__(self) -> None:
+        # B3 (#436): forward windows ``[as_of, as_of + horizon_secs)`` must not overlap across steps,
+        # or the trajectory double-counts P&L and (with B2) over-counts an incumbent's proven periods.
+        # Enforce that consecutive cutoffs are spaced by >= horizon_secs — the non-overlap invariant.
+        # ``main`` spaces ``as_of_points`` by ``step_days``, so this rejects --step-days < --horizon-days.
+        pts = sorted(self.as_of_points)
+        gaps = [b - a for a, b in zip(pts, pts[1:])]
+        if gaps and min(gaps) < self.horizon_secs:
+            raise ValueError(
+                f"overlapping forward windows: min as_of gap {min(gaps)}s < horizon_secs "
+                f"{self.horizon_secs}s — space cutoffs by >= horizon (issue #436 B3 non-overlap "
+                "invariant; raise --step-days to >= --horizon-days)")
 
 
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
@@ -708,7 +741,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     cpr = wallet_persistence_cpr(ss, split_at=split_at)
     decision = select_winner_or_nogo(
         return_matrix, baseline_key=baseline_key, n_grid=manifest["n_grid"],
-        n_grid_full=n_grid_full, cpr=cpr, seed=seed)
+        n_grid_full=n_grid_full, cpr=cpr, seed=seed, min_periods=params.min_periods)
     # A1 (#436): the deliverable is the WINNING trajectory's frozen final-step followed set (the set
     # the winner actually rode), selected directly from the captured results — never a cold re-score
     # at the latest as_of (which degenerates stateful policies). Falls back to the baseline on NO-GO.
@@ -758,8 +791,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                     help="Parquet snapshot directory (default: ranker_duck's data/parquet, "
                          "overridable via PE_RANKER_PARQUET_DIR)")
     ap.add_argument("--train-days", type=int, default=180)
-    ap.add_argument("--horizon-days", type=int, default=30)
-    ap.add_argument("--steps", type=int, default=6)
+    ap.add_argument("--horizon-days", type=int, default=30,
+                    help="forward window length (days); --step-days must be >= this so forward "
+                         "windows do not overlap (issue #436 B3 non-overlap invariant)")
+    ap.add_argument("--steps", type=int, default=24,
+                    help="walk-forward cutoffs; >= ranker_min_periods (24) for a trustworthy "
+                         "PBO/RW/SPA/DSR verdict (issue #436 B4)")
     ap.add_argument("--step-days", type=int, default=30)
     ap.add_argument("--start-unix", type=int, required=True)
     return ap
