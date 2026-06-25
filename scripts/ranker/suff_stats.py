@@ -19,9 +19,9 @@ NaN when the bought outcome has no pre-resolution trade; ``proxy_clv`` drops tho
 ``true_clv_close`` is the CLOB mid at/just-before the market CLOSE on the bought outcome (issue
 #429 PR4 menu ``true_clv``). It is derived once by ``materialize`` from a DuckDB join over the
 OPTIONAL ``market_price_history`` + ``token_conditions`` views (CLOB ``source='clob'`` series,
-``arg_max(price, t)`` where ``t <= COALESCE(end_date_unix, resolved_at_unix)``), so the
-``true_clv`` estimator reads it as a column. Unlike ``close_proxy`` it pins to the market CLOSE,
-not the last trade. It is NaN when no CLOB series covers the outcome (best-effort: PR2's measured
+``arg_max(price, t)`` where ``t <= LEAST(COALESCE(end_date_unix, resolved_at_unix), resolved_at_unix)``
+— the scheduled close capped at resolution, issue #436 B5), so the ``true_clv`` estimator reads it
+as a column. Unlike ``close_proxy`` it pins to the market CLOSE, not the last trade. It is NaN when no CLOB series covers the outcome (best-effort: PR2's measured
 ceiling) OR when the optional CLOB views are absent (pre-backfill); ``true_clv`` drops those.
 
 The materialized frame is band/window-AGNOSTIC (permissive bands): each ``Criteria`` grid
