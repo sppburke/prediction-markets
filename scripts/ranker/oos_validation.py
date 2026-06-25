@@ -84,8 +84,14 @@ def split_walkforward(ss: SuffStats, *, as_of: int, train_secs: int, horizon_sec
     """
     entry = ss["entry_ts"]
     in_sample = ss[(entry >= as_of - train_secs) & (entry < as_of) & (ss["resolved_at"] <= as_of)]
+    in_sample = in_sample.reset_index(drop=True)
     forward = ss[(entry >= as_of + embargo_secs) & (entry < as_of + horizon_secs)]
-    return in_sample.reset_index(drop=True), forward.reset_index(drop=True)
+    # B1 (#436): arm the LANDMINE-2 guard on the hot path, not just in tests. This is the single
+    # producer of the in-sample track for both ``screen_estimators`` and ``run_trajectory``; the
+    # filter above already enforces ``resolved_at <= as_of``, so this asserts the invariant and any
+    # future refactor that reintroduced a post-``as_of`` row fails loudly HERE, not as a silent leak.
+    assert_no_lookahead(in_sample, as_of=as_of)
+    return in_sample, forward.reset_index(drop=True)
 
 
 class PBO:

@@ -276,7 +276,8 @@ class EndToEndTest(unittest.TestCase):
         value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
         runner = _FakeRunner(value, points, 1_000_000)
         params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
-                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3})
+                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3},
+                                  min_periods=2)  # short synthetic trajectory: opt below the B4 floor
         axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"),
                      deflators=(bo.NO_DEFLATION,), policies=_POLICIES)
         a = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
@@ -350,7 +351,8 @@ class PreScreenNTest(unittest.TestCase):
         value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
         runner = _FakeRunner(value, points, 1_000_000)
         params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
-                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3})
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3},
+                                  min_periods=2)  # short synthetic trajectory: opt below the B4 floor
         axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill", "gu_koenker_npmle"),
                      deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",))
         res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
@@ -420,7 +422,8 @@ class A1DeliverableTest(unittest.TestCase):
         value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
         runner = _FakeRunner(value, points, 1_000_000)
         params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
-                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3})
+                                  k=5, screen_keep=2, demoter_kwargs={"min_periods": 3},
+                                  min_periods=2)  # short synthetic trajectory: opt below the B4 floor
         axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"), policies=_POLICIES)
         res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
         deliverable = res["deliverable"]
@@ -515,6 +518,7 @@ class ThresholdsWiredTest(unittest.TestCase):
         self.assertEqual(bo.RANKER_PBO_MAX, 0.5)
         self.assertEqual(bo.RANKER_DSR_MIN, 0.5)
         self.assertEqual(bo.RANKER_GRID_DSR_MIN, 0.95)
+        self.assertEqual(bo.RANKER_MIN_PERIODS, 24)             # B4 (#436)
 
     def test_winner_surfaces_advisory_grid_dsr(self) -> None:
         rng = np.random.default_rng(0)
@@ -540,6 +544,7 @@ class CliEngineTest(unittest.TestCase):
         self.assertEqual(ns.engine, "duck")          # bake-off requires the Parquet engine
         self.assertIsNone(ns.parquet_dir)            # -> ranker_duck default (data/parquet)
         self.assertEqual(ns.cache, "data/wallet_cache.db")
+        self.assertEqual(ns.steps, 24)               # B4 (#436): default >= ranker_min_periods
 
     def test_open_engine_passes_mode_not_cache_path(self) -> None:
         import ranker_duck
@@ -572,6 +577,62 @@ class CliEngineTest(unittest.TestCase):
                 bo._open_engine(ns)
         finally:
             ranker_duck.get_engine = orig
+
+
+class NonOverlapWindowsTest(unittest.TestCase):
+    """B3 (#436): BakeoffParams rejects overlapping forward windows (cutoffs spaced < horizon_secs),
+    which would double-count trajectory P&L and over-count B2 proven periods."""
+
+    def test_overlapping_cutoffs_raise(self) -> None:
+        with self.assertRaises(ValueError):
+            bo.BakeoffParams(as_of_points=[0, 50, 100], train_secs=300, horizon_secs=80)  # gap 50 < 80
+
+    def test_adjacent_cutoffs_ok(self) -> None:
+        # gap == horizon is the boundary: forward windows are back-to-back, non-overlapping.
+        p = bo.BakeoffParams(as_of_points=[0, 80, 160], train_secs=300, horizon_secs=80)
+        self.assertEqual(p.horizon_secs, 80)
+
+    def test_operator_step_day_defaults_satisfy_invariant(self) -> None:
+        # The operator defaults (--step-days 30 >= --horizon-days 30) construct without raising.
+        day = 86_400
+        pts = [i * 30 * day for i in range(bo.RANKER_MIN_PERIODS)]
+        bo.BakeoffParams(as_of_points=pts, train_secs=180 * day, horizon_secs=30 * day)
+
+
+class MinPeriodsFloorTest(unittest.TestCase):
+    """B4 (#436): a verdict needs >= ranker_min_periods walk-forward cutoffs, else an EXPLICIT
+    insufficient-periods NO-GO (not a silently-degenerate always-NO-GO from the bootstrap gates)."""
+
+    def _matrix(self, n_periods: int):
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, n_periods)
+        return pd.DataFrame({"baseline": base, "challenger": base + 0.8,
+                             "n0": base + rng.normal(0.0, 1.0, n_periods)})
+
+    def test_too_few_periods_is_explicit_nogo(self) -> None:
+        # default min_periods == RANKER_MIN_PERIODS (24); 12 < 24 -> short-circuit before the gates.
+        d = bo.select_winner_or_nogo(self._matrix(12), baseline_key="baseline", n_grid=20,
+                                     cpr={"go": True})
+        self.assertEqual(d["status"], "NO-GO")
+        self.assertIn("insufficient periods", d["reason"])
+        self.assertIn("ranker_min_periods", d["reason"])
+        self.assertIsNone(d["winner"])
+        self.assertIn("leaderboard", d)                          # uniform shape for the output writer
+        self.assertEqual(d["n_grid"], 20)
+
+    def test_enough_periods_clears_the_floor(self) -> None:
+        # Exactly RANKER_MIN_PERIODS periods -> the floor does NOT trigger; the verdict comes from the
+        # normal PBO/RW/SPA machinery (WINNER or a substantive NO-GO, not "insufficient periods").
+        d = bo.select_winner_or_nogo(self._matrix(bo.RANKER_MIN_PERIODS), baseline_key="baseline",
+                                     n_grid=20, cpr={"go": True})
+        self.assertNotIn("insufficient periods", d.get("reason", ""))
+        self.assertIn(d["status"], {"WINNER", "NO-GO"})
+
+    def test_floor_is_overridable_for_short_synthetic_runs(self) -> None:
+        # A low override lets a short synthetic trajectory reach the verdict (as run_bakeoff tests do).
+        d = bo.select_winner_or_nogo(self._matrix(12), baseline_key="baseline", n_grid=20,
+                                     cpr={"go": True}, min_periods=2)
+        self.assertNotIn("insufficient periods", d.get("reason", ""))
 
 
 if __name__ == "__main__":

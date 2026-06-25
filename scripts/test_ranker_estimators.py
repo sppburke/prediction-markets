@@ -19,12 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ranker.estimators import (  # noqa: E402
     REGISTRY,
+    _SD_FLOOR,
     EBShrinkageSkill,
     GuKoenkerNPMLE,
     ProxyCLV,
     TrueCLV,
     TStatBaseline,
 )
+from ranker_decay import weighted_stats  # noqa: E402
 
 PRICE = 0.50            # _eff = 0.51 for every synthetic position
 _EFF = min(PRICE + 0.01, 0.999)
@@ -184,6 +186,49 @@ class TrueCLVTest(unittest.TestCase):
         out = TrueCLV().score(ss, as_of=0, weights=np.ones(len(ss)))
         self.assertTrue(out.empty)
         self.assertEqual(list(out.columns), ["score", "rank"])
+
+
+class FloatFragilitySDFloorTest(unittest.TestCase):
+    """#436 A10 follow-up: np.std(ddof=1) of a mathematically-constant net/CLV series is exactly 0.0
+    at some n but ~1e-16 at others (mean-rounding in the computational-variance formula), so a bare
+    ``sd > 0`` admitted a 6-position win streak with a t-stat ~2e16 and ranked it #1. ``_SD_FLOOR``
+    drops these zero-dispersion wallets across ALL FIVE estimators — extending the deliberate n=5
+    zero-dispersion drop the existing tests pin to the n>=6 float-noise case. (n=6 verified to give a
+    non-zero sd ~1e-16 through ``weighted_stats``, so each drop here fails on a bare ``> 0``.)"""
+
+    def test_constant_series_sd_is_float_noise_below_floor(self) -> None:
+        # The fragility, through the estimators' actual stat path: a constant 6-position net series
+        # has a tiny NON-ZERO sd, so a bare `sd > 0` admits it; the floor (1e-9) catches it.
+        ss = _suff_stats([("perfect6", 6, 6)])
+        net = ((ss["payoff"] - ss["_eff"]) / ss["_eff"]).to_numpy()
+        _, sd, _, _ = weighted_stats(net, np.ones(6))
+        self.assertGreater(sd, 0.0)                   # n=6: float noise, NOT exactly 0 -> `>0` admits
+        self.assertLess(sd, _SD_FLOOR)                # ...but below the dispersion floor
+
+    def test_tstat_drops_six_position_streak(self) -> None:
+        ss = _suff_stats([("perfect6", 6, 6), ("a", 12, 7), ("b", 12, 5)])
+        out = TStatBaseline().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertNotIn("perfect6", out.index)       # undefined t-stat, not rank #1 with +2e16
+
+    def test_gukoenker_drops_six_position_streak(self) -> None:
+        ss = _suff_stats([("perfect6", 6, 6), ("a", 12, 7), ("b", 12, 5)])
+        out = GuKoenkerNPMLE().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertNotIn("perfect6", out.index)
+
+    def test_eb_drops_six_position_streak(self) -> None:
+        # The EB posterior of a zero-dispersion wallet would otherwise be norm.cdf(huge) == 1.0 (max).
+        ss = _suff_stats([("perfect6", 6, 6)] + [(w, 40, 28) for w in SKILLED]
+                         + [(w, 40, 20) for w in NULLS])
+        out = EBShrinkageSkill().score(ss, as_of=0, weights=np.ones(len(ss)))
+        self.assertNotIn("perfect6", out.index)
+
+    def test_clv_estimators_drop_six_position_constant(self) -> None:
+        for col, est in (("close_proxy", ProxyCLV()), ("true_clv_close", TrueCLV())):
+            ss = _clv_ss([("flat6", [(0.4, 0.6)] * 6),
+                          ("good", [(0.4, 0.6), (0.4, 0.55), (0.4, 0.62)]),
+                          ("bad", [(0.4, 0.3), (0.4, 0.35), (0.4, 0.31)])], col=col)
+            out = est.score(ss, as_of=0, weights=np.ones(len(ss)))
+            self.assertNotIn("flat6", out.index, msg=col)   # constant CLV -> undefined t-stat
 
 
 class RegistryTest(unittest.TestCase):

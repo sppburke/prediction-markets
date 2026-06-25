@@ -11,6 +11,7 @@ Run: ``python3 scripts/test_ranker_oos_validation.py``
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -72,6 +73,18 @@ class LookAheadGuardTest(unittest.TestCase):
         self.assertEqual(set(fwd["entry_ts"]), {350, 450})
         self.assertEqual(list(ins.index), [0, 1])                      # fresh RangeIndex
         assert_no_lookahead(ins, as_of=300)                            # guarantee holds
+
+    def test_split_walkforward_arms_the_guard(self) -> None:
+        # B1 (#436): split_walkforward arms assert_no_lookahead on the HOT PATH (not just in tests),
+        # so a future refactor that reintroduced a post-as_of row into the in-sample track fails
+        # loudly here. Verify the guard is invoked on the produced in-sample track at the cutoff.
+        ss = pd.DataFrame({"wallet": list("ab"), "entry_ts": [50, 150],
+                           "resolved_at": [120, 220]})
+        with mock.patch("ranker.oos_validation.assert_no_lookahead") as guard:
+            split_walkforward(ss, as_of=300, train_secs=300, horizon_secs=200)
+        guard.assert_called_once()
+        self.assertEqual(guard.call_args.kwargs["as_of"], 300)
+        self.assertEqual(set(guard.call_args.args[0]["entry_ts"]), {50, 150})  # guarded the in-sample
 
     def test_embargo_shifts_forward_start(self) -> None:
         ss = pd.DataFrame({"wallet": list("ab"), "entry_ts": [350, 450],
