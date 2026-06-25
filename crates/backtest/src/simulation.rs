@@ -1429,6 +1429,19 @@ struct PeriodPnlRow {
 /// E3). One row per wallet that carried a boundary position (all-zero rows are
 /// dropped), stamped at `period_end = win_end` so the Python window slice
 /// `(as_of, horizon]` includes it.
+///
+/// **Why the telescoping holds even under partial coverage.** Consecutive bake-off
+/// windows are *adjacent* — `as_of` of window k+1 equals `win_end` of window k (B3
+/// enforces `step_days ≥ horizon_days`; the operator default is `==`), so the shared
+/// boundary is marked at the SAME timestamp in both windows. `mark_at_or_before` is a
+/// pure function of that timestamp, so window k's `win_end` leg and window k+1's
+/// `as_of` leg are byte-identical and cancel — covered or not. A position uncovered
+/// at `as_of` (no CLOB sample at-or-before it) was therefore equally uncovered at the
+/// prior window's `win_end` (same instant), which credited nothing; crediting
+/// `(mark_H − cost)` in the first covered window is the position's single, correct
+/// first valuation — NOT a `mark − cost` stock double-count. (With `step_days >
+/// horizon_days` the windows are gapped and the inter-window interval is simply not
+/// evaluated — a deliberate skip, never a double-count.)
 fn build_mtm_rows(
     lifetimes: &[PositionLifetime],
     win_start: i64,

@@ -334,3 +334,118 @@ fn scenario_mtm_resolved_position_is_realized_not_marked() {
         "a position resolved before the horizon must be realized-only, never marked"
     );
 }
+
+/// Run the injected backtest over a single spanning position — wallet S buys `mkt-s` at D1, never
+/// resolves; CLOB covered only from D20 onward (NO sample at-or-before D10) — for one forward-MTM
+/// window, returning S's emitted horizon-MTM `unrealized_pnl` flow.
+fn run_span_window(as_of: i64, horizon: i64) -> f64 {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let out_dir = dir.path().join("out");
+    let s = wallet(0x55);
+    {
+        let mut cache = WalletCache::open(&cache_path).unwrap();
+        cache
+            .insert_new(
+                &s.to_string(),
+                vec![buy(s, "mkt-s", "s-1", dec!(0.50), T0 + SEC_PER_DAY)],
+            )
+            .unwrap();
+        cache
+            .upsert_token_conditions_batch(&[("tok-s".to_owned(), "mkt-s".to_owned(), 0)], T0)
+            .unwrap();
+        // No sample ≤ D10 (uncovered at as_of_1); 0.60 at D20; 0.70 at D30.
+        cache
+            .insert_price_history_batch(
+                &[
+                    (
+                        "mkt-s".to_owned(),
+                        "tok-s".to_owned(),
+                        T0 + 20 * SEC_PER_DAY,
+                        "0.60".to_owned(),
+                    ),
+                    (
+                        "mkt-s".to_owned(),
+                        "tok-s".to_owned(),
+                        T0 + 30 * SEC_PER_DAY,
+                        "0.70".to_owned(),
+                    ),
+                ],
+                "clob",
+            )
+            .unwrap();
+    }
+    let cache = WalletCache::open(&cache_path).unwrap();
+    let injected = vec![s];
+    let mut all_trades = load_injected_trades(&cache, &injected);
+    all_trades.sort_by_key(|t| t.timestamp.0);
+    let resolutions = pe_bootstrap::gamma::load_resolutions(&cache).unwrap();
+    let schedules = pe_bootstrap::gamma::load_schedules(&cache).unwrap();
+    let liq = pe_bootstrap::gamma::load_liquidity(&cache).unwrap();
+    let snapshots = cache.load_all_snapshots().unwrap();
+    let markets: HashSet<MarketId> = all_trades.iter().map(|t| t.market_id.clone()).collect();
+    let marks = cache.load_clob_marks(&markets, horizon).unwrap();
+    let config = BacktestConfig {
+        bootstrap_cache_path: cache_path.clone(),
+        output_dir: out_dir.clone(),
+        flat_usd: Some(dec!(25)),
+        max_signal_price: None,
+        mtm_window_start_unix: Some(as_of),
+        mtm_window_end_unix: Some(horizon),
+        strategy: WinnerFollowConfig {
+            slippage_rate: dec!(0),
+            ..WinnerFollowConfig::default()
+        },
+        ..BacktestConfig::default()
+    };
+    let ranker_config = RankerConfig::default();
+    let strategy = WinnerFollowStrategy::new(config.strategy.clone());
+    let injected_set: HashSet<WalletAddress> = injected.iter().copied().collect();
+    run_simulation_with(
+        &config,
+        &all_trades,
+        &snapshots,
+        &resolutions,
+        &schedules,
+        &liq,
+        &ranker_config,
+        &strategy,
+        true,
+        Some(&injected_set),
+        Some(&marks),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(out_dir.join("pnl_by_period.ndjson")).unwrap();
+    let rows: Vec<PnlRow> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    rows.iter()
+        .filter(|r| r.wallet == s.to_string() && r.is_horizon_mtm)
+        .map(|r| r.unrealized_pnl)
+        .sum()
+}
+
+#[test]
+fn scenario_mtm_partial_coverage_telescopes_no_double_count() {
+    // A spanning position covered only from D20 (uncovered at as_of_1=D10), across two ADJACENT
+    // windows (as_of_2 = horizon_1 = D20). Telescoping requires the per-window flows to sum to the
+    // single true gain (mark_H2 − cost)·50 = (0.70 − 0.50)·50 = 10:
+    //   - w1 (D10→D20): as_of uncovered → 0; horizon 0.60 → first credit (0.60−0.50)·50 = +5.
+    //   - w2 (D20→D30): as_of 0.60 (covered, == w1's horizon) → −5; horizon 0.70 → +10; flow = +5.
+    // The literal `mark − cost` stock would give w2 = +10 (no as_of subtraction) → 5 + 10 = 15, a
+    // double-count. PASS = both flows are +5 (so they sum to the true +10), NOT w2 = +10.
+    let d10 = T0 + 10 * SEC_PER_DAY;
+    let d20 = T0 + 20 * SEC_PER_DAY;
+    let d30 = T0 + 30 * SEC_PER_DAY;
+    let flow_w1 = run_span_window(d10, d20);
+    let flow_w2 = run_span_window(d20, d30);
+    let pass = flow_w1 == 5.0 && flow_w2 == 5.0;
+    println!(
+        "PASS={pass} mtm.partial_coverage_telescopes: flow_w1={flow_w1} (want 5.0) + flow_w2={flow_w2} (want 5.0, NOT stock 10.0) = true gain 10.0"
+    );
+    assert!(
+        pass,
+        "adjacent-window flows must telescope to (mark_H − cost) with no double-count under partial coverage"
+    );
+}
