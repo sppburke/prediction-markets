@@ -226,7 +226,8 @@ class HansenSPA:
 def brown_goetzmann_cpr(period1: pd.Series, period2: pd.Series) -> dict:
     """Cross-Product Ratio performance-persistence test (Brown-Goetzmann, RFS 1995).
 
-    Classify each wallet as Winner/Loser vs the cross-sectional median in two consecutive periods.
+    Classify each wallet as Winner/Loser vs the cross-sectional median in two consecutive periods
+    (wallets at exactly either period's median are dropped first — see the C3 note below).
     ``CPR = (WW*LL)/(WL*LW)``; CPR > 1 => persistence (winners stay winners). Significance via the
     log-CPR z-test (Christensen): ``sigma = sqrt(1/WW + 1/WL + 1/LW + 1/LL)``, ``z = ln(CPR)/sigma``.
     ``period1`` / ``period2`` are per-wallet performance Series sharing a wallet index. Returns a

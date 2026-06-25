@@ -146,7 +146,8 @@ def _npmle_em(log_like: np.ndarray, *, max_iter: int, tol: float) -> "tuple[np.n
     so a wallet whose mean falls many ``se`` from every grid node keeps well-defined responsibilities
     instead of underflowing its whole likelihood row to 0.0 (which the old linear EM then scored 0.0
     regardless of skill). The EM marginal log-likelihood is monotone non-decreasing — the drift guard
-    asserts ``ll_history`` never falls, catching a broken E/M step or iteration-cap truncation.
+    asserts ``ll_history`` never falls, catching a broken E/M step (a separate guard pins the verdict
+    invariant to the iteration cap).
     """
     pi = np.full(log_like.shape[1], 1.0 / log_like.shape[1])
     ll_history: list = []
@@ -184,7 +185,7 @@ def _npmle_scores(x: np.ndarray, se: np.ndarray, grid: np.ndarray, *, max_iter: 
         log_post = log_like + log_pi[None, :]
         log_marg = logsumexp(log_post, axis=1)                  # finite (pi sums to 1)
         log_pos = logsumexp(log_post + log_posw[None, :], axis=1)   # -inf if no positive mass
-        scores = np.exp(log_pos - log_marg)                    # in (0, 1]: 0 = no positive mass, 1 = all
+        scores = np.exp(log_pos - log_marg)                    # in [0, 1]: 0 = no positive mass, 1 = all
     return scores, ll_history
 
 
