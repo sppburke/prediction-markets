@@ -37,7 +37,7 @@ from ranker_decay import weighted_stats  # reuse #366 weighted statistics — ga
 from . import Criteria, FollowSet, SuffStats, WalletScores
 from .demotion import EmpiricalBernsteinDemoter
 from .deflation import DeflatedSharpe
-from .estimators import REGISTRY as ESTIMATOR_REGISTRY
+from .estimators import REGISTRY as ESTIMATOR_REGISTRY, _SD_FLOOR
 from .oos_validation import (
     HansenSPA,
     PBO,
@@ -74,6 +74,27 @@ RANKER_GRID_DSR_MIN = 0.95   # ranker_grid_dsr_min — leaderboard grid-DSR advi
 # / DSR panel is trustworthy; below it those bootstrap gates degenerate to a SILENT always-NO-GO, so
 # the winner gate emits an EXPLICIT "insufficient periods" verdict and `--steps` defaults to it.
 RANKER_MIN_PERIODS = 24      # ranker_min_periods — min as_of points for a trustworthy verdict [GATE]
+# Phase D (#436) calibrated knobs. The per-admission copy cost (D3) anchors to a real entry cost:
+# the copy-trader is a TAKER on entry and holds to resolution (no exit), so per new $25 position the
+# cost ≈ the Polymarket taker fee `25·feeRate·(1−p̄)` ≈ $0.625 at a blended ~0.05 rate and band-center
+# p̄≈0.5, plus ~$0.12 slippage ≈ $0.75 (docs/reference; swept {0, this} for sensitivity, glossary-
+# tunable). The compute ceiling (D2) bounds the deliberate search surface: `n_grid_full × steps`
+# (the naive injected-set backtest count; the in-run memo collapses it far below this) may not exceed
+# it — the default sweep is 5·2·4·12·2 = 960 configs × 24 steps = 23 040, under the 30 000 ceiling.
+RANKER_CHURN_COST_USD = 0.75       # ranker_churn_cost_usd — per-admission copy entry cost (USD) [D3]
+RANKER_BAKEOFF_MAX_BACKTESTS = 30_000  # ranker_bakeoff_max_backtests — n_grid_full × steps cap [D2]
+
+# Operator-run criteria SWEEP levels (D1). These are research-grid levels — the winning level feeds
+# #417 — so they live here + docs/31, NOT as single glossary defaults (the glossary'd swept knob is
+# `ranker_min_trl`). Each tuple is ordered OPERATOR-DEFAULT-FIRST, so `build_criteria_grid()[0]` —
+# the canonical level the 8a estimator screen runs under (A3↔D1) and the baseline config's criteria —
+# is the operator default by construction (itertools.product varies the LAST axis fastest).
+TTR_HOURS_LEVELS = (72.0, 24.0, 48.0)          # TTR horizon sweep (hours); 72h = operator default
+PRICE_BANDS = ((0.15, 0.85), (0.30, 0.70))     # entry-band sweep; the wide 0.15–0.85 band first
+MIN_TRL_LEVELS = (0, 20)                        # ranker_min_trl sweep; 0 = no gate (default), 20 = small
+OPERATOR_DEFAULT_CRITERIA = Criteria(
+    active_within_secs=0, ttr_hours=72.0, price_min=0.15, price_max=0.85,
+    half_life_days=0.0, min_trl=0)              # == build_criteria_grid()[0]; the canonical level
 
 
 # ───────────────────────── grid (8b: pre-registration) ─────────────────────────
@@ -163,6 +184,24 @@ def eligible_wallets(in_sample: SuffStats, criteria: Criteria, *, as_of: int) ->
     return set(last.index[ok.to_numpy()])
 
 
+def build_criteria_grid(*, ttr_hours_levels=TTR_HOURS_LEVELS, price_bands=PRICE_BANDS,
+                        min_trl_levels=MIN_TRL_LEVELS, active_within_secs: int = 0,
+                        half_life_days: float = 0.0) -> tuple:
+    """D1 (#436): the swept criteria grid = the cartesian product of the TTR / entry-band / MinTRL
+    levels. The level tuples are ordered operator-default-FIRST (72h TTR, the wide 0.15–0.85 band,
+    no-MinTRL-gate) and ``itertools.product`` varies the last axis fastest, so ``[0]`` — the
+    canonical level the 8a estimator screen runs under (A3↔D1) and the baseline config's criteria —
+    is the operator default by construction. ``active_within_secs`` and ``half_life_days`` are held
+    constant across the grid: ``half_life_days`` is carried-but-INERT in v1 (consumed by no
+    estimator/filter — it only labels the config key), so sweeping it would merely duplicate grid
+    columns; wiring recency decay into estimator scoring is deferred to #417/#418. A level list with
+    a repeated entry produces a colliding config key, caught loudly by ``pre_register_grid`` (A8)."""
+    return tuple(
+        Criteria(active_within_secs, ttr, pmin, pmax, half_life_days, trl)
+        for ttr, (pmin, pmax), trl in itertools.product(
+            ttr_hours_levels, price_bands, min_trl_levels))
+
+
 # ───────────────────────── deflation gate (per-wallet) ─────────────────────────
 def _wallet_sharpe_moments(in_sample: SuffStats, wallets, weights=None) -> pd.DataFrame:
     """Per-wallet net-edge Sharpe moments ``[sr, n_obs, skew, kurt]`` (non-excess kurtosis) for the
@@ -181,7 +220,7 @@ def _wallet_sharpe_moments(in_sample: SuffStats, wallets, weights=None) -> pd.Da
             continue
         w = np.ones(net.size) if weights is None else weights[g.index.to_numpy()]
         mean, sd, n_eff, _ = weighted_stats(net, w)
-        if not (n_eff >= 2 and sd > 0):
+        if not (n_eff >= 2 and sd > _SD_FLOOR):    # D2 (#436): float-noise sd (~1e-16) is not signal
             continue
         rows.append((wallet, mean / sd, n_eff,
                      float(skew(net)), float(kurtosis(net, fisher=False))))
@@ -275,6 +314,38 @@ def parse_pnl_by_period(path) -> pd.DataFrame:
     return pd.DataFrame(rows)[_PNL_COLUMNS]
 
 
+class MemoizingBacktestRunner:
+    """D2 (#436): an in-run memo over an inner ``BacktestRunner``, keyed on
+    ``(tuple(sorted(wallets)), flat_usd)``. The injected-set backtest is a deterministic,
+    order-independent pure function of the followed SET (the Rust path reads a wallet file and emits
+    per-(wallet, day) P&L), and the per-``as_of`` window slice + churn deduction happen in Python
+    AFTER (``run_trajectory``) — so two grid points sharing a followed set at the same step re-run the
+    SAME backtest. That is GUARANTEED for the two churn-cost levels (churn never changes the set,
+    only the post-hoc subtraction) and common across estimators/deflators/criteria, so caching it
+    collapses the churn axis exactly 2× plus every repeated followed set within ONE bake-off run.
+
+    Per-run only — instantiated fresh in ``run_bakeoff`` with NO persistence or eviction. The
+    persistent cross-run cache is the exact key/version/eviction-correctness risk this epic guards,
+    so it is deferred (#436 D2) until iteration cost proves prohibitive. The cached frame is never
+    mutated downstream (the window boolean-slice and ``pd.concat`` both copy), so it is returned
+    directly. ``calls`` (distinct followed sets = inner invocations) and ``lookups`` (total requests)
+    give the operator the realized speedup ``lookups / calls`` without a separate stubbed pass."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self._cache: dict = {}
+        self.calls = 0
+        self.lookups = 0
+
+    def run(self, wallets: list, *, flat_usd: float) -> pd.DataFrame:
+        self.lookups += 1
+        key = (tuple(sorted(wallets)), flat_usd)
+        if key not in self._cache:
+            self.calls += 1
+            self._cache[key] = self.inner.run(list(wallets), flat_usd=flat_usd)
+        return self._cache[key]
+
+
 # ───────────────────────── policy construction ─────────────────────────
 def build_policy(name: str, *, k: int, demoter, displacement_margin: int):
     """Construct a fresh stateful policy instance (issue #421: one instance per trajectory)."""
@@ -344,11 +415,24 @@ def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
 
 
 # ───────────────────────── 8c: policy trajectory ─────────────────────────
-def _churn(prev: FollowSet, follow: FollowSet) -> int:
-    """Admissions = wallets newly in the followed set (issue #421: turnover count x per-admission
-    cost; under hold-to-resolution an eviction halts new copies only, so only admissions cost)."""
-    prev_set = set(prev["wallet"]) if len(prev) else set()
-    return len(set(follow["wallet"]) - prev_set)
+def _churn(prev: FollowSet, follow: FollowSet) -> float:
+    """Turnover charged per step = the POSITIVE-PART L1 weight movement
+    ``Σ max(weight_followᵢ − weight_prevᵢ, 0)`` over the union of wallets (a wallet absent on a side
+    has weight 0). This is the capital newly deployed into a new-or-larger position — the only move
+    that incurs an entry cost under hold-to-resolution; a weight DECREASE / eviction halts new copies
+    but is not itself charged.
+
+    D3 (#436): for the three hard-set policies (every followed wallet at weight 1.0) this reduces
+    EXACTLY to the old count of newly-admitted wallets — each admission contributes ``+1.0``,
+    incumbents ``0``, evictions clamp to ``0`` — so their per-admission semantics are unchanged. For
+    ``policy_online_weighting``, whose continuous weights are normalized to sum to the set size (the
+    same total mass as a hard top-k of ``k`` — ``selectors.py``), it ALSO charges a wallet ramping
+    its weight UP, which the old admission count missed (the wallet was already in the set). So
+    ``churn_cost`` is USD per unit of weight increase = USD per newly admitted/enlarged unit ($25)
+    position, scale-consistent across both policy families."""
+    p = prev.set_index("wallet")["weight"] if len(prev) else pd.Series(dtype=float)
+    f = follow.set_index("wallet")["weight"] if len(follow) else pd.Series(dtype=float)
+    return float(f.subtract(p, fill_value=0.0).clip(lower=0.0).sum())
 
 
 @dataclass
@@ -409,12 +493,12 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         if follow.empty:
             returns.append(np.nan)                                   # A9: policy holds nothing
             continue
-        admissions = _churn(prev, follow)
+        turnover = _churn(prev, follow)          # D3 (#436): positive-part L1 weight movement
 
         pnl = runner.run(list(follow["wallet"]), flat_usd=flat_usd)
         window = pnl[(pnl["period_end"] > as_of) & (pnl["period_end"] <= as_of + horizon_secs)]
         gross = _weighted_window_pnl(window, follow)
-        returns.append(gross - grid_point.churn_cost * admissions)
+        returns.append(gross - grid_point.churn_cost * turnover)
         live_pnl = pd.concat([live_pnl, window], ignore_index=True)
         prev = follow
         final_follow, final_scores = follow, scores                 # A1: most recent real set
@@ -453,9 +537,12 @@ def _config_moments(return_matrix: pd.DataFrame) -> pd.DataFrame:
         series = return_matrix[cfg].to_numpy(dtype=float)
         n = series.size
         sd = series.std(ddof=1) if n > 1 else 0.0
-        se = sd / np.sqrt(n) if (n > 0 and sd > 0) else np.inf
+        # D2 (#436): `sd > _SD_FLOOR`, not `sd > 0` — a near-constant config (sub-1e-9 float-noise
+        # dispersion) would otherwise emit a spurious huge SR / tiny finite SE into the deflators and
+        # the winner_uncertainty AKM CI. Treat sub-floor dispersion as undefined (se=inf, sr=0).
+        se = sd / np.sqrt(n) if (n > 0 and sd > _SD_FLOOR) else np.inf
         rows.append((cfg, float(series.sum()), float(series.mean()),
-                     float(series.mean() / sd) if sd > 0 else 0.0, n,
+                     float(series.mean() / sd) if sd > _SD_FLOOR else 0.0, n,
                      float(skew(series)) if n > 2 else 0.0,
                      float(kurtosis(series, fisher=False)) if n > 3 else 3.0, float(se)))
     return pd.DataFrame(rows, columns=["config", "cum_return", "mean", "sr", "n_obs",
@@ -700,6 +787,7 @@ class BakeoffParams:
     flat_usd: float = 25.0
     demoter_kwargs: dict = field(default_factory=dict)
     min_periods: int = RANKER_MIN_PERIODS    # B4: verdict floor passed to select_winner_or_nogo
+    max_backtests: int = RANKER_BAKEOFF_MAX_BACKTESTS  # D2: n_grid_full × steps compute ceiling
 
     def __post_init__(self) -> None:
         # B3 (#436): forward windows ``[as_of, as_of + horizon_secs)`` must not overlap across steps,
@@ -720,6 +808,18 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). 8a prunes the estimator
     axis BEFORE ``N_GRID`` is frozen (it only ever shrinks the grid — never grows it post-hoc)."""
     n_grid_full = len(axes.enumerate_grid())     # A2: FULL pre-screen trial count for the DSR bar
+    # D2 (#436): cap the deliberate search surface BEFORE any expensive work. n_grid_full × steps is
+    # the NAIVE injected-set backtest count (a conservative upper bound — the memo below collapses the
+    # churn axis + repeated followed sets, and screened-out estimators never run a trajectory), so a
+    # grid that would blow past the committed ceiling is refused loudly: "keep N bounded" is an
+    # enforced number, not a hope. Tunable per run via params.max_backtests / ranker_bakeoff_max_backtests.
+    naive_backtests = n_grid_full * len(params.as_of_points)
+    if naive_backtests > params.max_backtests:
+        raise ValueError(
+            f"bake-off grid too large: n_grid_full({n_grid_full}) × steps"
+            f"({len(params.as_of_points)}) = {naive_backtests} naive backtests > "
+            f"ranker_bakeoff_max_backtests={params.max_backtests}; narrow the criteria/churn sweep "
+            "(fewer --ttr-hours/--bands/--min-trl levels) or raise the ceiling")
     survivors = screen_estimators(
         ss, list(axes.estimators), as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
@@ -732,8 +832,9 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     grid = pruned_axes.enumerate_grid()
     grid_by_key = {g.key: g for g in grid}        # A1: thread GridPoints, never re-parse a key
     baseline_key = _baseline_key(pruned_axes)
+    memo_runner = MemoizingBacktestRunner(runner)   # D2: in-run dedup of repeated followed sets
     return_matrix, results = run_trajectories(
-        grid, ss, runner, as_of_points=params.as_of_points,
+        grid, ss, memo_runner, as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd)
@@ -756,7 +857,11 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         else pd.DataFrame(columns=["score", "rank"]),
     }
     return {"manifest": manifest, "survivors": survivors, "return_matrix": return_matrix,
-            "cpr": cpr, "decision": decision, "deliverable": deliverable}
+            "cpr": cpr, "decision": decision, "deliverable": deliverable,
+            # D2 (#436): the realized memo speedup — distinct injected-set backtests actually run vs
+            # the naive per-(config, step) request count. Lets the operator size the real run.
+            "backtest_calls": {"distinct": memo_runner.calls, "total": memo_runner.lookups,
+                               "naive_ceiling": naive_backtests}}
 
 
 def _baseline_key(axes: BakeoffAxes) -> str:
@@ -769,6 +874,14 @@ def _baseline_key(axes: BakeoffAxes) -> str:
         raise ValueError("baseline config absent from the grid: axes must include "
                          f"{BASELINE_ESTIMATOR}/{NO_DEFLATION}/{BASELINE_POLICY}")
     return key
+
+
+def _parse_band(s: str) -> "tuple[float, float]":
+    """Parse a ``lo:hi`` entry-band CLI level into a ``(price_min, price_max)`` pair (D1, #436)."""
+    lo, sep, hi = s.partition(":")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"band {s!r} must be 'lo:hi' (e.g. 0.15:0.85)")
+    return (float(lo), float(hi))
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -799,6 +912,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          "PBO/RW/SPA/DSR verdict (issue #436 B4)")
     ap.add_argument("--step-days", type=int, default=30)
     ap.add_argument("--start-unix", type=int, required=True)
+    # D1 (#436): the criteria sweep. Each level list is ordered operator-default-first so criteria[0]
+    # stays the canonical 8a-screen / baseline level (build_criteria_grid). Narrow these to bound the
+    # compute ceiling (ranker_bakeoff_max_backtests). half_life is held (carried-but-inert in v1).
+    ap.add_argument("--ttr-hours", type=float, nargs="+", default=list(TTR_HOURS_LEVELS),
+                    help="criteria sweep: TTR horizons (hours); default '72 24 48' (72h canonical)")
+    ap.add_argument("--bands", type=_parse_band, nargs="+", default=list(PRICE_BANDS),
+                    help="criteria sweep: entry bands as lo:hi; default '0.15:0.85 0.30:0.70'")
+    ap.add_argument("--min-trl", type=int, nargs="+", default=list(MIN_TRL_LEVELS),
+                    help="criteria sweep: ranker_min_trl levels; default '0 20' (0 = no gate)")
+    ap.add_argument("--churn-cost", type=float, default=RANKER_CHURN_COST_USD,
+                    help="D3: per-admission copy cost USD, swept as {0, this}; "
+                         "default ranker_churn_cost_usd (0.75)")
     return ap
 
 
@@ -844,7 +969,10 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
         estimators=tuple(ESTIMATOR_REGISTRY), deflators=(NO_DEFLATION, DeflatedSharpe.name),
         policies=(FullRerank.name, KnockoutBackfill.name, HybridDisplacement.name,
                   OnlineWeighting.name),
-        criteria=(Criteria(0, 72.0, 0.15, 0.85, 0.0, 0),), churn_costs=(0.0, 1.0))
+        criteria=build_criteria_grid(                     # D1 (#436): the swept criteria grid
+            ttr_hours_levels=tuple(args.ttr_hours), price_bands=tuple(args.bands),
+            min_trl_levels=tuple(args.min_trl)),
+        churn_costs=(0.0, args.churn_cost))               # D3 (#436): {free, anchored} cost sweep
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()))
 
@@ -854,6 +982,10 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     status = {k: v for k, v in result["decision"].items() if k != "leaderboard"}
     (out_dir / "decision.json").write_text(json.dumps(status, indent=2, default=str))
     print(f"bake-off {result['decision']['status']}: {result['decision']['reason']}")
+    bc = result["backtest_calls"]                          # D2 (#436): realized memo speedup
+    print(f"compute: {len(axes.criteria)} criteria × {result['manifest']['n_grid']} run-set configs; "
+          f"{bc['distinct']} distinct backtests of {bc['total']} requested "
+          f"({bc['naive_ceiling']} naive ceiling)")
 
     # Cross-check the deliverable — the WINNING config's frozen final-step followed set (A1, #436;
     # the set the winner actually rode, applying its criteria/eligibility/deflation/policy), NOT a
