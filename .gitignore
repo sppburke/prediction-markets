@@ -48,6 +48,12 @@ paper_state.db-bak
 # holdout-baseline output, backtest-output. Multi-GB, host-specific.
 /data/
 
+# Operator run output — bake-off results (leaderboard/return_matrix/decision/
+# mtm_coverage/survivorship, pe-backtest ndjson), backfill logs, PID files.
+# Host-specific and regenerated; to preserve a winning run's small JSON
+# deliverable for #417 provenance, `git add -f` just those files.
+/runs/
+
 # Python tooling (analysis scripts under scripts/)
 __pycache__/
 *.py[cod]
