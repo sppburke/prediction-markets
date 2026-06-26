@@ -1157,6 +1157,39 @@ impl WalletCache {
         Ok(index)
     }
 
+    /// Load schedules for only `markets` into a `ScheduleIndex` via per-market
+    /// primary-key lookups (mirrors [`Self::load_resolutions_for_markets`] / the
+    /// bounded [`Self::load_clob_marks`]). The injected-set bake-off path (#453) uses
+    /// this to avoid the full-table scan in [`Self::load_all_schedules`].
+    ///
+    /// Mirrors [`Self::load_all_schedules`] exactly for the requested markets: a row
+    /// with a NULL `end_date_unix` still enters the index (presence distinguishes
+    /// "checked, no date" from "never fetched"), so the result is identical to
+    /// [`Self::load_all_schedules`] restricted to `markets`.
+    ///
+    /// # Precondition
+    /// Returns an empty index when `markets` is empty.
+    pub fn load_schedules_for_markets(
+        &self,
+        markets: &HashSet<MarketId>,
+    ) -> Result<ScheduleIndex, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT end_date_unix FROM market_schedules WHERE market_id = ?1")?;
+        let mut index = ScheduleIndex::new();
+        for market in markets {
+            let rows = stmt.query_map(params![market.0.0], |r| {
+                let end_date_unix: Option<i64> = r.get(0)?;
+                Ok(end_date_unix)
+            })?;
+            for row in rows {
+                let end_date_unix = row?;
+                index.insert(market.clone(), MarketSchedule { end_date_unix });
+            }
+        }
+        Ok(index)
+    }
+
     // ── market_price_history (issue #421 PR4 — CLV bake-off) ─────────────────────
 
     /// Insert a batch of coarse pre-resolution price points into `market_price_history` in one
@@ -1954,6 +1987,51 @@ impl WalletCache {
                     resolved_at_unix,
                 },
             );
+        }
+        Ok(index)
+    }
+
+    /// Load resolutions for only `markets` into a `ResolutionIndex` via per-market
+    /// primary-key lookups (one prepared statement reused across markets, mirroring
+    /// [`Self::load_clob_marks`]). The injected-set bake-off path (#453) uses this to
+    /// avoid the full-table scan in [`Self::load_all_resolutions`] on the 155 GB cache.
+    ///
+    /// The `winning_outcome_id IS NOT NULL` predicate is preserved verbatim, so voided
+    /// markets are excluded exactly as in the full load; the returned index for the
+    /// requested markets is therefore identical to [`Self::load_all_resolutions`]
+    /// restricted to `markets` (the bit-identity property the bake-off relies on).
+    ///
+    /// # Precondition
+    /// Returns an empty index when `markets` is empty.
+    pub fn load_resolutions_for_markets(
+        &self,
+        markets: &HashSet<MarketId>,
+    ) -> Result<ResolutionIndex, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT winning_outcome_id, resolved_at_unix \
+             FROM market_resolutions \
+             WHERE market_id = ?1 AND winning_outcome_id IS NOT NULL",
+        )?;
+        let mut index = ResolutionIndex::new();
+        for market in markets {
+            let rows = stmt.query_map(params![market.0.0], |r| {
+                let winner_i64: i64 = r.get(0)?;
+                let resolved_at: i64 = r.get(1)?;
+                Ok((winner_i64, resolved_at))
+            })?;
+            for row in rows {
+                let (winner_i64, resolved_at_unix) = row?;
+                let Ok(winning_outcome_id) = OutcomeId::try_from(winner_i64) else {
+                    continue; // out-of-range value; skip defensively
+                };
+                index.insert(
+                    market.clone(),
+                    MarketResolution {
+                        winning_outcome_id,
+                        resolved_at_unix,
+                    },
+                );
+            }
         }
         Ok(index)
     }
@@ -2798,7 +2876,7 @@ impl WalletCache {
 ///
 /// Only rows with `winning_outcome_id IS NOT NULL` are materialised in the
 /// [`ResolutionIndex`]; voided markets are filtered at load time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketResolution {
     /// 0-based index of the winning outcome (e.g. `OutcomeId(0)` = YES, `OutcomeId(1)` = NO).
     /// Promoted from raw `u8` to `OutcomeId` (issue #159) to eliminate the `.0` deref footgun.
@@ -2817,7 +2895,7 @@ pub type ResolutionIndex = HashMap<MarketId, MarketResolution>;
 /// `end_date_unix = None` means Gamma had no `endDate` for this market — the backtest
 /// treats this as "allow through" (no suppression) rather than falling back to
 /// `resolved_at_unix`, which would leak future state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketSchedule {
     /// Unix seconds of the market's scheduled `endDate`, or `None` if Gamma had none.
     pub end_date_unix: Option<i64>,
@@ -3161,6 +3239,97 @@ mod tests {
         let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
         cache.upsert_token_conditions_batch(&[], 100).unwrap();
         assert_eq!(cache.token_condition_count(), 0);
+    }
+
+    // ── bounded resolution/schedule loaders (issue #453) ─────────────────────────
+    //
+    // The bake-off injected path loads resolutions/schedules for only the traded
+    // markets. These prove the bounded loaders return exactly `load_all_*()`
+    // restricted to the requested set — the bit-identity property the optimization
+    // relies on — including the `winning_outcome_id IS NOT NULL` predicate.
+
+    fn mkt(id: &str) -> MarketId {
+        MarketId(VenueMarketId(id.to_owned()))
+    }
+
+    #[test]
+    fn load_resolutions_for_markets_equals_full_restricted() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        // Two resolved markets, a VOIDED market (NULL winner), plus two extra
+        // unrelated markets that must never leak into a bounded load.
+        cache.insert_resolution("m-a", Some(0), 100, 100).unwrap();
+        cache.insert_resolution("m-b", Some(1), 110, 110).unwrap();
+        cache.insert_resolution("m-void", None, 120, 120).unwrap();
+        cache.insert_resolution("x-1", Some(0), 130, 130).unwrap();
+        cache.insert_resolution("x-2", Some(1), 140, 140).unwrap();
+
+        let full = cache.load_all_resolutions().unwrap();
+        // The full load already drops the voided market.
+        assert!(!full.contains_key(&mkt("m-void")));
+
+        // Request the resolved pair, the voided market, and an absent market. The
+        // bounded result must equal the full index restricted to that set.
+        let requested: HashSet<MarketId> = ["m-a", "m-b", "m-void", "m-absent"]
+            .into_iter()
+            .map(mkt)
+            .collect();
+        let bounded = cache.load_resolutions_for_markets(&requested).unwrap();
+        let expected: ResolutionIndex = full
+            .iter()
+            .filter(|(k, _)| requested.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(bounded, expected);
+        // Concretely: only the two non-voided requested markets survive; the voided
+        // and absent markets are excluded, and the extra x-* never appear.
+        assert_eq!(bounded.len(), 2);
+        assert!(bounded.contains_key(&mkt("m-a")));
+        assert!(bounded.contains_key(&mkt("m-b")));
+        assert!(!bounded.contains_key(&mkt("m-void"))); // predicate preserved
+        assert!(!bounded.contains_key(&mkt("x-1")));
+    }
+
+    #[test]
+    fn load_resolutions_for_markets_empty_set_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.insert_resolution("m-a", Some(0), 100, 100).unwrap();
+        let bounded = cache.load_resolutions_for_markets(&HashSet::new()).unwrap();
+        assert!(bounded.is_empty());
+    }
+
+    #[test]
+    fn load_schedules_for_markets_equals_full_restricted() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        // A market with a concrete endDate, one with a NULL endDate (must still be
+        // present in the index — presence semantics), plus an extra unrelated market.
+        cache.insert_schedule("s-a", Some(200), 100).unwrap();
+        cache.insert_schedule("s-null", None, 100).unwrap();
+        cache.insert_schedule("x-1", Some(300), 100).unwrap();
+
+        let full = cache.load_all_schedules().unwrap();
+        // The NULL-endDate row is materialised (presence distinguishes "checked, no
+        // date" from "never fetched").
+        assert!(full.contains_key(&mkt("s-null")));
+
+        let requested: HashSet<MarketId> =
+            ["s-a", "s-null", "s-absent"].into_iter().map(mkt).collect();
+        let bounded = cache.load_schedules_for_markets(&requested).unwrap();
+        let expected: ScheduleIndex = full
+            .iter()
+            .filter(|(k, _)| requested.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(bounded, expected);
+        // The NULL-endDate market is preserved; the extra x-1 never appears.
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(
+            bounded.get(&mkt("s-null")).map(|s| s.end_date_unix),
+            Some(None)
+        );
+        assert!(!bounded.contains_key(&mkt("x-1")));
     }
 
     #[test]

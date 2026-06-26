@@ -91,11 +91,30 @@ async fn main() -> Result<(), BacktestError> {
         };
     let snapshots = cache.load_all_snapshots()?;
 
+    // The markets the injected wallets actually traded. Built once on the injected
+    // path and reused for the bounded resolution/schedule loads (below) and the
+    // forward-MTM CLOB-mark load (issue #453); `None` on the full-cache ranker path.
+    let injected_markets: Option<HashSet<MarketId>> = injected_wallets
+        .as_ref()
+        .map(|_| all_trades.iter().map(|t| t.market_id.clone()).collect());
+
     // Resolutions come from the bootstrap pipeline's Polygon CTF + CLOB/Gamma
-    // stages (the Dune fallback was removed in #335). The backtest reads
-    // whatever the cache already holds.
-    let resolutions = pe_bootstrap::gamma::load_resolutions(&cache)?;
-    let schedules = pe_bootstrap::gamma::load_schedules(&cache)?;
+    // stages (the Dune fallback was removed in #335). The backtest reads whatever
+    // the cache already holds. On the injected path the load is bounded to the
+    // traded markets via per-market PK lookups (#453) — bit-identical to the full
+    // scan because every resolution/schedule reader is keyed on a traded market —
+    // while the full-cache ranker path keeps the full-table scan. Liquidity stays
+    // full either way (`market_liquidity` is small; bounding it is no measurable win).
+    let (resolutions, schedules) = match &injected_markets {
+        Some(markets) => (
+            pe_bootstrap::gamma::load_resolutions_for_markets(&cache, markets)?,
+            pe_bootstrap::gamma::load_schedules_for_markets(&cache, markets)?,
+        ),
+        None => (
+            pe_bootstrap::gamma::load_resolutions(&cache)?,
+            pe_bootstrap::gamma::load_schedules(&cache)?,
+        ),
+    };
     let liq_index = pe_bootstrap::gamma::load_liquidity(&cache)?;
 
     info!(
@@ -243,11 +262,9 @@ async fn main() -> Result<(), BacktestError> {
         // pruned to `t <= mtm_window_end_unix`. `None` keeps the legacy
         // `unrealized_pnl = 0.0` behaviour for every other run.
         let clob_marks: Option<ClobMarkIndex> =
-            match (injected_set.as_ref(), config.mtm_window_end_unix) {
-                (Some(_), Some(max_t)) => {
-                    let markets: HashSet<MarketId> =
-                        all_trades.iter().map(|t| t.market_id.clone()).collect();
-                    let marks = cache.load_clob_marks(&markets, max_t)?;
+            match (injected_markets.as_ref(), config.mtm_window_end_unix) {
+                (Some(markets), Some(max_t)) => {
+                    let marks = cache.load_clob_marks(markets, max_t)?;
                     info!(
                         markets = markets.len(),
                         series = marks.len(),

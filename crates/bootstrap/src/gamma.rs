@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 
+use pe_core_types::MarketId;
 use pe_source_polymarket_public::{
     GammaMarketsClient, GammaMarketsError, MarketFilter, PageFetcher,
 };
@@ -395,6 +396,25 @@ pub fn load_schedules(cache: &WalletCache) -> Result<ScheduleIndex, BootstrapErr
 /// Load all liquidity rows from `cache` into a [`LiquidityIndex`].
 pub fn load_liquidity(cache: &WalletCache) -> Result<LiquidityIndex, BootstrapError> {
     cache.load_all_liquidity()
+}
+
+/// Load resolutions for only `markets` into a [`ResolutionIndex`] (the injected-set
+/// bake-off path, #453; bounded to the traded markets, mirroring the bounded CLOB-mark
+/// load). Identical to [`load_resolutions`] restricted to `markets`.
+pub fn load_resolutions_for_markets(
+    cache: &WalletCache,
+    markets: &HashSet<MarketId>,
+) -> Result<ResolutionIndex, BootstrapError> {
+    cache.load_resolutions_for_markets(markets)
+}
+
+/// Load schedules for only `markets` into a [`ScheduleIndex`] (the injected-set
+/// bake-off path, #453). Identical to [`load_schedules`] restricted to `markets`.
+pub fn load_schedules_for_markets(
+    cache: &WalletCache,
+    markets: &HashSet<MarketId>,
+) -> Result<ScheduleIndex, BootstrapError> {
+    cache.load_schedules_for_markets(markets)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
