@@ -434,10 +434,12 @@ def _forward_copy_pnl(forward: SuffStats, wallets) -> float:
 def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
                       train_secs: int, horizon_secs: int, k: int, keep: int,
                       criteria: "Criteria | None" = None) -> list:
-    """8a — rank estimators by mean point-in-time forward copy P&L of their top-k pick and keep the
+    """8a — rank estimators by mean point-in-time forward copy P&L of their top-k pick and return the
     best ``keep`` (the §Acceptance benchmark ``t_stat_baseline`` is always retained). Cheap: scores
-    once per ``as_of`` and reads the forward net edge directly, eliminating most of the menu before
-    the expensive policy trajectories.
+    once per ``as_of`` and reads the forward net edge directly. **#445 defect 4: this ranking is
+    ADVISORY ONLY** — it no longer prunes the run-set (its forward-payoff proxy mismatches the
+    realized + CLOB-MTM horizon objective), so ``run_bakeoff`` carries ALL estimators into the grid
+    and uses this return value as diagnostics, not as the run-set filter it once was.
 
     A3 (#436): the screen runs on the SAME gated universe the trajectories do — the static
     ``slice_by_criteria`` plus the per-``as_of`` ``eligible_wallets`` recency/MinTRL gate — under the
@@ -732,13 +734,17 @@ def grid_deflate(return_matrix: pd.DataFrame, *, benchmark: str, n_grid: int,
     """Apply the grid-level honesty layer (LANDMINE-1): Deflated-Sharpe per config, PBO, Romano-Wolf,
     Hansen-SPA. Returns the assembled results.
 
-    A2/A8 (#436) — the two trial counts are DIFFERENT by construction, so do not force them equal:
+    A2/A8 (#436) — the two trial counts are kept SEPARATE by construction (do not force them equal):
       * the scalar Deflated-Sharpe ``expected_max_sharpe`` bar takes the FULL pre-screen
-        ``n_trials_dsr`` (every config the menu could have produced, incl. the estimators 8a dropped)
-        — the honest multiplicity of the search;
+        ``n_trials_dsr`` (every config the menu could have produced) — the honest multiplicity;
       * ``PBO`` / ``RomanoWolf`` / ``HansenSPA`` are bootstrap Validators over the matrix COLUMNS and
         structurally cannot reflect screened-out / unrun configs, so they take ``n_grid`` (the
-        run-set columns, incl. the benchmark). Documented asymmetry, not a bug (docs/31)."""
+        run-set columns, incl. the benchmark).
+    #445 defect 4: with the 8a estimator screen no longer PRUNING, the run-set IS the full pre-screen
+    grid, so the two counts now COINCIDE in the current driver (the ``true_clv`` preflight applies
+    UPSTREAM, before ``N_GRID`` is frozen, so ``n_grid_full`` already reflects any exclusion). The
+    parameter split is retained so a future horizon-consistent screen that drops configs keeps the
+    honest DSR multiplicity (docs/31)."""
     n_trials_dsr = n_grid if n_trials_dsr is None else n_trials_dsr
     moments = _config_moments(return_matrix)
     deflated = DeflatedSharpe().deflate(
