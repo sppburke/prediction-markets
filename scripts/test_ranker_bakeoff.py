@@ -1340,5 +1340,101 @@ class TrueClvPreflightTest(unittest.TestCase):
         self.assertFalse(rpt["true_clv_excluded"])
 
 
+# ───────────────────────── issue #451: operator knobs (universe / policies / uniqueness memo) ─────
+class UniquenessCacheTest(unittest.TestCase):
+    """#451: the per-run (criteria, as_of) uniqueness memo is BIT-IDENTICAL to recomputing, and
+    collapses the redundant recomputations across configs/estimators sharing a criteria."""
+
+    def _setup(self):
+        ss, skill = _population(2)
+        points = [3_000_000 + i * 1_000_000 for i in range(6)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        return ss, points, _FakeRunner(value, points, 1_000_000)
+
+    def test_cache_is_bit_identical(self):
+        ss, points, runner = self._setup()
+        gp = bo.GridPoint("eb_shrinkage_skill", bo.NO_DEFLATION, "policy_knockout_backfill",
+                          Criteria(0, 72.0, 0.0, 1.0, 0.0, 0), 0.0)
+        kw = dict(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000, k=5,
+                  displacement_margin=5)
+        a = bo.run_trajectory(gp, ss, runner, **kw)                          # no cache
+        b = bo.run_trajectory(gp, ss, runner, uniqueness_cache={}, **kw)     # with the memo
+        pd.testing.assert_series_equal(a.returns, b.returns)
+        self.assertEqual(set(a.final_follow["wallet"]), set(b.final_follow["wallet"]))
+
+    def test_cache_collapses_recompute_across_configs(self):
+        ss, points, runner = self._setup()
+        calls = {"n": 0}
+        orig = bo.uniqueness_weights
+
+        def counting(ss_in):
+            calls["n"] += 1
+            return orig(ss_in)
+
+        crit = Criteria(0, 72.0, 0.0, 1.0, 0.0, 0)
+        axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill"),
+                     deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",), criteria=(crit,))
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=2, min_periods=2)
+        bo.uniqueness_weights = counting
+        try:
+            bo.run_bakeoff(ss, runner, axes, params, created_at=1)
+        finally:
+            bo.uniqueness_weights = orig
+        # 1 criteria × 6 as_of = at most 6 distinct in-samples. Without the memo the screen (2 est × 6)
+        # plus the trajectories (2 configs × 6) would recompute up to 24 times; the memo caps it at the
+        # distinct (criteria, as_of) count.
+        self.assertLessEqual(calls["n"], len(points))
+        self.assertGreater(calls["n"], 0)
+
+
+class BoundedUniverseTest(unittest.TestCase):
+    """#451: bounded_universe restricts the materialize input to a copyable position band (dropping
+    hyperactive bots + the noise tail), optionally the top-N by activity, or None for the full set."""
+
+    def _con(self):
+        import duckdb
+        con = duckdb.connect()
+        con.execute("CREATE TABLE trades (wallet_hex VARCHAR, market_id VARCHAR, outcome_id INTEGER)")
+        rows = [(w, f"m{m}", 0) for w, n in (("0xa", 3), ("0xb", 30), ("0xc", 600), ("0xd", 5))
+                for m in range(n)]
+        con.executemany("INSERT INTO trades VALUES (?, ?, ?)", rows)
+        return con
+
+    def test_none_when_no_bounds(self):
+        self.assertIsNone(bo.bounded_universe(self._con()))
+
+    def test_position_band_drops_bot_and_tail(self):
+        u = set(bo.bounded_universe(self._con(), pos_min=10, pos_max=100))
+        self.assertEqual(u, {"0xb"})        # a=3,d=5 (tail) + c=600 (bot) excluded; b=30 kept
+
+    def test_max_wallets_caps_by_activity(self):
+        u = bo.bounded_universe(self._con(), pos_min=1, pos_max=10_000, max_wallets=2)
+        self.assertEqual(len(u), 2)
+        self.assertEqual(set(u), {"0xc", "0xb"})   # the 2 most-active (600, 30)
+
+
+class OperatorKnobsCliTest(unittest.TestCase):
+    """#451: the universe-bounding + policy-sweep CLI flags parse; defaults preserve committed
+    full-universe / all-4-policy behaviour."""
+
+    def test_universe_and_policy_flags_parse(self):
+        ns = bo._build_arg_parser().parse_args(
+            ["--out-dir", "o", "--pe-backtest", "b", "--cache", "c", "--start-unix", "0",
+             "--max-wallets", "1000", "--universe-pos-min", "50", "--universe-pos-max", "250",
+             "--policies", "policy_full_rerank", "policy_knockout_backfill"])
+        self.assertEqual(ns.max_wallets, 1000)
+        self.assertEqual((ns.universe_pos_min, ns.universe_pos_max), (50, 250))
+        self.assertEqual(ns.policies, ["policy_full_rerank", "policy_knockout_backfill"])
+
+    def test_defaults_are_full_universe_all_policies(self):
+        ns = bo._build_arg_parser().parse_args(
+            ["--out-dir", "o", "--pe-backtest", "b", "--cache", "c", "--start-unix", "0"])
+        self.assertIsNone(ns.max_wallets)
+        self.assertIsNone(ns.universe_pos_min)
+        self.assertIsNone(ns.universe_pos_max)
+        self.assertEqual(len(ns.policies), 4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

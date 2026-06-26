@@ -431,9 +431,27 @@ def _forward_copy_pnl(forward: SuffStats, wallets) -> float:
     return float(((fwd["payoff"] - fwd["_eff"]) / fwd["_eff"]).mean())
 
 
+def _uniqueness_cached(in_sample, *, key, cache):
+    """``uniqueness_weights`` memoized per ``key`` (#451). The AFML uniqueness of an in-sample
+    depends only on ``(criteria, as_of)`` — the criteria slice + walk-forward split are deterministic
+    in those — so ``screen_estimators`` and every config's ``run_trajectory`` otherwise recompute the
+    SAME O(positions × segments) statistic up to ``n_grid × steps`` times. A per-run ``cache`` dict
+    keyed on ``(criteria, as_of)`` collapses that to once per distinct in-sample, BIT-IDENTICALLY
+    (same rows/order -> same positional weights, used read-only downstream). ``cache=None`` disables
+    it (back-compat for direct callers / tests)."""
+    if cache is None:
+        return uniqueness_weights(in_sample)
+    weights = cache.get(key)
+    if weights is None:
+        weights = uniqueness_weights(in_sample)
+        cache[key] = weights
+    return weights
+
+
 def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
                       train_secs: int, horizon_secs: int, k: int, keep: int,
-                      criteria: "Criteria | None" = None) -> list:
+                      criteria: "Criteria | None" = None,
+                      uniqueness_cache: "dict | None" = None) -> list:
     """8a — rank estimators by mean point-in-time forward copy P&L of their top-k pick and return the
     best ``keep`` (the §Acceptance benchmark ``t_stat_baseline`` is always retained). Cheap: scores
     once per ``as_of`` and reads the forward net edge directly. **#445 defect 4: this ranking is
@@ -463,7 +481,8 @@ def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
             candidates = in_sample[in_sample["wallet"].isin(eligible)]   # label-preserving slice
             if candidates.empty:
                 continue
-            weights = uniqueness_weights(in_sample)                      # full-frame, aligned index
+            weights = _uniqueness_cached(                                # full-frame, aligned index
+                in_sample, key=(criteria, as_of), cache=uniqueness_cache)  # #451 memo
             scores = estimator.score(candidates, as_of=as_of, weights=weights)
             if scores.empty:
                 continue
@@ -579,7 +598,8 @@ class TrajectoryResult:
 def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points: list,
                    train_secs: int, horizon_secs: int, k: int,
                    displacement_margin: int, demoter_kwargs: "dict | None" = None,
-                   flat_usd: float = 25.0) -> "TrajectoryResult":
+                   flat_usd: float = 25.0,
+                   uniqueness_cache: "dict | None" = None) -> "TrajectoryResult":
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
     of churn (indexed by ``as_of``) PLUS the final-step followed set (A1). Sequential by
     construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
@@ -629,7 +649,8 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         if candidates.empty:
             _no_signal()                                             # A9 + #445: no eligible set
             continue
-        weights = uniqueness_weights(in_sample)                      # full-frame, aligned index
+        weights = _uniqueness_cached(                                # full-frame, aligned index
+            in_sample, key=(grid_point.criteria, as_of), cache=uniqueness_cache)  # #451 memo
         scores = estimator.score(candidates, as_of=as_of, weights=weights)
         # Per-wallet deflation: n_trials = the CANDIDATE count being selected among (deflation.py
         # contract), NOT N_GRID — the grid trial count is the grid-level Validators' bar (8c).
@@ -1060,12 +1081,18 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
             f"({len(params.as_of_points)}) = {naive_backtests} naive backtests > "
             f"ranker_bakeoff_max_backtests={params.max_backtests}; narrow the criteria/churn sweep "
             "(fewer --ttr-hours/--bands/--min-trl levels) or raise the ceiling")
+    # #451: one per-run AFML-uniqueness memo shared by the 8a screen AND every config's trajectory.
+    # The uniqueness of an in-sample is fixed by (criteria, as_of), so this collapses up to
+    # n_grid × steps recomputations to once per distinct in-sample (bit-identical, see
+    # `_uniqueness_cached`) — the dominant Python cost on a large candidate universe.
+    uniqueness_cache: dict = {}
     # #445 defect 4: the 8a screen runs for its ADVISORY ranking only — it no longer prunes the
     # estimator axis (its forward-payoff proxy mismatches the realized + CLOB-MTM horizon objective).
     screen_advisory = screen_estimators(
         ss, list(axes.estimators), as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
-        k=params.k, keep=params.screen_keep, criteria=axes.criteria[0])   # A3: canonical criteria
+        k=params.k, keep=params.screen_keep, criteria=axes.criteria[0],   # A3: canonical criteria
+        uniqueness_cache=uniqueness_cache)
     run_axes = axes                              # no pruning: the run-set IS the full pre-screen grid
     manifest = pre_register_grid(run_axes, created_at=created_at)
     grid = run_axes.enumerate_grid()
@@ -1076,7 +1103,8 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         grid, ss, memo_runner, as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
-        demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd)
+        demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
+        uniqueness_cache=uniqueness_cache)
     split_at = int(np.median(params.as_of_points))
     cpr = wallet_persistence_cpr(ss, split_at=split_at)
     decision = select_winner_or_nogo(
@@ -1205,6 +1233,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--churn-cost", type=float, default=RANKER_CHURN_COST_USD,
                     help="D3: per-admission copy cost USD, swept as {0, this}; "
                          "default ranker_churn_cost_usd (0.75)")
+    # #451: bound the candidate universe + the policy sweep so the run is tractable on a constrained
+    # box. All default to the committed full-universe / all-4-policy behaviour.
+    ap.add_argument("--max-wallets", type=int, default=None,
+                    help="cap the candidate universe to the top-N most-active wallets within the "
+                         "position band (default: no cap -> full universe; #451)")
+    ap.add_argument("--universe-pos-min", type=int, default=None,
+                    help="keep only wallets with >= this many first-buy positions (drops the noise "
+                         "tail; default: no floor)")
+    ap.add_argument("--universe-pos-max", type=int, default=None,
+                    help="keep only wallets with <= this many first-buy positions (drops hyperactive "
+                         "uncopyable bots; default: no cap)")
+    ap.add_argument("--policies", nargs="+",
+                    default=[FullRerank.name, KnockoutBackfill.name,
+                             HybridDisplacement.name, OnlineWeighting.name],
+                    help="set-transition policy names to sweep (default: all 4; fewer = far fewer "
+                         "distinct backtests for a tractable run)")
     return ap
 
 
@@ -1228,6 +1272,29 @@ def _open_engine(args: argparse.Namespace):
     return con
 
 
+def bounded_universe(con, *, pos_min: "int | None" = None, pos_max: "int | None" = None,
+                     max_wallets: "int | None" = None) -> "list | None":
+    """Candidate-wallet shortlist bounded by first-buy position count, or ``None`` for the full
+    universe (#451). The committed full-universe ``materialize(con)`` extracts every wallet's
+    first-buy positions (~411k wallets / ~71M rows in the production parquet) — a pandas frame that
+    OOMs a memory-constrained box. When any bound is set, restrict the materialize input to wallets
+    with ``pos_min <= distinct (market, outcome) first-buys <= pos_max`` — a copyable shortlist that
+    drops hyperactive position-hoarding bots (``> pos_max``, uncopyable) and the thin noise tail
+    (``< pos_min``), optionally the top-``max_wallets`` by activity. Queries the engine's ``trades``
+    view; returns ``wallet_hex`` strings (the materialize universe contract)."""
+    if pos_min is None and pos_max is None and max_wallets is None:
+        return None
+    lo = 0 if pos_min is None else int(pos_min)
+    hi = (2 ** 63 - 1) if pos_max is None else int(pos_max)
+    cap = f"ORDER BY positions DESC LIMIT {int(max_wallets)}" if max_wallets else ""
+    rows = con.execute(
+        "SELECT wallet_hex FROM (SELECT wallet_hex, "
+        "count(DISTINCT (market_id, outcome_id)) AS positions FROM trades GROUP BY wallet_hex) "
+        f"WHERE positions BETWEEN {lo} AND {hi} {cap}"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage functions)
     """Operator entry: materialize suff_stats from the cache, run the bake-off against the real
     ``pe-backtest``, write the leaderboard / manifest / decision, cross-check ``paper_fills``."""
@@ -1240,7 +1307,15 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     con = _open_engine(args)
-    ss = suff_stats_mod.materialize(con)
+    # #451: optionally bound the candidate universe so the full-universe materialize does not OOM a
+    # constrained box; None -> the full universe (committed behaviour).
+    universe = bounded_universe(con, pos_min=args.universe_pos_min,
+                                pos_max=args.universe_pos_max, max_wallets=args.max_wallets)
+    if universe is not None:
+        print(f"candidate universe bounded to {len(universe):,} wallets "
+              f"(positions in [{args.universe_pos_min}, {args.universe_pos_max}]"
+              f"{f', top {args.max_wallets} by activity' if args.max_wallets else ''})")
+    ss = suff_stats_mod.materialize(con, wallets=universe)
 
     day = 86_400
     as_of_points = [args.start_unix + i * args.step_days * day for i in range(args.steps)]
@@ -1256,8 +1331,7 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
         ss, views_present=clv_views, estimators=tuple(ESTIMATOR_REGISTRY))
     axes = BakeoffAxes(
         estimators=estimators, deflators=(NO_DEFLATION, DeflatedSharpe.name),
-        policies=(FullRerank.name, KnockoutBackfill.name, HybridDisplacement.name,
-                  OnlineWeighting.name),
+        policies=tuple(args.policies),                    # #451: operator-selectable policy sweep
         criteria=build_criteria_grid(                     # D1 (#436): the swept criteria grid
             ttr_hours_levels=tuple(args.ttr_hours), price_bands=tuple(args.bands),
             min_trl_levels=tuple(args.min_trl)),
