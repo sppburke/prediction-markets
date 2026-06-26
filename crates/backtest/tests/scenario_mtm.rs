@@ -620,3 +620,135 @@ fn scenario_mtm_open_fraction_denominator_counts_closed_in_window() {
         "positions_in_window must include closed-in-window positions for a horizon-exposed wallet"
     );
 }
+
+/// #445 defect 3 fixture: a single QUIET wallet whose only trade is a BUY that resolves INSIDE the
+/// window with NO later trade to advance the simulation date axis past the resolution. Window
+/// `as_of = D10`, `horizon = D30`.
+///   - Wallet Z buys `mkt-quiet` at **D12**; it resolves (Z wins, outcome 0) at **D20** (inside the
+///     window). Z has no other trade, so the per-day resolution sweep — whose last date is D12 —
+///     never reaches D20. A STALE pre-resolution CLOB mark (0.60 at D18) exists, so WITHOUT the
+///     end-of-run sweep Z would be marked at (0.60−0.50)·50 = +5 (wrong) instead of realized at
+///     (1.0−0.50)·50 = +25.
+fn run_quiet_resolution_fixture() -> (Vec<PnlRow>, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let out_dir = dir.path().join("out");
+    let z = wallet(0x2c);
+    {
+        let mut cache = WalletCache::open(&cache_path).unwrap();
+        cache
+            .insert_new(
+                &z.to_string(),
+                vec![buy(
+                    z,
+                    "mkt-quiet",
+                    "z-1",
+                    dec!(0.50),
+                    T0 + 12 * SEC_PER_DAY,
+                )],
+            )
+            .unwrap();
+        // Resolves INSIDE the window at D20 (Z wins outcome 0). No later trade exists, so the per-day
+        // sweep (its last date is D12) never reaches it — only the end-of-run sweep can close it.
+        let r = T0 + 20 * SEC_PER_DAY;
+        cache.insert_resolution("mkt-quiet", Some(0), r, r).unwrap();
+        // A STALE pre-resolution CLOB mark (0.60 at D18): without the fix Z is mismarked at +5.
+        cache
+            .upsert_token_conditions_batch(
+                &[("tok-quiet".to_owned(), "mkt-quiet".to_owned(), 0)],
+                T0,
+            )
+            .unwrap();
+        cache
+            .insert_price_history_batch(
+                &[(
+                    "mkt-quiet".to_owned(),
+                    "tok-quiet".to_owned(),
+                    T0 + 18 * SEC_PER_DAY,
+                    "0.60".to_owned(),
+                )],
+                "clob",
+            )
+            .unwrap();
+    }
+
+    let cache = WalletCache::open(&cache_path).unwrap();
+    let injected = vec![z];
+    let mut all_trades = load_injected_trades(&cache, &injected);
+    all_trades.sort_by_key(|t| t.timestamp.0);
+
+    let resolutions = pe_bootstrap::gamma::load_resolutions(&cache).unwrap();
+    let schedules = pe_bootstrap::gamma::load_schedules(&cache).unwrap();
+    let liq = pe_bootstrap::gamma::load_liquidity(&cache).unwrap();
+    let snapshots = cache.load_all_snapshots().unwrap();
+    let markets: HashSet<MarketId> = all_trades.iter().map(|t| t.market_id.clone()).collect();
+    let marks = cache.load_clob_marks(&markets, HORIZON).unwrap();
+
+    let config = BacktestConfig {
+        bootstrap_cache_path: cache_path.clone(),
+        output_dir: out_dir.clone(),
+        flat_usd: Some(dec!(25)),
+        max_signal_price: None,
+        mtm_window_start_unix: Some(AS_OF),
+        mtm_window_end_unix: Some(HORIZON),
+        strategy: WinnerFollowConfig {
+            slippage_rate: dec!(0),
+            ..WinnerFollowConfig::default()
+        },
+        ..BacktestConfig::default()
+    };
+    let ranker_config = RankerConfig::default();
+    let strategy = WinnerFollowStrategy::new(config.strategy.clone());
+    let injected_set: HashSet<WalletAddress> = injected.iter().copied().collect();
+
+    run_simulation_with(
+        &config,
+        &all_trades,
+        &snapshots,
+        &resolutions,
+        &schedules,
+        &liq,
+        &ranker_config,
+        &strategy,
+        true,
+        Some(&injected_set),
+        Some(&marks),
+    )
+    .unwrap();
+
+    let text = std::fs::read_to_string(out_dir.join("pnl_by_period.ndjson")).unwrap();
+    let rows: Vec<PnlRow> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (rows, z.to_string())
+}
+
+#[test]
+fn scenario_mtm_quiet_wallet_in_window_resolution_is_realized_not_marked() {
+    // PASS: a copied position that resolves INSIDE the window with no later trade to advance the date
+    // axis is realized on a day row INSIDE `(as_of, horizon]` (+25) and is NOT marked at the stale
+    // CLOB mid (no horizon MTM row). Without the #445 end-of-run sweep it would be mismarked at +5
+    // (the stale 0.60 mark) and emit no realized row. FAIL otherwise.
+    let (rows, z) = run_quiet_resolution_fixture();
+    let realized: Vec<&PnlRow> = rows
+        .iter()
+        .filter(|r| r.wallet == z && !r.is_horizon_mtm)
+        .collect();
+    let realized_sum: f64 = realized.iter().map(|r| r.realized_pnl).sum();
+    let all_in_window = realized
+        .iter()
+        .all(|r| r.period_end > AS_OF && r.period_end <= HORIZON);
+    let has_mtm = mtm_row(&rows, &z).is_some();
+    let pass = realized_sum == 25.0 && all_in_window && !has_mtm && !realized.is_empty();
+    println!(
+        "PASS={pass} mtm.quiet_wallet_resolution: Z realized_sum={realized_sum} (want 25.0), \
+         realized_in_window={all_in_window} (want true), has_mtm={has_mtm} (want false), \
+         realized_rows={}",
+        realized.len()
+    );
+    assert!(
+        pass,
+        "a quiet-wallet in-window resolution must be realized inside the window, never marked"
+    );
+}
