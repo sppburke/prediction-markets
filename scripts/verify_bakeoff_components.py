@@ -32,7 +32,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ranker.bakeoff import _churn  # noqa: E402
 from ranker.deflation import DeflatedSharpe, deflated_sharpe_ratio, expected_max_sharpe  # noqa: E402
 from ranker.demotion import EmpiricalBernsteinDemoter  # noqa: E402
-from ranker.estimators import REGISTRY as EST  # noqa: E402
+from ranker.estimators import (  # noqa: E402
+    _EB_PRIOR_VAR_FLOOR,
+    _EB_TAU2_FLOOR_FRAC,
+    _SD_FLOOR,
+    REGISTRY as EST,
+)
 from ranker.oos_validation import (  # noqa: E402
     PBO,
     HansenSPA,
@@ -115,50 +120,55 @@ def _c_tstat():
     return "3 wallets: harness t-stat == scipy.ttest_1samp to 1e-9"
 
 
-@check("EBShrinkageSkill posterior == independent EB pipeline (DL tau2 vs statsmodels + closed form)")
+@check("EBShrinkageSkill posterior == independent EB pipeline INCLUDING the C1 finite-se2 mask")
 def _c_eb():
     rng = np.random.default_rng(3)
     specs = ([(f"s{i}", 0.76, 50) for i in range(4)]
              + [(f"n{i}", 0.50, 50) for i in range(4)]
-             + [(f"m{i}", 0.62, 40) for i in range(4)])
+             + [(f"m{i}", 0.62, 40) for i in range(4)]
+             + [("zero", 1.0, 50)])  # all-win -> zero dispersion -> MUST be masked out (C1 / A10)
     rows = []
     for w, wr, n in specs:
         rows += [(w, 1.0 if rng.random() < wr else 0.0, 0.5) for _ in range(n)]
     ss = _skill_ss(rows)
     sc = EST["eb_shrinkage_skill"]().score(ss, as_of=0, weights=np.ones(len(ss)))
-    # Independent per-wallet xbar, se2 (uniform weights -> numpy mean/var).
-    xbar, se2 = {}, {}
+    # The zero-dispersion wallet must DROP (NaN posterior) — this is the C1/A10 behaviour under test.
+    assert "zero" not in sc.index, "zero-dispersion wallet must be masked out, not scored"
+    # Independent per-wallet mean / sd over ALL wallets (uniform weights -> numpy mean/std).
+    means, sds, ns = {}, {}, {}
     for w, gg in ss.groupby("wallet", sort=False):
         net = ((gg.payoff - gg._eff) / gg._eff).to_numpy()
-        xbar[w], se2[w] = float(net.mean()), float(net.var(ddof=1) / len(net))
-    wl = list(xbar)
-    xv = np.array([xbar[w] for w in wl])
-    s2 = np.array([se2[w] for w in wl])
-    # DerSimonian-Laird tau2 — independent closed form, cross-checked against statsmodels.
+        means[w], sds[w], ns[w] = float(net.mean()), float(net.std(ddof=1)), len(net)
+    allw = list(means)
+    mu0 = float(np.mean([means[w] for w in allw]))            # harness: prior mean over ALL candidates
+    valid = [w for w in allw if sds[w] > _SD_FLOOR]           # C1: tau^2 over the finite-se^2 subset
+    assert set(valid) == set(sc.index), f"valid subset {set(valid)} != scored {set(sc.index)}"
+    se2 = {w: sds[w] ** 2 / ns[w] for w in valid}
+    xv = np.array([means[w] for w in valid])
+    s2 = np.array([se2[w] for w in valid])
+    # DerSimonian-Laird tau2 over the valid subset — independent closed form, vs statsmodels.
     pw = 1.0 / s2
     sw = pw.sum()
     xb = (pw * xv).sum() / sw
     q = (pw * (xv - xb) ** 2).sum()
     c = sw - (pw * pw).sum() / sw
-    tau2_cf = max((q - (xv.size - 1)) / c, 0.0)
+    tau2_dsl = max((q - (xv.size - 1)) / c, 0.0)
     sm_note = "statsmodels NA"
     if _HAVE_SM:
         tau2_sm = float(combine_effects(xv, s2, method_re="dl").tau2)
-        assert abs(tau2_cf - tau2_sm) <= 1e-6 + 1e-6 * abs(tau2_sm), \
-            f"DL tau2 closed-form {tau2_cf} != statsmodels {tau2_sm}"
-        sm_note = f"DL tau2 {tau2_cf:.4g}==statsmodels"
-    # Apply the harness's documented floor + mu0, then the normal-normal posterior independently.
+        assert abs(tau2_dsl - tau2_sm) <= 1e-6 + 1e-6 * abs(tau2_sm), \
+            f"DL tau2 closed-form {tau2_dsl} != statsmodels {tau2_sm}"
+        sm_note = f"DL tau2 {tau2_dsl:.4g}==statsmodels"
     var_means = float(np.var(xv, ddof=1))
-    tau2 = max(tau2_cf, 0.05 * var_means if var_means > 0 else 1e-9)
-    mu0 = float(xv.mean())  # harness: unweighted mean of per-wallet means
-    for w in wl:
+    floor = (_EB_TAU2_FLOOR_FRAC * var_means
+             if np.isfinite(var_means) and var_means > 0 else _EB_PRIOR_VAR_FLOOR)
+    tau2 = max(tau2_dsl, floor)
+    for w in valid:
         a = tau2 / (tau2 + se2[w])
-        post_mean = mu0 + a * (xbar[w] - mu0)
-        post_sd = math.sqrt(a * se2[w])
-        ref = float(norm.cdf(post_mean / post_sd))
+        ref = float(norm.cdf((mu0 + a * (means[w] - mu0)) / math.sqrt(a * se2[w])))
         assert abs(float(sc.loc[w, "score"]) - ref) < 1e-6, \
             f"{w}: harness EB {sc.loc[w,'score']} != independent EB {ref}"
-    return f"{len(wl)} wallets: harness EB score == independent EB pipeline; {sm_note}"
+    return f"{len(valid)} valid wallets + zero-disp dropped; harness EB == independent EB (C1 mask); {sm_note}"
 
 
 @check("GuKoenkerNPMLE recovers a known 2-point skill mixture (P(theta>0) separates populations)")
@@ -348,7 +358,14 @@ def _c_cpr():
         f"contingency {ww,wl,lw,ll} != harness {(res['ww'],res['wl'],res['lw'],res['ll'])}"
     odds, _ = fisher_exact([[ww, wl], [lw, ll]])
     assert abs(res["cpr"] - float(odds)) < 1e-9, f"CPR {res['cpr']} != fisher odds ratio {odds}"
-    return f"contingency {ww}/{wl}/{lw}/{ll} matches; CPR={res['cpr']:.4f} == fisher_exact odds ratio"
+    # Perfect-persistence branch (C3-hardened): identical periods -> WL=LW=0 -> go=True only on genuine
+    # ww>0 & ll>0. fisher_exact's odds ratio is inf here; the harness reports it as a deterministic GO.
+    s = pd.Series(np.arange(n, dtype=float), index=idx)
+    perf = brown_goetzmann_cpr(s, s)
+    assert perf["wl"] == 0 and perf["lw"] == 0 and perf["ww"] > 0 and perf["ll"] > 0, "not perfect persistence"
+    assert perf["go"] is True, "perfect persistence (WL=LW=0, WW>0, LL>0) must be go=True"
+    return (f"contingency {ww}/{wl}/{lw}/{ll} matches; CPR={res['cpr']:.4f} == fisher OR; "
+            f"perfect-persistence go branch exercised")
 
 
 # --------------------------------------------------------------------------------------------------
