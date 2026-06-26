@@ -1020,6 +1020,45 @@ pub fn run_simulation_with(
     // not enabled, so `pnl_by_period.ndjson` keeps its `unrealized_pnl = 0.0` shape.
     let mtm_rows: Vec<PeriodPnlRow> = if let Some((win_start, win_end, marks)) = mtm {
         for ((wallet, pos_key), open) in &open_positions {
+            // #445 defect 3: a still-open position whose market resolves INSIDE the forward window
+            // `(bought, horizon]` is REALIZED at its 0/1 outcome on the resolution day — NOT marked
+            // at a stale CLOB mid — even though the per-day resolution sweep never reached it (no
+            // later copied-wallet trade advanced the date axis past the resolution). It stays "open
+            // at sim end" for the simulation REPORT (its resolution is past the last trade, so
+            // bankroll/Sharpe are deliberately untouched here, matching the open-at-sim-end policy
+            // above), but the bake-off forward-MTM output realizes it in-window: a `period_pnl` row
+            // stamped on the resolution day, and `close_unix = resolved_at` so `build_mtm_rows`
+            // treats it as resolved (excluded from `open_at_horizon`), not open. Resolutions AFTER
+            // the horizon stay open (`close_unix = None`) and are correctly marked + lag-reported.
+            let resolved_in_window = resolutions.get(&pos_key.0).filter(|res| {
+                let bought_unix = open.bought_on.midnight().assume_utc().unix_timestamp();
+                res.resolved_at_unix >= bought_unix && res.resolved_at_unix <= win_end
+            });
+            let close_unix = if let Some(res) = resolved_in_window {
+                if emit_period_pnl {
+                    let realized_day = OffsetDateTime::from_unix_timestamp(res.resolved_at_unix)
+                        .map_err(|e| {
+                            BacktestError::Internal(format!(
+                                "resolved_at_unix {} out of range: {e}",
+                                res.resolved_at_unix
+                            ))
+                        })?
+                        .date();
+                    let close_price = if res.winning_outcome_id == pos_key.1 {
+                        Decimal::ONE
+                    } else {
+                        Decimal::ZERO
+                    };
+                    let pnl = (close_price - open.avg_fill_price) * Decimal::from(open.contracts);
+                    period_pnl
+                        .entry((*wallet, realized_day))
+                        .or_default()
+                        .realized += pnl;
+                }
+                Some(res.resolved_at_unix)
+            } else {
+                None
+            };
             mtm_lifetimes.push(PositionLifetime {
                 wallet: *wallet,
                 market: pos_key.0.clone(),
@@ -1027,7 +1066,7 @@ pub fn run_simulation_with(
                 contracts: open.contracts,
                 avg_fill_price: open.avg_fill_price,
                 open_unix: open.open_unix,
-                close_unix: None,
+                close_unix,
             });
         }
         build_mtm_rows(&mtm_lifetimes, win_start, win_end, marks, resolutions)
