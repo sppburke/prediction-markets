@@ -35,6 +35,8 @@ from ranker.oos_validation import (  # noqa: E402
 )
 from scipy.stats import norm  # noqa: E402
 
+from ranker_decay import weighted_stats  # noqa: E402
+
 
 class UniquenessWeightsTest(unittest.TestCase):
     def test_overlap_is_downweighted(self) -> None:
@@ -53,6 +55,36 @@ class UniquenessWeightsTest(unittest.TestCase):
                           index=[3, 7])                                # non-contiguous index
         with self.assertRaises(ValueError):
             uniqueness_weights(ss)
+
+    def test_uniform_overlap_does_not_reduce_n_eff(self) -> None:
+        # #445 defect 6 (contract): AFML uniqueness is a RELATIVE (mean-1) weight, not an absolute
+        # sample-size penalty. When every wallet's labels overlap identically the normalized weights
+        # are all equal, so weighted_stats takes the uniform short-circuit and n_eff == n — uniform
+        # overlap is NOT penalized (no double-counting vs the unweighted statistic). Locks the
+        # retained behavior so a future absolute-overlap penalty is a deliberate change.
+        ss = pd.DataFrame({
+            "wallet": ["A", "A", "A", "B", "B", "B"],
+            "entry_ts": [0, 0, 0, 0, 0, 0],
+            "ttr_ref": [10, 10, 10, 10, 10, 10],
+        })
+        w = uniqueness_weights(ss)
+        self.assertTrue(np.allclose(w, 1.0))                           # all equal after mean-1 norm
+        net = np.array([0.2, -0.1, 0.3, 0.1, 0.0, -0.2])
+        _, _, n_eff, _ = weighted_stats(net, w)
+        self.assertEqual(n_eff, float(len(net)))                       # n_eff == n: overlap not penalized
+
+    def test_differential_overlap_does_reduce_n_eff(self) -> None:
+        # Contrast (the case uniqueness IS for): A's labels overlap, B's are disjoint -> unequal
+        # weights -> Kish n_eff < n. Uniqueness bites only on DIFFERENTIAL overlap within the frame.
+        ss = pd.DataFrame({
+            "wallet": ["A", "A", "A", "B", "B", "B"],
+            "entry_ts": [0, 0, 0, 0, 20, 40],
+            "ttr_ref": [10, 10, 10, 10, 30, 50],
+        })
+        w = uniqueness_weights(ss)
+        net = np.array([0.2, -0.1, 0.3, 0.1, 0.0, -0.2])
+        _, _, n_eff, _ = weighted_stats(net, w)
+        self.assertLess(n_eff, float(len(net)))                        # differential overlap reduces n_eff
 
 
 class LookAheadGuardTest(unittest.TestCase):
@@ -284,6 +316,29 @@ class AKMWinnersTest(unittest.TestCase):
         self.assertEqual(out["ci_lo"], 3.0)
         self.assertEqual(out["ci_hi"], 3.0)
         self.assertEqual(out["median_unbiased"], 3.0)
+
+    def test_exact_top_tie_falls_back_unconditional(self) -> None:
+        # #445 defect 7: an EXACT top tie (the named/argmax winner == the runner-up estimate) has no
+        # "selected == STRICT max" event, so the truncated-normal conditioning is ill-posed at the
+        # boundary (`y == lower` pins the CDF at its truncation point; the probe returned a spurious
+        # median/CI near -7.29). Fall back to the honest UNCONDITIONAL normal CI, not a degenerate
+        # brentq solve. (Contract #445: exact ties are unconditional unless a tie-aware selection
+        # event is implemented; it is not in this remediation.)
+        est = np.array([1.0, 1.0, 0.0])              # winner 0 ties runner-up (est[1] == 1.0)
+        out = akm_inference_on_winners(est, np.ones(3), winner=0)
+        self.assertEqual(out["winner"], 0)
+        self.assertFalse(out["conditional"])
+        self.assertEqual(out["median_unbiased"], 1.0)            # naive (no truncation correction)
+        z = float(norm.ppf(0.975))
+        self.assertAlmostEqual(out["ci_lo"], 1.0 - z)            # unconditional N(y, s^2) CI, s = 1
+        self.assertAlmostEqual(out["ci_hi"], 1.0 + z)
+
+    def test_argmax_tie_default_winner_is_unconditional(self) -> None:
+        # #445 defect 7: same tie via the DEFAULT argmax path (winner=None -> argmax picks index 0,
+        # which ties index 1) -> still unconditional, not an ill-posed conditional solve.
+        out = akm_inference_on_winners(np.array([2.0, 2.0]), np.ones(2))
+        self.assertFalse(out["conditional"])
+        self.assertEqual(out["median_unbiased"], 2.0)
 
 
 class MRSWRankCSTest(unittest.TestCase):

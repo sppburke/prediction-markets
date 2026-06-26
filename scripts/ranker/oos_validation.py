@@ -314,9 +314,10 @@ def akm_inference_on_winners(estimates, ses, *, winner: "int | None" = None,
 
     ``winner`` selects which arm to condition on (default ``argmax``). Issue #436 A5: the bake-off
     awards the highest-cumulative-return RW-superior config, which need not be the mean-argmax; when
-    the named winner is NOT the max its selection event is not ``Y_w >= max others``, so the
-    truncated-normal conditioning is ill-posed — this falls back to the honest UNCONDITIONAL normal
-    CI (``conditional=False``) instead of a spurious shrinkage.
+    the named winner is NOT STRICTLY the max — either below it, OR an EXACT top tie ``y == lower``
+    (#445 defect 7) — its selection event is not ``Y_w >= max others`` (a tie pins the truncated CDF
+    at its bound), so the conditioning is ill-posed and this falls back to the honest UNCONDITIONAL
+    normal CI (``conditional=False``) instead of a spurious shrinkage.
 
     Returns ``{winner, naive_estimate, median_unbiased, ci_lo, ci_hi, truncation, conditional}``.
     """
@@ -332,7 +333,12 @@ def akm_inference_on_winners(estimates, ses, *, winner: "int | None" = None,
                 "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": float("-inf"),
                 "conditional": False}
     lower = float(np.max(np.delete(estimates, w)))             # runner-up = truncation bound
-    if y < lower:                                              # A5: named winner is not the max
+    if y <= lower:                                             # A5 + #445 defect 7: not STRICTLY the
+        # max (named winner below max, OR an EXACT top tie y == lower). The "selected == strict max"
+        # event does not hold, so the truncated-normal law is ill-posed at the boundary (y == lower
+        # pins its CDF at the truncation point); fall back to the honest UNCONDITIONAL normal CI
+        # rather than a spurious brentq solve. Exact ties stay unconditional unless a tie-aware
+        # selection event is implemented (out of #445 scope).
         return {"winner": w, "naive_estimate": y, "median_unbiased": y,
                 "ci_lo": y - z * s, "ci_hi": y + z * s, "truncation": lower,
                 "conditional": False}
