@@ -9,8 +9,8 @@ use std::io::Write as _;
 use std::path::Path;
 
 use pe_bootstrap::cache::{
-    ClobMarkIndex, LeaderboardSnapshots, LiquidityIndex, MarketResolution, ResolutionIndex,
-    ScheduleIndex, WalletCache,
+    ClobMarkIndex, LeaderboardSnapshots, LiquidityIndex, ResolutionIndex, ScheduleIndex,
+    WalletCache,
 };
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
@@ -468,24 +468,50 @@ pub fn run_simulation_with(
             let Some(res) = resolutions.get(&pos_key.0) else {
                 continue;
             };
-            // Realized on the sweep day (`sim_date`); the closed lifetime is recorded only when a
-            // forward-MTM window is configured (`mtm.is_some()`).
-            settle_position(
-                leader,
-                &pos_key,
-                &open,
-                res,
-                sim_date,
-                &mut bankroll,
-                &mut intraday_realized_pnl,
-                &mut exposure,
-                &mut pnl_accum,
-                &mut period_pnl,
-                &mut mtm_lifetimes,
-                emit_period_pnl,
-                mtm.is_some(),
-                fills_writer.as_mut(),
-            )?;
+            let close_price = if res.winning_outcome_id == pos_key.1 {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            };
+
+            let revenue = Decimal::from(open.contracts) * close_price;
+            let cost = Decimal::from(open.contracts) * open.avg_fill_price;
+            let pnl = revenue - cost;
+            bankroll += revenue;
+            intraday_realized_pnl += pnl;
+
+            let bps_removed = proposed_trade_bps(open.contracts, open.avg_fill_price, bankroll);
+            exposure.remove(leader, &pos_key.0, bps_removed);
+
+            pnl_accum.record(pnl);
+
+            if emit_period_pnl {
+                period_pnl.entry((leader, sim_date)).or_default().realized += pnl;
+            }
+
+            if mtm.is_some() {
+                mtm_lifetimes.push(PositionLifetime {
+                    wallet: leader,
+                    market: pos_key.0.clone(),
+                    outcome: pos_key.1,
+                    contracts: open.contracts,
+                    avg_fill_price: open.avg_fill_price,
+                    open_unix: open.open_unix,
+                    close_unix: Some(res.resolved_at_unix),
+                });
+            }
+
+            let fill = TradeFill {
+                simulated_at: sim_date.midnight().assume_utc(),
+                leader_wallet: leader.to_string(),
+                market_id: pos_key.0.0.0.clone(),
+                outcome_id: pos_key.1.0,
+                side: "resolution".to_owned(),
+                contracts: open.contracts,
+                signal_price: close_price,
+                fill_price: close_price,
+            };
+            write_fill(fills_writer.as_mut(), &fill)?;
         }
 
         // Advance incremental ledger: incorporate all trades strictly before today.
@@ -981,62 +1007,6 @@ pub fn run_simulation_with(
         }
     }
 
-    // #445 defect 3: close copied positions whose market resolved inside the configured forward-MTM
-    // window but were never reached by the per-day resolution sweep — a position that resolves after
-    // the last copied-wallet trade date (no later trade to advance the simulation date axis) would
-    // otherwise survive to the open-ended MTM pass below and be marked at a STALE CLOB mid instead of
-    // realized at its known 0/1 outcome. Bounded: iterates only the still-open copied positions and
-    // closes those whose `resolved_at_unix` is in `(bought, horizon]`, stamping realized P&L on the
-    // RESOLUTION day so it lands inside the Python `(as_of, horizon]` window; the closed lifetime
-    // (`close_unix = resolved_at`) makes `build_mtm_rows` treat it as resolved, not open-at-horizon.
-    // Only runs with a forward-MTM window (the injected bake-off path); the full-cache run is
-    // unaffected. Resolutions AFTER the horizon stay open — correctly marked + lag-reported.
-    if let Some((_win_start, win_end, _marks)) = mtm {
-        let to_close: Vec<(WalletAddress, PosKey)> = open_positions
-            .iter()
-            .filter_map(|((leader, pos_key), open)| {
-                let res = resolutions.get(&pos_key.0)?;
-                let bought_unix = open.bought_on.midnight().assume_utc().unix_timestamp();
-                if res.resolved_at_unix < bought_unix || res.resolved_at_unix > win_end {
-                    return None;
-                }
-                Some((*leader, pos_key.clone()))
-            })
-            .collect();
-        for (leader, pos_key) in to_close {
-            let Some(open) = open_positions.remove(&(leader, pos_key.clone())) else {
-                continue;
-            };
-            let Some(res) = resolutions.get(&pos_key.0) else {
-                continue;
-            };
-            let realized_day = OffsetDateTime::from_unix_timestamp(res.resolved_at_unix)
-                .map_err(|e| {
-                    BacktestError::Internal(format!(
-                        "resolved_at_unix {} out of range: {e}",
-                        res.resolved_at_unix
-                    ))
-                })?
-                .date();
-            settle_position(
-                leader,
-                &pos_key,
-                &open,
-                res,
-                realized_day,
-                &mut bankroll,
-                &mut intraday_realized_pnl,
-                &mut exposure,
-                &mut pnl_accum,
-                &mut period_pnl,
-                &mut mtm_lifetimes,
-                emit_period_pnl,
-                true,
-                fills_writer.as_mut(),
-            )?;
-        }
-    }
-
     // Positions still open at the simulation END are excluded from realized PnL —
     // their final value is unknown. Capital remains tied up in the bankroll (cost
     // was deducted at BUY). Named `open_at_sim_end` (Phase F / F3b) to disambiguate
@@ -1050,6 +1020,45 @@ pub fn run_simulation_with(
     // not enabled, so `pnl_by_period.ndjson` keeps its `unrealized_pnl = 0.0` shape.
     let mtm_rows: Vec<PeriodPnlRow> = if let Some((win_start, win_end, marks)) = mtm {
         for ((wallet, pos_key), open) in &open_positions {
+            // #445 defect 3: a still-open position whose market resolves INSIDE the forward window
+            // `(bought, horizon]` is REALIZED at its 0/1 outcome on the resolution day — NOT marked
+            // at a stale CLOB mid — even though the per-day resolution sweep never reached it (no
+            // later copied-wallet trade advanced the date axis past the resolution). It stays "open
+            // at sim end" for the simulation REPORT (its resolution is past the last trade, so
+            // bankroll/Sharpe are deliberately untouched here, matching the open-at-sim-end policy
+            // above), but the bake-off forward-MTM output realizes it in-window: a `period_pnl` row
+            // stamped on the resolution day, and `close_unix = resolved_at` so `build_mtm_rows`
+            // treats it as resolved (excluded from `open_at_horizon`), not open. Resolutions AFTER
+            // the horizon stay open (`close_unix = None`) and are correctly marked + lag-reported.
+            let resolved_in_window = resolutions.get(&pos_key.0).filter(|res| {
+                let bought_unix = open.bought_on.midnight().assume_utc().unix_timestamp();
+                res.resolved_at_unix >= bought_unix && res.resolved_at_unix <= win_end
+            });
+            let close_unix = if let Some(res) = resolved_in_window {
+                if emit_period_pnl {
+                    let realized_day = OffsetDateTime::from_unix_timestamp(res.resolved_at_unix)
+                        .map_err(|e| {
+                            BacktestError::Internal(format!(
+                                "resolved_at_unix {} out of range: {e}",
+                                res.resolved_at_unix
+                            ))
+                        })?
+                        .date();
+                    let close_price = if res.winning_outcome_id == pos_key.1 {
+                        Decimal::ONE
+                    } else {
+                        Decimal::ZERO
+                    };
+                    let pnl = (close_price - open.avg_fill_price) * Decimal::from(open.contracts);
+                    period_pnl
+                        .entry((*wallet, realized_day))
+                        .or_default()
+                        .realized += pnl;
+                }
+                Some(res.resolved_at_unix)
+            } else {
+                None
+            };
             mtm_lifetimes.push(PositionLifetime {
                 wallet: *wallet,
                 market: pos_key.0.clone(),
@@ -1057,7 +1066,7 @@ pub fn run_simulation_with(
                 contracts: open.contracts,
                 avg_fill_price: open.avg_fill_price,
                 open_unix: open.open_unix,
-                close_unix: None,
+                close_unix,
             });
         }
         build_mtm_rows(&mtm_lifetimes, win_start, win_end, marks, resolutions)
@@ -1336,80 +1345,6 @@ fn leader_win_rate_p_shrunk(
         .saturating_add(extra.saturating_mul(2));
     let den = Decimal::from(den_u);
     Probability::new((num / den).clamp(Decimal::ZERO, Decimal::ONE)).ok()
-}
-
-/// Settle one resolved copied position at its 0/1 outcome price: pay revenue into the bankroll,
-/// update exposure / the P&L accumulator / the intraday tally, stamp the realized P&L on
-/// `realized_day`, optionally record the closed lifetime for forward MTM, and log the resolution
-/// fill. Shared by the per-day resolution sweep and the #445 end-of-run sweep — the latter closes
-/// positions whose market resolves inside the MTM window with NO later copied-wallet trade to
-/// advance the date axis, which the per-day sweep would otherwise miss (leaving the position to be
-/// wrongly marked at a stale CLOB mid instead of realized at its known outcome).
-#[allow(clippy::too_many_arguments)]
-fn settle_position(
-    leader: WalletAddress,
-    pos_key: &PosKey,
-    open: &OpenPosition,
-    res: &MarketResolution,
-    realized_day: Date,
-    bankroll: &mut Decimal,
-    intraday_realized_pnl: &mut Decimal,
-    exposure: &mut ExposureTracker,
-    pnl_accum: &mut PnlAccumulator,
-    period_pnl: &mut HashMap<(WalletAddress, Date), PeriodAccum>,
-    mtm_lifetimes: &mut Vec<PositionLifetime>,
-    emit_period_pnl: bool,
-    record_lifetime: bool,
-    fills_writer: Option<&mut std::fs::File>,
-) -> Result<(), BacktestError> {
-    let close_price = if res.winning_outcome_id == pos_key.1 {
-        Decimal::ONE
-    } else {
-        Decimal::ZERO
-    };
-
-    let revenue = Decimal::from(open.contracts) * close_price;
-    let cost = Decimal::from(open.contracts) * open.avg_fill_price;
-    let pnl = revenue - cost;
-    *bankroll += revenue;
-    *intraday_realized_pnl += pnl;
-
-    let bps_removed = proposed_trade_bps(open.contracts, open.avg_fill_price, *bankroll);
-    exposure.remove(leader, &pos_key.0, bps_removed);
-
-    pnl_accum.record(pnl);
-
-    if emit_period_pnl {
-        period_pnl
-            .entry((leader, realized_day))
-            .or_default()
-            .realized += pnl;
-    }
-
-    if record_lifetime {
-        mtm_lifetimes.push(PositionLifetime {
-            wallet: leader,
-            market: pos_key.0.clone(),
-            outcome: pos_key.1,
-            contracts: open.contracts,
-            avg_fill_price: open.avg_fill_price,
-            open_unix: open.open_unix,
-            close_unix: Some(res.resolved_at_unix),
-        });
-    }
-
-    let fill = TradeFill {
-        simulated_at: realized_day.midnight().assume_utc(),
-        leader_wallet: leader.to_string(),
-        market_id: pos_key.0.0.0.clone(),
-        outcome_id: pos_key.1.0,
-        side: "resolution".to_owned(),
-        contracts: open.contracts,
-        signal_price: close_price,
-        fill_price: close_price,
-    };
-    write_fill(fills_writer, &fill)?;
-    Ok(())
 }
 
 fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> i32 {
