@@ -602,8 +602,9 @@ class PreScreenNTest(unittest.TestCase):
         axes = _axes(estimators=("t_stat_baseline", "eb_shrinkage_skill", "gu_koenker_npmle"),
                      deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",))
         res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
-        # screen_keep=1 prunes >= 1 estimator, so the run grid is smaller than the pre-screen grid.
-        self.assertGreaterEqual(res["decision"]["n_grid_full_pre_screen"], res["manifest"]["n_grid"])
+        # #445 defect 4: estimator pruning is DISABLED — the run grid EQUALS the full pre-screen grid
+        # even with screen_keep=1 (the 8a screen is advisory-only and no longer shrinks the run-set).
+        self.assertEqual(res["decision"]["n_grid_full_pre_screen"], res["manifest"]["n_grid"])
         self.assertEqual(res["decision"]["n_grid_full_pre_screen"], len(axes.enumerate_grid()))
 
 
@@ -1091,6 +1092,252 @@ class L1ChurnTest(unittest.TestCase):
         # the old admission count was 0 here; the L1 positive part charges the +0.5 ramp.
         self.assertAlmostEqual(
             bo._churn(self._fs({"w1": 0.3, "w2": 0.7}), self._fs({"w1": 0.8, "w2": 0.2})), 0.5)
+
+
+# ───────────────────────── issue #445: bake-off correctness remediation ─────────────────────────
+class NoSignalStateResetTest(unittest.TestCase):
+    """#445 defect 1: a no-signal period means the config HELD NOTHING. ``run_trajectory`` must reset
+    ``prev`` to an empty set and rebuild the policy (clearing online/incumbency carry) so a later
+    re-entry pays FULL churn; and if the FINAL cutoff is no-signal the deliverable
+    (``final_follow``/``final_scores``) is empty — NOT a fall-back to the most recent non-empty set."""
+
+    def _raw(self, rows):
+        return derive_columns(pd.DataFrame(
+            rows, columns=["wallet", "market_id", "outcome_id", "entry_ts", "ttr_secs", "price",
+                           "contracts", "payoff", "resolved_at", "close_proxy"]))
+
+    def _two_cluster_ss(self):
+        # Cluster A (entry ~1.5M, resolved 1.55M) and cluster C (entry ~5.5M, resolved 5.55M) for
+        # each wallet, with an EMPTY [3M,4M) window between them -> a no-signal middle cutoff.
+        rows = []
+        for wallet, payoffs in (("w1", [1.0, 1.0, 1.0, 0.0]), ("w2", [1.0, 0.0, 0.0, 0.0])):
+            for j, p in enumerate(payoffs):
+                rows.append((wallet, f"{wallet}_a{j}", 1, 1_500_000 + j, 3600, 0.5, 10, p,
+                             1_550_000, 0.55))
+                rows.append((wallet, f"{wallet}_c{j}", 1, 5_500_000 + j, 3600, 0.5, 10, p,
+                             5_550_000, 0.55))
+        return self._raw(rows)
+
+    def _gp(self, churn):
+        return bo.GridPoint("t_stat_baseline", bo.NO_DEFLATION, "policy_full_rerank",
+                            Criteria(0, 72.0, 0.0, 1.0, 0.0, 0), churn)
+
+    def test_reentry_after_no_signal_pays_full_churn(self):
+        ss = self._two_cluster_ss()
+        points = [2_000_000, 4_000_000, 6_000_000]            # live, no-signal, live
+        runner = _FakeRunner({"w1": 2.0, "w2": 1.0}, points, 1_000_000)
+        out = bo.run_trajectory(self._gp(1.0), ss, runner, as_of_points=points,
+                                train_secs=1_000_000, horizon_secs=1_000_000, k=5,
+                                displacement_margin=5, flat_usd=25.0)
+        self.assertTrue(np.isnan(out.returns.iloc[1]))           # no-signal middle period
+        # gross = 2*25 + 1*25 = 75; full re-entry churn = 2 wallets * 1.0 = 2 -> 73 BOTH live periods.
+        self.assertAlmostEqual(out.returns.iloc[0], 73.0)        # cold start: full admission
+        self.assertAlmostEqual(out.returns.iloc[2], 73.0)        # re-entry pays full churn again
+        self.assertAlmostEqual(out.returns.iloc[0], out.returns.iloc[2])
+
+    def test_final_cutoff_no_signal_empties_deliverable(self):
+        ss = self._two_cluster_ss()
+        points = [2_000_000, 4_000_000]                          # live, then no-signal LAST cutoff
+        runner = _FakeRunner({"w1": 2.0, "w2": 1.0}, points, 1_000_000)
+        out = bo.run_trajectory(self._gp(0.0), ss, runner, as_of_points=points,
+                                train_secs=1_000_000, horizon_secs=1_000_000, k=5,
+                                displacement_margin=5, flat_usd=25.0)
+        self.assertTrue(out.final_follow.empty)                  # no stale fall-back
+        self.assertTrue(out.final_scores.empty)
+
+
+class MinPeriodsAfterCleanTest(unittest.TestCase):
+    """#445 defect 2: the ``ranker_min_periods`` floor applies to the CLEANED dense matrix, not the
+    raw row count. 24 raw rows that clean to 2 must be an insufficient-periods NO-GO reporting
+    raw/clean/dropped counts — not reach leaderboard evaluation on 2 rows."""
+
+    def test_raw_passes_floor_but_clean_count_fails(self):
+        rng = np.random.default_rng(0)
+        base = rng.normal(0.0, 1.0, 24)
+        m = pd.DataFrame({"baseline": base, "challenger": base + 0.8,
+                          "n0": base + rng.normal(0.0, 1.0, 24)})
+        m.iloc[2:, m.columns.get_loc("n0")] = np.nan             # 22 of 24 rows drop (NaN in n0)
+        d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertEqual(d["status"], "NO-GO")
+        self.assertIn("insufficient periods", d["reason"])
+        self.assertIn("ranker_min_periods", d["reason"])
+        self.assertEqual(d["raw_periods"], 24)
+        self.assertEqual(d["clean_periods"], 2)
+        self.assertEqual(d["dropped_periods"], 22)
+        self.assertIsNone(d["winner"])
+
+    def test_clean_count_clears_floor_reports_counts(self):
+        # 24 dense rows -> 24 clean -> clears the floor; counts still reported.
+        rng = np.random.default_rng(1)
+        base = rng.normal(0.0, 1.0, 24)
+        m = pd.DataFrame({"baseline": base, "challenger": base + 0.8,
+                          "n0": base + rng.normal(0.0, 1.0, 24)})
+        d = bo.select_winner_or_nogo(m, baseline_key="baseline", n_grid=20, cpr={"go": True})
+        self.assertNotIn("insufficient periods", d.get("reason", ""))
+        self.assertEqual(d["raw_periods"], 24)
+        self.assertEqual(d["clean_periods"], 24)
+
+
+class EstimatorPruningDisabledTest(unittest.TestCase):
+    """#445 defect 4: the 8a forward-payoff screen no longer PRUNES the estimator axis (its proxy
+    target mismatches the realized+MTM horizon objective). ALL registered estimators are carried
+    into the pre-registered grid; ``n_grid`` equals the full pre-screen grid."""
+
+    def test_all_estimators_carried_into_grid_despite_screen_keep_1(self):
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(6)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        runner = _FakeRunner(value, points, 1_000_000)
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        ests = ("t_stat_baseline", "eb_shrinkage_skill", "gu_koenker_npmle")
+        axes = _axes(estimators=ests, deflators=(bo.NO_DEFLATION,), policies=("policy_full_rerank",))
+        res = bo.run_bakeoff(ss, runner, axes, params, created_at=1)
+        grid_ests = {key.split("|")[0] for key in res["manifest"]["grid_keys"]}
+        self.assertEqual(grid_ests, set(ests))                   # screen_keep=1 did NOT prune
+        self.assertEqual(res["manifest"]["n_grid"], len(axes.enumerate_grid()))
+
+
+class CrosscheckIdentityTest(unittest.TestCase):
+    """#445 defect 5: the live cross-check follows ``final_follow`` (the held set), left-joining
+    score metadata. A stateful incumbent absent from fresh scores stays in the check; a successful
+    live fetch with zero overlap of a non-empty follow hard-fails (not a clean zero-row result)."""
+
+    def _follow(self, wallets):
+        return pd.DataFrame({"wallet": list(wallets), "weight": [1.0] * len(wallets)})
+
+    def _scores(self, mapping):
+        return pd.DataFrame({"score": list(mapping.values()),
+                             "rank": list(range(1, len(mapping) + 1))}, index=list(mapping.keys()))
+
+    def test_incumbent_absent_from_scores_kept(self):
+        follow = self._follow(["wa", "wb"])                      # wb is a held incumbent
+        scores = self._scores({"wa": 0.9})                       # wb missing from fresh scores
+        realized = pd.DataFrame({"wallet": ["wa", "wb"], "realized_pnl": [5.0, -3.0]})
+        crosscheck, summary = bo.crosscheck_deliverable(follow, scores, realized)
+        self.assertIn("wb", set(crosscheck["wallet"]))           # NOT dropped by scores∩follow
+        self.assertEqual(summary["overlap_count"], 2)
+        self.assertAlmostEqual(summary["overlap_fraction"], 1.0)
+        self.assertEqual(summary["live_loser_flags"], 1)         # wb negative
+
+    def test_zero_overlap_after_successful_fetch_hard_fails(self):
+        follow = self._follow(["wa", "wb"])
+        scores = self._scores({"wa": 0.9, "wb": 0.8})
+        realized = pd.DataFrame({"wallet": ["wx"], "realized_pnl": [1.0]})   # disjoint cohort
+        with self.assertRaises(ValueError):
+            bo.crosscheck_deliverable(follow, scores, realized)
+
+    def test_empty_follow_zero_overlap_is_not_hard_fail(self):
+        follow = self._follow([])
+        scores = pd.DataFrame(columns=["score", "rank"])
+        realized = pd.DataFrame({"wallet": ["wx"], "realized_pnl": [1.0]})
+        crosscheck, summary = bo.crosscheck_deliverable(follow, scores, realized)
+        self.assertEqual(summary["overlap_count"], 0)            # advisory, not a hard fail
+        self.assertEqual(summary["n_follow"], 0)
+
+
+class SubprocessRunnerHermeticTest(unittest.TestCase):
+    """#445 defect 9: ``SubprocessBacktestRunner`` is exercised against a hermetic fake executable —
+    env wiring, the lowercased wallet file, MTM window bounds, and stale/missing-output handling."""
+
+    def _write_fake(self, path, *, emit_rows: bool):
+        lines = [
+            "#!/usr/bin/env python3",
+            "import json, os",
+            "out = os.environ['PE_BACKTEST_OUTPUT_DIR']",
+            "wp = os.environ['PE_BACKTEST_INJECTED_WALLETS_PATH']",
+            "wallets = [w for w in open(wp).read().splitlines() if w]",
+            "assert all(w == w.lower() for w in wallets), wallets",
+            "assert os.environ['PE_BACKTEST_MAX_TRADE_COUNT'] == '0'",
+            "keys = ('PE_BACKTEST_FLAT_USD','PE_BOOTSTRAP_CACHE_PATH',"
+            "'PE_BACKTEST_MTM_WINDOW_START_UNIX','PE_BACKTEST_MTM_WINDOW_END_UNIX')",
+            "cap = {'wallets': wallets, 'env': {k: os.environ.get(k) for k in keys}}",
+            "json.dump(cap, open(os.path.join(out, 'fake_capture.json'), 'w'))",
+        ]
+        if emit_rows:
+            lines += [
+                "with open(os.path.join(out, 'pnl_by_period.ndjson'), 'w') as f:",
+                "    for w in wallets:",
+                "        print(json.dumps({'wallet': w, 'period_end': 100, 'realized_pnl': 1.0,"
+                " 'unrealized_pnl': 0.0, 'n_fills': 1, 'notional': 10.0, 'is_horizon_mtm': False,"
+                " 'open_at_horizon': 0, 'marked_at_horizon': 0}), file=f)",
+            ]
+        path.write_text("\n".join(lines) + "\n")
+        import stat
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+    def test_hermetic_env_lowercase_and_window(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            binp = Path(d) / "fake_pe_backtest.py"
+            self._write_fake(binp, emit_rows=True)
+            out = Path(d) / "bt"
+            runner = bo.SubprocessBacktestRunner(str(binp), "cache.db", str(out))
+            df = runner.run(["0xABC", "0xDeF"], flat_usd=25.0, window=(1000, 2000))
+            self.assertEqual(len(df), 2)
+            self.assertEqual(list(df.columns), bo._PNL_COLUMNS)
+            cap = _json.loads((out / "fake_capture.json").read_text())
+            self.assertEqual(cap["wallets"], ["0xabc", "0xdef"])          # lowercased on write
+            self.assertEqual(cap["env"]["PE_BACKTEST_MTM_WINDOW_START_UNIX"], "1000")
+            self.assertEqual(cap["env"]["PE_BACKTEST_MTM_WINDOW_END_UNIX"], "2000")
+            self.assertEqual(cap["env"]["PE_BOOTSTRAP_CACHE_PATH"], "cache.db")
+
+    def test_stale_output_not_reparsed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "bt"
+            out.mkdir(parents=True)
+            (out / "pnl_by_period.ndjson").write_text(                    # stale prior-run output
+                '{"wallet":"0xstale","period_end":1,"realized_pnl":99.0,"unrealized_pnl":0.0,'
+                '"n_fills":1,"notional":1.0,"is_horizon_mtm":false,"open_at_horizon":0,'
+                '"marked_at_horizon":0}\n')
+            binp = Path(d) / "noop.py"
+            self._write_fake(binp, emit_rows=False)                       # writes NO pnl this run
+            runner = bo.SubprocessBacktestRunner(str(binp), "c", str(out))
+            df = runner.run(["0xa"], flat_usd=25.0)
+            self.assertTrue(df.empty)                                     # stale row NOT re-parsed
+
+
+class TrueClvPreflightTest(unittest.TestCase):
+    """#445 defect 10: ``true_clv`` is excluded from the estimator grid (visibly, not a silent
+    all-NaN arm) when the CLOB views are absent or position-level ``true_clv_close`` coverage is
+    below ``true_clv_coverage_warn_pct``; aborts if that leaves no estimator candidate."""
+
+    def _ss(self, covered_frac):
+        n = 100
+        n_cov = int(covered_frac * n)
+        return pd.DataFrame({"wallet": [f"w{i}" for i in range(n)],
+                             "true_clv_close": [0.5] * n_cov + [np.nan] * (n - n_cov)})
+
+    def test_views_absent_excludes_true_clv(self):
+        ests, rpt = bo.true_clv_preflight(self._ss(0.9), views_present=False,
+                                          estimators=("t_stat_baseline", "true_clv"))
+        self.assertEqual(ests, ("t_stat_baseline",))
+        self.assertTrue(rpt["true_clv_excluded"])
+
+    def test_low_coverage_excludes_true_clv(self):
+        ests, rpt = bo.true_clv_preflight(self._ss(0.10), views_present=True,    # 10% < 30%
+                                          estimators=("t_stat_baseline", "true_clv"))
+        self.assertEqual(ests, ("t_stat_baseline",))
+        self.assertTrue(rpt["true_clv_excluded"])
+        self.assertEqual(rpt["coverage_pct"], 10)
+
+    def test_sufficient_coverage_keeps_true_clv(self):
+        ests, rpt = bo.true_clv_preflight(self._ss(0.50), views_present=True,    # 50% >= 30%
+                                          estimators=("t_stat_baseline", "true_clv"))
+        self.assertIn("true_clv", ests)
+        self.assertFalse(rpt["true_clv_excluded"])
+
+    def test_exclusion_leaving_no_estimator_aborts(self):
+        with self.assertRaises(ValueError):
+            bo.true_clv_preflight(self._ss(0.0), views_present=False, estimators=("true_clv",))
+
+    def test_true_clv_not_requested_is_noop(self):
+        ests, rpt = bo.true_clv_preflight(self._ss(0.0), views_present=False,
+                                          estimators=("t_stat_baseline",))
+        self.assertEqual(ests, ("t_stat_baseline",))
+        self.assertFalse(rpt["true_clv_excluded"])
 
 
 if __name__ == "__main__":
