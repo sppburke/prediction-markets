@@ -3,10 +3,11 @@
 Composes the harness modules (estimators / deflation / selectors / demotion / policies /
 oos_validation) into the three-stage sweep that emits the §Deliverable:
 
-  (8a) estimator screen on cheap point-in-time forward copy P&L — eliminate most estimators;
-  (8b) PRE-REGISTER ``N_GRID`` over the surviving axes x criteria x the 4 policies (LANDMINE-1:
+  (8a) estimator screen on cheap point-in-time forward copy P&L — ADVISORY ranking only (#445
+       defect 4: it no longer PRUNES; its forward-payoff proxy mismatches the realized+MTM objective);
+  (8b) PRE-REGISTER ``N_GRID`` over ALL estimator axes x criteria x the 4 policies (LANDMINE-1:
        the grid-level deflation is only valid against a trial count fixed BEFORE scoring);
-  (8c) run the survivors as full walk-forward TRAJECTORIES (the policy axis calls ``pe-backtest``
+  (8c) run every registered config as a full walk-forward TRAJECTORY (the policy axis calls ``pe-backtest``
        per step via an injected ``BacktestRunner``) -> a grid-deflated leaderboard -> a recommended
        winner (with AKM/MRSW/FCR winner's-curse uncertainty) or an explicit NO-GO, cross-checked
        against the live cohort's ``paper_fills`` realized P&L.
@@ -300,7 +301,15 @@ class SubprocessBacktestRunner:
             window: "tuple | None" = None) -> pd.DataFrame:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         wallet_file = self.output_dir / "injected_wallets.txt"
-        wallet_file.write_text("\n".join(wallets) + "\n")
+        # #445 defect 9: the cache stores lowercase wallet_hex and pe-backtest matches injected
+        # wallets against it, so a stray upper/mixed-case id would silently match NOTHING. Lowercase
+        # defensively (the docstring's "lowercase-hex" contract) so a casing slip upstream cannot
+        # zero out the fills.
+        wallet_file.write_text("\n".join(w.lower() for w in wallets) + "\n")
+        out_file = self.output_dir / "pnl_by_period.ndjson"
+        # #445 defect 9: remove any stale output from a prior run, so a binary that emits nothing this
+        # run yields an empty frame (missing file) rather than a silent re-parse of the previous P&L.
+        out_file.unlink(missing_ok=True)
         env = {
             **os.environ,
             "PE_BACKTEST_INJECTED_WALLETS_PATH": str(wallet_file),
@@ -318,7 +327,7 @@ class SubprocessBacktestRunner:
             env["PE_BACKTEST_MTM_WINDOW_START_UNIX"] = str(int(as_of))
             env["PE_BACKTEST_MTM_WINDOW_END_UNIX"] = str(int(horizon_end))
         subprocess.run([self.binary], env=env, check=True)
-        return parse_pnl_by_period(self.output_dir / "pnl_by_period.ndjson")
+        return parse_pnl_by_period(out_file)
 
 
 def parse_pnl_by_period(path) -> pd.DataFrame:
@@ -466,6 +475,53 @@ def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
     return survivors
 
 
+# ───────────────────────── true-CLV coverage preflight (#445 defect 10) ─────────────────────────
+def true_clv_preflight(ss: SuffStats, *, views_present: bool, estimators,
+                       coverage_warn_pct: "int | None" = None) -> "tuple[tuple, dict]":
+    """#445 defect 10: gate the ``true_clv`` estimator on real CLOB coverage so it cannot silently
+    contribute an all-NaN ranking to the bake-off grid. Returns ``(filtered_estimators, report)``.
+
+    Excludes ``true_clv`` (and flags it in ``report``) when it is requested AND either the CLOB views
+    are absent (``views_present=False``) OR position-level ``true_clv_close`` coverage is below
+    ``coverage_warn_pct``. The exclusion is VISIBLE — the estimator drops out of the pre-registered
+    grid and the report carries a hard flag — never a silent all-NaN arm. Raises ``ValueError`` when
+    the exclusion leaves NO estimator candidate, so the abort happens UPSTREAM of ``run_bakeoff``
+    (before ``N_GRID`` is frozen). The run may continue for the remaining non-CLV estimators.
+
+    ``coverage_warn_pct`` defaults to the canonical ``true_clv_coverage_warn_pct`` (``_GLOSSARY.md`` /
+    ``suff_stats.TRUE_CLV_COVERAGE_WARN_PCT``); it is resolved lazily so importing ``bakeoff`` does not
+    eagerly pull ``suff_stats``/duckdb. ``views_present`` is ``market_price_history`` AND
+    ``token_conditions`` both registered. No second threshold is introduced (issue contract 6)."""
+    if coverage_warn_pct is None:
+        from .suff_stats import TRUE_CLV_COVERAGE_WARN_PCT
+        coverage_warn_pct = TRUE_CLV_COVERAGE_WARN_PCT
+    ests = list(estimators)
+    report = {"true_clv_requested": "true_clv" in ests, "true_clv_excluded": False, "reason": None,
+              "views_present": bool(views_present), "coverage_pct": None,
+              "coverage_warn_pct": int(coverage_warn_pct)}
+    if "true_clv" not in ests:
+        return tuple(ests), report
+    total = int(len(ss))
+    covered = (int(ss["true_clv_close"].notna().sum())
+               if ("true_clv_close" in ss.columns and total) else 0)
+    pct = (100 * covered // total) if total else 0
+    report["coverage_pct"] = pct
+    if not views_present:
+        report["reason"] = "CLOB views absent (need market_price_history + token_conditions)"
+    elif pct < coverage_warn_pct:
+        report["reason"] = (f"true_clv_close coverage {pct}% < "
+                            f"true_clv_coverage_warn_pct={coverage_warn_pct}%")
+    if report["reason"] is not None:
+        report["true_clv_excluded"] = True
+        ests = [e for e in ests if e != "true_clv"]
+        if not ests:
+            raise ValueError(
+                "true_clv preflight excluded the only estimator candidate "
+                f"({report['reason']}); no estimator remains — enable the CLOB views or include a "
+                "non-CLV estimator before freezing the grid")
+    return tuple(ests), report
+
+
 # ───────────────────────── 8c: policy trajectory ─────────────────────────
 def _churn(prev: FollowSet, follow: FollowSet) -> float:
     """Turnover charged per step = the POSITIVE-PART L1 weight movement
@@ -497,6 +553,11 @@ class TrajectoryResult:
     """
 
     returns: pd.Series
+    # #445 defect 1: ``final_follow`` / ``final_scores`` reflect the LATEST cutoff — the set the
+    # config held entering the final period. They are the last non-empty real set ONLY while the run
+    # ends on a live period; a no-signal FINAL cutoff leaves them EMPTY ("held nothing"), never a
+    # fall-back to an earlier non-empty set. Captured during the run (a stateful policy's set cannot
+    # be reproduced by a cold re-application at the latest ``as_of``).
     final_follow: FollowSet
     final_scores: WalletScores
     # E3 (#436): per-period CLOB forward-MTM coverage over the followed set — index =
@@ -524,7 +585,13 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
 
     A9 (#436): a period with no eligible set / no surviving signal / an empty followed set yields
     ``NaN`` (the config held nothing — EXCLUDED from its moments), NOT ``0.0`` (which would be a
-    real, low-variance "traded and made $0" and could out-rank a live config)."""
+    real, low-variance "traded and made $0" and could out-rank a live config).
+
+    #445 defect 1: "held nothing" also RESETS carry — ``prev`` returns to an empty set and the policy
+    is rebuilt via ``build_policy`` (clearing online weights / incumbency) so a later re-entry pays
+    full churn rather than inheriting the pre-gap set, and the final deliverable is cleared so a
+    no-signal FINAL cutoff reports an empty set rather than stale history. ``live_pnl`` (realized-only
+    evidence) is preserved across the gap; no synthetic P&L is fabricated for the no-signal period."""
     demoter = EmpiricalBernsteinDemoter(**(demoter_kwargs or {}))
     policy = build_policy(grid_point.policy, k=k, demoter=demoter,
                           displacement_margin=displacement_margin)
@@ -538,13 +605,27 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     final_scores: WalletScores = pd.DataFrame(columns=["score", "rank"])
     coverage_rows: dict = {}                                          # E3: as_of -> (open, marked, ...)
     lags_by_period: dict = {}                                         # F3a: as_of -> resolved lags
+
+    def _no_signal() -> None:
+        # #445 defect 1: the config held nothing this period. Record NaN, reset `prev` to empty and
+        # REBUILD the policy via the build_policy seam (clears OnlineWeighting's online state; with an
+        # empty `prev` the knockout/hybrid incumbency also resets), and clear the final deliverable so
+        # a no-signal FINAL cutoff is reported empty — never a fall-back to the most recent real set.
+        nonlocal prev, policy, final_follow, final_scores
+        returns.append(np.nan)
+        prev = pd.DataFrame({"wallet": [], "weight": []})
+        policy = build_policy(grid_point.policy, k=k, demoter=demoter,
+                              displacement_margin=displacement_margin)
+        final_follow = pd.DataFrame({"wallet": [], "weight": []})
+        final_scores = pd.DataFrame(columns=["score", "rank"])
+
     for as_of in as_of_points:
         in_sample, _forward = split_walkforward(
             ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
         eligible = eligible_wallets(in_sample, grid_point.criteria, as_of=as_of)
         candidates = in_sample[in_sample["wallet"].isin(eligible)]   # label-preserving slice
         if candidates.empty:
-            returns.append(np.nan)                                   # A9: no eligible set
+            _no_signal()                                             # A9 + #445: no eligible set
             continue
         weights = uniqueness_weights(in_sample)                      # full-frame, aligned index
         scores = estimator.score(candidates, as_of=as_of, weights=weights)
@@ -553,11 +634,11 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         scores = apply_deflation_gate(scores, in_sample, grid_point.deflator,
                                       n_trials=len(scores), weights=weights)
         if scores.empty:
-            returns.append(np.nan)                                   # A9: no surviving signal
+            _no_signal()                                             # A9 + #445: no surviving signal
             continue
         follow = policy.step(prev, scores, live_pnl, as_of=as_of)
         if follow.empty:
-            returns.append(np.nan)                                   # A9: policy holds nothing
+            _no_signal()                                             # A9 + #445: policy holds nothing
             continue
         turnover = _churn(prev, follow)          # D3 (#436): positive-part L1 weight movement
 
@@ -755,29 +836,38 @@ def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_g
     high-variance config); ``ranker_pbo_max`` / ``ranker_fdr_q`` are wired (were hardcoded); the
     no-signal panel is cleaned first; and the winner's grid-DSR is reported as an advisory.
 
-    B4 (#436): a verdict needs ``>= min_periods`` walk-forward cutoffs (``ranker_min_periods``) or it
-    is an explicit insufficient-periods NO-GO — below that the bootstrap gates degenerate silently."""
+    B4 (#436) + #445 defect 2: a verdict needs ``>= min_periods`` CLEANED walk-forward cutoffs
+    (``ranker_min_periods``) or it is an explicit insufficient-periods NO-GO — below that the
+    bootstrap gates degenerate silently. The floor applies to the dense matrix AFTER no-signal
+    cleaning (not the raw row count); the payload reports raw/clean/dropped period counts."""
     n_grid_full = n_grid if n_grid_full is None else n_grid_full
-    # B4 (#436): the CSCV / Romano-Wolf / Hansen-SPA / DSR panel needs >= min_periods walk-forward
-    # periods to be trustworthy; below it those gates degenerate to a SILENT always-NO-GO. Emit an
-    # EXPLICIT insufficient-periods verdict so the operator raises --steps, not a misleading
-    # "PBO/SPA failed". len(as_of_points) == the return-matrix row count (one row per cutoff).
-    n_periods = int(return_matrix.shape[0])
-    if n_periods < min_periods:
-        return {"n_grid": n_grid, "n_grid_full_pre_screen": n_grid_full, "baseline_key": baseline_key,
-                "cpr_go": bool(cpr.get("go", False)), "dropped_configs": [], "dropped_periods": 0,
-                "leaderboard": pd.DataFrame(), "winner": None, "status": "NO-GO",
-                "reason": f"insufficient periods: {n_periods} < ranker_min_periods={min_periods} "
-                          "(raise --steps)"}
+    # B4 (#436) + #445 defect 2: the CSCV / Romano-Wolf / Hansen-SPA / DSR panel needs
+    # >= min_periods walk-forward periods to be trustworthy; below it those gates degenerate to a
+    # SILENT always-NO-GO. The floor applies to the CLEANED DENSE matrix (`_clean_return_matrix`
+    # drops all-NaN configs + every no-signal period), NOT the raw row count: a panel with enough
+    # RAW rows that cleans down below the floor must still be an EXPLICIT insufficient-periods NO-GO,
+    # not reach leaderboard evaluation on a too-short dense matrix (the #445 raw-24/clean-2 leak).
+    raw_periods = int(return_matrix.shape[0])
     clean, info = _clean_return_matrix(return_matrix, baseline_key=baseline_key)
+    dropped_periods = int(info.get("dropped_periods", 0))
     base = {"n_grid": n_grid, "n_grid_full_pre_screen": n_grid_full, "baseline_key": baseline_key,
             "cpr_go": bool(cpr.get("go", False)),
             "dropped_configs": info.get("dropped_configs", []),
-            "dropped_periods": info.get("dropped_periods", 0)}
+            "dropped_periods": dropped_periods, "raw_periods": raw_periods,
+            # clean_periods = raw - dropped on the paths where cleaning counted periods; None only when
+            # cleaning bailed before counting (e.g. baseline produced no signal at all).
+            "clean_periods": (raw_periods - dropped_periods if "dropped_periods" in info else None)}
     if clean is None:
         # Always carry a (here empty) leaderboard so the operator-run output writer is uniform.
         return {**base, "leaderboard": pd.DataFrame(), "winner": None, "status": "NO-GO",
                 "reason": info["reason"]}
+    clean_periods = int(clean.shape[0])
+    base["clean_periods"] = clean_periods
+    if clean_periods < min_periods:
+        return {**base, "leaderboard": pd.DataFrame(), "winner": None, "status": "NO-GO",
+                "reason": f"insufficient periods: {clean_periods} clean (of {raw_periods} raw, "
+                          f"{dropped_periods} dropped as no-signal) < "
+                          f"ranker_min_periods={min_periods} (raise --steps)"}
 
     deflation = grid_deflate(clean, benchmark=baseline_key, n_grid=n_grid,
                              n_trials_dsr=n_grid_full, seed=seed)
@@ -870,6 +960,48 @@ def fetch_paper_fills_realized_pnl(*, url_env: str = "SUPABASE_URL",
     return _parse_paper_fills_rows(rows, wallet_col=wallet_col, pnl_col=pnl_col)
 
 
+def _followed_frame(follow: FollowSet, scores: WalletScores) -> pd.DataFrame:
+    """Build the cross-check frame from the followed set's wallets (#445 defect 5), left-joining
+    rank/score metadata from ``scores`` when present. Identity is ``follow.wallet`` — a stateful
+    policy can hold an incumbent that is ABSENT from the fresh ``scores``, and intersecting on
+    ``scores`` (the pre-#445 behaviour) would silently drop it from the live-loser check. One row per
+    followed wallet; wallets absent from ``scores`` keep NaN rank/score but remain in the frame."""
+    base = follow[["wallet"]].copy() if "wallet" in follow.columns else pd.DataFrame({"wallet": []})
+    if scores is not None and not scores.empty:
+        meta = scores.rename_axis("wallet").reset_index()        # wallet + score/rank columns
+        base = base.merge(meta, on="wallet", how="left")         # left-join keeps absent-from-scores
+    return base
+
+
+def crosscheck_deliverable(follow: FollowSet, scores: WalletScores,
+                           realized_pnl: pd.DataFrame) -> "tuple[pd.DataFrame, dict]":
+    """Cross-check the deliverable's followed set against the live cohort's realized P&L (#445
+    defect 5). Identity follows ``follow``: the frame is built from ``follow.wallet`` with ``scores``
+    metadata left-joined, so a held incumbent missing from the fresh scores still appears in the
+    check. Returns ``(crosscheck, summary)`` with ``overlap_count`` / ``overlap_fraction`` (vs
+    ``len(follow)``) / ``n_follow`` / ``live_loser_flags``.
+
+    HARD FAIL (raises ``ValueError``): a SUCCESSFUL live fetch (``realized_pnl`` already in hand) with
+    a non-empty followed set but ZERO overlap is a verification failure — the deliverable wallets are
+    entirely absent from the live cohort (identity/casing/source drift), NOT a clean zero-row result.
+    A missing-credentials fetch is the caller's advisory skip, handled BEFORE this is called."""
+    followed = _followed_frame(follow, scores)
+    crosscheck = paper_fills_crosscheck(followed, realized_pnl)
+    overlap_count = int(len(crosscheck))
+    n_follow = int(len(follow))
+    if n_follow > 0 and overlap_count == 0:
+        raise ValueError(
+            f"paper_fills cross-check FAILED: 0 of {n_follow} followed wallets overlap the live "
+            "cohort after a successful fetch — deliverable/live identity drift (check wallet "
+            "casing/source); not a clean zero-row result")
+    summary = {
+        "overlap_count": overlap_count, "n_follow": n_follow,
+        "overlap_fraction": (overlap_count / n_follow if n_follow else 0.0),
+        "live_loser_flags": int(crosscheck["disagree"].sum()) if not crosscheck.empty else 0,
+    }
+    return crosscheck, summary
+
+
 # ───────────────────────── orchestrator ─────────────────────────
 @dataclass
 class BakeoffParams:
@@ -902,8 +1034,13 @@ class BakeoffParams:
 
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
                 created_at: int = 0, seed: int = 0) -> dict:
-    """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). 8a prunes the estimator
-    axis BEFORE ``N_GRID`` is frozen (it only ever shrinks the grid — never grows it post-hoc)."""
+    """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
+    PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
+    horizon objective the trajectories optimize, so it could drop an estimator the true objective
+    would rank the winner). ALL registered estimators are carried into the pre-registered grid, so
+    ``n_grid`` == the full pre-screen trial count; the 8a screen is retained as advisory diagnostics
+    only. (Subject to the #445 defect-10 true-CLV preflight, which excludes `true_clv` UPSTREAM in
+    `main` when CLOB coverage is absent/low — see `true_clv_preflight`.)"""
     n_grid_full = len(axes.enumerate_grid())     # A2: FULL pre-screen trial count for the DSR bar
     # D2 (#436): cap the deliberate search surface BEFORE any expensive work. n_grid_full × steps is
     # the NAIVE injected-set backtest count (a conservative upper bound — the memo below collapses the
@@ -917,18 +1054,17 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
             f"({len(params.as_of_points)}) = {naive_backtests} naive backtests > "
             f"ranker_bakeoff_max_backtests={params.max_backtests}; narrow the criteria/churn sweep "
             "(fewer --ttr-hours/--bands/--min-trl levels) or raise the ceiling")
-    survivors = screen_estimators(
+    # #445 defect 4: the 8a screen runs for its ADVISORY ranking only — it no longer prunes the
+    # estimator axis (its forward-payoff proxy mismatches the realized + CLOB-MTM horizon objective).
+    screen_advisory = screen_estimators(
         ss, list(axes.estimators), as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, keep=params.screen_keep, criteria=axes.criteria[0])   # A3: canonical criteria
-    pruned_axes = BakeoffAxes(
-        estimators=tuple(e for e in axes.estimators if e in survivors),
-        deflators=axes.deflators, policies=axes.policies,
-        criteria=axes.criteria, churn_costs=axes.churn_costs)
-    manifest = pre_register_grid(pruned_axes, created_at=created_at)
-    grid = pruned_axes.enumerate_grid()
+    run_axes = axes                              # no pruning: the run-set IS the full pre-screen grid
+    manifest = pre_register_grid(run_axes, created_at=created_at)
+    grid = run_axes.enumerate_grid()
     grid_by_key = {g.key: g for g in grid}        # A1: thread GridPoints, never re-parse a key
-    baseline_key = _baseline_key(pruned_axes)
+    baseline_key = _baseline_key(run_axes)
     memo_runner = MemoizingBacktestRunner(runner)   # D2: in-run dedup of repeated followed sets
     return_matrix, results = run_trajectories(
         grid, ss, memo_runner, as_of_points=params.as_of_points,
@@ -994,7 +1130,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
              for idx, r in winner_res.coverage.iterrows()]
             if winner_res is not None and not winner_res.coverage.empty else []),
     }
-    return {"manifest": manifest, "survivors": survivors, "return_matrix": return_matrix,
+    return {"manifest": manifest, "survivors": screen_advisory, "return_matrix": return_matrix,
             "cpr": cpr, "decision": decision, "deliverable": deliverable,
             "mtm_coverage": mtm_coverage,
             # D2 (#436): the realized memo speedup — distinct injected-set backtests actually run vs
@@ -1104,8 +1240,16 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     as_of_points = [args.start_unix + i * args.step_days * day for i in range(args.steps)]
     params = BakeoffParams(as_of_points=as_of_points, train_secs=args.train_days * day,
                            horizon_secs=args.horizon_days * day)
+    # #445 defect 10: true-CLV preflight BEFORE the grid is frozen. Exclude `true_clv` from the
+    # estimator axis when the CLOB views are absent or position-level `true_clv_close` coverage is
+    # below `true_clv_coverage_warn_pct`, so it cannot contribute a silent all-NaN arm; abort if the
+    # exclusion leaves no estimator. The exclusion is visible in true_clv_preflight.json + decision.
+    clv_views = (suff_stats_mod._relation_exists(con, "market_price_history")
+                 and suff_stats_mod._relation_exists(con, "token_conditions"))
+    estimators, clv_preflight = true_clv_preflight(
+        ss, views_present=clv_views, estimators=tuple(ESTIMATOR_REGISTRY))
     axes = BakeoffAxes(
-        estimators=tuple(ESTIMATOR_REGISTRY), deflators=(NO_DEFLATION, DeflatedSharpe.name),
+        estimators=estimators, deflators=(NO_DEFLATION, DeflatedSharpe.name),
         policies=(FullRerank.name, KnockoutBackfill.name, HybridDisplacement.name,
                   OnlineWeighting.name),
         criteria=build_criteria_grid(                     # D1 (#436): the swept criteria grid
@@ -1114,6 +1258,14 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
         churn_costs=(0.0, args.churn_cost))               # D3 (#436): {free, anchored} cost sweep
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()))
+
+    # #445 defect 10: surface the true-CLV preflight in the decision payload + a dedicated file so the
+    # `true_clv` exclusion is VISIBLE in operator output, never a silent all-NaN ranking.
+    result["decision"]["true_clv_preflight"] = clv_preflight
+    (out_dir / "true_clv_preflight.json").write_text(json.dumps(clv_preflight, indent=2))
+    if clv_preflight["true_clv_excluded"]:
+        print(f"true_clv EXCLUDED from the grid: {clv_preflight['reason']} "
+              f"(coverage {clv_preflight['coverage_pct']}%); see true_clv_preflight.json")
 
     (out_dir / "manifest.json").write_text(json.dumps(result["manifest"], indent=2))
     result["return_matrix"].to_csv(out_dir / "return_matrix.csv")
@@ -1171,18 +1323,24 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     # the set the winner actually rode, applying its criteria/eligibility/deflation/policy), NOT a
     # cold re-score on the un-sliced in-sample — against the live cohort's realized P&L from Supabase
     # (issue #421 §Deliverable). Falls back to the baseline config's set on a NO-GO.
+    # #445 defect 5: the LIVE FETCH is the only advisory-skippable step (missing creds / network on a
+    # local/dev run). A SUCCESSFUL fetch then runs the cross-check, whose hard-fail — zero overlap of a
+    # non-empty followed set after a successful fetch — PROPAGATES and fails the operator run; it is
+    # NOT swallowed as advisory. Identity follows `final_follow` (crosscheck_deliverable), so a held
+    # incumbent absent from the fresh scores still appears in the live-loser check.
     try:
+        realized = fetch_paper_fills_realized_pnl()
+    except Exception as exc:        # missing creds / network: advisory skip for local/dev runs only
+        print(f"paper_fills cross-check skipped (live fetch unavailable): {exc}")
+    else:
         deliverable = result["deliverable"]
-        scores, follow = deliverable["scores"], deliverable["follow"]
-        followed = (scores.loc[scores.index.intersection(list(follow["wallet"]))]
-                    if not scores.empty else scores)
-        crosscheck = paper_fills_crosscheck(followed.reset_index(), fetch_paper_fills_realized_pnl())
+        crosscheck, summary = crosscheck_deliverable(
+            deliverable["follow"], deliverable["scores"], realized)
         crosscheck.to_csv(out_dir / "paper_fills_crosscheck.csv", index=False)
         print(f"paper_fills cross-check ({deliverable['winner_key']}): "
-              f"{int(crosscheck['disagree'].sum())} live-loser flags of {len(crosscheck)} "
-              "overlapping wallets")
-    except Exception as exc:  # advisory: an operator env without Supabase creds must not abort
-        print(f"paper_fills cross-check skipped: {exc}")
+              f"{summary['live_loser_flags']} live-loser flags; overlap "
+              f"{summary['overlap_count']}/{summary['n_follow']} "
+              f"({100.0 * summary['overlap_fraction']:.1f}% of followed wallets)")
 
 
 if __name__ == "__main__":  # pragma: no cover
