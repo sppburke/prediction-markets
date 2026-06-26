@@ -100,6 +100,7 @@ jobs:
           python3 scripts/test_ranker_policies.py
           python3 scripts/test_ranker_bakeoff.py
           python3 scripts/test_ranker_clv_source_comparison.py
+          python3 scripts/verify_bakeoff_components.py
 
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase
