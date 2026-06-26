@@ -56,8 +56,8 @@ try:
     from statsmodels.stats.meta_analysis import combine_effects
 
     _HAVE_SM = True
-except Exception:  # pragma: no cover - statsmodels is a hard dep but degrade gracefully
-    _HAVE_SM = False
+except Exception:  # pragma: no cover - absence is enforced LOUDLY by _c_external_refs_present (#445),
+    _HAVE_SM = False  # not silently degraded; this flag only lets the module import for that check.
 
 _EULER = 0.5772156649015329
 _CHECKS: "list" = []
@@ -375,7 +375,13 @@ def _c_pbo_exact():
     n_comb = int(out["n_combinations"].iloc[0])
     assert n_comb == 6, f"expected C(4,2)=6 CSCV splits, got {n_comb}"
     assert abs(prod_pbo - ref_pbo) < 1e-12, f"production PBO {prod_pbo} != exact enumeration {ref_pbo}"
-    return f"exact CSCV: production PBO={prod_pbo:.4f} == brute-force {ref_pbo:.4f} over {n_comb} splits"
+    # HAND-DERIVED ground truth (independent of BOTH implementations): periods 0 and 2 are identical
+    # ([4,0,1]) and periods 1 and 3 are identical ([0,3,1]). The IS-best is the OOS-worst in exactly
+    # the two splits whose IS pair is {0,2} (c0 dominates IS at mean 4, ranks last in the disjoint OOS
+    # {1,3}) and {1,3} (symmetrically c1) — the other four splits give the IS-best a tied-or-better OOS
+    # rank. So PBO = 2/6. Asserting against this literal removes any reliance on shared split logic.
+    assert abs(prod_pbo - 2.0 / 6.0) < 1e-12, f"production PBO {prod_pbo} != hand-derived 2/6"
+    return f"exact CSCV: production PBO={prod_pbo:.4f} == brute-force == hand-derived 2/6 over {n_comb} splits"
 
 
 @check("RomanoWolf/HansenSPA known-answer: a clear edge -> superior+SPA-GO; all-null -> none+NO-GO")
