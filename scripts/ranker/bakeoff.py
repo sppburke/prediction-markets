@@ -21,6 +21,27 @@ permissive (``active_within_secs=0`` -> no recency gate; ``min_trl=0`` -> no len
 default-constructed grid point does not silently drop candidates; the canonical defaults land in
 PR6's ``_GLOSSARY``.
 """
+# Operator ergonomics: allow ``python scripts/ranker/bakeoff.py …`` in addition to the
+# ``python -m ranker.bakeoff …`` form. Run as a bare script, this file's own directory
+# (``scripts/ranker/``) is ``sys.path[0]``, so the stdlib ``import selectors`` performed
+# by ``subprocess`` (below) resolves to the harness ``scripts/ranker/selectors.py`` and
+# crashes at import (a package-relative import with no parent). Re-exec as the proper
+# package module — ``scripts/`` on ``sys.path``, ``scripts/ranker/`` off it — so both the
+# relative harness imports and the stdlib imports resolve correctly. Skipped under
+# ``-m``/``import`` (then ``__package__`` is ``"ranker"``, so this is a no-op).
+if __name__ == "__main__" and not __package__:
+    import os as _os
+    import runpy as _runpy
+    import sys as _sys
+
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    _scripts = _os.path.dirname(_here)
+    _sys.path[:] = [p for p in _sys.path if _os.path.abspath(p or ".") != _here]
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+    _runpy.run_module("ranker.bakeoff", run_name="__main__", alter_sys=True)
+    raise SystemExit(0)
+
 import argparse
 import itertools
 import json
