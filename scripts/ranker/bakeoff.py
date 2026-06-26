@@ -432,13 +432,15 @@ def _forward_copy_pnl(forward: SuffStats, wallets) -> float:
 
 
 def _uniqueness_cached(in_sample, *, key, cache):
-    """``uniqueness_weights`` memoized per ``key`` (#451). The AFML uniqueness of an in-sample
-    depends only on ``(criteria, as_of)`` — the criteria slice + walk-forward split are deterministic
-    in those — so ``screen_estimators`` and every config's ``run_trajectory`` otherwise recompute the
-    SAME O(positions × segments) statistic up to ``n_grid × steps`` times. A per-run ``cache`` dict
-    keyed on ``(criteria, as_of)`` collapses that to once per distinct in-sample, BIT-IDENTICALLY
-    (same rows/order -> same positional weights, used read-only downstream). ``cache=None`` disables
-    it (back-compat for direct callers / tests)."""
+    """``uniqueness_weights`` memoized per ``key`` (#451). Within a single ``run_bakeoff`` the
+    in-sample is fully determined by ``(criteria, as_of)`` — ``ss``, ``train_secs`` and
+    ``horizon_secs`` are run-invariant (``BakeoffParams`` scalars, not grid axes), and the criteria
+    slice + walk-forward split are deterministic in them — so ``screen_estimators`` and every config's
+    ``run_trajectory`` otherwise recompute the SAME O(positions × segments) statistic up to
+    ``n_grid × steps`` times. A per-run ``cache`` dict keyed on ``(criteria, as_of)`` collapses that
+    to once per distinct in-sample, BIT-IDENTICALLY (same rows/order -> same positional weights, used
+    read-only downstream). The cache MUST stay scoped to one ``run_bakeoff`` (a fresh ``dict`` per
+    call); ``cache=None`` disables it (back-compat for direct callers / tests)."""
     if cache is None:
         return uniqueness_weights(in_sample)
     weights = cache.get(key)
@@ -1244,11 +1246,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--universe-pos-max", type=int, default=None,
                     help="keep only wallets with <= this many first-buy positions (drops hyperactive "
                          "uncopyable bots; default: no cap)")
-    ap.add_argument("--policies", nargs="+",
-                    default=[FullRerank.name, KnockoutBackfill.name,
-                             HybridDisplacement.name, OnlineWeighting.name],
+    _all_policies = [FullRerank.name, KnockoutBackfill.name,
+                     HybridDisplacement.name, OnlineWeighting.name]
+    ap.add_argument("--policies", nargs="+", choices=_all_policies, default=list(_all_policies),
                     help="set-transition policy names to sweep (default: all 4; fewer = far fewer "
-                         "distinct backtests for a tractable run)")
+                         "distinct backtests for a tractable run). A bad name fails fast at argparse "
+                         "rather than after the expensive materialize, like --engine.")
     return ap
 
 
@@ -1286,7 +1289,9 @@ def bounded_universe(con, *, pos_min: "int | None" = None, pos_max: "int | None"
         return None
     lo = 0 if pos_min is None else int(pos_min)
     hi = (2 ** 63 - 1) if pos_max is None else int(pos_max)
-    cap = f"ORDER BY positions DESC LIMIT {int(max_wallets)}" if max_wallets else ""
+    # `wallet_hex` tiebreaks the activity sort so the top-N membership is DETERMINISTIC across runs
+    # (positions can tie at the LIMIT boundary; the bake-off is reproducible by contract).
+    cap = f"ORDER BY positions DESC, wallet_hex LIMIT {int(max_wallets)}" if max_wallets else ""
     rows = con.execute(
         "SELECT wallet_hex FROM (SELECT wallet_hex, "
         "count(DISTINCT (market_id, outcome_id)) AS positions FROM trades GROUP BY wallet_hex) "

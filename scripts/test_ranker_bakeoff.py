@@ -1435,6 +1435,13 @@ class OperatorKnobsCliTest(unittest.TestCase):
         self.assertIsNone(ns.universe_pos_max)
         self.assertEqual(len(ns.policies), 4)
 
+    def test_bad_policy_name_fails_fast(self):
+        # choices= makes a typo fail at argparse, not after the expensive materialize (like --engine).
+        with self.assertRaises(SystemExit):
+            bo._build_arg_parser().parse_args(
+                ["--out-dir", "o", "--pe-backtest", "b", "--cache", "c", "--start-unix", "0",
+                 "--policies", "policy_typo"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
