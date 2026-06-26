@@ -20,12 +20,13 @@ cache and lives in the runbook's Phase 0.11, not here (this script runs with no 
 import math
 import sys
 import traceback
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import brentq
-from scipy.stats import fisher_exact, norm, truncnorm, ttest_1samp
+from scipy.optimize import brentq, minimize
+from scipy.stats import fisher_exact, norm, rankdata, truncnorm, ttest_1samp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -36,6 +37,8 @@ from ranker.estimators import (  # noqa: E402
     _EB_PRIOR_VAR_FLOOR,
     _EB_TAU2_FLOOR_FRAC,
     _SD_FLOOR,
+    _npmle_em,
+    _npmle_scores,
     REGISTRY as EST,
 )
 from ranker.oos_validation import (  # noqa: E402
@@ -53,8 +56,8 @@ try:
     from statsmodels.stats.meta_analysis import combine_effects
 
     _HAVE_SM = True
-except Exception:  # pragma: no cover - statsmodels is a hard dep but degrade gracefully
-    _HAVE_SM = False
+except Exception:  # pragma: no cover - absence is enforced LOUDLY by _c_external_refs_present (#445),
+    _HAVE_SM = False  # not silently degraded; this flag only lets the module import for that check.
 
 _EULER = 0.5772156649015329
 _CHECKS: "list" = []
@@ -75,6 +78,25 @@ def _skill_ss(rows) -> pd.DataFrame:
     """Build a suff_stats frame for the skill estimators from (wallet, payoff, _eff) rows, with a
     contiguous RangeIndex so `weights[g.index]` aligns (the harness's indexing contract)."""
     return pd.DataFrame(rows, columns=["wallet", "payoff", "_eff"]).reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------------------------------
+# Required external references (fail loud — no silent degrade in CI)
+# --------------------------------------------------------------------------------------------------
+@check("required external-reference packages present (fail loud, no silent degrade)")
+def _c_external_refs_present():
+    # #445: `statsmodels` is pinned in scripts/requirements.txt and backs the EB DerSimonian-Laird
+    # tau2 cross-check (`_c_eb`). A missing install must FAIL this gate, not silently degrade to a
+    # closed-form-only run that still reports GREEN — a CI image that dropped the dependency would
+    # otherwise pass with a weaker check set. (scipy / numpy / pandas / arch are hard imports at the
+    # top of this module, so their absence already fails at load; statsmodels is the one optional
+    # guarded reference, so it is the one this check enforces.)
+    assert _HAVE_SM, (
+        "statsmodels is unavailable but is a pinned dependency (scripts/requirements.txt) that backs "
+        "the EB DerSimonian-Laird tau2 external cross-check — install it; the verifier must not "
+        "silently degrade to closed-form-only in CI"
+    )
+    return "statsmodels available — the EB tau2 cross-check runs against statsmodels.combine_effects"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -195,6 +217,50 @@ def _c_npmle():
     return f"skilled {sk.mean():.3f} > null {nu.mean():.3f}; top-30% precision {prec:.2f}"
 
 
+@check("GuKoenkerNPMLE EM == constrained-optimizer NPMLE on a tiny grid (marginal loglik + posterior)")
+def _c_npmle_exact():
+    # #445: an INDEPENDENT NPMLE reference on a tiny fixed grid. The production fit is EM in log space
+    # (`_npmle_em`); here the Kiefer-Wolfowitz mixing weights are found by a constrained optimizer
+    # (SLSQP over the probability simplex) maximising the SAME concave marginal log-likelihood
+    # `Σ_i log Σ_k π_k N(x_i; g_k, se_i²)`. Both must reach the same marginal log-likelihood (its
+    # maximum is unique — the objective is concave in π) and the same per-wallet posterior P(θ>0).
+    grid = np.array([-0.4, 0.0, 0.4])                        # tiny grid; includes the 0 boundary
+    x = np.array([-0.40, -0.15, 0.05, 0.20, 0.45, 0.00])     # 6 wallets' net-edge means
+    se = np.array([0.15, 0.20, 0.18, 0.16, 0.22, 0.19])      # heteroskedastic SEs
+    # Linear likelihood L[i,k] = N(x_i; grid_k, se_i²); SLSQP maximises Σ log(L @ π) over the simplex.
+    big_l = norm.pdf((x[:, None] - grid[None, :]) / se[:, None]) / se[:, None]
+
+    def neg_ll(pi):
+        return -float(np.log(big_l @ pi).sum())
+
+    k = grid.size
+    res = minimize(
+        neg_ll, np.full(k, 1.0 / k), method="SLSQP",
+        bounds=[(0.0, 1.0)] * k,
+        constraints=({"type": "eq", "fun": lambda p: p.sum() - 1.0},),
+        options={"ftol": 1e-12, "maxiter": 1000},
+    )
+    assert res.success, f"SLSQP NPMLE did not converge: {res.message}"
+    pi_ref = np.clip(res.x, 0.0, None)
+    pi_ref = pi_ref / pi_ref.sum()
+    ll_ref = -neg_ll(pi_ref)
+    pos_w = np.where(grid > 0, 1.0, np.where(grid < 0, 0.0, 0.5))   # split boundary mass at grid == 0
+    post_ref = (big_l * pos_w[None, :]) @ pi_ref / (big_l @ pi_ref)
+
+    # Production EM + posterior on the same problem (log-space).
+    log_like = norm.logpdf((x[:, None] - grid[None, :]) / se[:, None]) - np.log(se[:, None])
+    pi_em, ll_hist = _npmle_em(log_like, max_iter=5000, tol=1e-12)
+    ll_em = float(np.log(big_l @ pi_em).sum())
+    scores_em, _ = _npmle_scores(x, se, grid, max_iter=5000, tol=1e-12)
+
+    assert all(ll_hist[i] <= ll_hist[i + 1] + 1e-9 for i in range(len(ll_hist) - 1)), \
+        "EM marginal log-likelihood is not monotone non-decreasing"
+    assert abs(ll_em - ll_ref) < 1e-6, f"EM loglik {ll_em:.8f} != SLSQP NPMLE loglik {ll_ref:.8f}"
+    post_diff = float(np.max(np.abs(scores_em - post_ref)))
+    assert post_diff < 1e-4, f"EM posterior != constrained-optimizer posterior (max diff {post_diff:.2e})"
+    return f"EM loglik {ll_em:.6f} == SLSQP {ll_ref:.6f}; posterior P(theta>0) matches to {post_diff:.1e}"
+
+
 @check("ProxyCLV / TrueCLV score == scipy.ttest_1samp on (close - price), per wallet")
 def _c_clv():
     rng = np.random.default_rng(5)
@@ -273,6 +339,49 @@ def _c_pbo():
     assert pbo_rev > 0.3 and pbo_rev > pbo_dom + 0.25, \
         f"anti-persistent PBO {pbo_rev} not elevated vs dominant {pbo_dom}"
     return f"persistent PBO={pbo_dom:.3f}(<0.2); anti-persistent PBO={pbo_rev:.3f}(IS-best=OOS-worst)"
+
+
+@check("PBO/CSCV EXACT enumeration: production PBO == independent brute-force CSCV on a tiny matrix")
+def _c_pbo_exact():
+    # #445: an INDEPENDENT, fully-enumerable CSCV cross-check (Bailey-Borwein-Lopez de Prado-Zhu). A
+    # tiny fixed matrix — T=4 periods, n=3 configs, s_groups=4 (one period per group) — gives exactly
+    # C(4,2)=6 IS/OOS splits. Re-derive PBO straight from the CSCV definition, using scipy.rankdata
+    # for the OOS midrank (independent of PBO.assess's hand-coded `worse + (equal+1)/2`), and assert
+    # the production value matches to the float. Distinct column means keep it non-degenerate (the A7
+    # near-zero-dispersion guard does not NaN it).
+    m = pd.DataFrame({
+        "c0": [4.0, 0.0, 4.0, 0.0],   # mean 2.0
+        "c1": [0.0, 3.0, 0.0, 3.0],   # mean 1.5
+        "c2": [1.0, 1.0, 1.0, 1.0],   # mean 1.0
+    })
+    matrix = m.to_numpy(dtype=float)
+    n_cols = matrix.shape[1]
+    s = 4
+    groups = np.array_split(np.arange(matrix.shape[0]), s)
+    logits = []
+    for is_groups in combinations(range(s), s // 2):
+        is_set = set(is_groups)
+        is_rows = np.concatenate([groups[g] for g in is_groups])
+        oos_rows = np.concatenate([groups[g] for g in range(s) if g not in is_set])
+        is_perf = matrix[is_rows].mean(axis=0)
+        oos_perf = matrix[oos_rows].mean(axis=0)
+        best = int(np.argmax(is_perf))
+        oos_rank = float(rankdata(oos_perf, method="average")[best])   # 1 = worst .. n_cols = best
+        omega = min(max(oos_rank / (n_cols + 1.0), 1e-6), 1.0 - 1e-6)
+        logits.append(math.log(omega / (1.0 - omega)))
+    ref_pbo = float(np.mean(np.asarray(logits) < 0.0))
+    out = PBO(s_groups=s).assess(m, n_configs=n_cols)
+    prod_pbo = float(out["pbo"].iloc[0])
+    n_comb = int(out["n_combinations"].iloc[0])
+    assert n_comb == 6, f"expected C(4,2)=6 CSCV splits, got {n_comb}"
+    assert abs(prod_pbo - ref_pbo) < 1e-12, f"production PBO {prod_pbo} != exact enumeration {ref_pbo}"
+    # HAND-DERIVED ground truth (independent of BOTH implementations): periods 0 and 2 are identical
+    # ([4,0,1]) and periods 1 and 3 are identical ([0,3,1]). The IS-best is the OOS-worst in exactly
+    # the two splits whose IS pair is {0,2} (c0 dominates IS at mean 4, ranks last in the disjoint OOS
+    # {1,3}) and {1,3} (symmetrically c1) — the other four splits give the IS-best a tied-or-better OOS
+    # rank. So PBO = 2/6. Asserting against this literal removes any reliance on shared split logic.
+    assert abs(prod_pbo - 2.0 / 6.0) < 1e-12, f"production PBO {prod_pbo} != hand-derived 2/6"
+    return f"exact CSCV: production PBO={prod_pbo:.4f} == brute-force == hand-derived 2/6 over {n_comb} splits"
 
 
 @check("RomanoWolf/HansenSPA known-answer: a clear edge -> superior+SPA-GO; all-null -> none+NO-GO")
@@ -414,7 +523,8 @@ def _c_churn():
 def main() -> int:
     print("=" * 96)
     print("Independent verification of ranker bake-off components (external-reference cross-checks)")
-    print(f"statsmodels external check: {'available' if _HAVE_SM else 'UNAVAILABLE (closed-form only)'}")
+    print("statsmodels external reference: "
+          + ("available" if _HAVE_SM else "MISSING (required — this run will FAIL, see the deps check)"))
     print("=" * 96)
     failures = 0
     for name, fn in _CHECKS:
