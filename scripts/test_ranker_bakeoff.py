@@ -1443,5 +1443,24 @@ class OperatorKnobsCliTest(unittest.TestCase):
                  "--policies", "policy_typo"])
 
 
+class DirectInvocationTest(unittest.TestCase):
+    """The operator entry must work as a bare script, not only as `python -m ranker.bakeoff`.
+    Run directly, `scripts/ranker/` is `sys.path[0]` and its `selectors.py` shadows the stdlib
+    `selectors` that `subprocess` imports, crashing at import; the top-of-file re-exec shim must
+    make `python scripts/ranker/bakeoff.py` behave like the module form (#451 operator entry)."""
+
+    def test_direct_script_help_runs(self) -> None:
+        import subprocess
+
+        script = Path(__file__).resolve().parent / "ranker" / "bakeoff.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
