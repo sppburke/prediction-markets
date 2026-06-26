@@ -752,3 +752,121 @@ fn scenario_mtm_quiet_wallet_in_window_resolution_is_realized_not_marked() {
         "a quiet-wallet in-window resolution must be realized inside the window, never marked"
     );
 }
+
+/// #454 follow-up fixture: ONE wallet with several open-at-horizon positions whose
+/// markets resolve at DISTINCT post-horizon times (plus one censored), so the emitted
+/// `resolution_lags_secs` array has > 1 element. Window `as_of = D10`, `horizon = D30`.
+/// All five buys are at D12 (no later trade), so the per-day sweep never reaches any
+/// resolution and every position is open at the horizon. Resolutions are inserted in a
+/// scrambled order; the emitted lag array must still be canonical ascending.
+///   - `mkt-r1` resolves D35 → lag 25d; `mkt-r2` D40 → 30d; `mkt-r3` D50 → 40d;
+///     `mkt-r4` D60 → 50d; `mkt-cens` never resolves → censored (-1).
+fn run_sorted_lags_fixture() -> (Vec<PnlRow>, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let out_dir = dir.path().join("out");
+    let w = wallet(0x4e);
+    {
+        let mut cache = WalletCache::open(&cache_path).unwrap();
+        cache
+            .insert_new(
+                &w.to_string(),
+                vec![
+                    buy(w, "mkt-r1", "w-1", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                    buy(w, "mkt-r2", "w-2", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                    buy(w, "mkt-r3", "w-3", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                    buy(w, "mkt-r4", "w-4", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                    buy(w, "mkt-cens", "w-5", dec!(0.50), T0 + 12 * SEC_PER_DAY),
+                ],
+            )
+            .unwrap();
+        // Scrambled insertion order — the emitted lags must be sorted regardless.
+        for (mkt, d) in [
+            ("mkt-r3", 50),
+            ("mkt-r1", 35),
+            ("mkt-r4", 60),
+            ("mkt-r2", 40),
+        ] {
+            let r = T0 + d * SEC_PER_DAY;
+            cache.insert_resolution(mkt, Some(0), r, r).unwrap();
+        }
+        // mkt-cens intentionally has no resolution row → censored (-1).
+    }
+
+    let cache = WalletCache::open(&cache_path).unwrap();
+    let injected = vec![w];
+    let mut all_trades = load_injected_trades(&cache, &injected);
+    all_trades.sort_by_key(|t| t.timestamp.0);
+
+    let resolutions = pe_bootstrap::gamma::load_resolutions(&cache).unwrap();
+    let schedules = pe_bootstrap::gamma::load_schedules(&cache).unwrap();
+    let liq = pe_bootstrap::gamma::load_liquidity(&cache).unwrap();
+    let snapshots = cache.load_all_snapshots().unwrap();
+    let markets: HashSet<MarketId> = all_trades.iter().map(|t| t.market_id.clone()).collect();
+    // No CLOB series needed — each row survives on open_at_horizon > 0.
+    let marks = cache.load_clob_marks(&markets, HORIZON).unwrap();
+
+    let config = BacktestConfig {
+        bootstrap_cache_path: cache_path.clone(),
+        output_dir: out_dir.clone(),
+        flat_usd: Some(dec!(25)),
+        max_signal_price: None,
+        mtm_window_start_unix: Some(AS_OF),
+        mtm_window_end_unix: Some(HORIZON),
+        strategy: WinnerFollowConfig {
+            slippage_rate: dec!(0),
+            ..WinnerFollowConfig::default()
+        },
+        ..BacktestConfig::default()
+    };
+    let ranker_config = RankerConfig::default();
+    let strategy = WinnerFollowStrategy::new(config.strategy.clone());
+    let injected_set: HashSet<WalletAddress> = injected.iter().copied().collect();
+
+    run_simulation_with(
+        &config,
+        &all_trades,
+        &snapshots,
+        &resolutions,
+        &schedules,
+        &liq,
+        &ranker_config,
+        &strategy,
+        true,
+        Some(&injected_set),
+        Some(&marks),
+    )
+    .unwrap();
+
+    let text = std::fs::read_to_string(out_dir.join("pnl_by_period.ndjson")).unwrap();
+    let rows: Vec<PnlRow> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    (rows, w.to_string())
+}
+
+#[test]
+fn scenario_mtm_resolution_lags_are_sorted_deterministically() {
+    // PASS: a wallet's resolution_lags_secs array is emitted in canonical ASCENDING order
+    // (not open_positions HashMap-iteration order), so the bake-off MTM output is
+    // byte-reproducible run-to-run (#454 follow-up). FAIL otherwise.
+    let (rows, w) = run_sorted_lags_fixture();
+    let row = mtm_row(&rows, &w).expect("wallet must have a horizon MTM row");
+    let want = vec![
+        -1,
+        25 * SEC_PER_DAY,
+        30 * SEC_PER_DAY,
+        40 * SEC_PER_DAY,
+        50 * SEC_PER_DAY,
+    ];
+    let pass = row.resolution_lags_secs == want && row.open_at_horizon == 5;
+    println!(
+        "PASS={pass} mtm.lags_sorted: lags={:?} (want {want:?}), open={} (want 5)",
+        row.resolution_lags_secs, row.open_at_horizon
+    );
+    assert!(
+        pass,
+        "resolution_lags_secs must be emitted in ascending order (deterministic), with all 5 positions"
+    );
+}

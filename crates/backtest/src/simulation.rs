@@ -1552,12 +1552,18 @@ fn build_mtm_rows(
     }
     by_wallet
         .into_iter()
-        .filter_map(|(wallet, m)| {
+        .filter_map(|(wallet, mut m)| {
             let flow = m.unreal_end - m.unreal_start;
             // Drop pure-noise rows (no flow and no horizon exposure to report).
             if flow.is_zero() && m.open_at_horizon == 0 {
                 return None;
             }
+            // Determinism: the lags were pushed in `open_positions` HashMap-iteration
+            // order (nondeterministic across runs). The array carries no companion
+            // position id, so it is a bag of per-position lags — sort it to a canonical
+            // ascending order so `pnl_by_period.ndjson` is byte-reproducible run-to-run
+            // (the `_lag_distribution` consumer sorts anyway, so this is semantics-free).
+            m.resolution_lags_secs.sort_unstable();
             Some(PeriodPnlRow {
                 wallet: wallet.to_string(),
                 period_end: win_end,
