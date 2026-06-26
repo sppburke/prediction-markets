@@ -120,6 +120,25 @@ class EBTau2RobustnessTest(unittest.TestCase):
         self.assertLess(self.scores.loc["precise_null", "score"], 0.8)
 
 
+class EBMu0MembershipTest(unittest.TestCase):
+    """#445 defect 8 (contract): the EB prior mean ``mu0`` is a cross-sectional LOCATION estimate over
+    the WHOLE candidate universe, so a zero-dispersion (unscoreable) wallet's mean STILL enters
+    ``mu0`` — even though that wallet is dropped from scoring (excluded from ``tau^2`` / posterior,
+    which need a finite sampling variance). Locks the retained asymmetry so changing ``mu0``
+    membership later is a deliberate modeling decision, not an accident."""
+
+    def test_zero_dispersion_candidate_shifts_mu0_and_is_dropped(self) -> None:
+        with_z = _suff_stats([("v1", 10, 6), ("v2", 10, 4), ("z", 6, 6)])   # z all-win -> sd 0
+        without_z = _suff_stats([("v1", 10, 6), ("v2", 10, 4)])
+        sa = EBShrinkageSkill().score(with_z, as_of=0, weights=np.ones(len(with_z)))
+        sb = EBShrinkageSkill().score(without_z, as_of=0, weights=np.ones(len(without_z)))
+        self.assertNotIn("z", sa.index)                          # zero-dispersion wallet unscoreable
+        self.assertNotIn("z", sb.index)
+        # `z`'s (high) mean enters mu0 only in `with_z`; tau^2 is identical (both over {v1, v2}), so
+        # v1's posterior score moves PURELY because mu0 shifted -> proves mu0 includes zero-disp means.
+        self.assertNotAlmostEqual(float(sa.loc["v1", "score"]), float(sb.loc["v1", "score"]), places=6)
+
+
 class TStatBaselineTest(unittest.TestCase):
     """The §Acceptance benchmark: raw net-edge t-stat ranks skilled above null; drops < 2 obs."""
 

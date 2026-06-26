@@ -144,6 +144,15 @@ class WeightedStatsNaNGuardTest(unittest.TestCase):
         self.assertTrue(math.isnan(wmean) and math.isnan(wstd) and math.isnan(tstat))
         self.assertEqual(n_eff, 0.0)
 
+    def test_all_zero_weights_is_nan(self) -> None:
+        # #445: all-zero weights -> sum-of-weights W = 0 -> NOT a valid sample. The W <= 0 guard must
+        # precede the uniform-weight shortcut; otherwise "all weights equal (to 0)" wrongly delegates
+        # to np.mean/np.std(ddof=1) and returns a finite UNWEIGHTED statistic masquerading as a real
+        # weighted sample.
+        wmean, wstd, n_eff, tstat = rd.weighted_stats([0.3, 0.5, 0.1], np.zeros(3))
+        self.assertTrue(math.isnan(wmean) and math.isnan(wstd) and math.isnan(tstat))
+        self.assertEqual(n_eff, 0.0)
+
 
 class ParseAsOfTest(unittest.TestCase):
     def test_none_and_empty(self) -> None:

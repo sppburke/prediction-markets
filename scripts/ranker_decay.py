@@ -71,7 +71,9 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
 
     Uniform-weight short-circuit: when every weight is equal (the flat `half_life ≤ 0`
     path, or all trades sharing a timestamp) delegate to `np.mean` / `np.std(ddof=1)`
-    so the result is bitwise-identical to the legacy unweighted statistic.
+    so the result is bitwise-identical to the legacy unweighted statistic. The `W ≤ 0`
+    guard precedes this short-circuit (#445), so an all-zero weight vector — which is
+    also "uniform" — returns NaN rather than a spurious unweighted statistic.
     """
     v = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -82,6 +84,14 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     # weights). A negative weight is a caller bug that would corrupt wmean/wvar — fail safe to NaN
     # (the wallet is dropped) rather than emit a silently wrong statistic.
     if bool(np.any(w < 0.0)):
+        return (float("nan"), float("nan"), 0.0, float("nan"))
+
+    # #445: the sum-of-weights (W <= 0) guard must PRECEDE the uniform-weight short-circuit. An
+    # all-zero weight vector is "uniform" (every weight equal), so without checking W first it would
+    # wrongly delegate to np.mean/np.std(ddof=1) and return a finite UNWEIGHTED statistic —
+    # masquerading as a valid sample when there are effectively no observations. W <= 0 => NaN.
+    big_w = float(w.sum())
+    if big_w <= 0.0:
         return (float("nan"), float("nan"), 0.0, float("nan"))
 
     # Uniform-weight short-circuit -> bitwise-identical to legacy np.mean/np.std(ddof=1).
@@ -95,10 +105,7 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
         return (wmean, wstd, n_eff, tstat)
 
     # General reliability-weighted path.
-    big_w = float(w.sum())
     v2 = float((w * w).sum())
-    if big_w <= 0.0:
-        return (float("nan"), float("nan"), 0.0, float("nan"))
     wmean = float((w * v).sum() / big_w)
     n_eff = (big_w * big_w / v2) if v2 > 0.0 else float("nan")
     denom = big_w * big_w - v2
