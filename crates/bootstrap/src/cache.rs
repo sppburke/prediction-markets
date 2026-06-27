@@ -1448,8 +1448,10 @@ impl WalletCache {
     /// Coverage of the CLOB token→condition map over resolved-with-winner markets
     /// (issue #429): `(resolved_with_winner, mapped)` where `mapped` counts those
     /// markets carrying at least one `token_conditions` row. The downstream
-    /// `price_history_backfill_targets` join requires both a winner and a token
-    /// map, so this is the realistic ceiling for that backfill.
+    /// `price_history_backfill_targets` join requires a winner and a token map, and
+    /// now also excludes legacy `source='polygon'` markets, so `mapped` is an *upper*
+    /// bound on that backfill's reach — the realistic ceiling is its non-`polygon`
+    /// subset.
     ///
     /// # Precondition
     /// Returns `(0, 0)` on an empty cache.
