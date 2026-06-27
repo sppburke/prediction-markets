@@ -1238,6 +1238,14 @@ impl WalletCache {
     /// curated slice — issue #429) are returned — a token id is required to query CLOB
     /// `/prices-history`.
     ///
+    /// Legacy `source = 'polygon'` resolutions are **excluded**: those markets predate the CLOB and
+    /// never list on `/prices-history` (verified — every probe returns an empty series; issue #429's
+    /// "do not re-chase the legacy polygon tail"), so fetching them is pure waste (they are the bulk
+    /// of the resolved universe). Targets are ordered by `resolved_at_unix DESC` (most-recently-
+    /// resolved first) so a bounded or interrupted run covers the recent markets — the ones the
+    /// bake-off candidate wallets actually trade — first, and `market_price_history` grows from the
+    /// start of the run rather than after the long non-listing tail.
+    ///
     /// # Precondition
     /// Returns an empty vec when no resolved markets have mapped tokens.
     pub fn price_history_backfill_targets(
@@ -1250,10 +1258,12 @@ impl WalletCache {
              JOIN market_resolutions mr ON mr.market_id = tc.condition_id \
              LEFT JOIN market_schedules ms ON ms.market_id = tc.condition_id \
              WHERE mr.winning_outcome_id IS NOT NULL \
+               AND mr.source <> 'polygon' \
                AND NOT EXISTS ( \
                    SELECT 1 FROM market_price_history mph \
                    WHERE mph.market_id = tc.condition_id AND mph.token_id = tc.token_id \
-               )";
+               ) \
+             ORDER BY mr.resolved_at_unix DESC";
         let sql = if limit > 0 {
             format!("{base} LIMIT {limit}")
         } else {
@@ -4299,6 +4309,71 @@ mod tests {
                 ("0xclob".to_owned(), "clob".to_owned()),
                 ("0xdune".to_owned(), "dune".to_owned()),
                 ("0xpoly".to_owned(), "polygon".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn price_history_backfill_targets_skips_polygon_and_orders_recent_first() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        // Resolved markets with token mappings, distinct resolved_at + sources.
+        cache
+            .insert_resolution_with_source("0xclob-new", Some(0), 300, 301, "clob")
+            .unwrap(); // target — newest
+        cache
+            .insert_resolution_with_source("0xgamma-mid", Some(0), 200, 201, "gamma")
+            .unwrap(); // target — middle
+        cache
+            .insert_resolution_with_source("0xclob-old", Some(0), 100, 101, "clob")
+            .unwrap(); // target — oldest
+        cache
+            .insert_resolution_with_source("0xpoly", Some(0), 250, 251, "polygon")
+            .unwrap(); // EXCLUDED — legacy polygon never lists on CLOB
+        cache
+            .insert_resolution_with_source("0xvoid", None, 400, 401, "clob")
+            .unwrap(); // EXCLUDED — no winner (voided)
+        cache
+            .insert_resolution_with_source("0xhasseries", Some(0), 500, 501, "clob")
+            .unwrap(); // EXCLUDED — already has a series (NOT EXISTS)
+        cache
+            .upsert_token_conditions_batch(
+                &[
+                    ("t-clob-new".to_owned(), "0xclob-new".to_owned(), 0),
+                    ("t-gamma".to_owned(), "0xgamma-mid".to_owned(), 0),
+                    ("t-clob-old".to_owned(), "0xclob-old".to_owned(), 0),
+                    ("t-poly".to_owned(), "0xpoly".to_owned(), 0),
+                    ("t-void".to_owned(), "0xvoid".to_owned(), 0),
+                    ("t-has".to_owned(), "0xhasseries".to_owned(), 0),
+                ],
+                1,
+            )
+            .unwrap();
+        cache
+            .insert_price_history_batch(
+                &[(
+                    "0xhasseries".to_owned(),
+                    "t-has".to_owned(),
+                    499,
+                    "0.5".to_owned(),
+                )],
+                "clob",
+            )
+            .unwrap();
+
+        let targets = cache.price_history_backfill_targets(0).unwrap();
+        let got: Vec<(&str, &str, i64)> = targets
+            .iter()
+            .map(|t| (t.market_id.as_str(), t.token_id.as_str(), t.close_ref_unix))
+            .collect();
+        // Polygon, voided, and already-serialized markets are excluded; the rest are
+        // ordered most-recently-resolved first (close_ref falls back to resolved_at).
+        assert_eq!(
+            got,
+            vec![
+                ("0xclob-new", "t-clob-new", 300),
+                ("0xgamma-mid", "t-gamma", 200),
+                ("0xclob-old", "t-clob-old", 100),
             ]
         );
     }
