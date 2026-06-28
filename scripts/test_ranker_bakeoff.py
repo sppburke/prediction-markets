@@ -11,9 +11,16 @@ seed at 0).
 
 Run: ``python3 scripts/test_ranker_bakeoff.py``
 """
+import os
 import sys
 import unittest
 from pathlib import Path
+
+# Pin BLAS to one thread BEFORE numpy import (mirrors bakeoff.py) — ProcessExecutorDeterminismTest
+# forks from THIS process, and this test file imports numpy before `bakeoff`, so the pin must be set
+# here too or the fork pool would run without the deadlock-safety mitigation.
+for _blas_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_blas_var, "1")
 
 import numpy as np
 import pandas as pd

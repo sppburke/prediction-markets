@@ -846,8 +846,11 @@ class _SubprocessRunnerFactory:
         return MemoizingBacktestRunner(SubprocessBacktestRunner(self.binary, self.cache_path, out))
 
 
-# Set in the parent (under the fork lock) before the process pool is created; fork workers inherit the
-# materialized `ss` frame copy-on-write through it (NOT pickled — far too large to ship per worker).
+# Set in the parent (in `_run_trajectories_process`, before the pool is created) so fork workers
+# inherit the materialized `ss` frame copy-on-write through it (NOT pickled — far too large to ship
+# per worker), and reset in a `finally`. Precondition: ONE `run_bakeoff` at a time per process — the
+# operator entrypoint is single-caller; this module-global would race under concurrent `run_bakeoff`
+# calls in the same process (none today), so no lock is taken.
 _PROCESS_SS = None
 
 
@@ -880,9 +883,11 @@ def _partition_by_criteria(grid: list) -> list:
 
 def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs):
     """Process executor: partition by criteria, fork workers sharing ``ss`` copy-on-write, gather and
-    merge. Aggregate memo stats are written back into the parent ``runner`` so ``run_bakeoff``'s
-    ``backtest_calls`` reporting is unchanged. BIT-IDENTICAL to serial (pure trajectories; the matrix
-    is rebuilt in grid order by the caller)."""
+    merge. Aggregate memo stats are summed back into the parent ``runner`` so ``run_bakeoff``'s
+    ``backtest_calls`` still reports: ``total`` (lookups) is identical to serial, but ``distinct``
+    (calls) can be HIGHER — per-worker memos cannot dedup an identical followed set ACROSS criteria
+    (they run in different processes). BIT-IDENTICAL results to serial (pure trajectories; the matrix
+    is rebuilt in grid order by the caller); only the dedup COUNT, never a return value, can differ."""
     global _PROCESS_SS
     kw = {k: v for k, v in kwargs.items() if k != "uniqueness_cache"}   # each worker owns its own
     chunks = _partition_by_criteria(grid)
