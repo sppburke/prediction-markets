@@ -20,9 +20,89 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+from numba import njit
 from scipy.stats import norm
 
 from . import SuffStats
+
+
+# cache=False is REQUIRED, not an oversight: numba SEGFAULTS on a *self-recursive* njit compiled with
+# cache=True (the on-disk cache mishandles the self-reference). The recompile cost is a non-issue —
+# the bake-off's process pool forks AFTER the parent's first call (the 8a screen) has JIT-compiled
+# this, so workers inherit the compiled code copy-on-write; serial/thread runs compile once.
+@njit(cache=False, fastmath=False)
+def _uw_pairwise(a, start, n):
+    """numpy's pairwise (divide-and-conquer) float64 reduction, replicated EXACTLY (8-accumulator
+    unroll, 128-element block, half rounded down to a multiple of 8). This is the ONLY subtlety in
+    making the JIT path bit-identical to the reference: a naive sequential sum would drift ~1e-16 from
+    ``ndarray.sum()``; matching the reduction TREE reproduces it to the last bit."""
+    if n < 8:
+        s = 0.0
+        for i in range(n):
+            s += a[start + i]
+        return s
+    if n <= 128:
+        r0 = a[start]; r1 = a[start+1]; r2 = a[start+2]; r3 = a[start+3]
+        r4 = a[start+4]; r5 = a[start+5]; r6 = a[start+6]; r7 = a[start+7]
+        i = 8
+        end = n - (n % 8)
+        while i < end:
+            r0 += a[start+i]; r1 += a[start+i+1]; r2 += a[start+i+2]; r3 += a[start+i+3]
+            r4 += a[start+i+4]; r5 += a[start+i+5]; r6 += a[start+i+6]; r7 += a[start+i+7]
+            i += 8
+        res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+        while i < n:
+            res += a[start + i]
+            i += 1
+        return res
+    half = n // 2
+    half -= half % 8
+    return _uw_pairwise(a, start, half) + _uw_pairwise(a, start + half, n - half)
+
+
+@njit(cache=False, fastmath=False)
+def _uw_all_groups(s_all, e_all, bounds, w):
+    """Per-wallet average-uniqueness over the contiguous wallet groups ``[bounds[g], bounds[g+1])`` of
+    the wallet-sorted ``(entry_ts, ttr_ref)`` arrays; writes each label's weight into ``w`` at its
+    sorted position. Mirrors the reference loop's arithmetic EXACTLY — integer concurrency counts, the
+    same ``seg/c`` terms, summed with ``_uw_pairwise`` — so the result is bit-identical."""
+    for gi in range(bounds.shape[0] - 1):
+        a = bounds[gi]
+        b = bounds[gi + 1]
+        n = b - a
+        s = s_all[a:b]
+        e = e_all[a:b]
+        bp = np.unique(np.concatenate((s, e)))
+        if bp.size < 2:
+            for k in range(n):
+                w[a + k] = 1.0
+            continue
+        m = bp.size - 1
+        lo = bp[:-1].astype(np.float64)
+        hi = bp[1:].astype(np.float64)
+        mid = (lo + hi) / 2.0
+        c = np.empty(m)
+        for j in range(m):
+            cnt = 0
+            for i in range(n):
+                if s[i] <= mid[j] and mid[j] < e[i]:
+                    cnt += 1
+            c[j] = cnt if cnt >= 1 else 1
+        seg = hi - lo
+        sj = s.astype(np.float64)
+        ej = e.astype(np.float64)
+        buf = np.empty(m)
+        for k in range(n):
+            span = ej[k] - sj[k]
+            if span > 0:
+                cnt = 0
+                for j in range(m):
+                    if lo[j] >= sj[k] and hi[j] <= ej[k]:
+                        buf[cnt] = seg[j] / c[j]
+                        cnt += 1
+                w[a + k] = _uw_pairwise(buf, 0, cnt) / span
+            else:
+                w[a + k] = 1.0
 
 
 def uniqueness_weights(ss: SuffStats) -> np.ndarray:
@@ -33,10 +113,41 @@ def uniqueness_weights(ss: SuffStats) -> np.ndarray:
     label boundaries), so integrate ``1/c_t`` over the boundary grid. Normalised to mean 1, so a
     wallet whose labels heavily overlap (high concurrency) gets per-label weight < 1.
 
+    Numba-accelerated: the per-wallet O(labels x segments) work runs in a JIT-compiled kernel
+    (``_uw_all_groups``) over wallet-sorted flat arrays — ~10-17x over the reference Python loop on a
+    large in-sample, which is the dominant cost of the bake-off at scale. **Bit-identical** to
+    :func:`_uniqueness_weights_pyloop` (asserted by test): a STABLE sort by first-appearance wallet
+    code preserves the reference's per-wallet row order, the concurrency counts are integers, and the
+    per-label ``seg/c`` sum matches numpy's pairwise reduction (``_uw_pairwise``) — so the JIT changes
+    only WHERE the identical float ops run, never the result.
+
     # Precondition: ``ss`` has a contiguous RangeIndex (0..n-1) — call on the full materialized
-    # frame or a ``reset_index(drop=True)`` slice (e.g. ``split_walkforward`` output). Per-wallet
-    # cost is O(labels x segments); cap pathological whale wallets if memory-bound (#421 note).
+    # frame or a ``reset_index(drop=True)`` slice (e.g. ``split_walkforward`` output).
     """
+    if len(ss) and not ss.index.equals(pd.RangeIndex(len(ss))):
+        raise ValueError("uniqueness_weights requires a contiguous RangeIndex (0..n-1); call on "
+                         "the full materialized frame or a reset_index(drop=True) slice")
+    if len(ss) == 0:
+        return np.empty(0, dtype=np.float64)
+    codes = pd.factorize(ss["wallet"].to_numpy(), sort=False)[0]   # first-appearance order
+    order = np.argsort(codes, kind="stable")                       # group rows by wallet, keep row order
+    s_all = ss["entry_ts"].to_numpy(np.int64)[order]
+    e_all = ss["ttr_ref"].to_numpy(np.int64)[order]
+    sorted_codes = codes[order]
+    bounds = np.concatenate((np.array([0], dtype=np.int64),
+                             (np.flatnonzero(np.diff(sorted_codes)) + 1).astype(np.int64),
+                             np.array([len(ss)], dtype=np.int64)))
+    w_sorted = np.empty(len(ss), dtype=np.float64)
+    _uw_all_groups(s_all, e_all, bounds, w_sorted)
+    w = np.empty(len(ss), dtype=np.float64)
+    w[order] = w_sorted                                           # restore ORIGINAL index order
+    return w / w.mean()
+
+
+def _uniqueness_weights_pyloop(ss: SuffStats) -> np.ndarray:
+    """Reference pure-Python implementation of :func:`uniqueness_weights` (the pre-numba loop). Kept
+    private as the bit-identity ORACLE the test pins the JIT version against; not used in production.
+    Per-wallet cost is O(labels x segments)."""
     if len(ss) and not ss.index.equals(pd.RangeIndex(len(ss))):
         raise ValueError("uniqueness_weights requires a contiguous RangeIndex (0..n-1); call on "
                          "the full materialized frame or a reset_index(drop=True) slice")

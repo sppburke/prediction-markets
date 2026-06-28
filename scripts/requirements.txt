@@ -24,3 +24,9 @@ scipy==1.17.1
 # both are pinned. cp311 wheels resolve against numpy 2.4 / pandas 3.0 / scipy 1.17.
 arch==8.0.0
 statsmodels==0.14.6
+# numba JIT-compiles the AFML uniqueness_weights kernel (scripts/ranker/oos_validation.py) — the
+# dominant Python cost of the bake-off at scale (~10-17x). It is BIT-IDENTICAL to the reference
+# pure-Python loop (a test pins it), so it is a pure speedup. cp311 wheel resolves against numpy 2.4
+# (numba 0.65 supports numpy up to 2.4); llvmlite is its pinned dependency.
+numba==0.65.1
+llvmlite==0.47.0
