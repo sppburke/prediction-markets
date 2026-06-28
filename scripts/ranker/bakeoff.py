@@ -899,11 +899,13 @@ class _SubprocessRunnerFactory:
         return MemoizingBacktestRunner(SubprocessBacktestRunner(self.binary, self.cache_path, out))
 
 
-# Set in the parent (in `_run_trajectories_process`, before the pool is created) so fork workers
-# inherit the materialized `ss` frame copy-on-write through it (NOT pickled — far too large to ship
-# per worker), and reset in a `finally`. Precondition: ONE `run_bakeoff` at a time per process — the
-# operator entrypoint is single-caller; this module-global would race under concurrent `run_bakeoff`
-# calls in the same process (none today), so no lock is taken.
+# Set in the parent before a fork pool is created so workers inherit a large read-only frame
+# copy-on-write through it (NOT pickled — far too large to ship per worker), and reset in a `finally`.
+# Two setters, never concurrently: `_run_trajectories_process` stores the full materialized `ss`;
+# `screen_estimators` (process path) stores the criteria-sliced `ss_c`. Precondition: ONE `run_bakeoff`
+# at a time per process, and the screen completes before the trajectories — the operator entrypoint is
+# single-caller, so the two setters run sequentially; this module-global would race under concurrent
+# `run_bakeoff` calls in the same process (none today), so no lock is taken.
 _PROCESS_SS = None
 
 
@@ -1556,12 +1558,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          "~min(16, cores-2) on a dedicated box; the Python scoring is GIL-serialised so "
                          "the realised speedup is ~2x on a large universe, more on a smaller pool.")
     ap.add_argument("--executor", choices=("thread", "process"), default="thread",
-                    help="trajectory parallelism backend for --workers>1. 'thread' (default): shared "
-                         "memo, GIL serialises the uniqueness_weights cold passes (~2x). 'process': a "
-                         "fork pool partitioned by criteria that ALSO parallelises the cold passes "
-                         "(the dominant Python cost on a large universe) — the fastest path for the "
-                         "full grid. BIT-IDENTICAL to serial either way; needs the real "
-                         "pe-backtest (each worker gets an isolated output dir).")
+                    help="parallelism backend for --workers>1 (applies to BOTH the 8a estimator screen "
+                         "and the trajectory grid). 'thread' (default): shared memo, GIL serialises the "
+                         "uniqueness_weights cold passes (~2x). 'process': a fork pool (screen fanned "
+                         "over as_of; trajectories partitioned by criteria) that ALSO parallelises the "
+                         "cold passes (the dominant Python cost on a large universe) — the fastest path "
+                         "for the full grid. BIT-IDENTICAL to serial either way; needs the real "
+                         "pe-backtest (each trajectory worker gets an isolated output dir).")
     return ap
 
 
