@@ -43,10 +43,14 @@ if __name__ == "__main__" and not __package__:
     raise SystemExit(0)
 
 import argparse
+import concurrent.futures
 import itertools
 import json
 import os
+import shutil
 import subprocess
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -320,35 +324,42 @@ class SubprocessBacktestRunner:
 
     def run(self, wallets: list, *, flat_usd: float,
             window: "tuple | None" = None) -> pd.DataFrame:
+        # Per-CALL scratch dir: `pe-backtest` writes a FIXED filename (`pnl_by_period.ndjson`) into
+        # `PE_BACKTEST_OUTPUT_DIR`, so the parallel `run_trajectories` seam (concurrent backtests)
+        # requires a DISTINCT dir per call or they clobber one another's wallet file / output. A fresh
+        # dir also subsumes the #445 defect-9 stale-output unlink: a binary that emits nothing this run
+        # yields an empty frame (missing file), never a re-parse of a prior run's P&L. The result frame
+        # is independent of the (random) dir name, so determinism is preserved; cleaned up after parse.
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        wallet_file = self.output_dir / "injected_wallets.txt"
-        # #445 defect 9: the cache stores lowercase wallet_hex and pe-backtest matches injected
-        # wallets against it, so a stray upper/mixed-case id would silently match NOTHING. Lowercase
-        # defensively (the docstring's "lowercase-hex" contract) so a casing slip upstream cannot
-        # zero out the fills.
-        wallet_file.write_text("\n".join(w.lower() for w in wallets) + "\n")
-        out_file = self.output_dir / "pnl_by_period.ndjson"
-        # #445 defect 9: remove any stale output from a prior run, so a binary that emits nothing this
-        # run yields an empty frame (missing file) rather than a silent re-parse of the previous P&L.
-        out_file.unlink(missing_ok=True)
-        env = {
-            **os.environ,
-            "PE_BACKTEST_INJECTED_WALLETS_PATH": str(wallet_file),
-            "PE_BACKTEST_FLAT_USD": str(flat_usd),
-            "PE_BACKTEST_MAX_TRADE_COUNT": "0",
-            "PE_BACKTEST_OUTPUT_DIR": str(self.output_dir),
-            "PE_BOOTSTRAP_CACHE_PATH": self.cache_path,
-            **self.extra_env,
-        }
-        # issue #436 Phase E: pass the forward-MTM window (as_of, horizon) so the
-        # binary marks still-open positions at the horizon (PE_BACKTEST_MTM_WINDOW_*).
-        # Without it the binary keeps the unrealized_pnl=0.0 sentinel.
-        if window is not None:
-            as_of, horizon_end = window
-            env["PE_BACKTEST_MTM_WINDOW_START_UNIX"] = str(int(as_of))
-            env["PE_BACKTEST_MTM_WINDOW_END_UNIX"] = str(int(horizon_end))
-        subprocess.run([self.binary], env=env, check=True)
-        return parse_pnl_by_period(out_file)
+        call_dir = Path(tempfile.mkdtemp(dir=self.output_dir))
+        try:
+            wallet_file = call_dir / "injected_wallets.txt"
+            # #445 defect 9: the cache stores lowercase wallet_hex and pe-backtest matches injected
+            # wallets against it, so a stray upper/mixed-case id would silently match NOTHING.
+            # Lowercase defensively (the docstring's "lowercase-hex" contract) so a casing slip
+            # upstream cannot zero out the fills.
+            wallet_file.write_text("\n".join(w.lower() for w in wallets) + "\n")
+            out_file = call_dir / "pnl_by_period.ndjson"
+            env = {
+                **os.environ,
+                "PE_BACKTEST_INJECTED_WALLETS_PATH": str(wallet_file),
+                "PE_BACKTEST_FLAT_USD": str(flat_usd),
+                "PE_BACKTEST_MAX_TRADE_COUNT": "0",
+                "PE_BACKTEST_OUTPUT_DIR": str(call_dir),
+                "PE_BOOTSTRAP_CACHE_PATH": self.cache_path,
+                **self.extra_env,
+            }
+            # issue #436 Phase E: pass the forward-MTM window (as_of, horizon) so the
+            # binary marks still-open positions at the horizon (PE_BACKTEST_MTM_WINDOW_*).
+            # Without it the binary keeps the unrealized_pnl=0.0 sentinel.
+            if window is not None:
+                as_of, horizon_end = window
+                env["PE_BACKTEST_MTM_WINDOW_START_UNIX"] = str(int(as_of))
+                env["PE_BACKTEST_MTM_WINDOW_END_UNIX"] = str(int(horizon_end))
+            subprocess.run([self.binary], env=env, check=True)
+            return parse_pnl_by_period(out_file)
+        finally:
+            shutil.rmtree(call_dir, ignore_errors=True)
 
 
 def parse_pnl_by_period(path) -> pd.DataFrame:
@@ -391,6 +402,55 @@ def _lag_distribution(resolved_secs: list, censored: int) -> dict:
             "max_days": float(a[-1])}
 
 
+class _SingleFlightCache:
+    """Thread-safe memo with single-flight: concurrent ``get_or_compute(key, factory)`` for the SAME
+    key invokes ``factory`` exactly once; the other callers block on the in-flight result. The cached
+    value is independent of WHICH thread computed it or in what order — ``factory`` must be a pure
+    function of ``key`` — so it preserves bit-identical results when ``run_trajectories`` runs
+    trajectories concurrently (the parallel seam needs a thread-safe backtest memo AND uniqueness
+    cache, both of which are pure-of-key). With one thread it degenerates to a plain memo. ``calls``
+    counts distinct ``factory`` invocations; ``lookups`` counts total requests (so the realized dedup
+    speedup is ``lookups / calls``). ``factory`` runs OUTSIDE the lock, so a slow compute (a
+    ``pe-backtest`` subprocess) never blocks a hit on a different key."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cache: dict = {}
+        self._inflight: dict = {}                 # key -> Event, held while one thread computes it
+        self.calls = 0
+        self.lookups = 0
+
+    def get_or_compute(self, key, factory):
+        with self._lock:
+            self.lookups += 1
+            if key in self._cache:
+                return self._cache[key]
+            event = self._inflight.get(key)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                self._inflight[key] = event
+        if not owner:                             # another thread owns this key — wait for its result
+            event.wait()
+            with self._lock:
+                if key in self._cache:
+                    return self._cache[key]
+            raise RuntimeError(f"single-flight: owner failed to compute {key!r}")
+        try:
+            value = factory()
+        except BaseException:                     # wake waiters so they re-raise rather than hang
+            with self._lock:
+                self._inflight.pop(key, None)
+            event.set()
+            raise
+        with self._lock:
+            self._cache[key] = value
+            self._inflight.pop(key, None)
+            self.calls += 1
+        event.set()
+        return value
+
+
 class MemoizingBacktestRunner:
     """D2 (#436): an in-run memo over an inner ``BacktestRunner``, keyed on
     ``(tuple(sorted(wallets)), flat_usd, window)``. The injected-set backtest is a deterministic,
@@ -409,23 +469,28 @@ class MemoizingBacktestRunner:
     persistent cross-run cache is the exact key/version/eviction-correctness risk this epic guards,
     so it is deferred (#436 D2) until iteration cost proves prohibitive. The cached frame is never
     mutated downstream (the window boolean-slice and ``pd.concat`` both copy), so it is returned
-    directly. ``calls`` (distinct followed sets = inner invocations) and ``lookups`` (total requests)
-    give the operator the realized speedup ``lookups / calls`` without a separate stubbed pass."""
+    directly. Backed by a thread-safe ``_SingleFlightCache`` so the parallel ``run_trajectories`` seam
+    can share ONE memo across concurrent trajectories without double-running a followed set or racing
+    the counters; ``calls`` (distinct followed sets = inner invocations) and ``lookups`` (total
+    requests) read through to it and give the realized speedup ``lookups / calls``."""
 
     def __init__(self, inner):
         self.inner = inner
-        self._cache: dict = {}
-        self.calls = 0
-        self.lookups = 0
+        self._cache = _SingleFlightCache()
 
     def run(self, wallets: list, *, flat_usd: float,
             window: "tuple | None" = None) -> pd.DataFrame:
-        self.lookups += 1
         key = (tuple(sorted(wallets)), flat_usd, window)
-        if key not in self._cache:
-            self.calls += 1
-            self._cache[key] = self.inner.run(list(wallets), flat_usd=flat_usd, window=window)
-        return self._cache[key]
+        return self._cache.get_or_compute(
+            key, lambda: self.inner.run(list(wallets), flat_usd=flat_usd, window=window))
+
+    @property
+    def calls(self) -> int:
+        return self._cache.calls
+
+    @property
+    def lookups(self) -> int:
+        return self._cache.lookups
 
 
 # ───────────────────────── policy construction ─────────────────────────
@@ -460,11 +525,16 @@ def _uniqueness_cached(in_sample, *, key, cache):
     ``run_trajectory`` otherwise recompute the SAME O(positions × segments) statistic up to
     ``n_grid × steps`` times. A per-run ``cache`` dict keyed on ``(criteria, as_of)`` collapses that
     to once per distinct in-sample, BIT-IDENTICALLY (same rows/order -> same positional weights, used
-    read-only downstream). The cache MUST stay scoped to one ``run_bakeoff`` (a fresh ``dict`` per
-    call); ``cache=None`` disables it (back-compat for direct callers / tests)."""
+    read-only downstream). The cache MUST stay scoped to one ``run_bakeoff``; ``cache=None`` disables
+    it (back-compat for direct callers / tests). ``run_bakeoff`` passes a thread-safe
+    ``_SingleFlightCache`` (so the parallel ``run_trajectories`` seam computes each ``(criteria,
+    as_of)`` cold pass exactly once even under concurrency); a plain ``dict`` is still accepted for
+    single-threaded callers."""
     if cache is None:
         return uniqueness_weights(in_sample)
-    weights = cache.get(key)
+    if hasattr(cache, "get_or_compute"):          # thread-safe single-flight (parallel run_bakeoff)
+        return cache.get_or_compute(key, lambda: uniqueness_weights(in_sample))
+    weights = cache.get(key)                       # back-compat: a plain dict (serial callers / tests)
     if weights is None:
         weights = uniqueness_weights(in_sample)
         cache[key] = weights
@@ -743,13 +813,33 @@ def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
     return float((per_wallet.loc[common] * weight.loc[common]).sum())
 
 
-def run_trajectories(grid: list, ss: SuffStats, runner, **kwargs) -> "tuple[pd.DataFrame, dict]":
+def run_trajectories(grid: list, ss: SuffStats, runner, *, max_workers: int = 1,
+                     **kwargs) -> "tuple[pd.DataFrame, dict]":
     """8c — run every grid point's trajectory. Returns ``(return_matrix, results)`` where
     ``return_matrix`` is the per-period return matrix (index = ``as_of``, columns = config keys) for
     the grid-level Validators and ``results`` maps each config key -> its ``TrajectoryResult`` (A1:
-    so the winning config's frozen final-step followed set is selected directly, not re-derived)."""
-    results = {gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid}
-    return pd.DataFrame({key: res.returns for key, res in results.items()}), results
+    so the winning config's frozen final-step followed set is selected directly, not re-derived).
+
+    ``max_workers > 1`` runs the (mutually independent) trajectories concurrently on a thread pool.
+    Each ``run_trajectory`` stays sequential WITHIN itself (``set_t -> pe-backtest -> live_pnl ->
+    policy -> set_{t+1}``); configs share no mutable state except the ``runner`` memo and the
+    ``uniqueness_cache``, both thread-safe single-flight (``_SingleFlightCache``). The dominant cost is
+    the ``pe-backtest`` subprocess, which releases the GIL, so threads overlap it (the GIL still
+    serialises the Python scoring — a deliberate, low-risk speedup vs the fork/BLAS footguns of a
+    process pool; the latter is the future lever for a Python-scoring-dominated full-universe run). The
+    parallel result is BIT-IDENTICAL to serial: each trajectory is a deterministic pure function of
+    ``(grid_point, ss, params)``, and the matrix columns are assembled in fixed GRID order below — not
+    completion order. ``max_workers <= 1`` is the original serial path."""
+    if max_workers and max_workers > 1 and len(grid) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {gp.key: pool.submit(run_trajectory, gp, ss, runner, **kwargs) for gp in grid}
+            results = {key: fut.result() for key, fut in futures.items()}
+    else:
+        results = {gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid}
+    # Assemble in GRID order (not results-insertion / thread-completion order) so the column order —
+    # and every downstream Validator that reads the matrix positionally — is identical serial vs
+    # parallel. (`results` is already grid-ordered, but iterate `grid` to make the invariant explicit.)
+    return pd.DataFrame({gp.key: results[gp.key].returns for gp in grid}), results
 
 
 # ───────────────────────── leaderboard + winner / NO-GO ─────────────────────────
@@ -1083,7 +1173,7 @@ class BakeoffParams:
 
 
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
-                created_at: int = 0, seed: int = 0) -> dict:
+                created_at: int = 0, seed: int = 0, max_workers: int = 1) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
     PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
     horizon objective the trajectories optimize, so it could drop an estimator the true objective
@@ -1107,8 +1197,9 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     # #451: one per-run AFML-uniqueness memo shared by the 8a screen AND every config's trajectory.
     # The uniqueness of an in-sample is fixed by (criteria, as_of), so this collapses up to
     # n_grid × steps recomputations to once per distinct in-sample (bit-identical, see
-    # `_uniqueness_cached`) — the dominant Python cost on a large candidate universe.
-    uniqueness_cache: dict = {}
+    # `_uniqueness_cached`) — the dominant Python cost on a large candidate universe. Thread-safe
+    # single-flight so the parallel `run_trajectories` seam computes each cold pass exactly once.
+    uniqueness_cache = _SingleFlightCache()
     # #445 defect 4: the 8a screen runs for its ADVISORY ranking only — it no longer prunes the
     # estimator axis (its forward-payoff proxy mismatches the realized + CLOB-MTM horizon objective).
     screen_advisory = screen_estimators(
@@ -1123,7 +1214,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     baseline_key = _baseline_key(run_axes)
     memo_runner = MemoizingBacktestRunner(runner)   # D2: in-run dedup of repeated followed sets
     return_matrix, results = run_trajectories(
-        grid, ss, memo_runner, as_of_points=params.as_of_points,
+        grid, ss, memo_runner, max_workers=max_workers, as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
@@ -1273,6 +1364,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                     help="set-transition policy names to sweep (default: all 4; fewer = far fewer "
                          "distinct backtests for a tractable run). A bad name fails fast at argparse "
                          "rather than after the expensive materialize, like --engine.")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel trajectory workers (thread pool). 1 = serial (default). >1 runs the "
+                         "mutually-independent configs concurrently — results are BIT-IDENTICAL (the "
+                         "pe-backtest subprocess dominates and releases the GIL). Recommend "
+                         "~min(16, cores-2) on a dedicated box; the Python scoring is GIL-serialised so "
+                         "the realised speedup is ~2x on a large universe, more on a smaller pool.")
     return ap
 
 
@@ -1363,7 +1460,8 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
             min_trl_levels=tuple(args.min_trl)),
         churn_costs=(0.0, args.churn_cost))               # D3 (#436): {free, anchored} cost sweep
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
-    result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()))
+    result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()),
+                         max_workers=args.workers)
 
     # #445 defect 10: surface the true-CLV preflight in the decision payload + a dedicated file so the
     # `true_clv` exclusion is VISIBLE in operator output, never a silent all-NaN ranking.

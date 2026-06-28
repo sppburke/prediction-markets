@@ -1252,7 +1252,9 @@ class SubprocessRunnerHermeticTest(unittest.TestCase):
             "keys = ('PE_BACKTEST_FLAT_USD','PE_BOOTSTRAP_CACHE_PATH',"
             "'PE_BACKTEST_MTM_WINDOW_START_UNIX','PE_BACKTEST_MTM_WINDOW_END_UNIX')",
             "cap = {'wallets': wallets, 'env': {k: os.environ.get(k) for k in keys}}",
-            "json.dump(cap, open(os.path.join(out, 'fake_capture.json'), 'w'))",
+            # Write the capture OUTSIDE the per-call scratch dir (`out`), which the runner removes
+            # after parsing — to a fixed path the test passes via `extra_env`.
+            "json.dump(cap, open(os.environ['FAKE_CAPTURE_PATH'], 'w'))",
         ]
         if emit_rows:
             lines += [
@@ -1273,30 +1275,39 @@ class SubprocessRunnerHermeticTest(unittest.TestCase):
             binp = Path(d) / "fake_pe_backtest.py"
             self._write_fake(binp, emit_rows=True)
             out = Path(d) / "bt"
-            runner = bo.SubprocessBacktestRunner(str(binp), "cache.db", str(out))
+            capture = Path(d) / "capture.json"
+            runner = bo.SubprocessBacktestRunner(str(binp), "cache.db", str(out),
+                                                 extra_env={"FAKE_CAPTURE_PATH": str(capture)})
             df = runner.run(["0xABC", "0xDeF"], flat_usd=25.0, window=(1000, 2000))
             self.assertEqual(len(df), 2)
             self.assertEqual(list(df.columns), bo._PNL_COLUMNS)
-            cap = _json.loads((out / "fake_capture.json").read_text())
+            cap = _json.loads(capture.read_text())
             self.assertEqual(cap["wallets"], ["0xabc", "0xdef"])          # lowercased on write
             self.assertEqual(cap["env"]["PE_BACKTEST_MTM_WINDOW_START_UNIX"], "1000")
             self.assertEqual(cap["env"]["PE_BACKTEST_MTM_WINDOW_END_UNIX"], "2000")
             self.assertEqual(cap["env"]["PE_BOOTSTRAP_CACHE_PATH"], "cache.db")
+            self.assertEqual(list(out.iterdir()), [])                     # per-call scratch removed
 
-    def test_stale_output_not_reparsed(self):
+    def test_isolated_dir_ignores_leftover_output_and_missing_is_empty(self):
+        # Per-call temp dirs isolate each run: a leftover `pnl_by_period.ndjson` in the SHARED
+        # output_dir (a prior run, or a concurrent run's file) is never read, and a binary that emits
+        # nothing yields an empty frame — subsumes the #445 defect-9 stale-unlink, now structural.
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "bt"
             out.mkdir(parents=True)
-            (out / "pnl_by_period.ndjson").write_text(                    # stale prior-run output
+            (out / "pnl_by_period.ndjson").write_text(                    # leftover in the SHARED dir
                 '{"wallet":"0xstale","period_end":1,"realized_pnl":99.0,"unrealized_pnl":0.0,'
                 '"n_fills":1,"notional":1.0,"is_horizon_mtm":false,"open_at_horizon":0,'
                 '"marked_at_horizon":0}\n')
             binp = Path(d) / "noop.py"
             self._write_fake(binp, emit_rows=False)                       # writes NO pnl this run
-            runner = bo.SubprocessBacktestRunner(str(binp), "c", str(out))
+            capture = Path(d) / "capture.json"
+            runner = bo.SubprocessBacktestRunner(str(binp), "c", str(out),
+                                                 extra_env={"FAKE_CAPTURE_PATH": str(capture)})
             df = runner.run(["0xa"], flat_usd=25.0)
-            self.assertTrue(df.empty)                                     # stale row NOT re-parsed
+            self.assertTrue(df.empty)                                     # leftover NOT re-parsed
+            self.assertTrue((out / "pnl_by_period.ndjson").exists())      # leftover untouched (isolated)
 
 
 class TrueClvPreflightTest(unittest.TestCase):
@@ -1460,6 +1471,87 @@ class DirectInvocationTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("usage:", result.stdout)
+
+
+class ParallelDeterminismTest(unittest.TestCase):
+    """The parallel ``run_trajectories`` seam (``max_workers > 1``) is BIT-IDENTICAL to serial: each
+    trajectory is a deterministic pure function of ``(grid_point, ss, params)`` and the matrix columns
+    are assembled in fixed GRID order, so thread scheduling cannot move the return matrix, the memo
+    dedup count, or the verdict. CI exercises it with the fake runner (the real speedup needs the
+    pe-backtest subprocess, which releases the GIL)."""
+
+    def _fixture(self):
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(10)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        # 1 est × 2 deflators × 2 policies (incl. the stateful knockout) × 2 criteria × 2 churn = 16
+        # configs: enough trajectories that 4 workers genuinely overlap, a stateful policy is
+        # exercised, and the 2nd criteria's uniqueness is computed DURING (concurrent) trajectories —
+        # so both shared caches (backtest memo + uniqueness) take real contention.
+        axes = _axes(estimators=("t_stat_baseline",),
+                     deflators=(bo.NO_DEFLATION, DeflatedSharpe.name),
+                     policies=("policy_full_rerank", "policy_knockout_backfill"),
+                     criteria=(Criteria(0, 72.0, 0.0, 1.0, 0.0, 0),
+                               Criteria(0, 72.0, 0.30, 0.70, 0.0, 0)),
+                     churn=(0.0, 1.0))
+        return ss, value, points, params, axes
+
+    def test_serial_and_parallel_are_bit_identical(self) -> None:
+        ss, value, points, params, axes = self._fixture()
+        serial = bo.run_bakeoff(ss, _FakeRunner(value, points, 1_000_000), axes, params,
+                                created_at=1, max_workers=1)
+        parallel = bo.run_bakeoff(ss, _FakeRunner(value, points, 1_000_000), axes, params,
+                                  created_at=1, max_workers=4)
+        # per-period return matrix identical value-for-value AND column-order-for-column-order
+        pd.testing.assert_frame_equal(serial["return_matrix"], parallel["return_matrix"])
+        self.assertEqual(list(serial["return_matrix"].columns),
+                         list(parallel["return_matrix"].columns))
+        # single-flight memo ran each distinct backtest exactly once in BOTH paths
+        self.assertEqual(serial["backtest_calls"], parallel["backtest_calls"])
+        # verdict + deliverable identical
+        self.assertEqual(serial["decision"]["status"], parallel["decision"]["status"])
+        self.assertEqual(serial["decision"]["winner"], parallel["decision"]["winner"])
+        self.assertEqual(serial["deliverable"]["winner_key"],
+                         parallel["deliverable"]["winner_key"])
+        pd.testing.assert_frame_equal(serial["deliverable"]["follow"].reset_index(drop=True),
+                                      parallel["deliverable"]["follow"].reset_index(drop=True))
+
+
+class SingleFlightCacheTest(unittest.TestCase):
+    """``_SingleFlightCache`` runs the factory exactly once per key even under heavy concurrent
+    contention — the thread-safety the shared backtest memo + uniqueness cache depend on."""
+
+    def test_factory_runs_once_per_key_under_contention(self) -> None:
+        import threading
+        import time
+        cache = bo._SingleFlightCache()
+        invocations: dict = {}
+        inv_lock = threading.Lock()
+
+        def factory(k):
+            with inv_lock:
+                invocations[k] = invocations.get(k, 0) + 1
+            time.sleep(0.02)                 # widen the compute window so same-key requests overlap
+            return k * 10
+
+        keys = [i % 5 for i in range(40)]    # 5 distinct keys, 40 concurrent requests
+        results: list = [None] * len(keys)
+
+        def worker(idx):
+            k = keys[idx]
+            results[idx] = cache.get_or_compute(k, lambda: factory(k))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(keys))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, [k * 10 for k in keys])        # every caller got the right value
+        self.assertEqual(max(invocations.values()), 1)           # each key computed EXACTLY once
+        self.assertEqual(cache.calls, 5)                         # 5 distinct factory invocations
+        self.assertEqual(cache.lookups, 40)                      # 40 total requests
 
 
 if __name__ == "__main__":
