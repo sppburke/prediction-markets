@@ -559,10 +559,48 @@ def _uniqueness_cached(in_sample, *, key, cache):
     return weights
 
 
+def _screen_one_as_of(ss_c, as_of, estimators, criteria, train_secs, horizon_secs, k, uniqueness_cache):
+    """The 8a screen's per-``as_of`` work, factored out so the split + uniqueness are computed ONCE per
+    as_of (the old estimator-outer loop recomputed ``split_walkforward`` once per estimator — 5x
+    redundant on the full frame) and so the as_of axis can be fanned out. Returns
+    ``{estimator_name: forward-copy P&L of its top-k pick}`` (a name absent = empty scores that as_of)."""
+    in_sample, forward = split_walkforward(
+        ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
+    if in_sample.empty or forward.empty:
+        return {}
+    eligible = eligible_wallets(in_sample, criteria, as_of=as_of)
+    candidates = in_sample[in_sample["wallet"].isin(eligible)]           # label-preserving slice
+    if candidates.empty:
+        return {}
+    weights = _uniqueness_cached(in_sample, key=(criteria, as_of), cache=uniqueness_cache)  # #451 memo
+    out = {}
+    for name in estimators:
+        scores = ESTIMATOR_REGISTRY[name]().score(candidates, as_of=as_of, weights=weights)
+        if scores.empty:
+            continue
+        picked = scores.nsmallest(min(k, len(scores)), "rank").index
+        out[name] = _forward_copy_pnl(forward, picked)
+    return out
+
+
+def _screen_as_of_chunk(as_of_chunk, estimators, criteria, train_secs, horizon_secs, k):
+    """Process-pool worker: the screen's per-as_of scores for a chunk of as_of over the fork-inherited
+    ``_PROCESS_SS`` (the criteria-sliced frame), with a private uniqueness cache. Returns
+    ``{as_of: {name: fwd_pnl}}``; each as_of is an independent pure function, so the partition cannot
+    change the result."""
+    ss_c = _PROCESS_SS
+    if ss_c is None:
+        raise RuntimeError("_screen_as_of_chunk: _PROCESS_SS not set (fork inheritance failed)")
+    uniq: dict = {}
+    return {as_of: _screen_one_as_of(ss_c, as_of, estimators, criteria, train_secs, horizon_secs, k, uniq)
+            for as_of in as_of_chunk}
+
+
 def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
                       train_secs: int, horizon_secs: int, k: int, keep: int,
                       criteria: "Criteria | None" = None,
-                      uniqueness_cache: "dict | None" = None) -> list:
+                      uniqueness_cache: "dict | None" = None,
+                      max_workers: int = 1, executor: str = "thread") -> list:
     """8a — rank estimators by mean point-in-time forward copy P&L of their top-k pick and return the
     best ``keep`` (the §Acceptance benchmark ``t_stat_baseline`` is always retained). Cheap: scores
     once per ``as_of`` and reads the forward net edge directly. **#445 defect 4: this ranking is
@@ -575,30 +613,45 @@ def screen_estimators(ss: SuffStats, estimators: list, *, as_of_points: list,
     canonical ``criteria`` (the singleton at Phase A; the chosen canonical level once the criteria
     axis goes plural, D1). Without it the screen ranked estimators on a wider universe than the one
     they were later scored on. ``criteria=None`` is the fully-permissive no-op default (back-compat).
-    """
+
+    The body is as_of-outer (split + uniqueness once per as_of) and, under ``executor="process"`` with
+    ``max_workers > 1``, fans the independent as_of out over a fork pool sharing ``ss_c`` copy-on-write
+    — the screen was a single-threaded ~30-min prefix on the full universe. BIT-IDENTICAL: each as_of's
+    per-estimator fwd P&L is a deterministic pure function, and the scoreboard is assembled in fixed
+    estimator order (stable tie-break) then as_of order — never partition order."""
     if criteria is None:
         criteria = Criteria(0, float("inf"), 0.0, 1.0, 0.0, 0)
     ss_c = slice_by_criteria(ss, criteria)
+    if max_workers and max_workers > 1 and executor == "process" and len(as_of_points) > 1:
+        # Parallel only under the process executor (matching the trajectories: each worker has a
+        # private uniqueness cache, as the per-criteria trajectory workers do — the parent's shared
+        # cache is not populated by the screen in this mode, which is consistent since the process
+        # trajectory workers recompute per-criteria anyway).
+        global _PROCESS_SS
+        chunks = [as_of_points[i::max_workers] for i in range(min(max_workers, len(as_of_points)))]
+        ctx = multiprocessing.get_context("fork")
+        per_as_of: dict = {}
+        _PROCESS_SS = ss_c                                  # fork workers inherit ss_c COW
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+                futures = [pool.submit(_screen_as_of_chunk, c, estimators, criteria,
+                                       train_secs, horizon_secs, k) for c in chunks if c]
+                for fut in futures:
+                    per_as_of.update(fut.result())
+        finally:
+            _PROCESS_SS = None
+    else:
+        # Serial (thread/serial executor): one shared uniqueness cache so the trajectories reuse the
+        # screen's criteria[0] cold passes (#451). Restructured as_of-outer — fixes the 5x split.
+        uniq = uniqueness_cache if uniqueness_cache is not None else {}
+        per_as_of = {as_of: _screen_one_as_of(ss_c, as_of, estimators, criteria,
+                                              train_secs, horizon_secs, k, uniq)
+                     for as_of in as_of_points}
+    # Aggregate in ESTIMATOR order (stable tie-break in `sorted`) over as_of order — identical to the
+    # original loop's per-name `fwd_pnls` list and mean.
     scoreboard = {}
     for name in estimators:
-        estimator = ESTIMATOR_REGISTRY[name]()
-        fwd_pnls = []
-        for as_of in as_of_points:
-            in_sample, forward = split_walkforward(
-                ss_c, as_of=as_of, train_secs=train_secs, horizon_secs=horizon_secs)
-            if in_sample.empty or forward.empty:
-                continue
-            eligible = eligible_wallets(in_sample, criteria, as_of=as_of)
-            candidates = in_sample[in_sample["wallet"].isin(eligible)]   # label-preserving slice
-            if candidates.empty:
-                continue
-            weights = _uniqueness_cached(                                # full-frame, aligned index
-                in_sample, key=(criteria, as_of), cache=uniqueness_cache)  # #451 memo
-            scores = estimator.score(candidates, as_of=as_of, weights=weights)
-            if scores.empty:
-                continue
-            picked = scores.nsmallest(min(k, len(scores)), "rank").index
-            fwd_pnls.append(_forward_copy_pnl(forward, picked))
+        fwd_pnls = [per_as_of[a][name] for a in as_of_points if name in per_as_of.get(a, {})]
         scoreboard[name] = float(np.mean(fwd_pnls)) if fwd_pnls else float("-inf")
     ranked = sorted(scoreboard, key=lambda n: scoreboard[n], reverse=True)
     survivors = ranked[:keep]
@@ -1318,7 +1371,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         ss, list(axes.estimators), as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, keep=params.screen_keep, criteria=axes.criteria[0],   # A3: canonical criteria
-        uniqueness_cache=uniqueness_cache)
+        uniqueness_cache=uniqueness_cache, max_workers=max_workers, executor=executor)
     run_axes = axes                              # no pruning: the run-set IS the full pre-screen grid
     manifest = pre_register_grid(run_axes, created_at=created_at)
     grid = run_axes.enumerate_grid()
