@@ -1553,6 +1553,58 @@ class SingleFlightCacheTest(unittest.TestCase):
         self.assertEqual(cache.calls, 5)                         # 5 distinct factory invocations
         self.assertEqual(cache.lookups, 40)                      # 40 total requests
 
+    def test_owner_exception_propagates_real_error_to_waiters(self) -> None:
+        # A failing factory (a real pe-backtest CalledProcessError under the parallel seam) is
+        # re-raised to the waiter as the OWNER's actual exception — not a generic RuntimeError — so a
+        # parallel run fails with the same diagnostics as a serial one, and is not counted as a `call`.
+        import threading
+        cache = bo._SingleFlightCache()
+        started = threading.Event()
+
+        class Boom(RuntimeError):
+            pass
+
+        def failing_factory():
+            started.set()
+            started.wait(0)            # no-op; readability — the sleep below holds the key in-flight
+            import time
+            time.sleep(0.10)           # hold "k" in-flight long enough for the waiter to register
+            raise Boom("backtest blew up")
+
+        errors: dict = {}
+
+        def call(tag):
+            try:
+                cache.get_or_compute("k", failing_factory)
+            except BaseException as exc:  # noqa: BLE001 - capturing for the assertion
+                errors[tag] = exc
+
+        owner = threading.Thread(target=call, args=("owner",))
+        owner.start()
+        started.wait()                 # ensure `owner` is the one running the factory
+        waiter = threading.Thread(target=call, args=("waiter",))
+        waiter.start()
+        owner.join()
+        waiter.join()
+        self.assertIsInstance(errors.get("owner"), Boom)
+        self.assertIsInstance(errors.get("waiter"), Boom)        # waiter got the REAL error, not RuntimeError
+        self.assertEqual(cache.calls, 0)                         # a raising factory is not a successful call
+
+
+class WorkersArgTest(unittest.TestCase):
+    """`--workers` fails fast (at argparse) on a non-positive value rather than silently running
+    serial after the expensive materialize — the fail-fast pattern PR #452 required for `--policies`."""
+
+    def test_rejects_non_positive(self) -> None:
+        import argparse
+        for bad in ("0", "-1", "-8"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                bo._positive_workers(bad)
+
+    def test_accepts_positive(self) -> None:
+        self.assertEqual(bo._positive_workers("1"), 1)
+        self.assertEqual(bo._positive_workers("12"), 12)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

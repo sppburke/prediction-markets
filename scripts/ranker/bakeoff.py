@@ -409,14 +409,15 @@ class _SingleFlightCache:
     function of ``key`` — so it preserves bit-identical results when ``run_trajectories`` runs
     trajectories concurrently (the parallel seam needs a thread-safe backtest memo AND uniqueness
     cache, both of which are pure-of-key). With one thread it degenerates to a plain memo. ``calls``
-    counts distinct ``factory`` invocations; ``lookups`` counts total requests (so the realized dedup
-    speedup is ``lookups / calls``). ``factory`` runs OUTSIDE the lock, so a slow compute (a
-    ``pe-backtest`` subprocess) never blocks a hit on a different key."""
+    counts distinct SUCCESSFUL ``factory`` invocations (a raising factory is re-raised to every waiter
+    and not counted); ``lookups`` counts total requests (so the realized dedup speedup is
+    ``lookups / calls``). ``factory`` runs OUTSIDE the lock, so a slow compute (a ``pe-backtest``
+    subprocess) never blocks a hit on a different key."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cache: dict = {}
-        self._inflight: dict = {}                 # key -> Event, held while one thread computes it
+        self._inflight: dict = {}                 # key -> {"event", "exc"} record while one thread computes
         self.calls = 0
         self.lookups = 0
 
@@ -425,29 +426,36 @@ class _SingleFlightCache:
             self.lookups += 1
             if key in self._cache:
                 return self._cache[key]
-            event = self._inflight.get(key)
-            owner = event is None
+            rec = self._inflight.get(key)
+            owner = rec is None
             if owner:
-                event = threading.Event()
-                self._inflight[key] = event
+                rec = {"event": threading.Event(), "exc": None}
+                self._inflight[key] = rec
         if not owner:                             # another thread owns this key — wait for its result
-            event.wait()
+            rec["event"].wait()
             with self._lock:
                 if key in self._cache:
                     return self._cache[key]
+            # The owner failed. Re-raise ITS exception (the real pe-backtest CalledProcessError, not a
+            # generic stand-in) so a parallel run fails with the same diagnostics as a serial one; the
+            # captured `exc` is read from the record this waiter already holds, so a NEW owner that has
+            # since started recomputing for future callers cannot mask it.
+            if rec["exc"] is not None:
+                raise rec["exc"]
             raise RuntimeError(f"single-flight: owner failed to compute {key!r}")
         try:
             value = factory()
-        except BaseException:                     # wake waiters so they re-raise rather than hang
+        except BaseException as exc:              # publish to the waiters, wake them, then re-raise
+            rec["exc"] = exc
             with self._lock:
                 self._inflight.pop(key, None)
-            event.set()
+            rec["event"].set()
             raise
         with self._lock:
             self._cache[key] = value
             self._inflight.pop(key, None)
             self.calls += 1
-        event.set()
+        rec["event"].set()
         return value
 
 
@@ -1307,6 +1315,15 @@ def _parse_band(s: str) -> "tuple[float, float]":
     return (float(lo), float(hi))
 
 
+def _positive_workers(s: str) -> int:
+    """Parse ``--workers`` and fail FAST (at argparse, before the expensive materialize — like
+    ``--bands``/``--engine``) on a nonsensical value, rather than silently falling back to serial."""
+    n = int(s)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--workers must be >= 1 (1 = serial), got {n}")
+    return n
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     """The operator-run CLI, extracted from ``main`` so a drift guard can assert the engine
     wiring (issue #421 PR6 follow-up). ``--engine`` is the ``ranker_duck`` engine MODE and
@@ -1364,7 +1381,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                     help="set-transition policy names to sweep (default: all 4; fewer = far fewer "
                          "distinct backtests for a tractable run). A bad name fails fast at argparse "
                          "rather than after the expensive materialize, like --engine.")
-    ap.add_argument("--workers", type=int, default=1,
+    ap.add_argument("--workers", type=_positive_workers, default=1,
                     help="parallel trajectory workers (thread pool). 1 = serial (default). >1 runs the "
                          "mutually-independent configs concurrently — results are BIT-IDENTICAL (the "
                          "pe-backtest subprocess dominates and releases the GIL). Recommend "
