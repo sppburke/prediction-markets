@@ -46,6 +46,7 @@ import argparse
 import concurrent.futures
 import itertools
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -53,6 +54,15 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Pin BLAS to a single thread BEFORE numpy/scipy import. The process executor (run_trajectories,
+# executor="process") shares the materialized `ss` frame with fork workers copy-on-write; a parent
+# that has already spawned a BLAS thread pool can deadlock a forked child's first BLAS call. The
+# bake-off parallelises across PROCESSES, not BLAS threads, so pinning to 1 here makes fork safe and
+# is negligible for this workload (DuckDB has its own threads; the hot `uniqueness_weights` is pure
+# Python). `setdefault` so an explicit operator override still wins.
+for _blas_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_blas_var, "1")
 
 import numpy as np
 import pandas as pd
@@ -821,32 +831,125 @@ def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
     return float((per_wallet.loc[common] * weight.loc[common]).sum())
 
 
+class _SubprocessRunnerFactory:
+    """Picklable per-worker runner builder for the process executor. A thread-safe memo cannot cross a
+    process boundary, so each worker gets its OWN ``MemoizingBacktestRunner`` over a
+    ``SubprocessBacktestRunner`` with an isolated output dir (``<out_base>/w<worker_id>``)."""
+
+    def __init__(self, binary: str, cache_path: str, out_base: str):
+        self.binary = binary
+        self.cache_path = cache_path
+        self.out_base = out_base
+
+    def __call__(self, worker_id: int):
+        out = str(Path(self.out_base) / f"w{worker_id}")
+        return MemoizingBacktestRunner(SubprocessBacktestRunner(self.binary, self.cache_path, out))
+
+
+# Set in the parent (in `_run_trajectories_process`, before the pool is created) so fork workers
+# inherit the materialized `ss` frame copy-on-write through it (NOT pickled — far too large to ship
+# per worker), and reset in a `finally`. Precondition: ONE `run_bakeoff` at a time per process — the
+# operator entrypoint is single-caller; this module-global would race under concurrent `run_bakeoff`
+# calls in the same process (none today), so no lock is taken.
+_PROCESS_SS = None
+
+
+def _run_trajectory_chunk(chunk, runner_factory, worker_id, kwargs):
+    """Process-pool worker: run a chunk of grid points against the fork-inherited ``_PROCESS_SS`` with
+    THIS worker's own runner (isolated output dir, private memo) and a private uniqueness cache.
+    Returns ``(results, calls, lookups)``. Each trajectory is a deterministic pure function of
+    ``(grid_point, ss, params)``, so which worker runs which chunk cannot change any result."""
+    ss = _PROCESS_SS
+    if ss is None:
+        raise RuntimeError("_run_trajectory_chunk: _PROCESS_SS not set (fork inheritance failed)")
+    runner = runner_factory(worker_id)
+    uniqueness: dict = {}                      # private, serial within the worker -> a plain dict suffices
+    results = {gp.key: run_trajectory(gp, ss, runner, uniqueness_cache=uniqueness, **kwargs)
+               for gp in chunk}
+    return results, runner.calls, runner.lookups
+
+
+def _partition_by_criteria(grid: list) -> list:
+    """Group grid points by criteria so each process worker OWNS one criteria's ``(criteria, as_of)``
+    cold ``uniqueness_weights`` passes — computed once per worker, fully in parallel across workers
+    (the GIL-bound scoring cost a thread pool cannot parallelise, and the dominant cost at scale).
+    Insertion order = grid criteria order, so partitioning is deterministic; chunk order is irrelevant
+    (results merge by key)."""
+    groups: dict = {}
+    for gp in grid:
+        groups.setdefault(repr(gp.criteria), []).append(gp)
+    return list(groups.values())
+
+
+def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs):
+    """Process executor: partition by criteria, fork workers sharing ``ss`` copy-on-write, gather and
+    merge. Aggregate memo stats are summed back into the parent ``runner`` so ``run_bakeoff``'s
+    ``backtest_calls`` still reports: ``total`` (lookups) is identical to serial, but ``distinct``
+    (calls) can be HIGHER — per-worker memos cannot dedup an identical followed set ACROSS criteria
+    (they run in different processes). BIT-IDENTICAL results to serial (pure trajectories; the matrix
+    is rebuilt in grid order by the caller); only the dedup COUNT, never a return value, can differ."""
+    global _PROCESS_SS
+    kw = {k: v for k, v in kwargs.items() if k != "uniqueness_cache"}   # each worker owns its own
+    chunks = _partition_by_criteria(grid)
+    ctx = multiprocessing.get_context("fork")
+    results: dict = {}
+    total_calls = total_lookups = 0
+    _PROCESS_SS = ss                           # set BEFORE the pool: fork workers inherit it COW
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+            futs = [pool.submit(_run_trajectory_chunk, chunk, runner_factory, i, kw)
+                    for i, chunk in enumerate(chunks)]
+            for fut in futs:
+                res, calls, lookups = fut.result()
+                results.update(res)
+                total_calls += calls
+                total_lookups += lookups
+    finally:
+        _PROCESS_SS = None
+    if hasattr(runner, "_cache"):              # surface the summed dedup via the parent's memo sink
+        runner._cache.calls = total_calls
+        runner._cache.lookups = total_lookups
+    return results
+
+
 def run_trajectories(grid: list, ss: SuffStats, runner, *, max_workers: int = 1,
+                     executor: str = "thread", runner_factory=None,
                      **kwargs) -> "tuple[pd.DataFrame, dict]":
     """8c — run every grid point's trajectory. Returns ``(return_matrix, results)`` where
     ``return_matrix`` is the per-period return matrix (index = ``as_of``, columns = config keys) for
     the grid-level Validators and ``results`` maps each config key -> its ``TrajectoryResult`` (A1:
     so the winning config's frozen final-step followed set is selected directly, not re-derived).
 
-    ``max_workers > 1`` runs the (mutually independent) trajectories concurrently on a thread pool.
-    Each ``run_trajectory`` stays sequential WITHIN itself (``set_t -> pe-backtest -> live_pnl ->
-    policy -> set_{t+1}``); configs share no mutable state except the ``runner`` memo and the
-    ``uniqueness_cache``, both thread-safe single-flight (``_SingleFlightCache``). The dominant cost is
-    the ``pe-backtest`` subprocess, which releases the GIL, so threads overlap it (the GIL still
-    serialises the Python scoring — a deliberate, low-risk speedup vs the fork/BLAS footguns of a
-    process pool; the latter is the future lever for a Python-scoring-dominated full-universe run). The
-    parallel result is BIT-IDENTICAL to serial: each trajectory is a deterministic pure function of
-    ``(grid_point, ss, params)``, and the matrix columns are assembled in fixed GRID order below — not
-    completion order. ``max_workers <= 1`` is the original serial path."""
-    if max_workers and max_workers > 1 and len(grid) > 1:
+    ``max_workers > 1`` runs the (mutually independent) trajectories concurrently. Each
+    ``run_trajectory`` stays sequential WITHIN itself (``set_t -> pe-backtest -> live_pnl -> policy ->
+    set_{t+1}``); configs share no mutable state across the parallel boundary.
+
+      * ``executor="thread"`` (default): one thread pool sharing the ``runner`` memo + ``uniqueness_cache``
+        (thread-safe single-flight). The ``pe-backtest`` subprocess releases the GIL so backtests
+        overlap, but the GIL serialises the Python scoring — so the ``uniqueness_weights`` cold passes
+        (the dominant cost at scale) stay serial.
+      * ``executor="process"``: a fork pool partitioned BY CRITERIA (``runner_factory`` builds a
+        private runner per worker; ``ss`` is shared copy-on-write). This ALSO parallelises the cold
+        passes — each worker owns one criteria's passes — so it is the lever for a Python-scoring-bound
+        run; needs a ``runner_factory``.
+
+    BIT-IDENTICAL to serial under either executor: each trajectory is a deterministic pure function of
+    ``(grid_point, ss, params)``, the memo/uniqueness caches are pure-of-key, and the matrix columns
+    are assembled in fixed GRID order below — never completion/partition order. ``max_workers <= 1`` is
+    the original serial path."""
+    if max_workers and max_workers > 1 and len(grid) > 1 and executor == "process":
+        if runner_factory is None:
+            raise ValueError("run_trajectories(executor='process') requires a runner_factory")
+        results = _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs)
+    elif max_workers and max_workers > 1 and len(grid) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {gp.key: pool.submit(run_trajectory, gp, ss, runner, **kwargs) for gp in grid}
             results = {key: fut.result() for key, fut in futures.items()}
     else:
         results = {gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid}
-    # Assemble in GRID order (not results-insertion / thread-completion order) so the column order —
-    # and every downstream Validator that reads the matrix positionally — is identical serial vs
-    # parallel. (`results` is already grid-ordered, but iterate `grid` to make the invariant explicit.)
+    # Assemble in GRID order (not results-insertion / completion / partition order) so the column
+    # order — and every downstream Validator that reads the matrix positionally — is identical across
+    # serial / thread / process. (Iterate `grid` to make the invariant explicit.)
     return pd.DataFrame({gp.key: results[gp.key].returns for gp in grid}), results
 
 
@@ -1181,7 +1284,8 @@ class BakeoffParams:
 
 
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
-                created_at: int = 0, seed: int = 0, max_workers: int = 1) -> dict:
+                created_at: int = 0, seed: int = 0, max_workers: int = 1,
+                executor: str = "thread", runner_factory=None) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
     PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
     horizon objective the trajectories optimize, so it could drop an estimator the true objective
@@ -1221,8 +1325,19 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     grid_by_key = {g.key: g for g in grid}        # A1: thread GridPoints, never re-parse a key
     baseline_key = _baseline_key(run_axes)
     memo_runner = MemoizingBacktestRunner(runner)   # D2: in-run dedup of repeated followed sets
+    # For the process executor each worker needs its OWN runner (private memo + isolated output dir,
+    # un-shareable across processes); derive a picklable factory from the SubprocessBacktestRunner.
+    # Explicit `runner_factory` wins (tests inject a fake). `memo_runner` then only sinks the summed
+    # dedup stats. The thread/serial path ignores the factory and shares `memo_runner` directly.
+    rf = runner_factory
+    if executor == "process" and rf is None:
+        if not isinstance(runner, SubprocessBacktestRunner):
+            raise ValueError("run_bakeoff(executor='process') needs a SubprocessBacktestRunner or an "
+                             "explicit runner_factory")
+        rf = _SubprocessRunnerFactory(runner.binary, runner.cache_path, str(runner.output_dir))
     return_matrix, results = run_trajectories(
-        grid, ss, memo_runner, max_workers=max_workers, as_of_points=params.as_of_points,
+        grid, ss, memo_runner, max_workers=max_workers, executor=executor, runner_factory=rf,
+        as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
@@ -1387,6 +1502,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          "pe-backtest subprocess dominates and releases the GIL). Recommend "
                          "~min(16, cores-2) on a dedicated box; the Python scoring is GIL-serialised so "
                          "the realised speedup is ~2x on a large universe, more on a smaller pool.")
+    ap.add_argument("--executor", choices=("thread", "process"), default="thread",
+                    help="trajectory parallelism backend for --workers>1. 'thread' (default): shared "
+                         "memo, GIL serialises the uniqueness_weights cold passes (~2x). 'process': a "
+                         "fork pool partitioned by criteria that ALSO parallelises the cold passes "
+                         "(the dominant Python cost on a large universe) — the fastest path for the "
+                         "full grid. BIT-IDENTICAL to serial either way; needs the real "
+                         "pe-backtest (each worker gets an isolated output dir).")
     return ap
 
 
@@ -1478,7 +1600,7 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
         churn_costs=(0.0, args.churn_cost))               # D3 (#436): {free, anchored} cost sweep
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()),
-                         max_workers=args.workers)
+                         max_workers=args.workers, executor=args.executor)
 
     # #445 defect 10: surface the true-CLV preflight in the decision payload + a dedicated file so the
     # `true_clv` exclusion is VISIBLE in operator output, never a silent all-NaN ranking.
