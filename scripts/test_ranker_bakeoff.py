@@ -1606,5 +1606,53 @@ class WorkersArgTest(unittest.TestCase):
         self.assertEqual(bo._positive_workers("12"), 12)
 
 
+class _FakeRunnerFactory:
+    """Picklable per-worker factory mirroring ``bo._SubprocessRunnerFactory`` for the process-executor
+    test — fork workers build their own ``MemoizingBacktestRunner(_FakeRunner(...))``."""
+
+    def __init__(self, value, points, horizon):
+        self.value = value
+        self.points = points
+        self.horizon = horizon
+
+    def __call__(self, worker_id):
+        return bo.MemoizingBacktestRunner(_FakeRunner(self.value, self.points, self.horizon))
+
+
+class ProcessExecutorDeterminismTest(unittest.TestCase):
+    """``executor='process'`` (a fork pool partitioned by criteria, sharing ``ss`` copy-on-write) is
+    BIT-IDENTICAL to serial — it parallelises the GIL-bound ``uniqueness_weights`` cold passes WITHOUT
+    changing the math (each trajectory is the same pure function; only WHICH process runs it differs).
+    Exercises the real fork ProcessPoolExecutor with a picklable fake runner (no cache/binary)."""
+
+    def test_process_matches_serial_bit_identical(self) -> None:
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(8)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        # 2 criteria so the partition has >1 chunk (workers run distinct criteria in parallel).
+        axes = _axes(estimators=("t_stat_baseline",), deflators=(bo.NO_DEFLATION,),
+                     policies=("policy_full_rerank", "policy_knockout_backfill"),
+                     criteria=(Criteria(0, 72.0, 0.0, 1.0, 0.0, 0),
+                               Criteria(0, 72.0, 0.30, 0.70, 0.0, 0)),
+                     churn=(0.0,))
+        serial = bo.run_bakeoff(ss, _FakeRunner(value, points, 1_000_000), axes, params, created_at=1)
+        proc = bo.run_bakeoff(ss, _FakeRunner(value, points, 1_000_000), axes, params, created_at=1,
+                              max_workers=4, executor="process",
+                              runner_factory=_FakeRunnerFactory(value, points, 1_000_000))
+        pd.testing.assert_frame_equal(serial["return_matrix"], proc["return_matrix"])
+        self.assertEqual(list(serial["return_matrix"].columns), list(proc["return_matrix"].columns))
+        # every (config, step) cell is requested once in BOTH (total lookups equal); `distinct` MAY be
+        # higher for the process path (per-worker memos can't dedup an identical set across criteria).
+        self.assertEqual(serial["backtest_calls"]["total"], proc["backtest_calls"]["total"])
+        self.assertGreaterEqual(proc["backtest_calls"]["distinct"], serial["backtest_calls"]["distinct"])
+        self.assertEqual(serial["decision"]["status"], proc["decision"]["status"])
+        self.assertEqual(serial["decision"]["winner"], proc["decision"]["winner"])
+        self.assertEqual(serial["deliverable"]["winner_key"], proc["deliverable"]["winner_key"])
+        pd.testing.assert_frame_equal(serial["deliverable"]["follow"].reset_index(drop=True),
+                                      proc["deliverable"]["follow"].reset_index(drop=True))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
