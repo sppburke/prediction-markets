@@ -260,6 +260,20 @@ class ScreenTest(unittest.TestCase):
         self.assertIn("t_stat_baseline", survivors)              # baseline always retained
         self.assertLessEqual(len(survivors), 3)                  # keep=2 (+ baseline if displaced)
 
+    def test_serial_and_process_screen_identical(self) -> None:
+        # The process-parallel screen (executor='process', a fork pool over the as_of axis) is
+        # BIT-IDENTICAL to the serial restructured screen: each as_of's per-estimator fwd P&L is a
+        # deterministic pure function and the scoreboard is assembled in fixed estimator/as_of order,
+        # so the survivor ranking is independent of how the as_of are partitioned across workers. (Real
+        # fork ProcessPoolExecutor on fake data — the screen is pure, no pe-backtest.)
+        ss, _ = _population(2)
+        points = [3_000_000 + i * 1_000_000 for i in range(10)]
+        ests = ["t_stat_baseline", "eb_shrinkage_skill", "gu_koenker_npmle", "proxy_clv"]
+        kw = dict(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000, k=5, keep=2)
+        serial = bo.screen_estimators(ss, ests, **kw)
+        proc = bo.screen_estimators(ss, ests, max_workers=4, executor="process", **kw)
+        self.assertEqual(serial, proc)                            # identical survivor ranking
+
 
 class TrajectoryTest(unittest.TestCase):
     def setUp(self) -> None:
