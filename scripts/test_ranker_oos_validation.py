@@ -24,6 +24,7 @@ from ranker.oos_validation import (  # noqa: E402
     HansenSPA,
     PBO,
     RomanoWolf,
+    _uniqueness_weights_pyloop,
     akm_inference_on_winners,
     assert_no_lookahead,
     brown_goetzmann_cpr,
@@ -85,6 +86,33 @@ class UniquenessWeightsTest(unittest.TestCase):
         net = np.array([0.2, -0.1, 0.3, 0.1, 0.0, -0.2])
         _, _, n_eff, _ = weighted_stats(net, w)
         self.assertLess(n_eff, float(len(net)))                        # differential overlap reduces n_eff
+
+    def test_numba_is_bit_identical_to_reference_loop(self) -> None:
+        # The JIT `uniqueness_weights` must equal the pure-Python reference BIT-FOR-BIT (not merely
+        # close) on a frame with realistic concurrency — varied label counts + overlapping spans — so
+        # the ~10-17x speedup is provably free of any result change. The pairwise-sum replication
+        # (`_uw_pairwise`) is what makes this hold; a naive numba sum would drift ~1e-16.
+        rng = np.random.default_rng(12345)
+        rows = []
+        for wi in range(60):
+            # every 10th wallet is a WHALE (200-400 labels -> >128 covered segments) so the test
+            # exercises `_uw_pairwise`'s recursive branch, not just the <=128 base case.
+            n = int(rng.integers(200, 400)) if wi % 10 == 0 else int(rng.integers(5, 40))
+            starts = rng.integers(0, 1_000_000, n)
+            durs = rng.integers(1, 200_000, n)
+            for a, d in zip(starts, durs):
+                rows.append((f"w{wi}", int(a), int(a + d)))
+        ss = pd.DataFrame(rows, columns=["wallet", "entry_ts", "ttr_ref"]).reset_index(drop=True)
+        fast = uniqueness_weights(ss)
+        ref = _uniqueness_weights_pyloop(ss)
+        self.assertTrue(np.array_equal(fast, ref),
+                        msg=f"not bit-identical: max|delta|={np.abs(fast - ref).max():.3e}")
+
+    def test_numba_matches_reference_on_edge_shapes(self) -> None:
+        # single-instant (entry==ttr) and disjoint single-label wallets also match the reference.
+        ss = pd.DataFrame({"wallet": ["a", "b", "c"], "entry_ts": [5, 7, 0],
+                           "ttr_ref": [5, 9, 100]}).reset_index(drop=True)   # 'a' is instantaneous
+        self.assertTrue(np.array_equal(uniqueness_weights(ss), _uniqueness_weights_pyloop(ss)))
 
 
 class LookAheadGuardTest(unittest.TestCase):
