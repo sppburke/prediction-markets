@@ -60,12 +60,15 @@ def _uw_pairwise(a, start, n):
     return _uw_pairwise(a, start, half) + _uw_pairwise(a, start + half, n - half)
 
 
+# cache=False here too (it calls the recursive `_uw_pairwise` — see that function's note; a cached
+# kernel calling an uncached recursive one is the same numba-cache footgun).
 @njit(cache=False, fastmath=False)
 def _uw_all_groups(s_all, e_all, bounds, w):
     """Per-wallet average-uniqueness over the contiguous wallet groups ``[bounds[g], bounds[g+1])`` of
     the wallet-sorted ``(entry_ts, ttr_ref)`` arrays; writes each label's weight into ``w`` at its
-    sorted position. Mirrors the reference loop's arithmetic EXACTLY — integer concurrency counts, the
-    same ``seg/c`` terms, summed with ``_uw_pairwise`` — so the result is bit-identical."""
+    sorted position. Mirrors the reference loop's arithmetic EXACTLY — concurrency counts are exact
+    integers (held in a float64 ``c`` array — small enough to be exact), the same ``seg/c`` terms,
+    summed with ``_uw_pairwise`` — so the result is bit-identical."""
     for gi in range(bounds.shape[0] - 1):
         a = bounds[gi]
         b = bounds[gi + 1]
@@ -117,9 +120,12 @@ def uniqueness_weights(ss: SuffStats) -> np.ndarray:
     (``_uw_all_groups``) over wallet-sorted flat arrays — ~10-17x over the reference Python loop on a
     large in-sample, which is the dominant cost of the bake-off at scale. **Bit-identical** to
     :func:`_uniqueness_weights_pyloop` (asserted by test): a STABLE sort by first-appearance wallet
-    code preserves the reference's per-wallet row order, the concurrency counts are integers, and the
-    per-label ``seg/c`` sum matches numpy's pairwise reduction (``_uw_pairwise``) — so the JIT changes
-    only WHERE the identical float ops run, never the result.
+    code preserves the reference's per-wallet row order, the concurrency counts are exact integers, and
+    the per-label ``seg/c`` sum reproduces numpy's pairwise reduction (``_uw_pairwise``) — so the JIT
+    changes only WHERE the identical float ops run, never the result. NOTE: ``_uw_pairwise`` replicates
+    numpy's *internal* pairwise-summation tree (8-acc unroll, 128 block), so strict bit-identity is
+    tied to the pinned numpy; ``test_numba_is_bit_identical_to_reference_loop`` (``np.array_equal``,
+    incl. the recursive >128-segment path) fails loudly on any numpy change that alters it.
 
     # Precondition: ``ss`` has a contiguous RangeIndex (0..n-1) — call on the full materialized
     # frame or a ``reset_index(drop=True)`` slice (e.g. ``split_walkforward`` output).
