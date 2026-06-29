@@ -310,6 +310,25 @@ class TrajectoryTest(unittest.TestCase):
         self.assertTrue((admissions >= -1e-9).all())
         self.assertGreater(admissions.sum(), 0)                  # full-rerank churns -> paid a cost
 
+    def test_score_cache_is_bit_identical(self) -> None:
+        # The estimator-score memo (key = (estimator, criteria, as_of)) is reused across configs that
+        # share that triple but differ in policy/deflator/churn. Two such configs run through a SHARED
+        # cache must be BIT-IDENTICAL to the no-cache baseline — the `.copy()` in `_score_cached`
+        # prevents the second config from seeing any in-place mutation of the first's cached frame.
+        runner = _FakeRunner(self.value, self.points, self.horizon)
+        kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
+                      k=5, displacement_margin=5)
+        gp_a = self._gp("policy_full_rerank", 0.0)
+        gp_b = self._gp("policy_full_rerank", 10.0)              # same (estimator, criteria); diff churn
+        base_a = bo.run_trajectory(gp_a, self.ss, runner, score_cache=None, **kwargs)
+        base_b = bo.run_trajectory(gp_b, self.ss, runner, score_cache=None, **kwargs)
+        for cache in ({}, bo._SingleFlightCache()):             # plain dict AND the production seam
+            ca = bo.run_trajectory(gp_a, self.ss, runner, score_cache=cache, **kwargs)
+            cb = bo.run_trajectory(gp_b, self.ss, runner, score_cache=cache, **kwargs)  # reuses gp_a
+            self.assertTrue(ca.returns.equals(base_a.returns))
+            self.assertTrue(cb.returns.equals(base_b.returns))  # cross-config reuse is bit-identical
+            self.assertTrue(ca.final_scores.equals(base_a.final_scores))
+
 
 class MtmObjectiveTest(unittest.TestCase):
     """E2b/E3 (#436): the CLOB forward-MTM flow enters the objective, the demoter/live_pnl stay
