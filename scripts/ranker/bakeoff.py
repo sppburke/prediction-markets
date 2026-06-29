@@ -559,6 +559,30 @@ def _uniqueness_cached(in_sample, *, key, cache):
     return weights
 
 
+def _score_cached(estimator, candidates, *, as_of, weights, key, cache):
+    """``estimator.score`` memoized per ``key = (estimator, criteria, as_of)`` — mirrors
+    :func:`_uniqueness_cached`. The ranking is a pure function of the candidate slice + ``as_of`` +
+    ``weights``, all fixed by that triple; but the grid recomputes it once per ``(deflator × policy ×
+    churn)`` config sharing the triple — 16x on the default 960-config grid (= 5 est × 12 criteria ×
+    16), and the ``gu_koenker_npmle`` score alone is ~20x the cost of the other estimators (a 2000-iter
+    EM). A per-run cache collapses that to once per distinct triple. Returns a fresh ``.copy()`` each
+    call — the downstream ``apply_deflation_gate`` (per-config deflator) and policy step receive an
+    independent frame, so the result is BIT-IDENTICAL to the uncached ``estimator.score`` (same values,
+    dtypes, index) with no cross-config aliasing. ``cache=None`` disables it; a thread-safe
+    ``_SingleFlightCache`` (parallel seam) and a plain ``dict`` (serial) are both accepted, as for
+    uniqueness. MUST stay scoped to one ``run_bakeoff``."""
+    if cache is None:
+        return estimator.score(candidates, as_of=as_of, weights=weights)
+    if hasattr(cache, "get_or_compute"):           # thread-safe single-flight (parallel run_bakeoff)
+        return cache.get_or_compute(
+            key, lambda: estimator.score(candidates, as_of=as_of, weights=weights)).copy()
+    cached = cache.get(key)                         # back-compat: a plain dict (serial callers / tests)
+    if cached is None:
+        cached = estimator.score(candidates, as_of=as_of, weights=weights)
+        cache[key] = cached
+    return cached.copy()
+
+
 def _screen_one_as_of(ss_c, as_of, estimators, criteria, train_secs, horizon_secs, k, uniqueness_cache):
     """The 8a screen's per-``as_of`` work, factored out so the split + uniqueness are computed ONCE per
     as_of (the old estimator-outer loop recomputed ``split_walkforward`` once per estimator — 5x
@@ -763,7 +787,8 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
                    train_secs: int, horizon_secs: int, k: int,
                    displacement_margin: int, demoter_kwargs: "dict | None" = None,
                    flat_usd: float = 25.0,
-                   uniqueness_cache: "dict | None" = None) -> "TrajectoryResult":
+                   uniqueness_cache: "dict | None" = None,
+                   score_cache: "dict | None" = None) -> "TrajectoryResult":
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
     of churn (indexed by ``as_of``) PLUS the final-step followed set (A1). Sequential by
     construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
@@ -815,7 +840,9 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
             continue
         weights = _uniqueness_cached(                                # full-frame, aligned index
             in_sample, key=(grid_point.criteria, as_of), cache=uniqueness_cache)  # #451 memo
-        scores = estimator.score(candidates, as_of=as_of, weights=weights)
+        scores = _score_cached(                                      # memo across deflator/policy/churn
+            estimator, candidates, as_of=as_of, weights=weights,
+            key=(grid_point.estimator, grid_point.criteria, as_of), cache=score_cache)
         # Per-wallet deflation: n_trials = the CANDIDATE count being selected among (deflation.py
         # contract), NOT N_GRID — the grid trial count is the grid-level Validators' bar (8c).
         scores = apply_deflation_gate(scores, in_sample, grid_point.deflator,
@@ -919,7 +946,9 @@ def _run_trajectory_chunk(chunk, runner_factory, worker_id, kwargs):
         raise RuntimeError("_run_trajectory_chunk: _PROCESS_SS not set (fork inheritance failed)")
     runner = runner_factory(worker_id)
     uniqueness: dict = {}                      # private, serial within the worker -> a plain dict suffices
-    results = {gp.key: run_trajectory(gp, ss, runner, uniqueness_cache=uniqueness, **kwargs)
+    score: dict = {}                           # same: memo estimator scores across this criteria's configs
+    results = {gp.key: run_trajectory(gp, ss, runner, uniqueness_cache=uniqueness,
+                                      score_cache=score, **kwargs)
                for gp in chunk}
     return results, runner.calls, runner.lookups
 
@@ -944,7 +973,8 @@ def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwa
     (they run in different processes). BIT-IDENTICAL results to serial (pure trajectories; the matrix
     is rebuilt in grid order by the caller); only the dedup COUNT, never a return value, can differ."""
     global _PROCESS_SS
-    kw = {k: v for k, v in kwargs.items() if k != "uniqueness_cache"}   # each worker owns its own
+    kw = {k: v for k, v in kwargs.items()                               # each worker owns its own
+          if k not in ("uniqueness_cache", "score_cache")}
     chunks = _partition_by_criteria(grid)
     ctx = multiprocessing.get_context("fork")
     results: dict = {}
@@ -1367,6 +1397,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     # `_uniqueness_cached`) — the dominant Python cost on a large candidate universe. Thread-safe
     # single-flight so the parallel `run_trajectories` seam computes each cold pass exactly once.
     uniqueness_cache = _SingleFlightCache()
+    score_cache = _SingleFlightCache()           # #451-style memo of estimator scores across the grid
     # #445 defect 4: the 8a screen runs for its ADVISORY ranking only — it no longer prunes the
     # estimator axis (its forward-payoff proxy mismatches the realized + CLOB-MTM horizon objective).
     screen_advisory = screen_estimators(
@@ -1396,7 +1427,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
-        uniqueness_cache=uniqueness_cache)
+        uniqueness_cache=uniqueness_cache, score_cache=score_cache)
     split_at = int(np.median(params.as_of_points))
     cpr = wallet_persistence_cpr(ss, split_at=split_at)
     decision = select_winner_or_nogo(
