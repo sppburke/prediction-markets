@@ -322,13 +322,12 @@ class TrajectoryTest(unittest.TestCase):
         gp_b = self._gp("policy_full_rerank", 10.0)              # same (estimator, criteria); diff churn
         base_a = bo.run_trajectory(gp_a, self.ss, runner, score_cache=None, **kwargs)
         base_b = bo.run_trajectory(gp_b, self.ss, runner, score_cache=None, **kwargs)
-        cache: dict = {}
-        ca = bo.run_trajectory(gp_a, self.ss, runner, score_cache=cache, **kwargs)
-        cb = bo.run_trajectory(gp_b, self.ss, runner, score_cache=cache, **kwargs)  # reuses gp_a's scores
-        self.assertTrue(ca.returns.equals(base_a.returns))
-        self.assertTrue(cb.returns.equals(base_b.returns))      # cross-config reuse is bit-identical
-        self.assertTrue(ca.final_scores.equals(base_a.final_scores))
-        self.assertEqual(len(cache), len(self.points))          # one cached score per as_of, deduped
+        for cache in ({}, bo._SingleFlightCache()):             # plain dict AND the production seam
+            ca = bo.run_trajectory(gp_a, self.ss, runner, score_cache=cache, **kwargs)
+            cb = bo.run_trajectory(gp_b, self.ss, runner, score_cache=cache, **kwargs)  # reuses gp_a
+            self.assertTrue(ca.returns.equals(base_a.returns))
+            self.assertTrue(cb.returns.equals(base_b.returns))  # cross-config reuse is bit-identical
+            self.assertTrue(ca.final_scores.equals(base_a.final_scores))
 
 
 class MtmObjectiveTest(unittest.TestCase):

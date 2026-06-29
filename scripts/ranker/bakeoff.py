@@ -565,12 +565,14 @@ def _score_cached(estimator, candidates, *, as_of, weights, key, cache):
     ``weights``, all fixed by that triple; but the grid recomputes it once per ``(deflator × policy ×
     churn)`` config sharing the triple — 16x on the default 960-config grid (= 5 est × 12 criteria ×
     16), and the ``gu_koenker_npmle`` score alone is ~20x the cost of the other estimators (a 2000-iter
-    EM). A per-run cache collapses that to once per distinct triple. Returns a fresh ``.copy()`` each
-    call — the downstream ``apply_deflation_gate`` (per-config deflator) and policy step receive an
-    independent frame, so the result is BIT-IDENTICAL to the uncached ``estimator.score`` (same values,
-    dtypes, index) with no cross-config aliasing. ``cache=None`` disables it; a thread-safe
-    ``_SingleFlightCache`` (parallel seam) and a plain ``dict`` (serial) are both accepted, as for
-    uniqueness. MUST stay scoped to one ``run_bakeoff``."""
+    EM). A per-run cache collapses that to once per distinct triple. ``weights`` is deliberately NOT in
+    the key: it is itself a pure function of ``(criteria, as_of)`` (the #451 uniqueness memo), so the
+    triple already pins it. On a cache hit / store the cached frame is returned as a fresh ``.copy()``
+    so the downstream ``apply_deflation_gate`` (per-config deflator) and policy step get an independent
+    frame and cannot alias the shared entry — BIT-IDENTICAL to the uncached ``estimator.score`` (same
+    values, dtypes, index). ``cache=None`` disables the memo and returns the fresh score directly
+    (already a new frame each call); a thread-safe ``_SingleFlightCache`` (parallel seam) and a plain
+    ``dict`` (serial) are both accepted, as for uniqueness. MUST stay scoped to one ``run_bakeoff``."""
     if cache is None:
         return estimator.score(candidates, as_of=as_of, weights=weights)
     if hasattr(cache, "get_or_compute"):           # thread-safe single-flight (parallel run_bakeoff)
