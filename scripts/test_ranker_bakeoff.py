@@ -329,6 +329,25 @@ class TrajectoryTest(unittest.TestCase):
             self.assertTrue(cb.returns.equals(base_b.returns))  # cross-config reuse is bit-identical
             self.assertTrue(ca.final_scores.equals(base_a.final_scores))
 
+    def test_deflation_cache_is_bit_identical(self) -> None:
+        # The DSR-gate memo (key = (estimator, criteria, as_of, deflator)) dedups the gate across the
+        # policy/churn configs sharing it. Two deflated configs run through a SHARED cache must be
+        # BIT-IDENTICAL to the no-cache baseline — `_deflation_cached`'s `.copy()` blocks the second
+        # config from aliasing the first's cached gated frame.
+        runner = _FakeRunner(self.value, self.points, self.horizon)
+        kwargs = dict(as_of_points=self.points, train_secs=3_000_000, horizon_secs=self.horizon,
+                      k=5, displacement_margin=5)
+        crit = Criteria(0, 72.0, 0.0, 1.0, 0.0, 0)
+        gp_a = bo.GridPoint("eb_shrinkage_skill", bo.DeflatedSharpe.name, "policy_full_rerank", crit, 0.0)
+        gp_b = bo.GridPoint("eb_shrinkage_skill", bo.DeflatedSharpe.name, "policy_full_rerank", crit, 10.0)
+        base_a = bo.run_trajectory(gp_a, self.ss, runner, deflation_cache=None, **kwargs)
+        base_b = bo.run_trajectory(gp_b, self.ss, runner, deflation_cache=None, **kwargs)
+        for cache in ({}, bo._SingleFlightCache()):             # plain dict AND the production seam
+            ca = bo.run_trajectory(gp_a, self.ss, runner, deflation_cache=cache, **kwargs)
+            cb = bo.run_trajectory(gp_b, self.ss, runner, deflation_cache=cache, **kwargs)  # reuses gp_a
+            self.assertTrue(ca.returns.equals(base_a.returns))
+            self.assertTrue(cb.returns.equals(base_b.returns))  # cross-config reuse is bit-identical
+
 
 class MtmObjectiveTest(unittest.TestCase):
     """E2b/E3 (#436): the CLOB forward-MTM flow enters the objective, the demoter/live_pnl stay
