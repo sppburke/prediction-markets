@@ -48,6 +48,11 @@ class _FakeDemoter:
     def should_demote(self, wallet, live_pnl, *, as_of) -> bool:
         return wallet in self.demote
 
+    def demote_set(self, live_pnl, *, as_of) -> set:
+        # consistent with should_demote (membership-only): the policy filters prev by this set, so
+        # `w not in demote_set` <=> `not should_demote(w)`, matching the old per-wallet loop.
+        return set(self.demote)
+
 
 class FullRerankTest(unittest.TestCase):
     def test_replaces_with_fresh_top_k(self) -> None:
