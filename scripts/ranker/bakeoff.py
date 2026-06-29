@@ -882,7 +882,10 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         # contract), NOT N_GRID — the grid trial count is the grid-level Validators' bar (8c).
         scores = _deflation_cached(                                  # memo across policy/churn (8x)
             scores, in_sample, grid_point.deflator, n_trials=len(scores), weights=weights,
-            key=(grid_point.estimator, grid_point.criteria, as_of, grid_point.deflator),
+            # n_trials in the key: the DSR null bar is O(log n_trials), so a cache entry must never be
+            # reused for a different candidate count (today len(scores) is pinned by the score memo, but
+            # keying it is robust if a future estimator's candidate set ever varies for the triple).
+            key=(grid_point.estimator, grid_point.criteria, as_of, grid_point.deflator, len(scores)),
             cache=deflation_cache)
         if scores.empty:
             _no_signal()                                             # A9 + #445: no surviving signal

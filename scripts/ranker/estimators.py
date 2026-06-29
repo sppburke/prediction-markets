@@ -158,6 +158,7 @@ def _npmle_em_kernel(log_like, max_iter, tol):
             log_pi[j] = np.log(pi[j]) if pi[j] > 0.0 else -np.inf   # -inf where pi == 0 (NPMLE is sparse)
             new_pi[j] = 0.0
         ll_sum = 0.0
+        ll_c = 0.0                                              # Kahan compensation (see below)
         for i in range(n):
             rmax = -np.inf
             for j in range(k):
@@ -168,7 +169,10 @@ def _npmle_em_kernel(log_like, max_iter, tol):
             for j in range(k):
                 s += np.exp((log_like[i, j] + log_pi[j]) - rmax)
             log_row = np.log(s) + rmax                          # log marginal for wallet i
-            ll_sum += log_row
+            ll_y = log_row - ll_c                                # Kahan-compensated accumulation so the
+            ll_t = ll_sum + ll_y                                # marginal loglik stays accurate to ~eps
+            ll_c = (ll_t - ll_sum) - ll_y                       # (not O(n.eps) drift) at 4e5+ wallets,
+            ll_sum = ll_t                                       # keeping the monotonicity guard robust
             for j in range(k):
                 new_pi[j] += np.exp((log_like[i, j] + log_pi[j]) - log_row)   # E-step responsibility
         maxchange = 0.0
