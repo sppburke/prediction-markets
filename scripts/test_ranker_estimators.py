@@ -196,6 +196,29 @@ class GuKoenkerNumericsTest(unittest.TestCase):
         _, ll = _npmle_scores(x, se, grid, max_iter=2000, tol=1e-8)
         self.assertTrue(np.all(np.diff(np.asarray(ll)) >= -1e-9), "EM log-likelihood decreased")
 
+    def test_numba_em_equivalent_to_reference(self) -> None:
+        # The numba EM kernel is numerically-equivalent to the numpy/scipy reference EM
+        # (`_npmle_em_pyloop`): the converged posterior scores match well within the EM's own
+        # approximation tolerance (the component gate accepts 1e-4 vs an independent SLSQP NPMLE), so
+        # the wallet RANKING — the only property the bake-off verdict depends on — is unchanged.
+        import ranker.estimators as est
+        rng = np.random.default_rng(7)
+        n = 300
+        x = rng.standard_normal(n) * 0.4
+        se = rng.uniform(0.1, 0.4, n)
+        grid = np.linspace(x.min(), x.max(), 64)
+        s_numba, _ = _npmle_scores(x, se, grid, max_iter=2000, tol=1e-8)
+        _orig = est._npmle_em
+        est._npmle_em = est._npmle_em_pyloop
+        try:
+            s_ref, _ = _npmle_scores(x, se, grid, max_iter=2000, tol=1e-8)
+        finally:
+            est._npmle_em = _orig
+        self.assertLess(float(np.abs(s_numba - s_ref).max()), 1e-6)        # << the gate's 1e-4 bar
+        order_numba = np.argsort(-s_numba, kind="stable")
+        order_ref = np.argsort(-s_ref, kind="stable")
+        self.assertTrue(np.array_equal(order_numba, order_ref), "ranking changed")
+
     def test_far_from_grid_precise_wallet_not_underflowed(self) -> None:
         # A precise wallet (tiny se) whose mean falls BETWEEN grid nodes: the LINEAR likelihood row
         # underflows to all-zero, so the old EM scored it 0.0 regardless of skill. Log space keeps the

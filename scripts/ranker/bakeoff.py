@@ -50,6 +50,7 @@ import multiprocessing
 import os
 import shutil
 import subprocess
+import time
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -259,9 +260,17 @@ def _wallet_sharpe_moments(in_sample: SuffStats, wallets, weights=None) -> pd.Da
     RangeIndex; ``None`` -> uniform (bitwise-identical to the legacy unweighted gate). Wallets with
     < 2 effective positions or zero dispersion are omitted (zero-dispersion positives are handled by
     the caller — see A10)."""
+    # O(n), not O(wallets x rows): group the frame ONCE instead of re-filtering `in_sample` by a string
+    # == for every candidate (~billions of comparisons per cell at full-universe scale). groupby
+    # (sort=False) keeps each wallet's rows in original order WITH their original RangeIndex, so `net`,
+    # `g.index` and the positional `weights[g.index]` — hence every moment — are BIT-IDENTICAL to the
+    # per-wallet filter; iterating `wallets` preserves the output row order.
+    groups = dict(tuple(in_sample[in_sample["wallet"].isin(set(wallets))].groupby("wallet", sort=False)))
     rows = []
     for wallet in wallets:
-        g = in_sample[in_sample["wallet"] == wallet]
+        g = groups.get(wallet)
+        if g is None:
+            continue
         net = ((g["payoff"] - g["_eff"]) / g["_eff"]).to_numpy()
         if net.size < 2:
             continue
@@ -280,9 +289,10 @@ def _zero_dispersion_positive(in_sample: SuffStats, wallets) -> set:
     pick for one — it bypasses the bar instead of being dropped as sub-threshold. (Rare in practice:
     sd==0 requires identical net edge across positions, which differing entry prices preclude — so
     this only ever force-keeps a wallet an estimator already chose to score.)"""
+    # O(n) groupby, not the O(wallets x rows) per-wallet re-filter (returns a set, so order is
+    # irrelevant). Each wallet's `net` is identical to the filter version -> same keep set, bit-identical.
     keep = set()
-    for wallet in wallets:
-        g = in_sample[in_sample["wallet"] == wallet]
+    for wallet, g in in_sample[in_sample["wallet"].isin(set(wallets))].groupby("wallet", sort=False):
         net = ((g["payoff"] - g["_eff"]) / g["_eff"]).to_numpy()
         # isclose, not == 0: a mathematically-constant series can carry ~1e-16 std from float
         # accumulation (np.std of 6 identical values != 0.0 exactly), so an exact test is fragile.
@@ -585,6 +595,28 @@ def _score_cached(estimator, candidates, *, as_of, weights, key, cache):
     return cached.copy()
 
 
+def _deflation_cached(scores, in_sample, deflator, *, n_trials, weights, key, cache):
+    """``apply_deflation_gate`` memoized per ``key = (estimator, criteria, as_of, deflator)``. The gate's
+    kept-wallet set is a pure function of ``(in_sample[criteria,as_of], scores.index, deflator,
+    n_trials, weights)`` — all fixed by that key (``scores`` comes from the per-(estimator,criteria,as_of)
+    score memo, so it is identical across the policy/churn configs that share the key, and
+    ``n_trials = len(scores)`` with it) — so the grid recomputed the O(positions) DSR gate once per
+    ``(policy x churn)`` combo (8x on the default grid). ``NO_DEFLATION`` is a cheap passthrough (not
+    cached). Returns a ``.copy()`` so the policy step cannot alias the cached frame -> BIT-IDENTICAL to
+    the uncached gate. ``cache=None`` disables; ``_SingleFlightCache`` / plain ``dict`` both accepted."""
+    if deflator == NO_DEFLATION or cache is None:
+        return apply_deflation_gate(scores, in_sample, deflator, n_trials=n_trials, weights=weights)
+    if hasattr(cache, "get_or_compute"):
+        return cache.get_or_compute(
+            key, lambda: apply_deflation_gate(scores, in_sample, deflator,
+                                              n_trials=n_trials, weights=weights)).copy()
+    cached = cache.get(key)
+    if cached is None:
+        cached = apply_deflation_gate(scores, in_sample, deflator, n_trials=n_trials, weights=weights)
+        cache[key] = cached
+    return cached.copy()
+
+
 def _screen_one_as_of(ss_c, as_of, estimators, criteria, train_secs, horizon_secs, k, uniqueness_cache):
     """The 8a screen's per-``as_of`` work, factored out so the split + uniqueness are computed ONCE per
     as_of (the old estimator-outer loop recomputed ``split_walkforward`` once per estimator — 5x
@@ -790,7 +822,8 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
                    displacement_margin: int, demoter_kwargs: "dict | None" = None,
                    flat_usd: float = 25.0,
                    uniqueness_cache: "dict | None" = None,
-                   score_cache: "dict | None" = None) -> "TrajectoryResult":
+                   score_cache: "dict | None" = None,
+                   deflation_cache: "dict | None" = None) -> "TrajectoryResult":
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
     of churn (indexed by ``as_of``) PLUS the final-step followed set (A1). Sequential by
     construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
@@ -847,8 +880,13 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
             key=(grid_point.estimator, grid_point.criteria, as_of), cache=score_cache)
         # Per-wallet deflation: n_trials = the CANDIDATE count being selected among (deflation.py
         # contract), NOT N_GRID — the grid trial count is the grid-level Validators' bar (8c).
-        scores = apply_deflation_gate(scores, in_sample, grid_point.deflator,
-                                      n_trials=len(scores), weights=weights)
+        scores = _deflation_cached(                                  # memo across policy/churn (8x)
+            scores, in_sample, grid_point.deflator, n_trials=len(scores), weights=weights,
+            # n_trials in the key: the DSR null bar is O(log n_trials), so a cache entry must never be
+            # reused for a different candidate count (today len(scores) is pinned by the score memo, but
+            # keying it is robust if a future estimator's candidate set ever varies for the triple).
+            key=(grid_point.estimator, grid_point.criteria, as_of, grid_point.deflator, len(scores)),
+            cache=deflation_cache)
         if scores.empty:
             _no_signal()                                             # A9 + #445: no surviving signal
             continue
@@ -938,20 +976,26 @@ class _SubprocessRunnerFactory:
 _PROCESS_SS = None
 
 
-def _run_trajectory_chunk(chunk, runner_factory, worker_id, kwargs):
+def _run_trajectory_chunk(chunk, runner_factory, worker_id, kwargs, progress_dir=None):
     """Process-pool worker: run a chunk of grid points against the fork-inherited ``_PROCESS_SS`` with
     THIS worker's own runner (isolated output dir, private memo) and a private uniqueness cache.
     Returns ``(results, calls, lookups)``. Each trajectory is a deterministic pure function of
-    ``(grid_point, ss, params)``, so which worker runs which chunk cannot change any result."""
+    ``(grid_point, ss, params)``, so which worker runs which chunk cannot change any result. Heartbeats
+    each finished config to a per-worker ``progress.w<id>.jsonl`` so the run is observable across the
+    fork boundary (the parent never sees individual configs in the process executor)."""
     ss = _PROCESS_SS
     if ss is None:
         raise RuntimeError("_run_trajectory_chunk: _PROCESS_SS not set (fork inheritance failed)")
     runner = runner_factory(worker_id)
     uniqueness: dict = {}                      # private, serial within the worker -> a plain dict suffices
     score: dict = {}                           # same: memo estimator scores across this criteria's configs
-    results = {gp.key: run_trajectory(gp, ss, runner, uniqueness_cache=uniqueness,
-                                      score_cache=score, **kwargs)
-               for gp in chunk}
+    deflation: dict = {}                       # same: memo the DSR gate across this criteria's configs
+    results = {}
+    for done, gp in enumerate(chunk, 1):
+        results[gp.key] = run_trajectory(gp, ss, runner, uniqueness_cache=uniqueness,
+                                         score_cache=score, deflation_cache=deflation, **kwargs)
+        _log_progress(progress_dir, "config_done", worker=worker_id, config=gp.key,
+                      done=done, chunk_total=len(chunk), _file=f"progress.w{worker_id}.jsonl")
     return results, runner.calls, runner.lookups
 
 
@@ -967,7 +1011,7 @@ def _partition_by_criteria(grid: list) -> list:
     return list(groups.values())
 
 
-def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs):
+def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs, progress_dir=None):
     """Process executor: partition by criteria, fork workers sharing ``ss`` copy-on-write, gather and
     merge. Aggregate memo stats are summed back into the parent ``runner`` so ``run_bakeoff``'s
     ``backtest_calls`` still reports: ``total`` (lookups) is identical to serial, but ``distinct``
@@ -976,7 +1020,7 @@ def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwa
     is rebuilt in grid order by the caller); only the dedup COUNT, never a return value, can differ."""
     global _PROCESS_SS
     kw = {k: v for k, v in kwargs.items()                               # each worker owns its own
-          if k not in ("uniqueness_cache", "score_cache")}
+          if k not in ("uniqueness_cache", "score_cache", "deflation_cache")}
     chunks = _partition_by_criteria(grid)
     ctx = multiprocessing.get_context("fork")
     results: dict = {}
@@ -984,7 +1028,7 @@ def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwa
     _PROCESS_SS = ss                           # set BEFORE the pool: fork workers inherit it COW
     try:
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
-            futs = [pool.submit(_run_trajectory_chunk, chunk, runner_factory, i, kw)
+            futs = [pool.submit(_run_trajectory_chunk, chunk, runner_factory, i, kw, progress_dir)
                     for i, chunk in enumerate(chunks)]
             for fut in futs:
                 res, calls, lookups = fut.result()
@@ -1024,16 +1068,25 @@ def run_trajectories(grid: list, ss: SuffStats, runner, *, max_workers: int = 1,
     ``(grid_point, ss, params)``, the memo/uniqueness caches are pure-of-key, and the matrix columns
     are assembled in fixed GRID order below — never completion/partition order. ``max_workers <= 1`` is
     the original serial path."""
+    progress_dir = kwargs.pop("progress_dir", None)        # logging sink, not a run_trajectory arg
+    n_total = len(grid)
     if max_workers and max_workers > 1 and len(grid) > 1 and executor == "process":
         if runner_factory is None:
             raise ValueError("run_trajectories(executor='process') requires a runner_factory")
-        results = _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs)
+        results = _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs,
+                                            progress_dir)
     elif max_workers and max_workers > 1 and len(grid) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {gp.key: pool.submit(run_trajectory, gp, ss, runner, **kwargs) for gp in grid}
-            results = {key: fut.result() for key, fut in futures.items()}
+            results = {}
+            for done, (key, fut) in enumerate(futures.items(), 1):
+                results[key] = fut.result()
+                _log_progress(progress_dir, "config_done", config=key, done=done, total=n_total)
     else:
-        results = {gp.key: run_trajectory(gp, ss, runner, **kwargs) for gp in grid}
+        results = {}
+        for done, gp in enumerate(grid, 1):
+            results[gp.key] = run_trajectory(gp, ss, runner, **kwargs)
+            _log_progress(progress_dir, "config_done", config=gp.key, done=done, total=n_total)
     # Assemble in GRID order (not results-insertion / completion / partition order) so the column
     # order — and every downstream Validator that reads the matrix positionally — is identical across
     # serial / thread / process. (Iterate `grid` to make the invariant explicit.)
@@ -1370,9 +1423,27 @@ class BakeoffParams:
                 "invariant; raise --step-days to >= --horizon-days)")
 
 
+def _log_progress(progress_dir, event: str, **fields) -> None:
+    """Append one ``{ts, event, ...}`` JSON line to ``<progress_dir>/<file>.jsonl`` (default
+    ``progress.jsonl``; pass ``_file=`` for a per-worker stream so concurrent process-pool workers don't
+    interleave). No-op when ``progress_dir`` is falsy. A long run MUST be a ``tail -f`` — phase
+    boundaries + per-config heartbeats with counts/elapsed — never a black box (the 'robust JSONL
+    progress logging' rule). Best-effort: logging can never raise into the run."""
+    if not progress_dir:
+        return
+    fname = fields.pop("_file", "progress.jsonl")
+    rec = {"ts": round(time.time(), 3), "event": event, **fields}
+    try:
+        with open(os.path.join(progress_dir, fname), "a") as fh:
+            fh.write(json.dumps(rec, default=str) + "\n")
+    except OSError:
+        pass
+
+
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
                 created_at: int = 0, seed: int = 0, max_workers: int = 1,
-                executor: str = "thread", runner_factory=None) -> dict:
+                executor: str = "thread", runner_factory=None,
+                progress_dir: "str | None" = None) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
     PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
     horizon objective the trajectories optimize, so it could drop an estimator the true objective
@@ -1400,13 +1471,20 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     # single-flight so the parallel `run_trajectories` seam computes each cold pass exactly once.
     uniqueness_cache = _SingleFlightCache()
     score_cache = _SingleFlightCache()           # #451-style memo of estimator scores across the grid
+    deflation_cache = _SingleFlightCache()       # same, for the per-(estimator,criteria,as_of,deflator) DSR gate
     # #445 defect 4: the 8a screen runs for its ADVISORY ranking only — it no longer prunes the
     # estimator axis (its forward-payoff proxy mismatches the realized + CLOB-MTM horizon objective).
+    _log_progress(progress_dir, "screen_start", n_estimators=len(axes.estimators),
+                  n_configs=n_grid_full, n_as_of=len(params.as_of_points),
+                  executor=executor, workers=max_workers)
+    _t_phase = time.time()
     screen_advisory = screen_estimators(
         ss, list(axes.estimators), as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, keep=params.screen_keep, criteria=axes.criteria[0],   # A3: canonical criteria
         uniqueness_cache=uniqueness_cache, max_workers=max_workers, executor=executor)
+    _log_progress(progress_dir, "screen_done", secs=round(time.time() - _t_phase, 1),
+                  survivors=screen_advisory)
     run_axes = axes                              # no pruning: the run-set IS the full pre-screen grid
     manifest = pre_register_grid(run_axes, created_at=created_at)
     grid = run_axes.enumerate_grid()
@@ -1423,18 +1501,27 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
             raise ValueError("run_bakeoff(executor='process') needs a SubprocessBacktestRunner or an "
                              "explicit runner_factory")
         rf = _SubprocessRunnerFactory(runner.binary, runner.cache_path, str(runner.output_dir))
+    _log_progress(progress_dir, "grid_start", n_configs=len(grid),
+                  n_as_of=len(params.as_of_points), executor=executor, workers=max_workers)
+    _t_phase = time.time()
     return_matrix, results = run_trajectories(
         grid, ss, memo_runner, max_workers=max_workers, executor=executor, runner_factory=rf,
         as_of_points=params.as_of_points,
         train_secs=params.train_secs, horizon_secs=params.horizon_secs,
         k=params.k, displacement_margin=params.displacement_margin,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
-        uniqueness_cache=uniqueness_cache, score_cache=score_cache)
+        uniqueness_cache=uniqueness_cache, score_cache=score_cache,
+        deflation_cache=deflation_cache, progress_dir=progress_dir)
+    _log_progress(progress_dir, "grid_done", secs=round(time.time() - _t_phase, 1),
+                  n_configs=len(grid))
+    _t_phase = time.time()
     split_at = int(np.median(params.as_of_points))
     cpr = wallet_persistence_cpr(ss, split_at=split_at)
     decision = select_winner_or_nogo(
         return_matrix, baseline_key=baseline_key, n_grid=manifest["n_grid"],
         n_grid_full=n_grid_full, cpr=cpr, seed=seed, min_periods=params.min_periods)
+    _log_progress(progress_dir, "honesty_done", secs=round(time.time() - _t_phase, 1),
+                  status=decision.get("status"), winner=decision.get("winner"))
     # A1 (#436): the deliverable is the WINNING trajectory's frozen final-step followed set (the set
     # the winner actually rode), selected directly from the captured results — never a cold re-score
     # at the latest as_of (which degenerates stateful policies). Falls back to the baseline on NO-GO.
@@ -1666,7 +1753,11 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
         print(f"candidate universe bounded to {len(universe):,} wallets "
               f"(positions in [{args.universe_pos_min}, {args.universe_pos_max}]"
               f"{f', top {args.max_wallets} by activity' if args.max_wallets else ''})")
+    _log_progress(str(out_dir), "materialize_start", n_wallets=(len(universe) if universe else None))
+    _t_mat = time.time()
     ss = suff_stats_mod.materialize(con, wallets=universe)
+    _log_progress(str(out_dir), "materialize_done", secs=round(time.time() - _t_mat, 1),
+                  n_positions=len(ss), n_wallets=int(ss["wallet"].nunique()))
 
     day = 86_400
     as_of_points = [args.start_unix + i * args.step_days * day for i in range(args.steps)]
@@ -1689,7 +1780,7 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
         churn_costs=(0.0, args.churn_cost))               # D3 (#436): {free, anchored} cost sweep
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()),
-                         max_workers=args.workers, executor=args.executor)
+                         max_workers=args.workers, executor=args.executor, progress_dir=str(out_dir))
 
     # #445 defect 10: surface the true-CLV preflight in the decision payload + a dedicated file so the
     # `true_clv` exclusion is VISIBLE in operator output, never a silent all-NaN ranking.

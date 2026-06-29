@@ -7,6 +7,7 @@ remaining menu estimators are pluggable drop-ins behind the same Protocol (issue
 "v1 build scope").
 """
 import numpy as np
+from numba import njit
 import pandas as pd
 from scipy.special import logsumexp
 from scipy.stats import norm
@@ -138,17 +139,74 @@ class TStatBaseline:
         return df[["score", "rank"]]
 
 
+@njit(cache=True, fastmath=False)
+def _npmle_em_kernel(log_like, max_iter, tol):
+    """numba EM: the SAME Kiefer-Wolfowitz fixed-point iteration as ``_npmle_em_pyloop``, with the
+    per-row log-sum-exp (``rmax`` + ``log(sum(exp(.-rmax)))``) and the responsibility M-step fused into
+    one compiled pass — no per-iteration n×k temporaries, no scipy ``logsumexp`` dispatch (~48k calls).
+    Not bit-identical to the numpy/scipy loop (numba ``exp``/``log`` + sequential sums differ ~1e-12),
+    but the EM is itself an approximation the component gate accepts to 1e-4/1e-6 vs an independent
+    SLSQP NPMLE, so the converged ``pi`` — and the resulting wallet RANKING — are unchanged."""
+    n, k = log_like.shape
+    pi = np.full(k, 1.0 / k)
+    ll_history = np.empty(max_iter)
+    log_pi = np.empty(k)
+    new_pi = np.empty(k)
+    used = 0
+    for it in range(max_iter):
+        for j in range(k):
+            log_pi[j] = np.log(pi[j]) if pi[j] > 0.0 else -np.inf   # -inf where pi == 0 (NPMLE is sparse)
+            new_pi[j] = 0.0
+        ll_sum = 0.0
+        ll_c = 0.0                                              # Kahan compensation (see below)
+        for i in range(n):
+            rmax = -np.inf
+            for j in range(k):
+                v = log_like[i, j] + log_pi[j]
+                if v > rmax:
+                    rmax = v
+            s = 0.0
+            for j in range(k):
+                s += np.exp((log_like[i, j] + log_pi[j]) - rmax)
+            log_row = np.log(s) + rmax                          # log marginal for wallet i
+            ll_y = log_row - ll_c                                # Kahan-compensated accumulation so the
+            ll_t = ll_sum + ll_y                                # marginal loglik stays accurate to ~eps
+            ll_c = (ll_t - ll_sum) - ll_y                       # (not O(n.eps) drift) at 4e5+ wallets,
+            ll_sum = ll_t                                       # keeping the monotonicity guard robust
+            for j in range(k):
+                new_pi[j] += np.exp((log_like[i, j] + log_pi[j]) - log_row)   # E-step responsibility
+        maxchange = 0.0
+        for j in range(k):
+            new_pi[j] /= n                                      # M-step
+            d = new_pi[j] - pi[j]
+            if d < 0.0:
+                d = -d
+            if d > maxchange:
+                maxchange = d
+        ll_history[it] = ll_sum
+        used = it + 1
+        for j in range(k):
+            pi[j] = new_pi[j]
+        if maxchange < tol:
+            break
+    return pi, ll_history[:used]
+
+
 def _npmle_em(log_like: np.ndarray, *, max_iter: int, tol: float) -> "tuple[np.ndarray, list]":
-    """Kiefer-Wolfowitz NPMLE mixing weights by EM in LOG space (#436 C2).
+    """Kiefer-Wolfowitz NPMLE mixing weights by EM in LOG space (#436 C2). numba-accelerated via
+    :func:`_npmle_em_kernel`; :func:`_npmle_em_pyloop` is the original numpy/scipy reference.
 
     ``log_like[i, k] = log N(x_i; grid_k, se_i^2)``. Returns ``(pi, ll_history)`` — the grid mixing
     distribution and the per-iteration marginal log-likelihood. The E-step normalises via log-sum-exp
     so a wallet whose mean falls many ``se`` from every grid node keeps well-defined responsibilities
-    instead of underflowing its whole likelihood row to 0.0 (which the old linear EM then scored 0.0
-    regardless of skill). The EM marginal log-likelihood is monotone non-decreasing — the drift guard
-    asserts ``ll_history`` never falls, catching a broken E/M step (a separate guard pins the verdict
-    invariant to the iteration cap).
-    """
+    instead of underflowing its whole likelihood row to 0.0. The EM marginal log-likelihood is monotone
+    non-decreasing — the component-gate drift check asserts ``ll_history`` never falls (to 1e-9)."""
+    pi, ll_history = _npmle_em_kernel(np.ascontiguousarray(log_like, dtype=np.float64), max_iter, tol)
+    return pi, list(ll_history)
+
+
+def _npmle_em_pyloop(log_like: np.ndarray, *, max_iter: int, tol: float) -> "tuple[np.ndarray, list]":
+    """Reference numpy/scipy EM (pre-numba). Retained as the equivalence oracle for the kernel."""
     pi = np.full(log_like.shape[1], 1.0 / log_like.shape[1])
     ll_history: list = []
     for _ in range(max_iter):
