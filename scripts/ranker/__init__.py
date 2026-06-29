@@ -106,11 +106,15 @@ class CapacityFilter(Protocol):
 
 @runtime_checkable
 class Demoter(Protocol):
-    """Per-wallet demotion decision from accumulated live copy P&L."""
+    """Demotion decision from accumulated live copy P&L. ``should_demote`` is the single-wallet
+    predicate; ``demote_set`` is the batched form the selection policies use — every demotion in one
+    pass, NOT a per-wallet rescan of ``live_pnl`` (an implementation must provide both)."""
 
     name: str
 
     def should_demote(self, wallet: str, live_pnl: pd.DataFrame, *, as_of: int) -> bool: ...
+
+    def demote_set(self, live_pnl: pd.DataFrame, *, as_of: int) -> set: ...
 
 
 @runtime_checkable
