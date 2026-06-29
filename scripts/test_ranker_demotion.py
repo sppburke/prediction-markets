@@ -54,6 +54,19 @@ class EmpiricalBernsteinDemoterTest(unittest.TestCase):
         pnl = _pnl("loser", [-10.0] * 8, start=100)             # period_end 100..107
         self.assertFalse(self.demoter.should_demote("loser", pnl, as_of=103))  # only 4 <= as_of
 
+    def test_demote_set_matches_should_demote_loop(self) -> None:
+        # `demote_set` (one groupby over the closed periods) is BIT-IDENTICAL to calling `should_demote`
+        # per wallet — the O(n) replacement for the per-incumbent object-`==` rescan the policy did in
+        # its selection loop. Mixed population so the kept set is non-trivial.
+        lp = pd.concat([_pnl("loser", [-10.0] * 8, start=100),
+                        _pnl("winner", [10.0] * 8, start=100),
+                        _pnl("noisy", [1.0, -1.0, 1.0, -1.0, 1.0, -1.0], start=100),
+                        _pnl("short", [-10.0] * 3, start=100)], ignore_index=True)
+        for as_of in (103, 200, 10_000):
+            loop = {w for w in lp["wallet"].unique()
+                    if self.demoter.should_demote(w, lp, as_of=as_of)}
+            self.assertEqual(self.demoter.demote_set(lp, as_of=as_of), loop)
+
     def test_empty_live_pnl(self) -> None:
         empty = pd.DataFrame(columns=["wallet", "period_end", "realized_pnl"])
         self.assertFalse(self.demoter.should_demote("any", empty, as_of=10_000))

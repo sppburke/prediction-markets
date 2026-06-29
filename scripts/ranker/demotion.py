@@ -13,6 +13,7 @@ The Wood-Zohren ``wallet_skill_cpd`` change-point demoter is a pluggable menu dr
 """
 import math
 
+import numpy as np
 import pandas as pd
 
 
@@ -44,11 +45,10 @@ class EmpiricalBernsteinDemoter:
         self.delta = delta
         self.min_periods = min_periods
 
-    def should_demote(self, wallet: str, live_pnl: pd.DataFrame, *, as_of: int) -> bool:
-        if len(live_pnl) == 0:
-            return False
-        rows = live_pnl[(live_pnl["wallet"] == wallet) & (live_pnl["period_end"] <= as_of)]
-        pnl = rows["realized_pnl"].to_numpy(dtype=float)
+    def _demote_from_pnl(self, pnl: np.ndarray) -> bool:
+        """The Empirical-Bernstein demotion decision for one wallet's closed realized-pnl series.
+        Factored out so a whole live_pnl frame can be judged in a single groupby (``demote_set``)
+        instead of an O(wallets x rows) per-wallet rescan."""
         n = len(pnl)
         if n < self.min_periods:
             return False
@@ -61,6 +61,25 @@ class EmpiricalBernsteinDemoter:
         ln = math.log(2.0 / self.delta)
         deviation = math.sqrt(2.0 * var * ln / n) + 3.0 * rng * ln / n
         return bool(mean + deviation < 0.0)
+
+    def should_demote(self, wallet: str, live_pnl: pd.DataFrame, *, as_of: int) -> bool:
+        if len(live_pnl) == 0:
+            return False
+        rows = live_pnl[(live_pnl["wallet"] == wallet) & (live_pnl["period_end"] <= as_of)]
+        return self._demote_from_pnl(rows["realized_pnl"].to_numpy(dtype=float))
+
+    def demote_set(self, live_pnl: pd.DataFrame, *, as_of: int) -> set:
+        """Every wallet the demoter would demote, computed in ONE ``groupby`` over the periods closed
+        by ``as_of`` — replacing the per-incumbent ``should_demote`` call (each an object-dtype
+        ``wallet ==`` rescan of the whole live_pnl, O(wallets x rows) inside the policy's selection
+        loop). BIT-IDENTICAL: ``groupby(sort=False)`` hands each wallet the same closed rows in the same
+        order as the filter, so the per-wallet ``realized_pnl`` series — and the EB decision — is
+        unchanged."""
+        if len(live_pnl) == 0:
+            return set()
+        closed = live_pnl[live_pnl["period_end"] <= as_of]
+        return {wallet for wallet, g in closed.groupby("wallet", sort=False)
+                if self._demote_from_pnl(g["realized_pnl"].to_numpy(dtype=float))}
 
 
 # Registered by `.name` (issue #421 "Architecture" — each module registered by .name).

@@ -56,8 +56,8 @@ class KnockoutBackfill:
 
     def step(self, prev: FollowSet, fresh: WalletScores, live_pnl: pd.DataFrame, *,
              as_of: int) -> FollowSet:
-        kept = [w for w in (prev["wallet"].to_list() if len(prev) else [])
-                if not self.demoter.should_demote(w, live_pnl, as_of=as_of)]
+        demoted = self.demoter.demote_set(live_pnl, as_of=as_of)   # one groupby, not a per-incumbent rescan
+        kept = [w for w in (prev["wallet"].to_list() if len(prev) else []) if w not in demoted]
         for wallet in fresh.sort_values("rank").index:          # backfill, best-ranked first
             if len(kept) >= self.k:
                 break
@@ -89,14 +89,16 @@ class HybridDisplacement:
         rank = fresh["rank"].to_dict()
         worst_rank = (int(fresh["rank"].max()) if len(fresh) else 0) + 1
 
+        # B2 (#436): mirror the demoter's as-of filter (demotion.py). live_pnl accumulates each step's
+        # forward horizon window, so by this step it holds rows with period_end > as_of from PRIOR
+        # steps; counting them would let FUTURE periods mark an incumbent "proven" and shield it from
+        # displacement. Only periods CLOSED by as_of count. Precomputed in ONE value_counts (was an
+        # object-dtype `wallet ==` rescan of live_pnl per (challenger, incumbent) — O(n²) at scale).
+        _closed_w = live_pnl.loc[live_pnl["period_end"] <= as_of, "wallet"] if len(live_pnl) else None
+        n_periods_map = _closed_w.value_counts().to_dict() if _closed_w is not None else {}
+
         def n_periods(wallet: str) -> int:
-            # B2 (#436): mirror the demoter's as-of filter (demotion.py). live_pnl accumulates each
-            # step's forward horizon window, so by this step it holds rows with period_end > as_of
-            # from PRIOR steps; counting them would let FUTURE periods mark an incumbent "proven" and
-            # shield it from displacement. Only periods closed by as_of count as live evidence.
-            if not len(live_pnl):
-                return 0
-            return int(((live_pnl["wallet"] == wallet) & (live_pnl["period_end"] <= as_of)).sum())
+            return int(n_periods_map.get(wallet, 0))
 
         for challenger in fresh.sort_values("rank").index:      # best challengers first
             if challenger in kept:
