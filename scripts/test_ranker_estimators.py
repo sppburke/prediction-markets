@@ -26,6 +26,7 @@ from ranker.estimators import (  # noqa: E402
     TrueCLV,
     TStatBaseline,
     _npmle_scores,
+    clv_diagnostic,
 )
 from ranker_decay import weighted_stats  # noqa: E402
 from scipy.stats import norm  # noqa: E402
@@ -309,6 +310,55 @@ class TrueCLVTest(unittest.TestCase):
         out = TrueCLV().score(ss, as_of=0, weights=np.ones(len(ss)))
         self.assertTrue(out.empty)
         self.assertEqual(list(out.columns), ["score", "rank"])
+
+
+class ClvDiagnosticTest(unittest.TestCase):
+    """#466: clv_diagnostic reduces _weighted_clv_tstat to one t-stat per close source and reports
+    INDEPENDENT per-source coverage (close_proxy vs true_clv_close are independent joins), short-
+    circuiting to (nan, 0.0) for both sources on the never-live / empty-followed-set guards."""
+
+    def _in_sample(self) -> pd.DataFrame:
+        # 3 wallets × 4 positions; close_proxy fully covered, true_clv_close covered for 2 of 3
+        # wallets ('mid' has no CLOB series) -> independent coverage, no true<=proxy invariant.
+        proxy = {"good": [0.60, 0.65, 0.55, 0.62], "bad": [0.30, 0.35, 0.32, 0.28],
+                 "mid": [0.50, 0.52, 0.48, 0.51]}
+        true = {"good": [0.61, 0.66, 0.56, 0.63], "bad": [0.31, 0.36, 0.33, 0.29],
+                "mid": [float("nan")] * 4}
+        rows = [(w, 0.40, proxy[w][i], true[w][i]) for w in ("good", "bad", "mid") for i in range(4)]
+        return pd.DataFrame(
+            rows, columns=["wallet", "price", "close_proxy", "true_clv_close"]).reset_index(drop=True)
+
+    @staticmethod
+    def _follow(wallets) -> pd.DataFrame:
+        return pd.DataFrame({"wallet": list(wallets), "weight": [1.0] * len(wallets)})
+
+    def test_four_keys_independent_coverage_and_finite_tstats(self) -> None:
+        ins = self._in_sample()
+        out = clv_diagnostic(ins, self._follow(["good", "bad", "mid"]), np.ones(len(ins)))
+        self.assertEqual(set(out), {"proxy_clv_tstat", "proxy_clv_cov",
+                                    "true_clv_tstat", "true_clv_cov"})
+        self.assertEqual(out["proxy_clv_cov"], 1.0)                 # 12/12 close_proxy covered
+        self.assertAlmostEqual(out["true_clv_cov"], 8 / 12)        # 'mid' (4) NaN -> 8/12 (independent)
+        self.assertTrue(np.isfinite(out["proxy_clv_tstat"]))
+        self.assertTrue(np.isfinite(out["true_clv_tstat"]))
+
+    def test_empty_follow_is_nan_zero(self) -> None:
+        ins = self._in_sample()
+        out = clv_diagnostic(ins, self._follow([]), np.ones(len(ins)))
+        self.assertTrue(np.isnan(out["proxy_clv_tstat"]) and out["proxy_clv_cov"] == 0.0)
+        self.assertTrue(np.isnan(out["true_clv_tstat"]) and out["true_clv_cov"] == 0.0)
+
+    def test_weights_none_is_nan_zero(self) -> None:
+        ins = self._in_sample()
+        out = clv_diagnostic(ins, self._follow(["good", "bad"]), None)
+        self.assertTrue(np.isnan(out["proxy_clv_tstat"]) and out["proxy_clv_cov"] == 0.0)
+        self.assertTrue(np.isnan(out["true_clv_tstat"]) and out["true_clv_cov"] == 0.0)
+
+    def test_single_followed_wallet_is_nan_zero(self) -> None:
+        ins = self._in_sample()
+        out = clv_diagnostic(ins, self._follow(["good"]), np.ones(len(ins)))   # <2 followed wallets
+        self.assertTrue(np.isnan(out["proxy_clv_tstat"]) and out["proxy_clv_cov"] == 0.0)
+        self.assertTrue(np.isnan(out["true_clv_tstat"]) and out["true_clv_cov"] == 0.0)
 
 
 class FloatFragilitySDFloorTest(unittest.TestCase):

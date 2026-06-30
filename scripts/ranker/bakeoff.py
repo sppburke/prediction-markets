@@ -74,7 +74,7 @@ from ranker_decay import weighted_stats  # reuse #366 weighted statistics — ga
 from . import Criteria, FollowSet, SuffStats, WalletScores
 from .demotion import EmpiricalBernsteinDemoter
 from .deflation import DeflatedSharpe
-from .estimators import REGISTRY as ESTIMATOR_REGISTRY, _SD_FLOOR
+from .estimators import REGISTRY as ESTIMATOR_REGISTRY, _SD_FLOOR, clv_diagnostic
 from .oos_validation import (
     HansenSPA,
     PBO,
@@ -182,11 +182,19 @@ class BakeoffAxes:
             self.estimators, self.deflators, self.policies, self.criteria, self.churn_costs)]
 
 
-def pre_register_grid(axes: BakeoffAxes, *, created_at: int = 0) -> dict:
+def pre_register_grid(axes: BakeoffAxes, *, created_at: int = 0,
+                      grid_override: "list | None" = None) -> dict:
     """8b — enumerate the grid and freeze ``N_GRID`` into a run manifest. ``N_GRID`` is the
     ``n_trials`` every grid-level Validator/Deflator is later given; nothing may be added to the
-    SCORED grid afterwards (LANDMINE-1)."""
-    grid = axes.enumerate_grid()
+    SCORED grid afterwards (LANDMINE-1).
+
+    #466 (confirmatory mode): ``grid_override`` substitutes a hand-picked SCORED grid for the
+    cartesian ``axes.enumerate_grid()`` — so ``n_grid`` / ``grid_keys`` reflect the override (the
+    13-config matrix the bootstrap Validators run on) while the DSR multiplicity stays the full
+    pre-screen ``n_grid_full`` (driven by the ``run_bakeoff`` local, never this manifest). The
+    extra ``n_grid_full`` / ``confirmatory`` manifest fields are recorded ONLY when an override is
+    set (provenance-only), so a default run is byte-identical to before."""
+    grid = axes.enumerate_grid() if grid_override is None else list(grid_override)
     keys = [g.key for g in grid]
     if len(set(keys)) != len(keys):
         # A8 (#436): a key collision silently merges two distinct configs into one matrix column,
@@ -195,7 +203,7 @@ def pre_register_grid(axes: BakeoffAxes, *, created_at: int = 0) -> dict:
         dupes = sorted(k for k, c in Counter(keys).items() if c > 1)
         raise ValueError(f"grid key collision: {len(dupes)} duplicate config key(s), e.g. "
                          f"{dupes[:3]} — distinct GridPoints must produce distinct keys")
-    return {
+    manifest = {
         "created_at": created_at,
         "n_grid": len(grid),
         "axes": {
@@ -205,6 +213,11 @@ def pre_register_grid(axes: BakeoffAxes, *, created_at: int = 0) -> dict:
         },
         "grid_keys": [g.key for g in grid],
     }
+    if grid_override is not None:
+        # Provenance only: the DSR bar reads the run_bakeoff `n_grid_full` local, not this field.
+        manifest["n_grid_full"] = len(axes.enumerate_grid())
+        manifest["confirmatory"] = True
+    return manifest
 
 
 # ───────────────────────── criteria + eligibility ─────────────────────────
@@ -248,6 +261,33 @@ def build_criteria_grid(*, ttr_hours_levels=TTR_HOURS_LEVELS, price_bands=PRICE_
         Criteria(active_within_secs, ttr, pmin, pmax, half_life_days, trl)
         for ttr, (pmin, pmax), trl in itertools.product(
             ttr_hours_levels, price_bands, min_trl_levels))
+
+
+def build_default_axes(args_like=None, *, estimators) -> "BakeoffAxes":
+    """The canonical full ``BakeoffAxes`` — the single source of truth for the DSR multiplicity
+    (#466 architecture). ``estimators`` is the POST-``true_clv_preflight`` tuple (computed in
+    ``main`` from ``ss`` + ``clv_views``); it is passed in, NOT re-derived here — this function never
+    re-runs the preflight. ``args_like`` (an argparse ``Namespace``) supplies the operator's swept
+    levels for a normal run; ``None`` -> the committed full-sweep defaults (3·TTR × 2·band × 2·MinTRL
+    criteria, all four policies, ``{0, ranker_churn_cost_usd}`` churn), which is what the confirmatory
+    path uses so its honest ``n_grid_full`` is the full pre-screen multiplicity regardless of any CLI
+    narrowing. Builds the deflator axis ``(none, deflated_sharpe)`` and ``build_criteria_grid`` with
+    KEYWORD args (the builder is keyword-only)."""
+    if args_like is None:
+        policies = (FullRerank.name, KnockoutBackfill.name,
+                    HybridDisplacement.name, OnlineWeighting.name)
+        ttr, bands, min_trl = TTR_HOURS_LEVELS, PRICE_BANDS, MIN_TRL_LEVELS
+        churn = RANKER_CHURN_COST_USD
+    else:
+        policies = tuple(args_like.policies)
+        ttr, bands, min_trl = tuple(args_like.ttr_hours), tuple(args_like.bands), tuple(args_like.min_trl)
+        churn = args_like.churn_cost
+    return BakeoffAxes(
+        estimators=tuple(estimators),
+        deflators=(NO_DEFLATION, DeflatedSharpe.name),
+        policies=policies,
+        criteria=build_criteria_grid(ttr_hours_levels=ttr, price_bands=bands, min_trl_levels=min_trl),
+        churn_costs=(0.0, churn))
 
 
 # ───────────────────────── deflation gate (per-wallet) ─────────────────────────
@@ -815,6 +855,14 @@ class TrajectoryResult:
     # censored -1s are tallied in coverage["censored"], not here) for open-at-horizon
     # positions — the resolution-lag distribution. ADVISORY reporting only.
     lags_by_period: dict = field(default_factory=dict)
+    # #466: the final-step followed set's proxy/true CLV t-stat + per-source coverage — a DIAGNOSTIC
+    # carried alongside the realized-$ + MTM verdict (never an input to it). Computed in-trajectory
+    # AFTER the P&L loop over the last-as_of in_sample split (the positional-weights contract frame);
+    # honest sentinels (NaN t-stat / 0.0 coverage) for a never-live or no-signal-final config.
+    proxy_clv_tstat: float = float("nan")
+    proxy_clv_cov: float = 0.0
+    true_clv_tstat: float = float("nan")
+    true_clv_cov: float = 0.0
 
 
 def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points: list,
@@ -851,6 +899,10 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     final_scores: WalletScores = pd.DataFrame(columns=["score", "rank"])
     coverage_rows: dict = {}                                          # E3: as_of -> (open, marked, ...)
     lags_by_period: dict = {}                                         # F3a: as_of -> resolved lags
+    # #466 / P2-B1: `weights` is bound only INSIDE a live period (below, after the candidates.empty
+    # guard), so a config never live in any period would leave it unbound at the post-loop CLV call →
+    # UnboundLocalError. Init it here so the diagnostic short-circuits cleanly on the never-live case.
+    weights = None
 
     def _no_signal() -> None:
         # #445 defect 1: the config held nothing this period. Record NaN, reset `prev` to empty and
@@ -926,10 +978,23 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
         final_follow, final_scores = follow, scores                 # A1: most recent real set
     coverage = pd.DataFrame.from_dict(coverage_rows, orient="index") if coverage_rows else \
         pd.DataFrame(columns=["open_at_horizon", "marked_at_horizon", "positions_in_window", "censored"])
+    # #466: CLV diagnostic over the final-step followed set, computed AFTER the P&L loop (so `returns`
+    # is already frozen — the call cannot perturb `return_matrix`) and NON-mutating, hence provably
+    # inert to the verdict. `in_sample` + `weights` are the LAST-as_of split + its uniqueness weights
+    # — the exact frame `_weighted_clv_tstat`'s positional-weight contract requires. Guarded by
+    # `weights is not None`: a never-live config (weights still None) skips the call entirely (no
+    # `in_sample` reference), and a no-signal-FINAL config (final_follow empty, but weights from a
+    # prior live period) short-circuits inside `clv_diagnostic` on the empty follow — so the rare
+    # in_sample/weights misalignment of that case is never exercised.
+    clv = (clv_diagnostic(in_sample, final_follow, weights) if weights is not None
+           else {"proxy_clv_tstat": float("nan"), "proxy_clv_cov": 0.0,
+                 "true_clv_tstat": float("nan"), "true_clv_cov": 0.0})
     return TrajectoryResult(
         returns=pd.Series(returns, index=list(as_of_points), name=grid_point.key, dtype=float),
         final_follow=final_follow, final_scores=final_scores, coverage=coverage,
-        lags_by_period=lags_by_period)
+        lags_by_period=lags_by_period,
+        proxy_clv_tstat=clv["proxy_clv_tstat"], proxy_clv_cov=clv["proxy_clv_cov"],
+        true_clv_tstat=clv["true_clv_tstat"], true_clv_cov=clv["true_clv_cov"])
 
 
 def _weighted_window_pnl(window: pd.DataFrame, follow: FollowSet) -> float:
@@ -1443,7 +1508,7 @@ def _log_progress(progress_dir, event: str, **fields) -> None:
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
                 created_at: int = 0, seed: int = 0, max_workers: int = 1,
                 executor: str = "thread", runner_factory=None,
-                progress_dir: "str | None" = None) -> dict:
+                progress_dir: "str | None" = None, grid_override: "list | None" = None) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
     PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
     horizon objective the trajectories optimize, so it could drop an estimator the true objective
@@ -1486,10 +1551,28 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     _log_progress(progress_dir, "screen_done", secs=round(time.time() - _t_phase, 1),
                   survivors=screen_advisory)
     run_axes = axes                              # no pruning: the run-set IS the full pre-screen grid
-    manifest = pre_register_grid(run_axes, created_at=created_at)
-    grid = run_axes.enumerate_grid()
+    manifest = pre_register_grid(run_axes, created_at=created_at, grid_override=grid_override)
+    baseline_key = _baseline_key(run_axes)        # validates the baseline ∈ the full pre-registered axes
+    if grid_override is not None:
+        # #466 (confirmatory mode): validate the hand-picked SCORED grid against the full
+        # pre-registered axes. Every override config MUST be a member (else the leaderboard scores a
+        # config the honest DSR bar never counted), the §Acceptance baseline must be present, and keys
+        # must be unique — raise loudly otherwise, never a silent empty-leaderboard NO-GO. The
+        # `n_grid_full` local (above) and the compute ceiling stay on the full 960 axes by design.
+        full_keys = {g.key for g in run_axes.enumerate_grid()}
+        ov_keys = [g.key for g in grid_override]
+        missing = [k for k in ov_keys if k not in full_keys]
+        if missing:
+            raise ValueError(f"grid_override has {len(missing)} config(s) absent from the full axes, "
+                             f"e.g. {missing[:3]} — every override config must be a pre-registered member")
+        if len(set(ov_keys)) != len(ov_keys):
+            raise ValueError("grid_override has duplicate config keys")
+        if baseline_key not in set(ov_keys):
+            raise ValueError(f"grid_override missing the baseline config {baseline_key!r}")
+        grid = list(grid_override)
+    else:
+        grid = run_axes.enumerate_grid()
     grid_by_key = {g.key: g for g in grid}        # A1: thread GridPoints, never re-parse a key
-    baseline_key = _baseline_key(run_axes)
     memo_runner = MemoizingBacktestRunner(runner)   # D2: in-run dedup of repeated followed sets
     # For the process executor each worker needs its OWN runner (private memo + isolated output dir,
     # un-shareable across processes); derive a picklable factory from the SubprocessBacktestRunner.
@@ -1520,6 +1603,20 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
     decision = select_winner_or_nogo(
         return_matrix, baseline_key=baseline_key, n_grid=manifest["n_grid"],
         n_grid_full=n_grid_full, cpr=cpr, seed=seed, min_periods=params.min_periods)
+    # #466: attach the CLV diagnostic AFTER the verdict — structurally inert, since
+    # select_winner_or_nogo received only `return_matrix` + scalars, never these per-config CLV
+    # fields. Index-preserving DataFrame.join (NOT pd.merge: merge would drop the config-key index
+    # and can reorder rows). The leaderboard is empty on the clean-is-None / insufficient-periods
+    # NO-GO paths (guarded); the winner's entry feeds decision["clv_diagnostic"], None on no-winner.
+    clv_cols = pd.DataFrame(
+        {key: {"proxy_clv_tstat": r.proxy_clv_tstat, "proxy_clv_cov": r.proxy_clv_cov,
+               "true_clv_tstat": r.true_clv_tstat, "true_clv_cov": r.true_clv_cov}
+         for key, r in results.items()}).T
+    if not decision["leaderboard"].empty:
+        decision["leaderboard"] = decision["leaderboard"].join(clv_cols)
+    winner_cfg = decision.get("winner")
+    decision["clv_diagnostic"] = (clv_cols.loc[winner_cfg].to_dict()
+                                  if winner_cfg is not None and winner_cfg in clv_cols.index else None)
     _log_progress(progress_dir, "honesty_done", secs=round(time.time() - _t_phase, 1),
                   status=decision.get("status"), winner=decision.get("winner"))
     # A1 (#436): the deliverable is the WINNING trajectory's frozen final-step followed set (the set
@@ -1595,6 +1692,21 @@ def _baseline_key(axes: BakeoffAxes) -> str:
         raise ValueError("baseline config absent from the grid: axes must include "
                          f"{BASELINE_ESTIMATOR}/{NO_DEFLATION}/{BASELINE_POLICY}")
     return key
+
+
+def _git_sha() -> str:
+    """#466: the repo HEAD SHA for the confirmatory run's audit trail (the committed
+    ``confirmatory_grid.py`` is the pre-registration; the SHA ties the run to it). Degrades
+    gracefully to ``"unknown"`` (or a ``-dirty`` suffix on an uncommitted tree) rather than aborting
+    the run if ``git`` is unavailable or the call fails — the audit field stays honest either way."""
+    try:
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                             check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True,
+                               text=True, check=True).stdout.strip()
+        return f"{sha}-dirty" if dirty else sha
+    except Exception:
+        return "unknown"
 
 
 def _parse_band(s: str) -> "tuple[float, float]":
@@ -1685,6 +1797,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          "cold passes (the dominant Python cost on a large universe) — the fastest path "
                          "for the full grid. BIT-IDENTICAL to serial either way; needs the real "
                          "pe-backtest (each trajectory worker gets an isolated output dir).")
+    # #466: confirmatory small-grid mode + its companion knobs.
+    ap.add_argument("--confirmatory", action="store_true",
+                    help="#466: run the pre-registered 13-config MinTRL-20 confirmatory grid "
+                         "(scripts/ranker/confirmatory_grid.py) instead of the full cartesian sweep. "
+                         "The honest Deflated-Sharpe multiplicity stays the full pre-screen "
+                         "n_grid_full (960 on a full-coverage cache); PBO/RW/SPA run on the 13-config "
+                         "matrix. Records git_sha + confirmatory provenance in manifest.json and a "
+                         "clv_diagnostic.json. CEILING: the compute cap gates on the FULL 960 axes, so "
+                         "--steps must be <= 31 (960×32 > ranker_bakeoff_max_backtests); raise "
+                         "--max-backtests to go higher. Use --min-periods 6 for this family.")
+    ap.add_argument("--min-periods", type=int, default=RANKER_MIN_PERIODS,
+                    help="verdict floor: clean walk-forward cutoffs required before the bootstrap "
+                         "panel is trusted (ranker_min_periods, default 24). Pass 6 for the "
+                         "confirmatory MinTRL-20 family — a PRE-REGISTERED floor: a value above the "
+                         "realized clean count self-forces an honest insufficient-periods NO-GO.")
+    ap.add_argument("--max-backtests", type=int, default=RANKER_BAKEOFF_MAX_BACKTESTS,
+                    help="compute ceiling: n_grid_full × steps may not exceed this "
+                         "(ranker_bakeoff_max_backtests, default 30000). The escape hatch for "
+                         "--steps > 31 under --confirmatory (the ceiling gates on the full 960 axes).")
+    ap.add_argument("--no-materialize-concurrency", action="store_true",
+                    help="skip the per-wallet c_t concurrency column in suff_stats.materialize "
+                         "(bit-identical; pure wall-clock win on the full-universe run).")
     return ap
 
 
@@ -1755,14 +1889,16 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
               f"{f', top {args.max_wallets} by activity' if args.max_wallets else ''})")
     _log_progress(str(out_dir), "materialize_start", n_wallets=(len(universe) if universe else None))
     _t_mat = time.time()
-    ss = suff_stats_mod.materialize(con, wallets=universe)
+    ss = suff_stats_mod.materialize(con, wallets=universe,
+                                    with_concurrency=not args.no_materialize_concurrency)
     _log_progress(str(out_dir), "materialize_done", secs=round(time.time() - _t_mat, 1),
                   n_positions=len(ss), n_wallets=int(ss["wallet"].nunique()))
 
     day = 86_400
     as_of_points = [args.start_unix + i * args.step_days * day for i in range(args.steps)]
     params = BakeoffParams(as_of_points=as_of_points, train_secs=args.train_days * day,
-                           horizon_secs=args.horizon_days * day)
+                           horizon_secs=args.horizon_days * day,
+                           min_periods=args.min_periods, max_backtests=args.max_backtests)
     # #445 defect 10: true-CLV preflight BEFORE the grid is frozen. Exclude `true_clv` from the
     # estimator axis when the CLOB views are absent or position-level `true_clv_close` coverage is
     # below `true_clv_coverage_warn_pct`, so it cannot contribute a silent all-NaN arm; abort if the
@@ -1771,16 +1907,38 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
                  and suff_stats_mod._relation_exists(con, "token_conditions"))
     estimators, clv_preflight = true_clv_preflight(
         ss, views_present=clv_views, estimators=tuple(ESTIMATOR_REGISTRY))
-    axes = BakeoffAxes(
-        estimators=estimators, deflators=(NO_DEFLATION, DeflatedSharpe.name),
-        policies=tuple(args.policies),                    # #451: operator-selectable policy sweep
-        criteria=build_criteria_grid(                     # D1 (#436): the swept criteria grid
-            ttr_hours_levels=tuple(args.ttr_hours), price_bands=tuple(args.bands),
-            min_trl_levels=tuple(args.min_trl)),
-        churn_costs=(0.0, args.churn_cost))               # D3 (#436): {free, anchored} cost sweep
+    # The canonical full axes (D1 #436 sweep) — the honest pre-screen DSR multiplicity. A normal run
+    # honours the operator's CLI sweep levels; the confirmatory path forces the committed full default.
+    axes = build_default_axes(args, estimators=estimators)
+    # #466: confirmatory small-grid mode. The full `axes` stay the honest pre-screen multiplicity (its
+    # n_grid_full drives the DSR bar); the run SCORES only the pre-registered 13-config grid.
+    grid_override = None
+    if args.confirmatory:
+        from .confirmatory_grid import (build_confirmatory_axes, build_confirmatory_grid,
+                                        validate_confirmatory_grid)
+        axes = build_confirmatory_axes(estimators)        # full default sweep on the post-preflight tuple
+        grid_override = build_confirmatory_grid()
+        if clv_preflight["true_clv_excluded"]:
+            # Low-coverage cache (<30% true_clv): the 4 true_clv challengers fell out of `axes`, so the
+            # membership check would ValueError on them — filter them out and verdict on the survivors.
+            full_keys = {g.key for g in axes.enumerate_grid()}
+            before = len(grid_override)
+            grid_override = [g for g in grid_override if g.key in full_keys]
+            print(f"WARN --confirmatory: true_clv EXCLUDED by preflight "
+                  f"({clv_preflight['reason']}); filtered grid_override {before} -> "
+                  f"{len(grid_override)} configs (verdict on the survivors, not 13)")
+        else:
+            validate_confirmatory_grid(axes)              # full 13-member integrity check
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()),
-                         max_workers=args.workers, executor=args.executor, progress_dir=str(out_dir))
+                         max_workers=args.workers, executor=args.executor,
+                         progress_dir=str(out_dir), grid_override=grid_override)
+    if args.confirmatory:
+        # Provenance: the committed confirmatory_grid.py IS the pre-registration; the SHA ties this
+        # run to it. pre_register_grid already set manifest["confirmatory"] + ["n_grid_full"].
+        result["manifest"]["git_sha"] = _git_sha()
+        result["manifest"]["confirmatory_grid_source"] = "scripts/ranker/confirmatory_grid.py"
+        result["manifest"]["min_periods_used"] = args.min_periods
 
     # #445 defect 10: surface the true-CLV preflight in the decision payload + a dedicated file so the
     # `true_clv` exclusion is VISIBLE in operator output, never a silent all-NaN ranking.
@@ -1795,6 +1953,10 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     result["decision"]["leaderboard"].to_csv(out_dir / "leaderboard.csv")
     status = {k: v for k, v in result["decision"].items() if k != "leaderboard"}
     (out_dir / "decision.json").write_text(json.dumps(status, indent=2, default=str))
+    # #466: the winner's CLV diagnostic (proxy/true t-stat + per-source coverage), or null on a
+    # NO-GO — a one-file-per-diagnostic sidecar mirroring true_clv_preflight.json / mtm_coverage.json.
+    (out_dir / "clv_diagnostic.json").write_text(
+        json.dumps(result["decision"].get("clv_diagnostic"), indent=2, default=str))
     print(f"bake-off {result['decision']['status']}: {result['decision']['reason']}")
     bc = result["backtest_calls"]                          # D2 (#436): realized memo speedup
     print(f"compute: {len(axes.criteria)} criteria × {result['manifest']['n_grid']} run-set configs; "
