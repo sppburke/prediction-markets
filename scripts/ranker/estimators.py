@@ -326,6 +326,53 @@ def _weighted_clv_tstat(
     return df[["score", "rank"]]
 
 
+def clv_diagnostic(in_sample: pd.DataFrame, follow: pd.DataFrame,
+                   weights: "np.ndarray | None") -> dict:
+    """Diagnostic-only proxy/true CLV t-stat + per-source coverage over a followed set (issue #466).
+
+    REPORTS, never gates — the bake-off verdict objective stays realized-$ + CLOB-MTM; this rides
+    alongside as a diagnostic. For each close source (``close_proxy`` -> ``proxy_clv``,
+    ``true_clv_close`` -> ``true_clv``) it computes the weighted-CLV t-stat (the mean of
+    :func:`_weighted_clv_tstat`'s per-wallet ``score``) over the ``follow`` wallets' positions in the
+    LAST-``as_of`` in-sample split, plus the fraction of those positions carrying a non-NaN close.
+
+    Alignment contract (the one way this could go wrong — plan-review B1 / P2-S7): ``weights`` is the
+    positional uniqueness array of the SAME reset-indexed ``in_sample`` (``split_walkforward`` ->
+    ``reset_index(drop=True)``). ``in_sample`` is filtered to ``follow.wallet`` with a LABEL-PRESERVING
+    ``.isin`` slice (its index is retained) and the FULL ``weights`` array is passed through unchanged,
+    so ``_weighted_clv_tstat``'s positional ``weights[g.index]`` stays aligned. A ``reset_index`` after
+    the slice, or a pre-filtered ``weights``, would re-introduce the positional misalignment.
+
+    The two coverage figures are INDEPENDENT (P2-S2): ``close_proxy`` (last pre-resolution trade) and
+    ``true_clv_close`` (CLOB series) are independent left-joins in ``suff_stats.materialize`` — neither
+    gates the other, so there is no ``true_cov <= proxy_cov`` invariant.
+
+    Non-mutating; the caller computes it AFTER the trajectory P&L loop has frozen ``returns`` so it is
+    provably inert to the verdict. Returns ``proxy_clv_tstat`` / ``proxy_clv_cov`` / ``true_clv_tstat``
+    / ``true_clv_cov``, short-circuiting to ``(nan, 0.0)`` for BOTH sources — before any
+    ``_weighted_clv_tstat`` / ``weights[...]`` indexing — when ``weights is None`` (a never-live
+    config), ``follow`` is empty (a no-signal final cutoff), or fewer than 2 followed wallets are
+    present in the split.
+    """
+    nan_result = {"proxy_clv_tstat": float("nan"), "proxy_clv_cov": 0.0,
+                  "true_clv_tstat": float("nan"), "true_clv_cov": 0.0}
+    if weights is None or follow is None or follow.empty or "wallet" not in follow.columns:
+        return dict(nan_result)
+    sub = in_sample[in_sample["wallet"].isin(set(follow["wallet"]))]   # label-preserving (keeps index)
+    if sub["wallet"].nunique() < 2:                                    # underpowered -> report nothing
+        return dict(nan_result)
+    out = {}
+    for close_col, prefix in (("close_proxy", "proxy_clv"), ("true_clv_close", "true_clv")):
+        if close_col not in sub.columns:
+            out[f"{prefix}_tstat"], out[f"{prefix}_cov"] = float("nan"), 0.0
+            continue
+        total = int(len(sub))
+        out[f"{prefix}_cov"] = (int(sub[close_col].notna().sum()) / total) if total else 0.0
+        ranking = _weighted_clv_tstat(sub, weights, close_col)        # FULL weights: positional contract
+        out[f"{prefix}_tstat"] = float(ranking["score"].mean()) if not ranking.empty else float("nan")
+    return out
+
+
 class ProxyCLV:
     """Closing-Line-Value skill per wallet (issue #421 ``proxy_clv``): ``CLV = close - entry`` on
     the bought outcome, where ``close`` is the last pre-resolution trade price (the suff_stats
