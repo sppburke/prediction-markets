@@ -1142,6 +1142,107 @@ def _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwa
     return results
 
 
+# ───────────────────────── out-of-core process executor (parquet slice per criteria) ─────────────
+def _ss_snapshot_write(ss: SuffStats, path: str) -> str:
+    """OOC: write the materialized ``ss`` to a parquet snapshot so the process workers load only THEIR
+    criteria slice (DuckDB predicate-pushdown) instead of fork-COW-sharing the full multi-GB frame —
+    decoupling grid-phase RAM from universe size. A ``_row`` column pins the original frame order so a
+    worker's ``ORDER BY _row`` slice is row-order-identical to the in-memory ``slice_by_criteria``,
+    preserving the positional uniqueness weights (BIT-IDENTICAL results). Written via DuckDB ``COPY``
+    (the repo's parquet convention — no pyarrow dependency)."""
+    import duckdb
+
+    # Shallow (copy-on-write) copy: pandas-3.0 CoW shares the column data, so this does NOT duplicate
+    # the multi-GB frame — only the columns reassigned below allocate (a few string columns + `_row`),
+    # keeping snapshot-write peak ≈ frame + a few GB rather than 2× the frame. `ss` itself is never
+    # mutated (CoW protects it for the parent's downstream cpr / survivorship use).
+    out = ss.copy(deep=False)
+    # DuckDB's pandas scan rejects pandas-3.0 ``str``/``string`` dtype — cast every non-numeric column
+    # to object (Python str), the VARCHAR-scannable form (mirrors duck_extract_positions's `universe`).
+    for col in out.columns:
+        if not pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].astype(object)
+    out["_row"] = np.arange(len(out), dtype=np.int64)
+    safe = str(path).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        con.register("_pe_ss_snapshot", out)
+        con.execute(f"COPY _pe_ss_snapshot TO '{safe}' (FORMAT parquet)")
+    finally:
+        con.close()
+    return path
+
+
+def _load_criteria_slice(snapshot_path: str, criteria: Criteria) -> pd.DataFrame:
+    """OOC worker-side: load exactly ``slice_by_criteria(ss, criteria)`` from the parquet snapshot via
+    DuckDB (the same TTR-horizon + price-band predicate), ``ORDER BY _row`` to restore the original
+    frame order, with ``_row`` dropped. Each worker opens its own short-lived connection — no shared
+    state across processes. ``preserve_insertion_order`` keeps the ORDER BY honoured."""
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        con.execute("SET preserve_insertion_order=true;")
+        return con.execute(
+            "SELECT * EXCLUDE (_row) FROM read_parquet(?) "
+            "WHERE (ttr_ref - entry_ts) <= ? AND price >= ? AND price <= ? ORDER BY _row",
+            [str(snapshot_path), criteria.ttr_hours * 3600.0,
+             criteria.price_min, criteria.price_max],
+        ).df()
+    finally:
+        con.close()
+
+
+def _run_trajectory_chunk_ooc(chunk, snapshot_path, runner_factory, worker_id, kwargs,
+                              progress_dir=None):
+    """OOC process worker: load THIS chunk's criteria slice from the parquet snapshot (a chunk is one
+    criteria by ``_partition_by_criteria``) and run its configs — mirrors ``_run_trajectory_chunk`` but
+    reads the slice from disk instead of the fork-inherited ``_PROCESS_SS``, so the full frame is never
+    duplicated per worker. ``run_trajectory``'s internal ``slice_by_criteria`` re-applies the same
+    criteria idempotently on the already-filtered slice."""
+    if not chunk:
+        return {}, 0, 0
+    ss_slice = _load_criteria_slice(snapshot_path, chunk[0].criteria)
+    runner = runner_factory(worker_id)
+    uniqueness: dict = {}
+    score: dict = {}
+    deflation: dict = {}
+    results = {}
+    for done, gp in enumerate(chunk, 1):
+        results[gp.key] = run_trajectory(gp, ss_slice, runner, uniqueness_cache=uniqueness,
+                                         score_cache=score, deflation_cache=deflation, **kwargs)
+        _log_progress(progress_dir, "config_done", worker=worker_id, config=gp.key,
+                      done=done, chunk_total=len(chunk), _file=f"progress.w{worker_id}.jsonl")
+    return results, runner.calls, runner.lookups
+
+
+def _run_trajectories_process_ooc(grid, snapshot_path, runner, max_workers, runner_factory, kwargs,
+                                  progress_dir=None):
+    """OOC process executor: like ``_run_trajectories_process`` but each worker loads its criteria
+    slice from ``snapshot_path`` (parquet) rather than the fork-inherited full frame — so the parent's
+    ``ss`` is never COW-duplicated and the run scales to many workers on the full universe without OOM
+    (grid-phase RAM ≈ workers × one criteria slice). BIT-IDENTICAL to the in-memory path: each slice is
+    the same rows in the same ``_row`` order, and the matrix is rebuilt in grid order by the caller."""
+    kw = {k: v for k, v in kwargs.items()
+          if k not in ("uniqueness_cache", "score_cache", "deflation_cache")}
+    chunks = _partition_by_criteria(grid)
+    ctx = multiprocessing.get_context("fork")
+    results: dict = {}
+    total_calls = total_lookups = 0
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+        futs = [pool.submit(_run_trajectory_chunk_ooc, chunk, snapshot_path, runner_factory, i, kw,
+                            progress_dir) for i, chunk in enumerate(chunks)]
+        for fut in futs:
+            res, calls, lookups = fut.result()
+            results.update(res)
+            total_calls += calls
+            total_lookups += lookups
+    if hasattr(runner, "_cache"):
+        runner._cache.calls = total_calls
+        runner._cache.lookups = total_lookups
+    return results
+
+
 def run_trajectories(grid: list, ss: SuffStats, runner, *, max_workers: int = 1,
                      executor: str = "thread", runner_factory=None,
                      **kwargs) -> "tuple[pd.DataFrame, dict]":
@@ -1168,12 +1269,18 @@ def run_trajectories(grid: list, ss: SuffStats, runner, *, max_workers: int = 1,
     are assembled in fixed GRID order below — never completion/partition order. ``max_workers <= 1`` is
     the original serial path."""
     progress_dir = kwargs.pop("progress_dir", None)        # logging sink, not a run_trajectory arg
+    ss_snapshot = kwargs.pop("ss_snapshot", None)          # OOC: parquet slice source (process path)
     n_total = len(grid)
     if max_workers and max_workers > 1 and len(grid) > 1 and executor == "process":
         if runner_factory is None:
             raise ValueError("run_trajectories(executor='process') requires a runner_factory")
-        results = _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs,
-                                            progress_dir)
+        if ss_snapshot is not None:
+            # OOC: workers load per-criteria slices from the parquet snapshot (no 26GB COW fork).
+            results = _run_trajectories_process_ooc(grid, ss_snapshot, runner, max_workers,
+                                                    runner_factory, kwargs, progress_dir)
+        else:
+            results = _run_trajectories_process(grid, ss, runner, max_workers, runner_factory, kwargs,
+                                                progress_dir)
     elif max_workers and max_workers > 1 and len(grid) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {gp.key: pool.submit(run_trajectory, gp, ss, runner, **kwargs) for gp in grid}
@@ -1543,7 +1650,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
                 created_at: int = 0, seed: int = 0, max_workers: int = 1,
                 executor: str = "thread", runner_factory=None,
                 progress_dir: "str | None" = None, grid_override: "list | None" = None,
-                forward_criteria_filter: bool = False) -> dict:
+                forward_criteria_filter: bool = False, out_of_core: bool = False) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
     PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
     horizon objective the trajectories optimize, so it could drop an estimator the true objective
@@ -1619,6 +1726,24 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
             raise ValueError("run_bakeoff(executor='process') needs a SubprocessBacktestRunner or an "
                              "explicit runner_factory")
         rf = _SubprocessRunnerFactory(runner.binary, runner.cache_path, str(runner.output_dir))
+    # OOC: write the materialized frame to a parquet snapshot so the process workers load only their
+    # criteria slice from disk instead of fork-COW-sharing the full multi-GB `ss` — the lever that lets
+    # the full universe run at high --workers without OOM. Only when out_of_core AND the process
+    # executor is in use; the parent keeps `ss` resident (for cpr / survivorship) but the workers never
+    # touch it, so it is never duplicated. The thread/serial paths ignore the snapshot.
+    ss_snapshot = None
+    if out_of_core and executor == "process":
+        if not progress_dir:
+            raise ValueError("out_of_core=True requires progress_dir (the snapshot directory)")
+        ss_snapshot = str(Path(progress_dir) / "ss_snapshot.parquet")
+        _log_progress(progress_dir, "ss_snapshot_start", path=ss_snapshot, rows=int(len(ss)))
+        _ss_snapshot_write(ss, ss_snapshot)
+        _log_progress(progress_dir, "ss_snapshot_done", path=ss_snapshot)
+    elif out_of_core:
+        # out_of_core only takes effect on the process executor (it bounds the fork's per-worker RAM);
+        # warn loudly rather than silently no-op on the thread/serial paths.
+        print(f"WARN: out_of_core=True has NO effect with executor={executor!r} (process only); "
+              "the in-memory frame is used as-is.")
     _log_progress(progress_dir, "grid_start", n_configs=len(grid),
                   n_as_of=len(params.as_of_points), executor=executor, workers=max_workers)
     _t_phase = time.time()
@@ -1630,7 +1755,7 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
         uniqueness_cache=uniqueness_cache, score_cache=score_cache,
         deflation_cache=deflation_cache, progress_dir=progress_dir,
-        forward_criteria_filter=forward_criteria_filter)
+        forward_criteria_filter=forward_criteria_filter, ss_snapshot=ss_snapshot)
     _log_progress(progress_dir, "grid_done", secs=round(time.time() - _t_phase, 1),
                   n_configs=len(grid))
     _t_phase = time.time()
@@ -1867,6 +1992,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          "'75%%'); sets PE_RANKER_DUCKDB_MEMORY_LIMIT before the engine opens. DuckDB "
                          "spills to disk above it, so a low value bounds Phase-A RAM on the full "
                          "universe at the cost of more disk I/O. Default: the env var / 8GB.")
+    ap.add_argument("--out-of-core", action="store_true",
+                    help="grid-phase memory: with --executor process, write the materialized frame to a "
+                         "parquet snapshot (<out-dir>/ss_snapshot.parquet) and have each worker load "
+                         "only ITS criteria slice from disk instead of fork-COW-sharing the full "
+                         "multi-GB frame — so RAM scales with one criteria slice, not the universe, and "
+                         "the full [20,inf] universe runs at high --workers without OOM. BIT-IDENTICAL "
+                         "(ORDER BY _row preserves frame order). No effect without --executor process.")
     return ap
 
 
@@ -1983,7 +2115,8 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()),
                          max_workers=args.workers, executor=args.executor,
                          progress_dir=str(out_dir), grid_override=grid_override,
-                         forward_criteria_filter=args.forward_criteria_filter)
+                         forward_criteria_filter=args.forward_criteria_filter,
+                         out_of_core=args.out_of_core)
     # #466 follow-up: record whether the forward copy was criteria-filtered, so a run's verdict is
     # interpretable (broad-copy vs band-confined) straight from manifest.json.
     result["manifest"]["forward_criteria_filter"] = args.forward_criteria_filter

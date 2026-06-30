@@ -1714,6 +1714,43 @@ class ProcessExecutorDeterminismTest(unittest.TestCase):
                                       proc["deliverable"]["follow"].reset_index(drop=True))
 
 
+class OutOfCoreProcessTest(unittest.TestCase):
+    """OOC: the ``--out-of-core`` process path — workers load per-criteria slices from a parquet
+    snapshot instead of fork-COW-sharing the full frame — is BIT-IDENTICAL to the in-memory serial
+    path. The snapshot's ``_row`` column + ``ORDER BY _row`` restore the original frame order, so the
+    positional uniqueness weights (and therefore every score) match exactly."""
+
+    def test_ooc_matches_serial_bit_identical(self) -> None:
+        import tempfile
+        ss, skill = _population(8, good=6, bad=6, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(8)]
+        value = {w: (1.0 if s >= 0.5 else -1.0) for w, s in skill.items()}
+        params = bo.BakeoffParams(as_of_points=points, train_secs=3_000_000, horizon_secs=1_000_000,
+                                  k=5, screen_keep=1, demoter_kwargs={"min_periods": 3}, min_periods=2)
+        # 2 criteria so the partition has >1 chunk → workers load distinct parquet slices.
+        axes = _axes(estimators=("t_stat_baseline",), deflators=(bo.NO_DEFLATION,),
+                     policies=("policy_full_rerank", "policy_knockout_backfill"),
+                     criteria=(Criteria(0, 72.0, 0.0, 1.0, 0.0, 0),
+                               Criteria(0, 72.0, 0.30, 0.70, 0.0, 0)),
+                     churn=(0.0,))
+        serial = bo.run_bakeoff(ss, _FakeRunner(value, points, 1_000_000), axes, params, created_at=1)
+        with tempfile.TemporaryDirectory() as d:
+            ooc = bo.run_bakeoff(ss, _FakeRunner(value, points, 1_000_000), axes, params, created_at=1,
+                                 max_workers=4, executor="process", out_of_core=True, progress_dir=d,
+                                 runner_factory=_FakeRunnerFactory(value, points, 1_000_000))
+            self.assertTrue(os.path.exists(os.path.join(d, "ss_snapshot.parquet")))
+        pd.testing.assert_frame_equal(serial["return_matrix"], ooc["return_matrix"])
+        self.assertEqual(serial["decision"]["status"], ooc["decision"]["status"])
+        self.assertEqual(serial["decision"]["winner"], ooc["decision"]["winner"])
+        self.assertEqual(serial["deliverable"]["winner_key"], ooc["deliverable"]["winner_key"])
+        pd.testing.assert_frame_equal(serial["deliverable"]["follow"].reset_index(drop=True),
+                                      ooc["deliverable"]["follow"].reset_index(drop=True))
+        # every (config, step) backtest is requested once in BOTH (total lookups equal); `distinct`
+        # may be higher for the per-worker-memo process path (matches ProcessExecutorDeterminismTest).
+        self.assertEqual(serial["backtest_calls"]["total"], ooc["backtest_calls"]["total"])
+        self.assertGreaterEqual(ooc["backtest_calls"]["distinct"], serial["backtest_calls"]["distinct"])
+
+
 class ForwardCriteriaFilterTest(unittest.TestCase):
     """#466 follow-up: `forward_criteria_filter` threads each config's criteria TTR + price band into
     the FORWARD backtest (so selection and deployment use the same filter), and the memo key includes
@@ -1777,6 +1814,9 @@ class ForwardCriteriaFilterTest(unittest.TestCase):
         self.assertEqual(bo._build_arg_parser().parse_args(argv + ["--duckdb-memory-limit", "16GB"])
                          .duckdb_memory_limit, "16GB")
         self.assertIsNone(bo._build_arg_parser().parse_args(argv).duckdb_memory_limit)
+        # --out-of-core: store_true, default False.
+        self.assertTrue(bo._build_arg_parser().parse_args(argv + ["--out-of-core"]).out_of_core)
+        self.assertFalse(bo._build_arg_parser().parse_args(argv).out_of_core)
 
 
 if __name__ == "__main__":
