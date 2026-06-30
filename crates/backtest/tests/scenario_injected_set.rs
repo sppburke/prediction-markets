@@ -121,6 +121,7 @@ fn run_fixture() -> (Vec<PnlRow>, String, String, String) {
         output_dir: out_dir.clone(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None, // prices are well below any cap; keep it explicit
+        min_signal_price: None,
         ..BacktestConfig::default()
     };
     let ranker_config = RankerConfig::default();

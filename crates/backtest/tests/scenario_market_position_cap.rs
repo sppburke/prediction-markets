@@ -144,6 +144,7 @@ fn base_config(dir: &TempDir, cap: Option<NonZeroU32>) -> BacktestConfig {
         require_known_expiry: false,
         max_positions_per_market: cap,
         max_signal_price: None,
+        min_signal_price: None,
         max_trade_count: 0,
         injected_wallets_path: None,
         mtm_window_start_unix: None,

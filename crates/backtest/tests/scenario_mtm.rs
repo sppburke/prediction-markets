@@ -208,6 +208,7 @@ fn run_fixture() -> (Vec<PnlRow>, String, String, String, String) {
         output_dir: out_dir.clone(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None, // prices are below any cap; keep it explicit
+        min_signal_price: None,
         mtm_window_start_unix: Some(AS_OF),
         mtm_window_end_unix: Some(HORIZON),
         // slippage 0 so fill_price == signal price (0.50) and the contract math is exact.
@@ -392,6 +393,7 @@ fn run_span_window(as_of: i64, horizon: i64) -> f64 {
         output_dir: out_dir.clone(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None,
+        min_signal_price: None,
         mtm_window_start_unix: Some(as_of),
         mtm_window_end_unix: Some(horizon),
         strategy: WinnerFollowConfig {
@@ -534,6 +536,7 @@ fn run_lag_fixture() -> (Vec<PnlRow>, String, String, String) {
         output_dir: out_dir.clone(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None,
+        min_signal_price: None,
         mtm_window_start_unix: Some(AS_OF),
         mtm_window_end_unix: Some(HORIZON),
         strategy: WinnerFollowConfig {
@@ -689,6 +692,7 @@ fn run_quiet_resolution_fixture() -> (Vec<PnlRow>, String) {
         output_dir: out_dir.clone(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None,
+        min_signal_price: None,
         mtm_window_start_unix: Some(AS_OF),
         mtm_window_end_unix: Some(HORIZON),
         strategy: WinnerFollowConfig {
@@ -811,6 +815,7 @@ fn run_sorted_lags_fixture() -> (Vec<PnlRow>, String) {
         output_dir: out_dir.clone(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None,
+        min_signal_price: None,
         mtm_window_start_unix: Some(AS_OF),
         mtm_window_end_unix: Some(HORIZON),
         strategy: WinnerFollowConfig {

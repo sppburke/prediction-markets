@@ -104,9 +104,10 @@ class _FakeRunner:
         self.points = points
         self.horizon = horizon
 
-    def run(self, wallets, *, flat_usd, window=None):
+    def run(self, wallets, *, flat_usd, window=None, **_filter):
         # Realized-only fake (no forward MTM): is_horizon_mtm=False so the objective is realized-only
-        # and live_pnl keeps every row, exactly as pre-E. `window` is accepted and ignored.
+        # and live_pnl keeps every row, exactly as pre-E. `window` and the #466 forward-criteria
+        # filter kwargs (max_hours_to_expiry/min_signal_price/max_signal_price) are accepted + ignored.
         rows = [{"wallet": w, "period_end": t + self.horizon // 2,
                  "realized_pnl": self.value.get(w, 0.0) * flat_usd, "unrealized_pnl": 0.0,
                  "n_fills": 2, "notional": flat_usd * 2,
@@ -132,7 +133,7 @@ class _MtmRunner(_FakeRunner):
         self.positions_n = positions_n if positions_n is not None else open_n
         self.lags = lags or {}
 
-    def run(self, wallets, *, flat_usd, window=None):
+    def run(self, wallets, *, flat_usd, window=None, **_filter):
         df = super().run(wallets, flat_usd=flat_usd, window=window)
         if window is None:
             return df
@@ -1711,6 +1712,67 @@ class ProcessExecutorDeterminismTest(unittest.TestCase):
         self.assertEqual(serial["deliverable"]["winner_key"], proc["deliverable"]["winner_key"])
         pd.testing.assert_frame_equal(serial["deliverable"]["follow"].reset_index(drop=True),
                                       proc["deliverable"]["follow"].reset_index(drop=True))
+
+
+class ForwardCriteriaFilterTest(unittest.TestCase):
+    """#466 follow-up: `forward_criteria_filter` threads each config's criteria TTR + price band into
+    the FORWARD backtest (so selection and deployment use the same filter), and the memo key includes
+    those params so two configs with distinct bands never falsely share a cached backtest."""
+
+    class _RecordingRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, wallets, *, flat_usd, window=None, max_hours_to_expiry=None,
+                min_signal_price=None, max_signal_price=None):
+            self.calls.append({"max_hours_to_expiry": max_hours_to_expiry,
+                               "min_signal_price": min_signal_price,
+                               "max_signal_price": max_signal_price})
+            return pd.DataFrame(columns=bo._PNL_COLUMNS)
+
+    def _gp(self):
+        # ttr 24h / band 0.30-0.70 — every _population position (price 0.50, ttr_secs 3600) survives.
+        return bo.GridPoint("t_stat_baseline", bo.NO_DEFLATION, "policy_full_rerank",
+                            Criteria(0, 24.0, 0.30, 0.70, 0.0, 0), 0.0)
+
+    def _run(self, *, forward_criteria_filter):
+        ss, _ = _population(8, good=4, bad=4, n_pos=60)
+        points = [3_000_000 + i * 1_000_000 for i in range(4)]
+        rec = self._RecordingRunner()
+        bo.run_trajectory(self._gp(), ss, rec, as_of_points=points, train_secs=3_000_000,
+                          horizon_secs=1_000_000, k=5, displacement_margin=5,
+                          forward_criteria_filter=forward_criteria_filter)
+        return rec
+
+    def test_filter_on_passes_criteria_to_runner(self) -> None:
+        rec = self._run(forward_criteria_filter=True)
+        self.assertTrue(rec.calls, "the forward backtest must be invoked at least once")
+        for c in rec.calls:
+            self.assertEqual(c["max_hours_to_expiry"], 24.0)
+            self.assertEqual(c["min_signal_price"], 0.30)
+            self.assertEqual(c["max_signal_price"], 0.70)
+
+    def test_filter_off_passes_none(self) -> None:
+        rec = self._run(forward_criteria_filter=False)        # default — legacy broad-copy
+        self.assertTrue(rec.calls)
+        for c in rec.calls:
+            self.assertIsNone(c["max_hours_to_expiry"])
+            self.assertIsNone(c["min_signal_price"])
+            self.assertIsNone(c["max_signal_price"])
+
+    def test_memo_key_includes_filter_params(self) -> None:
+        memo = bo.MemoizingBacktestRunner(_FakeRunner({"w1": 1.0}, [1000], 1000))
+        memo.run(["w1"], flat_usd=25.0, window=(0, 100))
+        memo.run(["w1"], flat_usd=25.0, window=(0, 100), max_hours_to_expiry=24.0)  # different filter
+        self.assertEqual(memo.calls, 2)                       # distinct keys -> 2 inner runs
+        memo.run(["w1"], flat_usd=25.0, window=(0, 100), max_hours_to_expiry=24.0)  # repeat -> cached
+        self.assertEqual((memo.lookups, memo.calls), (3, 2))
+
+    def test_cli_flag_parses(self) -> None:
+        argv = ["--out-dir", "o", "--pe-backtest", "b", "--cache", "c", "--start-unix", "0"]
+        self.assertTrue(bo._build_arg_parser().parse_args(argv + ["--forward-criteria-filter"])
+                        .forward_criteria_filter)
+        self.assertFalse(bo._build_arg_parser().parse_args(argv).forward_criteria_filter)
 
 
 if __name__ == "__main__":

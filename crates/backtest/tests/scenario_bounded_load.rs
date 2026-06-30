@@ -201,6 +201,7 @@ fn run(cache_path: &Path, out_dir: &Path, injected: &[WalletAddress], bounded: b
         output_dir: out_dir.to_path_buf(),
         flat_usd: Some(dec!(25)),
         max_signal_price: None,
+        min_signal_price: None,
         // Exercises reader (b) on every copied trade without suppressing any (every
         // market closes well within 60 days of its trade date).
         max_hours_to_expiry: Some(1440),
