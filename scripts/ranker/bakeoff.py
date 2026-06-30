@@ -1152,7 +1152,11 @@ def _ss_snapshot_write(ss: SuffStats, path: str) -> str:
     (the repo's parquet convention — no pyarrow dependency)."""
     import duckdb
 
-    out = ss.copy()
+    # Shallow (copy-on-write) copy: pandas-3.0 CoW shares the column data, so this does NOT duplicate
+    # the multi-GB frame — only the columns reassigned below allocate (a few string columns + `_row`),
+    # keeping snapshot-write peak ≈ frame + a few GB rather than 2× the frame. `ss` itself is never
+    # mutated (CoW protects it for the parent's downstream cpr / survivorship use).
+    out = ss.copy(deep=False)
     # DuckDB's pandas scan rejects pandas-3.0 ``str``/``string`` dtype — cast every non-numeric column
     # to object (Python str), the VARCHAR-scannable form (mirrors duck_extract_positions's `universe`).
     for col in out.columns:
@@ -1735,6 +1739,11 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         _log_progress(progress_dir, "ss_snapshot_start", path=ss_snapshot, rows=int(len(ss)))
         _ss_snapshot_write(ss, ss_snapshot)
         _log_progress(progress_dir, "ss_snapshot_done", path=ss_snapshot)
+    elif out_of_core:
+        # out_of_core only takes effect on the process executor (it bounds the fork's per-worker RAM);
+        # warn loudly rather than silently no-op on the thread/serial paths.
+        print(f"WARN: out_of_core=True has NO effect with executor={executor!r} (process only); "
+              "the in-memory frame is used as-is.")
     _log_progress(progress_dir, "grid_start", n_configs=len(grid),
                   n_as_of=len(params.as_of_points), executor=executor, workers=max_workers)
     _t_phase = time.time()

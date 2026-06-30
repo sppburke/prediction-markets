@@ -1745,6 +1745,10 @@ class OutOfCoreProcessTest(unittest.TestCase):
         self.assertEqual(serial["deliverable"]["winner_key"], ooc["deliverable"]["winner_key"])
         pd.testing.assert_frame_equal(serial["deliverable"]["follow"].reset_index(drop=True),
                                       ooc["deliverable"]["follow"].reset_index(drop=True))
+        # every (config, step) backtest is requested once in BOTH (total lookups equal); `distinct`
+        # may be higher for the per-worker-memo process path (matches ProcessExecutorDeterminismTest).
+        self.assertEqual(serial["backtest_calls"]["total"], ooc["backtest_calls"]["total"])
+        self.assertGreaterEqual(ooc["backtest_calls"]["distinct"], serial["backtest_calls"]["distinct"])
 
 
 class ForwardCriteriaFilterTest(unittest.TestCase):
