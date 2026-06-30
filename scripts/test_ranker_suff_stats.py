@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import duckdb  # noqa: E402
 
+import ranker_duck  # noqa: E402
 from ranker import suff_stats  # noqa: E402
 
 
@@ -229,6 +230,30 @@ def _raw() -> pd.DataFrame:
         "payoff": [1.0, 0.0],
         "resolved_at": [5000, 9500],
     })
+
+
+class MaterializeAsTest(unittest.TestCase):
+    """Phase-A memory path (issue #468 follow-up): ``duck_extract_positions(materialize_as=…)``
+    writes a DuckDB temp TABLE (returns None) carrying the SAME positions as the ``.df()`` path —
+    so the CLV joins can run in DuckDB instead of two pandas merges; a non-identifier name is rejected."""
+
+    def test_temp_table_matches_df_path(self) -> None:
+        con = _make_con()
+        df = ranker_duck.duck_extract_positions(con, ["0xa", "0xb"], **suff_stats._PERMISSIVE)
+        ret = ranker_duck.duck_extract_positions(
+            con, ["0xa", "0xb"], **suff_stats._PERMISSIVE, materialize_as="_pe_positions")
+        self.assertIsNone(ret)
+        tbl = con.execute("SELECT * FROM _pe_positions").df()
+        self.assertEqual(len(df), len(tbl))
+        key = ["wallet", "market_id", "outcome_id"]
+        self.assertEqual(sorted(map(tuple, df[key].itertuples(index=False))),
+                         sorted(map(tuple, tbl[key].itertuples(index=False))))
+
+    def test_bad_identifier_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ranker_duck.duck_extract_positions(
+                _make_con(), ["0xa"], **suff_stats._PERMISSIVE,
+                materialize_as="x; DROP TABLE trades")
 
 
 class DeriveColumnsTest(unittest.TestCase):

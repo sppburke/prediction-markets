@@ -175,15 +175,37 @@ def materialize(con, wallets: "list[str] | None" = None, *,
     """
     if wallets is None:
         wallets = all_wallets(con)
-    raw = ranker_duck.duck_extract_positions(con, wallets, **_PERMISSIVE)
-    # Left-join the per-(market, outcome) close proxy so the band/window-agnostic superset
-    # carries it for the proxy_clv estimator (NaN where the outcome never traded pre-resolution).
-    raw = raw.merge(close_proxy_prices(con), on=["market_id", "outcome_id"], how="left")
-    # Left-join the per-(market, outcome) CLOB close for the true_clv estimator (NaN where no CLOB
-    # series covers the outcome). Absent CLOB views -> all-NaN (true_clv degrades to empty).
-    clv_views = (_relation_exists(con, "market_price_history")
-                 and _relation_exists(con, "token_conditions"))
-    raw = raw.merge(true_clv_close_prices(con), on=["market_id", "outcome_id"], how="left")
+    # Phase-A memory (issue #468 follow-up): build the first-buy positions into a DuckDB temp TABLE
+    # (out-of-core, bounded by the engine's `memory_limit`), then LEFT JOIN the two per-(market,
+    # outcome) CLV close-price aggregates IN DUCKDB and pull the finished frame to pandas ONCE. This
+    # replaces the prior two pandas `.merge()` calls, each of which transiently DOUBLED the
+    # full-universe frame (~71M rows) in RAM — the dominant materialize peak. BIT-IDENTICAL output:
+    # the same left-joins on the same `(market_id, outcome_id)` keys, just executed in DuckDB. The
+    # CLV `close_proxy` / `true_clv_close` SQL is the canonical `_CLOSE_PROXY_SQL` / `_TRUE_CLV_SQL`
+    # (registered as views), so there is one source of that logic.
+    ranker_duck.duck_extract_positions(con, wallets, **_PERMISSIVE, materialize_as="_pe_positions")
+    # `_pe_positions` is now a multi-GB temp table; the try/finally guarantees it is dropped on ANY
+    # subsequent failure (view build, _relation_exists probe, the join) — not just the happy path —
+    # so an error never leaks the frame into a reused connection.
+    try:
+        con.execute(f"CREATE OR REPLACE TEMP VIEW _pe_close_proxy AS {_CLOSE_PROXY_SQL}")
+        clv_views = (_relation_exists(con, "market_price_history")
+                     and _relation_exists(con, "token_conditions"))
+        if clv_views:
+            con.execute(f"CREATE OR REPLACE TEMP VIEW _pe_true_clv AS {_TRUE_CLV_SQL}")
+            true_sel = "tc.true_clv_close"
+            true_join = "LEFT JOIN _pe_true_clv tc USING (market_id, outcome_id)"
+        else:
+            # CLOB views absent -> all-NaN `true_clv_close` (true_clv degrades to empty), matching the
+            # prior left-merge against the empty `true_clv_close_prices` frame — without building it.
+            true_sel, true_join = "CAST(NULL AS DOUBLE) AS true_clv_close", ""
+        raw = con.execute(
+            f"SELECT p.*, cp.close_proxy, {true_sel} "
+            f"FROM _pe_positions p "
+            f"LEFT JOIN _pe_close_proxy cp USING (market_id, outcome_id) {true_join}"
+        ).df()
+    finally:
+        con.execute("DROP TABLE IF EXISTS _pe_positions")   # free the temp positions on success OR error
     if clv_views:
         _log_true_clv_coverage(raw)
     return derive_columns(raw, slip=slip, with_concurrency=with_concurrency)

@@ -1862,6 +1862,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          "filter). Default OFF = the legacy broad-copy eval (no TTR ceiling on copies; "
                          "pe-backtest's 0.85 cap; no lower band), which matches run17/run18. Requires a "
                          "pe-backtest with PE_BACKTEST_MIN_SIGNAL_PRICE support (this PR).")
+    ap.add_argument("--duckdb-memory-limit", default=None,
+                    help="DuckDB working-set ceiling for the suff_stats materialize (e.g. '16GB', "
+                         "'75%%'); sets PE_RANKER_DUCKDB_MEMORY_LIMIT before the engine opens. DuckDB "
+                         "spills to disk above it, so a low value bounds Phase-A RAM on the full "
+                         "universe at the cost of more disk I/O. Default: the env var / 8GB.")
     return ap
 
 
@@ -1921,6 +1926,8 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.duckdb_memory_limit:        # bound the DuckDB working set before the engine opens
+        os.environ["PE_RANKER_DUCKDB_MEMORY_LIMIT"] = args.duckdb_memory_limit
     con = _open_engine(args)
     # #451: optionally bound the candidate universe so the full-universe materialize does not OOM a
     # constrained box; None -> the full universe (committed behaviour).
