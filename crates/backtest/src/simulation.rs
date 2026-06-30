@@ -735,6 +735,18 @@ pub fn run_simulation_with(
                         high_price_tracker.record(sim_date, false);
                     }
 
+                    // Low-price floor (issue #466 follow-up): the symmetric LOWER band to
+                    // `max_signal_price`, so the #421 bake-off forward copy can be confined to the
+                    // config's criteria price band `[price_min, price_max]` — aligning the forward
+                    // evaluation with the band the wallets were selected under. `None` = no floor
+                    // (legacy). Gated on `fill_price` (the price actually paid), like the cap, and
+                    // placed before the flat-USD / Kelly sizing branches so every path honors it.
+                    if let Some(floor) = config.min_signal_price
+                        && fill_price < floor
+                    {
+                        continue;
+                    }
+
                     // Flat-USD short-circuit (issue #134): backtest-only research
                     // lever that bypasses Kelly, per-trade cap, mode clamp,
                     // `risk-engine`, and the liquidity clamp. `floor(flat /

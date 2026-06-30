@@ -252,6 +252,19 @@ pub struct BacktestConfig {
     #[serde(default = "default_max_signal_price")]
     pub max_signal_price: Option<Decimal>,
 
+    /// Minimum slippage-adjusted fill price for a copied BUY — the symmetric LOWER
+    /// entry band to `max_signal_price`. `None` = no floor (default; legacy
+    /// behaviour). When set, BUYs whose `fill_price` is `< min_signal_price` are
+    /// suppressed, so the #421 bake-off forward copy can be confined to the
+    /// config's criteria price band `[price_min, price_max]` — aligning the forward
+    /// evaluation with the wallet-selection band (issue #466 follow-up; without it
+    /// the forward copy ignored the band the wallets were selected under).
+    /// Gated on `fill_price` (the price actually paid), like `max_signal_price`.
+    /// `PE_BACKTEST_MIN_SIGNAL_PRICE` overrides.
+    /// Canonical: `docs/_GLOSSARY.md` `backtest_min_signal_price_default`.
+    #[serde(default)]
+    pub min_signal_price: Option<Decimal>,
+
     /// Maximum number of trades the cache may contain before `pe-backtest` refuses to
     /// start.  Guards against accidentally loading the full 269M-trade production cache
     /// into RAM (OOM kill).  `0` disables the guard entirely.
@@ -425,6 +438,7 @@ impl Default for BacktestConfig {
             require_known_expiry: default_require_known_expiry(),
             max_positions_per_market: default_max_positions_per_market(),
             max_signal_price: default_max_signal_price(),
+            min_signal_price: None,
             max_trade_count: default_max_trade_count(),
             injected_wallets_path: None,
             mtm_window_start_unix: None,

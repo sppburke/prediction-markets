@@ -383,7 +383,10 @@ class SubprocessBacktestRunner:
         self.extra_env = extra_env or {}
 
     def run(self, wallets: list, *, flat_usd: float,
-            window: "tuple | None" = None) -> pd.DataFrame:
+            window: "tuple | None" = None,
+            max_hours_to_expiry: "float | None" = None,
+            min_signal_price: "float | None" = None,
+            max_signal_price: "float | None" = None) -> pd.DataFrame:
         # Per-CALL scratch dir: `pe-backtest` writes a FIXED filename (`pnl_by_period.ndjson`) into
         # `PE_BACKTEST_OUTPUT_DIR`, so the parallel `run_trajectories` seam (concurrent backtests)
         # requires a DISTINCT dir per call or they clobber one another's wallet file / output. A fresh
@@ -416,6 +419,16 @@ class SubprocessBacktestRunner:
                 as_of, horizon_end = window
                 env["PE_BACKTEST_MTM_WINDOW_START_UNIX"] = str(int(as_of))
                 env["PE_BACKTEST_MTM_WINDOW_END_UNIX"] = str(int(horizon_end))
+            # #466 follow-up: confine the FORWARD copy to the config's criteria TTR + price band, so
+            # the forward evaluation copies under the SAME filter the wallets were selected with. Unset
+            # -> pe-backtest defaults (no TTR ceiling; 0.85 cap; no floor) = the legacy broad-copy
+            # behaviour. ttr_hours is whole-numbered (72/24/48) so int() is exact.
+            if max_hours_to_expiry is not None:
+                env["PE_BACKTEST_MAX_HOURS_TO_EXPIRY"] = str(int(max_hours_to_expiry))
+            if min_signal_price is not None:
+                env["PE_BACKTEST_MIN_SIGNAL_PRICE"] = str(min_signal_price)
+            if max_signal_price is not None:
+                env["PE_BACKTEST_MAX_SIGNAL_PRICE"] = str(max_signal_price)
             subprocess.run([self.binary], env=env, check=True)
             return parse_pnl_by_period(out_file)
         finally:
@@ -547,10 +560,21 @@ class MemoizingBacktestRunner:
         self._cache = _SingleFlightCache()
 
     def run(self, wallets: list, *, flat_usd: float,
-            window: "tuple | None" = None) -> pd.DataFrame:
-        key = (tuple(sorted(wallets)), flat_usd, window)
+            window: "tuple | None" = None,
+            max_hours_to_expiry: "float | None" = None,
+            min_signal_price: "float | None" = None,
+            max_signal_price: "float | None" = None) -> pd.DataFrame:
+        # #466 follow-up: the forward-copy filter (TTR + price band) changes the emitted P&L, so it
+        # MUST be part of the memo key — else two configs with the same followed set but different
+        # criteria bands would falsely share a cached frame. Unset (legacy) -> the extra key fields
+        # are all None and dedup is identical to before.
+        key = (tuple(sorted(wallets)), flat_usd, window,
+               max_hours_to_expiry, min_signal_price, max_signal_price)
         return self._cache.get_or_compute(
-            key, lambda: self.inner.run(list(wallets), flat_usd=flat_usd, window=window))
+            key, lambda: self.inner.run(
+                list(wallets), flat_usd=flat_usd, window=window,
+                max_hours_to_expiry=max_hours_to_expiry, min_signal_price=min_signal_price,
+                max_signal_price=max_signal_price))
 
     @property
     def calls(self) -> int:
@@ -871,7 +895,8 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
                    flat_usd: float = 25.0,
                    uniqueness_cache: "dict | None" = None,
                    score_cache: "dict | None" = None,
-                   deflation_cache: "dict | None" = None) -> "TrajectoryResult":
+                   deflation_cache: "dict | None" = None,
+                   forward_criteria_filter: bool = False) -> "TrajectoryResult":
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
     of churn (indexed by ``as_of``) PLUS the final-step followed set (A1). Sequential by
     construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
@@ -950,8 +975,17 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
 
         # E (#436): pass the forward-MTM window so the binary marks still-open positions at
         # the horizon. The objective sums realized + unrealized (the MTM flow) over the window.
-        pnl = runner.run(list(follow["wallet"]), flat_usd=flat_usd,
-                         window=(as_of, as_of + horizon_secs))
+        # #466 follow-up: when forward_criteria_filter is set, confine the forward copy to THIS
+        # config's criteria TTR + price band (so selection and deployment use the same filter — a
+        # wallet picked on its <ttr_hours, in-band first-buys is then copied only on such trades).
+        # Default off -> the legacy broad-copy eval (no TTR ceiling; pe-backtest's 0.85 cap; no floor).
+        _crit = grid_point.criteria
+        pnl = runner.run(
+            list(follow["wallet"]), flat_usd=flat_usd,
+            window=(as_of, as_of + horizon_secs),
+            max_hours_to_expiry=(_crit.ttr_hours if forward_criteria_filter else None),
+            min_signal_price=(_crit.price_min if forward_criteria_filter else None),
+            max_signal_price=(_crit.price_max if forward_criteria_filter else None))
         window = pnl[(pnl["period_end"] > as_of) & (pnl["period_end"] <= as_of + horizon_secs)]
         is_mtm = window["is_horizon_mtm"].astype(bool)
         gross = _weighted_window_pnl(window, follow)                 # realized + unrealized (E2b)
@@ -1508,7 +1542,8 @@ def _log_progress(progress_dir, event: str, **fields) -> None:
 def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams, *,
                 created_at: int = 0, seed: int = 0, max_workers: int = 1,
                 executor: str = "thread", runner_factory=None,
-                progress_dir: "str | None" = None, grid_override: "list | None" = None) -> dict:
+                progress_dir: "str | None" = None, grid_override: "list | None" = None,
+                forward_criteria_filter: bool = False) -> dict:
     """Full staged sweep (8a -> 8b -> 8c -> leaderboard -> winner/NO-GO). #445 defect 4: 8a no longer
     PRUNES the estimator axis (its cheap forward-payoff proxy mismatches the realized + CLOB-MTM
     horizon objective the trajectories optimize, so it could drop an estimator the true objective
@@ -1594,7 +1629,8 @@ def run_bakeoff(ss: SuffStats, runner, axes: BakeoffAxes, params: BakeoffParams,
         k=params.k, displacement_margin=params.displacement_margin,
         demoter_kwargs=params.demoter_kwargs, flat_usd=params.flat_usd,
         uniqueness_cache=uniqueness_cache, score_cache=score_cache,
-        deflation_cache=deflation_cache, progress_dir=progress_dir)
+        deflation_cache=deflation_cache, progress_dir=progress_dir,
+        forward_criteria_filter=forward_criteria_filter)
     _log_progress(progress_dir, "grid_done", secs=round(time.time() - _t_phase, 1),
                   n_configs=len(grid))
     _t_phase = time.time()
@@ -1819,6 +1855,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-materialize-concurrency", action="store_true",
                     help="skip the per-wallet c_t concurrency column in suff_stats.materialize "
                          "(bit-identical; pure wall-clock win on the full-universe run).")
+    ap.add_argument("--forward-criteria-filter", action="store_true",
+                    help="#466 follow-up: confine each config's FORWARD copy to its criteria TTR + "
+                         "price band (so a wallet selected on its <ttr_hours, in-band first-buys is "
+                         "copied forward only on such trades — selection and deployment use the SAME "
+                         "filter). Default OFF = the legacy broad-copy eval (no TTR ceiling on copies; "
+                         "pe-backtest's 0.85 cap; no lower band), which matches run17/run18. Requires a "
+                         "pe-backtest with PE_BACKTEST_MIN_SIGNAL_PRICE support (this PR).")
     return ap
 
 
@@ -1932,7 +1975,11 @@ def main() -> None:  # pragma: no cover (operator entry; CI exercises the stage 
     runner = SubprocessBacktestRunner(args.pe_backtest, args.cache, str(out_dir / "bt"))
     result = run_bakeoff(ss, runner, axes, params, created_at=int(time.time()),
                          max_workers=args.workers, executor=args.executor,
-                         progress_dir=str(out_dir), grid_override=grid_override)
+                         progress_dir=str(out_dir), grid_override=grid_override,
+                         forward_criteria_filter=args.forward_criteria_filter)
+    # #466 follow-up: record whether the forward copy was criteria-filtered, so a run's verdict is
+    # interpretable (broad-copy vs band-confined) straight from manifest.json.
+    result["manifest"]["forward_criteria_filter"] = args.forward_criteria_filter
     if args.confirmatory:
         # Provenance: the committed confirmatory_grid.py IS the pre-registration; the SHA ties this
         # run to it. pre_register_grid already set manifest["confirmatory"] + ["n_grid_full"].
