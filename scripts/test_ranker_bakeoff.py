@@ -1773,6 +1773,10 @@ class ForwardCriteriaFilterTest(unittest.TestCase):
         self.assertTrue(bo._build_arg_parser().parse_args(argv + ["--forward-criteria-filter"])
                         .forward_criteria_filter)
         self.assertFalse(bo._build_arg_parser().parse_args(argv).forward_criteria_filter)
+        # --duckdb-memory-limit (Phase-A bound): parses to the raw string, default None.
+        self.assertEqual(bo._build_arg_parser().parse_args(argv + ["--duckdb-memory-limit", "16GB"])
+                         .duckdb_memory_limit, "16GB")
+        self.assertIsNone(bo._build_arg_parser().parse_args(argv).duckdb_memory_limit)
 
 
 if __name__ == "__main__":

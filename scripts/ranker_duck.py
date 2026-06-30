@@ -175,7 +175,7 @@ def get_engine(force: str | None = None,
 
 
 def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
-                           scheduled_only, price_min, price_max):
+                           scheduled_only, price_min, price_max, *, materialize_as=None):
     """Return a pandas DataFrame of QUALIFYING first-buy positions across `wallets` —
     the same SET the SQLite per-wallet scan+filter produces — with the 9 raw columns
     `wallet, market_id, outcome_id, entry_ts, ttr_secs, price, contracts, payoff,
@@ -251,7 +251,18 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
           AND TRY_CAST(fb.price_str AS DOUBLE) > 0 AND TRY_CAST(fb.price_str AS DOUBLE) < 1
           AND TRY_CAST(fb.price_str AS DOUBLE) >= ? AND TRY_CAST(fb.price_str AS DOUBLE) <= ?
         """
-        df = con.execute(sql, [win_start, win_end, ttr_lo, ttr_secs, price_min, price_max]).df()
+        params = [win_start, win_end, ttr_lo, ttr_secs, price_min, price_max]
+        if materialize_as is not None:
+            # Out-of-core path (Phase-A memory): CREATE the result as a DuckDB temp TABLE instead of
+            # pulling it into pandas. DuckDB spills to disk under its `memory_limit`, so the
+            # full-universe extract never builds a multi-GB pandas frame here; the caller then joins
+            # the CLV close columns in DuckDB and `.df()`s the finished frame ONCE. Returns None.
+            if not materialize_as.isidentifier():
+                raise ValueError(f"materialize_as must be a bare identifier, got {materialize_as!r}")
+            con.execute(f"CREATE OR REPLACE TEMP TABLE {materialize_as} AS {sql}", params)
+            df = None
+        else:
+            df = con.execute(sql, params).df()
     finally:
         con.unregister("universe")
     return df
