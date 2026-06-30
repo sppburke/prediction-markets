@@ -195,6 +195,11 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     quirks can't diverge). First-buy dedup is a hash `GROUP BY ... arg_min(struct_pack,
     timestamp_unix)` (NOT a `ROW_NUMBER` window) so it spills to disk instead of OOM-ing on
     the full-universe scan (#387); `struct_pack` keeps the chosen row's columns atomic.
+
+    When `materialize_as` is set (a bare SQL identifier), the result is written to a DuckDB temp
+    TABLE of that name and the function returns `None` instead of a pandas DataFrame — the Phase-A
+    out-of-core path so the caller can LEFT JOIN further columns in DuckDB before pulling the frame
+    to pandas once (issue #468 follow-up). Default `None` keeps the pandas-DataFrame return.
     """
     import pandas as pd
 
