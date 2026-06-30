@@ -896,7 +896,8 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
                    uniqueness_cache: "dict | None" = None,
                    score_cache: "dict | None" = None,
                    deflation_cache: "dict | None" = None,
-                   forward_criteria_filter: bool = False) -> "TrajectoryResult":
+                   forward_criteria_filter: bool = False,
+                   pre_sliced: bool = False) -> "TrajectoryResult":
     """Run one config as a full walk-forward trajectory; return its per-period forward copy P&L net
     of churn (indexed by ``as_of``) PLUS the final-step followed set (A1). Sequential by
     construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
@@ -915,7 +916,10 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     policy = build_policy(grid_point.policy, k=k, demoter=demoter,
                           displacement_margin=displacement_margin)
     estimator = ESTIMATOR_REGISTRY[grid_point.estimator]()
-    ss_c = slice_by_criteria(ss, grid_point.criteria)
+    # `pre_sliced` (OOC): `ss` is already exactly `slice_by_criteria(full, criteria)` (the worker
+    # loaded that criteria's parquet slice), so skip the re-slice — it would otherwise COPY the whole
+    # (already-filtered) frame again, doubling per-worker RAM. Bit-identical: same rows, same order.
+    ss_c = ss if pre_sliced else slice_by_criteria(ss, grid_point.criteria)
 
     prev: FollowSet = pd.DataFrame({"wallet": [], "weight": []})
     live_pnl = pd.DataFrame(columns=_PNL_COLUMNS)
@@ -1177,11 +1181,19 @@ def _load_criteria_slice(snapshot_path: str, criteria: Criteria) -> pd.DataFrame
     """OOC worker-side: load exactly ``slice_by_criteria(ss, criteria)`` from the parquet snapshot via
     DuckDB (the same TTR-horizon + price-band predicate), ``ORDER BY _row`` to restore the original
     frame order, with ``_row`` dropped. Each worker opens its own short-lived connection — no shared
-    state across processes. ``preserve_insertion_order`` keeps the ORDER BY honoured."""
+    state across processes. ``preserve_insertion_order`` keeps the ORDER BY honoured.
+
+    The connection's ``memory_limit`` (from ``PE_RANKER_DUCKDB_MEMORY_LIMIT``, default 2GB) and
+    ``threads`` (2) are bounded so N concurrent fork workers don't each grab DuckDB's default 80%-RAM
+    and oversubscribe on the ``ORDER BY`` sort — DuckDB spills the sort to disk under the cap instead.
+    """
     import duckdb
 
     con = duckdb.connect()
     try:
+        mem = os.environ.get("PE_RANKER_DUCKDB_MEMORY_LIMIT", "2GB").replace("'", "''")
+        con.execute(f"SET memory_limit='{mem}';")
+        con.execute("SET threads=2;")
         con.execute("SET preserve_insertion_order=true;")
         return con.execute(
             "SELECT * EXCLUDE (_row) FROM read_parquet(?) "
@@ -1209,8 +1221,11 @@ def _run_trajectory_chunk_ooc(chunk, snapshot_path, runner_factory, worker_id, k
     deflation: dict = {}
     results = {}
     for done, gp in enumerate(chunk, 1):
+        # pre_sliced=True: ss_slice IS this criteria's slice already — skip run_trajectory's redundant
+        # re-slice (which would copy the whole filtered frame again, doubling per-worker RAM).
         results[gp.key] = run_trajectory(gp, ss_slice, runner, uniqueness_cache=uniqueness,
-                                         score_cache=score, deflation_cache=deflation, **kwargs)
+                                         score_cache=score, deflation_cache=deflation,
+                                         pre_sliced=True, **kwargs)
         _log_progress(progress_dir, "config_done", worker=worker_id, config=gp.key,
                       done=done, chunk_total=len(chunk), _file=f"progress.w{worker_id}.jsonl")
     return results, runner.calls, runner.lookups
