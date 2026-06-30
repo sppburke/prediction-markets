@@ -1177,7 +1177,7 @@ def _ss_snapshot_write(ss: SuffStats, path: str) -> str:
     return path
 
 
-def _load_criteria_slice(snapshot_path: str, criteria: Criteria) -> pd.DataFrame:
+def _load_criteria_slice(snapshot_path: str, criteria: Criteria, worker_id: int) -> pd.DataFrame:
     """OOC worker-side: load exactly ``slice_by_criteria(ss, criteria)`` from the parquet snapshot via
     DuckDB (the same TTR-horizon + price-band predicate), ``ORDER BY _row`` to restore the original
     frame order, with ``_row`` dropped. Each worker opens its own short-lived connection — no shared
@@ -1186,15 +1186,24 @@ def _load_criteria_slice(snapshot_path: str, criteria: Criteria) -> pd.DataFrame
     The connection's ``memory_limit`` (from ``PE_RANKER_DUCKDB_MEMORY_LIMIT``, default 2GB) and
     ``threads`` (2) are bounded so N concurrent fork workers don't each grab DuckDB's default 80%-RAM
     and oversubscribe on the ``ORDER BY`` sort — DuckDB spills the sort to disk under the cap instead.
-    """
+
+    The spill goes to a **per-worker** ``temp_directory`` (``_duck_tmp_w{worker_id}`` beside the
+    snapshot). Without this, concurrent fork workers all spill to DuckDB's default ``.tmp/`` in the cwd
+    and race on the shared temp-block files — one worker deleting another's block raises an uncaught
+    ``duckdb::IOException`` ("Could not remove file ... No such file or directory") that aborts the
+    whole process pool (full-universe run23 died this way ~4 min into the grid, 2026-06-30)."""
     import duckdb
 
+    base = os.path.dirname(os.path.abspath(str(snapshot_path))) or "."
+    tmp_dir = os.path.join(base, f"_duck_tmp_w{worker_id}")
+    os.makedirs(tmp_dir, exist_ok=True)
     con = duckdb.connect()
     try:
         mem = os.environ.get("PE_RANKER_DUCKDB_MEMORY_LIMIT", "2GB").replace("'", "''")
         con.execute(f"SET memory_limit='{mem}';")
         con.execute("SET threads=2;")
         con.execute("SET preserve_insertion_order=true;")
+        con.execute(f"SET temp_directory='{tmp_dir.replace(chr(39), chr(39) * 2)}';")
         return con.execute(
             "SELECT * EXCLUDE (_row) FROM read_parquet(?) "
             "WHERE (ttr_ref - entry_ts) <= ? AND price >= ? AND price <= ? ORDER BY _row",
@@ -1203,6 +1212,7 @@ def _load_criteria_slice(snapshot_path: str, criteria: Criteria) -> pd.DataFrame
         ).df()
     finally:
         con.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _run_trajectory_chunk_ooc(chunk, snapshot_path, runner_factory, worker_id, kwargs,
@@ -1214,7 +1224,7 @@ def _run_trajectory_chunk_ooc(chunk, snapshot_path, runner_factory, worker_id, k
     criteria idempotently on the already-filtered slice."""
     if not chunk:
         return {}, 0, 0
-    ss_slice = _load_criteria_slice(snapshot_path, chunk[0].criteria)
+    ss_slice = _load_criteria_slice(snapshot_path, chunk[0].criteria, worker_id)
     runner = runner_factory(worker_id)
     uniqueness: dict = {}
     score: dict = {}
