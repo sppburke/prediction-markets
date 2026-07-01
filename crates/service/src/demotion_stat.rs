@@ -16,7 +16,10 @@
 //! range** `R̂ = max − min` as the bounded-support proxy (Maurer-Pontil empirical
 //! variant) — the same series/constant scheme as the CI-tested ranker-harness
 //! template (`scripts/ranker/demotion.py`), keeping the live gate and the harness
-//! in formula parity (#440 acceptance criterion). The previous per-share gate with
+//! in formula parity (the harness↔live parity requirement #440 also carries; note
+//! #440's *scope* text still describes the pre-rework per-share/lifetime semantics
+//! and should be read against this module as the new baseline). The previous
+//! per-share gate with
 //! the fixed worst-case range `R = 2` was structurally unable to fire below 15
 //! settled fills (`term2 = 7·2·ln(2/α)/(3·(n−1)) > 1` for all `n ≤ 14` at α = 0.10,
 //! exceeding the entire per-share support) — a measured live bleed the gate could
@@ -179,7 +182,7 @@ fn stats_from_series(edges: &[SettledEdge], alpha: Decimal, cutoff: i64) -> Wall
 ///
 /// `half_width = sqrt(2·V·L / n) + 3·R̂·L / n`, where `V` is the unbiased sample
 /// variance and `L = ln(2/α)` — the exact formula of the CI-tested harness template
-/// (`scripts/ranker/demotion.py`, `_demote_from_pnl`), kept in parity per #440.
+/// (`scripts/ranker/demotion.py`, `_demote_from_pnl`); harness↔live formula parity.
 /// `mean + half_width` is an upper CB on the true mean; `mean − half_width` a lower CB.
 fn empirical_bernstein_half_width(
     sample: &[Decimal],
@@ -432,6 +435,23 @@ mod tests {
             ..base
         };
         assert!(!no_cb.should_demote(10));
+    }
+
+    /// Reverse direction of the window divergence (intentional): a lifetime LOSER
+    /// whose trailing window is flat-or-positive is NOT demoted this tick — the
+    /// windowed conjunct is the sole P&L gate, and it fails open toward keeping.
+    /// (It stays demotable the moment its window turns red again; inactivity
+    /// eviction still applies independently.)
+    #[test]
+    fn lifetime_loser_with_flat_window_is_not_demoted() {
+        let dormant_loser = WalletEdgeStats {
+            settled_count: 40,
+            realized_pnl: dec!(-500), // lifetime deep red
+            windowed_pnl: dec!(0),    // nothing settled red in the window
+            lower_cb: Some(dec!(-22)),
+            upper_cb: Some(dec!(-3.5)),
+        };
+        assert!(!dormant_loser.should_demote(10));
     }
 
     /// The behaviour change of the rework: a large HISTORICAL winner that is bleeding
