@@ -565,6 +565,7 @@ async fn main() -> Result<()> {
             inactivity_hard_cap_secs: cfg.inactivity_hard_cap_secs,
             demotion_min_trades: cfg.demotion_min_trades,
             demotion_cb_alpha,
+            demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
             bench_overfetch: cfg.bench_overfetch,
             cap: supabase_reader::MAINTAINED_SET_SIZE,
         };

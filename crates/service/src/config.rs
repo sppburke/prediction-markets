@@ -261,6 +261,13 @@ pub struct ServiceConfig {
     #[serde(default = "default_demotion_cb_alpha")]
     pub demotion_cb_alpha: String,
 
+    /// Trailing window (seconds) for the demotion realized-P&L conjunct: a wallet is
+    /// only demotable when its realized P&L over fills settled within this window is
+    /// negative, so a big historical winner carries no unbounded bleed allowance.
+    /// Default: 2_592_000 (30 d). See `docs/_GLOSSARY.md`: `demotion_pnl_window_secs`.
+    #[serde(default = "default_demotion_pnl_window_secs")]
+    pub demotion_pnl_window_secs: u64,
+
     // ── Strategy ─────────────────────────────────────────────────────────────
     /// Initial bankroll as a decimal string (e.g. `"10000"`). Parsed to `Decimal` at startup.
     #[serde(default = "default_bankroll_usd")]
@@ -375,6 +382,10 @@ fn default_demotion_cb_alpha() -> String {
     "0.10".to_string()
 }
 
+const fn default_demotion_pnl_window_secs() -> u64 {
+    2_592_000 // 30 d
+}
+
 const fn default_position_reseed_interval_secs() -> u64 {
     300
 }
@@ -486,6 +497,7 @@ impl Default for ServiceConfig {
             bench_overfetch: default_bench_overfetch(),
             demotion_min_trades: default_demotion_min_trades(),
             demotion_cb_alpha: default_demotion_cb_alpha(),
+            demotion_pnl_window_secs: default_demotion_pnl_window_secs(),
             bankroll_usd: default_bankroll_usd(),
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),

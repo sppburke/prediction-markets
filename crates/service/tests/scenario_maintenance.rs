@@ -13,8 +13,12 @@
 //!   proven-winner-evicted-past-7d-cap         — a proven winner idle ≥7d is evicted (hard cap).
 //!   negative-edge-evicted-at-72h              — a not-proven, not-demotable wallet idle ≥72h is
 //!       evicted for inactivity, and the eviction carries its real last-trade time for the audit.
-//!   realized-pnl≥0-never-demoted              — realized P&L ≥ 0 is never demoted, even with a
-//!       confidently-negative upper CB.
+//!   realized-pnl≥0-never-demoted              — windowed realized P&L ≥ 0 is never demoted, even
+//!       with a confidently-negative upper CB.
+//!   historic-winner-recent-bleeder-demoted    — lifetime-green wallet bleeding in the trailing
+//!       window IS demoted (the dollar-gate rework's behaviour change).
+//!   small-sample-consistent-bleeder-demoted   — end-to-end (fills → wallet_edge_stats →
+//!       decide_evictions): n=12 consistent bleeder fires; impossible under the old R=2 gate.
 //!   writer-mutex-safety                       — concurrent refresh + replace serialized by the
 //!       shared writer mutex never lose an update (evicted stay out, backfill seeded from real
 //!       last trade stays in).
@@ -57,6 +61,7 @@ fn cfg() -> MaintenanceConfig {
         inactivity_hard_cap_secs: 604_800,
         demotion_min_trades: 10,
         demotion_cb_alpha: dec!(0.10),
+        demotion_pnl_window_secs: 2_592_000, // 30 d
         bench_overfetch: 10,
         cap: 25,
     }
@@ -90,6 +95,8 @@ fn watchlist(entries: Vec<WatchlistEntry>) -> Watchlist {
     }
 }
 
+/// `pnl` seeds BOTH the lifetime and the windowed sum; scenarios that need them to
+/// diverge (historic winner, recent bleeder) build `WalletEdgeStats` directly.
 fn stats(
     settled: usize,
     pnl: Decimal,
@@ -99,6 +106,7 @@ fn stats(
     WalletEdgeStats {
         settled_count: settled,
         realized_pnl: pnl,
+        windowed_pnl: pnl,
         lower_cb: lower,
         upper_cb: upper,
     }
@@ -205,6 +213,89 @@ fn realized_pnl_nonneg_never_demoted() {
         "PASS: realized P&L ≥ 0 is never demoted, regardless of a negative upper CB"
     );
     println!("PASS: realized-pnl≥0-never-demoted");
+}
+
+// ── historic-winner-recent-bleeder-demoted ──────────────────────────────────────
+#[test]
+fn historic_winner_recent_bleeder_demoted() {
+    // The dollar-gate rework's behaviour change: lifetime P&L deep green, trailing
+    // window red, CB proves the loss → Underperformance eviction. Under the old
+    // lifetime conjunct this wallet was shielded indefinitely.
+    let w = wallet(1);
+    let wl = watchlist(vec![entry(w, 100)]);
+    let mut s = HashMap::new();
+    s.insert(
+        w.to_string(),
+        WalletEdgeStats {
+            settled_count: 40,
+            realized_pnl: dec!(4110), // lifetime green
+            windowed_pnl: dec!(-60),  // trailing 30d red
+            lower_cb: Some(dec!(-22)),
+            upper_cb: Some(dec!(-3.5)),
+        },
+    );
+    let mut cur = HashMap::new();
+    cur.insert(w, Some(NOW - 10)); // recently active — demotion is idle-independent
+
+    let ev = decide_evictions(&wl, &s, &cur, &cfg(), NOW);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(
+        ev[0].reason,
+        KnockoutReason::Underperformance,
+        "PASS: a lifetime winner bleeding in the trailing window is demoted"
+    );
+    println!("PASS: historic-winner-recent-bleeder-demoted");
+}
+
+// ── small-sample-consistent-bleeder-demoted (end-to-end via wallet_edge_stats) ──
+#[test]
+fn small_sample_consistent_bleeder_demoted() {
+    // End-to-end through the REAL statistics path (fills → resolutions →
+    // wallet_edge_stats → decide_evictions): 12 consistent −$12.5 settled fills fire
+    // the knockout at a sample size where the old per-share R=2 gate was structurally
+    // unable to fire (term2 = 13.98/(n−1) > 1 for all n ≤ 14).
+    use pe_core_types::{MarketId, OutcomeId, Price, Side, VenueMarketId};
+    use pe_paper_pnl::ResolutionStore;
+    use pe_paper_state::FillRow;
+    use pe_service::demotion_stat::wallet_edge_stats;
+
+    let (_dir, db) = temp_db();
+    let mut store = ResolutionStore::load(Arc::clone(&db)).unwrap();
+    let mid = MarketId(VenueMarketId("0xm".to_string()));
+    // YES resolved to 0, settled yesterday (in-window).
+    store
+        .mark_settled(mid.clone(), vec![dec!(0), dec!(1)], dec!(0), NOW - 86_400)
+        .unwrap();
+
+    let w = wallet(1);
+    let leader = w.to_string();
+    let fills: Vec<FillRow> = (0..12)
+        .map(|i| FillRow {
+            idempotency_key: format!("wf|{leader}|0xsrc|0xm|0|buy|170000{i:04}"),
+            market_id: mid.clone(),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            contracts: 25,
+            fill_price: Price(dec!(0.50)),
+            event_seq: i,
+        })
+        .collect();
+
+    let s = wallet_edge_stats(&fills, &store, dec!(0.10), NOW, 2_592_000);
+    let wl = watchlist(vec![entry(w, 100)]);
+    let mut cur = HashMap::new();
+    cur.insert(w, Some(NOW - 10));
+
+    let ev = decide_evictions(&wl, &s, &cur, &cfg(), NOW);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(
+        ev[0].reason,
+        KnockoutReason::Underperformance,
+        "PASS: n=12 consistent bleeder demoted end-to-end (impossible under old gate)"
+    );
+    assert_eq!(ev[0].live_pnl, Some(dec!(-150)));
+    assert_eq!(ev[0].trades_observed, 12);
+    println!("PASS: small-sample-consistent-bleeder-demoted");
 }
 
 // ── backfilled-wallet-seeded-from-real-last-trade ───────────────────────────────

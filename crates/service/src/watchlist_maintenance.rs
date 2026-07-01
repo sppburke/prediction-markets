@@ -6,7 +6,8 @@
 //!      (≥ `demotion_min_trades` settled fills AND lower-CB edge > 0), which is spared up to
 //!      `inactivity_hard_cap_secs`; past the hard cap it is evicted unconditionally.
 //!   2. **Underperformance** — [`WalletEdgeStats::should_demote`]: upper-CB edge < 0 AND
-//!      realized P&L < 0 AND ≥ `demotion_min_trades` settled fills.
+//!      trailing-window realized P&L < 0 (`demotion_pnl_window_secs`) AND
+//!      ≥ `demotion_min_trades` settled fills.
 //!
 //! The idle clock is the wallet's *real last-trade time* (#357): the poll cursor is seeded from
 //! `ranking_entries.last_trade_unix` at admission — here, for each backfilled wallet, inside the
@@ -54,6 +55,9 @@ pub struct MaintenanceConfig {
     pub demotion_min_trades: usize,
     /// Empirical-Bernstein confidence level α (never `f64`).
     pub demotion_cb_alpha: Decimal,
+    /// Trailing window (seconds) for the demotion realized-P&L conjunct
+    /// (`WalletEdgeStats::windowed_pnl`).
+    pub demotion_pnl_window_secs: u64,
     /// Extra bench candidates fetched beyond the freed-slot count.
     pub bench_overfetch: usize,
     /// Working-set size cap (the maintained-N).
@@ -67,7 +71,8 @@ pub enum KnockoutReason {
     Inactivity,
     /// Idle ≥ the hard cap (a proven winner is no longer spared).
     InactivityHardCap,
-    /// Statistical demotion: upper-CB edge < 0 AND realized P&L < 0 AND enough settled trades.
+    /// Statistical demotion: upper-CB edge < 0 AND trailing-window realized P&L < 0
+    /// AND enough settled trades.
     Underperformance,
 }
 
@@ -78,7 +83,7 @@ impl KnockoutReason {
         match self {
             Self::Inactivity => "inactive>72h",
             Self::InactivityHardCap => "inactive>7d (hard cap)",
-            Self::Underperformance => "upper_cb_edge<0 & realized_pnl<0",
+            Self::Underperformance => "upper_cb_edge<0 & windowed_pnl<0",
         }
     }
 }
@@ -90,7 +95,8 @@ pub struct Eviction {
     pub wallet: WalletAddress,
     /// Which trigger fired.
     pub reason: KnockoutReason,
-    /// Realized P&L (dollars) if the wallet had settled fills; `None` when no stats exist.
+    /// Lifetime realized P&L (dollars) if the wallet had settled fills; `None` when no
+    /// stats exist. Audit field — the demotion *decision* uses the trailing-window sum.
     pub live_pnl: Option<Decimal>,
     /// Settled-fill count observed for the wallet (`0` when no stats exist).
     pub trades_observed: usize,
@@ -102,7 +108,7 @@ pub struct Eviction {
 /// Decide whether a single live wallet is knocked out this tick. Pure.
 ///
 /// Underperformance takes reason-precedence over inactivity: it is the more specific, actionable
-/// signal and its realized-P&L AND-gate is the safety net for the (unvalidated) CB constants.
+/// signal and its trailing-window realized-P&L AND-gate is the safety net for the CB constants.
 ///
 /// # Precondition
 /// `last_ts` is the wallet's poll cursor (its real last-trade time, #357). `None` means the wallet
@@ -304,7 +310,13 @@ async fn maintenance_tick(
             return;
         }
     };
-    let stats = wallet_edge_stats(&fills, &resolutions, cfg.demotion_cb_alpha);
+    let stats = wallet_edge_stats(
+        &fills,
+        &resolutions,
+        cfg.demotion_cb_alpha,
+        now_unix,
+        cfg.demotion_pnl_window_secs,
+    );
 
     // 3. Snapshot the live wallets and their cursors.
     let live_snapshot = live.snapshot();
@@ -418,11 +430,14 @@ mod tests {
             inactivity_hard_cap_secs: 604_800,  // 7 d
             demotion_min_trades: 10,
             demotion_cb_alpha: dec!(0.10),
+            demotion_pnl_window_secs: 2_592_000, // 30 d
             bench_overfetch: 10,
             cap: 25,
         }
     }
 
+    /// `pnl` seeds BOTH the lifetime and the windowed sum — tests that need them to
+    /// diverge construct `WalletEdgeStats` directly.
     fn stats(
         settled: usize,
         pnl: Decimal,
@@ -432,6 +447,7 @@ mod tests {
         WalletEdgeStats {
             settled_count: settled,
             realized_pnl: pnl,
+            windowed_pnl: pnl,
             lower_cb: lower,
             upper_cb: upper,
         }
@@ -489,10 +505,29 @@ mod tests {
 
     #[test]
     fn positive_pnl_never_demoted_even_with_negative_upper_cb() {
-        // The realized-P&L AND-gate is the safety net for the CB constants.
+        // The windowed realized-P&L AND-gate is the safety net for the CB constants.
         let s = stats(20, dec!(0), Some(dec!(-0.30)), Some(dec!(-0.05)));
         let active = Some(NOW - 10);
         assert_eq!(knockout_decision(active, Some(&s), &cfg(), NOW), None);
+    }
+
+    #[test]
+    fn lifetime_winner_bleeding_in_window_is_demoted() {
+        // Behaviour change of the dollar-gate rework: lifetime P&L deep green, but the
+        // trailing window is red AND the CB proves the loss → demote. Under the old
+        // lifetime conjunct this wallet was shielded indefinitely.
+        let s = WalletEdgeStats {
+            settled_count: 40,
+            realized_pnl: dec!(4110),
+            windowed_pnl: dec!(-60),
+            lower_cb: Some(dec!(-22)),
+            upper_cb: Some(dec!(-3.5)),
+        };
+        let active = Some(NOW - 10);
+        assert_eq!(
+            knockout_decision(active, Some(&s), &cfg(), NOW),
+            Some(KnockoutReason::Underperformance)
+        );
     }
 
     #[test]
