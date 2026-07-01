@@ -78,6 +78,7 @@ pub struct RuntimeConfig {
     pub inactivity_hard_cap_secs: u64,
     pub bench_overfetch: usize,
     pub demotion_min_trades: usize,
+    pub demotion_pnl_window_secs: u64,
     /// Price-impact gate cap in basis points; `0` disables it (fail-open). Consumed by the
     /// orchestrator's per-event `/book` gate (#398 WS2) and seeded in `service_config` at `0`.
     pub price_impact_cap_bps: i32,
@@ -121,6 +122,7 @@ impl RuntimeConfig {
             inactivity_hard_cap_secs: cfg.inactivity_hard_cap_secs,
             bench_overfetch: cfg.bench_overfetch,
             demotion_min_trades: cfg.demotion_min_trades,
+            demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
             price_impact_cap_bps: 0,
             flip_human_approved: cfg.strategy.flip_human_approved,
             kelly_fraction_above_default_human_approved: cfg
@@ -260,6 +262,11 @@ pub fn parse_config(
     );
     apply_parsed(&map, "bench_overfetch", &mut out.bench_overfetch);
     apply_parsed(&map, "demotion_min_trades", &mut out.demotion_min_trades);
+    apply_parsed(
+        &map,
+        "demotion_pnl_window_secs",
+        &mut out.demotion_pnl_window_secs,
+    );
     apply_parsed(&map, "price_impact_cap_bps", &mut out.price_impact_cap_bps);
     apply_parsed(&map, "polymarket_fee_rate", &mut out.polymarket_fee_rate);
     apply_parsed(&map, "slippage_rate", &mut out.slippage_rate);
