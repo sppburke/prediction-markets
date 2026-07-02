@@ -822,9 +822,11 @@ fn dry_run_and_disabled_archive_write_nothing() {
 }
 
 #[test]
-fn archive_rerun_replaces_rows_not_duplicates() {
-    // PASS: re-archiving the same delete-set (the crash-rerun case) replaces each
-    // wallet's archive rows instead of duplicating them.
+fn archive_rerun_is_idempotent_and_repurge_unions() {
+    // PASS: a crash-rerun over the same delete-set inserts nothing new (OR IGNORE
+    // under the unique row identities), and a wallet re-discovered with NEW trades
+    // and purged again ADDS those rows without touching the originally archived
+    // ones — the archive is a union across purges.
     let dir = TempDir::new().unwrap();
     let mut cache = open_cache(&dir);
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -837,18 +839,89 @@ fn archive_rerun_replaces_rows_not_duplicates() {
     }];
     let apath = archive_path(&dir);
     let first = cache.archive_wallets(&rows, &apath, now).unwrap();
-    let second = cache.archive_wallets(&rows, &apath, now).unwrap();
     assert_eq!(first.trades_archived, 5);
-    assert_eq!(second.trades_archived, 5, "rerun re-copies, not skips");
+
+    // Crash-rerun: same rows, nothing new inserted, totals unchanged.
+    let second = cache.archive_wallets(&rows, &apath, now).unwrap();
+    assert_eq!(
+        second.trades_archived, 0,
+        "rerun inserts nothing (OR IGNORE)"
+    );
+
+    // Re-discovery: the wallet re-accumulates 2 NEW trades and is purged again.
+    cache.conn_for_test_insert_trade(&wa, &format!("{wa}-new-0"), now - DAY);
+    cache.conn_for_test_insert_trade(&wa, &format!("{wa}-new-1"), now - DAY);
+    let third = cache.archive_wallets(&rows, &apath, now + 60).unwrap();
+    assert_eq!(third.trades_archived, 2, "only the new rows are added");
 
     let arch = rusqlite::Connection::open(&apath).unwrap();
     let trades: i64 = arch
         .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
         .unwrap();
-    let manifest: i64 = arch
-        .query_row("SELECT COUNT(*) FROM purge_manifest", [], |r| r.get(0))
+    assert_eq!(trades, 7, "union across purges: 5 original + 2 new");
+    let manifest_total: i64 = arch
+        .query_row(
+            "SELECT trades_archived FROM purge_manifest WHERE wallet_hex = ?1",
+            [&wa],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(trades, 5, "delete-then-insert: no duplication on rerun");
-    assert_eq!(manifest, 1);
-    println!("PASS: archive rerun replaces rows (idempotent), never duplicates");
+    assert_eq!(
+        manifest_total, 7,
+        "manifest carries the TOTAL archived count"
+    );
+    println!("PASS: archive rerun idempotent; re-purge unions, never overwrites");
+}
+
+#[test]
+fn archive_survives_additive_main_schema_migration() {
+    // PASS: after `main.trades` gains a column (an additive migration), archiving
+    // into a PRE-EXISTING archive still succeeds — the mirror is reconciled by
+    // name (`ALTER TABLE … ADD COLUMN`) and explicit-name inserts keep working.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let wa = wallet_hex(0xa);
+    let wb = wallet_hex(0xb);
+    dead_weight_with_n_trades(&mut cache, &wa, now, now - 30 * DAY, 3);
+    dead_weight_with_n_trades(&mut cache, &wb, now, now - 30 * DAY, 2);
+
+    // First archive creates the mirror at today's schema.
+    let apath = archive_path(&dir);
+    let rows_a = vec![PurgeRow {
+        wallet_hex: wa.clone(),
+        reason: PurgeReason::DeadWeight,
+    }];
+    cache.archive_wallets(&rows_a, &apath, now).unwrap();
+
+    // Simulate a future additive migration on main (SQLite appends the column).
+    {
+        let main = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+        main.execute_batch("ALTER TABLE trades ADD COLUMN future_col TEXT")
+            .unwrap();
+    }
+
+    // Archiving another wallet against the OLD archive must still succeed.
+    let rows_b = vec![PurgeRow {
+        wallet_hex: wb.clone(),
+        reason: PurgeReason::DeadWeight,
+    }];
+    let rep = cache.archive_wallets(&rows_b, &apath, now + 60).unwrap();
+    assert_eq!(rep.trades_archived, 2);
+
+    let arch = rusqlite::Connection::open(&apath).unwrap();
+    let trades: i64 = arch
+        .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(trades, 5, "3 pre-migration + 2 post-migration rows");
+    // The reconciled column exists in the archive; pre-migration rows read NULL.
+    let nulls: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM trades WHERE future_col IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(nulls, 5, "old archive rows read NULL in the new column");
+    println!("PASS: additive main migration never bricks an existing archive");
 }

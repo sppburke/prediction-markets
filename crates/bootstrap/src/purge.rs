@@ -131,9 +131,11 @@ pub fn run_purge(
     // Archive-before-DELETE (item 3.7 of the 2026-07-01 decision record on
     // issue #417): copy every doomed wallet's rows + a both-rules manifest into
     // the sibling archive DB while the trades lookup index is still live, BEFORE
-    // any destructive step. Fail-closed: an archive error (`?`) aborts the purge
-    // — never delete what was not archived. Dry-run/disabled runs archive
-    // nothing (they also delete nothing).
+    // any destructive step. Fail-closed WHILE ENABLED (the default): an archive
+    // error (`?`) aborts the purge, so nothing is deleted that was not archived.
+    // Setting `purge_archive_enabled=false` is an explicit operator opt-out of
+    // that guarantee (the armed purge then deletes without archiving); a dry run
+    // archives nothing (it also deletes nothing).
     if armed && !rows.is_empty() && config.purge_archive_enabled {
         let archive_path = config
             .purge_archive_path

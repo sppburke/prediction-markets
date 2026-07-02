@@ -2397,17 +2397,26 @@ impl WalletCache {
     /// item 3.7 of the 2026-07-01 decision record on issue #417). The #385 purge
     /// hard-deleted 85k wallets and made a point-in-time roster unreconstructable
     /// — an optimistic survivorship bias no later analysis could quantify. This
-    /// ends that: the purge orchestrator calls this first and ABORTS the purge on
-    /// any archive failure (fail-closed — never delete what was not archived).
+    /// ends that: when archiving is enabled (the default), the purge orchestrator
+    /// calls this first and ABORTS the purge on any archive failure (fail-closed
+    /// — never delete what was not archived; disabling the knob is an explicit
+    /// operator opt-out of that guarantee).
     ///
-    /// Mechanics: `ATTACH` the archive, create `trades` / `wallets` /
-    /// `leaderboard_snapshots` mirrors via `CREATE TABLE … AS SELECT * … WHERE 0`
-    /// (schema-drift-proof: columns always match `main`), plus a `purge_manifest`
-    /// census table (wallet, when, rule, trade count — covers BOTH rules, unlike
-    /// the live `purged_wallets` tombstone which records rule A only). Per wallet,
-    /// inside chunked transactions: delete its prior archive rows, then
-    /// `INSERT … SELECT` the current ones — so a crash-rerun replaces rather than
-    /// duplicates. The `DETACH` always runs; the first archive error wins.
+    /// Mechanics: `ATTACH` the archive; create `trades` / `wallets` /
+    /// `leaderboard_snapshots` mirrors (`CREATE TABLE … AS SELECT * … WHERE 0` on
+    /// first use) and then **reconcile columns by name** — any `main` column
+    /// missing from the mirror is `ALTER TABLE … ADD COLUMN`ed, and all inserts
+    /// use explicit name lists — so an additive schema migration on `main` never
+    /// breaks an existing archive (older archive rows read NULL in new columns).
+    /// Rows are copied with `INSERT OR IGNORE` under UNIQUE indexes on the real
+    /// row identities (`trades.source_trade_id`,
+    /// `leaderboard_snapshots(snapshot_at_unix, wallet_hex)`,
+    /// `wallets.wallet_hex`), so the archive is a **union across purges**: a
+    /// crash-rerun is idempotent, and a wallet re-discovered and re-purged later
+    /// ADDS its new rows without touching the originally archived ones. The
+    /// `purge_manifest` census row (both rules, unlike the rule-A-only live
+    /// tombstone) is upserted with the wallet's TOTAL archived trade count. The
+    /// `DETACH` always runs; the first archive error wins.
     ///
     /// # Precondition
     /// Call while the `trades` lookup index (`idx_trades_wallet_ts`) is still
@@ -2430,6 +2439,8 @@ impl WalletCache {
         // Everything between ATTACH and DETACH is bound (never `?`) so the DETACH
         // always runs on this connection; the original error is surfaced after.
         let work = (|| -> Result<(), BootstrapError> {
+            // Mirrors on first use + the manifest. CTAS is the bootstrap only;
+            // steady-state schema safety is the name reconciliation below.
             self.conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS purge_archive.trades AS \
                      SELECT * FROM main.trades WHERE 0;\n\
@@ -2442,29 +2453,44 @@ impl WalletCache {
                      purged_at_unix  INTEGER NOT NULL,\n\
                      reason          TEXT NOT NULL,\n\
                      trades_archived INTEGER NOT NULL\n\
-                 );",
+                 );\n\
+                 CREATE UNIQUE INDEX IF NOT EXISTS purge_archive.uidx_archive_trades_id \
+                     ON trades (source_trade_id);\n\
+                 CREATE INDEX IF NOT EXISTS purge_archive.idx_archive_trades_wallet \
+                     ON trades (wallet_hex);\n\
+                 CREATE UNIQUE INDEX IF NOT EXISTS purge_archive.uidx_archive_wallets_hex \
+                     ON wallets (wallet_hex);\n\
+                 CREATE UNIQUE INDEX IF NOT EXISTS purge_archive.uidx_archive_snaps \
+                     ON leaderboard_snapshots (snapshot_at_unix, wallet_hex);",
             )?;
+
+            // Name-based column reconciliation: append any main-only column to the
+            // mirror (SQLite ADD COLUMN appends; old archive rows read NULL), and
+            // return main's column-name list for the explicit-name INSERT.
+            let cols_t = self.archive_sync_columns("trades")?;
+            let cols_w = self.archive_sync_columns("wallets")?;
+            let cols_s = self.archive_sync_columns("leaderboard_snapshots")?;
+
+            let ins_sql = |table: &str, cols: &[String]| -> String {
+                let quoted: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+                let list = quoted.join(", ");
+                format!(
+                    "INSERT OR IGNORE INTO purge_archive.{table} ({list}) \
+                     SELECT {list} FROM main.{table} WHERE wallet_hex = ?1"
+                )
+            };
+            let sql_t = ins_sql("trades", &cols_t);
+            let sql_w = ins_sql("wallets", &cols_w);
+            let sql_s = ins_sql("leaderboard_snapshots", &cols_s);
+
             for chunk in rows.chunks(PURGE_CHUNK) {
                 let tx = self.conn.transaction()?;
                 {
-                    let mut del_t =
-                        tx.prepare("DELETE FROM purge_archive.trades WHERE wallet_hex = ?1")?;
-                    let mut del_w =
-                        tx.prepare("DELETE FROM purge_archive.wallets WHERE wallet_hex = ?1")?;
-                    let mut del_s = tx.prepare(
-                        "DELETE FROM purge_archive.leaderboard_snapshots WHERE wallet_hex = ?1",
-                    )?;
-                    let mut ins_t = tx.prepare(
-                        "INSERT INTO purge_archive.trades \
-                         SELECT * FROM main.trades WHERE wallet_hex = ?1",
-                    )?;
-                    let mut ins_w = tx.prepare(
-                        "INSERT INTO purge_archive.wallets \
-                         SELECT * FROM main.wallets WHERE wallet_hex = ?1",
-                    )?;
-                    let mut ins_s = tx.prepare(
-                        "INSERT INTO purge_archive.leaderboard_snapshots \
-                         SELECT * FROM main.leaderboard_snapshots WHERE wallet_hex = ?1",
+                    let mut ins_t = tx.prepare(&sql_t)?;
+                    let mut ins_w = tx.prepare(&sql_w)?;
+                    let mut ins_s = tx.prepare(&sql_s)?;
+                    let mut total_t = tx.prepare(
+                        "SELECT COUNT(*) FROM purge_archive.trades WHERE wallet_hex = ?1",
                     )?;
                     let mut man = tx.prepare(
                         "INSERT OR REPLACE INTO purge_archive.purge_manifest \
@@ -2472,15 +2498,14 @@ impl WalletCache {
                          VALUES (?1, ?2, ?3, ?4)",
                     )?;
                     for r in chunk {
-                        del_t.execute(params![r.wallet_hex])?;
-                        del_w.execute(params![r.wallet_hex])?;
-                        del_s.execute(params![r.wallet_hex])?;
-                        let t = ins_t.execute(params![r.wallet_hex])?;
-                        report.trades_archived += t;
+                        report.trades_archived += ins_t.execute(params![r.wallet_hex])?;
                         report.wallets_archived += ins_w.execute(params![r.wallet_hex])?;
                         report.snapshots_archived += ins_s.execute(params![r.wallet_hex])?;
-                        let t_i64 = i64::try_from(t).unwrap_or(i64::MAX);
-                        man.execute(params![r.wallet_hex, now_unix, r.reason.as_str(), t_i64])?;
+                        // Manifest carries the wallet's TOTAL archived trades (a
+                        // union across purges), not just this run's inserts.
+                        let total: i64 =
+                            total_t.query_row(params![r.wallet_hex], |row| row.get(0))?;
+                        man.execute(params![r.wallet_hex, now_unix, r.reason.as_str(), total])?;
                         report.manifest_written += 1;
                     }
                 }
@@ -2492,6 +2517,39 @@ impl WalletCache {
         work?;
         detach?;
         Ok(report)
+    }
+
+    /// Reconcile one archive mirror's columns with `main.<table>` by NAME: any
+    /// column present in `main` but missing from `purge_archive` is appended via
+    /// `ALTER TABLE … ADD COLUMN` (same declared type; existing archive rows read
+    /// NULL). Returns `main`'s column names in order, for explicit-name inserts.
+    /// Columns that only exist in the archive (a dropped `main` column) are left
+    /// in place and simply not written. Requires `purge_archive` to be attached.
+    fn archive_sync_columns(&self, table: &str) -> Result<Vec<String>, BootstrapError> {
+        let read_cols = |schema: &str| -> Result<Vec<(String, String)>, BootstrapError> {
+            let sql = format!("PRAGMA {schema}.table_info({table})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let cols = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(cols)
+        };
+        let main_cols = read_cols("main")?;
+        let arch_names: HashSet<String> = read_cols("purge_archive")?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        for (name, ty) in &main_cols {
+            if !arch_names.contains(name) {
+                // Additive migration on main → append to the mirror. Identifiers
+                // come from PRAGMA table_info (not user input); quote defensively.
+                let ddl = format!("ALTER TABLE purge_archive.{table} ADD COLUMN \"{name}\" {ty}");
+                self.conn.execute_batch(&ddl)?;
+            }
+        }
+        Ok(main_cols.into_iter().map(|(n, _)| n).collect())
     }
 
     /// `VACUUM` the database to reclaim freed pages (issue #385). Must run OUTSIDE
