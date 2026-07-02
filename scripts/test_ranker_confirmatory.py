@@ -183,7 +183,7 @@ class T6_ClvDiagnosticContractTest(unittest.TestCase):
 
 
 class T7_NeverLiveCrashGuardTest(unittest.TestCase):
-    def test_never_live_trajectory_clv_is_nan_without_crash(self) -> None:
+    def test_never_live_trajectory_is_all_zero_without_crash(self) -> None:
         ss, _ = _population(8, good=3, bad=3, n_pos=40)
         points = [3_000_000 + i * 1_000_000 for i in range(4)]
         runner = _FakeRunner({}, points, 1_000_000)
@@ -194,7 +194,9 @@ class T7_NeverLiveCrashGuardTest(unittest.TestCase):
         res = bo.run_trajectory(never_live, ss, runner, as_of_points=points, train_secs=3_000_000,
                                 horizon_secs=1_000_000, k=5, displacement_margin=5)
         self.assertTrue(res.final_follow.empty)
-        self.assertTrue(res.returns.isna().all())
+        # A2 (2026-07-01 decision record, #417; #475): a no-signal period records an economic
+        # $0, so a never-live trajectory is all-ZERO returns (not all-NaN as pre-A2).
+        self.assertTrue((res.returns == 0.0).all())
         self.assertTrue(np.isnan(res.proxy_clv_tstat))
         self.assertEqual(res.proxy_clv_cov, 0.0)
         self.assertTrue(np.isnan(res.true_clv_tstat))
