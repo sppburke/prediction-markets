@@ -100,6 +100,7 @@ jobs:
           python3 scripts/test_ranker_policies.py
           python3 scripts/test_ranker_bakeoff.py
           python3 scripts/test_ranker_confirmatory.py
+          python3 scripts/test_ranker_bench_composition.py
           python3 scripts/test_ranker_clv_source_comparison.py
           python3 scripts/verify_bakeoff_components.py
 
