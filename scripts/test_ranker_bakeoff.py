@@ -699,8 +699,10 @@ class CleanMatrixTest(unittest.TestCase):
         self.assertEqual(d["dropped_periods"], 1)               # that period dropped for all configs
         self.assertEqual(d["winner"], "challenger")
 
-    def test_run_trajectory_emits_nan_for_no_signal_period(self) -> None:
-        # An as_of before any in-sample data exists -> no eligible set -> NaN (not a real $0).
+    def test_run_trajectory_emits_zero_for_no_signal_period(self) -> None:
+        # A2 (2026-07-01 decision record): an as_of before any in-sample data exists -> no
+        # eligible set -> 0.0 — a no-signal period IS an economic $0 (the config held nothing),
+        # not missing data, so the rectangular cleaning no longer drops the period grid-wide.
         raw = pd.DataFrame(
             [("w1", "m1", 1, 5_000_000, 3600, 0.5, 10, 1.0, 5_005_000, 0.55),
              ("w1", "m2", 1, 5_100_000, 3600, 0.5, 10, 0.0, 5_105_000, 0.45),
@@ -715,7 +717,7 @@ class CleanMatrixTest(unittest.TestCase):
         out = bo.run_trajectory(gp, ss, runner, as_of_points=[1_000_000, 6_000_000],
                                 train_secs=3_000_000, horizon_secs=1_000_000, k=5,
                                 displacement_margin=5)
-        self.assertTrue(np.isnan(out.returns.iloc[0]))           # too early -> no signal -> NaN
+        self.assertEqual(out.returns.iloc[0], 0.0)               # too early -> no signal -> $0
         self.assertFalse(np.isnan(out.returns.iloc[1]))          # populated period -> a real number
 
 
@@ -1189,7 +1191,7 @@ class NoSignalStateResetTest(unittest.TestCase):
         out = bo.run_trajectory(self._gp(1.0), ss, runner, as_of_points=points,
                                 train_secs=1_000_000, horizon_secs=1_000_000, k=5,
                                 displacement_margin=5, flat_usd=25.0)
-        self.assertTrue(np.isnan(out.returns.iloc[1]))           # no-signal middle period
+        self.assertEqual(out.returns.iloc[1], 0.0)               # no-signal middle period = $0
         # gross = 2*25 + 1*25 = 75; full re-entry churn = 2 wallets * 1.0 = 2 -> 73 BOTH live periods.
         self.assertAlmostEqual(out.returns.iloc[0], 73.0)        # cold start: full admission
         self.assertAlmostEqual(out.returns.iloc[2], 73.0)        # re-entry pays full churn again

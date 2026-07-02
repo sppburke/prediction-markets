@@ -95,7 +95,8 @@ GROUP BY t.market_id, t.outcome_id
 # guard so a malformed price never wins the arg_max).
 _TRUE_CLV_SQL = """
 SELECT mph.market_id AS market_id, tc.outcome_index AS outcome_id,
-       arg_max(TRY_CAST(mph.price AS DOUBLE), mph.t) AS true_clv_close
+       arg_max(TRY_CAST(mph.price AS DOUBLE), mph.t) AS true_clv_close,
+       MAX(mph.t) AS true_clv_t
 FROM market_price_history mph
 JOIN token_conditions tc
   ON tc.condition_id = mph.market_id AND tc.token_id = mph.token_id
@@ -193,7 +194,12 @@ def materialize(con, wallets: "list[str] | None" = None, *,
                      and _relation_exists(con, "token_conditions"))
         if clv_views:
             con.execute(f"CREATE OR REPLACE TEMP VIEW _pe_true_clv AS {_TRUE_CLV_SQL}")
-            true_sel = "tc.true_clv_close"
+            # A3 (2026-07-01 decision record, #417): the chosen close tick must NOT predate the
+            # position's entry — a stale pre-entry tick is not a closing line for that position
+            # (hourly-fidelity CLOB history made 70% of a followed slice "close" at a tick older
+            # than the entry itself). Such positions get NULL (missing), never a bogus value.
+            true_sel = ("CASE WHEN tc.true_clv_t >= p.entry_ts THEN tc.true_clv_close END "
+                        "AS true_clv_close")
             true_join = "LEFT JOIN _pe_true_clv tc USING (market_id, outcome_id)"
         else:
             # CLOB views absent -> all-NaN `true_clv_close` (true_clv degrades to empty), matching the

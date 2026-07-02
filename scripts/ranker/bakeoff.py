@@ -934,12 +934,17 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     weights = None
 
     def _no_signal() -> None:
-        # #445 defect 1: the config held nothing this period. Record NaN, reset `prev` to empty and
-        # REBUILD the policy via the build_policy seam (clears OnlineWeighting's online state; with an
-        # empty `prev` the knockout/hybrid incumbency also resets), and clear the final deliverable so
-        # a no-signal FINAL cutoff is reported empty — never a fall-back to the most recent real set.
+        # #445 defect 1 + A2 (2026-07-01 decision record, #417): the config held nothing this
+        # period. Record 0.0 — a no-signal period is an ECONOMIC OUTCOME worth $0 net of churn,
+        # not missing data. (Recording NaN made the rectangular cleaning drop the period for the
+        # WHOLE grid, so the evaluation panel — and the baseline's cum return — was a function of
+        # which challenger configs were in the grid; run24's 8-of-24-period WINNER was that
+        # artifact.) State still resets: `prev` to empty and the policy REBUILT via the
+        # build_policy seam (clears OnlineWeighting's online state; with an empty `prev` the
+        # knockout/hybrid incumbency also resets), and the final deliverable cleared so a
+        # no-signal FINAL cutoff is reported empty — never a fall-back to the most recent real set.
         nonlocal prev, policy, final_follow, final_scores
-        returns.append(np.nan)
+        returns.append(0.0)
         prev = pd.DataFrame({"wallet": [], "weight": []})
         policy = build_policy(grid_point.policy, k=k, demoter=demoter,
                               displacement_margin=displacement_margin)
