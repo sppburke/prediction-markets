@@ -64,6 +64,29 @@ class ComposeBenchTest(unittest.TestCase):
         self.assertEqual(bench["policy_online_weighting"]["config"],
                          "eb_shrinkage_skill|none|policy_online_weighting|b|churn0.75")
 
+    def test_never_live_all_zero_arm_is_barred(self) -> None:
+        # #475 crown-bar mirror: vs a LOSING baseline an all-zero (never-live) hybrid pairs
+        # positive every period, but "never trade" is not benchable — slot goes to the live arm.
+        m = _matrix()
+        m["eb_shrinkage_skill|none|policy_hybrid_displacement|b|churn0.0"] = np.zeros(len(m))
+        out = bc.compose_bench(m, BASE)
+        self.assertEqual(out["bench"]["policy_hybrid_displacement"]["config"],
+                         "t_stat_baseline|none|policy_hybrid_displacement|b|churn0.75")
+
+    def test_constant_diff_yields_nan_t_not_float_noise(self) -> None:
+        # _SD_FLOOR guard: a challenger at baseline + exact constant has sd(diff) == 0 →
+        # paired_t must be NaN, never a catastrophic-cancellation ~1e16 statistic.
+        m = _matrix()
+        m["t_stat_baseline|none|policy_online_weighting|b|churn0.0"] = m[BASE] + 7.0
+        table = bc.paired_t_vs_baseline(m, BASE)
+        self.assertTrue(np.isnan(
+            table.loc["t_stat_baseline|none|policy_online_weighting|b|churn0.0", "paired_t"]))
+
+    def test_proxy_clv_ranked_arm_is_barred(self) -> None:
+        self.assertFalse(bc.eligible("proxy_clv|none|policy_hybrid_displacement|b|churn0.0"))
+        self.assertFalse(bc.eligible("true_clv|none|policy_hybrid_displacement|b|churn0.0"))
+        self.assertTrue(bc.eligible("t_stat_baseline|none|policy_hybrid_displacement|b|churn0.0"))
+
     def test_family_with_no_eligible_arm_is_none(self) -> None:
         m = _matrix().drop(columns=["eb_shrinkage_skill|none|policy_online_weighting|b|churn0.75"])
         out = bc.compose_bench(m, BASE)
