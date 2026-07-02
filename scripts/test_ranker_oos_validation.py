@@ -317,6 +317,23 @@ class AKMWinnersTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             akm_inference_on_winners([], [])
 
+    def test_near_tie_falls_back_to_unconditional(self) -> None:
+        # A5 (2026-07-01 decision record): a winner-vs-runner-up gap below
+        # AKM_NEAR_TIE_SIGMA*s makes the truncated-normal law numerically ill-posed
+        # (CDF underflow -> brentq returns a degenerate point CI; run24: gap 0.00049 sigma
+        # produced ci_lo == ci_hi). Such near-ties must return the honest UNCONDITIONAL
+        # normal CI: conditional=False, median == naive, non-degenerate width ~2*1.96*s.
+        est = [1.0 + 1e-6, 1.0, -0.5]
+        out = akm_inference_on_winners(est, [1.0, 1.0, 1.0])
+        self.assertFalse(out["conditional"])
+        self.assertEqual(out["median_unbiased"], out["naive_estimate"])
+        self.assertGreater(out["ci_hi"] - out["ci_lo"], 3.0)  # ~3.92 at alpha=0.05
+
+    def test_clear_gap_stays_conditional(self) -> None:
+        # A gap comfortably above the near-tie threshold keeps the conditional law.
+        out = akm_inference_on_winners([2.0, 1.0], [0.5, 0.5])
+        self.assertTrue(out["conditional"])
+
     def test_named_winner_that_is_the_max_is_conditional(self) -> None:
         # A5 (#436): pointing at the actual argmax -> the conditional truncated-normal shrinkage.
         est = np.array([3.0, 1.0, 0.5])

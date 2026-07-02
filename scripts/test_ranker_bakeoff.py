@@ -699,8 +699,10 @@ class CleanMatrixTest(unittest.TestCase):
         self.assertEqual(d["dropped_periods"], 1)               # that period dropped for all configs
         self.assertEqual(d["winner"], "challenger")
 
-    def test_run_trajectory_emits_nan_for_no_signal_period(self) -> None:
-        # An as_of before any in-sample data exists -> no eligible set -> NaN (not a real $0).
+    def test_run_trajectory_emits_zero_for_no_signal_period(self) -> None:
+        # A2 (2026-07-01 decision record): an as_of before any in-sample data exists -> no
+        # eligible set -> 0.0 — a no-signal period IS an economic $0 (the config held nothing),
+        # not missing data, so the rectangular cleaning no longer drops the period grid-wide.
         raw = pd.DataFrame(
             [("w1", "m1", 1, 5_000_000, 3600, 0.5, 10, 1.0, 5_005_000, 0.55),
              ("w1", "m2", 1, 5_100_000, 3600, 0.5, 10, 0.0, 5_105_000, 0.45),
@@ -715,7 +717,7 @@ class CleanMatrixTest(unittest.TestCase):
         out = bo.run_trajectory(gp, ss, runner, as_of_points=[1_000_000, 6_000_000],
                                 train_secs=3_000_000, horizon_secs=1_000_000, k=5,
                                 displacement_margin=5)
-        self.assertTrue(np.isnan(out.returns.iloc[0]))           # too early -> no signal -> NaN
+        self.assertEqual(out.returns.iloc[0], 0.0)               # too early -> no signal -> $0
         self.assertFalse(np.isnan(out.returns.iloc[1]))          # populated period -> a real number
 
 
@@ -1189,7 +1191,7 @@ class NoSignalStateResetTest(unittest.TestCase):
         out = bo.run_trajectory(self._gp(1.0), ss, runner, as_of_points=points,
                                 train_secs=1_000_000, horizon_secs=1_000_000, k=5,
                                 displacement_margin=5, flat_usd=25.0)
-        self.assertTrue(np.isnan(out.returns.iloc[1]))           # no-signal middle period
+        self.assertEqual(out.returns.iloc[1], 0.0)               # no-signal middle period = $0
         # gross = 2*25 + 1*25 = 75; full re-entry churn = 2 wallets * 1.0 = 2 -> 73 BOTH live periods.
         self.assertAlmostEqual(out.returns.iloc[0], 73.0)        # cold start: full admission
         self.assertAlmostEqual(out.returns.iloc[2], 73.0)        # re-entry pays full churn again
@@ -1821,3 +1823,28 @@ class ForwardCriteriaFilterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NeverLiveCrownBarTest(unittest.TestCase):
+    """A2 follow-through (2026-07-01, #417): post-A2 a never-live config is an all-ZERO column.
+    Against a money-LOSING baseline its constant positive paired diff can clear the RW/SPA
+    machinery — but "never trade" is not a crownable ranking method: the crown must skip it
+    (NO-GO when it is the only candidate), restoring #436 A9's protection at the selection layer."""
+
+    def test_all_zero_config_is_never_crowned(self) -> None:
+        rng = np.random.default_rng(7)
+        periods = 12
+        base = bo.BASELINE_KEY if hasattr(bo, "BASELINE_KEY") else None
+        # Build a 3-column matrix: a LOSING baseline, a dead all-zero config, a noisy loser.
+        cols = {}
+        baseline_key = "t_stat_baseline|none|policy_full_rerank|b|churn0.0"
+        cols[baseline_key] = rng.normal(-10.0, 1.0, periods)          # money-losing baseline
+        cols["dead|none|policy_full_rerank|b|churn0.0"] = np.zeros(periods)   # never-live
+        cols["noisy|none|policy_full_rerank|b|churn0.0"] = rng.normal(-5.0, 8.0, periods)
+        m = pd.DataFrame(cols, index=range(periods))
+        out = bo.select_winner_or_nogo(m, baseline_key=baseline_key, n_grid=3,
+                                       n_grid_full=3, min_periods=6,
+                                       cpr={"go": True, "cpr": 2.0, "pvalue": 0.01})
+        self.assertNotEqual(out.get("winner"),
+                            "dead|none|policy_full_rerank|b|churn0.0",
+                            "an all-zero never-live config must not be crowned")

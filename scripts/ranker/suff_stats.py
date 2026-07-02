@@ -22,7 +22,9 @@ OPTIONAL ``market_price_history`` + ``token_conditions`` views (CLOB ``source='c
 ``arg_max(price, t)`` where ``t <= LEAST(COALESCE(end_date_unix, resolved_at_unix), resolved_at_unix)``
 — the scheduled close capped at resolution, issue #436 B5), so the ``true_clv`` estimator reads it
 as a column. Unlike ``close_proxy`` it pins to the market CLOSE, not the last trade. It is NaN when no CLOB series covers the outcome (best-effort: PR2's measured
-ceiling) OR when the optional CLOB views are absent (pre-backfill); ``true_clv`` drops those.
+ceiling), when the optional CLOB views are absent (pre-backfill), OR when the chosen close tick
+PREDATES the position's entry (A3, 2026-07-01 decision record on #417 — a stale pre-entry tick
+is not a closing line for that position); ``true_clv`` drops those.
 
 The materialized frame is band/window-AGNOSTIC (permissive bands): each ``Criteria`` grid
 point slices ttr / price-band / window downstream in pandas, which is what makes "materialize
@@ -95,7 +97,8 @@ GROUP BY t.market_id, t.outcome_id
 # guard so a malformed price never wins the arg_max).
 _TRUE_CLV_SQL = """
 SELECT mph.market_id AS market_id, tc.outcome_index AS outcome_id,
-       arg_max(TRY_CAST(mph.price AS DOUBLE), mph.t) AS true_clv_close
+       arg_max(TRY_CAST(mph.price AS DOUBLE), mph.t) AS true_clv_close,
+       MAX(mph.t) AS true_clv_t
 FROM market_price_history mph
 JOIN token_conditions tc
   ON tc.condition_id = mph.market_id AND tc.token_id = mph.token_id
@@ -193,7 +196,12 @@ def materialize(con, wallets: "list[str] | None" = None, *,
                      and _relation_exists(con, "token_conditions"))
         if clv_views:
             con.execute(f"CREATE OR REPLACE TEMP VIEW _pe_true_clv AS {_TRUE_CLV_SQL}")
-            true_sel = "tc.true_clv_close"
+            # A3 (2026-07-01 decision record, #417): the chosen close tick must NOT predate the
+            # position's entry — a stale pre-entry tick is not a closing line for that position
+            # (hourly-fidelity CLOB history made 70% of a followed slice "close" at a tick older
+            # than the entry itself). Such positions get NULL (missing), never a bogus value.
+            true_sel = ("CASE WHEN tc.true_clv_t >= p.entry_ts THEN tc.true_clv_close END "
+                        "AS true_clv_close")
             true_join = "LEFT JOIN _pe_true_clv tc USING (market_id, outcome_id)"
         else:
             # CLOB views absent -> all-NaN `true_clv_close` (true_clv degrades to empty), matching the

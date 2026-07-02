@@ -232,6 +232,25 @@ def _raw() -> pd.DataFrame:
     })
 
 
+class TrueClvTickOrderingGuardTest(unittest.TestCase):
+    """A3 (2026-07-01 decision record, #417): a CLOB close tick that PREDATES the position's
+    entry is not a closing line for that position — hourly-fidelity history made 70% of a
+    followed slice "close" at a tick older than the entry itself. Such positions must carry
+    NULL ``true_clv_close`` (missing), never a stale pre-entry price."""
+
+    def test_pre_entry_tick_yields_null_close(self) -> None:
+        con = _make_clv_con()
+        # Map M1 (entry_ts = 1000) and give it ONE clob tick BEFORE the entry.
+        con.execute("INSERT INTO token_conditions VALUES ('tokM1', 'M1', 1, 9)")
+        con.execute(
+            "INSERT INTO market_price_history VALUES ('M1', 'tokM1', 500, '0.30', 'clob')")
+        ss = suff_stats.materialize(con, ["0xa", "0xb"]).set_index("market")
+        self.assertTrue(np.isnan(ss.loc["M1", "true_clv_close"]),
+                        "tick t=500 predates entry_ts=1000 -> NULL, not 0.30")
+        # M3's chosen tick (t=3100) postdates its entry (1500) -> unaffected.
+        self.assertEqual(ss.loc["M3", "true_clv_close"], 0.85)
+
+
 class MaterializeAsTest(unittest.TestCase):
     """Phase-A memory path (issue #468 follow-up): ``duck_extract_positions(materialize_as=…)``
     writes a DuckDB temp TABLE (returns None) carrying the SAME positions as the ``.df()`` path —
