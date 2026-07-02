@@ -128,6 +128,29 @@ pub fn run_purge(
         });
     }
 
+    // Archive-before-DELETE (item 3.7 of the 2026-07-01 decision record on
+    // issue #417): copy every doomed wallet's rows + a both-rules manifest into
+    // the sibling archive DB while the trades lookup index is still live, BEFORE
+    // any destructive step. Fail-closed: an archive error (`?`) aborts the purge
+    // — never delete what was not archived. Dry-run/disabled runs archive
+    // nothing (they also delete nothing).
+    if armed && !rows.is_empty() && config.purge_archive_enabled {
+        let archive_path = config
+            .purge_archive_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.cache_path.with_extension("purge-archive.db"));
+        let archived = cache.archive_wallets(&rows, &archive_path, now_unix)?;
+        tracing::info!(
+            archive = %archive_path.display(),
+            trades_archived = archived.trades_archived,
+            wallets_archived = archived.wallets_archived,
+            snapshots_archived = archived.snapshots_archived,
+            manifest_written = archived.manifest_written,
+            "purge: archive-before-DELETE complete"
+        );
+    }
+
     // Issue #401: gate the bulk index-drop + VACUUM on delete-set size. A small
     // daily armed purge (delete-set < `purge_bulk_min_wallets`) stays cheap —
     // indexes live, no VACUUM; only a genuine backlog clear pays the O(table)

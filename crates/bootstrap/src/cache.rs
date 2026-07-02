@@ -344,6 +344,22 @@ pub struct PurgeRow {
     pub reason: PurgeReason,
 }
 
+/// Outcome of [`WalletCache::archive_wallets`] (archive-before-DELETE, item 3.7 of
+/// the 2026-07-01 decision record on issue #417). Counts are rows copied into the
+/// attached archive database this run (re-archiving a wallet replaces its prior
+/// archive rows, so re-runs after a crash are idempotent, not additive).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveReport {
+    /// `trades` rows copied into the archive.
+    pub trades_archived: usize,
+    /// `wallets` rows copied into the archive.
+    pub wallets_archived: usize,
+    /// `leaderboard_snapshots` rows copied into the archive.
+    pub snapshots_archived: usize,
+    /// `purge_manifest` census rows written (== delete-set size).
+    pub manifest_written: usize,
+}
+
 /// Outcome of [`WalletCache::purge_wallets`] (issue #385). In `dry_run` mode the
 /// `*_deleted` counts are estimates (trades via `wallets.trade_count`, snapshots
 /// via `COUNT`) of what an armed run *would* remove; nothing is written.
@@ -2373,6 +2389,108 @@ impl WalletCache {
             }
             tx.commit()?;
         }
+        Ok(report)
+    }
+
+    /// Archive every doomed wallet's rows into a separate SQLite database at
+    /// `archive_path` BEFORE any destructive purge step (archive-before-DELETE,
+    /// item 3.7 of the 2026-07-01 decision record on issue #417). The #385 purge
+    /// hard-deleted 85k wallets and made a point-in-time roster unreconstructable
+    /// — an optimistic survivorship bias no later analysis could quantify. This
+    /// ends that: the purge orchestrator calls this first and ABORTS the purge on
+    /// any archive failure (fail-closed — never delete what was not archived).
+    ///
+    /// Mechanics: `ATTACH` the archive, create `trades` / `wallets` /
+    /// `leaderboard_snapshots` mirrors via `CREATE TABLE … AS SELECT * … WHERE 0`
+    /// (schema-drift-proof: columns always match `main`), plus a `purge_manifest`
+    /// census table (wallet, when, rule, trade count — covers BOTH rules, unlike
+    /// the live `purged_wallets` tombstone which records rule A only). Per wallet,
+    /// inside chunked transactions: delete its prior archive rows, then
+    /// `INSERT … SELECT` the current ones — so a crash-rerun replaces rather than
+    /// duplicates. The `DETACH` always runs; the first archive error wins.
+    ///
+    /// # Precondition
+    /// Call while the `trades` lookup index (`idx_trades_wallet_ts`) is still
+    /// present — i.e. before `drop_trades_bulk_delete_indexes` — or the per-wallet
+    /// `SELECT` degrades to a full scan of a ~269M-row table.
+    pub fn archive_wallets(
+        &mut self,
+        rows: &[PurgeRow],
+        archive_path: &Path,
+        now_unix: i64,
+    ) -> Result<ArchiveReport, BootstrapError> {
+        let mut report = ArchiveReport::default();
+        if rows.is_empty() {
+            return Ok(report);
+        }
+        let path_str = archive_path.to_string_lossy().into_owned();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS purge_archive", params![path_str])?;
+
+        // Everything between ATTACH and DETACH is bound (never `?`) so the DETACH
+        // always runs on this connection; the original error is surfaced after.
+        let work = (|| -> Result<(), BootstrapError> {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS purge_archive.trades AS \
+                     SELECT * FROM main.trades WHERE 0;\n\
+                 CREATE TABLE IF NOT EXISTS purge_archive.wallets AS \
+                     SELECT * FROM main.wallets WHERE 0;\n\
+                 CREATE TABLE IF NOT EXISTS purge_archive.leaderboard_snapshots AS \
+                     SELECT * FROM main.leaderboard_snapshots WHERE 0;\n\
+                 CREATE TABLE IF NOT EXISTS purge_archive.purge_manifest (\n\
+                     wallet_hex      TEXT PRIMARY KEY NOT NULL,\n\
+                     purged_at_unix  INTEGER NOT NULL,\n\
+                     reason          TEXT NOT NULL,\n\
+                     trades_archived INTEGER NOT NULL\n\
+                 );",
+            )?;
+            for chunk in rows.chunks(PURGE_CHUNK) {
+                let tx = self.conn.transaction()?;
+                {
+                    let mut del_t =
+                        tx.prepare("DELETE FROM purge_archive.trades WHERE wallet_hex = ?1")?;
+                    let mut del_w =
+                        tx.prepare("DELETE FROM purge_archive.wallets WHERE wallet_hex = ?1")?;
+                    let mut del_s = tx.prepare(
+                        "DELETE FROM purge_archive.leaderboard_snapshots WHERE wallet_hex = ?1",
+                    )?;
+                    let mut ins_t = tx.prepare(
+                        "INSERT INTO purge_archive.trades \
+                         SELECT * FROM main.trades WHERE wallet_hex = ?1",
+                    )?;
+                    let mut ins_w = tx.prepare(
+                        "INSERT INTO purge_archive.wallets \
+                         SELECT * FROM main.wallets WHERE wallet_hex = ?1",
+                    )?;
+                    let mut ins_s = tx.prepare(
+                        "INSERT INTO purge_archive.leaderboard_snapshots \
+                         SELECT * FROM main.leaderboard_snapshots WHERE wallet_hex = ?1",
+                    )?;
+                    let mut man = tx.prepare(
+                        "INSERT OR REPLACE INTO purge_archive.purge_manifest \
+                         (wallet_hex, purged_at_unix, reason, trades_archived) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for r in chunk {
+                        del_t.execute(params![r.wallet_hex])?;
+                        del_w.execute(params![r.wallet_hex])?;
+                        del_s.execute(params![r.wallet_hex])?;
+                        let t = ins_t.execute(params![r.wallet_hex])?;
+                        report.trades_archived += t;
+                        report.wallets_archived += ins_w.execute(params![r.wallet_hex])?;
+                        report.snapshots_archived += ins_s.execute(params![r.wallet_hex])?;
+                        let t_i64 = i64::try_from(t).unwrap_or(i64::MAX);
+                        man.execute(params![r.wallet_hex, now_unix, r.reason.as_str(), t_i64])?;
+                        report.manifest_written += 1;
+                    }
+                }
+                tx.commit()?;
+            }
+            Ok(())
+        })();
+        let detach = self.conn.execute_batch("DETACH DATABASE purge_archive");
+        work?;
+        detach?;
         Ok(report)
     }
 
