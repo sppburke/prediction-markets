@@ -536,6 +536,30 @@ pub struct BootstrapConfig {
         deserialize_with = "deserialize_opt_string_empty_none"
     )]
     pub purge_decision_csv: Option<String>,
+
+    /// Archive-before-DELETE for the armed purge (item 3.7 of the 2026-07-01
+    /// decision record on issue #417): every doomed wallet's `trades` / `wallets` /
+    /// `leaderboard_snapshots` rows plus a both-rules `purge_manifest` census are
+    /// copied into a sibling SQLite archive BEFORE any destructive step, and an
+    /// archive failure ABORTS the purge (fail-closed). Default `true`; disable only
+    /// on a disk-constrained box (the archive grows by the deleted volume).
+    /// Canonical default in `docs/_GLOSSARY.md`. `PE_BOOTSTRAP_PURGE_ARCHIVE_ENABLED`.
+    #[serde(
+        default = "default_purge_archive_enabled",
+        alias = "bootstrap_purge_archive_enabled",
+        deserialize_with = "deserialize_bool_or_01"
+    )]
+    pub purge_archive_enabled: bool,
+
+    /// Archive database path. Unset/empty derives `<cache_path stem>.purge-archive.db`
+    /// beside the cache (e.g. `data/wallet_cache.purge-archive.db`).
+    /// `PE_BOOTSTRAP_PURGE_ARCHIVE_PATH`.
+    #[serde(
+        default,
+        alias = "bootstrap_purge_archive_path",
+        deserialize_with = "deserialize_opt_string_empty_none"
+    )]
+    pub purge_archive_path: Option<String>,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -720,6 +744,10 @@ const fn default_purge_bulk_min_wallets() -> u64 {
     DEFAULT_PURGE_BULK_MIN_WALLETS
 }
 
+const fn default_purge_archive_enabled() -> bool {
+    true
+}
+
 // ── Default impl ──────────────────────────────────────────────────────────────
 
 impl Default for BootstrapConfig {
@@ -776,6 +804,8 @@ impl Default for BootstrapConfig {
             purge_loser_neff_min: default_purge_loser_neff_min(),
             purge_bulk_min_wallets: default_purge_bulk_min_wallets(),
             purge_decision_csv: None,
+            purge_archive_enabled: default_purge_archive_enabled(),
+            purge_archive_path: None,
         }
     }
 }

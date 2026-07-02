@@ -325,10 +325,15 @@ fn write_csv(dir: &TempDir, body: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// `cache_path` is derived from the CSV's directory (== the test tempdir, matching
+/// [`open_cache`]) so the archive-before-DELETE artifact lands inside the tempdir —
+/// never at the default `data/` path relative to the test cwd.
 fn cfg(csv: String, enabled: bool) -> BootstrapConfig {
+    let cache_path = std::path::Path::new(&csv).with_file_name("cache.db");
     BootstrapConfig {
         purge_decision_csv: Some(csv),
         purge_enabled: enabled,
+        cache_path,
         ..BootstrapConfig::default()
     }
 }
@@ -338,10 +343,8 @@ fn cfg(csv: String, enabled: bool) -> BootstrapConfig {
 /// regardless of the small delete-set sizes these deterministic fixtures use.
 fn cfg_with_bulk_min(csv: String, enabled: bool, bulk_min: u64) -> BootstrapConfig {
     BootstrapConfig {
-        purge_decision_csv: Some(csv),
-        purge_enabled: enabled,
         purge_bulk_min_wallets: bulk_min,
-        ..BootstrapConfig::default()
+        ..cfg(csv, enabled)
     }
 }
 
@@ -701,4 +704,224 @@ fn run_purge_incremental_mode_keeps_indexes_no_vacuum() {
     println!(
         "PASS: incremental-mode run_purge keeps both indexes live and skips VACUUM (freelist > 0, file unchanged at {pages_before} pages)"
     );
+}
+
+// ── archive-before-DELETE (item 3.7, 2026-07-01 decision record / #417) ────────
+
+/// The derived archive path for a test tempdir cache (`cache.db` →
+/// `cache.purge-archive.db`).
+fn archive_path(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("cache.purge-archive.db")
+}
+
+#[test]
+fn armed_purge_archives_before_delete() {
+    // PASS: after an armed purge, the sibling archive DB holds every doomed
+    // wallet's trades + wallet row + a both-rules manifest, the spared wallet is
+    // absent from the archive, and the live tables no longer hold the doomed rows.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let wa = wallet_hex(0xa); // rule A: eligible proven loser (1 trade)
+    let wb = wallet_hex(0xb); // spared eligible winner
+    let wc = wallet_hex(0xc); // rule B: dead weight, 5 trades
+    active_with_trade(&mut cache, &wa, now, now - 2 * DAY);
+    active_with_trade(&mut cache, &wb, now, now - 3_600);
+    dead_weight_with_n_trades(&mut cache, &wc, now, now - 30 * DAY, 5);
+
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000a,-3.0,-0.5,50,True\n\
+         0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
+    );
+    let report = run_purge(&cfg(csv, true), &mut cache, false).unwrap();
+    assert_eq!(report.proven_losers_deleted + report.dead_weight_deleted, 2);
+
+    let apath = archive_path(&dir);
+    assert!(apath.exists(), "archive DB must exist after an armed purge");
+    let arch = rusqlite::Connection::open(&apath).unwrap();
+    let count = |sql: &str| -> i64 { arch.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+    // Doomed wallets fully archived: wa 1 trade + wc 5 trades; both wallet rows;
+    // manifest covers BOTH rules (the live tombstone table records rule A only).
+    assert_eq!(count("SELECT COUNT(*) FROM trades"), 6);
+    assert_eq!(count("SELECT COUNT(*) FROM wallets"), 2);
+    assert_eq!(count("SELECT COUNT(*) FROM purge_manifest"), 2);
+    let reason_a: String = arch
+        .query_row(
+            "SELECT reason FROM purge_manifest WHERE wallet_hex = ?1",
+            [&wa],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let reason_c: String = arch
+        .query_row(
+            "SELECT reason FROM purge_manifest WHERE wallet_hex = ?1",
+            [&wc],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason_a, "proven_loser");
+    assert_eq!(reason_c, "dead_weight");
+    // Spared winner is NOT archived.
+    let wb_rows: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM wallets WHERE wallet_hex = ?1",
+            [&wb],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(wb_rows, 0);
+    // And the live side is actually purged (archive happened BEFORE delete).
+    assert!(!cache.conn_for_test_wallet_exists(&wa));
+    assert!(!cache.conn_for_test_wallet_exists(&wc));
+    assert!(cache.conn_for_test_wallet_exists(&wb));
+    println!("PASS: armed purge archives all doomed rows + both-rules manifest before deleting");
+}
+
+#[test]
+fn dry_run_and_disabled_archive_write_nothing() {
+    // PASS: a dry-run writes no archive; an armed run with the archive knob off
+    // still purges but writes no archive.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let wa = wallet_hex(0xa);
+    let wb = wallet_hex(0xb);
+    active_with_trade(&mut cache, &wa, now, now - 2 * DAY);
+    active_with_trade(&mut cache, &wb, now, now - 3_600);
+    let body = "wallet,tstat_net,mean_net,n_eff,eligible\n\
+                0x000000000000000000000000000000000000000a,-3.0,-0.5,50,True\n\
+                0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n";
+
+    // Dry run: nothing deleted, nothing archived.
+    let csv = write_csv(&dir, body);
+    run_purge(&cfg(csv.clone(), true), &mut cache, true).unwrap();
+    assert!(
+        !archive_path(&dir).exists(),
+        "dry-run must not write an archive"
+    );
+
+    // Armed with archive disabled: purge proceeds, no archive artifact.
+    let cfg_off = BootstrapConfig {
+        purge_archive_enabled: false,
+        ..cfg(csv, true)
+    };
+    run_purge(&cfg_off, &mut cache, false).unwrap();
+    assert!(
+        !cache.conn_for_test_wallet_exists(&wa),
+        "purge still deletes"
+    );
+    assert!(
+        !archive_path(&dir).exists(),
+        "disabled archive must write nothing"
+    );
+    println!("PASS: dry-run and archive-disabled runs write no archive artifact");
+}
+
+#[test]
+fn archive_rerun_is_idempotent_and_repurge_unions() {
+    // PASS: a crash-rerun over the same delete-set inserts nothing new (OR IGNORE
+    // under the unique row identities), and a wallet re-discovered with NEW trades
+    // and purged again ADDS those rows without touching the originally archived
+    // ones — the archive is a union across purges.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let wa = wallet_hex(0xa);
+    dead_weight_with_n_trades(&mut cache, &wa, now, now - 30 * DAY, 5);
+
+    let rows = vec![PurgeRow {
+        wallet_hex: wa.clone(),
+        reason: PurgeReason::DeadWeight,
+    }];
+    let apath = archive_path(&dir);
+    let first = cache.archive_wallets(&rows, &apath, now).unwrap();
+    assert_eq!(first.trades_archived, 5);
+
+    // Crash-rerun: same rows, nothing new inserted, totals unchanged.
+    let second = cache.archive_wallets(&rows, &apath, now).unwrap();
+    assert_eq!(
+        second.trades_archived, 0,
+        "rerun inserts nothing (OR IGNORE)"
+    );
+
+    // Re-discovery: the wallet re-accumulates 2 NEW trades and is purged again.
+    cache.conn_for_test_insert_trade(&wa, &format!("{wa}-new-0"), now - DAY);
+    cache.conn_for_test_insert_trade(&wa, &format!("{wa}-new-1"), now - DAY);
+    let third = cache.archive_wallets(&rows, &apath, now + 60).unwrap();
+    assert_eq!(third.trades_archived, 2, "only the new rows are added");
+
+    let arch = rusqlite::Connection::open(&apath).unwrap();
+    let trades: i64 = arch
+        .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(trades, 7, "union across purges: 5 original + 2 new");
+    let manifest_total: i64 = arch
+        .query_row(
+            "SELECT trades_archived FROM purge_manifest WHERE wallet_hex = ?1",
+            [&wa],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        manifest_total, 7,
+        "manifest carries the TOTAL archived count"
+    );
+    println!("PASS: archive rerun idempotent; re-purge unions, never overwrites");
+}
+
+#[test]
+fn archive_survives_additive_main_schema_migration() {
+    // PASS: after `main.trades` gains a column (an additive migration), archiving
+    // into a PRE-EXISTING archive still succeeds — the mirror is reconciled by
+    // name (`ALTER TABLE … ADD COLUMN`) and explicit-name inserts keep working.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let wa = wallet_hex(0xa);
+    let wb = wallet_hex(0xb);
+    dead_weight_with_n_trades(&mut cache, &wa, now, now - 30 * DAY, 3);
+    dead_weight_with_n_trades(&mut cache, &wb, now, now - 30 * DAY, 2);
+
+    // First archive creates the mirror at today's schema.
+    let apath = archive_path(&dir);
+    let rows_a = vec![PurgeRow {
+        wallet_hex: wa.clone(),
+        reason: PurgeReason::DeadWeight,
+    }];
+    cache.archive_wallets(&rows_a, &apath, now).unwrap();
+
+    // Simulate a future additive migration on main (SQLite appends the column).
+    {
+        let main = rusqlite::Connection::open(dir.path().join("cache.db")).unwrap();
+        main.execute_batch("ALTER TABLE trades ADD COLUMN future_col TEXT")
+            .unwrap();
+    }
+
+    // Archiving another wallet against the OLD archive must still succeed.
+    let rows_b = vec![PurgeRow {
+        wallet_hex: wb.clone(),
+        reason: PurgeReason::DeadWeight,
+    }];
+    let rep = cache.archive_wallets(&rows_b, &apath, now + 60).unwrap();
+    assert_eq!(rep.trades_archived, 2);
+
+    let arch = rusqlite::Connection::open(&apath).unwrap();
+    let trades: i64 = arch
+        .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(trades, 5, "3 pre-migration + 2 post-migration rows");
+    // The reconciled column exists in the archive; pre-migration rows read NULL.
+    let nulls: i64 = arch
+        .query_row(
+            "SELECT COUNT(*) FROM trades WHERE future_col IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(nulls, 5, "old archive rows read NULL in the new column");
+    println!("PASS: additive main migration never bricks an existing archive");
 }
