@@ -22,7 +22,9 @@ OPTIONAL ``market_price_history`` + ``token_conditions`` views (CLOB ``source='c
 ``arg_max(price, t)`` where ``t <= LEAST(COALESCE(end_date_unix, resolved_at_unix), resolved_at_unix)``
 — the scheduled close capped at resolution, issue #436 B5), so the ``true_clv`` estimator reads it
 as a column. Unlike ``close_proxy`` it pins to the market CLOSE, not the last trade. It is NaN when no CLOB series covers the outcome (best-effort: PR2's measured
-ceiling) OR when the optional CLOB views are absent (pre-backfill); ``true_clv`` drops those.
+ceiling), when the optional CLOB views are absent (pre-backfill), OR when the chosen close tick
+PREDATES the position's entry (A3, 2026-07-01 decision record on #417 — a stale pre-entry tick
+is not a closing line for that position); ``true_clv`` drops those.
 
 The materialized frame is band/window-AGNOSTIC (permissive bands): each ``Criteria`` grid
 point slices ttr / price-band / window downstream in pandas, which is what makes "materialize

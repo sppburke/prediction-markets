@@ -443,6 +443,9 @@ def akm_inference_on_winners(estimates, ses, *, winner: "int | None" = None,
     normal CI (``conditional=False``) instead of a spurious shrinkage.
 
     Returns ``{winner, naive_estimate, median_unbiased, ci_lo, ci_hi, truncation, conditional}``.
+    Falls back to the honest UNCONDITIONAL normal CI (``conditional=False``) when the named winner
+    is not the strict max, on EXACT top ties, on a zero-SE winner, and (A5, 2026-07-01) on
+    numerically-near ties — winner-vs-runner-up gap below ``AKM_NEAR_TIE_SIGMA``·SE.
     """
     estimates = np.asarray(estimates, dtype=float)
     ses = np.asarray(ses, dtype=float)

@@ -903,9 +903,11 @@ def run_trajectory(grid_point: GridPoint, ss: SuffStats, runner, *, as_of_points
     construction: ``set_t -> pe-backtest(set_t) -> live_pnl_t -> policy.step -> set_{t+1}``
     (issue #421 8c).
 
-    A9 (#436): a period with no eligible set / no surviving signal / an empty followed set yields
-    ``NaN`` (the config held nothing — EXCLUDED from its moments), NOT ``0.0`` (which would be a
-    real, low-variance "traded and made $0" and could out-rank a live config).
+    A2 (2026-07-01 decision record, #417; reverses #436 A9): a period with no eligible set /
+    no surviving signal / an empty followed set yields ``0.0`` — an economic $0 outcome, not
+    missing data — so the evaluation panel is no longer a function of which challenger configs
+    are in the grid. A9's dead-config concern is enforced at the SELECTION layer instead
+    (``select_winner_or_nogo`` never crowns a never-live all-zero config).
 
     #445 defect 1: "held nothing" also RESETS carry — ``prev`` returns to an empty set and the policy
     is rebuilt via ``build_policy`` (clearing online weights / incumbency) so a later re-entry pays
@@ -1427,11 +1429,13 @@ def winner_uncertainty(moments: pd.DataFrame, *, winner_config: "str | None" = N
 
 def _clean_return_matrix(return_matrix: pd.DataFrame, *,
                          baseline_key: str) -> "tuple[pd.DataFrame | None, dict]":
-    """A9 (#436): exclude no-signal configs/periods before the leaderboard. Drop configs that never
-    produced a signal (all-NaN columns) and make the panel rectangular by dropping periods any
-    surviving config missed — so a dead config is EXCLUDED, not scored a low-variance 0 that
-    out-ranks a live config, and the bootstrap Validators (PBO/RW/SPA) get a dense matrix. Returns
-    ``(clean, info)``, or ``(None, info)`` with a ``reason`` when no verdict is supportable."""
+    """A9 (#436) as amended by A2 (2026-07-01, #417): drop all-``NaN`` configs and make the panel
+    rectangular by dropping periods any surviving config missed, so the bootstrap Validators
+    (PBO/RW/SPA) get a dense matrix. Post-A2, no-signal periods record ``0.0`` (an economic $0),
+    so this cleaning only bites on genuinely-missing data — never-live configs are all-ZERO
+    columns (kept here, visible) and are barred from the crown in ``select_winner_or_nogo``.
+    Returns ``(clean, info)``, or ``(None, info)`` with a ``reason`` when no verdict is
+    supportable."""
     non_dead = return_matrix.dropna(axis=1, how="all")
     info = {"dropped_configs": [c for c in return_matrix.columns if c not in non_dead.columns]}
     if baseline_key not in non_dead.columns:
@@ -1471,7 +1475,8 @@ def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_g
     # B4 (#436) + #445 defect 2: the CSCV / Romano-Wolf / Hansen-SPA / DSR panel needs
     # >= min_periods walk-forward periods to be trustworthy; below it those gates degenerate to a
     # SILENT always-NO-GO. The floor applies to the CLEANED DENSE matrix (`_clean_return_matrix`
-    # drops all-NaN configs + every no-signal period), NOT the raw row count: a panel with enough
+    # drops all-NaN configs + genuinely-missing periods; post-A2 no-signal records 0.0 and is NOT
+    # dropped), NOT the raw row count: a panel with enough
     # RAW rows that cleans down below the floor must still be an EXPLICIT insufficient-periods NO-GO,
     # not reach leaderboard evaluation on a too-short dense matrix (the #445 raw-24/clean-2 leak).
     raw_periods = int(return_matrix.shape[0])
@@ -1519,6 +1524,13 @@ def select_winner_or_nogo(return_matrix: pd.DataFrame, *, baseline_key: str, n_g
     # A5 (#436): award the highest-cum-return RW-superior config that beats the baseline.
     winner = None
     for cfg in challengers.sort_values("cum_return", ascending=False).index:
+        # A2 follow-through (2026-07-01, #417): a never-live config is an all-zero column post-A2
+        # (it "held nothing" every period). Against a money-LOSING baseline its constant positive
+        # paired diff can clear RW/SPA — but "never trade" is not a crownable ranking method; the
+        # honest verdict there is NO-GO. This restores #436 A9's protection at the SELECTION layer
+        # (the panel keeps the economic $0s; the crown just never goes to a dead config).
+        if (clean[cfg] == 0.0).all():
+            continue
         if float(moments.loc[cfg, "cum_return"]) > baseline_cum and cfg in superior:
             winner = cfg
             break

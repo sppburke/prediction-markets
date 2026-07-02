@@ -1823,3 +1823,28 @@ class ForwardCriteriaFilterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NeverLiveCrownBarTest(unittest.TestCase):
+    """A2 follow-through (2026-07-01, #417): post-A2 a never-live config is an all-ZERO column.
+    Against a money-LOSING baseline its constant positive paired diff can clear the RW/SPA
+    machinery — but "never trade" is not a crownable ranking method: the crown must skip it
+    (NO-GO when it is the only candidate), restoring #436 A9's protection at the selection layer."""
+
+    def test_all_zero_config_is_never_crowned(self) -> None:
+        rng = np.random.default_rng(7)
+        periods = 12
+        base = bo.BASELINE_KEY if hasattr(bo, "BASELINE_KEY") else None
+        # Build a 3-column matrix: a LOSING baseline, a dead all-zero config, a noisy loser.
+        cols = {}
+        baseline_key = "t_stat_baseline|none|policy_full_rerank|b|churn0.0"
+        cols[baseline_key] = rng.normal(-10.0, 1.0, periods)          # money-losing baseline
+        cols["dead|none|policy_full_rerank|b|churn0.0"] = np.zeros(periods)   # never-live
+        cols["noisy|none|policy_full_rerank|b|churn0.0"] = rng.normal(-5.0, 8.0, periods)
+        m = pd.DataFrame(cols, index=range(periods))
+        out = bo.select_winner_or_nogo(m, baseline_key=baseline_key, n_grid=3,
+                                       n_grid_full=3, min_periods=6,
+                                       cpr={"go": True, "cpr": 2.0, "pvalue": 0.01})
+        self.assertNotEqual(out.get("winner"),
+                            "dead|none|policy_full_rerank|b|churn0.0",
+                            "an all-zero never-live config must not be crowned")
