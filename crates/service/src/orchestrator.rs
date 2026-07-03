@@ -53,7 +53,7 @@ pub struct OrchestratorConfig {
     pub mode: ExecutionMode,
     pub signal_config: SignalConfig,
     /// Drop signals whose market `endDate` is further than this many seconds into
-    /// the future. 0 disables the upper bound. Default: 72 h (259_200 s).
+    /// the future. 0 disables the upper bound. Default: 48 h (172_800 s, run28 cutover).
     pub max_resolution_horizon_secs: u64,
     /// Drop signals whose market resolves sooner than this many seconds from now.
     /// 0 disables the lower bound. Default: 60 s (docs/29 copy floor).
@@ -61,6 +61,10 @@ pub struct OrchestratorConfig {
     /// Maximum current price at which a BUY copy will fill (issue #142 parity).
     /// `Decimal::ZERO` disables the cap.
     pub max_fill_price: Decimal,
+    /// Minimum current price at which a BUY copy will fill — the run28 entry-band
+    /// lower bound (#468 parity with the backtest `min_signal_price` floor).
+    /// `Decimal::ZERO` disables the floor.
+    pub min_fill_price: Decimal,
     /// Copy-entry gate config (first-entry/fail-closed posture). The per-wallet
     /// market history is supplied separately to [`Orchestrator::new`].
     pub entry_gate_config: CopyEntryGateConfig,
@@ -88,6 +92,8 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBook
     min_resolution_horizon_secs: u64,
     // Skip BUYs whose current price is >= this (issue #142 parity). ZERO disables.
     max_fill_price: Decimal,
+    // Skip BUYs whose current price is < this (run28 band lower, #468 parity). ZERO disables.
+    min_fill_price: Decimal,
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
@@ -168,6 +174,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             max_resolution_horizon_secs: config.max_resolution_horizon_secs,
             min_resolution_horizon_secs: config.min_resolution_horizon_secs,
             max_fill_price: config.max_fill_price,
+            min_fill_price: config.min_fill_price,
             filled_positions,
             entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
@@ -286,6 +293,9 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             }
             if let Ok(price) = Decimal::from_str(&rc.max_fill_price) {
                 self.max_fill_price = price;
+            }
+            if let Ok(price) = Decimal::from_str(&rc.min_fill_price) {
+                self.min_fill_price = price;
             }
             self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
@@ -442,6 +452,25 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
                 market = %signal.market_id,
                 current_price = %current_price.0,
                 max_fill_price = %self.max_fill_price,
+                "signal did not produce order",
+            );
+            self.commit_no_fill(&trade, &leader_row);
+            return;
+        }
+
+        // min_fill_price band floor (run28 cutover, #468 selection↔deployment parity):
+        // skip BUYs whose current price is below the entry-band lower bound. Strictly
+        // `<` so the boundary value fills, mirroring the backtest `min_signal_price`
+        // floor the run28 eval used. ZERO disables.
+        if signal.leader_side == Side::Buy
+            && self.min_fill_price > Decimal::ZERO
+            && current_price.0 < self.min_fill_price
+        {
+            info!(
+                reason = "current price below min_fill_price",
+                market = %signal.market_id,
+                current_price = %current_price.0,
+                min_fill_price = %self.min_fill_price,
                 "signal did not produce order",
             );
             self.commit_no_fill(&trade, &leader_row);
