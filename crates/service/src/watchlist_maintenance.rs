@@ -23,6 +23,22 @@
 //! serialized by a shared [`tokio::sync::Mutex`] writer lock; readers stay lock-free. The
 //! realized-edge series both triggers consume comes from the authoritative local `paper_state.db`
 //! (`list_fills` + in-process [`ResolutionStore`]), never the best-effort Supabase mirror.
+//!
+//! ## Membership modes (2026-07-03 run28 cutover)
+//!
+//! [`MembershipMode`] selects who owns MEMBERSHIP between ranking batches:
+//!
+//! * [`MembershipMode::Knockout`] (legacy default) — hold-until-knockout: the ranking push
+//!   never changes membership; only the knockout+backfill above does.
+//! * [`MembershipMode::FullRerank`] — the ranker owns membership at every batch: on a batch
+//!   TRANSITION the newest `latest_ranking` top-`cap` wholesale-REPLACES the live set
+//!   ([`apply_full_rerank_swap`]) — wallets re-earn their slot each push (run28 `docs/33` §5:
+//!   the knockout-only policy was the worst tested; full re-rank the most robust). Memoryless
+//!   by design: the ranker's verdict overrides live demotion memory at each batch (the evicted
+//!   set clears), while the knockout above still runs BETWEEN batches as the intra-cycle
+//!   safety rail — a readmitted bleeder is re-demotable on the next tick. A failed top fetch
+//!   leaves the batch marker unadvanced so the swap retries next tick; the boot-observed batch
+//!   never triggers a swap (boot already seeded exactly that batch's top-`cap`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -40,6 +56,31 @@ use tracing::{info, warn};
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
 use crate::supabase_reader;
+
+/// Who owns watchlist MEMBERSHIP between ranking batches. See the module docs; canonical
+/// default in `docs/_GLOSSARY.md` (`watchlist_membership_mode`). Boot-frozen (env/TOML) —
+/// the maintenance loop is built once at startup, so changing the mode needs a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MembershipMode {
+    /// Hold-until-knockout (legacy): membership changes only via knockout + bench backfill.
+    #[default]
+    Knockout,
+    /// The newest ranking batch's top-`cap` replaces the live set on every batch transition.
+    FullRerank,
+}
+
+impl MembershipMode {
+    /// Parse the `watchlist_membership_mode` config string. `None` for an unknown value —
+    /// the caller (`main.rs`) fails fast rather than silently defaulting.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "knockout" => Some(Self::Knockout),
+            "full_rerank" => Some(Self::FullRerank),
+            _ => None,
+        }
+    }
+}
 
 /// Tuning for the maintenance tick. Every field is sourced from [`crate::config::ServiceConfig`]
 /// (defaults registered in `docs/_GLOSSARY.md`); `cap` is `supabase_reader::MAINTAINED_SET_SIZE`.
@@ -62,6 +103,8 @@ pub struct MaintenanceConfig {
     pub bench_overfetch: usize,
     /// Working-set size cap (the maintained-N).
     pub cap: usize,
+    /// Who owns membership between ranking batches (module docs; run28 cutover).
+    pub membership_mode: MembershipMode,
 }
 
 /// Why a live wallet was knocked out (drives the `wallet_lifecycle_events.reason` audit text).
@@ -74,6 +117,9 @@ pub enum KnockoutReason {
     /// Statistical demotion: upper-CB edge < 0 AND trailing-window realized P&L < 0
     /// AND enough settled trades.
     Underperformance,
+    /// Full-re-rank rotation ([`MembershipMode::FullRerank`]): the wallet fell out of the
+    /// newest batch's top-`cap`. Audit-only — never returned by [`knockout_decision`].
+    RankerRotation,
 }
 
 impl KnockoutReason {
@@ -84,6 +130,7 @@ impl KnockoutReason {
             Self::Inactivity => "inactive>72h",
             Self::InactivityHardCap => "inactive>7d (hard cap)",
             Self::Underperformance => "upper_cb_edge<0 & windowed_pnl<0",
+            Self::RankerRotation => "full_rerank: dropped from top-25",
         }
     }
 }
@@ -216,6 +263,48 @@ pub async fn apply_evictions_and_backfill(
     total
 }
 
+/// Wholesale membership rotation for [`MembershipMode::FullRerank`]: the newest ranking
+/// batch's top-`cap` REPLACES the live set. Returns `(new_live_total, dropped_wallets)`.
+///
+/// Set arithmetic: `removed = live \ incoming`, then [`apply_evictions_and_backfill`] with
+/// the full incoming list as candidates — survivors (live ∩ incoming) keep their existing
+/// entries (scores refresh via the score-update-only refresh loop within one interval),
+/// admitted wallets (incoming \ live) get their poll cursor seeded from the incoming
+/// side-map inside the writer-locked section (#357 — a missing seed would make the
+/// poller's first fetch unbounded). The final set is exactly the incoming membership
+/// (≤ `cap`), so `replace`'s score-sorted truncation never bites.
+pub async fn apply_full_rerank_swap(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    writer_lock: &Mutex<()>,
+    incoming: &[WatchlistEntry],
+    incoming_last_trade: &HashMap<WalletAddress, i64>,
+    cap: usize,
+    now_unix: i64,
+) -> (usize, Vec<WalletAddress>) {
+    let incoming_set: HashSet<WalletAddress> = incoming.iter().map(|e| e.wallet).collect();
+    let dropped: Vec<WalletAddress> = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|e| e.wallet)
+        .filter(|w| !incoming_set.contains(w))
+        .collect();
+    let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
+    let total = apply_evictions_and_backfill(
+        live,
+        paper_state,
+        writer_lock,
+        &removed,
+        incoming,
+        incoming_last_trade,
+        cap,
+        now_unix,
+    )
+    .await;
+    (total, dropped)
+}
+
 /// Run the maintenance tick loop until the process exits.
 ///
 /// `cfg.interval_secs == 0` disables the tick (returns immediately). The first tick fires one
@@ -282,20 +371,8 @@ async fn maintenance_tick(
 ) {
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
 
-    // 1. Detect a fresh ranking batch → clear the evicted-set so re-promoted wallets can return.
-    match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
-        Ok(latest) => {
-            if latest.is_some() && latest != *batch_marker {
-                if batch_marker.is_some() {
-                    evicted.clear();
-                }
-                *batch_marker = latest;
-            }
-        }
-        Err(e) => warn!(error = %e, "maintenance: batch-id fetch failed; keeping evicted-set"),
-    }
-
-    // 2. Per-wallet edge stats from the authoritative local paper-state.
+    // 1. Per-wallet edge stats from the authoritative local paper-state. (Computed before
+    // the batch step so a full-rerank rotation can stamp its audit rows with them.)
     let fills = match paper_state.list_fills() {
         Ok(f) => f,
         Err(e) => {
@@ -318,7 +395,7 @@ async fn maintenance_tick(
         cfg.demotion_pnl_window_secs,
     );
 
-    // 3. Snapshot the live wallets and their cursors.
+    // 2. Snapshot the live wallets and their cursors.
     let live_snapshot = live.snapshot();
     let live_wallets: Vec<WalletAddress> = live_snapshot.entries.iter().map(|e| e.wallet).collect();
     let mut cursors: HashMap<WalletAddress, Option<i64>> =
@@ -326,6 +403,84 @@ async fn maintenance_tick(
     for w in &live_wallets {
         // A cursor read error self-heals to `None` (treated as just-admitted, not inactive).
         cursors.insert(*w, paper_state.cursor(w).unwrap_or(None));
+    }
+
+    // 3. Ranking-batch step. Knockout mode: a fresh batch only clears the evicted-set so
+    // re-promoted wallets can return. FullRerank mode: a batch TRANSITION hands membership
+    // to the ranker — wholesale swap to the new top-`cap`; the marker only advances on a
+    // successful swap so a failed fetch retries next tick.
+    match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
+        Ok(latest) => match cfg.membership_mode {
+            MembershipMode::Knockout => {
+                if latest.is_some() && latest != *batch_marker {
+                    if batch_marker.is_some() {
+                        evicted.clear();
+                    }
+                    *batch_marker = latest;
+                }
+            }
+            MembershipMode::FullRerank => {
+                if latest.is_some() && batch_marker.is_none() {
+                    // Boot alignment: startup already seeded exactly this batch's top-cap.
+                    *batch_marker = latest;
+                } else if latest.is_some() && latest != *batch_marker {
+                    match supabase_reader::fetch(client, base_url, anon_key, secret_key, cfg.cap)
+                        .await
+                    {
+                        Ok((incoming, incoming_last_trade)) if !incoming.entries.is_empty() => {
+                            let (live_total, dropped) = apply_full_rerank_swap(
+                                live,
+                                paper_state,
+                                writer_lock,
+                                &incoming.entries,
+                                &incoming_last_trade,
+                                cfg.cap,
+                                now_unix,
+                            )
+                            .await;
+                            for w in &dropped {
+                                let s = stats.get(&w.to_string());
+                                if let Err(e) = supabase_reader::write_lifecycle_event(
+                                    client,
+                                    base_url,
+                                    anon_key,
+                                    secret_key,
+                                    &w.to_string(),
+                                    KnockoutReason::RankerRotation.reason_text(),
+                                    s.map(|st| st.realized_pnl),
+                                    i64::try_from(s.map_or(0, |st| st.settled_count))
+                                        .unwrap_or(i64::MAX),
+                                    cursors.get(w).copied().flatten(),
+                                )
+                                .await
+                                {
+                                    warn!(wallet = %w, error = %e,
+                                        "full_rerank: lifecycle write failed (best-effort)");
+                                }
+                            }
+                            // Memoryless by design: the ranker's verdict overrides demotion
+                            // memory at each batch; the knockout resumes next tick.
+                            evicted.clear();
+                            *batch_marker = latest;
+                            info!(
+                                batch_id = latest.unwrap_or(-1),
+                                dropped = dropped.len(),
+                                live_total,
+                                "full re-rank membership swap applied"
+                            );
+                            return;
+                        }
+                        Ok(_) => warn!(
+                            "full_rerank: top fetch returned 0 rows; keeping membership, \
+                             will retry next tick"
+                        ),
+                        Err(e) => warn!(error = %e,
+                            "full_rerank: top fetch failed; keeping membership, will retry next tick"),
+                    }
+                }
+            }
+        },
+        Err(e) => warn!(error = %e, "maintenance: batch-id fetch failed; keeping evicted-set"),
     }
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.
@@ -433,6 +588,7 @@ mod tests {
             demotion_pnl_window_secs: 2_592_000, // 30 d
             bench_overfetch: 10,
             cap: 25,
+            membership_mode: MembershipMode::default(),
         }
     }
 
@@ -528,6 +684,20 @@ mod tests {
             knockout_decision(active, Some(&s), &cfg(), NOW),
             Some(KnockoutReason::Underperformance)
         );
+    }
+
+    #[test]
+    fn membership_mode_parse_roundtrip() {
+        assert_eq!(
+            MembershipMode::parse("knockout"),
+            Some(MembershipMode::Knockout)
+        );
+        assert_eq!(
+            MembershipMode::parse(" Full_Rerank "),
+            Some(MembershipMode::FullRerank)
+        );
+        assert_eq!(MembershipMode::parse("greedy"), None);
+        assert_eq!(MembershipMode::default(), MembershipMode::Knockout);
     }
 
     #[test]

@@ -49,7 +49,7 @@ use pe_service::supabase_state::{
 };
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
-use pe_service::watchlist_maintenance::{MaintenanceConfig, run_maintenance_loop};
+use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
 
 #[tokio::main]
@@ -386,11 +386,13 @@ async fn main() -> Result<()> {
     // Reseed channel: carries periodic snapshots into the orchestrator (cap 1 = back-pressure).
     let (reseed_tx, reseed_rx) = mpsc::channel(1);
     let reseed_task = if cfg.position_reseed_interval_secs > 0 {
-        let reseed_wallets = wallets.clone();
+        // Reads the CURRENT watchlist each round (not the boot list) so wallets admitted
+        // post-boot — backfill or full-re-rank swaps — get leader-ledger seeds too.
+        let reseed_watchlist = live_watchlist.clone();
         let reseed_base_url = cfg.polymarket_base_url.clone();
         let reseed_fetcher = ReqwestFetcher::new(reqwest::Client::new());
         Some(tokio::spawn(run_reseed_loop(
-            reseed_wallets,
+            reseed_watchlist,
             reseed_base_url,
             cfg.position_page_limit,
             cfg.position_size_threshold,
@@ -562,6 +564,13 @@ async fn main() -> Result<()> {
     let maintenance_task = if !cfg.supabase_url.is_empty() && cfg.maintenance_interval_secs > 0 {
         let demotion_cb_alpha = Decimal::from_str(&cfg.demotion_cb_alpha)
             .with_context(|| format!("parse demotion_cb_alpha '{}'", cfg.demotion_cb_alpha))?;
+        let membership_mode =
+            MembershipMode::parse(&cfg.watchlist_membership_mode).with_context(|| {
+                format!(
+                    "invalid watchlist_membership_mode '{}' (knockout | full_rerank)",
+                    cfg.watchlist_membership_mode
+                )
+            })?;
         let maint_cfg = MaintenanceConfig {
             interval_secs: cfg.maintenance_interval_secs,
             inactivity_threshold_secs: cfg.inactivity_threshold_secs,
@@ -571,6 +580,7 @@ async fn main() -> Result<()> {
             demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
             bench_overfetch: cfg.bench_overfetch,
             cap: supabase_reader::MAINTAINED_SET_SIZE,
+            membership_mode,
         };
         Some(tokio::spawn(run_maintenance_loop(
             live_watchlist.clone(),

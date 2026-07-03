@@ -23,6 +23,13 @@
 //!       shared writer mutex never lose an update (evicted stay out, backfill seeded from real
 //!       last trade stays in).
 //!
+//!   full-rerank-swap-wholesale             — a batch transition in FullRerank mode replaces the
+//!       live set with exactly the incoming top-N: survivors keep their entries, dropped
+//!       wallets leave, admitted wallets get their poll cursor seeded from the incoming
+//!       side-map (#357) — never `now`.
+//!   full-rerank-swap-identity-noop         — incoming == live leaves membership byte-identical
+//!       and drops nobody.
+//!
 //! Run with: cargo nextest run -p pe-service --features scenario
 
 #![cfg(feature = "scenario")]
@@ -41,7 +48,8 @@ use pe_paper_state::PaperStateDb;
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::watchlist_maintenance::{
-    KnockoutReason, MaintenanceConfig, apply_evictions_and_backfill, decide_evictions,
+    KnockoutReason, MaintenanceConfig, MembershipMode, apply_evictions_and_backfill,
+    apply_full_rerank_swap, decide_evictions,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -64,6 +72,7 @@ fn cfg() -> MaintenanceConfig {
         demotion_pnl_window_secs: 2_592_000, // 30 d
         bench_overfetch: 10,
         cap: 25,
+        membership_mode: MembershipMode::default(),
     }
 }
 
@@ -483,4 +492,90 @@ async fn writer_mutex_serializes_refresh_and_replace() {
         );
     }
     println!("PASS: writer-mutex-safety");
+}
+
+// ── full-rerank-swap-wholesale (2026-07-03 run28 cutover) ───────────────────────
+/// PASS: after the swap, membership == exactly the incoming set; the admitted wallet's
+///       cursor is seeded from the incoming side-map (its real last trade, #357).
+/// FAIL: any pre-swap non-survivor remains, an incoming wallet is missing, or the
+///       admitted wallet's cursor is `now`/unset.
+#[tokio::test]
+async fn full_rerank_swap_wholesale() {
+    let (a, b, c, d) = (wallet(1), wallet(2), wallet(3), wallet(4));
+    let live = LiveWatchlist::new(watchlist(vec![entry(a, 300), entry(b, 200), entry(c, 100)]));
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    // Incoming batch top-N: B survives, D is admitted, A and C fall out.
+    let incoming = vec![entry(b, 250), entry(d, 240)];
+    let mut incoming_last_trade = HashMap::new();
+    let d_last_trade = NOW - 5_000;
+    incoming_last_trade.insert(d, d_last_trade);
+    incoming_last_trade.insert(b, NOW - 9_000);
+
+    let (total, dropped) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &incoming,
+        &incoming_last_trade,
+        cfg().cap,
+        NOW,
+    )
+    .await;
+
+    let members: HashSet<WalletAddress> =
+        live.snapshot().entries.iter().map(|e| e.wallet).collect();
+    assert_eq!(total, 2);
+    assert_eq!(
+        members,
+        HashSet::from([b, d]),
+        "membership must be exactly the incoming set"
+    );
+    let dropped_set: HashSet<WalletAddress> = dropped.into_iter().collect();
+    assert_eq!(
+        dropped_set,
+        HashSet::from([a, c]),
+        "dropped must be live \\ incoming"
+    );
+    // The ADMITTED wallet's inactivity clock starts at its real last trade, never `now`.
+    assert_eq!(db.cursor(&d).unwrap(), Some(d_last_trade));
+    // The SURVIVOR keeps its existing entry (structural swap, not a score refresh).
+    let b_entry = live
+        .snapshot()
+        .entries
+        .iter()
+        .find(|e| e.wallet == b)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        b_entry.leader_score_bps.0, 200,
+        "survivor entry left unchanged by the swap"
+    );
+    println!("PASS: full-rerank-swap-wholesale (set==incoming, cursor seeded, survivor intact)");
+}
+
+// ── full-rerank-swap-identity-noop ──────────────────────────────────────────────
+/// PASS: incoming == live drops nobody and leaves membership identical.
+/// FAIL: any eviction or membership change on an identity swap.
+#[tokio::test]
+async fn full_rerank_swap_identity_noop() {
+    let (a, b) = (wallet(1), wallet(2));
+    let live = LiveWatchlist::new(watchlist(vec![entry(a, 300), entry(b, 200)]));
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+    let incoming = vec![entry(a, 310), entry(b, 210)];
+    let side: HashMap<WalletAddress, i64> = HashMap::new();
+
+    let (total, dropped) =
+        apply_full_rerank_swap(&live, &db, &lock, &incoming, &side, 25, NOW).await;
+
+    assert_eq!(total, 2);
+    assert!(dropped.is_empty(), "identity swap must drop nobody");
+    let members: HashSet<WalletAddress> =
+        live.snapshot().entries.iter().map(|e| e.wallet).collect();
+    assert_eq!(members, HashSet::from([a, b]));
+    // Mode default sanity rides along: the legacy mode remains the compiled default.
+    assert_eq!(MembershipMode::default(), MembershipMode::Knockout);
+    println!("PASS: full-rerank-swap-identity-noop");
 }

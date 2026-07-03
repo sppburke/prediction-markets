@@ -165,10 +165,13 @@ pub async fn seed_all<F: PageFetcher>(
 
 /// Periodically re-seed the orchestrator's leader ledger from the positions API.
 ///
-/// Never advances poll cursors — cursor advancement is startup-only.
-/// Exits when `tx` is closed (orchestrator shut down).
+/// Reads the CURRENT live watchlist each round (2026-07-03 cutover fix): the loop used to
+/// iterate the boot wallet list forever, so wallets admitted post-boot (backfill, and now
+/// every 4h full-re-rank swap) never received leader-ledger seeds and their Adds were
+/// misclassified as Entries. Never advances poll cursors — cursor advancement is
+/// startup-only. Exits when `tx` is closed (orchestrator shut down).
 pub async fn run_reseed_loop<F: PageFetcher + Send + 'static>(
-    wallets: Vec<WalletAddress>,
+    live: crate::live_watchlist::LiveWatchlist,
     base_url: String,
     page_limit: u32,
     size_threshold: u32,
@@ -178,6 +181,8 @@ pub async fn run_reseed_loop<F: PageFetcher + Send + 'static>(
 ) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        let wallets: Vec<WalletAddress> =
+            live.snapshot().entries.iter().map(|e| e.wallet).collect();
         let map = seed_all(&wallets, &base_url, page_limit, size_threshold, &fetcher).await;
         if tx.send(map).await.is_err() {
             break;
