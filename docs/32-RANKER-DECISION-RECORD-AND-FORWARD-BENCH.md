@@ -70,6 +70,10 @@ rationale. Amendments A0–A8 referenced below are the audit's protocol amendmen
 
 ## 2. Bench composition (item 3.4 — computed from the FROZEN run25 matrix)
 
+> **SUPERSEDED 2026-07-03** by the §1 operator-decision entry (single-system cutover):
+> the incumbent control ceases to exist at the paper-P&L reset, so this bench is not
+> deployed. Retained verbatim as the historical registration.
+
 Rule (committed in `scripts/ranker/bench_composition.py`, run with
 `PYTHONPATH=scripts python -m ranker.bench_composition runs/run25-confirmatory-full/return_matrix.csv
 --baseline 't_stat_baseline|none|policy_full_rerank|ttr72.0_pb0.15-0.85_act0_trl0_hl0.0|churn0.0'`):
@@ -91,6 +95,13 @@ These paired-t values are descriptive (post-hoc on the same panel); they compose
 certify nothing. The forward gate below is the only selector among the benched arms.
 
 ## 3. The pre-registered forward gate (item 3.5 — registered BEFORE T0)
+
+> **SUPERSEDED 2026-07-03** by the §1 operator-decision entry: the forward gauge is the
+> ABSOLUTE forward paper P&L of the single new system from its fresh T0 (no incumbent to
+> pair against; no paired weekly difference, Bonferroni split, or regime guard). The A8
+> validity conditions below carry forward where applicable (identical flat sizing, the
+> #473 demotion gate deployed, fill-fidelity awareness); levels from sim remain upper
+> bounds (`docs/33` §7). Retained verbatim as the historical registration.
 
 - **Design.** Each challenger arm runs as its own paper pe-service instance beside the live
   incumbent (deployment layout is item 3.6, held pending operator review). Identical flat

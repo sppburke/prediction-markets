@@ -27,7 +27,14 @@ from scipy.stats import norm
 # as ties by `akm_inference_on_winners` — the conditional (truncated-normal) law is numerically
 # ill-posed there, so the honest UNCONDITIONAL CI is returned instead. Canonical default:
 # `docs/_GLOSSARY.md` `ranker_akm_near_tie_sigma`.
-AKM_NEAR_TIE_SIGMA = 1e-3
+# Widened 1e-3 -> 0.01 after run28 (docs/33 §2): run28's 0.003·SE winner gap sat ABOVE
+# the old guard yet produced the degenerate point CI. MEASURED (2026-07-03, this repo's
+# own akm at se=1): width-0 degeneracy at gaps 0.001-0.003·SE, jitter to ~0.005·SE,
+# well-posed by 0.01·SE — so 0.01 covers the observed zone with 2-3x margin. (docs/33's
+# earlier '~0.08·SE' estimate overstated the zone ~20x and would swallow legitimate
+# conditional corrections, e.g. the 0.05·SE verify_bakeoff_components fixture.)
+# docs/_GLOSSARY `ranker_akm_near_tie_sigma`.
+AKM_NEAR_TIE_SIGMA = 0.01
 
 from . import SuffStats
 

@@ -23,7 +23,9 @@ wallet_market_history_path       = "smoke-test/wallet_market_history.json"
 # fail-open: a wallet whose history could not be fetched (first-run API failure) is
 # treated as new (copies allowed); the loader warns per absent wallet. Set true to block.
 entry_gate_fail_closed           = false
-max_resolution_horizon_secs      = 259200  # 72 h
+max_resolution_horizon_secs      = 172800  # 48 h (run28 cutover)
+min_fill_price                   = "0.15"  # run28 entry-band floor (current price)
+watchlist_membership_mode        = "full_rerank"  # run28 cutover; knockout = legacy
 min_resolution_horizon_secs      = 60      # docs/29 copy floor; sub-minute breaks down
 max_fill_price                   = "0.85"  # #142 parity: skip BUYs at/above this current price
 

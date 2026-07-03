@@ -14,7 +14,7 @@ The target question every experiment must answer is narrow and operational: **"w
 
 ## Unit of evaluation: the set-transition policy
 
-The deployed system does not pick a point-in-time snapshot — it **maintains a followed set over time** (currently incremental knockout + backfill in `crates/service/src/watchlist_maintenance.rs`). A ranking that looks excellent at a single cutoff but behaves badly under the real maintenance policy is a false positive. So the bake-off's unit of evaluation is the **set-transition policy**: each candidate config is run as a walk-forward *trajectory* —
+The deployed system does not pick a point-in-time snapshot — it **maintains a followed set over time** (`crates/service/src/watchlist_maintenance.rs`: incremental knockout + backfill historically; `watchlist_membership_mode = full_rerank` — wholesale replacement per ranking batch — since the 2026-07-03 run28 cutover). A ranking that looks excellent at a single cutoff but behaves badly under the real maintenance policy is a false positive. So the bake-off's unit of evaluation is the **set-transition policy**: each candidate config is run as a walk-forward *trajectory* —
 
 ```
 set_t  →  pe-backtest(set_t)  →  live_pnl_t  →  policy.step(...)  →  set_{t+1}
@@ -40,7 +40,7 @@ Each axis is a `typing.Protocol` in `scripts/ranker/__init__.py`; every concrete
 | **Signal combiner** | `SignalCombiner.combine` | *(none — single-signal in v1)* | multi-signal blends |
 | **Deflation / calibration** | `Deflator.deflate` | `deflated_sharpe` (the deflation axis also accepts the literal `"none"` passthrough sentinel — a bypass recognised by the driver, not a `*_REGISTRY` class) | — |
 | **Selector** | `Selector.select` | `top_k`, `online_exp_weights` | corr-aware, weighted-conformal, TTTS-online, full BOA |
-| **Set-transition policy** | `SetTransitionPolicy.step` | `policy_full_rerank` (baseline), `policy_knockout_backfill` (the current live behaviour), `policy_hybrid_displacement`, `policy_online_weighting` | — |
+| **Set-transition policy** | `SetTransitionPolicy.step` | `policy_full_rerank` (baseline), `policy_knockout_backfill` (the pre-cutover live behaviour; `full_rerank` is live since 2026-07-03), `policy_hybrid_displacement`, `policy_online_weighting` | — |
 | **Integrity filter** | `IntegrityFilter.mask` | *(none)* — overlap is handled continuously by the uniqueness weights (§Honesty), not a threshold | overlap-ratio / wash / coordination filters |
 | **Capacity filter** | `CapacityFilter.haircut` | *(none)* | liquidity-at-fill haircut |
 | **Demotion** | `Demoter.should_demote` | `empirical_bernstein` (demote iff the empirical-Bernstein upper CB on per-period P&L < 0 **and** cumulative realized P&L < 0) | `wallet_skill_cpd` change-point |
