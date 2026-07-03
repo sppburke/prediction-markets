@@ -168,6 +168,7 @@ async fn run_with(
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
             max_fill_price: boot_max_fill,
+            min_fill_price: Decimal::ZERO,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config,
@@ -312,6 +313,7 @@ async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32
             max_resolution_horizon_secs: 0,
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config: Some(LiveRuntimeConfig::new(gate_snapshot(cap_bps))),
         },

@@ -122,8 +122,10 @@ pub struct ServiceConfig {
     pub gamma_resolution_poll_interval_secs: u64,
 
     /// Drop entry signals whose market `endDate` is further than this many seconds
-    /// into the future. Set to 0 to disable. Default: 259_200 (72 h) — aligned with
-    /// the band-cohort "<72 h before resolution" selection criterion (issue #290).
+    /// into the future. Set to 0 to disable. Default: 172_800 (48 h) — the run28
+    /// production TTR ceiling (2026-07-03 cutover, `docs/33` §5: 48 h ≈ 72 h on paired
+    /// weekly P&L, so the capital-velocity preference is free; was 72 h per issue #290).
+    /// Selection twin: `ranker_ttr_hours` in `docs/_GLOSSARY.md`.
     #[serde(default = "default_max_resolution_horizon_secs")]
     pub max_resolution_horizon_secs: u64,
 
@@ -152,6 +154,15 @@ pub struct ServiceConfig {
     /// geometry near $1). Set to `"0"` to disable. See `docs/_GLOSSARY.md`: `max_fill_price`.
     #[serde(default = "default_max_fill_price")]
     pub max_fill_price: String,
+
+    /// Minimum *current* market price at which a BUY copy will fill, as a decimal string —
+    /// the run28 entry-band lower bound (0.15), enforced at copy time so selection and
+    /// deployment share the filter (the #468 lesson). Mirrors the backtest
+    /// `min_signal_price` floor semantics exactly: a BUY whose current price is `<` this
+    /// is skipped (the boundary value itself fills). Set to `"0"` to disable.
+    /// See `docs/_GLOSSARY.md`: `min_fill_price`.
+    #[serde(default = "default_min_fill_price")]
+    pub min_fill_price: String,
 
     // ── Live wallet source (Supabase ranking handoff, issues #339, #370) ──────
     /// Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). This is the
@@ -327,7 +338,7 @@ const fn default_trade_poll_interval_secs() -> u64 {
 }
 
 const fn default_max_resolution_horizon_secs() -> u64 {
-    72 * 3600 // 259_200 s = 72 h (band-cohort "<72 h before resolution" criterion)
+    48 * 3600 // 172_800 s = 48 h (run28 production TTR ceiling, 2026-07-03 cutover)
 }
 
 fn default_wallet_market_history_path() -> PathBuf {
@@ -340,6 +351,10 @@ const fn default_min_resolution_horizon_secs() -> u64 {
 
 fn default_max_fill_price() -> String {
     "0.85".to_string()
+}
+
+fn default_min_fill_price() -> String {
+    "0.15".to_string() // run28 entry-band lower bound (2026-07-03 cutover)
 }
 
 const fn default_supabase_refresh_interval_secs() -> u64 {
@@ -482,6 +497,7 @@ impl Default for ServiceConfig {
             wallet_market_history_path: default_wallet_market_history_path(),
             entry_gate_fail_closed: false,
             max_fill_price: default_max_fill_price(),
+            min_fill_price: default_min_fill_price(),
             supabase_url: String::new(),
             supabase_anon_key: String::new(),
             supabase_secret_key: String::new(),
@@ -563,6 +579,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "wallet_market_history_path",
         "entry_gate_fail_closed",
         "max_fill_price",
+        "min_fill_price",
         "supabase_url",
         "supabase_anon_key",
         "supabase_secret_key",
@@ -609,7 +626,7 @@ mod tests {
         assert_eq!(cfg.position_reseed_interval_secs, 300);
         assert_eq!(cfg.position_page_limit, 500);
         assert_eq!(cfg.position_size_threshold, 1);
-        assert_eq!(cfg.max_resolution_horizon_secs, 259_200);
+        assert_eq!(cfg.max_resolution_horizon_secs, 172_800);
         assert_eq!(cfg.min_resolution_horizon_secs, 60);
         assert_eq!(
             cfg.wallet_market_history_path,
@@ -617,6 +634,7 @@ mod tests {
         );
         assert!(!cfg.entry_gate_fail_closed);
         assert_eq!(cfg.max_fill_price, "0.85");
+        assert_eq!(cfg.min_fill_price, "0.15");
         assert_eq!(cfg.supabase_url, "");
         assert_eq!(cfg.supabase_anon_key, "");
         assert_eq!(cfg.supabase_secret_key, "");
@@ -734,6 +752,7 @@ mode = "shadow"
             ("mode", d.mode.clone()),
             ("bankroll_usd", d.bankroll_usd.clone()),
             ("max_fill_price", d.max_fill_price.clone()),
+            ("min_fill_price", d.min_fill_price.clone()),
             (
                 "min_resolution_horizon_secs",
                 d.min_resolution_horizon_secs.to_string(),
@@ -796,6 +815,10 @@ mode = "shadow"
             ("bench_overfetch", d.bench_overfetch.to_string()),
             ("demotion_min_trades", d.demotion_min_trades.to_string()),
             ("demotion_cb_alpha", d.demotion_cb_alpha.clone()),
+            (
+                "demotion_pnl_window_secs",
+                d.demotion_pnl_window_secs.to_string(),
+            ),
             (
                 "flip_human_approved",
                 d.strategy.flip_human_approved.to_string(),

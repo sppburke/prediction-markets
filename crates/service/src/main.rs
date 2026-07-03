@@ -91,9 +91,11 @@ async fn main() -> Result<()> {
         fail_closed: cfg.entry_gate_fail_closed,
     };
 
-    // Parse the max-fill price cap eagerly so a malformed value fails fast before any I/O.
+    // Parse the fill-price band eagerly so a malformed value fails fast before any I/O.
     let max_fill_price = Decimal::from_str(&cfg.max_fill_price)
         .with_context(|| format!("parse max_fill_price '{}'", cfg.max_fill_price))?;
+    let min_fill_price = Decimal::from_str(&cfg.min_fill_price)
+        .with_context(|| format!("parse min_fill_price '{}'", cfg.min_fill_price))?;
 
     // #398 WS1: Supabase `service_config` is authoritative for the non-secret runtime knobs.
     // Fetch it once at boot (best-effort; fall back to env/compiled on any error) and seed the
@@ -503,6 +505,7 @@ async fn main() -> Result<()> {
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_fill_price,
+            min_fill_price,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
         },

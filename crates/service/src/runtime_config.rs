@@ -58,6 +58,9 @@ pub struct RuntimeConfig {
     /// running bankroll (no re-credit invariant, true by construction — there is no writer).
     pub bankroll_usd: String,
     pub max_fill_price: String,
+    /// Run28 entry-band lower bound on the current price (`"0"` disables) — the copy-time
+    /// twin of the backtest `min_signal_price` floor (#468 selection↔deployment parity).
+    pub min_fill_price: String,
     pub demotion_cb_alpha: String,
     pub min_resolution_horizon_secs: u64,
     pub max_resolution_horizon_secs: u64,
@@ -102,6 +105,7 @@ impl RuntimeConfig {
             mode: cfg.mode.clone(),
             bankroll_usd: cfg.bankroll_usd.clone(),
             max_fill_price: cfg.max_fill_price.clone(),
+            min_fill_price: cfg.min_fill_price.clone(),
             demotion_cb_alpha: cfg.demotion_cb_alpha.clone(),
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
@@ -284,6 +288,7 @@ pub fn parse_config(
     // Decimal-valued strings: validate as Decimal, store the string shape consumers expect.
     apply_decimal_string(&map, "bankroll_usd", &mut out.bankroll_usd);
     apply_decimal_string(&map, "max_fill_price", &mut out.max_fill_price);
+    apply_decimal_string(&map, "min_fill_price", &mut out.min_fill_price);
     apply_decimal_string(&map, "demotion_cb_alpha", &mut out.demotion_cb_alpha);
 
     // Sizing mode: reassemble the three flat KV keys into SizingMode (#398 WS2). An absent
@@ -607,8 +612,11 @@ mod tests {
         // Service-level knobs reconstruct too (spot-check the risk-engine gate inputs).
         assert_eq!(rc.mode, "paper");
         assert_eq!(rc.max_fill_price, "0.85");
+        assert_eq!(rc.min_fill_price, "0.15"); // run28 band floor (2026-07-03 cutover)
         assert_eq!(rc.bankroll_usd, "10000");
         assert_eq!(rc.min_resolution_horizon_secs, 60);
+        assert_eq!(rc.max_resolution_horizon_secs, 172_800); // run28 TTR ceiling
+        assert_eq!(rc.demotion_pnl_window_secs, 2_592_000); // #473, now seeded
         // price_impact_cap_bps is seeded at 0 (gate disabled / fail-open) — #398 WS2.
         assert_eq!(rc.price_impact_cap_bps, 0);
     }
