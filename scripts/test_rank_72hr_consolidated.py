@@ -295,5 +295,66 @@ class EmptyFloorTest(unittest.TestCase):
             self.assertFalse((Path(out) / "250_72hr_buyandhold_variance.txt").exists())
 
 
+class MinTRLGateTest(unittest.TestCase):
+    """--min-trl (run28 trl20 shape, #417 cutover): eligibility requires >= N qualifying
+    positions. WA has 5 qualifying first-buys and WB has 4, so a threshold of 5 splits
+    them; both stay in the CSV (rows are always written, only `eligible` flips)."""
+
+    def test_min_trl_flips_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            out = str(Path(tmp) / "out")
+            build_core_cache(db)
+            rc = run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0",
+                            "--floor-tstat", "0.5", "--min-trl", "5")
+            self.assertEqual(rc, 0)
+            rows = {r["wallet"]: r for r in
+                    read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))}
+            self.assertEqual(set(rows), {WA, WB})
+            self.assertEqual(rows[WA]["eligible"], "True")   # n=5 >= 5
+            self.assertEqual(rows[WB]["eligible"], "False")  # n=4 <  5
+            print("PASS: --min-trl 5 keeps WA (n=5) eligible, drops WB (n=4)")
+
+    def test_min_trl_replaces_zeroed_per_month_gates(self) -> None:
+        """The production shape: per-month gates zeroed, MinTRL alone decides (argparse
+        last-wins lets the extras override run_ranker's 1/2 per-month baseline)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            out = str(Path(tmp) / "out")
+            build_core_cache(db)
+            rc = run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0",
+                            "--floor-tstat", "0.5", "--min-avg-per-month", "0",
+                            "--min-active-months", "0", "--min-trl", "4")
+            self.assertEqual(rc, 0)
+            rows = {r["wallet"]: r for r in
+                    read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))}
+            self.assertEqual(rows[WA]["eligible"], "True")   # n=5 >= 4
+            self.assertEqual(rows[WB]["eligible"], "True")   # n=4 >= 4
+            print("PASS: zeroed per-month gates + --min-trl 4 = both wallets eligible")
+
+
+class PurgeDecisionCsvContractTest(unittest.TestCase):
+    """ranked_72hr_buyandhold.csv doubles as the ARMED purge's decision input:
+    `parse_decision_csv` in crates/bootstrap/src/purge.rs hard-requires these exact
+    header names and errors when any is missing. Pin the contract from the Python side
+    so a column rename fails CI here before it can break the purge."""
+
+    PURGE_CONTRACT = {"wallet", "eligible", "tstat_net", "mean_net", "n_eff"}
+
+    def test_header_contains_purge_contract_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            out = str(Path(tmp) / "out")
+            build_core_cache(db)
+            rc = run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0",
+                            "--floor-tstat", "0.5")
+            self.assertEqual(rc, 0)
+            with open(Path(out) / "ranked_72hr_buyandhold.csv", newline="") as f:
+                header = set(next(csv.reader(f)))
+            missing = self.PURGE_CONTRACT - header
+            self.assertFalse(missing, f"purge decision CSV lost columns: {missing}")
+            print("PASS: purge decision-CSV header contract intact")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -182,8 +182,10 @@ to Supabase and verify `latest_ranking` is populated.
 
 Production defaults are baked in (override via flags): `--universe-from-trades`,
 `HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
-mid-price band 0.15–0.85, TTR 72h, `--scheduled-only` (no resolved-at look-ahead),
-`floor_tstat=2.0`, `top_n=200`.
+mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_prod_min_trl`
+— replaces the per-month activity gates, which production zeroes; run28 cutover
+2026-07-03), `--scheduled-only` (no resolved-at look-ahead), `floor_tstat=2.0`,
+`top_n=200`.
 
 > **First full-universe run — stage the half-life.** For the first run after moving to
 > the full trade universe, override with `--half-life-days 0` (decay off) so a
@@ -226,8 +228,8 @@ for what was published to `latest_ranking` and when.
 
 The push appends one `ranking_batches` epoch (+ its `ranking_entries`) per run, so the
 table grows unbounded. After a successful push, `push_ranking_to_supabase.py` prunes
-`ranking_batches` to the newest `--keep-batches` rows (default **180** ≈ 6 months at the
-~daily cadence — the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; CASCADE
+`ranking_batches` to the newest `--keep-batches` rows (default **1080** ≈ 6 months at the
+4h production cadence, 6 pushes/day — the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; CASCADE
 removes their entries). `latest_ranking` reads only `max(batch_id)`, so pruning older
 epochs never touches the live read path or the `wallet_live_stats_mv` matview — it is
 storage hygiene, and it keeps enough epochs for the wholesale-swap-at-frequency-X replay.
