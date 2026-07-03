@@ -20,7 +20,7 @@ record. Cache shipped from the local box; integrity checksum in `box_cache.sha`.
 | `survivorship.json` | the standing optimistic-bias disclosure (#385 purge; current-snapshot universe) |
 | `true_clv_preflight.json` | true_clv exclusion record: coverage 25% < 30% gate (#429 permanent ceiling) |
 | `clv_diagnostic.json` | advisory CLV t-stats — struck from narratives per docs/32 A3; kept for the record |
-| `progress.jsonl` | phase timings: materialize 268s, screen 692s, grid 34,165s (9.49 h) |
+| `progress.jsonl` | phase timings: materialize 227s, screen 692s, grid 34,165s (9.49 h) |
 | `analysis_capacity.py` | the capacity + TTR + policy analysis that produced capacity_leaderboard.csv (run against this dir) |
 | `verify_ttr_pairing.py` | independent adversarial verification of the TTR pairing (written by a separate verifier; structural parse, no shared code) |
 | `launch_run28.sh` / `run28.log` | exact launcher CLI + run log of the authoritative run |

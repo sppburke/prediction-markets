@@ -19,7 +19,7 @@ README); working copies in gitignored `runs/run28-2026-weekly-lambda/`.
 | grid | 768 = 4 estimators × 2 deflators × 4 policies × 12 criteria (TTR {24,48,72} h × band {0.15–0.85, 0.30–0.70} × MinTRL {0,20}) × 2 churn ({0, 0.75}) |
 | eval | `--forward-criteria-filter` ON (selection and deployment share the filter, #468) |
 | true_clv | excluded by preflight: position-level CLOB-close coverage 25% < 30% gate — a permanent data ceiling (#429), not a prep gap |
-| provenance | Lambda 80-core/440 GB box, repo @ `a1d7601`; process executor, 12 workers; materialize 227 s, screen 692 s, grid 34,165 s (9.49 h), honesty layer 24.6 s; component gate `verify_bakeoff_components.py` 16/16 GREEN on the box before launch |
+| provenance | Lambda 80-core/440 GB box, repo @ `a1d7601`; process executor, `--workers 48` requested but effective parallelism 12 — the grid partitions into 12 criteria chunks, one process each (`progress.w0..w11`, box load steady at 12); materialize 227 s, screen 692 s, grid 34,165 s (9.49 h), honesty layer 24.6 s; component gate `verify_bakeoff_components.py` 16/16 GREEN on the box before launch |
 
 A thread-executor + numba-`nogil` speed variant was raced and **failed** (GIL-bound at
 ~1.2 cores — kernel calls are short relative to Python dispatch); it was killed and the
@@ -145,12 +145,20 @@ the `docs/32` §3 forward gate decides.
 
 The bench is not yet deployed (item 3.6 pending), so arm composition may be amended
 before T0. run28 motivates re-picking the **online_weighting slot** from the run28 panel
-instead of run25's: `proxy_clv|deflated_sharpe|policy_online_weighting|ttr48.0_pb0.15-0.85_act0_trl20_hl0.0|churn0.0`
-(or its `t_stat_baseline` twin, rank #3, operationally simpler). Rationale: weekly sd
-$4,482 vs the registered arm's $19,364 (≈4× faster forward convergence — directly
-serving the gate's time-to-signal constraint), capacity-fit at 134 signals/week (no
-truncation at the live bankroll), ttr48 (proven free, §5), and split-half-stable (#3/#3).
-The hybrid slot and incumbent control are unchanged; the gate itself (docs/32 §3) is
+instead of run25's. The capacity-metric #1 config is ranked by `proxy_clv`, which is
+**bench-ineligible** under the committed eligibility rule
+(`scripts/ranker/bench_composition.py` `INELIGIBLE_ESTIMATORS = ("true_clv", "proxy_clv")`
+— the A3 artifact classification applies to the estimator's slot eligibility, not just
+the diagnostic), so the proposed arm is its rule-compliant twin:
+
+`t_stat_baseline|deflated_sharpe|policy_online_weighting|ttr48.0_pb0.15-0.85_act0_trl20_hl0.0|churn0.0`
+(capacity rank #3, $3,251/wk, 130 signals/week).
+
+Rationale: weekly sd $3,453 vs the registered run25 arm's $19,364 (≈5–6× faster forward
+convergence — directly serving the gate's time-to-signal constraint), capacity-fit
+(no truncation at the live bankroll), ttr48 (proven free, §5), t = 4.61 vs zero, and
+split-half positive in both halves (top-6% in weeks 1–12, #1 in weeks 13–24). The
+hybrid slot and incumbent control are unchanged; the gate itself (docs/32 §3) is
 untouched. If adopted, edit docs/32 §2's table and note the amendment date there.
 
 ## 9. What this changes / what it does not
