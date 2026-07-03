@@ -82,7 +82,7 @@ def parse_args():
     p.add_argument("--min-avg-per-month", type=float, default=20.0)
     p.add_argument("--min-trl", type=int, default=0,
                    help="minimum track-record length: survival requires >= this many FILLED "
-                        "positions (docs/_GLOSSARY ranker_min_trl). 0 = off. Mirrors pass-1; "
+                        "positions (docs/_GLOSSARY ranker_prod_min_trl). 0 = off. Mirrors pass-1; "
                         "the run28 production shape uses 20 with the per-month gates zeroed.")
     p.add_argument("--target-n", type=int, default=25)
     return p.parse_args()

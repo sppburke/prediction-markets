@@ -99,7 +99,7 @@ PRICE_MAX="0.85"
 FLOOR_TSTAT="2.0"
 # MinTRL eligibility (run28 winner shape, 2026-07-03 cutover): >=20 qualifying positions
 # in-window REPLACES the per-month activity gates (run28's trl20 axis has no per-month
-# component), so production zeroes both. docs/_GLOSSARY `ranker_min_trl`.
+# component), so production zeroes both. docs/_GLOSSARY `ranker_prod_min_trl`.
 MIN_TRL="20"
 MIN_AVG_PER_MONTH="0"
 MIN_ACTIVE_MONTHS="0"
@@ -379,6 +379,8 @@ FILTER_ARGS=(--db "$DB")
 # TTR provenance: pass the actual ranking TTR ceiling so ranking_batches.ttr_max_secs
 # reflects the shape the entries were ranked at (the script default would silently
 # record 72h after the 48h cutover). Floor stays pass-1's --min-ttr-hours default (30s).
+# CAVEAT (same class as PR #351): on a --skip-rank re-push this records THIS run's
+# TTR_HOURS, not the TTR the reused CSVs were ranked at — pass a matching --ttr-hours.
 TTR_MAX_SECS="$(python3 -c "print(int(float('$TTR_HOURS')*3600))")"
 
 python3 scripts/push_ranking_to_supabase.py \

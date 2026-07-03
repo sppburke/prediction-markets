@@ -228,8 +228,8 @@ for what was published to `latest_ranking` and when.
 
 The push appends one `ranking_batches` epoch (+ its `ranking_entries`) per run, so the
 table grows unbounded. After a successful push, `push_ranking_to_supabase.py` prunes
-`ranking_batches` to the newest `--keep-batches` rows (default **180** ≈ 6 months at the
-~daily cadence — the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; CASCADE
+`ranking_batches` to the newest `--keep-batches` rows (default **1080** ≈ 6 months at the
+4h production cadence, 6 pushes/day — the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; CASCADE
 removes their entries). `latest_ranking` reads only `max(batch_id)`, so pruning older
 epochs never touches the live read path or the `wallet_live_stats_mv` matview — it is
 storage hygiene, and it keeps enough epochs for the wholesale-swap-at-frequency-X replay.

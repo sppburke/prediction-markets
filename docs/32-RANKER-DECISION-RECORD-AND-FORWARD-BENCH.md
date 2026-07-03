@@ -55,6 +55,18 @@ rationale. Amendments A0–A8 referenced below are the audit's protocol amendmen
   pre-T0 amendment to §2's online_weighting arm are in
   `docs/33-RUN28-2026-WEEKLY-BAKEOFF-RESULTS.md`. This registration is unchanged until
   that amendment is explicitly adopted here.
+- **OPERATOR DECISION 2026-07-03 — single-system cutover ADOPTED (explicit operator
+  override of this section's A4 no-cutover clause, on operator authority; paper trading
+  only).** The production ranker moves to the run28 default shape (`t_stat`, full-re-rank
+  policy semantics, TTR 48h, band 0.15–0.85, MinTRL-20 — `docs/33` §9) with 4-hourly
+  ranking pushes, paper P&L archived and reset to a fresh T0, and the forward gauge
+  becomes the ABSOLUTE forward paper P&L of the single new system. This supersedes §2's
+  incumbent-control bench composition and §3's paired gate (the incumbent ceases to
+  exist at reset). run28's evidence class is unchanged (A4 bench-composition/descriptive
+  — the operator decision, not the backtest, authorizes the cutover); 4h cadence is a
+  data-freshness choice, not an evidence-backed one (weekly was the tested cadence,
+  `docs/33` §5). The full §2/§3 rewrite lands in the cutover epic's docs PR; the shape
+  change itself ships in the same PR as this entry (Part of #417).
 
 ## 2. Bench composition (item 3.4 — computed from the FROZEN run25 matrix)
 

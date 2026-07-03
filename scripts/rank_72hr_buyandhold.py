@@ -30,7 +30,9 @@ Pipeline (see docs/26 and docs/_GLOSSARY.md):
               stake:  gross = (payoff - price)/price, payoff=1 if the bought outcome
               won else 0.  net = (payoff - eff)/eff, eff = min(price+slip, 0.999).
   Stage 3   : eligibility = avg >= MIN_AVG_PER_MONTH qualifying entries per ACTIVE
-              month AND active in >= MIN_ACTIVE_MONTHS of the window.  Rank eligible
+              month AND active in >= MIN_ACTIVE_MONTHS of the window AND n >= MIN_TRL
+              qualifying positions (run28 production zeroes the per-month gates and
+              uses --min-trl 20 alone; docs/_GLOSSARY ranker_prod_min_trl).  Rank eligible
               wallets by recency-weighted net t-stat (issue #366 decay: a trade one
               `--half-life-days` old weighs 0.5; <= 0 disables decay = flat = legacy,
               bitwise-identical via the weighted_stats uniform-weight short-circuit).
@@ -139,7 +141,7 @@ def parse_args() -> Params:
     p.add_argument("--min-active-months", type=int, default=3)
     p.add_argument("--min-trl", type=int, default=0,
                    help="minimum track-record length: eligibility requires >= this many "
-                        "qualifying positions in-window (docs/_GLOSSARY ranker_min_trl). "
+                        "qualifying positions in-window (docs/_GLOSSARY ranker_prod_min_trl). "
                         "0 = off. The run28 production shape uses 20 and ZEROES the "
                         "per-month gates (--min-avg-per-month 0 --min-active-months 0) — "
                         "MinTRL replaces them, it does not stack on top.")
