@@ -39,9 +39,19 @@ create table if not exists fill_market_snapshots_archive
   as select *, now() as archived_at from fill_market_snapshots where false;
 
 -- ── 2. Copy + verify + delete, fail-closed ───────────────────────────────────
+-- Columns are reconciled BY NAME (the #474 lesson, PR-review finding on this file's
+-- first draft): a future additive `alter table ... add column` on a live table must
+-- not break the next reset, so any missing column is added to the archive with the
+-- live column's exact type, and the insert lists columns explicitly — never a
+-- positional `select *`. Each table is locked ACCESS EXCLUSIVE for the transaction
+-- so no concurrent RPC write can slip between the archive insert and the delete
+-- (defense-in-depth; the runbook stops the service first).
 do $$
 declare
   t text;
+  arch text;
+  col record;
+  collist text;
   live_n bigint;
   copied_n bigint;
   tables constant text[] := array[
@@ -50,8 +60,23 @@ declare
   ];
 begin
   foreach t in array tables loop
+    arch := t || '_archive';
+    execute format('lock table %I in access exclusive mode', t);
+    for col in
+      select a.attname, format_type(a.atttypid, a.atttypmod) as typ
+      from pg_attribute a
+      where a.attrelid = t::regclass and a.attnum > 0 and not a.attisdropped
+    loop
+      execute format('alter table %I add column if not exists %I %s',
+                     arch, col.attname, col.typ);
+    end loop;
+    select string_agg(format('%I', a.attname), ', ' order by a.attnum)
+      into collist
+      from pg_attribute a
+      where a.attrelid = t::regclass and a.attnum > 0 and not a.attisdropped;
     execute format('select count(*) from %I', t) into live_n;
-    execute format('insert into %I select *, now() from %I', t || '_archive', t);
+    execute format('insert into %I (%s, archived_at) select %s, now() from %I',
+                   arch, collist, collist, t);
     get diagnostics copied_n = row_count;
     if copied_n <> live_n then
       raise exception 'archive count mismatch for %: live=% copied=% — ROLLING BACK',

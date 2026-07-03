@@ -58,10 +58,16 @@ if [[ "$MODE" == "dry-run" ]]; then
  3. Rotate the VPS local state (service MUST be stopped; adjust paths per
     `systemctl cat pe-service` WorkingDirectory):
       ssh -i ~/.ssh/id_personal sean@82.22.32.225 '
-        cd <service-workdir> &&
+        set -e; cd <service-workdir> &&
         mkdir -p archive-$(date +%Y%m%d) &&
-        mv paper_state.db paper_state.db-wal paper_state.db-shm \
-           paper.log paper.live.log archive-$(date +%Y%m%d)/ 2>/dev/null; true'
+        for f in paper_state.db paper_state.db-wal paper_state.db-shm \
+                 paper.log paper.live.log; do
+          if [ -e "$f" ]; then mv "$f" archive-$(date +%Y%m%d)/; fi
+        done &&
+        ls -la archive-$(date +%Y%m%d)/'
+    (the -wal/-shm files may legitimately be absent after a clean checkpoint; the
+     loop moves what exists and FAILS LOUDLY on a real mv error — verify the ls
+     shows at least paper_state.db AND paper.log before proceeding)
  4. Re-seed the fresh bankroll (still on the VPS, service stopped):
       confirm PE_BANKROLL_USD (or bankroll_usd) in the service env = the fresh
       starting value, then run the service binary once with --backfill-supabase.
