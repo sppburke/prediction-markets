@@ -164,6 +164,16 @@ pub struct ServiceConfig {
     #[serde(default = "default_min_fill_price")]
     pub min_fill_price: String,
 
+    /// Watchlist MEMBERSHIP owner between ranking batches (2026-07-03 run28 cutover):
+    /// `knockout` (legacy default — membership changes only via knockout + backfill) or
+    /// `full_rerank` (the newest ranking batch's top-25 replaces the live set each batch
+    /// transition). Boot-frozen: the maintenance loop is built once at startup, so a mode
+    /// change needs a restart — deliberately NOT in `service_config` (that table carries
+    /// runtime-mutable knobs only). Parsed fail-fast by `MembershipMode::parse` in
+    /// `main.rs`. See `docs/_GLOSSARY.md`: `watchlist_membership_mode`.
+    #[serde(default = "default_watchlist_membership_mode")]
+    pub watchlist_membership_mode: String,
+
     // ── Live wallet source (Supabase ranking handoff, issues #339, #370) ──────
     /// Supabase project REST base URL (e.g. `https://<ref>.supabase.co`). This is the
     /// **sole** wallet source (#370): there is no leaderboard/seed fallback, so the service
@@ -353,6 +363,10 @@ fn default_max_fill_price() -> String {
     "0.85".to_string()
 }
 
+fn default_watchlist_membership_mode() -> String {
+    "knockout".to_string() // legacy hold-until-knockout; the cutover sets full_rerank via env
+}
+
 fn default_min_fill_price() -> String {
     "0.15".to_string() // run28 entry-band lower bound (2026-07-03 cutover)
 }
@@ -498,6 +512,7 @@ impl Default for ServiceConfig {
             entry_gate_fail_closed: false,
             max_fill_price: default_max_fill_price(),
             min_fill_price: default_min_fill_price(),
+            watchlist_membership_mode: default_watchlist_membership_mode(),
             supabase_url: String::new(),
             supabase_anon_key: String::new(),
             supabase_secret_key: String::new(),
@@ -580,6 +595,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "entry_gate_fail_closed",
         "max_fill_price",
         "min_fill_price",
+        "watchlist_membership_mode",
         "supabase_url",
         "supabase_anon_key",
         "supabase_secret_key",
@@ -635,6 +651,7 @@ mod tests {
         assert!(!cfg.entry_gate_fail_closed);
         assert_eq!(cfg.max_fill_price, "0.85");
         assert_eq!(cfg.min_fill_price, "0.15");
+        assert_eq!(cfg.watchlist_membership_mode, "knockout");
         assert_eq!(cfg.supabase_url, "");
         assert_eq!(cfg.supabase_anon_key, "");
         assert_eq!(cfg.supabase_secret_key, "");
