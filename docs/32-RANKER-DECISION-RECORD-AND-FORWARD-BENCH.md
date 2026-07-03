@@ -49,6 +49,12 @@ rationale. Amendments A0–A8 referenced below are the audit's protocol amendmen
      frozen `ss_snapshot`.
 - **No production-ranker change on backtest evidence, and no single-config argmax freeze,
   ever** (amendments A4/A5). The forward bench below is the sole promotion instrument.
+- **run28 (2026-07-03)** was an explicit operator-ordered exception to A1's run
+  moratorium; the exception does not reopen the program, and run28's evidence class is
+  A4 bench-composition/descriptive, never certification. Results and a *proposed*
+  pre-T0 amendment to §2's online_weighting arm are in
+  `docs/33-RUN28-2026-WEEKLY-BAKEOFF-RESULTS.md`. This registration is unchanged until
+  that amendment is explicitly adopted here.
 
 ## 2. Bench composition (item 3.4 — computed from the FROZEN run25 matrix)
 

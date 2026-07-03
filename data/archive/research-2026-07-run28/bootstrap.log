@@ -1,0 +1,105 @@
+STEP uv-install 16:51:35
+downloading uv 0.11.26 x86_64-unknown-linux-gnu
+installing to /home/ubuntu/.local/bin
+  uv
+  uvx
+everything's installed!
+
+To add $HOME/.local/bin to your PATH, either restart your shell or run:
+
+    source $HOME/.local/bin/env (sh, bash, zsh)
+    source $HOME/.local/bin/env.fish (fish)
+STEP python-3.11.15 16:51:37
+Downloading cpython-3.11.15-linux-x86_64-gnu (download) (29.5MiB)
+ Downloaded cpython-3.11.15-linux-x86_64-gnu (download)
+Installed Python 3.11.15 in 1.53s
+ + cpython-3.11.15-linux-x86_64-gnu (python3.11)
+STEP venv 16:51:38
+Using CPython 3.11.15
+Creating virtual environment at: .venv-analysis
+Activate with: source .venv-analysis/bin/activate
+STEP pip-deps 16:51:39
+Using Python 3.11.15 environment at: .venv-analysis
+Resolved 12 packages in 372ms
+Downloading numpy (16.1MiB)
+Downloading pandas (10.8MiB)
+Downloading scipy (33.7MiB)
+Downloading numba (3.6MiB)
+Downloading duckdb (20.1MiB)
+Downloading llvmlite (53.7MiB)
+Downloading statsmodels (9.9MiB)
+ Downloaded numba
+ Downloaded duckdb
+ Downloaded numpy
+ Downloaded llvmlite
+ Downloaded statsmodels
+ Downloaded scipy
+ Downloaded pandas
+Prepared 12 packages in 2.82s
+Installed 12 packages in 93ms
+ + arch==8.0.0
+ + duckdb==1.3.2
+ + llvmlite==0.47.0
+ + numba==0.65.1
+ + numpy==2.4.4
+ + packaging==26.2
+ + pandas==3.0.3
+ + patsy==1.0.2
+ + python-dateutil==2.9.0.post0
+ + scipy==1.17.1
+ + six==1.17.0
+ + statsmodels==0.14.6
+STEP verify-python-imports 16:51:42
+py-imports OK 2.4.4 3.0.3 1.3.2 0.65.1
+STEP rustup 16:51:46
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /home/ubuntu/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to default
+info: default host triple is x86_64-unknown-linux-gnu
+info: skipping toolchain installation
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory ($HOME/.cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under $HOME/.cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "$HOME/.cargo/env"            # For sh/bash/zsh/ash/dash/pdksh
+source "$HOME/.cargo/env.fish"  # For fish
+source "~/.cargo/env.nu"  # For nushell
+source "$HOME/.cargo/env.tcsh"  # For tcsh
+. "$HOME/.cargo/env.ps1"        # For pwsh
+source "$HOME/.cargo/env.xsh"   # For xonsh
+STEP rust-toolchain-pin 16:51:47
+Default host: x86_64-unknown-linux-gnu
+rustup home:  /home/ubuntu/.rustup
+
+info: syncing channel updates for 1.95.0-x86_64-unknown-linux-gnu
+info: latest update on 2026-04-16 for version 1.95.0 (59807616e 2026-04-14)
+info: downloading 5 components
+installed toolchains
+--------------------
+
+active toolchain
+----------------
+name: 1.95.0-x86_64-unknown-linux-gnu
+active because: overridden by '/home/ubuntu/prediction-markets/rust-toolchain.toml'
+installed targets:
+  x86_64-unknown-linux-gnu
+STEP cargo-build-pe-backtest 16:51:58
+   Compiling pe-bootstrap v0.1.0 (/home/ubuntu/prediction-markets/crates/bootstrap)
+   Compiling pe-backtest v0.1.0 (/home/ubuntu/prediction-markets/crates/backtest)
+    Finished `release` profile [optimized] target(s) in 1m 11s
+STEP verify-binary 16:53:10
+-rwxrwxr-x 2 ubuntu ubuntu 4186200 Jul  2 16:53 target/release/pe-backtest
+Error: Config(Error { tag: Tag::Default, profile: Some(Profile(Uncased { string: "default" })), metadata: None, path: [], kind: MissingField("output_dir"), prev: None })
+(pe-backtest --help nonzero, checking binary exists)
+BOOTSTRAP_DONE 16:53:10

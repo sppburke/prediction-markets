@@ -47,6 +47,14 @@ paper_state.db-bak
 # Local data root (issue #166) — wallet_cache.db, wallet_set.json, Dune CSVs,
 # holdout-baseline output, backtest-output. Multi-GB, host-specific.
 /data/
+# Exception: curated, write-once research archives (small, reviewed artifacts).
+# The negation dance re-includes ONLY the named archive dirs; everything else
+# under /data/ (wallet_cache.db, parquet, secrets) stays ignored.
+!/data/
+/data/*
+!/data/archive/
+/data/archive/*
+!/data/archive/research-2026-07-run28/
 
 # Operator run output — bake-off results (leaderboard/return_matrix/decision/
 # mtm_coverage/survivorship, pe-backtest ndjson), backfill logs, PID files.

@@ -1,0 +1,12 @@
+[20:21:51] ranker_duck: registered optional view market_price_history (market_price_history.parquet)
+[20:21:51] ranker_duck: registered optional view token_conditions (token_conditions.parquet)
+[20:21:51] ranker_duck: engine=duck over data/parquet (memory_limit=8GB, threads=4)
+[suff_stats] WARN true_clv: 12394483/49487802 positions have a CLOB close (25%) — below 30% (best-effort CLOB coverage)
+candidate universe bounded to 209,063 wallets (positions in [20, None])
+true_clv EXCLUDED from the grid: true_clv_close coverage 25% < true_clv_coverage_warn_pct=30% (coverage 25%); see true_clv_preflight.json
+bake-off WINNER: beats baseline, RW-superior, PBO/SPA clear, CPR go
+compute: 12 criteria × 768 run-set configs; 6477 distinct backtests of 18432 requested (18432 naive ceiling)
+survivorship: universe 208670 wallets / 49487802 positions (current snapshot; #385-purged wallets absent at historical as_of → optimistic bias; survivorship.json)
+MTM coverage (winner): 973/1133 open-at-horizon positions marked (85.9%); per-(config, period) detail in mtm_coverage.json
+resolution lag (winner, open-at-horizon): open frac 1.6%; median 7.3d, p90 26.2d, censored 14.6% — advisory, in mtm_coverage.json
+paper_fills cross-check skipped (live fetch unavailable): set SUPABASE_URL and SUPABASE_SECRET_KEY in env (.env) for the paper_fills fetch

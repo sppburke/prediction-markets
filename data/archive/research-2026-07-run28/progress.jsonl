@@ -1,0 +1,7 @@
+{"ts": 1783023731.806, "event": "materialize_start", "n_wallets": 209063}
+{"ts": 1783023965.911, "event": "materialize_done", "secs": 227.0, "n_positions": 49487802, "n_wallets": 208670}
+{"ts": 1783023966.046, "event": "screen_start", "n_estimators": 4, "n_configs": 768, "n_as_of": 24, "executor": "process", "workers": 48}
+{"ts": 1783024658.348, "event": "screen_done", "secs": 692.3, "survivors": ["gu_koenker_npmle", "t_stat_baseline", "proxy_clv", "eb_shrinkage_skill"]}
+{"ts": 1783024658.355, "event": "grid_start", "n_configs": 768, "n_as_of": 24, "executor": "process", "workers": 48}
+{"ts": 1783058823.354, "event": "grid_done", "secs": 34165.0, "n_configs": 768}
+{"ts": 1783058847.994, "event": "honesty_done", "secs": 24.6, "status": "WINNER", "winner": "gu_koenker_npmle|none|policy_full_rerank|ttr48.0_pb0.15-0.85_act0_trl20_hl0.0|churn0.0"}
