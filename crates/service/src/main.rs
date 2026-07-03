@@ -134,6 +134,19 @@ async fn main() -> Result<()> {
     // if Supabase is empty or unreachable at boot, chosen over running an unvalidated set.
     // Deploy precondition: the authoritative `rank_and_push` cron must already be populating
     // `latest_ranking`.
+    // Record the ranking batch observed at boot BEFORE fetching the watchlist, so a batch
+    // landing in between reads as a transition on the first maintenance tick (full_rerank
+    // then swaps immediately) rather than being pinned as already-seen. Best-effort: `None`
+    // simply restores the first-tick pin behavior.
+    let boot_batch_marker = supabase_reader::fetch_latest_batch_id(
+        &reqwest::Client::new(),
+        &cfg.supabase_url,
+        &cfg.supabase_anon_key,
+        &cfg.supabase_secret_key,
+    )
+    .await
+    .unwrap_or_default();
+
     let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
         supabase_reader::fetch(
             &reqwest::Client::new(),
@@ -591,6 +604,7 @@ async fn main() -> Result<()> {
             cfg.supabase_secret_key.clone(),
             watchlist_writer_lock.clone(),
             maint_cfg,
+            boot_batch_marker,
         )))
     } else {
         None

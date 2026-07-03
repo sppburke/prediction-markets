@@ -130,7 +130,7 @@ impl KnockoutReason {
             Self::Inactivity => "inactive>72h",
             Self::InactivityHardCap => "inactive>7d (hard cap)",
             Self::Underperformance => "upper_cb_edge<0 & windowed_pnl<0",
-            Self::RankerRotation => "full_rerank: dropped from top-25",
+            Self::RankerRotation => "full_rerank: dropped from ranking top-N",
         }
     }
 }
@@ -320,6 +320,7 @@ pub async fn run_maintenance_loop(
     secret_key: String,
     writer_lock: Arc<Mutex<()>>,
     cfg: MaintenanceConfig,
+    initial_batch_marker: Option<i64>,
 ) {
     if cfg.interval_secs == 0 {
         info!("watchlist maintenance disabled (maintenance_interval_secs = 0)");
@@ -335,7 +336,11 @@ pub async fn run_maintenance_loop(
     // Wallets evicted under the current ranking batch: excluded from backfill so a just-evicted
     // wallet is not instantly re-admitted with a reset clock. Cleared when a new batch is pushed.
     let mut evicted: HashSet<WalletAddress> = HashSet::new();
-    let mut batch_marker: Option<i64> = None;
+    // Seeded with the batch observed at boot (fetched BEFORE the boot watchlist so a batch
+    // landing in between reads as a transition, never as already-seen — review finding on
+    // the first draft): a batch pushed between boot and the first tick now swaps on that
+    // first tick instead of being pinned as current and skipped until the next batch.
+    let mut batch_marker: Option<i64> = initial_batch_marker;
     loop {
         tokio::time::sleep(interval).await;
         maintenance_tick(
@@ -352,6 +357,37 @@ pub async fn run_maintenance_loop(
         )
         .await;
     }
+}
+
+/// Load per-wallet edge stats from the authoritative local paper-state. `None` (with a
+/// warn) on any read failure — the knockout pass skips its tick; the full-rerank audit
+/// degrades to stat-less rows.
+fn load_edge_stats(
+    paper_state: &Arc<PaperStateDb>,
+    cfg: &MaintenanceConfig,
+    now_unix: i64,
+) -> Option<HashMap<String, WalletEdgeStats>> {
+    let fills = match paper_state.list_fills() {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, "maintenance: list_fills failed");
+            return None;
+        }
+    };
+    let resolutions = match ResolutionStore::load(Arc::clone(paper_state)) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "maintenance: resolution-store load failed");
+            return None;
+        }
+    };
+    Some(wallet_edge_stats(
+        &fills,
+        &resolutions,
+        cfg.demotion_cb_alpha,
+        now_unix,
+        cfg.demotion_pnl_window_secs,
+    ))
 }
 
 /// One maintenance pass. Best-effort throughout: any single failure (batch fetch, list_fills,
@@ -371,44 +407,13 @@ async fn maintenance_tick(
 ) {
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
 
-    // 1. Per-wallet edge stats from the authoritative local paper-state. (Computed before
-    // the batch step so a full-rerank rotation can stamp its audit rows with them.)
-    let fills = match paper_state.list_fills() {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, "maintenance: list_fills failed; skipping tick");
-            return;
-        }
-    };
-    let resolutions = match ResolutionStore::load(Arc::clone(paper_state)) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, "maintenance: resolution-store load failed; skipping tick");
-            return;
-        }
-    };
-    let stats = wallet_edge_stats(
-        &fills,
-        &resolutions,
-        cfg.demotion_cb_alpha,
-        now_unix,
-        cfg.demotion_pnl_window_secs,
-    );
-
-    // 2. Snapshot the live wallets and their cursors.
-    let live_snapshot = live.snapshot();
-    let live_wallets: Vec<WalletAddress> = live_snapshot.entries.iter().map(|e| e.wallet).collect();
-    let mut cursors: HashMap<WalletAddress, Option<i64>> =
-        HashMap::with_capacity(live_wallets.len());
-    for w in &live_wallets {
-        // A cursor read error self-heals to `None` (treated as just-admitted, not inactive).
-        cursors.insert(*w, paper_state.cursor(w).unwrap_or(None));
-    }
-
-    // 3. Ranking-batch step. Knockout mode: a fresh batch only clears the evicted-set so
-    // re-promoted wallets can return. FullRerank mode: a batch TRANSITION hands membership
-    // to the ranker — wholesale swap to the new top-`cap`; the marker only advances on a
-    // successful swap so a failed fetch retries next tick.
+    // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
+    // legacy tick ran it first; a review finding on the first draft caught the reorder).
+    // Knockout mode: a fresh batch only clears the evicted-set so re-promoted wallets can
+    // return. FullRerank mode: a batch TRANSITION hands membership to the ranker —
+    // wholesale swap to the new top-`cap`; the marker only advances on a successful swap
+    // so a failed fetch retries next tick. Audit stats for dropped wallets are best-effort
+    // decoration: a list_fills failure degrades the audit rows, never blocks the swap.
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
         Ok(latest) => match cfg.membership_mode {
             MembershipMode::Knockout => {
@@ -438,8 +443,9 @@ async fn maintenance_tick(
                                 now_unix,
                             )
                             .await;
+                            let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
                             for w in &dropped {
-                                let s = stats.get(&w.to_string());
+                                let s = audit_stats.as_ref().and_then(|m| m.get(&w.to_string()));
                                 if let Err(e) = supabase_reader::write_lifecycle_event(
                                     client,
                                     base_url,
@@ -450,7 +456,7 @@ async fn maintenance_tick(
                                     s.map(|st| st.realized_pnl),
                                     i64::try_from(s.map_or(0, |st| st.settled_count))
                                         .unwrap_or(i64::MAX),
-                                    cursors.get(w).copied().flatten(),
+                                    paper_state.cursor(w).unwrap_or(None),
                                 )
                                 .await
                                 {
@@ -481,6 +487,23 @@ async fn maintenance_tick(
             }
         },
         Err(e) => warn!(error = %e, "maintenance: batch-id fetch failed; keeping evicted-set"),
+    }
+
+    // 2. Per-wallet edge stats from the authoritative local paper-state (knockout pass only —
+    // the batch step above never depends on this succeeding).
+    let Some(stats) = load_edge_stats(paper_state, cfg, now_unix) else {
+        warn!("maintenance: edge-stats load failed; skipping knockout pass this tick");
+        return;
+    };
+
+    // 3. Snapshot the live wallets and their cursors.
+    let live_snapshot = live.snapshot();
+    let live_wallets: Vec<WalletAddress> = live_snapshot.entries.iter().map(|e| e.wallet).collect();
+    let mut cursors: HashMap<WalletAddress, Option<i64>> =
+        HashMap::with_capacity(live_wallets.len());
+    for w in &live_wallets {
+        // A cursor read error self-heals to `None` (treated as just-admitted, not inactive).
+        cursors.insert(*w, paper_state.cursor(w).unwrap_or(None));
     }
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.
