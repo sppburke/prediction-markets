@@ -182,8 +182,10 @@ to Supabase and verify `latest_ranking` is populated.
 
 Production defaults are baked in (override via flags): `--universe-from-trades`,
 `HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
-mid-price band 0.15–0.85, TTR 72h, `--scheduled-only` (no resolved-at look-ahead),
-`floor_tstat=2.0`, `top_n=200`.
+mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_prod_min_trl`
+— replaces the per-month activity gates, which production zeroes; run28 cutover
+2026-07-03), `--scheduled-only` (no resolved-at look-ahead), `floor_tstat=2.0`,
+`top_n=200`.
 
 > **First full-universe run — stage the half-life.** For the first run after moving to
 > the full trade universe, override with `--half-life-days 0` (decay off) so a

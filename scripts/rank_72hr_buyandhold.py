@@ -92,6 +92,7 @@ class Params:
     min_ttr_secs: int       # lower TTR bound: drop first-buys entered < this close to resolution (copyability floor)
     min_avg_per_month: float
     min_active_months: int
+    min_trl: int            # minimum track-record length: qualifying positions n >= this (0 = off)
     target_n: int
     slip: float             # absolute price slippage (e.g. 0.01 = 1 cent)
     floor_tstat: float      # Stage-4 net-edge floor: keep wallets with net t-stat >= this
@@ -136,6 +137,12 @@ def parse_args() -> Params:
                         "price we'd actually get, not the leader's.")
     p.add_argument("--min-avg-per-month", type=float, default=20.0)
     p.add_argument("--min-active-months", type=int, default=3)
+    p.add_argument("--min-trl", type=int, default=0,
+                   help="minimum track-record length: eligibility requires >= this many "
+                        "qualifying positions in-window (docs/_GLOSSARY ranker_min_trl). "
+                        "0 = off. The run28 production shape uses 20 and ZEROES the "
+                        "per-month gates (--min-avg-per-month 0 --min-active-months 0) — "
+                        "MinTRL replaces them, it does not stack on top.")
     p.add_argument("--target-n", type=int, default=250)
     p.add_argument("--slip-cents", type=float, default=1.0,
                    help="entry slippage in cents of price (capped near $1); net = (payoff-eff)/eff")
@@ -174,6 +181,7 @@ def parse_args() -> Params:
         min_ttr_secs=int(a.min_ttr_hours * 3600),
         min_avg_per_month=a.min_avg_per_month,
         min_active_months=a.min_active_months,
+        min_trl=a.min_trl,
         target_n=a.target_n,
         slip=a.slip_cents / 100.0,
         floor_tstat=a.floor_tstat,
@@ -352,6 +360,7 @@ def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
     eligible = (
         (n / active_months >= prm.min_avg_per_month)
         and (active_months >= prm.min_active_months)
+        and (n >= prm.min_trl)
         and (n > 1)
         and not math.isnan(tstat_net)
     )
@@ -512,13 +521,15 @@ def main() -> int:
     stats["eligible"] = (
         (stats["avg_per_active_month"] >= prm.min_avg_per_month)
         & (stats["active_months"] >= prm.min_active_months)
+        & (stats["n"] >= prm.min_trl)
         & (stats["n"] > 1)
         & stats["tstat_net"].notna()
     )
     # primary ranking = net t-stat (realistic price-aware net edge, risk-adjusted)
     stats = stats.sort_values("tstat_net", ascending=False, na_position="last").reset_index(drop=True)
     n_elig = int(stats["eligible"].sum())
-    log(f"eligible wallets (avg>={prm.min_avg_per_month}/mo, >={prm.min_active_months} active months): {n_elig}")
+    log(f"eligible wallets (avg>={prm.min_avg_per_month}/mo, >={prm.min_active_months} active months, "
+        f"n>={prm.min_trl}): {n_elig}")
 
     ranked_path = os.path.join(prm.out_dir, "ranked_72hr_buyandhold.csv")
     stats.to_csv(ranked_path, index=False)

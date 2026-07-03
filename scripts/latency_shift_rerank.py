@@ -80,6 +80,10 @@ def parse_args():
                    help="drop wallets whose fillable fraction is below this")
     p.add_argument("--min-active-months", type=int, default=3)
     p.add_argument("--min-avg-per-month", type=float, default=20.0)
+    p.add_argument("--min-trl", type=int, default=0,
+                   help="minimum track-record length: survival requires >= this many FILLED "
+                        "positions (docs/_GLOSSARY ranker_min_trl). 0 = off. Mirrors pass-1; "
+                        "the run28 production shape uses 20 with the per-month gates zeroed.")
     p.add_argument("--target-n", type=int, default=25)
     return p.parse_args()
 
@@ -232,6 +236,7 @@ def main() -> int:
         eligible = (
             nf > 1 and am >= a.min_active_months
             and (nf / am if am else 0) >= a.min_avg_per_month
+            and nf >= a.min_trl
             and fr >= a.min_fill_rate
             and not math.isnan(t) and t >= a.floor_tstat and mean > 0
         )
