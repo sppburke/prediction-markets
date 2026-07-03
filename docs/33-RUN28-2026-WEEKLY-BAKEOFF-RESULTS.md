@@ -47,9 +47,12 @@ The crowned config is `gu_koenker_npmle|none|policy_full_rerank|ttr48.0_pb0.15-0
 - The AKM block (`median_unbiased = ci_lo = ci_hi = −6889`) is the known
   truncated-normal CDF **underflow artifact** (`oos_validation.py` `_truncated_normal_cdf`
   den≤0 branch): the winner/runner-up gap sits above the `AKM_NEAR_TIE_SIGMA = 1e-3`
-  guard but inside the numeric underflow zone (any gap below ~0.08·SE lands there).
+  guard but inside the numeric underflow zone (estimated here at the time as ~0.08·SE;
+  direct measurement during the fix put the true degenerate zone at ~0.003–0.005·SE).
   The honest post-selection statement is the unconditional CI, mean ± 1.96·SE.
   Hygiene follow-up: widen the near-tie guard so the fallback fires in this zone.
+  *(Done 2026-07-03: `AKM_NEAR_TIE_SIGMA` 1e-3 → 0.01, sized from measurement —
+  `ranker_akm_near_tie_sigma` in `_GLOSSARY.md`.)*
 - `grid_dsr_advisory_low = true` (DSR ≈ 0.0004) — advisory by design (`docs/31`), not a
   gate; the RW/SPA/PBO panel already deflates.
 
