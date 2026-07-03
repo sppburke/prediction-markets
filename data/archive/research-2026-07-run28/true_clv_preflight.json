@@ -1,0 +1,8 @@
+{
+  "true_clv_requested": true,
+  "true_clv_excluded": true,
+  "reason": "true_clv_close coverage 25% < true_clv_coverage_warn_pct=30%",
+  "views_present": true,
+  "coverage_pct": 25,
+  "coverage_warn_pct": 30
+}

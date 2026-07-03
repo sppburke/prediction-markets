@@ -1,0 +1,4 @@
+[01:46:19] ranker_duck: registered optional view market_price_history (market_price_history.parquet)
+[01:46:19] ranker_duck: registered optional view token_conditions (token_conditions.parquet)
+[01:46:19] ranker_duck: engine=duck over data/parquet (memory_limit=8GB, threads=4)
+[suff_stats] WARN true_clv: 12394483/49487802 positions have a CLOB close (25%) — below 30% (best-effort CLOB coverage)

@@ -1,0 +1,8 @@
+{
+  "universe_wallets": 208670,
+  "universe_positions": 49487802,
+  "point_in_time_roster": false,
+  "purge_hard_deletes_wallets": true,
+  "directional_bias": "optimistic",
+  "note": "Current-snapshot universe; #385-purged wallets are absent from historical as_of slices. Hard-delete makes a point-in-time roster unreconstructable. See docs/31."
+}
