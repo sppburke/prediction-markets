@@ -5,7 +5,8 @@ Automates the ingest of new candidate wallets from the Polymarket leaderboard
 `pe-bootstrap winner-discovery` subcommand upserts each discovered wallet into the
 local `wallet_cache.db` and activates the eligible ones; they then flow into the
 ranking pipeline (Step 0 of `scripts/rank_and_push.sh`) and reach the live set only
-via Supabase `latest_ranking` and the maintenance tick — never directly. This is the
+via Supabase `latest_ranking` — admitted by the maintenance tick (knockout mode) or
+the next batch swap (`full_rerank`, the cutover production mode) — never directly. This is the
 only sanctioned path for adding new wallets; see `AGENTS.md` "Do not add wallets" rule.
 
 ## Required environment
@@ -100,8 +101,9 @@ PE_BOOTSTRAP_RADION_MAX_REQUESTS_PER_RUN=8  # 8×30=240/mo, under the 300/mo Fre
 
 - **No direct auto-deploy to live.** Discovery writes only to the local SQLite
   cache. A discovered wallet reaches the live set only after the ranking pipeline
-  publishes it to Supabase `latest_ranking` and the maintenance tick admits it —
-  never directly from discovery.
+  publishes it to Supabase `latest_ranking` and the service admits it (maintenance-tick
+  backfill in knockout mode; the next batch swap in `full_rerank`) — never directly
+  from discovery.
 - **Idempotent.** Re-running with the same leaderboard snapshot is safe:
   `INSERT OR IGNORE` on `wallet_hex` is a no-op for already-known wallets.
 - **`CacheMutationLock`** is held only during the DB-write window inside

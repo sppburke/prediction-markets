@@ -329,6 +329,16 @@ class AKMWinnersTest(unittest.TestCase):
         self.assertEqual(out["median_unbiased"], out["naive_estimate"])
         self.assertGreater(out["ci_hi"] - out["ci_lo"], 3.0)  # ~3.92 at alpha=0.05
 
+    def test_run28_underflow_zone_falls_back_to_unconditional(self) -> None:
+        # run28 regression (docs/33 §2): a 0.003*SE gap sat ABOVE the old 1e-3 guard but
+        # inside the CDF underflow zone -> degenerate point CI (AKM median_unbiased ==
+        # ci_lo == ci_hi == -6889). The widened 0.08 guard must catch it.
+        est = [1.003, 1.0, -0.5]
+        out = akm_inference_on_winners(est, [1.0, 1.0, 1.0])
+        self.assertFalse(out["conditional"])
+        self.assertEqual(out["median_unbiased"], out["naive_estimate"])
+        self.assertGreater(out["ci_hi"] - out["ci_lo"], 3.0)
+
     def test_clear_gap_stays_conditional(self) -> None:
         # A gap comfortably above the near-tie threshold keeps the conditional law.
         out = akm_inference_on_winners([2.0, 1.0], [0.5, 0.5])

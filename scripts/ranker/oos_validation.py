@@ -27,7 +27,10 @@ from scipy.stats import norm
 # as ties by `akm_inference_on_winners` — the conditional (truncated-normal) law is numerically
 # ill-posed there, so the honest UNCONDITIONAL CI is returned instead. Canonical default:
 # `docs/_GLOSSARY.md` `ranker_akm_near_tie_sigma`.
-AKM_NEAR_TIE_SIGMA = 1e-3
+# Widened 1e-3 -> 0.08 after run28 (docs/33 §2): the truncated-normal CDF underflow
+# zone extends to gaps ~0.08·SE — run28's 0.003·SE winner gap sat ABOVE the old guard
+# yet still produced the degenerate point CI. docs/_GLOSSARY `ranker_akm_near_tie_sigma`.
+AKM_NEAR_TIE_SIGMA = 0.08
 
 from . import SuffStats
 

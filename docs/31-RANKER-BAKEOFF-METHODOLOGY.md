@@ -14,7 +14,7 @@ The target question every experiment must answer is narrow and operational: **"w
 
 ## Unit of evaluation: the set-transition policy
 
-The deployed system does not pick a point-in-time snapshot — it **maintains a followed set over time** (currently incremental knockout + backfill in `crates/service/src/watchlist_maintenance.rs`). A ranking that looks excellent at a single cutoff but behaves badly under the real maintenance policy is a false positive. So the bake-off's unit of evaluation is the **set-transition policy**: each candidate config is run as a walk-forward *trajectory* —
+The deployed system does not pick a point-in-time snapshot — it **maintains a followed set over time** (`crates/service/src/watchlist_maintenance.rs`: incremental knockout + backfill historically; `watchlist_membership_mode = full_rerank` — wholesale replacement per ranking batch — since the 2026-07-03 run28 cutover). A ranking that looks excellent at a single cutoff but behaves badly under the real maintenance policy is a false positive. So the bake-off's unit of evaluation is the **set-transition policy**: each candidate config is run as a walk-forward *trajectory* —
 
 ```
 set_t  →  pe-backtest(set_t)  →  live_pnl_t  →  policy.step(...)  →  set_{t+1}

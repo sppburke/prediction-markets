@@ -204,16 +204,25 @@ mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_pro
 - `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push.
 - Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
 
-### Cron (operator-installed)
+### Cron (operator-installed; 4h production cadence since the 2026-07-03 cutover)
 
 ```cron
-# daily 06:00 UTC on the box holding wallet_cache.db (NOT the VPS):
-0 6 * * *  cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
+# On the box holding wallet_cache.db (NOT the VPS).
+# Cheap 4-hourly tick: re-rank + push from the existing cache (skips the heavy refresh):
+0 4,8,12,16,20 * * *  cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh --skip-discovery --skip-backfill >> data/eval-results/cron.log 2>&1
+# Mandatory daily FULL run (refresh + purge; the push aborts on a >24h-stale cache):
+0 0 * * *             cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
 ```
 
+The PID lock makes an overlapping tick abort (exit 3) — a long full run simply eats the
+next 4h tick and the following one recovers. The 4h cadence is a data-freshness choice,
+not an evidence-backed one (weekly was run28's tested cadence, `docs/33` §5).
+
 `pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
-(score-update-only; the maintenance tick handles eviction/backfill of live-set
-membership).
+(score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
+`knockout` (legacy — the maintenance tick's eviction/backfill is the sole membership
+path) or `full_rerank` (each batch transition wholesale-replaces the live top-25 —
+the cutover production mode).
 
 ---
 

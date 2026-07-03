@@ -9,6 +9,9 @@ What run28 adds: the first artifact-free full-grid panel (see §2), the capacity
 ranking at the live bankroll, and the TTR / set-transition-policy / cadence answers the
 bench design needs. Artifacts: `data/archive/research-2026-07-run28/` (inventory in its
 README); working copies in gitignored `runs/run28-2026-weekly-lambda/`.
+(Point-in-time note: rows labeled "current prod shape" / "current live behavior" below
+describe PRE-cutover production; the 2026-07-03 single-system cutover — `docs/32` §1 —
+moved production to ttr48/trl20 + `full_rerank` membership.)
 
 ## 1. Design
 
