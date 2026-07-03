@@ -277,6 +277,21 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn(flag, self._log("rerank.log"), "pass-2 missing the default half-life")
         print(f"PASS: production default half-life ({EXPECTED_DEFAULT_HALF_LIFE}) threaded to both passes")
 
+    def test_run28_shape_threaded_to_stages(self):
+        """run28 cutover (#417): TTR 48h + MinTRL-20 (per-month gates zeroed) reach both
+        ranking passes, and the push receives the matching --ttr-max-secs provenance."""
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
+        for logname in ("rank.log", "rerank.log"):
+            log = self._log(logname)
+            self.assertIn("--min-trl 20", log, f"{logname} missing the MinTRL-20 gate")
+            self.assertIn("--min-avg-per-month 0", log, f"{logname} per-month gate not zeroed")
+            self.assertIn("--min-active-months 0", log, f"{logname} per-month gate not zeroed")
+        self.assertIn("--ttr-hours 48", self._log("rank.log"), "pass-1 missing TTR 48h")
+        self.assertIn("--ttr-max-secs 172800", self._log("push.log"),
+                      "push missing the 48h ttr_max_secs provenance")
+        print("PASS: run28 shape (ttr48 + trl20, per-month zeroed) threaded to rank/rerank/push")
+
     def test_missing_bootstrap_binary_is_fatal(self):
         (self.root / "target" / "release" / "pe-bootstrap").unlink()
         r = self._run()

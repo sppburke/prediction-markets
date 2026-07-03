@@ -3,8 +3,10 @@
 # pipeline. ONE command, ZERO arguments: it refreshes data, ranks, reranks, and
 # publishes the result to Supabase, so "done ranking" always means "in Supabase".
 #
-# THERE IS EXACTLY ONE RANKER: scripts/rank_72hr_buyandhold.py (72h buy-and-hold,
-# decay-aware, memory-safe inline scan over the full trade universe). pass-2
+# THERE IS EXACTLY ONE RANKER: scripts/rank_72hr_buyandhold.py (buy-and-hold,
+# decay-aware, memory-safe inline scan over the full trade universe; the "72hr" in
+# the filename is historical — the production TTR ceiling is 48h since the run28
+# cutover, docs/_GLOSSARY `ranker_ttr_hours`). pass-2
 # (latency_shift_rerank.py) reranks and adds hit_rate; push_ranking_to_supabase.py
 # publishes the `latest_ranking` table that pe-service reads. No second ranker, no
 # curated-universe pre-gate — the ranker's own filters decide the cohort (#370).
@@ -32,11 +34,19 @@
 #                    auto-skipped under --skip-backfill / --skip-rank (needs a fresh backfill+verdict).
 #
 # Production defaults are baked in (override via flags): --universe-from-trades,
-# HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 72h, --scheduled-only
-# (drops the resolved-at look-ahead fallback), floor_tstat 2.0, top_n 200.
+# HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 48h, MinTRL 20 (the run28
+# winner shape, 2026-07-03 cutover: --min-trl 20 REPLACES the per-month activity gates,
+# which production zeroes), --scheduled-only (drops the resolved-at look-ahead fallback),
+# floor_tstat 2.0, top_n 200.
 #
-# Cron (example — daily 06:00 UTC on the box holding wallet_cache.db; NOT the VPS):
-#   0 6 * * *  cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
+# Cron (4h production cadence on the box holding wallet_cache.db; NOT the VPS):
+#   The cheap 4-hourly tick re-ranks + pushes from the existing cache:
+#     0 */4 * * *  cd <repo> && bash scripts/rank_and_push.sh --skip-discovery --skip-backfill >> data/eval-results/cron.log 2>&1
+#   At least ONE full run per day stays MANDATORY (the push aborts if the cache's newest
+#   trade is >24h old, and purge only runs on full runs), e.g. replace the 06:00 tick:
+#     0 6 * * *    cd <repo> && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
+#   The PID lock makes an overlapping tick abort (exit 3) — a long full run simply eats
+#   the next 4h tick; the following tick recovers.
 #
 # Requirements on the box:
 #   - .env with SUPABASE_URL + SUPABASE_SECRET_KEY (sourced below).
@@ -82,11 +92,17 @@ HALF_LIFE_DAYS="30"
 # Shared decay age anchor for BOTH passes; empty => resolved below to UTC-midnight today (= the
 # relative win_end) so the two passes weight every trade against the identical anchor.
 AS_OF=""
-TTR_HOURS="72"
+TTR_HOURS="48"
 TARGET_N="25"
 PRICE_MIN="0.15"
 PRICE_MAX="0.85"
 FLOOR_TSTAT="2.0"
+# MinTRL eligibility (run28 winner shape, 2026-07-03 cutover): >=20 qualifying positions
+# in-window REPLACES the per-month activity gates (run28's trl20 axis has no per-month
+# component), so production zeroes both. docs/_GLOSSARY `ranker_prod_min_trl`.
+MIN_TRL="20"
+MIN_AVG_PER_MONTH="0"
+MIN_ACTIVE_MONTHS="0"
 LATENCY_SHIFT_SECS="20"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
@@ -124,6 +140,9 @@ while [[ $# -gt 0 ]]; do
     --price-min) PRICE_MIN="$2"; shift 2;;
     --price-max) PRICE_MAX="$2"; shift 2;;
     --floor-tstat) FLOOR_TSTAT="$2"; shift 2;;
+    --min-trl) MIN_TRL="$2"; shift 2;;
+    --min-avg-per-month) MIN_AVG_PER_MONTH="$2"; shift 2;;
+    --min-active-months) MIN_ACTIVE_MONTHS="$2"; shift 2;;
     --latency-shift-secs) LATENCY_SHIFT_SECS="$2"; shift 2;;
     --fill-window-secs) FILL_WINDOW_SECS="$2"; shift 2;;
     --top-n) TOP_N="$2"; shift 2;;
@@ -319,6 +338,8 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     "${WIN_ARGS[@]}" --ttr-hours "$TTR_HOURS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --target-n "$TARGET_N" --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
+    --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
+    --min-active-months "$MIN_ACTIVE_MONTHS" \
     --floor-tstat "$FLOOR_TSTAT" --scheduled-only
 
   echo "── Stage 2/3: pass-2 latency-shift rerank (adds hit_rate) ─────────────────────"
@@ -327,6 +348,8 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
+    --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
+    --min-active-months "$MIN_ACTIVE_MONTHS" \
     --floor-tstat "$FLOOR_TSTAT"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"
@@ -353,9 +376,17 @@ FILTER_ARGS=(--db "$DB")
 [[ -n "$ACTIVE_WINDOW_HOURS" ]] && FILTER_ARGS+=(--active-window-hours "$ACTIVE_WINDOW_HOURS")
 [[ -n "$MAX_CACHE_STALENESS_HOURS" ]] && FILTER_ARGS+=(--max-cache-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
 
+# TTR provenance: pass the actual ranking TTR ceiling so ranking_batches.ttr_max_secs
+# reflects the shape the entries were ranked at (the script default would silently
+# record 72h after the 48h cutover). Floor stays pass-1's --min-ttr-hours default (30s).
+# CAVEAT (same class as PR #351): on a --skip-rank re-push this records THIS run's
+# TTR_HOURS, not the TTR the reused CSVs were ranked at — pass a matching --ttr-hours.
+TTR_MAX_SECS="$(python3 -c "print(int(float('$TTR_HOURS')*3600))")"
+
 python3 scripts/push_ranking_to_supabase.py \
   --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N" \
   --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX" \
+  --ttr-max-secs "$TTR_MAX_SECS" \
   --latency-shift-secs "$LATENCY_SHIFT_SECS" \
   "${FILTER_ARGS[@]}" \
   --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
