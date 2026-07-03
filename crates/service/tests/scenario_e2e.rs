@@ -188,6 +188,7 @@ async fn scenario_e2e_clean_exit() {
             max_resolution_horizon_secs: 0, // disabled in tests
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
         },
@@ -252,6 +253,7 @@ async fn scenario_graceful_shutdown() {
             max_resolution_horizon_secs: 0, // disabled in tests
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
+            min_fill_price: Decimal::ZERO,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
         },

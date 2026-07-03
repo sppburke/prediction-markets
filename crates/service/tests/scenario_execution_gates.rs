@@ -162,18 +162,29 @@ async fn run_gate(
     history: HashMap<WalletAddress, HashSet<MarketId>>,
     trades: Vec<IncomingTrade>,
 ) -> usize {
-    // Max-fill cap disabled; markets quoted at 0.60 (in flat-fill range).
-    run_gate_capped(dir, gate_config, history, trades, Decimal::ZERO, "0.60").await
+    // Fill-price band disabled; markets quoted at 0.60 (in flat-fill range).
+    run_gate_capped(
+        dir,
+        gate_config,
+        history,
+        trades,
+        Decimal::ZERO,
+        Decimal::ZERO,
+        "0.60",
+    )
+    .await
 }
 
-/// Like [`run_gate`] but with an explicit `max_fill_price` cap and `mid_price` quote, to
-/// exercise the #339 current-price cap gate.
+/// Like [`run_gate`] but with an explicit fill-price band (`max_fill_price` cap +
+/// `min_fill_price` floor) and `mid_price` quote, to exercise the #339 current-price
+/// cap gate and the run28 band-floor gate (#468 parity).
 async fn run_gate_capped(
     dir: &TempDir,
     gate_config: CopyEntryGateConfig,
     history: HashMap<WalletAddress, HashSet<MarketId>>,
     trades: Vec<IncomingTrade>,
     max_fill_price: Decimal,
+    min_fill_price: Decimal,
     mid_price: &str,
 ) -> usize {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
@@ -198,6 +209,7 @@ async fn run_gate_capped(
             max_resolution_horizon_secs: 0, // horizon gate disabled; isolate the entry gate
             min_resolution_horizon_secs: 0,
             max_fill_price,
+            min_fill_price,
             entry_gate_config: gate_config,
             runtime_config: None,
         },
@@ -317,6 +329,7 @@ async fn max_fill_price_blocks_high_current_price() {
         HashMap::new(),
         vec![entry_trade("capped", market("0xnew"), dec!(0.60))],
         dec!(0.50), // cap below the 0.60 current price
+        Decimal::ZERO,
         "0.60",
     )
     .await;
@@ -335,9 +348,52 @@ async fn max_fill_price_admits_below_cap() {
         HashMap::new(),
         vec![entry_trade("under-cap", market("0xnew"), dec!(0.60))],
         dec!(0.70), // cap above the 0.60 current price
+        Decimal::ZERO,
         "0.60",
     )
     .await;
     assert_eq!(fills, 1);
     println!("PASS: max_fill_price admits a BUY whose current price is below the cap (1 fill)");
+}
+
+// ── Band-floor scenarios (run28 cutover; #468 selection↔deployment parity) ─────
+
+/// PASS: a first entry whose CURRENT market price (0.10) is below `min_fill_price`
+///       (0.15) produces zero fills — the band floor suppresses it.
+/// FAIL: any fill (the min_fill_price floor failed to fire).
+#[tokio::test]
+async fn min_fill_price_blocks_low_current_price() {
+    let dir = TempDir::new().unwrap();
+    let fills = run_gate_capped(
+        &dir,
+        band_config(false),
+        HashMap::new(),
+        vec![entry_trade("floored", market("0xnew"), dec!(0.10))],
+        Decimal::ZERO,
+        dec!(0.15), // floor above the 0.10 current price
+        "0.10",
+    )
+    .await;
+    assert_eq!(fills, 0);
+    println!("PASS: min_fill_price blocks a BUY whose current price is below the floor (0 fills)");
+}
+
+/// PASS: an entry at EXACTLY the floor (0.15) fills — the bound is inclusive, mirroring
+///       the backtest `min_signal_price` semantics (`< floor` skips) the run28 eval used.
+/// FAIL: zero fills (the floor wrongly suppressed the boundary value).
+#[tokio::test]
+async fn min_fill_price_admits_boundary_value() {
+    let dir = TempDir::new().unwrap();
+    let fills = run_gate_capped(
+        &dir,
+        band_config(false),
+        HashMap::new(),
+        vec![entry_trade("at-floor", market("0xnew"), dec!(0.15))],
+        Decimal::ZERO,
+        dec!(0.15), // floor equal to the current price
+        "0.15",
+    )
+    .await;
+    assert_eq!(fills, 1);
+    println!("PASS: min_fill_price admits a BUY at exactly the floor (1 fill)");
 }
