@@ -286,7 +286,7 @@ Backtest override: `PE_BACKTEST_PER_TRADE_CAP=unlimited` (or `bps:N` / `mode_def
 
 ```text
 Kelly                  → fractional-Kelly (the full c/p/bankroll math)
-Dollar { usd }         → contracts = max(1, floor(usd / current_price))   # the former flat path
+Dollar { usd }         → contracts = max(1, floor(usd / fill_price))      # flat path; fill_price = leader + haircut on the live copy path (#484)
 Contract { contracts } → contracts = exactly N
 ```
 

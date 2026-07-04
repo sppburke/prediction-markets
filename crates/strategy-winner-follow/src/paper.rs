@@ -38,8 +38,11 @@ pub struct PaperFill {
 /// The recorded fill price applies a basis-point haircut keyed on side, clamped to
 /// the open interval `(0, 1)`:
 ///
-/// - **BUY** pays fee + slippage: `min(limit × (1 + haircut_bps/10_000), 0.999)`.
-/// - **SELL** pays slippage only (no taker fee): `max(limit × (1 − slippage_bps/10_000), 0.001)`.
+/// - **BUY** pays fee + slippage: `clamp(limit × (1 + haircut_bps/10_000), 0.001, 0.999)`.
+/// - **SELL** pays slippage only (no taker fee): `clamp(limit × (1 − slippage_bps/10_000), 0.001, 0.999)`.
+///
+/// (Both bounds apply on each side: the lower `0.001` guards a degenerate `limit == 0` from
+/// yielding `Price(0)`, which would divide-by-zero the dollar-sizing path that consumes this.)
 ///
 /// `haircut_bps = 0` reproduces the un-haircut fill price for any `limit ≤ 0.999`.
 /// The BUY haircut mirrors the sizing cost `c` in `evaluate`; the SELL slippage is a

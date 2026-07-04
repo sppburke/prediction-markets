@@ -73,7 +73,7 @@ impl WinnerFollowStrategy {
     /// 2. Use the requested `mode` directly as the effective mode (no signal-kind clamping).
     /// 3. Return `Err(ShadowMode)` for Shadow — no order emitted.
     /// 4. Size contracts by `config.sizing_mode`:
-    ///    `Dollar { usd }` → `max(1, floor(usd / current_price))` (bypasses Kelly + `p`);
+    ///    `Dollar { usd }` → `max(1, floor(usd / dollar_sizing_price ?? current_price))` (bypasses Kelly + `p`);
     ///    `Contract { contracts }` → exactly `contracts` (bypasses Kelly + price math);
     ///    `Kelly` → select the mode fraction, compute cost-adjusted `c`, call `size_contracts`.
     /// 5. Clamp to `per_trade_cap`, then `min` with `book_cap_contracts` (the price-impact book
@@ -82,17 +82,19 @@ impl WinnerFollowStrategy {
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
-    /// `current_price` — the RAW market price the copy is cost-adjusted against (the leader's
-    /// entry price in replay; the live current price on the copy path). Drives the Kelly cost
-    /// `c`, the per-trade cap, and the exposure bps. The emitted `limit_price` stays at
-    /// `signal.leader_price` regardless (don't-chase).
+    /// `current_price` — the RAW (fee-exclusive) per-share price used only to derive the Kelly
+    /// cost `c` (which adds fee + slippage on top). In replay/backtest it is the leader's entry
+    /// price; on the live copy path the caller passes the leader's just-executed trade price (a
+    /// reliable current-price proxy — the Gamma mid is unreliable, #484). The emitted
+    /// `limit_price` stays at `signal.leader_price` regardless (don't-chase).
     ///
-    /// `dollar_sizing_price` — for `SizingMode::Dollar`, the price the `usd` notional is divided
-    /// by. `Some(p)` sizes `floor(usd / p)` (the live copy path passes the realistic FILL price
-    /// here, so `contracts × fill == usd`, while `current_price` stays the raw price for the
-    /// fee-additive Kelly `c` — avoiding a double-count); `None` falls back to `current_price`
-    /// (replay/backtest, which size at the same price they cost against). No effect on the
-    /// Kelly / Contract arms.
+    /// `dollar_sizing_price` — the realistic per-share COST of the position (leader + haircut on
+    /// the live path). When `Some(p)`, it is the divisor for `SizingMode::Dollar` (`floor(usd /
+    /// p)` → `contracts × fill == usd`) AND the basis for the per-trade cap and exposure bps, so
+    /// all three bound the real money at risk; `current_price` stays fee-exclusive for the Kelly
+    /// `c`, avoiding a double-count. `None` falls back to `current_price` for all of them
+    /// (replay/backtest, which size and cost against one price). No effect on the Kelly fraction
+    /// or the Contract arm's count.
     ///
     /// `p` — empirical win rate supplied by caller. Used only when `sizing_mode` is `Kelly`.
     ///
@@ -129,17 +131,30 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::ShadowMode);
         }
 
+        // `notional_price` = the realistic per-share cost of the position, used for the dollar
+        // divisor AND the per-trade cap / exposure bps so all three agree on the money at risk.
+        // When the caller supplies `dollar_sizing_price` (the live path's fill price = leader +
+        // haircut), everything is `contracts × fill`-accurate; else it falls back to
+        // `current_price` (replay/backtest, which cost against the same price they size at).
+        // `current_price` itself stays the RAW price for the Kelly fee model below (so the
+        // fee-additive `c` is not double-counted against a fee-inclusive price). Guard a
+        // degenerate zero (`Price::new` admits 0) before it can divide-by-zero.
+        let notional_price = dollar_sizing_price.unwrap_or(current_price);
+        if notional_price.0.is_zero() {
+            return Err(WinnerFollowError::NoEdge);
+        }
+
         // 4–5. Size contracts by sizing mode.
         let trading_mode = to_risk_trading_mode(effective_mode);
         let raw_contracts: u64 = match self.config.sizing_mode {
             SizingMode::Dollar { usd } => {
-                // Fixed USD notional: bypass Kelly fraction + size_contracts. Divide by
-                // `dollar_sizing_price` when supplied (the live path's realistic fill price, so
-                // `contracts × fill == usd`), else `current_price`. The per-trade cap (5b), book
-                // cap (5c), and risk gate (6) remain active below. Divisor is `Price`-typed and
-                // clamped ≥ 0.001 by its constructor / the fill-price clamp, so never zero.
-                let sizing_price = dollar_sizing_price.unwrap_or(current_price);
-                (usd / sizing_price.0).floor().to_u64().unwrap_or(1).max(1)
+                // Fixed USD notional: bypass Kelly fraction + size_contracts. `contracts × fill
+                // == usd`. The per-trade cap (5b), book cap (5c), and risk gate (6) remain active.
+                (usd / notional_price.0)
+                    .floor()
+                    .to_u64()
+                    .unwrap_or(1)
+                    .max(1)
             }
             SizingMode::Contract { contracts } => {
                 // Exactly N contracts: bypass Kelly + price math. Downstream caps still apply; a
@@ -181,9 +196,11 @@ impl WinnerFollowStrategy {
             }
         };
 
-        // 5b. Clamp to per-trade cap.
+        // 5b. Clamp to per-trade cap — against `notional_price` (the real per-share cost), so
+        // the cap bounds `contracts × fill`, the actual money at risk (not the fee-exclusive
+        // raw price).
         let cap_bps = self.config.per_trade_cap.resolve_bps(trading_mode);
-        let capped = clamp_contracts_to_cap(raw_contracts, current_price.0, bankroll, cap_bps);
+        let capped = clamp_contracts_to_cap(raw_contracts, notional_price.0, bankroll, cap_bps);
         // 5c. Price-impact book cap (#398 WS2): `min` with the contracts absorbable within
         // `price_impact_cap_bps` of best ask. `None` = no `/book` result / gate off (fail-open
         // passthrough); `Some(0)` = a successful read with nothing absorbable → clamp to 0 → skip.
@@ -196,9 +213,9 @@ impl WinnerFollowStrategy {
             return Err(WinnerFollowError::NoEdge);
         }
 
-        // 6. Risk gate.
+        // 6. Risk gate. Exposure bps on `notional_price` (the real per-share cost).
         snapshot.trading_mode = trading_mode;
-        snapshot.proposed_trade_bps = proposed_trade_bps(clamped, current_price.0, bankroll);
+        snapshot.proposed_trade_bps = proposed_trade_bps(clamped, notional_price.0, bankroll);
         snapshot.per_trade_cap_bps = cap_bps;
 
         match evaluate_risk(&snapshot) {
