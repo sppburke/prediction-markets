@@ -145,6 +145,7 @@ fn scenario_evaluate_at_price_sizes_at_current_keeps_leader_limit() {
             dec!(10_000),
             ExecutionMode::LiveTiny,
             None,
+            None,
         )
         .expect("current-price sizing should produce order");
     assert_eq!(
@@ -531,6 +532,7 @@ fn scenario_book_cap_none_is_fail_open_passthrough() {
             dec!(10_000),
             ExecutionMode::LiveTiny,
             None,
+            None,
         )
         .expect("fail-open should produce order");
     assert_eq!(
@@ -555,6 +557,7 @@ fn scenario_book_cap_some_reduces_size() {
             dec!(10_000),
             ExecutionMode::LiveTiny,
             Some(40),
+            None,
         )
         .expect("capped size should still produce order");
     assert_eq!(
@@ -579,6 +582,7 @@ fn scenario_book_cap_zero_skips_trade() {
         dec!(10_000),
         ExecutionMode::LiveTiny,
         Some(0),
+        None,
     );
     assert!(
         matches!(result, Err(WinnerFollowError::NoEdge)),

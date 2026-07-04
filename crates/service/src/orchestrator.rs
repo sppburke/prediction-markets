@@ -104,7 +104,9 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBook
     // Skip BUYs whose FILL price is < this (run28 band lower, #468 parity). ZERO disables.
     min_fill_price: Decimal,
     // Paper-fill haircut/slippage (bps): derive the realistic fill price a copy is sized
-    // and gated against, via `PaperExecutor::fill_price`, so sizing == the recorded fill.
+    // and gated against, via `PaperExecutor::fill_price`. Boot-frozen (NOT runtime-refreshed)
+    // to stay identical to the boot-built `PaperExecutor`'s own bps, so the sizing basis and
+    // the recorded fill can never disagree.
     paper_fill_haircut_bps: u32,
     paper_fill_slippage_bps: u32,
     // Tracks (market, outcome) pairs we already hold a paper position in.
@@ -316,8 +318,10 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
             self.entry_gate.set_fail_closed(rc.entry_gate_fail_closed);
             self.price_impact_cap_bps = rc.price_impact_cap_bps;
-            self.paper_fill_haircut_bps = rc.paper_fill_haircut_bps;
-            self.paper_fill_slippage_bps = rc.paper_fill_slippage_bps;
+            // NOTE: paper_fill_haircut/slippage_bps are deliberately NOT refreshed here. The
+            // `PaperExecutor` that records the fill bakes them in at boot with no runtime setter,
+            // so refreshing only the sizing side would desync sizing from the recorded fill after
+            // a live edit. They stay boot-frozen on both sides; changing them needs a restart.
         }
 
         // Mark polymarket freshness.
@@ -535,19 +539,21 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
 
         let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
-        // Size against `fill_basis` (the realistic fill price), NOT the mid: the Dollar
-        // arm computes `floor(sizing_dollar_usd / fill_basis)`, so `contracts × fill ==
-        // sizing_dollar_usd`. Per-trade-cap and exposure bps also become fill-accurate.
-        // (The Kelly arm would double-count fees against a fill-inclusive price, but the
-        // live copy path is flat-Dollar-only, so Kelly is inert here.)
+        // Sizing basis: pass the leader's price as the RAW `current_price` (Kelly cost `c`,
+        // per-trade cap, exposure bps) and `fill_basis` as the dollar-sizing price, so the
+        // Dollar arm computes `floor(sizing_dollar_usd / fill_basis)` (→ `contracts × fill ==
+        // sizing_dollar_usd`) while the fee-additive Kelly `c` is NOT double-counted against a
+        // fill-inclusive price. (Kelly is not used on the live copy path, but this keeps both
+        // arms correct rather than relying on that as an invariant.)
         match self.strategy.evaluate_at_price(
             &signal,
-            fill_basis,
+            signal.leader_price,
             p,
             snapshot,
             self.bankroll,
             self.mode,
             book_cap_contracts,
+            Some(fill_basis),
         ) {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");

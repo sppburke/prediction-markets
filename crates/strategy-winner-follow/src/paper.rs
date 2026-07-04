@@ -136,11 +136,15 @@ impl PaperExecutor {
         let clamped = match side {
             Side::Buy => {
                 let raw = limit * (Decimal::ONE + Decimal::from(haircut_bps) / bps);
-                raw.min(max_fill)
+                // Clamp into `[min_fill, max_fill]`: the upper bound keeps a BUY constructible
+                // (< 1); the lower bound guards a degenerate `limit == 0` from yielding
+                // `Price(0)` (valid per `Price::new`), which would divide-by-zero in the
+                // dollar-sizing path that consumes this price.
+                raw.min(max_fill).max(min_fill)
             }
             Side::Sell => {
                 let raw = limit * (Decimal::ONE - Decimal::from(slippage_bps) / bps);
-                raw.max(min_fill)
+                raw.max(min_fill).min(max_fill)
             }
         };
         Price::new(clamped).map_err(|_| PaperExecutionError::PriceOutOfRange)

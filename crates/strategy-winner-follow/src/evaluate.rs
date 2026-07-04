@@ -51,7 +51,8 @@ impl WinnerFollowStrategy {
         bankroll: Decimal,
         mode: ExecutionMode,
     ) -> Result<OrderIntent, WinnerFollowError> {
-        // The leader-price wrapper (replay/backtest) applies no price-impact book cap.
+        // The leader-price wrapper (replay/backtest) applies no price-impact book cap and sizes
+        // the dollar notional at the same price it cost-adjusts against (`None`).
         self.evaluate_at_price(
             signal,
             signal.leader_price,
@@ -59,6 +60,7 @@ impl WinnerFollowStrategy {
             snapshot,
             bankroll,
             mode,
+            None,
             None,
         )
     }
@@ -80,9 +82,17 @@ impl WinnerFollowStrategy {
     /// 6. Gate on risk snapshot.
     /// 7. Build and return `OrderIntent`.
     ///
-    /// `current_price` — the price the copy is sized and cost-adjusted against (the leader's
-    /// entry price in replay; the live market price on the copy path). The emitted
-    /// `limit_price` stays at `signal.leader_price` regardless (don't-chase).
+    /// `current_price` — the RAW market price the copy is cost-adjusted against (the leader's
+    /// entry price in replay; the live current price on the copy path). Drives the Kelly cost
+    /// `c`, the per-trade cap, and the exposure bps. The emitted `limit_price` stays at
+    /// `signal.leader_price` regardless (don't-chase).
+    ///
+    /// `dollar_sizing_price` — for `SizingMode::Dollar`, the price the `usd` notional is divided
+    /// by. `Some(p)` sizes `floor(usd / p)` (the live copy path passes the realistic FILL price
+    /// here, so `contracts × fill == usd`, while `current_price` stays the raw price for the
+    /// fee-additive Kelly `c` — avoiding a double-count); `None` falls back to `current_price`
+    /// (replay/backtest, which size at the same price they cost against). No effect on the
+    /// Kelly / Contract arms.
     ///
     /// `p` — empirical win rate supplied by caller. Used only when `sizing_mode` is `Kelly`.
     ///
@@ -104,6 +114,7 @@ impl WinnerFollowStrategy {
         bankroll: Decimal,
         mode: ExecutionMode,
         book_cap_contracts: Option<u64>,
+        dollar_sizing_price: Option<Price>,
     ) -> Result<OrderIntent, WinnerFollowError> {
         // 1. Flip gate.
         if signal.action == LeaderAction::Flip && !self.config.flip_human_approved {
@@ -122,9 +133,13 @@ impl WinnerFollowStrategy {
         let trading_mode = to_risk_trading_mode(effective_mode);
         let raw_contracts: u64 = match self.config.sizing_mode {
             SizingMode::Dollar { usd } => {
-                // Fixed USD notional: bypass Kelly fraction + size_contracts. The per-trade cap
-                // (5b), book cap (5c), and risk gate (6) remain active below.
-                (usd / current_price.0).floor().to_u64().unwrap_or(1).max(1)
+                // Fixed USD notional: bypass Kelly fraction + size_contracts. Divide by
+                // `dollar_sizing_price` when supplied (the live path's realistic fill price, so
+                // `contracts × fill == usd`), else `current_price`. The per-trade cap (5b), book
+                // cap (5c), and risk gate (6) remain active below. Divisor is `Price`-typed and
+                // clamped ≥ 0.001 by its constructor / the fill-price clamp, so never zero.
+                let sizing_price = dollar_sizing_price.unwrap_or(current_price);
+                (usd / sizing_price.0).floor().to_u64().unwrap_or(1).max(1)
             }
             SizingMode::Contract { contracts } => {
                 // Exactly N contracts: bypass Kelly + price math. Downstream caps still apply; a

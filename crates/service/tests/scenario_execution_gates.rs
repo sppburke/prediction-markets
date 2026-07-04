@@ -397,8 +397,11 @@ async fn min_fill_price_blocks_low_current_price() {
     println!("PASS: min_fill_price blocks a BUY whose current price is below the floor (0 fills)");
 }
 
-/// PASS: an entry at EXACTLY the floor (0.15) fills — the bound is inclusive, mirroring
-///       the backtest `min_signal_price` semantics (`< floor` skips) the run28 eval used.
+/// PASS: a copy whose FILL price is EXACTLY the floor fills — the bound is inclusive
+///       (`< floor` skips), mirroring the backtest `min_signal_price` semantics. Leader
+///       0.15 → fill 0.15 × 1.05 = 0.1575, and the floor is set to exactly 0.1575, so the
+///       comparison is `0.1575 < 0.1575` = false → admit. (Pins the strict-`<` boundary
+///       on the fill basis; a `<`→`<=` regression would flip this to 0 fills.)
 /// FAIL: zero fills (the floor wrongly suppressed the boundary value).
 #[tokio::test]
 async fn min_fill_price_admits_boundary_value() {
@@ -409,12 +412,12 @@ async fn min_fill_price_admits_boundary_value() {
         HashMap::new(),
         vec![entry_trade("at-floor", market("0xnew"), dec!(0.15))],
         Decimal::ZERO,
-        dec!(0.15), // floor equal to the current price
-        "0.15",
+        dec!(0.1575), // floor == the fill price (leader 0.15 × 1.05)
+        "0.60",       // mid irrelevant to gating now; kept in flat-fill range
     )
     .await;
     assert_eq!(fills, 1);
-    println!("PASS: min_fill_price admits a BUY at exactly the floor (1 fill)");
+    println!("PASS: min_fill_price admits a BUY whose fill price is exactly the floor (1 fill)");
 }
 
 // ── Fill-basis sizing/gating (this PR: size + gate off the fill price, not the mid) ──
