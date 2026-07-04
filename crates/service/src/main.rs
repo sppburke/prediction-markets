@@ -521,6 +521,8 @@ async fn main() -> Result<()> {
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_fill_price,
             min_fill_price,
+            paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
+            paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
         },

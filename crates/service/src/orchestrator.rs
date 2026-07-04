@@ -22,7 +22,7 @@ use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::PageFetcher;
-use pe_strategy_winner_follow::{ExecutionMode, PaperFill, WinnerFollowStrategy};
+use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, PaperFill, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::CLOBClient;
 use rust_decimal::Decimal;
@@ -65,6 +65,15 @@ pub struct OrchestratorConfig {
     /// lower bound (#468 parity with the backtest `min_signal_price` floor).
     /// `Decimal::ZERO` disables the floor.
     pub min_fill_price: Decimal,
+    /// BUY-side paper-fill haircut (bps); mirrors [`crate::config::ServiceConfig`]
+    /// `paper_fill_haircut_bps`. Used to derive the realistic fill price a copy is
+    /// sized and band-gated against (see [`Orchestrator::handle_trade`]), so sizing
+    /// and the recorded fill stay on one price rather than a stale market mid.
+    pub paper_fill_haircut_bps: u32,
+    /// SELL-side paper-fill slippage (bps); mirrors `paper_fill_slippage_bps`. Kept for
+    /// the shared [`WinnerFollowStrategy`]/[`pe_strategy_winner_follow::PaperExecutor::fill_price`]
+    /// formula; the copy path is BUY-only, so this only affects a hypothetical SELL copy.
+    pub paper_fill_slippage_bps: u32,
     /// Copy-entry gate config (first-entry/fail-closed posture). The per-wallet
     /// market history is supplied separately to [`Orchestrator::new`].
     pub entry_gate_config: CopyEntryGateConfig,
@@ -90,10 +99,14 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBook
     mid_price_cache: MidPriceCache<F>,
     max_resolution_horizon_secs: u64,
     min_resolution_horizon_secs: u64,
-    // Skip BUYs whose current price is >= this (issue #142 parity). ZERO disables.
+    // Skip BUYs whose FILL price is >= this (issue #142 parity). ZERO disables.
     max_fill_price: Decimal,
-    // Skip BUYs whose current price is < this (run28 band lower, #468 parity). ZERO disables.
+    // Skip BUYs whose FILL price is < this (run28 band lower, #468 parity). ZERO disables.
     min_fill_price: Decimal,
+    // Paper-fill haircut/slippage (bps): derive the realistic fill price a copy is sized
+    // and gated against, via `PaperExecutor::fill_price`, so sizing == the recorded fill.
+    paper_fill_haircut_bps: u32,
+    paper_fill_slippage_bps: u32,
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
@@ -175,6 +188,8 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             min_resolution_horizon_secs: config.min_resolution_horizon_secs,
             max_fill_price: config.max_fill_price,
             min_fill_price: config.min_fill_price,
+            paper_fill_haircut_bps: config.paper_fill_haircut_bps,
+            paper_fill_slippage_bps: config.paper_fill_slippage_bps,
             filled_positions,
             entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
@@ -301,6 +316,8 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
             self.entry_gate.set_fail_closed(rc.entry_gate_fail_closed);
             self.price_impact_cap_bps = rc.price_impact_cap_bps;
+            self.paper_fill_haircut_bps = rc.paper_fill_haircut_bps;
+            self.paper_fill_slippage_bps = rc.paper_fill_slippage_bps;
         }
 
         // Mark polymarket freshness.
@@ -415,10 +432,15 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             }
         }
 
-        // Post-latency price basis (#339): size the copy against the CURRENT market
-        // price (the copy fills now, not when the leader entered). Fail closed when the
-        // current price is unavailable — we cannot size or cost-adjust without it.
-        let current_price = {
+        // Market-liveness + observability (the Gamma mid). Historically (#339) this mid
+        // was ALSO the sizing/gating basis, but it is a 60 s-TTL per-outcome MARK price
+        // that can diverge sharply from the leader's just-executed trade price (observed
+        // ~2× on thin near-resolution markets), so keying sizing/gating off it produced
+        // uncontrolled notional and let fills slip outside the band. We keep fetching it
+        // only to (a) confirm the market is open/priced and (b) log the divergence for
+        // diagnosis; sizing and gating below use `fill_basis` instead. Fail closed on an
+        // absent mid (unchanged liveness behaviour).
+        let market_mid = {
             let mids = self
                 .mid_price_cache
                 .fetch_mids(std::slice::from_ref(&signal.market_id))
@@ -441,16 +463,45 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             }
         };
 
-        // max_fill_price safety rail (#142 parity): skip BUYs whose current price is at
-        // or above the cap (catastrophic payoff geometry near $1). ZERO disables.
+        // Realistic fill basis (#339 revisited): the price the copy will ACTUALLY fill at
+        // — the leader's just-executed trade price adjusted by the same paper haircut the
+        // executor applies (`PaperExecutor::fill_price`, the single source of truth). Size
+        // and band-gate against THIS, so notional == `sizing_dollar_usd` and the gates
+        // check the price actually paid — matching the backtest, which sizes and gates on
+        // its slippage-adjusted `fill_price` (`crates/backtest` `simulation.rs`), not a
+        // separate mid. The clamps make `fill_price` total for any valid `Price`; the
+        // fail-closed arm is defensive (no `unwrap`).
+        let fill_basis = match PaperExecutor::fill_price(
+            signal.leader_side,
+            signal.leader_price,
+            self.paper_fill_haircut_bps,
+            self.paper_fill_slippage_bps,
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                info!(
+                    reason = "leader price yields no constructible fill price",
+                    market = %signal.market_id,
+                    leader_price = %signal.leader_price.0,
+                    "signal did not produce order",
+                );
+                self.commit_no_fill(&trade, &leader_row);
+                return;
+            }
+        };
+
+        // max_fill_price safety rail (#142 parity): skip BUYs whose FILL price is at or
+        // above the cap (catastrophic payoff geometry near $1). ZERO disables. Gated on
+        // `fill_basis` (the price paid), matching the backtest's fill-price cap.
         if signal.leader_side == Side::Buy
             && self.max_fill_price > Decimal::ZERO
-            && current_price.0 >= self.max_fill_price
+            && fill_basis.0 >= self.max_fill_price
         {
             info!(
-                reason = "current price at or above max_fill_price",
+                reason = "fill price at or above max_fill_price",
                 market = %signal.market_id,
-                current_price = %current_price.0,
+                fill_price = %fill_basis.0,
+                leader_price = %signal.leader_price.0,
                 max_fill_price = %self.max_fill_price,
                 "signal did not produce order",
             );
@@ -459,17 +510,18 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
         }
 
         // min_fill_price band floor (run28 cutover, #468 selection↔deployment parity):
-        // skip BUYs whose current price is below the entry-band lower bound. Strictly
-        // `<` so the boundary value fills, mirroring the backtest `min_signal_price`
-        // floor the run28 eval used. ZERO disables.
+        // skip BUYs whose FILL price is below the entry-band lower bound. Strictly `<` so
+        // the boundary value fills, mirroring the backtest `min_signal_price` floor (also
+        // gated on the fill price). ZERO disables.
         if signal.leader_side == Side::Buy
             && self.min_fill_price > Decimal::ZERO
-            && current_price.0 < self.min_fill_price
+            && fill_basis.0 < self.min_fill_price
         {
             info!(
-                reason = "current price below min_fill_price",
+                reason = "fill price below min_fill_price",
                 market = %signal.market_id,
-                current_price = %current_price.0,
+                fill_price = %fill_basis.0,
+                leader_price = %signal.leader_price.0,
                 min_fill_price = %self.min_fill_price,
                 "signal did not produce order",
             );
@@ -483,9 +535,14 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
 
         let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
+        // Size against `fill_basis` (the realistic fill price), NOT the mid: the Dollar
+        // arm computes `floor(sizing_dollar_usd / fill_basis)`, so `contracts × fill ==
+        // sizing_dollar_usd`. Per-trade-cap and exposure bps also become fill-accurate.
+        // (The Kelly arm would double-count fees against a fill-inclusive price, but the
+        // live copy path is flat-Dollar-only, so Kelly is inert here.)
         match self.strategy.evaluate_at_price(
             &signal,
-            current_price,
+            fill_basis,
             p,
             snapshot,
             self.bankroll,
@@ -523,6 +580,11 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
                                 side = ?fill.intent.side,
                                 contracts = fill.intent.contracts.0,
                                 fill_price = %fill.simulated_fill_price.0,
+                                // Observability (this PR): the leader's trade price is the sizing/
+                                // gating basis; `market_mid` is the Gamma mid we no longer size off.
+                                // Their divergence characterises the mid's failure mode live.
+                                leader_price = %signal.leader_price.0,
+                                market_mid = %market_mid.0,
                             );
                         }
                     }

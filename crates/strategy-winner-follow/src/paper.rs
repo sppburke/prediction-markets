@@ -105,19 +105,41 @@ impl PaperExecutor {
 
     /// Apply the side-split haircut to `intent.limit_price` and clamp into `(0, 1)`.
     fn simulated_fill_price(&self, intent: &OrderIntent) -> Result<Price, PaperExecutionError> {
+        Self::fill_price(
+            intent.side,
+            intent.limit_price,
+            self.haircut_bps,
+            self.slippage_bps,
+        )
+    }
+
+    /// The haircut-adjusted fill price for `(side, limit_price)`, clamped into `(0, 1)`.
+    ///
+    /// Pure and side-effect free: this is the single source of truth for the paper-fill
+    /// price formula (see the type-level doc). It is `pub` so the live copy path can size
+    /// and gate a copy against the exact price it will fill at, rather than a separate
+    /// (stale) market-mid estimate — keeping sizing/gating and the recorded fill on one
+    /// price. BUY: `min(limit × (1 + haircut_bps/10_000), 0.999)`;
+    /// SELL: `max(limit × (1 − slippage_bps/10_000), 0.001)`.
+    pub fn fill_price(
+        side: Side,
+        limit_price: Price,
+        haircut_bps: u32,
+        slippage_bps: u32,
+    ) -> Result<Price, PaperExecutionError> {
         let bps = Decimal::from(10_000u32);
-        let limit = intent.limit_price.0;
+        let limit = limit_price.0;
         // Upper/lower bounds keep the result a constructible `Price` (and a BUY can
         // never fill at ≥ 1, nor a SELL at ≤ 0).
         let max_fill = Decimal::new(999, 3); // 0.999
         let min_fill = Decimal::new(1, 3); // 0.001
-        let clamped = match intent.side {
+        let clamped = match side {
             Side::Buy => {
-                let raw = limit * (Decimal::ONE + Decimal::from(self.haircut_bps) / bps);
+                let raw = limit * (Decimal::ONE + Decimal::from(haircut_bps) / bps);
                 raw.min(max_fill)
             }
             Side::Sell => {
-                let raw = limit * (Decimal::ONE - Decimal::from(self.slippage_bps) / bps);
+                let raw = limit * (Decimal::ONE - Decimal::from(slippage_bps) / bps);
                 raw.max(min_fill)
             }
         };
