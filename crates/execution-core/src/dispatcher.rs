@@ -6,8 +6,8 @@
 //!
 //! `PaperExecutor` is imported from `pe-strategy-winner-follow` — not moved.
 
-use pe_core_types::{EventSeq, SourceTimestamp};
-use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, PaperFill};
+use pe_core_types::{EventSeq, Price, SourceTimestamp};
+use pe_strategy_winner_follow::{ExecutionMode, FillSource, PaperExecutor, PaperFill};
 use pe_venue_core::OrderIntent;
 use pe_venue_polymarket::CLOBClient;
 
@@ -29,15 +29,21 @@ impl<C: CLOBClient> ExecutionDispatcher<C> {
     }
 
     /// Route `intent` to paper or live executor based on `mode`.
+    ///
+    /// `observed_fill_price` carries the orchestrator-resolved paper fill basis (#486): `Some`
+    /// on the paper path so `PaperExecutor` records it verbatim, `None` elsewhere (the executor
+    /// recomputes the local haircut). The live executor ignores it — a live order fills at the
+    /// venue's real price regardless.
     pub async fn execute(
         &mut self,
         intent: &OrderIntent,
         mode: ExecutionMode,
         now: SourceTimestamp,
+        observed_fill_price: Option<(Price, FillSource)>,
     ) -> Result<DispatchResult, ExecutionError> {
         match mode {
             ExecutionMode::Shadow | ExecutionMode::Paper => {
-                let (fill, seq) = self.paper.execute(intent, now)?;
+                let (fill, seq) = self.paper.execute(intent, now, observed_fill_price)?;
                 Ok(DispatchResult::Paper { fill, seq })
             }
             ExecutionMode::LiveTiny | ExecutionMode::Promoted => {

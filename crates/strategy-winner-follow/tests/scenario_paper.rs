@@ -58,7 +58,7 @@ fn scenario_paper_fill_round_trips_from_log() {
         // haircut/slippage = 0 so this round-trip test stays behavior-neutral.
         let mut executor = PaperExecutor::new(writer, paper_source(), 0, 0);
         let (fill, _seq) = executor
-            .execute(&intent, SourceTimestamp(NOW))
+            .execute(&intent, SourceTimestamp(NOW), None)
             .expect("execute");
 
         assert_eq!(
@@ -125,7 +125,7 @@ fn scenario_multiple_fills_ordered_in_log() {
         let mut executor = PaperExecutor::new(writer, paper_source(), 0, 0);
         for intent in &intents {
             executor
-                .execute(intent, SourceTimestamp(NOW))
+                .execute(intent, SourceTimestamp(NOW), None)
                 .expect("execute");
         }
     }
@@ -171,7 +171,7 @@ fn recorded_fill_price(
     let writer = Writer::open(dir.path().join(log)).expect("open writer");
     let mut executor = PaperExecutor::new(writer, paper_source(), haircut_bps, slippage_bps);
     let (fill, _seq) = executor
-        .execute(intent, SourceTimestamp(NOW))
+        .execute(intent, SourceTimestamp(NOW), None)
         .expect("execute");
     fill.simulated_fill_price.0
 }

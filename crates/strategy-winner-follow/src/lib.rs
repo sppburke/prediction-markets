@@ -19,4 +19,4 @@ pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig};
 pub use error::{PaperExecutionError, WinnerFollowError};
 pub use evaluate::WinnerFollowStrategy;
 pub use mode::ExecutionMode;
-pub use paper::{PaperExecutor, PaperFill};
+pub use paper::{FillSource, PaperExecutor, PaperFill};

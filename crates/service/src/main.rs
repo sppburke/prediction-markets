@@ -36,7 +36,7 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
-use pe_service::runtime_config::{LiveRuntimeConfig, load_initial_runtime_config};
+use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, load_initial_runtime_config};
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
@@ -482,10 +482,15 @@ async fn main() -> Result<()> {
     // orchestrator's mid-price cache so a fill rarely incurs an extra Gamma fetch. The
     // empty-secret-key warning is emitted once by the sink block above (identical gate) and
     // covers this writer too — keep the blocks ordered so it is not duplicated.
-    // One shared CLOB /book fetcher (#398 WS2): its 5 rps rate gate is global across the snapshot
-    // worker and the orchestrator's price-impact hot path. Built unconditionally so the
-    // orchestrator always has it; the worker clones it only when the snapshot block runs.
-    let book_fetcher = Arc::new(ReqwestClobBookFetcher::new(reqwest::Client::new()));
+    // One shared CLOB /book fetcher (#398 WS2, now also the #486 paper best-ask hot path): its 5
+    // rps rate gate is global across the snapshot worker, the price-impact gate, and the best-ask
+    // fill basis. Built unconditionally so the orchestrator always has it; the worker clones it
+    // only when the snapshot block runs. `with_base_url` is override-only parity with the order
+    // adapter (no prod change at the default) — the book is now on the paper fill path (#486).
+    let book_fetcher = Arc::new(
+        ReqwestClobBookFetcher::new(reqwest::Client::new())
+            .with_base_url(cfg.polymarket_clob_base_url.clone()),
+    );
 
     let (snapshot_handle, snapshot_task) =
         if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
@@ -523,6 +528,11 @@ async fn main() -> Result<()> {
             min_fill_price,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
             paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
+            // Boot value; production wires `runtime_config: Some(..)` so it is refreshed per event
+            // from the snapshot. An unknown env/TOML override defaults to `ClobBestAsk` (already
+            // warned when `from_service_config` built the runtime snapshot above).
+            fill_mode: FillMode::parse(&cfg.fill_mode).unwrap_or_default(),
+            clob_best_ask_fallback_haircut_bps: cfg.clob_best_ask_fallback_haircut_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
         },

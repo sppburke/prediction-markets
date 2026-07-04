@@ -41,6 +41,7 @@ use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
+use pe_service::runtime_config::FillMode;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -189,6 +190,10 @@ async fn run_trades(
             min_fill_price: Decimal::ZERO,
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
+            // #486: pin the pre-feature haircut basis so this existing assertion stays byte-
+            // identical (no /book fetch; leader × 1.05).
+            fill_mode: FillMode::LeaderHaircut,
+            clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
         },
@@ -385,7 +390,11 @@ async fn ac5_crash_between_log_and_sqlite_reconciles() {
         let writer = Writer::open(&log_path).unwrap();
         let mut executor = PaperExecutor::new(writer, SourceId("test.paper".into()), 0, 0);
         let (_fill, _seq) = executor
-            .execute(&fill_intent(), SourceTimestamp(OffsetDateTime::UNIX_EPOCH))
+            .execute(
+                &fill_intent(),
+                SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                None,
+            )
             .unwrap();
     }
     assert_eq!(
