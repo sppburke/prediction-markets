@@ -2,7 +2,8 @@
 //! then gates signals through strategy evaluation and execution dispatch.
 //!
 //! The orchestrator is dispatch + sizing: its I/O is the `ExecutionDispatcher`, the mid-price
-//! cache (Gamma), and — when the price-impact gate is on — the CLOB `/book` fetcher (#398 WS2).
+//! cache (Gamma), and the CLOB `/book` fetcher — read on every paper `clob_best_ask` BUY for the
+//! best-ask fill basis (#486) and, when the price-impact gate is on, for the size cap (#398 WS2).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;
@@ -581,10 +582,12 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
         // In paper `clob_best_ask` mode a BUY resolves to the fresh CLOB best-ask (else the
         // fallback haircut); otherwise the leader price adjusted by the boot-frozen paper haircut
         // (`PaperExecutor::fill_price`). Size and band-gate against THIS, so notional ==
-        // `sizing_dollar_usd` and the gates check the price actually paid — matching the backtest,
-        // which sizes and gates on its slippage-adjusted `fill_price` (`crates/backtest`
-        // `simulation.rs`), not a separate mid. In paper mode the basis is also recorded verbatim
-        // by the executor (via `observed_fill_price` below). The fail-closed arm is defensive.
+        // `sizing_dollar_usd` and the gates check the price actually paid. The haircut basis mirrors
+        // the backtest's slippage-adjusted `fill_price` (`crates/backtest` `simulation.rs`); the
+        // best-ask basis is a fresher, more conservative live-execution proxy with no backtest
+        // analog (the ranker models the fill as trade-print + 1¢; #486 Context). In paper mode the
+        // basis is recorded verbatim by the executor (via `observed_fill_price` below). The
+        // fail-closed arm is defensive.
         let (fill_basis, fill_source) = match self.resolve_fill_price(&signal).await {
             Ok(pair) => pair,
             Err(_) => {
