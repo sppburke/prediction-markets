@@ -187,6 +187,8 @@ async fn run_trades(
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
+            paper_fill_haircut_bps: 500,
+            paper_fill_slippage_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
         },

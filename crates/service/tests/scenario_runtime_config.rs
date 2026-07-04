@@ -169,6 +169,8 @@ async fn run_with(
             min_resolution_horizon_secs: 0,
             max_fill_price: boot_max_fill,
             min_fill_price: Decimal::ZERO,
+            paper_fill_haircut_bps: 500,
+            paper_fill_slippage_bps: 100,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config,
@@ -314,6 +316,8 @@ async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32
             min_resolution_horizon_secs: 0,
             max_fill_price: Decimal::ZERO,
             min_fill_price: Decimal::ZERO,
+            paper_fill_haircut_bps: 500,
+            paper_fill_slippage_bps: 100,
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config: Some(LiveRuntimeConfig::new(gate_snapshot(cap_bps))),
         },
@@ -343,7 +347,7 @@ async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32
     (paper_fill_count(dir), contracts)
 }
 
-/// PASS: a shallow book (3 contracts at best ask) caps the dollar-sized 200 down to 3.
+/// PASS: a shallow book (3 contracts at best ask) caps the dollar-sized 190 down to 3.
 #[tokio::test]
 async fn price_impact_shallow_book_caps_the_fill() {
     let dir = TempDir::new().unwrap();
@@ -354,7 +358,7 @@ async fn price_impact_shallow_book_caps_the_fill() {
         contracts, 3,
         "book cap must reduce the fill to the absorbable depth"
     );
-    println!("PASS: shallow /book caps the dollar-sized 200 to absorbable depth 3");
+    println!("PASS: shallow /book caps the dollar-sized 190 to absorbable depth 3");
 }
 
 /// PASS: an empty book (0 absorbable) yields Some(0) and skips the trade (distinct from fail-open).
@@ -367,15 +371,15 @@ async fn price_impact_empty_book_skips_trade() {
     println!("PASS: empty /book (0 absorbable) skips the trade (Some(0), not fail-open)");
 }
 
-/// PASS: a /book fetch error (token absent) FAILS OPEN — the full dollar-sized 200 fills.
+/// PASS: a /book fetch error (token absent) FAILS OPEN — the full dollar-sized 190 fills.
 #[tokio::test]
 async fn price_impact_book_fetch_error_fails_open() {
     let dir = TempDir::new().unwrap();
     let (fills, contracts) = run_gate(&dir, HashMap::new(), 100).await;
     assert_eq!(fills, 1);
     assert_eq!(
-        contracts, 200,
-        "a /book error must fail open (full dollar size)"
+        contracts, 190,
+        "a /book error must fail open (full dollar size: floor(100/(0.50×1.05))=190)"
     );
-    println!("PASS: /book fetch error fails open (full size 200, no cap)");
+    println!("PASS: /book fetch error fails open (full size 190, no cap)");
 }

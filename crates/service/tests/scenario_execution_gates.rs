@@ -42,7 +42,8 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, PaperExecutor, PaperFill, PerTradeCap, SizingMode, WinnerFollowConfig,
+    WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
@@ -97,10 +98,13 @@ fn entry_trade(id: &str, market_id: MarketId, price: Decimal) -> IncomingTrade {
     }
 }
 
-/// Strategy config that deterministically fills via the flat sizing path.
+/// Strategy config that deterministically fills via the flat sizing path. The per-trade
+/// cap is `Unlimited` so these gate/sizing scenarios measure the sizing math itself, not a
+/// bankroll-percentage clamp (the cap is exercised by the risk-engine's own tests).
 fn flat_fill_config() -> WinnerFollowConfig {
     WinnerFollowConfig {
         sizing_mode: SizingMode::Dollar { usd: dec!(100) },
+        per_trade_cap: PerTradeCap::Unlimited,
         ..WinnerFollowConfig::default()
     }
 }
@@ -152,6 +156,17 @@ fn paper_fill_count(dir: &TempDir) -> usize {
         return 0;
     }
     Reader::replay(&path).unwrap().count()
+}
+
+/// The FIRST paper fill's `(contracts, simulated_fill_price)`, replayed from the log.
+fn first_paper_fill(dir: &TempDir) -> Option<(u64, Decimal)> {
+    let path = dir.path().join("paper.log");
+    if !path.exists() {
+        return None;
+    }
+    let (_seq, env) = Reader::replay(&path).unwrap().next()?.unwrap();
+    let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+    Some((fill.intent.contracts.0, fill.simulated_fill_price.0))
 }
 
 /// Feed `trades` through a fresh orchestrator wired with `gate_config` + `history`
@@ -210,6 +225,10 @@ async fn run_gate_capped(
             min_resolution_horizon_secs: 0,
             max_fill_price,
             min_fill_price,
+            // Match the dispatcher's PaperExecutor haircut/slippage so sizing (fill_basis
+            // = leader × 1.05) equals the recorded fill.
+            paper_fill_haircut_bps: 500,
+            paper_fill_slippage_bps: 100,
             entry_gate_config: gate_config,
             runtime_config: None,
         },
@@ -378,8 +397,11 @@ async fn min_fill_price_blocks_low_current_price() {
     println!("PASS: min_fill_price blocks a BUY whose current price is below the floor (0 fills)");
 }
 
-/// PASS: an entry at EXACTLY the floor (0.15) fills — the bound is inclusive, mirroring
-///       the backtest `min_signal_price` semantics (`< floor` skips) the run28 eval used.
+/// PASS: a copy whose FILL price is EXACTLY the floor fills — the bound is inclusive
+///       (`< floor` skips), mirroring the backtest `min_signal_price` semantics. Leader
+///       0.15 → fill 0.15 × 1.05 = 0.1575, and the floor is set to exactly 0.1575, so the
+///       comparison is `0.1575 < 0.1575` = false → admit. (Pins the strict-`<` boundary
+///       on the fill basis; a `<`→`<=` regression would flip this to 0 fills.)
 /// FAIL: zero fills (the floor wrongly suppressed the boundary value).
 #[tokio::test]
 async fn min_fill_price_admits_boundary_value() {
@@ -390,10 +412,67 @@ async fn min_fill_price_admits_boundary_value() {
         HashMap::new(),
         vec![entry_trade("at-floor", market("0xnew"), dec!(0.15))],
         Decimal::ZERO,
-        dec!(0.15), // floor equal to the current price
-        "0.15",
+        dec!(0.1575), // floor == the fill price (leader 0.15 × 1.05)
+        "0.60",       // mid irrelevant to gating now; kept in flat-fill range
     )
     .await;
     assert_eq!(fills, 1);
-    println!("PASS: min_fill_price admits a BUY at exactly the floor (1 fill)");
+    println!("PASS: min_fill_price admits a BUY whose fill price is exactly the floor (1 fill)");
+}
+
+// ── Fill-basis sizing/gating (this PR: size + gate off the fill price, not the mid) ──
+
+/// PASS: with the Gamma mid (0.20) diverging sharply from the leader price (0.50), the
+///       flat-$100 copy's notional (contracts × fill) is ~$100 — sized off the fill
+///       price, NOT the mid. The old mid-based sizing (floor(100/0.20)=500 contracts)
+///       would have produced a ~$260 notional.
+/// FAIL: notional tracks the divergent mid (≫ $100).
+#[tokio::test]
+async fn notional_stable_when_mid_diverges_from_leader() {
+    let dir = TempDir::new().unwrap();
+    // Caps disabled (Decimal::ZERO) to isolate sizing; leader 0.50, mid 0.20 (2.5× off).
+    let fills = run_gate_capped(
+        &dir,
+        band_config(false),
+        HashMap::new(),
+        vec![entry_trade("diverge", market("0xnew"), dec!(0.50))],
+        Decimal::ZERO,
+        Decimal::ZERO,
+        "0.20",
+    )
+    .await;
+    assert_eq!(fills, 1);
+    let (contracts, fill_price) = first_paper_fill(&dir).expect("a fill was recorded");
+    // fill = 0.50 × 1.05 = 0.525; contracts = floor(100/0.525) = 190; notional = 99.75.
+    let notional = Decimal::from(contracts) * fill_price;
+    assert!(
+        (notional - dec!(100)).abs() <= fill_price,
+        "notional {notional} must be within one contract of $100 \
+         (fill {fill_price}, contracts {contracts})"
+    );
+    println!(
+        "PASS: notional ${notional} sized off the fill price, not the 0.20 mid \
+         (contracts {contracts} @ {fill_price})"
+    );
+}
+
+/// PASS: a leader BUY at 0.86 is rejected by the 0.85 max cap, because the FILL price
+///       0.86 × 1.05 = 0.903 ≥ 0.85 — the exact case a mid-based gate let through live.
+/// FAIL: any fill (the cap keyed off a mid < 0.85 and missed the 0.903 fill).
+#[tokio::test]
+async fn max_cap_rejects_leader_whose_fill_exceeds_cap() {
+    let dir = TempDir::new().unwrap();
+    // Mid quotes 0.83 (would pass a mid-based 0.85 cap); leader 0.86 → fill 0.903.
+    let fills = run_gate_capped(
+        &dir,
+        band_config(false),
+        HashMap::new(),
+        vec![entry_trade("over-cap-fill", market("0xnew"), dec!(0.86))],
+        dec!(0.85),
+        Decimal::ZERO,
+        "0.83",
+    )
+    .await;
+    assert_eq!(fills, 0);
+    println!("PASS: max cap rejects leader 0.86 (fill 0.903 ≥ 0.85) despite a 0.83 mid");
 }
