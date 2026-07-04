@@ -31,6 +31,29 @@ use tracing::warn;
 
 use crate::config::ServiceConfig;
 
+/// Paper fill-price mode (#486): the fresh CLOB best-ask, or the boot-frozen leader-price
+/// haircut. Stored as the `fill_mode` `service_config` string; an unknown value keeps the
+/// last-known-good (never a silent revert). `ClobBestAsk` is the compiled default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillMode {
+    /// A paper BUY fills at the fresh copy-time CLOB best-ask (sizing/band-gates key off it).
+    #[default]
+    ClobBestAsk,
+    /// The pre-#486 boot-frozen leader-price haircut fill (rollback / test-pin mode).
+    LeaderHaircut,
+}
+
+impl FillMode {
+    /// Parse a `fill_mode` string; `None` on an unknown value (caller keeps last-known-good).
+    pub fn parse(s: &str) -> Option<FillMode> {
+        match s.trim().to_lowercase().replace('-', "_").as_str() {
+            "clob_best_ask" | "clobbestask" => Some(FillMode::ClobBestAsk),
+            "leader_haircut" | "leaderhaircut" => Some(FillMode::LeaderHaircut),
+            _ => None,
+        }
+    }
+}
+
 /// One `service_config` row as returned by PostgREST (`select=key,value,value_type`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigRow {
@@ -71,6 +94,11 @@ pub struct RuntimeConfig {
     pub position_size_threshold: u32,
     pub paper_fill_haircut_bps: u32,
     pub paper_fill_slippage_bps: u32,
+    /// Paper fill-price mode (#486): `ClobBestAsk` (best-ask BUY fill) or `LeaderHaircut`
+    /// (boot-frozen haircut). Consumed by the orchestrator's per-event `resolve_fill_price`.
+    pub fill_mode: FillMode,
+    /// Fallback BUY haircut (bps) when a `clob_best_ask` fill has no usable ask (#486).
+    pub clob_best_ask_fallback_haircut_bps: u32,
     pub status_interval_secs: u64,
     pub log_retention_days: usize,
     pub gamma_resolution_poll_interval_secs: u64,
@@ -116,6 +144,11 @@ impl RuntimeConfig {
             position_size_threshold: cfg.position_size_threshold,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
             paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
+            fill_mode: FillMode::parse(&cfg.fill_mode).unwrap_or_else(|| {
+                warn!(value = %cfg.fill_mode, "boot fill_mode unknown; using clob_best_ask");
+                FillMode::default()
+            }),
+            clob_best_ask_fallback_haircut_bps: cfg.clob_best_ask_fallback_haircut_bps,
             status_interval_secs: cfg.status_interval_secs,
             log_retention_days: cfg.log_retention_days,
             gamma_resolution_poll_interval_secs: cfg.gamma_resolution_poll_interval_secs,
@@ -232,6 +265,11 @@ pub fn parse_config(
         "paper_fill_slippage_bps",
         &mut out.paper_fill_slippage_bps,
     );
+    apply_parsed(
+        &map,
+        "clob_best_ask_fallback_haircut_bps",
+        &mut out.clob_best_ask_fallback_haircut_bps,
+    );
     apply_parsed(&map, "status_interval_secs", &mut out.status_interval_secs);
     apply_parsed(&map, "log_retention_days", &mut out.log_retention_days);
     apply_parsed(
@@ -294,6 +332,19 @@ pub fn parse_config(
     // Sizing mode: reassemble the three flat KV keys into SizingMode (#398 WS2). An absent
     // `sizing_mode` key or an invalid/missing param keeps the last-known-good mode.
     out.sizing_mode = parse_sizing_mode(&map, last_good.sizing_mode);
+
+    // Paper fill mode (#486): an unknown value keeps the last-known-good (never a silent revert
+    // to a compiled default — a bad admin edit must not flip a paper BUY off the best-ask basis).
+    if let Some(raw) = map.get("fill_mode") {
+        match FillMode::parse(raw) {
+            Some(m) => out.fill_mode = m,
+            None => warn!(
+                key = "fill_mode",
+                value = %raw,
+                "service_config: unknown fill_mode; keeping last-known-good"
+            ),
+        }
+    }
 
     // Per-trade cap enum.
     if let Some(raw) = map.get("per_trade_cap") {
@@ -619,6 +670,39 @@ mod tests {
         assert_eq!(rc.demotion_pnl_window_secs, 2_592_000); // #473, now seeded
         // price_impact_cap_bps is seeded at 0 (gate disabled / fail-open) — #398 WS2.
         assert_eq!(rc.price_impact_cap_bps, 0);
+        // #486: paper fills record the CLOB best-ask; the fallback haircut is 1%.
+        assert_eq!(rc.fill_mode, FillMode::ClobBestAsk);
+        assert_eq!(rc.clob_best_ask_fallback_haircut_bps, 100);
+    }
+
+    #[test]
+    fn fill_mode_kv_reassembly_and_last_known_good() {
+        let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        assert_eq!(boot.fill_mode, FillMode::ClobBestAsk); // #486 compiled default
+        // A valid admin edit switches the mode.
+        let hc = parse_config(&[row("fill_mode", "leader_haircut", "text")], &boot, false);
+        assert_eq!(hc.fill_mode, FillMode::LeaderHaircut);
+        // An unknown value keeps the last-known-good (never a silent revert to a compiled default).
+        let last = RuntimeConfig {
+            fill_mode: FillMode::LeaderHaircut,
+            ..boot.clone()
+        };
+        assert_eq!(
+            parse_config(&[row("fill_mode", "bogus", "text")], &last, false).fill_mode,
+            FillMode::LeaderHaircut
+        );
+        // The fallback haircut overlays as a plain integer; an unparseable fill_mode in the same
+        // poll still applies the valid integer and keeps the last-known-good fill_mode.
+        let bps = parse_config(
+            &[
+                row("clob_best_ask_fallback_haircut_bps", "250", "integer"),
+                row("fill_mode", "not_a_mode", "text"),
+            ],
+            &boot,
+            false,
+        );
+        assert_eq!(bps.clob_best_ask_fallback_haircut_bps, 250);
+        assert_eq!(bps.fill_mode, FillMode::ClobBestAsk);
     }
 
     #[test]

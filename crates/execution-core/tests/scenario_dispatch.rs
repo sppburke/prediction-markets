@@ -110,7 +110,7 @@ async fn paper_mode_routes_to_paper_executor() {
     let dir = TempDir::new().unwrap();
     let mut dispatcher = make_dispatcher(&dir, filled_fixture());
     let result = dispatcher
-        .execute(&test_intent(), ExecutionMode::Paper, frozen_now())
+        .execute(&test_intent(), ExecutionMode::Paper, frozen_now(), None)
         .await
         .unwrap();
     assert!(
@@ -125,7 +125,7 @@ async fn shadow_mode_routes_to_paper_executor() {
     let dir = TempDir::new().unwrap();
     let mut dispatcher = make_dispatcher(&dir, filled_fixture());
     let result = dispatcher
-        .execute(&test_intent(), ExecutionMode::Shadow, frozen_now())
+        .execute(&test_intent(), ExecutionMode::Shadow, frozen_now(), None)
         .await
         .unwrap();
     assert!(matches!(result, DispatchResult::Paper { .. }));
@@ -138,7 +138,7 @@ async fn live_tiny_routes_to_live_executor_and_writes_fill() {
     let dir = TempDir::new().unwrap();
     let mut dispatcher = make_dispatcher(&dir, filled_fixture());
     let result = dispatcher
-        .execute(&test_intent(), ExecutionMode::LiveTiny, frozen_now())
+        .execute(&test_intent(), ExecutionMode::LiveTiny, frozen_now(), None)
         .await
         .unwrap();
     match result {
@@ -158,7 +158,7 @@ async fn promoted_routes_to_live_executor() {
     let dir = TempDir::new().unwrap();
     let mut dispatcher = make_dispatcher(&dir, filled_fixture());
     let result = dispatcher
-        .execute(&test_intent(), ExecutionMode::Promoted, frozen_now())
+        .execute(&test_intent(), ExecutionMode::Promoted, frozen_now(), None)
         .await
         .unwrap();
     assert!(matches!(result, DispatchResult::Live(_)));
@@ -171,7 +171,7 @@ async fn live_executor_writes_terminal_on_rejection() {
     let dir = TempDir::new().unwrap();
     let mut dispatcher = make_dispatcher(&dir, rejected_fixture());
     let result = dispatcher
-        .execute(&test_intent(), ExecutionMode::LiveTiny, frozen_now())
+        .execute(&test_intent(), ExecutionMode::LiveTiny, frozen_now(), None)
         .await
         .unwrap();
     match result {

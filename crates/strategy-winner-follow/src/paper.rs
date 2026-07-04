@@ -16,18 +16,42 @@ use crate::PaperExecutionError;
 const SCHEMA_VERSION: u32 = 1;
 const PARSER_VERSION: u32 = 1;
 
+/// Provenance of a paper fill's recorded price (#486).
+///
+/// Serialised as a bare string on [`PaperFill`]. `LeaderHaircut` is the `#[default]`, so a
+/// pre-#486 frame — written before the field existed — deserialises to `LeaderHaircut` via the
+/// field's `#[serde(default)]`: old frames legitimately *are* haircut fills, so crash-recovery
+/// replay (`pe_service::paper_recovery`) keeps working across the additive schema evolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FillSource {
+    /// The fresh CLOB best-ask observed at copy time (paper `clob_best_ask` BUY).
+    ClobBestAsk,
+    /// The `clob_best_ask_fallback_haircut_bps` fallback: no usable ask (SELL entry, empty /
+    /// errored / timed-out book, missing CLOB token, or a degenerate best-ask).
+    Fallback,
+    /// The boot-frozen leader-price haircut: paper `leader_haircut` mode, every non-paper mode,
+    /// or the recompute a `None` override takes — and every pre-#486 frame.
+    #[default]
+    LeaderHaircut,
+}
+
 /// A simulated fill recorded when an `OrderIntent` is executed in paper mode.
 ///
-/// `simulated_fill_price` is the haircut-adjusted fill price (see [`PaperExecutor`]).
-/// The JSON shape is unchanged from `schema_version = 1`: only the recorded value
-/// reflects the haircut, so existing logs replay unchanged.
-/// Replayable from the event-log: deserialise the JSON payload of any frame whose
-/// `schema_version = 1` and `parser_version = 1` written by a `PaperExecutor`.
+/// `simulated_fill_price` is the recorded fill price and `fill_source` its provenance
+/// ([`FillSource`]). Since #486 the JSON shape is *additive with a defaulted field* (it was
+/// "unchanged from `schema_version = 1`"): a pre-#486 frame carries no `fill_source` key and
+/// deserialises it to [`FillSource::LeaderHaircut`] via `#[serde(default)]`, so existing logs
+/// replay unchanged. Replayable from the event-log: deserialise the JSON payload of any frame
+/// whose `schema_version = 1` and `parser_version = 1` written by a `PaperExecutor`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperFill {
     pub intent: OrderIntent,
     pub simulated_fill_price: pe_core_types::Price,
     pub simulated_at: SourceTimestamp,
+    /// Provenance of `simulated_fill_price` (#486). `#[serde(default)]` → a pre-#486 frame
+    /// (no key) resolves to [`FillSource::LeaderHaircut`].
+    #[serde(default)]
+    pub fill_source: FillSource,
 }
 
 /// Executes `OrderIntent`s in paper mode by simulating fills and writing them to
@@ -73,21 +97,37 @@ impl PaperExecutor {
         }
     }
 
-    /// Simulate a haircut-adjusted fill and record it to the event-log.
+    /// Record a paper fill to the event-log, using `observed_fill_price` when the caller
+    /// resolved one, else the local side-split haircut.
+    ///
+    /// `observed_fill_price`: `Some((price, source))` records `price`/`source` verbatim — the
+    /// orchestrator's authoritative paper basis (best-ask or its fallback, #486), so the executor
+    /// is a pure recorder and the fill mode stays runtime-mutable with no executor setter. `None`
+    /// recomputes the haircut fill from `intent.limit_price` and tags it
+    /// [`FillSource::LeaderHaircut`], byte-identical to the pre-#486 behaviour.
     ///
     /// `now` is used as both `observed_at` and `received_at` on the envelope, and as
-    /// `simulated_at` on the fill record. Calls `sync()` after the append so each fill
-    /// is durable before returning. Returns the fill together with the event-log
-    /// [`EventSeq`] of its frame, so the caller can advance the reconciliation cursor.
+    /// `simulated_at` on the fill record. Calls `sync()` after the append so each fill is durable
+    /// before returning. Returns the fill together with the event-log [`EventSeq`] of its frame,
+    /// so the caller can advance the reconciliation cursor.
     pub fn execute(
         &mut self,
         intent: &OrderIntent,
         now: SourceTimestamp,
+        observed_fill_price: Option<(Price, FillSource)>,
     ) -> Result<(PaperFill, EventSeq), PaperExecutionError> {
+        let (simulated_fill_price, fill_source) = match observed_fill_price {
+            Some((price, source)) => (price, source),
+            None => (
+                self.simulated_fill_price(intent)?,
+                FillSource::LeaderHaircut,
+            ),
+        };
         let fill = PaperFill {
             intent: intent.clone(),
-            simulated_fill_price: self.simulated_fill_price(intent)?,
+            simulated_fill_price,
             simulated_at: now.clone(),
+            fill_source,
         };
 
         let payload = serde_json::to_vec(&fill)?;
@@ -151,5 +191,36 @@ impl PaperExecutor {
             }
         };
         Price::new(clamped).map_err(|_| PaperExecutionError::PriceOutOfRange)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// AC7(ii): a keyless pre-#486 `PaperFill` payload — captured from the pre-feature struct
+    /// (`tests/fixtures/pre_486_paper_fill.json`, a real payload byte-shape) — must deserialise,
+    /// exactly as `pe_service::paper_recovery` does via `serde_json::from_slice`, and resolve
+    /// `fill_source` to `LeaderHaircut` through `#[serde(default)]`. Without that default this
+    /// `from_slice` errors and crash-recovery replay aborts on restart — invisible to any
+    /// hash-chain test, which verifies stored bytes with no field-presence check.
+    #[test]
+    fn pre_486_keyless_frame_defaults_to_leader_haircut() {
+        const PRE_486: &[u8] = include_bytes!("../tests/fixtures/pre_486_paper_fill.json");
+        // Guard the fixture's provenance: a genuine pre-#486 payload carries no `fill_source` key.
+        assert!(
+            PRE_486
+                .windows(b"fill_source".len())
+                .all(|w| w != b"fill_source"),
+            "fixture must be a genuine pre-#486 payload with no fill_source key"
+        );
+        let fill: PaperFill =
+            serde_json::from_slice(PRE_486).expect("keyless pre-#486 frame must deserialise");
+        assert_eq!(fill.fill_source, FillSource::LeaderHaircut);
+        assert_eq!(
+            fill.simulated_fill_price,
+            Price::new(Decimal::new(42, 2)).unwrap()
+        );
     }
 }

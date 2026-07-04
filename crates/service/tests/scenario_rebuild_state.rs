@@ -79,7 +79,7 @@ fn rebuild_state_matches_original() {
 
     // BUY 10 @ 0.40
     let i1 = intent("k1", Side::Buy, 10, dec!(0.40));
-    let (f1, seq1) = executor.execute(&i1, ts.clone()).unwrap();
+    let (f1, seq1) = executor.execute(&i1, ts.clone(), None).unwrap();
     let r1 = FillRecord {
         idempotency_key: f1.intent.idempotency_key.clone(),
         market_id: f1.intent.market_id.clone(),
@@ -93,7 +93,7 @@ fn rebuild_state_matches_original() {
 
     // BUY 5 @ 0.60
     let i2 = intent("k2", Side::Buy, 5, dec!(0.60));
-    let (f2, seq2) = executor.execute(&i2, ts).unwrap();
+    let (f2, seq2) = executor.execute(&i2, ts, None).unwrap();
     let r2 = FillRecord {
         idempotency_key: f2.intent.idempotency_key.clone(),
         market_id: f2.intent.market_id.clone(),

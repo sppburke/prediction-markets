@@ -46,6 +46,7 @@ use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::runtime_config::FillMode;
 use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
@@ -191,6 +192,9 @@ async fn scenario_e2e_clean_exit() {
             min_fill_price: Decimal::ZERO,
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
+            // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
+            fill_mode: FillMode::LeaderHaircut,
+            clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
         },
@@ -258,6 +262,9 @@ async fn scenario_graceful_shutdown() {
             min_fill_price: Decimal::ZERO,
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
+            // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
+            fill_mode: FillMode::LeaderHaircut,
+            clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
         },

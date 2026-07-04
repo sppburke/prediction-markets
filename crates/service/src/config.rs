@@ -111,6 +111,20 @@ pub struct ServiceConfig {
     #[serde(default = "default_paper_fill_slippage_bps")]
     pub paper_fill_slippage_bps: u32,
 
+    /// Paper fill-price mode (#486): `clob_best_ask` (default — a paper BUY fills at the fresh
+    /// CLOB best-ask, and sizing/band-gates key off it) or `leader_haircut` (the pre-#486
+    /// boot-frozen leader-price haircut). Runtime-mutable via `service_config`; an unknown value
+    /// warns and keeps the last-known-good. See `docs/_GLOSSARY.md`: `fill_mode`.
+    #[serde(default = "default_fill_mode")]
+    pub fill_mode: String,
+
+    /// Fallback BUY haircut (bps) applied to the leader price when a paper `clob_best_ask` fill
+    /// has no usable best-ask (SELL entry, empty / errored / timed-out book, missing CLOB token,
+    /// or a degenerate ask). Default: 100 (1%) — the haircut demoted from primary to fallback
+    /// (#486). See `docs/_GLOSSARY.md`: `clob_best_ask_fallback_haircut_bps`.
+    #[serde(default = "default_clob_best_ask_fallback_haircut_bps")]
+    pub clob_best_ask_fallback_haircut_bps: u32,
+
     // ── Gamma / resolution polling ───────────────────────────────────────────
     /// Gamma API base URL (no trailing slash). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_gamma_base_url")]
@@ -459,6 +473,14 @@ const fn default_paper_fill_slippage_bps() -> u32 {
     100
 }
 
+fn default_fill_mode() -> String {
+    "clob_best_ask".to_string() // #486: paper BUY fills at the fresh CLOB best-ask
+}
+
+const fn default_clob_best_ask_fallback_haircut_bps() -> u32 {
+    100 // 1% — the haircut demoted from primary to fallback (#486)
+}
+
 fn default_bankroll_usd() -> String {
     "10000".to_string()
 }
@@ -504,6 +526,8 @@ impl Default for ServiceConfig {
             paper_state_db_path: default_paper_state_db_path(),
             paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
             paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
+            fill_mode: default_fill_mode(),
+            clob_best_ask_fallback_haircut_bps: default_clob_best_ask_fallback_haircut_bps(),
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
@@ -587,6 +611,8 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "paper_state_db_path",
         "paper_fill_haircut_bps",
         "paper_fill_slippage_bps",
+        "fill_mode",
+        "clob_best_ask_fallback_haircut_bps",
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
@@ -638,6 +664,8 @@ mod tests {
         assert_eq!(cfg.mode, "paper");
         assert_eq!(cfg.paper_fill_haircut_bps, 500);
         assert_eq!(cfg.paper_fill_slippage_bps, 100);
+        assert_eq!(cfg.fill_mode, "clob_best_ask");
+        assert_eq!(cfg.clob_best_ask_fallback_haircut_bps, 100);
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
         assert_eq!(cfg.position_reseed_interval_secs, 300);
         assert_eq!(cfg.position_page_limit, 500);
@@ -802,6 +830,11 @@ mode = "shadow"
             (
                 "paper_fill_slippage_bps",
                 d.paper_fill_slippage_bps.to_string(),
+            ),
+            ("fill_mode", d.fill_mode.clone()),
+            (
+                "clob_best_ask_fallback_haircut_bps",
+                d.clob_best_ask_fallback_haircut_bps.to_string(),
             ),
             ("status_interval_secs", d.status_interval_secs.to_string()),
             ("log_retention_days", d.log_retention_days.to_string()),

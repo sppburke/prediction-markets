@@ -39,7 +39,7 @@ use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
+use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -136,6 +136,8 @@ fn flat_snapshot(max_fill_price: &str, bankroll_usd: &str) -> RuntimeConfig {
     rc.min_resolution_horizon_secs = 0;
     rc.max_fill_price = max_fill_price.to_string();
     rc.bankroll_usd = bankroll_usd.to_string();
+    // #486: pin the pre-feature haircut basis so these gate scenarios stay on the ×1.05 fill.
+    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -171,6 +173,8 @@ async fn run_with(
             min_fill_price: Decimal::ZERO,
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
+            fill_mode: FillMode::LeaderHaircut,
+            clob_best_ask_fallback_haircut_bps: 100,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config,
@@ -281,6 +285,9 @@ fn gate_snapshot(cap_bps: i32) -> RuntimeConfig {
     rc.max_resolution_horizon_secs = 0;
     rc.min_resolution_horizon_secs = 0;
     rc.max_fill_price = "0.90".to_string();
+    // #486: the price-impact scenarios assert the ×1.05 haircut basis (floor(100/(0.50×1.05))=190),
+    // so pin leader_haircut — the best-ask basis would reprice the fallback to ×1.01.
+    rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
 
@@ -318,6 +325,8 @@ async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32
             min_fill_price: Decimal::ZERO,
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
+            fill_mode: FillMode::LeaderHaircut,
+            clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config: Some(LiveRuntimeConfig::new(gate_snapshot(cap_bps))),
         },
