@@ -198,6 +198,24 @@ mod tests {
     }
 
     #[test]
+    fn retired_radion_bit_no_longer_bypasses_count_gate() {
+        // Regression guard for the Radion retirement: bit 32 was SRC_RADION and used
+        // to bypass the trade-count activation gate (the `source_bits & 32` clause in
+        // `apply_activation_rules`). After retirement that clause is gone, so a wallet
+        // tagged only with the retired bit 32 and no trades must NOT activate — the
+        // symmetric counterpart to `retired_radion_bit_no_longer_lifts` (tombstones).
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(11), 0b0100000, false, None, None, None)
+            .unwrap();
+        let activated = apply_activation_rules(&mut cache).unwrap();
+        assert_eq!(
+            activated, 0,
+            "retired radion bit 32 must no longer bypass the trade-count gate"
+        );
+    }
+
+    #[test]
     fn activation_datadash_blocked_by_infra() {
         let (_dir, mut cache) = tmp_cache();
         cache
