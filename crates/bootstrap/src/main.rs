@@ -335,8 +335,6 @@ async fn main() {
                         tracing::info!(
                             leaderboard_unique = r.leaderboard_unique,
                             leaderboard_activated = r.leaderboard_activated,
-                            radion_unique = r.radion_unique,
-                            radion_activated = r.radion_activated,
                             datadash_unique = r.datadash_unique,
                             datadash_activated = r.datadash_activated,
                             "winner-discovery: complete"
@@ -454,14 +452,12 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     }
 
     // Step 1: discover wallets via the Polymarket leaderboard (all categories)
-    // + Radion (when activated). Replaces the retired Dune `enumerate` (#335).
+    // + datadash. Replaces the retired Dune `enumerate` (#335).
     match winner_discovery::run_winner_discovery(config, cache).await {
         Ok(r) => {
             tracing::info!(
                 leaderboard_unique = r.leaderboard_unique,
                 leaderboard_activated = r.leaderboard_activated,
-                radion_unique = r.radion_unique,
-                radion_activated = r.radion_activated,
                 datadash_unique = r.datadash_unique,
                 datadash_activated = r.datadash_activated,
                 "all: winner-discovery complete"

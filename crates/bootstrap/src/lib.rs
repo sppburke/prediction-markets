@@ -3,7 +3,7 @@
 //! Pipeline (invoked as `pe-bootstrap all` or no-arg):
 //! 1. `migrate::auto_migrate_legacy` — one-shot SQLite consolidation.
 //! 2. `winner_discovery::run_winner_discovery` — discover wallets via the
-//!    Polymarket leaderboard (all categories) + Radion (when activated).
+//!    Polymarket leaderboard (all categories) + datadash.
 //! 3. `fetch::run_fetch` — fetch Polymarket trade history per wallet.
 //! 4. `watchlist_phase::run_watchlist` — reconstruct ledgers, filter, write watchlist.json.
 //! 5. `fetch_resolutions_and_schedules` — fetch market resolution data (opt-in).
@@ -30,7 +30,6 @@ pub mod pile;
 pub mod polymarket;
 pub mod prices_history;
 pub mod purge;
-pub mod radion;
 pub mod wallet_discovery;
 pub mod wallet_set;
 pub mod watchlist_phase;

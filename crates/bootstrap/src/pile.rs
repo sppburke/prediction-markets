@@ -12,7 +12,7 @@
 //! | 2 | 0b0000100 | _(removed #335 — was Dune CSV; gap kept, persisted)_ |
 //! | 3 | 0b0001000 | _(removed #335 — was Dune incremental; gap kept, persisted)_ |
 //! | 4 | 0b0010000 | Polymarket leaderboard |
-//! | 5 | 0b0100000 | Radion |
+//! | 5 | 0b0100000 | _(removed — was Radion; gap kept, persisted)_ |
 //! | 6 | 0b1000000 | 502-gap |
 //! | 7 | 0b10000000 | datadash.xyz cohorts (#365) |
 //!
@@ -37,20 +37,24 @@ pub const SRC_TRADES: i64 = 0b0000010;
 // removed in #335. The gap is intentional — `source_bits` is persisted in the
 // live `wallet_cache.db`; do not renumber the surviving bits.
 pub const SRC_LEADERBOARD: i64 = 0b0010000;
-pub const SRC_RADION: i64 = 0b0100000;
+// bit5 (0b0100000) was SRC_RADION, removed when the Radion discovery source was
+// retired (its upstream `traders/analysis` endpoint was removed). The gap is
+// intentional — `source_bits` is persisted in the live `wallet_cache.db`; do not
+// renumber the surviving bits or reuse this bit.
 pub const SRC_GAP502: i64 = 0b1000000;
 /// datadash.xyz cohort discovery (issue #365). Bypasses the activation gate like
 /// the other curation-list sources.
 pub const SRC_DATADASH: i64 = 0b10000000;
 
 /// Sources whose re-discovery of a tombstoned wallet *lifts* the tombstone and
-/// re-admits it (issue #385): the Polymarket leaderboard and Radion only. The
-/// lift decision is read from each `upsert_wallets_bulk` row's own `source_bits`
-/// — `bits & TOMBSTONE_OVERRIDE_SOURCES != 0` lifts (leaderboard 16 / radion 32),
-/// any other bit (datadash 128, 502-gap 64, trades 2, wallet-set-json 1) leaves
-/// the tombstone intact (`bits & 48 == 0`). No caller passes this explicitly; the
-/// discrimination is automatic because each source tags rows with exactly its bit.
-pub const TOMBSTONE_OVERRIDE_SOURCES: i64 = SRC_LEADERBOARD | SRC_RADION;
+/// re-admits it (issue #385): the Polymarket leaderboard only. The lift decision
+/// is read from each `upsert_wallets_bulk` row's own `source_bits` — `bits &
+/// TOMBSTONE_OVERRIDE_SOURCES != 0` lifts (leaderboard 16), any other bit (datadash
+/// 128, 502-gap 64, trades 2, wallet-set-json 1) leaves the tombstone intact
+/// (`bits & 16 == 0`). No caller passes this explicitly; the discrimination is
+/// automatic because each source tags rows with exactly its bit. (The retired
+/// Radion source's bit 32 no longer lifts — existing radion-tagged rows are inert.)
+pub const TOMBSTONE_OVERRIDE_SOURCES: i64 = SRC_LEADERBOARD;
 
 /// Apply the activation rule. Sticky 0→1; `is_infra = 0` gates every branch.
 ///
@@ -207,7 +211,7 @@ mod tests {
     fn activation_is_sticky_zero_to_one_only() {
         let (_dir, mut cache) = tmp_cache();
         cache
-            .upsert_wallet(&hex(5), SRC_RADION, false, None, None, None)
+            .upsert_wallet(&hex(5), SRC_LEADERBOARD, false, None, None, None)
             .unwrap();
         let first = apply_activation_rules(&mut cache).unwrap();
         assert_eq!(first, 1);

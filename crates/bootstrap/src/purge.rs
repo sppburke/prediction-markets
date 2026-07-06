@@ -7,7 +7,7 @@
 //!   (`tstat_net <= purge_loser_tstat_max && mean_net < 0 && n_eff >=
 //!   purge_loser_neff_min`). Deleted **and tombstoned** ([`crate::cache::WalletCache::purge_wallets`]
 //!   writes a `purged_wallets` row) so a non-override discovery source cannot
-//!   silently re-ingest it. Re-discovery via the Polymarket leaderboard or Radion
+//!   silently re-ingest it. Re-discovery via the Polymarket leaderboard
 //!   lifts the tombstone (handled in `upsert_wallets_bulk`).
 //! - **Rule B (dead weight)** — `is_active = 1`, not eligible, refreshed this run
 //!   (`last_polymarket_fetch_at` within `BACKFILL_STALENESS_SECS`), newest trade

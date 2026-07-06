@@ -1,8 +1,0 @@
-{
-  "data": [
-    {"traderId": "0xAAAAaaaaAAAAaaaaAAAAaaaaAAAAaaaaAAAAaaaa", "venue": "polymarket", "traderScore": 86.0},
-    {"traderId": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "venue": "polymarket", "traderScore": 85.5},
-    {"traderId": "0x9999999999999999999999999999999999999999", "venue": "polymarket", "traderScore": 84.0}
-  ],
-  "nextCursor": null
-}

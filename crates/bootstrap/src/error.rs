@@ -32,8 +32,6 @@ pub enum BootstrapError {
     Clob { message: String },
     #[error("leaderboard: {message}")]
     Leaderboard { message: String },
-    #[error("radion: {message}")]
-    Radion { message: String },
     #[error("datadash: {message}")]
     Datadash { message: String },
     #[error("purge: {message}")]

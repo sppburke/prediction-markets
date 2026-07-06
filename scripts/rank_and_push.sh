@@ -13,7 +13,7 @@
 #
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
-#     discover     pe-bootstrap winner-discovery  leaderboard + datadash + radion → new wallets
+#     discover     pe-bootstrap winner-discovery  leaderboard + datadash → new wallets
 #     backfill     pe-bootstrap backfill          trade history for every active wallet (trades only)
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run
@@ -51,8 +51,7 @@
 # Requirements on the box:
 #   - .env with SUPABASE_URL + SUPABASE_SECRET_KEY (sourced below).
 #   - data/wallet_cache.db present (the ranker reads it; Step 0 refreshes it).
-#   - target/release/pe-bootstrap built, with its env config — incl.
-#     PE_BOOTSTRAP_RADION_API_KEY for the Radion source (#373).
+#   - target/release/pe-bootstrap built, with its env config.
 #     Build: cargo build --release -p pe-bootstrap
 #
 # Research / re-push overrides:
@@ -287,8 +286,8 @@ refresh_data() {
   if [[ "$SKIP_DISCOVERY" == "1" ]]; then
     echo "   discovery skipped (--skip-discovery)"
   else
-    # winner-discovery hits all three sources: leaderboard (errors propagate → fatal),
-    # datadash + radion (soft-fail internally → still exit 0). #324/#365/#373.
+    # winner-discovery hits both sources: leaderboard (errors propagate → fatal),
+    # datadash (soft-fails internally → still exit 0). #324/#365.
     run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
 

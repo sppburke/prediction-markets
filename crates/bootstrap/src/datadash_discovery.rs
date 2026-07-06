@@ -1,8 +1,8 @@
 //! datadash.xyz cohort wallet discovery (issue #365).
 //!
-//! Adds the public datadash.xyz cohort API as a third wallet-discovery source
-//! alongside the Polymarket leaderboard ([`crate::leaderboard_discovery`]) and the
-//! Radion stub ([`crate::radion`]). It ingests the distinct wallet addresses from
+//! Adds the public datadash.xyz cohort API as a wallet-discovery source
+//! alongside the Polymarket leaderboard ([`crate::leaderboard_discovery`]). It
+//! ingests the distinct wallet addresses from
 //! every datadash cohort *except* the configured exclusions (by exact id or exact
 //! title) and any cohort whose advertised `numWallets` exceeds the magnitude cap,
 //! adding only wallets not already in `wallet_cache.db` (the bulk upsert OR-merges
