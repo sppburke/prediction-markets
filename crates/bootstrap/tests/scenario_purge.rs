@@ -15,8 +15,7 @@ use std::collections::HashSet;
 use pe_bootstrap::BootstrapConfig;
 use pe_bootstrap::cache::{PurgeReason, PurgeRow, WalletCache};
 use pe_bootstrap::pile::{
-    BACKFILL_STALENESS_SECS, PILE_ACTIVATION_MIN_TRADES, SRC_DATADASH, SRC_LEADERBOARD, SRC_RADION,
-    SRC_TRADES,
+    BACKFILL_STALENESS_SECS, PILE_ACTIVATION_MIN_TRADES, SRC_DATADASH, SRC_LEADERBOARD, SRC_TRADES,
 };
 use pe_bootstrap::purge::run_purge;
 use tempfile::TempDir;
@@ -119,7 +118,7 @@ fn lift_outcome(bit: i64) -> (bool, bool) {
     )
 }
 
-// ── Override: leaderboard / radion lift; datadash / trades do not ─────────────
+// ── Override: leaderboard lifts; datadash / trades / retired-radion do not ────
 
 #[test]
 fn leaderboard_rediscovery_lifts_tombstone() {
@@ -130,11 +129,16 @@ fn leaderboard_rediscovery_lifts_tombstone() {
 }
 
 #[test]
-fn radion_rediscovery_lifts_tombstone() {
-    // PASS: re-discovery via SRC_RADION lifts the tombstone and re-admits.
-    let (still_purged, exists) = lift_outcome(SRC_RADION);
-    assert!(!still_purged && exists, "radion must lift + re-admit");
-    println!("PASS: radion re-discovery lifts the tombstone and re-admits the wallet");
+fn retired_radion_bit_no_longer_lifts() {
+    // Regression guard for the Radion retirement: bit 32 was SRC_RADION and used to
+    // lift the tombstone. After retirement it is dropped from TOMBSTONE_OVERRIDE_SOURCES
+    // (48 → 16), so a legacy row carrying only bit 32 must NOT lift (32 & 16 == 0).
+    let (still_purged, exists) = lift_outcome(0b0100000);
+    assert!(
+        still_purged && !exists,
+        "retired radion bit 32 must NOT lift (32 & 16 == 0)"
+    );
+    println!("PASS: retired radion bit (32) no longer lifts the tombstone");
 }
 
 #[test]
@@ -143,7 +147,7 @@ fn datadash_rediscovery_does_not_lift() {
     let (still_purged, exists) = lift_outcome(SRC_DATADASH);
     assert!(
         still_purged && !exists,
-        "datadash must NOT lift (128 & 48 == 0)"
+        "datadash must NOT lift (128 & 16 == 0)"
     );
     println!(
         "PASS: datadash re-discovery does NOT lift — tombstone intact, wallet not re-inserted"
@@ -156,7 +160,7 @@ fn migrate_trades_rediscovery_does_not_lift() {
     let (still_purged, exists) = lift_outcome(SRC_TRADES);
     assert!(
         still_purged && !exists,
-        "trades/migrate must NOT lift (2 & 48 == 0)"
+        "trades/migrate must NOT lift (2 & 16 == 0)"
     );
     println!("PASS: trades/migrate re-discovery does NOT lift — tombstone intact by construction");
 }

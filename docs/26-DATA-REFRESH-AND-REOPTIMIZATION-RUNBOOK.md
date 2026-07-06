@@ -32,7 +32,6 @@ cargo build --release -p pe-bootstrap
   No Polygon RPC / Alchemy provider is required.
 - **Supabase + Python.** `.env` must carry `SUPABASE_URL` + `SUPABASE_SECRET_KEY`
   (the push reads them). The ranking scripts run under `.venv-analysis/bin/python3`.
-  The Radion discovery source needs `PE_BOOTSTRAP_RADION_API_KEY` (#373).
 
 ---
 
@@ -171,7 +170,7 @@ bash scripts/rank_and_push.sh
 ```
 
 In order it runs: **Step 0** data refresh — `winner-discovery` (leaderboard +
-datadash + radion → new wallets) → `backfill` (trades only) → `events` →
+datadash → new wallets) → `backfill` (trades only) → `events` →
 `resolutions` (which also backfills missing schedule `end_date`s — the
 `resolutions` subcommand runs the full `fetch_resolutions_and_schedules`, so no
 separate `schedules` stage is needed, #383); **Stage 1** rank the full trade
@@ -251,7 +250,7 @@ history-preserving research re-push.
 ## Adding new wallets
 
 New-wallet discovery is **Step 0** of `rank_and_push.sh` (`pe-bootstrap
-winner-discovery`: Polymarket leaderboard + datadash + radion). Discovered wallets
+winner-discovery`: Polymarket leaderboard + datadash). Discovered wallets
 are ingested, backfilled, and ranked in the same run — there is no separate
 manual-review gate. See `docs/27-WINNER-DISCOVERY-RUNBOOK.md` for the discovery
 sources and their configuration.

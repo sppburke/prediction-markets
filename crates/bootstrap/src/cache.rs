@@ -11,9 +11,9 @@
 //!   fetched from Gamma. `end_date_unix NULL` means Gamma had no `endDate` for this
 //!   market (it is still in the skip-set to avoid re-fetching).
 //! - `wallets` — canonical wallet pile (issue #166). One row per known wallet across
-//!   every discovery source (`wallet_set.json`, `trades`, Dune CSV, Dune incremental,
-//!   Polymarket leaderboard, Radion, 502-gap). `is_active` is sticky (0→1 only) and
-//!   controls which wallets the `backfill` subcommand processes.
+//!   every discovery source (`wallet_set.json`, `trades`, Polymarket leaderboard,
+//!   502-gap, datadash). `is_active` is sticky (0→1 only) and controls which wallets
+//!   the `backfill` subcommand processes.
 //!
 //! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
 //! is needed. Per-wallet streaming reads keep peak memory bounded.
@@ -209,8 +209,9 @@ CREATE TABLE IF NOT EXISTS source_cursor (
 -- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
 -- `WalletAddress::Display`: `\"0x\" + 40 lowercase hex chars`.
 -- `source_bits`: bit0=wallet_set_json, bit1=trades, bit4=leaderboard,
--- bit5=radion, bit6=gap502. (bit2/bit3 were dune_csv/dune_incr, removed in
--- #335; the gap is intentional — `source_bits` is persisted, do not renumber.)
+-- bit6=gap502, bit7=datadash. (bit2/bit3 were dune_csv/dune_incr, removed in
+-- #335; bit5 was radion, removed on Radion retirement; the gaps are intentional
+-- — `source_bits` is persisted, do not renumber or reuse.)
 -- `is_active` is sticky 0→1; `is_infra` is also sticky once set.
 CREATE TABLE IF NOT EXISTS wallets (
     wallet_hex               TEXT    PRIMARY KEY NOT NULL,
@@ -265,7 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_fmrc_cutoff
 -- Only rule-A `proven_loser` deletions write a row here; rule-B `dead_weight`
 -- deletions write NO row (discovery may freely re-find them). The
 -- `upsert_wallets_bulk` gate skips re-inserting any wallet listed here UNLESS the
--- incoming row carries an override bit (leaderboard/radion = `source_bits & 48`),
+-- incoming row carries an override bit (leaderboard = `source_bits & 16`),
 -- which DELETEs the row (lifts the tombstone) and re-admits the wallet. `reason`
 -- is kept as TEXT for forward-compat / auditing.
 CREATE TABLE IF NOT EXISTS purged_wallets (
@@ -2195,7 +2196,7 @@ impl WalletCache {
     /// passes the bit from `topic_to_contract_version_bit`.
     pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
         // Issue #385 tombstone gate. Load the purged set once; for a tombstoned
-        // wallet, an incoming row carrying an override bit (leaderboard/radion =
+        // wallet, an incoming row carrying an override bit (leaderboard =
         // `source_bits & TOMBSTONE_OVERRIDE_SOURCES`) LIFTS the tombstone (DELETE
         // the `purged_wallets` row, then upsert normally — re-admit); any other
         // source bit (datadash/trades/wallet-set-json) SKIPS the row, leaving the
@@ -2222,7 +2223,7 @@ impl WalletCache {
             for (wallet, bits, infra, first_seen, closed, win_rate, version_bits) in rows {
                 if purged.contains(wallet) {
                     if (bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0 {
-                        // Override source (leaderboard/radion) → lift + re-admit.
+                        // Override source (leaderboard) → lift + re-admit.
                         lift.execute(params![wallet])?;
                         purged.remove(wallet);
                     } else {
@@ -2855,7 +2856,7 @@ impl WalletCache {
     ///
     /// Sticky semantics: only `is_active = 0` rows are considered. `is_infra = 0`
     /// gates **every** activation branch — a wallet listed in both the infra CSV
-    /// and a curation list (leaderboard/radion/502-gap) stays inactive.
+    /// and a curation list (leaderboard/502-gap/datadash) stays inactive.
     ///
     /// Issue #385 defense-in-depth: a tombstoned wallet (`purged_wallets`) is
     /// never activated even if a stray row exists. The primary guard is the
@@ -2870,7 +2871,6 @@ impl WalletCache {
                 COALESCE(trade_count, 0) >= ?1 \
              OR COALESCE(dune_closed_markets, 0) >= ?1 \
              OR (source_bits & 16) != 0 \
-             OR (source_bits & 32) != 0 \
              OR (source_bits & 64) != 0 \
              OR (source_bits & 128) != 0\
              )",

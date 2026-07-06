@@ -1,7 +1,7 @@
 # 27 — Winner-Discovery Runbook
 
 Automates the ingest of new candidate wallets from the Polymarket leaderboard
-(plus the datadash.xyz cohorts and the Radion trader-analysis API). The
+(plus the datadash.xyz cohorts). The
 `pe-bootstrap winner-discovery` subcommand upserts each discovered wallet into the
 local `wallet_cache.db` and activates the eligible ones; they then flow into the
 ranking pipeline (Step 0 of `scripts/rank_and_push.sh`) and reach the live set only
@@ -20,9 +20,6 @@ defaults"):
 ```
 PE_BOOTSTRAP_LEADERBOARD_BASE_URL        # override leaderboard host (testing)
 PE_BOOTSTRAP_LEADERBOARD_TOP_N           # default 50 (API hard-caps at 50)
-PE_BOOTSTRAP_RADION_API_URL              # default https://api.radion.app (on by default)
-PE_BOOTSTRAP_RADION_API_KEY              # required to activate Radion (skips silently if unset)
-PE_BOOTSTRAP_RADION_MAX_REQUESTS_PER_RUN # default 8 (Free-tier budget; resumable sweep)
 PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on by default; "" disables)
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db
 ```
@@ -42,7 +39,7 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 ```
 
 There is no separate eval/export stage or candidates JSON: `winner-discovery` fetches
-the leaderboard + datadash + radion slices and upserts new wallets (recording the
+the leaderboard + datadash slices and upserts new wallets (recording the
 source bit, activating eligible ones) straight into the cache. `rank_and_push.sh` then
 backfills their trade history and ranks them alongside the rest of the universe — the
 ranker's own eligibility filters decide which discovered wallets make the published
@@ -65,37 +62,15 @@ its `source_bits` column is OR-merged to record the new source.
 
 The `SRC_LEADERBOARD` bit (16) bypasses the 100-trade activation gate in
 `pe_bootstrap::pile::apply_activation_rules`, matching the curation-list
-behaviour of existing `SRC_RADION` (32) and `SRC_502_GAP` (64) bits.
+behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
 
-## Radion source (live, issue #373)
-
-The Radion trader-analysis API is the third discovery source, **on by default**
-(`radion_api_url` defaults to `https://api.radion.app`) but **inert until a key
-is set** — the API mandates an `X-API-Key` header, so the branch is silently
-skipped when `radion_api_key` is unset/empty. With a key, `winner-discovery`
-walks `GET /v1/polymarket/traders/analysis` (cursor-paginated, ordered by
-`traderScore`, best first), upserts each `traderId` (on Polymarket the wallet
-address) with `SRC_RADION`, and activates it immediately (the bit-32 gate bypass).
-
-The sweep is **resumable** to respect the Free-tier quota (50/hr, 300/mo, max 10
-wallets/request): the `nextCursor` is persisted in the `source_cursor` kv table
-under the `radion_traders_analysis` key, so each run resumes deeper into the
-ranking (up to `radion_max_requests_per_run`, default 8) and resets to the top
-when the sweep exhausts (`nextCursor=null`). A `429`/error persists the cursor
-reached and bails — it never blocks on `Retry-After` (at the monthly wall that is
-seconds-until-rollover, up to days). Radion failures **soft-fail** (warn + zero
-counts) so an outage or quota wall never breaks the `discover → backfill → rank`
-run.
-
-The deployment `.env` carries the full Radion block explicitly (operator
-preference — all knobs explicit, even when a code default exists):
-
-```
-PE_BOOTSTRAP_RADION_API_URL=https://api.radion.app
-PE_BOOTSTRAP_RADION_API_KEY=rk_…            # the live Free key
-PE_BOOTSTRAP_RADION_REQUEST_INTERVAL_MS=500
-PE_BOOTSTRAP_RADION_MAX_REQUESTS_PER_RUN=8  # 8×30=240/mo, under the 300/mo Free cap
-```
+> **Retired source — Radion.** A third source, the Radion `traders/analysis`
+> trader-ranking API (issue #373), was removed once Radion deprecated that
+> endpoint upstream (the REST API is now market-data only, no ranked-trader
+> route). Its `radion_*` config knobs, `PE_BOOTSTRAP_RADION_*` env keys, and the
+> `SRC_RADION` (bit 32) source bit were retired; bit 32 is now a reserved gap in
+> `source_bits` (not reused), and existing radion-tagged rows stay inert. Discovery
+> now runs the leaderboard + datadash sources only.
 
 ## Operational notes
 
@@ -116,7 +91,7 @@ PE_BOOTSTRAP_RADION_MAX_REQUESTS_PER_RUN=8  # 8×30=240/mo, under the 300/mo Fre
 
 - `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md` — full data-refresh and
   re-optimisation pipeline (includes watchlist export and VPS deploy).
-- `docs/_GLOSSARY.md` — `bootstrap_leaderboard_*` and `bootstrap_radion_*`
-  defaults, `SRC_LEADERBOARD` / `SRC_RADION` bit definitions.
+- `docs/_GLOSSARY.md` — `bootstrap_leaderboard_*` and `bootstrap_datadash_*`
+  defaults, `SRC_LEADERBOARD` / `SRC_DATADASH` bit definitions.
 - `docs/19-WINNER-FOLLOW-STRATEGY.md` — promotion ladder and eligibility gates
   that govern whether a newly-activated wallet reaches live execution.
