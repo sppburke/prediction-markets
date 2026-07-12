@@ -22,12 +22,15 @@ What it locks (the things that would silently break cron if wired wrong):
   - the skip flags bypass Step 0 / ranking for a pure re-push;
   - zero-arg invocation auto-creates a timestamped out-dir;
   - the production half-life default is threaded to both passes.
+  - the final WAL checkpoint runs after purge, truncates committed WAL bytes, and warns
+    without failing an already-published run when checkpointing is unavailable.
 
 Run: `python3 scripts/test_rank_and_push.py`
   or: `pytest scripts/test_rank_and_push.py -v`
 """
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -80,6 +83,11 @@ class RankAndPushScenario(unittest.TestCase):
         (self.root / "scripts").mkdir()
         (self.root / "target" / "release").mkdir(parents=True)
         (self.root / "data" / "eval-results").mkdir(parents=True)
+
+        # The final checkpoint opens the existing cache with URI mode=rw so a typo can never
+        # create an empty database. Most scenarios only need a valid empty cache; the WAL
+        # reclamation scenario below turns this into a WAL-mode fixture.
+        sqlite3.connect(self.root / "data" / "wallet_cache.db").close()
 
         # Copy the wrapper-under-test into the sandbox so its `cd "$(dirname "$0")/.."`
         # lands in <tmp>, where the stubs / .env / target/release live.
@@ -316,12 +324,35 @@ class RankAndPushScenario(unittest.TestCase):
         )
         print("PASS: purge runs last, after push, with the run's RANKED_CSV as the decision CSV")
 
+    def test_checkpoint_runs_after_purge_and_truncates_wal(self):
+        db = self.root / "data" / "wallet_cache.db"
+        connection = sqlite3.connect(db)
+        try:
+            self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("CREATE TABLE checkpoint_fixture (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO checkpoint_fixture VALUES ('committed')")
+            connection.commit()
+
+            wal = Path(f"{db}-wal")
+            self.assertTrue(wal.is_file() and wal.stat().st_size > 0, "fixture did not create a WAL")
+
+            r = self._run()
+            self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+            self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0, "final checkpoint did not truncate WAL")
+            self.assertGreater(r.stdout.index("Stage 5/5"), r.stdout.index("Stage 4/5"))
+            self.assertIn("[checkpoint] ok", r.stdout)
+        finally:
+            connection.close()
+        print("PASS: final checkpoint runs after purge and truncates committed WAL bytes")
+
     def test_skip_purge_bypasses_purge(self):
         r = self._run("--skip-purge")
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
         self.assertNotIn("purge", subs, "purge ran despite --skip-purge")
         self.assertIsNotNone(self._log("push.log"), "push must still run with --skip-purge")
+        self.assertIn("[checkpoint] ok", r.stdout, "checkpoint must still run when purge is skipped")
         print("PASS: --skip-purge bypasses the purge stage; push still runs")
 
     def test_purge_failure_is_non_fatal(self):
@@ -332,6 +363,15 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("purge", subs, "purge stage did not run")
         self.assertIn("WARN", r.stderr)
         print("PASS: purge exit 1 → WARN, run still succeeds (push already published)")
+
+    def test_checkpoint_failure_is_non_fatal(self):
+        (self.root / "data" / "wallet_cache.db").unlink()
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"checkpoint failure changed run status\nstderr={r.stderr}")
+        self.assertIn("database is not a file", r.stderr)
+        self.assertIn("[checkpoint] WARN", r.stderr)
+        self.assertIsNotNone(self._log("push.log"), "push must complete before checkpoint warning")
+        print("PASS: checkpoint failure → WARN, run still succeeds (push already published)")
 
     def test_auto_prune_removes_positions_csv(self):
         # After pass-2 consumes it, the multi-GB qualifying_positions_72hr.csv is pruned; the ranked

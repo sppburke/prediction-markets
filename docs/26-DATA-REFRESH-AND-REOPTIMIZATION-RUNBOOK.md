@@ -177,7 +177,12 @@ separate `schedules` stage is needed, #383); **Stage 1** rank the full trade
 universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
 there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** push
-to Supabase and verify `latest_ranking` is populated.
+to Supabase and verify `latest_ranking` is populated; **Stage 4** purge proven-loser
+and dead-weight wallets when armed; **Stage 5** run
+`PRAGMA wal_checkpoint(TRUNCATE)` against the local cache so committed WAL pages are
+checkpointed and the WAL file releases its disk footprint. The checkpoint is always
+attempted last, including re-pushes and runs that skip purge. A busy/error result warns
+without failing the already-complete Supabase publish; the next run retries it.
 
 Production defaults are baked in (override via flags): `--universe-from-trades`,
 `HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
@@ -201,6 +206,7 @@ mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_pro
 - `--half-life-days N` — override the production decay half-life.
 - `--skip-discovery` / `--skip-backfill` — skip Step-0 stages.
 - `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push.
+- `--skip-purge` — skip wallet deletion; the final WAL checkpoint still runs.
 - Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
 
 ### Cron (operator-installed; 4h production cadence since the 2026-07-03 cutover)
@@ -216,6 +222,9 @@ mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_pro
 The PID lock makes an overlapping tick abort (exit 3) — a long full run simply eats the
 next 4h tick and the following one recovers. The 4h cadence is a data-freshness choice,
 not an evidence-backed one (weekly was run28's tested cadence, `docs/33` §5).
+The final checkpoint remains inside that lock and starts only after every pipeline DB
+writer has exited. It checkpoints committed data rather than deleting rows; its storage
+effect is to truncate the separate `wallet_cache.db-wal` file.
 
 `pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
