@@ -61,14 +61,14 @@ See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibil
 
 ### Trade classification
 
-Each observed leader trade is classified as `Entry`, `Add`, `Trim`, `Exit`, `Flip`, or `Unknown` (`LeaderAction` in `core-types`). Action eligibility (which actions can initiate, reduce, or are blocked) and the confidence thresholds (`add_high_confidence_threshold_ppm`, `exit_high_confidence_threshold_ppm`) are defined canonically in `19-WINNER-FOLLOW-STRATEGY.md` ("Signal classification").
+Each observed leader trade is classified as `Entry`, `Add`, `Trim`, `Exit`, `Flip`, or `Unknown` (`LeaderAction` in `core-types`). The current production copy scope admits only first-ever BUY `Entry` signals and holds them to resolution; the other actions remain classified for ledger/replay and future profiles. Action eligibility and the confidence thresholds (`add_high_confidence_threshold_ppm`, `exit_high_confidence_threshold_ppm`) are defined canonically in `19-WINNER-FOLLOW-STRATEGY.md` ("Signal classification").
 
 ### Copy eligibility
 
 Do not copy unless ALL are true:
 
 1. leader is in active top-`active_watchlist_size` at decision time;
-2. the event is `Entry` or an `Add` meeting the high-confidence rule in `19-`;
+2. the event is a first-ever BUY `Entry`; SELLs and all later actions are blocked by the production copy-entry gate;
 3. current price is within `max_slippage_from_leader_bps` of leader's observed entry;
 4. market liquidity can fill the follower order without exceeding adverse-selection limits;
 5. market is not in a blocked category, settlement dispute, or stale-metadata state;

@@ -60,8 +60,9 @@ Winner-Follow requirements (full spec in `19-WINNER-FOLLOW-STRATEGY.md`):
 - Rank operators/traders by walk-forward LCB_5pct of follower log-growth per day,
   not raw PnL.
 - Use the eligibility thresholds and Kelly fractions from `19-WINNER-FOLLOW-STRATEGY.md`.
-- Copy only entry/add trades that survive liquidity, latency, slippage, cost, and
-  portfolio risk checks (gates in `04-PHASE-TRADING-STRATEGY.md`).
+- In the current production profile, copy only first-ever BUY entries that survive
+  liquidity, latency, slippage, cost, and portfolio risk checks; classify later actions
+  for replay (gates in `04-PHASE-TRADING-STRATEGY.md`).
 - Size with calibrated quarter-Kelly by default; hard caps from `19-`.
 - Produce deterministic replay showing why each copied trade was or was not taken.
 ```

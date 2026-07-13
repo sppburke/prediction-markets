@@ -26,8 +26,9 @@ const PARSER_VERSION: u32 = 1;
 pub enum FillSource {
     /// The fresh CLOB best-ask observed at copy time (paper `clob_best_ask` BUY).
     ClobBestAsk,
-    /// The `clob_best_ask_fallback_haircut_bps` fallback: no usable ask (SELL entry, empty /
-    /// errored / timed-out book, missing CLOB token, or a degenerate best-ask).
+    /// The `clob_best_ask_fallback_haircut_bps` fallback for a BUY with no usable ask (empty /
+    /// errored / timed-out book, missing CLOB token, or a degenerate best-ask). Production
+    /// Winner-Follow rejects SELLs before fill-price resolution.
     Fallback,
     /// The boot-frozen leader-price haircut: paper `leader_haircut` mode, every non-paper mode,
     /// or the recompute a `None` override takes — and every pre-#486 frame.

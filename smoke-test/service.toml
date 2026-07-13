@@ -15,7 +15,7 @@ jsonl_log_path                   = "smoke-test/paper.jsonl"
 bankroll_usd                     = "10000"
 mode                             = "paper"
 
-# Copy-entry gate (issues #290, #339): copy only a leader's first-ever entry into a
+# Copy-entry gate (issues #290, #339): copy only a leader's first-ever BUY entry into a
 # market that resolves within [min, max] of now. The leader-price band was removed in
 # #339 — live sizing is re-based on the current market price instead. Hold-to-resolution
 # is enforced by the orchestrator's filled-positions set.

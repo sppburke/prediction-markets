@@ -1,11 +1,13 @@
 //! Startup per-wallet market-history backfill for the copy-entry gate.
 //!
 //! [`WalletHistoryLoader::load`] fetches each watchlisted wallet's complete set
-//! of previously-entered markets from the free Polymarket Data API
+//! of previously-traded markets from the free Polymarket Data API
 //! (`/activity?type=TRADE`, cursor-paginated to completeness), unions it with a
 //! stale JSON sidecar (so the gate works immediately and survives an API outage),
 //! persists the merged map atomically, and warns for every wallet it could not
 //! populate. The returned map seeds [`crate::entry_gate::CopyEntryGate`].
+//! The any-trade set is a conservative superset for the first-BUY gate: it can
+//! suppress a later BUY after prior SELL-only activity, but it cannot admit a SELL.
 //!
 //! Lives in `crates/service` (not the pure, no-I/O `copy-signal-engine`) because
 //! it performs network and filesystem I/O.
@@ -21,7 +23,7 @@ use tracing::warn;
 /// Safety backstop: stop paginating after this many pages per wallet. At 500
 /// trades/page that is 100k trades; a wallet exceeding it gets partial history
 /// (and a loud warn) — a market entered before the cap could be missed, causing
-/// a false "first entry".
+/// a false "first-BUY entry".
 const HISTORY_MAX_PAGES: u32 = 200;
 
 /// Page size hardcoded by [`PolymarketEndpoint::UserTradeActivity`] (`limit=500`).
@@ -37,7 +39,7 @@ const KNOWN_PAGE_MARGIN: u32 = 2;
 
 // ── Sidecar ─────────────────────────────────────────────────────────────────
 
-/// On-disk JSON sidecar: each wallet's previously-entered markets.
+/// On-disk JSON sidecar: each wallet's previously-traded markets.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct WalletHistorySidecar {
     wallets: Vec<WalletHistoryEntry>,
@@ -51,7 +53,7 @@ struct WalletHistoryEntry {
 
 // ── Fetch DTO ───────────────────────────────────────────────────────────────
 
-/// Minimal projection of a `/activity?type=TRADE` item: the market entered and
+/// Minimal projection of a `/activity?type=TRADE` item: the market traded and
 /// the trade timestamp used as the pagination cursor.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,7 +164,7 @@ impl WalletHistoryLoader {
     /// final map (fetch failed and no stale data).
     ///
     /// A wallet present with an empty set is *known* to have no prior markets (every
-    /// entry is a first entry); a wallet absent is *unknown* and is governed by
+    /// BUY entry is a first entry); a wallet absent is *unknown* and is governed by
     /// `entry_gate_fail_closed` in [`crate::entry_gate::CopyEntryGate`].
     pub async fn load<F: PageFetcher>(
         wallets: &[WalletAddress],

@@ -208,12 +208,17 @@ Action eligibility:
 
 | Action | Live copy? | Notes |
 |---|---|---|
-| `Entry` | yes | Normally eligible |
-| `Add` | conditional | Eligible only if `action_confidence_ppm ≥ add_high_confidence_threshold_ppm` AND (leader's existing position in this market is currently profitable OR the add itself satisfies all `Entry` gates independently). "Profitable" = unrealized PnL > 0 at observed price. |
-| `Trim` | reduces only | Reduces mirrored exposure when `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm` and the follower has matching exposure |
-| `Exit` | reduces only | Same gate as Trim |
-| `Flip` | requires `flip_human_approved = true` | Default-deny |
+| `Entry` + `Buy` | yes | The only action/side admitted by the current production copy-scope gate |
+| `Entry` + `Sell` | block | Always rejected as `GateReject::NotBuy`; production Winner-Follow never opens a short |
+| `Add` | block | Classified for ledger/replay, but the current first-entry gate does not copy it |
+| `Trim` | block | Classified for ledger/replay; the current strategy holds copied BUYs to resolution |
+| `Exit` | block | Same as Trim |
+| `Flip` | block | The current first-entry gate blocks it; any future copy profile must also require `flip_human_approved = true` |
 | `Unknown` | block | Always |
+
+The classifier, strategy types, and paper executor retain generic SELL/reduction support for replay
+and a future inventory-backed exit profile. That lower-layer support does not make SELL reachable
+from the current production orchestrator.
 
 Idempotency key: `(leader, source_trade_id, market, outcome, side, observed_at_bucket)` where `observed_at_bucket = floor(observed_at_ms / 1_000)` (1-second buckets).
 
@@ -350,20 +355,20 @@ The TOML above is the only authoritative copy. README, `04-PHASE-TRADING-STRATEG
 
 ## Copy-scope gates (service-side, issue #290)
 
-These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below: a copied trade must be a **first-ever entry** into a market, resolving **within `[min, max]` of now**, **held to resolution**, with a **currently-available market price** inside the `[min_fill_price, max_fill_price)` current-price band. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`). The leader-price band of the original 72hr cohort was **removed in #339**; a **current-price band floor returned at the 2026-07-03 run28 cutover** (`min_fill_price`, #468 selection↔deployment parity — the run28 eval filtered forward copies to the band) alongside the pre-existing `max_fill_price` cap. Live sizing stays re-based on the **current** market price (see "Current-price sizing basis" below).
+These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below: a copied trade must be a **first-ever BUY entry** into a market, resolving **within `[min, max]` of now**, **held to resolution**, with a **currently-available market price** inside the `[min_fill_price, max_fill_price)` current-price band. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`). The leader-price band of the original 72hr cohort was **removed in #339**; a **current-price band floor returned at the 2026-07-03 run28 cutover** (`min_fill_price`, #468 selection↔deployment parity — the run28 eval filtered forward copies to the band) alongside the pre-existing `max_fill_price` cap. Live sizing stays re-based on the **current** market price (see "Current-price sizing basis" below).
 
 Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → classify:
 
 | # | Gate | Condition (copy iff …) | Source | Rationale |
 |---|---|---|---|---|
 | A | Hold-to-resolution | `(market, outcome)` not already held | `orchestrator.rs` `filled_positions` set | The cohort wallets sell winners early; dropping every later signal on a held contract (including the leader's own exits) reproduces copy-and-hold, capturing the full move. Re-seeded from `paper_positions()` on restart. **No code change in #290** — pre-existing behavior. |
-| B | First-ever entry | `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | `entry_gate.rs::admit` → `GateReject::NotAnEntry` / `NotFirstEntry` | The cohort was selected on first-ever market entries. Drops `Add`/`Trim`/`Exit`/`Flip` and re-entries. History is per-leader-wallet (`signal.leader.0`), backfilled at startup from the free Data API and a JSON sidecar (`wallet_market_history_path`); `record_entry` also blocks same-session re-entries. |
+| B | BUY-only first-ever entry | `signal.leader_side == Buy` **and** `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | `entry_gate.rs::admit` → `GateReject::NotBuy` / `NotAnEntry` / `NotFirstEntry` | The cohort was selected on first-ever BUYs. Drops every SELL, `Add`/`Trim`/`Exit`/`Flip`, and re-entry. History is per leader wallet (`signal.leader.0`), backfilled at startup from the free Data API and a JSON sidecar (`wallet_market_history_path`); the startup map is conservatively any-trade, while `record_entry` records only same-session admitted BUY entries. |
 | C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | `orchestrator.rs::check_resolution_horizon` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). Resolution time from `MarketEndCache` (Gamma). Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). One lookup serves both bounds. |
 | D | Fill-price band | a current mid for `(market, outcome)` exists (liveness) **and** the BUY **fill price** (leader price + paper haircut) is `≥ min_fill_price` **and** `< max_fill_price` | `orchestrator.rs` band block; sizing/gating via `PaperExecutor::fill_price` | The copy is sized and gated on the price it will ACTUALLY fill at (leader + haircut), matching the backtest's fill-price gate (#484; the Gamma mid via `MidPriceCache` is kept only for liveness + observability, no longer the sizing basis, because a stale/thin mid diverges from the fill). The `max_fill_price` cap (0.85) skips BUYs near $1 (issue-#142 parity); the `min_fill_price` floor (0.15, run28 cutover) skips BUYs below the entry band — the boundary value fills. **#486:** in the default `clob_best_ask` fill mode the BUY fill basis is the fresh CLOB best-ask (`resolve_fill_price`), so this band gate keys on the *ask* — a copy whose book ran to `≥ max_fill_price` is rejected even when the leader price was in-band; `leader_haircut` mode restores the haircut basis (`fill_mode`, `_GLOSSARY.md`). |
 
-**Fail posture (gate B history unknown).** A leader absent from the merged history map (startup fetch failed **and** no stale sidecar) is governed by `entry_gate_fail_closed` (`_GLOSSARY.md`): default `false` = **fail-open** (treat as new, copy allowed) to preserve availability for paper-only operation; `true` = **fail-closed** (block its `Entry` signals until history is known). Either way the loader emits a per-wallet `warn!`, so on a first-ever run a fetch failure is visible rather than silent. **Accepted exposure:** under the default fail-open posture, a transient API outage on first run can admit a non-first-entry as if it were a first entry; set `entry_gate_fail_closed = true` to trade availability for strictness.
+**Fail posture (gate B history unknown).** A leader absent from the merged history map (startup fetch failed **and** no stale sidecar) is governed by `entry_gate_fail_closed` (`_GLOSSARY.md`): default `false` = **fail-open** (treat a BUY entry as new, copy allowed) to preserve availability for paper-only operation; `true` = **fail-closed** (block its BUY `Entry` signals until history is known). SELL rejection is unconditional and does not depend on this posture. Either way the loader emits a per-wallet `warn!`, so on a first-ever run a fetch failure is visible rather than silent. **Accepted exposure:** under the default fail-open posture, a transient API outage on first run can admit a non-first-entry BUY as if it were a first entry; set `entry_gate_fail_closed = true` to trade availability for strictness.
 
-A rejected copy-scope gate logs the typed reason and commits a no-fill (the leader ledger is still mirrored, matching the existing no-edge path). Defaults for the gate config keys (`entry_gate_fail_closed`, `min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
+A rejected copy-scope gate logs the typed reason and commits a no-fill (the leader ledger is still mirrored, matching the existing no-edge path). A rejected SELL does not call `record_entry`, so it cannot consume same-session first-entry history. Defaults for the gate config keys (`entry_gate_fail_closed`, `min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
 
 **Current-price sizing basis (#339).** Unlike backtest (`simulation.rs`, which sizes at the historical fill price), the live copy path computes the Kelly cost `c` and the flat-path contract count at the **current** market price fetched at copy time — not `signal.leader_price`. The leader's price still sets the order's `limit_price` (don't-chase: if the price rose, the limit simply won't fill). This closes the live/backtest divergence the old leader-price band papered over.
 
@@ -414,7 +419,7 @@ simulation.rs gates (backtest only, lines 457-518)
 4. Do not chase beyond `max_slippage_from_leader_bps`.
 5. Recheck risk after partial fills.
 6. Reconcile against venue state before the next order.
-7. Follow exits only when the follower has mirrored exposure and the exit's `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
+7. Current production Winner-Follow ignores all SELL/Trim/Exit signals and holds copied BUYs to resolution. Any future exit-following profile must require matching inventory and `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
 8. Block live orders when the on-chain resolution source is unhealthy (`OnchainSourceUnhealthy`; see "Risk-block taxonomy" above).
 
 ## Promotion ladder

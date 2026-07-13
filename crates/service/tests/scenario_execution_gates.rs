@@ -173,6 +173,22 @@ fn first_paper_fill(dir: &TempDir) -> Option<(u64, Decimal)> {
     Some((fill.intent.contracts.0, fill.simulated_fill_price.0))
 }
 
+/// Every paper fill side in event-sequence order.
+fn paper_fill_sides(dir: &TempDir) -> Vec<Side> {
+    let path = dir.path().join("paper.log");
+    if !path.exists() {
+        return Vec::new();
+    }
+    Reader::replay(&path)
+        .unwrap()
+        .map(|frame| {
+            let (_seq, env) = frame.unwrap();
+            let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+            fill.intent.side
+        })
+        .collect()
+}
+
 /// Feed `trades` through a fresh orchestrator wired with `gate_config` + `history`
 /// and a flat-fill strategy in Paper mode; return the resulting paper-fill count.
 async fn run_gate(
@@ -304,6 +320,26 @@ async fn first_entry_blocks_known_market() {
     .await;
     assert_eq!(fills, 0);
     println!("PASS: first-entry blocks a market already in leader history (0 fills)");
+}
+
+/// PASS: a SELL observed from a flat leader ledger is rejected, and because it does not
+///       consume market-level first-entry history, a later BUY of the other outcome in the
+///       same market is admitted. The only recorded fill side is BUY.
+/// FAIL: a SELL fill is recorded, or the rejected SELL prevents the later BUY.
+#[tokio::test]
+async fn sell_is_rejected_without_consuming_first_entry_history() {
+    let dir = TempDir::new().unwrap();
+    let shared_market = market("0xbuy-only");
+    let mut sell = entry_trade("sell-first", shared_market.clone(), dec!(0.50));
+    sell.side = Side::Sell;
+    let mut buy = entry_trade("buy-second", shared_market, dec!(0.50));
+    buy.outcome_id = OutcomeId(1);
+
+    let fills = run_gate(&dir, band_config(false), HashMap::new(), vec![sell, buy]).await;
+
+    assert_eq!(fills, 1);
+    assert_eq!(paper_fill_sides(&dir), vec![Side::Buy]);
+    println!("PASS: SELL is rejected without consuming first-entry history; later BUY fills once");
 }
 
 // ── Fail-open / fail-closed posture ───────────────────────────────────────────
@@ -487,8 +523,9 @@ async fn max_cap_rejects_leader_whose_fill_exceeds_cap() {
 
 // ── Best-ask fill basis (#486) ────────────────────────────────────────────────
 // A paper BUY in `clob_best_ask` mode fills at the fresh CLOB best-ask (sizing + band-gate key
-// off it); no usable ask falls back to `leader × (1 + fallback_haircut)`. SELL entries and every
-// non-paper mode take the boot-frozen haircut with no `/book` fetch.
+// off it); no usable ask falls back to `leader × (1 + fallback_haircut)`. The production
+// copy-entry gate rejects SELLs before this path; every non-paper mode takes the boot-frozen
+// haircut with no `/book` fetch.
 
 const BA_HEX: &str = "0xbestask";
 const BA_TOKEN: &str = "0xbestask-0"; // outcome 0's token (mid_cache_with_tokens emits "{hex}-{i}")
@@ -549,17 +586,17 @@ fn bestask_trade(id: &str, side: Side, leader_price: Decimal) -> IncomingTrade {
     }
 }
 
-/// Feed one trade through a paper-mode orchestrator in `fill_mode`, wired with `books`
-/// (token → `/book`) and a `max_fill_price` cap (`ZERO` disables). Returns the paper-fill count
-/// and the first fill `(contracts, price, fill_source)`.
+/// Feed one trade through a paper-mode orchestrator in `fill_mode`, wired with `book_fetcher`
+/// and a `max_fill_price` cap (`ZERO` disables). Returns the paper-fill count and the first fill
+/// `(contracts, price, fill_source)`.
 #[allow(clippy::too_many_arguments)]
-async fn run_bestask(
+async fn run_bestask<B: ClobBookFetcher + 'static>(
     dir: &TempDir,
     fill_mode: FillMode,
     side: Side,
     leader_price: Decimal,
     max_fill_price: Decimal,
-    books: HashMap<String, OrderBook>,
+    book_fetcher: Arc<B>,
 ) -> (usize, Option<(u64, Decimal, FillSource)>) {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
@@ -600,7 +637,7 @@ async fn run_bestask(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(books)),
+        book_fetcher,
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
@@ -626,7 +663,7 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
-        books,
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .await;
     assert_eq!(fills, 1);
@@ -654,7 +691,10 @@ async fn best_ask_fallback_on_no_usable_ask() {
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
-        HashMap::from([(BA_TOKEN.to_string(), book(&[]))]),
+        Arc::new(FixtureClobBookFetcher::new(HashMap::from([(
+            BA_TOKEN.to_string(),
+            book(&[]),
+        )]))),
     )
     .await;
     assert_eq!(fills, 1);
@@ -670,7 +710,7 @@ async fn best_ask_fallback_on_no_usable_ask() {
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
-        HashMap::new(),
+        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .await;
     assert_eq!(fills, 1);
@@ -693,40 +733,31 @@ async fn band_gate_rejects_on_ask_above_cap() {
         Side::Buy,
         dec!(0.80), // leader in-band (< 0.85)
         dec!(0.85),
-        books,
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .await;
     assert_eq!(fills, 0);
     println!("PASS: AC3 — band gate rejects on the ask 0.86 ≥ 0.85 though leader 0.80 is in-band");
 }
 
-/// AC4: a SELL entry in `clob_best_ask` mode does NOT fetch the `/book` (no bid side); it fills
-/// via the shared SELL haircut branch at `leader × (1 − slippage)` and is tagged `Fallback` — the
-/// buy-side best-ask (0.55) is never recorded.
-/// PASS: recorded price == 0.495 (0.50 × 0.99), source Fallback, ≠ the 0.55 ask.
+/// AC4: a SELL entry in `clob_best_ask` mode is rejected by the production copy-entry gate
+/// before fill-price resolution. `PanicBookFetcher` proves the `/book` path is never reached.
+/// PASS: no panic and zero paper fills.
 #[tokio::test]
-async fn sell_entry_takes_haircut_branch_not_best_ask() {
+async fn sell_entry_is_rejected_before_best_ask_fetch() {
     let dir = TempDir::new().unwrap();
-    // A rich book is present; a SELL must ignore it (best-ask is the buy-side price).
-    let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.55), dec!(100))]))]);
     let (fills, first) = run_bestask(
         &dir,
         FillMode::ClobBestAsk,
         Side::Sell,
         dec!(0.50),
         Decimal::ZERO,
-        books,
+        Arc::new(PanicBookFetcher),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (_c, price, source) = first.expect("SELL fill recorded");
-    assert_eq!(
-        price,
-        dec!(0.495),
-        "SELL fills at leader × (1 − slippage), not the 0.55 ask"
-    );
-    assert_eq!(source, FillSource::Fallback);
-    println!("PASS: AC4 — SELL entry fills via the haircut branch (0.495, Fallback); ask not used");
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
+    println!("PASS: AC4 — SELL entry rejected before /book fetch, 0 fills");
 }
 
 /// AC5: `leader_haircut` mode ignores the `/book` entirely and records the boot-frozen 5% haircut
@@ -743,7 +774,7 @@ async fn leader_haircut_mode_records_haircut_fill() {
         Side::Buy,
         dec!(0.50),
         Decimal::ZERO,
-        books,
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .await;
     assert_eq!(fills, 1);
@@ -757,13 +788,14 @@ async fn leader_haircut_mode_records_haircut_fill() {
     println!("PASS: AC5 — leader_haircut mode records the 0.525 haircut fill (LeaderHaircut)");
 }
 
-/// A `ClobBookFetcher` that panics if `fetch_book` is ever called — asserts AC6's hard gate that
-/// a live mode performs NO `/book` fetch on the fill path.
+/// A `ClobBookFetcher` that panics if `fetch_book` is ever called. AC4 uses it to prove a SELL is
+/// rejected before fill-price resolution; AC6 uses it to prove live mode performs no fill-path
+/// `/book` fetch.
 struct PanicBookFetcher;
 
 impl ClobBookFetcher for PanicBookFetcher {
     async fn fetch_book(&self, _token_id: &str) -> Result<OrderBook, ClobBookError> {
-        panic!("AC6 hard gate: the /book fetcher must not be called in a live mode");
+        panic!("hard gate: the /book fetcher must not be called");
     }
 }
 

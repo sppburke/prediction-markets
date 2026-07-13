@@ -122,7 +122,7 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBook
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
-    // Copy-entry gate: admits only a leader's first-ever entry into a market
+    // Copy-entry gate: admits only a leader's first-ever BUY entry into a market
     // (#290; price band removed in #339).
     entry_gate: CopyEntryGate,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
@@ -322,12 +322,13 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
     ///
     /// Paper mode with `fill_mode == ClobBestAsk` and a BUY fetches the fresh CLOB `/book` for the
     /// signal's outcome token and returns the best-ask ([`FillSource::ClobBestAsk`]) when usable,
-    /// else the `clob_best_ask_fallback_haircut_bps` fallback ([`FillSource::Fallback`]). A SELL
-    /// entry never fetches (the `/book` holds no bid side) and takes the shared SELL haircut branch
-    /// ([`FillSource::Fallback`]). `LeaderHaircut` mode and every non-paper mode return the
-    /// boot-frozen haircut price ([`FillSource::LeaderHaircut`]), byte-identical to the pre-#486
-    /// basis. Only the paper-mode result is threaded to the executor as `observed_fill_price`;
-    /// other modes pass `None` and the executor recomputes the identical haircut.
+    /// else the `clob_best_ask_fallback_haircut_bps` fallback ([`FillSource::Fallback`]). The
+    /// production copy-entry gate rejects SELLs before this method. Its defensive non-BUY branch
+    /// retains the generic executor's SELL haircut but is unreachable from Winner-Follow.
+    /// `LeaderHaircut` mode and every non-paper mode return the boot-frozen haircut price
+    /// ([`FillSource::LeaderHaircut`]), byte-identical to the pre-#486 basis. Only the paper-mode
+    /// result is threaded to the executor as `observed_fill_price`; other modes pass `None` and
+    /// the executor recomputes the identical haircut.
     async fn resolve_fill_price(
         &self,
         signal: &LeaderSignal,
@@ -501,7 +502,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             return;
         }
 
-        // Copy-entry gate: copy only a leader's first-ever entry into a market
+        // Copy-entry gate: copy only a leader's first-ever BUY entry into a market
         // (#290; price band removed in #339).
         if let Some(reason) = self.entry_gate.admit(&signal) {
             info!(
@@ -513,7 +514,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             self.commit_no_fill(&trade, &leader_row);
             return;
         }
-        // Record the admitted entry so a same-session re-entry into this market is
+        // Record the admitted BUY entry so a same-session re-entry into this market is
         // blocked even if a later gate or the strategy rejects this signal.
         self.entry_gate
             .record_entry(signal.leader.0, &signal.market_id);
