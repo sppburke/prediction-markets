@@ -47,6 +47,7 @@ use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletA
 use pe_paper_state::PaperStateDb;
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
+use pe_service::supabase_reader::MAINTAINED_SET_SIZE;
 use pe_service::watchlist_maintenance::{
     KnockoutReason, MaintenanceConfig, MembershipMode, apply_evictions_and_backfill,
     apply_full_rerank_swap, decide_evictions,
@@ -417,21 +418,21 @@ async fn stale_seeded_wallet_no_admission_grace() {
 async fn writer_mutex_serializes_refresh_and_replace() {
     let (_dir, db) = temp_db();
     let lock = Arc::new(Mutex::new(()));
-    let cap = cfg().cap;
-    assert_eq!(cap, 25, "this scenario assumes the maintained-25 cap");
+    let cap = MAINTAINED_SET_SIZE;
+    assert_eq!(cap, 50, "production maintained set must follow the top 50");
 
-    // Live set starts full: wallets 1..=25.
-    let initial: Vec<WatchlistEntry> = (1..=25u8)
+    // Live set starts full: wallets 1..=50.
+    let initial: Vec<WatchlistEntry> = (1..=50u8)
         .map(|n| entry(wallet(n), 100 + i32::from(n)))
         .collect();
     let live = LiveWatchlist::new(watchlist(initial));
 
-    // Concurrent refresh: re-scores wallets 1..=25 (score-update-only, never re-admits evicted).
+    // Concurrent refresh: re-scores wallets 1..=50 (score-update-only, never re-admits evicted).
     let live_r = live.clone();
     let lock_r = Arc::clone(&lock);
     let refresh = tokio::spawn(async move {
         let fresh = watchlist(
-            (1..=25u8)
+            (1..=50u8)
                 .map(|n| entry(wallet(n), 9_000 + i32::from(n)))
                 .collect(),
         );
@@ -439,18 +440,18 @@ async fn writer_mutex_serializes_refresh_and_replace() {
         live_r.apply_refresh(&fresh)
     });
 
-    // Concurrent maintenance: evict 1..=5, backfill 26..=30.
+    // Concurrent maintenance: evict 1..=5, backfill 51..=55.
     let live_m = live.clone();
     let lock_m = Arc::clone(&lock);
     let db_m = Arc::clone(&db);
     let maint = tokio::spawn(async move {
         let removed: HashSet<WalletAddress> = (1..=5u8).map(wallet).collect();
-        let candidates: Vec<WatchlistEntry> = (26..=30u8)
+        let candidates: Vec<WatchlistEntry> = (51..=55u8)
             .map(|n| entry(wallet(n), 50 + i32::from(n)))
             .collect();
         // Each backfill candidate carries its real last-trade time (#357); the admission seed
         // must use that value, not `now`. Distinct per wallet so the assertion below is exact.
-        let candidate_last_trade: HashMap<WalletAddress, i64> = (26..=30u8)
+        let candidate_last_trade: HashMap<WalletAddress, i64> = (51..=55u8)
             .map(|n| (wallet(n), NOW - 100 - i64::from(n)))
             .collect();
         apply_evictions_and_backfill(
@@ -480,7 +481,7 @@ async fn writer_mutex_serializes_refresh_and_replace() {
             "evicted wallet {n} did not survive a concurrent refresh (no lost update)"
         );
     }
-    for n in 26..=30u8 {
+    for n in 51..=55u8 {
         assert!(
             present.contains(&wallet(n)),
             "backfilled wallet {n} was not clobbered by a concurrent refresh"
@@ -491,7 +492,7 @@ async fn writer_mutex_serializes_refresh_and_replace() {
             "backfilled wallet {n} cursor seeded from its real last trade (#357), not `now`"
         );
     }
-    println!("PASS: writer-mutex-safety");
+    println!("PASS: writer-mutex-safety (production cap=50)");
 }
 
 // ── full-rerank-swap-wholesale (2026-07-03 run28 cutover) ───────────────────────

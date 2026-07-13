@@ -180,7 +180,7 @@ pub struct ServiceConfig {
 
     /// Watchlist MEMBERSHIP owner between ranking batches (2026-07-03 run28 cutover):
     /// `knockout` (legacy default — membership changes only via knockout + backfill) or
-    /// `full_rerank` (the newest ranking batch's top-25 replaces the live set each batch
+    /// `full_rerank` (the newest ranking batch's top-50 replaces the live set each batch
     /// transition). Boot-frozen: the maintenance loop is built once at startup, so a mode
     /// change needs a restart — deliberately NOT in `service_config` (that table carries
     /// runtime-mutable knobs only). Parsed fail-fast by `MembershipMode::parse` in

@@ -34,12 +34,12 @@ pub const SUPABASE_FETCH_LIMIT: usize = MAINTAINED_SET_SIZE;
 
 /// Fixed size of the maintained live working set (issue #350 WS1; replaces `SUPABASE_LIVE_CAP`
 /// = 200). The live set is held at this width: the periodic refresh is score-update-only (no
-/// add/evict — see [`crate::live_watchlist::LiveWatchlist::apply_refresh`]), and the
-/// maintenance tick (#350 WS1 PR-D) evicts inactive/underperforming wallets and backfills
-/// freed slots from the Supabase bench up to this cap. The bench (`latest_ranking`) still
-/// holds the ranker's deeper top-200 push; only the live set is capped here.
+/// add/evict — see [`crate::live_watchlist::LiveWatchlist::apply_refresh`]), while membership
+/// changes either through maintenance knockout/backfill or a wholesale full-rerank swap. The
+/// bench (`latest_ranking`) still holds the ranker's deeper top-200 push; only the live set is
+/// capped here.
 /// See `docs/_GLOSSARY.md`: `MAINTAINED_SET_SIZE`.
-pub const MAINTAINED_SET_SIZE: usize = 25;
+pub const MAINTAINED_SET_SIZE: usize = 50;
 
 /// Candidate freshness window in hours (#357): a benched wallet is an eligible backfill
 /// candidate only if its real last trade (`last_trade_unix`) is within this window. Mirrors
