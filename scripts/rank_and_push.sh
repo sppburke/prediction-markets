@@ -30,8 +30,12 @@
 #   Verify           latest_ranking is now populated.
 #   Stage 4  purge   pe-bootstrap purge (#385)  delete proven-loser & dead-weight wallets from
 #                    the local cache (DELETE is a no-op unless purge_enabled=true; always reports).
-#                    Final + non-fatal (the push already published); --skip-purge to bypass,
+#                    Non-fatal (the push already published); --skip-purge to bypass,
 #                    auto-skipped under --skip-backfill / --skip-rank (needs a fresh backfill+verdict).
+#   Stage 5  checkpoint  PRAGMA wal_checkpoint(TRUNCATE)  checkpoint committed WAL pages into the
+#                        cache and truncate the WAL so completed runs release their disk footprint.
+#                        Always attempted last (including re-push / skipped-purge runs) and non-fatal:
+#                        a concurrent SQLite connection may temporarily prevent truncation.
 #
 # Production defaults are baked in (override via flags): --universe-from-trades,
 # HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 48h, MinTRL 20 (the run28
@@ -67,7 +71,7 @@
 #   --engine E            ranker engine: auto (default) | duck | sqlite. auto uses the DuckDB
 #                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
 #   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
-#   --skip-purge          skip the final Stage-4 cache purge (#385).
+#   --skip-purge          skip the Stage-4 cache purge (#385); the final WAL checkpoint still runs.
 #   --keep-intermediates  retain qualifying_positions_72hr.csv (the >5 GB pass-1 intermediate) instead
 #                         of auto-pruning it after pass-2; useful for debugging the raw position set.
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
@@ -402,20 +406,20 @@ n=cr.split("/")[-1]
 print(f"latest_ranking rows: {n}")
 raise SystemExit(0 if n.isdigit() and int(n)>0 else 1)
 PY
-echo "✓ rank_and_push complete — Supabase populated. pe-service picks it up within one refresh interval."
+echo "✓ Supabase populated. pe-service picks it up within one refresh interval."
 
-# ── Stage 4/4 (final): purge proven-loser & dead-weight wallets from the local cache (issue #385) ──
+# ── Stage 4/5: purge proven-loser & dead-weight wallets from the local cache (issue #385) ──
 # Opt-in: the DELETE is a no-op unless purge_enabled=true in .env; the stage still emits a would-purge
 # report every run. Runs AFTER the push/verify so a purge failure can never block the (already-complete)
 # Supabase publish — hence non-fatal here. Skipped when --skip-purge, or when this run did not produce a
 # fresh backfill + verdict CSV (--skip-backfill / --skip-rank): purge relies on a fresh backfill (it
 # refuses an armed run on a stale cache) and the current run's RANKED_CSV verdict.
 if [[ "$SKIP_PURGE" == "1" ]]; then
-  echo "── Stage 4/4: purge skipped (--skip-purge) ───────────────────────────────────"
+  echo "── Stage 4/5: purge skipped (--skip-purge) ───────────────────────────────────"
 elif [[ "$SKIP_BACKFILL" == "1" || "$SKIP_RANK" == "1" ]]; then
-  echo "── Stage 4/4: purge skipped (needs a fresh backfill + verdict this run) ───────"
+  echo "── Stage 4/5: purge skipped (needs a fresh backfill + verdict this run) ───────"
 else
-  echo "── Stage 4/4: purge proven-loser & dead-weight wallets (issue #385) ───────────"
+  echo "── Stage 4/5: purge proven-loser & dead-weight wallets (issue #385) ───────────"
   prc=0
   PE_BOOTSTRAP_CACHE_PATH="$DB" PE_BOOTSTRAP_PURGE_DECISION_CSV="$RANKED_CSV" \
     "$PE_BOOTSTRAP_BIN" purge "${BOOTSTRAP_CONFIG_ARGS[@]}" || prc=$?
@@ -424,3 +428,55 @@ else
     *) echo "   [purge] WARN exit $prc — purge stage failed; Supabase publish already complete, continuing" >&2 ;;
   esac
 fi
+
+# ── Stage 5/5 (final): checkpoint + truncate the SQLite WAL ─────────────────────────────────
+# Bulk purge/VACUUM and the earlier refresh stages can leave a large committed WAL after their
+# writer processes exit. Run TRUNCATE only after every DB-mutating stage has finished and while
+# this wrapper still owns the single-run PID lock. SQLite coordinates the checkpoint with any
+# other connections; a busy/error result is a WARN, never a reason to fail the already-complete
+# Supabase publish. URI mode=rw plus the file check prevents a wrong path from creating an empty DB.
+echo "── Stage 5/5: checkpoint + truncate SQLite WAL ──────────────────────────────"
+crc=0
+python3 - "$DB" <<'PY' || crc=$?
+import sqlite3
+import sys
+from pathlib import Path
+
+db_path = Path(sys.argv[1])
+if not db_path.is_file():
+    print(f"checkpoint error: database is not a file: {db_path}", file=sys.stderr)
+    raise SystemExit(1)
+
+wal_path = Path(f"{db_path}-wal")
+before = wal_path.stat().st_size if wal_path.is_file() else 0
+
+try:
+    uri = db_path.resolve().as_uri() + "?mode=rw"
+    with sqlite3.connect(uri, uri=True) as connection:
+        result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+except sqlite3.Error as error:
+    print(f"checkpoint error: {error}", file=sys.stderr)
+    raise SystemExit(1) from error
+
+if result is None or len(result) != 3:
+    print(f"checkpoint error: unexpected SQLite result: {result!r}", file=sys.stderr)
+    raise SystemExit(1)
+
+busy, wal_pages, checkpointed_pages = result
+after = wal_path.stat().st_size if wal_path.is_file() else 0
+reclaimed = max(0, before - after)
+print(
+    "checkpoint result: "
+    f"busy={busy} wal_pages={wal_pages} checkpointed_pages={checkpointed_pages}"
+)
+print(f"checkpoint WAL bytes: before={before} after={after} reclaimed={reclaimed}")
+
+if busy != 0:
+    print("checkpoint error: SQLite reported a busy connection; WAL was not fully truncated", file=sys.stderr)
+    raise SystemExit(1)
+PY
+case "$crc" in
+  0) echo "   [checkpoint] ok" ;;
+  *) echo "   [checkpoint] WARN exit $crc — WAL checkpoint/truncate did not complete; retry next run" >&2 ;;
+esac
+echo "✓ rank_and_push complete — Supabase published; final cache maintenance attempted."
