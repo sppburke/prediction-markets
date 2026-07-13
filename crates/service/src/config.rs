@@ -119,9 +119,9 @@ pub struct ServiceConfig {
     pub fill_mode: String,
 
     /// Fallback BUY haircut (bps) applied to the leader price when a paper `clob_best_ask` fill
-    /// has no usable best-ask (SELL entry, empty / errored / timed-out book, missing CLOB token,
-    /// or a degenerate ask). Default: 100 (1%) — the haircut demoted from primary to fallback
-    /// (#486). See `docs/_GLOSSARY.md`: `clob_best_ask_fallback_haircut_bps`.
+    /// has no usable best-ask (empty / errored / timed-out book, missing CLOB token, or a
+    /// degenerate ask). Default: 100 (1%) — the haircut demoted from primary to fallback (#486).
+    /// See `docs/_GLOSSARY.md`: `clob_best_ask_fallback_haircut_bps`.
     #[serde(default = "default_clob_best_ask_fallback_haircut_bps")]
     pub clob_best_ask_fallback_haircut_bps: u32,
 

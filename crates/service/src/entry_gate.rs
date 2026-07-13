@@ -1,11 +1,11 @@
-//! Pure copy-entry gate: copy only a leader's *first-ever entry* into a market
+//! Pure copy-entry gate: copy only a leader's *first-ever BUY entry* into a market
 //! (issues #290, #339).
 //!
-//! The original band-cohort also constrained the leader's entry price to `[0.40, 0.80]`;
-//! that band was removed in #339 — the latency-shifted ranker applies no band, and live
-//! sizing is re-based on the current market price instead (see `evaluate_at_price`).
-//! [`CopyEntryGate`] now enforces only the first-entry criterion (the resolution horizon
-//! and hold-to-resolution behaviour are enforced elsewhere — see
+//! The original leader-price band was removed in #339. The current fill-price band is
+//! enforced later in the orchestrator, and live sizing uses that fill basis (see
+//! `evaluate_at_price`).
+//! [`CopyEntryGate`] now enforces the BUY-only first-entry criterion (the resolution
+//! horizon and hold-to-resolution behaviour are enforced elsewhere — see
 //! `docs/19-WINNER-FOLLOW-STRATEGY.md`). It is pure and synchronous so it can be
 //! unit-tested in isolation; the per-wallet market history it consults is populated at
 //! startup by [`crate::wallet_history`].
@@ -14,13 +14,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use pe_copy_signal_engine::LeaderSignal;
-use pe_core_types::{LeaderAction, MarketId, WalletAddress};
+use pe_core_types::{LeaderAction, MarketId, Side, WalletAddress};
 
 /// Typed reason a [`LeaderSignal`] was rejected by [`CopyEntryGate::admit`].
 ///
 /// `Display` renders a short human-readable reason for structured logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateReject {
+    /// Current production Winner-Follow copies BUY entries only.
+    NotBuy,
     /// Action is not a first-position entry (`Add`/`Trim`/`Exit`/`Flip`/`Unknown`).
     NotAnEntry,
     /// The leader has already entered this market before (a re-entry, not a first entry).
@@ -32,6 +34,7 @@ pub enum GateReject {
 impl fmt::Display for GateReject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
+            Self::NotBuy => "copy scope is BUY-only",
             Self::NotAnEntry => "not a first-position entry",
             Self::NotFirstEntry => "leader already entered this market",
             Self::WalletHistoryMissing => "leader market history missing (fail-closed)",
@@ -50,14 +53,15 @@ pub struct CopyEntryGateConfig {
     pub fail_closed: bool,
 }
 
-/// Pure, synchronous gate enforcing the band-cohort copy-scope criteria.
+/// Pure, synchronous gate enforcing the BUY-only first-entry copy-scope criteria.
 ///
 /// Built once at startup from a per-wallet history map; mutated in-session via
 /// [`Self::record_entry`] so same-session re-entries are also blocked.
 pub struct CopyEntryGate {
     config: CopyEntryGateConfig,
-    /// For each leader wallet, the set of markets it has already entered. A wallet
-    /// absent from the map has unknown history (governed by `fail_closed`).
+    /// For each leader wallet, the conservative set of markets with prior trade
+    /// activity. A wallet absent from the map has unknown history (governed by
+    /// `fail_closed`).
     history: HashMap<WalletAddress, HashSet<MarketId>>,
 }
 
@@ -78,14 +82,18 @@ impl CopyEntryGate {
 
     /// Returns `None` to admit the signal, or `Some(reason)` to reject it.
     ///
-    /// Checks, in order: the action is an `Entry` → first-entry (the leader has not
-    /// entered this market before). A wallet absent from the history map is admitted
-    /// when `fail_closed` is false (treat as new) and rejected otherwise.
+    /// Checks, in order: the side is [`Side::Buy`] → the action is an `Entry` →
+    /// first-entry (the leader has not entered this market before). A wallet absent from
+    /// the history map is admitted when `fail_closed` is false (treat as new) and rejected
+    /// otherwise.
     ///
     /// The wallet is resolved as `signal.leader.0` (`LeaderSignal.leader` is a
     /// `TraderId(WalletAddress)`), equal to the `trade.wallet` used elsewhere in
     /// the copy path.
     pub fn admit(&self, signal: &LeaderSignal) -> Option<GateReject> {
+        if signal.leader_side != Side::Buy {
+            return Some(GateReject::NotBuy);
+        }
         if signal.action != LeaderAction::Entry {
             return Some(GateReject::NotAnEntry);
         }
@@ -105,7 +113,7 @@ impl CopyEntryGate {
         None
     }
 
-    /// Record an observed entry so a same-session re-entry into `market` is blocked.
+    /// Record an admitted BUY entry so a same-session re-entry into `market` is blocked.
     ///
     /// Called for every admitted `Entry` — including on no-fill and even when a
     /// later gate or the strategy rejects the signal — so duplicate entries within
@@ -185,6 +193,16 @@ mod tests {
         ] {
             let s = signal(action, market("0xnew"), Price(dec!(0.60)));
             assert_eq!(gate.admit(&s), Some(GateReject::NotAnEntry), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_sell_before_history_posture() {
+        for fail_closed in [false, true] {
+            let gate = CopyEntryGate::new(CopyEntryGateConfig { fail_closed }, HashMap::new());
+            let mut s = signal(LeaderAction::Entry, market("0xnew"), Price(dec!(0.60)));
+            s.leader_side = Side::Sell;
+            assert_eq!(gate.admit(&s), Some(GateReject::NotBuy));
         }
     }
 
