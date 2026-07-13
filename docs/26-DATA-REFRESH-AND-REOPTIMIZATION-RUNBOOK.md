@@ -229,8 +229,10 @@ effect is to truncate the separate `wallet_cache.db-wal` file.
 `pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
 `knockout` (legacy — the maintenance tick's eviction/backfill is the sole membership
-path) or `full_rerank` (each batch transition wholesale-replaces the live top-25 —
-the cutover production mode).
+path) or `full_rerank` (each batch transition wholesale-replaces the live top-50 —
+the cutover production mode). Run28 fixed `k=25` and did not sweep watchlist width;
+top-50 is an operator-directed paper experiment adopted 2026-07-13, not a run28-backed
+N choice.
 
 ---
 

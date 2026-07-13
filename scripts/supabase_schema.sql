@@ -2,7 +2,7 @@
 -- LOCAL ranker writes append-only batches (heavy compute, has the 359 GB wallet DB);
 -- VPS reads the latest batch (light) and runs the absolute-loss demotion test.
 -- `batch_id` is the EPOCH — append-only history future-proofs the "is a wholesale
--- top-25 swap at frequency X worthwhile" replay (project_copytrade_knockout_policy).
+-- top-N swap at frequency X worthwhile" replay (project_copytrade_knockout_policy).
 -- Idempotent: safe to re-run.
 
 create table if not exists ranking_batches (
@@ -21,7 +21,7 @@ create table if not exists ranking_batches (
 
 create table if not exists ranking_entries (
   batch_id    bigint  not null references ranking_batches(batch_id) on delete cascade,
-  rank        integer not null,               -- 1..N (top-200 bench; top-25 = live)
+  rank        integer not null,               -- 1..N (top-200 bench; top-50 = live)
   wallet_hex  text    not null,
   ls_edge     numeric,                         -- latency-shifted mean net return
   ls_tstat    numeric,                         -- latency-shifted net t-stat
