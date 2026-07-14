@@ -47,7 +47,9 @@ use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletA
 use pe_paper_state::PaperStateDb;
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::supabase_reader::MAINTAINED_SET_SIZE;
+use pe_service::runtime_config::{
+    AppliedWatchlistCapacity, DEFAULT_ACTIVE_WATCHLIST_SIZE, WatchlistCapacityEpoch,
+};
 use pe_service::watchlist_maintenance::{
     KnockoutReason, MaintenanceConfig, MembershipMode, apply_evictions_and_backfill,
     apply_full_rerank_swap, decide_evictions,
@@ -58,6 +60,12 @@ use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
+
+fn capacity(target: usize) -> (AppliedWatchlistCapacity, WatchlistCapacityEpoch) {
+    let applied = AppliedWatchlistCapacity::new(target);
+    let epoch = applied.load();
+    (applied, epoch)
+}
 
 const NOW: i64 = 1_900_000_000;
 const H72: i64 = 259_200;
@@ -72,7 +80,6 @@ fn cfg() -> MaintenanceConfig {
         demotion_cb_alpha: dec!(0.10),
         demotion_pnl_window_secs: 2_592_000, // 30 d
         bench_overfetch: 10,
-        cap: 25,
         membership_mode: MembershipMode::default(),
     }
 }
@@ -331,17 +338,19 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
     let candidates = vec![entry(fresh, 150)];
     let mut candidate_last_trade = HashMap::new();
     candidate_last_trade.insert(fresh, fresh_last_trade);
+    let (applied, epoch) = capacity(25);
     let size = apply_evictions_and_backfill(
         &live,
         &db,
         &lock,
+        &applied,
+        epoch,
         &HashSet::new(),
         &candidates,
         &candidate_last_trade,
-        cfg().cap,
-        NOW,
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(size, 2, "backfilled into the live set");
 
     // Cursor seeded from the REAL last trade, not `now` (#357 reverses the admission clock).
@@ -382,17 +391,19 @@ async fn stale_seeded_wallet_no_admission_grace() {
     let candidates = vec![entry(stale, 150)];
     let mut candidate_last_trade = HashMap::new();
     candidate_last_trade.insert(stale, stale_last_trade);
+    let (applied, epoch) = capacity(25);
     apply_evictions_and_backfill(
         &live,
         &db,
         &lock,
+        &applied,
+        epoch,
         &HashSet::new(),
         &candidates,
         &candidate_last_trade,
-        cfg().cap,
-        NOW,
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(
         db.cursor(&stale).unwrap(),
         Some(stale_last_trade),
@@ -418,21 +429,22 @@ async fn stale_seeded_wallet_no_admission_grace() {
 async fn writer_mutex_serializes_refresh_and_replace() {
     let (_dir, db) = temp_db();
     let lock = Arc::new(Mutex::new(()));
-    let cap = MAINTAINED_SET_SIZE;
-    assert_eq!(cap, 50, "production maintained set must follow the top 50");
+    let cap = DEFAULT_ACTIVE_WATCHLIST_SIZE;
+    let (applied, epoch) = capacity(cap);
+    assert_eq!(cap, 100, "production default must follow the top 100");
 
-    // Live set starts full: wallets 1..=50.
-    let initial: Vec<WatchlistEntry> = (1..=50u8)
+    // Live set starts full: wallets 1..=100.
+    let initial: Vec<WatchlistEntry> = (1..=100u8)
         .map(|n| entry(wallet(n), 100 + i32::from(n)))
         .collect();
     let live = LiveWatchlist::new(watchlist(initial));
 
-    // Concurrent refresh: re-scores wallets 1..=50 (score-update-only, never re-admits evicted).
+    // Concurrent refresh: re-scores wallets 1..=100 (score-update-only, never re-admits evicted).
     let live_r = live.clone();
     let lock_r = Arc::clone(&lock);
     let refresh = tokio::spawn(async move {
         let fresh = watchlist(
-            (1..=50u8)
+            (1..=100u8)
                 .map(|n| entry(wallet(n), 9_000 + i32::from(n)))
                 .collect(),
         );
@@ -440,31 +452,33 @@ async fn writer_mutex_serializes_refresh_and_replace() {
         live_r.apply_refresh(&fresh)
     });
 
-    // Concurrent maintenance: evict 1..=5, backfill 51..=55.
+    // Concurrent maintenance: evict 1..=5, backfill 101..=105.
     let live_m = live.clone();
     let lock_m = Arc::clone(&lock);
     let db_m = Arc::clone(&db);
+    let applied_m = applied.clone();
     let maint = tokio::spawn(async move {
         let removed: HashSet<WalletAddress> = (1..=5u8).map(wallet).collect();
-        let candidates: Vec<WatchlistEntry> = (51..=55u8)
+        let candidates: Vec<WatchlistEntry> = (101..=105u8)
             .map(|n| entry(wallet(n), 50 + i32::from(n)))
             .collect();
         // Each backfill candidate carries its real last-trade time (#357); the admission seed
         // must use that value, not `now`. Distinct per wallet so the assertion below is exact.
-        let candidate_last_trade: HashMap<WalletAddress, i64> = (51..=55u8)
+        let candidate_last_trade: HashMap<WalletAddress, i64> = (101..=105u8)
             .map(|n| (wallet(n), NOW - 100 - i64::from(n)))
             .collect();
         apply_evictions_and_backfill(
             &live_m,
             &db_m,
             &lock_m,
+            &applied_m,
+            epoch,
             &removed,
             &candidates,
             &candidate_last_trade,
-            cap,
-            NOW,
         )
         .await
+        .unwrap()
     });
 
     let (_r, _m) = (refresh.await.unwrap(), maint.await.unwrap());
@@ -481,7 +495,7 @@ async fn writer_mutex_serializes_refresh_and_replace() {
             "evicted wallet {n} did not survive a concurrent refresh (no lost update)"
         );
     }
-    for n in 51..=55u8 {
+    for n in 101..=105u8 {
         assert!(
             present.contains(&wallet(n)),
             "backfilled wallet {n} was not clobbered by a concurrent refresh"
@@ -492,7 +506,7 @@ async fn writer_mutex_serializes_refresh_and_replace() {
             "backfilled wallet {n} cursor seeded from its real last trade (#357), not `now`"
         );
     }
-    println!("PASS: writer-mutex-safety (production cap=50)");
+    println!("PASS: writer-mutex-safety (production default=100)");
 }
 
 // ── full-rerank-swap-wholesale (2026-07-03 run28 cutover) ───────────────────────
@@ -513,17 +527,19 @@ async fn full_rerank_swap_wholesale() {
     let d_last_trade = NOW - 5_000;
     incoming_last_trade.insert(d, d_last_trade);
     incoming_last_trade.insert(b, NOW - 9_000);
+    let (applied, epoch) = capacity(25);
 
     let (total, dropped) = apply_full_rerank_swap(
         &live,
         &db,
         &lock,
+        &applied,
+        epoch,
         &incoming,
         &incoming_last_trade,
-        cfg().cap,
-        NOW,
     )
-    .await;
+    .await
+    .unwrap();
 
     let members: HashSet<WalletAddress> =
         live.snapshot().entries.iter().map(|e| e.wallet).collect();
@@ -567,9 +583,12 @@ async fn full_rerank_swap_identity_noop() {
     let lock = Mutex::new(());
     let incoming = vec![entry(a, 310), entry(b, 210)];
     let side: HashMap<WalletAddress, i64> = HashMap::new();
+    let (applied, epoch) = capacity(25);
 
     let (total, dropped) =
-        apply_full_rerank_swap(&live, &db, &lock, &incoming, &side, 25, NOW).await;
+        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &incoming, &side)
+            .await
+            .unwrap();
 
     assert_eq!(total, 2);
     assert!(dropped.is_empty(), "identity swap must drop nobody");
@@ -579,4 +598,143 @@ async fn full_rerank_swap_identity_noop() {
     // Mode default sanity rides along: the legacy mode remains the compiled default.
     assert_eq!(MembershipMode::default(), MembershipMode::Knockout);
     println!("PASS: full-rerank-swap-identity-noop");
+}
+
+// ── runtime-capacity-grow-shrink ────────────────────────────────────────
+/// PASS: one process can atomically grow 50→100 and shrink 100→75; every newly admitted
+///       wallet receives its ranking-provided inactivity cursor before the call returns.
+/// FAIL: a restart is required, membership is not exactly the requested top-N, or a hot-grown
+///       cursor is missing/seeded to `now`.
+#[tokio::test]
+async fn runtime_capacity_grows_and_shrinks_without_restart() {
+    let initial: Vec<WatchlistEntry> = (1..=50u8)
+        .map(|n| entry(wallet(n), 1_000 - i32::from(n)))
+        .collect();
+    let live = LiveWatchlist::new(watchlist(initial));
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    let top_100: Vec<WatchlistEntry> = (1..=100u8)
+        .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
+        .collect();
+    let side: HashMap<WalletAddress, i64> = (1..=100u8)
+        .map(|n| (wallet(n), NOW - i64::from(n)))
+        .collect();
+    let (grow_capacity, grow_epoch) = capacity(100);
+    let (grown, dropped) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &grow_capacity,
+        grow_epoch,
+        &top_100,
+        &side,
+    )
+    .await
+    .unwrap();
+    assert_eq!(grown, 100);
+    assert!(dropped.is_empty());
+    for n in 51..=100u8 {
+        assert_eq!(db.cursor(&wallet(n)).unwrap(), Some(NOW - i64::from(n)));
+    }
+
+    let top_75: Vec<WatchlistEntry> = top_100.into_iter().take(75).collect();
+    let (shrink_capacity, shrink_epoch) = capacity(75);
+    let (shrunk, dropped) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &shrink_capacity,
+        shrink_epoch,
+        &top_75,
+        &side,
+    )
+    .await
+    .unwrap();
+    assert_eq!(shrunk, 75);
+    assert_eq!(dropped.len(), 25);
+    let members: HashSet<WalletAddress> = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|item| item.wallet)
+        .collect();
+    assert_eq!(members, (1..=75u8).map(wallet).collect());
+    println!("PASS: runtime-capacity hot grow 50->100 and shrink 100->75");
+}
+
+// ── stale-capacity-plan-rejected ──────────────────────────────────────
+/// PASS: a maintenance plan captured at 50 cannot truncate a newer 100-wallet generation, and
+///       an ABA target match with a different generation is still rejected.
+#[tokio::test]
+async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
+    let live = LiveWatchlist::new(watchlist(
+        (1..=100u8)
+            .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
+            .collect(),
+    ));
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+    let applied = AppliedWatchlistCapacity::new(50);
+    let stale_50 = applied.load();
+    applied.store(WatchlistCapacityEpoch {
+        generation: 1,
+        target: 100,
+    });
+    let top_50: Vec<WatchlistEntry> = (1..=50u8)
+        .map(|n| entry(wallet(n), 3_000 - i32::from(n)))
+        .collect();
+    let side: HashMap<WalletAddress, i64> = HashMap::new();
+    let error = apply_full_rerank_swap(&live, &db, &lock, &applied, stale_50, &top_50, &side)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("stale watchlist capacity plan"));
+    assert_eq!(live.snapshot().entries.len(), 100);
+
+    // ABA: target returns to 50, but generation 2 must still reject generation 0's stale plan.
+    applied.store(WatchlistCapacityEpoch {
+        generation: 2,
+        target: 50,
+    });
+    let error = apply_full_rerank_swap(&live, &db, &lock, &applied, stale_50, &top_50, &side)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("stale watchlist capacity plan"));
+    assert_eq!(live.snapshot().entries.len(), 100);
+    println!("PASS: stale capacity epochs cannot undo newer membership (including ABA)");
+}
+
+// ── cursor-prerequisite-fail-closed ───────────────────────────────────
+/// PASS: a missing last-trade cursor rejects an admission before ArcSwap publication.
+#[tokio::test]
+async fn missing_admission_cursor_leaves_membership_unchanged() {
+    let original = wallet(1);
+    let newcomer = wallet(2);
+    let live = LiveWatchlist::new(watchlist(vec![entry(original, 100)]));
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+    let (applied, epoch) = capacity(1);
+    let incoming = vec![entry(newcomer, 200)];
+
+    let error = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &applied,
+        epoch,
+        &incoming,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("missing last_trade_unix"));
+    let members: HashSet<WalletAddress> = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect();
+    assert_eq!(members, HashSet::from([original]));
+    assert_eq!(db.cursor(&newcomer).unwrap(), None);
+    println!("PASS: cursor prerequisite fails closed before membership publication");
 }

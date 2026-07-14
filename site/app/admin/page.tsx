@@ -45,8 +45,8 @@ export default async function AdminPage() {
   return (
     <Panel title="Admin — service config">
       <p className="mb-3 text-sm text-muted">
-        Supabase-authoritative runtime knobs. Edits apply to the live trader within ≤60 s (no
-        restart) and are audit-logged. Signed in as{" "}
+        Supabase-authoritative runtime knobs. The live trader polls edits within ≤30 s (no
+        restart) and applies them after validation. Signed in as{" "}
         <span className="text-text">{session?.user?.email}</span>.
       </p>
       <AdminConfigTable rows={rows} />

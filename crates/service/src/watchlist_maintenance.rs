@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use pe_core_types::WalletAddress;
 use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{PaperStateDb, PaperStateError};
 use pe_trader_index::{Watchlist, WatchlistEntry};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -55,6 +55,7 @@ use tracing::{info, warn};
 
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
+use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use crate::supabase_reader;
 
 /// Who owns watchlist MEMBERSHIP between ranking batches. See the module docs; canonical
@@ -83,7 +84,8 @@ impl MembershipMode {
 }
 
 /// Tuning for the maintenance tick. Every field is sourced from [`crate::config::ServiceConfig`]
-/// (defaults registered in `docs/_GLOSSARY.md`); `cap` is `supabase_reader::MAINTAINED_SET_SIZE`.
+/// (defaults registered in `docs/_GLOSSARY.md`). The working-set cap is read from the last
+/// successfully [`AppliedWatchlistCapacity`] epoch at the start of every tick.
 #[derive(Debug, Clone)]
 pub struct MaintenanceConfig {
     /// Seconds between ticks. `0` disables the loop entirely (handled by the caller).
@@ -101,10 +103,42 @@ pub struct MaintenanceConfig {
     pub demotion_pnl_window_secs: u64,
     /// Extra bench candidates fetched beyond the freed-slot count.
     pub bench_overfetch: usize,
-    /// Working-set size cap (the maintained-N).
-    pub cap: usize,
     /// Who owns membership between ranking batches (module docs; run28 cutover).
     pub membership_mode: MembershipMode,
+}
+
+/// Fail-closed structural membership errors. Every variant leaves the in-memory generation
+/// unchanged; cursor batches are transactional, so a cursor failure is unchanged too.
+#[derive(Debug, thiserror::Error)]
+pub enum MembershipApplyError {
+    /// Network work was planned against an applied epoch that has since been superseded.
+    #[error(
+        "stale watchlist capacity plan: expected generation {expected_generation} target {expected_target}, applied generation {applied_generation} target {applied_target}"
+    )]
+    StaleCapacity {
+        expected_generation: u64,
+        expected_target: usize,
+        applied_generation: u64,
+        applied_target: usize,
+    },
+    /// A freshness-filtered/ranked admission unexpectedly lacked its real last-trade cursor.
+    #[error("missing last_trade_unix for newly admitted wallet {wallet}")]
+    MissingCursor { wallet: WalletAddress },
+    /// SQLite rejected the all-or-nothing cursor batch.
+    #[error("persist admission cursors: {0}")]
+    Cursor(#[from] PaperStateError),
+}
+
+fn stale_capacity_error(
+    expected: WatchlistCapacityEpoch,
+    applied: WatchlistCapacityEpoch,
+) -> MembershipApplyError {
+    MembershipApplyError::StaleCapacity {
+        expected_generation: expected.generation,
+        expected_target: expected.target,
+        applied_generation: applied.generation,
+        applied_target: applied.target,
+    }
 }
 
 /// Why a live wallet was knocked out (drives the `wallet_lifecycle_events.reason` audit text).
@@ -222,87 +256,135 @@ pub fn decide_evictions(
         .collect()
 }
 
-/// Apply the decided evictions and backfill freed slots, atomically, under the writer lock.
+fn planned_admissions(
+    current: &[WatchlistEntry],
+    removed: &HashSet<WalletAddress>,
+    candidates: &[WatchlistEntry],
+    cap: usize,
+) -> Vec<WalletAddress> {
+    let mut present: HashSet<WalletAddress> = current
+        .iter()
+        .filter(|entry| !removed.contains(&entry.wallet))
+        .map(|entry| entry.wallet)
+        .collect();
+    let mut size = present.len().min(cap);
+    let mut admitted = Vec::new();
+    for candidate in candidates {
+        if size >= cap {
+            break;
+        }
+        if removed.contains(&candidate.wallet) || !present.insert(candidate.wallet) {
+            continue;
+        }
+        admitted.push(candidate.wallet);
+        size += 1;
+    }
+    admitted
+}
+
+fn admission_seeds(
+    admissions: &[WalletAddress],
+    last_trade: &HashMap<WalletAddress, i64>,
+) -> Result<Vec<(WalletAddress, i64)>, MembershipApplyError> {
+    admissions
+        .iter()
+        .map(|wallet| {
+            last_trade
+                .get(wallet)
+                .copied()
+                .map(|timestamp| (*wallet, timestamp))
+                .ok_or(MembershipApplyError::MissingCursor { wallet: *wallet })
+        })
+        .collect()
+}
+
+/// Apply the decided evictions and backfill freed slots atomically under the writer lock.
 ///
-/// Inside the single writer-locked critical section: snapshot the live set, [`LiveWatchlist::replace`]
-/// (evict `removed`, backfill `candidates`, cap to `cap`), then seed the poll cursor of each
-/// *newly admitted* wallet from its real last-trade time in `candidate_last_trade` (#357), so its
-/// inactivity clock starts at the real last trade — before the poller's next round advances it
-/// forward. The poller snapshots the live set once per round, so a wallet admitted here is invisible
-/// to the in-flight round and this seed always lands first. A candidate absent from
-/// `candidate_last_trade` (should not happen: the freshness filter requires a non-NULL
-/// `last_trade_unix`) falls back to `now_unix`. Returns the new live-set size.
+/// The exact admission set is computed from the locked generation, all real last-trade cursors
+/// are committed in one SQLite transaction, and only then is membership published. An epoch
+/// mismatch, missing timestamp, or SQLite failure leaves membership unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_evictions_and_backfill(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
     writer_lock: &Mutex<()>,
+    applied_capacity: &AppliedWatchlistCapacity,
+    expected_capacity: WatchlistCapacityEpoch,
     removed: &HashSet<WalletAddress>,
     candidates: &[WatchlistEntry],
     candidate_last_trade: &HashMap<WalletAddress, i64>,
-    cap: usize,
-    now_unix: i64,
-) -> usize {
+) -> Result<usize, MembershipApplyError> {
     let _guard = writer_lock.lock().await;
-    let before: HashSet<WalletAddress> = live.snapshot().entries.iter().map(|e| e.wallet).collect();
-    let total = live.replace(removed, candidates, cap);
-    for entry in &live.snapshot().entries {
-        if !before.contains(&entry.wallet) {
-            // Newly admitted via backfill: seed the inactivity clock from the wallet's real
-            // last-trade time (#357), not `now`. `now_unix` is only a defensive fallback —
-            // a freshness-filtered candidate always carries a `last_trade_unix`.
-            let seed = candidate_last_trade
-                .get(&entry.wallet)
-                .copied()
-                .unwrap_or(now_unix);
-            if let Err(e) = paper_state.set_cursor(&entry.wallet, seed) {
-                warn!(wallet = %entry.wallet, error = %e, "failed to seed backfill cursor");
-            }
-        }
+    let applied = applied_capacity.load();
+    if applied != expected_capacity {
+        return Err(stale_capacity_error(expected_capacity, applied));
     }
-    total
+    let current = live.snapshot();
+    let admissions = planned_admissions(
+        &current.entries,
+        removed,
+        candidates,
+        expected_capacity.target,
+    );
+    let seeds = admission_seeds(&admissions, candidate_last_trade)?;
+    paper_state.set_cursors(&seeds)?;
+    Ok(live.replace(removed, candidates, expected_capacity.target))
 }
 
-/// Wholesale membership rotation for [`MembershipMode::FullRerank`]: the newest ranking
-/// batch's top-`cap` REPLACES the live set. Returns `(new_live_total, dropped_wallets)`.
+/// Apply an exact ranked membership while the caller holds the structural-writer mutex.
 ///
-/// Set arithmetic: `removed = live \ incoming`, then [`apply_evictions_and_backfill`] with
-/// the full incoming list as candidates — survivors (live ∩ incoming) keep their existing
-/// entries (scores refresh via the score-update-only refresh loop within one interval),
-/// admitted wallets (incoming \ live) get their poll cursor seeded from the incoming
-/// side-map inside the writer-locked section (#357 — a missing seed would make the
-/// poller's first fetch unbounded). The final set is exactly the incoming membership
-/// (≤ `cap`), so `replace`'s score-sorted truncation never bites.
+/// Used by both same-cap full reranks and runtime capacity transitions. Cursor persistence is a
+/// fail-closed prerequisite to ArcSwap publication.
+pub(crate) fn apply_ranked_membership_locked(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    incoming: &[WatchlistEntry],
+    incoming_last_trade: &HashMap<WalletAddress, i64>,
+    cap: usize,
+) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
+    let current = live.snapshot();
+    let incoming_set: HashSet<WalletAddress> = incoming
+        .iter()
+        .take(cap)
+        .map(|entry| entry.wallet)
+        .collect();
+    let dropped: Vec<WalletAddress> = current
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .filter(|wallet| !incoming_set.contains(wallet))
+        .collect();
+    let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
+    let admissions = planned_admissions(&current.entries, &removed, incoming, cap);
+    let seeds = admission_seeds(&admissions, incoming_last_trade)?;
+    paper_state.set_cursors(&seeds)?;
+    let total = live.replace(&removed, incoming, cap);
+    Ok((total, dropped))
+}
+
+/// Wholesale membership rotation for [`MembershipMode::FullRerank`]. The operation is rejected
+/// if network work was planned against an applied capacity epoch that is no longer current.
 pub async fn apply_full_rerank_swap(
     live: &LiveWatchlist,
     paper_state: &PaperStateDb,
     writer_lock: &Mutex<()>,
+    applied_capacity: &AppliedWatchlistCapacity,
+    expected_capacity: WatchlistCapacityEpoch,
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
-    cap: usize,
-    now_unix: i64,
-) -> (usize, Vec<WalletAddress>) {
-    let incoming_set: HashSet<WalletAddress> = incoming.iter().map(|e| e.wallet).collect();
-    let dropped: Vec<WalletAddress> = live
-        .snapshot()
-        .entries
-        .iter()
-        .map(|e| e.wallet)
-        .filter(|w| !incoming_set.contains(w))
-        .collect();
-    let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
-    let total = apply_evictions_and_backfill(
+) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
+    let _guard = writer_lock.lock().await;
+    let applied = applied_capacity.load();
+    if applied != expected_capacity {
+        return Err(stale_capacity_error(expected_capacity, applied));
+    }
+    apply_ranked_membership_locked(
         live,
         paper_state,
-        writer_lock,
-        &removed,
         incoming,
         incoming_last_trade,
-        cap,
-        now_unix,
+        expected_capacity.target,
     )
-    .await;
-    (total, dropped)
 }
 
 /// Run the maintenance tick loop until the process exits.
@@ -320,6 +402,7 @@ pub async fn run_maintenance_loop(
     secret_key: String,
     writer_lock: Arc<Mutex<()>>,
     cfg: MaintenanceConfig,
+    applied_capacity: AppliedWatchlistCapacity,
     initial_batch_marker: Option<i64>,
 ) {
     if cfg.interval_secs == 0 {
@@ -343,6 +426,7 @@ pub async fn run_maintenance_loop(
     let mut batch_marker: Option<i64> = initial_batch_marker;
     loop {
         tokio::time::sleep(interval).await;
+        let capacity_epoch = applied_capacity.load();
         maintenance_tick(
             &live,
             &paper_state,
@@ -351,7 +435,9 @@ pub async fn run_maintenance_loop(
             &anon_key,
             &secret_key,
             &writer_lock,
+            &applied_capacity,
             &cfg,
+            capacity_epoch,
             &mut evicted,
             &mut batch_marker,
         )
@@ -401,11 +487,14 @@ async fn maintenance_tick(
     anon_key: &str,
     secret_key: &str,
     writer_lock: &Mutex<()>,
+    applied_capacity: &AppliedWatchlistCapacity,
     cfg: &MaintenanceConfig,
+    capacity_epoch: WatchlistCapacityEpoch,
     evicted: &mut HashSet<WalletAddress>,
     batch_marker: &mut Option<i64>,
 ) {
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+    let cap = capacity_epoch.target;
 
     // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
     // legacy tick ran it first; a review finding on the first draft caught the reorder).
@@ -429,20 +518,27 @@ async fn maintenance_tick(
                     // Boot alignment: startup already seeded exactly this batch's top-cap.
                     *batch_marker = latest;
                 } else if latest.is_some() && latest != *batch_marker {
-                    match supabase_reader::fetch(client, base_url, anon_key, secret_key, cfg.cap)
-                        .await
+                    match supabase_reader::fetch(client, base_url, anon_key, secret_key, cap).await
                     {
                         Ok((incoming, incoming_last_trade)) if !incoming.entries.is_empty() => {
-                            let (live_total, dropped) = apply_full_rerank_swap(
+                            let swap = apply_full_rerank_swap(
                                 live,
                                 paper_state,
                                 writer_lock,
+                                applied_capacity,
+                                capacity_epoch,
                                 &incoming.entries,
                                 &incoming_last_trade,
-                                cfg.cap,
-                                now_unix,
                             )
                             .await;
+                            let (live_total, dropped) = match swap {
+                                Ok(applied) => applied,
+                                Err(error) => {
+                                    warn!(%error,
+                                        "full_rerank: structural apply failed; keeping membership and batch marker for retry");
+                                    return;
+                                }
+                            };
                             let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
                             for w in &dropped {
                                 let s = audit_stats.as_ref().and_then(|m| m.get(&w.to_string()));
@@ -508,23 +604,25 @@ async fn maintenance_tick(
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.
     let evictions = decide_evictions(&live_snapshot, &stats, &cursors, cfg, now_unix);
-    if evictions.is_empty() && live_wallets.len() >= cfg.cap {
+    if evictions.is_empty() && live_wallets.len() >= cap {
         return;
     }
 
-    // 5. Record this tick's evictions in the cross-tick evicted-set.
+    // 5. Stage this tick's evictions. Commit the cross-tick memory only after the structural
+    // write succeeds; a stale capacity epoch must leave both membership and policy memory intact.
+    let mut next_evicted = evicted.clone();
     for ev in &evictions {
-        evicted.insert(ev.wallet);
+        next_evicted.insert(ev.wallet);
     }
 
     // 6. Fetch bench candidates for freed slots, excluding (live ∪ evicted), then atomic replace.
     let survivors = live_wallets.len().saturating_sub(evictions.len());
-    let freed = cfg.cap.saturating_sub(survivors);
+    let freed = cap.saturating_sub(survivors);
     let (candidates, candidate_last_trade) = if freed > 0 {
         let exclude: Vec<WalletAddress> = live_wallets
             .iter()
             .copied()
-            .chain(evicted.iter().copied())
+            .chain(next_evicted.iter().copied())
             .collect();
         match supabase_reader::fetch_candidates(
             client,
@@ -557,18 +655,27 @@ async fn maintenance_tick(
         (Vec::new(), HashMap::new())
     };
 
-    let removed: HashSet<WalletAddress> = evicted.iter().copied().collect();
-    let live_total = apply_evictions_and_backfill(
+    let removed: HashSet<WalletAddress> = next_evicted.iter().copied().collect();
+    let live_total = match apply_evictions_and_backfill(
         live,
         paper_state,
         writer_lock,
+        applied_capacity,
+        capacity_epoch,
         &removed,
         &candidates,
         &candidate_last_trade,
-        cfg.cap,
-        now_unix,
     )
-    .await;
+    .await
+    {
+        Ok(total) => total,
+        Err(error) => {
+            warn!(%error,
+                "maintenance: structural apply failed; keeping membership and eviction memory");
+            return;
+        }
+    };
+    *evicted = next_evicted;
 
     // 7. Best-effort lifecycle audit rows for each eviction this tick.
     for ev in &evictions {
@@ -610,7 +717,6 @@ mod tests {
             demotion_cb_alpha: dec!(0.10),
             demotion_pnl_window_secs: 2_592_000, // 30 d
             bench_overfetch: 10,
-            cap: 25,
             membership_mode: MembershipMode::default(),
         }
     }

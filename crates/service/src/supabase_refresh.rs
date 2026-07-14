@@ -7,8 +7,8 @@
 //! set degrades to "stale", never "empty").
 //!
 //! After each refresh the loop best-effort publishes the live-set size to Supabase's
-//! `service_runtime` row (the count lives only in service memory; the site cannot derive it
-//! from `latest_ranking` because it does not know `SUPABASE_FETCH_LIMIT`). A publish failure
+//! `service_runtime` row (the count lives only in service memory; the site cannot derive actual
+//! membership from the configured cap or the deeper `latest_ranking` bench). A publish failure
 //! never affects the refresh — the analytics write is strictly downstream of copy decisions.
 
 use std::future::Future;
@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::live_watchlist::LiveWatchlist;
+use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
 
 /// Publishes the live watchlist size to Supabase so the site can show "N watched".
@@ -100,8 +101,9 @@ pub async fn refresh_and_publish(
 /// Refresh `live` from Supabase every `interval_secs` (score-update-only — see
 /// [`LiveWatchlist::apply_refresh`]) and publish the live-set size after each refresh.
 ///
-/// `fetch_limit` bounds the `latest_ranking` query (`?limit=`). The refresh never changes
-/// membership (issue #350 WS1): the maintenance tick is the sole evictor/backfiller.
+/// The current runtime `active_watchlist_size` bounds each `latest_ranking` query (`?limit=`).
+/// The refresh never changes membership (issue #350 WS1): maintenance, full-rerank transitions,
+/// and explicit runtime capacity changes own structural swaps.
 /// Publishing needs the service-role secret; when it is absent the loop still refreshes but
 /// skips the publish.
 #[allow(clippy::too_many_arguments)]
@@ -111,7 +113,7 @@ pub async fn run_supabase_refresh_loop(
     base_url: String,
     anon_key: String,
     secret_key: String,
-    fetch_limit: usize,
+    applied_capacity: AppliedWatchlistCapacity,
     interval_secs: u64,
     writer_lock: Arc<Mutex<()>>,
 ) {
@@ -125,6 +127,7 @@ pub async fn run_supabase_refresh_loop(
     let interval = Duration::from_secs(interval_secs);
     loop {
         tokio::time::sleep(interval).await;
+        let fetch_limit = applied_capacity.load().target;
         match supabase_reader::fetch(&client, &base_url, &anon_key, &secret_key, fetch_limit).await
         {
             // Score-update-only refresh: the last-trade side-map (#357) is unused here (the
@@ -133,14 +136,20 @@ pub async fn run_supabase_refresh_loop(
                 let fetched = fresh.entries.len();
                 // Serialize the ArcSwap write against the maintenance tick's `replace`
                 // (#350 WS1 PR-D); readers stay lock-free.
-                let _writer = writer_lock.lock().await;
-                let live_total = match &publisher {
-                    Some(p) => refresh_and_publish(&live, &fresh, p).await,
-                    None => live.apply_refresh(&fresh),
+                let live_total = {
+                    let _writer = writer_lock.lock().await;
+                    live.apply_refresh(&fresh)
                 };
+                // Publishing is network I/O and strictly downstream of membership. Never hold
+                // the structural-writer mutex while awaiting it.
+                if let Some(p) = &publisher
+                    && let Err(e) = p.publish(live_total).await
+                {
+                    warn!(error = %e, "failed to publish watchlist size to supabase");
+                }
                 info!(
-                    fetched,
-                    live_total, "live watchlist refreshed from supabase"
+                    fetch_limit,
+                    fetched, live_total, "live watchlist refreshed from supabase"
                 );
             }
             Err(e) => {

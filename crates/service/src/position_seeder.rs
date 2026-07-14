@@ -18,6 +18,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::orchestrator_control::OrchestratorControl;
+
 /// Safety backstop: stop paginating after this many pages per wallet.
 /// A wallet exceeding `page_limit × POSITION_MAX_PAGES` live positions gets partial coverage;
 /// a `warn!` is emitted so hub-like wallets are visible in logs.
@@ -177,14 +179,18 @@ pub async fn run_reseed_loop<F: PageFetcher + Send + 'static>(
     size_threshold: u32,
     interval_secs: u64,
     fetcher: F,
-    tx: mpsc::Sender<HashMap<WalletAddress, PositionSnapshot>>,
+    tx: mpsc::Sender<OrchestratorControl>,
 ) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         let wallets: Vec<WalletAddress> =
             live.snapshot().entries.iter().map(|e| e.wallet).collect();
         let map = seed_all(&wallets, &base_url, page_limit, size_threshold, &fetcher).await;
-        if tx.send(map).await.is_err() {
+        if tx
+            .send(OrchestratorControl::PositionReseed(map))
+            .await
+            .is_err()
+        {
             break;
         }
     }

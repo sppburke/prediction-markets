@@ -23,7 +23,6 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use pe_copy_signal_engine::PositionSnapshot;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
     BasisPoints, ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality,
@@ -127,7 +126,7 @@ fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
     ExecutionDispatcher::new(paper_executor, live_executor)
 }
 
-fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, PositionSnapshot>> {
+fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
     mpsc::channel(1).1
 }
 

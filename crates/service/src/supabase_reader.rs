@@ -24,23 +24,6 @@ use time::OffsetDateTime;
 /// it is not a gate. A t-stat of 2.5 maps to 2500 bps. See `docs/_GLOSSARY.md`.
 const LS_TSTAT_BPS_SCALE: i64 = 1_000;
 
-/// Number of top-ranked wallets fetched per refresh — bounds the `latest_ranking` query
-/// (`?limit=`). Equals [`MAINTAINED_SET_SIZE`]: the refresh fetches exactly the maintained
-/// working set. The ranker pushes a deeper top-200 bench; only the live set is capped.
-/// See `docs/_GLOSSARY.md`: `SUPABASE_FETCH_LIMIT`.
-// Defined in terms of `MAINTAINED_SET_SIZE` so the "fetch exactly the maintained set"
-// coupling is machine-enforced, not just documented (const refs are order-independent).
-pub const SUPABASE_FETCH_LIMIT: usize = MAINTAINED_SET_SIZE;
-
-/// Fixed size of the maintained live working set (issue #350 WS1; replaces `SUPABASE_LIVE_CAP`
-/// = 200). The live set is held at this width: the periodic refresh is score-update-only (no
-/// add/evict — see [`crate::live_watchlist::LiveWatchlist::apply_refresh`]), while membership
-/// changes either through maintenance knockout/backfill or a wholesale full-rerank swap. The
-/// bench (`latest_ranking`) still holds the ranker's deeper top-200 push; only the live set is
-/// capped here.
-/// See `docs/_GLOSSARY.md`: `MAINTAINED_SET_SIZE`.
-pub const MAINTAINED_SET_SIZE: usize = 50;
-
 /// Candidate freshness window in hours (#357): a benched wallet is an eligible backfill
 /// candidate only if its real last trade (`last_trade_unix`) is within this window. Mirrors
 /// the canonical `upload_active_window_hours` = 72 in `docs/_GLOSSARY.md` (the ranker drops

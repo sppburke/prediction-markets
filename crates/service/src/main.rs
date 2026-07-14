@@ -26,7 +26,8 @@ use tracing::info;
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::clob_book::ReqwestClobBookFetcher;
 use pe_service::config_poller::{
-    CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, fetch_service_config, run_config_poll_loop,
+    CONFIG_POLL_INTERVAL_SECS, SupabaseConfigFetcher, capacity_request_channel,
+    fetch_service_config, run_capacity_worker, run_config_poll_loop,
 };
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
@@ -36,7 +37,9 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::position_seeder::{run_reseed_loop, seed_all};
-use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, load_initial_runtime_config};
+use pe_service::runtime_config::{
+    AppliedWatchlistCapacity, FillMode, LiveRuntimeConfig, load_initial_runtime_config,
+};
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
@@ -49,6 +52,7 @@ use pe_service::supabase_state::{
 };
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
+use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
 
@@ -147,13 +151,14 @@ async fn main() -> Result<()> {
     .await
     .unwrap_or_default();
 
+    let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
     let (initial_watchlist, bootstrap_last_trade): (Watchlist, HashMap<_, _>) =
         supabase_reader::fetch(
             &reqwest::Client::new(),
             &cfg.supabase_url,
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
-            supabase_reader::SUPABASE_FETCH_LIMIT,
+            initial_watchlist_size,
         )
         .await
         .context("bootstrap watchlist from Supabase (the sole wallet source)")?;
@@ -176,6 +181,7 @@ async fn main() -> Result<()> {
     // Shared writer mutex (#350 WS1 PR-D): serializes the score-update refresh loop and the
     // maintenance tick's evict+backfill on the live watchlist's ArcSwap (readers stay lock-free).
     let watchlist_writer_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let applied_watchlist_capacity = AppliedWatchlistCapacity::new(initial_watchlist_size);
 
     // Publish the initial watched-count so the analytics site reflects it within seconds of
     // start (the refresh loop's first publish is one interval away). Best-effort; needs the
@@ -193,8 +199,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // One-time snapshot driving the startup position seed and wallet-history backfill.
-    // Refresh-admitted wallets are not retro-seeded/backfilled (acceptable for v1; #3).
+    // One-time snapshot driving the startup position seed and wallet-history backfill. Runtime
+    // capacity growth separately prepares newly admitted wallets before publishing membership.
     let wallets: Vec<_> = live_watchlist
         .snapshot()
         .entries
@@ -348,12 +354,12 @@ async fn main() -> Result<()> {
         .await;
         let seeded = snapshot_map.len();
         leader_ledger.overlay(snapshot_map.clone());
-        // Seed the poll cursor from each bootstrapped wallet's real last-trade time (#357),
-        // UNCONDITIONALLY: this establishes the inactivity clock at the real last trade
-        // (idle = now − cursor) and repairs any corrupted `now`-seed left by a prior build. A
-        // wallet absent from the side-map (a NULL `last_trade_unix` column in the ranking)
-        // keeps its persisted cursor; a never-seeded `None` cursor self-heals via the
-        // poller's first unbounded fetch and is never reset to `now` (no admission grace).
+        // Seed each bootstrapped wallet's poll cursor from its real last-trade time (#357).
+        // Cursor writes are monotonic, so this establishes the inactivity clock for new/older
+        // rows without regressing a newer cursor already advanced by polling. A wallet absent
+        // from the side-map (a NULL `last_trade_unix` ranking column) keeps its persisted cursor;
+        // a never-seeded `None` cursor self-heals via the poller's first unbounded fetch and is
+        // never reset to `now` (no admission grace).
         let mut cursor_seeded = 0usize;
         for (wallet, last_trade_unix) in &bootstrap_last_trade {
             if let Err(e) = paper_state.set_cursor(wallet, *last_trade_unix) {
@@ -396,8 +402,10 @@ async fn main() -> Result<()> {
         map
     };
 
-    // Reseed channel: carries periodic snapshots into the orchestrator (cap 1 = back-pressure).
-    let (reseed_tx, reseed_rx) = mpsc::channel(1);
+    // Orchestrator control channel: periodic position reseeds plus seed-before-membership
+    // admission preparation for runtime watchlist growth. Capacity 2 keeps both bounded while
+    // allowing one of each class to queue.
+    let (control_tx, control_rx) = mpsc::channel(2);
     let reseed_task = if cfg.position_reseed_interval_secs > 0 {
         // Reads the CURRENT watchlist each round (not the boot list) so wallets admitted
         // post-boot — backfill or full-re-rank swaps — get leader-ledger seeds too.
@@ -411,10 +419,9 @@ async fn main() -> Result<()> {
             cfg.position_size_threshold,
             cfg.position_reseed_interval_secs,
             reseed_fetcher,
-            reseed_tx,
+            control_tx.clone(),
         )))
     } else {
-        drop(reseed_tx);
         None
     };
 
@@ -544,7 +551,7 @@ async fn main() -> Result<()> {
         health.clone(),
         market_end_cache.clone(),
         mid_price_cache.clone(),
-        reseed_rx,
+        control_rx,
         sink_handle.clone(),
         snapshot_handle,
         supabase_state.clone(),
@@ -576,7 +583,7 @@ async fn main() -> Result<()> {
             cfg.supabase_url.clone(),
             cfg.supabase_anon_key.clone(),
             cfg.supabase_secret_key.clone(),
-            supabase_reader::SUPABASE_FETCH_LIMIT,
+            applied_watchlist_capacity.clone(),
             cfg.supabase_refresh_interval_secs,
             watchlist_writer_lock.clone(),
         )))
@@ -604,7 +611,6 @@ async fn main() -> Result<()> {
             demotion_cb_alpha,
             demotion_pnl_window_secs: cfg.demotion_pnl_window_secs,
             bench_overfetch: cfg.bench_overfetch,
-            cap: supabase_reader::MAINTAINED_SET_SIZE,
             membership_mode,
         };
         Some(tokio::spawn(run_maintenance_loop(
@@ -616,30 +622,68 @@ async fn main() -> Result<()> {
             cfg.supabase_secret_key.clone(),
             watchlist_writer_lock.clone(),
             maint_cfg,
+            applied_watchlist_capacity.clone(),
             boot_batch_marker,
         )))
     } else {
         None
     };
 
-    // Service-config poll task (#398 WS1): every CONFIG_POLL_INTERVAL_SECS, refresh the
-    // LiveRuntimeConfig the orchestrator reads per event. Spawned only when Supabase is
-    // configured; fail-soft (keeps last-known-good on any fetch error). No writer lock needed —
-    // the poller is the sole writer of this ArcSwap (the watchlist lock guards a different cell).
-    let config_poll_task = if cfg.supabase_url.is_empty() {
-        None
+    // Service-config polling remains fixed at 30 seconds while a separate latest-only worker
+    // performs slow admission preparation. The poller stays the sole RuntimeConfig writer; the
+    // capacity worker commits membership + its applied epoch under the structural mutex and sends
+    // a small completion back to the poller.
+    let (config_poll_task, capacity_task) = if cfg.supabase_url.is_empty() {
+        (None, None)
     } else {
-        Some(tokio::spawn(run_config_poll_loop(
+        let (capacity_requests, capacity_request_rx) =
+            capacity_request_channel(initial_watchlist_size, watchlist_writer_lock.clone());
+        let (capacity_result_tx, capacity_result_rx) = mpsc::channel(4);
+        let capacity_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("build bounded watchlist-capacity HTTP client")?;
+        let capacity_applier = SupabaseWatchlistCapacity::new(
+            live_watchlist.clone(),
+            paper_state.clone(),
+            watchlist_writer_lock.clone(),
+            applied_watchlist_capacity.clone(),
+            capacity_request_rx.clone(),
+            control_tx,
+            capacity_http_client,
+            cfg.supabase_url.clone(),
+            cfg.supabase_anon_key.clone(),
+            cfg.supabase_secret_key.clone(),
+            cfg.polymarket_base_url.clone(),
+            cfg.wallet_market_history_path.clone(),
+            cfg.position_page_limit,
+            cfg.position_size_threshold,
+        );
+        let worker = tokio::spawn(run_capacity_worker(
+            capacity_applier,
+            applied_watchlist_capacity.clone(),
+            capacity_request_rx,
+            capacity_result_tx,
+        ));
+        let config_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("build bounded service-config HTTP client")?;
+        let poller = tokio::spawn(run_config_poll_loop(
             live_runtime_config.clone(),
             SupabaseConfigFetcher::new(
-                reqwest::Client::new(),
+                config_http_client,
                 cfg.supabase_url.clone(),
                 cfg.supabase_anon_key.clone(),
                 cfg.supabase_secret_key.clone(),
             ),
+            capacity_requests,
+            applied_watchlist_capacity.clone(),
+            capacity_result_rx,
             CONFIG_POLL_INTERVAL_SECS,
             clob_creds_present,
-        )))
+        ));
+        (Some(poller), Some(worker))
     };
 
     // Status snapshot task (issue #184 follow-up): every `status_interval_secs`, atomically
@@ -651,6 +695,7 @@ async fn main() -> Result<()> {
             Duration::from_secs(cfg.status_interval_secs),
             paper_state.clone(),
             live_watchlist.clone(),
+            applied_watchlist_capacity.clone(),
             cfg.mode.clone(),
             cfg.supabase_authoritative,
             supabase_rpc_calls,
@@ -717,6 +762,9 @@ async fn main() -> Result<()> {
         t.abort();
     }
     if let Some(t) = config_poll_task {
+        t.abort();
+    }
+    if let Some(t) = capacity_task {
         t.abort();
     }
     info!("pe-service stopped");

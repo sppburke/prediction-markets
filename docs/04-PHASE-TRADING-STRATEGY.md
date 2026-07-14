@@ -57,7 +57,7 @@ Kalshi candidate discovery is not equivalent because public trades do not identi
 
 ### Eligibility thresholds
 
-See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibility thresholds"). Watchlist sizes are `active_watchlist_size = 50` and `incubator_watchlist_size = 250` (`_GLOSSARY.md`).
+See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibility thresholds"). Watchlist sizes are `active_watchlist_size = 100` (a Supabase-authoritative runtime cap) and `incubator_watchlist_size = 250` (`_GLOSSARY.md`).
 
 ### Trade classification
 

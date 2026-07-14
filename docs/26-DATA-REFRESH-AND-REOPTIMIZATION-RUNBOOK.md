@@ -229,10 +229,20 @@ effect is to truncate the separate `wallet_cache.db-wal` file.
 `pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
 `knockout` (legacy — the maintenance tick's eviction/backfill is the sole membership
-path) or `full_rerank` (each batch transition wholesale-replaces the live top-50 —
-the cutover production mode). Run28 fixed `k=25` and did not sweep watchlist width;
-top-50 is an operator-directed paper experiment adopted 2026-07-13, not a run28-backed
-N choice.
+path) or `full_rerank` (each batch transition wholesale-replaces the live
+top-`active_watchlist_size` — the cutover production mode). `active_watchlist_size` is
+Supabase-authoritative (default 100, valid `1..=200`) and is polled every 30 seconds. A
+grow fetches the requested top-N and preloads all newly admitted wallets' prior-market
+history and current positions before the atomic membership swap; a shrink uses the same
+atomic swap. Invalid values, Supabase failures, or incomplete admission preparation keep
+the last-known-good target and membership, then retry independently on the
+capacity worker's next 30-second retry. Check
+`status.json`: `watchlist_size` is actual membership and `watchlist_target_size` is the
+last safely applied runtime cap. Installing this runtime-capacity support requires one normal
+`pe-service` restart; subsequent valid `service_config` edits hot-swap without a restart.
+Run28 fixed `k=25` and did not sweep watchlist width. The earlier top-50 paper experiment
+adopted 2026-07-13 and the superseding 100-wallet default are operator-directed choices,
+not run28-backed N choices.
 
 ---
 

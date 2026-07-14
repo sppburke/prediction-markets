@@ -564,9 +564,31 @@ impl PaperStateDb {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO poll_cursors (wallet_hex, last_ts_unix) VALUES (?1, ?2) \
-             ON CONFLICT(wallet_hex) DO UPDATE SET last_ts_unix = excluded.last_ts_unix",
+             ON CONFLICT(wallet_hex) DO UPDATE SET \
+                last_ts_unix = MAX(poll_cursors.last_ts_unix, excluded.last_ts_unix)",
             params![wallet.to_string(), ts_unix],
         )?;
+        Ok(())
+    }
+
+    /// Atomically advance several poll cursors in one SQLite transaction.
+    ///
+    /// Membership transitions use this before publishing newly admitted wallets, so either every
+    /// admission has a bounded activity cursor or none of the cursor batch is committed.
+    pub fn set_cursors(&self, cursors: &[(WalletAddress, i64)]) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix) VALUES (?1, ?2) \
+                 ON CONFLICT(wallet_hex) DO UPDATE SET \
+                    last_ts_unix = MAX(poll_cursors.last_ts_unix, excluded.last_ts_unix)",
+            )?;
+            for (wallet, ts_unix) in cursors {
+                statement.execute(params![wallet.to_string(), ts_unix])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1207,6 +1229,29 @@ mod tests {
         assert_eq!(db.cursor(&w).unwrap(), Some(1_700_000_000));
         db.set_cursor(&w, 1_700_000_500).unwrap();
         assert_eq!(db.cursor(&w).unwrap(), Some(1_700_000_500));
+        db.set_cursor(&w, 1_699_999_999).unwrap();
+        assert_eq!(
+            db.cursor(&w).unwrap(),
+            Some(1_700_000_500),
+            "a stale poll must not regress the activity cursor"
+        );
+    }
+
+    #[test]
+    fn cursor_batch_commits_every_wallet() {
+        let (_dir, db) = db();
+        let first = wallet();
+        let mut bytes = first.0;
+        bytes[19] = bytes[19].wrapping_add(1);
+        let second = WalletAddress(bytes);
+        db.set_cursors(&[(first, 1_700_000_001), (second, 1_700_000_002)])
+            .unwrap();
+        assert_eq!(db.cursor(&first).unwrap(), Some(1_700_000_001));
+        assert_eq!(db.cursor(&second).unwrap(), Some(1_700_000_002));
+        db.set_cursors(&[(first, 1_600_000_000), (second, 1_800_000_000)])
+            .unwrap();
+        assert_eq!(db.cursor(&first).unwrap(), Some(1_700_000_001));
+        assert_eq!(db.cursor(&second).unwrap(), Some(1_800_000_000));
     }
 
     #[test]

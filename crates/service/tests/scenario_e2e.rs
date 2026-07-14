@@ -27,7 +27,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use pe_copy_signal_engine::PositionSnapshot;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, classify_trade};
 use pe_core_types::{
     BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
@@ -126,7 +125,7 @@ fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
     Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap())
 }
 
-fn dead_reseed_rx() -> mpsc::Receiver<HashMap<pe_core_types::WalletAddress, PositionSnapshot>> {
+fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
     mpsc::channel(1).1
 }
 
