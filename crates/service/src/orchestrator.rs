@@ -10,9 +10,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pe_copy_signal_engine::{
-    IncomingTrade, LeaderSignal, PositionSnapshot, SignalConfig, classify_trade,
-};
+use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig, classify_trade};
 use pe_core_types::{
     EventSeq, MarketId, MarketOutcomeId, Price, Probability, ReconstructionQuality, Side,
     SourceTimestamp, TraderId, VenueId, WalletAddress,
@@ -40,6 +38,7 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
+use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::{self, FillMode, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, absorbable_contracts_within_bps, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, supabase_fill_from};
@@ -128,7 +127,7 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBook
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
-    reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
+    control_rx: mpsc::Receiver<OrchestratorControl>,
     // Best-effort Supabase analytics sink (issue #343). `None` when disabled — and always
     // `None` in authoritative mode (issue #397), where `run_sink` is not spawned, so the
     // best-effort `send_fill` below is suppressed automatically.
@@ -158,6 +157,33 @@ pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBook
     clob_best_ask_fallback_haircut_bps: u32,
 }
 
+fn apply_control_message(
+    entry_gate: &mut CopyEntryGate,
+    position_ledger: &mut PositionLedger,
+    message: OrchestratorControl,
+) {
+    match message {
+        OrchestratorControl::PositionReseed(map) => {
+            let wallets = map.len();
+            position_ledger.overlay(map);
+            info!(wallets, "leader ledger reseeded from live positions API");
+        }
+        OrchestratorControl::PrepareAdmissions {
+            history,
+            positions,
+            acknowledged,
+        } => {
+            let wallets = positions.len();
+            entry_gate.merge_history(history);
+            position_ledger.overlay(positions);
+            // The acknowledgement is intentionally last: membership remains unpublished until
+            // both single-owner ledgers contain the admission prerequisites.
+            let _ = acknowledged.send(());
+            info!(wallets, "hot-watchlist admission state prepared");
+        }
+    }
+}
+
 impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<C, F, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -172,7 +198,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
         health: SharedHealth,
         market_end_cache: MarketEndCache,
         mid_price_cache: MidPriceCache<F>,
-        reseed_rx: mpsc::Receiver<HashMap<WalletAddress, PositionSnapshot>>,
+        control_rx: mpsc::Receiver<OrchestratorControl>,
         sink: Option<SinkHandle>,
         snapshot_sink: Option<SnapshotHandle>,
         supabase_state: Option<SupabaseStateClient>,
@@ -212,7 +238,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             filled_positions,
             entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
-            reseed_rx,
+            control_rx,
             sink,
             snapshot_sink,
             supabase_state,
@@ -232,7 +258,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
     pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
         let mut trades_done = false;
-        let mut reseed_done = false;
+        let mut control_done = false;
 
         loop {
             if trades_done {
@@ -247,14 +273,14 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
                     }
                     break;
                 }
-                result = self.reseed_rx.recv(), if !reseed_done => {
+                result = self.control_rx.recv(), if !control_done => {
                     match result {
-                        Some(map) => {
-                            let n = map.len();
-                            self.position_ledger.overlay(map);
-                            info!(wallets = n, "leader ledger reseeded from live positions API");
-                        }
-                        None => reseed_done = true,
+                        Some(message) => apply_control_message(
+                            &mut self.entry_gate,
+                            &mut self.position_ledger,
+                            message,
+                        ),
+                        None => control_done = true,
                     }
                 }
                 result = self.trade_rx.recv(), if !trades_done => {
@@ -964,7 +990,22 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::check_resolution_horizon;
+    use std::collections::{HashMap, HashSet};
+
+    use pe_copy_signal_engine::{LeaderSignal, PositionSnapshot, PositionState};
+    use pe_core_types::{
+        ContractQty, LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ProbabilityPpm,
+        Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
+        WalletAddress,
+    };
+    use pe_position_ledger::PositionLedger;
+    use rust_decimal_macros::dec;
+    use time::OffsetDateTime;
+    use tokio::sync::oneshot;
+
+    use super::{apply_control_message, check_resolution_horizon};
+    use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig, GateReject};
+    use crate::orchestrator_control::OrchestratorControl;
 
     const NOW: i64 = 1_700_000_000;
 
@@ -1029,5 +1070,66 @@ mod tests {
             check_resolution_horizon(Some(NOW + 1), NOW, 259_200, 0),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn admission_control_acknowledges_only_after_both_ledgers_are_ready() {
+        let wallet = WalletAddress([9; 20]);
+        let market = MarketId(VenueMarketId("0xknown".to_string()));
+        let outcome = MarketOutcomeId::new(market.clone(), OutcomeId(0));
+        let mut gate =
+            CopyEntryGate::new(CopyEntryGateConfig { fail_closed: true }, HashMap::new());
+        let mut ledger = PositionLedger::new();
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        apply_control_message(
+            &mut gate,
+            &mut ledger,
+            OrchestratorControl::PrepareAdmissions {
+                history: HashMap::from([(wallet, HashSet::from([market.clone()]))]),
+                positions: HashMap::from([(
+                    wallet,
+                    PositionSnapshot {
+                        wallet,
+                        positions: HashMap::from([(
+                            outcome,
+                            PositionState {
+                                long_contracts: 7,
+                                short_contracts: 0,
+                            },
+                        )]),
+                    },
+                )]),
+                acknowledged,
+            },
+        );
+        acknowledgement.await.unwrap();
+
+        assert_eq!(
+            ledger
+                .position(&wallet)
+                .unwrap()
+                .positions
+                .values()
+                .next()
+                .unwrap()
+                .long_contracts,
+            7
+        );
+        let signal = LeaderSignal {
+            leader: TraderId(wallet),
+            venue: VenueId::polymarket(),
+            market_id: market,
+            outcome_id: OutcomeId(0),
+            action: LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: Price(dec!(0.50)),
+            leader_size: Quantity(ContractQty(1)),
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: SourceTradeId("control-test".to_string()),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+        };
+        assert_eq!(gate.admit(&signal), Some(GateReject::NotFirstEntry));
     }
 }

@@ -66,7 +66,7 @@ pub enum SizingMode {
 ///
 /// Approval flags default to `false` (deny). Since #398 (Decision #2) they are admin-mutable at
 /// runtime via the Supabase `service_config` table (audit-logged via `updated_by`/`updated_at`),
-/// applied on the next ≤60s config poll — reversing the prior "signed config change only" rule.
+/// applied on the next ≤30s config poll — reversing the prior "signed config change only" rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WinnerFollowConfig {
     /// Allow `LeaderAction::Flip` trades. Default: false.

@@ -42,7 +42,7 @@ sudo certbot --nginx -d <your-domain>
 - Signing in with a non-allowlisted Google account → AccessDenied (nothing renders).
 - Signing in as the allowlisted email → dashboard + `/admin` load.
 - `/admin` edits a `service_config` row → row's `updated_by`/`updated_at` stamped (check via psql);
-  pe-service applies it within ≤60 s.
+  pe-service polls it within ≤30 s and applies it after validation.
 - A PATCH to `/api/config` from any other session → 403.
 
 ## Lockout recovery (risk #9)

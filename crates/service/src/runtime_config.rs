@@ -2,9 +2,10 @@
 //!
 //! The `service_config` KV table is authoritative for every non-secret, runtime-mutable knob.
 //! pe-service polls it (`config_poller`) into a [`LiveRuntimeConfig`] `ArcSwap` snapshot and the
-//! orchestrator rebuilds the strategy/mode/gate knobs per event. Secrets, paths, bind, channel caps,
-//! `supabase_sink_enabled`, and `supabase_authoritative` stay env/boot-frozen — this module
-//! never carries them.
+//! orchestrator rebuilds the strategy/mode/gate knobs per event. A watchlist-capacity edit is
+//! committed to this snapshot only after its admission preparation and atomic membership swap
+//! succeed. Secrets, paths, bind, channel caps, `supabase_sink_enabled`, and
+//! `supabase_authoritative` stay env/boot-frozen — this module never carries them.
 //!
 //! Precedence is **KV > env > compiled**: [`load_initial_runtime_config`] seeds a
 //! [`RuntimeConfig`] from the boot [`ServiceConfig`] (env over compiled, already merged by
@@ -30,6 +31,63 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::config::ServiceConfig;
+
+/// Default number of top-ranked wallets followed by `pe-service`.
+///
+/// Supabase `service_config.active_watchlist_size` is authoritative when present; this value is
+/// the boot/last-known-good fallback when the row is absent or the initial fetch fails.
+pub const DEFAULT_ACTIVE_WATCHLIST_SIZE: usize = 100;
+
+/// Smallest accepted runtime watchlist target. Zero is rejected rather than silently stopping
+/// every copy decision through an operator typo.
+pub const MIN_ACTIVE_WATCHLIST_SIZE: usize = 1;
+
+/// Largest accepted runtime watchlist target. The rank pipeline publishes a top-200 bench, so a
+/// larger value cannot be satisfied without changing that upstream contract first.
+pub const MAX_ACTIVE_WATCHLIST_SIZE: usize = 200;
+
+/// The membership cap that has actually been published to the live watchlist.
+///
+/// This is deliberately separate from a pending Supabase request and from the broader runtime
+/// config snapshot. Structural writers consult it while holding their shared mutex, which lets a
+/// stale maintenance plan detect that a newer capacity transition already won the race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchlistCapacityEpoch {
+    /// Monotonic generation assigned when Supabase requests a different target.
+    pub generation: u64,
+    /// Requested/applied top-N cap for this generation.
+    pub target: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppliedWatchlistCapacity {
+    inner: Arc<ArcSwap<WatchlistCapacityEpoch>>,
+}
+
+impl AppliedWatchlistCapacity {
+    /// Seed the applied cap from the boot-time Supabase config used to build the initial set.
+    pub fn new(initial: usize) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(WatchlistCapacityEpoch {
+                generation: 0,
+                target: initial,
+            })),
+        }
+    }
+
+    /// Read the last epoch committed in the structural-writer critical section.
+    pub fn load(&self) -> WatchlistCapacityEpoch {
+        *self.inner.load_full()
+    }
+
+    /// Commit a successful capacity transition.
+    ///
+    /// Callers must hold the live watchlist's structural-writer mutex while publishing both the
+    /// membership generation and this value.
+    pub fn store(&self, value: WatchlistCapacityEpoch) {
+        self.inner.store(Arc::new(value));
+    }
+}
 
 /// Paper fill-price mode (#486): the fresh CLOB best-ask, or the boot-frozen leader-price
 /// haircut. Stored as the `fill_mode` `service_config` string; an unknown value keeps the
@@ -73,6 +131,9 @@ pub struct ConfigRow {
 /// reconstruct a complete config with no lossy round-trip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
+    /// Maximum number of top-ranked wallets actively followed. Supabase-only (no TOML/env
+    /// surface), hot-reloaded by the config poller and bounded to the published ranking bench.
+    pub active_watchlist_size: usize,
     // ── Service runtime knobs ────────────────────────────────────────────────
     /// Trading mode (`paper` | `shadow` | `live_tiny` | `promoted`). Transitions to a live mode
     /// are guarded by [`validate_mode_transition`].
@@ -130,6 +191,7 @@ impl RuntimeConfig {
     /// field yet, so it defaults to `0` (disabled).
     pub fn from_service_config(cfg: &ServiceConfig) -> Self {
         Self {
+            active_watchlist_size: DEFAULT_ACTIVE_WATCHLIST_SIZE,
             mode: cfg.mode.clone(),
             bankroll_usd: cfg.bankroll_usd.clone(),
             max_fill_price: cfg.max_fill_price.clone(),
@@ -222,6 +284,25 @@ pub fn parse_config(
         .map(|r| (r.key.as_str(), r.value.trim()))
         .collect();
     let mut out = last_good.clone();
+
+    // A syntactically valid 0 or value beyond the published bench is still invalid. Never clamp
+    // an operator edit silently; retain the last-known-good target and warn.
+    if let Some(raw) = map.get("active_watchlist_size") {
+        match raw.parse::<usize>() {
+            Ok(value)
+                if (MIN_ACTIVE_WATCHLIST_SIZE..=MAX_ACTIVE_WATCHLIST_SIZE).contains(&value) =>
+            {
+                out.active_watchlist_size = value;
+            }
+            _ => warn!(
+                key = "active_watchlist_size",
+                value = %raw,
+                min = MIN_ACTIVE_WATCHLIST_SIZE,
+                max = MAX_ACTIVE_WATCHLIST_SIZE,
+                "service_config: watchlist size is invalid; keeping last-known-good"
+            ),
+        }
+    }
 
     // Plain typed fields (FromStr): bad parse -> keep last-known-good.
     apply_parsed(
@@ -441,8 +522,8 @@ impl LiveRuntimeConfig {
         self.inner.load_full()
     }
 
-    /// Publish a new snapshot (single-writer; the poller serializes against the watchlist tick
-    /// via the shared writer lock).
+    /// Publish a new snapshot. The config coordinator is the sole production writer; structural
+    /// watchlist serialization is handled separately by the capacity request/applier path.
     pub fn store(&self, cfg: RuntimeConfig) {
         self.inner.store(Arc::new(cfg));
     }
@@ -662,6 +743,7 @@ mod tests {
         assert_eq!(rc.winner_follow_config(), expected);
         // Service-level knobs reconstruct too (spot-check the risk-engine gate inputs).
         assert_eq!(rc.mode, "paper");
+        assert_eq!(rc.active_watchlist_size, 100);
         assert_eq!(rc.max_fill_price, "0.85");
         assert_eq!(rc.min_fill_price, "0.15"); // run28 band floor (2026-07-03 cutover)
         assert_eq!(rc.bankroll_usd, "10000");
@@ -763,6 +845,37 @@ mod tests {
         assert_eq!(out.trade_poll_interval_secs, boot.trade_poll_interval_secs);
         assert_eq!(out.max_fill_price, boot.max_fill_price);
         assert_eq!(out.paper_fill_haircut_bps, 777);
+    }
+
+    #[test]
+    fn active_watchlist_size_accepts_bounds_and_rejects_invalid_values() {
+        let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        assert_eq!(boot.active_watchlist_size, DEFAULT_ACTIVE_WATCHLIST_SIZE);
+
+        for value in [MIN_ACTIVE_WATCHLIST_SIZE, 100, MAX_ACTIVE_WATCHLIST_SIZE] {
+            let parsed = parse_config(
+                &[row("active_watchlist_size", &value.to_string(), "integer")],
+                &boot,
+                false,
+            );
+            assert_eq!(parsed.active_watchlist_size, value);
+        }
+
+        let last = RuntimeConfig {
+            active_watchlist_size: 77,
+            ..boot
+        };
+        for invalid in ["0", "201", "-1", "not-a-number"] {
+            let parsed = parse_config(
+                &[row("active_watchlist_size", invalid, "integer")],
+                &last,
+                false,
+            );
+            assert_eq!(
+                parsed.active_watchlist_size, 77,
+                "invalid value {invalid} must retain last-known-good"
+            );
+        }
     }
 
     #[test]

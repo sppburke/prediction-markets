@@ -21,7 +21,7 @@ create table if not exists ranking_batches (
 
 create table if not exists ranking_entries (
   batch_id    bigint  not null references ranking_batches(batch_id) on delete cascade,
-  rank        integer not null,               -- 1..N (top-200 bench; top-50 = live)
+  rank        integer not null,               -- 1..N (top-200 bench; live width is runtime config)
   wallet_hex  text    not null,
   ls_edge     numeric,                         -- latency-shifted mean net return
   ls_tstat    numeric,                         -- latency-shifted net t-stat
@@ -130,10 +130,11 @@ insert into supabase_sink_hwm (id, last_event_seq) values (1, 0)
   on conflict (id) do nothing;
 
 -- Service runtime telemetry: the size of pe-service's current live watchlist (the wallets
--- it actually copies = the maintained working set of `MAINTAINED_SET_SIZE` wallets, held by
+-- it actually copies = the maintained working set capped by `active_watchlist_size`, held by
 -- a score-update-only refresh and the maintenance tick — issue #350 WS1). The count lives
--- only in service memory, so the analytics site cannot derive it from latest_ranking (it
--- does not know the limit) — pe-service publishes it here every refresh. Single row
+-- only in service memory, so the analytics site cannot derive it from latest_ranking plus
+-- the configured cap — pe-service publishes it here after bootstrap, refreshes, and runtime
+-- capacity changes. Single row
 -- (id = 1). Anon-readable (see RLS below).
 create table if not exists service_runtime (
   id             integer     primary key default 1 check (id = 1),
@@ -145,7 +146,7 @@ insert into service_runtime (id, watchlist_size) values (1, 0)
 
 -- ── Operator runtime config (issue #398 WS1) ─────────────────────────────────
 -- Supabase is authoritative for all non-secret runtime knobs. pe-service polls this table
--- (WS1, 60 s) into an ArcSwap snapshot and rebuilds the strategy config per event; the admin
+-- (WS1, 30 s) into an ArcSwap snapshot and rebuilds the strategy config per event; the admin
 -- panel (WS3) edits rows with the service-role key. Secrets, paths, bind, channel caps, and
 -- supabase_authoritative stay env/boot-frozen and are NOT here. KV layout (one row per knob)
 -- so old binaries ignore unknown keys and new keys land additively. value_type drives the
@@ -163,9 +164,11 @@ create table if not exists service_config (
 -- smoke-test/service.toml override (sizing_mode=dollar, sizing_dollar_usd=25), so the pre-first-poll
 -- window and any Supabase outage size at $25 flat, never Kelly (#398 WS2 cutover safety). `do
 -- nothing` never clobbers a live admin edit. Rust tests assert these match the boot defaults: the
--- flat-scalar keys in crates/service config.rs `service_config_seed_matches_boot_defaults`, and the
--- three sizing keys (reassembled into SizingMode) in runtime_config `seed_reconstructs_boot_strategy`.
+-- flat-scalar keys in crates/service config.rs `service_config_seed_matches_boot_defaults`, and
+-- RuntimeConfig-only keys (including the three keys reassembled into SizingMode) in runtime_config
+-- `seed_reconstructs_boot_strategy`.
 insert into service_config (key, value, value_type, description) values
+  ('active_watchlist_size',                 '100',    'integer', 'Maximum top-ranked wallets pe-service actively follows; hot-reloaded every 30 seconds (1..200)'),
   ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
   ('bankroll_usd',                          '10000',  'decimal', 'Starting-capital baseline (dashboard denominator); never re-credits the running bankroll'),
   ('max_fill_price',                        '0.85',   'decimal', 'Skip BUYs at or above this current price'),

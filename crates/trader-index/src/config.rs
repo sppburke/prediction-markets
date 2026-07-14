@@ -54,7 +54,7 @@ pub struct RankerConfig {
     /// Lowered from 10: N_eff replaces the hard filter.
     pub incubator_min_distinct_markets: u32,
     /// Maximum active leaders/operators in the watchlist.
-    /// Default: 50 (`active_watchlist_size` in `_GLOSSARY.md`).
+    /// Default: 100 (`active_watchlist_size` in `_GLOSSARY.md`).
     pub active_watchlist_size: usize,
     /// Maximum incubator candidates in the watchlist.
     /// Default: 250 (`incubator_watchlist_size` in `_GLOSSARY.md`).
@@ -74,7 +74,7 @@ impl Default for RankerConfig {
             incubator_window_days: 90,
             incubator_min_closed_trades: 5,
             incubator_min_distinct_markets: 1,
-            active_watchlist_size: 50,
+            active_watchlist_size: 100,
             incubator_watchlist_size: 250,
             min_reconstruction_quality: 60,
         }

@@ -80,6 +80,18 @@ impl CopyEntryGate {
         self.config.fail_closed = fail_closed;
     }
 
+    /// Merge preloaded history for wallets about to join the live set.
+    ///
+    /// Union semantics preserve both startup history and same-session entries already recorded
+    /// by [`Self::record_entry`]. The capacity controller calls this through the orchestrator
+    /// before atomically admitting a hot-grown wallet, so it never passes through the
+    /// absent-wallet fail-open path merely because membership changed at runtime.
+    pub fn merge_history(&mut self, additional: HashMap<WalletAddress, HashSet<MarketId>>) {
+        for (wallet, markets) in additional {
+            self.history.entry(wallet).or_default().extend(markets);
+        }
+    }
+
     /// Returns `None` to admit the signal, or `Some(reason)` to reject it.
     ///
     /// Checks, in order: the side is [`Side::Buy`] → the action is an `Entry` →
@@ -254,5 +266,23 @@ mod tests {
             Some(GateReject::NotFirstEntry),
             "second entry into same market blocked"
         );
+    }
+
+    #[test]
+    fn merge_history_unions_without_erasing_same_session_entries() {
+        let mut gate = CopyEntryGate::new(band_config(), HashMap::new());
+        let in_session = market("0xin-session");
+        gate.record_entry(wallet(), &in_session);
+
+        let historical = market("0xhistorical");
+        gate.merge_history(HashMap::from([(
+            wallet(),
+            HashSet::from([historical.clone()]),
+        )]));
+
+        for known in [in_session, historical] {
+            let s = signal(LeaderAction::Entry, known, Price(dec!(0.60)));
+            assert_eq!(gate.admit(&s), Some(GateReject::NotFirstEntry));
+        }
     }
 }

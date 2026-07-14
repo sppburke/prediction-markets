@@ -18,6 +18,7 @@ use time::format_description::well_known::Rfc3339;
 use tracing::warn;
 
 use crate::live_watchlist::LiveWatchlist;
+use crate::runtime_config::AppliedWatchlistCapacity;
 
 /// One snapshot of pe-service health, serialized to `status.json`.
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +39,9 @@ pub struct StatusSnapshot {
     pub last_event_seq: u64,
     /// Live watchlist size (wallets currently copied).
     pub watchlist_size: usize,
+    /// Last successfully applied Supabase-configured cap. It can differ from `watchlist_size`
+    /// when the ranking bench cannot fill every requested slot or maintenance is between fills.
+    pub watchlist_target_size: usize,
     /// Cumulative authoritative RPC calls (`commit_fill` + `apply_resolution`) since boot;
     /// `0` when not in authoritative mode. Diff two snapshots for the Supabase write rate.
     pub supabase_rpc_calls: u64,
@@ -53,6 +57,7 @@ pub fn build_snapshot(
     uptime_secs: u64,
     now_unix: i64,
     watchlist_size: usize,
+    watchlist_target_size: usize,
     supabase_rpc_calls: u64,
 ) -> StatusSnapshot {
     StatusSnapshot {
@@ -74,6 +79,7 @@ pub fn build_snapshot(
             .map(|s| s.0)
             .unwrap_or(0),
         watchlist_size,
+        watchlist_target_size,
         supabase_rpc_calls,
     }
 }
@@ -89,11 +95,13 @@ pub fn write_snapshot(path: &Path, snapshot: &StatusSnapshot) -> std::io::Result
 
 /// Periodic status-writer task: every `interval`, build + atomically write the snapshot.
 /// Best-effort — a write error is logged (to `errors.jsonl`), never fatal.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_status_writer(
     path: PathBuf,
     interval: Duration,
     paper_state: Arc<PaperStateDb>,
     watchlist: LiveWatchlist,
+    applied_capacity: AppliedWatchlistCapacity,
     mode: String,
     authoritative: bool,
     supabase_rpc_calls: Option<Arc<AtomicU64>>,
@@ -113,6 +121,7 @@ pub async fn run_status_writer(
             started_at.elapsed().as_secs(),
             OffsetDateTime::now_utc().unix_timestamp(),
             watchlist.snapshot().entries.len(),
+            applied_capacity.load().target,
             calls,
         );
         if let Err(e) = write_snapshot(&path, &snap) {

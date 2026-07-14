@@ -180,7 +180,7 @@ pub struct ServiceConfig {
 
     /// Watchlist MEMBERSHIP owner between ranking batches (2026-07-03 run28 cutover):
     /// `knockout` (legacy default — membership changes only via knockout + backfill) or
-    /// `full_rerank` (the newest ranking batch's top-50 replaces the live set each batch
+    /// `full_rerank` (the newest ranking batch's configured top-N replaces the live set each batch
     /// transition). Boot-frozen: the maintenance loop is built once at startup, so a mode
     /// change needs a restart — deliberately NOT in `service_config` (that table carries
     /// runtime-mutable knobs only). Parsed fail-fast by `MembershipMode::parse` in
@@ -765,10 +765,11 @@ mode = "shadow"
     }
 
     /// Seed keys that are NOT flat `ServiceConfig` scalars, so this test (which compares flat seed
-    /// values to flat boot fields) excludes them. The enum-shaped sizing keys and the
-    /// RuntimeConfig-only `price_impact_cap_bps` are validated against the boot defaults in
+    /// values to flat boot fields) excludes them. The enum-shaped sizing keys and RuntimeConfig-
+    /// only fields are validated against boot defaults in
     /// `runtime_config::tests::seed_reconstructs_boot_strategy`.
-    const SIZING_KEYS: [&str; 4] = [
+    const RUNTIME_ONLY_KEYS: [&str; 5] = [
+        "active_watchlist_size",
         "sizing_mode",
         "sizing_dollar_usd",
         "sizing_contracts",
@@ -899,7 +900,7 @@ mode = "shadow"
         }
         // The three sizing keys must be present (validated for value elsewhere); all other seed
         // keys must be in the flat boot-default set.
-        for k in SIZING_KEYS {
+        for k in RUNTIME_ONLY_KEYS {
             assert!(
                 seed.contains_key(k),
                 "service_config seed is missing key `{k}`"
@@ -908,7 +909,7 @@ mode = "shadow"
         let expected_keys: std::collections::HashSet<&str> = expected
             .iter()
             .map(|(k, _)| *k)
-            .chain(SIZING_KEYS)
+            .chain(RUNTIME_ONLY_KEYS)
             .collect();
         for k in seed.keys() {
             assert!(
