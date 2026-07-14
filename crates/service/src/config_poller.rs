@@ -493,6 +493,7 @@ mod tests {
 
     struct CancellableApplier {
         applied: AppliedWatchlistCapacity,
+        writer_lock: Arc<Mutex<()>>,
         calls: Arc<StdMutex<Vec<usize>>>,
         first_started: Arc<Notify>,
     }
@@ -507,6 +508,7 @@ mod tests {
                 self.first_started.notify_one();
                 std::future::pending::<()>().await;
             }
+            let _writer = self.writer_lock.lock().await;
             self.applied.store(request);
             Ok(request.target)
         }
@@ -522,6 +524,7 @@ mod tests {
         let worker = tokio::spawn(run_capacity_worker(
             CancellableApplier {
                 applied: applied.clone(),
+                writer_lock: Arc::clone(&requests.writer_lock),
                 calls: Arc::clone(&calls),
                 first_started: Arc::clone(&first_started),
             },
@@ -560,6 +563,7 @@ mod tests {
         let worker = tokio::spawn(run_capacity_worker(
             CancellableApplier {
                 applied: applied.clone(),
+                writer_lock: Arc::clone(&requests.writer_lock),
                 calls: Arc::clone(&calls),
                 first_started: Arc::clone(&first_started),
             },

@@ -4,7 +4,7 @@
 //! admitted wallet has its prior-market history and current positions loaded first, those maps
 //! are applied by the single-owner orchestrator, and only then is the new membership generation
 //! published. Shrinks use the same atomic full-rerank primitive. Any failure leaves membership
-//! and the last-known-good capacity unchanged so the next config poll can retry.
+//! and the last-known-good capacity unchanged for the worker's independent 30-second retry.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
