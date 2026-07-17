@@ -31,6 +31,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Agent workflow contracts
+        run: |
+          bash scripts/check_skill_parity.sh
+          bash scripts/check_skill_parity.sh --sync
+          git diff --exit-code
+          python3 scripts/check_agent_workflow_contract.py
+
       # The Rust target/ plus the (#397) redundant `pe-service --features scenario` re-link can
       # exhaust the runner root fs; that surfaces as `ld ... signal 7 [Bus error]` while linking
       # (a full-fs mmap fault, not OOM). Adding the #421 Python deps (arch/statsmodels) tipped it
@@ -72,11 +84,6 @@ jobs:
       - run: cargo audit
 
       - run: cargo metadata --locked --format-version 1 > /dev/null
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: Install Python analytics deps
         run: python3 -m pip install -r scripts/requirements.txt
