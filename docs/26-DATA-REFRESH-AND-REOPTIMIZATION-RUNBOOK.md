@@ -31,7 +31,14 @@ cargo build --release -p pe-bootstrap
   source (#369; key-free), with Gamma supplying open-market schedules/liquidity.
   No Polygon RPC / Alchemy provider is required.
 - **Supabase + Python.** `.env` must carry `SUPABASE_URL` + `SUPABASE_SECRET_KEY`
-  (the push reads them). The ranking scripts run under `.venv-analysis/bin/python3`.
+  (the push reads them). `rank_and_push.sh` selects its own interpreter so the documented
+  one-line command is independent of an interactive shell's `PATH`: `PE_PYTHON` (an
+  executable-path override) → `.venv-analysis/bin/python3` → `.venv/bin/python3`. It does
+  not silently use the system `python3`. Install `scripts/requirements.txt` into one of those
+  repository environments. Before taking the PID lock, creating a run directory, or refreshing
+  the cache, the wrapper imports its required modules and exits with remediation instructions if
+  the environment is incomplete. DuckDB remains optional under `engine=auto` (SQLite fallback)
+  and is mandatory under `engine=duck`.
 
 ---
 

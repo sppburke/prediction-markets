@@ -21,6 +21,9 @@ What it locks (the things that would silently break cron if wired wrong):
   - the PID lock blocks a concurrent run and reclaims a stale one;
   - the skip flags bypass Step 0 / ranking for a pure re-push;
   - zero-arg invocation auto-creates a timestamped out-dir;
+  - a clean cron/nohup PATH still selects the repository Python environment;
+  - PE_PYTHON overrides repository environments and accepts executable paths with spaces;
+  - a missing interpreter or dependency fails before the lock, output dir, or data refresh;
   - the production half-life default is threaded to both passes.
   - the final WAL checkpoint runs after purge, truncates committed WAL bytes, and warns
     without failing an already-published run when checkpointing is unavailable.
@@ -30,9 +33,11 @@ Run: `python3 scripts/test_rank_and_push.py`
 """
 import os
 import shutil
+import shlex
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -84,6 +89,13 @@ class RankAndPushScenario(unittest.TestCase):
         (self.root / "target" / "release").mkdir(parents=True)
         (self.root / "data" / "eval-results").mkdir(parents=True)
 
+        # The wrapper must own interpreter selection. The sandbox's canonical repo environment
+        # logs every invocation, then delegates to the interpreter running this test (CI installs
+        # scripts/requirements.txt into it). Tests can replace this shim to exercise failures.
+        self.python_log = self.root / "python_invocations.log"
+        self.repo_python = self.root / ".venv-analysis" / "bin" / "python3"
+        self._write_python_shim(self.repo_python, self.python_log)
+
         # The final checkpoint opens the existing cache with URI mode=rw so a typo can never
         # create an empty database. Most scenarios only need a valid empty cache; the WAL
         # reclamation scenario below turns this into a WAL-mode fixture.
@@ -118,6 +130,12 @@ class RankAndPushScenario(unittest.TestCase):
 
         # Fake pass-1 ranker: log argv, emit the two CSVs the wrapper expects in --out-dir.
         _write_exec(
+            self.root / "scripts" / "export_trades_parquet.py",
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            'open("export.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n',
+        )
+        _write_exec(
             self.root / "scripts" / "rank_72hr_buyandhold.py",
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
@@ -151,8 +169,18 @@ class RankAndPushScenario(unittest.TestCase):
         self._tmp.cleanup()
 
     # ── helpers ──────────────────────────────────────────────────────────────────────
+    def _write_python_shim(self, path, log):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_exec(
+            path,
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+        )
+
     def _run(self, *args, exit_env=None):
         env = dict(os.environ)
+        env.pop("PE_PYTHON", None)
         env.update(exit_env or {})
         return subprocess.run(
             ["bash", str(self.wrapper), *args],
@@ -168,6 +196,114 @@ class RankAndPushScenario(unittest.TestCase):
         return p.read_text() if p.exists() else None
 
     # ── scenarios ────────────────────────────────────────────────────────────────────
+    def test_zero_arg_clean_path_uses_repository_python(self):
+        poison_dir = self.root / "poison-bin"
+        poison_dir.mkdir()
+        poison_log = self.root / "poison_python.log"
+        _write_exec(
+            poison_dir / "python3",
+            "#!/usr/bin/env bash\n"
+            f"echo ambient-python-used >> {shlex.quote(str(poison_log))}\n"
+            "exit 99\n",
+        )
+        r = self._run(exit_env={"PATH": f"{poison_dir}:/usr/bin:/bin"})
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertTrue(self.python_log.exists(), "repository interpreter was never invoked")
+        self.assertFalse(poison_log.exists(), "wrapper used ambient python3 from PATH")
+        self.assertIn(str(self.repo_python), r.stdout)
+        print("PASS: zero-arg clean-PATH run uses the repository Python, never ambient python3")
+
+    def test_pe_python_override_with_spaces_wins(self):
+        custom_log = self.root / "custom_python.log"
+        custom_python = self.root / "custom python" / "bin" / "python3"
+        self._write_python_shim(custom_python, custom_log)
+        r = self._run(exit_env={"PE_PYTHON": str(custom_python)})
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertTrue(custom_log.exists(), "PE_PYTHON interpreter was never invoked")
+        self.assertFalse(self.python_log.exists(), "repository interpreter won over PE_PYTHON")
+        self.assertIn(str(custom_python), r.stdout)
+        print("PASS: PE_PYTHON executable path with spaces overrides repository environments")
+
+    def test_venv_fallback_when_analysis_environment_absent(self):
+        shutil.rmtree(self.root / ".venv-analysis")
+        fallback_log = self.root / "venv_python.log"
+        fallback_python = self.root / ".venv" / "bin" / "python3"
+        self._write_python_shim(fallback_python, fallback_log)
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertTrue(fallback_log.exists(), ".venv fallback was never invoked")
+        self.assertIn(str(fallback_python), r.stdout)
+        print("PASS: .venv/bin/python3 is the automatic fallback when .venv-analysis is absent")
+
+    def test_missing_repository_python_fails_before_mutation(self):
+        shutil.rmtree(self.root / ".venv-analysis")
+        r = self._run()
+        self.assertEqual(r.returncode, 2, f"missing repo Python should exit 2\nstderr={r.stderr}")
+        self.assertIn("no repository Python found", r.stderr)
+        self._assert_preflight_left_no_pipeline_state()
+        print("PASS: absent repository Python fails before lock, output directory, or refresh")
+
+    def test_dependency_failure_fails_before_mutation(self):
+        _write_exec(
+            self.repo_python,
+            "#!/usr/bin/env bash\n"
+            "echo 'simulated missing numpy' >&2\n"
+            "exit 1\n",
+        )
+        r = self._run()
+        self.assertEqual(r.returncode, 2, f"dependency failure should exit 2\nstderr={r.stderr}")
+        self.assertIn("dependency preflight failed", r.stderr)
+        self.assertIn("pip install -r scripts/requirements.txt", r.stderr)
+        self._assert_preflight_left_no_pipeline_state()
+        print("PASS: missing dependency fails before lock, output directory, or refresh")
+
+    def test_invalid_pe_python_fails_closed(self):
+        missing = self.root / "does not exist" / "python3"
+        r = self._run(exit_env={"PE_PYTHON": str(missing)})
+        self.assertEqual(r.returncode, 2, f"invalid PE_PYTHON should exit 2\nstderr={r.stderr}")
+        self.assertIn("PE_PYTHON is not executable", r.stderr)
+        self.assertFalse(self.python_log.exists(), "invalid override silently fell back to repo Python")
+        self._assert_preflight_left_no_pipeline_state()
+        print("PASS: invalid PE_PYTHON fails closed instead of silently falling back")
+
+    def test_forced_duck_missing_dependency_fails_before_mutation(self):
+        _write_exec(
+            self.repo_python,
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$1\" == '-c' && \"${2:-}\" == 'import duckdb' ]]; then exit 1; fi\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+        )
+        r = self._run("--engine", "duck", "--skip-export")
+        self.assertEqual(r.returncode, 2, f"forced duck without duckdb should exit 2\nstderr={r.stderr}")
+        self.assertIn("--engine duck requires duckdb", r.stderr)
+        self._assert_preflight_left_no_pipeline_state()
+        print("PASS: forced DuckDB fails before mutation even when Parquet export is skipped")
+
+    def test_auto_engine_missing_duckdb_warns_and_falls_back(self):
+        _write_exec(
+            self.repo_python,
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$1\" == '-c' && \"${2:-}\" == 'import duckdb' ]]; then exit 1; fi\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+        )
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"auto DuckDB fallback failed\nstdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIn("engine=auto will fall back to SQLite", r.stderr)
+        self.assertIsNotNone(self._log("rank.log"), "ranking did not run through SQLite fallback")
+        print("PASS: auto engine preserves the reviewed SQLite fallback when duckdb is absent")
+
+    def _assert_preflight_left_no_pipeline_state(self):
+        self.assertIsNone(self._log("pe_bootstrap.log"), "refresh ran despite failed preflight")
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / ".rank_and_push.lock").exists(),
+            "failed preflight created the pipeline lock",
+        )
+        self.assertEqual(
+            list((self.root / "data" / "eval-results").glob("cron-*")),
+            [],
+            "failed preflight created a run output directory",
+        )
+
     def test_happy_path_default_universe_and_step0_order(self):
         r = self._run()
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
