@@ -55,6 +55,9 @@
 # Requirements on the box:
 #   - .env with SUPABASE_URL + SUPABASE_SECRET_KEY (sourced below).
 #   - data/wallet_cache.db present (the ranker reads it; Step 0 refreshes it).
+#   - Python dependencies installed in .venv-analysis (preferred) or .venv. Set
+#     PE_PYTHON to an executable path to override the repository-local interpreter.
+#     Install: <venv>/bin/python3 -m pip install -r scripts/requirements.txt
 #   - target/release/pe-bootstrap built, with its env config.
 #     Build: cargo build --release -p pe-bootstrap
 #
@@ -197,6 +200,83 @@ export PE_RANKER_ENGINE="$ENGINE"
 export PE_RANKER_PARQUET_DIR="$PARQUET_DIR"
 export PE_RANKER_PARQUET_MAX_AGE_HOURS="$PARQUET_MAX_AGE_HOURS"
 
+# ── Repository Python runtime + fail-fast dependency preflight ───────────────────────────
+# Cron, SSH, and nohup commonly start with a minimal PATH. Never let their ambient `python3`
+# choose the analytics environment: an incomplete system interpreter can otherwise fail only
+# after the multi-hour refresh has finished. PE_PYTHON is an executable path (not a shell
+# command); absent an override, use a repository-local environment in canonical order.
+PYTHON_BIN=""
+if [[ -n "${PE_PYTHON:-}" ]]; then
+  if [[ "$PE_PYTHON" == /* ]]; then
+    PYTHON_BIN="$PE_PYTHON"
+  else
+    PYTHON_BIN="$PWD/$PE_PYTHON"
+  fi
+  [[ -x "$PYTHON_BIN" ]] || {
+    echo "FATAL: PE_PYTHON is not executable: $PYTHON_BIN" >&2
+    exit 2
+  }
+else
+  for candidate in "$PWD/.venv-analysis/bin/python3" "$PWD/.venv/bin/python3"; do
+    if [[ -x "$candidate" ]]; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+  [[ -n "$PYTHON_BIN" ]] || {
+    echo "FATAL: no repository Python found (.venv-analysis/bin/python3 or .venv/bin/python3)." >&2
+    echo "Create one and install: <venv>/bin/python3 -m pip install -r scripts/requirements.txt" >&2
+    exit 2
+  }
+fi
+
+# sqlite3 and urllib.request are required by the push/verify/checkpoint path even for a pure
+# re-push. Full ranking additionally imports numpy and pandas unconditionally. Import the real
+# modules (rather than only inspecting package metadata) so broken native wheels fail here too.
+PYTHON_MODULES=(sqlite3 urllib.request)
+if [[ "$SKIP_RANK" == "0" ]]; then
+  PYTHON_MODULES+=(numpy pandas)
+fi
+if ! "$PYTHON_BIN" - "${PYTHON_MODULES[@]}" <<'PY'
+import importlib
+import sys
+
+failures = []
+for module_name in sys.argv[1:]:
+    try:
+        importlib.import_module(module_name)
+    except Exception as error:  # the operator needs the concrete broken import
+        failures.append(f"{module_name}: {type(error).__name__}: {error}")
+
+if failures:
+    print("Python dependency preflight failed:", file=sys.stderr)
+    for failure in failures:
+        print(f"  - {failure}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  echo "FATAL: Python dependency preflight failed for $PYTHON_BIN" >&2
+  echo "Install: $PYTHON_BIN -m pip install -r scripts/requirements.txt" >&2
+  exit 2
+fi
+
+# DuckDB stays optional in auto mode (the reviewed SQLite fallback) and irrelevant in sqlite
+# mode. Forced duck mode cannot work without it, so fail before refresh rather than hours later.
+if [[ "$SKIP_RANK" == "0" && "$ENGINE" != "sqlite" ]]; then
+  if "$PYTHON_BIN" -c 'import duckdb' 2>/dev/null; then
+    echo "Python runtime: $PYTHON_BIN (dependency preflight ok; DuckDB available)"
+  elif [[ "$ENGINE" == "duck" ]]; then
+    echo "FATAL: --engine duck requires duckdb in $PYTHON_BIN" >&2
+    echo "Install: $PYTHON_BIN -m pip install -r scripts/requirements.txt" >&2
+    exit 2
+  else
+    echo "Python runtime: $PYTHON_BIN (dependency preflight ok)"
+    echo "WARN: duckdb is unavailable; engine=auto will fall back to SQLite" >&2
+  fi
+else
+  echo "Python runtime: $PYTHON_BIN (dependency preflight ok)"
+fi
+
 # ── Single-run lock (PID-based) ──────────────────────────────────────────────────────────
 # A full run (≈496K wallets, 30–90 min) must never overlap the next cron tick. A live holder
 # aborts the new run; a stale lock from a crashed run (PID not alive) is reclaimed. The trap
@@ -323,7 +403,7 @@ refresh_data
 # returns None and both passes fall back to SQLite; with --engine duck it is fatal.
 if [[ "$SKIP_RANK" == "0" && "$SKIP_EXPORT" == "0" && "$ENGINE" != "sqlite" ]]; then
   echo "── Step 0a: export Parquet snapshot ($PARQUET_DIR) for the DuckDB read-layer ──"
-  if python3 scripts/export_trades_parquet.py --db "$DB" --out-dir "$PARQUET_DIR"; then
+  if "$PYTHON_BIN" scripts/export_trades_parquet.py --db "$DB" --out-dir "$PARQUET_DIR"; then
     echo "   export ok"
   elif [[ "$ENGINE" == "duck" ]]; then
     echo "FATAL: --engine duck but the Parquet export failed" >&2; exit 1
@@ -336,7 +416,7 @@ fi
 
 if [[ "$SKIP_RANK" == "0" ]]; then
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
-  python3 scripts/rank_72hr_buyandhold.py \
+  "$PYTHON_BIN" scripts/rank_72hr_buyandhold.py \
     --db "$DB" "${UNIVERSE_ARGS[@]}" --out-dir "$OUT_DIR" \
     "${WIN_ARGS[@]}" --ttr-hours "$TTR_HOURS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
@@ -346,7 +426,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --floor-tstat "$FLOOR_TSTAT" --scheduled-only
 
   echo "── Stage 2/3: pass-2 latency-shift rerank (adds hit_rate) ─────────────────────"
-  python3 scripts/latency_shift_rerank.py \
+  "$PYTHON_BIN" scripts/latency_shift_rerank.py \
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
@@ -384,9 +464,9 @@ FILTER_ARGS=(--db "$DB")
 # record 72h after the 48h cutover). Floor stays pass-1's --min-ttr-hours default (30s).
 # CAVEAT (same class as PR #351): on a --skip-rank re-push this records THIS run's
 # TTR_HOURS, not the TTR the reused CSVs were ranked at — pass a matching --ttr-hours.
-TTR_MAX_SECS="$(python3 -c "print(int(float('$TTR_HOURS')*3600))")"
+TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
 
-python3 scripts/push_ranking_to_supabase.py \
+"$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
   --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N" \
   --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX" \
   --ttr-max-secs "$TTR_MAX_SECS" \
@@ -395,7 +475,7 @@ python3 scripts/push_ranking_to_supabase.py \
   --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
 
 echo "── Verify: Supabase latest_ranking is now populated ──────────────────────────"
-python3 - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import os, urllib.request
 base=os.environ["SUPABASE_URL"]; key=os.environ["SUPABASE_SECRET_KEY"]
 req=urllib.request.Request(f"{base}/rest/v1/latest_ranking?select=rank&limit=1",
@@ -437,7 +517,7 @@ fi
 # Supabase publish. URI mode=rw plus the file check prevents a wrong path from creating an empty DB.
 echo "── Stage 5/5: checkpoint + truncate SQLite WAL ──────────────────────────────"
 crc=0
-python3 - "$DB" <<'PY' || crc=$?
+"$PYTHON_BIN" - "$DB" <<'PY' || crc=$?
 import sqlite3
 import sys
 from pathlib import Path
