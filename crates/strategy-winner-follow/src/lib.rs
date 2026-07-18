@@ -17,6 +17,9 @@ pub mod paper;
 
 pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig};
 pub use error::{PaperExecutionError, WinnerFollowError};
-pub use evaluate::WinnerFollowStrategy;
+pub use evaluate::{
+    OrganicCanaryOrder, OrganicCanaryPolicy, OrganicDecisionProof, WinnerFollowStrategy,
+    organic_decision_proof_hash,
+};
 pub use mode::ExecutionMode;
 pub use paper::{FillSource, PaperExecutor, PaperFill};

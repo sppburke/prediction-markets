@@ -27,7 +27,7 @@ pe-source-core                = { path = "../source-core",                  vers
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
 pe-trader-index               = { path = "../trader-index",                 version = "0.1.0" }
 
-alloy           = { workspace = true }
+alloy-primitives = { workspace = true }
 anyhow          = { workspace = true }
 const_format    = { workspace = true }
 figment         = { workspace = true }

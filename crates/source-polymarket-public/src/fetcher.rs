@@ -7,13 +7,27 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use pe_core_types::{RawHttpAttempt, RawHttpResponse, RawTransportFailure, TransportErrorClass};
 use pe_source_core::SourceError;
+use time::OffsetDateTime;
 
 // Defaults — canonical values live in `docs/_GLOSSARY.md` "Polymarket public source" section.
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRIES: u32 = 3;
 /// Enforces ≤ 20 req/s per the Polymarket Data API documented limit (200 req/10s on `/trades`).
 const MIN_INTERVAL_MS: u64 = 50;
+
+/// Stable semantic identity for an observed public request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpRequestContext {
+    pub source_id: &'static str,
+    pub endpoint_kind: &'static str,
+}
+
+const UNOBSERVED_CONTEXT: HttpRequestContext = HttpRequestContext {
+    source_id: "polymarket-public",
+    endpoint_kind: "unobserved-page",
+};
 
 /// Abstracts HTTP page fetching so production and test connectors share the same logic.
 ///
@@ -94,15 +108,176 @@ impl ReqwestFetcher {
         self.min_interval_ms = ms;
         self
     }
-}
 
-impl PageFetcher for ReqwestFetcher {
-    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
-        // Rate-limit gate: each call claims the next available slot,
-        // computed as max(now, last_slot + min_interval_ms), and stamps it
-        // before releasing the lock so concurrent callers observe the
-        // reservation rather than the pre-sleep `now`. Wall-clock throughput
-        // stays at ≤ 1 / min_interval_ms even when many tasks share this fetcher.
+    /// Fetch while returning every raw attempt to the caller-owned observer.
+    /// The observer is synchronous so a single-owner campaign actor can append evidence before
+    /// this method decides to retry; it must not perform network I/O.
+    pub async fn fetch_page_observed(
+        &self,
+        url: &str,
+        context: HttpRequestContext,
+        mut observe: impl FnMut(RawHttpAttempt) -> Result<(), SourceError>,
+    ) -> Result<Vec<u8>, SourceError> {
+        self.fetch_page_inner(url, context, None, &mut observe)
+            .await
+    }
+
+    /// Fetch with a workflow deadline enforced after the rate slot and at the request seam.
+    pub async fn fetch_page_observed_until(
+        &self,
+        url: &str,
+        context: HttpRequestContext,
+        deadline: Instant,
+        mut observe: impl FnMut(RawHttpAttempt) -> Result<(), SourceError>,
+    ) -> Result<Vec<u8>, SourceError> {
+        self.fetch_page_inner(url, context, Some(deadline), &mut observe)
+            .await
+    }
+
+    async fn fetch_page_inner(
+        &self,
+        url: &str,
+        context: HttpRequestContext,
+        deadline: Option<Instant>,
+        observe: &mut impl FnMut(RawHttpAttempt) -> Result<(), SourceError>,
+    ) -> Result<Vec<u8>, SourceError> {
+        if !self.wait_for_rate_slot(deadline).await {
+            return Err(SourceError::Transient {
+                message: "request deadline elapsed before send".to_owned(),
+            });
+        }
+
+        let mut attempt = 0u32;
+        let parsed_url = reqwest::Url::parse(url).map_err(|error| SourceError::Fatal {
+            message: error.to_string(),
+        })?;
+        let path = parsed_url.path().to_owned();
+        let ordered_query = parsed_url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        loop {
+            let ordinal = attempt + 1;
+            let request_timeout = match deadline {
+                Some(deadline) => deadline
+                    .checked_duration_since(Instant::now())
+                    .map(|remaining| remaining.min(self.timeout))
+                    .ok_or_else(|| SourceError::Transient {
+                        message: "request deadline elapsed before send".to_owned(),
+                    })?,
+                None => self.timeout,
+            };
+            let observed_at = OffsetDateTime::now_utc();
+            let send_result = self.client.get(url).timeout(request_timeout).send().await;
+
+            match send_result {
+                Err(e) => {
+                    observe(RawHttpAttempt::TransportFailure(RawTransportFailure {
+                        source_id: context.source_id.to_owned(),
+                        endpoint_kind: context.endpoint_kind.to_owned(),
+                        method: "GET".to_owned(),
+                        path: path.clone(),
+                        ordered_query: ordered_query.clone(),
+                        attempt_ordinal: ordinal,
+                        observed_at,
+                        received_at: OffsetDateTime::now_utc(),
+                        error_class: if e.is_timeout() {
+                            TransportErrorClass::Timeout
+                        } else if e.is_connect() {
+                            TransportErrorClass::Connect
+                        } else {
+                            TransportErrorClass::Other
+                        },
+                        schema_version: 1,
+                        parser_version: 1,
+                        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    }))?;
+                    if attempt >= self.max_retries {
+                        return Err(SourceError::Transient {
+                            message: e.to_string(),
+                        });
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let headers = observed_headers(resp.headers());
+                    let retry_after = header_value(&headers, "retry-after");
+                    let body = match resp.bytes().await {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(e) => {
+                            observe(RawHttpAttempt::TransportFailure(RawTransportFailure {
+                                source_id: context.source_id.to_owned(),
+                                endpoint_kind: context.endpoint_kind.to_owned(),
+                                method: "GET".to_owned(),
+                                path: path.clone(),
+                                ordered_query: ordered_query.clone(),
+                                attempt_ordinal: ordinal,
+                                observed_at,
+                                received_at: OffsetDateTime::now_utc(),
+                                error_class: TransportErrorClass::BodyRead,
+                                schema_version: 1,
+                                parser_version: 1,
+                                adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            }))?;
+                            if attempt >= self.max_retries {
+                                return Err(SourceError::Transient {
+                                    message: e.to_string(),
+                                });
+                            }
+                            attempt += 1;
+                            tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
+                            continue;
+                        }
+                    };
+                    observe(RawHttpAttempt::Response(RawHttpResponse {
+                        source_id: context.source_id.to_owned(),
+                        endpoint_kind: context.endpoint_kind.to_owned(),
+                        method: "GET".to_owned(),
+                        path: path.clone(),
+                        ordered_query: ordered_query.clone(),
+                        observed_at,
+                        received_at: OffsetDateTime::now_utc(),
+                        status,
+                        headers: headers.clone(),
+                        body: body.clone(),
+                        attempt_ordinal: ordinal,
+                        source_at: source_at(&headers),
+                        schema_version: 1,
+                        parser_version: 1,
+                        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    }))?;
+
+                    if status == 429 {
+                        let retry_after_secs = retry_after
+                            .as_deref()
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .unwrap_or(30);
+                        return Err(SourceError::RateLimited { retry_after_secs });
+                    }
+                    if is_retryable_status(status) {
+                        if attempt >= self.max_retries {
+                            return Err(SourceError::Transient {
+                                message: format!("HTTP {status}"),
+                            });
+                        }
+                        attempt += 1;
+                        tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
+                        continue;
+                    }
+                    if status >= 400 {
+                        return Err(SourceError::Fatal {
+                            message: format!("HTTP {status}"),
+                        });
+                    }
+                    return Ok(body);
+                }
+            }
+        }
+    }
+
+    async fn wait_for_rate_slot(&self, deadline: Option<Instant>) -> bool {
         let min_interval = Duration::from_millis(self.min_interval_ms);
         let sleep_for = {
             let mut guard = self
@@ -114,82 +289,55 @@ impl PageFetcher for ReqwestFetcher {
                 None => now,
                 Some(last) => last.max(now) + min_interval,
             };
+            if deadline.is_some_and(|deadline| next_slot >= deadline) {
+                return false;
+            }
             *guard = Some(next_slot);
             next_slot.checked_duration_since(now)
         };
-        if let Some(d) = sleep_for {
-            tokio::time::sleep(d).await;
+        if let Some(duration) = sleep_for {
+            tokio::time::sleep(duration).await;
         }
-
-        let mut attempt = 0u32;
-        loop {
-            let send_result = self.client.get(url).timeout(self.timeout).send().await;
-
-            match send_result {
-                Err(e) => {
-                    // Network or timeout error — retryable.
-                    if attempt >= self.max_retries {
-                        return Err(SourceError::Transient {
-                            message: e.to_string(),
-                        });
-                    }
-                    attempt += 1;
-                    tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
-                }
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-
-                    if status == 429 {
-                        // Rate-limited by server — return to caller to apply Retry-After.
-                        let retry_after = resp
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(30);
-                        return Err(SourceError::RateLimited {
-                            retry_after_secs: retry_after,
-                        });
-                    }
-
-                    if is_retryable_status(status) {
-                        // 5xx or 408 — retryable.
-                        if attempt >= self.max_retries {
-                            return Err(SourceError::Transient {
-                                message: format!("HTTP {status}"),
-                            });
-                        }
-                        attempt += 1;
-                        tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
-                        continue;
-                    }
-
-                    if status >= 400 {
-                        // 4xx (non-429, non-408) — unrecoverable.
-                        return Err(SourceError::Fatal {
-                            message: format!("HTTP {status}"),
-                        });
-                    }
-
-                    // 2xx / 3xx — read body. Retry on connection-reset
-                    // (server may close a pooled connection mid-transfer).
-                    match resp.bytes().await {
-                        Ok(b) => return Ok(b.to_vec()),
-                        Err(e) => {
-                            if attempt >= self.max_retries {
-                                return Err(SourceError::Transient {
-                                    message: e.to_string(),
-                                });
-                            }
-                            attempt += 1;
-                            tokio::time::sleep(backoff(self.initial_backoff_ms, attempt)).await;
-                            // Fall through — loop resends the request on a fresh connection.
-                        }
-                    }
-                }
-            }
-        }
+        true
     }
+}
+
+impl PageFetcher for ReqwestFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.fetch_page_inner(url, UNOBSERVED_CONTEXT, None, &mut |_| Ok(()))
+            .await
+    }
+}
+
+fn observed_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    [
+        "content-type",
+        "date",
+        "etag",
+        "retry-after",
+        "x-request-id",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| (name.to_owned(), value.to_owned()))
+    })
+    .collect()
+}
+
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+fn source_at(headers: &[(String, String)]) -> Option<OffsetDateTime> {
+    header_value(headers, "date").and_then(|value| {
+        OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc2822).ok()
+    })
 }
 
 /// Exponential backoff: `initial_ms * 2^(attempt-1)`, capped at 30 s.
@@ -238,6 +386,141 @@ impl PageFetcher for FixtureFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_response_retains_retry_headers() {
+        let app = axum::Router::new().route(
+            "/limited",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "17"), ("content-type", "application/json")],
+                    "{}",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_max_retries(0);
+        let mut attempts = Vec::new();
+        let result = fetcher
+            .fetch_page_observed(
+                &format!("http://{address}/limited"),
+                HttpRequestContext {
+                    source_id: "test-server",
+                    endpoint_kind: "limited",
+                },
+                |attempt| {
+                    attempts.push(attempt);
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(SourceError::RateLimited { .. })));
+        assert!(matches!(attempts.as_slice(), [RawHttpAttempt::Response(_)]));
+        let Some(RawHttpAttempt::Response(response)) = attempts.first() else {
+            return;
+        };
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "retry-after" && value == "17")
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_before_reserved_rate_slot_emits_no_attempt() {
+        let app = axum::Router::new().route("/ok", axum::routing::get(|| async { "{}" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(0)
+            .with_min_interval_ms(200);
+        let url = format!("http://{address}/ok?token_id=11");
+        fetcher
+            .fetch_page_observed(
+                &url,
+                HttpRequestContext {
+                    source_id: "test-server",
+                    endpoint_kind: "book",
+                },
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+
+        let mut attempts = Vec::new();
+        let result = fetcher
+            .fetch_page_observed_until(
+                &url,
+                HttpRequestContext {
+                    source_id: "test-server",
+                    endpoint_kind: "book",
+                },
+                Instant::now() + Duration::from_millis(10),
+                |attempt| {
+                    attempts.push(attempt);
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(SourceError::Transient { .. })));
+        assert!(attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_deadline_emits_exact_transport_identity() {
+        let app = axum::Router::new().route(
+            "/hang",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                "{}"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_max_retries(0);
+        let mut attempts = Vec::new();
+        let result = fetcher
+            .fetch_page_observed_until(
+                &format!("http://{address}/hang?next_cursor=abc&limit=500"),
+                HttpRequestContext {
+                    source_id: "test-server",
+                    endpoint_kind: "activity-page",
+                },
+                Instant::now() + Duration::from_millis(20),
+                |attempt| {
+                    attempts.push(attempt);
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(SourceError::Transient { .. })));
+        assert!(matches!(
+            attempts.as_slice(),
+            [RawHttpAttempt::TransportFailure(_)]
+        ));
+        let failure = attempts
+            .iter()
+            .find_map(|attempt| match attempt {
+                RawHttpAttempt::TransportFailure(failure) => Some(failure),
+                RawHttpAttempt::Response(_) => None,
+            })
+            .expect("transport failure was asserted above");
+        assert_eq!(failure.path, "/hang");
+        assert_eq!(
+            failure.ordered_query,
+            [
+                ("next_cursor".to_owned(), "abc".to_owned()),
+                ("limit".to_owned(), "500".to_owned())
+            ]
+        );
+        assert_eq!(failure.error_class, TransportErrorClass::Timeout);
+    }
 
     #[test]
     fn retryable_status_includes_408_and_5xx() {

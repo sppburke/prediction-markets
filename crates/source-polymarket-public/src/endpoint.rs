@@ -117,6 +117,13 @@ pub enum PolymarketEndpoint {
         end: Option<i64>,
         start: Option<i64>,
     },
+    /// Strict offset page used by the live canary to prove one bounded activity window complete.
+    UserTradeActivityPage {
+        user: String,
+        end: i64,
+        start: Option<i64>,
+        offset: u32,
+    },
     /// Live open positions for a single wallet via `/positions`.
     ///
     /// `redeemable`: when `Some(false)`, restrict to live (unresolved) positions.
@@ -139,7 +146,9 @@ impl PolymarketEndpoint {
     pub fn key(&self) -> &'static str {
         match self {
             Self::Leaderboard { .. } => "leaderboard",
-            Self::UserTradeActivity { .. } => "user_trade_activity",
+            Self::UserTradeActivity { .. } | Self::UserTradeActivityPage { .. } => {
+                "user_trade_activity"
+            }
             Self::CurrentPositions { .. } => "current_positions",
             Self::ClosedPositions { .. } => "closed_positions",
         }
@@ -168,6 +177,20 @@ impl PolymarketEndpoint {
                 }
                 if let Some(s) = start {
                     url.push_str(&format!("&start={s}"));
+                }
+                url
+            }
+            Self::UserTradeActivityPage {
+                user,
+                end,
+                start,
+                offset,
+            } => {
+                let mut url = format!(
+                    "{base}/activity?user={user}&type=TRADE&limit=500&offset={offset}&sortDirection=DESC&end={end}"
+                );
+                if let Some(start) = start {
+                    url.push_str(&format!("&start={start}"));
                 }
                 url
             }

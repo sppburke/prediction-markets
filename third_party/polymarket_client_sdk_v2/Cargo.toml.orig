@@ -1,0 +1,399 @@
+[package]
+name = "polymarket_client_sdk_v2"
+description = "Polymarket CLOB (Central Limit Order Book) API client SDK"
+version = "0.7.0"
+authors = [
+    "Polymarket Engineering <engineering@polymarket.com>",
+    "Chaz Byrnes <chaz@polymarket.com>",
+]
+readme = "README.md"
+repository = "https://github.com/Polymarket/rs-clob-client-v2"
+license = "MIT"
+keywords = ["polymarket", "clob", "orderbook", "trading", "prediction-market"]
+categories = [
+    "api-bindings",
+    "cryptography::cryptocurrencies",
+    "finance",
+    "web-programming::http-client",
+]
+edition = "2024"
+rust-version = "1.88.0" # MSRV
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+clob = []
+data = []
+gamma = []
+bridge = []
+ctf = ["alloy/contract", "alloy/providers"]
+rfq = []
+tracing = ["dep:tracing", "dep:serde_ignored", "dep:serde_path_to_error"]
+ws = [
+    "dep:backoff",
+    "dep:bitflags",
+    "dep:tokio-tungstenite",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+]
+rtds = [
+    "dep:backoff",
+    "dep:tokio-tungstenite",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+]
+heartbeats = ["dep:tokio-util", "tokio/macros", "tokio/rt-multi-thread"]
+
+[dependencies]
+alloy = { version = "=1.6.3", default-features = false, features = [
+    "dyn-abi",
+    "reqwest",
+    "reqwest-rustls-tls",
+    "serde",
+    "signer-local",
+    "signers",
+    "sol-types"
+] }
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+backoff = { version = "0.4.0", optional = true }
+base64 = "0.22.1"
+bitflags = { version = "2.11.0", optional = true }
+bon = "3.9.1"
+chrono = { version = "0.4.44", features = ["serde"] }
+dashmap = "6.1.0"
+futures = "0.3.32"
+hmac = "0.12.1"
+phf = { version = "0.13.1", features = ["macros"] }
+rand = "0.10.0"
+reqwest = { version = "0.13.2", features = ["json", "query", "rustls"] }
+rust_decimal = { version = "1.41.0", features = ["serde"] }
+rust_decimal_macros = "1.40.0"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = "1.0.228"
+serde_html_form = { version = "0.4" }
+serde_ignored = { version = "0.1", optional = true }
+serde_json = "1.0.149"
+serde_path_to_error = { version = "0.1", optional = true }
+serde_repr = "0.1.20"
+serde_with = { version = "3.18.0", features = ["chrono_0_4", "json"] }
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+strum_macros = "0.28.0"
+tokio = { version = "1.50.0", features = ["time"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"], optional = true }
+tokio-util = { version = "0.7.18", optional = true }
+tracing = { version = "0.1", optional = true }
+url = "2.5.8"
+uuid = { version = "1.23.0", features = ["serde", "v4", "v7"] }
+
+[dev-dependencies]
+alloy = { version = "=1.6.3", default-features = false, features = [
+    "contract",
+    "providers",
+    "reqwest",
+    "signer-aws",
+    "signer-local",
+] }
+anyhow = "1.0.102"
+aws-config = "1.8.13"
+aws-sdk-kms = "1.99.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+futures-util = "0.3.31"
+httpmock = "0.8.3"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "async"
+path = "examples/clob/async.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "authenticated"
+path = "examples/clob/authenticated.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "aws_authenticated"
+path = "examples/clob/aws_authenticated.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "builder_authenticated"
+path = "examples/clob/builder_authenticated.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "heartbeats"
+path = "examples/clob/heartbeats.rs"
+required-features = ["clob", "heartbeats", "tracing"]
+
+[[example]]
+name = "streaming"
+path = "examples/clob/streaming.rs"
+required-features = ["clob", "tracing"]
+
+[[example]]
+name = "unauthenticated"
+path = "examples/clob/unauthenticated.rs"
+required-features = ["clob", "tracing"]
+
+[[example]]
+name = "get_midpoint"
+path = "examples/clob/market/get_midpoint.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_orderbook"
+path = "examples/clob/market/get_orderbook.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_price"
+path = "examples/clob/market/get_price.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_spread"
+path = "examples/clob/market/get_spread.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_last_trade_price"
+path = "examples/clob/market/get_last_trade_price.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_server_time"
+path = "examples/clob/market/get_server_time.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "create_or_derive_api_key"
+path = "examples/clob/keys/create_or_derive_api_key.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_api_keys"
+path = "examples/clob/keys/get_api_keys.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "delete_api_key"
+path = "examples/clob/keys/delete_api_key.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_balance_allowance"
+path = "examples/clob/account/get_balance_allowance.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "update_balance_allowance"
+path = "examples/clob/account/update_balance_allowance.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_open_orders"
+path = "examples/clob/account/get_open_orders.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_trades"
+path = "examples/clob/account/get_trades.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_notifications"
+path = "examples/clob/account/get_notifications.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "gtc_limit_buy"
+path = "examples/clob/orders/gtc_limit_buy.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "gtc_limit_buy_deposit_wallet"
+path = "examples/clob/orders/gtc_limit_buy_deposit_wallet.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "gtc_limit_sell"
+path = "examples/clob/orders/gtc_limit_sell.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "market_buy"
+path = "examples/clob/orders/market_buy.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "cancel_order"
+path = "examples/clob/orders/cancel_order.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "cancel_all"
+path = "examples/clob/orders/cancel_all.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "is_order_scoring"
+path = "examples/clob/scoring/is_order_scoring.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "get_closed_only_mode"
+path = "examples/clob/scoring/get_closed_only_mode.rs"
+required-features = ["clob"]
+
+[[example]]
+name = "approvals"
+path = "examples/approvals.rs"
+required-features = ["tracing"]
+
+[[example]]
+name = "check_approvals"
+path = "examples/check_approvals.rs"
+required-features = ["tracing"]
+
+[[example]]
+name = "ctf"
+path = "examples/ctf.rs"
+required-features = ["ctf", "tracing"]
+
+[[example]]
+name = "data"
+path = "examples/data.rs"
+required-features = ["data", "tracing"]
+
+[[example]]
+name = "gamma"
+path = "examples/gamma/client.rs"
+required-features = ["gamma", "tracing"]
+
+[[example]]
+name = "gamma_streaming"
+path = "examples/gamma/streaming.rs"
+required-features = ["gamma", "tracing"]
+
+[[example]]
+name = "bridge"
+path = "examples/bridge.rs"
+required-features = ["bridge", "tracing"]
+
+[[example]]
+name = "websocket_orderbook"
+path = "examples/clob/ws/orderbook.rs"
+required-features = ["clob", "ws"]
+
+[[example]]
+name = "websocket_user"
+path = "examples/clob/ws/user.rs"
+required-features = ["clob", "ws"]
+
+[[example]]
+name = "rfq_quotes"
+path = "examples/clob/rfq/quotes.rs"
+required-features = ["clob", "rfq"]
+
+[[example]]
+name = "rfq_requests"
+path = "examples/clob/rfq/requests.rs"
+required-features = ["clob", "rfq"]
+
+[[example]]
+name = "rtds_crypto_prices"
+path = "examples/rtds_crypto_prices.rs"
+required-features = ["rtds", "tracing"]
+
+[[example]]
+name = "websocket_unsubscribe"
+path = "examples/clob/ws/unsubscribe.rs"
+required-features = ["clob", "ws"]
+
+[[bench]]
+name = "deserialize_clob"
+harness = false
+required-features = ["clob"]
+
+[[bench]]
+name = "deserialize_websocket"
+harness = false
+required-features = ["clob", "ws"]
+
+[[bench]]
+name = "clob_order_operations"
+harness = false
+required-features = ["clob"]
+
+# https://rust-lang.github.io/rust-clippy/master/index.html?versions=lte%3A88
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+create_dir = "warn"
+dbg_macro = "warn"
+doc_include_without_cfg = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
+exit = "warn"
+filetype_is_file = "warn"
+float_arithmetic = "warn"
+get_unwrap = "warn"
+if_then_some_else_none = "warn"
+impl_trait_in_params = "warn"
+infinite_loop = "warn"
+large_include_file = "warn"
+let_underscore_untyped = "warn"
+map_err_ignore = "warn"
+map_with_unused_argument_over_ranges = "warn"
+missing_assert_message = "warn"
+missing_errors_doc = "allow"
+module_name_repetitions = "warn"
+multiple_crate_versions = "allow"
+multiple_inherent_impl = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+needless_raw_strings = "warn"
+non_zero_suggestions = "warn"
+pathbuf_init_then_push = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+pub_without_shorthand = "warn"
+rc_buffer = "warn"
+redundant_test_prefix = "warn"
+redundant_type_annotations = "warn"
+ref_patterns = "warn"
+renamed_function_params = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+return_and_then = "warn"
+same_name_method = "warn"
+self_named_module_files = "warn"
+similar_names = "allow"
+single_char_lifetime_names = "warn"
+str_to_string = "warn"
+string_add = "warn"
+string_slice = "warn"
+todo = "warn"
+too_many_lines = "allow"
+try_err = "warn"
+undocumented_unsafe_blocks = "warn"
+unneeded_field_pattern = "warn"
+unseparated_literal_suffix = "warn"
+unused_trait_names = "warn"
+unwrap_used = "warn"
+
+[profile.bench]
+lto = "thin"        # Link-Time Optimization: enables cross-crate inlining
+codegen-units = 1   # Single codegen unit allows more aggressive optimizations

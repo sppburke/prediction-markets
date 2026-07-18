@@ -1,5 +1,9 @@
 # 35 — pe-service binary deploy runbook (VPS)
 
+> This runbook deploys the ordinary **paper-only** `pe-service`. It does not deploy or configure
+> the isolated Polymarket V2 canary; see
+> [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
+
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
 deploying it to the VPS. Until this file, the procedure lived only in session memory —
 fields marked *(verify)* are recorded from operator history and must be confirmed

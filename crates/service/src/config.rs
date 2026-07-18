@@ -308,7 +308,7 @@ pub struct ServiceConfig {
     #[serde(default = "default_bankroll_usd")]
     pub bankroll_usd: String,
 
-    /// Execution mode: `shadow` | `paper` | `live_tiny` | `promoted`.
+    /// Execution mode: `shadow` | `paper`.
     #[serde(default = "default_mode")]
     pub mode: String,
 
@@ -321,26 +321,6 @@ pub struct ServiceConfig {
     /// Polymarket CLOB REST API base URL. Set via `PE_POLYMARKET_CLOB_BASE_URL`.
     #[serde(default = "default_clob_base_url")]
     pub polymarket_clob_base_url: String,
-
-    /// Funder (EOA) wallet address. Set via `PE_POLYMARKET_FUNDER_ADDRESS`; never committed.
-    #[serde(default)]
-    pub polymarket_funder_address: String,
-
-    /// Funder EOA private key. Set via `PE_POLYMARKET_PRIVATE_KEY`; never committed.
-    #[serde(default)]
-    pub polymarket_private_key: String,
-
-    /// Polymarket CLOB API key. Set via `PE_POLYMARKET_CLOB_API_KEY`; never committed.
-    #[serde(default)]
-    pub polymarket_clob_api_key: String,
-
-    /// Polymarket CLOB API secret, base64-encoded. Set via `PE_POLYMARKET_CLOB_API_SECRET`.
-    #[serde(default)]
-    pub polymarket_clob_api_secret: String,
-
-    /// Polymarket CLOB API passphrase. Set via `PE_POLYMARKET_CLOB_API_PASSPHRASE`.
-    #[serde(default)]
-    pub polymarket_clob_api_passphrase: String,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -557,11 +537,6 @@ impl Default for ServiceConfig {
             mode: default_mode(),
             strategy: WinnerFollowConfig::default(),
             polymarket_clob_base_url: default_clob_base_url(),
-            polymarket_funder_address: String::new(),
-            polymarket_private_key: String::new(),
-            polymarket_clob_api_key: String::new(),
-            polymarket_clob_api_secret: String::new(),
-            polymarket_clob_api_passphrase: String::new(),
         }
     }
 }
@@ -634,11 +609,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "mode",
         "strategy",
         "polymarket_clob_base_url",
-        "polymarket_funder_address",
-        "polymarket_private_key",
-        "polymarket_clob_api_key",
-        "polymarket_clob_api_secret",
-        "polymarket_clob_api_passphrase",
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
     Ok(cfg)

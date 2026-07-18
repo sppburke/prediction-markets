@@ -22,14 +22,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use base64::Engine as _;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
     BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
-use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
+use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{
@@ -48,8 +47,6 @@ use pe_strategy_winner_follow::{
     WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
-use pe_venue_polymarket::clob_client::{OrderStatus, OrderStatusResponse, PostOrderResponse};
-use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
@@ -133,20 +130,10 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
+fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
     let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
     let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    let live_writer = Writer::open(dir.path().join("live.log")).unwrap();
-    let creds = PolymarketCredentials::mainnet(
-        "0x0000000000000000000000000000000000000001".into(),
-        "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
-        "key".into(),
-        base64::engine::general_purpose::STANDARD.encode(b"secret"),
-        "pass".into(),
-    );
-    let adapter = PolymarketVenueAdapter::new(FixtureCLOBClient::new(vec![], vec![]), creds);
-    let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("test.live".into()));
-    ExecutionDispatcher::new(paper_executor, live_executor)
+    ExecutionDispatcher::paper_only(paper_executor)
 }
 
 fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
@@ -800,40 +787,12 @@ impl ClobBookFetcher for PanicBookFetcher {
 
 /// A dispatcher whose LiveTiny path completes cleanly with a filled fixture order (AC6 asserts the
 /// BOOK fetcher is untouched, not the order path).
-fn make_live_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
-    let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
-    let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
-    let live_writer = Writer::open(dir.path().join("live.log")).unwrap();
-    let creds = PolymarketCredentials::mainnet(
-        "0x0000000000000000000000000000000000000001".into(),
-        "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
-        "key".into(),
-        base64::engine::general_purpose::STANDARD.encode(b"secret"),
-        "pass".into(),
-    );
-    let clob = FixtureCLOBClient::new(
-        vec![Ok(PostOrderResponse {
-            success: true,
-            error_msg: String::new(),
-            order_id: "live-1".into(),
-        })],
-        vec![Ok(OrderStatusResponse {
-            id: "live-1".into(),
-            status: OrderStatus::Filled,
-            quantity_filled: "100000000".into(),
-            quantity_remaining: "0".into(),
-            avg_price: "0.50".into(),
-        })],
-    );
-    let adapter = PolymarketVenueAdapter::new(clob, creds);
-    let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("test.live".into()));
-    ExecutionDispatcher::new(paper_executor, live_executor)
+fn make_live_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
+    make_dispatcher(dir)
 }
 
-/// AC6 (HARD GATE): a live mode NEVER fetches the `/book` on the fill path — a `PanicBookFetcher`
-/// would panic if it were called — even with `fill_mode = clob_best_ask`; and no paper fill is
-/// written (a live fill lands in live.log). Sizing/gates use the local haircut basis.
-/// PASS: no panic, 0 paper fills. FAIL: a panic (book fetched live) or any paper fill.
+/// AC6 (HARD GATE): an ordinary live mode never reaches the `/book` or a POST path. The dispatcher
+/// rejects it, and no paper or live event is written.
 #[tokio::test]
 async fn live_mode_never_fetches_book_ac6() {
     let dir = TempDir::new().unwrap();
@@ -883,7 +842,12 @@ async fn live_mode_never_fetches_book_ac6() {
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
 
-    assert_eq!(paper_fill_count(&dir), 0, "live mode writes no paper fill");
+    assert_eq!(
+        paper_fill_count(&dir),
+        0,
+        "retired live mode writes no paper fill"
+    );
+    assert!(!dir.path().join("live.log").exists());
     println!(
         "PASS: AC6 — live mode performs no /book fetch (panic fetcher untouched), 0 paper fills"
     );

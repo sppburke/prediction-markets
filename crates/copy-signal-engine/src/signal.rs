@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 /// A classified, ready-to-gate trade signal from a watchlisted leader.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderSignal {
     pub leader: TraderId,
     pub venue: VenueId,

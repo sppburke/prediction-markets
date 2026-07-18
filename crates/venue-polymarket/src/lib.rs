@@ -1,21 +1,21 @@
 //! Polymarket CLOB venue adapter for the prediction-edge system.
 //!
-//! Provides order submission and fill confirmation against the Polymarket CLOB REST API.
+//! Provides strict Polymarket V2 canary market validation and one-shot order submission.
 //!
 //! # Modules
 //!
-//! - **signing** — L1 EIP-712 order signing + L2 HMAC-SHA256 API auth (internal).
-//! - **clob_client** — [`CLOBClient`] trait + [`ReqwestCLOBClient`] + [`FixtureCLOBClient`].
-//! - **adapter** — [`PolymarketVenueAdapter`]: ties signing + HTTP client together.
-//! - **error** — [`PolymarketError`].
+//! The retired V1 signing, retrying POST, and status-polling path is intentionally absent.
 
 #![forbid(unsafe_code)]
 
-pub mod adapter;
-pub mod clob_client;
-pub mod error;
-pub mod signing;
+pub mod canary_market;
+pub mod v2;
 
-pub use adapter::{PolymarketCredentials, PolymarketVenueAdapter};
-pub use clob_client::{CLOBClient, FixtureCLOBClient, ReqwestCLOBClient};
-pub use error::PolymarketError;
+pub use canary_market::{
+    AskLevel, CanaryBookSnapshot, CanaryMarketError, ClobMarketEvidence, ExecutableLadder,
+    executable_ladder, parse_book, parse_market_evidence,
+};
+pub use v2::{
+    CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CanaryV2Error, PostOnceResult,
+    PreparedPolymarketBuy, PreparedSubmission, SDK_ARCHIVE_SHA256, SDK_VERSION, V2BuyRequest,
+};

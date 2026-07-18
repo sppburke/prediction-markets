@@ -74,7 +74,7 @@ fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
 /// `trade_parser::parse_trades` (camelCase keys; `timestamp` in seconds).
 fn activity_payload(a_ts: i64, b_ts: i64) -> Vec<u8> {
     format!(
-        r#"[{{"transactionHash":"0xAAA","conditionId":"0xcondA","side":"BUY","size":40,"price":0.60,"timestamp":{a_ts}}},{{"transactionHash":"0xBBB","conditionId":"0xcondB","side":"BUY","size":10,"price":0.45,"timestamp":{b_ts}}}]"#
+        r#"[{{"transactionHash":"0xAAA","conditionId":"0xcondA","outcomeIndex":0,"side":"BUY","size":40,"price":0.60,"timestamp":{a_ts}}},{{"transactionHash":"0xBBB","conditionId":"0xcondB","outcomeIndex":1,"side":"BUY","size":10,"price":0.45,"timestamp":{b_ts}}}]"#
     )
     .into_bytes()
 }

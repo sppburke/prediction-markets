@@ -102,17 +102,12 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 | `PE_BACKTEST_STEP_DAYS` | Walk-forward step size in days | | `1` |
 | `PE_BACKTEST_KELLY_SWEEP` | `1` to run Kelly-fraction sweep instead of single run | | `0` |
 
-#### Live trading only (pe-service, not yet implemented)
+#### Credentialed canary
 
-| Variable | Description |
-|---|---|
-| `PE_POLYMARKET_PRIVATE_KEY` | EOA private key for signing orders |
-| `PE_POLYMARKET_CLOB_API_KEY` | CLOB API key |
-| `PE_POLYMARKET_CLOB_API_SECRET` | CLOB API secret |
-| `PE_POLYMARKET_CLOB_API_PASSPHRASE` | CLOB API passphrase |
-| `PE_POLYMARKET_FUNDER_ADDRESS` | Funder wallet address |
-| `PE_POLYMARKET_OPERATOR_ADDRESSES` | Comma-separated proxy operator addresses |
-| `PE_EOA` | EOA address (for identity checks) |
+Ordinary `pe-service` is paper-only and has no live credential environment variables. The
+isolated V2 canary receives root-owned files through systemd `LoadCredential=` and is installed
+inactive. See [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md); never
+place canary credentials in the ordinary `.env`.
 
 ## Startup sequence
 
@@ -165,20 +160,11 @@ cargo run --release --bin pe-service
 
 Paper mode is the default for `leader_follow` after fresh bootstrap (see `docs/19-WINNER-FOLLOW-STRATEGY.md` "Promotion ladder"). Promotion to live-tiny requires a manual review and passing the walk-forward gate.
 
-### Recipe C — Live-tiny (first real capital)
+### Recipe C — Install the inactive canary
 
-**Prerequisites:** passing paper-mode walk-forward gate (see `docs/19-WINNER-FOLLOW-STRATEGY.md` "Promotion ladder: ordinary leader-follow"). Manual review required before enabling.
-
-```bash
-# Set Polymarket live credentials in .env:
-#   PE_POLYMARKET_PRIVATE_KEY, PE_POLYMARKET_CLOB_API_KEY,
-#   PE_POLYMARKET_CLOB_API_SECRET, PE_POLYMARKET_CLOB_API_PASSPHRASE,
-#   PE_POLYMARKET_FUNDER_ADDRESS, PE_POLYMARKET_OPERATOR_ADDRESSES, PE_EOA
-
-cargo run --release --bin pe-service
-# Live-tiny caps: 25 bps per trade, 3% per leader, 25% total exposure.
-# See canonical risk-cap TOML in docs/19-WINNER-FOLLOW-STRATEGY.md.
-```
+The implementation workflow may build and install the disabled unit only. It does not authorize
+wallet creation, funding, allowance mutation, arming, or a POST. Follow the artifact and
+permission checks in [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 ## Acceptance gate
 

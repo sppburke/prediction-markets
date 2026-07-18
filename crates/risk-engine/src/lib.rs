@@ -7,8 +7,9 @@ pub mod engine;
 pub mod snapshot;
 
 pub use block::RiskBlock;
-pub use engine::{RiskDecision, evaluate_risk};
-pub use snapshot::{RiskSnapshot, TradingMode};
+pub use engine::{RiskDecision, evaluate_canary_risk, evaluate_risk, exposure_bps_ceil};
+pub use pe_core_types::CanaryOrigin;
+pub use snapshot::{CanaryRiskSnapshot, RiskSnapshot, TradingMode};
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -159,5 +160,81 @@ mod tests_liquidity_clamp {
             clamp_contracts_to_liquidity(5, dec!(5000), dec!(0.05), dec!(200), dec!(0.50)),
             5
         );
+    }
+}
+
+#[cfg(test)]
+mod canary_tests {
+    use pe_core_types::{BasisPoints, CollateralAmount};
+
+    use super::*;
+
+    fn clean() -> CanaryRiskSnapshot {
+        CanaryRiskSnapshot {
+            origin: CanaryOrigin::Organic,
+            proposed_worst_case_debit: CollateralAmount::from_atomic(1_000_000),
+            canary_bankroll: CollateralAmount::from_atomic(400_000_000),
+            leader_exposure_bps: Some(BasisPoints(0)),
+            market_exposure_bps: BasisPoints(0),
+            family_exposure_bps: BasisPoints(0),
+            total_copy_exposure_bps: BasisPoints(0),
+            open_exposure_bps: BasisPoints(0),
+            drawdown_bps: BasisPoints(0),
+            resolver_tradable: true,
+            account_state_fresh: true,
+            venue_reconciliation_fresh: true,
+            geoblock_fresh: true,
+            geoblocked: false,
+            closed_only_fresh: true,
+            closed_only: false,
+            jurisdiction_attestation_valid: true,
+            pending_reservation: false,
+            allowance: CollateralAmount::from_atomic(8_000_000),
+            standard_spender_only: true,
+        }
+    }
+
+    #[test]
+    fn exact_one_dollar_at_four_hundred_is_25_bps() {
+        assert_eq!(evaluate_canary_risk(&clean()), RiskDecision::Approved);
+    }
+
+    #[test]
+    fn one_atomic_unit_over_cap_is_blocked() {
+        let mut snapshot = clean();
+        snapshot.proposed_worst_case_debit = CollateralAmount::from_atomic(1_000_001);
+        assert_eq!(
+            evaluate_canary_risk(&snapshot),
+            RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded)
+        );
+    }
+
+    #[test]
+    fn remaining_allowance_must_cover_the_next_worst_case_debit() {
+        let mut snapshot = clean();
+        snapshot.allowance = CollateralAmount::from_atomic(999_999);
+        assert_eq!(
+            evaluate_canary_risk(&snapshot),
+            RiskDecision::Blocked(RiskBlock::AllowanceExceeded)
+        );
+    }
+
+    #[test]
+    fn exposure_rounds_positive_values_outward() {
+        assert_eq!(
+            exposure_bps_ceil(
+                CollateralAmount::from_atomic(1),
+                CollateralAmount::from_atomic(400_000_000)
+            ),
+            Some(BasisPoints(1))
+        );
+    }
+
+    #[test]
+    fn probe_has_no_fabricated_leader_exposure() {
+        let mut snapshot = clean();
+        snapshot.origin = CanaryOrigin::OperatorProbe;
+        snapshot.leader_exposure_bps = None;
+        assert_eq!(evaluate_canary_risk(&snapshot), RiskDecision::Approved);
     }
 }

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prediction-edge.local/schema/resolver-card-v1.json",
+  "title": "Prediction Edge resolver card v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "card_id",
+    "condition_id",
+    "family",
+    "resolver_source",
+    "upstream_sources",
+    "output_space",
+    "timing",
+    "rounding",
+    "tie_rule",
+    "finality",
+    "revision_policy",
+    "status",
+    "valid_from",
+    "valid_until"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "card_id": { "type": "string", "minLength": 1 },
+    "condition_id": { "type": "string", "minLength": 1 },
+    "family": {
+      "enum": [
+        "weather", "crypto_benchmark_window", "crypto_spot_path", "sports_official",
+        "macro_release", "chart_ranking", "documents", "event_feed",
+        "politics_elections", "other"
+      ]
+    },
+    "resolver_source": { "$ref": "#/$defs/taggedRule" },
+    "upstream_sources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/taggedRule" }
+    },
+    "output_space": { "$ref": "#/$defs/taggedRule" },
+    "timing": { "$ref": "#/$defs/taggedRule" },
+    "rounding": { "$ref": "#/$defs/taggedRule" },
+    "tie_rule": {
+      "enum": ["no_trade_past_equal", "yes_on_equal", "no_on_equal", "source_defined"]
+    },
+    "finality": { "$ref": "#/$defs/taggedRule" },
+    "revision_policy": {
+      "enum": [
+        "no_revisions", "accept_until_final", "accept_only_official_corrections",
+        "human_review_required"
+      ]
+    },
+    "status": { "enum": ["tradable", "ambiguous", "deferred"] },
+    "valid_from": { "type": "string", "format": "date-time" },
+    "valid_until": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "taggedRule": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "value": {}
+      }
+    }
+  }
+}

@@ -3,7 +3,10 @@
 //! Every price, quantity, probability, identifier, and timestamp used across
 //! the workspace is defined here. No `f64` for money, prices, or probabilities.
 
+pub mod amount;
+pub mod canary;
 pub mod error;
+pub mod http_evidence;
 pub mod identity;
 pub mod ids;
 pub mod polymarket;
@@ -14,11 +17,17 @@ pub mod side;
 pub mod signal;
 pub mod time;
 
+pub use amount::{CollateralAmount, ShareAmount};
+pub use canary::CanaryOrigin;
 pub use error::Error;
+pub use http_evidence::{
+    RawArtifactObservation, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
+    TransportErrorClass,
+};
 pub use identity::{TraderId, VenueAccountId, WalletAddress};
 pub use ids::{
     EventSeq, MarketId, MarketOutcomeId, ModelId, OrderLocalId, OutcomeId, ResolverCardId,
-    SourceId, SourceTradeId, StrategyId, VenueId, VenueMarketId,
+    SourceId, SourceTradeId, StrategyId, VenueId, VenueMarketId, VenueOrderId,
 };
 pub use polymarket::{
     PolymarketConditionId, PolymarketOrderId, PolymarketOrderType, PolymarketTokenId,

@@ -18,7 +18,7 @@
 //!
 //! Every constant carries its original `verified <date> from <source>` comment.
 
-use alloy::primitives::{Address, B256, address, b256};
+use alloy_primitives::{Address, B256, address, b256};
 
 // ── Contract addresses ───────────────────────────────────────────────────────
 
@@ -86,7 +86,7 @@ pub(crate) fn normalise_condition_id(raw: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use alloy::primitives::keccak256;
+    use alloy_primitives::keccak256;
 
     use super::{
         ALL_ORDER_FILLED_TOPICS, TOPIC_ORDER_FILLED_V1, TOPIC_ORDER_FILLED_V2,

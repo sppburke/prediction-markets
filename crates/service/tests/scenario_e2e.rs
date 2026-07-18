@@ -26,7 +26,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use base64::Engine as _;
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, classify_trade};
 use pe_core_types::{
     BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
@@ -34,7 +33,7 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_event_log::Writer;
-use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
+use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
@@ -52,7 +51,6 @@ use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
-use pe_venue_polymarket::{FixtureCLOBClient, PolymarketCredentials, PolymarketVenueAdapter};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -101,24 +99,12 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
     }
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher<FixtureCLOBClient> {
+fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
     let paper_path = dir.path().join("paper.log");
     let paper_writer = Writer::open(&paper_path).unwrap();
     let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
 
-    let live_path = dir.path().join("live.log");
-    let live_writer = Writer::open(&live_path).unwrap();
-    let creds = PolymarketCredentials::mainnet(
-        "0x0000000000000000000000000000000000000001".into(),
-        "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
-        "key".into(),
-        base64::engine::general_purpose::STANDARD.encode(b"secret"),
-        "pass".into(),
-    );
-    let adapter = PolymarketVenueAdapter::new(FixtureCLOBClient::new(vec![], vec![]), creds);
-    let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("test.live".into()));
-
-    ExecutionDispatcher::new(paper_executor, live_executor)
+    ExecutionDispatcher::paper_only(paper_executor)
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {

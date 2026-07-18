@@ -291,6 +291,26 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `position_size_threshold` | 1 | `ServiceConfig` field. Minimum position size (contracts) to include; positions below this are treated as dust. |
 | `position_max_pages` | 20 | **Module const** in `crates/service/src/position_seeder.rs` (not a TOML/env key). Safety backstop: pagination stops after this many pages per wallet; a `warn!` is emitted if hit. |
 
+### Isolated Polymarket V2 canary (`pe-service-live-canary`)
+
+The canary is a boot-frozen campaign role, not an `ExecutionMode` or promotion state. It is
+installed inactive and is the only credentialed order path. Ordinary `pe-service` remains
+paper-only. The dedicated actor owns the credentialed client, one mode-0600 event log, command
+serialization, reservation, one-shot POST, reconciliation, and recovery.
+
+| Key | Canonical value | Meaning |
+|---|---:|---|
+| `canary_command_queue_capacity` | 1 | Capacity of the normal actor mailbox; saturation rejects before acceptance. |
+| `canary_post_timeout_secs` | 10 | Total budget for the one allowed POST attempt; timeout is ambiguous and closes admission. |
+| `canary_reconciliation_timeout_secs` | 30 | Budget for one authenticated reconciliation pass. |
+| `canary_reconciliation_interval_secs` | 30 | Non-overlapping observation cadence while armed or closed with unresolved state. |
+| `canary_ranking_max_age_secs` | 21,600 | Maximum age of the one strictly matched Supabase ranking batch used for organic admission (6 hours). |
+| `canary_shutdown_work_deadline_secs` | 40 | Signal-to-work cutoff for POST completion and the one designated final reconciliation; the final 5 seconds are reserved for durable terminal state/status. |
+| `canary_shutdown_deadline_secs` | 45 | Application drain deadline; systemd's 50-second guard is outer-only. |
+
+Campaign financial limits and eligibility are canonical in
+[`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md#isolated-polymarket-v2-canary).
+
 ### Paper trading state (`paper-state`, issue #282)
 
 | Key | Default | Meaning |

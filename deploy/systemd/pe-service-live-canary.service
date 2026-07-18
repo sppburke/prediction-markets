@@ -1,0 +1,34 @@
+[Unit]
+Description=Inactive Polymarket V2 Winner-Follow canary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prediction-edge-canary
+Group=prediction-edge-canary
+UMask=0077
+ExecStart=/usr/local/bin/pe-service-live-canary daemon
+LoadCredential=canary-boot-config:/etc/prediction-edge-canary/canary-boot-config.json
+LoadCredential=polymarket-private-key:/etc/prediction-edge-canary/polymarket-private-key
+LoadCredential=polymarket-api-key:/etc/prediction-edge-canary/polymarket-api-key
+LoadCredential=polymarket-api-secret:/etc/prediction-edge-canary/polymarket-api-secret
+LoadCredential=polymarket-api-passphrase:/etc/prediction-edge-canary/polymarket-api-passphrase
+LoadCredential=polymarket-deposit-wallet:/etc/prediction-edge-canary/polymarket-deposit-wallet
+LoadCredential=supabase-url:/etc/prediction-edge-canary/supabase-url
+LoadCredential=supabase-anon-key:/etc/prediction-edge-canary/supabase-anon-key
+StateDirectory=pe-service-live-canary
+StateDirectoryMode=0700
+RuntimeDirectory=pe-service-live-canary
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+TimeoutStopSec=50
+Restart=no
+
+[Install]
+# Deliberately no WantedBy: installation never enables or starts the inactive canary.
