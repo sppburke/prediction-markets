@@ -79,7 +79,6 @@ pub struct CanaryRiskSnapshot {
     pub family_exposure_bps: BasisPoints,
     pub total_copy_exposure_bps: BasisPoints,
     pub open_exposure_bps: BasisPoints,
-    pub drawdown_bps: BasisPoints,
     pub resolver_tradable: bool,
     pub account_state_fresh: bool,
     pub venue_reconciliation_fresh: bool,

@@ -9,7 +9,10 @@ use pe_core_types::{
     ShareAmount, Side, StrategyId,
 };
 use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
-use pe_risk_engine::{RiskDecision, RiskSnapshot, clamp_contracts_to_cap, evaluate_risk};
+use pe_risk_engine::{
+    CANARY_MAX_ORDER_DEBIT, CANARY_PER_TRADE_CAP_BPS, RiskDecision, RiskSnapshot,
+    clamp_contracts_to_cap, evaluate_risk,
+};
 use pe_venue_core::OrderIntent;
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +24,6 @@ use crate::{
 const STRATEGY_ID: &str = "winner-follow";
 const ORDER_VALIDITY_SECONDS: u32 = 30;
 const ORGANIC_CHASE_BPS: u32 = 75;
-const CANARY_PER_TRADE_BPS: u64 = 25;
-const CANARY_ABSOLUTE_CAP_ATOMIC: u64 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrganicCanaryOrder {
@@ -81,8 +82,8 @@ impl OrganicCanaryPolicy {
             sized,
             kelly_cost,
             canary_bankroll.to_decimal(),
-            CANARY_PER_TRADE_BPS as i32,
-            Some(CollateralAmount::from_atomic(CANARY_ABSOLUTE_CAP_ATOMIC)),
+            CANARY_PER_TRADE_CAP_BPS.0,
+            Some(CANARY_MAX_ORDER_DEBIT),
         );
         if contracts == 0 {
             return Err(WinnerFollowError::NoEdge);
@@ -436,7 +437,7 @@ mod canary_tests {
             .evaluate(
                 &signal(),
                 Probability(dec!(0.90)),
-                CollateralAmount::from_atomic(400_000_000),
+                CollateralAmount::from_atomic(200_000_000),
                 Price(dec!(0.01)),
             )
             .unwrap();
@@ -444,6 +445,20 @@ mod canary_tests {
         assert_eq!(order.intent.contracts, ContractQty(2));
         assert_eq!(order.maximum_collateral.atomic(), 1_000_000);
         assert_eq!(order.shares.atomic(), 2_000_000);
+    }
+
+    #[test]
+    fn organic_policy_uses_the_lower_dynamic_cap_after_bankroll_declines() {
+        let order = OrganicCanaryPolicy
+            .evaluate(
+                &signal(),
+                Probability(dec!(0.90)),
+                CollateralAmount::from_atomic(199_000_000),
+                Price(dec!(0.01)),
+            )
+            .unwrap();
+        assert_eq!(order.intent.contracts, ContractQty(1));
+        assert_eq!(order.maximum_collateral.atomic(), 500_000);
     }
 
     #[test]
@@ -455,7 +470,7 @@ mod canary_tests {
                 .evaluate(
                     &ineligible,
                     Probability(dec!(0.90)),
-                    CollateralAmount::from_atomic(400_000_000),
+                    CollateralAmount::from_atomic(200_000_000),
                     Price(dec!(0.01)),
                 )
                 .is_err()
@@ -469,7 +484,7 @@ mod canary_tests {
             .evaluate(
                 &signal,
                 Probability(dec!(0.75)),
-                CollateralAmount::from_atomic(400_000_000),
+                CollateralAmount::from_atomic(200_000_000),
                 Price(dec!(0.01)),
             )
             .unwrap();

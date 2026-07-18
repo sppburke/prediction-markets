@@ -12,7 +12,7 @@ use pe_core_types::{
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
 use pe_resolver_card::MarketFamily;
-use pe_risk_engine::CanaryRiskSnapshot;
+use pe_risk_engine::{CANARY_MAX_ALLOWANCE, CanaryRiskSnapshot};
 use pe_strategy_winner_follow::{
     OrganicCanaryPolicy, OrganicDecisionProof, organic_decision_proof_hash,
 };
@@ -21,9 +21,8 @@ use pe_venue_polymarket::PreparedPolymarketBuy;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub const CAMPAIGN_START_COLLATERAL: CollateralAmount = CollateralAmount::from_atomic(400_000_000);
+pub const CAMPAIGN_START_COLLATERAL: CollateralAmount = CollateralAmount::from_atomic(200_000_000);
 pub const CAMPAIGN_MAX_COMMITMENT: CollateralAmount = CollateralAmount::from_atomic(8_000_000);
-pub const CAMPAIGN_MAX_ALLOWANCE: CollateralAmount = CollateralAmount::from_atomic(8_000_000);
 pub const PROBE_POST_LIMIT: u8 = 3;
 pub const ORGANIC_POST_LIMIT: u8 = 5;
 pub const CAMPAIGN_MAX_DURATION_SECS: i64 = 7 * 24 * 60 * 60;
@@ -204,7 +203,7 @@ impl CampaignAuthorization {
             || self.jurisdiction_attestation_hash.trim().is_empty()
             || self.account_attestation_hash.trim().is_empty()
             || self.starting_collateral != CAMPAIGN_START_COLLATERAL
-            || self.allowance > CAMPAIGN_MAX_ALLOWANCE
+            || self.allowance > CANARY_MAX_ALLOWANCE
             || self.commitment_cap != CAMPAIGN_MAX_COMMITMENT
             || self.probe_slots != PROBE_POST_LIMIT
             || self.organic_slots != ORGANIC_POST_LIMIT
@@ -355,13 +354,6 @@ impl CanaryAdmission {
         let expected_total_exposure =
             pe_risk_engine::exposure_bps_ceil(exposure.total, state.canary_bankroll)
                 .ok_or(CanaryStateError::Arithmetic)?;
-        let loss = state
-            .starting_collateral
-            .checked_sub(state.free_collateral)
-            .unwrap_or(CollateralAmount::ZERO);
-        let expected_drawdown = pe_risk_engine::exposure_bps_ceil(loss, state.starting_collateral)
-            .map(|drawdown| pe_core_types::BasisPoints(-drawdown.0))
-            .unwrap_or(pe_core_types::BasisPoints(i32::MIN));
         let organic_proof_valid = match (&self.origin, &self.organic_decision_proof) {
             (AttemptOrigin::OperatorProbe, None) => true,
             (AttemptOrigin::Organic, Some(proof)) => {
@@ -447,7 +439,6 @@ impl CanaryAdmission {
             || self.risk.family_exposure_bps != expected_family_exposure
             || self.risk.total_copy_exposure_bps != expected_total_exposure
             || self.risk.open_exposure_bps != expected_total_exposure
-            || self.risk.drawdown_bps != expected_drawdown
             || self.risk.pending_reservation != state.pending.is_some()
             || self.risk.allowance != state.allowance
             || self.risk.account_state_fresh
@@ -1499,7 +1490,7 @@ mod tests {
             issued_at: datetime!(2026-07-17 0:00 UTC),
             expires_at: datetime!(2026-07-24 0:00 UTC),
             starting_collateral: CAMPAIGN_START_COLLATERAL,
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             commitment_cap: CAMPAIGN_MAX_COMMITMENT,
             probe_slots: PROBE_POST_LIMIT,
             organic_slots: ORGANIC_POST_LIMIT,
@@ -1511,6 +1502,35 @@ mod tests {
             command_id: id.to_owned(),
             command_hash: format!("hash-{id}"),
         }
+    }
+
+    #[test]
+    fn campaign_authority_requires_exact_two_hundred_dollars() {
+        let mut authorization = authority();
+        let now = datetime!(2026-07-18 0:00 UTC);
+        assert!(authorization.validate(now).is_ok());
+
+        for invalid in [199_999_999, 200_000_001, 400_000_000] {
+            authorization.starting_collateral = CollateralAmount::from_atomic(invalid);
+            assert!(matches!(
+                authorization.validate(now),
+                Err(CanaryStateError::AuthorityMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn campaign_authority_accepts_a_selected_allowance_up_to_eight_dollars() {
+        let mut authorization = authority();
+        let now = datetime!(2026-07-18 0:00 UTC);
+        authorization.allowance = CollateralAmount::from_atomic(5_000_000);
+        assert!(authorization.validate(now).is_ok());
+
+        authorization.allowance = CollateralAmount::from_atomic(8_000_001);
+        assert!(matches!(
+            authorization.validate(now),
+            Err(CanaryStateError::AuthorityMismatch)
+        ));
     }
 
     fn blank_reconciliation() -> CanaryReconciliation {
@@ -1577,7 +1597,6 @@ mod tests {
                     family_exposure_bps: pe_core_types::BasisPoints(0),
                     total_copy_exposure_bps: pe_core_types::BasisPoints(0),
                     open_exposure_bps: pe_core_types::BasisPoints(0),
-                    drawdown_bps: pe_core_types::BasisPoints(0),
                     resolver_tradable: true,
                     account_state_fresh: true,
                     venue_reconciliation_fresh: true,
@@ -1640,6 +1659,7 @@ mod tests {
     }
 
     fn settle(state: &mut CanaryCampaignState, identity: &str) {
+        let requested_collateral = state.pending.as_ref().unwrap().worst_case_debit;
         state
             .apply(&CanaryEvent::PostInFlight {
                 identity: identity.to_owned(),
@@ -1658,7 +1678,7 @@ mod tests {
             .unwrap();
         let report = ExactExecutionReport {
             venue_order_id: Some(pe_core_types::VenueOrderId(format!("venue-{identity}"))),
-            requested_collateral: CollateralAmount::from_atomic(500_000),
+            requested_collateral,
             requested_shares: ShareAmount::from_atomic(5_000_000),
             filled_collateral: CollateralAmount::from_atomic(500_000),
             filled_shares: ShareAmount::from_atomic(5_000_000),
@@ -1728,7 +1748,7 @@ mod tests {
             .unwrap();
         state.apply(&prepared("probe-1", 1_000_000)).unwrap();
         assert_eq!(state.committed_debit.atomic(), 1_000_000);
-        assert_eq!(state.canary_bankroll.atomic(), 399_000_000);
+        assert_eq!(state.canary_bankroll.atomic(), 199_000_000);
         assert!(matches!(
             state.apply(&prepared("probe-2", 1_000_000)),
             Err(CanaryStateError::PendingAttempt)
@@ -1805,6 +1825,48 @@ mod tests {
     }
 
     #[test]
+    fn journal_rebuild_accepts_legacy_schema_one_drawdown_input() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("canary.log");
+        let mut journal = CanaryJournal::open(&path).unwrap();
+        let mut legacy_authority = authority();
+        legacy_authority.starting_collateral = CollateralAmount::from_atomic(400_000_000);
+        journal
+            .append_sync(
+                &CanaryEvent::CampaignArmed {
+                    authorization: legacy_authority,
+                    receipt: receipt("arm"),
+                },
+                datetime!(2026-07-17 1:00 UTC),
+            )
+            .unwrap();
+
+        let mut legacy = serde_json::to_value(prepared("probe-1", 1_000_000)).unwrap();
+        legacy["admission"]["risk"]["canary_bankroll"] = serde_json::json!(400_000_000);
+        legacy["admission"]["risk"]["drawdown_bps"] = serde_json::json!(-25);
+        journal
+            .writer
+            .append(EnvelopeIn {
+                source_id: SourceId("live-canary".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(datetime!(2026-07-17 1:01 UTC)),
+                received_at: ReceivedAt::now_utc(),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&legacy).unwrap(),
+            })
+            .unwrap();
+        journal.writer.sync().unwrap();
+        drop(journal);
+
+        let rebuilt = CanaryJournal::rebuild(&path).unwrap();
+        assert_eq!(rebuilt.starting_collateral.atomic(), 400_000_000);
+        assert_eq!(rebuilt.probe_posts, 1);
+        assert_eq!(rebuilt.committed_debit.atomic(), 1_000_000);
+        assert_eq!(rebuilt.pending.unwrap().identity, "probe-1");
+    }
+
+    #[test]
     fn reconciliation_and_attempt_finalization_rebuild_atomically() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("canary.log");
@@ -1848,7 +1910,7 @@ mod tests {
                     observed_at: datetime!(2026-07-17 1:05 UTC),
                     geoblocked: false,
                     closed_only: false,
-                    free_collateral: CollateralAmount::from_atomic(399_500_000),
+                    free_collateral: CollateralAmount::from_atomic(199_500_000),
                     allowance: CollateralAmount::from_atomic(7_500_000),
                     standard_spender_only: true,
                     open_order_ids: Vec::new(),
@@ -1881,7 +1943,7 @@ mod tests {
         assert_eq!(rebuilt, expected);
         assert_eq!(rebuilt.pending.unwrap().phase, AttemptPhase::Review);
         assert_eq!(rebuilt.attempts[0].open_debit.atomic(), 500_000);
-        assert_eq!(rebuilt.free_collateral.atomic(), 399_500_000);
+        assert_eq!(rebuilt.free_collateral.atomic(), 199_500_000);
     }
 
     #[test]
@@ -1960,7 +2022,7 @@ mod tests {
             .unwrap();
         for ordinal in 1..=PROBE_POST_LIMIT {
             let identity = format!("probe-{ordinal}");
-            state.apply(&prepared(&identity, 500_000)).unwrap();
+            state.apply(&prepared(&identity, 1_000_000)).unwrap();
             settle(&mut state, &identity);
             let reviewed_probe_hash = state.reviewable_probe_hash().unwrap().unwrap();
             state
@@ -1975,7 +2037,7 @@ mod tests {
         assert_eq!(state.allowance, CollateralAmount::from_atomic(6_500_000));
         assert_eq!(
             state.free_collateral,
-            CollateralAmount::from_atomic(398_500_000)
+            CollateralAmount::from_atomic(198_500_000)
         );
         assert_eq!(state.stage, CampaignStage::OrganicReady);
         assert!(matches!(
@@ -2002,11 +2064,12 @@ mod tests {
         for ordinal in 1..=ORGANIC_POST_LIMIT {
             let identity = format!("organic-{ordinal}");
             state
-                .apply(&prepared_for(&identity, 500_000, AttemptOrigin::Organic))
+                .apply(&prepared_for(&identity, 1_000_000, AttemptOrigin::Organic))
                 .unwrap();
             settle(&mut state, &identity);
         }
         assert_eq!(state.organic_posts, ORGANIC_POST_LIMIT);
+        assert_eq!(state.committed_debit, CAMPAIGN_MAX_COMMITMENT);
         assert_eq!(state.stage, CampaignStage::ClosedObserving);
         assert_eq!(state.terminal_reason, Some(ClosureReason::Exhausted));
         assert!(matches!(
@@ -2058,8 +2121,8 @@ mod tests {
             observed_at: datetime!(2026-07-17 1:00 UTC),
             geoblocked: false,
             closed_only: false,
-            free_collateral: CollateralAmount::from_atomic(399_000_000),
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            free_collateral: CollateralAmount::from_atomic(199_000_000),
+            allowance: CANARY_MAX_ALLOWANCE,
             standard_spender_only: true,
             open_order_ids: Vec::new(),
             all_trade_ids: Vec::new(),
@@ -2085,7 +2148,7 @@ mod tests {
             ..CanaryCampaignState::default()
         };
         let mut unexplained = base_snapshot.clone();
-        unexplained.free_collateral = CollateralAmount::from_atomic(399_000_001);
+        unexplained.free_collateral = CollateralAmount::from_atomic(199_000_001);
         assert!(!state.reconciliation_balance_explained(&unexplained));
         let mut partial_transfer = base_snapshot.clone();
         partial_transfer.positions[0].shares = ShareAmount::from_atomic(1_999_999);
@@ -2096,9 +2159,9 @@ mod tests {
         redeemed.position_count = 0;
         redeemed.free_collateral = base_snapshot.free_collateral;
         assert!(!state.reconciliation_balance_explained(&redeemed));
-        redeemed.free_collateral = CollateralAmount::from_atomic(401_000_000);
+        redeemed.free_collateral = CollateralAmount::from_atomic(201_000_000);
         assert!(!state.reconciliation_balance_explained(&redeemed));
-        redeemed.free_collateral = CollateralAmount::from_atomic(401_000_001);
+        redeemed.free_collateral = CollateralAmount::from_atomic(201_000_001);
         assert!(!state.reconciliation_balance_explained(&redeemed));
         let mut losing_state = state.clone();
         let mut losing = redeemed.clone();
@@ -2118,7 +2181,7 @@ mod tests {
             .unwrap();
         assert_eq!(losing_state.attempts[0].open_debit, CollateralAmount::ZERO);
 
-        redeemed.free_collateral = CollateralAmount::from_atomic(401_000_000);
+        redeemed.free_collateral = CollateralAmount::from_atomic(201_000_000);
         redeemed.resolutions = vec![CanaryResolution {
             condition_id: PolymarketConditionId("condition".to_owned()),
             winner: OutcomeId(0),
@@ -2139,7 +2202,7 @@ mod tests {
     fn allowance_reconciliation_accepts_only_the_exact_fill_debit() {
         let state = CanaryCampaignState {
             campaign_id: Some("campaign".to_owned()),
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             ..CanaryCampaignState::default()
         };
         let report = ExactExecutionReport {
@@ -2175,7 +2238,7 @@ mod tests {
         let baseline = CanaryReconciliation {
             observed_at: datetime!(2026-07-17 1:00 UTC),
             free_collateral: CAMPAIGN_START_COLLATERAL,
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             standard_spender_only: true,
             ..blank_reconciliation()
         };
@@ -2183,13 +2246,13 @@ mod tests {
             campaign_id: Some("campaign".to_owned()),
             stage: CampaignStage::ClosedObserving,
             free_collateral: CAMPAIGN_START_COLLATERAL,
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             last_reconciliation: Some(baseline.clone()),
             ..CanaryCampaignState::default()
         };
         let mut drifted = baseline.clone();
         drifted.observed_at = datetime!(2026-07-17 1:01 UTC);
-        drifted.free_collateral = CollateralAmount::from_atomic(399_999_999);
+        drifted.free_collateral = CollateralAmount::from_atomic(199_999_999);
         state
             .apply(&CanaryEvent::ReconciliationRecorded {
                 context: "drift".to_owned(),
@@ -2225,7 +2288,7 @@ mod tests {
         };
         let baseline = CanaryReconciliation {
             observed_at: datetime!(2026-07-17 1:00 UTC),
-            free_collateral: CollateralAmount::from_atomic(399_500_000),
+            free_collateral: CollateralAmount::from_atomic(199_500_000),
             allowance: CollateralAmount::from_atomic(7_500_000),
             standard_spender_only: true,
             position_count: 1,
@@ -2291,8 +2354,8 @@ mod tests {
             observed_at: datetime!(2026-07-17 1:00 UTC),
             geoblocked: false,
             closed_only: false,
-            free_collateral: CollateralAmount::from_atomic(397_000_000),
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            free_collateral: CollateralAmount::from_atomic(197_000_000),
+            allowance: CANARY_MAX_ALLOWANCE,
             standard_spender_only: true,
             open_order_ids: Vec::new(),
             all_trade_ids: Vec::new(),
@@ -2336,9 +2399,9 @@ mod tests {
             },
         ];
         let mut external_top_up = settled.clone();
-        external_top_up.free_collateral = CollateralAmount::from_atomic(398_500_000);
+        external_top_up.free_collateral = CollateralAmount::from_atomic(198_500_000);
         assert!(!state.reconciliation_balance_explained(&external_top_up));
-        settled.free_collateral = CollateralAmount::from_atomic(398_000_000);
+        settled.free_collateral = CollateralAmount::from_atomic(198_000_000);
         assert!(state.reconciliation_balance_explained(&settled));
         state
             .apply(&CanaryEvent::ReconciliationRecorded {
@@ -2370,8 +2433,8 @@ mod tests {
             observed_at: datetime!(2026-07-17 1:00 UTC),
             geoblocked: false,
             closed_only: false,
-            free_collateral: CollateralAmount::from_atomic(397_000_000),
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            free_collateral: CollateralAmount::from_atomic(197_000_000),
+            allowance: CANARY_MAX_ALLOWANCE,
             standard_spender_only: true,
             open_order_ids: Vec::new(),
             all_trade_ids: Vec::new(),
@@ -2420,11 +2483,11 @@ mod tests {
             ..previous.clone()
         };
 
-        assert!(state.reconciliation_balance_explained(&settled_at(398_000_000, 0)));
-        assert!(state.reconciliation_balance_explained(&settled_at(399_000_000, 1)));
-        assert!(!state.reconciliation_balance_explained(&settled_at(397_000_000, 0)));
-        assert!(!state.reconciliation_balance_explained(&settled_at(398_500_000, 0)));
-        assert!(!state.reconciliation_balance_explained(&settled_at(400_000_000, 1)));
+        assert!(state.reconciliation_balance_explained(&settled_at(198_000_000, 0)));
+        assert!(state.reconciliation_balance_explained(&settled_at(199_000_000, 1)));
+        assert!(!state.reconciliation_balance_explained(&settled_at(197_000_000, 0)));
+        assert!(!state.reconciliation_balance_explained(&settled_at(198_500_000, 0)));
+        assert!(!state.reconciliation_balance_explained(&settled_at(200_000_000, 1)));
     }
 
     #[test]

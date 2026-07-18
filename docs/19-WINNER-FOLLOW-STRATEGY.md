@@ -430,13 +430,15 @@ promotion ladder. A separately reviewed campaign may consume at most three indiv
 authorized probes followed by five automatic ordinary Winner-Follow attempts over at most seven
 days.
 
-The campaign starts from exactly $400.000000 of freshly reconciled free pUSD cash, no positions or
+The campaign starts from exactly $200.000000 of freshly reconciled free pUSD cash, no positions or
 orders, and one standard-V2-exchange allowance no greater than $8.000000. Each BUY-only,
 fee-free, standard-exchange, binary Geopolitics attempt is a whole-share V2 limit FOK with exact
-worst-case debit bounded by both $1.000000 and `floor_to_collateral_atomic(25 bps ×
+worst-case debit bounded by both $1.000000 and `floor_to_collateral_atomic(50 bps ×
 canary_bankroll)`. The monotonic sum of reserved worst-case debits and the approved allowance are
 each capped at $8.000000; rejection or a smaller realized debit restores neither a slot nor
-commitment.
+commitment. The campaign accepts the entire $8.000000 commitment as loss exposure and has no
+canary drawdown measure or drawdown stop; the dynamic per-order percentage cap and the remaining
+free bankroll can still reduce executable aggregate debit below $8.000000.
 
 `canary_bankroll` is freshly reconciled free deposit-wallet pUSD minus a pending reservation. No
 conditional-token mark is included. Exposure basis points round positive values outward against

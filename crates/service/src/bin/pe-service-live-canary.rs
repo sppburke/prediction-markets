@@ -1127,12 +1127,6 @@ fn finalize_canary_order(
     let market_exposure_bps = exposure_bps(exposure.market, state.canary_bankroll)?;
     let family_exposure_bps = exposure_bps(exposure.family, state.canary_bankroll)?;
     let total_exposure_bps = exposure_bps(exposure.total, state.canary_bankroll)?;
-    let loss = state
-        .starting_collateral
-        .checked_sub(state.free_collateral)
-        .unwrap_or(CollateralAmount::ZERO);
-    let drawdown =
-        exposure_bps_ceil(loss, state.starting_collateral).unwrap_or(BasisPoints(i32::MAX));
     let now = OffsetDateTime::now_utc();
     let quote = CanaryQuote {
         origin,
@@ -1172,7 +1166,6 @@ fn finalize_canary_order(
             family_exposure_bps,
             total_copy_exposure_bps: total_exposure_bps,
             open_exposure_bps: total_exposure_bps,
-            drawdown_bps: BasisPoints(-drawdown.0),
             resolver_tradable: true,
             account_state_fresh: true,
             venue_reconciliation_fresh: true,
@@ -1589,5 +1582,42 @@ mod tests {
 
         assert!(resolver_inventory_identity_hash(directory.path()).is_ok());
         assert!(resolver_inventory_hash(directory.path()).is_err());
+    }
+
+    #[test]
+    fn running_binary_rejects_a_journal_bound_to_the_legacy_artifact() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("resolver.json"), b"{}").unwrap();
+        let resolver_hash = resolver_inventory_identity_hash(directory.path()).unwrap();
+        let boot = CanaryBootIdentity {
+            config: CanaryBootConfig {
+                schema_version: 1,
+                implementation_commit: "current-commit".to_owned(),
+                jurisdiction: "US".to_owned(),
+                jurisdiction_attestation_hash: "jurisdiction".to_owned(),
+                account_attestation_hash: "account".to_owned(),
+            },
+            config_hash: "config".to_owned(),
+            binary_hash: "current-binary".to_owned(),
+            wallet: "wallet".to_owned(),
+            owner_signer: "owner".to_owned(),
+            spender: "spender".to_owned(),
+            resolver_dir: directory.path().to_path_buf(),
+        };
+        let state = CanaryCampaignState {
+            campaign_id: Some("legacy-campaign".to_owned()),
+            implementation_commit: Some("current-commit".to_owned()),
+            binary_hash: Some("legacy-binary".to_owned()),
+            config_hash: Some("config".to_owned()),
+            resolver_inventory_hash: Some(resolver_hash),
+            sdk_archive_sha256: Some(SDK_ARCHIVE_SHA256.to_owned()),
+            sdk_effective_vendor_tree_sha256: Some(SDK_EFFECTIVE_VENDOR_TREE_SHA256.to_owned()),
+            wallet: Some("wallet".to_owned()),
+            owner_signer: Some("owner".to_owned()),
+            spender: Some("spender".to_owned()),
+            ..CanaryCampaignState::default()
+        };
+
+        assert!(ensure_running_campaign_binding(&state, &boot).is_err());
     }
 }
