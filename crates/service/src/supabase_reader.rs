@@ -10,14 +10,19 @@
 //! [`Decimal`] (via the exact decimal literal), never through `f64`.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr as _;
 
-use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
+use pe_core_types::{
+    BasisPoints, RawHttpAttempt, RawHttpResponse, RawTransportFailure, ReconstructionQuality,
+    SourceTimestamp, TransportErrorClass, WalletAddress,
+};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// t-stat → basis-points scale for `leader_score_bps`. The score only orders entries
 /// within the live set (`watchlist.rs`: entries sorted descending by `leader_score_bps`);
@@ -30,6 +35,7 @@ const LS_TSTAT_BPS_SCALE: i64 = 1_000;
 /// wallets idle > 72h at upload; this is the read-side gate for the same window). Typed `i64`
 /// for direct unix-second arithmetic with the poll clock — no narrowing cast.
 pub const ACTIVE_WINDOW_HOURS: i64 = 72;
+pub const CANARY_RANKING_MAX_AGE_SECS: i64 = 21_600;
 
 /// Reconstruction quality assigned to Supabase-sourced wallets. The ranker has already
 /// applied its own data-quality gates, so these wallets are treated as fully reconstructed
@@ -48,12 +54,37 @@ pub enum SupabaseError {
     /// The 2xx body could not be decoded as the expected JSON rows.
     #[error("supabase response decode failed: {0}")]
     Decode(reqwest::Error),
+    #[error("supabase response JSON failed: {0}")]
+    Json(serde_json::Error),
+    #[error("supabase canary observation failed: {reason}")]
+    CanaryObserved {
+        reason: String,
+        attempts: Vec<RawHttpAttempt>,
+    },
+}
+
+fn observed_canary_contract(
+    reason: impl Into<String>,
+    responses: &[RawHttpResponse],
+) -> SupabaseError {
+    SupabaseError::CanaryObserved {
+        reason: reason.into(),
+        attempts: responses
+            .iter()
+            .cloned()
+            .map(RawHttpAttempt::Response)
+            .collect(),
+    }
 }
 
 /// One row of the `latest_ranking` view. Unused columns (`batch_id`, `rank`, `ls_edge`,
 /// `fill_rate`, `avg_price`) are ignored by serde.
 #[derive(Debug, Deserialize)]
 struct RankingRow {
+    #[serde(default)]
+    batch_id: Option<i64>,
+    #[serde(default)]
+    rank: Option<i64>,
     wallet_hex: String,
     /// Mean payoff among filled positions ∈ [0,1] = Kelly `p`. → `win_rate_bps`.
     #[serde(default)]
@@ -69,6 +100,295 @@ struct RankingRow {
     /// poll cursor / inactivity clock (#357 PR-3); it never affects the row→entry map.
     #[serde(default)]
     last_trade_unix: Option<i64>,
+}
+
+/// Strict canary-only ranking read. Unlike the ordinary paper reader, this rejects malformed,
+/// stale, duplicate, incomplete, or cross-batch rows and raw-captures the owning batch timestamp.
+pub async fn fetch_canary_observed(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    limit: usize,
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>, Vec<RawHttpResponse>), SupabaseError> {
+    let ranking_url = format!(
+        "{}/rest/v1/latest_ranking?order=rank&limit={}",
+        base_url.trim_end_matches('/'),
+        limit
+    );
+    let ranking = get_observation(client, &ranking_url, anon_key).await?;
+    let mut observations = vec![ranking.clone()];
+    let rows: Vec<RankingRow> = serde_json::from_slice(&ranking.body)
+        .map_err(|error| observed_canary_contract(error.to_string(), &observations))?;
+    if rows.is_empty() {
+        return Err(observed_canary_contract(
+            "latest ranking is empty",
+            &observations,
+        ));
+    }
+    if rows.len() > limit {
+        return Err(observed_canary_contract(
+            "latest ranking exceeded the requested limit",
+            &observations,
+        ));
+    }
+    let now = OffsetDateTime::now_utc();
+    let mut batch_id = None;
+    let mut wallets = HashSet::new();
+    let mut ranks = HashSet::new();
+    let mut previous_rank = None;
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut cursors = HashMap::new();
+    for row in &rows {
+        let row_batch = row.batch_id.ok_or_else(|| {
+            observed_canary_contract("ranking row omitted batch_id", &observations)
+        })?;
+        if batch_id
+            .replace(row_batch)
+            .is_some_and(|batch| batch != row_batch)
+        {
+            return Err(observed_canary_contract(
+                "latest ranking mixed multiple batches",
+                &observations,
+            ));
+        }
+        let rank = row.rank.filter(|rank| *rank > 0).ok_or_else(|| {
+            observed_canary_contract("ranking row omitted a valid rank", &observations)
+        })?;
+        if !ranks.insert(rank) {
+            return Err(observed_canary_contract(
+                "latest ranking repeated a rank",
+                &observations,
+            ));
+        }
+        if previous_rank.is_some_and(|previous| rank <= previous) {
+            return Err(observed_canary_contract(
+                "latest ranking was not ordered by increasing rank",
+                &observations,
+            ));
+        }
+        previous_rank = Some(rank);
+        let entry = map_row(row).ok_or_else(|| {
+            observed_canary_contract("ranking row has an invalid wallet", &observations)
+        })?;
+        if !wallets.insert(entry.wallet) {
+            return Err(observed_canary_contract(
+                "latest ranking repeated a wallet",
+                &observations,
+            ));
+        }
+        let hit_rate = cell_to_decimal(row.hit_rate.as_ref());
+        let score = cell_to_decimal(row.ls_tstat.as_ref());
+        let score_fits = score
+            .and_then(|value| (value * Decimal::from(LS_TSTAT_BPS_SCALE)).round().to_i32())
+            .is_some();
+        let trade_count_fits = row
+            .n_trades
+            .and_then(|trades| u32::try_from(trades).ok())
+            .is_some();
+        if hit_rate.is_none_or(|value| !(Decimal::ZERO..=Decimal::ONE).contains(&value))
+            || !score_fits
+            || !trade_count_fits
+        {
+            return Err(observed_canary_contract(
+                "ranking row has an invalid required score field",
+                &observations,
+            ));
+        }
+        let last_trade = row.last_trade_unix.ok_or_else(|| {
+            observed_canary_contract("ranking row omitted last_trade_unix", &observations)
+        })?;
+        let age = now.unix_timestamp().saturating_sub(last_trade);
+        if age < 0 || age > ACTIVE_WINDOW_HOURS.saturating_mul(3_600) {
+            return Err(observed_canary_contract(
+                "ranking row last trade is stale or future-dated",
+                &observations,
+            ));
+        }
+        cursors.insert(entry.wallet, last_trade);
+        entries.push(entry);
+    }
+    let batch_id = batch_id.ok_or_else(|| {
+        observed_canary_contract("latest ranking omitted batch identity", &observations)
+    })?;
+    let batch_url = format!(
+        "{}/rest/v1/ranking_batches?select=batch_id,created_at&batch_id=eq.{batch_id}&limit=2",
+        base_url.trim_end_matches('/')
+    );
+    let batch = match get_observation(client, &batch_url, anon_key).await {
+        Ok(batch) => batch,
+        Err(SupabaseError::CanaryObserved {
+            reason,
+            mut attempts,
+        }) => {
+            let mut prior = observations
+                .iter()
+                .cloned()
+                .map(RawHttpAttempt::Response)
+                .collect::<Vec<_>>();
+            prior.append(&mut attempts);
+            return Err(SupabaseError::CanaryObserved {
+                reason,
+                attempts: prior,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    observations.push(batch.clone());
+    #[derive(Deserialize)]
+    struct BatchRow {
+        batch_id: i64,
+        created_at: String,
+    }
+    let batch_rows: Vec<BatchRow> = serde_json::from_slice(&batch.body)
+        .map_err(|error| observed_canary_contract(error.to_string(), &observations))?;
+    let [batch_row] = batch_rows.as_slice() else {
+        return Err(observed_canary_contract(
+            "ranking batch lookup did not return exactly one row",
+            &observations,
+        ));
+    };
+    let created_at = OffsetDateTime::parse(&batch_row.created_at, &Rfc3339).map_err(|error| {
+        observed_canary_contract(
+            format!("ranking batch created_at is invalid: {error}"),
+            &observations,
+        )
+    })?;
+    let age = now - created_at;
+    if batch_row.batch_id != batch_id
+        || age.is_negative()
+        || age.whole_seconds() > CANARY_RANKING_MAX_AGE_SECS
+    {
+        return Err(observed_canary_contract(
+            "ranking batch is mismatched, stale, or future-dated",
+            &observations,
+        ));
+    }
+    let active_count = entries.len();
+    Ok((
+        Watchlist {
+            entries,
+            snapshot_at: SourceTimestamp(created_at),
+            active_count,
+            incubator_count: 0,
+        },
+        cursors,
+        observations,
+    ))
+}
+
+async fn get_observation(
+    client: &reqwest::Client,
+    url: &str,
+    anon_key: &str,
+) -> Result<RawHttpResponse, SupabaseError> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| SupabaseError::CanaryObserved {
+        reason: error.to_string(),
+        attempts: Vec::new(),
+    })?;
+    let path = parsed.path().to_owned();
+    let ordered_query = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let observed_at = OffsetDateTime::now_utc();
+    let response = client
+        .get(url)
+        .header("apikey", anon_key)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {anon_key}"))
+        .send()
+        .await
+        .map_err(|error| SupabaseError::CanaryObserved {
+            reason: error.to_string(),
+            attempts: vec![RawHttpAttempt::TransportFailure(RawTransportFailure {
+                source_id: "supabase-ranking".to_owned(),
+                endpoint_kind: path.clone(),
+                method: "GET".to_owned(),
+                path: path.clone(),
+                ordered_query: ordered_query.clone(),
+                attempt_ordinal: 1,
+                observed_at,
+                received_at: OffsetDateTime::now_utc(),
+                error_class: if error.is_timeout() {
+                    TransportErrorClass::Timeout
+                } else if error.is_connect() {
+                    TransportErrorClass::Connect
+                } else {
+                    TransportErrorClass::Other
+                },
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+            })],
+        })?;
+    let status = response.status();
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            matches!(
+                name.as_str(),
+                "content-type" | "date" | "etag" | "retry-after" | "x-request-id"
+            )
+            .then(|| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.to_string(), value.to_owned()))
+            })
+            .flatten()
+        })
+        .collect();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| SupabaseError::CanaryObserved {
+            reason: error.to_string(),
+            attempts: vec![RawHttpAttempt::TransportFailure(RawTransportFailure {
+                source_id: "supabase-ranking".to_owned(),
+                endpoint_kind: path.clone(),
+                method: "GET".to_owned(),
+                path: path.clone(),
+                ordered_query: ordered_query.clone(),
+                attempt_ordinal: 1,
+                observed_at,
+                received_at: OffsetDateTime::now_utc(),
+                error_class: TransportErrorClass::BodyRead,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+            })],
+        })?
+        .to_vec();
+    let source_at = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("date"))
+        .and_then(|(_, value)| {
+            OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()
+        });
+    let observation = RawHttpResponse {
+        source_id: "supabase-ranking".to_owned(),
+        endpoint_kind: path.clone(),
+        method: "GET".to_owned(),
+        path,
+        ordered_query,
+        observed_at,
+        received_at: OffsetDateTime::now_utc(),
+        status: status.as_u16(),
+        headers,
+        body,
+        attempt_ordinal: 1,
+        source_at,
+        schema_version: 1,
+        parser_version: 1,
+        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    if !status.is_success() {
+        return Err(SupabaseError::CanaryObserved {
+            reason: format!("HTTP {}", status.as_u16()),
+            attempts: vec![RawHttpAttempt::Response(observation)],
+        });
+    }
+    Ok(observation)
 }
 
 /// Parse a PostgREST numeric cell (JSON number or string) into a [`Decimal`] without f64.
@@ -400,6 +720,8 @@ mod tests {
         n: Option<i64>,
     ) -> RankingRow {
         RankingRow {
+            batch_id: None,
+            rank: None,
             wallet_hex: wallet_hex.to_string(),
             hit_rate: Some(hit),
             ls_tstat: Some(tstat),
@@ -583,5 +905,135 @@ mod tests {
             entry["last_trade_unix"].is_null(),
             "absent last-trade time serializes as null, not a sentinel (#357)"
         );
+    }
+
+    #[derive(Clone)]
+    struct CanaryRankingFixture {
+        created_at: String,
+        last_trade_unix: i64,
+    }
+
+    async fn latest_ranking(
+        axum::extract::State(state): axum::extract::State<CanaryRankingFixture>,
+    ) -> axum::Json<serde_json::Value> {
+        axum::Json(json!([{
+            "batch_id": 7,
+            "rank": 1,
+            "wallet_hex": HEX_A,
+            "hit_rate": "0.63",
+            "ls_tstat": "2.5",
+            "n_trades": 42,
+            "last_trade_unix": state.last_trade_unix
+        }]))
+    }
+
+    async fn ranking_batch(
+        axum::extract::State(state): axum::extract::State<CanaryRankingFixture>,
+    ) -> axum::Json<serde_json::Value> {
+        axum::Json(json!([{"batch_id": 7, "created_at": state.created_at}]))
+    }
+
+    async fn canary_ranking_server(created_at: OffsetDateTime) -> String {
+        let state = CanaryRankingFixture {
+            created_at: created_at.format(&Rfc3339).unwrap(),
+            last_trade_unix: OffsetDateTime::now_utc().unix_timestamp(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/rest/v1/latest_ranking",
+                axum::routing::get(latest_ranking),
+            )
+            .route(
+                "/rest/v1/ranking_batches",
+                axum::routing::get(ranking_batch),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn canary_ranking_requires_a_fresh_matching_batch() {
+        let base = canary_ranking_server(OffsetDateTime::now_utc()).await;
+        let (watchlist, cursors, evidence) =
+            fetch_canary_observed(&reqwest::Client::new(), &base, "anon", 100)
+                .await
+                .unwrap();
+        assert_eq!(watchlist.entries.len(), 1);
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(evidence.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn canary_ranking_rejects_a_stale_batch() {
+        let base = canary_ranking_server(
+            OffsetDateTime::now_utc() - time::Duration::seconds(CANARY_RANKING_MAX_AGE_SECS + 1),
+        )
+        .await;
+        assert!(matches!(
+            fetch_canary_observed(&reqwest::Client::new(), &base, "anon", 100).await,
+            Err(SupabaseError::CanaryObserved { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn canary_ranking_non_success_retains_response_evidence() {
+        let app = axum::Router::new().route(
+            "/rest/v1/latest_ranking",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "9")],
+                    "unavailable",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = fetch_canary_observed(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "anon",
+            100,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SupabaseError::CanaryObserved { .. }));
+        let SupabaseError::CanaryObserved { attempts, .. } = error else {
+            return;
+        };
+        assert!(matches!(attempts.as_slice(), [RawHttpAttempt::Response(_)]));
+    }
+
+    #[tokio::test]
+    async fn canary_ranking_transport_failure_retains_request_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = fetch_canary_observed(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "anon",
+            100,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SupabaseError::CanaryObserved { .. }));
+        let SupabaseError::CanaryObserved { attempts, .. } = error else {
+            return;
+        };
+        assert!(matches!(
+            attempts.as_slice(),
+            [RawHttpAttempt::TransportFailure(_)]
+        ));
+        let [RawHttpAttempt::TransportFailure(failure)] = attempts.as_slice() else {
+            return;
+        };
+        assert_eq!(failure.path, "/rest/v1/latest_ranking");
+        assert_eq!(failure.attempt_ordinal, 1);
+        assert!(failure.received_at >= failure.observed_at);
     }
 }

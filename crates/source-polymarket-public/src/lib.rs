@@ -18,8 +18,9 @@ pub use clob_prices_history::{
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
 pub use endpoint::{LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint};
-pub use fetcher::{FixtureFetcher, PageFetcher, ReqwestFetcher};
+pub use fetcher::{FixtureFetcher, HttpRequestContext, PageFetcher, ReqwestFetcher};
 pub use gamma_markets::{
     GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarkets, GammaMarketsClient,
     GammaMarketsError, MarketFilter, parse_outcome_prices,
 };
+pub mod canary;

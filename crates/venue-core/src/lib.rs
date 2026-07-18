@@ -3,7 +3,10 @@
 //! Strategy crates emit [`OrderIntent`]; only `execution-core` submits orders
 //! to venues. This crate defines the boundary types shared across venue adapters.
 
-use pe_core_types::{ContractQty, MarketId, OutcomeId, Price, Side, StrategyId};
+use pe_core_types::{
+    CollateralAmount, ContractQty, MarketId, OutcomeId, Price, ShareAmount, Side, StrategyId,
+    VenueOrderId,
+};
 use serde::{Deserialize, Serialize};
 
 /// Intent to place an order, emitted by a strategy crate.
@@ -39,6 +42,27 @@ pub enum OrderOutcome {
     Rejected {
         reason: String,
     },
+}
+
+/// One exact venue trade row. Reconciliation may return multiple rows for one order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VenueFill {
+    pub trade_id: String,
+    pub collateral_debit: CollateralAmount,
+    pub shares: ShareAmount,
+    pub fee: CollateralAmount,
+}
+
+/// Exact additive result for credentialed execution and replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactExecutionReport {
+    pub venue_order_id: Option<VenueOrderId>,
+    pub requested_collateral: CollateralAmount,
+    pub requested_shares: ShareAmount,
+    pub filled_collateral: CollateralAmount,
+    pub filled_shares: ShareAmount,
+    pub fees: CollateralAmount,
+    pub fills: Vec<VenueFill>,
 }
 
 /// Errors returned by venue adapter operations.

@@ -15,6 +15,7 @@ panic = "deny"
 float_arithmetic = "deny"
 
 [dependencies]
+blake3.workspace = true
 pe-copy-signal-engine = { path = "../copy-signal-engine", version = "0.1.0" }
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 pe-event-log = { path = "../event-log", version = "0.1.0" }

@@ -46,6 +46,22 @@ The signing module is isolated. Golden tests, no secret logging, explicit L1/L2 
 
 Polymarket uses signature types and a funder address that can be an EOA, proxy wallet, or Gnosis Safe. Public profile/trade data exposes `proxyWallet`; authenticated trading uses the configured funder. The venue adapter keeps these concepts typed and never assumes the displayed wallet is the same thing as the original funding EOA.
 
+### Isolated V2 canary boundary
+
+The retired V1 signing/submission implementation is absent. The only credentialed path is the
+dedicated, initially inactive `pe-service-live-canary` role. It pins SDK 0.7.0 with the `clob`
+feature only, the explicit production CLOB host, Polygon standard V2 exchange, `POLY_1271`, and a
+deposit-wallet maker/signer/funder. Its reachable order surface is BUY-only limit FOK with zero
+builder/metadata, `postOnly = false`, and explicit `deferExec = false`; batches, replacement,
+market-order builders, hidden polling, and V1 are unreachable.
+
+Admission requires strict agreement among Gamma event/market evidence, CLOB long/short metadata,
+the fresh book, resolver card, authenticated account reads, standard-exchange contract identity,
+and exact signed fields. The supported market subset is fee-free, zero-delay, non-Neg-Risk,
+binary Geopolitics. Current `nr`/`fd`/`itode` omission handling and source verification dates are
+recorded in [`15-SOURCES.md`](15-SOURCES.md); operations are in
+[`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
+
 ## Sports
 
 Sports markets require resolver cards (sub-types in `_GLOSSARY.md`) with game ID, league, start time, official resolution URL if available, auto-cancel behavior, live-state source, and finality rule.

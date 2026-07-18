@@ -1,6 +1,12 @@
 use pe_source_core::SourceStatus;
 
-use crate::{block::RiskBlock, snapshot::RiskSnapshot};
+use pe_core_types::{BasisPoints, CollateralAmount};
+
+use crate::{
+    block::RiskBlock,
+    snapshot::{CanaryRiskSnapshot, RiskSnapshot},
+};
+use pe_core_types::CanaryOrigin;
 
 /// Result of evaluating a risk snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +68,79 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
         return RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded);
     }
 
+    RiskDecision::Approved
+}
+
+/// Convert an exact positive amount to bankroll basis points, rounding outward.
+pub fn exposure_bps_ceil(
+    amount: CollateralAmount,
+    bankroll: CollateralAmount,
+) -> Option<BasisPoints> {
+    if bankroll == CollateralAmount::ZERO {
+        return None;
+    }
+    let numerator = u128::from(amount.atomic()).checked_mul(10_000)?;
+    let denominator = u128::from(bankroll.atomic());
+    let bps = numerator.checked_add(denominator.checked_sub(1)?)? / denominator;
+    i32::try_from(bps).ok().map(BasisPoints)
+}
+
+/// Pure fail-closed gate for the isolated canary path.
+pub fn evaluate_canary_risk(s: &CanaryRiskSnapshot) -> RiskDecision {
+    let Some(proposed) = exposure_bps_ceil(s.proposed_worst_case_debit, s.canary_bankroll) else {
+        return RiskDecision::Blocked(RiskBlock::InvalidCanaryBankroll);
+    };
+
+    if !s.resolver_tradable {
+        return RiskDecision::Blocked(RiskBlock::ResolverNotTradable);
+    }
+    if !s.account_state_fresh {
+        return RiskDecision::Blocked(RiskBlock::AccountStateStale);
+    }
+    if !s.venue_reconciliation_fresh {
+        return RiskDecision::Blocked(RiskBlock::VenueReconciliationStale);
+    }
+    if !s.geoblock_fresh || s.geoblocked || !s.jurisdiction_attestation_valid {
+        return RiskDecision::Blocked(RiskBlock::JurisdictionBlocked);
+    }
+    if !s.closed_only_fresh || s.closed_only {
+        return RiskDecision::Blocked(RiskBlock::ClosedOnly);
+    }
+    if s.pending_reservation {
+        return RiskDecision::Blocked(RiskBlock::PendingReservation);
+    }
+    if !s.standard_spender_only
+        || s.allowance.atomic() > 8_000_000
+        || s.allowance < s.proposed_worst_case_debit
+    {
+        return RiskDecision::Blocked(RiskBlock::AllowanceExceeded);
+    }
+    if proposed.0 > 25 || s.proposed_worst_case_debit.atomic() > 1_000_000 {
+        return RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded);
+    }
+    if s.drawdown_bps.0 <= -200 {
+        return RiskDecision::Blocked(RiskBlock::CanaryDrawdownStop);
+    }
+
+    let leader = match (s.origin, s.leader_exposure_bps) {
+        (CanaryOrigin::Organic, Some(value)) => value,
+        (CanaryOrigin::OperatorProbe, None) => BasisPoints(0),
+        _ => return RiskDecision::Blocked(RiskBlock::OriginInputsInvalid),
+    };
+    if leader.0 + proposed.0 > 300 {
+        return RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded);
+    }
+    if s.market_exposure_bps.0 + proposed.0 > 200 {
+        return RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded);
+    }
+    if s.family_exposure_bps.0 + proposed.0 > 800 {
+        return RiskDecision::Blocked(RiskBlock::FamilyConcentrationExceeded);
+    }
+    if s.total_copy_exposure_bps.0 + proposed.0 > 2_500
+        || s.open_exposure_bps.0 + proposed.0 > 2_500
+    {
+        return RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded);
+    }
     RiskDecision::Approved
 }
 

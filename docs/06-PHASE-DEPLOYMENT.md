@@ -52,6 +52,10 @@ replay-cli                         Rust CLI
 4. **live-tiny:** live orders with strict caps from `19-`.
 5. **scaled-live:** only after metrics prove stability per the promotion criteria in `_GLOSSARY.md`.
 
+The bounded Polymarket V2 Winner-Follow canary is an isolated role, not a deployment mode or a
+promotion stage. Its dedicated inactive system unit and operational boundary are documented in
+[`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
+
 ## Health endpoints
 
 `axum`:

@@ -1,4 +1,4 @@
-use pe_core_types::BasisPoints;
+use pe_core_types::{BasisPoints, CanaryOrigin, CollateralAmount};
 use pe_source_core::SourceStatus;
 use serde::{Deserialize, Serialize};
 
@@ -66,4 +66,29 @@ pub struct RiskSnapshot {
 
 fn default_per_trade_cap_bps() -> i32 {
     25
+}
+
+/// Typed, fail-closed risk inputs for the isolated canary path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryRiskSnapshot {
+    pub origin: CanaryOrigin,
+    pub proposed_worst_case_debit: CollateralAmount,
+    pub canary_bankroll: CollateralAmount,
+    pub leader_exposure_bps: Option<BasisPoints>,
+    pub market_exposure_bps: BasisPoints,
+    pub family_exposure_bps: BasisPoints,
+    pub total_copy_exposure_bps: BasisPoints,
+    pub open_exposure_bps: BasisPoints,
+    pub drawdown_bps: BasisPoints,
+    pub resolver_tradable: bool,
+    pub account_state_fresh: bool,
+    pub venue_reconciliation_fresh: bool,
+    pub geoblock_fresh: bool,
+    pub geoblocked: bool,
+    pub closed_only_fresh: bool,
+    pub closed_only: bool,
+    pub jurisdiction_attestation_valid: bool,
+    pub pending_reservation: bool,
+    pub allowance: CollateralAmount,
+    pub standard_spender_only: bool,
 }

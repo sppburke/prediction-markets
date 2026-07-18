@@ -28,4 +28,24 @@ pub enum RiskBlock {
     CopyLatencyKillSwitch,
     /// Proposed trade size exceeds the per-mode cap (live-tiny: 25 bps, promoted: 100 bps).
     PerTradeSizeExceeded,
+    /// Resolver evidence is absent, stale, ambiguous, deferred, or mismatched.
+    ResolverNotTradable,
+    /// Deposit-wallet balances, orders, trades, positions, or allowance are stale.
+    AccountStateStale,
+    /// Venue reconciliation has not completed successfully within its freshness budget.
+    VenueReconciliationStale,
+    /// Same-egress jurisdiction evidence is stale, blocked, or disagrees with the authority.
+    JurisdictionBlocked,
+    /// Authenticated CLOB account is in close-only mode or the observation is stale.
+    ClosedOnly,
+    /// A nonterminal reservation already owns the one allowed in-flight slot.
+    PendingReservation,
+    /// Allowance exceeds the campaign cap or names another spender.
+    AllowanceExceeded,
+    /// Canary bankroll is zero or the exact debit cannot be expressed safely.
+    InvalidCanaryBankroll,
+    /// Organic requests require leader exposure; probes must not fabricate it.
+    OriginInputsInvalid,
+    /// Conservative cash-ledger drawdown has reached the canonical intraday stop.
+    CanaryDrawdownStop,
 }

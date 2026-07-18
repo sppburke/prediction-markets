@@ -65,23 +65,36 @@
 | https://docs.polymarket.com/market-data/websocket/user-channel | 2026-06-03 | 2026-09-01 |
 | https://docs.polymarket.com/market-data/websocket/sports | — | — |
 | https://docs.polymarket.com/market-data/websocket/rtds | 2026-06-03 | 2026-09-01 |
-| https://docs.polymarket.com/trading/overview | — | — |
-| https://docs.polymarket.com/trading/orders/create | — | — |
+| https://docs.polymarket.com/v2-migration | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/overview | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/orders/create | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/fees | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/builders/fees | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/deposit-wallets | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/clients/l2 | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/concepts/order-lifecycle | — | — |
-| https://docs.polymarket.com/api-reference/authentication | 2026-05-02 | 2026-07-01 |
+| https://docs.polymarket.com/api-reference/authentication | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/geoblock | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/introduction | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/polymarket-101 | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/trading/bridge/deposit | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/trading/bridge/supported-assets | — | — |
 | https://docs.polymarket.com/trading/bridge/status | — | — |
-| https://docs.polymarket.com/developers/contracts | — | — |
+| https://docs.polymarket.com/resources/contracts | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-05-09 | 2026-07-08 |
+| https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-07-17 | 2026-09-15 |
 | https://clob.polymarket.com/markets?closed=true | 2026-06-20 | 2026-08-19 |
-| https://clob.polymarket.com/book?token_id={tokenId} | 2026-06-16 | 2026-08-15 |
+| https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-17 | 2026-09-15 |
+| https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-17 | 2026-09-15 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-06-23 | 2026-08-22 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-06-23 | 2026-08-22 |
-| https://gamma-api.polymarket.com/markets?condition_ids={id} | 2026-06-20 | 2026-08-19 |
+| https://gamma-api.polymarket.com/markets?condition_ids={id} | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
 ## Public sources
@@ -152,6 +165,20 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-07-17: Re-verified the production CLOB V2 migration/host, order/FOK behavior, fees,
+  builder fees, deposit-wallet `POLY_1271` identity, authentication, standard V2 contracts,
+  Gamma tag/market mapping, CLOB long/short market metadata and book, geoblock, authenticated
+  closed-only/balance/orders/trades reads, and Data positions. Current sampled
+  `/clob-markets/{condition_id}` responses may omit `nr`, `fd`, and `itode`: the canary accepts an
+  absent `nr` only when independent long-market and book evidence explicitly prove standard
+  `neg_risk == false`, accepts absent `fd` only when Gamma explicitly proves fees disabled and all
+  available CLOB base-fee fields are zero, and accepts absent `itode` only under the pinned SDK
+  0.7.0/parser-version omission rule while the long-form market explicitly reports
+  `seconds_delay == 0`. Any present `nr == true`, nonzero `fd`/base fee, `itode == true`, positive
+  delay, source disagreement, or schema drift fails closed. Re-verify these observations before
+  operational authority; documentation examples show these fields but do not establish that every
+  live response includes them.
 
 - 2026-05-07: Checked Kalshi REST/WS API reference, changelog, and core market spec pages. No breaking changes relative to prior implementation assumptions.
 - 2026-05-07: Checked Polygon RPC docs and AWS ECS/ECR/Secrets Manager welcome pages for structural changes. No breaking changes noted.

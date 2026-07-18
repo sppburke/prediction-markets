@@ -12,21 +12,23 @@ workspace = true
 scenario = []
 
 [dependencies]
+blake3.workspace = true
 pe-core-types               = { path = "../core-types",               version = "0.1.0" }
 pe-event-log                = { path = "../event-log",                version = "0.1.0" }
 pe-venue-core               = { path = "../venue-core",               version = "0.1.0" }
 pe-venue-polymarket         = { path = "../venue-polymarket",         version = "0.1.0" }
 pe-strategy-winner-follow   = { path = "../strategy-winner-follow",   version = "0.1.0" }
+pe-risk-engine             = { path = "../risk-engine",              version = "0.1.0" }
+pe-resolver-card           = { path = "../resolver-card",            version = "0.1.0" }
 
 serde.workspace = true
 serde_json.workspace = true
+rust_decimal.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
 tempfile.workspace = true

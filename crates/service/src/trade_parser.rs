@@ -18,6 +18,8 @@ pub enum TradeParseError {
     InvalidSide(String),
     #[error("invalid timestamp {0}")]
     InvalidTimestamp(i64),
+    #[error("trade omitted outcomeIndex")]
+    MissingOutcomeIndex,
 }
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
@@ -42,7 +44,8 @@ struct RawTrade {
     price: Decimal,
     /// Unix timestamp in seconds or milliseconds — normalised below.
     timestamp: i64,
-    /// Outcome index: 0 = YES, 1 = NO.  Absent on older records; defaults to 0.
+    /// Outcome index: 0 = YES, 1 = NO. Older records may omit it; ordinary ingestion preserves
+    /// its historical outcome-zero default while the canary's strict parser rejects the omission.
     #[serde(default)]
     outcome_index: Option<u16>,
 }
@@ -68,6 +71,26 @@ pub fn parse_trades(
         }
     }
     Ok(out)
+}
+
+/// Parse a live-canary page without dropping an individual malformed trade. Ordinary paper
+/// ingestion keeps its warn-and-skip posture; a canary wallet is unavailable unless its complete
+/// page can be reconstructed.
+pub fn parse_trades_strict(
+    bytes: &[u8],
+    wallet: pe_core_types::WalletAddress,
+) -> Result<Vec<IncomingTrade>, TradeParseError> {
+    let response: TradeResponse = serde_json::from_slice(bytes)?;
+    let now = OffsetDateTime::now_utc();
+    response
+        .into_iter()
+        .map(|raw| {
+            if raw.outcome_index.is_none() {
+                return Err(TradeParseError::MissingOutcomeIndex);
+            }
+            convert_trade(raw, wallet, now)
+        })
+        .collect()
 }
 
 fn convert_trade(
@@ -129,7 +152,7 @@ mod tests {
 
     #[test]
     fn parses_valid_trade() {
-        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":50,"price":0.65,"timestamp":1704067200}]"#;
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":50,"price":0.65,"timestamp":1704067200,"outcomeIndex":0}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].contracts.0, 50);
@@ -140,7 +163,7 @@ mod tests {
 
     #[test]
     fn millisecond_timestamp_normalised() {
-        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"SELL","size":10,"price":0.40,"timestamp":1704067200000}]"#;
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"SELL","size":10,"price":0.40,"timestamp":1704067200000,"outcomeIndex":0}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].observed_at.unix_timestamp(), 1_704_067_200);
@@ -161,10 +184,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_outcome_index_defaults_to_yes() {
+    fn ordinary_missing_outcome_index_keeps_legacy_default() {
         let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":5,"price":0.55,"timestamp":1704067200}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades[0].outcome_id, OutcomeId(0));
+        assert!(matches!(
+            parse_trades_strict(json, dummy_wallet()),
+            Err(TradeParseError::MissingOutcomeIndex)
+        ));
+    }
+
+    #[test]
+    fn strict_parser_rejects_an_individually_invalid_trade() {
+        let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"INVALID","size":10,"price":0.40,"timestamp":1704067200,"outcomeIndex":0}]"#;
+        assert!(matches!(
+            parse_trades_strict(json, dummy_wallet()),
+            Err(TradeParseError::InvalidSide(_))
+        ));
+        assert!(parse_trades(json, dummy_wallet()).unwrap().is_empty());
     }
 
     // Issue #159: outcomeIndex > 255 must parse, matching the bootstrap-side DTO.

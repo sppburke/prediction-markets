@@ -5,11 +5,13 @@ use rust_decimal::prelude::ToPrimitive as _;
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, ContractQty, KellyFraction, LeaderAction, Price, Probability, Side, StrategyId,
+    BasisPoints, CollateralAmount, ContractQty, KellyFraction, LeaderAction, Price, Probability,
+    ShareAmount, Side, StrategyId,
 };
 use pe_kelly_sizer::{KELLY_NORMAL, KELLY_PAPER_BACKTEST, KellyInput, size_contracts};
 use pe_risk_engine::{RiskDecision, RiskSnapshot, clamp_contracts_to_cap, evaluate_risk};
 use pe_venue_core::OrderIntent;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     SizingMode, WinnerFollowConfig, WinnerFollowError,
@@ -18,6 +20,89 @@ use crate::{
 
 const STRATEGY_ID: &str = "winner-follow";
 const ORDER_VALIDITY_SECONDS: u32 = 30;
+const ORGANIC_CHASE_BPS: u32 = 75;
+const CANARY_PER_TRADE_BPS: u64 = 25;
+const CANARY_ABSOLUTE_CAP_ATOMIC: u64 = 1_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrganicCanaryOrder {
+    pub intent: OrderIntent,
+    pub kelly_cost: Price,
+    pub maximum_collateral: CollateralAmount,
+    pub shares: ShareAmount,
+}
+
+/// Replay-complete inputs and evidence commitments for one organic canary policy decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrganicDecisionProof {
+    pub signal: LeaderSignal,
+    pub probability: Probability,
+    pub idempotency_key: String,
+    pub evidence_hashes: Vec<String>,
+}
+
+pub fn organic_decision_proof_hash(
+    proof: &OrganicDecisionProof,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_vec(proof).map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Immutable, Supabase-independent sizing policy for the isolated organic canary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrganicCanaryPolicy;
+
+impl OrganicCanaryPolicy {
+    pub fn evaluate(
+        self,
+        signal: &LeaderSignal,
+        p: Probability,
+        canary_bankroll: CollateralAmount,
+        minimum_tick_size: Price,
+    ) -> Result<OrganicCanaryOrder, WinnerFollowError> {
+        if signal.leader_side != Side::Buy || signal.action != LeaderAction::Entry {
+            return Err(WinnerFollowError::NoEdge);
+        }
+        if minimum_tick_size.0 <= Decimal::ZERO {
+            return Err(WinnerFollowError::NoEdge);
+        }
+        let chase = Decimal::ONE + Decimal::from(ORGANIC_CHASE_BPS) / Decimal::from(10_000u32);
+        let unquantized = signal.leader_price.0 * chase;
+        let quantized = (unquantized / minimum_tick_size.0).floor() * minimum_tick_size.0;
+        let kelly_cost = Price::new(quantized).map_err(|_| WinnerFollowError::NoEdge)?;
+        let sized = size_contracts(&KellyInput {
+            p,
+            c: kelly_cost,
+            kelly_fraction: KELLY_NORMAL,
+            bankroll: canary_bankroll.to_decimal(),
+        })?
+        .0;
+        let contracts = clamp_contracts_to_policy_cap(
+            sized,
+            kelly_cost,
+            canary_bankroll.to_decimal(),
+            CANARY_PER_TRADE_BPS as i32,
+            Some(CollateralAmount::from_atomic(CANARY_ABSOLUTE_CAP_ATOMIC)),
+        );
+        if contracts == 0 {
+            return Err(WinnerFollowError::NoEdge);
+        }
+        let maximum_collateral =
+            CollateralAmount::from_decimal_exact(Decimal::from(contracts) * kelly_cost.0)
+                .map_err(|_| WinnerFollowError::NoEdge)?;
+        let shares = ShareAmount::from_atomic(
+            contracts
+                .checked_mul(1_000_000)
+                .ok_or(WinnerFollowError::NoEdge)?,
+        );
+        Ok(OrganicCanaryOrder {
+            intent: build_order_intent(signal, contracts, kelly_cost),
+            kelly_cost,
+            maximum_collateral,
+            shares,
+        })
+    }
+}
 
 /// Winner-Follow strategy evaluator.
 ///
@@ -200,7 +285,8 @@ impl WinnerFollowStrategy {
         // the cap bounds `contracts × fill`, the actual money at risk (not the fee-exclusive
         // raw price).
         let cap_bps = self.config.per_trade_cap.resolve_bps(trading_mode);
-        let capped = clamp_contracts_to_cap(raw_contracts, notional_price.0, bankroll, cap_bps);
+        let capped =
+            clamp_contracts_to_policy_cap(raw_contracts, notional_price, bankroll, cap_bps, None);
         // 5c. Price-impact book cap (#398 WS2): `min` with the contracts absorbable within
         // `price_impact_cap_bps` of best ask. `None` = no `/book` result / gate off (fail-open
         // passthrough); `Some(0)` = a successful read with nothing absorbable → clamp to 0 → skip.
@@ -224,18 +310,34 @@ impl WinnerFollowStrategy {
         }
 
         // 7. Build OrderIntent.
-        let idempotency_key = build_idempotency_key(signal);
+        Ok(build_order_intent(signal, clamped, signal.leader_price))
+    }
+}
 
-        Ok(OrderIntent {
-            strategy_id: StrategyId(STRATEGY_ID.to_string()),
-            market_id: signal.market_id.clone(),
-            outcome_id: signal.outcome_id,
-            side: signal.leader_side,
-            contracts: ContractQty(clamped),
-            limit_price: signal.leader_price,
-            validity_seconds: ORDER_VALIDITY_SECONDS,
-            idempotency_key,
-        })
+fn clamp_contracts_to_policy_cap(
+    contracts: u64,
+    price: Price,
+    bankroll: Decimal,
+    cap_bps: i32,
+    absolute_cap: Option<CollateralAmount>,
+) -> u64 {
+    let proportional = clamp_contracts_to_cap(contracts, price.0, bankroll, cap_bps);
+    absolute_cap.map_or(proportional, |cap| {
+        let absolute_contracts = (cap.to_decimal() / price.0).floor().to_u64().unwrap_or(0);
+        proportional.min(absolute_contracts)
+    })
+}
+
+fn build_order_intent(signal: &LeaderSignal, contracts: u64, limit_price: Price) -> OrderIntent {
+    OrderIntent {
+        strategy_id: StrategyId(STRATEGY_ID.to_owned()),
+        market_id: signal.market_id.clone(),
+        outcome_id: signal.outcome_id,
+        side: signal.leader_side,
+        contracts: ContractQty(contracts),
+        limit_price,
+        validity_seconds: ORDER_VALIDITY_SECONDS,
+        idempotency_key: build_idempotency_key(signal),
     }
 }
 
@@ -259,7 +361,10 @@ fn kelly_fraction(
     }
 }
 
-/// Compute `floor((contracts * price / bankroll) * 10_000)` as basis points.
+/// Compute the positive proposed exposure in basis points, rounded outward.
+///
+/// Exposure is a safety limit, so any positive fractional basis point counts as the next whole
+/// basis point. This prevents one atomic unit above a cap from appearing to be within it.
 ///
 /// Returns `BasisPoints(0)` if the bankroll is zero or conversion fails.
 fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> BasisPoints {
@@ -268,7 +373,7 @@ fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> Basi
     }
     let notional = Decimal::from(contracts) * price;
     let bps_decimal = (notional / bankroll) * Decimal::from(10_000u32);
-    BasisPoints(bps_decimal.floor().to_i32().unwrap_or(0))
+    BasisPoints(bps_decimal.ceil().to_i32().unwrap_or(i32::MAX))
 }
 
 /// Build the idempotency key per `_GLOSSARY.md`.
@@ -290,4 +395,92 @@ fn build_idempotency_key(signal: &LeaderSignal) -> String {
         side_str,
         bucket,
     )
+}
+
+#[cfg(test)]
+mod canary_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use pe_core_types::{
+        OutcomeId, ProbabilityPpm, Quantity, ReconstructionQuality, SourceTradeId, TraderId,
+        VenueId, VenueMarketId, WalletAddress,
+    };
+    use rust_decimal_macros::dec;
+    use time::OffsetDateTime;
+
+    use super::*;
+
+    fn signal() -> LeaderSignal {
+        let wallet: WalletAddress =
+            serde_json::from_str("\"0x1111111111111111111111111111111111111111\"").unwrap();
+        LeaderSignal {
+            leader: TraderId(wallet),
+            venue: VenueId::polymarket(),
+            market_id: pe_core_types::MarketId(VenueMarketId("0xcondition".to_owned())),
+            outcome_id: OutcomeId(0),
+            action: LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: Price(dec!(0.50)),
+            leader_size: Quantity(ContractQty(10)),
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: SourceTradeId("trade".to_owned()),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+        }
+    }
+
+    #[test]
+    fn organic_policy_quantizes_chase_down_and_caps_at_one_dollar() {
+        let order = OrganicCanaryPolicy
+            .evaluate(
+                &signal(),
+                Probability(dec!(0.90)),
+                CollateralAmount::from_atomic(400_000_000),
+                Price(dec!(0.01)),
+            )
+            .unwrap();
+        assert_eq!(order.kelly_cost, Price(dec!(0.50)));
+        assert_eq!(order.intent.contracts, ContractQty(2));
+        assert_eq!(order.maximum_collateral.atomic(), 1_000_000);
+        assert_eq!(order.shares.atomic(), 2_000_000);
+    }
+
+    #[test]
+    fn organic_policy_rejects_non_entry_and_non_buy() {
+        let mut ineligible = signal();
+        ineligible.action = LeaderAction::Add;
+        assert!(
+            OrganicCanaryPolicy
+                .evaluate(
+                    &ineligible,
+                    Probability(dec!(0.90)),
+                    CollateralAmount::from_atomic(400_000_000),
+                    Price(dec!(0.01)),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn organic_decision_proof_hash_binds_signal_policy_identity_and_evidence() {
+        let signal = signal();
+        let evaluated = OrganicCanaryPolicy
+            .evaluate(
+                &signal,
+                Probability(dec!(0.75)),
+                CollateralAmount::from_atomic(400_000_000),
+                Price(dec!(0.01)),
+            )
+            .unwrap();
+        let mut proof = OrganicDecisionProof {
+            signal,
+            probability: Probability(dec!(0.75)),
+            idempotency_key: evaluated.intent.idempotency_key,
+            evidence_hashes: vec!["evidence-envelope".to_owned()],
+        };
+        let expected = organic_decision_proof_hash(&proof).unwrap();
+        proof.evidence_hashes.push("forged".to_owned());
+        assert_ne!(organic_decision_proof_hash(&proof).unwrap(), expected);
+    }
 }

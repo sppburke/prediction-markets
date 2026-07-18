@@ -1,31 +1,30 @@
-//! `ExecutionDispatcher`: routes `OrderIntent` to paper or live executor by mode.
+//! Ordinary paper-only `ExecutionDispatcher`.
 //!
 //! Mode dispatch:
 //! - `Shadow` / `Paper` → `PaperExecutor` (no live funds involved)
-//! - `LiveTiny` / `Promoted` → `LiveExecutor` (real CLOB submission)
+//! - `LiveTiny` / `Promoted` → fail closed (the isolated canary owns the only live POST seam)
 //!
 //! `PaperExecutor` is imported from `pe-strategy-winner-follow` — not moved.
 
 use pe_core_types::{EventSeq, Price, SourceTimestamp};
 use pe_strategy_winner_follow::{ExecutionMode, FillSource, PaperExecutor, PaperFill};
 use pe_venue_core::OrderIntent;
-use pe_venue_polymarket::CLOBClient;
 
 use crate::error::ExecutionError;
-use crate::live::{LiveExecuteResult, LiveExecutor};
 
 /// Routes `OrderIntent` to paper or live execution based on `ExecutionMode`.
 ///
 /// The mode is consulted on every call, so it can change between calls without
 /// re-constructing the dispatcher.
-pub struct ExecutionDispatcher<C: CLOBClient> {
+pub struct ExecutionDispatcher {
     paper: PaperExecutor,
-    live: LiveExecutor<C>,
 }
 
-impl<C: CLOBClient> ExecutionDispatcher<C> {
-    pub fn new(paper: PaperExecutor, live: LiveExecutor<C>) -> Self {
-        Self { paper, live }
+impl ExecutionDispatcher {
+    /// Construct the ordinary service dispatcher. Credentialed execution is deliberately absent;
+    /// the isolated canary actor is the only production owner of a POST seam.
+    pub fn paper_only(paper: PaperExecutor) -> Self {
+        Self { paper }
     }
 
     /// Route `intent` to paper or live executor based on `mode`.
@@ -46,10 +45,10 @@ impl<C: CLOBClient> ExecutionDispatcher<C> {
                 let (fill, seq) = self.paper.execute(intent, now, observed_fill_price)?;
                 Ok(DispatchResult::Paper { fill, seq })
             }
-            ExecutionMode::LiveTiny | ExecutionMode::Promoted => {
-                let result = self.live.execute(intent, now).await?;
-                Ok(DispatchResult::Live(result))
-            }
+            ExecutionMode::LiveTiny | ExecutionMode::Promoted => Err(ExecutionError::Live(
+                "ordinary credentialed dispatch is retired; use the isolated inactive canary role"
+                    .to_owned(),
+            )),
         }
     }
 }
@@ -61,5 +60,4 @@ impl<C: CLOBClient> ExecutionDispatcher<C> {
 #[derive(Debug, Clone)]
 pub enum DispatchResult {
     Paper { fill: PaperFill, seq: EventSeq },
-    Live(LiveExecuteResult),
 }

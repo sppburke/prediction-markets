@@ -11,14 +11,13 @@ use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
-use pe_execution_core::{ExecutionDispatcher, LiveExecutor};
+use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::PaperStateDb;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
-use pe_venue_polymarket::{PolymarketCredentials, PolymarketVenueAdapter, ReqwestCLOBClient};
 use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -105,11 +104,9 @@ async fn main() -> Result<()> {
     // Fetch it once at boot (best-effort; fall back to env/compiled on any error) and seed the
     // `LiveRuntimeConfig` ArcSwap that the config poller refreshes and the orchestrator reads per
     // event. `clob_creds_present` gates live-mode transitions (paper stays paper without creds).
-    let clob_creds_present = !cfg.polymarket_funder_address.is_empty()
-        && !cfg.polymarket_private_key.is_empty()
-        && !cfg.polymarket_clob_api_key.is_empty()
-        && !cfg.polymarket_clob_api_secret.is_empty()
-        && !cfg.polymarket_clob_api_passphrase.is_empty();
+    // The ordinary paper service has no credentialed construction path. Supabase therefore cannot
+    // promote it into live execution; the isolated canary binary owns separate credentials/state.
+    let clob_creds_present = false;
     let initial_config_rows = if cfg.supabase_url.is_empty() {
         Vec::new()
     } else {
@@ -277,59 +274,7 @@ async fn main() -> Result<()> {
         cfg.paper_fill_slippage_bps,
     );
 
-    // Live event-log writer (separate file so paper and live fills are distinct streams).
-    let live_log_path = cfg.event_log_path.with_extension("live.log");
-    let live_writer = Writer::open(&live_log_path)
-        .with_context(|| format!("open live event log {}", live_log_path.display()))?;
-
-    // Fail fast: live modes require all five CLOB credential fields to be non-empty.
-    // Mirrors the parse_mode pattern of validating config eagerly before any I/O.
-    if matches!(mode, ExecutionMode::LiveTiny | ExecutionMode::Promoted) {
-        anyhow::ensure!(
-            !cfg.polymarket_funder_address.is_empty(),
-            "PE_POLYMARKET_FUNDER_ADDRESS is required for mode '{}'",
-            cfg.mode
-        );
-        anyhow::ensure!(
-            !cfg.polymarket_private_key.is_empty(),
-            "PE_POLYMARKET_PRIVATE_KEY is required for mode '{}'",
-            cfg.mode
-        );
-        anyhow::ensure!(
-            !cfg.polymarket_clob_api_key.is_empty(),
-            "PE_POLYMARKET_CLOB_API_KEY is required for mode '{}'",
-            cfg.mode
-        );
-        anyhow::ensure!(
-            !cfg.polymarket_clob_api_secret.is_empty(),
-            "PE_POLYMARKET_CLOB_API_SECRET is required for mode '{}'",
-            cfg.mode
-        );
-        anyhow::ensure!(
-            !cfg.polymarket_clob_api_passphrase.is_empty(),
-            "PE_POLYMARKET_CLOB_API_PASSPHRASE is required for mode '{}'",
-            cfg.mode
-        );
-    }
-
-    // Polymarket CLOB adapter.
-    let clob_creds = PolymarketCredentials::mainnet(
-        cfg.polymarket_funder_address.clone(),
-        cfg.polymarket_private_key.clone(),
-        cfg.polymarket_clob_api_key.clone(),
-        cfg.polymarket_clob_api_secret.clone(),
-        cfg.polymarket_clob_api_passphrase.clone(),
-    );
-    // Log funder address only when credentials are present (live mode only).
-    if !cfg.polymarket_funder_address.is_empty() {
-        info!(funder = %cfg.polymarket_funder_address, "polymarket clob credentials loaded");
-    }
-
-    let clob_client = ReqwestCLOBClient::new(reqwest::Client::new());
-    let adapter = PolymarketVenueAdapter::new(clob_client, clob_creds)
-        .with_base_url(&cfg.polymarket_clob_base_url);
-    let live_executor = LiveExecutor::new(adapter, live_writer, SourceId("pe-service.live".into()));
-    let dispatcher = ExecutionDispatcher::new(paper_executor, live_executor);
+    let dispatcher = ExecutionDispatcher::paper_only(paper_executor);
 
     let health = new_shared_health(false);
 
@@ -1032,10 +977,11 @@ fn parse_mode(s: &str) -> Result<ExecutionMode> {
     match s.to_lowercase().replace('-', "_").as_str() {
         "shadow" => Ok(ExecutionMode::Shadow),
         "paper" => Ok(ExecutionMode::Paper),
-        "live_tiny" | "livetiny" => Ok(ExecutionMode::LiveTiny),
-        "promoted" => Ok(ExecutionMode::Promoted),
+        "live_tiny" | "livetiny" | "promoted" => Err(anyhow::anyhow!(
+            "ordinary live modes are retired; use the isolated inactive canary role"
+        )),
         other => Err(anyhow::anyhow!(
-            "unknown mode '{}'; expected shadow|paper|live_tiny|promoted",
+            "unknown mode '{}'; expected shadow|paper",
             other
         )),
     }

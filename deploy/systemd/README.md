@@ -1,4 +1,14 @@
-# pe-bootstrap systemd units
+# systemd units
+
+The `pe-bootstrap-*` files are user-mode research/maintenance timers. The separate
+`pe-service-live-canary.service` is a system unit for the isolated, initially disabled
+Polymarket V2 canary. It uses a dedicated unprivileged account, systemd credentials, and private
+state/runtime directories; it never reads the ordinary service `.env`.
+
+Do not enable or start the canary as part of installation. Follow
+[`docs/36-POLYMARKET-V2-CANARY-RUNBOOK.md`](../../docs/36-POLYMARKET-V2-CANARY-RUNBOOK.md).
+
+## pe-bootstrap timers
 
 User-mode systemd timer + service pairs that run the pile-maintenance
 subcommands added in issue #166. All units are `Type=oneshot` and log to the

@@ -255,17 +255,18 @@ impl RuntimeConfig {
 /// Parse `proposed` against a guard-hard mode-transition policy.
 ///
 /// Returns `Ok(canonical_mode)` to apply, or `Err(reason)` to refuse (the caller keeps
-/// `current` and logs the reason). A live mode (`live_tiny` | `promoted`) is refused unless CLOB
-/// credentials are present; an unknown string is refused.
+/// `current` and logs the reason). Ordinary live modes are retired and always refused; an unknown
+/// string is refused. `clob_creds_present` remains in the signature while callers migrate, but it
+/// cannot authorize a transition.
 pub fn validate_mode_transition(
     proposed: &str,
-    clob_creds_present: bool,
+    _clob_creds_present: bool,
     current: &str,
 ) -> Result<String, String> {
     match parse_execution_mode(proposed) {
         None => Err(format!("unknown mode '{proposed}'")),
-        Some(m) if is_live_mode(m) && !clob_creds_present => Err(format!(
-            "mode '{proposed}' requires CLOB credentials (absent); staying '{current}'"
+        Some(m) if is_live_mode(m) => Err(format!(
+            "ordinary mode '{proposed}' is retired; staying '{current}'"
         )),
         Some(m) => Ok(canonical_mode_string(m)),
     }
@@ -961,12 +962,10 @@ mod tests {
 
     #[test]
     fn mode_transition_guard() {
-        // paper -> live_tiny is refused without CLOB creds, accepted with.
+        // Ordinary live modes are refused regardless of credential presence.
         assert!(validate_mode_transition("live_tiny", false, "paper").is_err());
-        assert_eq!(
-            validate_mode_transition("live_tiny", true, "paper").unwrap(),
-            "live_tiny"
-        );
+        assert!(validate_mode_transition("live_tiny", true, "paper").is_err());
+        assert!(validate_mode_transition("promoted", true, "paper").is_err());
         // non-live transitions and canonicalization always succeed; unknown is refused.
         assert_eq!(
             validate_mode_transition("Shadow", false, "paper").unwrap(),
@@ -978,8 +977,8 @@ mod tests {
         let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
         let refused = parse_config(&[row("mode", "live_tiny", "text")], &boot, false);
         assert_eq!(refused.mode, "paper");
-        let accepted = parse_config(&[row("mode", "live_tiny", "text")], &boot, true);
-        assert_eq!(accepted.mode, "live_tiny");
+        let still_refused = parse_config(&[row("mode", "live_tiny", "text")], &boot, true);
+        assert_eq!(still_refused.mode, "paper");
     }
 
     #[test]

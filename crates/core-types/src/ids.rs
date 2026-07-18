@@ -61,6 +61,17 @@ impl fmt::Display for VenueMarketId {
     }
 }
 
+/// Opaque venue-assigned order identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VenueOrderId(pub String);
+
+impl fmt::Display for VenueOrderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl FromStr for VenueMarketId {
     type Err = std::convert::Infallible;
 

@@ -422,6 +422,40 @@ simulation.rs gates (backtest only, lines 457-518)
 7. Current production Winner-Follow ignores all SELL/Trim/Exit signals and holds copied BUYs to resolution. Any future exit-following profile must require matching inventory and `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
 8. Block live orders when the on-chain resolution source is unhealthy (`OnchainSourceUnhealthy`; see "Risk-block taxonomy" above).
 
+## Isolated Polymarket V2 canary
+
+The canary is orthogonal to `ExecutionMode`, ordinary `live_tiny`, and promotion evidence. It
+starts inactive, cannot be armed by Supabase/runtime configuration, and never advances the
+promotion ladder. A separately reviewed campaign may consume at most three individually
+authorized probes followed by five automatic ordinary Winner-Follow attempts over at most seven
+days.
+
+The campaign starts from exactly $400.000000 of freshly reconciled free pUSD cash, no positions or
+orders, and one standard-V2-exchange allowance no greater than $8.000000. Each BUY-only,
+fee-free, standard-exchange, binary Geopolitics attempt is a whole-share V2 limit FOK with exact
+worst-case debit bounded by both $1.000000 and `floor_to_collateral_atomic(25 bps ×
+canary_bankroll)`. The monotonic sum of reserved worst-case debits and the approved allowance are
+each capped at $8.000000; rejection or a smaller realized debit restores neither a slot nor
+commitment.
+
+`canary_bankroll` is freshly reconciled free deposit-wallet pUSD minus a pending reservation. No
+conditional-token mark is included. Exposure basis points round positive values outward against
+that denominator. Missing or stale resolver, account, geoblock, closed-only, watchlist/history,
+position, fee/category/delay, or book evidence fails before reservation. Any post-reservation
+reject, timeout, ambiguity, partial/live state, drift, external activity, expiry, or kill closes
+admission.
+
+Organic attempts retain the ordinary eligible `LeaderSignal`, calibrated ranking `p`, canonical
+idempotency key, BUY-entry/history/latency/resolution gates, and concentration checks. Their Kelly
+cost is `leader_price × 1.0075`, quantized down to the venue tick, with proven zero fee, canonical
+live Kelly fraction, and the caps above. Operator probes bypass leader/Kelly gates but bind one
+campaign/ordinal, condition/outcome/token, exact whole shares, absolute worst price/debit,
+resolver hash, and canonical authority hash. Both origins converge on one immutable quote,
+exact-risk, V2 preparation, synced reservation, and exactly-one-POST path.
+
+See [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md) for inactive
+installation and later authority boundaries.
+
 ## Promotion ladder
 
 Winner-Follow has a single leader-follow promotion ladder.

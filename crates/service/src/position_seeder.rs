@@ -32,7 +32,7 @@ const POSITION_MAX_PAGES: u32 = 20;
 struct RawPosition {
     condition_id: String,
     #[serde(default)]
-    outcome_index: u16,
+    outcome_index: Option<u16>,
     size: Decimal,
 }
 
@@ -42,6 +42,8 @@ struct RawPosition {
 pub enum PositionParseError {
     #[error("failed to deserialize positions response: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("position omitted outcomeIndex")]
+    MissingOutcomeIndex,
 }
 
 // ── Parse ─────────────────────────────────────────────────────────────────────
@@ -62,7 +64,7 @@ pub fn parse_positions(
             _ => continue,
         };
         let market_id = MarketId(VenueMarketId(item.condition_id));
-        let key = MarketOutcomeId::new(market_id, OutcomeId(item.outcome_index));
+        let key = MarketOutcomeId::new(market_id, OutcomeId(item.outcome_index.unwrap_or(0)));
         positions.insert(
             key,
             PositionState {
@@ -72,6 +74,18 @@ pub fn parse_positions(
         );
     }
     Ok(PositionSnapshot { wallet, positions })
+}
+
+/// Parse live-canary positions without the ordinary parser's legacy outcome-zero default.
+pub fn parse_positions_strict(
+    bytes: &[u8],
+    wallet: WalletAddress,
+) -> Result<PositionSnapshot, PositionParseError> {
+    let raw: Vec<RawPosition> = serde_json::from_slice(bytes)?;
+    if raw.iter().any(|position| position.outcome_index.is_none()) {
+        return Err(PositionParseError::MissingOutcomeIndex);
+    }
+    parse_positions(bytes, wallet)
 }
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
@@ -249,13 +263,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_missing_outcome_index_defaults_zero() {
+    fn ordinary_missing_outcome_index_keeps_legacy_default() {
         let w = wallet();
-        // outcomeIndex absent → #[serde(default)] → 0
         let bytes = br#"[{"conditionId":"0xccc","size":"10"}]"#;
         let snap = parse_positions(bytes, w).unwrap();
         let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(0));
         assert!(snap.positions.contains_key(&key));
+        assert!(matches!(
+            parse_positions_strict(bytes, w),
+            Err(PositionParseError::MissingOutcomeIndex)
+        ));
     }
 
     #[tokio::test]

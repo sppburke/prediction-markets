@@ -9,6 +9,10 @@ publish.workspace = true
 name = "pe-service"
 path = "src/main.rs"
 
+[[bin]]
+name = "pe-service-live-canary"
+path = "src/bin/pe-service-live-canary.rs"
+
 [lib]
 name = "pe_service"
 path = "src/lib.rs"
@@ -24,6 +28,7 @@ pe-core-types               = { path = "../core-types",                 version 
 pe-copy-signal-engine       = { path = "../copy-signal-engine",         version = "0.1.0" }
 pe-event-log                = { path = "../event-log",                  version = "0.1.0" }
 pe-risk-engine              = { path = "../risk-engine",                version = "0.1.0" }
+pe-resolver-card            = { path = "../resolver-card",              version = "0.1.0" }
 pe-source-core              = { path = "../source-core",                version = "0.1.0" }
 pe-source-polymarket-public = { path = "../source-polymarket-public",   version = "0.1.0" }
 pe-strategy-winner-follow   = { path = "../strategy-winner-follow",     version = "0.1.0" }
@@ -36,6 +41,7 @@ pe-paper-state              = { path = "../paper-state",                version 
 pe-paper-pnl                = { path = "../paper-pnl",                  version = "0.1.0" }
 
 anyhow          = { workspace = true }
+blake3          = { workspace = true }
 arc-swap        = { workspace = true }
 axum            = { workspace = true }
 figment         = { workspace = true }

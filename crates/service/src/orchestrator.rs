@@ -25,7 +25,6 @@ use pe_strategy_winner_follow::{
     ExecutionMode, FillSource, PaperExecutionError, PaperExecutor, PaperFill, WinnerFollowStrategy,
 };
 use pe_trader_index::Watchlist;
-use pe_venue_polymarket::CLOBClient;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
 use time::OffsetDateTime;
@@ -92,13 +91,13 @@ pub struct OrchestratorConfig {
     pub runtime_config: Option<LiveRuntimeConfig>,
 }
 
-pub struct Orchestrator<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
+pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     trade_rx: mpsc::Receiver<IncomingTrade>,
     position_ledger: PositionLedger,
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
-    dispatcher: ExecutionDispatcher<C>,
+    dispatcher: ExecutionDispatcher,
     mode: ExecutionMode,
     bankroll: Decimal,
     paper_state: Arc<PaperStateDb>,
@@ -184,7 +183,7 @@ fn apply_control_message(
     }
 }
 
-impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<C, F, B> {
+impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         trade_rx: mpsc::Receiver<IncomingTrade>,
@@ -192,7 +191,7 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
         config: OrchestratorConfig,
         history_map: HashMap<WalletAddress, HashSet<MarketId>>,
         strategy: WinnerFollowStrategy,
-        dispatcher: ExecutionDispatcher<C>,
+        dispatcher: ExecutionDispatcher,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -696,9 +695,8 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
             }
             Ok(intent) => {
                 let now = SourceTimestamp(OffsetDateTime::now_utc());
-                // Paper mode: hand the executor the resolved basis (best-ask or fallback) to record
-                // verbatim (#486). Live submits at the venue's real ask, and Shadow recomputes the
-                // identical boot-frozen haircut from `None` — both unchanged from pre-#486.
+                // Paper mode records the resolved basis verbatim. Shadow recomputes the identical
+                // boot-frozen haircut from `None`. Ordinary live modes fail closed in the dispatcher.
                 let observed_fill_price =
                     (self.mode == ExecutionMode::Paper).then_some((fill_basis, fill_source));
                 match self
@@ -741,17 +739,6 @@ impl<C: CLOBClient, F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrat
                                 market_mid = %market_mid.0,
                             );
                         }
-                    }
-                    Ok(DispatchResult::Live(result)) => {
-                        // Live execution is out of paper-state's fill scope; still mark
-                        // seen + mirror the leader ledger so dedup holds across modes.
-                        self.commit_no_fill(&trade, &leader_row);
-                        info!(
-                            kind = "live_execution",
-                            idempotency_key = %intent.idempotency_key,
-                            market = %intent.market_id,
-                            outcome = ?result.outcome(),
-                        );
                     }
                 }
             }
