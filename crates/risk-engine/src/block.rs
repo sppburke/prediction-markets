@@ -46,6 +46,4 @@ pub enum RiskBlock {
     InvalidCanaryBankroll,
     /// Organic requests require leader exposure; probes must not fabricate it.
     OriginInputsInvalid,
-    /// Conservative cash-ledger drawdown has reached the canonical intraday stop.
-    CanaryDrawdownStop,
 }

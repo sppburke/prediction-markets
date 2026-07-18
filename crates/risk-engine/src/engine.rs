@@ -3,6 +3,7 @@ use pe_source_core::SourceStatus;
 use pe_core_types::{BasisPoints, CollateralAmount};
 
 use crate::{
+    CANARY_MAX_ALLOWANCE, CANARY_MAX_ORDER_DEBIT, CANARY_PER_TRADE_CAP_BPS,
     block::RiskBlock,
     snapshot::{CanaryRiskSnapshot, RiskSnapshot},
 };
@@ -110,16 +111,13 @@ pub fn evaluate_canary_risk(s: &CanaryRiskSnapshot) -> RiskDecision {
         return RiskDecision::Blocked(RiskBlock::PendingReservation);
     }
     if !s.standard_spender_only
-        || s.allowance.atomic() > 8_000_000
+        || s.allowance > CANARY_MAX_ALLOWANCE
         || s.allowance < s.proposed_worst_case_debit
     {
         return RiskDecision::Blocked(RiskBlock::AllowanceExceeded);
     }
-    if proposed.0 > 25 || s.proposed_worst_case_debit.atomic() > 1_000_000 {
+    if proposed > CANARY_PER_TRADE_CAP_BPS || s.proposed_worst_case_debit > CANARY_MAX_ORDER_DEBIT {
         return RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded);
-    }
-    if s.drawdown_bps.0 <= -200 {
-        return RiskDecision::Blocked(RiskBlock::CanaryDrawdownStop);
     }
 
     let leader = match (s.origin, s.leader_exposure_bps) {

@@ -7,14 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pe_core_types::{RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass};
+use pe_risk_engine::CANARY_MAX_ALLOWANCE;
 use pe_venue_polymarket::{PostOnceResult, PreparedSubmission, V2BuyRequest};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 use crate::canary::{
-    CAMPAIGN_MAX_ALLOWANCE, CAMPAIGN_START_COLLATERAL, CampaignAuthorization, CanaryAdmission,
-    CanaryCampaignState, CanaryEvent, CanaryJournal, CanaryReconciliation, CanaryStateError,
-    ClosureReason, CommandReceipt, OrganicStageAuthorization, PendingAttempt, raw_evidence_hash,
+    CAMPAIGN_START_COLLATERAL, CampaignAuthorization, CanaryAdmission, CanaryCampaignState,
+    CanaryEvent, CanaryJournal, CanaryReconciliation, CanaryStateError, ClosureReason,
+    CommandReceipt, OrganicStageAuthorization, PendingAttempt, raw_evidence_hash,
 };
 
 pub const CANARY_COMMAND_QUEUE_CAPACITY: usize = 1;
@@ -895,7 +896,7 @@ impl<S: CanarySubmitter + CanaryReconciler> CanaryActor<S> {
         } else if snapshot.geoblocked
             || snapshot.closed_only
             || !snapshot.standard_spender_only
-            || snapshot.allowance > CAMPAIGN_MAX_ALLOWANCE
+            || snapshot.allowance > CANARY_MAX_ALLOWANCE
             || accounting_drift
             || allowance_drift
             || !snapshot.open_order_ids.is_empty()
@@ -1061,6 +1062,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use pe_core_types::CollateralAmount;
     use tempfile::tempdir;
     use time::Duration as TimeDuration;
 
@@ -1075,6 +1077,8 @@ mod tests {
         fail_reconciliation: Arc<AtomicBool>,
         block_reconciliation: Option<(Arc<Notify>, Arc<Notify>)>,
         geoblocked: bool,
+        free_collateral: CollateralAmount,
+        allowance: CollateralAmount,
     }
 
     fn test_transport_failure(endpoint_kind: &str) -> RawTransportFailure {
@@ -1160,6 +1164,8 @@ mod tests {
         ) -> Result<CanaryReconciliation, String> {
             let mut snapshot = snapshot();
             snapshot.geoblocked = self.geoblocked;
+            snapshot.free_collateral = self.free_collateral;
+            snapshot.allowance = self.allowance;
             Ok(snapshot)
         }
     }
@@ -1170,7 +1176,7 @@ mod tests {
             geoblocked: false,
             closed_only: false,
             free_collateral: CAMPAIGN_START_COLLATERAL,
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             standard_spender_only: true,
             open_order_ids: Vec::new(),
             all_trade_ids: Vec::new(),
@@ -1190,7 +1196,7 @@ mod tests {
             starting_collateral: CAMPAIGN_START_COLLATERAL,
             free_collateral: CAMPAIGN_START_COLLATERAL,
             canary_bankroll: CAMPAIGN_START_COLLATERAL,
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             ..CanaryCampaignState::default()
         }
     }
@@ -1215,7 +1221,7 @@ mod tests {
             issued_at: now,
             expires_at: now + TimeDuration::hours(1),
             starting_collateral: CAMPAIGN_START_COLLATERAL,
-            allowance: CAMPAIGN_MAX_ALLOWANCE,
+            allowance: CANARY_MAX_ALLOWANCE,
             commitment_cap: CAMPAIGN_MAX_COMMITMENT,
             probe_slots: PROBE_POST_LIMIT,
             organic_slots: ORGANIC_POST_LIMIT,
@@ -1281,6 +1287,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: None,
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1340,6 +1348,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: None,
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1356,6 +1366,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arm_requires_exact_cash_and_the_selected_allowance() {
+        for (free_collateral, reconciled_allowance, accepted) in [
+            (199_999_999, 5_000_000, false),
+            (200_000_000, 5_000_000, true),
+            (200_000_000, 5_000_001, false),
+            (200_000_001, 5_000_000, false),
+        ] {
+            let directory = tempdir().unwrap();
+            let journal = CanaryJournal::open(directory.path().join("canary.log")).unwrap();
+            let (actor, handle) = CanaryActor::new(
+                CanaryCampaignState::default(),
+                journal,
+                FakeIo {
+                    reconciliations: Arc::new(AtomicUsize::new(0)),
+                    fail_reconciliation: Arc::new(AtomicBool::new(false)),
+                    block_reconciliation: None,
+                    geoblocked: false,
+                    free_collateral: CollateralAmount::from_atomic(free_collateral),
+                    allowance: CollateralAmount::from_atomic(reconciled_allowance),
+                },
+            );
+            let task = tokio::spawn(actor.run());
+            let mut selected_authority = authority();
+            selected_authority.allowance = CollateralAmount::from_atomic(5_000_000);
+            let result = handle.arm(receipt("arm"), selected_authority).await;
+            assert_eq!(result.is_ok(), accepted);
+            handle.kill(receipt("kill")).await.unwrap();
+            handle
+                .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn journal_sync_failure_stops_the_actor_before_campaign_arm() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("canary.log");
@@ -1369,6 +1415,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: None,
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1393,6 +1441,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: None,
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1424,6 +1474,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: Some((started.clone(), release.clone())),
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1459,6 +1511,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: Some((started.clone(), release.clone())),
                 geoblocked: true,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1495,6 +1549,8 @@ mod tests {
                 fail_reconciliation: Arc::new(AtomicBool::new(false)),
                 block_reconciliation: Some((started.clone(), release.clone())),
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
@@ -1528,6 +1584,8 @@ mod tests {
                 fail_reconciliation: fail.clone(),
                 block_reconciliation: None,
                 geoblocked: false,
+                free_collateral: CAMPAIGN_START_COLLATERAL,
+                allowance: CANARY_MAX_ALLOWANCE,
             },
         );
         let task = tokio::spawn(actor.run());
