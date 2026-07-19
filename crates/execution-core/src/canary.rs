@@ -1800,6 +1800,40 @@ mod tests {
     }
 
     #[test]
+    fn probe_authority_hash_ignores_declared_hash() {
+        let mut probe = ProbeAuthorization {
+            schema_version: 1,
+            campaign_id: "campaign".to_owned(),
+            campaign_authorization_hash: "campaign-authority".to_owned(),
+            probe_ordinal: 1,
+            condition_id: PolymarketConditionId("condition".to_owned()),
+            outcome_id: OutcomeId(0),
+            token_id: PolymarketTokenId("11".to_owned()),
+            shares: ShareAmount::from_atomic(2_000_000),
+            worst_price: Price(dec!(0.50)),
+            maximum_collateral: CollateralAmount::from_atomic(1_000_000),
+            resolver_card_hash: "resolver".to_owned(),
+            authority_hash: String::new(),
+            expires_at: datetime!(2026-07-18 0:00 UTC),
+        };
+        let expected = probe_authority_hash(&probe).unwrap();
+        probe.authority_hash = "ignored-self-field".to_owned();
+
+        assert_eq!(probe_authority_hash(&probe).unwrap(), expected);
+    }
+
+    #[test]
+    fn organic_evidence_bundle_hash_preserves_review_order() {
+        let reviewed = vec!["probe-one".to_owned(), "probe-two".to_owned()];
+        let reversed = vec!["probe-two".to_owned(), "probe-one".to_owned()];
+
+        assert_ne!(
+            organic_evidence_bundle_hash(&reviewed).unwrap(),
+            organic_evidence_bundle_hash(&reversed).unwrap()
+        );
+    }
+
+    #[test]
     fn journal_rebuilds_the_same_state() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("canary.log");

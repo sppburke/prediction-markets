@@ -16,8 +16,8 @@ use pe_core_types::{
 use pe_execution_core::{
     AttemptAttribution, AttemptOrigin, CampaignAuthorization, CampaignStage, CanaryActor,
     CanaryActorHandle, CanaryAdmission, CanaryCampaignState, CanaryJournal, CanaryQuote,
-    CommandReceipt, OrganicStageAuthorization, ProbeAuthorization, probe_authority_hash,
-    raw_evidence_hash, response_evidence_hash,
+    CommandReceipt, OrganicStageAuthorization, ProbeAuthorization, organic_evidence_bundle_hash,
+    probe_authority_hash, raw_evidence_hash, response_evidence_hash,
 };
 use pe_resolver_card::{MarketFamily, validate_install_expected};
 use pe_risk_engine::{CanaryRiskSnapshot, exposure_bps_ceil};
@@ -200,13 +200,17 @@ async fn main() -> Result<()> {
         Some("artifact-identity") if args.len() == 3 => {
             print_artifact_identity(Path::new(&args[1]), Path::new(&args[2]))
         }
+        Some("authority-hash") if args.len() == 3 => {
+            println!("{}", authority_hash(&args[1], &args[2])?);
+            Ok(())
+        }
         Some("resolver-card")
             if args.get(1).map(String::as_str) == Some("validate-install") && args.len() == 4 =>
         {
             validate_resolver_install(Path::new(&args[2]), Path::new(&args[3]))
         }
         _ => bail!(
-            "usage: pe-service-live-canary daemon|status|artifact-identity BOOT_CONFIG RESOLVER_DIR|arm-probes FILE|reconcile|probe-buy FILE|review-probe CAMPAIGN ORDINAL|advance-organic FILE|kill|resolver-card validate-install INPUT OUTPUT"
+            "usage: pe-service-live-canary daemon|status|artifact-identity BOOT_CONFIG RESOLVER_DIR|authority-hash probe PROBE_AUTHORIZATION.json|authority-hash reviewed-probes REVIEWED_PROBE_HASHES.json|arm-probes FILE|reconcile|probe-buy FILE|review-probe CAMPAIGN ORDINAL|advance-organic FILE|kill|resolver-card validate-install INPUT OUTPUT"
         ),
     }
 }
@@ -763,10 +767,7 @@ async fn build_probe(
     );
 
     let tag_url = format!("{GAMMA_HOST}/tags/100265");
-    let market_url = format!(
-        "{GAMMA_HOST}/markets?condition_ids={}&limit=500",
-        authorization.condition_id.0
-    );
+    let market_url = gamma_market_url(&authorization.condition_id);
     let long_url = format!("{CLOB_V2_HOST}/markets/{}", authorization.condition_id.0);
     let short_url = format!(
         "{CLOB_V2_HOST}/clob-markets/{}",
@@ -901,10 +902,7 @@ async fn build_organic(
     ensure_resolution_horizon(&resolver.card.timing, OffsetDateTime::now_utc())?;
 
     let tag_url = format!("{GAMMA_HOST}/tags/100265");
-    let market_url = format!(
-        "{GAMMA_HOST}/markets?condition_ids={}&limit=500",
-        condition_id.0
-    );
+    let market_url = gamma_market_url(&condition_id);
     let long_url = format!("{CLOB_V2_HOST}/markets/{}", condition_id.0);
     let short_url = format!("{CLOB_V2_HOST}/clob-markets/{}", condition_id.0);
     let tag = fetch_raw(
@@ -1517,6 +1515,25 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     serde_json::from_slice(&fs::read(path)?).with_context(|| format!("parse {path}"))
 }
 
+fn authority_hash(kind: &str, path: &str) -> Result<String> {
+    match kind {
+        "probe" => {
+            probe_authority_hash(&read_json::<ProbeAuthorization>(path)?).map_err(Into::into)
+        }
+        "reviewed-probes" => {
+            organic_evidence_bundle_hash(&read_json::<Vec<String>>(path)?).map_err(Into::into)
+        }
+        _ => bail!("unknown authority-hash form: {kind}"),
+    }
+}
+
+fn gamma_market_url(condition_id: &PolymarketConditionId) -> String {
+    format!(
+        "{GAMMA_HOST}/markets?condition_ids={}&limit=500&include_tag=true",
+        condition_id.0
+    )
+}
+
 fn command_id() -> String {
     if let Ok(command_id) = env::var("PE_CANARY_COMMAND_ID")
         && !command_id.trim().is_empty()
@@ -1619,5 +1636,15 @@ mod tests {
         };
 
         assert!(ensure_running_campaign_binding(&state, &boot).is_err());
+    }
+
+    #[test]
+    fn gamma_market_query_requests_direct_tags() {
+        let condition = PolymarketConditionId("0xcondition".to_owned());
+
+        assert_eq!(
+            gamma_market_url(&condition),
+            "https://gamma-api.polymarket.com/markets?condition_ids=0xcondition&limit=500&include_tag=true"
+        );
     }
 }

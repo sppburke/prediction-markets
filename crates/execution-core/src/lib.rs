@@ -19,8 +19,8 @@ pub use canary::{
     CampaignStage, CanaryAdmission, CanaryCampaignState, CanaryEvent, CanaryExposureAmounts,
     CanaryJournal, CanaryPosition, CanaryQuote, CanaryReconciliation, CanaryResolution,
     CanaryStateError, ClosureReason, CommandReceipt, OrganicStageAuthorization, PendingAttempt,
-    ProbeAuthorization, artifact_evidence_hash, probe_authority_hash, raw_evidence_hash,
-    response_evidence_hash,
+    ProbeAuthorization, artifact_evidence_hash, organic_evidence_bundle_hash, probe_authority_hash,
+    raw_evidence_hash, response_evidence_hash,
 };
 pub use canary_actor::{
     CANARY_COMMAND_QUEUE_CAPACITY, CANARY_POST_TIMEOUT_SECS, CANARY_RECONCILIATION_TIMEOUT_SECS,

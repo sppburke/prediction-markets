@@ -84,17 +84,19 @@
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
 | https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-07-17 | 2026-09-15 |
 | https://clob.polymarket.com/markets?closed=true | 2026-06-20 | 2026-08-19 |
-| https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-17 | 2026-09-15 |
-| https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
+| https://clob.polymarket.com/markets/{condition_id} | 2026-07-18 | 2026-09-16 |
+| https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-06-23 | 2026-08-22 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-06-23 | 2026-08-22 |
-| https://gamma-api.polymarket.com/markets?condition_ids={id} | 2026-07-17 | 2026-09-15 |
+| https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
 ## Public sources
@@ -165,6 +167,20 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-07-18: The official Gamma `List markets` contract exposes `include_tag` and direct
+  `Market.tags`. For active standard Geopolitics condition
+  `0x6bd56627aa21311850825edb27e53434a0e17a4f782be0086bc07f71eee00d0d`, the public
+  `condition_ids` response omitted nested `events[].tags`; adding `include_tag=true` returned direct
+  tag ID `100265` / slug `geopolitics`. The same sample explicitly reported Gamma `negRisk=false`,
+  `feesEnabled=false`, `feeSchedule=null`, and `secondsDelay=null`; the long CLOB market reported
+  active/accepting, `neg_risk=false`, `seconds_delay=0`, matching two-token identity, minimum order
+  size 5, and tick 0.01. Its compact CLOB response omitted `nr`, `fd`, and `itode` (and both base-fee
+  fields), while the public book agreed on condition/token identity, `neg_risk=false`, minimum size,
+  and tick with nonempty string-valued bid/ask levels. This pass supports requesting documented
+  direct tags and retaining the existing independent fail-closed long-market, fee, delay, compact
+  metadata, and book checks; it does not establish authenticated account, geoblock, or closed-only
+  state.
 
 - 2026-07-17: Re-verified the production CLOB V2 migration/host, order/FOK behavior, fees,
   builder fees, deposit-wallet `POLY_1271` identity, authentication, standard V2 contracts,
