@@ -415,7 +415,7 @@ Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (`pe_bootstrap::lock::CacheMutationLock`). Acquired by the cache-mutating subcommands (`winner-discovery`, `backfill`, `--backfill-v1-attribution`) to serialize cache mutations; stale-PID reclaim handles a crashed prior holder. |
+| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (`pe_bootstrap::lock::CacheMutationLock`). Acquired by cache-mutating discovery/backfill paths and the standalone `activate-next`, `purge`, `purge-infra`, and `clear-infra-exclusion` commands before opening the cache read/write; stale-PID reclaim handles a crashed prior holder. |
 | `wallets.polymarket_contracts_seen` (column) | `i64`, default `0` | Legacy OR-merged V1/V2 CTF-exchange attribution bitmask. Its on-chain enumeration writer was removed in #326, so every wallet is now left `0`; the column persists for schema backward-compat. |
 | `wallet_enum_completed_contracts` / `wallet_enum_topic_hashes` / `wallet_enum_chunk_progress` (cursors) | `source_cursor` keys (`pe_bootstrap::migrate::CURSOR_WALLET_ENUM_*`) | Legacy on-chain enumeration progress. Still written once by the `wallet_set.json` → SQLite migration (`migrate::auto_migrate_legacy` → `save_enum_state`) as a migration-audit marker, but **no longer read** — the reader (`load_enum_state`) and the `enumerate` subcommand were removed in #335. |
 
@@ -660,16 +660,17 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `clob_page_max_retries` | 5 | Walk-level retries on a transient / rate-limited CLOB `/markets?closed=true` page fetch before the closed-markets walk aborts (issue #429 follow-up). Sits *on top of* `ReqwestFetcher`'s internal fast retries (`polymarket_max_retries`); rides through *sustained* flakiness (e.g. a minute of `error decoding response body`) so one bad page does not abort the ~1,457-page re-walk. `Transient` and `RateLimited` share this budget (`RateLimited` waits `retry_after`, floored at 1s); `Fatal` (4xx) errors still abort immediately, and the error propagates once the budget is exhausted. Const `CLOB_PAGE_MAX_RETRIES` in `pe_bootstrap::clob`. |
 | `clob_page_retry_base_ms` | 1_000 | Base backoff (ms) for the CLOB page retry; exponential (`base · 2^attempt`) capped at 30s. With `clob_page_max_retries=5` the inter-attempt backoff sums to ~31s (1+2+4+8+16) before giving up — total wall-time per page is higher because each attempt also spends `ReqwestFetcher`'s own retries/timeout; `RateLimited` instead waits the server's `retry_after` (floored at 1s). Const `CLOB_PAGE_RETRY_BASE_MS` in `pe_bootstrap::clob`. |
 | `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / 502-gap / datadash) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
+| `bootstrap_pipeline_activation_batch_wallets` | 20,000 | Maximum inactive, non-infra, non-tombstoned wallets activated by one zero-argument `rank_and_push.sh` cycle. Discovery and backfill defer the legacy global rule inside this wrapper; `activate-next` owns the single deterministic, transactionally audited batch. If fewer remain it activates all and warns; if none remain it warns and skips. Hardcoded as `pe_bootstrap::pile::PIPELINE_ACTIVATION_BATCH_WALLETS`. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. Initial deployment runs with `0` to drain the bulk catch-up queue; steady-state daily timers may set a positive value if daily run time grows unmanageable. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
 | `bootstrap_backfill_staleness_secs` | 86_400 (1 day) | Per-wallet staleness window for `pe-bootstrap backfill` (issue #166). A wallet is eligible for re-fetch when `last_polymarket_fetch_at IS NULL OR < now - 86_400`. Hardcoded as `pe_bootstrap::pile::BACKFILL_STALENESS_SECS`; matches the daily systemd timer cadence. Reused by `pe-bootstrap purge` (#385) as the rule-B freshness gate. |
-| `bootstrap_purge_enabled` | `false` | Arms the `pe-bootstrap purge` DELETE (issue #385). Default `false` keeps the stage report-only — a dry-run that deletes nothing, though the would-purge report still runs each cycle (it reuses the Step-0 backfill's refresh, never re-running `refresh_trade_counts`). Set `PE_BOOTSTRAP_PURGE_ENABLED=1` to arm; even when armed, `--dry-run` still only reports. |
+| `bootstrap_purge_enabled` | `false` | Arms only the ordinary `pe-bootstrap purge` proven-loser/dead-weight DELETE (issue #385). Default `false` keeps that stage report-only. It does not govern `purge-infra`, which is armed whenever invoked and is report-only only with explicit `--dry-run`. Set `PE_BOOTSTRAP_PURGE_ENABLED=1` to arm the ordinary purge. |
 | `bootstrap_purge_inactivity_secs` | 1_209_600 (14 days) | Rule-B (dead-weight) dormancy threshold (issue #385): an `is_active=1`, not-eligible wallet refreshed this run is deleted (no tombstone) when its newest trade is older than this. A zero-trade wallet (`MAX(timestamp_unix) IS NULL`) is never matched. `PE_BOOTSTRAP_PURGE_INACTIVITY_SECS` overrides. |
 | `bootstrap_purge_loser_tstat_max` | -2.0 | Rule-A (proven-loser) net t-stat ceiling (issue #385): an eligible wallet is deleted **and tombstoned** when `tstat_net <= -2.0 AND mean_net < 0 AND n_eff >= bootstrap_purge_loser_neff_min`. The one `f64` bootstrap config (a t-stat is a statistic, outside the "no raw f64" money/price/probability rule). `PE_BOOTSTRAP_PURGE_LOSER_TSTAT_MAX` overrides. |
 | `bootstrap_purge_loser_neff_min` | 20 | Rule-A minimum effective sample size (`n_eff`, Kish) for a proven-loser verdict (issue #385) — guards against tombstoning on a tiny sample. `PE_BOOTSTRAP_PURGE_LOSER_NEFF_MIN` overrides. |
 | `bootstrap_purge_bulk_min_wallets` | 20_000 | Delete-set size (wallet count) at/above which an armed `pe-bootstrap purge` runs in **bulk mode** (issue #401): drop the two non-lookup `trades` indexes → delete → VACUUM → rebuild. Below it the armed purge runs **incremental** — indexes stay live, no VACUUM — so cheap daily purges (hundreds of wallets) plateau the file while a rare backlog clear stays fast. `PE_BOOTSTRAP_PURGE_BULK_MIN_WALLETS` overrides. |
 | `bootstrap_purge_archive_enabled` | true | Archive-before-DELETE for the armed purge (item 3.7, 2026-07-01 decision record, issue #417): every doomed wallet's `trades`/`wallets`/`leaderboard_snapshots` rows + a both-rules `purge_manifest` census are copied into the sibling archive DB before any destructive step; an archive failure ABORTS the purge (fail-closed). Disable only on a disk-constrained box. `PE_BOOTSTRAP_PURGE_ARCHIVE_ENABLED`. |
 | `bootstrap_purge_archive_path` | "" (derived) | Archive DB path; empty derives `<cache_path stem>.purge-archive.db` beside the cache. `PE_BOOTSTRAP_PURGE_ARCHIVE_PATH`. |
-| `tombstone_override_sources` | `SRC_LEADERBOARD` (= 16) | The source bits whose re-discovery of a tombstoned wallet *lifts* the tombstone and re-admits it (issue #385): Polymarket leaderboard (16) only. Datadash (128), 502-gap (64), trades (2), wallet-set-json (1), and the retired Radion bit (32) leave the tombstone intact (`bits & 16 == 0`). Read from each `upsert_wallets_bulk` row's own `source_bits`; hardcoded as `pe_bootstrap::pile::TOMBSTONE_OVERRIDE_SOURCES`. |
+| `tombstone_override_sources` | `SRC_LEADERBOARD` (= 16) | The source bits whose re-discovery of a non-infrastructure tombstoned wallet *lifts* the tombstone and re-admits it (issue #385): Polymarket leaderboard (16) only. An `infra` tombstone is never lifted by ordinary discovery, including leaderboard discovery; only the explicit operator command `clear-infra-exclusion --wallet <hex> --confirm` may remove it. Datadash (128), 502-gap (64), trades (2), wallet-set-json (1), and the retired Radion bit (32) leave every tombstone intact. |
 | `bootstrap_leaderboard_request_interval_ms` | 500 | Minimum milliseconds between Polymarket leaderboard API requests during `pe-bootstrap winner-discovery` (issue #324). Applied per-fetch via `ReqwestFetcher::with_min_interval_ms`. Set via `PE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS`. |
 | `bootstrap_leaderboard_top_n` | 50 | Maximum wallets fetched per leaderboard slice during `pe-bootstrap winner-discovery` (#324; all-category in #335). The `/v1/leaderboard` API hard-caps `limit` at 50; larger values are silently truncated server-side (verified live 2026-06-14). Set via `PE_BOOTSTRAP_LEADERBOARD_TOP_N`. |
 | `bootstrap_leaderboard_categories` | all 10 | Leaderboard categories swept by `winner-discovery` (#335). Default = `OVERALL, POLITICS, SPORTS, CRYPTO, CULTURE, MENTIONS, WEATHER, ECONOMICS, TECH, FINANCE`. Each is crossed with `{PNL,VOL} × {DAY,WEEK,MONTH,ALL}` (≤ 80 slices); a category the API rejects (4xx) is skipped with a `warn!`. Results dedupe before the pile upsert. Set via `PE_BOOTSTRAP_LEADERBOARD_CATEGORIES` (TOML array of category names). |
@@ -714,9 +715,24 @@ WHERE is_active = 0 AND is_infra = 0 AND (
 -- radion-tagged rows keep the bit but no longer bypass the activation gate.
 ```
 
-`is_active` and `is_infra` are sticky once set (never decay). Re-running
-`migrate` after edits to the input CSVs only adds source bits and infra flags;
-it never removes them. To "un-mark" a wallet, delete its row.
+`is_active` and `is_infra` are sticky under repository-owned automatic rules
+(they never decay). Re-running `migrate` after edits to input data only adds
+source bits and infra flags; it never removes them. Infrastructure purge removes
+the live row but preserves a durable exclusion as described below.
+
+The zero-argument rank-and-push pipeline is a controlled exception to the
+legacy unbounded activation call sites: `winner-discovery` and `backfill` run
+with deferred activation, then one `activate-next` transaction records the
+batch in `wallet_activation_batches` and `wallet_activation_batch_wallets`
+before setting those exact wallets active. The per-run `activated_wallets.csv`
+is derived from that durable batch and can be regenerated with the same batch
+ID without consuming another batch. Direct standalone `winner-discovery` and
+`backfill` retain the legacy immediate activation behavior.
+
+`purge-infra` archives and deletes live wallet-keyed rows before ranking and
+writes a non-liftable `purged_wallets(reason='infra')` exclusion in the same
+delete transaction. This preserves the classification after the live `wallets`
+row is gone and prevents a later discovery cycle from re-admitting it.
 
 #### Leaderboard snapshots (`leaderboard_snapshots` table)
 

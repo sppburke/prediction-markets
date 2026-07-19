@@ -11,7 +11,8 @@ network (localhost only), no real DB, deterministic.
 What it locks (the things that would silently break cron if wired wrong):
   - default universe source is `--universe-from-trades`, never `--universe ""` (the ranker
     hard-errors on neither/both);
-  - Step 0 runs discover → backfill → events → resolutions, in that order (issue #383 removed
+  - Step 0 runs deferred discovery → controlled activation → deferred backfill → events →
+    resolutions → infrastructure purge, in that order (issue #383 removed
     the redundant trailing `schedules` stage — fetch_resolutions_and_schedules already covers it);
   - PE_BOOTSTRAP_FETCH_RESOLUTIONS is unset for `backfill` (trades-only) and =1 for `resolutions`,
     so the CLOB→Gamma refresh runs exactly once, not twice (issue #383);
@@ -313,9 +314,22 @@ class RankAndPushScenario(unittest.TestCase):
         subs = [ln.split()[0] for ln in boot.splitlines() if ln.strip()]
         self.assertEqual(
             subs,
-            ["winner-discovery", "backfill", "events", "resolutions", "purge"],
+            [
+                "winner-discovery",
+                "activate-next",
+                "backfill",
+                "events",
+                "resolutions",
+                "purge-infra",
+                "purge",
+            ],
             "Step-0 stages ran out of canonical order, or the final purge stage (#385) is missing",
         )
+        boot_lines = boot.splitlines()
+        self.assertIn("--defer-activation", boot_lines[0])
+        self.assertIn("--batch-id", boot_lines[1])
+        self.assertIn("--audit-csv", boot_lines[1])
+        self.assertIn("--defer-activation", boot_lines[2])
 
         rank = self._log("rank.log")
         self.assertIn("--universe-from-trades", rank)
@@ -324,7 +338,51 @@ class RankAndPushScenario(unittest.TestCase):
         # Auto-timestamped out-dir was created.
         crons = list((self.root / "data" / "eval-results").glob("cron-*"))
         self.assertEqual(len(crons), 1, f"expected one auto out-dir, got {crons}")
+        self.assertIn(f"RANK_AND_PUSH_RUN_DIR={crons[0].relative_to(self.root)}", r.stdout)
         print("PASS: happy path — default --universe-from-trades, Step-0 order, auto out-dir")
+
+    def test_activation_batch_id_binds_complete_output_path(self):
+        first_out = self.root / "first" / "shared-name"
+        second_out = self.root / "second" / "shared-name"
+        first = self._run("--out-dir", str(first_out))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_line = next(
+            line
+            for line in (self._log("pe_bootstrap.log") or "").splitlines()
+            if line.startswith("activate-next")
+        )
+
+        (self.root / "pe_bootstrap.log").unlink()
+        second = self._run("--out-dir", str(second_out))
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_line = next(
+            line
+            for line in (self._log("pe_bootstrap.log") or "").splitlines()
+            if line.startswith("activate-next")
+        )
+
+        def batch_id(line):
+            args = line.split()
+            return args[args.index("--batch-id") + 1]
+
+        self.assertNotEqual(
+            batch_id(first_line),
+            batch_id(second_line),
+            "distinct output paths with the same basename reused an activation cohort",
+        )
+
+    def test_activation_batch_id_accepts_output_path_with_spaces(self):
+        out = self.root / "directory with spaces" / "shared name"
+        result = self._run("--out-dir", str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        activation = next(
+            line
+            for line in (self._log("pe_bootstrap.log") or "").splitlines()
+            if line.startswith("activate-next")
+        )
+        args = activation.split()
+        batch_id = args[args.index("--batch-id") + 1]
+        self.assertRegex(batch_id, r"^run-[0-9a-f]{16}$")
 
     def test_fetch_resolutions_env_scoped_to_resolutions_only(self):
         # Issue #383: PE_BOOTSTRAP_FETCH_RESOLUTIONS must be UNSET (empty) when `backfill` runs
@@ -382,6 +440,29 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertTrue(any(l.startswith("winner-discovery") for l in boot))
         self.assertFalse(any(l.startswith("backfill") for l in boot), "ran backfill after fatal discovery")
         print("PASS: winner-discovery exit 1 (leaderboard fatal) → run aborts before backfill")
+
+    def test_activation_fatal_aborts_before_backfill(self):
+        r = self._run(exit_env={"STUB_EXIT_activate_next": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        boot = self._log("pe_bootstrap.log").splitlines()
+        self.assertTrue(any(l.startswith("activate-next") for l in boot))
+        self.assertFalse(any(l.startswith("backfill") for l in boot))
+
+    def test_infra_purge_fatal_aborts_before_export_and_ranking(self):
+        r = self._run(exit_env={"STUB_EXIT_purge_infra": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIsNone(self._log("export.log"))
+        self.assertIsNone(self._log("rank.log"))
+
+    def test_skip_discovery_skips_activation_and_still_defers_backfill(self):
+        r = self._run("--skip-discovery")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertFalse(any(l.startswith("winner-discovery") for l in boot))
+        self.assertFalse(any(l.startswith("activate-next") for l in boot))
+        backfill = [l for l in boot if l.startswith("backfill")]
+        self.assertEqual(len(backfill), 1)
+        self.assertIn("--defer-activation", backfill[0])
 
     def test_concurrent_run_blocked_by_live_lock(self):
         lock = self.root / "data" / "eval-results" / ".rank_and_push.lock"

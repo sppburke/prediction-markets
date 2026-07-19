@@ -19,7 +19,10 @@
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;
-use crate::wallet_discovery::{SourceDiscoveryResult, WalletDiscoverySource, run_source_discovery};
+use crate::pile::ActivationPolicy;
+use crate::wallet_discovery::{
+    SourceDiscoveryResult, WalletDiscoverySource, run_source_discovery_with_policy,
+};
 
 /// Aggregate counts across all discovery sources.
 #[derive(Debug, Default, Clone, Copy)]
@@ -35,11 +38,34 @@ pub async fn run_winner_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
-    let lb = run_source_discovery(WalletDiscoverySource::Leaderboard, config, cache).await?;
+    run_winner_discovery_with_policy(config, cache, ActivationPolicy::Immediate).await
+}
+
+/// Winner discovery with an explicit activation policy. The full rank-and-push
+/// wrapper defers both sources to one controlled batch.
+pub async fn run_winner_discovery_with_policy(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    activation_policy: ActivationPolicy,
+) -> Result<WinnerDiscoveryReport, BootstrapError> {
+    let lb = run_source_discovery_with_policy(
+        WalletDiscoverySource::Leaderboard,
+        config,
+        cache,
+        activation_policy,
+    )
+    .await?;
     // Datadash soft-fails: a third-party outage must not break `pe-bootstrap all`.
     // Only `BootstrapError::Datadash` is swallowed; any other variant (e.g. a
     // shared-cache failure) still propagates as fatal.
-    let dd = match run_source_discovery(WalletDiscoverySource::Datadash, config, cache).await {
+    let dd = match run_source_discovery_with_policy(
+        WalletDiscoverySource::Datadash,
+        config,
+        cache,
+        activation_policy,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(BootstrapError::Datadash { message }) => {
             tracing::warn!(

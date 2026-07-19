@@ -98,6 +98,25 @@ pub async fn run_leaderboard_discovery<F: PageFetcher + Send + Sync>(
     top_n: u32,
     cache: &mut WalletCache,
 ) -> Result<LeaderboardDiscoveryReport, BootstrapError> {
+    run_leaderboard_discovery_with_policy(
+        fetcher,
+        categories,
+        top_n,
+        cache,
+        pile::ActivationPolicy::Immediate,
+    )
+    .await
+}
+
+/// Discovery variant used by the full pipeline to defer global activation to
+/// its single controlled 20,000-wallet batch.
+pub async fn run_leaderboard_discovery_with_policy<F: PageFetcher + Send + Sync>(
+    fetcher: &LeaderboardFetcher<F>,
+    categories: &[LeaderboardCategory],
+    top_n: u32,
+    cache: &mut WalletCache,
+    activation_policy: pile::ActivationPolicy,
+) -> Result<LeaderboardDiscoveryReport, BootstrapError> {
     let mut all: Vec<String> = Vec::new();
     let mut slices_attempted = 0usize;
     let mut slices_fetched = 0usize;
@@ -145,7 +164,7 @@ pub async fn run_leaderboard_discovery<F: PageFetcher + Send + Sync>(
         .collect();
     cache.upsert_wallets_bulk(&upserts)?;
 
-    let activated = pile::apply_activation_rules(cache)?;
+    let activated = pile::apply_activation_policy(cache, activation_policy)?;
 
     tracing::info!(
         slices_attempted,

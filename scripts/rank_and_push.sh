@@ -13,12 +13,14 @@
 #
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
-#     discover     pe-bootstrap winner-discovery  leaderboard + datadash → new wallets
-#     backfill     pe-bootstrap backfill          trade history for every active wallet (trades only)
+#     discover     pe-bootstrap winner-discovery --defer-activation  ingest without bulk activation
+#     activate     pe-bootstrap activate-next     at most the next audited 20,000 non-infra wallets
+#     backfill     pe-bootstrap backfill --defer-activation  trade history for every active wallet
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run
 #                                                  ONCE (fetch_resolutions_and_schedules; the latter
 #                                                  is the --scheduled-only TTR clock)
+#   Step 0i purge   pe-bootstrap purge-infra       archive + delete infra wallet data before ranking
 #   Step 0a export  export_trades_parquet.py       trades+maps → Parquet for the DuckDB read-layer
 #                                                  (#375; auto/duck engines only; --skip-export bypass)
 #   Stage 1  rank    rank_72hr_buyandhold.py  --universe-from-trades  (every wallet w/ trade data)
@@ -43,14 +45,8 @@
 # which production zeroes), --scheduled-only (drops the resolved-at look-ahead fallback),
 # floor_tstat 2.0, top_n 200.
 #
-# Cron (4h production cadence on the box holding wallet_cache.db; NOT the VPS):
-#   The cheap 4-hourly tick re-ranks + pushes from the existing cache:
-#     0 */4 * * *  cd <repo> && bash scripts/rank_and_push.sh --skip-discovery --skip-backfill >> data/eval-results/cron.log 2>&1
-#   At least ONE full run per day stays MANDATORY (the push aborts if the cache's newest
-#   trade is >24h old, and purge only runs on full runs), e.g. replace the 06:00 tick:
-#     0 6 * * *    cd <repo> && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
-#   The PID lock makes an overlapping tick abort (exit 3) — a long full run simply eats
-#   the next 4h tick; the following tick recovers.
+# Continuous production execution is owned by scripts/rank_and_push_loop.sh.
+# Do not run a cron/timer copy alongside that supervisor.
 #
 # Requirements on the box:
 #   - .env with SUPABASE_URL + SUPABASE_SECRET_KEY (sourced below).
@@ -74,7 +70,8 @@
 #   --engine E            ranker engine: auto (default) | duck | sqlite. auto uses the DuckDB
 #                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
 #   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
-#   --skip-purge          skip the Stage-4 cache purge (#385); the final WAL checkpoint still runs.
+#   --skip-purge          skip both pre-rank infra purge and Stage-4 ordinary purge (#385);
+#                         the final WAL checkpoint still runs.
 #   --keep-intermediates  retain qualifying_positions_72hr.csv (the >5 GB pass-1 intermediate) instead
 #                         of auto-pruning it after pass-2; useful for debugging the raw position set.
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
@@ -295,6 +292,17 @@ echo "$$" > "$LOCK_FILE"
 trap 'rm -f "$LOCK_FILE"' EXIT
 
 mkdir -p "$OUT_DIR"
+echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
+
+ACTIVATION_RUN_HASH="$("$PYTHON_BIN" -c \
+  'import hashlib, os, sys; print(hashlib.sha256(os.path.realpath(os.path.abspath(sys.argv[1])).encode()).hexdigest()[:16])' \
+  "$OUT_DIR")"
+ACTIVATION_BATCH_ID="run-${ACTIVATION_RUN_HASH}"
+if [[ ! "$ACTIVATION_BATCH_ID" =~ ^run-[0-9a-f]{16}$ ]]; then
+  echo "FATAL: output directory cannot form a valid activation batch id: $OUT_DIR" >&2
+  exit 2
+fi
+ACTIVATION_AUDIT_CSV="$OUT_DIR/activated_wallets.csv"
 
 RANKED_CSV="$OUT_DIR/ranked_72hr_buyandhold.csv"
 POSITIONS_CSV="$OUT_DIR/qualifying_positions_72hr.csv"
@@ -346,7 +354,7 @@ run_refresh_stage() {
   esac
 }
 
-# Always-on data refresh (discover → backfill → events → resolutions). Each half is
+# Always-on data refresh (discover → activate → backfill → events → resolutions). Each half is
 # independently bypassable; when both are skipped the whole step is a no-op (no binary needed).
 refresh_data() {
   if [[ "$SKIP_DISCOVERY" == "1" && "$SKIP_BACKFILL" == "1" ]]; then
@@ -365,20 +373,23 @@ refresh_data() {
   # the ranker reads.
   export PE_BOOTSTRAP_CACHE_PATH="$DB"
 
-  echo "── Step 0: data refresh (discover → backfill → events → resolutions) ──"
+  echo "── Step 0: data refresh (discover → activate 20,000 → backfill → events → resolutions) ──"
 
   if [[ "$SKIP_DISCOVERY" == "1" ]]; then
     echo "   discovery skipped (--skip-discovery)"
   else
     # winner-discovery hits both sources: leaderboard (errors propagate → fatal),
     # datadash (soft-fails internally → still exit 0). #324/#365.
-    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
+      --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
+      "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
 
   if [[ "$SKIP_BACKFILL" == "1" ]]; then
     echo "   backfill + market-data skipped (--skip-backfill)"
   else
-    run_refresh_stage "backfill" "$PE_BOOTSTRAP_BIN" backfill "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    run_refresh_stage "backfill" "$PE_BOOTSTRAP_BIN" backfill --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
     run_refresh_stage "events" "$PE_BOOTSTRAP_BIN" events "${BOOTSTRAP_CONFIG_ARGS[@]}"
     # The explicit `resolutions` subcommand runs the CLOB→Gamma resolutions+schedules pipeline
     # UNCONDITIONALLY (main.rs:199) — it does NOT gate on PE_BOOTSTRAP_FETCH_RESOLUTIONS. `backfill`
@@ -395,6 +406,22 @@ refresh_data() {
 }
 
 refresh_data
+
+# Infrastructure must be absent from the same cache snapshot the ranker reads.
+# This stage is armed by invocation, archive-before-delete, and fatal before any
+# export/rank/push. `--skip-purge` is the one explicit bypass for both purge kinds.
+if [[ "$SKIP_PURGE" == "1" ]]; then
+  echo "── Step 0i: infrastructure purge skipped (--skip-purge) ───────────────────────"
+elif [[ "$SKIP_RANK" == "1" ]]; then
+  echo "── Step 0i: infrastructure purge skipped (--skip-rank reuses an existing ranking) ──"
+else
+  [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
+    echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
+    exit 2
+  }
+  export PE_BOOTSTRAP_CACHE_PATH="$DB"
+  run_refresh_stage "purge-infra" "$PE_BOOTSTRAP_BIN" purge-infra "${BOOTSTRAP_CONFIG_ARGS[@]}"
+fi
 
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
 # Full atomic rewrite from the just-refreshed cache (so the snapshot is fresh for this run).

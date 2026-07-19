@@ -40,6 +40,16 @@ pub async fn run_backfill(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<BackfillReport, BootstrapError> {
+    run_backfill_with_policy(config, cache, pile::ActivationPolicy::Immediate).await
+}
+
+/// Backfill with explicit activation behavior. The rank-and-push wrapper always
+/// uses `Deferred`, including its `--skip-discovery` partial mode.
+pub async fn run_backfill_with_policy(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    activation_policy: pile::ActivationPolicy,
+) -> Result<BackfillReport, BootstrapError> {
     // ── 1. Due set ─────────────────────────────────────────────────────────────
     let now_unix = OffsetDateTime::now_utc().unix_timestamp();
     let due_hexes = pile::select_backfill_due(cache, now_unix, config.backfill_limit)?;
@@ -111,7 +121,7 @@ pub async fn run_backfill(
     }
 
     cache.refresh_trade_counts()?;
-    let activated = pile::apply_activation_rules(cache)?;
+    let activated = pile::apply_activation_policy(cache, activation_policy)?;
 
     let fetched = fetch_set.len().saturating_sub(failed_count);
     tracing::info!(

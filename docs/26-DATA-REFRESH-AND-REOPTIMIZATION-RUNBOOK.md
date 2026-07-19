@@ -172,15 +172,19 @@ which `pe-service` reads. There is exactly one ranker
 push (`scripts/push_ranking_to_supabase.py`) publishes (#370).
 
 ```bash
-# The single, cron-ready entry point. Zero args. Runs on the cache box.
+# The single one-shot entry point. Zero args. Runs on the cache box.
 bash scripts/rank_and_push.sh
 ```
 
-In order it runs: **Step 0** data refresh — `winner-discovery` (leaderboard +
-datadash → new wallets) → `backfill` (trades only) → `events` →
-`resolutions` (which also backfills missing schedule `end_date`s — the
+In order it runs: **Step 0** data refresh — `winner-discovery
+--defer-activation` (leaderboard + datadash ingest) → one transactionally
+audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`) →
+`backfill --defer-activation` (trades only) → `events` → `resolutions` →
+**Step 0i** archive and delete every infra wallet's live wallet-keyed data
+before the ranker snapshot (and write a durable, non-liftable infra exclusion).
+`resolutions` also backfills missing schedule `end_date`s — the
 `resolutions` subcommand runs the full `fetch_resolutions_and_schedules`, so no
-separate `schedules` stage is needed, #383); **Stage 1** rank the full trade
+separate `schedules` stage is needed (#383). **Stage 1** ranks the full trade
 universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
 there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** push
@@ -211,24 +215,60 @@ mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_pro
 
 - `--universe <file>` — rank a curated wallet file instead of all-trade-wallets.
 - `--half-life-days N` — override the production decay half-life.
-- `--skip-discovery` / `--skip-backfill` — skip Step-0 stages.
+- `--skip-discovery` / `--skip-backfill` — skip Step-0 stages. Every backfill
+  launched through this wrapper still defers global activation;
+  `--skip-discovery` also skips `activate-next`, so it activates no new wallet.
 - `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push.
 - `--skip-purge` — skip wallet deletion; the final WAL checkpoint still runs.
 - Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
 
-### Cron (operator-installed; 4h production cadence since the 2026-07-03 cutover)
+### Continuous Forge supervisor
 
-```cron
-# On the box holding wallet_cache.db (NOT the VPS).
-# Cheap 4-hourly tick: re-rank + push from the existing cache (skips the heavy refresh):
-0 4,8,12,16,20 * * *  cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh --skip-discovery --skip-backfill >> data/eval-results/cron.log 2>&1
-# Mandatory daily FULL run (refresh + purge; the push aborts on a >24h-stale cache):
-0 0 * * *             cd /home/sean/git/prediction-markets && bash scripts/rank_and_push.sh >> data/eval-results/cron.log 2>&1
+Production repetition is file-governed and runs the complete one-shot command
+with exactly zero parameters each cycle. Before cutover, inventory and disable
+every user/root crontab, systemd timer, or other supervisor that invokes
+`rank_and_push.sh`; retain a backup for rollback. A scheduled one-shot must not
+race this supervisor.
+
+The Linux/Forge supervisor requires `flock`, `setsid`, an external `kill`, and
+negative process-group signaling. It fails before taking its singleton lock or
+launching a child if that preflight is unavailable.
+
+```bash
+cd /home/sean/git/prediction-markets
+
+# Enable atomically, then launch one supervisor.
+loop_flag_tmp="data/eval-results/.rank_and_push.loop.$$"
+printf 'run\n' > "$loop_flag_tmp"
+mv "$loop_flag_tmp" data/eval-results/rank_and_push.loop
+nohup bash scripts/rank_and_push_loop.sh \
+  > data/eval-results/rank-and-push-loop.log 2>&1 < /dev/null &
 ```
 
-The PID lock makes an overlapping tick abort (exit 3) — a long full run simply eats the
-next 4h tick and the following one recovers. The 4h cadence is a data-freshness choice,
-not an evidence-backed one (weekly was run28's tested cadence, `docs/33` §5).
+The flag accepts exactly `run` or `stop`. Missing means a clean stop; empty or
+any other value is fatal. The supervisor checks only between completed cycles:
+
+```bash
+# Graceful: finish the current full cycle, then stop.
+loop_flag_tmp="data/eval-results/.rank_and_push.loop.$$"
+printf 'stop\n' > "$loop_flag_tmp"
+mv "$loop_flag_tmp" data/eval-results/rank_and_push.loop
+
+# Immediate: terminate the supervisor; it TERM-signals the entire current
+# one-shot process group, waits, and escalates to KILL after its bounded grace.
+kill -TERM "$(tr -cd '0-9' < data/eval-results/.rank_and_push_loop.lock)"
+```
+
+After an immediate stop, verify no loop, wrapper, bootstrap, or ranking Python
+descendant remains; neither `.rank_and_push.lock` nor the cache mutation lock is
+held; and SQLite opens/read-checks cleanly. A nonzero child exit stops the loop
+instead of retry-spinning. Rollback writes `stop`, waits for termination, and
+restores the backed-up prior scheduler only if one existed.
+
+Each cycle logs `LOOP_CYCLE_START`, the child PID/process-group ID, the one-shot
+`RANK_AND_PUSH_RUN_DIR=...` handoff, and `LOOP_CYCLE_END` with exit status. The
+distinct supervisor lock prevents two loops from racing at a cycle boundary.
+
 The final checkpoint remains inside that lock and starts only after every pipeline DB
 writer has exited. It checkpoints committed data rather than deleting rows; its storage
 effect is to truncate the separate `wallet_cache.db-wal` file.
@@ -260,13 +300,19 @@ not run28-backed N choices.
 artifacts to `data/archive/`; never delete eval outputs — they are the audit trail
 for what was published to `latest_ranking` and when.
 
+Each full cycle also writes `activated_wallets.csv`. Its rows are derived from
+the same run's durable SQLite activation batch; if CSV materialization fails,
+rerun `activate-next` with that same logged batch ID and audit path to regenerate
+the exact cohort without activating another batch.
+
 ### Supabase batch retention (#411)
 
 The push appends one `ranking_batches` epoch (+ its `ranking_entries`) per run, so the
 table grows unbounded. After a successful push, `push_ranking_to_supabase.py` prunes
-`ranking_batches` to the newest `--keep-batches` rows (default **1080** ≈ 6 months at the
-4h production cadence, 6 pushes/day — the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; CASCADE
-removes their entries). `latest_ranking` reads only `max(batch_id)`, so pruning older
+`ranking_batches` to the newest `--keep-batches` rows (default **1080**, owned by
+the `ranking_batches_retention` default in `docs/_GLOSSARY.md`; actual wall-clock
+coverage depends on full-cycle duration under the continuous supervisor). CASCADE
+removes their entries. `latest_ranking` reads only `max(batch_id)`, so pruning older
 epochs never touches the live read path or the `wallet_live_stats_mv` matview — it is
 storage hygiene, and it keeps enough epochs for the wholesale-swap-at-frequency-X replay.
 The prune is best-effort: a failure logs a warning and does not fail the push (growth
@@ -278,7 +324,8 @@ history-preserving research re-push.
 ## Adding new wallets
 
 New-wallet discovery is **Step 0** of `rank_and_push.sh` (`pe-bootstrap
-winner-discovery`: Polymarket leaderboard + datadash). Discovered wallets
-are ingested, backfilled, and ranked in the same run — there is no separate
+winner-discovery`: Polymarket leaderboard + datadash). The wrapper defers the
+legacy immediate activation call sites and admits only its one controlled batch;
+those wallets are backfilled and ranked in the same run — there is no separate
 manual-review gate. See `docs/27-WINNER-DISCOVERY-RUNBOOK.md` for the discovery
 sources and their configuration.

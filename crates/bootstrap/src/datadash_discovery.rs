@@ -292,6 +292,27 @@ pub async fn run_datadash_discovery<F: CohortFetcher + Send + Sync>(
     max_cohort_wallets: u64,
     cache: &mut WalletCache,
 ) -> Result<DatadashDiscoveryReport, BootstrapError> {
+    run_datadash_discovery_with_policy(
+        fetcher,
+        exclude_ids,
+        exclude_titles,
+        max_cohort_wallets,
+        cache,
+        pile::ActivationPolicy::Immediate,
+    )
+    .await
+}
+
+/// Discovery variant used by the full pipeline to defer global activation to
+/// its single controlled batch.
+pub async fn run_datadash_discovery_with_policy<F: CohortFetcher + Send + Sync>(
+    fetcher: &F,
+    exclude_ids: &[String],
+    exclude_titles: &[String],
+    max_cohort_wallets: u64,
+    cache: &mut WalletCache,
+    activation_policy: pile::ActivationPolicy,
+) -> Result<DatadashDiscoveryReport, BootstrapError> {
     let cohorts = fetcher.list_cohorts().await?;
     let cohorts_listed = cohorts.len();
 
@@ -371,7 +392,7 @@ pub async fn run_datadash_discovery<F: CohortFetcher + Send + Sync>(
         .collect();
     cache.upsert_wallets_bulk(&upserts)?;
 
-    let activated = pile::apply_activation_rules(cache)?;
+    let activated = pile::apply_activation_policy(cache, activation_policy)?;
 
     tracing::info!(
         cohorts_listed,

@@ -40,6 +40,9 @@ async fn main() {
                 | "winner-discovery"
                 | "prices-history"
                 | "purge"
+                | "activate-next"
+                | "purge-infra"
+                | "clear-infra-exclusion"
         )
     );
 
@@ -53,6 +56,11 @@ async fn main() {
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
         let mut stage: Option<&str> = None;
         let mut reset_clob_cursor = false;
+        let mut defer_activation = false;
+        let mut confirm = false;
+        let mut batch_id: Option<&str> = None;
+        let mut audit_csv: Option<std::path::PathBuf> = None;
+        let mut wallet_arg: Option<&str> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -64,6 +72,28 @@ async fn main() {
                 reset_clob_cursor = true;
             } else if a == "--dry-run" {
                 dry_run = true;
+            } else if a == "--defer-activation" {
+                defer_activation = true;
+            } else if a == "--confirm" {
+                confirm = true;
+            } else if a == "--batch-id" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                batch_id = Some(rest[i]);
+            } else if let Some(v) = a.strip_prefix("--batch-id=") {
+                batch_id = Some(v);
+            } else if a == "--audit-csv" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                audit_csv = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--audit-csv=") {
+                audit_csv = Some(std::path::PathBuf::from(v));
+            } else if a == "--wallet" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                wallet_arg = Some(rest[i]);
+            } else if let Some(v) = a.strip_prefix("--wallet=") {
+                wallet_arg = Some(v);
             } else if a == "--dump-ledgers" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -116,6 +146,24 @@ async fn main() {
             };
             std::process::exit(exit);
         }
+
+        // Serialize standalone mutators before opening the shared cache RW.
+        // Discovery owns its narrower per-source lock internally; these commands
+        // have no nested acquisition and hold this guard for their full mutation.
+        let _cache_mutation_lock = if matches!(
+            sub,
+            "activate-next" | "backfill" | "purge" | "purge-infra" | "clear-infra-exclusion"
+        ) {
+            match pe_bootstrap::lock::CacheMutationLock::acquire(&bootstrap_config.cache_path) {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    tracing::error!(error = %e, subcommand = sub, "bootstrap: cache mutation lock failed");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
 
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
@@ -279,7 +327,17 @@ async fn main() {
                 }
             }
 
-            "backfill" => match backfill::run_backfill(&bootstrap_config, &mut cache).await {
+            "backfill" => match backfill::run_backfill_with_policy(
+                &bootstrap_config,
+                &mut cache,
+                if defer_activation {
+                    pile::ActivationPolicy::Deferred
+                } else {
+                    pile::ActivationPolicy::Immediate
+                },
+            )
+            .await
+            {
                 Ok(r) => {
                     tracing::info!(
                         due = r.due,
@@ -330,7 +388,17 @@ async fn main() {
             }
 
             "winner-discovery" => {
-                match winner_discovery::run_winner_discovery(&bootstrap_config, &mut cache).await {
+                match winner_discovery::run_winner_discovery_with_policy(
+                    &bootstrap_config,
+                    &mut cache,
+                    if defer_activation {
+                        pile::ActivationPolicy::Deferred
+                    } else {
+                        pile::ActivationPolicy::Immediate
+                    },
+                )
+                .await
+                {
                     Ok(r) => {
                         tracing::info!(
                             leaderboard_unique = r.leaderboard_unique,
@@ -398,6 +466,113 @@ async fn main() {
                     1
                 }
             },
+
+            "activate-next" => {
+                let Some(batch_id) = batch_id else {
+                    tracing::error!("activate-next: --batch-id is required");
+                    std::process::exit(1);
+                };
+                match pile::activate_next(&mut cache, batch_id) {
+                    Ok(batch) => {
+                        if let Some(path) = audit_csv.as_deref()
+                            && let Err(e) = pile::write_activation_audit_csv(&batch, path)
+                        {
+                            tracing::error!(
+                                error = %e,
+                                batch_id = batch.batch_id,
+                                activated = batch.wallet_hexes.len(),
+                                audit = %path.display(),
+                                "activate-next: activation committed but CSV materialization failed; rerun the same batch id to regenerate without activating another cohort"
+                            );
+                            std::process::exit(1);
+                        }
+                        let activated = batch.wallet_hexes.len();
+                        if activated == 0 {
+                            tracing::warn!(
+                                batch_id = batch.batch_id,
+                                "activate-next: no inactive non-infrastructure wallets remain; skipping"
+                            );
+                        } else if activated < batch.requested_count {
+                            tracing::warn!(
+                                batch_id = batch.batch_id,
+                                activated,
+                                requested = batch.requested_count,
+                                reused = batch.reused,
+                                "activate-next: candidate pile depleted; activated remaining wallets"
+                            );
+                        } else {
+                            tracing::info!(
+                                batch_id = batch.batch_id,
+                                activated,
+                                reused = batch.reused,
+                                "activate-next: controlled batch complete"
+                            );
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "activate-next: fatal");
+                        1
+                    }
+                }
+            }
+
+            "purge-infra" => match purge::run_infra_purge(&bootstrap_config, &mut cache, dry_run) {
+                Ok(r) => {
+                    tracing::info!(
+                        infrastructure = r.infrastructure_deleted,
+                        trades = r.trades_deleted,
+                        snapshots = r.snapshots_deleted,
+                        wallet_features = r.wallet_features_deleted,
+                        tombstones = r.tombstones_written,
+                        dry_run = r.dry_run,
+                        "purge-infra: complete"
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "purge-infra: fatal");
+                    1
+                }
+            },
+
+            "clear-infra-exclusion" => {
+                if !confirm {
+                    tracing::error!("clear-infra-exclusion: --confirm is required");
+                    std::process::exit(1);
+                }
+                let Some(wallet) = wallet_arg else {
+                    tracing::error!("clear-infra-exclusion: --wallet <hex> is required");
+                    std::process::exit(1);
+                };
+                let normalized = match pe_core_types::WalletAddress::from_hex(wallet) {
+                    Ok(address) => address.to_string(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "clear-infra-exclusion: invalid wallet");
+                        std::process::exit(1);
+                    }
+                };
+                match cache.clear_infra_exclusion(&normalized) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            wallet = normalized,
+                            "clear-infra-exclusion: exclusion cleared"
+                        );
+                        0
+                    }
+                    Ok(false) => {
+                        tracing::error!(
+                            wallet = normalized,
+                            "clear-infra-exclusion: matching infra exclusion not found"
+                        );
+                        1
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, wallet = normalized, "clear-infra-exclusion: fatal");
+                        1
+                    }
+                }
+            }
 
             _ => unreachable!("known_sub filter restricts to known subcommand names"),
         };

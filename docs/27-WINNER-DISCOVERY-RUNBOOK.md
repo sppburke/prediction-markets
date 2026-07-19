@@ -3,7 +3,9 @@
 Automates the ingest of new candidate wallets from the Polymarket leaderboard
 (plus the datadash.xyz cohorts). The
 `pe-bootstrap winner-discovery` subcommand upserts each discovered wallet into the
-local `wallet_cache.db` and activates the eligible ones; they then flow into the
+local `wallet_cache.db`. A standalone invocation immediately applies the legacy
+activation rules; the full rank-and-push wrapper explicitly defers that behavior
+and admits only its one transactionally audited controlled batch. Wallets then flow into the
 ranking pipeline (Step 0 of `scripts/rank_and_push.sh`) and reach the live set only
 via Supabase `latest_ranking` — admitted by the maintenance tick (knockout mode) or
 the next batch swap (`full_rerank`, the cutover production mode) — never directly. This is the
@@ -33,14 +35,23 @@ before each rank). To run it standalone:
 # Build the bootstrap binary first if not already built:
 cargo build --release -p pe-bootstrap
 
-# Discover + activate new wallets into the cache:
+# Standalone discovery preserves legacy immediate activation:
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap winner-discovery
 ```
 
+Do not add `--defer-activation` to an ad-hoc command unless the same operation
+also runs `activate-next` with a stable batch ID. `rank_and_push.sh` owns that
+pairing: both discovery and backfill defer the global rule, and one
+`activate-next` transaction selects at most
+`bootstrap_pipeline_activation_batch_wallets`, records the exact batch in
+SQLite, and exports `activated_wallets.csv` into the run directory. Empty or
+partially depleted candidate piles warn without failing the cycle.
+
 There is no separate eval/export stage or candidates JSON: `winner-discovery` fetches
 the leaderboard + datadash slices and upserts new wallets (recording the
-source bit, activating eligible ones) straight into the cache. `rank_and_push.sh` then
+source bit) straight into the cache. In standalone mode it activates eligible
+ones immediately. `rank_and_push.sh` instead admits only the controlled batch, then
 backfills their trade history and ranks them alongside the rest of the universe — the
 ranker's own eligibility filters decide which discovered wallets make the published
 cohort.
@@ -81,6 +92,14 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   from discovery.
 - **Idempotent.** Re-running with the same leaderboard snapshot is safe:
   `INSERT OR IGNORE` on `wallet_hex` is a no-op for already-known wallets.
+- **Bounded inside the wrapper.** `--skip-discovery` skips both discovery and
+  controlled activation. Backfill launched by the wrapper always defers global
+  activation, so no wrapper override can silently activate an unbounded cohort.
+- **Infrastructure exclusions survive deletion.** `purge-infra` archives and
+  deletes live infra wallet data, then ordinary discovery refuses to lift its
+  durable `reason='infra'` tombstone. Exceptional reclassification requires the
+  explicit operator-only `clear-infra-exclusion --wallet <hex> --confirm` command;
+  it clears only that exclusion and does not recreate or activate the wallet.
 - **`CacheMutationLock`** is held only during the DB-write window inside
   `winner-discovery` and released before `backfill` starts, so no lock
   conflict with parallel `pe-bootstrap` invocations.
