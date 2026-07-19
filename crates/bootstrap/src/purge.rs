@@ -14,6 +14,11 @@
 //!   older than `purge_inactivity_secs`. Deleted with **no tombstone** — discovery
 //!   may re-find it.
 //!
+//! [`run_infra_purge`] is the separate pre-ranking path: it archives and removes
+//! every `is_infra = 1` wallet regardless of active state and writes a durable,
+//! non-liftable `infra` tombstone. Invocation is armed by default; only
+//! `--dry-run` is report-only.
+//!
 //! The guard keeps the rule-B set off every eligible (hence pushed-cohort) wallet:
 //! the pushed cohort ⊆ `latency_shift_rerank.py load_candidates` (`eligible &
 //! tstat_net>=floor & mean_net>0`) ⊆ the CSV's `eligible=True` set, so excluding
@@ -21,9 +26,9 @@
 //! deletes eligible losers, a set disjoint from the cohort (`mean_net<0` vs `>0`).
 //!
 //! **No refresh here.** `is_active`/`trade_count` are already current from the
-//! Step-0 `backfill` stage (`backfill.rs` runs `refresh_trade_counts` +
-//! `apply_activation_rules` at its tail) earlier in the same pipeline run; nothing
-//! between backfill and purge mutates them. An armed purge on a globally stale
+//! Step-0 `backfill` stage (which refreshes counts) earlier in the same pipeline
+//! run. The pre-ranking infra purge does not alter the ordinary purge's non-infra
+//! candidate state. An armed purge on a globally stale
 //! cache (no fresh backfill) is refused.
 //!
 //! **Bulk-delete index dance (issue #401).** An armed run drops the two
@@ -128,77 +133,7 @@ pub fn run_purge(
         });
     }
 
-    // Archive-before-DELETE (item 3.7 of the 2026-07-01 decision record on
-    // issue #417): copy every doomed wallet's rows + a both-rules manifest into
-    // the sibling archive DB while the trades lookup index is still live, BEFORE
-    // any destructive step. Fail-closed WHILE ENABLED (the default): an archive
-    // error (`?`) aborts the purge, so nothing is deleted that was not archived.
-    // Setting `purge_archive_enabled=false` is an explicit operator opt-out of
-    // that guarantee (the armed purge then deletes without archiving); a dry run
-    // archives nothing (it also deletes nothing).
-    if armed && !rows.is_empty() && config.purge_archive_enabled {
-        let archive_path = config
-            .purge_archive_path
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.cache_path.with_extension("purge-archive.db"));
-        let archived = cache.archive_wallets(&rows, &archive_path, now_unix)?;
-        tracing::info!(
-            archive = %archive_path.display(),
-            trades_archived = archived.trades_archived,
-            wallets_archived = archived.wallets_archived,
-            snapshots_archived = archived.snapshots_archived,
-            manifest_written = archived.manifest_written,
-            "purge: archive-before-DELETE complete"
-        );
-    }
-
-    // Issue #401: gate the bulk index-drop + VACUUM on delete-set size. A small
-    // daily armed purge (delete-set < `purge_bulk_min_wallets`) stays cheap —
-    // indexes live, no VACUUM; only a genuine backlog clear pays the O(table)
-    // index rebuild + full VACUUM. `rows.len()` is the cheap free-of-query proxy
-    // for trades deleted (more wallets ≈ more trades); the purge outcome is
-    // identical either way — only cost differs. `try_from`/`unwrap_or(MAX)`
-    // avoids a narrowing cast; on a 64-bit `usize` it is infallible, and the
-    // dead `MAX` arm would (safely) pick the bulk path for an impossible set.
-    let bulk =
-        armed && u64::try_from(rows.len()).unwrap_or(u64::MAX) >= config.purge_bulk_min_wallets;
-    let report = if bulk {
-        // Bulk mode (issue #401): the #403 fast-delete sequence. Drop the two
-        // non-lookup `trades` secondary indexes so the per-wallet delete only
-        // churns the `wallet_hex` lookup index + PK, VACUUM the compacted table,
-        // then rebuild the two indexes once. Ordering: drop → delete → VACUUM →
-        // recreate. Recreate-then-propagate: bind (never `?`) the delete/VACUUM
-        // AND the rebuild results, so the rebuild ALWAYS runs in this same
-        // invocation, then surface errors in priority order delete → VACUUM →
-        // rebuild. The ORIGINAL delete/VACUUM error therefore wins over a rebuild
-        // error, and no mid-run failure leaves a slow-query DB waiting on the next
-        // `open`'s SCHEMA backstop. Nothing is deleted before the drop, so the
-        // drop's own `?` early-return is safe.
-        cache.drop_trades_bulk_delete_indexes()?;
-        let purge_res = cache.purge_wallets(&rows, now_unix, false);
-        let vacuum_res = if purge_res.is_ok() {
-            cache.vacuum()
-        } else {
-            Ok(())
-        };
-        let recreate_res = cache.create_trades_bulk_delete_indexes();
-        let report = purge_res?;
-        vacuum_res?;
-        recreate_res?;
-        tracing::info!("purge: bulk mode — dropped + rebuilt 2 trades indexes + VACUUM complete");
-        report
-    } else if armed {
-        // Incremental mode (issue #401): indexes stay live (a cheap per-wallet
-        // indexed delete for a small set), no drop/rebuild, no VACUUM. Freed
-        // pages are reused by the next backfill's inserts; the file plateaus.
-        let report = cache.purge_wallets(&rows, now_unix, false)?;
-        tracing::info!("purge: incremental mode — indexes live, no VACUUM");
-        report
-    } else {
-        // Dry-run / disabled: report-only, no index ops (deletes nothing).
-        cache.purge_wallets(&rows, now_unix, true)?
-    };
+    let (report, bulk) = execute_purge_rows(config, cache, &rows, now_unix, armed, "purge")?;
     tracing::info!(
         csv = %csv_path.display(),
         armed,
@@ -208,13 +143,102 @@ pub fn run_purge(
         eligible = decisions.eligible.len(),
         proven_losers = report.proven_losers_deleted,
         dead_weight = report.dead_weight_deleted,
+        infrastructure = report.infrastructure_deleted,
         trades = report.trades_deleted,
         snapshots = report.snapshots_deleted,
+        wallet_features = report.wallet_features_deleted,
         tombstones = report.tombstones_written,
         dry_run = report.dry_run,
         "purge: report"
     );
     Ok(report)
+}
+
+/// Delete every live infrastructure wallet and its wallet-keyed cache data.
+/// Unlike the ordinary loser/dead-weight purge, invocation is armed by default;
+/// only explicit `--dry-run` is report-only.
+pub fn run_infra_purge(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    dry_run: bool,
+) -> Result<PurgeReport, BootstrapError> {
+    let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+    let rows: Vec<PurgeRow> = cache
+        .infra_wallet_hexes()?
+        .into_iter()
+        .map(|wallet_hex| PurgeRow {
+            wallet_hex,
+            reason: PurgeReason::Infrastructure,
+        })
+        .collect();
+    let armed = !dry_run;
+    let (report, bulk) = execute_purge_rows(config, cache, &rows, now_unix, armed, "purge-infra")?;
+    tracing::info!(
+        armed,
+        bulk,
+        delete_set = rows.len(),
+        infrastructure = report.infrastructure_deleted,
+        trades = report.trades_deleted,
+        snapshots = report.snapshots_deleted,
+        wallet_features = report.wallet_features_deleted,
+        tombstones = report.tombstones_written,
+        dry_run = report.dry_run,
+        "purge-infra: report"
+    );
+    Ok(report)
+}
+
+/// Shared archive/delete/index lifecycle for ordinary and infrastructure purge.
+fn execute_purge_rows(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    rows: &[PurgeRow],
+    now_unix: i64,
+    armed: bool,
+    label: &str,
+) -> Result<(PurgeReport, bool), BootstrapError> {
+    if armed && !rows.is_empty() && config.purge_archive_enabled {
+        let archive_path = config
+            .purge_archive_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.cache_path.with_extension("purge-archive.db"));
+        let archived = cache.archive_wallets(rows, &archive_path, now_unix)?;
+        tracing::info!(
+            stage = label,
+            archive = %archive_path.display(),
+            trades_archived = archived.trades_archived,
+            wallets_archived = archived.wallets_archived,
+            snapshots_archived = archived.snapshots_archived,
+            manifest_written = archived.manifest_written,
+            "purge: archive-before-DELETE complete"
+        );
+    }
+
+    let bulk =
+        armed && u64::try_from(rows.len()).unwrap_or(u64::MAX) >= config.purge_bulk_min_wallets;
+    let report = if bulk {
+        cache.drop_trades_bulk_delete_indexes()?;
+        let purge_res = cache.purge_wallets(rows, now_unix, false);
+        let vacuum_res = if purge_res.is_ok() {
+            cache.vacuum()
+        } else {
+            Ok(())
+        };
+        let recreate_res = cache.create_trades_bulk_delete_indexes();
+        let report = purge_res?;
+        vacuum_res?;
+        recreate_res?;
+        tracing::info!(stage = label, "purge: bulk mode complete");
+        report
+    } else if armed {
+        let report = cache.purge_wallets(rows, now_unix, false)?;
+        tracing::info!(stage = label, "purge: incremental mode complete");
+        report
+    } else {
+        cache.purge_wallets(rows, now_unix, true)?
+    };
+    Ok((report, bulk))
 }
 
 /// Resolve the decision CSV: explicit `purge_decision_csv` if set, else the

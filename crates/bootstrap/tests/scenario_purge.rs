@@ -17,7 +17,7 @@ use pe_bootstrap::cache::{PurgeReason, PurgeRow, WalletCache};
 use pe_bootstrap::pile::{
     BACKFILL_STALENESS_SECS, PILE_ACTIVATION_MIN_TRADES, SRC_DATADASH, SRC_LEADERBOARD, SRC_TRADES,
 };
-use pe_bootstrap::purge::run_purge;
+use pe_bootstrap::purge::{run_infra_purge, run_purge};
 use tempfile::TempDir;
 
 const DAY: i64 = 86_400;
@@ -448,6 +448,95 @@ fn run_purge_dry_run_reports_without_deleting() {
         "rule-A loser reported as would-delete"
     );
     println!("PASS: dry-run run_purge reports the rule-A loser but deletes nothing");
+}
+
+#[test]
+fn infra_purge_is_armed_durable_and_invalidates_wallet_derived_data() {
+    // PASS: purge-infra ignores ordinary purge_enabled=false, archives and
+    // deletes only infra wallet-keyed rows, writes a non-liftable exclusion,
+    // clears the first-mover cache, and preserves activation-batch audit.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let infra = wallet_hex(0x31);
+    let normal = wallet_hex(0x32);
+    upsert(&mut cache, &infra, SRC_LEADERBOARD);
+    upsert(&mut cache, &normal, SRC_LEADERBOARD);
+    cache.mark_infra(&infra).unwrap();
+    cache.conn_for_test_insert_trade(&infra, "infra-trade", 1_000);
+    cache.conn_for_test_insert_trade(&normal, "normal-trade", 1_001);
+    cache
+        .raw_conn_for_test()
+        .execute_batch(
+            "CREATE TABLE wallet_features (wallet_hex TEXT PRIMARY KEY, score INTEGER); \
+             INSERT INTO wallet_features VALUES \
+             ('0x0000000000000000000000000000000000000031', 1), \
+             ('0x0000000000000000000000000000000000000032', 2); \
+             INSERT INTO first_mover_rank_cache \
+             (cutoff_unix, market_id, outcome_id, ts_json) VALUES (1, 'm', 0, '[]');",
+        )
+        .unwrap();
+    let batch = cache
+        .activate_next_batch("historical", 1, PILE_ACTIVATION_MIN_TRADES, 999)
+        .unwrap();
+    assert!(!batch.wallet_hexes.is_empty());
+
+    let config = BootstrapConfig {
+        cache_path: dir.path().join("cache.db"),
+        purge_enabled: false,
+        purge_bulk_min_wallets: u64::MAX,
+        ..BootstrapConfig::default()
+    };
+    let preview = run_infra_purge(&config, &mut cache, true).unwrap();
+    assert!(preview.dry_run);
+    assert_eq!(preview.infrastructure_deleted, 1);
+    assert!(cache.conn_for_test_wallet_exists(&infra));
+
+    let report = run_infra_purge(&config, &mut cache, false).unwrap();
+    assert!(!report.dry_run);
+    assert_eq!(report.infrastructure_deleted, 1);
+    assert_eq!(report.wallet_features_deleted, 1);
+    assert_eq!(report.tombstones_written, 1);
+    assert!(!cache.conn_for_test_wallet_exists(&infra));
+    assert!(cache.conn_for_test_wallet_exists(&normal));
+    assert!(cache.is_purged(&infra).unwrap());
+    let conn = cache.raw_conn_for_test();
+    let feature_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM wallet_features", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(feature_rows, 1, "non-infra feature row preserved");
+    let rank_cache_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM first_mover_rank_cache", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rank_cache_rows, 0, "derived cache invalidated");
+    let audit_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM wallet_activation_batch_wallets WHERE batch_id='historical'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_rows, 1, "activation audit survives live-wallet purge");
+
+    upsert(&mut cache, &infra, SRC_LEADERBOARD);
+    assert!(
+        !cache.conn_for_test_wallet_exists(&infra),
+        "leaderboard cannot lift an infra exclusion"
+    );
+    assert!(cache.clear_infra_exclusion(&infra).unwrap());
+    upsert(&mut cache, &infra, SRC_LEADERBOARD);
+    assert!(cache.conn_for_test_wallet_exists(&infra));
+
+    let archive = rusqlite::Connection::open(dir.path().join("cache.purge-archive.db")).unwrap();
+    let reason: String = archive
+        .query_row(
+            "SELECT reason FROM purge_manifest WHERE wallet_hex=?1",
+            [&infra],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "infra");
 }
 
 // ── #401: bulk-delete index drop/rebuild + SCHEMA-on-open backstop ────────────

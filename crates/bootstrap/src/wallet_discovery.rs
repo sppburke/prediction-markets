@@ -13,13 +13,14 @@ use pe_source_polymarket_public::ReqwestFetcher;
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::datadash_discovery::{
-    DatadashDiscoveryReport, ReqwestCohortFetcher, run_datadash_discovery,
+    DatadashDiscoveryReport, ReqwestCohortFetcher, run_datadash_discovery_with_policy,
 };
 use crate::error::BootstrapError;
 use crate::leaderboard_discovery::{
-    LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery,
+    LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery_with_policy,
 };
 use crate::lock::CacheMutationLock;
+use crate::pile::ActivationPolicy;
 
 /// The supported wallet-discovery sources for `winner-discovery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,17 @@ pub async fn run_source_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
+    run_source_discovery_with_policy(source, config, cache, ActivationPolicy::Immediate).await
+}
+
+/// Source discovery with an explicit activation policy. The rank-and-push
+/// pipeline uses `Deferred`; standalone callers retain `Immediate`.
+pub async fn run_source_discovery_with_policy(
+    source: WalletDiscoverySource,
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+    activation_policy: ActivationPolicy,
+) -> Result<SourceDiscoveryResult, BootstrapError> {
     match source {
         WalletDiscoverySource::Leaderboard => {
             let base_url = config
@@ -59,11 +71,12 @@ pub async fn run_source_discovery(
                     .with_min_interval_ms(config.leaderboard_request_interval_ms),
             );
             let _lock = CacheMutationLock::acquire(&config.cache_path)?;
-            let r: LeaderboardDiscoveryReport = run_leaderboard_discovery(
+            let r: LeaderboardDiscoveryReport = run_leaderboard_discovery_with_policy(
                 &fetcher,
                 &config.leaderboard_categories,
                 config.leaderboard_top_n,
                 cache,
+                activation_policy,
             )
             .await?;
             Ok(SourceDiscoveryResult {
@@ -100,12 +113,13 @@ pub async fn run_source_discovery(
                     message: format!("lock: {e}"),
                 }
             })?;
-            let r: DatadashDiscoveryReport = run_datadash_discovery(
+            let r: DatadashDiscoveryReport = run_datadash_discovery_with_policy(
                 &fetcher,
                 &config.datadash_exclude_ids,
                 &config.datadash_exclude_titles,
                 config.datadash_max_cohort_wallets,
                 cache,
+                activation_policy,
             )
             .await?;
             Ok(SourceDiscoveryResult {

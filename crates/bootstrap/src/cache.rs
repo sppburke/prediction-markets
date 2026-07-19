@@ -28,7 +28,7 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_trader_index::snapshot::RawTrade;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
@@ -262,18 +262,32 @@ CREATE TABLE IF NOT EXISTS first_mover_rank_cache (
 CREATE INDEX IF NOT EXISTS idx_fmrc_cutoff
     ON first_mover_rank_cache(cutoff_unix);
 
--- Tombstones for wallets hard-deleted by `pe-bootstrap purge` (issue #385).
--- Only rule-A `proven_loser` deletions write a row here; rule-B `dead_weight`
--- deletions write NO row (discovery may freely re-find them). The
--- `upsert_wallets_bulk` gate skips re-inserting any wallet listed here UNLESS the
--- incoming row carries an override bit (leaderboard = `source_bits & 16`),
--- which DELETEs the row (lifts the tombstone) and re-admits the wallet. `reason`
--- is kept as TEXT for forward-compat / auditing.
+-- Tombstones for wallets hard-deleted by purge. Rule-A `proven_loser` and
+-- `infra` deletions write a row; rule-B `dead_weight` writes none. Leaderboard
+-- discovery may lift a proven-loser tombstone, but an infra tombstone is
+-- non-liftable except through the explicit operator clearance command.
 CREATE TABLE IF NOT EXISTS purged_wallets (
     wallet_hex     TEXT    PRIMARY KEY NOT NULL,
     purged_at_unix INTEGER NOT NULL,
     reason         TEXT    NOT NULL
 );
+
+-- Durable, idempotent audit for controlled wallet activation. The member table
+-- deliberately has no foreign key to `wallets`: a later purge must not erase
+-- the exact cohort activated by an earlier pipeline cycle.
+CREATE TABLE IF NOT EXISTS wallet_activation_batches (
+    batch_id           TEXT    PRIMARY KEY NOT NULL,
+    activated_at_unix  INTEGER NOT NULL,
+    requested_count    INTEGER NOT NULL,
+    activated_count    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wallet_activation_batch_wallets (
+    batch_id    TEXT NOT NULL,
+    wallet_hex  TEXT NOT NULL,
+    PRIMARY KEY (batch_id, wallet_hex)
+);
+CREATE INDEX IF NOT EXISTS idx_activation_batch_wallet
+    ON wallet_activation_batch_wallets(wallet_hex);
 "
 );
 
@@ -321,20 +335,25 @@ pub enum PurgeReason {
     /// Active, not eligible, and long-dormant dead weight (rule B). Deleted with
     /// **no tombstone** — discovery may re-find it.
     DeadWeight,
+    /// Infrastructure wallet. Live wallet data is deleted, but a non-liftable
+    /// tombstone permanently excludes ordinary discovery and activation.
+    Infrastructure,
 }
 
 impl PurgeReason {
-    /// Tag string stored in `purged_wallets.reason` (proven losers only).
+    /// Tag string stored in purge manifests and, for tombstoned reasons,
+    /// `purged_wallets.reason`.
     const fn as_str(self) -> &'static str {
         match self {
             PurgeReason::ProvenLoser => "proven_loser",
             PurgeReason::DeadWeight => "dead_weight",
+            PurgeReason::Infrastructure => "infra",
         }
     }
 
     /// Whether a `purged_wallets` tombstone is written for this reason.
     const fn tombstoned(self) -> bool {
-        matches!(self, PurgeReason::ProvenLoser)
+        matches!(self, PurgeReason::ProvenLoser | PurgeReason::Infrastructure)
     }
 }
 
@@ -370,14 +389,29 @@ pub struct PurgeReport {
     pub proven_losers_deleted: usize,
     /// Rule-B (dead-weight) wallets deleted, no tombstone (would-delete in dry-run).
     pub dead_weight_deleted: usize,
+    /// Infrastructure wallets deleted and durably excluded from rediscovery.
+    pub infrastructure_deleted: usize,
     /// `trades` rows deleted across all purged wallets (estimate in dry-run).
     pub trades_deleted: usize,
     /// `leaderboard_snapshots` rows deleted across all purged wallets.
     pub snapshots_deleted: usize,
-    /// Tombstones written to `purged_wallets` (== `proven_losers_deleted`).
+    /// Rows deleted from the optional legacy `wallet_features` table.
+    pub wallet_features_deleted: usize,
+    /// Tombstones written to `purged_wallets` (proven-loser + infrastructure).
     pub tombstones_written: usize,
     /// True when this was a preview (`dry_run`) — nothing was written.
     pub dry_run: bool,
+}
+
+/// Durable result of one controlled activation batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationBatch {
+    pub batch_id: String,
+    pub requested_count: usize,
+    pub wallet_hexes: Vec<String>,
+    /// True when this call reused an already-committed batch rather than
+    /// activating another cohort.
+    pub reused: bool,
 }
 
 /// Per-market fee schedule row loaded from `market_fees` (issue #23).
@@ -2195,14 +2229,10 @@ impl WalletCache {
     /// pass `0` when V1/V2 attribution is unavailable; the enumeration path
     /// passes the bit from `topic_to_contract_version_bit`.
     pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
-        // Issue #385 tombstone gate. Load the purged set once; for a tombstoned
-        // wallet, an incoming row carrying an override bit (leaderboard =
-        // `source_bits & TOMBSTONE_OVERRIDE_SOURCES`) LIFTS the tombstone (DELETE
-        // the `purged_wallets` row, then upsert normally — re-admit); any other
-        // source bit (datadash/trades/wallet-set-json) SKIPS the row, leaving the
-        // tombstone intact and the wallet un-inserted. An empty `purged_wallets`
-        // makes this a no-op, so behaviour is identical to pre-#385.
-        let mut purged = self.load_purged_set()?;
+        // Issue #385 tombstone gate. Leaderboard may lift a non-infra tombstone;
+        // all other sources skip it. Infrastructure tombstones are never lifted
+        // here, regardless of source.
+        let mut purged = self.load_purged_reasons()?;
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -2221,8 +2251,11 @@ impl WalletCache {
             )?;
             let mut lift = tx.prepare("DELETE FROM purged_wallets WHERE wallet_hex = ?1")?;
             for (wallet, bits, infra, first_seen, closed, win_rate, version_bits) in rows {
-                if purged.contains(wallet) {
-                    if (bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0 {
+                if let Some(reason) = purged.get(wallet) {
+                    // Infrastructure exclusions are permanent under ordinary
+                    // discovery. Only the explicit operator clearance command
+                    // may remove them.
+                    if reason != "infra" && (bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0 {
                         // Override source (leaderboard) → lift + re-admit.
                         lift.execute(params![wallet])?;
                         purged.remove(wallet);
@@ -2252,6 +2285,27 @@ impl WalletCache {
         let mut stmt = self.conn.prepare("SELECT wallet_hex FROM purged_wallets")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<std::collections::HashSet<_>, _>>()?)
+    }
+
+    /// Load tombstoned wallets and their durable purge reason.
+    pub fn load_purged_reasons(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT wallet_hex, reason FROM purged_wallets")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
+    }
+
+    /// Remove one durable infrastructure exclusion. This does not recreate or
+    /// activate the wallet; a later discovery must re-admit it normally.
+    pub fn clear_infra_exclusion(&mut self, wallet_hex: &str) -> Result<bool, BootstrapError> {
+        let affected = self.conn.execute(
+            "DELETE FROM purged_wallets WHERE wallet_hex = ?1 AND reason = 'infra'",
+            params![wallet_hex],
+        )?;
+        Ok(affected == 1)
     }
 
     /// Whether a wallet is currently tombstoned (issue #385).
@@ -2306,7 +2360,9 @@ impl WalletCache {
     /// tombstone written **in the same chunk transaction** as their row deletions,
     /// so a mid-purge crash can never leave a proven loser deleted-but-untombstoned
     /// (which a non-override source would then silently re-ingest). Rule-B
-    /// (`DeadWeight`) rows are deleted with no tombstone.
+    /// (`DeadWeight`) rows are deleted with no tombstone. Infrastructure rows
+    /// get a non-liftable tombstone. Every armed non-empty deletion clears the
+    /// trade-derived `first_mover_rank_cache` in its first chunk transaction.
     ///
     /// In `dry_run` mode nothing is written: the report's `*_deleted` counts are
     /// estimates (trades via `wallets.trade_count`, snapshots via `COUNT`).
@@ -2319,8 +2375,18 @@ impl WalletCache {
         now_unix: i64,
         dry_run: bool,
     ) -> Result<PurgeReport, BootstrapError> {
-        let proven = rows.iter().filter(|r| r.reason.tombstoned()).count();
-        let dead = rows.len() - proven;
+        let proven = rows
+            .iter()
+            .filter(|r| r.reason == PurgeReason::ProvenLoser)
+            .count();
+        let dead = rows
+            .iter()
+            .filter(|r| r.reason == PurgeReason::DeadWeight)
+            .count();
+        let infrastructure = rows
+            .iter()
+            .filter(|r| r.reason == PurgeReason::Infrastructure)
+            .count();
         let mut report = PurgeReport {
             dry_run,
             ..PurgeReport::default()
@@ -2332,6 +2398,12 @@ impl WalletCache {
         if dry_run {
             let mut trades_est: i64 = 0;
             let mut snaps: i64 = 0;
+            let mut features: i64 = 0;
+            let has_wallet_features: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wallet_features')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
             for chunk in rows.chunks(PURGE_CHUNK) {
                 let placeholders = (1..=chunk.len())
                     .map(|i| format!("?{i}"))
@@ -2353,24 +2425,50 @@ impl WalletCache {
                 snaps += self
                     .conn
                     .query_row(&sq, &params_vec[..], |r| r.get::<_, i64>(0))?;
+                if has_wallet_features {
+                    let fq = format!(
+                        "SELECT COUNT(*) FROM wallet_features WHERE wallet_hex IN ({placeholders})"
+                    );
+                    features += self
+                        .conn
+                        .query_row(&fq, &params_vec[..], |r| r.get::<_, i64>(0))?;
+                }
             }
             report.proven_losers_deleted = proven;
             report.dead_weight_deleted = dead;
-            report.tombstones_written = proven;
+            report.infrastructure_deleted = infrastructure;
+            report.tombstones_written = proven + infrastructure;
             report.trades_deleted = usize::try_from(trades_est).unwrap_or(usize::MAX);
             report.snapshots_deleted = usize::try_from(snaps).unwrap_or(usize::MAX);
+            report.wallet_features_deleted = usize::try_from(features).unwrap_or(usize::MAX);
             return Ok(report);
         }
 
         // Armed: delete per chunk in ONE transaction so each rule-A wallet's
         // tombstone and its row deletions commit atomically (crash-safety).
-        for chunk in rows.chunks(PURGE_CHUNK) {
+        let has_wallet_features: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='wallet_features')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        for (chunk_index, chunk) in rows.chunks(PURGE_CHUNK).enumerate() {
             let tx = self.conn.transaction()?;
             {
+                // The rank cache is valid only for a fixed trades table. Clear
+                // it in the first committed delete transaction so an interrupted
+                // multi-chunk purge can never leave stale derived rows behind.
+                if chunk_index == 0 {
+                    tx.execute("DELETE FROM first_mover_rank_cache", [])?;
+                }
                 let mut del_trades = tx.prepare("DELETE FROM trades WHERE wallet_hex = ?1")?;
                 let mut del_snaps =
                     tx.prepare("DELETE FROM leaderboard_snapshots WHERE wallet_hex = ?1")?;
                 let mut del_wallet = tx.prepare("DELETE FROM wallets WHERE wallet_hex = ?1")?;
+                let mut del_features = if has_wallet_features {
+                    Some(tx.prepare("DELETE FROM wallet_features WHERE wallet_hex = ?1")?)
+                } else {
+                    None
+                };
                 let mut tomb = tx.prepare(
                     "INSERT OR REPLACE INTO purged_wallets (wallet_hex, purged_at_unix, reason) \
                      VALUES (?1, ?2, ?3)",
@@ -2378,13 +2476,18 @@ impl WalletCache {
                 for r in chunk {
                     report.trades_deleted += del_trades.execute(params![r.wallet_hex])?;
                     report.snapshots_deleted += del_snaps.execute(params![r.wallet_hex])?;
+                    if let Some(stmt) = del_features.as_mut() {
+                        report.wallet_features_deleted += stmt.execute(params![r.wallet_hex])?;
+                    }
                     del_wallet.execute(params![r.wallet_hex])?;
                     if r.reason.tombstoned() {
                         tomb.execute(params![r.wallet_hex, now_unix, r.reason.as_str()])?;
                         report.tombstones_written += 1;
-                        report.proven_losers_deleted += 1;
-                    } else {
-                        report.dead_weight_deleted += 1;
+                    }
+                    match r.reason {
+                        PurgeReason::ProvenLoser => report.proven_losers_deleted += 1,
+                        PurgeReason::DeadWeight => report.dead_weight_deleted += 1,
+                        PurgeReason::Infrastructure => report.infrastructure_deleted += 1,
                     }
                 }
             }
@@ -2877,6 +2980,152 @@ impl WalletCache {
             params![min_trades],
         )?;
         Ok(affected)
+    }
+
+    /// Activate at most `requested_count` inactive, non-infrastructure,
+    /// non-tombstoned wallets and durably record the exact cohort in the same
+    /// transaction. Reusing `batch_id` returns the committed cohort without
+    /// activating another wallet.
+    pub fn activate_next_batch(
+        &mut self,
+        batch_id: &str,
+        requested_count: usize,
+        min_trades: i64,
+        now_unix: i64,
+    ) -> Result<ActivationBatch, BootstrapError> {
+        if batch_id.is_empty()
+            || !batch_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(BootstrapError::Invalid {
+                message:
+                    "activation batch id must contain only ASCII letters, digits, '.', '_', or '-'"
+                        .to_owned(),
+            });
+        }
+        let requested_i64 =
+            i64::try_from(requested_count).map_err(|_| BootstrapError::Invalid {
+                message: "activation requested count exceeds SQLite integer range".to_owned(),
+            })?;
+
+        let tx = self.conn.transaction()?;
+        let existing: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT requested_count, activated_count FROM wallet_activation_batches \
+                 WHERE batch_id = ?1",
+                params![batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if let Some((stored_requested, stored_activated)) = existing {
+            if stored_requested != requested_i64 {
+                return Err(BootstrapError::Invalid {
+                    message: format!(
+                        "activation batch {batch_id} requested_count mismatch: stored {stored_requested}, requested {requested_i64}"
+                    ),
+                });
+            }
+            let wallet_hexes = {
+                let mut stmt = tx.prepare(
+                    "SELECT wallet_hex FROM wallet_activation_batch_wallets \
+                     WHERE batch_id = ?1 ORDER BY wallet_hex",
+                )?;
+                stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let stored_count =
+                usize::try_from(stored_activated).map_err(|_| BootstrapError::Invalid {
+                    message: format!("activation batch {batch_id} has an invalid stored count"),
+                })?;
+            if wallet_hexes.len() != stored_count {
+                return Err(BootstrapError::Invalid {
+                    message: format!(
+                        "activation batch {batch_id} audit mismatch: {stored_count} recorded, {} members",
+                        wallet_hexes.len()
+                    ),
+                });
+            }
+            tx.commit()?;
+            return Ok(ActivationBatch {
+                batch_id: batch_id.to_owned(),
+                requested_count,
+                wallet_hexes,
+                reused: true,
+            });
+        }
+
+        let wallet_hexes = {
+            let mut stmt = tx.prepare(
+                "SELECT w.wallet_hex FROM wallets w \
+                 WHERE w.is_active = 0 AND w.is_infra = 0 \
+                   AND NOT EXISTS (SELECT 1 FROM purged_wallets p WHERE p.wallet_hex = w.wallet_hex) \
+                 ORDER BY CASE WHEN ( \
+                              COALESCE(w.trade_count, 0) >= ?1 \
+                           OR COALESCE(w.dune_closed_markets, 0) >= ?1 \
+                           OR (w.source_bits & 16) != 0 \
+                           OR (w.source_bits & 64) != 0 \
+                           OR (w.source_bits & 128) != 0 \
+                          ) THEN 0 ELSE 1 END, \
+                          w.dune_win_rate_bps DESC NULLS LAST, \
+                          w.dune_closed_markets DESC NULLS LAST, \
+                          w.trade_count DESC, w.wallet_hex ASC \
+                 LIMIT ?2",
+            )?;
+            stmt.query_map(params![min_trades, requested_i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let activated_i64 =
+            i64::try_from(wallet_hexes.len()).map_err(|_| BootstrapError::Invalid {
+                message: "activation batch size exceeds SQLite integer range".to_owned(),
+            })?;
+        tx.execute(
+            "INSERT INTO wallet_activation_batches \
+             (batch_id, activated_at_unix, requested_count, activated_count) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![batch_id, now_unix, requested_i64, activated_i64],
+        )?;
+        {
+            let mut audit = tx.prepare(
+                "INSERT INTO wallet_activation_batch_wallets (batch_id, wallet_hex) \
+                 VALUES (?1, ?2)",
+            )?;
+            let mut activate = tx.prepare(
+                "UPDATE wallets SET is_active = 1 \
+                 WHERE wallet_hex = ?1 AND is_active = 0 AND is_infra = 0 \
+                   AND NOT EXISTS (SELECT 1 FROM purged_wallets p WHERE p.wallet_hex = wallets.wallet_hex)",
+            )?;
+            for wallet in &wallet_hexes {
+                audit.execute(params![batch_id, wallet])?;
+                if activate.execute(params![wallet])? != 1 {
+                    return Err(BootstrapError::Invalid {
+                        message: format!(
+                            "activation batch {batch_id} lost eligibility for wallet {wallet}"
+                        ),
+                    });
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(ActivationBatch {
+            batch_id: batch_id.to_owned(),
+            requested_count,
+            wallet_hexes,
+            reused: false,
+        })
+    }
+
+    /// Select every currently live infrastructure wallet for purge.
+    pub fn infra_wallet_hexes(&self) -> Result<Vec<String>, BootstrapError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT wallet_hex FROM wallets WHERE is_infra = 1 ORDER BY wallet_hex")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Number of wallets currently in the pile (any status).
