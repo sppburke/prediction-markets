@@ -164,7 +164,9 @@ pub struct ResolverCard {
     pub finality: FinalityRule,
     pub revision_policy: RevisionPolicy,
     pub status: ResolverStatus,
+    #[serde(with = "time::serde::rfc3339")]
     pub valid_from: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub valid_until: OffsetDateTime,
 }
 
@@ -273,6 +275,30 @@ mod tests {
     use time::macros::datetime;
     use uuid::Uuid;
 
+    const RFC3339_CARD_JSON: &[u8] = br#"{
+        "schema_version": 1,
+        "card_id": "00000000-0000-0000-0000-000000000000",
+        "condition_id": "0x01",
+        "family": "event_feed",
+        "resolver_source": {
+            "kind": "official_api",
+            "value": "https://example.invalid/feed"
+        },
+        "upstream_sources": [],
+        "output_space": { "kind": "binary" },
+        "timing": {
+            "kind": "point_in_time",
+            "value": "2026-07-20T00:00:00Z"
+        },
+        "rounding": { "kind": "as_published" },
+        "tie_rule": "source_defined",
+        "finality": { "kind": "as_published" },
+        "revision_policy": "accept_only_official_corrections",
+        "status": "tradable",
+        "valid_from": "2026-07-01T00:00:00Z",
+        "valid_until": "2026-08-01T00:00:00Z"
+    }"#;
+
     fn card() -> ResolverCard {
         ResolverCard {
             schema_version: 1,
@@ -303,6 +329,34 @@ mod tests {
             Some(validated.canonical_hash.to_hex().as_str()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn validates_and_emits_schema_rfc3339_validity_timestamps() {
+        let validated =
+            validate_install(RFC3339_CARD_JSON, datetime!(2026-07-17 0:00 UTC)).unwrap();
+        let encoded = serde_json::to_value(&validated.card).unwrap();
+
+        assert_eq!(encoded["valid_from"], "2026-07-01T00:00:00Z");
+        assert_eq!(encoded["valid_until"], "2026-08-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rejects_malformed_and_legacy_sequence_validity_timestamps() {
+        for invalid in [
+            serde_json::json!("not-a-timestamp"),
+            serde_json::json!([2026, 182, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(RFC3339_CARD_JSON).unwrap();
+            value["valid_from"] = invalid;
+            assert!(matches!(
+                validate_install(
+                    &serde_json::to_vec(&value).unwrap(),
+                    datetime!(2026-07-17 0:00 UTC)
+                ),
+                Err(ResolverCardError::Json(_))
+            ));
+        }
     }
 
     #[test]
