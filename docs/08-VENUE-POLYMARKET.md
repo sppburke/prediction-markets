@@ -55,11 +55,13 @@ deposit-wallet maker/signer/funder. Its reachable order surface is BUY-only limi
 builder/metadata, `postOnly = false`, and explicit `deferExec = false`; batches, replacement,
 market-order builders, hidden polling, and V1 are unreachable.
 
-Admission requires strict agreement among Gamma event/market evidence, CLOB long/short metadata,
-the fresh book, resolver card, authenticated account reads, standard-exchange contract identity,
-and exact signed fields. The supported market subset is fee-free, zero-delay, non-Neg-Risk,
-binary Geopolitics. Current `nr`/`fd`/`itode` omission handling and source verification dates are
-recorded in [`15-SOURCES.md`](15-SOURCES.md); operations are in
+Admission requires strict agreement among Gamma canonical tag identity and direct market-tag
+evidence, CLOB long/short metadata, the fresh book, resolver card, authenticated account reads,
+standard-exchange contract identity, and exact signed fields. The Gamma market query explicitly
+requests documented direct tags; missing or mismatched Geopolitics ID/slug evidence fails closed.
+The supported market subset is fee-free, zero-delay, non-Neg-Risk, binary Geopolitics. Current
+Gamma tag-shape and CLOB `nr`/`fd`/`itode` omission observations and verification dates are recorded
+in [`15-SOURCES.md`](15-SOURCES.md); operations are in
 [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 ## Sports

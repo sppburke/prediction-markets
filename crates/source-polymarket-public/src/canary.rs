@@ -66,11 +66,6 @@ struct Market {
     fees_enabled: Option<bool>,
     fee_schedule: Option<serde_json::Value>,
     seconds_delay: Option<u64>,
-    events: Vec<MarketEvent>,
-}
-
-#[derive(Deserialize)]
-struct MarketEvent {
     tags: Vec<Tag>,
 }
 
@@ -100,12 +95,11 @@ pub fn parse_strict_market(
     if market.seconds_delay.is_some_and(|delay| delay > 0) {
         return Err(StrictGammaError::Delayed);
     }
-    if !market.events.iter().any(|event| {
-        event
-            .tags
-            .iter()
-            .any(|tag| tag.id == GEOPOLITICS_TAG_ID && tag.slug == GEOPOLITICS_TAG_SLUG)
-    }) {
+    if !market
+        .tags
+        .iter()
+        .any(|tag| tag.id == GEOPOLITICS_TAG_ID && tag.slug == GEOPOLITICS_TAG_SLUG)
+    {
         return Err(StrictGammaError::WrongTag);
     }
     let outcomes: Vec<String> =
@@ -146,7 +140,7 @@ mod tests {
 
     fn market(fees: &str, delay: &str) -> Vec<u8> {
         format!(
-            r#"[{{"conditionId":"0xc","active":true,"closed":false,"acceptingOrders":true,"enableOrderBook":true,"negRisk":false,"outcomes":"[\"Yes\",\"No\"]","clobTokenIds":"[\"11\",\"22\"]","feesEnabled":{fees},"feeSchedule":null,"secondsDelay":{delay},"events":[{{"tags":[{{"id":"100265","slug":"geopolitics"}}]}}]}}]"#
+            r#"[{{"conditionId":"0xc","active":true,"closed":false,"acceptingOrders":true,"enableOrderBook":true,"negRisk":false,"outcomes":"[\"Yes\",\"No\"]","clobTokenIds":"[\"11\",\"22\"]","feesEnabled":{fees},"feeSchedule":null,"secondsDelay":{delay},"tags":[{{"id":"100265","slug":"geopolitics"}}]}}]"#
         )
         .into_bytes()
     }
@@ -172,6 +166,49 @@ mod tests {
         assert_eq!(
             parse_strict_market(&market("false", "1"), &condition, OutcomeId(0)),
             Err(StrictGammaError::Delayed)
+        );
+    }
+
+    #[test]
+    fn direct_geopolitics_tag_is_required_exactly() {
+        let condition = PolymarketConditionId("0xc".to_owned());
+        let valid: serde_json::Value =
+            serde_json::from_slice(&market("false", "null")).expect("fixture should parse");
+
+        let mut missing = valid.clone();
+        missing[0]
+            .as_object_mut()
+            .expect("market should be an object")
+            .remove("tags");
+        assert!(matches!(
+            parse_strict_market(
+                &serde_json::to_vec(&missing).expect("fixture should serialize"),
+                &condition,
+                OutcomeId(0)
+            ),
+            Err(StrictGammaError::Json(_))
+        ));
+
+        let mut wrong_id = valid.clone();
+        wrong_id[0]["tags"][0]["id"] = serde_json::Value::String("other".to_owned());
+        assert_eq!(
+            parse_strict_market(
+                &serde_json::to_vec(&wrong_id).expect("fixture should serialize"),
+                &condition,
+                OutcomeId(0)
+            ),
+            Err(StrictGammaError::WrongTag)
+        );
+
+        let mut wrong_slug = valid;
+        wrong_slug[0]["tags"][0]["slug"] = serde_json::Value::String("politics".to_owned());
+        assert_eq!(
+            parse_strict_market(
+                &serde_json::to_vec(&wrong_slug).expect("fixture should serialize"),
+                &condition,
+                OutcomeId(0)
+            ),
+            Err(StrictGammaError::WrongTag)
         );
     }
 }

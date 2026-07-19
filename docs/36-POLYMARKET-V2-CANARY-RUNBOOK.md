@@ -30,7 +30,7 @@ Record the full commit in the deployment evidence. Copy the binary and
 `deploy/systemd/pe-service-live-canary.service` to root-controlled staging paths on the target;
 do not replace a running binary.
 
-## Install without starting
+## Install non-secret artifacts without starting
 
 The following is an operator procedure requiring root authority; it is not part of an ordinary
 development cycle.
@@ -41,18 +41,16 @@ development cycle.
    `0755`.
 3. Install the unit at `/etc/systemd/system/pe-service-live-canary.service`, owned by root and mode
    `0644`. Run `systemd-analyze verify` and `systemctl daemon-reload`.
-4. Create `/etc/prediction-edge-canary` owned by root and mode `0700`. Credential source files are
-   root-owned mode `0600`. Use
-   [`canary-boot-config.example.json`](../deploy/systemd/canary-boot-config.example.json) as the
-   schema guide, replacing every placeholder. The five Polymarket credential files, deposit-wallet
-   address, and Supabase URL/anon key are each single-value files named exactly as the unit's
-   `LoadCredential=` entries. Never use a service-role Supabase key.
+4. Create `/etc/prediction-edge-canary` owned by root and mode `0700`. Do not place the boot config,
+   private key, API credentials, deposit-wallet address, or Supabase values during this non-secret
+   installation phase.
 5. Run `systemctl is-enabled pe-service-live-canary`; `disabled` or `static` is expected. Do not
    enable or start it.
 
-Installing credential source files does not authorize starting the daemon. Operational authority
-must separately approve the exact implementation commit, binary/config/SDK/resolver hashes,
-wallet, owner signer, spender, jurisdiction/account attestations, allowance, and expiry.
+Installation does not authorize wallet creation, secret placement, or starting the daemon.
+Operational authority must separately approve the exact implementation commit,
+binary/config/SDK/resolver hashes, wallet, owner signer, spender, jurisdiction/account attestations,
+allowance, and expiry.
 
 ## Resolver installation
 
@@ -68,8 +66,13 @@ Install validated cards as
 deterministic inventory hash over the sorted filenames and bytes; the campaign authority must match
 the daemon's computed inventory hash exactly.
 
-After the boot config and complete resolver inventory are installed, obtain the versioned identity
-from the installed executable itself:
+## Finalize artifact identity, then place secrets
+
+After the final non-secret boot config and complete resolver inventory are installed, but before
+placing the seven secret single-value sources, obtain the versioned identity from the installed
+executable itself. Use
+[`canary-boot-config.example.json`](../deploy/systemd/canary-boot-config.example.json) as the schema
+guide, replacing every placeholder:
 
 ```bash
 /usr/local/bin/pe-service-live-canary artifact-identity \
@@ -80,7 +83,15 @@ from the installed executable itself:
 Use this JSON verbatim when preparing later authority: it identifies the actual executable and boot
 config bytes with BLAKE3, the sorted resolver inventory with BLAKE3, the upstream SDK archive with
 SHA-256, and the effective reviewed vendor tree with SHA-256. Do not substitute path names, Git
-abbreviations, or an independently chosen hashing recipe.
+abbreviations, or an independently chosen hashing recipe. `artifact-identity` does not read or hash
+private keys, API credentials, deposit-wallet files, or Supabase values.
+
+Under separate credential-placement authority, install the five Polymarket single-value files
+(private key, API key, API secret, API passphrase, and deposit-wallet address) and the Supabase URL
+and anon key. Each source is named exactly as the remaining unit `LoadCredential=` entries,
+root-owned, and mode `0600`. Never use a service-role Supabase key. Secret placement does not
+authorize starting the daemon; the later daemon boot and campaign authority independently validate
+the public wallet, owner signer, and spender bindings. Keep the unit stopped and disabled/static.
 
 ## Inactive verification
 
@@ -97,11 +108,30 @@ After an authorized daemon start—but before arming—`status` must show `inact
 pending attempt, zero slots consumed, and an unlatched kill state. Verify `/var/lib` and `/run`
 service directories are mode `0700`; `canary.log`, `status.json`, and `control.sock` are mode `0600`.
 
+## Prepare authority hashes offline
+
+These commands only read the named non-secret JSON file and print one lowercase BLAKE3 hash. They do
+not read credentials, contact the daemon or network, inspect the event log, or authorize an action:
+
+```bash
+pe-service-live-canary authority-hash probe PROBE_AUTHORIZATION.json
+pe-service-live-canary authority-hash reviewed-probes REVIEWED_PROBE_HASHES.json
+```
+
+For a probe, set the required `authority_hash` field to `""`, run the first command, replace the
+field with the printed hash, run the command again, and require the same output. The declared field
+is deliberately excluded from the canonical probe hash. The reviewed-probes input is exactly the
+ordered JSON string array from sanitized state; changing the order changes the bundle hash. Hashes
+are reviewed inputs for later authority artifacts, never authorization by themselves. Authority
+files remain root-controlled and are not systemd credentials.
+
 ## Operator commands
 
-All commands are thin clients to the resident daemon. Set `PE_CANARY_COMMAND_ID` to a stable unique
-ID when retrying the same state-changing command; reuse of an ID with different command content is
-rejected. Authority JSON files remain root-controlled and contain no private key or API secret.
+The commands below are thin clients to the resident daemon. Before each `reconcile` or mutating
+command, set and record a stable unique `PE_CANARY_COMMAND_ID`; reuse that ID only when retrying the
+identical command. Reuse with different command content is rejected. `status`, `artifact-identity`,
+resolver validation, and authority hashing do not use command receipts. Authority JSON files remain
+root-controlled and contain no private key or API secret.
 
 ```bash
 pe-service-live-canary status
@@ -126,13 +156,20 @@ outer guard around the application's 45-second deadline.
 
 ## Rollback and recovery
 
-1. Invoke `kill` and wait for its synced acknowledgment; then invoke `reconcile`.
-2. Stop and mask the unit. Do not delete or truncate the event log, resolver cards, status snapshot,
-   authority artifacts, or unresolved inventory evidence.
-3. Preserve credentials only when authenticated no-admission reconciliation is required. Otherwise
-   remove the credential source files through the approved secret-handling process.
-4. Preserve filled inventory in `closed_observing` until settlement and any external redemption are
-   authoritatively reconciled. Redemption is not performed by this binary.
+1. Invoke `kill` with its recorded command ID and wait for its synced acknowledgment; then invoke
+   `reconcile` with a distinct recorded command ID.
+2. Require authoritative evidence for every pending or ambiguous order, filled position,
+   settlement, redemption, allowance, and cash balance. Do not delete or truncate the event log,
+   resolver cards, status snapshot, authority artifacts, credentials needed for recovery, or
+   unresolved inventory evidence.
+3. If filled or unresolved inventory remains, keep the campaign in no-admission
+   `closed_observing`. Under explicit recovery authority, leave the daemon running closed or perform
+   only bounded recovery starts and authenticated reconciliation at reviewed checkpoints. Recovery
+   never restores admission, slots, or commitment and never authorizes a POST.
+4. Stop and mask the unit only after authoritative reconciliation proves there is no pending or
+   ambiguous order, open debit, unresolved recovery, or filled inventory awaiting settlement or
+   separately authorized external redemption. Then remove credential sources through the approved
+   secret-handling process. Redemption is not performed by this binary.
 5. Restore a prior reviewed V2 binary only if its authority and journal compatibility remain valid.
    Never restore or run the retired V1 path with live credentials.
 
