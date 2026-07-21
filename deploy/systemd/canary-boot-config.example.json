@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "implementation_commit": "FULL_40_HEX_GIT_COMMIT",
-  "jurisdiction": "OPERATOR_REVIEWED_JURISDICTION",
+  "jurisdiction": "UPPERCASE_ISO_3166_1_ALPHA_2_EGRESS_COUNTRY",
   "jurisdiction_attestation_hash": "BLAKE3_OF_REVIEWED_ATTESTATION",
   "account_attestation_hash": "BLAKE3_OF_REVIEWED_ACCOUNT_ATTESTATION"
 }

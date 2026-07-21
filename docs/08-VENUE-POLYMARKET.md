@@ -57,11 +57,16 @@ market-order builders, hidden polling, and V1 are unreachable.
 
 Admission requires strict agreement among Gamma canonical tag identity and direct market-tag
 evidence, CLOB long/short metadata, the fresh book, resolver card, authenticated account reads,
-standard-exchange contract identity, and exact signed fields. The Gamma market query explicitly
-requests documented direct tags; missing or mismatched Geopolitics ID/slug evidence fails closed.
-The supported market subset is fee-free, zero-delay, non-Neg-Risk, binary Geopolitics. Current
-Gamma tag-shape and CLOB `nr`/`fd`/`itode` omission observations and verification dates are recorded
-in [`15-SOURCES.md`](15-SOURCES.md); operations are in
+standard-exchange contract identity, same-egress API jurisdiction evidence, and exact signed fields.
+The raw geoblock country must exactly match the authority-bound uppercase ISO country code in the
+boot config. A raw `blocked: true` for IE, JP, MT, or NL means close-only on the frontend and does
+not block API orders; any other blocked country remains API-blocked. Missing, malformed, mismatched,
+or unknown response shapes fail closed, and the authenticated `closed_only` check remains an
+independent admission gate. The Gamma market query explicitly requests documented direct tags;
+missing or mismatched Geopolitics ID/slug evidence fails closed. The supported market subset is
+fee-free, zero-delay, non-Neg-Risk, binary Geopolitics. Current jurisdiction, Gamma tag-shape, and
+CLOB `nr`/`fd`/`itode` observations and verification dates are recorded in
+[`15-SOURCES.md`](15-SOURCES.md); operations are in
 [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 ## Sports

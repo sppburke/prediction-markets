@@ -72,7 +72,8 @@ After the final non-secret boot config and complete resolver inventory are insta
 placing the seven secret single-value sources, obtain the versioned identity from the installed
 executable itself. Use
 [`canary-boot-config.example.json`](../deploy/systemd/canary-boot-config.example.json) as the schema
-guide, replacing every placeholder:
+guide, replacing every placeholder. `jurisdiction` is the reviewed egress country as an uppercase
+ISO 3166-1 alpha-2 code (for example, `IE`), not a country name or datacenter label:
 
 ```bash
 /usr/local/bin/pe-service-live-canary artifact-identity \
@@ -85,6 +86,13 @@ config bytes with BLAKE3, the sorted resolver inventory with BLAKE3, the upstrea
 SHA-256, and the effective reviewed vendor tree with SHA-256. Do not substitute path names, Git
 abbreviations, or an independently chosen hashing recipe. `artifact-identity` does not read or hash
 private keys, API credentials, deposit-wallet files, or Supabase values.
+
+At reconciliation, the daemon requires the same-egress geoblock response country to match this
+authority-bound `jurisdiction`. Under the current official Polymarket contract, IE, JP, MT, and NL
+are close-only on the frontend but unrestricted at the API, so `blocked: true` alone does not close
+API admission for those four matching country codes. Other blocked countries remain closed;
+missing, malformed, or mismatched location evidence closes admission. The authenticated account
+`closed_only` response is a separate gate and closes admission whenever true.
 
 Under separate credential-placement authority, install the five Polymarket single-value files
 (private key, API key, API secret, API passphrase, and deposit-wallet address) and the Supabase URL

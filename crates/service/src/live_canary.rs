@@ -24,11 +24,12 @@ pub struct LiveCanaryIo {
     positions: ReqwestFetcher,
     positions_wallet: String,
     standard_spender: String,
+    expected_jurisdiction: String,
     boot_observations: Mutex<Vec<RawHttpResponse>>,
 }
 
 impl LiveCanaryIo {
-    pub fn new(venue: CanaryV2Client) -> Result<Self, String> {
+    pub fn new(venue: CanaryV2Client, expected_jurisdiction: String) -> Result<Self, String> {
         let wallet = venue.deposit_wallet();
         let boot_observations = venue.take_raw_observations("boot");
         Ok(Self {
@@ -36,6 +37,7 @@ impl LiveCanaryIo {
             positions: ReqwestFetcher::new(reqwest::Client::new()).with_max_retries(0),
             positions_wallet: wallet,
             standard_spender: CanaryV2Client::standard_spender().map_err(|e| e.to_string())?,
+            expected_jurisdiction,
             boot_observations: Mutex::new(boot_observations),
         })
     }
@@ -237,7 +239,13 @@ impl CanaryReconciler for LiveCanaryIo {
         pending: Option<&PendingAttempt>,
         known_trade_ids: &[String],
     ) -> Result<CanaryReconciliation, String> {
-        parse_reconciliation(raw, pending, known_trade_ids, &self.standard_spender)
+        parse_reconciliation(
+            raw,
+            pending,
+            known_trade_ids,
+            &self.standard_spender,
+            &self.expected_jurisdiction,
+        )
     }
 }
 
@@ -265,6 +273,7 @@ fn parse_reconciliation(
     pending: Option<&PendingAttempt>,
     known_trade_ids: &[String],
     standard_spender: &str,
+    expected_jurisdiction: &str,
 ) -> Result<CanaryReconciliation, String> {
     let response = |path: &str| {
         raw.evidence
@@ -330,10 +339,7 @@ fn parse_reconciliation(
         .flatten()
         .collect::<Vec<_>>();
 
-    let geoblocked = geoblock
-        .get("blocked")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| "geoblock response omitted blocked".to_owned())?;
+    let geoblocked = api_orders_geoblocked(&geoblock, expected_jurisdiction)?;
     let closed_only = closed_only
         .get("closed_only")
         .and_then(Value::as_bool)
@@ -533,6 +539,34 @@ fn parse_reconciliation(
         execution_report,
         evidence_hashes,
     })
+}
+
+fn api_orders_geoblocked(geoblock: &Value, expected_jurisdiction: &str) -> Result<bool, String> {
+    let blocked = geoblock
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "geoblock response omitted blocked".to_owned())?;
+    geoblock
+        .get("ip")
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.trim().is_empty())
+        .ok_or_else(|| "geoblock response omitted ip".to_owned())?;
+    let country = geoblock
+        .get("country")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "geoblock response omitted country".to_owned())?;
+    geoblock
+        .get("region")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "geoblock response omitted region".to_owned())?;
+    if country != expected_jurisdiction {
+        return Err("geoblock country disagrees with canary jurisdiction".to_owned());
+    }
+
+    // https://docs.polymarket.com/api-reference/geoblock, verified 2026-07-20:
+    // these jurisdictions are close-only on the frontend, not restricted at the API.
+    let frontend_only = matches!(country, "IE" | "JP" | "MT" | "NL");
+    Ok(blocked && !frontend_only)
 }
 
 fn parse_resolution(response: &RawHttpResponse) -> Result<Option<CanaryResolution>, String> {
@@ -835,10 +869,12 @@ mod tests {
         }
     }
 
-    fn complete_raw(
+    fn complete_raw_with_eligibility(
         trades: Value,
         positions: Value,
         exact_order_exists: bool,
+        geoblock: Value,
+        closed_only: bool,
     ) -> RawReconciliation {
         let mut exact_order = response(
             "/data/order/0xorder-hash",
@@ -849,15 +885,11 @@ mod tests {
         exact_order.status = if exact_order_exists { 200 } else { 404 };
         RawReconciliation {
             evidence: vec![
-                RawEvidence::HttpResponse(response(
-                    "/api/geoblock",
-                    Vec::new(),
-                    json!({"blocked": false}),
-                )),
+                RawEvidence::HttpResponse(response("/api/geoblock", Vec::new(), geoblock)),
                 RawEvidence::HttpResponse(response(
                     "/auth/ban-status/closed-only",
                     Vec::new(),
-                    json!({"closed_only": false}),
+                    json!({"closed_only": closed_only}),
                 )),
                 RawEvidence::HttpResponse(response(
                     "/balance-allowance",
@@ -885,6 +917,82 @@ mod tests {
         }
     }
 
+    fn complete_raw(
+        trades: Value,
+        positions: Value,
+        exact_order_exists: bool,
+    ) -> RawReconciliation {
+        complete_raw_with_eligibility(
+            trades,
+            positions,
+            exact_order_exists,
+            geoblock("IE", false),
+            false,
+        )
+    }
+
+    fn geoblock(country: &str, blocked: bool) -> Value {
+        json!({
+            "blocked": blocked,
+            "ip": "82.22.32.225",
+            "country": country,
+            "region": "L"
+        })
+    }
+
+    #[test]
+    fn frontend_only_jurisdictions_do_not_block_canary_api_orders() {
+        for country in ["IE", "JP", "MT", "NL"] {
+            assert_eq!(
+                api_orders_geoblocked(&geoblock(country, true), country),
+                Ok(false)
+            );
+        }
+    }
+
+    #[test]
+    fn api_restricted_and_unknown_jurisdictions_remain_blocked() {
+        for country in ["GB", "CU", "ZZ"] {
+            assert_eq!(
+                api_orders_geoblocked(&geoblock(country, true), country),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn geoblock_requires_complete_matching_location_evidence() {
+        for geoblock in [
+            json!({"blocked": false, "country": "IE", "region": "L"}),
+            json!({"blocked": false, "ip": "82.22.32.225", "region": "L"}),
+            json!({"blocked": false, "ip": "82.22.32.225", "country": "IE"}),
+            json!({
+                "blocked": "false",
+                "ip": "82.22.32.225",
+                "country": "IE",
+                "region": "L"
+            }),
+        ] {
+            assert!(api_orders_geoblocked(&geoblock, "IE").is_err());
+        }
+
+        assert!(api_orders_geoblocked(&geoblock("IE", false), "ES").is_err());
+    }
+
+    #[test]
+    fn frontend_only_status_does_not_override_authenticated_closed_only() {
+        let snapshot = parse_reconciliation(
+            &complete_raw_with_eligibility(json!([]), json!([]), false, geoblock("IE", true), true),
+            None,
+            &[],
+            "spender",
+            "IE",
+        )
+        .unwrap();
+        assert!(!snapshot.geoblocked);
+        assert!(snapshot.closed_only);
+    }
+
     #[test]
     fn exhaustive_reconciliation_proves_ambiguous_post_had_no_fill() {
         let snapshot = parse_reconciliation(
@@ -892,6 +1000,7 @@ mod tests {
             Some(&ambiguous_pending()),
             &[],
             "spender",
+            "IE",
         )
         .unwrap();
         let report = snapshot.execution_report.unwrap();
@@ -919,6 +1028,7 @@ mod tests {
             Some(&ambiguous_pending()),
             &[],
             "spender",
+            "IE",
         )
         .unwrap();
         let report = snapshot.execution_report.unwrap();
@@ -935,6 +1045,7 @@ mod tests {
             Some(&ambiguous_pending()),
             &[],
             "spender",
+            "IE",
         )
         .unwrap();
         assert!(snapshot.execution_report.is_none());

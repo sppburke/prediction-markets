@@ -74,7 +74,7 @@
 | https://docs.polymarket.com/trading/clients/l2 | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/concepts/order-lifecycle | — | — |
 | https://docs.polymarket.com/api-reference/authentication | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/geoblock | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/geoblock | 2026-07-20 | 2026-09-18 |
 | https://docs.polymarket.com/api-reference/introduction | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/polymarket-101 | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/trading/bridge/deposit | 2026-05-02 | 2026-07-01 |
@@ -167,6 +167,16 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-07-20: Re-verified the official geoblock reference. It classifies IE, JP, MT, and NL as
+  close-only on the frontend and explicitly says the API is not restricted for those jurisdictions.
+  Its field description and examples still describe `blocked` as general order availability, so the
+  boolean alone is insufficient to distinguish this documented frontend-only group. A live
+  same-egress read from the intended Ireland VPS returned `blocked=true`, `country=IE`, and the VPS
+  address, while the public CLOB time endpoint remained reachable. The canary therefore requires
+  the returned country to match its authority-bound boot jurisdiction and derives API eligibility
+  from the documented country class; malformed or mismatched evidence fails closed. This pass does
+  not establish authenticated account `closed_only` state or authenticated order acceptance.
 
 - 2026-07-18: The official Gamma `List markets` contract exposes `include_tag` and direct
   `Market.tags`. For active standard Geopolitics condition
