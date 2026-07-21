@@ -41,7 +41,7 @@ const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
 const DEFAULT_PURGE_INACTIVITY_SECS: i64 = 1_209_600; // 14 days
 const DEFAULT_PURGE_LOSER_TSTAT_MAX: f64 = -2.0;
 const DEFAULT_PURGE_LOSER_NEFF_MIN: f64 = 20.0;
-const DEFAULT_PURGE_BULK_MIN_WALLETS: u64 = 20_000;
+const DEFAULT_PURGE_BULK_MIN_WALLETS: u64 = 5_000;
 
 /// Bootstrap configuration loaded from an optional TOML file with `PE_*` env var overlay.
 ///
@@ -475,7 +475,7 @@ pub struct BootstrapConfig {
     /// runs in **bulk mode** — drop the two non-lookup `trades` indexes, delete,
     /// VACUUM, rebuild (issue #401). Below it, an armed purge runs **incremental**:
     /// indexes stay live and no VACUUM runs, so cheap daily purges plateau the
-    /// file. Default 20_000. Canonical default in `docs/_GLOSSARY.md`.
+    /// file. Default 5_000. Canonical default in `docs/_GLOSSARY.md`.
     /// `PE_BOOTSTRAP_PURGE_BULK_MIN_WALLETS`.
     #[serde(
         default = "default_purge_bulk_min_wallets",
@@ -1015,6 +1015,21 @@ mod tests {
             let cfg = load(Some(std::path::Path::new("config.toml")))
                 .map_err(|e| figment::Error::from(e.to_string()))?;
             assert_eq!(cfg.prices_history_coverage_warn_pct, 55);
+            Ok(())
+        });
+    }
+
+    /// The purge bulk-mode cutoff defaults to the canonical 5,000 wallets and
+    /// remains operator-overridable through the production environment loader.
+    #[test]
+    fn purge_bulk_min_wallets_default_and_env() {
+        assert_eq!(BootstrapConfig::default().purge_bulk_min_wallets, 5_000);
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+            jail.set_env("PE_BOOTSTRAP_PURGE_BULK_MIN_WALLETS", "7500");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert_eq!(cfg.purge_bulk_min_wallets, 7_500);
             Ok(())
         });
     }
