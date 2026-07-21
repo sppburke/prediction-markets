@@ -447,6 +447,12 @@ position, fee/category/delay, or book evidence fails before reservation. Any pos
 reject, timeout, ambiguity, partial/live state, drift, external activity, expiry, or kill closes
 admission.
 
+For canary admission, geoblock means API order restriction, not frontend availability. The raw
+same-egress response country must exactly match the authority-bound boot jurisdiction. IE, JP, MT,
+and NL are treated as frontend-only close-only jurisdictions under the current official contract;
+`blocked: true` for any other country remains API-blocked. Authenticated account `closed_only`
+status is independent and always fails admission when true.
+
 Organic attempts retain the ordinary eligible `LeaderSignal`, calibrated ranking `p`, canonical
 idempotency key, BUY-entry/history/latency/resolution gates, and concentration checks. Their Kelly
 cost is `leader_price × 1.0075`, quantized down to the venue tick, with proven zero fee, canonical

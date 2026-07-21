@@ -124,6 +124,22 @@ struct CanaryBootConfig {
     account_attestation_hash: String,
 }
 
+impl CanaryBootConfig {
+    fn validate(&self) -> Result<()> {
+        let jurisdiction = self.jurisdiction.as_bytes();
+        ensure!(
+            self.schema_version == 1
+                && !self.implementation_commit.trim().is_empty()
+                && jurisdiction.len() == 2
+                && jurisdiction.iter().all(u8::is_ascii_uppercase)
+                && !self.jurisdiction_attestation_hash.trim().is_empty()
+                && !self.account_attestation_hash.trim().is_empty(),
+            "invalid canary boot config"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct CanaryBootIdentity {
     config: CanaryBootConfig,
@@ -224,14 +240,7 @@ async fn run_daemon() -> Result<()> {
     let boot_config_bytes = read_credential_bytes(&credentials_directory, "canary-boot-config")?;
     let boot_config: CanaryBootConfig =
         serde_json::from_slice(&boot_config_bytes).context("parse canary boot config")?;
-    ensure!(
-        boot_config.schema_version == 1
-            && !boot_config.implementation_commit.trim().is_empty()
-            && !boot_config.jurisdiction.trim().is_empty()
-            && !boot_config.jurisdiction_attestation_hash.trim().is_empty()
-            && !boot_config.account_attestation_hash.trim().is_empty(),
-        "invalid canary boot config"
-    );
+    boot_config.validate()?;
     let credentials = load_credentials()?;
     let supabase_url = read_secret(&credentials_directory, "supabase-url")?;
     let supabase_anon_key = read_secret(&credentials_directory, "supabase-anon-key")?;
@@ -250,7 +259,8 @@ async fn run_daemon() -> Result<()> {
         spender: CanaryV2Client::standard_spender().map_err(|error| anyhow::anyhow!(error))?,
         resolver_dir: resolver_dir.clone(),
     });
-    let io = LiveCanaryIo::new(client).map_err(anyhow::Error::msg)?;
+    let io =
+        LiveCanaryIo::new(client, boot.config.jurisdiction.clone()).map_err(anyhow::Error::msg)?;
     let journal_path = state_dir.join("canary.log");
     let state = if journal_path.exists() {
         CanaryJournal::rebuild(&journal_path).context("rebuild canary journal")?
@@ -1438,10 +1448,7 @@ fn print_artifact_identity(boot_config_path: &Path, resolver_dir: &Path) -> Resu
     let boot_config_bytes = fs::read(boot_config_path).context("read canary boot config")?;
     let config: CanaryBootConfig =
         serde_json::from_slice(&boot_config_bytes).context("parse canary boot config")?;
-    ensure!(
-        config.schema_version == 1 && !config.implementation_commit.trim().is_empty(),
-        "invalid canary boot config"
-    );
+    config.validate()?;
     let identity = ArtifactIdentityV1 {
         schema_version: 1,
         implementation_commit: config.implementation_commit,
@@ -1574,6 +1581,24 @@ mod tests {
 
     use super::*;
 
+    fn boot_config(jurisdiction: &str) -> CanaryBootConfig {
+        CanaryBootConfig {
+            schema_version: 1,
+            implementation_commit: "current-commit".to_owned(),
+            jurisdiction: jurisdiction.to_owned(),
+            jurisdiction_attestation_hash: "jurisdiction".to_owned(),
+            account_attestation_hash: "account".to_owned(),
+        }
+    }
+
+    #[test]
+    fn boot_config_requires_an_uppercase_iso_country_code() {
+        assert!(boot_config("IE").validate().is_ok());
+        for jurisdiction in ["Ireland", "ie", "I", ""] {
+            assert!(boot_config(jurisdiction).validate().is_err());
+        }
+    }
+
     #[test]
     fn expired_resolver_bytes_remain_available_for_recovery_identity() {
         let directory = tempdir().unwrap();
@@ -1607,13 +1632,7 @@ mod tests {
         fs::write(directory.path().join("resolver.json"), b"{}").unwrap();
         let resolver_hash = resolver_inventory_identity_hash(directory.path()).unwrap();
         let boot = CanaryBootIdentity {
-            config: CanaryBootConfig {
-                schema_version: 1,
-                implementation_commit: "current-commit".to_owned(),
-                jurisdiction: "US".to_owned(),
-                jurisdiction_attestation_hash: "jurisdiction".to_owned(),
-                account_attestation_hash: "account".to_owned(),
-            },
+            config: boot_config("US"),
             config_hash: "config".to_owned(),
             binary_hash: "current-binary".to_owned(),
             wallet: "wallet".to_owned(),
