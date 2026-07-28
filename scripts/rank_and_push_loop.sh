@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Continuously run the complete zero-argument rank-and-push pipeline while the
-# operator flag contains exactly `run`. Linux/Forge only: requires flock,
-# setsid, and negative-process-group signaling.
+# operator flag contains exactly `run`. Transient failures resume either the
+# exact pending publication or the same pre-publication logical cycle. Linux/
+# Forge only: requires flock, setsid, and negative-process-group signaling.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -29,6 +30,7 @@ fi
 
 FLAG_FILE="data/eval-results/rank_and_push.loop"
 PENDING_FILE="data/eval-results/rank_and_push.pending"
+CYCLE_FILE="data/eval-results/rank_and_push.cycle"
 LOOP_LOCK_FILE="data/eval-results/.rank_and_push_loop.lock"
 TRANSIENT_RETRY_DELAY_SECS=60
 mkdir -p "$(dirname "$FLAG_FILE")"
@@ -117,10 +119,13 @@ while true; do
 
   child_args=()
   child_kind="cycle"
-  if [[ -e "$PENDING_FILE" ]]; then
-    child_kind="resume"
+  if [[ -e "$PENDING_FILE" || -L "$PENDING_FILE" ]]; then
+    child_kind="publication-resume"
     child_args+=(--resume-pending)
-    echo "LOOP_RESUME_START utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) pending=$PENDING_FILE"
+    echo "LOOP_RESUME_START kind=publication utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) pointer=$PENDING_FILE"
+  elif [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
+    child_kind="cycle-resume"
+    echo "LOOP_RESUME_START kind=cycle utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) pointer=$CYCLE_FILE"
   else
     cycle=$((cycle + 1))
     started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -137,8 +142,8 @@ while true; do
   wait "$ACTIVE_CHILD_PID" || child_status=$?
   ACTIVE_CHILD_PID=""
   ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  if [[ "$child_kind" == "resume" ]]; then
-    echo "LOOP_RESUME_END utc=$ended_at status=$child_status"
+  if [[ "$child_kind" == "publication-resume" || "$child_kind" == "cycle-resume" ]]; then
+    echo "LOOP_RESUME_END kind=$child_kind utc=$ended_at status=$child_status"
   else
     echo "LOOP_CYCLE_END cycle=$cycle utc=$ended_at status=$child_status"
   fi
@@ -151,8 +156,9 @@ while true; do
     exit "$child_status"
   fi
 
-  [[ -e "$PENDING_FILE" ]] || {
-    echo "FATAL: transient exit 75 did not retain $PENDING_FILE; loop stopped" >&2
+  [[ -e "$PENDING_FILE" || -L "$PENDING_FILE" \
+      || -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]] || {
+    echo "FATAL: transient exit 75 retained neither recovery pointer; loop stopped" >&2
     exit 1
   }
   echo "LOOP_TEMPFAIL kind=$child_kind status=75 retry_in=${TRANSIENT_RETRY_DELAY_SECS}s"

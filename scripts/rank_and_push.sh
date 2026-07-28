@@ -47,6 +47,9 @@
 # floor_tstat 2.0, top_n 200.
 #
 # Continuous production execution is owned by scripts/rank_and_push_loop.sh.
+# A zero-argument run persists its logical run directory before activation. A
+# pre-publication retry reuses that directory and therefore the same audited
+# activation batch; a pending exact publication request takes precedence.
 # Do not run a cron/timer copy alongside that supervisor.
 #
 # Requirements on the box:
@@ -132,6 +135,8 @@ BOOTSTRAP_CONFIG=""               # optional BootstrapConfig TOML positional for
 PE_BOOTSTRAP_BIN="target/release/pe-bootstrap"
 RESUME_PENDING="0"                # internal supervisor recovery path; never starts a new cohort
 PENDING_FILE="data/eval-results/rank_and_push.pending"
+CYCLE_FILE="data/eval-results/rank_and_push.cycle"
+PRODUCTION_CYCLE="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -173,10 +178,18 @@ done
 
 [[ -f .env ]] || { echo "FATAL: .env not found (need SUPABASE_URL + SUPABASE_SECRET_KEY)" >&2; exit 2; }
 
+# A direct zero-argument production invocation must honor the exact publication
+# recovery request just like the supervisor. Never rebuild the same cycle while
+# an already-materialized request is pending.
+if [[ "$INVOCATION_ARGC" -eq 0 && ( -e "$PENDING_FILE" || -L "$PENDING_FILE" ) ]]; then
+  RESUME_PENDING="1"
+  echo "RANK_AND_PUSH_AUTO_RESUME_PENDING=$PENDING_FILE"
+fi
+
 # The internal recovery path accepts no other flags and follows only an atomically-written
 # production pointer. Resolve + validate it before creating any output or taking the run lock.
 if [[ "$RESUME_PENDING" == "1" ]]; then
-  if [[ "$INVOCATION_ARGC" -ne 1 ]]; then
+  if [[ "$INVOCATION_ARGC" -ne 0 && "$INVOCATION_ARGC" -ne 1 ]]; then
     echo "FATAL: --resume-pending cannot be combined with other arguments" >&2
     exit 2
   fi
@@ -213,9 +226,8 @@ if [[ "$RESUME_PENDING" == "1" ]]; then
   SKIP_RANK="1"
   SKIP_EXPORT="1"
   echo "RANK_AND_PUSH_RESUME_REQUEST=$PENDING_REQUEST"
-elif [[ -z "$OUT_DIR" ]]; then
-  # Zero-arg production cycle: no caller-supplied flags or output path required.
-  OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
+elif [[ "$INVOCATION_ARGC" -eq 0 ]]; then
+  PRODUCTION_CYCLE="1"
 fi
 
 # Load secrets up front so EVERY stage (incl. the push + verify, which read SUPABASE_URL /
@@ -319,6 +331,18 @@ else
   echo "Python runtime: $PYTHON_BIN (dependency preflight ok)"
 fi
 
+# Fail before the run lock, logical-cycle directory, or pointer when this
+# invocation will need the Rust cache mutator. A pure research re-push can still
+# omit the binary because every bootstrap stage is skipped.
+if [[ "$SKIP_DISCOVERY" == "0" || "$SKIP_BACKFILL" == "0" \
+      || ( "$SKIP_PURGE" == "0" && "$SKIP_RANK" == "0" ) \
+      || ( "$SKIP_PURGE" == "0" && "$RESUME_PENDING" == "1" ) ]]; then
+  [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
+    echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
+    exit 2
+  }
+fi
+
 # ── Single-run lock (PID-based) ──────────────────────────────────────────────────────────
 # A full run (≈496K wallets, 30–90 min) must never overlap the next cron tick. A live holder
 # aborts the new run; a stale lock from a crashed run (PID not alive) is reclaimed. The trap
@@ -334,7 +358,65 @@ if [[ -e "$LOCK_FILE" ]]; then
   echo "WARN: reclaiming stale lock (PID ${LOCK_PID:-unknown} not alive)." >&2
 fi
 echo "$$" > "$LOCK_FILE"
-trap 'rm -f "$LOCK_FILE"' EXIT
+CYCLE_TMP=""
+cleanup_rank_and_push() {
+  rm -f "$LOCK_FILE"
+  if [[ -n "$CYCLE_TMP" ]]; then
+    rm -f "$CYCLE_TMP"
+  fi
+}
+trap cleanup_rank_and_push EXIT
+
+validate_cycle_pointer() {
+  [[ -f "$CYCLE_FILE" && ! -L "$CYCLE_FILE" ]] || {
+    echo "FATAL: cycle pointer is missing or not a regular file: $CYCLE_FILE" >&2
+    return 2
+  }
+  local -a cycle_lines=()
+  mapfile -t cycle_lines < "$CYCLE_FILE"
+  if [[ "${#cycle_lines[@]}" -ne 1 || -z "${cycle_lines[0]}" ]]; then
+    echo "FATAL: $CYCLE_FILE must contain exactly one non-empty run directory" >&2
+    return 2
+  fi
+  local cycle_dir="${cycle_lines[0]}"
+  if [[ ! "$cycle_dir" =~ ^data/eval-results/cron-[0-9]{8}T[0-9]{6}Z$ ]]; then
+    echo "FATAL: cycle pointer must name one repository-relative production cron directory" >&2
+    return 2
+  fi
+  local cycle_real
+  cycle_real="$(readlink -f -- "$cycle_dir" 2>/dev/null || true)"
+  local repo_real
+  repo_real="$(pwd -P)"
+  case "$cycle_real" in
+    "$repo_real"/data/eval-results/cron-*) ;;
+    *)
+      echo "FATAL: cycle pointer escaped the production cron directory" >&2
+      return 2
+      ;;
+  esac
+  [[ -d "$cycle_real" && ! -L "$cycle_dir" ]] || {
+    echo "FATAL: cycle run directory is missing or not a real directory: $cycle_dir" >&2
+    return 2
+  }
+  printf '%s' "$cycle_dir"
+}
+
+if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
+  if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
+    OUT_DIR="$(validate_cycle_pointer)" || exit $?
+    echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
+  else
+    OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$OUT_DIR"
+    CYCLE_TMP="${CYCLE_FILE}.tmp.$$"
+    printf '%s\n' "$OUT_DIR" > "$CYCLE_TMP"
+    mv -f -- "$CYCLE_TMP" "$CYCLE_FILE"
+    CYCLE_TMP=""
+    echo "RANK_AND_PUSH_CYCLE_CREATED=$OUT_DIR"
+  fi
+elif [[ -z "$OUT_DIR" ]]; then
+  OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 
 mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
@@ -640,19 +722,46 @@ esac
 # Compare-and-clear: never erase a different/newer recovery request. The request JSON
 # remains in the run directory as publication audit evidence; only the singleton pointer
 # is consumed after the same run's publish, purge, and checkpoint tail finishes.
-if [[ -f "$PENDING_FILE" && ! -L "$PENDING_FILE" ]]; then
-  mapfile -t COMPLETED_PENDING_LINES < "$PENDING_FILE"
-  if [[ "${#COMPLETED_PENDING_LINES[@]}" -eq 1 && -n "${COMPLETED_PENDING_LINES[0]}" ]]; then
-    COMPLETED_PENDING_REAL="$(readlink -f -- "${COMPLETED_PENDING_LINES[0]}" 2>/dev/null || true)"
-    REQUEST_REAL="$(readlink -f -- "$PUBLISH_REQUEST_FILE" 2>/dev/null || true)"
-    if [[ -n "$REQUEST_REAL" && "$COMPLETED_PENDING_REAL" == "$REQUEST_REAL" ]]; then
-      rm -f "$PENDING_FILE"
-      echo "   [recovery] cleared completed pending publication pointer"
+if [[ -e "$PENDING_FILE" || -L "$PENDING_FILE" ]]; then
+  if [[ -f "$PENDING_FILE" && ! -L "$PENDING_FILE" ]]; then
+    mapfile -t COMPLETED_PENDING_LINES < "$PENDING_FILE"
+    if [[ "${#COMPLETED_PENDING_LINES[@]}" -eq 1 && -n "${COMPLETED_PENDING_LINES[0]}" ]]; then
+      COMPLETED_PENDING_REAL="$(readlink -f -- "${COMPLETED_PENDING_LINES[0]}" 2>/dev/null || true)"
+      REQUEST_REAL="$(readlink -f -- "$PUBLISH_REQUEST_FILE" 2>/dev/null || true)"
+      if [[ -n "$REQUEST_REAL" && "$COMPLETED_PENDING_REAL" == "$REQUEST_REAL" ]]; then
+        rm -f "$PENDING_FILE"
+        echo "   [recovery] cleared completed pending publication pointer"
+      else
+        echo "   [recovery] WARN pending pointer changed; leaving it intact" >&2
+      fi
     else
-      echo "   [recovery] WARN pending pointer changed; leaving it intact" >&2
+      echo "   [recovery] WARN malformed pending pointer; leaving it intact" >&2
     fi
   else
-    echo "   [recovery] WARN malformed pending pointer; leaving it intact" >&2
+    echo "   [recovery] WARN unsafe pending pointer; leaving it intact" >&2
+  fi
+fi
+
+# Compare-and-clear the broader logical-cycle pointer only after publication and
+# the maintenance tail have completed. A changed/malformed pointer is evidence
+# for another operator action and must never be erased.
+if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
+  if [[ -f "$CYCLE_FILE" && ! -L "$CYCLE_FILE" ]]; then
+    mapfile -t COMPLETED_CYCLE_LINES < "$CYCLE_FILE"
+    if [[ "${#COMPLETED_CYCLE_LINES[@]}" -eq 1 && -n "${COMPLETED_CYCLE_LINES[0]}" ]]; then
+      COMPLETED_CYCLE_REAL="$(readlink -f -- "${COMPLETED_CYCLE_LINES[0]}" 2>/dev/null || true)"
+      OUT_DIR_REAL="$(readlink -f -- "$OUT_DIR" 2>/dev/null || true)"
+      if [[ -n "$OUT_DIR_REAL" && "$COMPLETED_CYCLE_REAL" == "$OUT_DIR_REAL" ]]; then
+        rm -f "$CYCLE_FILE"
+        echo "   [recovery] cleared completed logical-cycle pointer"
+      else
+        echo "   [recovery] WARN cycle pointer changed; leaving it intact" >&2
+      fi
+    else
+      echo "   [recovery] WARN malformed cycle pointer; leaving it intact" >&2
+    fi
+  else
+    echo "   [recovery] WARN unsafe cycle pointer; leaving it intact" >&2
   fi
 fi
 echo "✓ rank_and_push complete — Supabase published; final cache maintenance attempted."

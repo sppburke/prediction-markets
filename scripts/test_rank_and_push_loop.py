@@ -58,12 +58,34 @@ class RankAndPushLoopScenario(unittest.TestCase):
             "  fail) exit 7 ;;\n"
             "  transient)\n"
             "    if [[ \"$#\" -eq 0 ]]; then\n"
+            "      mkdir -p data/eval-results/cron-test\n"
+            "      printf 'data/eval-results/cron-test\\n' "
+            "> data/eval-results/rank_and_push.cycle\n"
             "      printf 'data/eval-results/cron-test/ranking_publish_request.json\\n' "
             "> data/eval-results/rank_and_push.pending\n"
             "      exit 75\n"
             "    fi\n"
             "    rm -f data/eval-results/rank_and_push.pending\n"
+            "    rm -f data/eval-results/rank_and_push.cycle\n"
             "    printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
+            "    ;;\n"
+            "  transient_cycle)\n"
+            "    if [[ ! -e cycle_attempted ]]; then\n"
+            "      : > cycle_attempted\n"
+            "      mkdir -p data/eval-results/cron-test\n"
+            "      printf 'data/eval-results/cron-test\\n' "
+            "> data/eval-results/rank_and_push.cycle\n"
+            "      exit 75\n"
+            "    fi\n"
+            "    rm -f data/eval-results/rank_and_push.cycle\n"
+            "    printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
+            "    ;;\n"
+            "  transient_cycle_stop)\n"
+            "    mkdir -p data/eval-results/cron-test\n"
+            "    printf 'data/eval-results/cron-test\\n' "
+            "> data/eval-results/rank_and_push.cycle\n"
+            "    printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
+            "    exit 75\n"
             "    ;;\n"
             "  transient_stop)\n"
             "    printf 'data/eval-results/cron-test/ranking_publish_request.json\\n' "
@@ -131,6 +153,19 @@ class RankAndPushLoopScenario(unittest.TestCase):
         self.assertEqual(failed.returncode, 7)
         self.assertEqual(failed.stdout.count("LOOP_CYCLE_START"), 1)
 
+    def test_permanent_cycle_failure_stops_and_preserves_pointer(self):
+        cycle_dir = self.root / "data" / "eval-results" / "cron-test"
+        cycle_dir.mkdir()
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        cycle.write_text(f"{cycle_dir.relative_to(self.root)}\n")
+        self.flag.write_text("run\n")
+
+        failed = self._run(mode="fail")
+
+        self.assertEqual(failed.returncode, 7)
+        self.assertIn("rank-and-push cycle-resume exited 7", failed.stderr)
+        self.assertEqual(cycle.read_text().strip(), str(cycle_dir.relative_to(self.root)))
+
     def test_transient_failure_resumes_pending_without_second_full_cycle(self):
         self.flag.write_text("run\n")
         recovered = self._run(mode="transient")
@@ -142,8 +177,19 @@ class RankAndPushLoopScenario(unittest.TestCase):
         )
         self.assertEqual(recovered.stdout.count("LOOP_CYCLE_START"), 1)
         self.assertIn("LOOP_TEMPFAIL kind=cycle status=75", recovered.stdout)
-        self.assertIn("LOOP_RESUME_START", recovered.stdout)
-        self.assertIn("LOOP_RESUME_END", recovered.stdout)
+        self.assertIn("LOOP_RESUME_START kind=publication", recovered.stdout)
+        self.assertIn("LOOP_RESUME_END kind=publication-resume", recovered.stdout)
+
+    def test_transient_cycle_failure_retries_same_cycle_with_zero_arguments(self):
+        self.flag.write_text("run\n")
+        recovered = self._run(mode="transient_cycle")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual((self.root / "child_argc").read_text().splitlines(), ["0", "0"])
+        self.assertEqual((self.root / "child_args").read_text().splitlines(), ["", ""])
+        self.assertEqual(recovered.stdout.count("LOOP_CYCLE_START"), 1)
+        self.assertIn("LOOP_TEMPFAIL kind=cycle status=75", recovered.stdout)
+        self.assertIn("LOOP_RESUME_START kind=cycle", recovered.stdout)
+        self.assertIn("LOOP_RESUME_END kind=cycle-resume", recovered.stdout)
 
     def test_stop_flag_during_transient_delay_prevents_resume(self):
         self.flag.write_text("run\n")
@@ -154,6 +200,17 @@ class RankAndPushLoopScenario(unittest.TestCase):
         self.assertTrue(
             (self.root / "data" / "eval-results" / "rank_and_push.pending").exists(),
             "operator stop must preserve the resumable request",
+        )
+
+    def test_stop_flag_during_cycle_retry_preserves_cycle_pointer(self):
+        self.flag.write_text("run\n")
+        stopped = self._run(mode="transient_cycle_stop")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual((self.root / "child_argc").read_text().splitlines(), ["0"])
+        self.assertIn("reason=flag_stop_during_retry", stopped.stdout)
+        self.assertTrue(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
+            "operator stop must preserve the logical-cycle pointer",
         )
 
     def test_singleton_preserves_pid_and_term_kills_resistant_child_group(self):
