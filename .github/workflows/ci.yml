@@ -95,6 +95,7 @@ jobs:
           python3 scripts/test_rank_72hr_consolidated.py
           python3 scripts/test_clob_reconciliation.py
           python3 scripts/test_rank_and_push.py
+          python3 scripts/test_rank_and_push_loop.py
           python3 scripts/test_ranker_duck_parity.py
           python3 scripts/test_probe_gamma_ua.py
           python3 scripts/test_ranker_interfaces.py
@@ -131,3 +132,8 @@ jobs:
         env:
           PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: cargo nextest run -p pe-service --features scenario pg_parity
+
+      - name: Ranking publication RPC idempotency + rollback test
+        env:
+          PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: python3 scripts/test_ranking_publish_rpc.py

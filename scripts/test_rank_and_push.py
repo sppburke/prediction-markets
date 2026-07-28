@@ -2,11 +2,10 @@
 """Use-case + regression guard for the cron-ready `scripts/rank_and_push.sh` wrapper
 (issue #370 PR2).
 
-The wrapper orchestrates a 30–90 min pipeline over a 162 GB cache and live APIs, so it
+The wrapper orchestrates a long-running pipeline over a large cache and live APIs, so it
 cannot be run for real in CI. This test instead stands up a fully *stubbed* repo root —
-a fake `target/release/pe-bootstrap`, fake pass-1/pass-2/push Python scripts, and a
-localhost HTTP stub for the Supabase verify — and drives the real wrapper against it. No
-network (localhost only), no real DB, deterministic.
+a fake `target/release/pe-bootstrap` plus fake pass-1/pass-2/push Python scripts — and
+drives the real wrapper against it. No network, no real data, deterministic.
 
 What it locks (the things that would silently break cron if wired wrong):
   - default universe source is `--universe-from-trades`, never `--universe ""` (the ranker
@@ -158,12 +157,24 @@ class RankAndPushScenario(unittest.TestCase):
             "os.makedirs(out, exist_ok=True)\n"
             'open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n',
         )
-        # Fake push: log argv, succeed (no real Supabase write).
+        # Fake push: log argv, emulate durable request/pending writes, and optionally
+        # return the requested status (including EX_TEMPFAIL=75).
         _write_exec(
             self.root / "scripts" / "push_ranking_to_supabase.py",
             "#!/usr/bin/env python3\n"
-            "import sys\n"
-            'open("push.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n',
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "a = sys.argv[1:]\n"
+            'open("push.log", "a").write(" ".join(a) + "\\n")\n'
+            'if "--request-file" in a:\n'
+            '    request = Path(a[a.index("--request-file") + 1])\n'
+            '    request.parent.mkdir(parents=True, exist_ok=True)\n'
+            '    request.write_text("{}\\n")\n'
+            'if "--pending-file" in a:\n'
+            '    pending = Path(a[a.index("--pending-file") + 1])\n'
+            '    pending.parent.mkdir(parents=True, exist_ok=True)\n'
+            '    pending.write_text(str(request) + "\\n")\n'
+            'raise SystemExit(int(os.environ.get("STUB_PUSH_EXIT", "0")))\n',
         )
 
     def tearDown(self):
@@ -493,6 +504,76 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNone(self._log("rank.log"), "ranking ran during a pure re-push")
         self.assertIsNotNone(self._log("push.log"), "re-push did not push")
         print("PASS: --skip-discovery --skip-backfill --skip-rank → re-push only")
+
+    def test_transient_push_retains_request_and_resume_runs_only_tail(self):
+        first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        pending = self.root / "data" / "eval-results" / "rank_and_push.pending"
+        self.assertTrue(pending.is_file(), "transient push did not retain pending pointer")
+        request = self.root / pending.read_text().strip()
+        self.assertTrue(request.is_file(), "pending pointer target was not persisted first")
+
+        boot_before = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertEqual(sum(line.startswith("activate-next") for line in boot_before), 1)
+        self.assertFalse(
+            any(line.startswith("purge ") or line == "purge" for line in boot_before),
+            "post-publish purge ran after a failed push",
+        )
+
+        resumed = self._run("--resume-pending")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        boot_after = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertEqual(
+            sum(line.startswith("activate-next") for line in boot_after),
+            1,
+            "resume activated a second wallet cohort",
+        )
+        self.assertEqual(
+            sum(line.startswith("backfill") for line in boot_after),
+            1,
+            "resume reran the expensive refresh",
+        )
+        self.assertEqual(
+            sum(line.startswith("purge") and not line.startswith("purge-infra")
+                for line in boot_after),
+            1,
+            "resume did not finish the original purge tail exactly once",
+        )
+        self.assertEqual(len((self._log("rank.log") or "").splitlines()), 1)
+        self.assertIn("--resume-request", (self._log("push.log") or "").splitlines()[-1])
+        self.assertFalse(pending.exists(), "completed tail did not clear its pending pointer")
+        print("PASS: transient push resume replays request + purge/checkpoint, no activation/rank")
+
+    def test_successful_zero_arg_cycle_clears_its_pending_pointer(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.pending").exists()
+        )
+        self.assertIn("[recovery] cleared completed pending", result.stdout)
+
+    def test_parameterized_research_run_never_owns_production_pending_pointer(self):
+        result = self._run("--skip-purge")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        push = self._log("push.log") or ""
+        self.assertIn("--request-file", push)
+        self.assertNotIn("--pending-file", push)
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.pending").exists()
+        )
+
+    def test_resume_rejects_pointer_outside_production_cron_directory(self):
+        request = self.root / "outside.json"
+        request.write_text("{}\n")
+        pending = self.root / "data" / "eval-results" / "rank_and_push.pending"
+        pending.write_text("outside.json\n")
+        result = self._run("--resume-pending")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("escaped the production cron directory", result.stderr)
+        self.assertIsNone(self._log("pe_bootstrap.log"))
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / ".rank_and_push.lock").exists()
+        )
 
     def test_default_half_life_threaded_to_both_passes(self):
         r = self._run()

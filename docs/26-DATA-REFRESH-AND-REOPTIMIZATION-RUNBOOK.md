@@ -187,8 +187,10 @@ before the ranker snapshot (and write a durable, non-liftable infra exclusion).
 separate `schedules` stage is needed (#383). **Stage 1** ranks the full trade
 universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
-there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** push
-to Supabase and verify `latest_ranking` is populated; **Stage 4** purge proven-loser
+there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** record
+the exact publication request, atomically publish it through the idempotent
+`publish_ranking_batch` RPC, and verify that exact batch is `latest_ranking`; **Stage 4**
+purge proven-loser
 and dead-weight wallets when armed; **Stage 5** run
 `PRAGMA wal_checkpoint(TRUNCATE)` against the local cache so committed WAL pages are
 checkpointed and the WAL file releases its disk footprint. The checkpoint is always
@@ -261,13 +263,29 @@ kill -TERM "$(tr -cd '0-9' < data/eval-results/.rank_and_push_loop.lock)"
 
 After an immediate stop, verify no loop, wrapper, bootstrap, or ranking Python
 descendant remains; neither `.rank_and_push.lock` nor the cache mutation lock is
-held; and SQLite opens/read-checks cleanly. A nonzero child exit stops the loop
-instead of retry-spinning. Rollback writes `stop`, waits for termination, and
-restores the backed-up prior scheduler only if one existed.
+held; and SQLite opens/read-checks cleanly. A permanent nonzero child exit stops
+the loop. Exit 75 is reserved for exhausted transient Supabase failures: the
+loop retains the exact request, waits 60 seconds while checking the run flag
+once per second, and invokes the internal recovery path. Recovery does not run
+discovery, activate another 20,000-wallet cohort, backfill, export, or rank. It
+replays the same content-addressed RPC request, then completes the interrupted
+run's purge/checkpoint tail before the next zero-argument cycle. Rollback writes
+`stop`, waits for termination, and restores the backed-up prior scheduler only
+if one existed.
 
 Each cycle logs `LOOP_CYCLE_START`, the child PID/process-group ID, the one-shot
 `RANK_AND_PUSH_RUN_DIR=...` handoff, and `LOOP_CYCLE_END` with exit status. The
-distinct supervisor lock prevents two loops from racing at a cycle boundary.
+recovery path additionally logs `LOOP_TEMPFAIL`, `LOOP_RESUME_START`, and
+`LOOP_RESUME_END`. The distinct supervisor lock prevents two loops from racing
+at a cycle boundary.
+
+Before first deployment, apply `scripts/supabase_schema.sql` before updating the
+Forge checkout. The additive `ranking_batches.publish_key` column and unique
+index preserve historical batches whose key is null. The service-role-only
+`publish_ranking_batch` RPC creates/reuses the keyed batch and inserts all entries
+inside one PostgreSQL transaction, so a failed request exposes neither a partial
+epoch nor a duplicate epoch. If code rollback is required, stop the loop and
+restore the prior checkout; the additive schema can remain in place.
 
 The final checkpoint remains inside that lock and starts only after every pipeline DB
 writer has exited. It checkpoints committed data rather than deleting rows; its storage
@@ -295,10 +313,16 @@ not run28-backed N choices.
 
 ## Output artifacts
 
-`rank_and_push.sh` writes each run's ranked CSVs under an auto-timestamped
-`data/eval-results/cron-<UTC>/` (override with `--out-dir`). Retire superseded
-artifacts to `data/archive/`; never delete eval outputs — they are the audit trail
-for what was published to `latest_ranking` and when.
+`rank_and_push.sh` writes each run's ranked CSVs and
+`ranking_publish_request.json` under an auto-timestamped
+`data/eval-results/cron-<UTC>/` (override with `--out-dir`). The request records
+the exact batch provenance, filtered entries, retention value, and content hash
+used for retry/audit. During an incomplete production publication,
+`data/eval-results/rank_and_push.pending` contains one repository-relative path
+to that request; it is compare-and-cleared only after publication verification
+and the same run's purge/checkpoint tail. Retire superseded artifacts to
+`data/archive/`; never delete eval outputs — they are the audit trail for what
+was published to `latest_ranking` and when.
 
 Each full cycle also writes `activated_wallets.csv`. Its rows are derived from
 the same run's durable SQLite activation batch; if CSV materialization fails,

@@ -1,33 +1,63 @@
 #!/usr/bin/env python3
-"""Push a latency-shifted wallet ranking (pass-2 output) to Supabase as one append-only
-EPOCH batch: insert a `ranking_batches` row (config + provenance), then the top-N
-`ranking_entries`. The VPS reads `latest_ranking` and runs the absolute-loss demotion
-test (project_copytrade_knockout_policy).
+"""Publish one latency-shifted wallet ranking to Supabase.
 
-REST-only (PostgREST) via the SUPABASE_SECRET_KEY in env — no DB driver, no committed
-secret. Idempotent batches are NOT enforced (append-only by design: every run = a new
-epoch). After a successful push the script prunes `ranking_batches` to the newest
-`--keep-batches` (default 180 ≈ 6 months; CASCADE drops their entries), bounding the
-append-only growth while retaining enough epochs for the wholesale-swap-at-frequency-X
-replay (#411). `--keep-batches 0` disables the prune.
+The exact request is durably recorded before the first network write. The
+``publish_ranking_batch`` RPC owns batch creation/reuse and entry insertion in
+one database transaction, so transient retries cannot expose a partial ranking
+or create duplicate epochs. The VPS reads ``latest_ranking`` and applies the
+absolute-loss demotion test.
+
+REST-only (PostgREST) via ``SUPABASE_SECRET_KEY``. After successful publication,
+old batch history is pruned to ``--keep-batches`` (0 disables pruning).
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+
+PUBLISH_REQUEST_VERSION = 1
+SUPABASE_MAX_RETRIES = 5
+SUPABASE_RETRY_BASE_SECS = 1
+SUPABASE_RETRY_MAX_SECS = 30
+TEMPFAIL_EXIT = 75
 
 
 class CacheStaleError(Exception):
     """The trade cache's newest trade is older than the staleness bound, i.e. the
     backfill-before-push contract (docs/26) was not honoured. Pushing anyway would
     filter out *every* wallet (none look "active"), so we abort instead."""
+
+
+class SupabaseRequestError(Exception):
+    """One classified Supabase HTTP/transport failure."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        retryable: bool,
+        status: int | None = None,
+        retry_after_secs: int | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.retryable = retryable
+        self.status = status
+        self.retry_after_secs = retry_after_secs
+
+
+class TransientRetriesExhausted(Exception):
+    """A retryable Supabase request exhausted its bounded retry budget."""
 
 
 def _newest_trade_unix(con: sqlite3.Connection) -> int | None:
@@ -90,7 +120,20 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
     return kept, len(rows) - len(kept), last
 
 
-def _req(method: str, url: str, key: str, body=None, prefer: str | None = None):
+def _retry_after_seconds(error: urllib.error.HTTPError) -> int | None:
+    if error.headers is None:
+        return None
+    raw = error.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return None
+    return max(0, parsed)
+
+
+def _request_once(method: str, url: str, key: str, body=None, prefer: str | None = None):
     data = json.dumps(body).encode() if body is not None else None
     headers = {
         "apikey": key,
@@ -100,9 +143,60 @@ def _req(method: str, url: str, key: str, body=None, prefer: str | None = None):
     if prefer:
         headers["Prefer"] = prefer
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        raw = r.read()
-        return r.status, (json.loads(raw) if raw else None)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read()
+            return response.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:300]
+        retryable = error.code in (408, 425, 429) or 500 <= error.code <= 599
+        raise SupabaseRequestError(
+            f"HTTP {error.code}: {detail}",
+            retryable=retryable,
+            status=error.code,
+            retry_after_secs=_retry_after_seconds(error),
+        ) from error
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise SupabaseRequestError(
+            f"{type(error).__name__}: {error}",
+            retryable=True,
+        ) from error
+
+
+def _req(
+    method: str,
+    url: str,
+    key: str,
+    body=None,
+    prefer: str | None = None,
+    *,
+    max_retries: int = SUPABASE_MAX_RETRIES,
+    sleep=time.sleep,
+):
+    """Run one idempotent request with bounded transient-only retry."""
+    for retry in range(max_retries + 1):
+        try:
+            return _request_once(method, url, key, body=body, prefer=prefer)
+        except SupabaseRequestError as error:
+            if not error.retryable:
+                raise
+            if retry == max_retries:
+                raise TransientRetriesExhausted(str(error)) from error
+            exponential = min(
+                SUPABASE_RETRY_BASE_SECS * (2**retry),
+                SUPABASE_RETRY_MAX_SECS,
+            )
+            delay = (
+                max(1, min(error.retry_after_secs, SUPABASE_RETRY_MAX_SECS))
+                if error.retry_after_secs is not None
+                else exponential
+            )
+            print(
+                f"WARNING: transient Supabase {method} failure; "
+                f"retry {retry + 1}/{max_retries} in {delay}s: {error}",
+                file=sys.stderr,
+            )
+            sleep(delay)
 
 
 def _num(r, k):
@@ -111,7 +205,7 @@ def _num(r, k):
     return float(v) if v not in ("", None) else None
 
 
-def build_entries(top, batch_id, last_trade_map):
+def build_entries(top, last_trade_map):
     """Build the `ranking_entries` rows for one batch.
 
     Each entry carries the wallet's real last-trade timestamp (#357) from ``last_trade_map``
@@ -121,7 +215,7 @@ def build_entries(top, batch_id, last_trade_map):
     entries = []
     for i, r in enumerate(top, start=1):
         entries.append({
-            "batch_id": batch_id, "rank": i, "wallet_hex": r["wallet"],
+            "rank": i, "wallet_hex": r["wallet"],
             "ls_edge": _num(r, "mean_net_ls"), "ls_tstat": _num(r, "tstat_net_ls"),
             "fill_rate": _num(r, "fill_rate"),
             "n_trades": int(float(r["n_filled"])) if r.get("n_filled") else None,
@@ -131,9 +225,134 @@ def build_entries(top, batch_id, last_trade_map):
     return entries
 
 
+def publication_key(batch: dict, entries: list[dict]) -> str:
+    """Content-address one immutable ranking publication."""
+    canonical = json.dumps(
+        {"batch": batch, "entries": entries},
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def build_publish_request(batch: dict, entries: list[dict], keep_batches: int) -> dict:
+    request = {
+        "version": PUBLISH_REQUEST_VERSION,
+        "batch": batch,
+        "entries": entries,
+        "keep_batches": keep_batches,
+    }
+    request["publish_key"] = publication_key(batch, entries)
+    validate_publish_request(request)
+    return request
+
+
+def validate_publish_request(request: dict) -> None:
+    """Reject incomplete or modified durable retry state before any network write."""
+    if request.get("version") != PUBLISH_REQUEST_VERSION:
+        raise ValueError(
+            f"unsupported publish request version: {request.get('version')!r}"
+        )
+    batch = request.get("batch")
+    entries = request.get("entries")
+    keep_batches = request.get("keep_batches")
+    if not isinstance(batch, dict):
+        raise ValueError("publish request batch must be an object")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("publish request entries must be a non-empty array")
+    if not isinstance(keep_batches, int) or keep_batches < 0:
+        raise ValueError("publish request keep_batches must be a non-negative integer")
+    expected_ranks = list(range(1, len(entries) + 1))
+    actual_ranks = [entry.get("rank") for entry in entries if isinstance(entry, dict)]
+    if len(actual_ranks) != len(entries) or actual_ranks != expected_ranks:
+        raise ValueError("publish request entry ranks must be contiguous from 1")
+    if any(not entry.get("wallet_hex") for entry in entries):
+        raise ValueError("publish request entries require wallet_hex")
+    expected_key = publication_key(batch, entries)
+    if request.get("publish_key") != expected_key:
+        raise ValueError("publish request content hash mismatch")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temporary:
+            temp_name = temporary.name
+            os.chmod(temp_name, 0o600)
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
+def save_publish_request(path: str, request: dict) -> None:
+    validate_publish_request(request)
+    rendered = json.dumps(
+        request,
+        allow_nan=False,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    _atomic_write_text(Path(path), rendered + "\n")
+
+
+def load_publish_request(path: str) -> dict:
+    with open(path, encoding="utf-8") as handle:
+        request = json.load(handle)
+    if not isinstance(request, dict):
+        raise ValueError("publish request root must be an object")
+    validate_publish_request(request)
+    return request
+
+
+def save_pending_pointer(path: str, request_path: str) -> None:
+    request = Path(request_path)
+    if not request.is_file():
+        raise ValueError(f"publish request is not a file: {request_path}")
+    try:
+        rendered = str(request.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError as error:
+        raise ValueError("publish request must be inside the repository") from error
+    _atomic_write_text(Path(path), rendered + "\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ranked-csv", required=True, help="pass-2 latency_shift_ranked.csv")
+    ap.add_argument("--ranked-csv", help="pass-2 latency_shift_ranked.csv")
+    ap.add_argument(
+        "--request-file",
+        help="atomically persist the exact publication request before network I/O",
+    )
+    ap.add_argument(
+        "--pending-file",
+        help="atomically point the production supervisor at --request-file",
+    )
+    ap.add_argument(
+        "--resume-request",
+        help="replay an existing validated publication request without rebuilding it",
+    )
+    ap.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="persist request/pending state without contacting Supabase",
+    )
     ap.add_argument("--top-n", type=int, default=200)
     ap.add_argument("--band-lo", type=float, default=0.15)
     ap.add_argument("--band-hi", type=float, default=0.85)
@@ -189,19 +408,13 @@ def prune_old_batches(url: str, key: str, keep: int) -> int | None:
     return cutoff
 
 
-def main() -> int:
-    a = build_parser().parse_args()
-    process_now = int(time.time())  # single time anchor: active filter + last-trade stamps
-
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SECRET_KEY")
-    if not url or not key:
-        print("FATAL: set SUPABASE_URL and SUPABASE_SECRET_KEY in env (.env)", file=sys.stderr)
-        return 1
-    url = url.rstrip("/")
+def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
+    if not a.ranked_csv:
+        raise ValueError("--ranked-csv is required unless --resume-request is used")
 
     # Read pass-2 ranking; keep survivors first, then by latency-shifted t-stat desc.
-    rows = list(csv.DictReader(open(a.ranked_csv, newline="")))
+    with open(a.ranked_csv, newline="", encoding="utf-8") as ranked_file:
+        rows = list(csv.DictReader(ranked_file))
     universe_count = len(rows)  # full ranked universe, recorded before the active filter
 
     # Active-only upload filter (issue #350 WS3): when a cache is provided, drop ranked
@@ -212,83 +425,154 @@ def main() -> int:
     # it with idle ones.
     last_trade_map: dict[str, int] = {}
     if a.db:
-        try:
-            rows, dropped, last_trade_map = filter_active_rows(
-                rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, process_now
-            )
-        except CacheStaleError as e:
-            print(f"FATAL: {e}", file=sys.stderr)
-            return 1
-        except (sqlite3.Error, OSError) as e:
-            print(f"FATAL: could not read cache {a.db!r}: {e}", file=sys.stderr)
-            return 1
+        rows, dropped, last_trade_map = filter_active_rows(
+            rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, process_now
+        )
         print(f"active-filter: dropped {dropped} wallet(s) idle > {a.active_window_hours}h "
               f"per {a.db}; {len(rows)} remain")
 
-    def key_fn(r):
-        t = r.get("tstat_net_ls", "")
-        return (r.get("survives", "").lower() == "true", float(t) if t not in ("", None) else -9.0)
+    def key_fn(row):
+        tstat = row.get("tstat_net_ls", "")
+        return (
+            row.get("survives", "").lower() == "true",
+            float(tstat) if tstat not in ("", None) else -9.0,
+        )
+
     rows.sort(key=key_fn, reverse=True)
     top = rows[: a.top_n]
     if not top:
-        print("FATAL: no rows to push (empty CSV, or the active filter removed all)",
-              file=sys.stderr)
-        return 1
+        raise ValueError("no rows to push (empty CSV, or the active filter removed all)")
 
     batch = {
         "git_sha": a.git_sha or None,
-        "band_lo": a.band_lo, "band_hi": a.band_hi,
-        "ttr_floor_secs": a.ttr_floor_secs, "ttr_max_secs": a.ttr_max_secs,
+        "band_lo": a.band_lo,
+        "band_hi": a.band_hi,
+        "ttr_floor_secs": a.ttr_floor_secs,
+        "ttr_max_secs": a.ttr_max_secs,
         "latency_shift_secs": a.latency_shift_secs,
         "universe_size": a.universe_size or universe_count,
         "notes": a.notes or None,
     }
-    try:
-        st, rep = _req("POST", f"{url}/rest/v1/ranking_batches", key, body=batch,
-                       prefer="return=representation")
-    except (urllib.error.URLError, OSError) as e:
-        detail = e.read().decode()[:300] if isinstance(e, urllib.error.HTTPError) else str(e)
-        print(f"FATAL: batch insert failed: {detail}", file=sys.stderr)
-        return 1
-    batch_id = rep[0]["batch_id"]
-    print(f"created batch_id={batch_id} ({st})")
+    entries = build_entries(top, last_trade_map)
+    return build_publish_request(batch, entries, a.keep_batches)
 
-    entries = build_entries(top, batch_id, last_trade_map)
-    # PostgREST accepts a JSON array for bulk insert; chunk to stay under limits.
-    CHUNK = 500
-    try:
-        for j in range(0, len(entries), CHUNK):
-            _req("POST", f"{url}/rest/v1/ranking_entries", key, body=entries[j:j + CHUNK],
-                 prefer="return=minimal")
-    except (urllib.error.URLError, OSError) as e:
-        # HTTPError carries a body; URLError/OSError (incl. ConnectionReset mid-read) don't.
-        detail = e.read().decode()[:300] if isinstance(e, urllib.error.HTTPError) else str(e)
-        print(f"FATAL: entries insert failed: {detail}; deleting orphaned batch {batch_id}",
-              file=sys.stderr)
-        try:
-            _req("DELETE", f"{url}/rest/v1/ranking_batches?batch_id=eq.{batch_id}", key,
-                 prefer="return=minimal")
-        except (urllib.error.URLError, OSError):
-            print(f"WARNING: could not delete orphaned batch {batch_id} — clean up manually",
-                  file=sys.stderr)
-        return 1
-    print(f"inserted {len(entries)} entries into batch {batch_id}")
 
-    # Bound the append-only ranking_batches history (#411): keep the newest N, CASCADE drops
-    # their entries. Best-effort — the push already succeeded, so ANY prune failure (transport,
-    # PostgREST error, or a malformed response) only warns (with HTTP status + body when
-    # available) and never fails the run; growth stays bounded and self-heals on the next push.
+def _batch_id_from_rpc_response(response) -> int:
+    if isinstance(response, int) and not isinstance(response, bool):
+        return response
+    if isinstance(response, str) and response.isdigit():
+        return int(response)
+    raise ValueError(f"publish_ranking_batch returned invalid batch id: {response!r}")
+
+
+def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
+    validate_publish_request(request)
+    _, response = _req(
+        "POST",
+        f"{url}/rest/v1/rpc/publish_ranking_batch",
+        key,
+        body={
+            "p_publish_key": request["publish_key"],
+            "p_batch": request["batch"],
+            "p_entries": request["entries"],
+        },
+    )
+    batch_id = _batch_id_from_rpc_response(response)
+    entries = request["entries"]
+    print(
+        f"published batch_id={batch_id} entries={len(entries)} "
+        f"publish_key={request['publish_key'][:16]}"
+    )
+
+    # Verify the exact committed epoch, not merely that an older ranking exists.
+    _, latest = _req(
+        "GET",
+        f"{url}/rest/v1/latest_ranking"
+        f"?select=batch_id,rank&order=rank.asc&limit={len(entries)}",
+        key,
+    )
+    expected_ranks = list(range(1, len(entries) + 1))
+    if (
+        not isinstance(latest, list)
+        or [row.get("rank") for row in latest if isinstance(row, dict)] != expected_ranks
+        or any(row.get("batch_id") != batch_id for row in latest if isinstance(row, dict))
+    ):
+        raise ValueError(
+            f"latest_ranking did not expose exact batch {batch_id} "
+            f"with ranks 1..{len(entries)}"
+        )
+    print(f"latest_ranking rows: {len(latest)} (batch_id={batch_id})")
+
+    # Bound the append-only ranking_batches history (#411). Best-effort — the atomic
+    # publication and exact verification already succeeded, so cleanup self-heals later.
+    keep_batches = request["keep_batches"]
     try:
-        cutoff = prune_old_batches(url, key, a.keep_batches)
+        cutoff = prune_old_batches(url, key, keep_batches)
         if cutoff is not None:
-            print(f"pruned ranking_batches with batch_id <= {cutoff} (kept newest {a.keep_batches})")
-    except Exception as e:  # noqa: BLE001 — best-effort cleanup must never fail a succeeded push
-        if isinstance(e, urllib.error.HTTPError):
-            detail = f"HTTP {e.code}: {e.read().decode()[:300]}"
+            print(
+                f"pruned ranking_batches with batch_id <= {cutoff} "
+                f"(kept newest {keep_batches})"
+            )
+    except Exception as error:  # noqa: BLE001 — post-publish cleanup is explicitly best-effort
+        print(
+            f"WARNING: ranking_batches prune failed "
+            f"({type(error).__name__}: {error}); history not trimmed this run — "
+            "bounded and self-heals on the next successful push",
+            file=sys.stderr,
+        )
+    return batch_id
+
+
+def main() -> int:
+    a = build_parser().parse_args()
+    process_now = int(time.time())  # single time anchor: active filter + last-trade stamps
+
+    try:
+        if a.resume_request:
+            if a.ranked_csv or a.request_file or a.pending_file or a.prepare_only:
+                raise ValueError(
+                    "--resume-request cannot be combined with ranking preparation arguments"
+                )
+            request = load_publish_request(a.resume_request)
         else:
-            detail = f"{type(e).__name__}: {e}"
-        print(f"WARNING: ranking_batches prune failed ({detail}); history not trimmed this "
-              f"run — bounded and self-heals on the next successful push", file=sys.stderr)
+            if a.pending_file and not a.request_file:
+                raise ValueError("--pending-file requires --request-file")
+            if a.prepare_only and not a.request_file:
+                raise ValueError("--prepare-only requires --request-file")
+            request = prepare_publish_request(a, process_now)
+            if a.request_file:
+                save_publish_request(a.request_file, request)
+                print(
+                    f"saved publish request: {a.request_file} "
+                    f"(publish_key={request['publish_key'][:16]})"
+                )
+            if a.pending_file:
+                save_pending_pointer(a.pending_file, a.request_file)
+                print(f"saved pending pointer: {a.pending_file}")
+            if a.prepare_only:
+                print("publish request prepared; network publication skipped")
+                return 0
+    except (CacheStaleError, json.JSONDecodeError, OSError, sqlite3.Error, ValueError) as error:
+        print(f"FATAL: could not prepare publication: {error}", file=sys.stderr)
+        return 1
+
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SECRET_KEY")
+    if not url or not key:
+        print("FATAL: set SUPABASE_URL and SUPABASE_SECRET_KEY in env (.env)", file=sys.stderr)
+        return 1
+
+    try:
+        publish_request_to_supabase(request, url.rstrip("/"), key)
+    except TransientRetriesExhausted as error:
+        print(
+            f"TEMPFAIL: transient Supabase retries exhausted: {error}",
+            file=sys.stderr,
+        )
+        return TEMPFAIL_EXIT
+    except (SupabaseRequestError, ValueError) as error:
+        print(f"FATAL: Supabase publication failed: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

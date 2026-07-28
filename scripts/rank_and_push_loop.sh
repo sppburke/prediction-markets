@@ -28,7 +28,9 @@ if ! setsid sh -c '"$1" -0 -- "-$$"' sh "$KILL_BIN"; then
 fi
 
 FLAG_FILE="data/eval-results/rank_and_push.loop"
+PENDING_FILE="data/eval-results/rank_and_push.pending"
 LOOP_LOCK_FILE="data/eval-results/.rank_and_push_loop.lock"
+TRANSIENT_RETRY_DELAY_SECS=60
 mkdir -p "$(dirname "$FLAG_FILE")"
 
 # Kernel-held singleton lock: stale process exits release it automatically. Open
@@ -113,24 +115,60 @@ while true; do
     run) ;;
   esac
 
-  cycle=$((cycle + 1))
-  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "LOOP_CYCLE_START cycle=$cycle utc=$started_at flag=$flag_value"
+  child_args=()
+  child_kind="cycle"
+  if [[ -e "$PENDING_FILE" ]]; then
+    child_kind="resume"
+    child_args+=(--resume-pending)
+    echo "LOOP_RESUME_START utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) pending=$PENDING_FILE"
+  else
+    cycle=$((cycle + 1))
+    started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "LOOP_CYCLE_START cycle=$cycle utc=$started_at flag=$flag_value"
+  fi
 
   # setsid makes the one-shot shell the leader of a dedicated process group.
   # Its machine-readable RANK_AND_PUSH_RUN_DIR line is inherited into this log.
-  setsid bash scripts/rank_and_push.sh &
+  setsid bash scripts/rank_and_push.sh "${child_args[@]}" &
   ACTIVE_CHILD_PID=$!
-  echo "LOOP_CHILD cycle=$cycle pid=$ACTIVE_CHILD_PID pgid=$ACTIVE_CHILD_PID"
+  echo "LOOP_CHILD kind=$child_kind cycle=$cycle pid=$ACTIVE_CHILD_PID pgid=$ACTIVE_CHILD_PID"
 
   child_status=0
   wait "$ACTIVE_CHILD_PID" || child_status=$?
   ACTIVE_CHILD_PID=""
   ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "LOOP_CYCLE_END cycle=$cycle utc=$ended_at status=$child_status"
+  if [[ "$child_kind" == "resume" ]]; then
+    echo "LOOP_RESUME_END utc=$ended_at status=$child_status"
+  else
+    echo "LOOP_CYCLE_END cycle=$cycle utc=$ended_at status=$child_status"
+  fi
 
-  if [[ "$child_status" -ne 0 ]]; then
-    echo "FATAL: rank-and-push cycle $cycle exited $child_status; loop stopped" >&2
+  if [[ "$child_status" -eq 0 ]]; then
+    continue
+  fi
+  if [[ "$child_status" -ne 75 ]]; then
+    echo "FATAL: rank-and-push $child_kind exited $child_status; loop stopped" >&2
     exit "$child_status"
   fi
+
+  [[ -e "$PENDING_FILE" ]] || {
+    echo "FATAL: transient exit 75 did not retain $PENDING_FILE; loop stopped" >&2
+    exit 1
+  }
+  echo "LOOP_TEMPFAIL kind=$child_kind status=75 retry_in=${TRANSIENT_RETRY_DELAY_SECS}s"
+  for ((waited = 0; waited < TRANSIENT_RETRY_DELAY_SECS; waited++)); do
+    flag_value="$(read_flag)" || exit $?
+    case "$flag_value" in
+      missing)
+        echo "LOOP_STOP reason=flag_missing_during_retry"
+        exit 0
+        ;;
+      stop)
+        echo "LOOP_STOP reason=flag_stop_during_retry"
+        exit 0
+        ;;
+      run) ;;
+    esac
+    sleep 1
+  done
 done
