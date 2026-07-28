@@ -85,6 +85,7 @@
 | https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-07-17 | 2026-09-15 |
 | https://clob.polymarket.com/markets?closed=true | 2026-06-20 | 2026-08-19 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
 | https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
@@ -167,6 +168,11 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-07-28: Re-verified the official Gamma `GET /events` reference for issue #506. It continues
+  to expose offset/limit pagination and embedded `markets[]` rows carrying `conditionId` and
+  `clobTokenIds`, matching the existing `pe-bootstrap events` parser. This pass changes retry and
+  recovery behavior only; it does not change the endpoint or parsed payload contract.
 
 - 2026-07-20: Re-verified the official geoblock reference. It classifies IE, JP, MT, and NL as
   close-only on the frontend and explicitly says the API is not restricted for those jurisdictions.

@@ -263,21 +263,68 @@ kill -TERM "$(tr -cd '0-9' < data/eval-results/.rank_and_push_loop.lock)"
 
 After an immediate stop, verify no loop, wrapper, bootstrap, or ranking Python
 descendant remains; neither `.rank_and_push.lock` nor the cache mutation lock is
-held; and SQLite opens/read-checks cleanly. A permanent nonzero child exit stops
-the loop. Exit 75 is reserved for exhausted transient Supabase failures: the
-loop retains the exact request, waits 60 seconds while checking the run flag
-once per second, and invokes the internal recovery path. Recovery does not run
-discovery, activate another 20,000-wallet cohort, backfill, export, or rank. It
-replays the same content-addressed RPC request, then completes the interrupted
-run's purge/checkpoint tail before the next zero-argument cycle. Rollback writes
-`stop`, waits for termination, and restores the backed-up prior scheduler only
-if one existed.
+held; and SQLite opens/read-checks cleanly.
+
+Each zero-argument one-shot creates its run directory, then atomically writes
+`data/eval-results/rank_and_push.cycle` after dependency preflight and run-lock
+acquisition but before discovery, activation, or any other cache mutation. The
+directory deterministically owns that cycle's activation batch ID. A direct
+zero-argument invocation and the supervisor both honor an existing recovery
+pointer rather than allocating a new run.
+
+Exit 75 means a bounded transient operation exhausted its in-process retries.
+The loop waits 60 seconds while checking the run flag once per second, then:
+
+- If `rank_and_push.pending` exists, it takes precedence. Recovery replays the
+  same content-addressed Supabase request and completes only that run's
+  purge/checkpoint tail; it does not rediscover, activate, backfill, export, or
+  rank.
+- Otherwise, if `rank_and_push.cycle` exists, the loop invokes the normal
+  zero-argument command. The one-shot reuses the pointed run directory and
+  deterministic activation batch, so retrying discovery, activation, backfill,
+  events, or ranking cannot admit another 20,000-wallet cohort.
+- Exit 75 without either pointer is fatal. Any nonzero code other than 75 is a
+  permanent failure and stops the loop with the applicable pointer retained for
+  diagnosis and an operator-directed retry.
+
+Both pointers are regular, non-symlink, one-line repository-relative paths and
+are validated beneath `data/eval-results/cron-<UTC>/`. Successful completion
+compare-and-clears only a pointer that still names the run being completed. If
+the pointer changed or became malformed, the wrapper warns and preserves it.
+Rollback writes `stop`, waits for termination, and restores the backed-up prior
+scheduler only if one existed.
+
+Inspect recovery state without changing it:
+
+```bash
+for pointer in \
+  data/eval-results/rank_and_push.pending \
+  data/eval-results/rank_and_push.cycle
+do
+  if [[ -L "$pointer" ]]; then
+    printf '%s\n' "$pointer: unsafe symlink"
+  elif [[ -f "$pointer" ]]; then
+    printf '%s: ' "$pointer"
+    sed -n '1,2p' "$pointer"
+  else
+    printf '%s\n' "$pointer: absent"
+  fi
+done
+```
+
+For a production cycle interrupted before this pointer contract was deployed,
+do not simply start a new zero-argument run. First prove from the old run log
+and SQLite audit that its `cron-<UTC>` directory maps to the already-committed
+activation batch, prove no pipeline process or lock is live, and prove no
+publication pointer conflicts. Only then atomically seed `rank_and_push.cycle`
+with that exact repository-relative directory and start the current supervisor.
+If any identity or liveness check is ambiguous, leave the loop stopped.
 
 Each cycle logs `LOOP_CYCLE_START`, the child PID/process-group ID, the one-shot
-`RANK_AND_PUSH_RUN_DIR=...` handoff, and `LOOP_CYCLE_END` with exit status. The
-recovery path additionally logs `LOOP_TEMPFAIL`, `LOOP_RESUME_START`, and
-`LOOP_RESUME_END`. The distinct supervisor lock prevents two loops from racing
-at a cycle boundary.
+`RANK_AND_PUSH_RUN_DIR=...` handoff, and `LOOP_CYCLE_END` with exit status.
+Recovery additionally logs `LOOP_TEMPFAIL`, `LOOP_RESUME_START`, and
+`LOOP_RESUME_END`, with `kind=publication-resume` or `kind=cycle-resume`.
+The distinct supervisor lock prevents two loops from racing at a cycle boundary.
 
 Before first deployment, apply `scripts/supabase_schema.sql` before updating the
 Forge checkout. The additive `ranking_batches.publish_key` column and unique
@@ -317,10 +364,14 @@ not run28-backed N choices.
 `ranking_publish_request.json` under an auto-timestamped
 `data/eval-results/cron-<UTC>/` (override with `--out-dir`). The request records
 the exact batch provenance, filtered entries, retention value, and content hash
-used for retry/audit. During an incomplete production publication,
+used for retry/audit. During any incomplete zero-argument production cycle,
+`data/eval-results/rank_and_push.cycle` contains the repository-relative run
+directory and preserves the cycle's deterministic activation identity. During
+an incomplete production publication,
 `data/eval-results/rank_and_push.pending` contains one repository-relative path
-to that request; it is compare-and-cleared only after publication verification
-and the same run's purge/checkpoint tail. Retire superseded artifacts to
+to that request and takes recovery precedence over the broader cycle pointer.
+Both are compare-and-cleared only after publication verification and the same
+run's purge/checkpoint tail. Retire superseded artifacts to
 `data/archive/`; never delete eval outputs — they are the audit trail for what
 was published to `latest_ranking` and when.
 

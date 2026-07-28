@@ -25,6 +25,8 @@ What it locks (the things that would silently break cron if wired wrong):
   - PE_PYTHON overrides repository environments and accepts executable paths with spaces;
   - a missing interpreter or dependency fails before the lock, output dir, or data refresh;
   - the production half-life default is threaded to both passes.
+  - a durable logical-cycle pointer exists before activation and a zero-argument retry
+    reuses its exact run directory / activation batch instead of admitting another cohort;
   - the final WAL checkpoint runs after purge, truncates committed WAL bytes, and warns
     without failing an already-published run when checkpointing is unavailable.
 
@@ -122,6 +124,12 @@ class RankAndPushScenario(unittest.TestCase):
             'echo "$*" >> pe_bootstrap.log\n'
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
+            'if [[ -f data/eval-results/rank_and_push.cycle ]]; then\n'
+            '  tr -d "\\n" < data/eval-results/rank_and_push.cycle >> pe_bootstrap_cycle.log\n'
+            'else\n'
+            '  printf missing >> pe_bootstrap_cycle.log\n'
+            'fi\n'
+            'printf "\\n" >> pe_bootstrap_cycle.log\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -174,6 +182,10 @@ class RankAndPushScenario(unittest.TestCase):
             '    pending = Path(a[a.index("--pending-file") + 1])\n'
             '    pending.parent.mkdir(parents=True, exist_ok=True)\n'
             '    pending.write_text(str(request) + "\\n")\n'
+            'if os.environ.get("STUB_REPLACE_CYCLE"):\n'
+            '    replacement = Path("data/eval-results/cron-20990101T000000Z")\n'
+            '    replacement.mkdir(parents=True, exist_ok=True)\n'
+            '    Path("data/eval-results/rank_and_push.cycle").write_text(str(replacement) + "\\n")\n'
             'raise SystemExit(int(os.environ.get("STUB_PUSH_EXIT", "0")))\n',
         )
 
@@ -350,6 +362,17 @@ class RankAndPushScenario(unittest.TestCase):
         crons = list((self.root / "data" / "eval-results").glob("cron-*"))
         self.assertEqual(len(crons), 1, f"expected one auto out-dir, got {crons}")
         self.assertIn(f"RANK_AND_PUSH_RUN_DIR={crons[0].relative_to(self.root)}", r.stdout)
+        cycle_observations = (self._log("pe_bootstrap_cycle.log") or "").splitlines()
+        self.assertTrue(cycle_observations)
+        self.assertNotIn("missing", cycle_observations)
+        self.assertTrue(
+            all(observation == str(crons[0].relative_to(self.root)) for observation in cycle_observations),
+            f"cache mutation ran without the exact logical-cycle pointer: {cycle_observations}",
+        )
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
+            "successful cycle did not clear its logical-cycle pointer",
+        )
         print("PASS: happy path — default --universe-from-trades, Step-0 order, auto out-dir")
 
     def test_activation_batch_id_binds_complete_output_path(self):
@@ -542,7 +565,59 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(len((self._log("rank.log") or "").splitlines()), 1)
         self.assertIn("--resume-request", (self._log("push.log") or "").splitlines()[-1])
         self.assertFalse(pending.exists(), "completed tail did not clear its pending pointer")
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
+            "completed publication tail did not clear the logical-cycle pointer",
+        )
         print("PASS: transient push resume replays request + purge/checkpoint, no activation/rank")
+
+    def test_zero_arg_transient_cycle_reuses_run_directory_and_activation_batch(self):
+        first = self._run(exit_env={"STUB_EXIT_events": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        self.assertTrue(cycle.is_file(), "temporary events failure lost logical-cycle identity")
+        first_out = cycle.read_text().strip()
+
+        first_boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        first_activation = next(line for line in first_boot if line.startswith("activate-next"))
+        first_args = first_activation.split()
+        first_batch = first_args[first_args.index("--batch-id") + 1]
+
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn(f"RANK_AND_PUSH_CYCLE_RESUME={first_out}", resumed.stdout)
+        self.assertIn(f"RANK_AND_PUSH_RUN_DIR={first_out}", resumed.stdout)
+
+        activations = [
+            line
+            for line in (self._log("pe_bootstrap.log") or "").splitlines()
+            if line.startswith("activate-next")
+        ]
+        self.assertEqual(len(activations), 2)
+        second_args = activations[1].split()
+        second_batch = second_args[second_args.index("--batch-id") + 1]
+        self.assertEqual(first_batch, second_batch, "cycle retry selected another activation batch")
+        self.assertEqual(
+            len(list((self.root / "data" / "eval-results").glob("cron-*"))),
+            1,
+            "cycle retry created another production run directory",
+        )
+        self.assertFalse(cycle.exists(), "completed retried cycle did not clear its pointer")
+
+    def test_direct_zero_arg_prefers_pending_publication_over_cycle_replay(self):
+        first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        boot_before = (self._log("pe_bootstrap.log") or "").splitlines()
+
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("RANK_AND_PUSH_AUTO_RESUME_PENDING=", resumed.stdout)
+        self.assertEqual(
+            (self._log("pe_bootstrap.log") or "").splitlines(),
+            boot_before + ["purge"],
+            "direct zero-argument recovery reran pre-publication stages",
+        )
+        self.assertIn("--resume-request", (self._log("push.log") or "").splitlines()[-1])
 
     def test_successful_zero_arg_cycle_clears_its_pending_pointer(self):
         result = self._run()
@@ -551,6 +626,9 @@ class RankAndPushScenario(unittest.TestCase):
             (self.root / "data" / "eval-results" / "rank_and_push.pending").exists()
         )
         self.assertIn("[recovery] cleared completed pending", result.stdout)
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists()
+        )
 
     def test_parameterized_research_run_never_owns_production_pending_pointer(self):
         result = self._run("--skip-purge")
@@ -561,6 +639,71 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(
             (self.root / "data" / "eval-results" / "rank_and_push.pending").exists()
         )
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists()
+        )
+
+    def test_parameterized_run_ignores_existing_production_cycle_pointer(self):
+        cycle_dir = self.root / "data" / "eval-results" / "cron-20260728T092155Z"
+        cycle_dir.mkdir()
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        cycle.write_text(f"{cycle_dir.relative_to(self.root)}\n")
+        research_out = self.root / "research-output"
+
+        result = self._run("--skip-purge", "--out-dir", str(research_out))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cycle.read_text().strip(), str(cycle_dir.relative_to(self.root)))
+        self.assertIn(str(research_out), self._log("rank.log") or "")
+
+    def test_cycle_pointer_validation_fails_closed_before_cache_mutation(self):
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        invalid_values = (
+            "/tmp/cron-20260728T092155Z\n",
+            "data/eval-results/not-cron\n",
+            "data/eval-results/cron-20260728T092155Z\nextra\n",
+            "data/eval-results/cron-20260728T092155Z\n",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                if (self.root / "pe_bootstrap.log").exists():
+                    (self.root / "pe_bootstrap.log").unlink()
+                cycle.write_text(value)
+                result = self._run()
+                self.assertEqual(result.returncode, 2)
+                self.assertIsNone(self._log("pe_bootstrap.log"))
+
+    def test_cycle_pointer_symlink_fails_closed_before_cache_mutation(self):
+        target_dir = self.root / "data" / "eval-results" / "cron-20260728T092155Z"
+        target_dir.mkdir()
+        target = self.root / "cycle-pointer-target"
+        target.write_text(f"{target_dir.relative_to(self.root)}\n")
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        cycle.symlink_to(target)
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing or not a regular file", result.stderr)
+        self.assertIsNone(self._log("pe_bootstrap.log"))
+
+    def test_success_compare_clear_preserves_changed_cycle_pointer(self):
+        result = self._run(exit_env={"STUB_REPLACE_CYCLE": "1"})
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            cycle.read_text().strip(),
+            "data/eval-results/cron-20990101T000000Z",
+        )
+        self.assertIn("cycle pointer changed; leaving it intact", result.stderr)
+
+    def test_permanent_failure_preserves_cycle_pointer(self):
+        result = self._run(exit_env={"STUB_EXIT_events": "1"})
+        self.assertEqual(result.returncode, 1)
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        self.assertTrue(cycle.is_file())
+        self.assertIn("cron-", cycle.read_text())
 
     def test_resume_rejects_pointer_outside_production_cron_directory(self):
         request = self.root / "outside.json"
@@ -603,6 +746,15 @@ class RankAndPushScenario(unittest.TestCase):
         r = self._run()
         self.assertNotEqual(r.returncode, 0, "missing pe-bootstrap should be fatal")
         self.assertIn("pe-bootstrap", r.stderr)
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
+            "dependency preflight must fail before publishing a logical cycle",
+        )
+        self.assertEqual(
+            list((self.root / "data" / "eval-results").glob("cron-*")),
+            [],
+            "dependency preflight must fail before creating the run directory",
+        )
         print("PASS: missing pe-bootstrap binary → fatal before any stage")
 
     def test_purge_runs_after_push_with_decision_csv(self):

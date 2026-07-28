@@ -46,6 +46,16 @@ pub(crate) const EVENTS_CURSOR_KEY: &str = "gamma_events_sweep_offset";
 /// observed maximum that returns reliably.
 const EVENTS_PAGE_LIMIT: u64 = 500;
 
+/// Walk-level retries for one Gamma `/events` page after the shared HTTP
+/// fetcher's own fast retries are exhausted.
+const EVENTS_PAGE_MAX_RETRIES: u32 = 5;
+
+/// Base delay for the walk-level retry. Exponential backoff is capped at 30s.
+const EVENTS_PAGE_RETRY_BASE_MS: u64 = 1_000;
+
+/// A missing or zero `Retry-After` must not create a tight retry loop.
+const EVENTS_RATE_LIMIT_MIN_WAIT_SECS: u64 = 1;
+
 /// Orphan-rate warn threshold (integer percent). Gamma's /events covers only a
 /// curated subset of all traded condition IDs: a 90–99% orphan rate is expected
 /// on a full historical cache. Warn only at near-total orphan coverage (99%) to
@@ -78,19 +88,93 @@ pub struct EventsReport {
 pub struct GammaEventsFetcher<F: PageFetcher> {
     base_url: String,
     fetcher: F,
+    page_max_retries: u32,
+    page_retry_base: Duration,
 }
 
 impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
     pub fn new(base_url: String, fetcher: F) -> Self {
-        Self { base_url, fetcher }
+        Self {
+            base_url,
+            fetcher,
+            page_max_retries: EVENTS_PAGE_MAX_RETRIES,
+            page_retry_base: Duration::from_millis(EVENTS_PAGE_RETRY_BASE_MS),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_page_retry(mut self, max_retries: u32, base: Duration) -> Self {
+        self.page_max_retries = max_retries;
+        self.page_retry_base = base;
+        self
+    }
+
+    /// Fetch one sequential page with a sustained-flakiness budget on top of
+    /// `ReqwestFetcher`'s short internal retries.
+    ///
+    /// `Ok(None)` is Gamma's documented-in-practice page-boundary 422. Fatal
+    /// errors and response parsing remain permanent; only source transient and
+    /// rate-limit errors consume this retry budget and become exit-75-capable
+    /// [`BootstrapError::TransientSource`] after exhaustion.
+    async fn fetch_page_with_retry(
+        &self,
+        url: &str,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>, BootstrapError> {
+        let mut retries = 0u32;
+        loop {
+            match self.fetcher.fetch_page(url).await {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(SourceError::Fatal { message }) if message.contains("HTTP 422") => {
+                    return Ok(None);
+                }
+                Err(SourceError::Fatal { message }) => {
+                    warn!(
+                        offset,
+                        error = %message,
+                        "events: permanent fetch error — aborting page"
+                    );
+                    return Err(BootstrapError::Gamma {
+                        message: format!("events fetch at offset {offset}: {message}"),
+                    });
+                }
+                Err(error) => {
+                    if retries >= self.page_max_retries {
+                        return Err(BootstrapError::TransientSource {
+                            source_name: "gamma-events",
+                            message: format!(
+                                "events fetch at offset {offset}: {error} \
+                                 (after {retries} page retries)"
+                            ),
+                        });
+                    }
+                    let wait = if let SourceError::RateLimited { retry_after_secs } = &error {
+                        Duration::from_secs(
+                            u64::from(*retry_after_secs).max(EVENTS_RATE_LIMIT_MIN_WAIT_SECS),
+                        )
+                    } else {
+                        events_retry_backoff(self.page_retry_base, retries)
+                    };
+                    retries += 1;
+                    warn!(
+                        offset,
+                        error = %error,
+                        attempt = retries,
+                        backoff = ?wait,
+                        "events: transient fetch error — retrying page"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
     }
 
     /// Sweep every `/events` page, upsert each market's `conditionId → event`
     /// row, then self-map traded-market orphans and apply the coverage gate.
     ///
-    /// Fatal on any fetch/parse error (a paged sweep cannot skip a page without
-    /// desyncing the offset). Returns [`BootstrapError::Gamma`] if the orphan
-    /// rate exceeds [`ORPHAN_FAIL_PCT`] (a join-key/form break).
+    /// A fatal fetch/parse error aborts because a paged sweep cannot skip a page
+    /// without desynchronizing the offset. Exhausted transient fetches preserve
+    /// their typed temporary classification for supervisor recovery.
     pub async fn sweep(&self, cache: &mut WalletCache) -> Result<EventsReport, BootstrapError> {
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
         let mut offset: u64 = cache
@@ -113,21 +197,8 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
                 "{}/events?limit={EVENTS_PAGE_LIMIT}&offset={offset}",
                 self.base_url
             );
-            let bytes = match self.fetcher.fetch_page(&url).await {
-                Ok(b) => b,
-                // Gamma returns 422 when offset >= total event count (instead of
-                // an empty array). Treat it as end-of-data, same as an empty page.
-                Err(SourceError::Fatal { message }) if message.contains("HTTP 422") => break,
-                Err(SourceError::Fatal { message }) => {
-                    return Err(BootstrapError::Gamma {
-                        message: format!("events fetch at offset {offset}: {message}"),
-                    });
-                }
-                Err(e) => {
-                    return Err(BootstrapError::Gamma {
-                        message: format!("events fetch at offset {offset}: {e}"),
-                    });
-                }
+            let Some(bytes) = self.fetch_page_with_retry(&url, offset).await? else {
+                break;
             };
 
             let page = parse_events_page(&bytes).map_err(|e| BootstrapError::Gamma {
@@ -266,6 +337,11 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
 
         Ok(report)
     }
+}
+
+fn events_retry_backoff(base: Duration, retry: u32) -> Duration {
+    let multiplier = 1u32 << retry.min(10);
+    base.saturating_mul(multiplier).min(Duration::from_secs(30))
 }
 
 /// Build the production `/events` fetcher and run a full sweep.
@@ -429,7 +505,158 @@ where
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use tempfile::TempDir;
+
     use super::*;
+
+    struct SequenceFetcher {
+        results: Mutex<VecDeque<Result<Vec<u8>, SourceError>>>,
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl SequenceFetcher {
+        fn new(results: Vec<Result<Vec<u8>, SourceError>>) -> Self {
+            Self {
+                results: Mutex::new(results.into()),
+                urls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.urls.lock().unwrap().len()
+        }
+
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    impl PageFetcher for SequenceFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            self.urls.lock().unwrap().push(url.to_owned());
+            self.results.lock().unwrap().pop_front().unwrap_or_else(|| {
+                Err(SourceError::Fatal {
+                    message: "test sequence exhausted".to_owned(),
+                })
+            })
+        }
+    }
+
+    fn empty_cache() -> (WalletCache, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let cache = WalletCache::open(&dir.path().join("events.db")).unwrap();
+        (cache, dir)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_retry_transient_then_success_reuses_offset() {
+        let fetcher = SequenceFetcher::new(vec![
+            Err(SourceError::Transient {
+                message: "body read failed".to_owned(),
+            }),
+            Ok(b"[]".to_vec()),
+        ]);
+        let (mut cache, _dir) = empty_cache();
+        cache.set_source_cursor(EVENTS_CURSOR_KEY, "500").unwrap();
+        let events = GammaEventsFetcher::new("https://gamma.test".to_owned(), fetcher);
+
+        let report = events.sweep(&mut cache).await.unwrap();
+
+        assert_eq!(report.events_seen, 0);
+        assert_eq!(events.fetcher.call_count(), 2);
+        assert_eq!(
+            events.fetcher.urls(),
+            vec![
+                "https://gamma.test/events?limit=500&offset=500",
+                "https://gamma.test/events?limit=500&offset=500"
+            ]
+        );
+        assert_eq!(
+            cache.get_source_cursor(EVENTS_CURSOR_KEY).as_deref(),
+            Some("0")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn page_retry_rate_limit_then_success() {
+        let fetcher = SequenceFetcher::new(vec![
+            Err(SourceError::RateLimited {
+                retry_after_secs: 0,
+            }),
+            Ok(b"[]".to_vec()),
+        ]);
+        let (mut cache, _dir) = empty_cache();
+        let events = GammaEventsFetcher::new("https://gamma.test".to_owned(), fetcher);
+
+        events.sweep(&mut cache).await.unwrap();
+
+        assert_eq!(events.fetcher.call_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_transient_is_typed_and_preserves_cursor() {
+        let fetcher = SequenceFetcher::new(
+            (0..=EVENTS_PAGE_MAX_RETRIES)
+                .map(|_| {
+                    Err(SourceError::Transient {
+                        message: "body read failed".to_owned(),
+                    })
+                })
+                .collect(),
+        );
+        let (mut cache, _dir) = empty_cache();
+        cache.set_source_cursor(EVENTS_CURSOR_KEY, "1000").unwrap();
+        let events = GammaEventsFetcher::new("https://gamma.test".to_owned(), fetcher);
+
+        let error = events.sweep(&mut cache).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            BootstrapError::TransientSource {
+                source_name: "gamma-events",
+                ..
+            }
+        ));
+        assert_eq!(error.exit_code(), BootstrapError::TEMPFAIL_EXIT_CODE);
+        assert_eq!(
+            cache.get_source_cursor(EVENTS_CURSOR_KEY).as_deref(),
+            Some("1000")
+        );
+        assert_eq!(
+            events.fetcher.call_count(),
+            usize::try_from(EVENTS_PAGE_MAX_RETRIES + 1).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_fetch_and_parse_errors_do_not_retry() {
+        let (mut fatal_cache, _fatal_dir) = empty_cache();
+        let fatal = GammaEventsFetcher::new(
+            "https://gamma.test".to_owned(),
+            SequenceFetcher::new(vec![Err(SourceError::Fatal {
+                message: "HTTP 400".to_owned(),
+            })]),
+        )
+        .with_page_retry(5, Duration::ZERO);
+        let fatal_error = fatal.sweep(&mut fatal_cache).await.unwrap_err();
+        assert!(matches!(fatal_error, BootstrapError::Gamma { .. }));
+        assert_eq!(fatal_error.exit_code(), 1);
+        assert_eq!(fatal.fetcher.call_count(), 1);
+
+        let (mut parse_cache, _parse_dir) = empty_cache();
+        let malformed = GammaEventsFetcher::new(
+            "https://gamma.test".to_owned(),
+            SequenceFetcher::new(vec![Ok(b"{not-json".to_vec())]),
+        )
+        .with_page_retry(5, Duration::ZERO);
+        let parse_error = malformed.sweep(&mut parse_cache).await.unwrap_err();
+        assert!(matches!(parse_error, BootstrapError::Gamma { .. }));
+        assert_eq!(parse_error.exit_code(), 1);
+        assert_eq!(malformed.fetcher.call_count(), 1);
+    }
 
     #[test]
     fn parse_events_page_extracts_id_slug_and_conditions() {

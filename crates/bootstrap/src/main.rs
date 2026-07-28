@@ -308,8 +308,13 @@ async fn main() {
                     0
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "events: fatal");
-                    1
+                    let exit_code = e.exit_code();
+                    if exit_code == BootstrapError::TEMPFAIL_EXIT_CODE {
+                        tracing::warn!(error = %e, exit_code, "events: temporary failure");
+                    } else {
+                        tracing::error!(error = %e, exit_code, "events: fatal");
+                    }
+                    exit_code
                 }
             },
 

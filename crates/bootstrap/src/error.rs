@@ -2,6 +2,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
+    #[error("temporary source failure ({source_name}): {message}")]
+    TransientSource {
+        source_name: &'static str,
+        message: String,
+    },
     #[error("etherscan: {message}")]
     Etherscan { message: String },
     #[error("polymarket fetch for {wallet}: {message}")]
@@ -50,8 +55,41 @@ pub enum BootstrapError {
     Internal,
 }
 
+impl BootstrapError {
+    pub const TEMPFAIL_EXIT_CODE: i32 = 75;
+
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::TransientSource { .. } => Self::TEMPFAIL_EXIT_CODE,
+            _ => 1,
+        }
+    }
+}
+
 impl From<figment::Error> for BootstrapError {
     fn from(e: figment::Error) -> Self {
         BootstrapError::Config(Box::new(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BootstrapError;
+
+    #[test]
+    fn transient_source_uses_tempfail_exit_code() {
+        let error = BootstrapError::TransientSource {
+            source_name: "gamma-events",
+            message: "body read failed".to_owned(),
+        };
+        assert_eq!(error.exit_code(), BootstrapError::TEMPFAIL_EXIT_CODE);
+    }
+
+    #[test]
+    fn permanent_error_uses_fatal_exit_code() {
+        let error = BootstrapError::Gamma {
+            message: "invalid payload".to_owned(),
+        };
+        assert_eq!(error.exit_code(), 1);
     }
 }
