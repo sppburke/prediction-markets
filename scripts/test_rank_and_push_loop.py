@@ -41,18 +41,36 @@ class RankAndPushLoopScenario(unittest.TestCase):
         loop_copy = self.root / "scripts" / "rank_and_push_loop.sh"
         shutil.copy(LOOP, loop_copy)
         loop_copy.write_text(
-            loop_copy.read_text().replace("TERM_GRACE_SECS=30", "TERM_GRACE_SECS=1")
+            loop_copy.read_text()
+            .replace("TERM_GRACE_SECS=30", "TERM_GRACE_SECS=1")
+            .replace("TRANSIENT_RETRY_DELAY_SECS=60", "TRANSIENT_RETRY_DELAY_SECS=1")
         )
         loop_copy.chmod(0o755)
         (self.root / "scripts" / "rank_and_push.sh").write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
-            "printf '%s\\n' \"$#\" > child_argc\n"
+            "printf '%s\\n' \"$#\" >> child_argc\n"
+            "printf '%s\\n' \"$*\" >> child_args\n"
             "printf '%s\\n' \"$$\" > child.pid\n"
             "echo RANK_AND_PUSH_RUN_DIR=data/eval-results/cron-test\n"
             "case \"${STUB_MODE:-once}\" in\n"
             "  once) printf 'stop\\n' > data/eval-results/rank_and_push.loop ;;\n"
             "  fail) exit 7 ;;\n"
+            "  transient)\n"
+            "    if [[ \"$#\" -eq 0 ]]; then\n"
+            "      printf 'data/eval-results/cron-test/ranking_publish_request.json\\n' "
+            "> data/eval-results/rank_and_push.pending\n"
+            "      exit 75\n"
+            "    fi\n"
+            "    rm -f data/eval-results/rank_and_push.pending\n"
+            "    printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
+            "    ;;\n"
+            "  transient_stop)\n"
+            "    printf 'data/eval-results/cron-test/ranking_publish_request.json\\n' "
+            "> data/eval-results/rank_and_push.pending\n"
+            "    printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
+            "    exit 75\n"
+            "    ;;\n"
             "  hold) sleep 300 & printf '%s\\n' \"$!\" > descendant.pid; wait ;;\n"
             "  resist) sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > descendant.pid; "
             "while :; do sleep 1; done' & wait ;;\n"
@@ -112,6 +130,31 @@ class RankAndPushLoopScenario(unittest.TestCase):
         failed = self._run(mode="fail")
         self.assertEqual(failed.returncode, 7)
         self.assertEqual(failed.stdout.count("LOOP_CYCLE_START"), 1)
+
+    def test_transient_failure_resumes_pending_without_second_full_cycle(self):
+        self.flag.write_text("run\n")
+        recovered = self._run(mode="transient")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual((self.root / "child_argc").read_text().splitlines(), ["0", "1"])
+        self.assertEqual(
+            (self.root / "child_args").read_text().splitlines(),
+            ["", "--resume-pending"],
+        )
+        self.assertEqual(recovered.stdout.count("LOOP_CYCLE_START"), 1)
+        self.assertIn("LOOP_TEMPFAIL kind=cycle status=75", recovered.stdout)
+        self.assertIn("LOOP_RESUME_START", recovered.stdout)
+        self.assertIn("LOOP_RESUME_END", recovered.stdout)
+
+    def test_stop_flag_during_transient_delay_prevents_resume(self):
+        self.flag.write_text("run\n")
+        stopped = self._run(mode="transient_stop")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual((self.root / "child_argc").read_text().splitlines(), ["0"])
+        self.assertIn("reason=flag_stop_during_retry", stopped.stdout)
+        self.assertTrue(
+            (self.root / "data" / "eval-results" / "rank_and_push.pending").exists(),
+            "operator stop must preserve the resumable request",
+        )
 
     def test_singleton_preserves_pid_and_term_kills_resistant_child_group(self):
         self.flag.write_text("run\n")

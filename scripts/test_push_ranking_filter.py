@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import chdir
 from pathlib import Path
 from unittest import mock
 
@@ -112,6 +113,9 @@ class DefaultsDriftTest(unittest.TestCase):
         self.assertEqual(a.max_cache_staleness_hours, 24)  # upload_max_cache_staleness_hours
         self.assertEqual(a.keep_batches, 1080)            # ranking_batches_retention (#411; 1080 at the 4h cadence, run28 cutover)
         self.assertIsNone(a.db)                            # filter off unless --db given
+        self.assertEqual(pr.SUPABASE_MAX_RETRIES, 5)       # ranking_publish_max_retries
+        self.assertEqual(pr.SUPABASE_RETRY_BASE_SECS, 1)   # ranking_publish_retry_base_secs
+        self.assertEqual(pr.SUPABASE_RETRY_MAX_SECS, 30)   # ranking_publish_retry_max_secs
 
 
 class BuildEntriesTest(unittest.TestCase):
@@ -123,13 +127,212 @@ class BuildEntriesTest(unittest.TestCase):
              "fill_rate": "0.5", "n_filled": "10", "hit_rate": "0.6", "avg_price": "0.4"},
             {"wallet": "0xbbb"},  # missing numerics + absent from the map
         ]
-        entries = pr.build_entries(top, batch_id=42, last_trade_map={"0xaaa": NOW - 5 * HOUR})
+        entries = pr.build_entries(top, last_trade_map={"0xaaa": NOW - 5 * HOUR})
         self.assertEqual(entries[0]["last_trade_unix"], NOW - 5 * HOUR)  # keyed by lowercase
         self.assertIsNone(entries[1]["last_trade_unix"])                 # absent -> NULL
         self.assertEqual(entries[0]["rank"], 1)
         self.assertEqual(entries[0]["wallet_hex"], "0xAAA")             # original case preserved
-        self.assertEqual(entries[0]["batch_id"], 42)
+        self.assertNotIn("batch_id", entries[0])                         # RPC injects atomically
         self.assertIsNone(entries[1]["ls_edge"])                        # blank numeric -> NULL
+
+
+class PublishRequestTest(unittest.TestCase):
+    def _request(self, keep_batches=0):
+        batch = {
+            "git_sha": "abc123",
+            "band_lo": 0.15,
+            "band_hi": 0.85,
+            "ttr_floor_secs": 30,
+            "ttr_max_secs": 172800,
+            "latency_shift_secs": 20,
+            "universe_size": 2,
+            "notes": "test",
+        }
+        entries = [
+            {
+                "rank": 1,
+                "wallet_hex": "0xaaa",
+                "ls_edge": 0.1,
+                "ls_tstat": 2.5,
+                "fill_rate": 0.8,
+                "n_trades": 20,
+                "hit_rate": 0.6,
+                "avg_price": 0.4,
+                "last_trade_unix": NOW,
+            },
+            {
+                "rank": 2,
+                "wallet_hex": "0xbbb",
+                "ls_edge": None,
+                "ls_tstat": None,
+                "fill_rate": None,
+                "n_trades": None,
+                "hit_rate": None,
+                "avg_price": None,
+                "last_trade_unix": None,
+            },
+        ]
+        return pr.build_publish_request(batch, entries, keep_batches)
+
+    def test_request_round_trip_and_content_hash_tamper_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "request.json"
+            request = self._request()
+            pr.save_publish_request(str(path), request)
+            self.assertEqual(pr.load_publish_request(str(path)), request)
+            tampered = pr.load_publish_request(str(path))
+            tampered["entries"][0]["wallet_hex"] = "0xchanged"
+            with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+                pr.validate_publish_request(tampered)
+
+    def test_pending_pointer_is_atomic_repository_relative(self):
+        with tempfile.TemporaryDirectory() as tmp, chdir(tmp):
+            request_path = Path("data/eval-results/cron-test/ranking_publish_request.json")
+            request_path.parent.mkdir(parents=True)
+            pr.save_publish_request(str(request_path), self._request())
+            pending = Path("data/eval-results/rank_and_push.pending")
+            pr.save_pending_pointer(str(pending), str(request_path))
+            self.assertEqual(pending.read_text(), f"{request_path}\n")
+
+    def test_prepare_only_seeds_exact_recovery_without_credentials_or_network(self):
+        with tempfile.TemporaryDirectory() as tmp, chdir(tmp):
+            csv_path = Path("data/eval-results/cron-test/latency_shift_ranked.csv")
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text(
+                "wallet,survives,tstat_net_ls\n0xaaa,true,2.5\n",
+                encoding="utf-8",
+            )
+            request_path = csv_path.with_name("ranking_publish_request.json")
+            pending_path = Path("data/eval-results/rank_and_push.pending")
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "push",
+                        "--ranked-csv",
+                        str(csv_path),
+                        "--request-file",
+                        str(request_path),
+                        "--pending-file",
+                        str(pending_path),
+                        "--prepare-only",
+                    ],
+                ),
+                mock.patch.dict("os.environ", {}, clear=True),
+                mock.patch.object(pr, "_request_once") as network,
+            ):
+                self.assertEqual(pr.main(), 0)
+            network.assert_not_called()
+            request = pr.load_publish_request(str(request_path))
+            self.assertEqual(request["entries"][0]["wallet_hex"], "0xaaa")
+            self.assertEqual(pending_path.read_text(), f"{request_path}\n")
+
+    def test_rpc_publication_verifies_exact_returned_batch(self):
+        request = self._request(keep_batches=0)
+        latest = [
+            {"batch_id": 42, "rank": 1},
+            {"batch_id": 42, "rank": 2},
+        ]
+        with mock.patch.object(
+            pr,
+            "_req",
+            side_effect=[(200, 42), (200, latest)],
+        ) as request_mock:
+            batch_id = pr.publish_request_to_supabase(
+                request, "https://x.supabase.co", "secret"
+            )
+        self.assertEqual(batch_id, 42)
+        self.assertEqual(request_mock.call_count, 2)
+        rpc = request_mock.call_args_list[0]
+        self.assertEqual(rpc.args[0], "POST")
+        self.assertTrue(rpc.args[1].endswith("/rest/v1/rpc/publish_ranking_batch"))
+        self.assertEqual(rpc.kwargs["body"]["p_publish_key"], request["publish_key"])
+        self.assertNotIn("batch_id", rpc.kwargs["body"]["p_entries"][0])
+
+    def test_retry_transient_only_with_bounded_exponential_backoff(self):
+        transient = pr.SupabaseRequestError("timeout", retryable=True)
+        with mock.patch.object(
+            pr,
+            "_request_once",
+            side_effect=[transient, transient, (200, {"ok": True})],
+        ) as once:
+            sleeps = []
+            result = pr._req(
+                "POST",
+                "https://x",
+                "secret",
+                max_retries=5,
+                sleep=sleeps.append,
+            )
+        self.assertEqual(result, (200, {"ok": True}))
+        self.assertEqual(once.call_count, 3)
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_retry_after_is_bounded_and_never_tight_loops(self):
+        transient = pr.SupabaseRequestError(
+            "HTTP 429", retryable=True, status=429, retry_after_secs=0
+        )
+        with mock.patch.object(
+            pr,
+            "_request_once",
+            side_effect=[transient, (200, {"ok": True})],
+        ):
+            sleeps = []
+            pr._req(
+                "POST",
+                "https://x",
+                "secret",
+                max_retries=1,
+                sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [1])
+
+    def test_permanent_error_never_retries(self):
+        permanent = pr.SupabaseRequestError(
+            "HTTP 401", retryable=False, status=401
+        )
+        with mock.patch.object(pr, "_request_once", side_effect=permanent) as once:
+            with self.assertRaises(pr.SupabaseRequestError):
+                pr._req("POST", "https://x", "secret", sleep=lambda _: None)
+        self.assertEqual(once.call_count, 1)
+
+    def test_transient_exhaustion_raises_typed_error(self):
+        transient = pr.SupabaseRequestError("timeout", retryable=True)
+        with mock.patch.object(pr, "_request_once", side_effect=transient):
+            sleeps = []
+            with self.assertRaises(pr.TransientRetriesExhausted):
+                pr._req(
+                    "POST",
+                    "https://x",
+                    "secret",
+                    max_retries=2,
+                    sleep=sleeps.append,
+                )
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_main_maps_exhausted_transient_to_exit_75(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request_path = Path(tmp) / "request.json"
+            pr.save_publish_request(str(request_path), self._request())
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["push", "--resume-request", str(request_path)],
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {"SUPABASE_URL": "https://x", "SUPABASE_SECRET_KEY": "secret"},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    pr,
+                    "publish_request_to_supabase",
+                    side_effect=pr.TransientRetriesExhausted("timeout"),
+                ),
+            ):
+                self.assertEqual(pr.main(), 75)
 
 
 class PruneOldBatchesTest(unittest.TestCase):

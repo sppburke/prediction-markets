@@ -28,8 +28,9 @@
 #            prune   delete the multi-GB qualifying_positions_72hr.csv once pass-2 has consumed it
 #                    (kept: the .txt deliverables, ranked_72hr_buyandhold.csv, latency_shift_ranked.csv;
 #                    --keep-intermediates to retain it; only prunes when this run generated it)
-#   Stage 3  push    push_ranking_to_supabase.py → Supabase latest_ranking
-#   Verify           latest_ranking is now populated.
+#   Stage 3  publish push_ranking_to_supabase.py records the exact request, then
+#                    atomically/idempotently publishes it through the Supabase RPC.
+#   Verify           that exact batch and contiguous rank set are latest_ranking.
 #   Stage 4  purge   pe-bootstrap purge (#385)  delete proven-loser & dead-weight wallets from
 #                    the local cache (DELETE is a no-op unless purge_enabled=true; always reports).
 #                    Non-fatal (the push already published); --skip-purge to bypass,
@@ -78,6 +79,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+INVOCATION_ARGC=$#
 
 # ── Defaults (override via flags) ────────────────────────────────────────────────────────
 DB="data/wallet_cache.db"
@@ -128,6 +130,8 @@ SKIP_PURGE="0"
 KEEP_INTERMEDIATES="0"            # 1 => retain the multi-GB qualifying_positions_72hr.csv after pass-2
 BOOTSTRAP_CONFIG=""               # optional BootstrapConfig TOML positional for Step-0 stages
 PE_BOOTSTRAP_BIN="target/release/pe-bootstrap"
+RESUME_PENDING="0"                # internal supervisor recovery path; never starts a new cohort
+PENDING_FILE="data/eval-results/rank_and_push.pending"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -162,14 +166,55 @@ while [[ $# -gt 0 ]]; do
     --parquet-dir) PARQUET_DIR="$2"; shift 2;;
     --parquet-max-age-hours) PARQUET_MAX_AGE_HOURS="$2"; shift 2;;
     --skip-export) SKIP_EXPORT="1"; shift;;
+    --resume-pending) RESUME_PENDING="1"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
 
 [[ -f .env ]] || { echo "FATAL: .env not found (need SUPABASE_URL + SUPABASE_SECRET_KEY)" >&2; exit 2; }
 
-# Zero-arg cron: default OUT_DIR to a timestamped dir so no flag is ever required.
-if [[ -z "$OUT_DIR" ]]; then
+# The internal recovery path accepts no other flags and follows only an atomically-written
+# production pointer. Resolve + validate it before creating any output or taking the run lock.
+if [[ "$RESUME_PENDING" == "1" ]]; then
+  if [[ "$INVOCATION_ARGC" -ne 1 ]]; then
+    echo "FATAL: --resume-pending cannot be combined with other arguments" >&2
+    exit 2
+  fi
+  [[ -f "$PENDING_FILE" && ! -L "$PENDING_FILE" ]] || {
+    echo "FATAL: pending publication pointer is missing or not a regular file: $PENDING_FILE" >&2
+    exit 2
+  }
+  mapfile -t PENDING_LINES < "$PENDING_FILE"
+  if [[ "${#PENDING_LINES[@]}" -ne 1 || -z "${PENDING_LINES[0]}" ]]; then
+    echo "FATAL: $PENDING_FILE must contain exactly one non-empty request path" >&2
+    exit 2
+  fi
+  PENDING_REQUEST="${PENDING_LINES[0]}"
+  [[ "$PENDING_REQUEST" != /* ]] || {
+    echo "FATAL: pending publication request path must be repository-relative" >&2
+    exit 2
+  }
+  PENDING_REQUEST_REAL="$(readlink -f -- "$PENDING_REQUEST" 2>/dev/null || true)"
+  REPO_REAL="$(pwd -P)"
+  case "$PENDING_REQUEST_REAL" in
+    "$REPO_REAL"/data/eval-results/cron-*/ranking_publish_request.json) ;;
+    *)
+      echo "FATAL: pending publication request escaped the production cron directory" >&2
+      exit 2
+      ;;
+  esac
+  [[ -f "$PENDING_REQUEST_REAL" && ! -L "$PENDING_REQUEST_REAL" ]] || {
+    echo "FATAL: pending publication request is missing or not a regular file" >&2
+    exit 2
+  }
+  OUT_DIR="$(dirname "$PENDING_REQUEST_REAL")"
+  SKIP_DISCOVERY="1"
+  SKIP_BACKFILL="1"
+  SKIP_RANK="1"
+  SKIP_EXPORT="1"
+  echo "RANK_AND_PUSH_RESUME_REQUEST=$PENDING_REQUEST"
+elif [[ -z "$OUT_DIR" ]]; then
+  # Zero-arg production cycle: no caller-supplied flags or output path required.
   OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 
@@ -307,6 +352,7 @@ ACTIVATION_AUDIT_CSV="$OUT_DIR/activated_wallets.csv"
 RANKED_CSV="$OUT_DIR/ranked_72hr_buyandhold.csv"
 POSITIONS_CSV="$OUT_DIR/qualifying_positions_72hr.csv"
 LATENCY_CSV="$OUT_DIR/latency_shift_ranked.csv"
+PUBLISH_REQUEST_FILE="$OUT_DIR/ranking_publish_request.json"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 # Universe source: explicit --universe <file>, else the production default --universe-from-trades
@@ -479,41 +525,45 @@ if [[ "$SKIP_RANK" == "0" && "$KEEP_INTERMEDIATES" == "0" && -f "$POSITIONS_CSV"
   echo "── Pruned pass-1 intermediate: $POSITIONS_CSV (${pos_sz:-?} freed; --keep-intermediates to retain) ──"
 fi
 
-echo "── Stage 3/3: push to Supabase (the previously-missing step) ──────────────────"
-# Active-only upload filter args (issue #350 WS3): always pass --db; window/staleness only
-# when explicitly overridden, so the canonical defaults stay solely in the push script.
-FILTER_ARGS=(--db "$DB")
-[[ -n "$ACTIVE_WINDOW_HOURS" ]] && FILTER_ARGS+=(--active-window-hours "$ACTIVE_WINDOW_HOURS")
-[[ -n "$MAX_CACHE_STALENESS_HOURS" ]] && FILTER_ARGS+=(--max-cache-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
+echo "── Stage 3/3: atomically publish exact ranking to Supabase ─────────────────────"
+PUSH_ARGS=()
+if [[ "$RESUME_PENDING" == "1" ]]; then
+  # The request contains the original provenance, active-filter result, entry clocks,
+  # and content hash. Never rebuild it from a later clock/cache/code revision.
+  PUSH_ARGS+=(--resume-request "$PUBLISH_REQUEST_FILE")
+else
+  # Active-only upload filter args (issue #350 WS3): always pass --db; window/staleness
+  # only when explicitly overridden, so the canonical defaults stay in the push script.
+  FILTER_ARGS=(--db "$DB")
+  [[ -n "$ACTIVE_WINDOW_HOURS" ]] && FILTER_ARGS+=(--active-window-hours "$ACTIVE_WINDOW_HOURS")
+  [[ -n "$MAX_CACHE_STALENESS_HOURS" ]] && FILTER_ARGS+=(--max-cache-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
 
-# TTR provenance: pass the actual ranking TTR ceiling so ranking_batches.ttr_max_secs
-# reflects the shape the entries were ranked at (the script default would silently
-# record 72h after the 48h cutover). Floor stays pass-1's --min-ttr-hours default (30s).
-# CAVEAT (same class as PR #351): on a --skip-rank re-push this records THIS run's
-# TTR_HOURS, not the TTR the reused CSVs were ranked at — pass a matching --ttr-hours.
-TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
+  # TTR provenance: pass the actual ranking TTR ceiling so the durable request reflects
+  # the shape these entries were ranked at.
+  TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
+  PUSH_ARGS+=(
+    --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N"
+    --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX"
+    --ttr-max-secs "$TTR_MAX_SECS"
+    --latency-shift-secs "$LATENCY_SHIFT_SECS"
+    "${FILTER_ARGS[@]}"
+    --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
+    --request-file "$PUBLISH_REQUEST_FILE"
+  )
+  # Parameterized research/re-push invocations never own the singleton production
+  # recovery pointer. The complete zero-argument cycle is its sole normal writer.
+  if [[ "$INVOCATION_ARGC" -eq 0 ]]; then
+    PUSH_ARGS+=(--pending-file "$PENDING_FILE")
+  fi
+fi
 
-"$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
-  --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N" \
-  --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX" \
-  --ttr-max-secs "$TTR_MAX_SECS" \
-  --latency-shift-secs "$LATENCY_SHIFT_SECS" \
-  "${FILTER_ARGS[@]}" \
-  --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
-
-echo "── Verify: Supabase latest_ranking is now populated ──────────────────────────"
-"$PYTHON_BIN" - <<'PY'
-import os, urllib.request
-base=os.environ["SUPABASE_URL"]; key=os.environ["SUPABASE_SECRET_KEY"]
-req=urllib.request.Request(f"{base}/rest/v1/latest_ranking?select=rank&limit=1",
-    headers={"apikey":key,"Authorization":f"Bearer {key}","Prefer":"count=exact","Range":"0-0"})
-with urllib.request.urlopen(req, timeout=20) as r:
-    cr=r.headers.get("Content-Range","?")
-n=cr.split("/")[-1]
-print(f"latest_ranking rows: {n}")
-raise SystemExit(0 if n.isdigit() and int(n)>0 else 1)
-PY
-echo "✓ Supabase populated. pe-service picks it up within one refresh interval."
+push_rc=0
+"$PYTHON_BIN" scripts/push_ranking_to_supabase.py "${PUSH_ARGS[@]}" || push_rc=$?
+if [[ "$push_rc" -ne 0 ]]; then
+  echo "   [push] exit $push_rc — pending request retained for recovery" >&2
+  exit "$push_rc"
+fi
+echo "✓ Supabase exact batch published and verified. pe-service picks it up within one refresh interval."
 
 # ── Stage 4/5: purge proven-loser & dead-weight wallets from the local cache (issue #385) ──
 # Opt-in: the DELETE is a no-op unless purge_enabled=true in .env; the stage still emits a would-purge
@@ -523,7 +573,7 @@ echo "✓ Supabase populated. pe-service picks it up within one refresh interval
 # refuses an armed run on a stale cache) and the current run's RANKED_CSV verdict.
 if [[ "$SKIP_PURGE" == "1" ]]; then
   echo "── Stage 4/5: purge skipped (--skip-purge) ───────────────────────────────────"
-elif [[ "$SKIP_BACKFILL" == "1" || "$SKIP_RANK" == "1" ]]; then
+elif [[ "$RESUME_PENDING" == "0" && ( "$SKIP_BACKFILL" == "1" || "$SKIP_RANK" == "1" ) ]]; then
   echo "── Stage 4/5: purge skipped (needs a fresh backfill + verdict this run) ───────"
 else
   echo "── Stage 4/5: purge proven-loser & dead-weight wallets (issue #385) ───────────"
@@ -586,4 +636,23 @@ case "$crc" in
   0) echo "   [checkpoint] ok" ;;
   *) echo "   [checkpoint] WARN exit $crc — WAL checkpoint/truncate did not complete; retry next run" >&2 ;;
 esac
+
+# Compare-and-clear: never erase a different/newer recovery request. The request JSON
+# remains in the run directory as publication audit evidence; only the singleton pointer
+# is consumed after the same run's publish, purge, and checkpoint tail finishes.
+if [[ -f "$PENDING_FILE" && ! -L "$PENDING_FILE" ]]; then
+  mapfile -t COMPLETED_PENDING_LINES < "$PENDING_FILE"
+  if [[ "${#COMPLETED_PENDING_LINES[@]}" -eq 1 && -n "${COMPLETED_PENDING_LINES[0]}" ]]; then
+    COMPLETED_PENDING_REAL="$(readlink -f -- "${COMPLETED_PENDING_LINES[0]}" 2>/dev/null || true)"
+    REQUEST_REAL="$(readlink -f -- "$PUBLISH_REQUEST_FILE" 2>/dev/null || true)"
+    if [[ -n "$REQUEST_REAL" && "$COMPLETED_PENDING_REAL" == "$REQUEST_REAL" ]]; then
+      rm -f "$PENDING_FILE"
+      echo "   [recovery] cleared completed pending publication pointer"
+    else
+      echo "   [recovery] WARN pending pointer changed; leaving it intact" >&2
+    fi
+  else
+    echo "   [recovery] WARN malformed pending pointer; leaving it intact" >&2
+  fi
+fi
 echo "✓ rank_and_push complete — Supabase published; final cache maintenance attempted."

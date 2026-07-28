@@ -18,6 +18,12 @@ create table if not exists ranking_batches (
   universe_size      integer,
   notes              text
 );
+-- Content-addressed publication identity. Nullable keeps every pre-RPC/direct-insert
+-- historical batch compatible; new production pushes set it through
+-- `publish_ranking_batch`, whose unique index makes an ambiguous HTTP retry converge.
+alter table ranking_batches add column if not exists publish_key text;
+create unique index if not exists idx_ranking_batches_publish_key
+  on ranking_batches (publish_key) where publish_key is not null;
 
 create table if not exists ranking_entries (
   batch_id    bigint  not null references ranking_batches(batch_id) on delete cascade,
@@ -36,6 +42,122 @@ create index if not exists idx_ranking_entries_wallet on ranking_entries (wallet
 -- Nullable + idempotent so an existing project gains the column with no rebuild; the VPS
 -- seeds each admitted wallet's poll cursor (the inactivity clock) from this value.
 alter table ranking_entries add column if not exists last_trade_unix bigint;
+
+-- Atomic, idempotent ranking publication. PostgREST executes each RPC request in one
+-- transaction: the new epoch is therefore invisible until all entries exist, and any
+-- validation/insert failure rolls the whole request back. A retry with the same SHA-256
+-- content key reuses the original batch_id and entry rows.
+create or replace function publish_ranking_batch(
+  p_publish_key text,
+  p_batch       jsonb,
+  p_entries     jsonb
+) returns bigint
+language plpgsql
+as $$
+declare
+  v_batch_id       bigint;
+  v_expected       integer;
+  v_distinct_ranks integer;
+  v_min_rank       integer;
+  v_max_rank       integer;
+  v_missing_wallet integer;
+  v_actual         integer;
+begin
+  if p_publish_key is null or p_publish_key !~ '^[0-9a-f]{64}$' then
+    raise exception 'publish key must be a lowercase SHA-256 hex digest';
+  end if;
+  if jsonb_typeof(p_batch) is distinct from 'object' then
+    raise exception 'batch payload must be a JSON object';
+  end if;
+  if jsonb_typeof(p_entries) is distinct from 'array' then
+    raise exception 'entries payload must be a JSON array';
+  end if;
+
+  v_expected := jsonb_array_length(p_entries);
+  if v_expected < 1 then
+    raise exception 'entries payload must not be empty';
+  end if;
+
+  select count(distinct entry.rank), min(entry.rank), max(entry.rank),
+         count(*) filter (where entry.wallet_hex is null or entry.wallet_hex = '')
+    into v_distinct_ranks, v_min_rank, v_max_rank, v_missing_wallet
+    from jsonb_to_recordset(p_entries) as entry(
+      rank            integer,
+      wallet_hex      text,
+      ls_edge         numeric,
+      ls_tstat        numeric,
+      fill_rate       numeric,
+      n_trades        integer,
+      hit_rate        numeric,
+      avg_price       numeric,
+      last_trade_unix bigint
+    );
+  if v_distinct_ranks <> v_expected or v_min_rank <> 1 or v_max_rank <> v_expected then
+    raise exception 'entry ranks must be unique and contiguous from 1';
+  end if;
+  if v_missing_wallet <> 0 then
+    raise exception 'every entry requires wallet_hex';
+  end if;
+
+  insert into ranking_batches (
+    publish_key, git_sha, config_hash, band_lo, band_hi, ttr_floor_secs,
+    ttr_max_secs, latency_shift_secs, universe_size, notes
+  )
+  values (
+    p_publish_key,
+    p_batch->>'git_sha',
+    p_batch->>'config_hash',
+    nullif(p_batch->>'band_lo', '')::numeric,
+    nullif(p_batch->>'band_hi', '')::numeric,
+    nullif(p_batch->>'ttr_floor_secs', '')::integer,
+    nullif(p_batch->>'ttr_max_secs', '')::integer,
+    nullif(p_batch->>'latency_shift_secs', '')::integer,
+    nullif(p_batch->>'universe_size', '')::integer,
+    p_batch->>'notes'
+  )
+  on conflict (publish_key) where publish_key is not null do update
+    set publish_key = excluded.publish_key
+  returning batch_id into v_batch_id;
+
+  insert into ranking_entries (
+    batch_id, rank, wallet_hex, ls_edge, ls_tstat, fill_rate, n_trades,
+    hit_rate, avg_price, last_trade_unix
+  )
+  select
+    v_batch_id, entry.rank, entry.wallet_hex, entry.ls_edge, entry.ls_tstat,
+    entry.fill_rate, entry.n_trades, entry.hit_rate, entry.avg_price,
+    entry.last_trade_unix
+  from jsonb_to_recordset(p_entries) as entry(
+    rank            integer,
+    wallet_hex      text,
+    ls_edge         numeric,
+    ls_tstat        numeric,
+    fill_rate       numeric,
+    n_trades        integer,
+    hit_rate        numeric,
+    avg_price       numeric,
+    last_trade_unix bigint
+  )
+  on conflict (batch_id, rank) do nothing;
+
+  select count(*) into v_actual
+    from ranking_entries
+   where batch_id = v_batch_id;
+  if v_actual <> v_expected then
+    raise exception
+      'published batch % has % entries; expected %',
+      v_batch_id, v_actual, v_expected;
+  end if;
+
+  return v_batch_id;
+end;
+$$;
+
+revoke all on function publish_ranking_batch(text, jsonb, jsonb)
+  from public, anon, authenticated;
+grant execute on function publish_ranking_batch(text, jsonb, jsonb)
+  to service_role;
+notify pgrst, 'reload schema';
 
 create table if not exists wallet_lifecycle_events (
   id              bigserial primary key,       -- VPS writes the demotion/promotion audit trail
