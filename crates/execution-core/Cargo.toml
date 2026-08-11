@@ -20,6 +20,7 @@ pe-venue-polymarket         = { path = "../venue-polymarket",         version = 
 pe-strategy-winner-follow   = { path = "../strategy-winner-follow",   version = "0.1.0" }
 pe-risk-engine             = { path = "../risk-engine",              version = "0.1.0" }
 pe-resolver-card           = { path = "../resolver-card",            version = "0.1.0" }
+pe-source-polymarket-public = { path = "../source-polymarket-public", version = "0.1.0" }
 
 serde.workspace = true
 serde_json.workspace = true

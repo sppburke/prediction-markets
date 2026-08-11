@@ -3621,6 +3621,7 @@ dependencies = [
  "pe-event-log",
  "pe-resolver-card",
  "pe-risk-engine",
+ "pe-source-polymarket-public",
  "pe-strategy-winner-follow",
  "pe-venue-core",
  "pe-venue-polymarket",
