@@ -356,6 +356,7 @@ struct PositionRow {
 ///
 /// The RPC `.await` completes before `PaperStateDb::commit_fill` takes the SQLite mutex, so
 /// the lock is never held across the await (no cross-await lock, no `Send` hazard).
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,

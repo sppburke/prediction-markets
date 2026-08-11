@@ -223,6 +223,11 @@ async fn main() -> Result<()> {
             "replayed uncommitted fills from event log on startup"
         );
     }
+    // #508 Decision 10: resume staged dispatch aggregates AFTER fill accounting healed —
+    // flip seeds whose fill frame is durable, finalize stuck seeds, leave redeliverable
+    // seeds pending. Recovery only flips existing seeds; it never reconstructs targets.
+    pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
+        .context("resume dispatch seeds")?;
 
     // Supabase authoritative client (issue #397): built only when the flag is set. It is the
     // sole writer of `paper_fills`/`settled_markets` (the best-effort `run_sink` is not spawned
@@ -467,6 +472,43 @@ async fn main() -> Result<()> {
             (None, None)
         };
 
+    // #508: live account contexts — one boot fetch (best-effort; empty on failure) plus a
+    // 30 s refresh loop, mirroring the config poller's last-known-good posture. With no
+    // Supabase (or no armed accounts) the snapshot is empty and the copy path is the
+    // Phase-A baseline (no dispatch seeds are staged).
+    let live_accounts = if cfg.supabase_url.is_empty() {
+        None
+    } else {
+        let accounts_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("build live-accounts HTTP client")?;
+        let initial = match pe_service::live_accounts::fetch_live_accounts(
+            &accounts_http_client,
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(error = %e, "live accounts boot fetch failed; starting with none armed");
+                pe_service::live_accounts::LiveAccountsSnapshot::default()
+            }
+        };
+        let live = pe_service::live_accounts::LiveAccounts::new(initial);
+        tokio::spawn(pe_service::live_accounts::run_live_accounts_poller(
+            live.clone(),
+            accounts_http_client,
+            cfg.supabase_url.clone(),
+            cfg.supabase_anon_key.clone(),
+            cfg.supabase_secret_key.clone(),
+            CONFIG_POLL_INTERVAL_SECS,
+        ));
+        Some(live)
+    };
+
     let orch = Orchestrator::new(
         trade_rx,
         live_watchlist.clone(),
@@ -487,7 +529,7 @@ async fn main() -> Result<()> {
             clob_best_ask_fallback_haircut_bps: cfg.clob_best_ask_fallback_haircut_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
-            live_accounts: None,
+            live_accounts: live_accounts.clone(),
         },
         history_map,
         WinnerFollowStrategy::new(cfg.strategy.clone()),
@@ -645,6 +687,7 @@ async fn main() -> Result<()> {
             cfg.mode.clone(),
             cfg.supabase_authoritative,
             supabase_rpc_calls,
+            live_accounts.clone(),
         )))
     } else {
         None

@@ -603,6 +603,36 @@ impl PaperStateDb {
         Ok(pruned)
     }
 
+    /// The Phase-D executor's first-boot instant (#508 Decision 8 arming fence),
+    /// recorded once and immutable thereafter: promotion records/requests predating it
+    /// are never honored, so the executor binary provably ships dark. Returns the fence
+    /// (existing or newly recorded at `now_unix`).
+    pub fn record_live_executor_first_boot(&self, now_unix: i64) -> Result<i64, PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('live_executor_first_boot_unix', ?1)",
+            params![now_unix],
+        )?;
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'live_executor_first_boot_unix'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Read the arming fence, or `None` before the executor's first boot.
+    pub fn live_executor_first_boot(&self) -> Result<Option<i64>, PaperStateError> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'live_executor_first_boot_unix'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     // ── Bankroll ─────────────────────────────────────────────────────────────
 
     /// Initialise the bankroll to `initial` if not already present, then return

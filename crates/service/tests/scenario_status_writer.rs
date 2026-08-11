@@ -64,7 +64,7 @@ fn seeded_db() -> (TempDir, PaperStateDb) {
 #[test]
 fn ac_snapshot_reflects_state() {
     let (_dir, db) = seeded_db();
-    let snap = build_snapshot(&db, "paper", true, 123, 1_700_000_500, 25, 100, 42);
+    let snap = build_snapshot(&db, "paper", true, 123, 1_700_000_500, 25, 100, 42, None);
 
     // PASS: every field mirrors the seeded state (bankroll compared scale-insensitively).
     assert_eq!(
@@ -94,7 +94,7 @@ fn ac_snapshot_reflects_state() {
 fn ac_write_is_atomic_and_valid_json() {
     let (dir, db) = seeded_db();
     let path = dir.path().join("status.json");
-    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_000, 25, 100, 0);
+    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_000, 25, 100, 0, None);
     write_snapshot(&path, &snap).unwrap();
 
     // PASS: the file exists, no temp left behind, and parses to the expected shape.
@@ -117,7 +117,7 @@ fn ac_write_is_atomic_and_valid_json() {
 fn ac_uninitialised_bankroll_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let db = PaperStateDb::open(&dir.path().join("p.db")).unwrap(); // no init_bankroll
-    let snap = build_snapshot(&db, "shadow", false, 0, 1_700_000_000, 0, 100, 0);
+    let snap = build_snapshot(&db, "shadow", false, 0, 1_700_000_000, 0, 100, 0, None);
 
     // PASS: an uninitialised bankroll is `None` (serializes as JSON null), counts are 0.
     assert!(snap.bankroll.is_none(), "uninitialised bankroll → None");
