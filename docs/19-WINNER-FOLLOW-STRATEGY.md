@@ -486,6 +486,39 @@ exact-risk, V2 preparation, synced reservation, and exactly-one-POST path.
 See [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md) for inactive
 installation and later authority boundaries.
 
+## Ordinary live execution (#508)
+
+Ordinary `pe-service` has per-account modes `off | live_tiny`. `promoted` is deferred because it
+has no distinct financial contract after retirement of the per-trade cap; the promotion ladder
+below remains canonical for when a distinct promoted contract is introduced. The account grammar,
+armed-account bound, per-account price-impact default, dispatch retention, and redemption surfacing
+threshold live only in `_GLOSSARY.md`.
+
+The panel requests a mode, but the service is the sole writer of effective mode through the atomic
+`account_set_effective_mode` control RPC. Arming requires a decryptable, correctly bound credential
+bundle; venue state not `closed_only`; passing geoblock evidence; sufficient balance and allowance
+for both V2 exchange spenders; and an unrevoked promotion review newer than the executor's
+first-boot arming fence. Requested mode alone never authorizes an order. Invalid credentials, a
+missing/revoked promotion record, or `closed_only` demote an armed account; transient probe failure
+refuses orders without demotion. A pending, ambiguous, or failed redemption is the non-demoting
+exception: it closes that account's new-BUY admission until confirmation.
+
+Venue settlement is payoff authority (Decision 11). Ordinary live admission composes an automated
+`VenueSettlementRecord` from `resolver-card` with fresh live-admission market evidence: condition,
+outcome, and token identity must agree; NegRisk is admitted and carried; fee fields are recorded but
+do not gate. Missing, stale, ambiguous, or disagreeing evidence fails closed. Hand-installed full
+`ResolverCard`s remain canary-only.
+
+Resolved positions redeem automatically (Decision 12). NegRisk evidence selects the V2 collateral
+adapter, and custody kind selects the supported Relayer transport. Recovery reconciles before any
+resubmission, applies no dust floor, and keeps new-BUY admission closed for that account after a
+pending, ambiguous, or failed attempt until redemption is confirmed.
+
+The dispatch aggregate is durably staged at shared signal admission, before the paper outcome can
+be durable, with frozen ordered account targets and credential bindings. The seed moves
+`pending_paper -> ready` atomically with a typed paper outcome. That outcome records sequencing and
+recovery state only: paper fills and paper-only skips never gate an otherwise admitted live target.
+
 ## Promotion ladder
 
 Winner-Follow has a single leader-follow promotion ladder.

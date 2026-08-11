@@ -118,7 +118,7 @@ pub fn decrypt_bundle(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
 
     use std::io::Write as _;
 

@@ -6,10 +6,15 @@
 
 ## Boundary
 
-`pe-service-live-canary` is independent of ordinary paper `pe-service`: it has a dedicated Unix
+`pe-service-live-canary` is independent of ordinary `pe-service`: it has a dedicated Unix
 account, binary, state root, runtime root, event log, socket, resolver inventory, and systemd
 credential set. It cannot select `live_tiny` or `promoted`; the Supabase anon credential supplies
 only the ordinary read-only watchlist and cannot arm or alter financial policy.
+
+Since #508, ordinary `pe-service` also carries a per-account live execution path with separate
+credential custody (age-sealed account bundles plus a systemd `LoadCredential=` age identity); it
+ships dark until armed. That does not widen this canary, which remains isolated and
+standard-exchange-only.
 
 The canonical financial limits and lifecycle are in
 [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md). The unit must remain disabled and

@@ -75,6 +75,10 @@ pub struct ModeInputs<'a, P: ArmingProbe> {
     pub promotion: &'a PromotionFacts,
     /// The arming fence; `None` = the executor has never booted (nothing may arm).
     pub fence_unix: Option<i64>,
+    /// Accounts ALREADY effective `live_tiny` (excluding this one). Arming is refused at
+    /// [`crate::live_accounts::LIVE_ARMED_ACCOUNTS_MAX`] (#508 Decision 4 — the tested v1
+    /// bound is enforced, not advisory).
+    pub already_armed_count: usize,
     pub probe: &'a P,
 }
 
@@ -103,6 +107,15 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
     }
     if !armed && !wants_armed {
         return ModeDecision::Keep;
+    }
+    // v1 bound (Decision 4): the service refuses arming beyond live_armed_accounts_max.
+    if !armed && inputs.already_armed_count >= crate::live_accounts::LIVE_ARMED_ACCOUNTS_MAX {
+        return ModeDecision::RefuseOrders {
+            reason: format!(
+                "arming refused: {} accounts already armed (live_armed_accounts_max)",
+                inputs.already_armed_count
+            ),
+        };
     }
 
     // Promotion-record validity (persistent when invalid).
@@ -264,6 +277,7 @@ mod tests {
             credentials: creds,
             promotion,
             fence_unix: Some(1_000),
+            already_armed_count: 0,
             probe,
         }
     }
@@ -406,6 +420,24 @@ mod tests {
         // Off and not requesting: no decision.
         let d3 = evaluate_mode(&inputs("off", "off", CheckOutcome::Pass, &promo, &probe));
         assert_eq!(d3, ModeDecision::Keep);
+    }
+
+    #[test]
+    fn arming_a_third_account_is_refused() {
+        // Decision 4 (#508): v1 arms at most two accounts; the service refuses a third.
+        let probe = all_pass();
+        let promo = reviewed(true);
+        let mut third = inputs("live_tiny", "off", CheckOutcome::Pass, &promo, &probe);
+        third.already_armed_count = 2;
+        let d = evaluate_mode(&third);
+        assert!(
+            matches!(d, ModeDecision::RefuseOrders { ref reason } if reason.contains("live_armed_accounts_max")),
+            "{d:?}"
+        );
+        // An ALREADY-armed account is unaffected by the bound (it only gates arming).
+        let mut armed = inputs("live_tiny", "live_tiny", CheckOutcome::Pass, &promo, &probe);
+        armed.already_armed_count = 2;
+        assert_eq!(evaluate_mode(&armed), ModeDecision::Keep);
     }
 
     #[test]

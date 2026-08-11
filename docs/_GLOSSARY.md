@@ -294,9 +294,10 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 
 The canary is a boot-frozen campaign role, not an `ExecutionMode` or promotion state. It is
-installed inactive and is the only credentialed order path. Ordinary `pe-service` remains
-paper-only. The dedicated actor owns the credentialed client, one mode-0600 event log, command
-serialization, reservation, one-shot POST, reconciliation, and recovery.
+installed inactive and remains isolated from ordinary `pe-service`, whose #508 path instead uses
+per-account sealed credentials and ships dark until an account is armed. The dedicated canary actor
+owns its credentialed client, one mode-0600 event log, command serialization, reservation, one-shot
+POST, reconciliation, and recovery.
 
 | Key | Canonical value | Meaning |
 |---|---:|---|
@@ -310,6 +311,16 @@ serialization, reservation, one-shot POST, reconciliation, and recovery.
 
 Campaign financial limits and eligibility are canonical in
 [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md#isolated-polymarket-v2-canary).
+
+### Ordinary multi-account live execution (`pe-service`, issue #508)
+
+| Key | Canonical value | Meaning |
+|---|---:|---|
+| `live_armed_accounts_max` | 2 | v1 maximum simultaneously armed accounts. The service refuses a third; raising this requires re-validating the production p95 latency and sustained CLOB request budgets. |
+| `account_id` | `[a-z0-9_-]{1,32}` | Immutable lowercase account slug grammar, enforced by `core-types::AccountId` and `accounts.account_id`. |
+| `live_price_impact_cap_bps_default` | 100 | Per-account default in `accounts.live_price_impact_cap_bps`; the database accepts `1..=10_000`. This is distinct from the shared paper `price_impact_cap_bps_default`. |
+| `dispatch_seed_retention_days` | 30 | Retain terminal dispatch aggregates for this many days after finalization, then prune seed and target rows together. |
+| `live_redemption_surface_after_attempts` | 3 | Compiled threshold after which an unresolved automatic redemption is surfaced prominently; it is not an operator knob. |
 
 ### Paper trading state (`paper-state`, issue #282)
 
@@ -461,7 +472,7 @@ a focused file for problems, and a bounded stream for detail — never an unboun
 
 | Artifact | Shape | Use |
 |---|---|---|
-| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — `updated_at, uptime_secs, mode, authoritative, bankroll, open_positions, fills_total, settled_total, last_event_seq, watchlist_size, watchlist_target_size, supabase_rpc_calls`. `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap (the compiled fallback until a Supabase value is applied). Read this first; no grep. |
+| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — `updated_at, uptime_secs, mode, authoritative, bankroll, open_positions, fills_total, settled_total, last_event_seq, watchlist_size, watchlist_target_size, supabase_rpc_calls`, plus an additive optional `live` block with `pending_dispatch_seeds`, `ready_dispatch_seeds`, and per-account `account_id, is_primary, enabled, requested_live_mode, effective_live_mode, armed`. `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap (the compiled fallback until a Supabase value is applied). Read this first; no grep. |
 | `<stem>.<date>.jsonl` (from `jsonl_log_path`) | full stream, rotated **daily**, keeps `log_retention_days` | full detail; grep one day's file |
 | `errors.<date>.jsonl` (same dir) | **WARN+ERROR only**, rotated daily | the clean "what broke" tape (no INFO chatter) |
 

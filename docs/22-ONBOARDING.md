@@ -102,12 +102,15 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 | `PE_BACKTEST_STEP_DAYS` | Walk-forward step size in days | | `1` |
 | `PE_BACKTEST_KELLY_SWEEP` | `1` to run Kelly-fraction sweep instead of single run | | `0` |
 
-#### Credentialed canary
+#### Live credential custody
 
-Ordinary `pe-service` is paper-only and has no live credential environment variables. The
-isolated V2 canary receives root-owned files through systemd `LoadCredential=` and is installed
-inactive. See [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md); never
-place canary credentials in the ordinary `.env`.
+Ordinary `pe-service` has a #508 per-account live path that ships dark until armed. Its credentials
+are age-sealed per-account bundles in Supabase; only the service-scoped age identity arrives through
+systemd `LoadCredential=`. They are not environment variables. The isolated V2 canary keeps its own
+root-owned systemd credentials and remains inactive. See
+[`35-PE-SERVICE-DEPLOY-RUNBOOK.md`](35-PE-SERVICE-DEPLOY-RUNBOOK.md) and
+[`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md); never place either
+path's live credentials in the ordinary `.env`.
 
 ## Startup sequence
 

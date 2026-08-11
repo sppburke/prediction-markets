@@ -48,11 +48,12 @@ Polymarket uses signature types and a funder address that can be an EOA, proxy w
 
 ### Isolated V2 canary boundary
 
-The retired V1 signing/submission implementation is absent. The only credentialed path is the
-dedicated, initially inactive `pe-service-live-canary` role. It pins SDK 0.7.0 with the `clob`
-feature only, the explicit production CLOB host, Polygon standard V2 exchange, `POLY_1271`, and a
-deposit-wallet maker/signer/funder. Its reachable order surface is BUY-only limit FOK with zero
-builder/metadata, `postOnly = false`, and explicit `deferExec = false`; batches, replacement,
+The retired V1 signing/submission implementation is absent. Ordinary `pe-service` now has a #508
+per-account V2 execution path that ships dark until armed. The dedicated, initially inactive
+`pe-service-live-canary` remains a separate standard-exchange-only role. It pins SDK 0.7.0 with the
+`clob` feature only, the explicit production CLOB host, Polygon standard V2 exchange, `POLY_1271`,
+and a deposit-wallet maker/signer/funder. Its reachable order surface is BUY-only limit FOK with
+zero builder/metadata, `postOnly = false`, and explicit `deferExec = false`; batches, replacement,
 market-order builders, hidden polling, and V1 are unreachable.
 
 Admission requires strict agreement among Gamma canonical tag identity and direct market-tag
