@@ -165,3 +165,72 @@ fn rebuild_state_empty_log_gives_initial_bankroll() {
 
     println!("PASS: missing log → bankroll={initial}, applied=0");
 }
+
+/// #508 Decision 10: `--rebuild-state` (an event-log replay into a FRESH DB) must never
+/// synthesize dispatch state — the frozen aggregate lives only in the original SQLite and
+/// recovery may only flip existing staged seeds, never reconstruct targets from current
+/// accounts or configuration.
+/// PASS: the rebuilt DB carries ZERO dispatch seeds even though the original had one.
+#[test]
+fn rebuild_never_synthesizes_dispatch_targets() {
+    println!("Scenario: rebuild_state — dispatch aggregates are never synthesized");
+    let dir = TempDir::new().unwrap();
+    let rebuild_dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("paper_state.db");
+    let log_path = dir.path().join("paper.log");
+    let rebuild_db_path = rebuild_dir.path().join("paper_state_rebuilt.db");
+
+    // Original run: one fill through the executor + a staged, flipped dispatch seed.
+    let db = PaperStateDb::open(&db_path).unwrap();
+    db.init_bankroll(dec!(1000)).unwrap();
+    let writer = Writer::open(&log_path).unwrap();
+    let mut executor = PaperExecutor::new(writer, SourceId("test.paper".into()), 500, 100);
+    let one = intent("wf|k508", Side::Buy, 10, dec!(0.40));
+    let (fill, seq) = executor
+        .execute(&one, SourceTimestamp(OffsetDateTime::UNIX_EPOCH), None)
+        .unwrap();
+    db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+        dispatch_id: "wf|k508".to_string(),
+        signal_json: "{\"schema_version\":1}".to_string(),
+        source_trade_id: "src-508".to_string(),
+        created_at_unix: 1_000,
+        targets: vec![pe_paper_state::DispatchTargetSeed {
+            account_id: "primary-acct".to_string(),
+            credential_bundle_version: 1,
+            credential_key_id: "key-1".to_string(),
+        }],
+    })
+    .unwrap();
+    db.commit_fill_with_flip(
+        &SourceTradeId("src-508".to_string()),
+        &leader(10),
+        &FillRecord {
+            idempotency_key: fill.intent.idempotency_key.clone(),
+            market_id: fill.intent.market_id.clone(),
+            outcome_id: fill.intent.outcome_id,
+            side: fill.intent.side,
+            contracts: fill.intent.contracts.0,
+            fill_price: fill.simulated_fill_price,
+        },
+        seq,
+        Some(pe_paper_state::DispatchFlip {
+            dispatch_id: "wf|k508",
+            paper_outcome: "fill",
+        }),
+    )
+    .unwrap();
+    assert!(db.dispatch_seed("wf|k508").unwrap().is_some());
+
+    // Rebuild into a fresh DB from the event log alone.
+    let rebuilt = PaperStateDb::open(&rebuild_db_path).unwrap();
+    rebuilt.init_bankroll(dec!(1000)).unwrap();
+    let applied = reconcile_paper_state(&log_path, &rebuilt).unwrap();
+    assert_eq!(applied, 1, "the fill replays");
+    assert!(
+        rebuilt.dispatch_seed("wf|k508").unwrap().is_none(),
+        "rebuild must not synthesize dispatch aggregates"
+    );
+    assert!(rebuilt.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(rebuilt.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+    println!("PASS: rebuild replayed the fill and synthesized ZERO dispatch state");
+}
