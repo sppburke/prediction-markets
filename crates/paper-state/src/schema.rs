@@ -120,4 +120,42 @@ CREATE TABLE IF NOT EXISTS fill_market_snapshots (
     ask_levels_json       TEXT,
     captured_at_unix      INTEGER NOT NULL
 );
+
+-- #508 Decision 10: the crash-safe two-phase live dispatch aggregate. When an admitted
+-- copy signal has at least one live target, the orchestrator durably stages ONE seed row
+-- (state 'pending_paper') BEFORE the paper fill can become durable in the event log; the
+-- seed flips to 'ready' inside the same SQLite transaction that commits the paper outcome
+-- (fill or typed no-fill, recorded in paper_outcome). The frozen signal_json carries the
+-- complete normalized signal, ordered target list identity, and configuration/decision
+-- identity — redelivery reuses the staged seed and NEVER recomputes targets from current
+-- configuration. finalized_at_unix is set when every target is terminal (the retention
+-- anchor for `dispatch_seed_retention_days`, _GLOSSARY.md). Additive tables — materialise
+-- on the live DB via `IF NOT EXISTS` with SCHEMA_VERSION held at 1.
+CREATE TABLE IF NOT EXISTS dispatch_seeds (
+    dispatch_id       TEXT    PRIMARY KEY NOT NULL,
+    state             TEXT    NOT NULL CHECK(state IN ('pending_paper','ready')),
+    signal_json       TEXT    NOT NULL,
+    paper_outcome     TEXT,
+    source_trade_id   TEXT    NOT NULL,
+    created_at_unix   INTEGER NOT NULL,
+    finalized_at_unix INTEGER
+);
+
+-- Frozen ordered live targets for one dispatch aggregate: primary first, then
+-- (execution_order, account_id), ranks assigned at staging. Each target binds the
+-- admitted credential identity (Decision 10 credential binding); the executor requires
+-- an exact match before POST. `state` is the coarse lifecycle; `terminal_reason` the
+-- typed detail (e.g. 'filled', 'killed', 'credential_version_changed').
+CREATE TABLE IF NOT EXISTS dispatch_targets (
+    dispatch_id               TEXT    NOT NULL,
+    account_id                TEXT    NOT NULL,
+    exec_rank                 INTEGER NOT NULL,
+    credential_bundle_version INTEGER NOT NULL,
+    credential_key_id         TEXT    NOT NULL,
+    state                     TEXT    NOT NULL
+        CHECK(state IN ('pending','submitted','ambiguous','terminal')),
+    terminal_reason           TEXT,
+    updated_at_unix           INTEGER NOT NULL,
+    PRIMARY KEY (dispatch_id, account_id)
+);
 ";

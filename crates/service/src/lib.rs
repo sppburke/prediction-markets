@@ -8,6 +8,7 @@ pub mod config_poller;
 pub mod demotion_stat;
 pub mod entry_gate;
 pub mod health;
+pub mod live_accounts;
 pub mod live_canary;
 pub mod live_watchlist;
 pub mod logging;

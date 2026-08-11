@@ -167,6 +167,7 @@ async fn run_with(
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config,
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig {
@@ -328,6 +329,7 @@ async fn run_gate_with(
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config: Some(LiveRuntimeConfig::new(rc)),
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),

@@ -487,6 +487,7 @@ async fn main() -> Result<()> {
             clob_best_ask_fallback_haircut_bps: cfg.clob_best_ask_fallback_haircut_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
+            live_accounts: None,
         },
         history_map,
         WinnerFollowStrategy::new(cfg.strategy.clone()),

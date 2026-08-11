@@ -183,6 +183,7 @@ async fn run_trades(
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(strategy_cfg),

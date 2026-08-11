@@ -213,7 +213,7 @@ async fn ac_wt_rpc_first_then_sqlite_mirror() {
     let src = SourceTradeId("src5".to_string());
 
     let ret =
-        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row)
+        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row, None)
             .await
             .unwrap();
 
@@ -237,7 +237,7 @@ async fn ac_fail_closed_leaves_sqlite_untouched() {
     let src = SourceTradeId("src5".to_string());
 
     let ret =
-        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row)
+        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row, None)
             .await;
 
     // PASS: the RPC error propagates (caller skips the trade), and SQLite is NOT written — the
@@ -384,6 +384,7 @@ async fn ac_parity_fake_matches_paper_state_over_fill_mix() {
             &record,
             EventSeq(seq as u64),
             &sup_row,
+            None,
         )
         .await
         .unwrap();
