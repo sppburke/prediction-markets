@@ -10,6 +10,7 @@
 
 pub mod canary_market;
 pub mod ladder;
+pub mod redemption;
 pub mod v2;
 
 pub use canary_market::{
@@ -18,6 +19,20 @@ pub use canary_market::{
 };
 pub use ladder::{
     LADDER_MAX_AGE_MS, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy, plan_exact_shares,
+};
+pub use redemption::{
+    ApprovalCheckRequest, ApprovalEvidence, ApprovalReadError, ApprovalReader,
+    BuilderApiKeyCredentials, CONDITIONAL_TOKENS, ConfirmedRedemption, CustodyKind,
+    DEPOSIT_WALLET_RELAY_TARGET, NEGRISK_COLLATERAL_ADAPTER, REDEEM_POSITIONS_SELECTOR,
+    REDEEM_POSITIONS_SIGNATURE, REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION,
+    REDEMPTION_SCHEMA_VERSION, RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_NONCE_PATH,
+    RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX, RELAYER_LEGACY_NONCE_PATH,
+    RELAYER_LEGACY_TRANSACTION_PATH, RELAYER_SUBMIT_PATH, RedemptionCall, RedemptionError,
+    RedemptionTransport, RedemptionTransportError, RelayerApiKeyCredentials, RelayerCredentials,
+    RelayerHttpRequest, RelayerNonce, RelayerPollPolicy, RelayerSignatureParams, RelayerState,
+    RelayerTransportClient, STANDARD_COLLATERAL_ADAPTER, SignedRedemptionRequest,
+    UnsupportedCustody, UnverifiedApprovalReader, build_redemption_call, redemption_adapter,
+    redemption_approval_requests, require_verified_approval,
 };
 pub use v2::{
     CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CanaryV2Error, PostOnceResult,
