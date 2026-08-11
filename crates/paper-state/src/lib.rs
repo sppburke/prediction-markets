@@ -1918,12 +1918,18 @@ mod tests {
     #[test]
     fn stage_is_idempotent_and_freezes_targets() {
         let (_dir, db) = db();
-        assert!(db.stage_dispatch_seed(&seed("d1", &["primary", "partner"])).unwrap());
+        assert!(
+            db.stage_dispatch_seed(&seed("d1", &["primary", "partner"]))
+                .unwrap()
+        );
         // Redelivery with a DIFFERENT target list must reuse the frozen seed untouched.
         assert!(!db.stage_dispatch_seed(&seed("d1", &["other"])).unwrap());
         let targets = db.dispatch_targets("d1").unwrap();
         assert_eq!(
-            targets.iter().map(|t| t.account_id.as_str()).collect::<Vec<_>>(),
+            targets
+                .iter()
+                .map(|t| t.account_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["primary", "partner"],
             "frozen order preserved; redelivery never recomputes targets"
         );
@@ -1945,13 +1951,19 @@ mod tests {
             &leader(10, 0),
             &fill("d2", Side::Buy, 10, dec!(0.50)),
             EventSeq(1),
-            Some(DispatchFlip { dispatch_id: "d2", paper_outcome: "fill" }),
+            Some(DispatchFlip {
+                dispatch_id: "d2",
+                paper_outcome: "fill",
+            }),
         )
         .unwrap();
         let row = db.dispatch_seed("d2").unwrap().unwrap();
         assert_eq!(row.state, "ready");
         assert_eq!(row.paper_outcome.as_deref(), Some("fill"));
-        assert!(db.is_seen(&src).unwrap(), "seen-mark and flip share one transaction");
+        assert!(
+            db.is_seen(&src).unwrap(),
+            "seen-mark and flip share one transaction"
+        );
         // The ready, unfinalized seed is visible to the fan-out consumer, oldest first.
         let ready = db.unfinalized_ready_dispatch_seeds().unwrap();
         assert_eq!(ready.len(), 1);
@@ -1965,7 +1977,10 @@ mod tests {
         db.commit_seen_no_fill_with_flip(
             &SourceTradeId("src-d3".to_string()),
             &leader(0, 0),
-            Some(DispatchFlip { dispatch_id: "d3", paper_outcome: "no_fill:no_edge" }),
+            Some(DispatchFlip {
+                dispatch_id: "d3",
+                paper_outcome: "no_fill:no_edge",
+            }),
         )
         .unwrap();
         let row = db.dispatch_seed("d3").unwrap().unwrap();
@@ -1982,7 +1997,11 @@ mod tests {
         assert!(!db.flip_dispatch_ready("d4", "fill").unwrap());
         // The outcome recorded by the FIRST flip is retained.
         assert_eq!(
-            db.dispatch_seed("d4").unwrap().unwrap().paper_outcome.as_deref(),
+            db.dispatch_seed("d4")
+                .unwrap()
+                .unwrap()
+                .paper_outcome
+                .as_deref(),
             Some("fill")
         );
         // A flip against a never-staged seed is an invariant breach.
@@ -1997,14 +2016,19 @@ mod tests {
         let (_dir, db) = db();
         db.stage_dispatch_seed(&seed("d5", &["a", "b"])).unwrap();
         db.flip_dispatch_ready("d5", "fill").unwrap();
-        db.set_dispatch_target_state("d5", "a", "terminal", Some("filled"), 2_000).unwrap();
+        db.set_dispatch_target_state("d5", "a", "terminal", Some("filled"), 2_000)
+            .unwrap();
         assert!(
             !db.finalize_dispatch_if_terminal("d5", 2_000).unwrap(),
             "one non-terminal target must block finalization"
         );
-        db.set_dispatch_target_state("d5", "b", "terminal", Some("killed"), 2_100).unwrap();
+        db.set_dispatch_target_state("d5", "b", "terminal", Some("killed"), 2_100)
+            .unwrap();
         assert!(db.finalize_dispatch_if_terminal("d5", 2_100).unwrap());
-        assert!(!db.finalize_dispatch_if_terminal("d5", 2_200).unwrap(), "idempotent");
+        assert!(
+            !db.finalize_dispatch_if_terminal("d5", 2_200).unwrap(),
+            "idempotent"
+        );
         assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
         // Retention: not yet pruned inside the window, pruned past it (targets cascade).
         assert_eq!(db.prune_terminal_dispatch(2_500, 1_000).unwrap(), 0);
@@ -2036,8 +2060,8 @@ mod tests {
             db.set_dispatch_target_state("d7", "ghost", "terminal", None, 1),
             Err(PaperStateError::Internal(_))
         ));
-        db.set_dispatch_target_state("d7", "a", "submitted", None, 1).unwrap();
+        db.set_dispatch_target_state("d7", "a", "submitted", None, 1)
+            .unwrap();
         assert_eq!(db.dispatch_targets("d7").unwrap()[0].state, "submitted");
     }
 }
-

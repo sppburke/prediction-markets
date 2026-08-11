@@ -72,7 +72,10 @@ impl VenueSettlementRecord {
     /// Validate this record for a live ENTRY at `now`: schema supported, fresh within its
     /// window, and the venue still reports the market unresolved (an already-resolved or
     /// ambiguous market must never admit a new live entry). Fails closed on any violation.
-    pub fn validate_fresh_for_entry(&self, now: OffsetDateTime) -> Result<(), VenueSettlementError> {
+    pub fn validate_fresh_for_entry(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<(), VenueSettlementError> {
         if self.schema_version != VENUE_SETTLEMENT_SCHEMA_VERSION {
             return Err(VenueSettlementError::Schema(self.schema_version));
         }
@@ -129,8 +132,11 @@ mod tests {
         );
         // Resolved / ambiguous markets never admit a live entry.
         assert_eq!(
-            record(VenueResolutionStatus::ResolvedWinner { outcome_index: 0 }, 1_000)
-                .validate_fresh_for_entry(at(1_010)),
+            record(
+                VenueResolutionStatus::ResolvedWinner { outcome_index: 0 },
+                1_000
+            )
+            .validate_fresh_for_entry(at(1_010)),
             Err(VenueSettlementError::AlreadyResolved)
         );
         assert_eq!(
