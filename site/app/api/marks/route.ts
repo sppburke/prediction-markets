@@ -1,4 +1,4 @@
-// Live mark proxy for unrealized PnL (#398 WS3, step 19). Server-side Gamma price fetch with an
+// Current-mark proxy for watched-paper unrealized PnL (#398 WS3, #508 terminology). Gamma fetch with an
 // in-process 30s TTL cache (no Supabase writes) keyed "market:outcome". Returns { key: mark } for
 // the requested keys; a key whose market can't be fetched is simply omitted (the cell shows "—").
 import { NextResponse } from "next/server";

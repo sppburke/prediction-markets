@@ -1,5 +1,5 @@
-// Gate every non-static, non-auth route behind the single-email session (#398 WS3, step 15).
-// The `authorized` callback in `auth.ts` redirects unauthenticated requests to sign-in.
+// Gate every non-static, non-auth route behind any authenticated session (#508 Phase C).
+// Account/live handlers re-resolve their stronger authorization through lib/authz.ts.
 export { auth as middleware } from "@/auth";
 
 export const config = {

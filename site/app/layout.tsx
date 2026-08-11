@@ -5,9 +5,9 @@ import { Providers } from "@/components/Providers";
 import { SignOut } from "@/components/SignOut";
 
 export const metadata: Metadata = {
-  title: "Paper-trade analytics — historical vs live",
+  title: "Paper-trade analytics — historical vs watched",
   description:
-    "Per-wallet historical (ranker) vs live (paper) copy-trade stats from Supabase.",
+    "Per-wallet historical (ranker) vs watched (paper) copy-trade stats from Supabase.",
 };
 
 export const viewport: Viewport = {
@@ -31,7 +31,10 @@ export default function RootLayout({
                   pe<span className="text-accent">·</span>analytics
                 </Link>
                 <nav className="flex items-center gap-4 text-xs text-muted">
-                  <span>historical vs live · paper</span>
+                  <span>historical vs watched · paper</span>
+                  <Link href="/live" className="hover:text-accent">
+                    live
+                  </Link>
                   <Link href="/admin" className="hover:text-accent">
                     admin
                   </Link>
@@ -43,7 +46,7 @@ export default function RootLayout({
             <footer className="mx-auto max-w-6xl px-4 py-8 text-xs text-muted">
               Reads the Supabase <code className="text-accent">wallet_live_stats</code> view
               via the anon key (read-only RLS). Local <code>paper_state.db</code> stays
-              authoritative. Single-email access (#398 WS3).
+              authoritative. Account-scoped Live data is authorized per request (#508).
             </footer>
           </div>
         </Providers>

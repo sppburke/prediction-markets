@@ -13,7 +13,7 @@ import {
 import { formatUsd, shortWallet, toNum } from "@/lib/format";
 import type { WalletLiveStats } from "@/lib/types";
 
-/** Top wallets by absolute live realized P&L, coloured by sign. */
+/** Top wallets by absolute watched-paper realized P&L, coloured by sign. */
 export function PnlBarChart({ rows, top = 15 }: { rows: WalletLiveStats[]; top?: number }) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);

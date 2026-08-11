@@ -1,6 +1,6 @@
-// Server-only Supabase client holding the SERVICE-ROLE key (bypasses RLS) for the admin write
-// path (#398 WS3, step 16, Decision #7). NEVER import this from a client component — `server-only`
-// makes that a build error, and the runtime `typeof window` guard is a second backstop (risk #8).
+// Server-only Supabase client holding the SERVICE-ROLE key (bypasses RLS) for authz, account/live
+// reads, and admin writes (#398 WS3, #508 Phase C). NEVER import this from a client component —
+// `server-only` makes that a build error, and the runtime guard is a second backstop.
 import "server-only";
 
 import { type SupabaseClient, createClient } from "@supabase/supabase-js";

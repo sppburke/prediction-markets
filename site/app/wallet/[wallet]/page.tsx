@@ -37,7 +37,7 @@ export default async function WalletDetailPage({
           ← all wallets
         </Link>
         <h1 className="mt-1 break-all text-lg font-semibold tabular-nums">{wallet}</h1>
-        <p className="text-xs text-muted">Historical (ranker) vs live (paper) detail.</p>
+        <p className="text-xs text-muted">Historical (ranker) vs watched (paper) detail.</p>
       </div>
 
       {error ? (
@@ -48,7 +48,7 @@ export default async function WalletDetailPage({
         <>
           <div className="grid gap-6 lg:grid-cols-2">
             <HistVsLivePanel row={row} />
-            <Panel title="Win rate — historical vs live">
+            <Panel title="Win rate — historical vs watched">
               <WinRateCompareChart row={row} />
             </Panel>
           </div>

@@ -8,7 +8,7 @@ export class NotConfiguredError extends Error {
   }
 }
 
-/** All wallets in the historical-vs-live view. Reads the `wallet_live_stats_mv` materialized
+/** All wallets in the historical-vs-watched view. Reads the `wallet_live_stats_mv` materialized
  * view (a periodically-refreshed cache of the `wallet_live_stats` aggregation) so the heavy
  * full-table aggregation runs on a schedule, not on every page view. */
 export async function fetchWalletStats(): Promise<WalletLiveStats[]> {
@@ -22,7 +22,7 @@ export async function fetchWalletStats(): Promise<WalletLiveStats[]> {
   return (data ?? []) as WalletLiveStats[];
 }
 
-/** pe-service's current live watchlist size ("N watched"), or null if not yet published. */
+/** pe-service's current paper watchlist size ("N watched"), or null if not yet published. */
 export async function fetchServiceRuntime(): Promise<ServiceRuntime | null> {
   const sb = getSupabase();
   if (!sb) throw new NotConfiguredError();
@@ -35,7 +35,7 @@ export async function fetchServiceRuntime(): Promise<ServiceRuntime | null> {
   return (data as ServiceRuntime | null) ?? null;
 }
 
-/** One wallet's historical-vs-live row (wallet keys are lowercase). Reads the
+/** One wallet's historical-vs-watched row (wallet keys are lowercase). Reads the
  * `wallet_live_stats_mv` materialized view (filter pushed down to the indexed `wallet`). */
 export async function fetchWalletStat(wallet: string): Promise<WalletLiveStats | null> {
   const sb = getSupabase();
@@ -50,7 +50,7 @@ export async function fetchWalletStat(wallet: string): Promise<WalletLiveStats |
 }
 
 /** Lowercase `wallet_hex` set pe-service is actively copying (#398 WS3 step 20). Soft-fails to an
- * empty set when the table is unreadable/empty (risk #10) so the Live tab degrades gracefully to
+ * empty set when the table is unreadable/empty (risk #10) so the Watched tab degrades gracefully to
  * `live_open_fills>0` rather than erroring. */
 export async function fetchWatchedSet(): Promise<Set<string>> {
   const sb = getSupabase();

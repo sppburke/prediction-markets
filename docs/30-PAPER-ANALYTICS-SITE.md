@@ -1,8 +1,8 @@
 # 30 — Paper-trade analytics pipeline (sink → schema → view → site)
 
-The historical-vs-live analytics stack for the live paper copy-trader (issue
+The historical-vs-watched analytics stack for the paper copy-trader (issue
 #343). It projects paper trading into Supabase and renders a per-wallet
-historical-vs-live view. In the default (analytics-only) mode the local trade
+historical-vs-watched view. In the default (analytics-only) mode the local trade
 path is unaffected: `paper_state.db` stays authoritative and the event log stays
 the durable write-ahead.
 
@@ -20,7 +20,7 @@ The event log stays the local crash-recovery WAL. See `_GLOSSARY.md`:
 pe-service (Rust)                         Supabase                     site/ (Next.js)
   paper fills + settlements  ──sink──▶  paper_fills                      reads
   (best-effort, drop-on-full)           settled_markets   ──view──▶  wallet_live_stats ──anon──▶  overview + per-wallet
-  ranker batches (local push) ───────▶  ranking_entries / latest_ranking                            historical-vs-live
+  ranker batches (local push) ───────▶  ranking_entries / latest_ranking                            historical-vs-watched
 ```
 
 - **Sink** (`crates/service/src/supabase_sink.rs`, PR2): dual-writes fills +
@@ -43,11 +43,13 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   every 2 min; a unique index on `wallet` enables the concurrent refresh. The site reads the
   matview. Apply the SQL to Supabase, then deploy the site. (The pg_cron block self-skips on a
   Postgres without the extension, so the file also loads in CI.)
-- **Site** (`site/`, PR3): thin read-only Next.js viewer (App Router + Tailwind +
-  Recharts + `@supabase/supabase-js`). Overview + per-wallet historical-vs-live
-  panels and charts; the two pages are **server-rendered with ISR** (`export const
+- **Site** (`site/`, PR3 + issue #508 Phase C): the shared Paper overview and per-wallet
+  historical-vs-watched panels remain read-only Next.js views (App Router + Tailwind + Recharts +
+  `@supabase/supabase-js`) using anon RLS. Phase C adds Google-authenticated, service-role-backed
+  per-account Live views and admin RPC controls, including write-only age-sealed credentials.
+  The two Paper pages are **server-rendered with ISR** (`export const
   revalidate = 60`), so the `wallet_live_stats_mv` read is fetched server-side and shared
-  across viewers rather than re-queried from every browser. Self-hosted on :3000; anon key.
+  across viewers rather than re-queried from every browser. Self-hosted on :3000.
 
 ## Numeric precision
 
@@ -64,8 +66,11 @@ strategy thresholds (which live in `_GLOSSARY.md` / `19-`).
 - Apply the schema via the IPv4 session pooler (the direct host is IPv6-only); see
   the memory note in the project handoff and `scripts/supabase_schema.sql`.
 - Site: `cd site && cp .env.example .env.local && npm ci && npm run build && npm run start`.
-- Site env vars are the **public** anon key only (`NEXT_PUBLIC_SUPABASE_URL`,
-  `NEXT_PUBLIC_SUPABASE_ANON_KEY`); never the secret key.
+- Shared Paper reads use the **public** anon key (`NEXT_PUBLIC_SUPABASE_URL`,
+  `NEXT_PUBLIC_SUPABASE_ANON_KEY`). Since issue #508 Phase C, the site also holds the server-only
+  `SUPABASE_SERVICE_ROLE_KEY` for per-request account authorization, account-scoped Live reads, and
+  admin control RPCs; it is never exposed to browser code. Sealed credential writes use the public
+  `PE_AGE_RECIPIENT`; the matching private identity is not installed on the site host.
 
 ## Status / follow-ups
 

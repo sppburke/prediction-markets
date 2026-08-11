@@ -1,21 +1,24 @@
 # pe-analytics-site
 
-Historical-vs-live paper-trade analytics site (issue #343 PR3). A thin, read-only
-Next.js 15 (App Router) + Tailwind + Recharts viewer over the Supabase
-`wallet_live_stats` view. It reads with the **public anon/publishable key** under
-read-only RLS (`scripts/supabase_schema.sql`); the local `paper_state.db` and the
-service-role secret key stay on `pe-service`.
+Historical-vs-watched paper-trade analytics plus account-scoped live execution
+visibility and controls (issue #508 Phase C). The Next.js 15 App Router site reads
+the shared Paper views with the public anon/publishable key under read-only RLS.
+Server-only account authorization, Live reads, and admin controls use the service-role
+key; it is never sent to the browser.
 
 ## What it shows
 
-- **Overview (`/`)** — portfolio KPIs, a live realized-P&L-by-wallet bar chart, and
+- **Overview (`/`)** — portfolio KPIs, a watched-paper realized-P&L-by-wallet bar chart, and
   a sortable per-wallet table joining historical (ranker: `ls_edge`, `hit_rate`,
-  `n_trades`, …) against live (paper: realized P&L, win rate, open/settled fills).
-- **Wallet detail (`/wallet/<addr>`)** — the historical-vs-live panel, a win-rate
+  `n_trades`, …) against watched paper stats (realized P&L, win rate, fills).
+- **Wallet detail (`/wallet/<addr>`)** — the historical-vs-watched panel, a win-rate
   comparison chart, and the recent paper-fill tape.
+- **Live (`/live`)** — authorized account-scoped live fills, positions, and account state.
+- **Accounts (`/admin/accounts`)** — admin-only account controls and write-only sealed
+  credential rotation.
 
 This beats the legacy portfolio-only SSR dashboard (`crates/paper-pnl/dashboard.rs`)
-by adding the per-wallet historical-vs-live join the SSR page never had.
+by adding the per-wallet historical-vs-watched join the SSR page never had.
 
 ## Numeric display
 
@@ -30,7 +33,7 @@ contract is locked by `lib/format.test.ts` (`npm run test`).
 
 ```bash
 cd site
-cp .env.example .env.local   # fill in NEXT_PUBLIC_SUPABASE_URL + _ANON_KEY
+cp .env.example .env.local   # fill in public + server-only auth/account settings
 npm ci
 npm run dev                  # http://localhost:3000
 ```
