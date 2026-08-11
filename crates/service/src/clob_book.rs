@@ -72,6 +72,11 @@ pub struct BookLevel {
 pub struct OrderBook {
     /// Ask levels `{price, size}` as returned by `/book`.
     pub asks: Vec<BookLevel>,
+    /// Client-side fetch completion time (Unix ms), stamped by the
+    /// [`ClobBookFetcher`] implementations (#508 Phase A). The impact-gate
+    /// planner refuses to price an order off a snapshot older than the shared
+    /// ladder staleness bound. `from_book_json` leaves it `0` (parse-only).
+    pub fetched_at_ms: u64,
 }
 
 impl OrderBook {
@@ -94,7 +99,10 @@ impl OrderBook {
             })?;
             asks.push(BookLevel { price, size });
         }
-        Ok(Self { asks })
+        Ok(Self {
+            asks,
+            fetched_at_ms: 0,
+        })
     }
 
     /// Best (lowest-price) ask, or `None` for an empty book. Computed as the
@@ -102,6 +110,29 @@ impl OrderBook {
     /// returns levels in.
     pub fn best_ask(&self) -> Option<Decimal> {
         self.asks.iter().map(|level| level.price).min()
+    }
+
+    /// The positive-size, positive-price ask ladder sorted ascending by price —
+    /// the planner input (#508 Phase A). Zero-size dust and non-positive prices
+    /// are filtered (they must not anchor a fill basis); sizes are truncated to
+    /// the 6-dp exact share scale (never overstating depth); a level whose
+    /// price is not a valid [`pe_core_types::Price`] (out of `[0, 1]`) yields
+    /// `None` — a corrupt book the impact gate treats as unusable (fail-closed).
+    pub fn ladder(&self) -> Option<Vec<pe_venue_polymarket::AskLevel>> {
+        let mut out = Vec::with_capacity(self.asks.len());
+        for level in &self.asks {
+            let size = level
+                .size
+                .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero);
+            if size <= Decimal::ZERO || level.price <= Decimal::ZERO {
+                continue;
+            }
+            let price = pe_core_types::Price::new(level.price).ok()?;
+            let shares = pe_core_types::ShareAmount::from_decimal_exact(size).ok()?;
+            out.push(pe_venue_polymarket::AskLevel { price, shares });
+        }
+        out.sort_by_key(|level| level.price);
+        Some(out)
     }
 }
 
@@ -207,8 +238,15 @@ impl ClobBookFetcher for ReqwestClobBookFetcher {
             .bytes()
             .await
             .map_err(|e| ClobBookError::Request(e.to_string()))?;
-        OrderBook::from_book_json(&body)
+        let mut book = OrderBook::from_book_json(&body)?;
+        book.fetched_at_ms = now_unix_ms();
+        Ok(book)
     }
+}
+
+/// Current Unix time in milliseconds (`0` before the epoch — unreachable on a live host).
+pub(crate) fn now_unix_ms() -> u64 {
+    u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
 /// Deterministic [`ClobBookFetcher`] returning pre-loaded books keyed by token
@@ -227,10 +265,17 @@ impl FixtureClobBookFetcher {
 
 impl ClobBookFetcher for FixtureClobBookFetcher {
     async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
-        self.books
+        let mut book = self
+            .books
             .get(token_id)
             .cloned()
-            .ok_or_else(|| ClobBookError::MissingFixture(token_id.to_string()))
+            .ok_or_else(|| ClobBookError::MissingFixture(token_id.to_string()))?;
+        // Mirror production: stamp fetch completion so a fixture book is fresh at plan time.
+        // A fixture that pre-sets a non-zero `fetched_at_ms` keeps it (staleness tests).
+        if book.fetched_at_ms == 0 {
+            book.fetched_at_ms = now_unix_ms();
+        }
+        Ok(book)
     }
 }
 
@@ -334,6 +379,7 @@ mod tests {
                     price: dec!(0.6),
                     size: dec!(10),
                 }],
+                fetched_at_ms: 0,
             },
         );
         let fetcher = FixtureClobBookFetcher::new(books);

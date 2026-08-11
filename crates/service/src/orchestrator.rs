@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig, classify_trade};
 use pe_core_types::{
-    EventSeq, MarketId, MarketOutcomeId, Price, Probability, ReconstructionQuality, Side,
-    SourceTimestamp, TraderId, VenueId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, Price, Probability,
+    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
@@ -22,11 +22,12 @@ use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::PageFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, FillSource, PaperExecutionError, PaperExecutor, PaperFill, WinnerFollowStrategy,
+    ExecutionMode, FillSource, PaperExecutionError, PaperExecutor, PaperFill, SizingMode,
+    WinnerFollowStrategy,
 };
 use pe_trader_index::Watchlist;
+use pe_venue_polymarket::{AskLevel, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive as _;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -39,7 +40,7 @@ use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::{self, FillMode, LiveRuntimeConfig};
-use crate::snapshot_worker::{SnapshotHandle, absorbable_contracts_within_bps, enqueue_if_buy};
+use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, supabase_fill_from};
 use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
 
@@ -294,20 +295,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
     // ── Private handlers ──────────────────────────────────────────────────────
 
-    /// Contracts absorbable within `price_impact_cap_bps` of best ask from the live `/book`
-    /// (#398 WS2 step 5c). Returns:
-    /// - `None` — gate disabled, missing CLOB token, or a `/book` fetch error/timeout: **fail-open**
-    ///   (no cap, risk #4), or an implausibly deep book whose contract count overflows `u64`.
-    /// - `Some(0)` — a successful read with nothing absorbable within the band (empty ask book, or
-    ///   no level within `bps`): the trade is **skipped** (distinct from fail-open).
-    /// - `Some(n)` — cap the size at `n` contracts.
-    async fn book_cap_contracts(&self, signal: &LeaderSignal) -> Option<u64> {
-        let cap_bps = self.price_impact_cap_bps;
-        if cap_bps <= 0 {
-            return None; // gate disabled → fail-open
-        }
-        let bps = u64::try_from(cap_bps).ok()?;
-        // The outcome's CLOB token id (served from the mid cache, warm from the price fetch above).
+    /// Impact-gate ladder plan (#508 Phase A): ONE `/book` fetch per admitted signal feeds
+    /// the band gate, the budget planner, and (in `clob_best_ask` paper mode) the fill basis.
+    ///
+    /// Called only when the gate is enabled (`price_impact_cap_bps ≥ 1`). Every failure is a
+    /// typed skip reason and **fails closed** — unusable book (missing token, fetch
+    /// error/timeout, corrupt levels, empty ladder, stale snapshot) and an in-band ladder
+    /// affording no whole share both produce no order. The planner budget follows the sizing
+    /// mode: `Dollar` plans within its USD notional; `Contract` caps at the requested count
+    /// within the available bankroll; `Kelly` plans the full in-band depth within bankroll.
+    async fn plan_impact_gate(&self, signal: &LeaderSignal) -> Result<LadderPlan, &'static str> {
+        let cap_bps =
+            u64::try_from(self.price_impact_cap_bps).map_err(|_| "impact gate cap invalid")?;
         let snaps = self
             .mid_price_cache
             .fetch_snapshots(std::slice::from_ref(&signal.market_id))
@@ -317,29 +316,62 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .get(usize::from(signal.outcome_id.0))
                 .cloned()
         }) else {
-            return None; // missing token → fail-open (risk #4)
+            return Err("price-impact book unusable: missing CLOB token (fail closed)");
         };
-        match tokio::time::timeout(
+        let book = match tokio::time::timeout(
             Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
             self.book_fetcher.fetch_book(&token_id),
         )
         .await
         {
-            Ok(Ok(book)) => match absorbable_contracts_within_bps(&book, bps) {
-                Some(d) => Some(d.floor().to_u64().unwrap_or(u64::MAX)),
-                // `None` = no best ask (empty asks → 0 absorbable → skip) or a Decimal overflow on
-                // a non-empty (implausibly deep) book → fail-open.
-                None if book.asks.is_empty() => Some(0),
-                None => None,
-            },
-            Ok(Err(e)) => {
-                info!(error = %e, market = %signal.market_id, "price-impact /book fetch failed; gate fails open");
-                None
+            Ok(Ok(book)) => book,
+            Ok(Err(_)) => {
+                return Err("price-impact book unusable: /book fetch failed (fail closed)");
             }
             Err(_) => {
-                info!(market = %signal.market_id, "price-impact /book fetch timed out; gate fails open");
-                None
+                return Err("price-impact book unusable: /book fetch timed out (fail closed)");
             }
+        };
+        let Some(ladder) = book.ladder() else {
+            return Err("price-impact book unusable: corrupt ask levels (fail closed)");
+        };
+        let Some(best) = ladder.first().map(|l| l.price) else {
+            return Err("price-impact book unusable: empty ask book (fail closed)");
+        };
+        if ladder_is_stale(crate::clob_book::now_unix_ms(), book.fetched_at_ms) {
+            return Err("price-impact book unusable: stale snapshot (fail closed)");
+        }
+        // Inclusive band ceiling: best × (1 + cap/10_000), clamped into the Price domain —
+        // the same edge semantic as the analytics `absorbable_usd_100bps` column.
+        let ceiling_raw = (best.0
+            * (Decimal::from(10_000u32 + u32::try_from(cap_bps).unwrap_or(10_000))
+                / Decimal::from(10_000u32)))
+        .min(Decimal::ONE);
+        let ceiling =
+            Price::new(ceiling_raw).map_err(|_| "price-impact band ceiling not constructible")?;
+        // Planner budget from the sizing mode; 6-dp truncation never overstates the budget.
+        let to_budget = |d: Decimal| {
+            CollateralAmount::from_decimal_exact(
+                d.max(Decimal::ZERO)
+                    .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
+            )
+            .map_err(|_| "impact budget not constructible")
+        };
+        let (budget, max_shares) = match self.strategy.config().sizing_mode {
+            SizingMode::Dollar { usd } => (to_budget(usd)?, None),
+            SizingMode::Contract { contracts } => (to_budget(self.bankroll)?, Some(contracts)),
+            SizingMode::Kelly => (to_budget(self.bankroll)?, None),
+        };
+        let max_price = Price::new(Decimal::ONE).map_err(|_| "price domain invariant broken")?;
+        match plan_budget_buy(&ladder, budget, max_shares, Price::ZERO, max_price, ceiling) {
+            Ok(plan) => Ok(plan),
+            Err(LadderError::NothingAffordable) => {
+                Err("impact band absorbs no whole share within the sizing budget (skip)")
+            }
+            Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
+                Err("price-impact ladder walk failed (fail closed)")
+            }
+            Err(LadderError::Amount) => Err("price-impact ladder arithmetic failed (fail closed)"),
         }
     }
 
@@ -604,27 +636,62 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
         };
 
-        // Realistic fill basis (#339 revisited, #486): the price the copy will ACTUALLY fill at.
-        // In paper `clob_best_ask` mode a BUY resolves to the fresh CLOB best-ask (else the
-        // fallback haircut); otherwise the leader price adjusted by the boot-frozen paper haircut
+        // Price-impact gate (#508 Phase A): when enabled (`price_impact_cap_bps ≥ 1`), ONE
+        // `/book` fetch produces the executable-ladder plan that feeds the band gate, the
+        // size cap, and (in `clob_best_ask` paper mode) the VWAP fill basis. An unusable
+        // book — missing token, fetch error/timeout, corrupt/empty/stale — fails CLOSED
+        // (skip; the #398 fail-open posture is retired), as does an in-band ladder that
+        // affords no whole share.
+        let gate_plan: Option<LadderPlan> = if self.price_impact_cap_bps > 0 {
+            match self.plan_impact_gate(&signal).await {
+                Ok(plan) => Some(plan),
+                Err(reason) => {
+                    info!(
+                        reason,
+                        market = %signal.market_id,
+                        outcome = signal.outcome_id.0,
+                        "signal did not produce order",
+                    );
+                    self.commit_no_fill(&trade, &leader_row);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Realistic fill basis (#339 revisited, #486, #508): the price the copy will ACTUALLY
+        // fill at. With the impact gate enabled in paper `clob_best_ask` mode, a BUY prices at
+        // the planned ladder VWAP (`estimated_ladder_spend / shares` — multi-level exact, from
+        // the same single `/book` fetch as the gate). Otherwise: in paper `clob_best_ask` mode
+        // a BUY resolves to the fresh CLOB best-ask (else the fallback haircut); other modes
+        // use the leader price adjusted by the boot-frozen paper haircut
         // (`PaperExecutor::fill_price`). Size and band-gate against THIS, so notional ==
-        // `sizing_dollar_usd` and the gates check the price actually paid. The haircut basis mirrors
-        // the backtest's slippage-adjusted `fill_price` (`crates/backtest` `simulation.rs`); the
-        // best-ask basis is a fresher, more conservative live-execution proxy with no backtest
-        // analog (the ranker models the fill as trade-print + 1¢; #486 Context). In paper mode the
+        // `sizing_dollar_usd` and the gates check the price actually paid. In paper mode the
         // basis is recorded verbatim by the executor (via `observed_fill_price` below). The
-        // fail-closed arm is defensive.
-        let (fill_basis, fill_source) = match self.resolve_fill_price(&signal).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                info!(
-                    reason = "leader price yields no constructible fill price",
-                    market = %signal.market_id,
-                    leader_price = %signal.leader_price.0,
-                    "signal did not produce order",
-                );
-                self.commit_no_fill(&trade, &leader_row);
-                return;
+        // fail-closed arms are defensive.
+        let planned_vwap_basis = gate_plan.as_ref().and_then(|plan| {
+            (self.mode == ExecutionMode::Paper
+                && self.fill_mode == FillMode::ClobBestAsk
+                && signal.leader_side == Side::Buy)
+                .then(|| plan.vwap())
+                .flatten()
+        });
+        let (fill_basis, fill_source) = if let Some(vwap) = planned_vwap_basis {
+            (vwap, FillSource::ClobBestAsk)
+        } else {
+            match self.resolve_fill_price(&signal).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    info!(
+                        reason = "leader price yields no constructible fill price",
+                        market = %signal.market_id,
+                        leader_price = %signal.leader_price.0,
+                        "signal did not produce order",
+                    );
+                    self.commit_no_fill(&trade, &leader_row);
+                    return;
+                }
             }
         };
 
@@ -667,9 +734,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return;
         }
 
-        // Price-impact gate (#398 WS2 step 5c): when enabled, cap the size at the contracts
-        // absorbable within `price_impact_cap_bps` of best ask from the live /book.
-        let book_cap_contracts = self.book_cap_contracts(&signal).await;
+        // Size cap from the ladder plan (#508): the planned whole-share quantity IS the
+        // within-band, within-budget maximum. Gate off → `None` (no cap; no `/book` fetch).
+        let book_cap_contracts = gate_plan
+            .as_ref()
+            .map(|plan| plan.shares.atomic() / 1_000_000);
 
         let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
@@ -695,10 +764,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
             Ok(intent) => {
                 let now = SourceTimestamp(OffsetDateTime::now_utc());
+                // Exact recorded basis (#508): when the ladder plan priced this BUY and the
+                // strategy sized BELOW the planned quantity (Kelly/Contract clamps), re-price
+                // the VWAP over the ladder prefix actually consumed by the final count, so
+                // the recorded fill is exact for the executed size. (Dollar sizing lands on
+                // the planned quantity, where the prefix VWAP equals the plan VWAP.)
+                let recorded_basis = if planned_vwap_basis.is_some() {
+                    gate_plan
+                        .as_ref()
+                        .and_then(|plan| prefix_vwap(&plan.used_asks, intent.contracts.0))
+                        .unwrap_or(fill_basis)
+                } else {
+                    fill_basis
+                };
                 // Paper mode records the resolved basis verbatim. Shadow recomputes the identical
                 // boot-frozen haircut from `None`. Ordinary live modes fail closed in the dispatcher.
                 let observed_fill_price =
-                    (self.mode == ExecutionMode::Paper).then_some((fill_basis, fill_source));
+                    (self.mode == ExecutionMode::Paper).then_some((recorded_basis, fill_source));
                 match self
                     .dispatcher
                     .execute(&intent, self.mode, now, observed_fill_price)
@@ -948,12 +1030,45 @@ fn check_resolution_horizon(
     None
 }
 
+/// VWAP over the first `contracts` whole shares of a planned ladder prefix (#508). Used to
+/// re-price the recorded paper fill when the strategy sizes below the planned quantity, so
+/// the recorded price is exact for the executed size. `None` when the prefix cannot cover
+/// `contracts` (caller falls back to the plan VWAP) or the count is zero.
+fn prefix_vwap(used_asks: &[AskLevel], contracts: u64) -> Option<Price> {
+    if contracts == 0 {
+        return None;
+    }
+    let mut remaining = contracts.checked_mul(1_000_000)?;
+    let mut spend = Decimal::ZERO;
+    for level in used_asks {
+        let take = remaining.min(level.shares.atomic());
+        spend = spend.checked_add(
+            ShareAmount::from_atomic(take)
+                .to_decimal()
+                .checked_mul(level.price.0)?,
+        )?;
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+    if remaining != 0 {
+        return None;
+    }
+    Price::new(spend / Decimal::from(contracts)).ok()
+}
+
 // ── Stub risk snapshot ────────────────────────────────────────────────────────
 
 /// Build a zeroed [`RiskSnapshot`] with LiveTiny mode.
 ///
 /// All exposure and PnL fields are zero; no anti-gaming flags; source healthy.
 /// Phase 0B stub — real exposure tracking is a separate later issue.
+///
+/// `concentration_caps` is `None`: concentration enforcement is un-enforced by owner
+/// decision on the production copy path (#508 Phase A; recorded in docs/19-). The
+/// drawdown/latency kill switches stay armed — they are inert here only because the
+/// PnL/latency inputs are zeroed by this stub.
 ///
 /// `evaluate()` overwrites `trading_mode` and `proposed_trade_bps` before calling
 /// the risk gate, so their initial values here are overridden.
@@ -971,6 +1086,7 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny, // overridden by evaluate()
         proposed_trade_bps: BasisPoints(0),  // overridden by evaluate()
         per_trade_cap_bps: 0,                // overridden by evaluate()
+        concentration_caps: None,            // un-enforced by owner decision (#508)
     }
 }
 

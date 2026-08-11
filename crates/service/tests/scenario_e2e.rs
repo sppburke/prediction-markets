@@ -36,7 +36,7 @@ use pe_event_log::Writer;
 use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
-use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
+use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, snapshot::TradingMode};
 use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
@@ -143,6 +143,7 @@ fn clean_snapshot() -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
+        concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
 

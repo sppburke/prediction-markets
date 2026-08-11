@@ -523,6 +523,7 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .iter()
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
+        fetched_at_ms: 0,
     }
 }
 

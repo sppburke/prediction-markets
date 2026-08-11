@@ -14,7 +14,7 @@ use pe_core_types::{
     ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
     VenueMarketId, WalletAddress,
 };
-use pe_risk_engine::{RiskSnapshot, snapshot::TradingMode};
+use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{
     ExecutionMode, PerTradeCap, WinnerFollowConfig, WinnerFollowStrategy,
@@ -71,6 +71,7 @@ fn clean_snapshot() -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(0),
         per_trade_cap_bps: 0, // overridden by evaluate()
+        concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
 

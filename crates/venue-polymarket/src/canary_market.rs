@@ -256,6 +256,12 @@ pub fn parse_book(
     })
 }
 
+/// The canary's all-or-nothing ladder: exactly `requested_shares` inside the band, priced by
+/// the shared planner (#508 Phase A). A thin wrapper over
+/// [`crate::ladder::plan_exact_shares`] so reviewed canary behavior cannot drift: this
+/// wrapper keeps the canary's staleness bound ([`crate::ladder::LADDER_MAX_AGE_MS`]) and
+/// minimum-order check, and maps every planner failure onto the pre-existing
+/// [`CanaryMarketError`] surface (a below-band executable ask remains `InsufficientDepth`).
 pub fn executable_ladder(
     snapshot: &CanaryBookSnapshot,
     now_ms: u64,
@@ -264,53 +270,31 @@ pub fn executable_ladder(
     maximum_price_exclusive: Price,
     origin_ceiling: Price,
 ) -> Result<ExecutableLadder, CanaryMarketError> {
-    if now_ms < snapshot.observed_timestamp_ms || now_ms - snapshot.observed_timestamp_ms > 2_000 {
+    if crate::ladder::ladder_is_stale(now_ms, snapshot.observed_timestamp_ms) {
         return Err(CanaryMarketError::StaleBook);
     }
     if requested_shares < snapshot.minimum_order_size {
         return Err(CanaryMarketError::BelowMinimum);
     }
-    let mut remaining = requested_shares.atomic();
-    let mut used_asks = Vec::new();
-    for level in &snapshot.asks {
-        if level.price < minimum_price {
-            return Err(CanaryMarketError::InsufficientDepth);
-        }
-        if level.price >= maximum_price_exclusive || level.price > origin_ceiling {
-            break;
-        }
-        let used = remaining.min(level.shares.atomic());
-        if used > 0 {
-            used_asks.push(AskLevel {
-                price: level.price,
-                shares: ShareAmount::from_atomic(used),
-            });
-            remaining -= used;
-        }
-        if remaining == 0 {
-            break;
-        }
-    }
-    if remaining != 0 {
-        return Err(CanaryMarketError::InsufficientDepth);
-    }
-    let best_ask = used_asks
-        .first()
-        .map(|level| level.price)
-        .ok_or(CanaryMarketError::InsufficientDepth)?;
-    let limit_price = used_asks
-        .last()
-        .map(|level| level.price)
-        .ok_or(CanaryMarketError::InsufficientDepth)?;
-    let maximum_collateral =
-        CollateralAmount::from_decimal_exact(requested_shares.to_decimal() * limit_price.0)
-            .map_err(|_| CanaryMarketError::Amount)?;
+    let plan = crate::ladder::plan_exact_shares(
+        &snapshot.asks,
+        requested_shares,
+        minimum_price,
+        maximum_price_exclusive,
+        origin_ceiling,
+    )
+    .map_err(|e| match e {
+        crate::ladder::LadderError::Amount => CanaryMarketError::Amount,
+        crate::ladder::LadderError::BelowBandAsk
+        | crate::ladder::LadderError::InsufficientDepth
+        | crate::ladder::LadderError::NothingAffordable => CanaryMarketError::InsufficientDepth,
+    })?;
     Ok(ExecutableLadder {
-        used_asks,
-        best_ask,
-        limit_price,
-        shares: requested_shares,
-        maximum_collateral,
+        used_asks: plan.used_asks,
+        best_ask: plan.best_ask,
+        limit_price: plan.limit_price,
+        shares: plan.shares,
+        maximum_collateral: plan.worst_case_debit,
     })
 }
 

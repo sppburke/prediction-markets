@@ -53,20 +53,24 @@ pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
         return RiskDecision::Blocked(RiskBlock::PerTradeSizeExceeded);
     }
 
-    // 7. Concentration caps (add proposed trade to existing exposure)
-    let proposed = s.proposed_trade_bps.0;
+    // 7. Concentration caps (add proposed trade to existing exposure). Enforced only when the
+    //    snapshot carries caps: `None` = un-enforced by owner decision (#508 Phase A; the
+    //    production copy path). Backtest and tests keep `ConcentrationCaps::CANONICAL`.
+    if let Some(caps) = s.concentration_caps {
+        let proposed = s.proposed_trade_bps.0;
 
-    if s.leader_exposure_bps.0 + proposed > 300 {
-        return RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded);
-    }
-    if s.market_exposure_bps.0 + proposed > 200 {
-        return RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded);
-    }
-    if s.family_exposure_bps.0 + proposed > 800 {
-        return RiskDecision::Blocked(RiskBlock::FamilyConcentrationExceeded);
-    }
-    if s.total_copy_exposure_bps.0 + proposed > 2_500 {
-        return RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded);
+        if s.leader_exposure_bps.0 + proposed > caps.max_leader_bps {
+            return RiskDecision::Blocked(RiskBlock::LeaderConcentrationExceeded);
+        }
+        if s.market_exposure_bps.0 + proposed > caps.max_market_bps {
+            return RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded);
+        }
+        if s.family_exposure_bps.0 + proposed > caps.max_family_bps {
+            return RiskDecision::Blocked(RiskBlock::FamilyConcentrationExceeded);
+        }
+        if s.total_copy_exposure_bps.0 + proposed > caps.max_total_copy_bps {
+            return RiskDecision::Blocked(RiskBlock::TotalCopyExposureExceeded);
+        }
     }
 
     RiskDecision::Approved
@@ -164,6 +168,7 @@ mod tests {
             trading_mode: TradingMode::LiveTiny,
             proposed_trade_bps: BasisPoints(10),
             per_trade_cap_bps: 25,
+            concentration_caps: Some(crate::ConcentrationCaps::CANONICAL),
         }
     }
 
@@ -171,6 +176,28 @@ mod tests {
     fn clean_snapshot_is_approved() {
         let s = clean_snapshot();
         assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
+    }
+
+    #[test]
+    fn concentration_enforced_only_when_caps_are_carried() {
+        // #508 Phase A regression: an impact-sized $230 order at a $10,000 bankroll is
+        // 230 bps. With the canonical caps it breaches the 200 bps market cap; with
+        // `None` (un-enforced by owner decision — the production posture) it is approved.
+        let mut s = clean_snapshot();
+        s.per_trade_cap_bps = 10_000; // per_trade_cap=unlimited (#508 Phase A)
+        s.proposed_trade_bps = BasisPoints(230);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::MarketConcentrationExceeded)
+        );
+        s.concentration_caps = None;
+        assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
+        // Drawdown/latency kill switches still fire with non-zero inputs regardless.
+        s.intraday_pnl_bps = BasisPoints(-1_000);
+        assert_eq!(
+            evaluate_risk(&s),
+            RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
+        );
     }
 
     #[test]

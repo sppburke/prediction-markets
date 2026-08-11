@@ -735,15 +735,16 @@ mode = "shadow"
     }
 
     /// Seed keys that are NOT flat `ServiceConfig` scalars, so this test (which compares flat seed
-    /// values to flat boot fields) excludes them. The enum-shaped sizing keys and RuntimeConfig-
-    /// only fields are validated against boot defaults in
+    /// values to flat boot fields) excludes them. The enum-shaped sizing/cap keys and
+    /// RuntimeConfig-only fields are validated against boot defaults in
     /// `runtime_config::tests::seed_reconstructs_boot_strategy`.
-    const RUNTIME_ONLY_KEYS: [&str; 5] = [
+    const RUNTIME_ONLY_KEYS: [&str; 6] = [
         "active_watchlist_size",
         "sizing_mode",
         "sizing_dollar_usd",
         "sizing_contracts",
         "price_impact_cap_bps",
+        "per_trade_cap",
     ];
 
     #[test]

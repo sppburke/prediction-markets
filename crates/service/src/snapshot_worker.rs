@@ -131,26 +131,11 @@ pub fn absorbable_usd_within_bps(book: &OrderBook, bps: u64) -> Option<Decimal> 
     Some(total)
 }
 
-/// Σ size (contract count) over ask levels priced within `bps` of the best (lowest) ask — the
-/// number of contracts absorbable without moving the price more than `bps`. Preferred over
-/// `absorbable_usd_within_bps / fill_price` (which blends levels at differing prices) for the
-/// price-impact book cap (#398 WS2). Returns `None` when the book has no asks or the running sum
-/// overflows `Decimal`.
-#[must_use]
-pub fn absorbable_contracts_within_bps(book: &OrderBook, bps: u64) -> Option<Decimal> {
-    let best = book.best_ask()?;
-    let numerator = Decimal::from(BPS_DENOMINATOR.checked_add(bps)?);
-    let ceiling = best
-        .checked_mul(numerator)?
-        .checked_div(Decimal::from(BPS_DENOMINATOR))?;
-    let mut total = Decimal::ZERO;
-    for level in &book.asks {
-        if level.price <= ceiling {
-            total = total.checked_add(level.size)?;
-        }
-    }
-    Some(total)
-}
+// NOTE (#508 Phase A): the former `absorbable_contracts_within_bps` — the #398 WS2 gate's
+// contract-count sum — was removed with the gate's move to the budget-based ladder planner
+// (`pe_venue_polymarket::plan_budget_buy`), which owns the within-band quantity, VWAP, and
+// worst-case debit. `absorbable_usd_within_bps` stays: it feeds the analytics column
+// `absorbable_usd_100bps`, not the gate.
 
 /// Serialize the ask side as a compact JSON array of `{price, size}` string-decimals for
 /// ad-hoc capacity queries. `None` only on a serialization failure (unreachable for this
@@ -299,6 +284,7 @@ mod tests {
                 .iter()
                 .map(|&(price, size)| BookLevel { price, size })
                 .collect(),
+            fetched_at_ms: 0,
         }
     }
 
@@ -316,28 +302,6 @@ mod tests {
     #[test]
     fn absorbable_empty_book_is_none() {
         assert_eq!(absorbable_usd_within_bps(&book(&[]), 100), None);
-        assert_eq!(absorbable_contracts_within_bps(&book(&[]), 100), None);
-    }
-
-    #[test]
-    fn absorbable_contracts_sums_sizes_within_band() {
-        // best ask = 0.50 → ceiling = 0.505. Sizes at 0.50 and 0.505 count (140); 0.51 excluded.
-        // Contract count, NOT USD: the price-impact book cap (#398 WS2) caps the contract size.
-        let b = book(&[
-            (dec!(0.50), dec!(100)),
-            (dec!(0.505), dec!(40)),
-            (dec!(0.51), dec!(1000)),
-        ]);
-        assert_eq!(absorbable_contracts_within_bps(&b, 100), Some(dec!(140)));
-    }
-
-    #[test]
-    fn absorbable_contracts_counts_only_levels_within_band() {
-        // best 0.50 → tiny 1 bps band (ceiling 0.50005): only the best level (size 7) is within
-        // the band; the 0.60 level is excluded. The best ask is always within its own band, so a
-        // non-empty book never sums to 0 — 0 absorbable arises only from an empty book.
-        let b = book(&[(dec!(0.50), dec!(7)), (dec!(0.60), dec!(1000))]);
-        assert_eq!(absorbable_contracts_within_bps(&b, 1), Some(dec!(7)));
     }
 
     #[test]

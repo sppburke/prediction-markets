@@ -123,6 +123,12 @@ impl WinnerFollowStrategy {
         self.config = config;
     }
 
+    /// Read the current strategy config. The orchestrator derives the impact-gate planner
+    /// budget from `sizing_mode` (#508 Phase A).
+    pub fn config(&self) -> &WinnerFollowConfig {
+        &self.config
+    }
+
     /// Evaluate a leader signal at the leader's own entry price.
     ///
     /// Thin wrapper over [`Self::evaluate_at_price`] that sizes against

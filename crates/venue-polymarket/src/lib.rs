@@ -9,11 +9,15 @@
 #![forbid(unsafe_code)]
 
 pub mod canary_market;
+pub mod ladder;
 pub mod v2;
 
 pub use canary_market::{
     AskLevel, CanaryBookSnapshot, CanaryMarketError, ClobMarketEvidence, ExecutableLadder,
     executable_ladder, parse_book, parse_market_evidence,
+};
+pub use ladder::{
+    LADDER_MAX_AGE_MS, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy, plan_exact_shares,
 };
 pub use v2::{
     CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CanaryV2Error, PostOnceResult,

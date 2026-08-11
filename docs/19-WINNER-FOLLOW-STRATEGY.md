@@ -269,15 +269,27 @@ p = calibrated_probability(
 
 ## Per-trade cap configuration
 
-After Kelly sizing, the strategy clamps the contract count to a per-trade size cap before the risk gate. This keeps single-trade notional within a configurable fraction of bankroll regardless of Kelly fraction.
+After Kelly sizing, the strategy clamps the contract count to a per-trade size cap before the risk gate.
 
-`PerTradeCap` variants (set in `WinnerFollowConfig.per_trade_cap`):
+**Owner decision (#508, recorded): the ordinary per-trade bps caps are retired in production.** The
+production `service_config.per_trade_cap` row is `unlimited` after the #508 Phase-A cutover, and the
+**price-impact cap** (`price_impact_cap_bps`, `_GLOSSARY.md`) becomes the sole policy order-size
+limit, below the always-applying available-bankroll affordability bound: an order is automatically
+downsized to what the CLOB ask book absorbs within the band (e.g. a $500 budget with $230 absorbable
+→ a $230 order at the exact ladder VWAP). `sizing_dollar_usd` stays the sizing input, not a cap.
+
+The `PerTradeCap` enum is retained for backtest/research and as the safe boot posture
+(set in `WinnerFollowConfig.per_trade_cap`):
 
 | Variant | Resolved cap | Use |
 |---|---|---|
-| `ModeDefault` (default) | 25 bps LiveTiny / 100 bps Promoted | Production |
+| `ModeDefault` (default) | 25 bps LiveTiny / 100 bps Promoted | Boot/outage posture; backtest default |
 | `Bps(n)` | `n` bps of bankroll | Research / tuning |
-| `Unlimited` | 10 000 bps (full bankroll) | Backtest Kelly-fraction study |
+| `Unlimited` | 10 000 bps (full bankroll) | **Production (#508)**; backtest Kelly-fraction study |
+
+The service **pins `ModeDefault` at boot** regardless of TOML/env (#508 round-5): a config-fetch
+outage provably runs the 25 bps clamp with the impact gate off until the first successful poll;
+`unlimited` can take effect only through the Supabase KV row.
 
 Clamp formula: `max_contracts = floor(bankroll × cap_bps / 10_000 / price)`. When `max_contracts == 0` (bankroll < price), the strategy returns `NoEdge`.
 
@@ -295,7 +307,7 @@ Dollar { usd }         → contracts = max(1, floor(usd / fill_price))      # fl
 Contract { contracts } → contracts = exactly N
 ```
 
-Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–5c–6 (per-trade cap, price-impact book cap `price_impact_cap_bps`, risk gate) remain active in all modes. The book cap (#398 WS2) `min`s the size to the live CLOB `/book` contracts absorbable within `price_impact_cap_bps` of best ask; `0` disables it, a `/book` error fails open, and 0 absorbable skips the trade. This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
+Steps 1–3 (Flip gate, mode clamp, Shadow gate) and steps 5b–5c–6 (per-trade cap, price-impact book cap `price_impact_cap_bps`, risk gate) remain active in all modes. The book cap (#398 WS2, reworked in #508 Phase A) `min`s the size to the **budget-planned executable ask ladder**: one `/book` fetch per admitted signal feeds the band gate, the within-band whole-share quantity (`pe_venue_polymarket::plan_budget_buy`), and — in `clob_best_ask` paper mode — the exact ladder-VWAP fill basis, with the FOK limit at the worst accepted tick and `worst_case_debit = shares × limit`. With the gate enabled, an **unusable book fails CLOSED** (missing token / fetch error / timeout / stale / corrupt / empty ⇒ skip — the #398 fail-open posture is retired), and an in-band ladder affording no whole share skips. Edits are valid `1..=10_000` bps (`0` rejected, last-known-good retained; "effectively off" is an explicit `10_000`); gate-off exists only as the compiled boot default. This differs from the backtest's `PE_BACKTEST_FLAT_USD` lever, which bypasses all sizing layers and is a research-only path.
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
@@ -317,6 +329,16 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 
 ```toml
 # winner-follow.toml — canonical risk caps. Other docs reference this block.
+#
+# Enforcement status (#508 Phase A owner decision, recorded):
+# - Per-trade bps caps: RETIRED in production (per_trade_cap = unlimited after the cutover;
+#   ModeDefault stays the boot/outage posture). The price-impact cap is the sole policy size
+#   limit — production default 100 bps of best ask (`price_impact_cap_bps`, _GLOSSARY.md).
+# - Concentration caps: UN-ENFORCED BY DECISION on the production copy path. The values below
+#   remain canonical for backtest/tests, carried as `RiskSnapshot.concentration_caps =
+#   Some(ConcentrationCaps::CANONICAL)`; production passes `None` (typed, not accidental).
+# - Drawdown stops + latency kill switch: code ARMED but currently inert in production — the
+#   Phase-0B stub feeds zeroed PnL/latency inputs (real exposure tracking is future work).
 
 [winner_follow.modes]
 leader_follow                = "live_tiny"   # paper -> live_tiny -> promoted (see promotion criteria below)
@@ -329,17 +351,17 @@ fraction_leader_promoted     = 0.25          # raise to 0.50 only with kelly_fra
 fraction_hard_max            = 0.50          # absolute ceiling without separate signed config change
 
 [winner_follow.risk]
-# Per-trade caps
+# Per-trade caps (ModeDefault resolution; production retired these — see header note)
 max_trade_live_tiny_bps              = 25    # 0.25 % bankroll
 max_trade_promoted_bps               = 100   # 1.00 %
 
-# Concentration caps
+# Concentration caps (backtest/tests; un-enforced by decision in production — header note)
 max_leader_bps                       = 300   # 3.00 % per leader
 max_market_bps                       = 200   # 2.00 % per market
 max_family_bps                       = 800   # 8.00 % per MarketFamily
 max_total_copy_bps                   = 2500  # 25.00 % total open copy exposure
 
-# Drawdown stops
+# Drawdown stops (armed; inert via zeroed stub inputs — header note)
 intraday_stop_bps                    = -200  # halt new entries at -2.00 % intraday
 rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
@@ -474,8 +496,10 @@ Winner-Follow has a single leader-follow promotion ladder.
 historical reconstruction
   -> walk-forward backtest passes (LCB_5pct > 0)
   -> paper-copy ≥ 30 days, ≥ 90 closed trades, drift within `_GLOSSARY.md` "close behavior" definition
-  -> live-tiny (kelly = 0.25, max_trade = 25 bps)
-  -> promoted (same kelly, max_trade = 100 bps) after another 30-day live-tiny window passes the gates
+  -> live-tiny (kelly = 0.25; size bounded by the price-impact cap since #508 — the 25 bps
+     per-trade cap is the retired ModeDefault resolution)
+  -> promoted (same kelly; the 100 bps ModeDefault resolution likewise retired) after another
+     30-day live-tiny window passes the gates
 ```
 
 A demotion resets the promotion clock.

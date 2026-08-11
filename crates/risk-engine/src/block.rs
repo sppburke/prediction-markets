@@ -26,7 +26,9 @@ pub enum RiskBlock {
     KillSwitchDrawdown,
     /// Copy latency p95 has exceeded the kill switch threshold (>3000 ms).
     CopyLatencyKillSwitch,
-    /// Proposed trade size exceeds the per-mode cap (live-tiny: 25 bps, promoted: 100 bps).
+    /// Proposed trade size exceeds `RiskSnapshot.per_trade_cap_bps` (the resolved
+    /// `PerTradeCap`; production runs `unlimited` = 10 000 bps since #508 — the price-impact
+    /// cap is the sole policy size limit there).
     PerTradeSizeExceeded,
     /// Resolver evidence is absent, stale, ambiguous, deferred, or mismatched.
     ResolverNotTradable,
