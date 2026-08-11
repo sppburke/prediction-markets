@@ -422,13 +422,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         let targets = armed
             .iter()
             .filter_map(|account| {
-                account.credential_binding.as_ref().map(|(version, key_id)| {
-                    pe_paper_state::DispatchTargetSeed {
+                account
+                    .credential_binding
+                    .as_ref()
+                    .map(|(version, key_id)| pe_paper_state::DispatchTargetSeed {
                         account_id: account.account_id.as_str().to_owned(),
                         credential_bundle_version: *version,
                         credential_key_id: key_id.clone(),
-                    }
-                })
+                    })
             })
             .collect::<Vec<_>>();
         // The frozen signal + decision identity: redelivery replays THIS, never current config.
@@ -756,15 +757,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         let clob_basis_applies = self.mode == ExecutionMode::Paper
             && self.fill_mode == FillMode::ClobBestAsk
             && signal.leader_side == Side::Buy;
-        let planned_vwap_basis = gate_plan.and_then(|plan| {
-            clob_basis_applies.then(|| plan.vwap()).flatten()
-        });
+        let planned_vwap_basis =
+            gate_plan.and_then(|plan| clob_basis_applies.then(|| plan.vwap()).flatten());
         // Zero-absorb reads still anchor the SHARED band gate on the successful best ask
         // (#508 Decision 10 — the paper-only skip happens after staging, below).
         let zero_absorb_basis = match &gate {
-            Some(GatePlan::NothingAffordable { best_ask }) if clob_basis_applies => {
-                Some(*best_ask)
-            }
+            Some(GatePlan::NothingAffordable { best_ask }) if clob_basis_applies => Some(*best_ask),
             _ => None,
         };
         let (fill_basis, fill_source) = if let Some(vwap) = planned_vwap_basis {
@@ -939,7 +937,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         // neither the position nor the dedup advanced (the event log holds the
                         // fill and replays on restart). Do not mark the contract filled.
                         if self
-                            .commit_paper_fill(&trade, &leader_row, &fill, seq, dispatch_id.as_deref())
+                            .commit_paper_fill(
+                                &trade,
+                                &leader_row,
+                                &fill,
+                                seq,
+                                dispatch_id.as_deref(),
+                            )
                             .await
                         {
                             self.filled_positions.insert(filled_key);
@@ -1009,10 +1013,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             paper_outcome: &outcome,
         });
         for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self
-                .paper_state
-                .commit_seen_no_fill_with_flip(&trade.source_trade_id, leader, flip)
-            {
+            match self.paper_state.commit_seen_no_fill_with_flip(
+                &trade.source_trade_id,
+                leader,
+                flip,
+            ) {
                 Ok(()) => return,
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
                     error!(
@@ -1134,10 +1139,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         });
         let mut committed = None;
         for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self
-                .paper_state
-                .commit_fill_with_flip(&trade.source_trade_id, leader, &record, seq, flip)
-            {
+            match self.paper_state.commit_fill_with_flip(
+                &trade.source_trade_id,
+                leader,
+                &record,
+                seq,
+                flip,
+            ) {
                 Ok(b) => {
                     committed = Some(b);
                     break;

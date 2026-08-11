@@ -212,10 +212,18 @@ async fn ac_wt_rpc_first_then_sqlite_mirror() {
     let (record, sup_row) = fill_pair(&wf_key(5), Side::Buy, 10, dec!(0.40), 5);
     let src = SourceTradeId("src5".to_string());
 
-    let ret =
-        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row, None)
-            .await
-            .unwrap();
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &record,
+        EventSeq(5),
+        &sup_row,
+        None,
+    )
+    .await
+    .unwrap();
 
     // PASS: the RPC return is the authoritative bankroll (1000 - 0.40*10 = 996), and SQLite
     //       mirrored the fill to the same value.
@@ -236,9 +244,17 @@ async fn ac_fail_closed_leaves_sqlite_untouched() {
     let (record, sup_row) = fill_pair(&wf_key(5), Side::Buy, 10, dec!(0.40), 5);
     let src = SourceTradeId("src5".to_string());
 
-    let ret =
-        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row, None)
-            .await;
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &record,
+        EventSeq(5),
+        &sup_row,
+        None,
+    )
+    .await;
 
     // PASS: the RPC error propagates (caller skips the trade), and SQLite is NOT written — the
     //       event log holds the fill and replays on restart.

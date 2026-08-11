@@ -273,7 +273,12 @@ mod tests {
                 row("primary-acct", true, true, 9, "live_tiny"),
                 row("beta", false, true, 0, "live_tiny"),
             ],
-            &[cred("zeta"), cred("alpha"), cred("primary-acct"), cred("beta")],
+            &[
+                cred("zeta"),
+                cred("alpha"),
+                cred("primary-acct"),
+                cred("beta"),
+            ],
         );
         let order: Vec<&str> = snap
             .accounts

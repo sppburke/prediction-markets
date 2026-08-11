@@ -72,12 +72,7 @@ pub struct LiveProjectionWriter {
 
 impl LiveProjectionWriter {
     #[must_use]
-    pub fn new(
-        client: reqwest::Client,
-        base_url: &str,
-        anon_key: &str,
-        secret_key: &str,
-    ) -> Self {
+    pub fn new(client: reqwest::Client, base_url: &str, anon_key: &str, secret_key: &str) -> Self {
         Self {
             client,
             base_url: base_url.trim_end_matches('/').to_owned(),

@@ -231,6 +231,11 @@ fn rebuild_never_synthesizes_dispatch_targets() {
         "rebuild must not synthesize dispatch aggregates"
     );
     assert!(rebuilt.pending_dispatch_seeds().unwrap().is_empty());
-    assert!(rebuilt.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+    assert!(
+        rebuilt
+            .unfinalized_ready_dispatch_seeds()
+            .unwrap()
+            .is_empty()
+    );
     println!("PASS: rebuild replayed the fill and synthesized ZERO dispatch state");
 }

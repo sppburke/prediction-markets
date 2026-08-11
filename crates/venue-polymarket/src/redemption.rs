@@ -7,12 +7,16 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
+use alloy_primitives::keccak256;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE;
 use hmac::{Hmac, Mac as _};
 use pe_core_types::{PolymarketConditionId, RawHttpResponse};
+use polymarket_client_sdk_v2::auth::{PrivateKeySigner, Signer as _};
 use polymarket_client_sdk_v2::types::{Address, B256, U256};
 use polymarket_client_sdk_v2::{POLYGON, contract_config};
 use reqwest::Method;
@@ -164,6 +168,130 @@ pub struct SignedRedemptionRequest {
     pub deadline_unix: Option<u64>,
     pub signature_params: Option<RelayerSignatureParams>,
     pub metadata: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RedemptionSigningError {
+    #[error("private key is invalid")]
+    InvalidPrivateKey,
+    #[error("custody wallet is not a valid EVM address")]
+    InvalidCustodyWallet,
+    #[error("redemption call target is not a valid EVM address")]
+    InvalidCallTarget,
+    #[error("Relayer nonce is not a valid uint256")]
+    InvalidNonce,
+    #[error("alloy signer failed to sign the Deposit Wallet batch digest")]
+    SigningFailed,
+    #[error("alloy local signer unexpectedly deferred signing")]
+    SigningDeferred,
+}
+
+// verified 2026-08-11 from https://docs.polymarket.com/trading/wallets-auth
+// and https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/deposit-wallet.ts
+// Domain: DepositWallet/1, Polygon 137, verifyingContract = the Deposit Wallet.
+const DEPOSIT_WALLET_DOMAIN_TYPE: &str =
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+const DEPOSIT_WALLET_DOMAIN_NAME: &str = "DepositWallet";
+const DEPOSIT_WALLET_DOMAIN_VERSION: &str = "1";
+
+// verified 2026-08-11 from https://docs.polymarket.com/trading/wallets-auth
+// and https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/deposit-wallet.ts
+// EIP-712 encodeType appends the referenced Call type to the primary Batch type.
+const DEPOSIT_WALLET_CALL_TYPE: &str = "Call(address target,uint256 value,bytes data)";
+const DEPOSIT_WALLET_BATCH_TYPE: &str = concat!(
+    "Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)",
+    "Call(address target,uint256 value,bytes data)"
+);
+
+// verified 2026-08-11 from the official client's signTypedData call at
+// https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/deposit-wallet.ts;
+// digest construction is EIP-712: https://eips.ethereum.org/EIPS/eip-712.
+fn deposit_wallet_redemption_digest(
+    call: &RedemptionCall,
+    custody_wallet: &str,
+    nonce: &str,
+    deadline_unix: u64,
+) -> Result<B256, RedemptionSigningError> {
+    let wallet = Address::from_str(custody_wallet)
+        .map_err(|_| RedemptionSigningError::InvalidCustodyWallet)?;
+    let target =
+        Address::from_str(&call.to).map_err(|_| RedemptionSigningError::InvalidCallTarget)?;
+    let nonce = U256::from_str(nonce).map_err(|_| RedemptionSigningError::InvalidNonce)?;
+
+    let mut domain = Vec::with_capacity(5 * 32);
+    domain.extend_from_slice(keccak256(DEPOSIT_WALLET_DOMAIN_TYPE).as_slice());
+    domain.extend_from_slice(keccak256(DEPOSIT_WALLET_DOMAIN_NAME).as_slice());
+    domain.extend_from_slice(keccak256(DEPOSIT_WALLET_DOMAIN_VERSION).as_slice());
+    push_u256_word(&mut domain, &U256::from(POLYGON));
+    push_address_word(&mut domain, &wallet);
+    let domain_separator = keccak256(domain);
+
+    let mut encoded_call = Vec::with_capacity(4 * 32);
+    encoded_call.extend_from_slice(keccak256(DEPOSIT_WALLET_CALL_TYPE).as_slice());
+    push_address_word(&mut encoded_call, &target);
+    push_u256_word(&mut encoded_call, &U256::ZERO);
+    encoded_call.extend_from_slice(keccak256(&call.calldata).as_slice());
+    let call_hash = keccak256(encoded_call);
+    let calls_hash = keccak256(call_hash.as_slice());
+
+    let mut batch = Vec::with_capacity(5 * 32);
+    batch.extend_from_slice(keccak256(DEPOSIT_WALLET_BATCH_TYPE).as_slice());
+    push_address_word(&mut batch, &wallet);
+    push_u256_word(&mut batch, &nonce);
+    push_u256_word(&mut batch, &U256::from(deadline_unix));
+    batch.extend_from_slice(calls_hash.as_slice());
+    let batch_hash = keccak256(batch);
+
+    let mut digest = Vec::with_capacity(66);
+    digest.extend_from_slice(&[0x19, 0x01]);
+    digest.extend_from_slice(domain_separator.as_slice());
+    digest.extend_from_slice(batch_hash.as_slice());
+    Ok(keccak256(digest))
+}
+
+struct LocalSignerWake;
+
+impl Wake for LocalSignerWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+/// Sign one official Relayer `WALLET` Deposit Wallet batch containing the supplied redemption.
+///
+/// Safe and Proxy custody use different wallet-specific payloads and are deliberately not covered
+/// by this constructor.
+pub fn sign_deposit_wallet_redemption(
+    private_key: &str,
+    call: &RedemptionCall,
+    custody_wallet: &str,
+    nonce: &str,
+    deadline_unix: u64,
+) -> Result<SignedRedemptionRequest, RedemptionSigningError> {
+    let signer = PrivateKeySigner::from_str(private_key)
+        .map_err(|_| RedemptionSigningError::InvalidPrivateKey)?;
+    let digest = deposit_wallet_redemption_digest(call, custody_wallet, nonce, deadline_unix)?;
+
+    // PrivateKeySigner is a synchronous local alloy signer behind an async trait. Polling its
+    // sign_hash future once avoids nesting a Tokio runtime inside this intentionally sync API.
+    let waker = Waker::from(Arc::new(LocalSignerWake));
+    let mut context = Context::from_waker(&waker);
+    let mut signature = signer.sign_hash(&digest);
+    let signature = match signature.as_mut().poll(&mut context) {
+        Poll::Ready(Ok(signature)) => signature,
+        Poll::Ready(Err(_)) => return Err(RedemptionSigningError::SigningFailed),
+        Poll::Pending => return Err(RedemptionSigningError::SigningDeferred),
+    };
+
+    Ok(SignedRedemptionRequest {
+        call: call.clone(),
+        custody: CustodyKind::DepositWallet,
+        signer_address: signer.address().to_string(),
+        custody_wallet: custody_wallet.to_owned(),
+        nonce: nonce.to_owned(),
+        signature: signature.to_string(),
+        deadline_unix: Some(deadline_unix),
+        signature_params: None,
+        metadata: "Redeem positions".to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1117,7 +1245,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use alloy_primitives::keccak256;
     use axum::Router;
     use axum::body::Bytes;
     use axum::extract::{Path, Query, State};
@@ -1208,6 +1335,68 @@ mod tests {
             Address::from_str(NEGRISK_COLLATERAL_ADAPTER)
                 .unwrap()
                 .to_string()
+        );
+    }
+
+    #[test]
+    fn deposit_wallet_redemption_signature_matches_official_eip712_golden() {
+        // Public Hardhat key also used by the official builder-relayer-client signature fixtures.
+        const PRIVATE_KEY: &str =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let call = call(false);
+        let digest = deposit_wallet_redemption_digest(&call, WALLET, "7", 2_000_000_000).unwrap();
+        assert_eq!(
+            digest.to_string(),
+            "0xc83b365dc194257ce9fd3df833d4981a6e2213820cbeba0b58aaeab51b1c584d"
+        );
+
+        let request =
+            sign_deposit_wallet_redemption(PRIVATE_KEY, &call, WALLET, "7", 2_000_000_000).unwrap();
+        assert_eq!(
+            request.signature,
+            concat!(
+                "0xf8d5727615cccfd2f2de2d3bd4f18438011c4394df8a4a39e16bb006e2e803c3",
+                "519a72060bfdc3104d68e89f9a1a17ab797ca26c734fdae325ac06bdebbe9abc1b"
+            )
+        );
+        assert_eq!(
+            request.signer_address,
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        );
+        assert_eq!(request.custody, CustodyKind::DepositWallet);
+        assert_eq!(request.signature_params, None);
+    }
+
+    #[test]
+    fn signed_deposit_wallet_request_serialization_matches_official_shape() {
+        const PRIVATE_KEY: &str =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let client = RelayerTransportClient::new(
+            RELAYER_BASE_URL,
+            RelayerCredentials::RelayerApiKey(RelayerApiKeyCredentials {
+                api_key: "good-key".to_owned(),
+                address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_owned(),
+            }),
+            policy(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let signed =
+            sign_deposit_wallet_redemption(PRIVATE_KEY, &call(false), WALLET, "7", 2_000_000_000)
+                .unwrap();
+        let submission = client.build_submission_at(&signed, 1_000).unwrap();
+        assert_eq!(
+            String::from_utf8(submission.body).unwrap(),
+            concat!(
+                r#"{"type":"WALLET","from":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","to":"0x00000000000Fb5C9ADea0298D729A0CB3823Cc07","nonce":"7","signature":"0xf8d5727615cccfd2f2de2d3bd4f18438011c4394df8a4a39e16bb006e2e803c3519a72060bfdc3104d68e89f9a1a17ab797ca26c734fdae325ac06bdebbe9abc1b","metadata":"Redeem positions","depositWalletParams":{"depositWallet":"0x2222222222222222222222222222222222222222","deadline":"2000000000","calls":[{"target":"0xAdA100Db00Ca00073811820692005400218FcE1f","value":"0","data":"0x01b7037c"#,
+                "000000000000000000000000c011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "0000000000000000000000000000000000000000000000000000000000000080",
+                "0000000000000000000000000000000000000000000000000000000000000002",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+                "0000000000000000000000000000000000000000000000000000000000000002",
+                r#""}]}}"#
+            )
         );
     }
 

@@ -130,11 +130,9 @@ mod tests {
         let encryptor =
             age::Encryptor::with_recipients(std::iter::once(recipient as &dyn age::Recipient))
                 .unwrap();
-        let mut armored = age::armor::ArmoredWriter::wrap_output(
-            Vec::new(),
-            age::armor::Format::AsciiArmor,
-        )
-        .unwrap();
+        let mut armored =
+            age::armor::ArmoredWriter::wrap_output(Vec::new(), age::armor::Format::AsciiArmor)
+                .unwrap();
         let mut writer = encryptor.wrap_output(&mut armored).unwrap();
         writer.write_all(plaintext.as_bytes()).unwrap();
         writer.finish().unwrap();

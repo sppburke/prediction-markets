@@ -286,7 +286,13 @@ mod tests {
     fn arms_only_when_every_check_passes() {
         let probe = all_pass();
         let promo = reviewed(true);
-        let d = evaluate_mode(&inputs("live_tiny", "off", CheckOutcome::Pass, &promo, &probe));
+        let d = evaluate_mode(&inputs(
+            "live_tiny",
+            "off",
+            CheckOutcome::Pass,
+            &promo,
+            &probe,
+        ));
         assert_eq!(
             d,
             ModeDecision::SetEffective {
@@ -302,7 +308,13 @@ mod tests {
         // not arm — D1 provably ships dark.
         let probe = all_pass();
         let promo = reviewed(false);
-        let d = evaluate_mode(&inputs("live_tiny", "off", CheckOutcome::Pass, &promo, &probe));
+        let d = evaluate_mode(&inputs(
+            "live_tiny",
+            "off",
+            CheckOutcome::Pass,
+            &promo,
+            &probe,
+        ));
         assert!(
             matches!(d, ModeDecision::RefuseOrders { ref reason } if reason.contains("promotion_record")),
             "{d:?}"

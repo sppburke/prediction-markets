@@ -28,11 +28,12 @@ pub use redemption::{
     REDEMPTION_SCHEMA_VERSION, RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_NONCE_PATH,
     RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX, RELAYER_LEGACY_NONCE_PATH,
     RELAYER_LEGACY_TRANSACTION_PATH, RELAYER_SUBMIT_PATH, RedemptionCall, RedemptionError,
-    RedemptionTransport, RedemptionTransportError, RelayerApiKeyCredentials, RelayerCredentials,
-    RelayerHttpRequest, RelayerNonce, RelayerPollPolicy, RelayerSignatureParams, RelayerState,
-    RelayerTransportClient, STANDARD_COLLATERAL_ADAPTER, SignedRedemptionRequest,
-    UnsupportedCustody, UnverifiedApprovalReader, build_redemption_call, redemption_adapter,
-    redemption_approval_requests, require_verified_approval,
+    RedemptionSigningError, RedemptionTransport, RedemptionTransportError,
+    RelayerApiKeyCredentials, RelayerCredentials, RelayerHttpRequest, RelayerNonce,
+    RelayerPollPolicy, RelayerSignatureParams, RelayerState, RelayerTransportClient,
+    STANDARD_COLLATERAL_ADAPTER, SignedRedemptionRequest, UnsupportedCustody,
+    UnverifiedApprovalReader, build_redemption_call, redemption_adapter,
+    redemption_approval_requests, require_verified_approval, sign_deposit_wallet_redemption,
 };
 pub use v2::{
     CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CanaryV2Error, PostOnceResult,

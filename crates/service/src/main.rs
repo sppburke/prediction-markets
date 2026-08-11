@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
-use pe_execution_core::ExecutionDispatcher;
+use pe_execution_core::{ExecutionDispatcher, LiveJournal};
 use pe_paper_state::PaperStateDb;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
@@ -509,6 +509,58 @@ async fn main() -> Result<()> {
         Some(live)
     };
 
+    // Ordinary #508 live execution: one task owns strict account/seed ordering, mode probes,
+    // redemption posture, and retention. A missing age identity is warned exactly once and
+    // passed as `None`; the mode machine then cannot arm, while the paper orchestrator remains
+    // fully operational. The account-tagged journal is a mode-0600 sibling of the paper log.
+    let live_fanout_task = if let Some(live_accounts) = live_accounts.clone() {
+        let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                tracing::warn!(error = %error, "ordinary live age identity unavailable; live arming disabled");
+                None
+            }
+        };
+        let journal_path = live_journal_path(&cfg.event_log_path);
+        match LiveJournal::open(&journal_path) {
+            Ok(journal) => {
+                let projection = pe_service::live_projections::LiveProjectionWriter::new(
+                    reqwest::Client::new(),
+                    &cfg.supabase_url,
+                    &cfg.supabase_anon_key,
+                    &cfg.supabase_secret_key,
+                );
+                Some(tokio::spawn(pe_service::live_fanout::run_live_fanout(
+                    pe_service::live_fanout::LiveFanoutConfig {
+                        paper_state: paper_state.clone(),
+                        live_accounts,
+                        live_watchlist: live_watchlist.clone(),
+                        runtime_config: live_runtime_config.clone(),
+                        identity,
+                        journal: Arc::new(journal),
+                        journal_path,
+                        projection,
+                        book_fetcher: book_fetcher.clone(),
+                        http: reqwest::Client::new(),
+                        supabase_url: cfg.supabase_url.clone(),
+                        supabase_anon_key: cfg.supabase_anon_key.clone(),
+                        supabase_secret_key: cfg.supabase_secret_key.clone(),
+                        gamma_base_url: cfg.gamma_base_url.clone(),
+                        clob_base_url: cfg.polymarket_clob_base_url.clone(),
+                        data_base_url: cfg.polymarket_base_url.clone(),
+                        reconcile_interval_secs: cfg.supabase_sink_reconcile_interval_secs,
+                    },
+                )))
+            }
+            Err(error) => {
+                tracing::warn!(path = %journal_path.display(), error = %error, "ordinary live journal unavailable; live fan-out disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let orch = Orchestrator::new(
         trade_rx,
         live_watchlist.clone(),
@@ -756,8 +808,19 @@ async fn main() -> Result<()> {
     if let Some(t) = capacity_task {
         t.abort();
     }
+    if let Some(t) = live_fanout_task {
+        t.abort();
+    }
     info!("pe-service stopped");
     Ok(())
+}
+
+fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
+    event_log_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("live_journal.log")
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
