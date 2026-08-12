@@ -15,9 +15,11 @@ pub(crate) const META_LAST_APPLIED_EVENT_SEQ: &str = "last_applied_event_seq";
 /// (issue #397): the highest event-log `seq` whose fill has been applied to the
 /// authoritative Supabase `commit_fill` RPC. Parallel to [`META_LAST_APPLIED_EVENT_SEQ`]
 /// (the local SQLite reconciliation cursor) but kept **separate** so a SQLite-only
-/// reconcile never advances it; on SQLite loss it resets to 0 → a safe full idempotent
-/// replay (the RPC gate debits each fill at most once). Local-only state — the event log,
-/// whose frames it counts, is itself local.
+/// reconcile never advances it; on SQLite loss the row is ABSENT (`None`) → a safe full
+/// idempotent replay that includes seq 0 (the RPC gate debits each fill at most once).
+/// `Some(0)` is distinct: seq 0 confirmed (#510). Local-only state — the event log,
+/// whose frames it counts, is itself local. Advanced at runtime by
+/// `commit_fill_authoritative` on each confirmed successor fill (#510).
 pub(crate) const META_LAST_SUPABASE_APPLIED_EVENT_SEQ: &str = "last_supabase_applied_event_seq";
 
 /// Single-row `bankroll` table primary key.

@@ -289,7 +289,9 @@ impl SinkWriter for SupabaseWriter {
             return Err(SinkError::Status(status.as_u16()));
         }
         let rows: Vec<HwmRow> = resp.json().await.map_err(SinkError::Decode)?;
-        Ok(rows.first().map(|r| r.last_event_seq).unwrap_or(0))
+        // Absent row = "nothing sunk" = -1, matching the schema seed (#510): the `> hwm`
+        // filter then includes fill seq 0.
+        Ok(rows.first().map(|r| r.last_event_seq).unwrap_or(-1))
     }
 
     async fn write_hwm(&self, last_event_seq: i64) -> Result<(), SinkError> {
@@ -298,18 +300,22 @@ impl SinkWriter for SupabaseWriter {
     }
 }
 
-/// Catch up `paper_fills` from the high-water-mark, returning the new HWM.
+/// Catch up `paper_fills` from the high-water-mark, returning `(new_hwm, complete)`.
 ///
 /// Scans the ordered `list_fills()` stream for `event_seq > hwm`, upserting each. The HWM
 /// advances along the prefix on every confirmed write (or an intentional non-`wf` skip) and
 /// **halts at the first failed write**, so a transient Supabase error leaves the tail for
-/// the next reconcile rather than silently skipping it.
+/// the next reconcile rather than silently skipping it. `complete` is `false` when the
+/// sweep halted early (#510): the best-effort runtime sink ignores it (the next reconcile
+/// retries), but the one-time `--backfill-supabase` must NOT seed cursors on a partial
+/// sweep — that would permanently hide the omitted fills.
 pub async fn reconcile_fills<W: SinkWriter>(
     writer: &W,
     paper_state: &PaperStateDb,
     hwm: i64,
-) -> Result<i64, SinkError> {
+) -> Result<(i64, bool), SinkError> {
     let mut new_hwm = hwm;
+    let mut complete = true;
     for row in paper_state
         .list_fills()?
         .into_iter()
@@ -324,6 +330,7 @@ pub async fn reconcile_fills<W: SinkWriter>(
                         event_seq = row.event_seq,
                         "supabase sink: fill upsert failed; halting catch-up at last confirmed prefix"
                     );
+                    complete = false;
                     break;
                 }
             },
@@ -337,7 +344,7 @@ pub async fn reconcile_fills<W: SinkWriter>(
             }
         }
     }
-    Ok(new_hwm)
+    Ok((new_hwm, complete))
 }
 
 /// Re-upsert the full settled-market set (idempotent on `market_id`). A single upsert
@@ -362,7 +369,11 @@ pub async fn reconcile_settled<W: SinkWriter>(
 /// re-upsert the settled set. All failures are logged and swallowed (best-effort).
 async fn reconcile<W: SinkWriter>(writer: &W, paper_state: &PaperStateDb) {
     match writer.read_hwm().await {
-        Ok(hwm) => match reconcile_fills(writer, paper_state, hwm).await {
+        // Best-effort path: partial completion is fine — the next reconcile retries the tail.
+        Ok(hwm) => match reconcile_fills(writer, paper_state, hwm)
+            .await
+            .map(|(h, _)| h)
+        {
             Ok(new_hwm) if new_hwm > hwm => {
                 if let Err(e) = writer.write_hwm(new_hwm).await {
                     warn!(error = %e, new_hwm, "supabase sink: write hwm failed; will re-advance next reconcile");

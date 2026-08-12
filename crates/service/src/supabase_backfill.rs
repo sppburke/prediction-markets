@@ -59,25 +59,38 @@ pub async fn backfill_supabase(
             .with_context(|| format!("upsert paper_positions {}", pos.market_id))?;
     }
 
-    // Final paper_fills reconcile (#397 SF-A): complete the pre-cutover fill tail so it is not
-    // permanently absent from the authoritative ledger. Reuses the best-effort sink path.
+    // Final paper_fills reconcile (#397 SF-A, hardened in #510): a FULL idempotent sweep
+    // from `-1` — not the sink HWM — so fill seq 0 is included (the sink HWM seeds at 0 and
+    // `> hwm` would skip it) and a stale high-epoch HWM surviving a paper reset (the reset
+    // preserves `supabase_sink_hwm` while the fresh log restarts at seq 0) cannot mask the
+    // current epoch. `upsert_fill` is merge-idempotent and the backfill is one-time, so the
+    // full sweep is safe and rerunnable.
     let writer = SupabaseWriter::new(reqwest::Client::new(), supabase_url, anon_key, secret_key);
-    let hwm = writer.read_hwm().await.context("read fills HWM")?;
-    let new_hwm = reconcile_fills(&writer, paper_state, hwm)
+    let (new_hwm, complete) = reconcile_fills(&writer, paper_state, -1)
         .await
         .context("final fills reconcile")?;
-    if new_hwm > hwm {
-        writer.write_hwm(new_hwm).await.context("write fills HWM")?;
-    }
+    // #510: NEVER seed cursors on a partial sweep — that would permanently hide the omitted
+    // fills behind the watermark. Abort (rerunnable; everything above is idempotent).
+    anyhow::ensure!(
+        complete,
+        "fills reconcile halted before completing; rerun --backfill-supabase (no cursor was seeded)"
+    );
+    // Unconditional write: after a complete full sweep this IS the current-epoch HWM, and a
+    // regression vs a stale pre-reset value is the correct outcome (#510).
+    writer.write_hwm(new_hwm).await.context("write fills HWM")?;
 
-    // Seed the catch-up watermark to the event-log head (#397 B-C): the first authoritative
-    // boot then re-applies zero fills and trusts the backfilled scalar.
+    // Seed the catch-up watermark to the event-log head (#397 B-C) — but only when a fill
+    // exists (#510 absent-vs-zero): on an empty DB `last_applied_event_seq()` conflates
+    // absence with 0 and would persist a false `Some(0)` ("seq 0 confirmed"). The paper log
+    // carries only fills, so `fills_count() > 0` ⟺ frames exist.
     let head = paper_state
         .last_applied_event_seq()
         .context("read event-log head")?;
-    paper_state
-        .set_supabase_applied_event_seq(head)
-        .context("seed supabase watermark")?;
+    if paper_state.fills_count().context("count fills")? > 0 {
+        paper_state
+            .set_supabase_applied_event_seq(head)
+            .context("seed supabase watermark")?;
+    }
 
     let counts = BackfillCounts {
         bankroll_set,

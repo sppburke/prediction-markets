@@ -128,7 +128,7 @@ async fn ac_hwm_advances_prefix_and_halts_at_first_failure() {
         ..Default::default()
     };
 
-    let new_hwm = reconcile_fills(&writer, &db, 0).await.unwrap();
+    let (new_hwm, _complete) = reconcile_fills(&writer, &db, 0).await.unwrap();
 
     // PASS: HWM advances only over the confirmed prefix (5) and halts at the first failure
     //       (9); 14 is left for the next reconcile. Not integer adjacency.
@@ -142,8 +142,8 @@ async fn ac_dedup_reconcile_is_idempotent() {
     let (_dir, db) = seed_fills(&[(5, &wf_key(5)), (9, &wf_key(9)), (14, &wf_key(14))]);
     let writer = FakeWriter::default();
 
-    let hwm1 = reconcile_fills(&writer, &db, 0).await.unwrap();
-    let hwm2 = reconcile_fills(&writer, &db, hwm1).await.unwrap();
+    let (hwm1, _c1) = reconcile_fills(&writer, &db, 0).await.unwrap();
+    let (hwm2, _c2) = reconcile_fills(&writer, &db, hwm1).await.unwrap();
 
     // PASS: first pass writes all 3 and advances to 14; re-running from 14 writes nothing
     //       new (no dupes, no gaps).
@@ -169,7 +169,7 @@ async fn ac_skip_non_wf_fill_and_advance() {
     let (_dir, db) = seed_fills(&[(5, &wf_key(5)), (9, "legacy|nokey")]);
     let writer = FakeWriter::default();
 
-    let new_hwm = reconcile_fills(&writer, &db, 0).await.unwrap();
+    let (new_hwm, _complete) = reconcile_fills(&writer, &db, 0).await.unwrap();
 
     // PASS: only the wf fill (5) is written; the non-wf fill (9) is skipped and the HWM
     //       advances past it so it is never re-examined.
@@ -219,4 +219,55 @@ async fn ac_settled_reconcile_reupserts_full_set() {
     //       writer's upsert is idempotent on market_id, so re-upserting is safe.
     assert_eq!(writer.settled.lock().unwrap().len(), 4);
     println!("PASS: AC-HEAL — settled reconcile re-upserted the full set on each of 2 passes");
+}
+
+/// #510: the backfill sweeps from `-1` so fill seq 0 is included — with the sink-HWM `0` it
+/// is structurally skipped (the `> hwm` filter), the defect this pins.
+/// PASS: hwm=-1 sends [0, 5]; hwm=0 sends only [5] (the regression control).
+#[tokio::test]
+async fn ac_510_full_sweep_from_minus_one_includes_seq_zero() {
+    let (_dir, db) = seed_fills(&[(0, &wf_key(0)), (5, &wf_key(5))]);
+    let full = FakeWriter::default();
+    let (hwm, complete) = reconcile_fills(&full, &db, -1).await.unwrap();
+    assert_eq!((hwm, complete), (5, true));
+    assert_eq!(
+        *full.fills.lock().unwrap(),
+        vec![0, 5],
+        "-1 sweep includes seq 0"
+    );
+
+    let partial = FakeWriter::default();
+    let (hwm0, _c) = reconcile_fills(&partial, &db, 0).await.unwrap();
+    assert_eq!(hwm0, 5);
+    assert_eq!(
+        *partial.fills.lock().unwrap(),
+        vec![5],
+        "hwm=0 skips seq 0 — why -1 is passed"
+    );
+    println!("PASS: AC-510-SWEEP — -1 includes seq 0; 0 skips it");
+}
+
+/// #510: `reconcile_fills` reports completion so the one-time backfill can refuse to seed
+/// cursors on a partial sweep (a halted sweep returning Ok used to look complete).
+/// PASS: an injected mid-sweep failure yields complete=false; the rerun completes.
+#[tokio::test]
+async fn ac_510_incomplete_sweep_is_reported_and_rerun_completes() {
+    let (_dir, db) = seed_fills(&[(0, &wf_key(0)), (1, &wf_key(1)), (2, &wf_key(2))]);
+    let failing = FakeWriter {
+        fail_on_seq: Some(1),
+        ..Default::default()
+    };
+    let (hwm, complete) = reconcile_fills(&failing, &db, -1).await.unwrap();
+    assert_eq!(
+        (hwm, complete),
+        (0, false),
+        "halt at 1 → incomplete, prefix hwm 0"
+    );
+
+    // Rerun (idempotent, resumable): a healthy writer completes from the prefix.
+    let healthy = FakeWriter::default();
+    let (hwm2, complete2) = reconcile_fills(&healthy, &db, hwm).await.unwrap();
+    assert_eq!((hwm2, complete2), (2, true));
+    assert_eq!(*healthy.fills.lock().unwrap(), vec![1, 2]);
+    println!("PASS: AC-510-STRICT — partial sweep reported; rerun resumes and completes");
 }
