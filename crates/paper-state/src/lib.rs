@@ -141,6 +141,63 @@ pub struct FillMarketSnapshot {
     pub captured_at_unix: i64,
 }
 
+/// Flip instruction folded into a paper-outcome commit (#508 Decision 10): the staged
+/// dispatch seed `dispatch_id` flips `pending_paper → ready` with this typed
+/// `paper_outcome` (`"fill"` or `"no_fill:<reason>"`) in the same transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchFlip<'a> {
+    pub dispatch_id: &'a str,
+    pub paper_outcome: &'a str,
+}
+
+/// One frozen live target inside a staged dispatch seed (#508). Order in
+/// [`DispatchSeedRecord::targets`] IS the frozen execution order (primary first, then
+/// `(execution_order, account_id)`); `exec_rank` is assigned from that order at staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchTargetSeed {
+    pub account_id: String,
+    pub credential_bundle_version: i64,
+    pub credential_key_id: String,
+}
+
+/// A complete dispatch aggregate to stage (#508 Decision 10): the frozen normalized
+/// signal + configuration/decision identity (`signal_json`, caller-owned JSON stored
+/// verbatim) and the frozen ordered target list. Staged BEFORE the paper outcome can
+/// become durable; idempotent on `dispatch_id` (redelivery reuses the staged seed).
+#[derive(Debug, Clone)]
+pub struct DispatchSeedRecord {
+    pub dispatch_id: String,
+    pub signal_json: String,
+    pub source_trade_id: String,
+    pub created_at_unix: i64,
+    pub targets: Vec<DispatchTargetSeed>,
+}
+
+/// A staged dispatch aggregate read back from `dispatch_seeds`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchSeedRow {
+    pub dispatch_id: String,
+    pub state: String,
+    pub signal_json: String,
+    pub paper_outcome: Option<String>,
+    pub source_trade_id: String,
+    pub created_at_unix: i64,
+    pub finalized_at_unix: Option<i64>,
+}
+
+/// A frozen dispatch target read back from `dispatch_targets`, in `exec_rank` order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchTargetRow {
+    pub dispatch_id: String,
+    pub account_id: String,
+    pub exec_rank: i64,
+    pub credential_bundle_version: i64,
+    pub credential_key_id: String,
+    pub state: String,
+    pub terminal_reason: Option<String>,
+    pub updated_at_unix: i64,
+}
+
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
 pub struct PaperStateDb {
     conn: Mutex<Connection>,
@@ -212,10 +269,26 @@ impl PaperStateDb {
         source_trade_id: &SourceTradeId,
         leader: &LeaderPositionRow,
     ) -> Result<(), PaperStateError> {
+        self.commit_seen_no_fill_with_flip(source_trade_id, leader, None)
+    }
+
+    /// [`Self::commit_seen_no_fill`] that also flips a staged dispatch seed
+    /// `pending_paper → ready` with a **typed** no-fill outcome in the same transaction
+    /// (#508 Decision 10). With `flip = None` the behavior is byte-identical to the
+    /// plain no-fill commit (the zero-live-target path stays untyped and untouched).
+    pub fn commit_seen_no_fill_with_flip(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        flip: Option<DispatchFlip<'_>>,
+    ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id)?;
         tx_upsert_leader(&tx, leader)?;
+        if let Some(flip) = flip {
+            tx_flip_dispatch_ready(&tx, flip)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -237,6 +310,21 @@ impl PaperStateDb {
         fill: &FillRecord,
         fill_seq: EventSeq,
     ) -> Result<Decimal, PaperStateError> {
+        self.commit_fill_with_flip(source_trade_id, leader, fill, fill_seq, None)
+    }
+
+    /// [`Self::commit_fill`] that also flips a staged dispatch seed `pending_paper → ready`
+    /// in the same transaction (#508 Decision 10), recording the `fill` outcome on the
+    /// aggregate row. With `flip = None` the behavior is byte-identical to the plain fill
+    /// commit.
+    pub fn commit_fill_with_flip(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        fill: &FillRecord,
+        fill_seq: EventSeq,
+        flip: Option<DispatchFlip<'_>>,
+    ) -> Result<Decimal, PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id)?;
@@ -251,6 +339,9 @@ impl PaperStateDb {
             // Duplicate idempotency key: fill already applied; do not double-count.
             tx_read_bankroll(&tx)?
         };
+        if let Some(flip) = flip {
+            tx_flip_dispatch_ready(&tx, flip)?;
+        }
         tx.commit()?;
         Ok(bankroll)
     }
@@ -293,6 +384,253 @@ impl PaperStateDb {
         tx_set_last_applied(&tx, fill_seq)?;
         tx.commit()?;
         Ok(inserted)
+    }
+
+    // ── Live dispatch aggregate (#508 Decision 10) ───────────────────────────
+
+    /// Durably stage a dispatch aggregate (seed + frozen ordered targets) in one
+    /// transaction, state `pending_paper`. Idempotent: a seed already staged under this
+    /// `dispatch_id` is left untouched (redelivery reuses it and never recomputes targets
+    /// from current configuration) and `false` is returned.
+    pub fn stage_dispatch_seed(&self, seed: &DispatchSeedRecord) -> Result<bool, PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO dispatch_seeds
+                 (dispatch_id, state, signal_json, paper_outcome, source_trade_id,
+                  created_at_unix, finalized_at_unix)
+             VALUES (?1, 'pending_paper', ?2, NULL, ?3, ?4, NULL)",
+            params![
+                seed.dispatch_id,
+                seed.signal_json,
+                seed.source_trade_id,
+                seed.created_at_unix
+            ],
+        )? == 1;
+        if inserted {
+            for (rank, target) in seed.targets.iter().enumerate() {
+                let rank = i64::try_from(rank)
+                    .map_err(|_| PaperStateError::Internal("target rank overflow".into()))?;
+                tx.execute(
+                    "INSERT INTO dispatch_targets
+                         (dispatch_id, account_id, exec_rank, credential_bundle_version,
+                          credential_key_id, state, terminal_reason, updated_at_unix)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6)",
+                    params![
+                        seed.dispatch_id,
+                        target.account_id,
+                        rank,
+                        target.credential_bundle_version,
+                        target.credential_key_id,
+                        seed.created_at_unix
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Standalone `pending_paper → ready` flip (boot stuck-seed finalization, #508
+    /// Decision 10). The transactional trade-path flip rides
+    /// [`Self::commit_fill_with_flip`] / [`Self::commit_seen_no_fill_with_flip`] instead.
+    /// Returns `true` when this call performed the flip; `false` when the seed was
+    /// already `ready` (idempotent). A missing seed is an invariant breach.
+    pub fn flip_dispatch_ready(
+        &self,
+        dispatch_id: &str,
+        paper_outcome: &str,
+    ) -> Result<bool, PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let flipped = tx_flip_dispatch_ready(
+            &tx,
+            DispatchFlip {
+                dispatch_id,
+                paper_outcome,
+            },
+        )?;
+        tx.commit()?;
+        Ok(flipped)
+    }
+
+    /// Read one dispatch aggregate row, or `None`.
+    pub fn dispatch_seed(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchSeedRow>, PaperStateError> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT dispatch_id, state, signal_json, paper_outcome, source_trade_id,
+                    created_at_unix, finalized_at_unix
+             FROM dispatch_seeds WHERE dispatch_id = ?1",
+            params![dispatch_id],
+            row_to_dispatch_seed,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Every `pending_paper` seed, oldest first (boot stuck-seed finalization input).
+    pub fn pending_dispatch_seeds(&self) -> Result<Vec<DispatchSeedRow>, PaperStateError> {
+        self.list_dispatch_seeds("state = 'pending_paper'")
+    }
+
+    /// Every `ready`, not-yet-finalized seed, oldest first (the live fan-out consumes
+    /// these strictly in order; boot resumes incomplete aggregates oldest-first).
+    pub fn unfinalized_ready_dispatch_seeds(
+        &self,
+    ) -> Result<Vec<DispatchSeedRow>, PaperStateError> {
+        self.list_dispatch_seeds("state = 'ready' AND finalized_at_unix IS NULL")
+    }
+
+    fn list_dispatch_seeds(
+        &self,
+        predicate: &str,
+    ) -> Result<Vec<DispatchSeedRow>, PaperStateError> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT dispatch_id, state, signal_json, paper_outcome, source_trade_id,
+                    created_at_unix, finalized_at_unix
+             FROM dispatch_seeds WHERE {predicate}
+             ORDER BY created_at_unix ASC, dispatch_id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_dispatch_seed)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The frozen targets of one aggregate, in execution order.
+    pub fn dispatch_targets(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Vec<DispatchTargetRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT dispatch_id, account_id, exec_rank, credential_bundle_version,
+                    credential_key_id, state, terminal_reason, updated_at_unix
+             FROM dispatch_targets WHERE dispatch_id = ?1 ORDER BY exec_rank ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![dispatch_id], |row| {
+                Ok(DispatchTargetRow {
+                    dispatch_id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    exec_rank: row.get(2)?,
+                    credential_bundle_version: row.get(3)?,
+                    credential_key_id: row.get(4)?,
+                    state: row.get(5)?,
+                    terminal_reason: row.get(6)?,
+                    updated_at_unix: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Durably transition one target's lifecycle state (`pending` / `submitted` /
+    /// `ambiguous` / `terminal`, with the typed detail in `terminal_reason`).
+    pub fn set_dispatch_target_state(
+        &self,
+        dispatch_id: &str,
+        account_id: &str,
+        state: &str,
+        terminal_reason: Option<&str>,
+        now_unix: i64,
+    ) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE dispatch_targets
+             SET state = ?3, terminal_reason = ?4, updated_at_unix = ?5
+             WHERE dispatch_id = ?1 AND account_id = ?2",
+            params![dispatch_id, account_id, state, terminal_reason, now_unix],
+        )?;
+        if updated != 1 {
+            return Err(PaperStateError::Internal(format!(
+                "dispatch target {dispatch_id}/{account_id} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stamp `finalized_at_unix` when every target of a `ready` aggregate is terminal
+    /// (also finalizes a zero-live-outcome seed whose targets were all terminalized at
+    /// boot). Returns `true` when this call performed the finalization.
+    pub fn finalize_dispatch_if_terminal(
+        &self,
+        dispatch_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, PaperStateError> {
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE dispatch_seeds SET finalized_at_unix = ?2
+             WHERE dispatch_id = ?1 AND finalized_at_unix IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM dispatch_targets
+                   WHERE dispatch_targets.dispatch_id = dispatch_seeds.dispatch_id
+                     AND dispatch_targets.state != 'terminal'
+               )",
+            params![dispatch_id, now_unix],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Delete terminal aggregates finalized more than `retention_secs` ago (#508:
+    /// `dispatch_seed_retention_days`, `_GLOSSARY.md`). Returns the pruned seed count.
+    pub fn prune_terminal_dispatch(
+        &self,
+        now_unix: i64,
+        retention_secs: i64,
+    ) -> Result<usize, PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let cutoff = now_unix.saturating_sub(retention_secs);
+        tx.execute(
+            "DELETE FROM dispatch_targets WHERE dispatch_id IN (
+                 SELECT dispatch_id FROM dispatch_seeds
+                 WHERE finalized_at_unix IS NOT NULL AND finalized_at_unix < ?1
+             )",
+            params![cutoff],
+        )?;
+        let pruned = tx.execute(
+            "DELETE FROM dispatch_seeds
+             WHERE finalized_at_unix IS NOT NULL AND finalized_at_unix < ?1",
+            params![cutoff],
+        )?;
+        tx.commit()?;
+        Ok(pruned)
+    }
+
+    /// The Phase-D executor's first-boot instant (#508 Decision 8 arming fence),
+    /// recorded once and immutable thereafter: promotion records/requests predating it
+    /// are never honored, so the executor binary provably ships dark. Returns the fence
+    /// (existing or newly recorded at `now_unix`).
+    pub fn record_live_executor_first_boot(&self, now_unix: i64) -> Result<i64, PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('live_executor_first_boot_unix', ?1)",
+            params![now_unix],
+        )?;
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'live_executor_first_boot_unix'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Read the arming fence, or `None` before the executor's first boot.
+    pub fn live_executor_first_boot(&self) -> Result<Option<i64>, PaperStateError> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'live_executor_first_boot_unix'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     // ── Bankroll ─────────────────────────────────────────────────────────────
@@ -779,6 +1117,50 @@ impl PaperStateDb {
 }
 
 // ── Transaction-scoped helpers ──────────────────────────────────────────────
+
+/// Map a `dispatch_seeds` row into [`DispatchSeedRow`].
+fn row_to_dispatch_seed(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchSeedRow> {
+    Ok(DispatchSeedRow {
+        dispatch_id: row.get(0)?,
+        state: row.get(1)?,
+        signal_json: row.get(2)?,
+        paper_outcome: row.get(3)?,
+        source_trade_id: row.get(4)?,
+        created_at_unix: row.get(5)?,
+        finalized_at_unix: row.get(6)?,
+    })
+}
+
+/// Flip a staged dispatch seed `pending_paper → ready` inside the caller's transaction
+/// (#508 Decision 10). `false` = the seed was already `ready` (an idempotent redelivery
+/// re-commit); a missing seed is an invariant breach — the flip may only ever target an
+/// existing staged seed (recovery never reconstructs dispatch state).
+fn tx_flip_dispatch_ready(
+    tx: &Transaction<'_>,
+    flip: DispatchFlip<'_>,
+) -> Result<bool, PaperStateError> {
+    let flipped = tx.execute(
+        "UPDATE dispatch_seeds SET state = 'ready', paper_outcome = ?2
+         WHERE dispatch_id = ?1 AND state = 'pending_paper'",
+        params![flip.dispatch_id, flip.paper_outcome],
+    )? == 1;
+    if !flipped {
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM dispatch_seeds WHERE dispatch_id = ?1",
+                params![flip.dispatch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(PaperStateError::Internal(format!(
+                "dispatch flip targeted a seed that was never staged: {}",
+                flip.dispatch_id
+            )));
+        }
+    }
+    Ok(flipped)
+}
 
 fn tx_mark_seen(
     tx: &Transaction<'_>,
@@ -1513,5 +1895,173 @@ mod tests {
         let rows = db.list_fill_snapshots().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].idempotency_key, "k4");
+    }
+    // ── Live dispatch aggregate (#508 Decision 10) ───────────────────────────
+
+    fn seed(id: &str, targets: &[&str]) -> DispatchSeedRecord {
+        DispatchSeedRecord {
+            dispatch_id: id.to_string(),
+            signal_json: format!("{{\"frozen\":\"{id}\"}}"),
+            source_trade_id: format!("src-{id}"),
+            created_at_unix: 1_000,
+            targets: targets
+                .iter()
+                .map(|a| DispatchTargetSeed {
+                    account_id: (*a).to_string(),
+                    credential_bundle_version: 1,
+                    credential_key_id: "key-1".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn stage_is_idempotent_and_freezes_targets() {
+        let (_dir, db) = db();
+        assert!(
+            db.stage_dispatch_seed(&seed("d1", &["primary", "partner"]))
+                .unwrap()
+        );
+        // Redelivery with a DIFFERENT target list must reuse the frozen seed untouched.
+        assert!(!db.stage_dispatch_seed(&seed("d1", &["other"])).unwrap());
+        let targets = db.dispatch_targets("d1").unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| t.account_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "partner"],
+            "frozen order preserved; redelivery never recomputes targets"
+        );
+        assert_eq!(targets[0].exec_rank, 0);
+        assert_eq!(targets[1].exec_rank, 1);
+        let row = db.dispatch_seed("d1").unwrap().unwrap();
+        assert_eq!(row.state, "pending_paper");
+        assert_eq!(row.paper_outcome, None);
+    }
+
+    #[test]
+    fn commit_fill_with_flip_flips_in_the_same_transaction() {
+        let (_dir, db) = db();
+        db.init_bankroll(dec!(1000)).unwrap();
+        db.stage_dispatch_seed(&seed("d2", &["primary"])).unwrap();
+        let src = SourceTradeId("src-d2".to_string());
+        db.commit_fill_with_flip(
+            &src,
+            &leader(10, 0),
+            &fill("d2", Side::Buy, 10, dec!(0.50)),
+            EventSeq(1),
+            Some(DispatchFlip {
+                dispatch_id: "d2",
+                paper_outcome: "fill",
+            }),
+        )
+        .unwrap();
+        let row = db.dispatch_seed("d2").unwrap().unwrap();
+        assert_eq!(row.state, "ready");
+        assert_eq!(row.paper_outcome.as_deref(), Some("fill"));
+        assert!(
+            db.is_seen(&src).unwrap(),
+            "seen-mark and flip share one transaction"
+        );
+        // The ready, unfinalized seed is visible to the fan-out consumer, oldest first.
+        let ready = db.unfinalized_ready_dispatch_seeds().unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].dispatch_id, "d2");
+    }
+
+    #[test]
+    fn commit_no_fill_with_flip_records_the_typed_outcome() {
+        let (_dir, db) = db();
+        db.stage_dispatch_seed(&seed("d3", &["primary"])).unwrap();
+        db.commit_seen_no_fill_with_flip(
+            &SourceTradeId("src-d3".to_string()),
+            &leader(0, 0),
+            Some(DispatchFlip {
+                dispatch_id: "d3",
+                paper_outcome: "no_fill:no_edge",
+            }),
+        )
+        .unwrap();
+        let row = db.dispatch_seed("d3").unwrap().unwrap();
+        assert_eq!(row.state, "ready");
+        assert_eq!(row.paper_outcome.as_deref(), Some("no_fill:no_edge"));
+    }
+
+    #[test]
+    fn flip_is_idempotent_and_a_missing_seed_is_an_invariant_breach() {
+        let (_dir, db) = db();
+        db.stage_dispatch_seed(&seed("d4", &["primary"])).unwrap();
+        assert!(db.flip_dispatch_ready("d4", "fill").unwrap());
+        // Second flip: already ready → no-op, not an error (idempotent redelivery).
+        assert!(!db.flip_dispatch_ready("d4", "fill").unwrap());
+        // The outcome recorded by the FIRST flip is retained.
+        assert_eq!(
+            db.dispatch_seed("d4")
+                .unwrap()
+                .unwrap()
+                .paper_outcome
+                .as_deref(),
+            Some("fill")
+        );
+        // A flip against a never-staged seed is an invariant breach.
+        assert!(matches!(
+            db.flip_dispatch_ready("ghost", "fill"),
+            Err(PaperStateError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn finalize_requires_every_target_terminal_and_prune_respects_retention() {
+        let (_dir, db) = db();
+        db.stage_dispatch_seed(&seed("d5", &["a", "b"])).unwrap();
+        db.flip_dispatch_ready("d5", "fill").unwrap();
+        db.set_dispatch_target_state("d5", "a", "terminal", Some("filled"), 2_000)
+            .unwrap();
+        assert!(
+            !db.finalize_dispatch_if_terminal("d5", 2_000).unwrap(),
+            "one non-terminal target must block finalization"
+        );
+        db.set_dispatch_target_state("d5", "b", "terminal", Some("killed"), 2_100)
+            .unwrap();
+        assert!(db.finalize_dispatch_if_terminal("d5", 2_100).unwrap());
+        assert!(
+            !db.finalize_dispatch_if_terminal("d5", 2_200).unwrap(),
+            "idempotent"
+        );
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // Retention: not yet pruned inside the window, pruned past it (targets cascade).
+        assert_eq!(db.prune_terminal_dispatch(2_500, 1_000).unwrap(), 0);
+        assert_eq!(db.prune_terminal_dispatch(5_000, 1_000).unwrap(), 1);
+        assert!(db.dispatch_seed("d5").unwrap().is_none());
+        assert!(db.dispatch_targets("d5").unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_state_survives_reopen_and_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper_state.db");
+        {
+            let db = PaperStateDb::open(&path).unwrap();
+            db.stage_dispatch_seed(&seed("d6", &["primary"])).unwrap();
+        }
+        // Reopen runs the additive DDL again (idempotent) and the staged seed persists.
+        let db = PaperStateDb::open(&path).unwrap();
+        let row = db.dispatch_seed("d6").unwrap().unwrap();
+        assert_eq!(row.state, "pending_paper");
+        assert_eq!(db.pending_dispatch_seeds().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_target_state_rejects_unknown_targets() {
+        let (_dir, db) = db();
+        db.stage_dispatch_seed(&seed("d7", &["a"])).unwrap();
+        assert!(matches!(
+            db.set_dispatch_target_state("d7", "ghost", "terminal", None, 1),
+            Err(PaperStateError::Internal(_))
+        ));
+        db.set_dispatch_target_state("d7", "a", "submitted", None, 1)
+            .unwrap();
+        assert_eq!(db.dispatch_targets("d7").unwrap()[0].state, "submitted");
     }
 }

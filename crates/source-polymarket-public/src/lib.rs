@@ -10,6 +10,7 @@ pub mod connector;
 pub mod endpoint;
 pub mod fetcher;
 pub mod gamma_markets;
+pub mod live_admission;
 
 pub use clob_prices_history::{
     CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS,
@@ -22,5 +23,9 @@ pub use fetcher::{FixtureFetcher, HttpRequestContext, PageFetcher, ReqwestFetche
 pub use gamma_markets::{
     GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarkets, GammaMarketsClient,
     GammaMarketsError, MarketFilter, parse_outcome_prices,
+};
+pub use live_admission::{
+    LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveFeeEvidence, LiveMarketError,
+    LiveMarketEvidence, validate_live_market,
 };
 pub mod canary;

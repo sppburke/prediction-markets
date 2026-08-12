@@ -1,11 +1,11 @@
-//! `pe-execution-core` — mode-aware execution dispatcher for the prediction-edge system.
+//! `pe-execution-core` — auditable execution primitives for the prediction-edge system.
 //!
-//! Routes ordinary `OrderIntent` values to paper execution. The isolated canary actor is the only
-//! credentialed execution owner:
+//! The existing dispatcher continues to route ordinary `OrderIntent` values as before:
 //! - `Shadow` / `Paper` → `PaperExecutor` (from `pe-strategy-winner-follow`)
 //! - `LiveTiny` / `Promoted` → fail closed
 //!
-//! All executors write durable records to the event log before returning.
+//! The isolated canary actor remains unchanged. The ordinary-live modules expose a separate
+//! two-phase executor, account-tagged journal, and redemption state machine for service wiring.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +13,9 @@ pub mod canary;
 pub mod canary_actor;
 pub mod dispatcher;
 pub mod error;
+pub mod live_executor;
+pub mod live_journal;
+pub mod redemption_machine;
 
 pub use canary::{
     AttemptAttribution, AttemptOrigin, AttemptPhase, CampaignAttemptRecord, CampaignAuthorization,
@@ -29,6 +32,35 @@ pub use canary_actor::{
 };
 pub use dispatcher::{DispatchResult, ExecutionDispatcher};
 pub use error::ExecutionError;
+pub use live_executor::{
+    FrozenLiveTarget, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutor,
+    LiveExecutorError, LiveModeSnapshot, LiveOrderOutcome, LiveOrderRequest, LiveOrderVenue,
+    LivePostClassification, LivePostFuture, LivePostParseError, LivePrepareResult,
+    LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
+    LiveVenuePreparationError, LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared,
+    LiveVenueReconciledOutcome, LiveVenueReconciliation, LiveVenueReconciliationError,
+    PreparedLiveOrder,
+};
+pub use live_journal::{
+    CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LiveAccountReadFailure,
+    LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
+    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts,
+    LiveFeeEvidenceAudit, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
+    LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveMarketEvidenceAudit,
+    LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
+    LiveOrderPostAudit, LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure,
+    LiveOrderPreparedAudit, LiveOrderReconciliationAudit, LiveOrderRejectKind,
+    LiveReconciliationSource, RedemptionAttemptIdentity, RedemptionCustodyAudit,
+    RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
+    RedemptionRequestedAudit, RedemptionTransactionAudit, replay_account,
+};
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,
+};
+pub use redemption_machine::{
+    LIVE_REDEMPTION_SURFACE_AFTER_ATTEMPTS, RedemptionAction, RedemptionAttempt,
+    RedemptionAttemptState, RedemptionDriverError, RedemptionEvent, RedemptionFailureKind,
+    RedemptionPassInput, RedemptionPassResult, RedemptionPosture, RedemptionStatusObservation,
+    RedemptionStatusReadError, RedemptionStatusReader, advance, reconstruct_redemption_attempts,
+    redemption_posture, run_redemption_pass,
 };

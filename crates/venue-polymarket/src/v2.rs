@@ -4,6 +4,7 @@ use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy_primitives::keccak256;
 use pe_core_types::{
     CollateralAmount, OutcomeId, PolymarketConditionId, PolymarketTokenId, Price, RawEvidence,
     RawHttpResponse, RawTransportFailure, ShareAmount, TransportErrorClass,
@@ -22,6 +23,7 @@ use polymarket_client_sdk_v2::{
     POLYGON, ResponseObservation, ResponseObserver, TransportFailureClass,
     TransportFailureObservation, contract_config,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -105,6 +107,8 @@ pub struct PostOnceResult {
     /// status or a contradictory payload remains ambiguous until reconciliation.
     pub definitive: bool,
     pub order_id: String,
+    pub making_amount: Decimal,
+    pub taking_amount: Decimal,
     pub error_message: Option<String>,
 }
 
@@ -196,6 +200,19 @@ impl CanaryV2Client {
         &self,
         request: V2BuyRequest,
     ) -> Result<PreparedSubmission, CanaryV2Error> {
+        self.prepare_buy_for_market(request, false).await
+    }
+
+    /// Prepares a V2 FOK BUY against the exchange selected by admitted market evidence.
+    ///
+    /// `neg_risk` must come from the fail-closed live-admission artifact for `request.token_id`.
+    /// The value is installed in the SDK cache before build/sign so the SDK and this audit record
+    /// select the same EIP-712 verifying contract.
+    pub async fn prepare_buy_for_market(
+        &self,
+        request: V2BuyRequest,
+        neg_risk: bool,
+    ) -> Result<PreparedSubmission, CanaryV2Error> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| CanaryV2Error::Clock)?;
@@ -215,7 +232,7 @@ impl CanaryV2Client {
         let tick_size = TickSize::try_from(request.tick_size.0)
             .map_err(|e| CanaryV2Error::Client(e.to_string()))?;
         self.client.set_tick_size(token_id, tick_size);
-        self.client.set_neg_risk(token_id, false);
+        self.client.set_neg_risk(token_id, neg_risk);
 
         let whole_shares = request.shares.atomic() / 1_000_000;
         let signable = self
@@ -269,11 +286,11 @@ impl CanaryV2Client {
         let serialized_body =
             serde_json::to_vec(&signed).map_err(|e| CanaryV2Error::Wire(e.to_string()))?;
         validate_wire(&serialized_body)?;
-        let order_hash = standard_order_hash(order)?;
+        let order_hash = selected_order_hash(order, neg_risk)?;
         let post_body_hash = blake3::hash(&serialized_body);
-        let standard = contract_config(POLYGON, false)
+        let exchange = contract_config(POLYGON, neg_risk)
             .and_then(|config| config.exchange_v2)
-            .ok_or_else(|| CanaryV2Error::Client("missing standard V2 contract".to_owned()))?;
+            .ok_or_else(|| CanaryV2Error::Client("missing selected V2 contract".to_owned()))?;
         let prepared = PreparedPolymarketBuy {
             condition_id: request.condition_id,
             outcome_id: request.outcome_id,
@@ -281,10 +298,10 @@ impl CanaryV2Client {
             maker,
             signer,
             funder: wallet,
-            verifying_contract: standard.to_string(),
-            spender: standard.to_string(),
+            verifying_contract: exchange.to_string(),
+            spender: exchange.to_string(),
             exchange_domain_version: 2,
-            neg_risk: false,
+            neg_risk,
             side: "BUY".to_owned(),
             salt: order.salt.to_string(),
             timestamp_ms: order
@@ -408,6 +425,8 @@ impl CanaryV2Client {
                 success: false,
                 definitive: false,
                 order_id: String::new(),
+                making_amount: Decimal::ZERO,
+                taking_amount: Decimal::ZERO,
                 error_message: Some(format!("HTTP status {}", observation.status)),
             });
         }
@@ -420,6 +439,8 @@ impl CanaryV2Client {
             success: response.success && matched,
             definitive,
             order_id: response.order_id,
+            making_amount: response.making_amount,
+            taking_amount: response.taking_amount,
             error_message: if response.success && !matched {
                 Some(format!("unexpected FOK status {}", response.status))
             } else {
@@ -428,13 +449,12 @@ impl CanaryV2Client {
         })
     }
 
-    pub async fn clob_reconciliation_raw(
+    /// Read only the three account-admission surfaces. The balance response carries the
+    /// allowance map for both V2 exchange spenders, so no order/trade pagination is needed.
+    pub async fn account_probe_raw(
         &self,
-        pending_order_hash: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> (Vec<RawEvidence>, Option<String>) {
-        const PAGE_LIMIT: usize = 100;
-
         let deadline = deadline.into_std();
         let mut evidence = Vec::new();
         macro_rules! capture {
@@ -464,6 +484,42 @@ impl CanaryV2Client {
             self.client
                 .balance_allowance_raw(BalanceAllowanceRequest::default(), Some(deadline))
         );
+        (evidence, None)
+    }
+
+    pub async fn clob_reconciliation_raw(
+        &self,
+        pending_order_hash: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> (Vec<RawEvidence>, Option<String>) {
+        const PAGE_LIMIT: usize = 100;
+
+        let (mut evidence, protocol_failure) = self.account_probe_raw(deadline).await;
+        if protocol_failure.is_some()
+            || evidence
+                .iter()
+                .any(|item| matches!(item, RawEvidence::HttpTransportFailure(_)))
+        {
+            return (evidence, protocol_failure);
+        }
+        let deadline = deadline.into_std();
+        macro_rules! capture {
+            ($endpoint:literal, $future:expr) => {
+                match $future.await {
+                    Ok(observation) => evidence.push(RawEvidence::HttpResponse(raw_response(
+                        $endpoint,
+                        observation,
+                    ))),
+                    Err(error) => match raw_failure(&error, $endpoint, 1) {
+                        Some(failure) => {
+                            evidence.push(RawEvidence::HttpTransportFailure(failure));
+                            return (evidence, None);
+                        }
+                        None => return (evidence, Some(error.to_string())),
+                    },
+                }
+            };
+        }
         if let Some(order_hash) = pending_order_hash {
             capture!(
                 "exact-order",
@@ -544,6 +600,13 @@ impl CanaryV2Client {
             .and_then(|config| config.exchange_v2)
             .map(|address| address.to_string())
             .ok_or_else(|| CanaryV2Error::Client("missing standard V2 contract".to_owned()))
+    }
+
+    pub fn negrisk_spender() -> Result<String, CanaryV2Error> {
+        contract_config(POLYGON, true)
+            .and_then(|config| config.exchange_v2)
+            .map(|address| address.to_string())
+            .ok_or_else(|| CanaryV2Error::Client("missing NegRisk V2 contract".to_owned()))
     }
 
     #[must_use]
@@ -731,6 +794,75 @@ fn standard_order_hash(
         .ok_or(CanaryV2Error::PreparedMismatch)
 }
 
+fn selected_order_hash(
+    order: &polymarket_client_sdk_v2::clob::types::OrderV2,
+    neg_risk: bool,
+) -> Result<String, CanaryV2Error> {
+    if !neg_risk {
+        return standard_order_hash(order);
+    }
+    let verifying_contract = contract_config(POLYGON, true)
+        .and_then(|config| config.exchange_v2)
+        .ok_or_else(|| CanaryV2Error::Client("missing NegRisk V2 contract".to_owned()))?;
+    Ok(v2_order_hash_with_contract(order, verifying_contract))
+}
+
+/// Mirrors the SDK's `standard_v2_order_hash`, but accepts the verifying contract selected for
+/// the admitted token. The vendored SDK exposes no NegRisk twin: its signing path constructs this
+/// same domain from `contract_config(chain_id, neg_risk)` in `clob/client.rs:1832-1848`.
+fn v2_order_hash_with_contract(
+    order: &polymarket_client_sdk_v2::clob::types::OrderV2,
+    verifying_contract: Address,
+) -> String {
+    const ORDER_TYPE: &[u8] = b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+    const DOMAIN_TYPE: &[u8] =
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+
+    let mut order_words = Vec::with_capacity(12 * 32);
+    order_words.extend_from_slice(keccak256(ORDER_TYPE).as_slice());
+    push_u256_word(&mut order_words, &order.salt);
+    push_address_word(&mut order_words, &order.maker);
+    push_address_word(&mut order_words, &order.signer);
+    push_u256_word(&mut order_words, &order.tokenId);
+    push_u256_word(&mut order_words, &order.makerAmount);
+    push_u256_word(&mut order_words, &order.takerAmount);
+    push_u8_word(&mut order_words, order.side);
+    push_u8_word(&mut order_words, order.signatureType);
+    push_u256_word(&mut order_words, &order.timestamp);
+    order_words.extend_from_slice(order.metadata.as_slice());
+    order_words.extend_from_slice(order.builder.as_slice());
+    let order_struct_hash = keccak256(order_words);
+
+    let mut domain_words = Vec::with_capacity(5 * 32);
+    domain_words.extend_from_slice(keccak256(DOMAIN_TYPE).as_slice());
+    domain_words.extend_from_slice(keccak256(b"Polymarket CTF Exchange").as_slice());
+    domain_words.extend_from_slice(keccak256(b"2").as_slice());
+    push_u256_word(&mut domain_words, &U256::from(POLYGON));
+    push_address_word(&mut domain_words, &verifying_contract);
+    let domain_separator = keccak256(domain_words);
+
+    let mut digest_input = [0_u8; 66];
+    digest_input[0] = 0x19;
+    digest_input[1] = 0x01;
+    digest_input[2..34].copy_from_slice(domain_separator.as_slice());
+    digest_input[34..].copy_from_slice(order_struct_hash.as_slice());
+    keccak256(digest_input).to_string()
+}
+
+fn push_u256_word(target: &mut Vec<u8>, value: &U256) {
+    target.extend_from_slice(&value.to_be_bytes::<32>());
+}
+
+fn push_address_word(target: &mut Vec<u8>, value: &Address) {
+    target.extend_from_slice(&[0_u8; 12]);
+    target.extend_from_slice(value.as_slice());
+}
+
+fn push_u8_word(target: &mut Vec<u8>, value: u8) {
+    target.extend_from_slice(&[0_u8; 31]);
+    target.push(value);
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -900,19 +1032,110 @@ mod tests {
         (client, state)
     }
 
+    fn buy_request() -> V2BuyRequest {
+        V2BuyRequest {
+            condition_id: PolymarketConditionId("0xcondition".to_owned()),
+            outcome_id: OutcomeId(0),
+            token_id: PolymarketTokenId("11".to_owned()),
+            limit_price: Price::new(dec!(0.10)).unwrap(),
+            shares: ShareAmount::from_atomic(5_000_000),
+            maximum_collateral: CollateralAmount::from_atomic(500_000),
+            tick_size: Price::new(dec!(0.01)).unwrap(),
+            metadata_hashes: vec!["metadata-hash".to_owned()],
+        }
+    }
+
     async fn prepared(client: &CanaryV2Client) -> Result<PreparedSubmission, CanaryV2Error> {
-        client
-            .prepare_buy(V2BuyRequest {
-                condition_id: PolymarketConditionId("0xcondition".to_owned()),
-                outcome_id: OutcomeId(0),
-                token_id: PolymarketTokenId("11".to_owned()),
-                limit_price: Price::new(dec!(0.10)).unwrap(),
-                shares: ShareAmount::from_atomic(5_000_000),
-                maximum_collateral: CollateralAmount::from_atomic(500_000),
-                tick_size: Price::new(dec!(0.01)).unwrap(),
-                metadata_hashes: vec!["metadata-hash".to_owned()],
-            })
+        client.prepare_buy(buy_request()).await
+    }
+
+    fn order_from_submission(
+        submission: &PreparedSubmission,
+    ) -> polymarket_client_sdk_v2::clob::types::OrderV2 {
+        fn u256(value: &serde_json::Value) -> U256 {
+            let encoded = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            U256::from_str(&encoded).unwrap()
+        }
+
+        let body: serde_json::Value = serde_json::from_slice(&submission.serialized_body).unwrap();
+        let raw = &body["order"];
+        let mut order = polymarket_client_sdk_v2::clob::types::OrderV2::default();
+        order.salt = u256(&raw["salt"]);
+        order.maker = Address::from_str(raw["maker"].as_str().unwrap()).unwrap();
+        order.signer = Address::from_str(raw["signer"].as_str().unwrap()).unwrap();
+        order.tokenId = u256(&raw["tokenId"]);
+        order.makerAmount = u256(&raw["makerAmount"]);
+        order.takerAmount = u256(&raw["takerAmount"]);
+        assert_eq!(raw["side"].as_str(), Some("BUY"));
+        order.side = Side::Buy as u8;
+        order.signatureType = u8::try_from(raw["signatureType"].as_u64().unwrap()).unwrap();
+        order.timestamp = u256(&raw["timestamp"]);
+        order.metadata = B256::from_str(raw["metadata"].as_str().unwrap()).unwrap();
+        order.builder = B256::from_str(raw["builder"].as_str().unwrap()).unwrap();
+        order
+    }
+
+    #[tokio::test]
+    async fn standard_market_preparation_binds_standard_exchange_and_hash() {
+        let (client, _) = client().await;
+        let submission = client
+            .prepare_buy_for_market(buy_request(), false)
             .await
+            .unwrap();
+        let standard = contract_config(POLYGON, false)
+            .and_then(|config| config.exchange_v2)
+            .unwrap();
+        let order = order_from_submission(&submission);
+
+        assert!(!submission.prepared().neg_risk);
+        assert_eq!(
+            submission.prepared().verifying_contract,
+            standard.to_string()
+        );
+        assert_eq!(submission.prepared().spender, standard.to_string());
+        assert_eq!(
+            CanaryV2Client::standard_spender().unwrap(),
+            standard.to_string()
+        );
+        assert_eq!(
+            submission.prepared().order_hash,
+            standard_v2_order_hash(&order).unwrap().to_string()
+        );
+        assert_eq!(
+            submission.prepared().order_hash,
+            v2_order_hash_with_contract(&order, standard)
+        );
+    }
+
+    #[tokio::test]
+    async fn negrisk_market_preparation_binds_negrisk_exchange_and_hash() {
+        let (client, _) = client().await;
+        let submission = client
+            .prepare_buy_for_market(buy_request(), true)
+            .await
+            .unwrap();
+        let negrisk = contract_config(POLYGON, true)
+            .and_then(|config| config.exchange_v2)
+            .unwrap();
+        let order = order_from_submission(&submission);
+        let expected_hash = v2_order_hash_with_contract(&order, negrisk);
+        let standard_hash = standard_v2_order_hash(&order).unwrap().to_string();
+
+        assert!(submission.prepared().neg_risk);
+        assert_eq!(
+            submission.prepared().verifying_contract,
+            negrisk.to_string()
+        );
+        assert_eq!(submission.prepared().spender, negrisk.to_string());
+        assert_eq!(
+            CanaryV2Client::negrisk_spender().unwrap(),
+            negrisk.to_string()
+        );
+        assert_eq!(submission.prepared().order_hash, expected_hash);
+        assert_ne!(submission.prepared().order_hash, standard_hash);
     }
 
     #[tokio::test]
@@ -932,6 +1155,8 @@ mod tests {
         let result = CanaryV2Client::parse_post_response(&raw).unwrap();
         assert!(result.success);
         assert_eq!(result.order_id, "0xorder");
+        assert_eq!(result.making_amount, dec!(0.5));
+        assert_eq!(result.taking_amount, dec!(5));
         assert_eq!(state.posts.load(Ordering::SeqCst), 1);
         assert_eq!(
             state.content_type.lock().unwrap().as_deref(),
@@ -1049,6 +1274,28 @@ mod tests {
         assert_eq!(failure.path, "/api/geoblock");
         assert!(failure.ordered_query.is_empty());
         assert_eq!(failure.error_class, TransportErrorClass::Timeout);
+    }
+
+    #[tokio::test]
+    async fn account_probe_reads_allowances_without_order_or_trade_pagination() {
+        let (client, state) = client().await;
+        let (evidence, protocol_failure) = client
+            .account_probe_raw(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(protocol_failure.is_none());
+        let endpoint_kinds = evidence
+            .iter()
+            .filter_map(|item| match item {
+                RawEvidence::HttpResponse(response) => Some(response.endpoint_kind.as_str()),
+                RawEvidence::HttpTransportFailure(_) | RawEvidence::Artifact(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            endpoint_kinds,
+            vec!["geoblock", "closed-only", "balance-allowance"]
+        );
+        assert_eq!(state.orders_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.exact_order_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

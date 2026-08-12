@@ -5,7 +5,7 @@ import type { Numeric } from "./format";
 // modelled as `Numeric` and rendered through lib/format.ts.
 export interface WalletLiveStats {
   wallet: string;
-  // ── live (paper) side ──
+  // ── watched (paper) side; legacy DB field prefix stays `live_` ──
   live_total_fills: Numeric;
   live_settled_count: Numeric;
   live_open_fills: Numeric;
@@ -24,7 +24,7 @@ export interface WalletLiveStats {
   last_trade_unix: Numeric; // epoch s of the wallet's real last on-chain trade at the last rank push (#357); null if aged out / pre-#357 batch
 }
 
-// The single `service_runtime` row: pe-service's current live watchlist size (the wallets
+// The single `service_runtime` row: pe-service's current paper watchlist size (the wallets
 // it actually copies). Published by the service because the count is in-memory only and the
 // site cannot derive it from the ranking. Absent/0 until the service has published once.
 export interface ServiceRuntime {
@@ -56,4 +56,51 @@ export interface PaperFill {
   entry_unix: number | null;
   event_seq: number;
   inserted_at: string;
+}
+
+// Display-safe #508 account control state. Credential ciphertext is intentionally absent.
+export interface AccountAdminRow {
+  account_id: string;
+  is_primary: boolean;
+  login_email: string | null;
+  enabled: boolean;
+  execution_order: number;
+  requested_live_mode: "off" | "live_tiny";
+  effective_live_mode: "off" | "live_tiny";
+  live_sizing_mode: "kelly" | "dollar" | "contract" | null;
+  live_sizing_dollar_usd: Numeric;
+  live_sizing_contracts: Numeric;
+  live_price_impact_cap_bps: number;
+  created_at: string;
+  updated_at: string;
+  credentials: AccountCredentialMetadata | null;
+}
+
+export interface AccountCredentialMetadata {
+  bundle_version: number;
+  key_id: string;
+  fingerprint: string;
+  updated_at: string;
+}
+
+export interface LiveFill extends PaperFill {
+  account_id: string;
+}
+
+export interface LivePosition {
+  account_id: string;
+  market_id: string;
+  outcome_id: number;
+  long_contracts: Numeric;
+  short_contracts: Numeric;
+  cost_basis: Numeric;
+}
+
+export interface LiveAccountState {
+  account_id: string;
+  free_collateral: Numeric;
+  reserved: Numeric;
+  unredeemed_value: Numeric;
+  last_reconciled_at: string | null;
+  admission_closed_reason: string | null;
 }

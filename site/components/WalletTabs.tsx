@@ -1,14 +1,14 @@
 "use client";
 
-// Live / Historical / Bench wallet tabs (#398 WS3, step 20) + the portfolio Unrealized-P&L KPI
-// (step 19). On mount this fetches live marks for every open fill from /api/marks and computes
+// Watched / Historical / Bench wallet tabs (#398 WS3, #508 Phase C terminology) + the portfolio
+// Unrealized-P&L KPI. On mount this fetches current marks for every open fill from /api/marks and computes
 // per-wallet + portfolio unrealized P&L = Σ side_sign × (mark − fill_price) × contracts.
 //
 // Tab membership (predicates may overlap by design):
-//   Live       = watched by pe-service OR has open fills (+ an Unrealized column)
+//   Watched    = watched by pe-service OR has open fills (+ an Unrealized column)
 //   Historical = has any settled fill
-//   Bench      = not Live and never settled
-// If the watchlist is empty (soft-fail), Live degrades to "has open fills" only.
+//   Bench      = not Watched and never settled
+// If the watchlist is empty (soft-fail), Watched degrades to "has open fills" only.
 import { useEffect, useMemo, useState } from "react";
 
 import { formatUsd, toNum } from "@/lib/format";
@@ -77,7 +77,7 @@ export function WalletTabs({
   );
 
   const tabs: { key: TabKey; label: string; rows: WalletLiveStats[] }[] = [
-    { key: "live", label: `Live (${live.length})`, rows: live },
+    { key: "live", label: `Watched (${live.length})`, rows: live },
     { key: "historical", label: `Historical (${historical.length})`, rows: historical },
     { key: "bench", label: `Bench (${bench.length})`, rows: bench },
   ];
@@ -91,7 +91,7 @@ export function WalletTabs({
           value={unrealized.size === 0 ? "—" : formatUsd(unrealizedTotal, { sign: true })}
           tone="signed"
           signOf={unrealized.size === 0 ? null : unrealizedTotal}
-          sub="open positions · live marks"
+          sub="open paper positions · current marks"
         />
       </div>
       <div className="mb-3 flex gap-2 text-xs">

@@ -24,7 +24,7 @@ pub use http_evidence::{
     RawArtifactObservation, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
     TransportErrorClass,
 };
-pub use identity::{TraderId, VenueAccountId, WalletAddress};
+pub use identity::{AccountId, TraderId, VenueAccountId, WalletAddress};
 pub use ids::{
     EventSeq, MarketId, MarketOutcomeId, ModelId, OrderLocalId, OutcomeId, ResolverCardId,
     SourceId, SourceTradeId, StrategyId, VenueId, VenueMarketId, VenueOrderId,

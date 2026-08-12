@@ -13,7 +13,7 @@ import {
 import { toNum } from "@/lib/format";
 import type { WalletLiveStats } from "@/lib/types";
 
-/** Historical (ranker hit_rate) vs live (paper win_rate) win-rate, in percent. */
+/** Historical (ranker hit_rate) vs watched (paper win_rate) win-rate, in percent. */
 export function WinRateCompareChart({ row }: { row: WalletLiveStats }) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
@@ -22,7 +22,7 @@ export function WinRateCompareChart({ row }: { row: WalletLiveStats }) {
   const live = toNum(row.live_win_rate);
   const data = [
     { label: "Historical", pct: hist === null ? null : hist * 100, fill: "#4ea1ff" },
-    { label: "Live", pct: live === null ? null : live * 100, fill: "#2ecc71" },
+    { label: "Watched", pct: live === null ? null : live * 100, fill: "#2ecc71" },
   ].filter((d) => d.pct !== null) as Array<{ label: string; pct: number; fill: string }>;
 
   if (!mounted) return <div className="h-56" />;

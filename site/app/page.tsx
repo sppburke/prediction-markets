@@ -31,7 +31,7 @@ export default async function OverviewPage() {
     return <StateNotice kind="empty" message="No wallets in wallet_live_stats yet." />;
   }
 
-  // Secondary: the live watched-count. A failure here must not blank the page, so it falls
+  // Secondary: the watched-count. A failure here must not blank the page, so it falls
   // back to "—".
   let watched: number | null = null;
   try {
@@ -41,7 +41,7 @@ export default async function OverviewPage() {
     watched = null;
   }
 
-  // Secondary (soft-fail): the watched set drives the Live tab; open fills drive unrealized P&L.
+  // Secondary (soft-fail): the watched set drives the Watched tab; open fills drive unrealized P&L.
   const watchedSet = await fetchWatchedSet().catch(() => new Set<string>());
   const openFills = await fetchOpenFills().catch(() => []);
 
@@ -50,14 +50,14 @@ export default async function OverviewPage() {
       <div>
         <h1 className="text-lg font-semibold">Portfolio overview</h1>
         <p className="text-xs text-muted">
-          Per-wallet historical (ranker) vs live (paper) stats. Click a wallet for detail.
+          Per-wallet historical (ranker) vs watched (paper) stats. Click a wallet for detail.
         </p>
       </div>
       <KpiCards rows={rows} watched={watched} />
-      <Panel title="Live realized P&L by wallet">
+      <Panel title="Watched paper realized P&L by wallet">
         <PnlBarChart rows={rows} />
       </Panel>
-      <Panel title="Wallets — historical vs live">
+      <Panel title="Wallets — historical vs watched">
         <WalletTabs rows={rows} watchedSet={[...watchedSet]} openFills={openFills} />
       </Panel>
     </div>

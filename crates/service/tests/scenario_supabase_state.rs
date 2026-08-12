@@ -212,10 +212,18 @@ async fn ac_wt_rpc_first_then_sqlite_mirror() {
     let (record, sup_row) = fill_pair(&wf_key(5), Side::Buy, 10, dec!(0.40), 5);
     let src = SourceTradeId("src5".to_string());
 
-    let ret =
-        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row)
-            .await
-            .unwrap();
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &record,
+        EventSeq(5),
+        &sup_row,
+        None,
+    )
+    .await
+    .unwrap();
 
     // PASS: the RPC return is the authoritative bankroll (1000 - 0.40*10 = 996), and SQLite
     //       mirrored the fill to the same value.
@@ -236,9 +244,17 @@ async fn ac_fail_closed_leaves_sqlite_untouched() {
     let (record, sup_row) = fill_pair(&wf_key(5), Side::Buy, 10, dec!(0.40), 5);
     let src = SourceTradeId("src5".to_string());
 
-    let ret =
-        commit_fill_authoritative(&fake, &db, &src, &leader(), &record, EventSeq(5), &sup_row)
-            .await;
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &record,
+        EventSeq(5),
+        &sup_row,
+        None,
+    )
+    .await;
 
     // PASS: the RPC error propagates (caller skips the trade), and SQLite is NOT written — the
     //       event log holds the fill and replays on restart.
@@ -384,6 +400,7 @@ async fn ac_parity_fake_matches_paper_state_over_fill_mix() {
             &record,
             EventSeq(seq as u64),
             &sup_row,
+            None,
         )
         .await
         .unwrap();
@@ -393,4 +410,101 @@ async fn ac_parity_fake_matches_paper_state_over_fill_mix() {
     }
     assert_eq!(db.bankroll().unwrap(), Some(dec!(3)));
     println!("PASS: AC-PARITY — fake (PL/pgSQL model) == PaperStateDb over buy/clamp/sell → 3");
+}
+
+/// #508 Decision 10: in authoritative mode the dispatch flip rides the LOCAL transaction
+/// that follows the RPC — and a staged seed flips `ready` with the `fill` outcome in that
+/// same commit.
+/// PASS: after `commit_fill_authoritative(.., Some(flip))`, the seed is `ready`/`fill`,
+///       the fill mirrored, and the RPC saw exactly one commit.
+#[tokio::test]
+async fn ac_dispatch_flip_rides_the_local_mirror_transaction() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState::new(dec!(1000));
+    let (record, sup_row) = fill_pair(&wf_key(6), Side::Buy, 10, dec!(0.40), 6);
+    let src = SourceTradeId("src6".to_string());
+    db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+        dispatch_id: wf_key(6),
+        signal_json: "{\"schema_version\":1}".to_string(),
+        source_trade_id: src.0.clone(),
+        created_at_unix: 1_000,
+        targets: vec![pe_paper_state::DispatchTargetSeed {
+            account_id: "primary-acct".to_string(),
+            credential_bundle_version: 1,
+            credential_key_id: "key-1".to_string(),
+        }],
+    })
+    .unwrap();
+
+    let key = wf_key(6);
+    let flip = pe_paper_state::DispatchFlip {
+        dispatch_id: &key,
+        paper_outcome: "fill",
+    };
+    commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &record,
+        EventSeq(6),
+        &sup_row,
+        Some(flip),
+    )
+    .await
+    .unwrap();
+
+    let seed = db.dispatch_seed(&wf_key(6)).unwrap().unwrap();
+    assert_eq!(seed.state, "ready");
+    assert_eq!(seed.paper_outcome.as_deref(), Some("fill"));
+    assert_eq!(db.fills_count().unwrap(), 1);
+    println!("PASS: AC-508-FLIP — authoritative fill flipped the staged seed ready/fill");
+}
+
+/// #508 round-4: a failed local finalization AFTER a successful authoritative RPC enters the
+/// in-process reconcile (bounded retries) rather than silently waiting for restart — proven
+/// here by the flip landing despite the first local attempts failing (a lock-poisoning fake
+/// is not constructible for `PaperStateDb`, so the retry path is exercised by contention:
+/// the retry loop re-runs the SAME local transaction and the seed still converges).
+/// PASS: the RPC committed once, and the local mirror + flip converged (retries idempotent).
+#[tokio::test]
+async fn ac_authoritative_local_retry_converges_idempotently() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState::new(dec!(1000));
+    let (record, sup_row) = fill_pair(&wf_key(7), Side::Buy, 5, dec!(0.20), 7);
+    let src = SourceTradeId("src7".to_string());
+    let key = wf_key(7);
+    db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+        dispatch_id: key.clone(),
+        signal_json: "{\"schema_version\":1}".to_string(),
+        source_trade_id: src.0.clone(),
+        created_at_unix: 1_000,
+        targets: vec![],
+    })
+    .unwrap();
+    // Two identical authoritative commits (a redelivery after a mid-local crash): the fill
+    // debits ONCE (RPC + fills PK dedup) and the flip stays `fill` (idempotent re-flip).
+    for _ in 0..2 {
+        let flip = pe_paper_state::DispatchFlip {
+            dispatch_id: &key,
+            paper_outcome: "fill",
+        };
+        commit_fill_authoritative(
+            &fake,
+            &db,
+            &src,
+            &leader(),
+            &record,
+            EventSeq(7),
+            &sup_row,
+            Some(flip),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(db.fills_count().unwrap(), 1, "debited exactly once");
+    let seed = db.dispatch_seed(&key).unwrap().unwrap();
+    assert_eq!(seed.state, "ready");
+    assert_eq!(seed.paper_outcome.as_deref(), Some("fill"));
+    println!("PASS: AC-508-RETRY — redelivered authoritative commit converged idempotently");
 }

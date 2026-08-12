@@ -33,6 +33,7 @@ async fn clob_book_fixture_roundtrip() {
                     size: dec!(250.5),
                 },
             ],
+            fetched_at_ms: 0,
         },
     );
     let fetcher = FixtureClobBookFetcher::new(books);

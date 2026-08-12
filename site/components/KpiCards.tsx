@@ -6,7 +6,7 @@ import { Stat } from "./Stat";
 /**
  * Portfolio-level KPIs aggregated from the per-wallet view rows.
  *
- * `watched` is pe-service's current live watchlist size (the wallets it actually copies),
+ * `watched` is pe-service's current paper watchlist size (the wallets it actually copies),
  * published to `service_runtime`; `null` until the service has published once. It is the
  * headline because the view's row count is the far larger *ranked* universe — shown as
  * context, not as the followed set.
@@ -36,12 +36,12 @@ export function KpiCards({
   const overallEdge = settled > 0 ? realized / settled : null;
 
   return (
-    <Panel title="Live paper portfolio">
+    <Panel title="Watched paper portfolio">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
         <Stat
           label="Watched"
           value={watched === null ? "—" : formatInt(watched)}
-          sub={`${formatInt(tradedWallets)} live · ${formatInt(rows.length)} ranked`}
+          sub={`${formatInt(tradedWallets)} traded · ${formatInt(rows.length)} ranked`}
         />
         <Stat label="Realized P&L" value={formatUsd(realized, { sign: true })} tone="signed" signOf={realized} />
         <Stat label="Settled fills" value={formatInt(settled)} />

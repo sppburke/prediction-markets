@@ -9,7 +9,7 @@ pub mod snapshot;
 pub use block::RiskBlock;
 pub use engine::{RiskDecision, evaluate_canary_risk, evaluate_risk, exposure_bps_ceil};
 pub use pe_core_types::CanaryOrigin;
-pub use snapshot::{CanaryRiskSnapshot, RiskSnapshot, TradingMode};
+pub use snapshot::{CanaryRiskSnapshot, ConcentrationCaps, RiskSnapshot, TradingMode};
 
 use pe_core_types::{BasisPoints, CollateralAmount};
 

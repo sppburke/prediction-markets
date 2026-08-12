@@ -356,6 +356,7 @@ struct PositionRow {
 ///
 /// The RPC `.await` completes before `PaperStateDb::commit_fill` takes the SQLite mutex, so
 /// the lock is never held across the await (no cross-await lock, no `Send` hazard).
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
@@ -364,13 +365,36 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     record: &FillRecord,
     seq: EventSeq,
     sup_row: &SupabaseFillRow,
+    flip: Option<pe_paper_state::DispatchFlip<'_>>,
 ) -> Result<Decimal, SupabaseStateError> {
     let new_bankroll = supabase.commit_fill(sup_row).await?;
-    if let Err(e) = paper_state.commit_fill(source_trade_id, leader, record, seq) {
+    // #508 round-4: the local transaction (mirror + seen + dispatch flip) follows the
+    // authoritative RPC; a failure here surfaces and retries IN-PROCESS (bounded) — the
+    // dispatch flip must not silently wait for a restart. Restart recovery remains the
+    // durable backstop.
+    let mut local = Ok(());
+    for attempt in 1u32..=3 {
+        local = paper_state
+            .commit_fill_with_flip(source_trade_id, leader, record, seq, flip)
+            .map(|_| ());
+        match &local {
+            Ok(()) => break,
+            Err(e) if attempt < 3 => {
+                tracing::error!(
+                    error = %e,
+                    attempt,
+                    "authoritative fill: local mirror/flip failed; retrying in-process"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(_) => {}
+        }
+    }
+    if let Err(e) = local {
         warn!(
             error = %e,
-            "authoritative fill committed to Supabase but local SQLite mirror failed \
-             (heals on restart/reprocess)"
+            "authoritative fill committed to Supabase but local SQLite mirror/flip failed \
+             after in-process retries (heals on restart/reprocess)"
         );
     }
     Ok(new_bankroll)

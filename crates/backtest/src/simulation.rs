@@ -17,9 +17,9 @@ use pe_core_types::{
     BasisPoints, KellyFraction, LeaderAction, MarketId, OutcomeId, Probability, ProbabilityPpm,
     Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
-use pe_risk_engine::RiskSnapshot;
 use pe_risk_engine::clamp_contracts_to_liquidity;
 use pe_risk_engine::snapshot::TradingMode;
+use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
 use pe_source_core::SourceStatus;
 use pe_strategy_winner_follow::{WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::ledger::TraderLedger;
@@ -1398,6 +1398,8 @@ fn build_risk_snapshot(ctx: &RiskContext<'_>) -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(ctx.proposed_bps),
         per_trade_cap_bps: 0, // evaluate() overwrites with resolved cap from WinnerFollowConfig
+        // Backtest keeps concentration enforcement at the docs/19 canonical ladder (#508).
+        concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
 

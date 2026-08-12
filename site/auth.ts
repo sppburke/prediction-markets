@@ -1,17 +1,30 @@
-// next-auth v5 (Auth.js) config for the single-email-gated dashboard (#398 WS3).
+// next-auth v5 (Auth.js) config for Google authentication (#398 WS3, #508 Phase C).
 //
 // Strict Google OAuth, single allowed identity, JWT sessions. Served behind an nginx TLS proxy on
 // the DuckDNS host, so `trustHost: true` lets next-auth derive its https origin from the forwarded
 // request headers (no bare-IP / port ambiguity). Secrets are read lazily, so `next build` stays
 // green without them.
 //
-// Gates: `authorized` makes the middleware redirect any unauthenticated request to the (public)
-// sign-in page — the rest of the site stays behind it; `signIn` admits only the allowlisted Google
-// account (a wrong account → next-auth's built-in AccessDenied, nothing else renders).
+// Gates: `authorized` is Edge-safe and checks session presence only; `signIn` admits the hard-coded
+// admin or exactly one account.login_email match through the service-role client. Live/account
+// authorization is deliberately re-resolved on each protected request by lib/authz.ts.
 import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 
-import { isAllowedEmail } from "@/lib/auth";
+import { buildAuthCallbacks, type LoginEmailLookup } from "@/lib/auth";
+import { getServiceRoleSupabase } from "@/lib/supabase-server";
+
+const lookupLoginEmail: LoginEmailLookup = async (normalizedEmail) => {
+  const supabase = getServiceRoleSupabase();
+  const { data, error } = await supabase
+    .from("accounts")
+    .select("account_id, login_email")
+    .eq("login_email", normalizedEmail)
+    .limit(2);
+  return { rows: data ?? [], error };
+};
+
+export const authCallbacks = buildAuthCallbacks(lookupLoginEmail);
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   trustHost: true,
@@ -22,12 +35,5 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     }),
   ],
   session: { strategy: "jwt" },
-  callbacks: {
-    authorized({ auth: session }) {
-      return isAllowedEmail(session?.user?.email);
-    },
-    signIn({ profile }) {
-      return isAllowedEmail(profile?.email);
-    },
-  },
+  callbacks: authCallbacks,
 });

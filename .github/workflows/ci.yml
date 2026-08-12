@@ -127,6 +127,14 @@ jobs:
           # Matview SQL must load on vanilla Postgres too (its pg_cron block self-skips when the
           # extension is absent, as it is here); validates the DDL + the wallet_live_stats_mv index/grant.
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_wallet_live_stats_mv.sql
+          # Multi-account live schema (#508 Phase B): loaded TWICE to prove idempotent re-run.
+          psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_multi_account_live_schema.sql
+          psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_multi_account_live_schema.sql
+
+      - name: Multi-account schema acceptance suite (issue #508)
+        env:
+          PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bash scripts/test_multi_account_schema.sh "$PG_URL"
 
       - name: Postgres RPC parity + concurrency test (issue #397)
         env:

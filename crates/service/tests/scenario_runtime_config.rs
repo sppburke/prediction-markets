@@ -41,7 +41,8 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, RuntimeConfig};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, PaperExecutor, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
+    ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
+    WinnerFollowConfig, WinnerFollowStrategy,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
@@ -166,6 +167,7 @@ async fn run_with(
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
             runtime_config,
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig {
@@ -285,12 +287,22 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .iter()
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
+        fetched_at_ms: 0,
     }
 }
 
 /// Run one BUY through an orchestrator wired with `books` (token → /book) and the gate at
 /// `cap_bps`. Returns (fill count, filled contracts).
 async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32) -> (usize, u64) {
+    run_gate_with(dir, books, gate_snapshot(cap_bps)).await
+}
+
+/// [`run_gate`] with an explicit runtime-config snapshot (e.g. `clob_best_ask` fill mode).
+async fn run_gate_with(
+    dir: &TempDir,
+    books: HashMap<String, OrderBook>,
+    rc: RuntimeConfig,
+) -> (usize, u64) {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
 
@@ -316,7 +328,8 @@ async fn run_gate(dir: &TempDir, books: HashMap<String, OrderBook>, cap_bps: i32
             fill_mode: FillMode::LeaderHaircut,
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: CopyEntryGateConfig { fail_closed: false },
-            runtime_config: Some(LiveRuntimeConfig::new(gate_snapshot(cap_bps))),
+            runtime_config: Some(LiveRuntimeConfig::new(rc)),
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
@@ -368,15 +381,79 @@ async fn price_impact_empty_book_skips_trade() {
     println!("PASS: empty /book (0 absorbable) skips the trade (Some(0), not fail-open)");
 }
 
-/// PASS: a /book fetch error (token absent) FAILS OPEN — the full dollar-sized 190 fills.
+/// PASS (#508 Phase A): a /book fetch error (token absent) FAILS CLOSED — no fill. This
+/// flips the #398 fail-open posture: with the gate enabled, an unusable book must never
+/// admit an unbounded order.
 #[tokio::test]
-async fn price_impact_book_fetch_error_fails_open() {
+async fn price_impact_book_fetch_error_fails_closed() {
     let dir = TempDir::new().unwrap();
-    let (fills, contracts) = run_gate(&dir, HashMap::new(), 100).await;
+    let (fills, _) = run_gate(&dir, HashMap::new(), 100).await;
+    assert_eq!(
+        fills, 0,
+        "an unusable /book must skip the trade (fail closed)"
+    );
+    println!("PASS: /book fetch error fails CLOSED with the gate enabled (#508)");
+}
+
+/// PASS (#508 Phase A): a stale book snapshot (fetched_at_ms pinned to 1 — far older than the
+/// 2 s ladder bound) skips the trade when the gate is enabled.
+#[tokio::test]
+async fn price_impact_stale_book_skips_trade() {
+    let dir = TempDir::new().unwrap();
+    let mut stale = book(&[(dec!(0.50), dec!(300))]);
+    stale.fetched_at_ms = 1; // non-zero → the fixture fetcher keeps it; ancient → stale
+    let books = HashMap::from([(GATE_TOKEN.to_string(), stale)]);
+    let (fills, _) = run_gate(&dir, books, 100).await;
+    assert_eq!(fills, 0, "a stale book snapshot must skip (fail closed)");
+    println!("PASS: stale book snapshot skips the trade with the gate enabled (#508)");
+}
+
+/// First recorded paper fill: (contracts, simulated price, provenance) from the event log.
+fn first_paper_fill_full(dir: &TempDir) -> Option<(u64, Decimal, FillSource)> {
+    let path = dir.path().join("paper.log");
+    if !path.exists() {
+        return None;
+    }
+    let (_seq, env) = Reader::replay(&path).unwrap().next()?.unwrap();
+    let fill: PaperFill = serde_json::from_slice(&env.payload).unwrap();
+    Some((
+        fill.intent.contracts.0,
+        fill.simulated_fill_price.0,
+        fill.fill_source,
+    ))
+}
+
+/// PASS (#508 Phase A): with the gate enabled in `clob_best_ask` mode, a multi-level ladder
+/// produces the budget-planned whole-share quantity, recorded at the exact ladder VWAP with
+/// the worst-tick limit walk — the $500→$230 downsize shape at scenario scale. The $100
+/// dollar budget meets a band holding 3 @ 0.50 + 300 @ 0.5025 (ceiling 0.505): the planner
+/// affords 199 whole shares spending $99.99, so the fill records 199 @ VWAP(99.99/199).
+#[tokio::test]
+async fn price_impact_ladder_vwap_fill_with_clob_best_ask() {
+    let dir = TempDir::new().unwrap();
+    let books = HashMap::from([(
+        GATE_TOKEN.to_string(),
+        book(&[
+            (dec!(0.50), dec!(3)),
+            (dec!(0.5025), dec!(300)),
+            (dec!(0.60), dec!(1000)), // outside the 100 bps band — never touched
+        ]),
+    )]);
+    let mut rc = gate_snapshot(100);
+    rc.fill_mode = FillMode::ClobBestAsk; // the production fill mode (#486)
+    let (fills, contracts) = run_gate_with(&dir, books, rc).await;
     assert_eq!(fills, 1);
     assert_eq!(
-        contracts, 190,
-        "a /book error must fail open (full dollar size: floor(100/(0.50×1.05))=190)"
+        contracts, 199,
+        "budget-planned whole shares within the band"
     );
-    println!("PASS: /book fetch error fails open (full size 190, no cap)");
+    let (fill_contracts, price, source) = first_paper_fill_full(&dir).expect("fill recorded");
+    assert_eq!(fill_contracts, 199);
+    assert_eq!(
+        price,
+        dec!(99.99) / dec!(199),
+        "recorded fill == exact ladder VWAP (multi-level, not best-ask)"
+    );
+    assert_eq!(source, FillSource::ClobBestAsk);
+    println!("PASS: gate-on clob_best_ask fill = 199 contracts at exact ladder VWAP (#508)");
 }

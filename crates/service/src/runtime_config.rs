@@ -46,6 +46,15 @@ pub const MIN_ACTIVE_WATCHLIST_SIZE: usize = 1;
 /// larger value cannot be satisfied without changing that upstream contract first.
 pub const MAX_ACTIVE_WATCHLIST_SIZE: usize = 200;
 
+/// Smallest accepted `price_impact_cap_bps` edit (#508 Phase A). `0` is rejected — the sole
+/// policy size limit cannot be switched off by edit; gate-off exists only as the compiled
+/// boot default.
+pub const MIN_PRICE_IMPACT_CAP_BPS: i32 = 1;
+
+/// Largest accepted `price_impact_cap_bps` edit: 10_000 bps (100 % of best ask) is the
+/// explicit "effectively off" value.
+pub const MAX_PRICE_IMPACT_CAP_BPS: i32 = 10_000;
+
 /// The membership cap that has actually been published to the live watchlist.
 ///
 /// This is deliberately separate from a pending Supabase request and from the broader runtime
@@ -229,7 +238,12 @@ impl RuntimeConfig {
                 .kelly_fraction_above_default_human_approved,
             polymarket_fee_rate: cfg.strategy.polymarket_fee_rate,
             kelly_fraction_override: cfg.strategy.kelly_fraction_override,
-            per_trade_cap: cfg.strategy.per_trade_cap,
+            // #508 Phase A outage posture, compiled (round-5 Blocking fix): the boot snapshot
+            // pins `ModeDefault` regardless of TOML `[strategy]`/`PE_` env, exactly like the
+            // `price_impact_cap_bps: 0` hardcode above. A config-fetch outage therefore
+            // provably boots the 25 bps clamp + gate off; `per_trade_cap=unlimited` can take
+            // effect only through the KV row on a successful poll.
+            per_trade_cap: PerTradeCap::ModeDefault,
             slippage_rate: cfg.strategy.slippage_rate,
             sizing_mode: cfg.strategy.sizing_mode,
         }
@@ -391,7 +405,26 @@ pub fn parse_config(
         "demotion_pnl_window_secs",
         &mut out.demotion_pnl_window_secs,
     );
-    apply_parsed(&map, "price_impact_cap_bps", &mut out.price_impact_cap_bps);
+    // Price-impact cap (#508 Phase A): the sole policy size limit. Valid range 1..=10_000
+    // inclusive — `0` and out-of-range values are REJECTED (last-known-good retained), so
+    // the limit cannot be switched off by an edit; "effectively off" is an explicit 10_000.
+    // Gate-off exists only as the compiled boot default (the committed `'0'` seed is
+    // rejected here, leaving the compiled 0 until the first in-range edit — e.g. the #508
+    // A3 cutover UPDATE to 100).
+    if let Some(raw) = map.get("price_impact_cap_bps") {
+        match raw.parse::<i32>() {
+            Ok(v) if (MIN_PRICE_IMPACT_CAP_BPS..=MAX_PRICE_IMPACT_CAP_BPS).contains(&v) => {
+                out.price_impact_cap_bps = v;
+            }
+            _ => warn!(
+                key = "price_impact_cap_bps",
+                value = %raw,
+                min = MIN_PRICE_IMPACT_CAP_BPS,
+                max = MAX_PRICE_IMPACT_CAP_BPS,
+                "service_config: price_impact_cap_bps outside 1..=10000; keeping last-known-good"
+            ),
+        }
+    }
     apply_parsed(&map, "polymarket_fee_rate", &mut out.polymarket_fee_rate);
     apply_parsed(&map, "slippage_rate", &mut out.slippage_rate);
     // Approval flags are admin-mutable via service_config (#398 Decision #2 — reverses the old
@@ -707,6 +740,9 @@ mod tests {
     fn winner_follow_config_round_trips_every_nondefault_field() {
         // #398 round-5 reconstruction fidelity: with EVERY strategy field non-default, the
         // rebuild must reproduce it field-for-field — a mis-mapped field would mismatch here.
+        // Exception (#508 Phase A): `per_trade_cap` is PINNED to `ModeDefault` at boot (the
+        // compiled outage posture), so its TOML/env value never reaches the runtime config —
+        // covered by `boot_pins_per_trade_cap_regardless_of_toml_env` below.
         let strat = WinnerFollowConfig {
             flip_human_approved: true,
             kelly_fraction_above_default_human_approved: true,
@@ -720,17 +756,79 @@ mod tests {
             strategy: strat.clone(),
             ..Default::default()
         };
+        let expected = WinnerFollowConfig {
+            per_trade_cap: PerTradeCap::ModeDefault, // pinned boot posture (#508)
+            ..strat
+        };
         assert_eq!(
             RuntimeConfig::from_service_config(&cfg).winner_follow_config(),
-            strat
+            expected
         );
+    }
+
+    #[test]
+    fn boot_pins_per_trade_cap_regardless_of_toml_env() {
+        // #508 round-5 Blocking regression: with a TOML/env `per_trade_cap = unlimited`
+        // override and ZERO config rows (a config-fetch outage), boot must still land on
+        // `ModeDefault` — never "unlimited with the gate off" (no policy size limit at all).
+        let cfg = ServiceConfig {
+            strategy: WinnerFollowConfig {
+                per_trade_cap: PerTradeCap::Unlimited,
+                ..WinnerFollowConfig::default()
+            },
+            ..Default::default()
+        };
+        let rc = load_initial_runtime_config(&[], &cfg, false);
+        assert_eq!(rc.per_trade_cap, PerTradeCap::ModeDefault);
+        assert_eq!(rc.price_impact_cap_bps, 0, "gate off until the first poll");
+        // The KV row remains the sole path to `unlimited` (a successful poll).
+        let polled = parse_config(&[row("per_trade_cap", "unlimited", "text")], &rc, false);
+        assert_eq!(polled.per_trade_cap, PerTradeCap::Unlimited);
+    }
+
+    #[test]
+    fn price_impact_cap_rejects_zero_and_out_of_range() {
+        // #508 Phase A: valid range 1..=10_000; `0` (the committed seed) and >10_000 are
+        // rejected with the last-known-good retained — the sole policy size limit cannot be
+        // switched off by edit.
+        let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        assert_eq!(boot.price_impact_cap_bps, 0); // compiled gate-off default
+        for invalid in ["0", "-5", "10001", "nope"] {
+            let out = parse_config(
+                &[row("price_impact_cap_bps", invalid, "integer")],
+                &boot,
+                false,
+            );
+            assert_eq!(
+                out.price_impact_cap_bps, 0,
+                "invalid edit {invalid} must retain last-known-good"
+            );
+        }
+        let last = RuntimeConfig {
+            price_impact_cap_bps: 100,
+            ..boot.clone()
+        };
+        let out = parse_config(&[row("price_impact_cap_bps", "0", "integer")], &last, false);
+        assert_eq!(
+            out.price_impact_cap_bps, 100,
+            "a 0 edit cannot disable the gate"
+        );
+        for (valid, want) in [("1", 1), ("100", 100), ("10000", 10_000)] {
+            let out = parse_config(
+                &[row("price_impact_cap_bps", valid, "integer")],
+                &boot,
+                false,
+            );
+            assert_eq!(out.price_impact_cap_bps, want);
+        }
     }
 
     #[test]
     fn seed_reconstructs_boot_strategy() {
         // The committed seed, parsed through load_initial, reconstructs the live boot strategy:
-        // sizing dollar-$25 (never Kelly), fee 0.04, slippage 0.01, approvals off; per_trade_cap
-        // and kelly_fraction_override are not seeded, so they fall through to the compiled defaults.
+        // sizing dollar-$25 (never Kelly), fee 0.04, slippage 0.01, approvals off. per_trade_cap
+        // IS seeded (`mode_default`, #508 Phase A) and must reconstruct the pinned boot posture;
+        // kelly_fraction_override is not seeded and falls through to the compiled default.
         let rc = load_initial_runtime_config(&seed_rows(), &ServiceConfig::default(), false);
         let expected = WinnerFollowConfig {
             flip_human_approved: false,
@@ -751,7 +849,8 @@ mod tests {
         assert_eq!(rc.min_resolution_horizon_secs, 60);
         assert_eq!(rc.max_resolution_horizon_secs, 172_800); // run28 TTR ceiling
         assert_eq!(rc.demotion_pnl_window_secs, 2_592_000); // #473, now seeded
-        // price_impact_cap_bps is seeded at 0 (gate disabled / fail-open) — #398 WS2.
+        // The committed '0' seed is REJECTED by the 1..=10_000 validator (#508 Phase A);
+        // boot retains the compiled gate-off default — the intended safe posture.
         assert_eq!(rc.price_impact_cap_bps, 0);
         // #486: paper fills record the CLOB best-ask; the fallback haircut is 1%.
         assert_eq!(rc.fill_mode, FillMode::ClobBestAsk);

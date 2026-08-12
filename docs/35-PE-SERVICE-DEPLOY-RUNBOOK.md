@@ -1,7 +1,8 @@
 # 35 — pe-service binary deploy runbook (VPS)
 
-> This runbook deploys the ordinary **paper-only** `pe-service`. It does not deploy or configure
-> the isolated Polymarket V2 canary; see
+> This runbook deploys ordinary `pe-service`, including the #508 per-account live path that ships
+> dark over the shared paper book. It does not deploy or configure the isolated Polymarket V2
+> canary; see
 > [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
@@ -38,6 +39,82 @@ against the live box on first use, then corrected here.
    restart loop), watchlist seeded from `latest_ranking`, `service_config poll loop
    started`, no poll failures; then confirm behavior-specific log lines for the deploy
    (e.g. the first `full re-rank membership swap applied` after a ranking push).
+
+## #508 Phase A config cutover (A0–A4)
+
+Every production update is a predicated compare-and-swap. Save each returned `value` and
+`updated_at`; zero rows from A3, A4, or a reversal means another writer won, so stop and reconcile.
+A1 may return zero because the row already exists; A1b is authoritative in either case.
+
+```sql
+-- A0: capture both predicate tokens before any mutation.
+select key, value, updated_at
+from service_config
+where key in ('price_impact_cap_bps', 'per_trade_cap')
+order by key;
+
+-- A1: only if per_trade_cap is absent, install the old-binary-safe posture.
+insert into service_config (key, value, value_type, description, updated_by)
+select 'per_trade_cap', 'mode_default', 'text',
+       'Per-trade cap cutover posture (#508)', '<operator>'
+where not exists (select 1 from service_config where key = 'per_trade_cap')
+returning key, value, updated_at;
+
+-- A1b: re-select and retain the exact tokens the later UPDATE will predicate on.
+select key, value, updated_at
+from service_config
+where key in ('price_impact_cap_bps', 'per_trade_cap')
+order by key;
+
+-- A3: after A2, use the A1b price-impact tokens; exactly one row must return.
+update service_config
+set value = '100', updated_by = '<operator>', updated_at = now()
+where key = 'price_impact_cap_bps'
+  and value = '<A1b-price-impact-value>'
+  and updated_at = '<A1b-price-impact-updated-at>'
+returning key, value, updated_at;
+
+-- A4: last, use the A1b per-trade tokens; exactly one row must return.
+update service_config
+set value = 'unlimited', updated_by = '<operator>', updated_at = now()
+where key = 'per_trade_cap'
+  and value = '<A1b-per-trade-value>'
+  and updated_at = '<A1b-per-trade-updated-at>'
+returning key, value, updated_at;
+```
+
+A2 is the normal binary deploy/restart above. Verify clean boot and that the last-known-good shared
+impact gate is applied before A3; apply A4 only after A3 is observed. Retain the old binary and
+captured tokens through two valid orders. Rollback changes `per_trade_cap` first, then either restore
+the gate row and restart the current binary, or restore the old binary and only then restore the old
+gate-row value. Each reversal uses the current `value, updated_at` tokens and must return exactly one
+row.
+
+## #508 Phase D ordinary-live installation and arming
+
+### D1 — ship dark
+
+Install the service-scoped age identity at a root-owned path with mode `0600`. Install the committed
+`pe-service` drop-in that maps it as `LoadCredential=pe-age-identity:<identity-path>`, then run
+`systemctl daemon-reload` and verify the effective unit with `systemctl cat pe-service`. Deploy the
+Phase-D binary in that same stop/swap/start operation. Its first boot records the arming fence, so no
+earlier promotion review can arm an account.
+
+### Arm one account
+
+1. Rotate the account credentials through the panel; plaintext must never enter `.env`, Supabase,
+   logs, or shell history.
+2. Externally provision and verify pUSD allowance from the account wallet for both V2 exchange
+   spenders. `pe-service` verifies allowance but never mutates it.
+3. Record the custody wallet kind and address, then verify Conditional Tokens `isApprovedForAll`
+   for both V2 collateral adapters. Approval mutation remains an external operator action.
+4. For EOA custody, provision a small POL gas balance. EOA transport remains deferred pending the
+   wallet-kind inventory; ordinary-live v1 uses Relayer transport only.
+5. After the Phase-D first boot, record the promotion review and its evidence in the panel.
+6. Request `live_tiny` in the panel. Requested mode is not authority; wait for the service's audited
+   effective-mode transition.
+7. Observe the account admission audit and `status.json` live block. Any failed fence keeps the
+   account dark; do not bypass it with direct table writes.
 
 ## Rollback
 

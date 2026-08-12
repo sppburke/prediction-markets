@@ -60,13 +60,13 @@ const COLUMNS: Col[] = [
     // Relative age is the at-a-glance inactivity read (#357); the absolute UTC date sits in the title.
     cell: (r) => <span title={formatDate(r.last_trade_unix)}>{formatAge(r.last_trade_unix)}</span>,
   },
-  { key: "live_total_fills", label: "Live fills", group: "live", sort: (r) => num(r.live_total_fills), cell: (r) => formatInt(r.live_total_fills) },
+  { key: "live_total_fills", label: "Paper fills", group: "live", sort: (r) => num(r.live_total_fills), cell: (r) => formatInt(r.live_total_fills) },
   { key: "live_settled_count", label: "Settled", group: "live", sort: (r) => num(r.live_settled_count), cell: (r) => formatInt(r.live_settled_count) },
   { key: "live_open_fills", label: "Open", group: "live", sort: (r) => num(r.live_open_fills), cell: (r) => formatInt(r.live_open_fills) },
-  { key: "live_win_rate", label: "Live win%", group: "live", sort: (r) => num(r.live_win_rate), cell: (r) => formatPct(r.live_win_rate) },
+  { key: "live_win_rate", label: "Paper win%", group: "live", sort: (r) => num(r.live_win_rate), cell: (r) => formatPct(r.live_win_rate) },
   {
     key: "live_realized_pnl",
-    label: "Live P&L",
+    label: "Paper P&L",
     group: "live",
     sort: (r) => num(r.live_realized_pnl),
     cell: (r) => (
@@ -75,7 +75,7 @@ const COLUMNS: Col[] = [
       </span>
     ),
   },
-  { key: "live_edge", label: "Live ¢/trade", group: "live", sort: (r) => num(r.live_edge), cell: (r) => formatCents(r.live_edge, { sign: true }) },
+  { key: "live_edge", label: "Paper ¢/trade", group: "live", sort: (r) => num(r.live_edge), cell: (r) => formatCents(r.live_edge, { sign: true }) },
 ];
 
 const GROUP_TONE: Record<Col["group"], string> = {
@@ -89,7 +89,7 @@ export function WalletTable({
   unrealized,
 }: {
   rows: WalletLiveStats[];
-  /** Lowercase wallet → unrealized P&L (USD). When provided (Live tab), an Unrealized column is
+  /** Lowercase wallet → unrealized P&L (USD). When provided (Watched tab), an Unrealized column is
    * appended; absent for the Historical/Bench tabs. */
   unrealized?: Map<string, number>;
 }) {
@@ -144,7 +144,7 @@ export function WalletTable({
                 className={`whitespace-nowrap px-3 py-2 font-medium ${
                   c.align === "left" ? "text-left" : "text-right"
                 } ${c.key === "wallet" ? "" : "cursor-pointer select-none hover:text-text"}`}
-                title={c.group === "hist" ? "Historical (ranker)" : c.group === "live" ? "Live (paper)" : ""}
+                title={c.group === "hist" ? "Historical (ranker)" : c.group === "live" ? "Watched (paper)" : ""}
               >
                 <span className={GROUP_TONE[c.group]}>{c.label}</span>
                 {sortKey === c.key ? <span className="ml-1">{asc ? "▲" : "▼"}</span> : null}

@@ -45,6 +45,31 @@ pub struct StatusSnapshot {
     /// Cumulative authoritative RPC calls (`commit_fill` + `apply_resolution`) since boot;
     /// `0` when not in authoritative mode. Diff two snapshots for the Supabase write rate.
     pub supabase_rpc_calls: u64,
+    /// Per-account live execution block (#508) — additive shape; `None` until the live
+    /// accounts poll is configured. Present-but-empty when configured with no accounts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveStatusBlock>,
+}
+
+/// Additive live-execution status (#508): dispatch-aggregate depth + one row per account.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveStatusBlock {
+    /// Staged aggregates awaiting their paper outcome.
+    pub pending_dispatch_seeds: usize,
+    /// Ready, not-yet-finalized aggregates awaiting the live fan-out.
+    pub ready_dispatch_seeds: usize,
+    pub accounts: Vec<LiveAccountStatus>,
+}
+
+/// One account's live posture in `status.json` (#508).
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveAccountStatus {
+    pub account_id: String,
+    pub is_primary: bool,
+    pub enabled: bool,
+    pub requested_live_mode: String,
+    pub effective_live_mode: String,
+    pub armed: bool,
 }
 
 /// Build a snapshot from the (cheap) live counters. Deterministic given its scalar inputs —
@@ -59,6 +84,7 @@ pub fn build_snapshot(
     watchlist_size: usize,
     watchlist_target_size: usize,
     supabase_rpc_calls: u64,
+    live_accounts: Option<&crate::live_accounts::LiveAccountsSnapshot>,
 ) -> StatusSnapshot {
     StatusSnapshot {
         updated_at: OffsetDateTime::from_unix_timestamp(now_unix)
@@ -81,6 +107,28 @@ pub fn build_snapshot(
         watchlist_size,
         watchlist_target_size,
         supabase_rpc_calls,
+        live: live_accounts.map(|snapshot| LiveStatusBlock {
+            pending_dispatch_seeds: paper_state
+                .pending_dispatch_seeds()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            ready_dispatch_seeds: paper_state
+                .unfinalized_ready_dispatch_seeds()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            accounts: snapshot
+                .accounts
+                .iter()
+                .map(|a| LiveAccountStatus {
+                    account_id: a.account_id.as_str().to_owned(),
+                    is_primary: a.is_primary,
+                    enabled: a.enabled,
+                    requested_live_mode: a.requested_live_mode.clone(),
+                    effective_live_mode: a.effective_live_mode.clone(),
+                    armed: a.is_armed(),
+                })
+                .collect(),
+        }),
     }
 }
 
@@ -105,6 +153,7 @@ pub async fn run_status_writer(
     mode: String,
     authoritative: bool,
     supabase_rpc_calls: Option<Arc<AtomicU64>>,
+    live_accounts: Option<crate::live_accounts::LiveAccounts>,
 ) {
     let started_at = Instant::now();
     let mut ticker = tokio::time::interval(interval);
@@ -123,6 +172,7 @@ pub async fn run_status_writer(
             watchlist.snapshot().entries.len(),
             applied_capacity.load().target,
             calls,
+            live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
         );
         if let Err(e) = write_snapshot(&path, &snap) {
             warn!(error = %e, path = %path.display(), "status writer: write failed");

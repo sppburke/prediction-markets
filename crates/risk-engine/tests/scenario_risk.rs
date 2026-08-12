@@ -2,7 +2,7 @@
 
 use pe_core_types::BasisPoints;
 use pe_risk_engine::{
-    RiskBlock, RiskSnapshot,
+    ConcentrationCaps, RiskBlock, RiskSnapshot,
     engine::{RiskDecision, evaluate_risk},
     snapshot::TradingMode,
 };
@@ -21,6 +21,7 @@ fn base_snapshot() -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
+        concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
 

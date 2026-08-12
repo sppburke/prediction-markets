@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig, classify_trade};
 use pe_core_types::{
-    EventSeq, MarketId, MarketOutcomeId, Price, Probability, ReconstructionQuality, Side,
-    SourceTimestamp, TraderId, VenueId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, Price, Probability,
+    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
@@ -22,11 +22,12 @@ use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
 use pe_source_polymarket_public::PageFetcher;
 use pe_strategy_winner_follow::{
-    ExecutionMode, FillSource, PaperExecutionError, PaperExecutor, PaperFill, WinnerFollowStrategy,
+    ExecutionMode, FillSource, PaperExecutionError, PaperExecutor, PaperFill, SizingMode,
+    WinnerFollowStrategy,
 };
 use pe_trader_index::Watchlist;
+use pe_venue_polymarket::{AskLevel, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive as _;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -39,7 +40,7 @@ use crate::market_end_cache::MarketEndCache;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::{self, FillMode, LiveRuntimeConfig};
-use crate::snapshot_worker::{SnapshotHandle, absorbable_contracts_within_bps, enqueue_if_buy};
+use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, supabase_fill_from};
 use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
 
@@ -47,6 +48,22 @@ use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
 /// 5 s per-request timeout so a slow book fails open (no cap) without stalling the trade.
 /// Canonical default in `docs/_GLOSSARY.md`: `clob_book_hot_path_timeout_secs`.
 const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
+
+/// Bounded in-process retry for a failed local paper-outcome commit (#508 round-4: every
+/// failed local finalization surfaces and enters an in-process reconcile pass — never a
+/// silent log-and-continue). Restart recovery remains the durable backstop.
+const LOCAL_COMMIT_RETRIES: u32 = 3;
+const LOCAL_COMMIT_RETRY_DELAY_MS: u64 = 100;
+
+/// Outcome of the enabled price-impact gate for one admitted signal (#508).
+enum GatePlan {
+    /// The budget planner produced a within-band plan (quantity/VWAP/limit).
+    Planned(LadderPlan),
+    /// The book read SUCCEEDED but the in-band ladder affords no whole share of the paper
+    /// budget — a paper-only skip that must never suppress live targets (Decision 10). The
+    /// best ask anchors the shared band gate.
+    NothingAffordable { best_ask: Price },
+}
 
 /// Orchestrator configuration.
 pub struct OrchestratorConfig {
@@ -89,6 +106,10 @@ pub struct OrchestratorConfig {
     /// rebuilds the strategy/mode/gate knobs from its snapshot per event. `None` (tests) keeps the
     /// boot config — the per-event rebuild is skipped.
     pub runtime_config: Option<LiveRuntimeConfig>,
+    /// Live account contexts (#508): `Some` in production so admitted signals with armed
+    /// live targets stage a dispatch aggregate. `None` (tests / Supabase off) = zero
+    /// targets = the Phase-A baseline path (no seeds).
+    pub live_accounts: Option<crate::live_accounts::LiveAccounts>,
 }
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
@@ -154,6 +175,9 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // Fallback BUY haircut (bps) for a `clob_best_ask` fill with no usable ask (#486), rebuilt
     // per event alongside `fill_mode`.
     clob_best_ask_fallback_haircut_bps: u32,
+    // Live account contexts (#508): armed targets stage dispatch aggregates. `None` in
+    // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
+    live_accounts: Option<crate::live_accounts::LiveAccounts>,
 }
 
 fn apply_control_message(
@@ -246,6 +270,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             price_impact_cap_bps: 0,
             fill_mode: config.fill_mode,
             clob_best_ask_fallback_haircut_bps: config.clob_best_ask_fallback_haircut_bps,
+            live_accounts: config.live_accounts,
         })
     }
 
@@ -294,20 +319,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
     // ── Private handlers ──────────────────────────────────────────────────────
 
-    /// Contracts absorbable within `price_impact_cap_bps` of best ask from the live `/book`
-    /// (#398 WS2 step 5c). Returns:
-    /// - `None` — gate disabled, missing CLOB token, or a `/book` fetch error/timeout: **fail-open**
-    ///   (no cap, risk #4), or an implausibly deep book whose contract count overflows `u64`.
-    /// - `Some(0)` — a successful read with nothing absorbable within the band (empty ask book, or
-    ///   no level within `bps`): the trade is **skipped** (distinct from fail-open).
-    /// - `Some(n)` — cap the size at `n` contracts.
-    async fn book_cap_contracts(&self, signal: &LeaderSignal) -> Option<u64> {
-        let cap_bps = self.price_impact_cap_bps;
-        if cap_bps <= 0 {
-            return None; // gate disabled → fail-open
-        }
-        let bps = u64::try_from(cap_bps).ok()?;
-        // The outcome's CLOB token id (served from the mid cache, warm from the price fetch above).
+    /// Impact-gate ladder plan (#508 Phase A): ONE `/book` fetch per admitted signal feeds
+    /// the band gate, the budget planner, and (in `clob_best_ask` paper mode) the fill basis.
+    ///
+    /// Called only when the gate is enabled (`price_impact_cap_bps ≥ 1`). Every failure is a
+    /// typed skip reason and **fails closed** — unusable book (missing token, fetch
+    /// error/timeout, corrupt levels, empty ladder, stale snapshot) and an in-band ladder
+    /// affording no whole share both produce no order. The planner budget follows the sizing
+    /// mode: `Dollar` plans within its USD notional; `Contract` caps at the requested count
+    /// within the available bankroll; `Kelly` plans the full in-band depth within bankroll.
+    async fn plan_impact_gate(&self, signal: &LeaderSignal) -> Result<GatePlan, &'static str> {
+        let cap_bps =
+            u64::try_from(self.price_impact_cap_bps).map_err(|_| "impact gate cap invalid")?;
         let snaps = self
             .mid_price_cache
             .fetch_snapshots(std::slice::from_ref(&signal.market_id))
@@ -317,28 +340,123 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .get(usize::from(signal.outcome_id.0))
                 .cloned()
         }) else {
-            return None; // missing token → fail-open (risk #4)
+            return Err("price-impact book unusable: missing CLOB token (fail closed)");
         };
-        match tokio::time::timeout(
+        let book = match tokio::time::timeout(
             Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
             self.book_fetcher.fetch_book(&token_id),
         )
         .await
         {
-            Ok(Ok(book)) => match absorbable_contracts_within_bps(&book, bps) {
-                Some(d) => Some(d.floor().to_u64().unwrap_or(u64::MAX)),
-                // `None` = no best ask (empty asks → 0 absorbable → skip) or a Decimal overflow on
-                // a non-empty (implausibly deep) book → fail-open.
-                None if book.asks.is_empty() => Some(0),
-                None => None,
-            },
-            Ok(Err(e)) => {
-                info!(error = %e, market = %signal.market_id, "price-impact /book fetch failed; gate fails open");
-                None
+            Ok(Ok(book)) => book,
+            Ok(Err(_)) => {
+                return Err("price-impact book unusable: /book fetch failed (fail closed)");
             }
             Err(_) => {
-                info!(market = %signal.market_id, "price-impact /book fetch timed out; gate fails open");
-                None
+                return Err("price-impact book unusable: /book fetch timed out (fail closed)");
+            }
+        };
+        let Some(ladder) = book.ladder() else {
+            return Err("price-impact book unusable: corrupt ask levels (fail closed)");
+        };
+        let Some(best) = ladder.first().map(|l| l.price) else {
+            return Err("price-impact book unusable: empty ask book (fail closed)");
+        };
+        if ladder_is_stale(crate::clob_book::now_unix_ms(), book.fetched_at_ms) {
+            return Err("price-impact book unusable: stale snapshot (fail closed)");
+        }
+        // Inclusive band ceiling: best × (1 + cap/10_000), clamped into the Price domain —
+        // the same edge semantic as the analytics `absorbable_usd_100bps` column.
+        let ceiling_raw = (best.0
+            * (Decimal::from(10_000u32 + u32::try_from(cap_bps).unwrap_or(10_000))
+                / Decimal::from(10_000u32)))
+        .min(Decimal::ONE);
+        let ceiling =
+            Price::new(ceiling_raw).map_err(|_| "price-impact band ceiling not constructible")?;
+        // Planner budget from the sizing mode; 6-dp truncation never overstates the budget.
+        let to_budget = |d: Decimal| {
+            CollateralAmount::from_decimal_exact(
+                d.max(Decimal::ZERO)
+                    .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
+            )
+            .map_err(|_| "impact budget not constructible")
+        };
+        let (budget, max_shares) = match self.strategy.config().sizing_mode {
+            SizingMode::Dollar { usd } => (to_budget(usd)?, None),
+            SizingMode::Contract { contracts } => (to_budget(self.bankroll)?, Some(contracts)),
+            SizingMode::Kelly => (to_budget(self.bankroll)?, None),
+        };
+        let max_price = Price::new(Decimal::ONE).map_err(|_| "price domain invariant broken")?;
+        match plan_budget_buy(&ladder, budget, max_shares, Price::ZERO, max_price, ceiling) {
+            Ok(plan) => Ok(GatePlan::Planned(plan)),
+            // Decision 10 taxonomy (#508): a SUCCESSFUL read whose in-band depth cannot
+            // absorb the paper budget is a PAPER-ONLY decision — it must never suppress
+            // otherwise-admissible live targets, so it is not a shared rejection. The
+            // best ask from the successful read anchors the shared band gate.
+            Err(LadderError::NothingAffordable) => {
+                Ok(GatePlan::NothingAffordable { best_ask: best })
+            }
+            Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
+                Err("price-impact ladder walk failed (fail closed)")
+            }
+            Err(LadderError::Amount) => Err("price-impact ladder arithmetic failed (fail closed)"),
+        }
+    }
+
+    /// Stage the #508 dispatch aggregate when the current live-accounts snapshot carries
+    /// armed targets (Decision 10: staged at shared signal admission, durably, BEFORE the
+    /// paper outcome can become durable). Returns the staged `dispatch_id`, or `None` when
+    /// no target exists (no aggregate; the Phase-A baseline path). A staging failure is a
+    /// hard skip signalled as `Err` — the caller abandons the trade without marking it
+    /// seen, so a redelivery can retry the whole admission.
+    fn stage_dispatch_if_targeted(&self, signal: &LeaderSignal) -> Result<Option<String>, ()> {
+        let Some(live) = self.live_accounts.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = live.snapshot();
+        let armed = snapshot.armed_targets();
+        if armed.is_empty() {
+            return Ok(None);
+        }
+        let dispatch_id = pe_strategy_winner_follow::build_idempotency_key(signal);
+        let targets = armed
+            .iter()
+            .filter_map(|account| {
+                account
+                    .credential_binding
+                    .as_ref()
+                    .map(|(version, key_id)| pe_paper_state::DispatchTargetSeed {
+                        account_id: account.account_id.as_str().to_owned(),
+                        credential_bundle_version: *version,
+                        credential_key_id: key_id.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        // The frozen signal + decision identity: redelivery replays THIS, never current config.
+        let frozen = serde_json::json!({
+            "schema_version": 1,
+            "signal": signal,
+            "fill_mode": format!("{:?}", self.fill_mode),
+            "price_impact_cap_bps": self.price_impact_cap_bps,
+            "mode": format!("{:?}", self.mode),
+        });
+        let record = pe_paper_state::DispatchSeedRecord {
+            dispatch_id: dispatch_id.clone(),
+            signal_json: frozen.to_string(),
+            source_trade_id: signal.source_trade_id.0.clone(),
+            created_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            targets,
+        };
+        match self.paper_state.stage_dispatch_seed(&record) {
+            Ok(_staged_or_reused) => Ok(Some(dispatch_id)),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    dispatch_id = %dispatch_id,
+                    "dispatch seed staging failed; abandoning the trade unseen (fail closed for \
+                     paper AND live — a redelivery retries the whole admission)"
+                );
+                Err(())
             }
         }
     }
@@ -510,22 +628,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             &self.signal_config,
         ) else {
             // No signal: still mark seen + mirror the leader ledger (AC2).
-            self.commit_no_fill(&trade, &leader_row);
+            self.commit_no_fill(&trade, &leader_row).await;
             return;
         };
 
-        // Single-position-per-contract gate: drop if we already hold this (market, outcome).
-        let pos_key = MarketOutcomeId::new(signal.market_id.clone(), signal.outcome_id);
-        if self.filled_positions.contains(&pos_key) {
-            info!(
-                reason = "already hold position in this market outcome",
-                market = %signal.market_id,
-                outcome = signal.outcome_id.0,
-                "signal did not produce order",
-            );
-            self.commit_no_fill(&trade, &leader_row);
-            return;
-        }
+        // NOTE (#508): the hold/already-filled gate historically ran HERE, before the
+        // first-BUY entry gate. It is now a PAPER-ONLY decision relocated after dispatch
+        // staging (below), so a paper-held position can never suppress live targets.
+        // `entry_gate.record_entry`'s pre-staging side effect is deliberately kept.
 
         // Copy-entry gate: copy only a leader's first-ever BUY entry into a market
         // (#290; price band removed in #339).
@@ -536,7 +646,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 leader_price = %signal.leader_price.0,
                 "signal did not produce order",
             );
-            self.commit_no_fill(&trade, &leader_row);
+            self.commit_no_fill(&trade, &leader_row).await;
             return;
         }
         // Record the admitted BUY entry so a same-session re-entry into this market is
@@ -568,7 +678,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     resolution_unix = ?resolution_unix,
                     "signal did not produce order",
                 );
-                self.commit_no_fill(&trade, &leader_row);
+                self.commit_no_fill(&trade, &leader_row).await;
                 return;
             }
         }
@@ -598,33 +708,80 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
-                    self.commit_no_fill(&trade, &leader_row);
+                    self.commit_no_fill(&trade, &leader_row).await;
                     return;
                 }
             }
         };
 
-        // Realistic fill basis (#339 revisited, #486): the price the copy will ACTUALLY fill at.
-        // In paper `clob_best_ask` mode a BUY resolves to the fresh CLOB best-ask (else the
-        // fallback haircut); otherwise the leader price adjusted by the boot-frozen paper haircut
+        // Price-impact gate (#508 Phase A): when enabled (`price_impact_cap_bps ≥ 1`), ONE
+        // `/book` fetch produces the executable-ladder plan that feeds the band gate, the
+        // size cap, and (in `clob_best_ask` paper mode) the VWAP fill basis. An unusable
+        // book — missing token, fetch error/timeout, corrupt/empty/stale — fails CLOSED
+        // (skip; the #398 fail-open posture is retired), as does an in-band ladder that
+        // affords no whole share.
+        let gate: Option<GatePlan> = if self.price_impact_cap_bps > 0 {
+            match self.plan_impact_gate(&signal).await {
+                Ok(outcome) => Some(outcome),
+                Err(reason) => {
+                    // Shared-gate rejection (#508 Decision 10): an UNUSABLE admission
+                    // quote suppresses every destination, pre-staging — no aggregate.
+                    info!(
+                        reason,
+                        market = %signal.market_id,
+                        outcome = signal.outcome_id.0,
+                        "signal did not produce order",
+                    );
+                    self.commit_no_fill(&trade, &leader_row).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let gate_plan: Option<&LadderPlan> = match &gate {
+            Some(GatePlan::Planned(plan)) => Some(plan),
+            _ => None,
+        };
+
+        // Realistic fill basis (#339 revisited, #486, #508): the price the copy will ACTUALLY
+        // fill at. With the impact gate enabled in paper `clob_best_ask` mode, a BUY prices at
+        // the planned ladder VWAP (`estimated_ladder_spend / shares` — multi-level exact, from
+        // the same single `/book` fetch as the gate). Otherwise: in paper `clob_best_ask` mode
+        // a BUY resolves to the fresh CLOB best-ask (else the fallback haircut); other modes
+        // use the leader price adjusted by the boot-frozen paper haircut
         // (`PaperExecutor::fill_price`). Size and band-gate against THIS, so notional ==
-        // `sizing_dollar_usd` and the gates check the price actually paid. The haircut basis mirrors
-        // the backtest's slippage-adjusted `fill_price` (`crates/backtest` `simulation.rs`); the
-        // best-ask basis is a fresher, more conservative live-execution proxy with no backtest
-        // analog (the ranker models the fill as trade-print + 1¢; #486 Context). In paper mode the
+        // `sizing_dollar_usd` and the gates check the price actually paid. In paper mode the
         // basis is recorded verbatim by the executor (via `observed_fill_price` below). The
-        // fail-closed arm is defensive.
-        let (fill_basis, fill_source) = match self.resolve_fill_price(&signal).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                info!(
-                    reason = "leader price yields no constructible fill price",
-                    market = %signal.market_id,
-                    leader_price = %signal.leader_price.0,
-                    "signal did not produce order",
-                );
-                self.commit_no_fill(&trade, &leader_row);
-                return;
+        // fail-closed arms are defensive.
+        let clob_basis_applies = self.mode == ExecutionMode::Paper
+            && self.fill_mode == FillMode::ClobBestAsk
+            && signal.leader_side == Side::Buy;
+        let planned_vwap_basis =
+            gate_plan.and_then(|plan| clob_basis_applies.then(|| plan.vwap()).flatten());
+        // Zero-absorb reads still anchor the SHARED band gate on the successful best ask
+        // (#508 Decision 10 — the paper-only skip happens after staging, below).
+        let zero_absorb_basis = match &gate {
+            Some(GatePlan::NothingAffordable { best_ask }) if clob_basis_applies => Some(*best_ask),
+            _ => None,
+        };
+        let (fill_basis, fill_source) = if let Some(vwap) = planned_vwap_basis {
+            (vwap, FillSource::ClobBestAsk)
+        } else if let Some(best_ask) = zero_absorb_basis {
+            (best_ask, FillSource::ClobBestAsk)
+        } else {
+            match self.resolve_fill_price(&signal).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    info!(
+                        reason = "leader price yields no constructible fill price",
+                        market = %signal.market_id,
+                        leader_price = %signal.leader_price.0,
+                        "signal did not produce order",
+                    );
+                    self.commit_no_fill(&trade, &leader_row).await;
+                    return;
+                }
             }
         };
 
@@ -643,7 +800,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 max_fill_price = %self.max_fill_price,
                 "signal did not produce order",
             );
-            self.commit_no_fill(&trade, &leader_row);
+            self.commit_no_fill(&trade, &leader_row).await;
             return;
         }
 
@@ -663,13 +820,60 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 min_fill_price = %self.min_fill_price,
                 "signal did not produce order",
             );
-            self.commit_no_fill(&trade, &leader_row);
+            self.commit_no_fill(&trade, &leader_row).await;
             return;
         }
 
-        // Price-impact gate (#398 WS2 step 5c): when enabled, cap the size at the contracts
-        // absorbable within `price_impact_cap_bps` of best ask from the live /book.
-        let book_cap_contracts = self.book_cap_contracts(&signal).await;
+        // ── Shared gates end here. Stage the dispatch aggregate (#508 Decision 10) ──
+        // Every rejection ABOVE suppressed all destinations pre-staging (no aggregate).
+        // Every decision BELOW is paper-only and must never suppress live targets.
+        let dispatch_id = match self.stage_dispatch_if_targeted(&signal) {
+            Ok(id) => id,
+            Err(()) => {
+                self.entry_gate
+                    .unrecord_entry(signal.leader.0, &signal.market_id);
+                return; // staging failed: abandoned unseen (redelivery retries)
+            }
+        };
+
+        // Relocated hold/already-filled gate (#508; historically pre-first-BUY): a paper
+        // position we already hold skips the PAPER order only — live targets in the staged
+        // aggregate still execute against their own venue state.
+        let pos_key = MarketOutcomeId::new(signal.market_id.clone(), signal.outcome_id);
+        if self.filled_positions.contains(&pos_key) {
+            info!(
+                reason = "already hold position in this market outcome (paper-only)",
+                market = %signal.market_id,
+                outcome = signal.outcome_id.0,
+                "signal did not produce order",
+            );
+            self.commit_no_fill_flipping(&trade, &leader_row, dispatch_id.as_deref(), "paper_held")
+                .await;
+            return;
+        }
+
+        // Paper-only zero-absorb skip (#508 Decision 10): the successful admission quote
+        // could not absorb one whole share of the paper budget.
+        if matches!(&gate, Some(GatePlan::NothingAffordable { .. })) {
+            info!(
+                reason = "impact band absorbs no whole share of the paper budget (paper-only)",
+                market = %signal.market_id,
+                outcome = signal.outcome_id.0,
+                "signal did not produce order",
+            );
+            self.commit_no_fill_flipping(
+                &trade,
+                &leader_row,
+                dispatch_id.as_deref(),
+                "impact_absorbs_zero",
+            )
+            .await;
+            return;
+        }
+
+        // Size cap from the ladder plan (#508): the planned whole-share quantity IS the
+        // within-band, within-budget maximum. Gate off → `None` (no cap; no `/book` fetch).
+        let book_cap_contracts = gate_plan.map(|plan| plan.shares.atomic() / 1_000_000);
 
         let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
@@ -691,14 +895,28 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         ) {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");
-                self.commit_no_fill(&trade, &leader_row);
+                let reason = format!("paper_reject:{e}");
+                self.commit_no_fill_flipping(&trade, &leader_row, dispatch_id.as_deref(), &reason)
+                    .await;
             }
             Ok(intent) => {
                 let now = SourceTimestamp(OffsetDateTime::now_utc());
+                // Exact recorded basis (#508): when the ladder plan priced this BUY and the
+                // strategy sized BELOW the planned quantity (Kelly/Contract clamps), re-price
+                // the VWAP over the ladder prefix actually consumed by the final count, so
+                // the recorded fill is exact for the executed size. (Dollar sizing lands on
+                // the planned quantity, where the prefix VWAP equals the plan VWAP.)
+                let recorded_basis = if planned_vwap_basis.is_some() {
+                    gate_plan
+                        .and_then(|plan| prefix_vwap(&plan.used_asks, intent.contracts.0))
+                        .unwrap_or(fill_basis)
+                } else {
+                    fill_basis
+                };
                 // Paper mode records the resolved basis verbatim. Shadow recomputes the identical
                 // boot-frozen haircut from `None`. Ordinary live modes fail closed in the dispatcher.
                 let observed_fill_price =
-                    (self.mode == ExecutionMode::Paper).then_some((fill_basis, fill_source));
+                    (self.mode == ExecutionMode::Paper).then_some((recorded_basis, fill_source));
                 match self
                     .dispatcher
                     .execute(&intent, self.mode, now, observed_fill_price)
@@ -706,7 +924,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 {
                     Err(e) => {
                         error!(error = %e, "execution dispatcher failed");
-                        self.commit_no_fill(&trade, &leader_row);
+                        self.commit_no_fill_flipping(
+                            &trade,
+                            &leader_row,
+                            dispatch_id.as_deref(),
+                            "paper_dispatch_error",
+                        )
+                        .await;
                     }
                     Ok(DispatchResult::Paper { fill, seq }) => {
                         let filled_key = MarketOutcomeId::new(
@@ -717,7 +941,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         // neither the position nor the dedup advanced (the event log holds the
                         // fill and replays on restart). Do not mark the contract filled.
                         if self
-                            .commit_paper_fill(&trade, &leader_row, &fill, seq)
+                            .commit_paper_fill(
+                                &trade,
+                                &leader_row,
+                                &fill,
+                                seq,
+                                dispatch_id.as_deref(),
+                            )
                             .await
                         {
                             self.filled_positions.insert(filled_key);
@@ -764,13 +994,52 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
-    /// Commit dedup + leader-ledger mirror for a processed trade that produced no fill.
-    fn commit_no_fill(&self, trade: &IncomingTrade, leader: &LeaderPositionRow) {
-        if let Err(e) = self
-            .paper_state
-            .commit_seen_no_fill(&trade.source_trade_id, leader)
-        {
-            error!(error = %e, "paper-state commit_seen_no_fill failed");
+    /// Commit dedup + leader-ledger mirror for a processed trade that produced no fill
+    /// (the pre-staging/zero-live-target path — untyped, as before #508).
+    async fn commit_no_fill(&self, trade: &IncomingTrade, leader: &LeaderPositionRow) {
+        self.commit_no_fill_flipping(trade, leader, None, "").await;
+    }
+
+    /// [`Self::commit_no_fill`] that also flips a staged dispatch aggregate with a TYPED
+    /// no-fill outcome (#508 Decision 10) in the same transaction. Every failed local
+    /// finalization surfaces and retries in-process (bounded) — never a silent
+    /// log-and-continue (round-4); restart recovery remains the durable backstop.
+    async fn commit_no_fill_flipping(
+        &self,
+        trade: &IncomingTrade,
+        leader: &LeaderPositionRow,
+        dispatch_id: Option<&str>,
+        no_fill_reason: &str,
+    ) {
+        let outcome = format!("no_fill:{no_fill_reason}");
+        let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
+            dispatch_id: id,
+            paper_outcome: &outcome,
+        });
+        for attempt in 1..=LOCAL_COMMIT_RETRIES {
+            match self.paper_state.commit_seen_no_fill_with_flip(
+                &trade.source_trade_id,
+                leader,
+                flip,
+            ) {
+                Ok(()) => return,
+                Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
+                    error!(
+                        error = %e,
+                        attempt,
+                        "paper-state no-fill commit failed; retrying in-process"
+                    );
+                    tokio::time::sleep(Duration::from_millis(LOCAL_COMMIT_RETRY_DELAY_MS)).await;
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        dispatch_id = ?dispatch_id,
+                        "paper-state no-fill commit failed after in-process retries; \
+                         restart recovery / redelivery is the backstop"
+                    );
+                }
+            }
         }
     }
 
@@ -791,6 +1060,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         leader: &LeaderPositionRow,
         fill: &PaperFill,
         seq: EventSeq,
+        dispatch_id: Option<&str>,
     ) -> bool {
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
@@ -824,6 +1094,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 return false;
             };
             let paper_state = self.paper_state.clone();
+            let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
+                dispatch_id: id,
+                paper_outcome: "fill",
+            });
             match commit_fill_authoritative(
                 &supabase,
                 &paper_state,
@@ -832,6 +1106,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 &record,
                 seq,
                 &sup_row,
+                flip,
             )
             .await
             {
@@ -858,12 +1133,42 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return true;
         }
 
-        // Legacy path: SQLite authoritative + best-effort Supabase sink mirror.
-        match self
-            .paper_state
-            .commit_fill(&trade.source_trade_id, leader, &record, seq)
-        {
-            Ok(new_bankroll) => {
+        // Legacy path: SQLite authoritative + best-effort Supabase sink mirror. A failed
+        // commit retries in-process (#508 round-4) and finally returns `false` — the
+        // caller must NOT mark the contract filled on an unacknowledged commit (the event
+        // log holds the fill; restart recovery / the fills PK dedup the redelivery).
+        let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
+            dispatch_id: id,
+            paper_outcome: "fill",
+        });
+        let mut committed = None;
+        for attempt in 1..=LOCAL_COMMIT_RETRIES {
+            match self.paper_state.commit_fill_with_flip(
+                &trade.source_trade_id,
+                leader,
+                &record,
+                seq,
+                flip,
+            ) {
+                Ok(b) => {
+                    committed = Some(b);
+                    break;
+                }
+                Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
+                    error!(error = %e, attempt, "paper-state commit_fill failed; retrying in-process");
+                    tokio::time::sleep(Duration::from_millis(LOCAL_COMMIT_RETRY_DELAY_MS)).await;
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "paper-state commit_fill failed after in-process retries; fill NOT \
+                         acknowledged (event log holds it; restart recovery is the backstop)"
+                    );
+                }
+            }
+        }
+        match committed {
+            Some(new_bankroll) => {
                 self.bankroll = new_bankroll;
                 // Best-effort mirror to Supabase (issue #343). Never blocks the trade path.
                 if let Some(sink) = &self.sink {
@@ -889,7 +1194,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     OffsetDateTime::now_utc().unix_timestamp(),
                 );
             }
-            Err(e) => error!(error = %e, "paper-state commit_fill failed"),
+            None => return false,
         }
         true
     }
@@ -948,12 +1253,45 @@ fn check_resolution_horizon(
     None
 }
 
+/// VWAP over the first `contracts` whole shares of a planned ladder prefix (#508). Used to
+/// re-price the recorded paper fill when the strategy sizes below the planned quantity, so
+/// the recorded price is exact for the executed size. `None` when the prefix cannot cover
+/// `contracts` (caller falls back to the plan VWAP) or the count is zero.
+fn prefix_vwap(used_asks: &[AskLevel], contracts: u64) -> Option<Price> {
+    if contracts == 0 {
+        return None;
+    }
+    let mut remaining = contracts.checked_mul(1_000_000)?;
+    let mut spend = Decimal::ZERO;
+    for level in used_asks {
+        let take = remaining.min(level.shares.atomic());
+        spend = spend.checked_add(
+            ShareAmount::from_atomic(take)
+                .to_decimal()
+                .checked_mul(level.price.0)?,
+        )?;
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+    if remaining != 0 {
+        return None;
+    }
+    Price::new(spend / Decimal::from(contracts)).ok()
+}
+
 // ── Stub risk snapshot ────────────────────────────────────────────────────────
 
 /// Build a zeroed [`RiskSnapshot`] with LiveTiny mode.
 ///
 /// All exposure and PnL fields are zero; no anti-gaming flags; source healthy.
 /// Phase 0B stub — real exposure tracking is a separate later issue.
+///
+/// `concentration_caps` is `None`: concentration enforcement is un-enforced by owner
+/// decision on the production copy path (#508 Phase A; recorded in docs/19-). The
+/// drawdown/latency kill switches stay armed — they are inert here only because the
+/// PnL/latency inputs are zeroed by this stub.
 ///
 /// `evaluate()` overwrites `trading_mode` and `proposed_trade_bps` before calling
 /// the risk gate, so their initial values here are overridden.
@@ -971,6 +1309,7 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
         trading_mode: TradingMode::LiveTiny, // overridden by evaluate()
         proposed_trade_bps: BasisPoints(0),  // overridden by evaluate()
         per_trade_cap_bps: 0,                // overridden by evaluate()
+        concentration_caps: None,            // un-enforced by owner decision (#508)
     }
 }
 

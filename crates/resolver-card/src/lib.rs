@@ -1,6 +1,14 @@
-//! Offline validation for the canonical, versioned resolver-card contract.
+//! Offline validation for the canonical, versioned resolver-card contract, plus the
+//! automated venue-settlement admission record for ordinary live copy (#508).
 
 #![forbid(unsafe_code)]
+
+pub mod venue_settlement;
+
+pub use venue_settlement::{
+    VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementError,
+    VenueSettlementRecord,
+};
 
 use pe_core_types::{PolymarketConditionId, ResolverCardId, SourceTimestamp};
 use rust_decimal::Decimal;

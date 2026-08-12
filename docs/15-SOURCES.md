@@ -67,10 +67,12 @@
 | https://docs.polymarket.com/market-data/websocket/rtds | 2026-06-03 | 2026-09-01 |
 | https://docs.polymarket.com/v2-migration | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/overview | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/trading/orders/create | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/orders/create | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/trading/fees | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/builders/fees | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/deposit-wallets | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/trading/wallets-auth | 2026-08-11 | 2026-10-10 |
+| https://docs.polymarket.com/trading/positions/manage | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/trading/clients/l2 | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/concepts/order-lifecycle | — | — |
 | https://docs.polymarket.com/api-reference/authentication | 2026-07-17 | 2026-09-15 |
@@ -80,7 +82,10 @@
 | https://docs.polymarket.com/trading/bridge/deposit | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/trading/bridge/supported-assets | — | — |
 | https://docs.polymarket.com/trading/bridge/status | — | — |
-| https://docs.polymarket.com/resources/contracts | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/resources/contracts | 2026-08-11 | 2026-10-10 |
+| https://docs.polymarket.com/api-reference/relayer/submit-a-transaction | 2026-08-11 | 2026-10-10 |
+| https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
+| https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
 | https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-07-17 | 2026-09-15 |
 | https://clob.polymarket.com/markets?closed=true | 2026-06-20 | 2026-08-19 |
@@ -168,6 +173,23 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-08-11: Re-verified the #508 ordinary-live Polymarket contracts and transports. Polygon 137
+  lists `CtfCollateralAdapter` `0xAdA100Db00Ca00073811820692005400218FcE1f`,
+  `NegRiskCtfCollateralAdapter` `0xadA2005600Dec949baf300f4C6120000bDB6eAab`, Conditional Tokens
+  `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045`, pUSD
+  `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`, and Deposit Wallet Factory
+  `0x00000000000Fb5C9ADea0298D729A0CB3823Cc07`. Adapter redemption is amounts-free
+  `redeemPositions(address,bytes32,bytes32,uint256[])` (selector `0x01b7037c`) with a zero
+  `parentCollectionId` and `indexSets [1,2]`. Deposit Wallet transport uses
+  `GET /v1/account/transactions/params?address=<signer>&type=WALLET`, `POST /submit`, then
+  `GET /v1/account/transactions/<id>` through `STATE_CONFIRMED`; Proxy/Safe retains
+  `/relay-payload` plus `/transaction?id=`. Auth is `RELAYER_API_KEY` plus
+  `RELAYER_API_KEY_ADDRESS`, or a Builder key/secret/passphrase emitting `POLY_BUILDER_*` headers
+  whose signature is padded URL-safe-Base64 HMAC-SHA256 over `timestamp + method + path + body`.
+  Official order docs select the standard or
+  NegRisk V2 exchange from token market context; the shipped vendored SDK re-reads `neg_risk` for
+  the token at sign time (`third_party/polymarket_client_sdk_v2/src/clob/client.rs:1832`).
 
 - 2026-07-28: Re-verified the official Gamma `GET /events` reference for issue #506. It continues
   to expose offset/limit pagination and embedded `markets[]` rows carrying `conditionId` and

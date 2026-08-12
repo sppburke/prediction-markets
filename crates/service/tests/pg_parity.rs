@@ -284,3 +284,100 @@ async fn pg_parity_and_concurrency() {
         K * M
     );
 }
+
+/// PG-CAS (#508 Phase A): rehearse the predicated compare-and-swap `service_config` UPDATE
+/// the A0–A4 operator steps rely on. Many agents push to prod, so every production config
+/// mutation is `UPDATE … WHERE key=… AND value=:prior AND updated_at=:prior_ts RETURNING …`:
+/// a concurrent edit landing between token capture and the predicated UPDATE must make the
+/// UPDATE return **zero rows** (the operator aborts/reconciles), leaving the row intact.
+#[tokio::test]
+async fn pg_cas_predicated_update_rehearsal() {
+    let Ok(url) = std::env::var("PE_TEST_PG_URL") else {
+        eprintln!(
+            "SKIP: PE_TEST_PG_URL unset — CAS rehearsal runs only in CI / against a local pg"
+        );
+        return;
+    };
+    let client = connect(&url).await;
+    // Isolated key: never a seeded production row, so this cannot race pg_parity.
+    client
+        .execute(
+            "insert into service_config (key, value, value_type, description)
+             values ('cas_rehearsal_key', '0', 'integer', 'pg_parity CAS rehearsal (#508)')
+             on conflict (key) do update set value = '0', updated_at = now()",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // A0: capture the predicate tokens.
+    let row = client
+        .query_one(
+            "select value, updated_at from service_config where key = 'cas_rehearsal_key'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let prior_value: String = row.get(0);
+    let prior_ts: std::time::SystemTime = row.get(1);
+
+    // A3 happy path: the predicated UPDATE returns exactly one row and its tokens.
+    let updated = client
+        .query(
+            "update service_config set value = '100', updated_by = 'cas-rehearsal', updated_at = now()
+             where key = 'cas_rehearsal_key' and value = $1 and updated_at = $2
+             returning key, value, updated_at",
+            &[&prior_value, &prior_ts],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.len(),
+        1,
+        "predicated UPDATE must return exactly one row"
+    );
+    assert_eq!(updated[0].get::<_, String>(1), "100");
+
+    // Concurrent-edit window: a second agent's edit lands, then OUR stale-token UPDATE must
+    // return zero rows and leave the concurrent value untouched.
+    client
+        .execute(
+            "update service_config set value = '250', updated_by = 'other-agent', updated_at = now()
+             where key = 'cas_rehearsal_key'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let stale = client
+        .query(
+            "update service_config set value = '999', updated_by = 'cas-rehearsal', updated_at = now()
+             where key = 'cas_rehearsal_key' and value = $1 and updated_at = $2
+             returning key",
+            &[&prior_value, &prior_ts],
+        )
+        .await
+        .unwrap();
+    assert!(
+        stale.is_empty(),
+        "a stale-token predicated UPDATE must return zero rows (abort/reconcile)"
+    );
+    let now_value: String = client
+        .query_one(
+            "select value from service_config where key = 'cas_rehearsal_key'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(now_value, "250", "the concurrent edit must be left intact");
+
+    // Cleanup so re-runs start clean.
+    client
+        .execute(
+            "delete from service_config where key = 'cas_rehearsal_key'",
+            &[],
+        )
+        .await
+        .unwrap();
+    println!("PASS: PG-CAS — predicated service_config UPDATE aborts on a concurrent edit (#508)");
+}

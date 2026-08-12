@@ -1,0 +1,10 @@
+# cargo-audit configuration (#508).
+#
+# RUSTSEC-2026-0235 (rkyv < 0.8.17 out-of-bounds reads validating Rc/Arc archives):
+# rkyv 0.7 is an UNUSED optional dependency pin of rust_decimal in Cargo.lock — no
+# workspace target enables the `rkyv` feature, and `cargo tree -i rkyv --workspace`
+# resolves to nothing, so the vulnerable code is never compiled into any artifact.
+# rust_decimal's compatible range is ^0.7 (>=0.8.17 is not reachable by a lockfile
+# update); remove this ignore when rust_decimal moves to rkyv 0.8.
+[advisories]
+ignore = ["RUSTSEC-2026-0235"]

@@ -20,7 +20,7 @@ cargo install cargo-nextest cargo-deny cargo-audit
 
 # 2. Configure environment
 cp .env.example .env
-# Edit .env and fill in required values (Polygon RPC, Dune API key, Etherscan API key, output paths)
+# Fill in the env-driven inputs; ordinary live credentials use the sealed #508 custody path, not .env
 
 # 3. Run bootstrap (builds the wallet cache and trade history, ~2-4 hours first run)
 cargo run --release --bin pe-bootstrap

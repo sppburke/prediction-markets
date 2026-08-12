@@ -2,7 +2,7 @@
   "name": "pe-analytics-site",
   "version": "0.1.0",
   "private": true,
-  "description": "Historical-vs-live paper-trade analytics site (issue #343 PR3). Reads the Supabase wallet_live_stats view via the anon key + read-only RLS.",
+  "description": "Historical-vs-watched paper analytics plus account-scoped live controls and activity (#508 Phase C).",
   "engines": {
     "node": ">=20"
   },
@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
+    "age-encryption": "0.3.0",
     "next": "^15.1.0",
     "next-auth": "5.0.0-beta.25",
     "react": "^18.3.1",

@@ -123,6 +123,12 @@ impl WinnerFollowStrategy {
         self.config = config;
     }
 
+    /// Read the current strategy config. The orchestrator derives the impact-gate planner
+    /// budget from `sizing_mode` (#508 Phase A).
+    pub fn config(&self) -> &WinnerFollowConfig {
+        &self.config
+    }
+
     /// Evaluate a leader signal at the leader's own entry price.
     ///
     /// Thin wrapper over [`Self::evaluate_at_price`] that sizes against
@@ -377,11 +383,12 @@ fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> Basi
     BasisPoints(bps_decimal.ceil().to_i32().unwrap_or(i32::MAX))
 }
 
-/// Build the idempotency key per `_GLOSSARY.md`.
+/// Build the idempotency key per `_GLOSSARY.md` — public so the #508 dispatch aggregate
+/// can derive its `dispatch_id` from the same canonical identity the order intent carries.
 ///
 /// Format: `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{bucket}`
 /// where `bucket = floor(observed_at_ms / 1_000) = observed_at.unix_timestamp()`.
-fn build_idempotency_key(signal: &LeaderSignal) -> String {
+pub fn build_idempotency_key(signal: &LeaderSignal) -> String {
     let side_str = match signal.leader_side {
         pe_core_types::Side::Buy => "buy",
         pe_core_types::Side::Sell => "sell",

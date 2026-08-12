@@ -10,10 +10,43 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingMode {
-    /// First live stage; default cap = 25 bps when `PerTradeCap::ModeDefault`.
+    /// First live stage; `PerTradeCap::ModeDefault` resolves 25 bps (a boot/backtest
+    /// posture — production retired the per-trade bps caps in #508).
     LiveTiny,
-    /// After passing promotion gates; default cap = 100 bps when `PerTradeCap::ModeDefault`.
+    /// After passing promotion gates; `ModeDefault` resolves 100 bps (same retirement).
     Promoted,
+}
+
+/// Concentration caps in basis points of bankroll, applied to `existing exposure +
+/// proposed trade` per dimension (#508 Phase A).
+///
+/// Carried on [`RiskSnapshot`] as an `Option`: `Some(caps)` enforces the ladder (backtest
+/// and tests keep the canonical `docs/19-` values via [`ConcentrationCaps::CANONICAL`]);
+/// `None` = concentration is **not enforced by owner decision** — the production copy path
+/// passes `None`, recorded in `docs/19-WINNER-FOLLOW-STRATEGY.md`. This is the
+/// `PerTradeCap` → `per_trade_cap_bps` precedent: the policy value moves onto the snapshot
+/// so the engine stays pure and the enforcement posture is explicit in the type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcentrationCaps {
+    /// Max per-leader exposure (docs/19 canonical: 300 bps).
+    pub max_leader_bps: i32,
+    /// Max per-market exposure (docs/19 canonical: 200 bps).
+    pub max_market_bps: i32,
+    /// Max per-family exposure (docs/19 canonical: 800 bps).
+    pub max_family_bps: i32,
+    /// Max total open copy exposure (docs/19 canonical: 2500 bps).
+    pub max_total_copy_bps: i32,
+}
+
+impl ConcentrationCaps {
+    /// The canonical `docs/19-WINNER-FOLLOW-STRATEGY.md` ladder (300/200/800/2500 bps),
+    /// used wherever enforcement is kept (backtest, risk tests).
+    pub const CANONICAL: Self = Self {
+        max_leader_bps: 300,
+        max_market_bps: 200,
+        max_family_bps: 800,
+        max_total_copy_bps: 2_500,
+    };
 }
 
 /// Point-in-time snapshot of all risk inputs for a single proposed trade.
@@ -62,6 +95,10 @@ pub struct RiskSnapshot {
     /// Default 25 for serde backwards compatibility with snapshots written before this field existed.
     #[serde(default = "default_per_trade_cap_bps")]
     pub per_trade_cap_bps: i32,
+    /// Concentration-cap enforcement (#508 Phase A): `Some` enforces, `None` = un-enforced
+    /// by owner decision (the production copy path). No serde default — every snapshot is
+    /// code-constructed (none is persisted anywhere), so the posture is always explicit.
+    pub concentration_caps: Option<ConcentrationCaps>,
 }
 
 fn default_per_trade_cap_bps() -> i32 {

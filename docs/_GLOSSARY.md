@@ -294,9 +294,10 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 
 The canary is a boot-frozen campaign role, not an `ExecutionMode` or promotion state. It is
-installed inactive and is the only credentialed order path. Ordinary `pe-service` remains
-paper-only. The dedicated actor owns the credentialed client, one mode-0600 event log, command
-serialization, reservation, one-shot POST, reconciliation, and recovery.
+installed inactive and remains isolated from ordinary `pe-service`, whose #508 path instead uses
+per-account sealed credentials and ships dark until an account is armed. The dedicated canary actor
+owns its credentialed client, one mode-0600 event log, command serialization, reservation, one-shot
+POST, reconciliation, and recovery.
 
 | Key | Canonical value | Meaning |
 |---|---:|---|
@@ -310,6 +311,16 @@ serialization, reservation, one-shot POST, reconciliation, and recovery.
 
 Campaign financial limits and eligibility are canonical in
 [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md#isolated-polymarket-v2-canary).
+
+### Ordinary multi-account live execution (`pe-service`, issue #508)
+
+| Key | Canonical value | Meaning |
+|---|---:|---|
+| `live_armed_accounts_max` | 2 | v1 maximum simultaneously armed accounts. The service refuses a third; raising this requires re-validating the production p95 latency and sustained CLOB request budgets. |
+| `account_id` | `[a-z0-9_-]{1,32}` | Immutable lowercase account slug grammar, enforced by `core-types::AccountId` and `accounts.account_id`. |
+| `live_price_impact_cap_bps_default` | 100 | Per-account default in `accounts.live_price_impact_cap_bps`; the database accepts `1..=10_000`. This is distinct from the shared paper `price_impact_cap_bps_default`. |
+| `dispatch_seed_retention_days` | 30 | Retain terminal dispatch aggregates for this many days after finalization, then prune seed and target rows together. |
+| `live_redemption_surface_after_attempts` | 3 | Compiled threshold after which an unresolved automatic redemption is surfaced prominently; it is not an operator knob. |
 
 ### Paper trading state (`paper-state`, issue #282)
 
@@ -461,7 +472,7 @@ a focused file for problems, and a bounded stream for detail — never an unboun
 
 | Artifact | Shape | Use |
 |---|---|---|
-| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — `updated_at, uptime_secs, mode, authoritative, bankroll, open_positions, fills_total, settled_total, last_event_seq, watchlist_size, watchlist_target_size, supabase_rpc_calls`. `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap (the compiled fallback until a Supabase value is applied). Read this first; no grep. |
+| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — `updated_at, uptime_secs, mode, authoritative, bankroll, open_positions, fills_total, settled_total, last_event_seq, watchlist_size, watchlist_target_size, supabase_rpc_calls`, plus an additive optional `live` block with `pending_dispatch_seeds`, `ready_dispatch_seeds`, and per-account `account_id, is_primary, enabled, requested_live_mode, effective_live_mode, armed`. `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap (the compiled fallback until a Supabase value is applied). Read this first; no grep. |
 | `<stem>.<date>.jsonl` (from `jsonl_log_path`) | full stream, rotated **daily**, keeps `log_retention_days` | full detail; grep one day's file |
 | `errors.<date>.jsonl` (same dir) | **WARN+ERROR only**, rotated daily | the clean "what broke" tape (no INFO chatter) |
 
@@ -778,10 +789,10 @@ CREATE TABLE leaderboard_snapshots (
 | `kelly_p_extra_per_missing_snapshot_default` | 5 | Pseudo-observations added per missing snapshot. See `kelly_p_min_snapshots_default` for the full formula. Both ops use saturating arithmetic. Set via `PE_BACKTEST_KELLY_P_EXTRA_PER_MISSING_SNAPSHOT`. |
 | `liquidity_take_fraction_default` | `0.05` | Fraction of cached Gamma `liquidity` USD the sizer may take per BUY. Applied as `max_contracts = floor(take_fraction × liquidity_usd / fill_price)` in `simulation.rs` after `evaluate()` returns. `0` disables the gate (silent passthrough). Worked example: at `liquidity_usd = $5,000`, `take_fraction = 0.05`, `fill_price = $0.50` → max contracts = `floor(5000 × 0.05 / 0.50) = 500`. Set via `PE_BACKTEST_LIQUIDITY_TAKE_FRACTION`. **Backtest staleness caveat:** stored value is depth-at-last-bootstrap-refresh (≈ now), applied uniformly across the entire historical sim window — markets that *grew* in depth get over-clamped, markets that *shrank* get under-clamped. |
 | `liquidity_min_required_usd_default` | 200 | Minimum Gamma `liquidity` USD required to apply the clamp. Below this floor, depth data is too noisy to act on — clamp is bypassed (passthrough with `tracing::warn!`). Tracked via report counter `liquidity_below_floor_bypasses`. Set via `PE_BACKTEST_LIQUIDITY_MIN_REQUIRED_USD`. |
-| `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. |
+| `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. **#508:** the service PINS `ModeDefault` at boot regardless of TOML/env (compiled outage posture); the Supabase `per_trade_cap` KV row (seeded `mode_default`) is the sole path to another value, and production runs `unlimited` after the Phase-A cutover (per-trade bps caps retired — the impact cap is the sole policy size limit, `docs/19-`). |
 | `per_trade_cap_unlimited_resolved_bps` | 10 000 | Effective cap in basis points when `PerTradeCap::Unlimited` is selected. Full bankroll — Kelly fraction is the only size constraint. |
 | `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode` (#398 WS2; replaced `flat_usd_per_trade`). `kelly` = fractional-Kelly sizing. `dollar` (`sizing_dollar_usd`) sizes each BUY as `max(1, floor(usd / fill_price))` contracts (fill_price = leader price + paper haircut on the live copy path, so `contracts × fill == usd`; #484) — the former flat path, eliminating bankroll compounding; use when the Kelly `p` input is a per-leader constant with no per-trade signal (issue #161). `contract` (`sizing_contracts`) sizes exactly N contracts. The per-trade cap, risk gate, and price-impact book cap (`price_impact_cap_bps`) remain active in all modes. The live boot default is `dollar` / `sizing_dollar_usd = 25` (`smoke-test/service.toml`). KV layer: three flat `service_config` keys `sizing_mode` / `sizing_dollar_usd` / `sizing_contracts`. |
-| `price_impact_cap_bps_default` | `0` | Default for the live price-impact gate (`RuntimeConfig.price_impact_cap_bps`, #398 WS2). `0` disables the gate (fail-open). When `> 0`, the orchestrator fetches the CLOB `/book` per BUY and `min`s the size to the contracts absorbable within this many bps of best ask (`snapshot_worker::absorbable_contracts_within_bps`); a `/book` error or missing token fails open (no cap), while a successful read with 0 absorbable yields `Some(0)` and skips the trade. Admin-mutable via `service_config`. |
+| `price_impact_cap_bps_default` | `0` (compiled) / `100` (production cutover) | The price-impact cap (`RuntimeConfig.price_impact_cap_bps`; #398 WS2, reworked #508 Phase A) — **the sole policy order-size limit** below the always-applying available-bankroll bound. When enabled, ONE CLOB `/book` fetch per admitted BUY feeds the band gate, the budget-based executable-ladder planner (`pe_venue_polymarket::plan_budget_buy`: max whole shares within this many bps of best ask satisfying the sizing budget), and — in `clob_best_ask` mode — the exact ladder-VWAP fill basis (`estimated_ladder_spend / shares`; FOK limit = worst accepted tick; `worst_case_debit = shares × limit`). **Fail-closed when enabled**: an unusable book (missing token / fetch error / timeout / stale beyond the shared 2 s ladder bound / corrupt / empty) skips the trade, as does an in-band ladder affording no whole share. Edits valid `1..=10_000` inclusive; `0` and out-of-range are rejected with last-known-good retained — the limit cannot be switched off by edit ("effectively off" = explicit `10_000`); gate-off exists only as the compiled boot default (the committed `'0'` seed is rejected at parse). Production posture after the #508 A3 cutover UPDATE: `100`. Admin-mutable via `service_config`. |
 | `clob_book_hot_path_timeout_secs` | `2` | Timeout for the orchestrator's hot-path CLOB `/book` fetches — the price-impact gate (#398 WS2) and the `clob_best_ask` best-ask fill basis (#486) both use `orchestrator::CLOB_BOOK_HOT_PATH_TIMEOUT_SECS`. Tighter than the snapshot worker's 5 s per-request timeout so a slow book fails open (no cap / haircut fallback) without stalling the trade. |
 | `backtest_suppression_warn_threshold_pct` | 30 | Single warn threshold shared by every per-quarter BUY-signal suppression diagnostic (`expiry_filter_suppression_pct`, `high_price_suppression_pct`, …). Logged as a warning when any quarter exceeds it. Hardcoded as `SUPPRESSION_WARN_THRESHOLD` in `crates/backtest/src/simulation.rs`. |
 | `backtest_require_known_expiry_default` | `true` | Strict-mode flag for the `max_hours_to_expiry` filter. `true` (default after #137 Sub-PR 3, gated on PR #154 stage 6f raising trade-set schedule coverage to 99.64%) — when both schedule and resolution are absent for a market, the BUY signal fails closed (suppressed). `false` (rollback / legacy) — both-absent allows the trade through. The fallback chain (schedule → resolution → flag) was unified in PR #139; pre-#139 the NULL-schedule path short-circuited to allow regardless of resolution. Set via `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY`. |

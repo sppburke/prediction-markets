@@ -241,6 +241,7 @@ async fn run_gate_capped(
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: gate_config,
             runtime_config: None,
+            live_accounts: None,
         },
         history,
         WinnerFollowStrategy::new(flat_fill_config()),
@@ -523,6 +524,7 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .iter()
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
+        fetched_at_ms: 0,
     }
 }
 
@@ -610,6 +612,7 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
@@ -824,6 +827,7 @@ async fn live_mode_never_fetches_book_ac6() {
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
+            live_accounts: None,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),

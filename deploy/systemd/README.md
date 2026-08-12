@@ -8,6 +8,12 @@ state/runtime directories; it never reads the ordinary service `.env`.
 Do not enable or start the canary as part of installation. Follow
 [`docs/36-POLYMARKET-V2-CANARY-RUNBOOK.md`](../../docs/36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
+Ordinary `pe-service` live credential custody (#508) follows the same root-controlled source-file
+precedent without sharing canary secrets: install the committed drop-in that maps the root-owned
+mode-`0600` age identity as `LoadCredential=pe-age-identity:<identity-path>`. The per-account bundles
+remain age-sealed in Supabase and are never environment variables. Install, verify, and arm only via
+[`docs/35-PE-SERVICE-DEPLOY-RUNBOOK.md`](../../docs/35-PE-SERVICE-DEPLOY-RUNBOOK.md).
+
 ## pe-bootstrap timers
 
 User-mode systemd timer + service pairs that run the pile-maintenance

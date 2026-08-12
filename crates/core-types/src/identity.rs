@@ -103,3 +103,85 @@ impl fmt::Display for VenueAccountId {
         f.write_str(&self.0)
     }
 }
+
+/// Live-execution account identity (#508 Decision 2): a lowercase text slug chosen at
+/// panel creation (e.g. `sppburke`), immutable thereafter. One canonical grammar —
+/// `[a-z0-9_-]{1,32}` — validated identically here and by the `accounts.account_id`
+/// database `CHECK` (`scripts/supabase_multi_account_live_schema.sql`), the
+/// [`WalletAddress::from_hex`] validation precedent. Deliberately NOT
+/// [`VenueAccountId`]: an account here exists before any venue account does.
+/// Serde: the plain validated string.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct AccountId(String);
+
+impl AccountId {
+    /// Parse and validate a slug against the canonical grammar `[a-z0-9_-]{1,32}`.
+    pub fn new(slug: &str) -> Result<Self, Error> {
+        if slug.is_empty() || slug.len() > 32 {
+            return Err(Error::ParseError {
+                message: format!("account slug must be 1..=32 chars, got {}", slug.len()),
+            });
+        }
+        if !slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        {
+            return Err(Error::ParseError {
+                message: format!("account slug {slug:?} violates [a-z0-9_-]{{1,32}}"),
+            });
+        }
+        Ok(AccountId(slug.to_owned()))
+    }
+
+    /// The validated slug.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AccountId({})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        AccountId::new(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod account_id_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::AccountId;
+
+    #[test]
+    fn grammar_accepts_and_rejects_canonically() {
+        for ok in ["sppburke", "a", "partner-2", "x_1", &"a".repeat(32)] {
+            assert!(AccountId::new(ok).is_ok(), "{ok:?} must parse");
+        }
+        for bad in ["", "Upper", "space here", "é", "dot.", &"a".repeat(33)] {
+            assert!(AccountId::new(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn serde_round_trips_and_rejects_invalid() {
+        let id = AccountId::new("sppburke").unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"sppburke\"");
+        assert_eq!(serde_json::from_str::<AccountId>(&json).unwrap(), id);
+        assert!(serde_json::from_str::<AccountId>("\"Bad Slug\"").is_err());
+    }
+}
