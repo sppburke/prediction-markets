@@ -23,6 +23,7 @@ use polymarket_client_sdk_v2::{
     POLYGON, ResponseObservation, ResponseObserver, TransportFailureClass,
     TransportFailureObservation, contract_config,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -106,6 +107,8 @@ pub struct PostOnceResult {
     /// status or a contradictory payload remains ambiguous until reconciliation.
     pub definitive: bool,
     pub order_id: String,
+    pub making_amount: Decimal,
+    pub taking_amount: Decimal,
     pub error_message: Option<String>,
 }
 
@@ -422,6 +425,8 @@ impl CanaryV2Client {
                 success: false,
                 definitive: false,
                 order_id: String::new(),
+                making_amount: Decimal::ZERO,
+                taking_amount: Decimal::ZERO,
                 error_message: Some(format!("HTTP status {}", observation.status)),
             });
         }
@@ -434,6 +439,8 @@ impl CanaryV2Client {
             success: response.success && matched,
             definitive,
             order_id: response.order_id,
+            making_amount: response.making_amount,
+            taking_amount: response.taking_amount,
             error_message: if response.success && !matched {
                 Some(format!("unexpected FOK status {}", response.status))
             } else {
@@ -442,13 +449,12 @@ impl CanaryV2Client {
         })
     }
 
-    pub async fn clob_reconciliation_raw(
+    /// Read only the three account-admission surfaces. The balance response carries the
+    /// allowance map for both V2 exchange spenders, so no order/trade pagination is needed.
+    pub async fn account_probe_raw(
         &self,
-        pending_order_hash: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> (Vec<RawEvidence>, Option<String>) {
-        const PAGE_LIMIT: usize = 100;
-
         let deadline = deadline.into_std();
         let mut evidence = Vec::new();
         macro_rules! capture {
@@ -478,6 +484,42 @@ impl CanaryV2Client {
             self.client
                 .balance_allowance_raw(BalanceAllowanceRequest::default(), Some(deadline))
         );
+        (evidence, None)
+    }
+
+    pub async fn clob_reconciliation_raw(
+        &self,
+        pending_order_hash: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> (Vec<RawEvidence>, Option<String>) {
+        const PAGE_LIMIT: usize = 100;
+
+        let (mut evidence, protocol_failure) = self.account_probe_raw(deadline).await;
+        if protocol_failure.is_some()
+            || evidence
+                .iter()
+                .any(|item| matches!(item, RawEvidence::HttpTransportFailure(_)))
+        {
+            return (evidence, protocol_failure);
+        }
+        let deadline = deadline.into_std();
+        macro_rules! capture {
+            ($endpoint:literal, $future:expr) => {
+                match $future.await {
+                    Ok(observation) => evidence.push(RawEvidence::HttpResponse(raw_response(
+                        $endpoint,
+                        observation,
+                    ))),
+                    Err(error) => match raw_failure(&error, $endpoint, 1) {
+                        Some(failure) => {
+                            evidence.push(RawEvidence::HttpTransportFailure(failure));
+                            return (evidence, None);
+                        }
+                        None => return (evidence, Some(error.to_string())),
+                    },
+                }
+            };
+        }
         if let Some(order_hash) = pending_order_hash {
             capture!(
                 "exact-order",
@@ -1113,6 +1155,8 @@ mod tests {
         let result = CanaryV2Client::parse_post_response(&raw).unwrap();
         assert!(result.success);
         assert_eq!(result.order_id, "0xorder");
+        assert_eq!(result.making_amount, dec!(0.5));
+        assert_eq!(result.taking_amount, dec!(5));
         assert_eq!(state.posts.load(Ordering::SeqCst), 1);
         assert_eq!(
             state.content_type.lock().unwrap().as_deref(),
@@ -1230,6 +1274,28 @@ mod tests {
         assert_eq!(failure.path, "/api/geoblock");
         assert!(failure.ordered_query.is_empty());
         assert_eq!(failure.error_class, TransportErrorClass::Timeout);
+    }
+
+    #[tokio::test]
+    async fn account_probe_reads_allowances_without_order_or_trade_pagination() {
+        let (client, state) = client().await;
+        let (evidence, protocol_failure) = client
+            .account_probe_raw(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(protocol_failure.is_none());
+        let endpoint_kinds = evidence
+            .iter()
+            .filter_map(|item| match item {
+                RawEvidence::HttpResponse(response) => Some(response.endpoint_kind.as_str()),
+                RawEvidence::HttpTransportFailure(_) | RawEvidence::Artifact(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            endpoint_kinds,
+            vec!["geoblock", "closed-only", "balance-allowance"]
+        );
+        assert_eq!(state.orders_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.exact_order_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

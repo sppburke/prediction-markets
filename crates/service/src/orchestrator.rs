@@ -829,7 +829,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // Every decision BELOW is paper-only and must never suppress live targets.
         let dispatch_id = match self.stage_dispatch_if_targeted(&signal) {
             Ok(id) => id,
-            Err(()) => return, // staging failed: abandoned unseen (redelivery retries)
+            Err(()) => {
+                self.entry_gate
+                    .unrecord_entry(signal.leader.0, &signal.market_id);
+                return; // staging failed: abandoned unseen (redelivery retries)
+            }
         };
 
         // Relocated hold/already-filled gate (#508; historically pre-first-BUY): a paper

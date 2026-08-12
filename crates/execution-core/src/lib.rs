@@ -44,14 +44,15 @@ pub use live_executor::{
 pub use live_journal::{
     CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LiveAccountReadFailure,
     LiveAccountStateAudit, LiveAdmissionArtifactAudit, LiveAdmissionEvaluationAudit,
-    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveFeeEvidenceAudit, LiveJournal,
-    LiveJournalError, LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload,
-    LiveMarketEvidenceAudit, LiveModeTransitionAudit, LiveModeTransitionReason,
-    LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderPostAudit, LiveOrderPreparationFailedAudit,
-    LiveOrderPreparationFailure, LiveOrderPreparedAudit, LiveOrderReconciliationAudit,
-    LiveOrderRejectKind, LiveReconciliationSource, RedemptionAttemptIdentity,
-    RedemptionCustodyAudit, RedemptionReceiptAudit, RedemptionReceiptStatusAudit,
-    RedemptionRequestAudit, RedemptionRequestedAudit, RedemptionTransactionAudit, replay_account,
+    LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode, LiveExecutedAmounts,
+    LiveFeeEvidenceAudit, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
+    LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveMarketEvidenceAudit,
+    LiveModeTransitionAudit, LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity,
+    LiveOrderPostAudit, LiveOrderPreparationFailedAudit, LiveOrderPreparationFailure,
+    LiveOrderPreparedAudit, LiveOrderReconciliationAudit, LiveOrderRejectKind,
+    LiveReconciliationSource, RedemptionAttemptIdentity, RedemptionCustodyAudit,
+    RedemptionReceiptAudit, RedemptionReceiptStatusAudit, RedemptionRequestAudit,
+    RedemptionRequestedAudit, RedemptionTransactionAudit, replay_account,
 };
 pub use pe_core_types::{
     RawArtifactObservation, RawEvidence, RawHttpResponse, RawTransportFailure, TransportErrorClass,
@@ -60,6 +61,6 @@ pub use redemption_machine::{
     LIVE_REDEMPTION_SURFACE_AFTER_ATTEMPTS, RedemptionAction, RedemptionAttempt,
     RedemptionAttemptState, RedemptionDriverError, RedemptionEvent, RedemptionFailureKind,
     RedemptionPassInput, RedemptionPassResult, RedemptionPosture, RedemptionStatusObservation,
-    RedemptionStatusReadError, RedemptionStatusReader, advance, redemption_posture,
-    run_redemption_pass,
+    RedemptionStatusReadError, RedemptionStatusReader, advance, reconstruct_redemption_attempts,
+    redemption_posture, run_redemption_pass,
 };

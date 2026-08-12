@@ -12,13 +12,13 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use pe_core_types::{
-    CollateralAmount, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
+    CollateralAmount, Price, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
     TransportErrorClass,
 };
 use pe_execution_core::{
-    LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact, LiveOrderAmbiguityKind,
-    LiveOrderVenue, LivePostClassification, LivePostFuture, LivePostParseError,
-    LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
+    LiveAccountReadFailure, LiveAccountStateFuture, LiveAdmissionArtifact, LiveExecutedAmounts,
+    LiveOrderAmbiguityKind, LiveOrderVenue, LivePostClassification, LivePostFuture,
+    LivePostParseError, LiveReconciliationFuture, LiveVenueAccountReadError, LiveVenueAccountState,
     LiveVenuePreparationError, LiveVenuePrepareFuture, LiveVenuePrepareRequest, LiveVenuePrepared,
     LiveVenueReconciledOutcome, LiveVenueReconciliation, LiveVenueReconciliationError,
     RedemptionStatusObservation, RedemptionStatusReadError, RedemptionStatusReader,
@@ -35,6 +35,7 @@ use pe_venue_polymarket::{
     RelayerCredentials, RelayerPollPolicy, RelayerTransportClient, SignedRedemptionRequest,
     V2BuyRequest,
 };
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -104,8 +105,7 @@ impl PolymarketLiveVenue {
     ) -> Result<LiveVenueAccountState, LiveVenueAccountReadError> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (evidence, protocol_failure) =
-            self.client.clob_reconciliation_raw(None, deadline).await;
+        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
         if protocol_failure.is_some() {
             return Err(account_read_error(
                 LiveAccountReadFailure::Protocol,
@@ -113,6 +113,23 @@ impl PolymarketLiveVenue {
             ));
         }
         parse_account_state(evidence, neg_risk)
+    }
+
+    pub(crate) async fn account_states(
+        &self,
+    ) -> Result<(LiveVenueAccountState, LiveVenueAccountState), LiveVenueAccountReadError> {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
+        let (evidence, protocol_failure) = self.client.account_probe_raw(deadline).await;
+        if protocol_failure.is_some() {
+            return Err(account_read_error(
+                LiveAccountReadFailure::Protocol,
+                evidence,
+            ));
+        }
+        let standard = parse_account_state(evidence.clone(), false)?;
+        let neg_risk = parse_account_state(evidence, true)?;
+        Ok((standard, neg_risk))
     }
 }
 
@@ -157,26 +174,7 @@ impl LiveOrderVenue for PolymarketLiveVenue {
         &self,
         response: &RawHttpResponse,
     ) -> Result<LivePostClassification, LivePostParseError> {
-        let parsed = CanaryV2Client::parse_post_response(response)
-            .map_err(|_| LivePostParseError::InvalidResponse)?;
-        if parsed.success {
-            if parsed.order_id.trim().is_empty() {
-                return Err(LivePostParseError::InvalidResponse);
-            }
-            return Ok(LivePostClassification::Matched {
-                venue_order_id: parsed.order_id,
-            });
-        }
-        if parsed.definitive && parsed.order_id.trim().is_empty() {
-            return Ok(LivePostClassification::Rejected {
-                venue_order_id: None,
-            });
-        }
-        // A returned order identity must be looked up and, if still live, cancelled. A
-        // contradictory/nonterminal FOK response is likewise ambiguous until that pass.
-        Ok(LivePostClassification::Ambiguous {
-            kind: LiveOrderAmbiguityKind::UnexpectedResponse,
-        })
+        classify_order_post_response(response)
     }
 
     fn reconcile_and_cancel_by_order_hash<'a>(
@@ -240,6 +238,44 @@ impl LiveOrderVenue for PolymarketLiveVenue {
     fn read_balance_and_allowance<'a>(&'a self, neg_risk: bool) -> LiveAccountStateFuture<'a> {
         Box::pin(async move { self.account_state(neg_risk).await })
     }
+}
+
+fn classify_order_post_response(
+    response: &RawHttpResponse,
+) -> Result<LivePostClassification, LivePostParseError> {
+    let parsed = CanaryV2Client::parse_post_response(response)
+        .map_err(|_| LivePostParseError::InvalidResponse)?;
+    if parsed.success {
+        if parsed.order_id.trim().is_empty()
+            || parsed.making_amount <= Decimal::ZERO
+            || parsed.taking_amount <= Decimal::ZERO
+            || parsed.taking_amount.fract() != Decimal::ZERO
+            || parsed
+                .making_amount
+                .checked_div(parsed.taking_amount)
+                .and_then(|price| Price::new(price).ok())
+                .is_none()
+        {
+            return Err(LivePostParseError::InvalidResponse);
+        }
+        return Ok(LivePostClassification::Matched {
+            venue_order_id: parsed.order_id,
+            executed: LiveExecutedAmounts {
+                making_amount: parsed.making_amount,
+                taking_amount: parsed.taking_amount,
+            },
+        });
+    }
+    if parsed.definitive && parsed.order_id.trim().is_empty() {
+        return Ok(LivePostClassification::Rejected {
+            venue_order_id: None,
+        });
+    }
+    // A returned order identity must be looked up and, if still live, cancelled. A
+    // contradictory/nonterminal FOK response is likewise ambiguous until that pass.
+    Ok(LivePostClassification::Ambiguous {
+        kind: LiveOrderAmbiguityKind::UnexpectedResponse,
+    })
 }
 
 enum ReconciliationClassification {
@@ -823,5 +859,77 @@ impl RedemptionStatusReader for LiveRedemptionAdapter {
         >,
     > {
         Box::pin(async move { self.status(transaction_id).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use rust_decimal_macros::dec;
+    use serde_json::json;
+
+    use super::*;
+
+    fn post_response(body: serde_json::Value) -> RawHttpResponse {
+        RawHttpResponse {
+            source_id: "test".to_owned(),
+            endpoint_kind: "order-post".to_owned(),
+            method: "POST".to_owned(),
+            path: "/order".to_owned(),
+            ordered_query: Vec::new(),
+            status: 200,
+            headers: Vec::new(),
+            body: serde_json::to_vec(&body).unwrap(),
+            attempt_ordinal: 1,
+            source_at: None,
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            schema_version: 1,
+            parser_version: 1,
+            adapter_version: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn matched_post_classification_retains_executed_price_improvement_amounts() {
+        let response = post_response(json!({
+            "errorMsg": null,
+            "makingAmount": "4.00",
+            "takingAmount": "10",
+            "orderID": "venue-order",
+            "status": "MATCHED",
+            "success": true,
+            "transactionHashes": [],
+            "tradeIds": ["trade-1"]
+        }));
+        assert_eq!(
+            classify_order_post_response(&response).unwrap(),
+            LivePostClassification::Matched {
+                venue_order_id: "venue-order".to_owned(),
+                executed: LiveExecutedAmounts {
+                    making_amount: dec!(4.00),
+                    taking_amount: dec!(10),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn matched_post_with_missing_amounts_is_unparseable_for_reconcile_first() {
+        let response = post_response(json!({
+            "errorMsg": null,
+            "makingAmount": "",
+            "takingAmount": "",
+            "orderID": "venue-order",
+            "status": "MATCHED",
+            "success": true,
+            "transactionHashes": [],
+            "tradeIds": ["trade-1"]
+        }));
+        assert_eq!(
+            classify_order_post_response(&response),
+            Err(LivePostParseError::InvalidResponse)
+        );
     }
 }

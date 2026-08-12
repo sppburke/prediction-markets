@@ -1,5 +1,6 @@
 //! Pure durable redemption state machine plus one-pass transport driver.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::live_journal::{
-    LiveJournal, LiveJournalError, LiveJournalPayload, RedemptionAttemptIdentity,
+    LiveJournal, LiveJournalError, LiveJournalEvent, LiveJournalPayload, RedemptionAttemptIdentity,
     RedemptionCustodyAudit, RedemptionReceiptAudit, RedemptionReceiptStatusAudit,
     RedemptionRequestAudit, RedemptionRequestedAudit, RedemptionTransactionAudit,
     http_attempt_hashes,
@@ -100,6 +101,111 @@ impl RedemptionAttemptState {
 pub struct RedemptionAttempt {
     pub identity: RedemptionAttemptIdentity,
     pub state: RedemptionAttemptState,
+}
+
+/// Rebuild the latest durable state of every account-scoped redemption family.
+///
+/// A request without a later transaction identity remains `SubmissionReserved`; callers must
+/// freeze it because the journal cannot prove whether the relayer accepted the submission.
+#[must_use]
+pub fn reconstruct_redemption_attempts(
+    events: &[LiveJournalEvent],
+) -> HashMap<RedemptionAttemptIdentity, RedemptionAttempt> {
+    let mut attempts = HashMap::new();
+    for event in events {
+        match &event.payload {
+            LiveJournalPayload::RedemptionRequested(audit) => {
+                let state = RedemptionAttemptState::SubmissionReserved {
+                    attempt_count: audit.attempt_count,
+                    redeemable_balance: audit.redeemable_balance,
+                    request_hash: audit.request.request_hash.clone(),
+                };
+                attempts.insert(
+                    audit.identity.clone(),
+                    RedemptionAttempt {
+                        identity: audit.identity.clone(),
+                        state,
+                    },
+                );
+            }
+            LiveJournalPayload::RedemptionTransactionIdentified(audit) => {
+                attempts.insert(
+                    audit.identity.clone(),
+                    RedemptionAttempt {
+                        identity: audit.identity.clone(),
+                        state: RedemptionAttemptState::InFlight {
+                            attempt_count: audit.attempt_count,
+                            transaction_id: audit.transaction_id.clone(),
+                            submit_body_hash: audit.submit_body_hash.clone(),
+                        },
+                    },
+                );
+            }
+            LiveJournalPayload::RedemptionReceiptTransition(audit) => {
+                let Some(prior) = attempts.get(&audit.identity) else {
+                    continue;
+                };
+                let submit_body_hash = match &prior.state {
+                    RedemptionAttemptState::InFlight {
+                        submit_body_hash, ..
+                    }
+                    | RedemptionAttemptState::Ambiguous {
+                        submit_body_hash, ..
+                    } => submit_body_hash.clone(),
+                    _ => String::new(),
+                };
+                let state = match audit.status {
+                    RedemptionReceiptStatusAudit::Pending => RedemptionAttemptState::InFlight {
+                        attempt_count: audit.attempt_count,
+                        transaction_id: audit.transaction_id.clone(),
+                        submit_body_hash,
+                    },
+                    RedemptionReceiptStatusAudit::Ambiguous => RedemptionAttemptState::Ambiguous {
+                        attempt_count: audit.attempt_count,
+                        transaction_id: Some(audit.transaction_id.clone()),
+                        submit_body_hash,
+                    },
+                    RedemptionReceiptStatusAudit::Confirmed => match &audit.transaction_hash {
+                        Some(transaction_hash) if !transaction_hash.trim().is_empty() => {
+                            RedemptionAttemptState::ConfirmedAwaitingBalance {
+                                attempt_count: audit.attempt_count,
+                                transaction_id: audit.transaction_id.clone(),
+                                transaction_hash: transaction_hash.clone(),
+                                confirmed_at: event.timestamp,
+                            }
+                        }
+                        _ => RedemptionAttemptState::Ambiguous {
+                            attempt_count: audit.attempt_count,
+                            transaction_id: Some(audit.transaction_id.clone()),
+                            submit_body_hash,
+                        },
+                    },
+                    RedemptionReceiptStatusAudit::TerminalFailure => {
+                        RedemptionAttemptState::Failed {
+                            attempt_count: audit.attempt_count,
+                            retry_not_before: event.timestamp,
+                            failure: RedemptionFailureKind::Terminal,
+                        }
+                    }
+                };
+                attempts.insert(
+                    audit.identity.clone(),
+                    RedemptionAttempt {
+                        identity: audit.identity.clone(),
+                        state,
+                    },
+                );
+            }
+            LiveJournalPayload::AdmissionEvaluated(_)
+            | LiveJournalPayload::OrderPreparationFailed(_)
+            | LiveJournalPayload::OrderPrepared(_)
+            | LiveJournalPayload::OrderPosted(_)
+            | LiveJournalPayload::OrderReconciled(_)
+            | LiveJournalPayload::CredentialBindingMismatch { .. }
+            | LiveJournalPayload::ModeTransitionApplied(_) => {}
+        }
+    }
+    attempts
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1271,7 +1377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_after_acceptance_reconciles_before_resubmit() {
+    async fn restart_mid_flight_reconstructs_and_reconciles_without_resubmit() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
@@ -1298,12 +1404,22 @@ mod tests {
                 ..
             }
         ));
+        let events = replay_account(&path, &first.attempt.identity.account_id).unwrap();
+        let mut reconstructed = reconstruct_redemption_attempts(&events);
+        let resumed = reconstructed.remove(&first.attempt.identity).unwrap();
+        assert!(matches!(
+            resumed.state,
+            RedemptionAttemptState::Ambiguous {
+                transaction_id: Some(_),
+                ..
+            }
+        ));
         let second = run_redemption_pass(
             &transport,
             &status,
             &journal,
             input(
-                first.attempt,
+                resumed,
                 now() + Duration::seconds(1),
                 CollateralAmount::from_atomic(1),
                 Some(&request),
@@ -1317,6 +1433,50 @@ mod tests {
         ));
         assert_eq!(transport.submissions.load(Ordering::SeqCst), 1);
         assert_eq!(status.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn requested_without_transaction_identity_restarts_frozen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let original = attempt(RedemptionAttemptState::SubmissionReserved {
+            attempt_count: 1,
+            redeemable_balance: CollateralAmount::from_atomic(1),
+            request_hash: "request-hash".to_owned(),
+        });
+        journal
+            .append(
+                original.identity.account_id.clone(),
+                now(),
+                LiveJournalPayload::RedemptionRequested(Box::new(RedemptionRequestedAudit {
+                    identity: original.identity.clone(),
+                    attempt_count: 1,
+                    redeemable_balance: CollateralAmount::from_atomic(1),
+                    request: redemption_request_audit(&signed(), "request-hash".to_owned()),
+                })),
+            )
+            .unwrap();
+        let events = replay_account(&path, &original.identity.account_id).unwrap();
+        let resumed = reconstruct_redemption_attempts(&events)
+            .remove(&original.identity)
+            .unwrap();
+        let transport = FixtureTransport::new(SubmitBehavior::Confirmed);
+        let status = FixtureStatus::new(StatusBehavior::Pending);
+        let result = run_redemption_pass(
+            &transport,
+            &status,
+            &journal,
+            input(resumed, now(), CollateralAmount::from_atomic(1), None),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result.actions.as_slice(),
+            [RedemptionAction::AwaitTransactionIdentity]
+        ));
+        assert_eq!(transport.submissions.load(Ordering::SeqCst), 0);
+        assert_eq!(status.reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

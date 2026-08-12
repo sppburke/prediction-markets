@@ -63,6 +63,9 @@ pub struct CopyEntryGate {
     /// activity. A wallet absent from the map has unknown history (governed by
     /// `fail_closed`).
     history: HashMap<WalletAddress, HashSet<MarketId>>,
+    /// Entries admitted during this process lifetime. Kept separate so a staging rollback can
+    /// remove only its own tentative record without erasing startup/preloaded history.
+    same_session: HashSet<(WalletAddress, MarketId)>,
 }
 
 impl CopyEntryGate {
@@ -71,7 +74,11 @@ impl CopyEntryGate {
         config: CopyEntryGateConfig,
         history: HashMap<WalletAddress, HashSet<MarketId>>,
     ) -> Self {
-        Self { config, history }
+        Self {
+            config,
+            history,
+            same_session: HashSet::new(),
+        }
     }
 
     /// Update the absent-wallet fail-closed posture from a runtime-config poll (#398 WS1). The
@@ -110,6 +117,12 @@ impl CopyEntryGate {
             return Some(GateReject::NotAnEntry);
         }
         let wallet = signal.leader.0;
+        if self
+            .same_session
+            .contains(&(wallet, signal.market_id.clone()))
+        {
+            return Some(GateReject::NotFirstEntry);
+        }
         match self.history.get(&wallet) {
             Some(markets) => {
                 if markets.contains(&signal.market_id) {
@@ -131,10 +144,13 @@ impl CopyEntryGate {
     /// later gate or the strategy rejects the signal — so duplicate entries within
     /// one run are dropped regardless of downstream outcome.
     pub fn record_entry(&mut self, wallet: WalletAddress, market: &MarketId) {
-        self.history
-            .entry(wallet)
-            .or_default()
-            .insert(market.clone());
+        self.same_session.insert((wallet, market.clone()));
+    }
+
+    /// Roll back the tentative same-session record when durable dispatch staging fails.
+    /// Startup and capacity-preloaded history is never mutated by this operation.
+    pub fn unrecord_entry(&mut self, wallet: WalletAddress, market: &MarketId) {
+        self.same_session.remove(&(wallet, market.clone()));
     }
 }
 
@@ -266,6 +282,18 @@ mod tests {
             Some(GateReject::NotFirstEntry),
             "second entry into same market blocked"
         );
+    }
+
+    #[test]
+    fn staging_failure_rollback_allows_redelivery() {
+        let mut gate = CopyEntryGate::new(band_config(), HashMap::new());
+        let m = market("0xredelivery");
+        let s = signal(LeaderAction::Entry, m.clone(), Price(dec!(0.60)));
+        assert_eq!(gate.admit(&s), None);
+        gate.record_entry(wallet(), &m);
+        assert_eq!(gate.admit(&s), Some(GateReject::NotFirstEntry));
+        gate.unrecord_entry(wallet(), &m);
+        assert_eq!(gate.admit(&s), None, "redelivery must be admitted");
     }
 
     #[test]

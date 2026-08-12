@@ -444,8 +444,12 @@ async fn main() -> Result<()> {
     // fill basis. Built unconditionally so the orchestrator always has it; the worker clones it
     // only when the snapshot block runs. `with_base_url` is override-only parity with the order
     // adapter (no prod change at the default) — the book is now on the paper fill path (#486).
+    let book_http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build bounded CLOB book HTTP client")?;
     let book_fetcher = Arc::new(
-        ReqwestClobBookFetcher::new(reqwest::Client::new())
+        ReqwestClobBookFetcher::new(book_http_client)
             .with_base_url(cfg.polymarket_clob_base_url.clone()),
     );
 
@@ -524,8 +528,12 @@ async fn main() -> Result<()> {
         let journal_path = live_journal_path(&cfg.event_log_path);
         match LiveJournal::open(&journal_path) {
             Ok(journal) => {
+                let live_http_client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .context("build bounded ordinary-live HTTP client")?;
                 let projection = pe_service::live_projections::LiveProjectionWriter::new(
-                    reqwest::Client::new(),
+                    live_http_client.clone(),
                     &cfg.supabase_url,
                     &cfg.supabase_anon_key,
                     &cfg.supabase_secret_key,
@@ -541,14 +549,15 @@ async fn main() -> Result<()> {
                         journal_path,
                         projection,
                         book_fetcher: book_fetcher.clone(),
-                        http: reqwest::Client::new(),
+                        http: live_http_client,
                         supabase_url: cfg.supabase_url.clone(),
                         supabase_anon_key: cfg.supabase_anon_key.clone(),
                         supabase_secret_key: cfg.supabase_secret_key.clone(),
                         gamma_base_url: cfg.gamma_base_url.clone(),
                         clob_base_url: cfg.polymarket_clob_base_url.clone(),
                         data_base_url: cfg.polymarket_base_url.clone(),
-                        reconcile_interval_secs: cfg.supabase_sink_reconcile_interval_secs,
+                        projection_reconcile_interval_secs: cfg
+                            .supabase_sink_reconcile_interval_secs,
                     },
                 )))
             }

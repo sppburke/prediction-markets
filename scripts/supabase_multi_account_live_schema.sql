@@ -441,6 +441,16 @@ begin
     from public.account_credentials
    where account_id = p_account_id;
 
+  -- Compare-and-set on the version chain (#508 review): a rotation must supply exactly
+  -- current+1 under the account lock, so two concurrent rotations cannot both seal the
+  -- same version (the frozen dispatch credential binding stays unambiguous). The site
+  -- rereads and reseals on conflict.
+  if p_bundle_version is distinct from coalesce(v_bundle_version, 0) + 1 then
+    raise exception
+      'credential rotation version conflict: supplied %, current %',
+      p_bundle_version, coalesce(v_bundle_version, 0);
+  end if;
+
   v_from_value := pg_catalog.jsonb_build_object(
     'bundle_version', v_bundle_version,
     'key_id', v_key_id,

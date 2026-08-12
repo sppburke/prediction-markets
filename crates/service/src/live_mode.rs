@@ -144,7 +144,7 @@ pub fn evaluate_mode<P: ArmingProbe>(inputs: &ModeInputs<'_, P>) -> ModeDecision
         (
             "balance_allowance",
             inputs.probe.balance_and_both_spender_allowances(),
-            true,
+            false,
         ),
     ];
 
@@ -401,6 +401,27 @@ mod tests {
         assert!(
             matches!(d3, ModeDecision::SetEffective { mode: "off", .. }),
             "{d3:?}"
+        );
+    }
+
+    #[test]
+    fn armed_balance_or_allowance_failure_refuses_without_demoting() {
+        let probe = FixtureProbe {
+            balance: CheckOutcome::PersistentFail("allowance below posture"),
+            ..all_pass()
+        };
+        let promo = reviewed(true);
+        let decision = evaluate_mode(&inputs(
+            "live_tiny",
+            "live_tiny",
+            CheckOutcome::Pass,
+            &promo,
+            &probe,
+        ));
+        assert!(
+            matches!(decision, ModeDecision::RefuseOrders { ref reason }
+                if reason.contains("balance_allowance")),
+            "{decision:?}"
         );
     }
 

@@ -4,7 +4,7 @@
 //! `live_account_state` (service-role only from birth) and commits its effective-mode
 //! transitions through the `account_set_effective_mode` control RPC so state + audit
 //! event land atomically (Decision 8 / the #397 sole-writer precedent). Projection
-//! writes are idempotent (`resolution=merge-duplicates` upserts on the natural keys) and
+//! writes are idempotent (insert-only fills ignore duplicates; mutable rows merge) and
 //! converge on the per-account reconcile pass (the `supabase_sink` self-heal precedent);
 //! the account-tagged raw journal remains the audit/replay history — these rows exist
 //! for the site.
@@ -96,7 +96,7 @@ impl LiveProjectionWriter {
             .post(&url)
             .header("apikey", token)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-            .header("Prefer", "resolution=merge-duplicates")
+            .header("Prefer", upsert_preference(table))
             .json(rows)
             .send()
             .await
@@ -169,5 +169,34 @@ impl LiveProjectionWriter {
             });
         }
         Ok(())
+    }
+}
+
+fn upsert_preference(table: &str) -> &'static str {
+    if table == "live_fills" {
+        "resolution=ignore-duplicates"
+    } else {
+        "resolution=merge-duplicates"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upsert_preference;
+
+    #[test]
+    fn immutable_fills_ignore_duplicates_while_mutable_tables_merge() {
+        assert_eq!(
+            upsert_preference("live_fills"),
+            "resolution=ignore-duplicates"
+        );
+        assert_eq!(
+            upsert_preference("live_positions"),
+            "resolution=merge-duplicates"
+        );
+        assert_eq!(
+            upsert_preference("live_account_state"),
+            "resolution=merge-duplicates"
+        );
     }
 }

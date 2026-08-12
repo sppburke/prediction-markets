@@ -63,6 +63,9 @@ export async function POST(
     .maybeSingle();
   if (readError) return NextResponse.json({ error: readError.message }, { status: 500 });
 
+  // The RPC compare-and-sets on exactly current+1 under the account lock (#508 review):
+  // a concurrent rotation makes it raise a version-conflict, surfaced below as 409 so
+  // the admin re-submits against the fresh state (never two bundles sealing one version).
   const bundleVersion = nextBundleVersion(previous?.bundle_version);
   const keyId = body.key_id.trim();
   const plaintext = buildCredentialPlaintext({
@@ -92,7 +95,10 @@ export async function POST(
     actor: ALLOWED_EMAIL,
   });
   const { error } = await supabase.rpc("account_rotate_credentials", args);
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  if (error) {
+    const conflict = error.message.includes("version conflict");
+    return NextResponse.json({ error: error.message }, { status: conflict ? 409 : 500 });
+  }
   return NextResponse.json({
     ok: true,
     bundle_version: bundleVersion,

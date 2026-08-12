@@ -32,6 +32,17 @@ pub struct CredentialBindingIdentity {
     pub key_id: String,
 }
 
+/// Immutable metadata needed to rebuild a matched fill projection from the journal alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveFillProjectionIdentity {
+    pub leader_wallet: String,
+    pub source_trade_id: Option<String>,
+    pub market_id: String,
+    pub outcome_id: i64,
+    pub side: String,
+}
+
 /// Replay identity shared by admission, preparation, and all order transitions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +53,8 @@ pub struct LiveOrderIdentity {
     pub config_hash: String,
     pub decision_hash: String,
     pub evidence_hashes: Vec<String>,
+    #[serde(default)]
+    pub fill_projection: Option<Box<LiveFillProjectionIdentity>>,
     pub schema_version: u16,
     pub parser_version: u16,
 }
@@ -367,11 +380,23 @@ pub enum LiveOrderAmbiguityKind {
     ReconciliationPending,
 }
 
+/// Venue-reported executed collateral and whole-share amounts from a successful order POST.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveExecutedAmounts {
+    pub making_amount: rust_decimal::Decimal,
+    pub taking_amount: rust_decimal::Decimal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome", content = "detail")]
 pub enum LiveJournalOrderOutcome {
     Matched {
         venue_order_id: String,
+        /// `None` is retained only for order-hash reconciliation results whose trade amounts
+        /// were not captured. Such matches are terminal for submission but not projectable.
+        #[serde(default)]
+        executed: Option<LiveExecutedAmounts>,
     },
     Killed {
         venue_order_id: Option<String>,
@@ -404,7 +429,7 @@ pub struct LiveOrderReconciliationAudit {
 }
 
 /// Durable identity of one redemption attempt family.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedemptionAttemptIdentity {
     pub account_id: AccountId,
@@ -711,6 +736,7 @@ mod tests {
             config_hash: "config".to_owned(),
             decision_hash: "decision".to_owned(),
             evidence_hashes: vec!["evidence".to_owned()],
+            fill_projection: None,
             schema_version: 1,
             parser_version: 1,
         }

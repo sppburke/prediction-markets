@@ -13,11 +13,13 @@ use pe_core_types::{
 };
 use pe_execution_core::{
     CredentialBindingIdentity, FrozenLiveTarget, LiveAdmissionRefusal, LiveControlMode,
-    LiveExecutor, LiveJournal, LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot,
-    LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit,
-    LiveOrderVenue, LivePrepareResult, LiveReconciliationSource, LiveVenueReconciledOutcome,
-    RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput,
-    redemption_posture, replay_account, run_redemption_pass,
+    LiveExecutedAmounts, LiveExecutor, LiveFillProjectionIdentity, LiveJournal, LiveJournalEvent,
+    LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot, LiveModeTransitionAudit,
+    LiveModeTransitionReason, LiveOrderAmbiguityKind, LiveOrderIdentity, LiveOrderOutcome,
+    LiveOrderReconciliationAudit, LiveOrderVenue, LivePrepareResult, LiveReconciliationSource,
+    LiveVenueReconciledOutcome, RedemptionAttempt, RedemptionAttemptIdentity,
+    RedemptionAttemptState, RedemptionEvent, RedemptionPassInput, advance,
+    reconstruct_redemption_attempts, redemption_posture, replay_account, run_redemption_pass,
 };
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
@@ -28,6 +30,7 @@ use pe_venue_polymarket::{
     RelayerPollPolicy, build_redemption_call, plan_budget_buy, sign_deposit_wallet_redemption,
 };
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive as _;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
@@ -41,7 +44,9 @@ use crate::live_mode::{
     ArmingProbe, CheckOutcome, ModeDecision, ModeInputs, PromotionEventRow, PromotionFacts,
     evaluate_mode, promotion_facts_from_rows,
 };
-use crate::live_projections::{LiveAccountStateRow, LiveFillRow, LiveProjectionWriter};
+use crate::live_projections::{
+    LiveAccountStateRow, LiveFillRow, LivePositionRow, LiveProjectionWriter,
+};
 use crate::live_venue_adapter::{
     LiveAdmissionBuilder, LiveRedemptionAdapter, LiveVenueAdapterError, PolymarketLiveVenue,
 };
@@ -54,6 +59,10 @@ const MODE_INTERVAL_SECS: i64 = 30;
 const PRUNE_INTERVAL_SECS: i64 = 3_600;
 const DISPATCH_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const REDEMPTION_RETRY_SECS: i64 = 30;
+/// Ordinary redemption inventory/status reconcile cadence (Decision 12).
+const REDEMPTION_RECONCILE_CADENCE_SECS: i64 = 300;
+const REDEEMABLE_POSITION_PAGE_LIMIT: usize = 500;
+const REDEEMABLE_POSITION_MAX_OFFSET: usize = 10_000;
 // verified 2026-08-11 from the official four-minute Deposit Wallet batch example:
 // https://github.com/Polymarket/builder-relayer-client#execute-deposit-wallet-batch
 const DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS: u64 = 4 * 60;
@@ -76,7 +85,7 @@ pub struct LiveFanoutConfig {
     pub gamma_base_url: String,
     pub clob_base_url: String,
     pub data_base_url: String,
-    pub reconcile_interval_secs: u64,
+    pub projection_reconcile_interval_secs: u64,
 }
 
 #[derive(Default)]
@@ -100,8 +109,16 @@ struct FanoutState {
     closures: AdmissionClosures,
     last_mode_unix: Option<i64>,
     last_redemption_unix: Option<i64>,
+    last_projection_unix: Option<i64>,
     last_prune_unix: Option<i64>,
-    touched_state: HashMap<String, LiveAccountStateRow>,
+    account_state_inputs: HashMap<String, AccountStateInputs>,
+}
+
+#[derive(Default)]
+struct AccountStateInputs {
+    free_collateral: Option<Decimal>,
+    unredeemed_value: Option<Decimal>,
+    last_reconciled_at: Option<String>,
 }
 
 /// Start the first-boot arming fence, then drive mode, redemption, retention, and ordered fan-out.
@@ -128,14 +145,28 @@ pub async fn run_live_fanout(config: LiveFanoutConfig) {
         closures: AdmissionClosures::default(),
         last_mode_unix: None,
         last_redemption_unix: None,
+        last_projection_unix: None,
         last_prune_unix: None,
-        touched_state: HashMap::new(),
+        account_state_inputs: HashMap::new(),
     };
+    reconcile_projections(&mut state, OffsetDateTime::now_utc()).await;
+    state.last_projection_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
     let mut ticker = tokio::time::interval(Duration::from_secs(FANOUT_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         let now = OffsetDateTime::now_utc();
+        let projection_interval =
+            i64::try_from(state.config.projection_reconcile_interval_secs.max(1))
+                .unwrap_or(i64::MAX);
+        if due(
+            state.last_projection_unix,
+            now.unix_timestamp(),
+            projection_interval,
+        ) {
+            reconcile_projections(&mut state, now).await;
+            state.last_projection_unix = Some(now.unix_timestamp());
+        }
         match recovery_is_pending(&state.config.paper_state) {
             Ok(true) => {
                 if let Err(error) = run_dispatch_pass(&mut state, now).await {
@@ -159,12 +190,10 @@ pub async fn run_live_fanout(config: LiveFanoutConfig) {
             drive_modes(&mut state, now).await;
             state.last_mode_unix = Some(now.unix_timestamp());
         }
-        let redemption_interval =
-            i64::try_from(state.config.reconcile_interval_secs.max(1)).unwrap_or(i64::MAX);
         if due(
             state.last_redemption_unix,
             now.unix_timestamp(),
-            redemption_interval,
+            REDEMPTION_RECONCILE_CADENCE_SECS,
         ) {
             drive_redemptions(&mut state, now).await;
             state.last_redemption_unix = Some(now.unix_timestamp());
@@ -242,7 +271,6 @@ async fn run_dispatch_pass(
         return Ok(());
     }
     for seed in seeds {
-        state.touched_state.clear();
         let signal = parse_frozen_signal(&seed)?;
         let targets = state
             .config
@@ -261,17 +289,10 @@ async fn run_dispatch_pass(
                 PassControl::FreezePass => return Ok(()),
             }
         }
-        if state
+        state
             .config
             .paper_state
-            .finalize_dispatch_if_terminal(&seed.dispatch_id, now.unix_timestamp())?
-        {
-            for row in state.touched_state.values() {
-                if let Err(error) = state.config.projection.upsert_account_state(row).await {
-                    warn!(account_id = %row.account_id, error = %error, "live account-state projection failed; reconcile will heal");
-                }
-            }
-        }
+            .finalize_dispatch_if_terminal(&seed.dispatch_id, now.unix_timestamp())?;
     }
     Ok(())
 }
@@ -339,12 +360,10 @@ async fn process_target(
         let outcome = recover_target(state, target, &venue, now).await?;
         let transition = outcome_transition(&outcome);
         persist_outcome(state, target, &outcome, now)?;
-        if matches!(outcome, LiveOrderOutcome::Matched { .. })
-            && let Some(prepared) = recovered_prepared(state, target)?
-        {
-            project_fill(state, seed, target, signal, &prepared.ladder, now).await;
-        }
         capture_account_state(state, account, &venue, false, now).await;
+        if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
+            reconcile_account_projection(state, account, now).await;
+        }
         return Ok(if transition.freeze {
             PassControl::FreezePass
         } else {
@@ -532,10 +551,10 @@ async fn process_target(
             let outcome = executor.submit(prepared, now).await?;
             let transition = outcome_transition(&outcome);
             persist_outcome(state, target, &outcome, now)?;
-            if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
-                project_fill(state, seed, target, signal, &plan, now).await;
-            }
             capture_account_state_row(state, account, &account_state, now);
+            if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
+                reconcile_account_projection(state, account, now).await;
+            }
             Ok(if transition.freeze {
                 PassControl::FreezePass
             } else {
@@ -638,6 +657,13 @@ fn build_order_identity(
         config_hash,
         decision_hash,
         evidence_hashes,
+        fill_projection: Some(Box::new(LiveFillProjectionIdentity {
+            leader_wallet: signal.leader.to_string(),
+            source_trade_id: Some(seed.source_trade_id.clone()),
+            market_id: signal.market_id.to_string(),
+            outcome_id: i64::from(signal.outcome_id.0),
+            side: "buy".to_owned(),
+        })),
         schema_version: 1,
         parser_version: 1,
     })
@@ -733,60 +759,20 @@ fn ladder_terminal_reason(error: &LadderError) -> &'static str {
     }
 }
 
-async fn project_fill(
-    state: &FanoutState,
-    seed: &DispatchSeedRow,
-    target: &DispatchTargetRow,
-    signal: &LeaderSignal,
-    plan: &pe_venue_polymarket::LadderPlan,
-    now: OffsetDateTime,
-) {
-    let Some(fill_price) = plan.vwap() else {
-        warn!(dispatch_id = %seed.dispatch_id, account_id = %target.account_id, "matched live order has no valid VWAP projection");
-        return;
-    };
-    let row = LiveFillRow {
-        account_id: target.account_id.clone(),
-        idempotency_key: format!("{}:{}", seed.dispatch_id, target.account_id),
-        leader_wallet: signal.leader.to_string(),
-        source_trade_id: Some(seed.source_trade_id.clone()),
-        market_id: signal.market_id.to_string(),
-        outcome_id: i64::from(signal.outcome_id.0),
-        side: "buy".to_owned(),
-        contracts: plan.shares.to_decimal(),
-        fill_price: fill_price.0,
-        entry_unix: Some(now.unix_timestamp()),
-        // Stable across projection retries; the account/idempotency natural key remains the
-        // authoritative uniqueness boundary.
-        event_seq: seed.created_at_unix,
-    };
-    if let Err(error) = state.config.projection.upsert_fills(&[row]).await {
-        warn!(dispatch_id = %seed.dispatch_id, account_id = %target.account_id, error = %error, "live fill projection failed; reconcile will heal");
-    }
-}
-
 fn capture_account_state_row(
     state: &mut FanoutState,
     account: &AccountContext,
     account_state: &pe_execution_core::LiveVenueAccountState,
     now: OffsetDateTime,
 ) {
-    state.touched_state.insert(
-        account.account_id.as_str().to_owned(),
-        LiveAccountStateRow {
-            account_id: account.account_id.as_str().to_owned(),
-            free_collateral: account_state.reconciled_free_collateral.to_decimal(),
-            reserved: Decimal::ZERO,
-            unredeemed_value: Decimal::ZERO,
-            last_reconciled_at: now
-                .format(&time::format_description::well_known::Rfc3339)
-                .ok(),
-            admission_closed_reason: state
-                .closures
-                .reason(account.account_id.as_str())
-                .map(str::to_owned),
-        },
-    );
+    let inputs = state
+        .account_state_inputs
+        .entry(account.account_id.as_str().to_owned())
+        .or_default();
+    inputs.free_collateral = Some(account_state.reconciled_free_collateral.to_decimal());
+    inputs.last_reconciled_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok();
 }
 
 async fn capture_account_state(
@@ -801,10 +787,307 @@ async fn capture_account_state(
     }
 }
 
+#[derive(Default)]
+struct ProjectionDerivation {
+    fills: Vec<LiveFillRow>,
+    positions: Vec<LivePositionRow>,
+    reserved: Decimal,
+    latest_free_collateral: Option<Decimal>,
+    latest_reconciled_at: Option<String>,
+}
+
+fn executed_fill_price(executed: &LiveExecutedAmounts) -> Option<Decimal> {
+    if executed.making_amount <= Decimal::ZERO
+        || executed.taking_amount <= Decimal::ZERO
+        || executed.taking_amount.fract() != Decimal::ZERO
+    {
+        return None;
+    }
+    let price = executed.making_amount.checked_div(executed.taking_amount)?;
+    Price::new(price).ok().map(|value| value.0)
+}
+
+fn derive_projection_rows(
+    paper_state: &PaperStateDb,
+    account_id: &AccountId,
+    events: &[LiveJournalEvent],
+) -> Result<ProjectionDerivation, FanoutError> {
+    let mut fills = HashMap::<String, (LiveFillRow, Decimal)>::new();
+    let mut reservations = HashMap::<String, Decimal>::new();
+    let mut redeemed_conditions = HashSet::<String>::new();
+    let mut latest_free_collateral = None;
+    let mut latest_reconciled_at = None;
+
+    for event in events {
+        match &event.payload {
+            LiveJournalPayload::AdmissionEvaluated(audit) => {
+                if let Some(account_state) = audit.account_state.as_ref() {
+                    latest_free_collateral =
+                        Some(account_state.reconciled_free_collateral.to_decimal());
+                    latest_reconciled_at = account_state
+                        .observed_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .ok();
+                }
+            }
+            LiveJournalPayload::OrderPrepared(prepared) => {
+                reservations.insert(
+                    prepared.identity.idempotency_key.clone(),
+                    prepared.ladder.worst_case_debit.to_decimal(),
+                );
+            }
+            LiveJournalPayload::OrderReconciled(reconciled) => {
+                if !matches!(
+                    reconciled.outcome,
+                    LiveJournalOrderOutcome::Ambiguous { .. }
+                ) {
+                    reservations.remove(&reconciled.identity.idempotency_key);
+                }
+                let LiveJournalOrderOutcome::Matched {
+                    executed: Some(executed),
+                    ..
+                } = &reconciled.outcome
+                else {
+                    if matches!(
+                        reconciled.outcome,
+                        LiveJournalOrderOutcome::Matched { executed: None, .. }
+                    ) {
+                        error!(
+                            account_id = %account_id,
+                            dispatch_id = %reconciled.identity.dispatch_id,
+                            "matched live order lacks executed amounts; fill projection remains pending"
+                        );
+                    }
+                    continue;
+                };
+                let Some(fill_price) = executed_fill_price(executed) else {
+                    error!(
+                        account_id = %account_id,
+                        dispatch_id = %reconciled.identity.dispatch_id,
+                        "matched live order has invalid executed amounts; fill projection remains pending"
+                    );
+                    continue;
+                };
+                let projection = if let Some(projection) =
+                    reconciled.identity.fill_projection.as_deref()
+                {
+                    projection.clone()
+                } else {
+                    let Some(seed) = paper_state.dispatch_seed(&reconciled.identity.dispatch_id)?
+                    else {
+                        error!(
+                            account_id = %account_id,
+                            dispatch_id = %reconciled.identity.dispatch_id,
+                            "matched live order has neither journaled nor frozen dispatch metadata; fill projection remains pending"
+                        );
+                        continue;
+                    };
+                    let signal = match parse_frozen_signal(&seed) {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            error!(
+                                account_id = %account_id,
+                                dispatch_id = %reconciled.identity.dispatch_id,
+                                error = %error,
+                                "matched live order frozen signal is invalid; fill projection remains pending"
+                            );
+                            continue;
+                        }
+                    };
+                    LiveFillProjectionIdentity {
+                        leader_wallet: signal.leader.to_string(),
+                        source_trade_id: Some(seed.source_trade_id),
+                        market_id: signal.market_id.to_string(),
+                        outcome_id: i64::from(signal.outcome_id.0),
+                        side: "buy".to_owned(),
+                    }
+                };
+                let Ok(event_seq) = i64::try_from(event.seq) else {
+                    error!(
+                        account_id = %account_id,
+                        dispatch_id = %reconciled.identity.dispatch_id,
+                        "matched live order event sequence overflow; fill projection remains pending"
+                    );
+                    continue;
+                };
+                fills
+                    .entry(reconciled.identity.idempotency_key.clone())
+                    .or_insert_with(|| {
+                        (
+                            LiveFillRow {
+                                account_id: account_id.as_str().to_owned(),
+                                idempotency_key: reconciled.identity.idempotency_key.clone(),
+                                leader_wallet: projection.leader_wallet,
+                                source_trade_id: projection.source_trade_id,
+                                market_id: projection.market_id,
+                                outcome_id: projection.outcome_id,
+                                side: projection.side,
+                                contracts: executed.taking_amount,
+                                fill_price,
+                                entry_unix: Some(event.timestamp.unix_timestamp()),
+                                event_seq,
+                            },
+                            executed.making_amount,
+                        )
+                    });
+            }
+            LiveJournalPayload::RedemptionReceiptTransition(receipt)
+                if receipt.status == pe_execution_core::RedemptionReceiptStatusAudit::Confirmed =>
+            {
+                redeemed_conditions.insert(receipt.identity.condition_id.0.clone());
+            }
+            LiveJournalPayload::OrderPreparationFailed(_)
+            | LiveJournalPayload::OrderPosted(_)
+            | LiveJournalPayload::RedemptionRequested(_)
+            | LiveJournalPayload::RedemptionTransactionIdentified(_)
+            | LiveJournalPayload::RedemptionReceiptTransition(_)
+            | LiveJournalPayload::CredentialBindingMismatch { .. }
+            | LiveJournalPayload::ModeTransitionApplied(_) => {}
+        }
+    }
+
+    let mut position_totals = HashMap::<(String, i64), (i64, Decimal)>::new();
+    for (row, collateral) in fills.values() {
+        let Some(contracts) = row.contracts.to_i64() else {
+            error!(
+                account_id = %account_id,
+                idempotency_key = %row.idempotency_key,
+                "matched live order contracts overflow position projection"
+            );
+            continue;
+        };
+        let total = position_totals
+            .entry((row.market_id.clone(), row.outcome_id))
+            .or_insert((0, Decimal::ZERO));
+        total.0 = total.0.saturating_add(contracts);
+        total.1 += *collateral;
+    }
+    for ((market_id, _), total) in &mut position_totals {
+        if redeemed_conditions.contains(market_id) {
+            *total = (0, Decimal::ZERO);
+        }
+    }
+
+    let mut fill_rows = fills.into_values().map(|(row, _)| row).collect::<Vec<_>>();
+    fill_rows.sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
+    let mut positions = position_totals
+        .into_iter()
+        .map(
+            |((market_id, outcome_id), (long_contracts, cost_basis))| LivePositionRow {
+                account_id: account_id.as_str().to_owned(),
+                market_id,
+                outcome_id,
+                long_contracts,
+                short_contracts: 0,
+                cost_basis,
+            },
+        )
+        .collect::<Vec<_>>();
+    positions.sort_by(|left, right| {
+        (&left.market_id, left.outcome_id).cmp(&(&right.market_id, right.outcome_id))
+    });
+
+    Ok(ProjectionDerivation {
+        fills: fill_rows,
+        positions,
+        reserved: reservations.into_values().sum(),
+        latest_free_collateral,
+        latest_reconciled_at,
+    })
+}
+
+async fn reconcile_account_projection(
+    state: &mut FanoutState,
+    account: &AccountContext,
+    _now: OffsetDateTime,
+) {
+    let events = match replay_account(&state.config.journal_path, &account.account_id) {
+        Ok(events) => events,
+        Err(error) => {
+            error!(account_id = %account.account_id, error = %error, "live projection journal replay failed");
+            return;
+        }
+    };
+    let derived = match derive_projection_rows(
+        state.config.paper_state.as_ref(),
+        &account.account_id,
+        &events,
+    ) {
+        Ok(derived) => derived,
+        Err(error) => {
+            error!(account_id = %account.account_id, error = %error, "live projection derivation failed");
+            return;
+        }
+    };
+    if let Err(error) = state.config.projection.upsert_fills(&derived.fills).await {
+        warn!(account_id = %account.account_id, error = %error, "live fill projection reconcile failed");
+    }
+    if let Err(error) = state
+        .config
+        .projection
+        .upsert_positions(&derived.positions)
+        .await
+    {
+        warn!(account_id = %account.account_id, error = %error, "live position projection reconcile failed");
+    }
+
+    let closed_reason = state
+        .closures
+        .reason(account.account_id.as_str())
+        .map(str::to_owned);
+    let Some(row) = compose_account_state_row(
+        account.account_id.as_str(),
+        state.account_state_inputs.get(account.account_id.as_str()),
+        &derived,
+        closed_reason,
+    ) else {
+        return;
+    };
+    if let Err(error) = state.config.projection.upsert_account_state(&row).await {
+        warn!(account_id = %account.account_id, error = %error, "live account-state projection reconcile failed");
+    }
+}
+
+fn compose_account_state_row(
+    account_id: &str,
+    inputs: Option<&AccountStateInputs>,
+    derived: &ProjectionDerivation,
+    admission_closed_reason: Option<String>,
+) -> Option<LiveAccountStateRow> {
+    let free_collateral = inputs
+        .and_then(|inputs| inputs.free_collateral)
+        .or(derived.latest_free_collateral);
+    let last_reconciled_at = inputs
+        .and_then(|inputs| inputs.last_reconciled_at.clone())
+        .or_else(|| derived.latest_reconciled_at.clone());
+    let unredeemed_value = inputs.and_then(|inputs| inputs.unredeemed_value);
+    if free_collateral.is_none()
+        && unredeemed_value.is_none()
+        && derived.reserved == Decimal::ZERO
+        && admission_closed_reason.is_none()
+    {
+        return None;
+    }
+    Some(LiveAccountStateRow {
+        account_id: account_id.to_owned(),
+        free_collateral: free_collateral.unwrap_or(Decimal::ZERO),
+        reserved: derived.reserved,
+        unredeemed_value: unredeemed_value.unwrap_or(Decimal::ZERO),
+        last_reconciled_at,
+        admission_closed_reason,
+    })
+}
+
+async fn reconcile_projections(state: &mut FanoutState, now: OffsetDateTime) {
+    let snapshot = state.config.live_accounts.snapshot();
+    for account in &snapshot.accounts {
+        reconcile_account_projection(state, account, now).await;
+    }
+}
+
 struct RecoveredPrepared {
     identity: LiveOrderIdentity,
     order_hash: String,
-    ladder: pe_venue_polymarket::LadderPlan,
 }
 
 fn recovered_prepared(
@@ -821,26 +1104,9 @@ fn recovered_prepared(
             LiveJournalPayload::OrderPrepared(prepared)
                 if prepared.identity.dispatch_id == target.dispatch_id =>
             {
-                let used_asks = prepared
-                    .ladder
-                    .used_asks
-                    .iter()
-                    .map(|ask| pe_venue_polymarket::AskLevel {
-                        price: ask.price,
-                        shares: ask.shares,
-                    })
-                    .collect();
                 Some(RecoveredPrepared {
                     identity: prepared.identity.clone(),
                     order_hash: prepared.prepared.order_hash.clone(),
-                    ladder: pe_venue_polymarket::LadderPlan {
-                        used_asks,
-                        best_ask: prepared.ladder.best_ask,
-                        limit_price: prepared.ladder.limit_price,
-                        shares: prepared.ladder.shares,
-                        estimated_ladder_spend: prepared.ladder.estimated_ladder_spend,
-                        worst_case_debit: prepared.ladder.worst_case_debit,
-                    },
                 })
             }
             _ => None,
@@ -871,10 +1137,12 @@ async fn recover_target(
             LiveVenueReconciledOutcome::Matched { venue_order_id } => (
                 LiveJournalOrderOutcome::Matched {
                     venue_order_id: venue_order_id.clone(),
+                    executed: None,
                 },
                 LiveOrderOutcome::Matched {
                     order_hash: prepared.order_hash.clone(),
                     venue_order_id,
+                    executed: None,
                 },
                 reconciliation.evidence,
             ),
@@ -1092,10 +1360,7 @@ async fn fetch_promotions(
         &state.config.supabase_anon_key,
         &state.config.supabase_secret_key,
     );
-    let url = format!(
-        "{}/rest/v1/account_events?select=account_id,event_kind,created_at&event_kind=in.(promotion_reviewed,promotion_review_revoked)",
-        state.config.supabase_url.trim_end_matches('/')
-    );
+    let url = promotion_events_url(&state.config.supabase_url);
     let response = state
         .config
         .http
@@ -1125,6 +1390,13 @@ async fn fetch_promotions(
         .collect())
 }
 
+fn promotion_events_url(supabase_url: &str) -> String {
+    format!(
+        "{}/rest/v1/account_events?select=account_id,event_kind,created_at&event_kind=in.(promotion_reviewed,promotion_review_revoked)&order=created_at.desc&limit=50",
+        supabase_url.trim_end_matches('/')
+    )
+}
+
 struct StaticProbe {
     account: CheckOutcome,
     geoblock: CheckOutcome,
@@ -1145,7 +1417,7 @@ impl ArmingProbe for StaticProbe {
     }
 }
 
-async fn drive_modes(state: &mut FanoutState, _now: OffsetDateTime) {
+async fn drive_modes(state: &mut FanoutState, now: OffsetDateTime) {
     let snapshot = state.config.live_accounts.snapshot();
     if snapshot.accounts.is_empty() {
         return;
@@ -1184,7 +1456,7 @@ async fn drive_modes(state: &mut FanoutState, _now: OffsetDateTime) {
         .filter(|account| account.effective_live_mode == "live_tiny")
         .count();
     for account in &snapshot.accounts {
-        let (credential_outcome, probe) = mode_probe(state, account).await;
+        let (credential_outcome, probe) = mode_probe(state, account, now).await;
         let facts = promotions
             .get(account.account_id.as_str())
             .cloned()
@@ -1219,6 +1491,24 @@ async fn drive_modes(state: &mut FanoutState, _now: OffsetDateTime) {
                     .await
                 {
                     Ok(()) => {
+                        let transition = LiveModeTransitionAudit {
+                            requested: mode_value(&account.requested_live_mode),
+                            previous_effective: mode_value(&account.effective_live_mode),
+                            new_effective: mode_value(mode),
+                            reason: mode_transition_reason(&reason),
+                        };
+                        if let Err(error) = state.config.journal.append(
+                            account.account_id.clone(),
+                            now,
+                            LiveJournalPayload::ModeTransitionApplied(transition),
+                        ) {
+                            state.closures.mode.insert(
+                                account.account_id.as_str().to_owned(),
+                                "effective-mode journal pending".to_owned(),
+                            );
+                            error!(account_id = %account.account_id, error = %error, "effective live-mode transition committed but journal append failed");
+                            continue;
+                        }
                         if account.effective_live_mode == "live_tiny" && mode == "off" {
                             armed_count = armed_count.saturating_sub(1);
                         } else if account.effective_live_mode != "live_tiny" && mode == "live_tiny"
@@ -1247,7 +1537,25 @@ async fn drive_modes(state: &mut FanoutState, _now: OffsetDateTime) {
     }
 }
 
-async fn mode_probe(state: &FanoutState, account: &AccountContext) -> (CheckOutcome, StaticProbe) {
+fn mode_transition_reason(reason: &str) -> LiveModeTransitionReason {
+    if reason.starts_with("armed:") {
+        LiveModeTransitionReason::Armed
+    } else if reason.contains("operator requested") {
+        LiveModeTransitionReason::OperatorKill
+    } else if reason.contains("credential") {
+        LiveModeTransitionReason::CredentialInvalidated
+    } else if reason.contains("promotion_record") {
+        LiveModeTransitionReason::PromotionInvalidated
+    } else {
+        LiveModeTransitionReason::AccountClosedOnly
+    }
+}
+
+async fn mode_probe(
+    state: &mut FanoutState,
+    account: &AccountContext,
+    now: OffsetDateTime,
+) -> (CheckOutcome, StaticProbe) {
     let unavailable = StaticProbe {
         account: CheckOutcome::Transient("account query unavailable"),
         geoblock: CheckOutcome::Transient("geoblock query unavailable"),
@@ -1309,11 +1617,9 @@ async fn mode_probe(state: &FanoutState, account: &AccountContext) -> (CheckOutc
             );
         }
     };
-    let standard = venue.read_balance_and_allowance(false).await;
-    let neg_risk = venue.read_balance_and_allowance(true).await;
-    let (standard, neg_risk) = match (standard, neg_risk) {
-        (Ok(standard), Ok(neg_risk)) => (standard, neg_risk),
-        _ => return (CheckOutcome::Pass, unavailable),
+    let (standard, neg_risk) = match venue.account_states().await {
+        Ok(states) => states,
+        Err(_) => return (CheckOutcome::Pass, unavailable),
     };
     let account_outcome = if standard.closed_only || neg_risk.closed_only {
         CheckOutcome::PersistentFail("closed_only")
@@ -1353,6 +1659,14 @@ async fn mode_probe(state: &FanoutState, account: &AccountContext) -> (CheckOutc
         }
     };
     let balance = standard.collateral_balance.min(neg_risk.collateral_balance);
+    let inputs = state
+        .account_state_inputs
+        .entry(account.account_id.as_str().to_owned())
+        .or_default();
+    inputs.free_collateral = Some(balance.to_decimal());
+    inputs.last_reconciled_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok();
     let posture = arming_posture(
         sizing,
         balance,
@@ -1397,8 +1711,8 @@ fn arming_posture(sizing: SizingMode, balance: CollateralAmount, cap_bps: i32) -
 struct RedeemablePositionRow {
     condition_id: String,
     size: Decimal,
-    #[serde(default)]
-    neg_risk: Option<bool>,
+    #[serde(rename = "negativeRisk")]
+    neg_risk: bool,
 }
 
 /// Redemption discovery and submission remain fail-closed for every custody kind except the
@@ -1443,8 +1757,26 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
         };
         let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
             Ok(venue) => venue,
-            Err(_) => continue,
+            Err(error) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption venue unavailable: {error}"),
+                );
+                continue;
+            }
         };
+        let events = match replay_account(&state.config.journal_path, &account.account_id) {
+            Ok(events) => events,
+            Err(error) => {
+                error!(account_id = %account.account_id, error = %error, "redemption journal replay failed; attempt frozen");
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    "redemption journal unavailable; attempt frozen".to_owned(),
+                );
+                continue;
+            }
+        };
+        let mut attempts = reconstruct_redemption_attempts(&events);
         let positions = match fetch_redeemable_positions(state, &venue.deposit_wallet()).await {
             Ok(positions) => positions,
             Err(reason) => {
@@ -1452,121 +1784,88 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                     account.account_id.as_str().to_owned(),
                     format!("redemption inventory unavailable: {reason}"),
                 );
-                upsert_redemption_state(state, account, Decimal::ZERO, now).await;
                 continue;
             }
         };
-        if positions.is_empty() {
-            state
-                .closures
-                .redemption
-                .remove(account.account_id.as_str());
-            upsert_redemption_state(state, account, Decimal::ZERO, now).await;
-            continue;
-        }
         let unredeemed = positions
             .iter()
             .map(|position| position.size.max(Decimal::ZERO))
             .sum::<Decimal>();
-        let closure_reason = 'redemption: {
-            let Some(position) = positions.first() else {
-                break 'redemption "redeemable inventory could not be selected".to_owned();
-            };
-            let Some(custody) = custody_kind(account.custody_wallet_kind.as_deref()) else {
-                break 'redemption "redemption custody kind is missing or unknown".to_owned();
-            };
-            if custody != CustodyKind::DepositWallet {
-                break 'redemption format!(
-                    "redemption submission unsupported for {custody:?} custody"
+        capture_redemption_state(state, account, unredeemed, now);
+        if positions.is_empty() && attempts.is_empty() {
+            state
+                .closures
+                .redemption
+                .remove(account.account_id.as_str());
+            continue;
+        }
+
+        let Some(custody) = custody_kind(account.custody_wallet_kind.as_deref()) else {
+            state.closures.redemption.insert(
+                account.account_id.as_str().to_owned(),
+                "redemption custody kind is missing or unknown".to_owned(),
+            );
+            continue;
+        };
+        if custody != CustodyKind::DepositWallet {
+            state.closures.redemption.insert(
+                account.account_id.as_str().to_owned(),
+                format!("redemption submission unsupported for {custody:?} custody"),
+            );
+            continue;
+        }
+        let Some(api_key) = credentials.relayer_api_key.as_ref() else {
+            state.closures.redemption.insert(
+                account.account_id.as_str().to_owned(),
+                "redemption Relayer API key is unavailable".to_owned(),
+            );
+            continue;
+        };
+        let owner_signer = venue.owner_signer();
+        let relayer_credentials = RelayerCredentials::RelayerApiKey(RelayerApiKeyCredentials {
+            api_key: api_key.clone(),
+            address: owner_signer.clone(),
+        });
+        let policy = RelayerPollPolicy {
+            request_timeout: Duration::from_secs(10),
+            poll_interval: Duration::from_secs(2),
+            maximum_polls: 5,
+        };
+        let adapter = match LiveRedemptionAdapter::new(relayer_credentials, custody, policy) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption adapter unavailable: {error}"),
                 );
+                continue;
             }
-            let Some(api_key) = credentials.relayer_api_key.as_ref() else {
-                break 'redemption "redemption Relayer API key is unavailable".to_owned();
-            };
-            let owner_signer = venue.owner_signer();
-            let relayer_credentials = RelayerCredentials::RelayerApiKey(RelayerApiKeyCredentials {
-                api_key: api_key.clone(),
-                address: owner_signer.clone(),
-            });
-            let policy = RelayerPollPolicy {
-                request_timeout: Duration::from_secs(10),
-                poll_interval: Duration::from_secs(2),
-                maximum_polls: 5,
-            };
-            let adapter = match LiveRedemptionAdapter::new(relayer_credentials, custody, policy) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    break 'redemption format!("redemption adapter unavailable: {error}");
-                }
-            };
-            let custody_wallet = account
-                .custody_wallet_address
-                .clone()
-                .unwrap_or_else(|| venue.deposit_wallet());
-            if !custody_wallet.eq_ignore_ascii_case(&venue.deposit_wallet()) {
-                break 'redemption "redemption custody wallet does not match decrypted credentials"
-                    .to_owned();
-            }
-            let call = match build_redemption_call(
-                PolymarketConditionId(position.condition_id.clone()),
-                position.neg_risk.unwrap_or(false),
-            ) {
-                Ok(call) => call,
-                Err(error) => {
-                    break 'redemption format!("redemption call construction failed: {error}");
-                }
-            };
-            let nonce = match adapter.fetch_nonce(&owner_signer, custody).await {
-                Ok(nonce) => nonce,
-                Err(error) => {
-                    break 'redemption format!("redemption nonce unavailable: {error}");
-                }
-            };
-            let deadline_unix =
-                match u64::try_from(now.unix_timestamp())
-                    .ok()
-                    .and_then(|timestamp| {
-                        timestamp.checked_add(DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS)
-                    }) {
-                    Some(deadline) => deadline,
-                    None => break 'redemption "redemption deadline overflow".to_owned(),
-                };
-            let signed_request = match sign_deposit_wallet_redemption(
-                &credentials.private_key,
-                &call,
-                &custody_wallet,
-                &nonce.nonce,
-                deadline_unix,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    break 'redemption format!("redemption signing failed: {error}");
-                }
-            };
-            let request_hash =
-                match adapter.submission_body_hash(&signed_request, now.unix_timestamp()) {
-                    Ok(hash) => hash,
-                    Err(error) => {
-                        break 'redemption format!("redemption request validation failed: {error}");
-                    }
-                };
-            let attempt = RedemptionAttempt {
-                identity: RedemptionAttemptIdentity {
-                    account_id: account.account_id.clone(),
-                    condition_id: call.condition_id.clone(),
-                    adapter: call.to.clone(),
-                    custody_wallet,
-                },
-                state: RedemptionAttemptState::default(),
-            };
-            let redeemable = CollateralAmount::from_decimal_exact(
-                position
-                    .size
-                    .max(Decimal::ZERO)
-                    .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
-            )
-            .unwrap_or(CollateralAmount::ZERO);
-            match run_redemption_pass(
+        };
+        let custody_wallet = account
+            .custody_wallet_address
+            .clone()
+            .unwrap_or_else(|| venue.deposit_wallet());
+        if !custody_wallet.eq_ignore_ascii_case(&venue.deposit_wallet()) {
+            state.closures.redemption.insert(
+                account.account_id.as_str().to_owned(),
+                "redemption custody wallet does not match decrypted credentials".to_owned(),
+            );
+            continue;
+        }
+
+        let reconcile_first = attempts
+            .values()
+            .filter(|attempt| !redemption_needs_fresh_submission(&attempt.state, now))
+            .min_by(|left, right| {
+                left.identity
+                    .condition_id
+                    .0
+                    .cmp(&right.identity.condition_id.0)
+            })
+            .cloned();
+        if let Some(attempt) = reconcile_first {
+            let redeemable = redeemable_for_attempt(&positions, &attempt.identity);
+            let result = run_redemption_pass(
                 &adapter,
                 &adapter,
                 state.config.journal.as_ref(),
@@ -1574,32 +1873,217 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                     attempt,
                     now,
                     resolved_winner_redeemable: redeemable,
-                    signed_request: Some(&signed_request),
-                    request_hash: Some(&request_hash),
+                    signed_request: None,
+                    request_hash: None,
                     retry_not_before_on_failure: now
                         + time::Duration::seconds(REDEMPTION_RETRY_SECS),
                 },
             )
-            .await
-            {
-                Ok(result) => {
-                    let posture = redemption_posture(&result.attempt.state);
-                    if posture.surface_prominently {
-                        "redemption unresolved after repeated attempts".to_owned()
-                    } else if posture.closes_new_buy_admission {
-                        "redemption pending".to_owned()
-                    } else {
-                        "redeemable inventory awaiting balance reconciliation".to_owned()
-                    }
-                }
-                Err(error) => format!("redemption driver failed: {error}"),
+            .await;
+            let closure_reason = match result {
+                Ok(result) => redemption_closure_reason(result.attempt, redeemable, now),
+                Err(error) => Some(format!("redemption driver failed: {error}")),
+            };
+            set_redemption_closure(state, account, closure_reason);
+            continue;
+        }
+
+        let Some(position) = positions.first() else {
+            state
+                .closures
+                .redemption
+                .remove(account.account_id.as_str());
+            continue;
+        };
+        let call = match build_redemption_call(
+            PolymarketConditionId(position.condition_id.clone()),
+            position.neg_risk,
+        ) {
+            Ok(call) => call,
+            Err(error) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption call construction failed: {error}"),
+                );
+                continue;
             }
         };
+        let identity = RedemptionAttemptIdentity {
+            account_id: account.account_id.clone(),
+            condition_id: call.condition_id.clone(),
+            adapter: call.to.clone(),
+            custody_wallet: custody_wallet.clone(),
+        };
+        let attempt = attempts.remove(&identity).unwrap_or(RedemptionAttempt {
+            identity,
+            state: RedemptionAttemptState::default(),
+        });
+        let nonce = match adapter.fetch_nonce(&owner_signer, custody).await {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption nonce unavailable: {error}"),
+                );
+                continue;
+            }
+        };
+        let deadline_unix = match u64::try_from(now.unix_timestamp())
+            .ok()
+            .and_then(|timestamp| timestamp.checked_add(DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS))
+        {
+            Some(deadline) => deadline,
+            None => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    "redemption deadline overflow".to_owned(),
+                );
+                continue;
+            }
+        };
+        let signed_request = match sign_deposit_wallet_redemption(
+            &credentials.private_key,
+            &call,
+            &custody_wallet,
+            &nonce.nonce,
+            deadline_unix,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption signing failed: {error}"),
+                );
+                continue;
+            }
+        };
+        let request_hash = match adapter.submission_body_hash(&signed_request, now.unix_timestamp())
+        {
+            Ok(hash) => hash,
+            Err(error) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption request validation failed: {error}"),
+                );
+                continue;
+            }
+        };
+        let redeemable = redeemable_amount(position.size);
+        let closure_reason = match run_redemption_pass(
+            &adapter,
+            &adapter,
+            state.config.journal.as_ref(),
+            RedemptionPassInput {
+                attempt,
+                now,
+                resolved_winner_redeemable: redeemable,
+                signed_request: Some(&signed_request),
+                request_hash: Some(&request_hash),
+                retry_not_before_on_failure: now + time::Duration::seconds(REDEMPTION_RETRY_SECS),
+            },
+        )
+        .await
+        {
+            Ok(result) => redemption_closure_reason(result.attempt, redeemable, now),
+            Err(error) => Some(format!("redemption driver failed: {error}")),
+        };
+        set_redemption_closure(state, account, closure_reason);
+    }
+}
+
+fn redemption_needs_fresh_submission(state: &RedemptionAttemptState, now: OffsetDateTime) -> bool {
+    match state {
+        RedemptionAttemptState::Idle { .. } | RedemptionAttemptState::Complete { .. } => true,
+        RedemptionAttemptState::Failed {
+            retry_not_before, ..
+        } => now >= *retry_not_before,
+        RedemptionAttemptState::SubmissionReserved { .. }
+        | RedemptionAttemptState::InFlight { .. }
+        | RedemptionAttemptState::Ambiguous { .. }
+        | RedemptionAttemptState::ConfirmedAwaitingBalance { .. } => false,
+    }
+}
+
+fn redeemable_amount(size: Decimal) -> CollateralAmount {
+    CollateralAmount::from_decimal_exact(
+        size.max(Decimal::ZERO)
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
+    )
+    .unwrap_or(CollateralAmount::ZERO)
+}
+
+fn redeemable_for_attempt(
+    positions: &[RedeemablePositionRow],
+    identity: &RedemptionAttemptIdentity,
+) -> CollateralAmount {
+    positions
+        .iter()
+        .find(|position| position.condition_id == identity.condition_id.0)
+        .map_or(CollateralAmount::ZERO, |position| {
+            redeemable_amount(position.size)
+        })
+}
+
+fn redemption_closure_reason(
+    mut attempt: RedemptionAttempt,
+    redeemable: CollateralAmount,
+    now: OffsetDateTime,
+) -> Option<String> {
+    if matches!(
+        attempt.state,
+        RedemptionAttemptState::ConfirmedAwaitingBalance { .. }
+    ) && redeemable == CollateralAmount::ZERO
+    {
+        let (state, _) = advance(
+            attempt.state,
+            RedemptionEvent::BalanceReconciled {
+                reconciled_at: now,
+                credited_collateral: CollateralAmount::ZERO,
+                remaining_redeemable: CollateralAmount::ZERO,
+            },
+        );
+        attempt.state = state;
+    }
+    if matches!(
+        attempt.state,
+        RedemptionAttemptState::SubmissionReserved { .. }
+            | RedemptionAttemptState::Ambiguous {
+                transaction_id: None,
+                ..
+            }
+    ) {
+        error!(
+            account_id = %attempt.identity.account_id,
+            condition_id = %attempt.identity.condition_id.0,
+            "redemption submission identity cannot be reconstructed; attempt remains frozen"
+        );
+        return Some("redemption submission identity unavailable; attempt frozen".to_owned());
+    }
+    let posture = redemption_posture(&attempt.state);
+    if posture.surface_prominently {
+        Some("redemption unresolved after repeated attempts".to_owned())
+    } else if posture.closes_new_buy_admission {
+        Some("redemption pending".to_owned())
+    } else {
+        None
+    }
+}
+
+fn set_redemption_closure(
+    state: &mut FanoutState,
+    account: &AccountContext,
+    reason: Option<String>,
+) {
+    if let Some(reason) = reason {
         state
             .closures
             .redemption
-            .insert(account.account_id.as_str().to_owned(), closure_reason);
-        upsert_redemption_state(state, account, unredeemed, now).await;
+            .insert(account.account_id.as_str().to_owned(), reason);
+    } else {
+        state
+            .closures
+            .redemption
+            .remove(account.account_id.as_str());
     }
 }
 
@@ -1617,45 +2101,70 @@ async fn fetch_redeemable_positions(
     state: &FanoutState,
     wallet: &str,
 ) -> Result<Vec<RedeemablePositionRow>, &'static str> {
-    let url = format!(
-        "{}/positions?user={wallet}&redeemable=true&sizeThreshold=0&limit=500&offset=0",
-        state.config.data_base_url.trim_end_matches('/')
-    );
-    let response = state
-        .config
-        .http
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| "transport")?;
-    if !response.status().is_success() {
-        return Err("status");
-    }
-    response.json().await.map_err(|_| "decode")
+    fetch_redeemable_positions_from(&state.config.http, &state.config.data_base_url, wallet).await
 }
 
-async fn upsert_redemption_state(
-    state: &FanoutState,
+async fn fetch_redeemable_positions_from(
+    client: &reqwest::Client,
+    data_base_url: &str,
+    wallet: &str,
+) -> Result<Vec<RedeemablePositionRow>, &'static str> {
+    let mut positions = Vec::new();
+    for offset in (0..=REDEEMABLE_POSITION_MAX_OFFSET).step_by(REDEEMABLE_POSITION_PAGE_LIMIT) {
+        let url = format!(
+            "{}/positions?user={wallet}&redeemable=true&sizeThreshold=0&limit={REDEEMABLE_POSITION_PAGE_LIMIT}&offset={offset}",
+            data_base_url.trim_end_matches('/')
+        );
+        let response = client.get(url).send().await.map_err(|_| "transport")?;
+        if !response.status().is_success() {
+            return Err("status");
+        }
+        let page: Vec<serde_json::Value> = response.json().await.map_err(|_| "decode")?;
+        let page_len = page.len();
+        for (index, value) in page.into_iter().enumerate() {
+            match serde_json::from_value(value) {
+                Ok(position) => positions.push(position),
+                Err(parse_error) => {
+                    error!(
+                        wallet,
+                        offset,
+                        index,
+                        error = %parse_error,
+                        "redeemable position is unparseable; redemption pass fails closed"
+                    );
+                    return Err("unparseable position");
+                }
+            }
+        }
+        if page_len < REDEEMABLE_POSITION_PAGE_LIMIT {
+            return Ok(positions);
+        }
+        if offset == REDEEMABLE_POSITION_MAX_OFFSET {
+            error!(
+                wallet,
+                offset,
+                "redeemable positions pagination bound reached; redemption pass fails closed"
+            );
+            return Err("pagination bound reached");
+        }
+    }
+    Err("pagination bound reached")
+}
+
+fn capture_redemption_state(
+    state: &mut FanoutState,
     account: &AccountContext,
     unredeemed: Decimal,
     now: OffsetDateTime,
 ) {
-    let row = LiveAccountStateRow {
-        account_id: account.account_id.as_str().to_owned(),
-        free_collateral: Decimal::ZERO,
-        reserved: Decimal::ZERO,
-        unredeemed_value: unredeemed,
-        last_reconciled_at: now
-            .format(&time::format_description::well_known::Rfc3339)
-            .ok(),
-        admission_closed_reason: state
-            .closures
-            .reason(account.account_id.as_str())
-            .map(str::to_owned),
-    };
-    if let Err(error) = state.config.projection.upsert_account_state(&row).await {
-        warn!(account_id = %account.account_id, error = %error, "redemption posture projection failed");
-    }
+    let inputs = state
+        .account_state_inputs
+        .entry(account.account_id.as_str().to_owned())
+        .or_default();
+    inputs.unredeemed_value = Some(unredeemed);
+    inputs.last_reconciled_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok();
 }
 
 #[cfg(test)]
@@ -1666,6 +2175,15 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
 
+    use axum::extract::{Query, State};
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    use pe_core_types::{
+        ContractQty, LeaderAction, MarketId, OutcomeId, ProbabilityPpm, Quantity,
+        ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
+        WalletAddress,
+    };
     use pe_execution_core::{
         LiveAccountReadFailure, LiveOrderRejectKind, LivePostClassification, LivePostParseError,
         LiveVenueAccountReadError, LiveVenueAccountState, LiveVenuePreparationError,
@@ -1673,6 +2191,8 @@ mod tests {
         LiveVenueReconciliationError,
     };
     use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed};
+    use pe_venue_polymarket::NEGRISK_COLLATERAL_ADAPTER;
+    use rust_decimal_macros::dec;
     use tempfile::tempdir;
 
     use super::*;
@@ -1682,6 +2202,7 @@ mod tests {
         let matched = LiveOrderOutcome::Matched {
             order_hash: "hash".to_owned(),
             venue_order_id: "id".to_owned(),
+            executed: None,
         };
         let killed = LiveOrderOutcome::Killed {
             order_hash: "hash".to_owned(),
@@ -1718,6 +2239,34 @@ mod tests {
         assert!(due(None, 1_000, 30));
         assert!(!due(Some(990), 1_000, 30));
         assert!(due(Some(970), 1_000, 30));
+    }
+
+    #[test]
+    fn applied_mode_transition_reason_is_typed_for_the_journal() {
+        assert_eq!(
+            mode_transition_reason("armed: all checks passed"),
+            LiveModeTransitionReason::Armed
+        );
+        assert_eq!(
+            mode_transition_reason("demoted: credentials — invalid"),
+            LiveModeTransitionReason::CredentialInvalidated
+        );
+        assert_eq!(
+            mode_transition_reason("operator requested off/disabled"),
+            LiveModeTransitionReason::OperatorKill
+        );
+    }
+
+    #[test]
+    fn promotion_events_read_is_latest_first_and_bounded() {
+        let url = promotion_events_url("https://example.test/");
+        assert!(url.contains("order=created_at.desc"));
+        assert!(url.ends_with("limit=50"));
+    }
+
+    #[test]
+    fn redemption_reconcile_cadence_is_named_five_minutes() {
+        assert_eq!(REDEMPTION_RECONCILE_CADENCE_SECS, 300);
     }
 
     struct FakeVenue {
@@ -1846,6 +2395,262 @@ mod tests {
         (dir, db)
     }
 
+    fn projection_signal() -> LeaderSignal {
+        LeaderSignal {
+            leader: TraderId(WalletAddress([0xaa; 20])),
+            venue: VenueId::polymarket(),
+            market_id: MarketId(VenueMarketId(
+                "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_owned(),
+            )),
+            outcome_id: OutcomeId(0),
+            action: LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: Price(dec!(0.50)),
+            leader_size: Quantity(ContractQty(10)),
+            observed_at: OffsetDateTime::UNIX_EPOCH,
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: SourceTradeId("source-projection".to_owned()),
+            action_confidence_ppm: ProbabilityPpm(1_000_000),
+        }
+    }
+
+    fn projection_identity(dispatch_id: &str) -> LiveOrderIdentity {
+        let signal = projection_signal();
+        LiveOrderIdentity {
+            dispatch_id: dispatch_id.to_owned(),
+            idempotency_key: format!("{dispatch_id}:account"),
+            quote_id: "quote".to_owned(),
+            config_hash: "config".to_owned(),
+            decision_hash: "decision".to_owned(),
+            evidence_hashes: vec!["evidence".to_owned()],
+            fill_projection: Some(Box::new(LiveFillProjectionIdentity {
+                leader_wallet: signal.leader.to_string(),
+                source_trade_id: Some(signal.source_trade_id.0),
+                market_id: signal.market_id.to_string(),
+                outcome_id: i64::from(signal.outcome_id.0),
+                side: "buy".to_owned(),
+            })),
+            schema_version: 1,
+            parser_version: 1,
+        }
+    }
+
+    fn matched_projection_event(
+        account_id: &AccountId,
+        dispatch_id: &str,
+        seq: u64,
+    ) -> LiveJournalEvent {
+        LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq,
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                identity: projection_identity(dispatch_id),
+                order_hash: "order-hash".to_owned(),
+                source: LiveReconciliationSource::PostResponse,
+                outcome: LiveJournalOrderOutcome::Matched {
+                    venue_order_id: "venue-order".to_owned(),
+                    executed: Some(LiveExecutedAmounts {
+                        making_amount: dec!(4.00),
+                        taking_amount: dec!(10),
+                    }),
+                },
+                evidence: Vec::new(),
+                evidence_hashes: Vec::new(),
+            })),
+        }
+    }
+
+    #[test]
+    fn real_shape_negative_risk_position_selects_negrisk_adapter() {
+        let fixture = serde_json::json!({
+            "proxyWallet": "0x1111111111111111111111111111111111111111",
+            "asset": "123",
+            "conditionId": "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "size": 10,
+            "avgPrice": 0.42,
+            "redeemable": true,
+            "negativeRisk": true
+        });
+        let position: RedeemablePositionRow = serde_json::from_value(fixture).unwrap();
+        let call = build_redemption_call(
+            PolymarketConditionId(position.condition_id),
+            position.neg_risk,
+        )
+        .unwrap();
+        assert!(call.neg_risk);
+        assert_eq!(call.to, NEGRISK_COLLATERAL_ADAPTER);
+
+        let missing = serde_json::json!({
+            "conditionId": "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "size": 10
+        });
+        assert!(serde_json::from_value::<RedeemablePositionRow>(missing).is_err());
+    }
+
+    #[test]
+    fn journal_projection_reconcile_heals_dropped_write_and_deduplicates_dispatch() {
+        let (_dir, db) = db();
+        let account_id = AccountId::new("account").unwrap();
+        let dispatch_id = "dispatch-projection";
+        let events = vec![
+            matched_projection_event(&account_id, dispatch_id, 7),
+            matched_projection_event(&account_id, dispatch_id, 8),
+        ];
+        let rows = derive_projection_rows(&db, &account_id, &events).unwrap();
+        assert_eq!(rows.fills.len(), 1, "duplicate dispatch converges");
+        assert_eq!(rows.fills[0].contracts, dec!(10));
+        assert_eq!(
+            rows.fills[0].fill_price,
+            dec!(0.40),
+            "executed price improvement must replace the 0.50 plan quote"
+        );
+        assert_eq!(rows.fills[0].event_seq, 7);
+        assert_eq!(rows.positions.len(), 1);
+        assert_eq!(rows.positions[0].long_contracts, 10);
+        assert_eq!(rows.positions[0].cost_basis, dec!(4.00));
+    }
+
+    #[test]
+    fn confirmed_redemption_receipt_zeroes_the_derived_position() {
+        let (_dir, db) = db();
+        let account_id = AccountId::new("account").unwrap();
+        let dispatch_id = "dispatch-redeemed";
+        let signal = projection_signal();
+        let condition_id = signal.market_id.0.0.clone();
+        let receipt = LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 8,
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
+            payload: LiveJournalPayload::RedemptionReceiptTransition(Box::new(
+                pe_execution_core::RedemptionReceiptAudit {
+                    identity: RedemptionAttemptIdentity {
+                        account_id: account_id.clone(),
+                        condition_id: PolymarketConditionId(condition_id),
+                        adapter: NEGRISK_COLLATERAL_ADAPTER.to_owned(),
+                        custody_wallet: "0x1111111111111111111111111111111111111111".to_owned(),
+                    },
+                    attempt_count: 1,
+                    transaction_id: "tx".to_owned(),
+                    transaction_hash: Some("0xreceipt".to_owned()),
+                    status: pe_execution_core::RedemptionReceiptStatusAudit::Confirmed,
+                    evidence: Vec::new(),
+                    evidence_hashes: Vec::new(),
+                },
+            )),
+        };
+        let rows = derive_projection_rows(
+            &db,
+            &account_id,
+            &[
+                matched_projection_event(&account_id, dispatch_id, 7),
+                receipt,
+            ],
+        )
+        .unwrap();
+        assert_eq!(rows.positions[0].long_contracts, 0);
+        assert_eq!(rows.positions[0].cost_basis, Decimal::ZERO);
+    }
+
+    #[test]
+    fn single_account_state_writer_composes_dispatch_and_redemption_inputs() {
+        let inputs = AccountStateInputs {
+            free_collateral: Some(dec!(12.50)),
+            unredeemed_value: Some(dec!(3)),
+            last_reconciled_at: Some("2026-08-11T12:00:00Z".to_owned()),
+        };
+        let derived = ProjectionDerivation {
+            reserved: dec!(2.50),
+            ..ProjectionDerivation::default()
+        };
+        let row = compose_account_state_row(
+            "account",
+            Some(&inputs),
+            &derived,
+            Some("redemption pending".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(row.free_collateral, dec!(12.50));
+        assert_eq!(row.reserved, dec!(2.50));
+        assert_eq!(row.unredeemed_value, dec!(3));
+        assert_eq!(
+            row.admission_closed_reason.as_deref(),
+            Some("redemption pending")
+        );
+    }
+
+    #[test]
+    fn reconstructed_ambiguous_attempt_reconciles_before_nonce_path() {
+        let state = RedemptionAttemptState::Ambiguous {
+            attempt_count: 1,
+            transaction_id: Some("tx-existing".to_owned()),
+            submit_body_hash: "body".to_owned(),
+        };
+        assert!(!redemption_needs_fresh_submission(
+            &state,
+            OffsetDateTime::UNIX_EPOCH
+        ));
+    }
+
+    #[derive(Clone)]
+    struct PositionPageState {
+        offsets: Arc<Mutex<Vec<usize>>>,
+    }
+
+    async fn position_page(
+        State(state): State<PositionPageState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        let offset = query
+            .get("offset")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap();
+        assert_eq!(query.get("redeemable").map(String::as_str), Some("true"));
+        assert_eq!(query.get("limit").map(String::as_str), Some("500"));
+        state.offsets.lock().unwrap().push(offset);
+        let count = if offset == 0 { 500 } else { 1 };
+        Json(
+            (0..count)
+                .map(|index| {
+                    serde_json::json!({
+                        "conditionId": format!(
+                            "0x{index:064x}"
+                        ),
+                        "size": 1,
+                        "negativeRisk": index % 2 == 0
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn redeemable_positions_fetch_walks_offset_pages_to_exhaustion() {
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/positions", get(position_page))
+            .with_state(PositionPageState {
+                offsets: offsets.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let positions = fetch_redeemable_positions_from(
+            &client,
+            &format!("http://{address}"),
+            "0x1111111111111111111111111111111111111111",
+        )
+        .await
+        .unwrap();
+        assert_eq!(positions.len(), 501);
+        assert_eq!(*offsets.lock().unwrap(), vec![0, 500]);
+    }
+
     fn stage(db: &PaperStateDb, id: &str, created: i64, accounts: &[&str]) {
         db.stage_dispatch_seed(&DispatchSeedRecord {
             dispatch_id: id.to_owned(),
@@ -1891,6 +2696,7 @@ mod tests {
                         LiveOrderOutcome::Matched {
                             order_hash: target.account_id.clone(),
                             venue_order_id,
+                            executed: None,
                         }
                     }
                     LiveVenueReconciledOutcome::Killed { venue_order_id } => {

@@ -124,7 +124,7 @@ pub fn resume_dispatch_seeds(
         let FrozenLeader::Wallet(wallet) = frozen.signal.leader;
         let observed_unix = frozen.signal.observed_at.unix_timestamp();
         let cursor = paper_state.cursor(&wallet).context("read poll cursor")?;
-        let redelivery_possible = cursor.is_none_or(|c| c < observed_unix);
+        let redelivery_possible = redelivery_is_possible(cursor, observed_unix);
         if redelivery_possible {
             out.left_pending += 1;
         } else {
@@ -141,4 +141,20 @@ pub fn resume_dispatch_seeds(
         "dispatch seeds resumed at boot"
     );
     Ok(out)
+}
+
+fn redelivery_is_possible(cursor: Option<i64>, observed_unix: i64) -> bool {
+    cursor.is_none_or(|cursor| cursor <= observed_unix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redelivery_is_possible;
+
+    #[test]
+    fn cursor_equal_to_observed_boundary_remains_redeliverable() {
+        assert!(redelivery_is_possible(Some(1_700_000_000), 1_700_000_000));
+        assert!(redelivery_is_possible(Some(1_699_999_999), 1_700_000_000));
+        assert!(!redelivery_is_possible(Some(1_700_000_001), 1_700_000_000));
+    }
 }

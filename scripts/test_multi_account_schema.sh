@@ -62,8 +62,11 @@ expect_ok  "promotion review revoked"            "select account_revoke_promotio
 n=$(psql "$URL" -Atc "select count(*) from account_events where account_id='partner-2' and event_kind in ('promotion_reviewed','promotion_review_revoked')")
 if [ "$n" = "2" ]; then echo "PASS: review+revoke = two typed events"; else echo "FAIL: got $n review events"; fails=$((fails+1)); fi
 
-# 9. Credential rotation: sealed bundle never in events
+# 9. Credential rotation: sealed bundle never in events; version chain is CAS-enforced
+expect_err "rotation with a version gap rejected" "select account_rotate_credentials('partner-2', 3, 'key-1', 'X', 'fp', 't')"
 expect_ok  "credential rotation"                 "select account_rotate_credentials('partner-2', 1, 'key-1', 'AGE-SEALED-SECRET-BYTES', 'fp:ab12', 't')"
+expect_err "replayed same-version rotation rejected" "select account_rotate_credentials('partner-2', 1, 'key-1', 'Y', 'fp2', 't')"
+expect_ok  "next-version rotation accepted"      "select account_rotate_credentials('partner-2', 2, 'key-2', 'Z', 'fp3', 't')"
 leak=$(psql "$URL" -Atc "select count(*) from account_events where from_value like '%SEALED-SECRET%' or to_value like '%SEALED-SECRET%' or reason like '%SEALED-SECRET%'")
 if [ "$leak" = "0" ]; then echo "PASS: sealed bundle absent from event ledger"; else echo "FAIL: sealed bundle leaked to events"; fails=$((fails+1)); fi
 
