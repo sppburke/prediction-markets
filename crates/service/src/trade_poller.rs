@@ -128,12 +128,23 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                                 // still hold the cursor. Rescan via the strict
                                 // descending page endpoint with a FIXED end bound.
                                 if window.len() >= PAGE_ROWS {
-                                    match self.paged_window(wallet, start).await {
+                                    // Data-derived fixed end bound (deterministic; `end`
+                                    // is inclusive): the rescan proves (start, end];
+                                    // anything newer arrives next round.
+                                    let end = window
+                                        .iter()
+                                        .map(|t| t.observed_at.unix_timestamp())
+                                        .max()
+                                        .unwrap_or(0);
+                                    match self.paged_window(wallet, start, end).await {
                                         Some(paged) => window = paged,
                                         None => window_complete = false,
                                     }
                                 }
-                                if self.deliver_and_advance(wallet, window, window_complete).await {
+                                if self
+                                    .deliver_and_advance(wallet, window, window_complete)
+                                    .await
+                                {
                                     // Channel closed; orchestrator is shutting down.
                                     return;
                                 }
@@ -162,8 +173,8 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
         &self,
         wallet: pe_core_types::WalletAddress,
         start: Option<i64>,
+        end: i64,
     ) -> Option<Vec<IncomingTrade>> {
-        let end = OffsetDateTime::now_utc().unix_timestamp().saturating_add(1);
         let mut seen_ids = HashSet::new();
         let mut out = Vec::new();
         for page in 0..POLLER_MAX_PAGES {
@@ -236,7 +247,10 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
             let ts = trade.observed_at.unix_timestamp();
             max_ts = Some(max_ts.map_or(ts, |m: i64| m.max(ts)));
             // Read failure ⇒ treat as unseen (fail closed: hold rather than lose).
-            let is_seen = self.paper_state.is_seen(&trade.source_trade_id).unwrap_or(false);
+            let is_seen = self
+                .paper_state
+                .is_seen(&trade.source_trade_id)
+                .unwrap_or(false);
             if !is_seen {
                 min_unseen = Some(min_unseen.map_or(ts, |m: i64| m.min(ts)));
                 if now_unix.saturating_sub(ts) > HELD_WARN_AFTER_SECS {
@@ -282,7 +296,11 @@ const HELD_WARN_AFTER_SECS: i64 = 3_600;
 /// #511 cursor decision, pure for tests: `None` = freeze/no-write (incomplete window or
 /// empty page); `Some(min_unseen − 1)` = hold below the oldest unseen trade;
 /// `Some(max_ts)` = the whole window is seen — advance.
-fn cursor_advance(max_ts: Option<i64>, min_unseen: Option<i64>, window_complete: bool) -> Option<i64> {
+fn cursor_advance(
+    max_ts: Option<i64>,
+    min_unseen: Option<i64>,
+    window_complete: bool,
+) -> Option<i64> {
     if !window_complete {
         return None;
     }
@@ -306,6 +324,19 @@ fn cursor_start(cursor: Option<i64>) -> Option<i64> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::cursor_start;
+
+    #[test]
+    fn cursor_advance_holds_below_oldest_unseen() {
+        // All seen → advance to max.
+        assert_eq!(super::cursor_advance(Some(100), None, true), Some(100));
+        // One unseen at 90 → hold at 89 (boundary-second refetch keeps ts==90 reachable).
+        assert_eq!(super::cursor_advance(Some(100), Some(90), true), Some(89));
+        // Incomplete window (malformed row / failed or capped paged rescan) → freeze.
+        assert_eq!(super::cursor_advance(Some(100), Some(90), false), None);
+        assert_eq!(super::cursor_advance(Some(100), None, false), None);
+        // Empty page → no write.
+        assert_eq!(super::cursor_advance(None, None, true), None);
+    }
 
     #[test]
     fn cursor_start_steps_back_one_second_to_cover_the_boundary() {

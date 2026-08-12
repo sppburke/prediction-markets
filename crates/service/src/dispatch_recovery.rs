@@ -18,7 +18,7 @@
 //! Recovery only ever FLIPS existing staged seeds — it never reconstructs dispatch state
 //! from current accounts or configuration (the frozen `signal_json` is the sole identity).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};

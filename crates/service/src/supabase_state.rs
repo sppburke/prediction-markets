@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
 use pe_paper_pnl::ResolutionStore;
-use pe_paper_state::{FillRow, 
-    FillRecord, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
+use pe_paper_state::{
+    FillRecord, FillRow, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -68,31 +68,6 @@ const fn side_str(side: Side) -> &'static str {
     }
 }
 
-/// Parse a PostgREST scalar-RPC return (a JSON string or number) into a [`Decimal`] — never
-/// via `f64`. `NULL` maps to [`SupabaseStateError::Null`].
-fn decimal_from_rpc(
-    v: &serde_json::Value,
-    what: &'static str,
-) -> Result<Decimal, SupabaseStateError> {
-    match v {
-        serde_json::Value::String(s) => {
-            Decimal::from_str(s.trim()).map_err(|_| SupabaseStateError::Corrupt(s.clone()))
-        }
-        // The RPCs `RETURN text`, so a bare number is unexpected. Accept an exact integer
-        // without ever touching `f64` (CLAUDE.md: no f64 for money); refuse a float rather
-        // than round-trip it lossily.
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(Decimal::from)
-            .or_else(|| n.as_u64().map(Decimal::from))
-            .ok_or_else(|| {
-                SupabaseStateError::Corrupt(format!("{what}: non-integer numeric RPC return {n}"))
-            }),
-        serde_json::Value::Null => Err(SupabaseStateError::Null(what)),
-        other => Err(SupabaseStateError::Corrupt(other.to_string())),
-    }
-}
-
 /// The canonical fill the authority holds for an idempotency key (#511): the
 /// `commit_fill_v2` `row` payload, parsed fail-closed. On `existing`, `event_seq` is the
 /// ORIGINAL frame's — the local mirror must record THESE fields, not the retry's.
@@ -107,10 +82,16 @@ pub struct CanonicalFill {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FillV2Outcome {
     /// Newly applied under this key.
-    Applied { bankroll: Decimal, row: CanonicalFill },
+    Applied {
+        bankroll: Decimal,
+        row: CanonicalFill,
+    },
     /// The key already existed (an earlier attempt landed — including ambiguously);
     /// `row` is the canonical fill to converge on.
-    Existing { bankroll: Decimal, row: CanonicalFill },
+    Existing {
+        bankroll: Decimal,
+        row: CanonicalFill,
+    },
     /// The market is settled and the key absent: refused, nothing inserted.
     Settled { bankroll: Decimal },
 }
@@ -362,7 +343,9 @@ fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
     let d = Decimal::from_str_exact(raw)
         .map_err(|e| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {e}")))?;
     if d < Decimal::ZERO {
-        return Err(SupabaseStateError::Corrupt(format!("{what}: negative {raw:?}")));
+        return Err(SupabaseStateError::Corrupt(format!(
+            "{what}: negative {raw:?}"
+        )));
     }
     Ok(d)
 }
@@ -372,15 +355,18 @@ fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateErro
         "buy" => Side::Buy,
         "sell" => Side::Sell,
         other => {
-            return Err(SupabaseStateError::Corrupt(format!("v2 row side {other:?}")));
+            return Err(SupabaseStateError::Corrupt(format!(
+                "v2 row side {other:?}"
+            )));
         }
     };
     let contracts = u64::try_from(row.contracts)
         .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row contracts {}", row.contracts)))?;
     let event_seq = u64::try_from(row.event_seq)
         .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row event_seq {}", row.event_seq)))?;
-    let outcome_id = u16::try_from(row.outcome_id)
-        .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row outcome_id {}", row.outcome_id)))?;
+    let outcome_id = u16::try_from(row.outcome_id).map_err(|_| {
+        SupabaseStateError::Corrupt(format!("v2 row outcome_id {}", row.outcome_id))
+    })?;
     Ok(CanonicalFill {
         record: FillRecord {
             idempotency_key: row.idempotency_key,
@@ -523,17 +509,16 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     let mut local = Ok(());
     for attempt in 1u32..=3 {
         local = match &outcome {
-            FillV2Outcome::Applied { bankroll, row } | FillV2Outcome::Existing { bankroll, row } => {
-                paper_state.commit_fill_canonical(
-                    Some(source_trade_id),
-                    Some(leader),
-                    &row.record,
-                    row.event_seq,
-                    seq,
-                    *bankroll,
-                    flip,
-                )
-            }
+            FillV2Outcome::Applied { bankroll, row }
+            | FillV2Outcome::Existing { bankroll, row } => paper_state.commit_fill_canonical(
+                Some(source_trade_id),
+                Some(leader),
+                &row.record,
+                row.event_seq,
+                seq,
+                *bankroll,
+                flip,
+            ),
             FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill(
                 source_trade_id,
                 Some(leader),
@@ -656,8 +641,8 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
         SupabaseStateError::Corrupt(format!("open event log {}: {e}", event_log_path.display()))
     })?;
     for frame in replay {
-        let (seq, envelope) = frame
-            .map_err(|e| SupabaseStateError::Corrupt(format!("read event-log frame: {e}")))?;
+        let (seq, envelope) =
+            frame.map_err(|e| SupabaseStateError::Corrupt(format!("read event-log frame: {e}")))?;
         let seq_i = i64::try_from(seq.0).unwrap_or(i64::MAX);
         if seq_i <= new_wm {
             continue;

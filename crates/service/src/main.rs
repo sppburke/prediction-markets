@@ -1105,7 +1105,10 @@ async fn tick_resolution(
                 .settle_and_credit_from_positions(
                     &res.market_id,
                     &serde_json::to_string(
-                        &res.outcome_prices.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        &res.outcome_prices
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
                     )
                     .context("encode outcome prices")?,
                     now_unix,

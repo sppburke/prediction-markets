@@ -298,3 +298,60 @@ mod tests {
         assert!(ledger.position(&w).is_some());
     }
 }
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects
+)]
+mod restore_tests {
+    use super::*;
+    use pe_core_types::{MarketId, OutcomeId, VenueMarketId};
+
+    #[test]
+    fn restore_is_the_exact_inverse_of_one_ingest() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xm".into())), OutcomeId(0));
+        let mut ledger = PositionLedger::new();
+        let trade = |contracts: u64, side: Side| IncomingTrade {
+            wallet,
+            market_id: MarketId(VenueMarketId("0xm".into())),
+            outcome_id: OutcomeId(0),
+            side,
+            price: pe_core_types::Price(rust_decimal::Decimal::ONE),
+            contracts: pe_core_types::ContractQty(contracts),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            received_at: time::OffsetDateTime::UNIX_EPOCH,
+            source_trade_id: pe_core_types::SourceTradeId("t".into()),
+        };
+        // Entry created by the trade → restore(None) removes it entirely.
+        ledger.ingest(&trade(10, Side::Buy));
+        ledger.restore(wallet, &key, None);
+        assert!(
+            !ledger
+                .position(&wallet)
+                .unwrap()
+                .positions
+                .contains_key(&key)
+        );
+        // Existing position: capture, mutate via a partially-covering BUY, restore exactly.
+        ledger.ingest(&trade(4, Side::Sell)); // short 4
+        let prev = ledger
+            .position(&wallet)
+            .unwrap()
+            .positions
+            .get(&key)
+            .map(|st| (st.long_contracts, st.short_contracts));
+        assert_eq!(prev, Some((0, 4)));
+        ledger.ingest(&trade(10, Side::Buy)); // covers 4, long 6 — NOT trivially invertible
+        ledger.restore(wallet, &key, prev);
+        let st = ledger
+            .position(&wallet)
+            .unwrap()
+            .positions
+            .get(&key)
+            .cloned()
+            .unwrap();
+        assert_eq!((st.long_contracts, st.short_contracts), (0, 4));
+    }
+}

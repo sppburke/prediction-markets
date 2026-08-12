@@ -243,7 +243,9 @@ impl PaperStateDb {
         // Guarded ALTER (idempotent across reopens); CREATE IF NOT EXISTS above cannot
         // add a column to a pre-existing table.
         let has_activity: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('poll_cursors') WHERE name = 'last_activity_unix'")?
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('poll_cursors') WHERE name = 'last_activity_unix'",
+            )?
             .exists([])?;
         if !has_activity {
             conn.execute(
@@ -1094,7 +1096,11 @@ impl PaperStateDb {
     /// MAX-advance `wallet`'s activity clock (#511). UPDATE-only: a wallet with no
     /// cursor row keeps none (a fabricated delivery cursor would unhold an unbounded
     /// first fetch); the knockout treats a missing row as just-admitted, which is safe.
-    pub fn set_activity(&self, wallet: &WalletAddress, ts_unix: i64) -> Result<(), PaperStateError> {
+    pub fn set_activity(
+        &self,
+        wallet: &WalletAddress,
+        ts_unix: i64,
+    ) -> Result<(), PaperStateError> {
         let conn = self.lock();
         conn.execute(
             "UPDATE poll_cursors              SET last_activity_unix = MAX(COALESCE(last_activity_unix, 0), ?2)              WHERE wallet_hex = ?1",
@@ -1847,7 +1853,7 @@ mod tests {
             )
             .unwrap();
         // 1000 - (0.40 * 10) = 996
-        assert_eq!(new, dec!(996.0));
+        assert_eq!(new, FillCommitOutcome::Applied(dec!(996.0)));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(996.0)));
         assert!(db.is_seen(&id).unwrap());
         assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(7));
@@ -1877,7 +1883,7 @@ mod tests {
                 EventSeq(2),
             )
             .unwrap();
-        assert_eq!(new, dec!(97.40));
+        assert_eq!(new, FillCommitOutcome::Applied(dec!(97.40)));
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos[0].long_contracts, 6);
     }
@@ -1895,7 +1901,7 @@ mod tests {
                 EventSeq(1),
             )
             .unwrap();
-        assert_eq!(new, Decimal::ZERO);
+        assert_eq!(new, FillCommitOutcome::Applied(Decimal::ZERO));
         assert_eq!(db.bankroll().unwrap(), Some(Decimal::ZERO));
     }
 
@@ -1920,7 +1926,7 @@ mod tests {
                 EventSeq(2),
             )
             .unwrap();
-        assert_eq!(new, dec!(995.0));
+        assert_eq!(new, FillCommitOutcome::Applied(dec!(995.0)));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(995.0)));
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos[0].long_contracts, 10);
@@ -1960,6 +1966,35 @@ mod tests {
         // last_applied advanced to 4 by commit_fill, so reconcile finds nothing to do.
         assert!(!db.reconcile_fill(&f, EventSeq(4)).unwrap());
         assert_eq!(db.bankroll().unwrap(), Some(dec!(995.0)));
+    }
+
+    #[test]
+    fn seed_if_absent_preserves_held_cursor_and_max_seeds_activity() {
+        let (_dir, db) = db();
+        let w = wallet();
+        // Vacancy: seed lands as both cursor and activity.
+        db.seed_cursor_if_absent(&w, 100).unwrap();
+        assert_eq!(db.cursor(&w).unwrap(), Some(100));
+        assert_eq!(db.activity(&w).unwrap(), Some(100));
+        // A held cursor is NEVER jumped by a later (higher) seed — activity still MAXes.
+        db.seed_cursor_if_absent(&w, 500).unwrap();
+        assert_eq!(
+            db.cursor(&w).unwrap(),
+            Some(100),
+            "delivery cursor preserved (#511)"
+        );
+        assert_eq!(db.activity(&w).unwrap(), Some(500), "activity MAX-seeded");
+        // Activity is MAX-only and UPDATE-only (no row → no fabricated cursor).
+        db.set_activity(&w, 400).unwrap();
+        assert_eq!(db.activity(&w).unwrap(), Some(500));
+        let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        db.set_activity(&other, 999).unwrap();
+        assert_eq!(
+            db.cursor(&other).unwrap(),
+            None,
+            "no delivery cursor fabricated"
+        );
+        assert_eq!(db.activity(&other).unwrap(), None);
     }
 
     #[test]

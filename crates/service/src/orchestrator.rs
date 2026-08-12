@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig, classify_trade};
-use pe_core_types::{SourceTradeId, 
+use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, MarketOutcomeId, Price, Probability,
-    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
+    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
+    WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
@@ -42,7 +43,9 @@ use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::{self, FillMode, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
 use crate::supabase_sink::{SinkHandle, SupabaseFillRow, supabase_fill_from};
-use crate::supabase_state::{AuthoritativeFillOutcome, SupabaseStateClient, commit_fill_authoritative};
+use crate::supabase_state::{
+    AuthoritativeFillOutcome, SupabaseStateClient, commit_fill_authoritative,
+};
 
 /// Hot-path `/book` fetch timeout for the price-impact gate (#398 WS2). Tighter than the worker's
 /// 5 s per-request timeout so a slow book fails open (no cap) without stalling the trade.
@@ -67,7 +70,6 @@ enum GatePlan {
     /// best ask anchors the shared band gate.
     NothingAffordable { best_ask: Price },
 }
-
 
 /// Captured pre-admission state for exact rollback (#511): the leader ledger's
 /// pre-trade `(long, short)` for the touched key, or `None` when the trade created it.
@@ -679,8 +681,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             prev: position
                 .as_ref()
                 .and_then(|s| {
-                    s.positions
-                        .get(&MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id))
+                    s.positions.get(&MarketOutcomeId::new(
+                        trade.market_id.clone(),
+                        trade.outcome_id,
+                    ))
                 })
                 .map(|st| (st.long_contracts, st.short_contracts)),
         };
@@ -701,7 +705,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             &self.signal_config,
         ) else {
             // No signal: still mark seen + mirror the leader ledger (AC2).
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None).await;
+            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
+                .await;
             return;
         };
 
@@ -719,7 +724,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 leader_price = %signal.leader_price.0,
                 "signal did not produce order",
             );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None).await;
+            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
+                .await;
             return;
         }
         // Record the admitted BUY entry so a same-session re-entry into this market is
@@ -751,7 +757,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     resolution_unix = ?resolution_unix,
                     "signal did not produce order",
                 );
-                self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "",
+                    &rb,
+                    Some(&signal.market_id),
+                )
                 .await;
                 return;
             }
@@ -782,8 +795,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
-                    self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        "",
+                        &rb,
+                        Some(&signal.market_id),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -807,8 +827,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
-                    self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        "",
+                        &rb,
+                        Some(&signal.market_id),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -855,8 +882,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         leader_price = %signal.leader_price.0,
                         "signal did not produce order",
                     );
-                    self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        "",
+                        &rb,
+                        Some(&signal.market_id),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1194,7 +1228,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             contracts: fill.intent.contracts.0,
             fill_price: fill.simulated_fill_price,
         };
-        let filled_key = MarketOutcomeId::new(fill.intent.market_id.clone(), fill.intent.outcome_id);
+        let filled_key =
+            MarketOutcomeId::new(fill.intent.market_id.clone(), fill.intent.outcome_id);
 
         // Authoritative path (issue #397): Supabase RPC first, then SQLite mirror. The client
         // and Arc are cloned (cheap) so neither borrows `self` across the `.await`.
@@ -1359,10 +1394,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     ) -> PaperCommitResult {
         let Some(supabase) = self.supabase_state.clone() else {
             // Legacy: the frozen local commit is the terminal protocol.
-            let flip = parked.dispatch_id.as_deref().map(|id| pe_paper_state::DispatchFlip {
-                dispatch_id: id,
-                paper_outcome: "fill",
-            });
+            let flip = parked
+                .dispatch_id
+                .as_deref()
+                .map(|id| pe_paper_state::DispatchFlip {
+                    dispatch_id: id,
+                    paper_outcome: "fill",
+                });
             return match self.paper_state.commit_fill_with_flip(
                 &source_trade_id,
                 &parked.leader,
@@ -1391,10 +1429,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return PaperCommitResult::Parked;
         };
         let paper_state = self.paper_state.clone();
-        let flip = parked.dispatch_id.as_deref().map(|id| pe_paper_state::DispatchFlip {
-            dispatch_id: id,
-            paper_outcome: "fill",
-        });
+        let flip = parked
+            .dispatch_id
+            .as_deref()
+            .map(|id| pe_paper_state::DispatchFlip {
+                dispatch_id: id,
+                paper_outcome: "fill",
+            });
         match commit_fill_authoritative(
             &supabase,
             &paper_state,
@@ -1403,7 +1444,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             &parked.record,
             parked.seq,
             sup_row,
-        flip,
+            flip,
         )
         .await
         {
