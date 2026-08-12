@@ -39,6 +39,18 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio_postgres::{Client, NoTls};
 
+/// The pg tests share one database and nextest runs each test in its OWN PROCESS — an
+/// in-process mutex cannot serialize them. A session-scoped Postgres advisory lock does:
+/// the returned connection holds it for the test's lifetime and releases it on drop.
+async fn pg_lock(url: &str) -> Client {
+    let client = connect(url).await;
+    client
+        .batch_execute("select pg_advisory_lock(715_511)")
+        .await
+        .unwrap();
+    client
+}
+
 const LEADER_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const START: &str = "100000";
 
@@ -151,6 +163,7 @@ async fn pg_parity_and_concurrency() {
         );
         return;
     };
+    let _guard = pg_lock(&url).await;
     let client = connect(&url).await;
 
     // ── PG-PARITY: SQL commit_fill == PaperStateDb::commit_fill over a fill mix ──────────
@@ -189,6 +202,9 @@ async fn pg_parity_and_concurrency() {
                 EventSeq(seq as u64),
             )
             .unwrap();
+        let pe_paper_state::FillCommitOutcome::Applied(rust_bankroll) = rust_bankroll else {
+            panic!("parity fixture never settles markets mid-mix");
+        };
         let pg_bankroll = sql_commit_fill(
             &client,
             key,
@@ -298,6 +314,7 @@ async fn pg_cas_predicated_update_rehearsal() {
         );
         return;
     };
+    let _guard = pg_lock(&url).await;
     let client = connect(&url).await;
     // Isolated key: never a seeded production row, so this cannot race pg_parity.
     client
@@ -380,4 +397,214 @@ async fn pg_cas_predicated_update_rehearsal() {
         .await
         .unwrap();
     println!("PASS: PG-CAS — predicated service_config UPDATE aborts on a concurrent edit (#508)");
+}
+
+/// Call `commit_fill_v2`; return the raw jsonb as serde_json::Value.
+#[allow(clippy::too_many_arguments)]
+async fn sql_commit_fill_v2(
+    client: &Client,
+    key: &str,
+    market: &str,
+    price: &str,
+    seq: i64,
+) -> serde_json::Value {
+    let row = client
+        .query_one(
+            "select commit_fill_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)::text",
+            &[
+                &key,
+                &LEADER_HEX,
+                &"src",
+                &market,
+                &0i32,
+                &"buy",
+                &10i64,
+                &price,
+                &0i64,
+                &seq,
+            ],
+        )
+        .await
+        .unwrap();
+    serde_json::from_str(&row.get::<_, String>(0)).unwrap()
+}
+
+/// PG-511-V2: v2 outcome protocol on live PL/pgSQL — applied parity with v1 arithmetic,
+/// `existing` returns the CANONICAL row (even after later settlement), `settled` refuses
+/// absent keys, and `apply_resolution_v2` computes the credit in-RPC from paper_positions.
+#[tokio::test]
+async fn pg_511_v2_outcomes_and_in_rpc_credit() {
+    let Ok(url) = std::env::var("PE_TEST_PG_URL") else {
+        eprintln!("SKIP: PE_TEST_PG_URL unset");
+        return;
+    };
+    let _guard = pg_lock(&url).await;
+    let client = connect(&url).await;
+    reset(&client, "1000").await;
+
+    // applied: 1000 − 10×0.40 = 996; row carries the canonical fields.
+    let v = sql_commit_fill_v2(&client, "wf|k1", "0xmkt", "0.40", 0).await;
+    assert_eq!(v["outcome"], "applied");
+    assert_eq!(dec(v["bankroll"].as_str().unwrap()), dec!(996.0));
+    assert_eq!(v["row"]["event_seq"], 0);
+
+    // existing: same key, re-priced retry at a NEW seq → canonical (original) row wins.
+    let v = sql_commit_fill_v2(&client, "wf|k1", "0xmkt", "0.55", 7).await;
+    assert_eq!(v["outcome"], "existing");
+    assert_eq!(v["row"]["fill_price"].as_str().unwrap(), "0.40");
+    assert_eq!(v["row"]["event_seq"], 0);
+    assert_eq!(dec(v["bankroll"].as_str().unwrap()), dec!(996.0));
+
+    // resolution v2: credit computed IN-RPC from paper_positions (10 long × 1 = 10).
+    let row = client
+        .query_one(
+            "select apply_resolution_v2($1,$2::text::jsonb,$3)::text",
+            &[&"0xmkt", &r#"["1","0"]"#, &100i64],
+        )
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0)).unwrap();
+    assert_eq!(r["outcome"], "applied");
+    assert_eq!(r["credit"].as_str().unwrap(), "10");
+    assert_eq!(dec(r["bankroll"].as_str().unwrap()), dec!(1006.0));
+
+    // idempotent retry: existing + canonical recorded values, no double credit.
+    let row = client
+        .query_one(
+            "select apply_resolution_v2($1,$2::text::jsonb,$3)::text",
+            &[&"0xmkt", &r#"["1","0"]"#, &999i64],
+        )
+        .await
+        .unwrap();
+    let r: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0)).unwrap();
+    assert_eq!(r["outcome"], "existing");
+    assert_eq!(r["credit"].as_str().unwrap(), "10");
+    assert_eq!(r["settled_at_unix"], 100);
+    assert_eq!(dec(r["bankroll"].as_str().unwrap()), dec!(1006.0));
+
+    // settled refusal: a NEW key into the settled market is refused, nothing inserted.
+    let v = sql_commit_fill_v2(&client, "wf|k2", "0xmkt", "0.30", 8).await;
+    assert_eq!(v["outcome"], "settled");
+    assert!(v["row"].is_null());
+    assert_eq!(dec(v["bankroll"].as_str().unwrap()), dec!(1006.0));
+    // existing STILL wins over settlement (ordering).
+    let v = sql_commit_fill_v2(&client, "wf|k1", "0xmkt", "0.99", 9).await;
+    assert_eq!(v["outcome"], "existing");
+    println!("PASS: PG-511-V2 — applied/existing/settled + in-RPC credit on live PL/pgSQL");
+}
+
+/// PG-511-CONC: genuinely OVERLAPPING fill and resolution transactions, both orders. The
+/// bankroll-row lock taken FIRST serializes admission: fill-first ⇒ its position is in the
+/// resolution's in-RPC read (credited); resolution-first ⇒ the settled row is visible to
+/// the fill's check (refused). Money is conserved in both interleavings.
+#[tokio::test]
+async fn pg_511_concurrent_fill_vs_resolution_conserves_money() {
+    let Ok(url) = std::env::var("PE_TEST_PG_URL") else {
+        eprintln!("SKIP: PE_TEST_PG_URL unset");
+        return;
+    };
+    let _guard = pg_lock(&url).await;
+    for fill_first in [true, false] {
+        let a = connect(&url).await;
+        reset(&a, "1000").await;
+        drop(a);
+
+        const FILL_SQL: &str =
+            "select commit_fill_v2('wf|kc','0xled','src','0xmkt',0,'buy',10,'0.40',0,0)::text";
+        const RES_SQL: &str =
+            "select apply_resolution_v2('0xmkt','[\"1\",\"0\"]'::jsonb,100)::text";
+        let (first_sql, second_sql) = if fill_first {
+            (FILL_SQL, RES_SQL)
+        } else {
+            (RES_SQL, FILL_SQL)
+        };
+
+        // Session 1: begin, run its statement (takes the bankroll lock), HOLD uncommitted.
+        let s1 = connect(&url).await;
+        s1.batch_execute("begin").await.unwrap();
+        s1.query_one(first_sql, &[]).await.unwrap();
+
+        // Session 2 (own task, owns its client): begins and issues the other statement,
+        // which BLOCKS on the bankroll lock until session 1 commits.
+        let url2 = url.clone();
+        let second = tokio::spawn(async move {
+            let s2 = connect(&url2).await;
+            s2.batch_execute("begin").await.unwrap();
+            let v = s2.query_one(second_sql, &[]).await.unwrap();
+            s2.batch_execute("commit").await.unwrap();
+            v.get::<_, String>(0)
+        });
+        // Give session 2 time to reach the lock (a genuine overlap), then release.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "session 2 must be blocked on the bankroll lock"
+        );
+        s1.batch_execute("commit").await.unwrap();
+        let _second_json = second.await.unwrap();
+
+        let check = connect(&url).await;
+        let bankroll = dec(&check
+            .query_one("select bankroll_str from paper_bankroll where id = 0", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0));
+        let fills: i64 = check
+            .query_one("select count(*) from paper_fills", &[])
+            .await
+            .unwrap()
+            .get(0);
+        if fill_first {
+            // Fill held the lock first ⇒ applied (996), and the blocked resolution then
+            // saw its position ⇒ credited 10 ⇒ 1006. The fill can NEVER be settled-over.
+            assert_eq!(fills, 1);
+            assert_eq!(bankroll, dec!(1006.0), "fill-first: applied AND credited");
+        } else {
+            // Resolution held the lock first ⇒ settled with zero positions; the blocked
+            // fill then saw the settled row ⇒ refused. No debit, no credit, no orphan.
+            assert_eq!(fills, 0);
+            assert_eq!(bankroll, dec!(1000), "resolution-first: fill refused");
+        }
+        println!(
+            "PASS: PG-511-CONC fill_first={fill_first} → fills={fills}, bankroll={bankroll} (conserved)"
+        );
+    }
+}
+
+/// PG-511-ACL: the v2 RPCs are service-role-only (public/anon/authenticated revoked).
+#[tokio::test]
+async fn pg_511_v2_acl_service_role_only() {
+    let Ok(url) = std::env::var("PE_TEST_PG_URL") else {
+        eprintln!("SKIP: PE_TEST_PG_URL unset");
+        return;
+    };
+    let _guard = pg_lock(&url).await;
+    let client = connect(&url).await;
+    for (role, expect) in [
+        ("anon", false),
+        ("authenticated", false),
+        ("service_role", true),
+    ] {
+        let row = client
+            .query_one(
+                "select has_function_privilege($1, \
+                 'commit_fill_v2(text,text,text,text,integer,text,bigint,text,bigint,bigint)', \
+                 'execute'), has_function_privilege($1, \
+                 'apply_resolution_v2(text,jsonb,bigint)', 'execute')",
+                &[&role],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<_, bool>(0),
+            expect,
+            "commit_fill_v2 acl for {role}"
+        );
+        assert_eq!(
+            row.get::<_, bool>(1),
+            expect,
+            "apply_resolution_v2 acl for {role}"
+        );
+    }
+    println!("PASS: PG-511-ACL — v2 RPCs are service-role-only");
 }

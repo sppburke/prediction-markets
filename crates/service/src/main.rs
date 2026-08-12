@@ -215,25 +215,26 @@ async fn main() -> Result<()> {
     paper_state
         .init_bankroll(configured_bankroll)
         .context("initialise paper-state bankroll")?;
-    let reconciled = reconcile_paper_state(&cfg.event_log_path, &paper_state)
-        .context("reconcile paper-state from event log")?;
-    if reconciled > 0 {
-        info!(
-            reconciled,
-            "replayed uncommitted fills from event log on startup"
-        );
+    // #511: LEGACY-ONLY blind frame replay. In authoritative mode the boot frame-walk
+    // below owns local application — every unresolved frame is decided by the authority
+    // (`commit_fill_v2`), so a refused frame can never resurrect locally. The blind
+    // replay would apply such frames unconditionally.
+    if !cfg.supabase_authoritative {
+        let reconciled = reconcile_paper_state(&cfg.event_log_path, &paper_state)
+            .context("reconcile paper-state from event log")?;
+        if reconciled > 0 {
+            info!(
+                reconciled,
+                "replayed uncommitted fills from event log on startup"
+            );
+        }
     }
-    // #508 Decision 10: resume staged dispatch aggregates AFTER fill accounting healed —
-    // flip seeds whose fill frame is durable, finalize stuck seeds, leave redeliverable
-    // seeds pending. Recovery only flips existing seeds; it never reconstructs targets.
-    pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
-        .context("resume dispatch seeds")?;
 
     // Supabase authoritative client (issue #397): built only when the flag is set. It is the
     // sole writer of `paper_fills`/`settled_markets` (the best-effort `run_sink` is not spawned
-    // below), and runs the boot catch-up-then-pull so the bankroll/positions read just after
+    // below), and runs the boot frame-walk-then-pull so the bankroll/positions read just after
     // reflect the Supabase source of truth. Fail-closed: requires the service-role secret, and
-    // a catch-up/pull error aborts boot (refuse to run authoritative without the authority).
+    // a walk/pull error aborts boot (refuse to run authoritative without the authority).
     let supabase_state = if cfg.supabase_authoritative {
         anyhow::ensure!(
             !cfg.supabase_url.is_empty(),
@@ -250,9 +251,9 @@ async fn main() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
-        supabase_authoritative_boot(&client, &paper_state)
+        supabase_authoritative_boot(&client, &paper_state, &cfg.event_log_path)
             .await
-            .context("supabase authoritative boot (catch-up then pull)")?;
+            .context("supabase authoritative boot (frame-walk then pull)")?;
         info!(
             "supabase authoritative mode active: paper-state writes through to Supabase (system of record)"
         );
@@ -260,6 +261,12 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // #508 Decision 10 (#511: AFTER frame dispositions exist in either mode): resume staged
+    // dispatch aggregates — flip seeds whose fill frame reached a disposition, finalize
+    // stuck seeds, leave redeliverable seeds pending. Never reconstructs targets.
+    pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
+        .context("resume dispatch seeds")?;
 
     let bankroll = paper_state
         .bankroll()
@@ -305,14 +312,15 @@ async fn main() -> Result<()> {
         let seeded = snapshot_map.len();
         leader_ledger.overlay(snapshot_map.clone());
         // Seed each bootstrapped wallet's poll cursor from its real last-trade time (#357).
-        // Cursor writes are monotonic, so this establishes the inactivity clock for new/older
-        // rows without regressing a newer cursor already advanced by polling. A wallet absent
+        // #511: the DELIVERY cursor seeds insert-only (an existing — possibly held — cursor
+        // is a valid lower bound and must never be jumped); the ACTIVITY clock MAX-seeds,
+        // establishing the inactivity clock for new/older rows. A wallet absent
         // from the side-map (a NULL `last_trade_unix` ranking column) keeps its persisted cursor;
         // a never-seeded `None` cursor self-heals via the poller's first unbounded fetch and is
         // never reset to `now` (no admission grace).
         let mut cursor_seeded = 0usize;
         for (wallet, last_trade_unix) in &bootstrap_last_trade {
-            if let Err(e) = paper_state.set_cursor(wallet, *last_trade_unix) {
+            if let Err(e) = paper_state.seed_cursor_if_absent(wallet, *last_trade_unix) {
                 tracing::warn!(wallet = %wallet, error = %e, "failed to seed startup cursor from last_trade_unix");
             } else {
                 cursor_seeded += 1;
@@ -842,6 +850,15 @@ fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
 /// The idempotency-key PK backstop and organic cursor re-warm cover the gaps on restart.
 fn run_rebuild_state() -> Result<()> {
     let cfg = load_config()?;
+    // #511: frame-only reconstruction cannot know authority dispositions (a refused or
+    // ambiguously-failed frame would resurrect locally and diverge from Supabase).
+    // Rebuild is a LEGACY-mode tool.
+    anyhow::ensure!(
+        !cfg.supabase_authoritative,
+        "--rebuild-state is refused in authoritative mode (PE_SUPABASE_AUTHORITATIVE=true): \
+         local frame replay cannot know authority dispositions. Restore locally by restarting \
+         the service — the boot frame-walk converges SQLite on the Supabase system of record."
+    );
     let db_path = &cfg.paper_state_db_path;
 
     // Back up before wiping so the user can recover from an accidental rebuild.
@@ -863,6 +880,16 @@ fn run_rebuild_state() -> Result<()> {
     paper_state
         .init_bankroll(configured_bankroll)
         .context("init bankroll")?;
+
+    // #511: restore the settled-markets authority from the backup BEFORE replaying, so
+    // replay refuses fills into already-settled markets instead of resurrecting
+    // never-creditable positions.
+    if backup_path.exists() {
+        let restored = paper_state
+            .restore_settled_markets_from(&backup_path)
+            .context("restore settled_markets from backup")?;
+        println!("  settled markets restored: {restored}");
+    }
 
     // last_applied_event_seq = None on a fresh DB → reconcile_paper_state replays all frames.
     let applied =
@@ -1039,46 +1066,64 @@ async fn tick_resolution(
             .filter(|p| p.market_id == res.market_id)
             .cloned()
             .collect();
-        let credit = PnlLedger::resolution_credit(&market_positions, &res.outcome_prices);
+        let credit;
         if let Some(sup) = supabase_state {
-            // Authoritative (issue #397): apply the `apply_resolution` RPC FIRST (atomic
-            // settled-guard + bankroll credit, exactly-once), then mirror to SQLite. On RPC
-            // error, leave the market unsettled locally so the next tick retries (fail-closed).
-            if let Err(e) = apply_resolution_authoritative(
+            // Authoritative (#397/#511): `apply_resolution_v2` FIRST — the credit is
+            // computed INSIDE the RPC from `paper_positions` under the bankroll lock
+            // (closing the read-then-resolve TOCTOU with fills), then mirrored to SQLite
+            // with the RETURNED canonical values. On RPC error, leave the market
+            // unsettled locally so the next tick retries (fail-closed).
+            let _ = &market_positions; // authoritative credit is server-computed (#511)
+            match apply_resolution_authoritative(
                 sup,
                 &mut store,
                 &res.market_id,
                 &res.outcome_prices,
-                credit,
                 now_unix,
             )
             .await
             {
-                tracing::warn!(
-                    error = %e,
-                    market = %res.market_id,
-                    "authoritative apply_resolution failed; leaving unsettled for next-tick retry"
-                );
-                continue;
+                Ok(_bankroll) => {
+                    credit = store
+                        .settled_credit(&res.market_id)
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        market = %res.market_id,
+                        "authoritative apply_resolution failed; leaving unsettled for next-tick retry"
+                    );
+                    continue;
+                }
             }
         } else {
-            // Legacy (SQLite-authoritative): mark settled before crediting the bankroll, so a
-            // crash after `mark_settled` but before `credit_bankroll` leaves the market marked
-            // settled — the next poll skips it (under-credit, not over-credit). The reverse
-            // order would double-credit on restart.
+            // Legacy (#511): settle + credit in ONE SQLite transaction, the credit
+            // computed inside it from freshly-read positions — a fill committing between
+            // an outside read and the settle can no longer be silently uncredited.
+            let (applied_credit, _bankroll) = paper_state
+                .settle_and_credit_from_positions(
+                    &res.market_id,
+                    &serde_json::to_string(
+                        &res.outcome_prices
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>(),
+                    )
+                    .context("encode outcome prices")?,
+                    now_unix,
+                    |positions| PnlLedger::resolution_credit(positions, &res.outcome_prices),
+                )
+                .context("settle and credit")?;
+            credit = applied_credit;
             store
-                .mark_settled(
+                .note_settled(
                     res.market_id.clone(),
                     res.outcome_prices.clone(),
-                    credit,
+                    applied_credit,
                     now_unix,
                 )
-                .context("mark settled")?;
-            if credit > rust_decimal::Decimal::ZERO {
-                paper_state
-                    .credit_bankroll(credit)
-                    .context("credit bankroll")?;
-            }
+                .context("note settled")?;
         }
         tracing::info!(market = %res.market_id, %credit, "resolution applied");
     }

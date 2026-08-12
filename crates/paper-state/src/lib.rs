@@ -84,9 +84,19 @@ pub struct PaperPositionRow {
     pub short_contracts: u64,
 }
 
+/// Outcome of a local fill commit (#511). Both arms carry the post-commit bankroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillCommitOutcome {
+    /// The fill applied (or was an already-applied duplicate key; no double-count).
+    Applied(Decimal),
+    /// The market is already settled: seen + typed flip written, no fill applied —
+    /// a fill here could never be credited (`settle_and_credit` retries credit zero).
+    RefusedSettled(Decimal),
+}
+
 /// A paper fill to record. Built by the service tier from the executed `OrderIntent`
 /// and the `PaperFill` returned by the executor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillRecord {
     pub idempotency_key: String,
     pub market_id: MarketId,
@@ -229,6 +239,20 @@ impl PaperStateDb {
         if found == 0 {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        // #511 additive migration: split the activity clock from the delivery cursor.
+        // Guarded ALTER (idempotent across reopens); CREATE IF NOT EXISTS above cannot
+        // add a column to a pre-existing table.
+        let has_activity: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('poll_cursors') WHERE name = 'last_activity_unix'",
+            )?
+            .exists([])?;
+        if !has_activity {
+            conn.execute(
+                "ALTER TABLE poll_cursors ADD COLUMN last_activity_unix INTEGER",
+                [],
+            )?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -302,14 +326,16 @@ impl PaperStateDb {
     /// of issue #282 Open risk #6), the position and bankroll are **not** applied
     /// twice. `mark_seen`/`upsert_leader` still run, since they concern this trade.
     ///
-    /// Returns the post-fill bankroll so the caller can keep its in-memory copy in sync.
+    /// Returns the commit outcome; both arms carry the post-commit bankroll so the
+    /// caller can keep its in-memory copy in sync (#511: `RefusedSettled` = the market
+    /// already settled — seen + typed flip written, no fill applied).
     pub fn commit_fill(
         &self,
         source_trade_id: &SourceTradeId,
         leader: &LeaderPositionRow,
         fill: &FillRecord,
         fill_seq: EventSeq,
-    ) -> Result<Decimal, PaperStateError> {
+    ) -> Result<FillCommitOutcome, PaperStateError> {
         self.commit_fill_with_flip(source_trade_id, leader, fill, fill_seq, None)
     }
 
@@ -324,11 +350,30 @@ impl PaperStateDb {
         fill: &FillRecord,
         fill_seq: EventSeq,
         flip: Option<DispatchFlip<'_>>,
-    ) -> Result<Decimal, PaperStateError> {
+    ) -> Result<FillCommitOutcome, PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id)?;
         tx_upsert_leader(&tx, leader)?;
+        // #511: no fill may enter a settled market — the resolution for it already ran
+        // and can never credit the position (`settle_and_credit` retries credit zero).
+        // Checked INSIDE the transaction: the single-connection mutex serializes this
+        // against the local settle txn, so there is no check-then-commit window.
+        if tx_is_settled(&tx, &fill.market_id)? {
+            if let Some(flip) = flip {
+                tx_flip_dispatch_ready(
+                    &tx,
+                    DispatchFlip {
+                        dispatch_id: flip.dispatch_id,
+                        paper_outcome: "no_fill:market_settled",
+                    },
+                )?;
+            }
+            tx_set_last_applied_max(&tx, fill_seq)?;
+            let bankroll = tx_read_bankroll(&tx)?;
+            tx.commit()?;
+            return Ok(FillCommitOutcome::RefusedSettled(bankroll));
+        }
         let inserted = tx_record_fill(&tx, fill, fill_seq)?;
         let bankroll = if inserted {
             tx_apply_our_position(&tx, fill)?;
@@ -343,7 +388,87 @@ impl PaperStateDb {
             tx_flip_dispatch_ready(&tx, flip)?;
         }
         tx.commit()?;
-        Ok(bankroll)
+        Ok(FillCommitOutcome::Applied(bankroll))
+    }
+
+    /// Terminal disposition for a frame the authority refused (settled market) or a
+    /// runtime settled-refusal (#511): seen + optional leader mirror + typed dispatch
+    /// flip + `last_applied = max(·, seq)` — no fills row, no money. Boot replay then
+    /// early-skips the frame forever, and the Supabase watermark successor-advances
+    /// over it. `leader` is `None` on the boot path (the frame does not carry the
+    /// long/short mirror; it refreshes on the wallet's next processed trade).
+    pub fn commit_refused_fill(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: Option<&LeaderPositionRow>,
+        seq: EventSeq,
+        flip: Option<DispatchFlip<'_>>,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx_mark_seen(&tx, source_trade_id)?;
+        if let Some(leader) = leader {
+            tx_upsert_leader(&tx, leader)?;
+        }
+        if let Some(flip) = flip {
+            tx_flip_dispatch_ready(&tx, flip)?;
+        }
+        tx_set_last_applied_max(&tx, seq)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Convergence transaction for an authority-confirmed fill (#511): mirror the
+    /// CANONICAL row the `commit_fill_v2` RPC returned — on `existing`, the canonical
+    /// `event_seq` differs from the current frame's — and SET the bankroll to the
+    /// authority-returned value (never re-derived locally). One transaction: seen +
+    /// optional leader mirror + canonical fill row (INSERT OR IGNORE by key, position
+    /// applied only when newly inserted) + bankroll SET + dispatch flip +
+    /// `last_applied = max(·, current_seq)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_fill_canonical(
+        &self,
+        source_trade_id: Option<&SourceTradeId>,
+        leader: Option<&LeaderPositionRow>,
+        fill: &FillRecord,
+        canonical_seq: EventSeq,
+        current_seq: EventSeq,
+        canonical_bankroll: Decimal,
+        flip: Option<DispatchFlip<'_>>,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if let Some(id) = source_trade_id {
+            tx_mark_seen(&tx, id)?;
+        }
+        if let Some(leader) = leader {
+            tx_upsert_leader(&tx, leader)?;
+        }
+        let inserted = tx_record_fill(&tx, fill, canonical_seq)?;
+        if inserted {
+            tx_apply_our_position(&tx, fill)?;
+        }
+        tx_set_bankroll(&tx, canonical_bankroll)?;
+        if let Some(flip) = flip {
+            tx_flip_dispatch_ready(&tx, flip)?;
+        }
+        tx_set_last_applied_max(&tx, current_seq)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `true` when a fill row exists for `idempotency_key` (#511: dispatch recovery
+    /// flips by disposition — fills row = "fill"; disposed row-less frame = refused).
+    pub fn fill_exists(&self, idempotency_key: &str) -> Result<bool, PaperStateError> {
+        let conn = self.lock();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM fills WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Replay a logged fill whose SQLite commit was lost to a crash between the
@@ -358,7 +483,8 @@ impl PaperStateDb {
     /// `seen_trades`/`leader_positions` are **not** restored here (they are never
     /// written to the event log); a mid-crash trade's leader-ledger effect and
     /// seen-mark self-heal when the poll backstop re-delivers it (the `fills`
-    /// PK then blocks a duplicate fill). See issue #282 Open risk #7.
+    /// PK then blocks a duplicate fill). Since #511 that redelivery is GUARANTEED:
+    /// the poll cursor never advances past an unseen trade (#282 Open risk #7, closed).
     ///
     /// Returns `true` if this call newly applied the fill.
     pub fn reconcile_fill(
@@ -373,6 +499,15 @@ impl PaperStateDb {
         if let Some(last_applied) = tx_last_applied(&tx)?
             && fill_seq.0 <= last_applied
         {
+            tx.commit()?;
+            return Ok(false);
+        }
+        // #511: never resurrect a fill into a settled market — the resolution already ran
+        // and can never credit it. Advance the cursor (terminal disposition) without
+        // applying. Covers legacy replay and `--rebuild-state` (which restores
+        // `settled_markets` from its backup before replaying).
+        if tx_is_settled(&tx, &fill.market_id)? {
+            tx_set_last_applied(&tx, fill_seq)?;
             tx.commit()?;
             return Ok(false);
         }
@@ -765,6 +900,15 @@ impl PaperStateDb {
         Ok(EventSeq(read_last_applied(&conn)?.unwrap_or(0)))
     }
 
+    /// Absent-vs-zero variant of [`last_applied_event_seq`](Self::last_applied_event_seq)
+    /// (#511): `None` = no disposition has ever advanced the cursor (fresh DB), which is
+    /// distinct from `Some(0)` = seq 0 disposed. Dispatch recovery uses this to avoid
+    /// misreading an undisposed seq-0 frame as a settled refusal.
+    pub fn last_applied_event_seq_opt(&self) -> Result<Option<EventSeq>, PaperStateError> {
+        let conn = self.lock();
+        Ok(read_last_applied(&conn)?.map(EventSeq))
+    }
+
     /// The highest event-log `seq` whose fill has been applied to the **authoritative
     /// Supabase** `commit_fill` RPC (issue #397). `None` = the meta row is ABSENT — no
     /// fill has ever been confirmed (fresh DB, or after a SQLite loss, forcing a safe
@@ -934,6 +1078,73 @@ impl PaperStateDb {
         Ok(())
     }
 
+    /// Newest trade timestamp ever observed for `wallet` (#511 activity clock), or
+    /// `None` (no row / unmigrated / never observed). Feeds the inactivity knockout;
+    /// callers fall back to [`cursor`](Self::cursor) on `None`.
+    pub fn activity(&self, wallet: &WalletAddress) -> Result<Option<i64>, PaperStateError> {
+        let conn = self.lock();
+        let ts: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT last_activity_unix FROM poll_cursors WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ts.flatten())
+    }
+
+    /// MAX-advance `wallet`'s activity clock (#511). UPDATE-only: a wallet with no
+    /// cursor row keeps none (a fabricated delivery cursor would unhold an unbounded
+    /// first fetch); the knockout treats a missing row as just-admitted, which is safe.
+    pub fn set_activity(
+        &self,
+        wallet: &WalletAddress,
+        ts_unix: i64,
+    ) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE poll_cursors              SET last_activity_unix = MAX(COALESCE(last_activity_unix, 0), ?2)              WHERE wallet_hex = ?1",
+            params![wallet.to_string(), ts_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Seed `wallet`'s delivery cursor ONLY when it has none (#511): an existing cursor
+    /// — held or not — is already a valid lower bound and must never be jumped by a
+    /// startup/admission seed. Seeds the activity clock too (MAX via the insert value).
+    pub fn seed_cursor_if_absent(
+        &self,
+        wallet: &WalletAddress,
+        ts_unix: i64,
+    ) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)              VALUES (?1, ?2, ?2)              ON CONFLICT(wallet_hex) DO UPDATE SET                 last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0),                                          excluded.last_activity_unix)",
+            params![wallet.to_string(), ts_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Batch [`seed_cursor_if_absent`](Self::seed_cursor_if_absent) in one transaction
+    /// (membership admission publishes all-or-none, mirroring `set_cursors`).
+    pub fn seed_cursors_if_absent(
+        &self,
+        cursors: &[(WalletAddress, i64)],
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)                  VALUES (?1, ?2, ?2)                  ON CONFLICT(wallet_hex) DO UPDATE SET                     last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0),                                              excluded.last_activity_unix)",
+            )?;
+            for (wallet, ts_unix) in cursors {
+                statement.execute(params![wallet.to_string(), ts_unix])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ── Settled markets (resolution double-credit guard) ──────────────────────
 
     /// Record a settled market, **idempotent** on `market_id` (`ON CONFLICT DO NOTHING`):
@@ -972,6 +1183,88 @@ impl PaperStateDb {
     /// tick calls the RPC first, then this. Gating the credit on the settled-row insert
     /// (not just `ON CONFLICT DO NOTHING` on the marker) is what makes a reload-then-retry
     /// idempotent — the marker no-ops but the credit must not re-run.
+    /// Copy the `settled_markets` rows from another paper-state DB (#511 rebuild): the
+    /// rebuild wipes the DB before replaying, which would discard the very authority that
+    /// lets replay refuse fills into settled markets. Restores rows verbatim (idempotent).
+    pub fn restore_settled_markets_from(&self, other: &Path) -> Result<usize, PaperStateError> {
+        let src = Connection::open_with_flags(other, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut rows = Vec::new();
+        {
+            let mut statement = src.prepare(
+                "SELECT market_id, outcome_prices, credit_applied, settled_at_unix \
+                 FROM settled_markets",
+            )?;
+            let mapped = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for r in mapped {
+                rows.push(r?);
+            }
+        }
+        let n = rows.len();
+        let conn = self.lock();
+        for (market, prices, credit, at) in rows {
+            conn.execute(
+                "INSERT INTO settled_markets \
+                    (market_id, outcome_prices, credit_applied, settled_at_unix) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(market_id) DO NOTHING",
+                params![market, prices, credit, at],
+            )?;
+        }
+        Ok(n)
+    }
+
+    /// Legacy-mode settle (#511): compute the credit **inside** the settle transaction
+    /// from freshly-read positions, closing the read-then-settle TOCTOU (a fill
+    /// committing between an outside read and the settle could never be credited).
+    /// `credit_fn` is pure (e.g. `PnlLedger::resolution_credit`); it sees the market's
+    /// positions as of this transaction. Returns `(credit_applied, bankroll)`;
+    /// `(0, bankroll)` when the market was already settled.
+    pub fn settle_and_credit_from_positions<F>(
+        &self,
+        market_id: &MarketId,
+        outcome_prices_json: &str,
+        settled_at_unix: i64,
+        credit_fn: F,
+    ) -> Result<(Decimal, Decimal), PaperStateError>
+    where
+        F: FnOnce(&[PaperPositionRow]) -> Decimal,
+    {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if tx_is_settled(&tx, market_id)? {
+            let bankroll = tx_read_bankroll(&tx)?;
+            tx.commit()?;
+            return Ok((Decimal::ZERO, bankroll));
+        }
+        let positions = tx_positions_for_market(&tx, market_id)?;
+        let credit = credit_fn(&positions);
+        tx.execute(
+            "INSERT INTO settled_markets \
+                (market_id, outcome_prices, credit_applied, settled_at_unix) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(market_id) DO NOTHING",
+            params![
+                market_id.to_string(),
+                outcome_prices_json,
+                credit.to_string(),
+                settled_at_unix,
+            ],
+        )?;
+        let current = tx_read_bankroll(&tx)?;
+        let new = current
+            .checked_add(credit)
+            .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
+        tx_set_bankroll(&tx, new)?;
+        tx.commit()?;
+        Ok((credit, new))
+    }
+
     pub fn settle_and_credit(
         &self,
         market_id: &MarketId,
@@ -1292,6 +1585,75 @@ fn tx_read_bankroll(tx: &Transaction<'_>) -> Result<Decimal, PaperStateError> {
     }
 }
 
+/// `last_applied = max(last_applied, seq)` — monotone disposition advance (#511):
+/// canonical/refused dispositions must never regress the replay cursor.
+fn tx_set_last_applied_max(tx: &Transaction<'_>, seq: EventSeq) -> Result<(), PaperStateError> {
+    let current = tx_last_applied(tx)?.unwrap_or(0);
+    let target = seq.0.max(current);
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_LAST_APPLIED_EVENT_SEQ, to_i64(target)?],
+    )?;
+    Ok(())
+}
+
+/// SET the bankroll to an authority-provided canonical value (#511) — never derived.
+fn tx_set_bankroll(tx: &Transaction<'_>, bankroll: Decimal) -> Result<(), PaperStateError> {
+    tx.execute(
+        "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
+        params![BANKROLL_ROW_ID, bankroll.to_string()],
+    )?;
+    Ok(())
+}
+
+/// `true` when `market_id` is in `settled_markets` — the #511 fill-refusal guard,
+/// transaction-scoped so the single-connection mutex serializes it with settles.
+fn tx_is_settled(tx: &Transaction<'_>, market_id: &MarketId) -> Result<bool, PaperStateError> {
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM settled_markets WHERE market_id = ?1",
+            params![market_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// The market's position rows as of this transaction (#511 in-txn resolution credit).
+fn tx_positions_for_market(
+    tx: &Transaction<'_>,
+    market_id: &MarketId,
+) -> Result<Vec<PaperPositionRow>, PaperStateError> {
+    let mut statement = tx.prepare(
+        "SELECT market_id, outcome_id, long_contracts, short_contracts \
+         FROM positions WHERE market_id = ?1",
+    )?;
+    let rows = statement.query_map(params![market_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (market, outcome, long, short) = row?;
+        out.push(PaperPositionRow {
+            market_id: MarketId(pe_core_types::VenueMarketId(market)),
+            outcome_id: OutcomeId(
+                u16::try_from(outcome)
+                    .map_err(|_| PaperStateError::Internal(format!("outcome_id {outcome}")))?,
+            ),
+            long_contracts: parse_u64(long)?,
+            short_contracts: parse_u64(short)?,
+        });
+    }
+    Ok(out)
+}
+
 fn tx_set_last_applied(tx: &Transaction<'_>, seq: EventSeq) -> Result<(), PaperStateError> {
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2) \
@@ -1491,7 +1853,7 @@ mod tests {
             )
             .unwrap();
         // 1000 - (0.40 * 10) = 996
-        assert_eq!(new, dec!(996.0));
+        assert_eq!(new, FillCommitOutcome::Applied(dec!(996.0)));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(996.0)));
         assert!(db.is_seen(&id).unwrap());
         assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(7));
@@ -1521,7 +1883,7 @@ mod tests {
                 EventSeq(2),
             )
             .unwrap();
-        assert_eq!(new, dec!(97.40));
+        assert_eq!(new, FillCommitOutcome::Applied(dec!(97.40)));
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos[0].long_contracts, 6);
     }
@@ -1539,7 +1901,7 @@ mod tests {
                 EventSeq(1),
             )
             .unwrap();
-        assert_eq!(new, Decimal::ZERO);
+        assert_eq!(new, FillCommitOutcome::Applied(Decimal::ZERO));
         assert_eq!(db.bankroll().unwrap(), Some(Decimal::ZERO));
     }
 
@@ -1564,7 +1926,7 @@ mod tests {
                 EventSeq(2),
             )
             .unwrap();
-        assert_eq!(new, dec!(995.0));
+        assert_eq!(new, FillCommitOutcome::Applied(dec!(995.0)));
         assert_eq!(db.bankroll().unwrap(), Some(dec!(995.0)));
         let pos = db.paper_positions().unwrap();
         assert_eq!(pos[0].long_contracts, 10);
@@ -1604,6 +1966,35 @@ mod tests {
         // last_applied advanced to 4 by commit_fill, so reconcile finds nothing to do.
         assert!(!db.reconcile_fill(&f, EventSeq(4)).unwrap());
         assert_eq!(db.bankroll().unwrap(), Some(dec!(995.0)));
+    }
+
+    #[test]
+    fn seed_if_absent_preserves_held_cursor_and_max_seeds_activity() {
+        let (_dir, db) = db();
+        let w = wallet();
+        // Vacancy: seed lands as both cursor and activity.
+        db.seed_cursor_if_absent(&w, 100).unwrap();
+        assert_eq!(db.cursor(&w).unwrap(), Some(100));
+        assert_eq!(db.activity(&w).unwrap(), Some(100));
+        // A held cursor is NEVER jumped by a later (higher) seed — activity still MAXes.
+        db.seed_cursor_if_absent(&w, 500).unwrap();
+        assert_eq!(
+            db.cursor(&w).unwrap(),
+            Some(100),
+            "delivery cursor preserved (#511)"
+        );
+        assert_eq!(db.activity(&w).unwrap(), Some(500), "activity MAX-seeded");
+        // Activity is MAX-only and UPDATE-only (no row → no fabricated cursor).
+        db.set_activity(&w, 400).unwrap();
+        assert_eq!(db.activity(&w).unwrap(), Some(500));
+        let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        db.set_activity(&other, 999).unwrap();
+        assert_eq!(
+            db.cursor(&other).unwrap(),
+            None,
+            "no delivery cursor fabricated"
+        );
+        assert_eq!(db.activity(&other).unwrap(), None);
     }
 
     #[test]

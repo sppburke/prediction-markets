@@ -237,7 +237,7 @@ pub struct ServiceConfig {
     // ── Supabase authoritative paper-state (issue #397) ───────────────────────
     /// Make Supabase the authoritative system of record for paper-state (issue #397).
     /// When `true`: a paper fill writes the `commit_fill` RPC first (fail-closed — on error
-    /// the trade is skipped, the event log holds the fill and replays on restart), then
+    /// the fill is parked and the frozen record retries via v2 — #511), then
     /// mirrors to SQLite; resolutions go through the `apply_resolution` RPC; boot does a
     /// catch-up-then-pull against Supabase; and the best-effort `run_sink` is NOT spawned
     /// (the RPCs are the sole writer of `paper_fills`/`settled_markets`). When `false`

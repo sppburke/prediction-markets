@@ -172,6 +172,158 @@ end;
 $$;
 
 -- ════════════════════════════════════════════════════════════════════════════
+-- #511 v2 RPCs — the authority owns fill admission and resolution credit.
+--
+-- Serialization: BOTH functions lock the paper_bankroll singleton FIRST (the global
+-- money mutex; ~100 fills/wk makes this free). Locking last only serializes the
+-- arithmetic, not admission: under READ COMMITTED a fill's settled-check and a
+-- resolution's position-read could each run before the other's commit. Lock-first
+-- makes the two strictly serial: fill-first ⇒ its position is visible to the
+-- resolution's in-function read (credited); resolution-first ⇒ the settled row is
+-- visible to the fill's check (refused).
+--
+-- v1 (`commit_fill`, `apply_resolution`) is RETAINED for the binary-rollout window and
+-- as the rollback path; revoke it in a later cycle once the #511 binary has soaked.
+-- ════════════════════════════════════════════════════════════════════════════
+
+-- Atomic fill commit v2. Order matters (#511 R3): an existing idempotency_key returns
+-- its CANONICAL row even if the market has since settled (the earlier attempt landed;
+-- the caller must converge on it); only an absent key can be refused as settled.
+-- Returns jsonb: {outcome: 'applied'|'existing'|'settled', bankroll: text, row: {...}|null}
+-- (money as decimal strings; `row` carries the canonical paper_fills fields).
+create or replace function commit_fill_v2(
+  p_idempotency_key text,
+  p_leader_wallet   text,
+  p_source_trade_id text,
+  p_market_id       text,
+  p_outcome_id      integer,
+  p_side            text,
+  p_contracts       bigint,
+  p_fill_price      text,
+  p_entry_unix      bigint,
+  p_event_seq       bigint
+) returns jsonb
+language plpgsql
+as $$
+declare
+  v_bankroll text;
+  v_row      paper_fills%rowtype;
+begin
+  -- Global money mutex (see header). RAISEs if the singleton is absent.
+  select bankroll_str into v_bankroll from paper_bankroll where id = 0 for update;
+  if v_bankroll is null then
+    raise exception
+      'paper_bankroll singleton missing; run --backfill-supabase before enabling PE_SUPABASE_AUTHORITATIVE';
+  end if;
+
+  select * into v_row from paper_fills where idempotency_key = p_idempotency_key;
+  if found then
+    return jsonb_build_object(
+      'outcome', 'existing',
+      'bankroll', v_bankroll,
+      'row', jsonb_build_object(
+        'idempotency_key', v_row.idempotency_key,
+        'leader_wallet',   v_row.leader_wallet,
+        'source_trade_id', v_row.source_trade_id,
+        'market_id',       v_row.market_id,
+        'outcome_id',      v_row.outcome_id,
+        'side',            v_row.side,
+        'contracts',       v_row.contracts,
+        'fill_price',      v_row.fill_price::text,
+        'entry_unix',      v_row.entry_unix,
+        'event_seq',       v_row.event_seq));
+  end if;
+
+  if exists (select 1 from settled_markets where market_id = p_market_id) then
+    return jsonb_build_object('outcome', 'settled', 'bankroll', v_bankroll, 'row', null);
+  end if;
+
+  -- v1 arithmetic verbatim (insert cannot conflict: the key was absent under the lock).
+  perform commit_fill(
+    p_idempotency_key, p_leader_wallet, p_source_trade_id, p_market_id, p_outcome_id,
+    p_side, p_contracts, p_fill_price, p_entry_unix, p_event_seq);
+
+  select bankroll_str into v_bankroll from paper_bankroll where id = 0;
+  select * into v_row from paper_fills where idempotency_key = p_idempotency_key;
+  return jsonb_build_object(
+    'outcome', 'applied',
+    'bankroll', v_bankroll,
+    'row', jsonb_build_object(
+      'idempotency_key', v_row.idempotency_key,
+      'leader_wallet',   v_row.leader_wallet,
+      'source_trade_id', v_row.source_trade_id,
+      'market_id',       v_row.market_id,
+      'outcome_id',      v_row.outcome_id,
+      'side',            v_row.side,
+      'contracts',       v_row.contracts,
+      'fill_price',      v_row.fill_price::text,
+      'entry_unix',      v_row.entry_unix,
+      'event_seq',       v_row.event_seq));
+end;
+$$;
+
+-- Atomic resolution v2 (#511): credit computed INSIDE the function from paper_positions
+-- under the bankroll lock — the client no longer computes it from a pre-RPC snapshot
+-- (the read-then-resolve TOCTOU). Credit = greatest(Σ (long−short)×price[outcome], 0),
+-- the exact PnlLedger::resolution_credit semantics (missing index ⇒ 0). Returns jsonb
+-- {outcome: 'applied'|'existing', credit: text, outcome_prices: jsonb,
+--  settled_at_unix: bigint, bankroll: text} — on 'existing', the CANONICAL recorded
+-- values, so a crash-then-retry client mirrors idempotently with no double credit.
+create or replace function apply_resolution_v2(
+  p_market_id       text,
+  p_outcome_prices  jsonb,
+  p_settled_at_unix bigint
+) returns jsonb
+language plpgsql
+as $$
+declare
+  v_bankroll text;
+  v_credit   numeric;
+  v_settled  settled_markets%rowtype;
+begin
+  select bankroll_str into v_bankroll from paper_bankroll where id = 0 for update;
+  if v_bankroll is null then
+    raise exception
+      'paper_bankroll singleton missing; run --backfill-supabase before enabling PE_SUPABASE_AUTHORITATIVE';
+  end if;
+
+  select * into v_settled from settled_markets where market_id = p_market_id;
+  if found then
+    return jsonb_build_object(
+      'outcome', 'existing',
+      'credit', v_settled.credit_applied::text,
+      'outcome_prices', v_settled.outcome_prices,
+      'settled_at_unix', v_settled.settled_at_unix,
+      'bankroll', v_bankroll);
+  end if;
+
+  select coalesce(greatest(sum(
+           (p.long_contracts - p.short_contracts)
+           * coalesce((p_outcome_prices ->> p.outcome_id)::numeric, 0)
+         ), 0), 0)
+    into v_credit
+    from paper_positions p
+   where p.market_id = p_market_id;
+
+  insert into settled_markets (market_id, outcome_prices, credit_applied, settled_at_unix)
+  values (p_market_id, p_outcome_prices, v_credit, p_settled_at_unix);
+
+  update paper_bankroll
+     set bankroll_str = (bankroll_str::numeric + v_credit)::text,
+         updated_at   = now()
+   where id = 0;
+  select bankroll_str into v_bankroll from paper_bankroll where id = 0;
+
+  return jsonb_build_object(
+    'outcome', 'applied',
+    'credit', v_credit::text,
+    'outcome_prices', p_outcome_prices,
+    'settled_at_unix', p_settled_at_unix,
+    'bankroll', v_bankroll);
+end;
+$$;
+
+-- ════════════════════════════════════════════════════════════════════════════
 -- Row-level security & grants
 -- The site reads paper_bankroll + paper_positions with the anon key (RLS below). The
 -- two RPCs move money, so they are writer-only: revoke execute from anon/authenticated.
@@ -198,3 +350,16 @@ grant execute on function commit_fill(
 
 revoke all on function apply_resolution(text, jsonb, text, bigint) from public, anon, authenticated;
 grant execute on function apply_resolution(text, jsonb, text, bigint) to service_role;
+
+revoke all on function commit_fill_v2(
+  text, text, text, text, integer, text, bigint, text, bigint, bigint
+) from public, anon, authenticated;
+grant execute on function commit_fill_v2(
+  text, text, text, text, integer, text, bigint, text, bigint, bigint
+) to service_role;
+
+revoke all on function apply_resolution_v2(text, jsonb, bigint) from public, anon, authenticated;
+grant execute on function apply_resolution_v2(text, jsonb, bigint) to service_role;
+
+-- PostgREST discovers new RPCs only after a schema reload.
+notify pgrst, 'reload schema';

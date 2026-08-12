@@ -71,6 +71,32 @@ impl PositionLedger {
         }
     }
 
+    /// Restore the exact pre-trade state for one `(wallet, market-outcome)` — the
+    /// inverse of a single `ingest` whose pre-trade `(long, short)` was captured by the
+    /// caller (#511 pre-frame rollback: an abandoned-unseen admission must leave the
+    /// ledger byte-identical so redelivery classifies identically). `prev = None` means
+    /// the trade created the entry — remove it.
+    pub fn restore(
+        &mut self,
+        wallet: WalletAddress,
+        key: &MarketOutcomeId,
+        prev: Option<(u64, u64)>,
+    ) {
+        let Some(snap) = self.snapshots.get_mut(&wallet) else {
+            return;
+        };
+        match prev {
+            Some((long_contracts, short_contracts)) => {
+                let state = snap.positions.entry(key.clone()).or_default();
+                state.long_contracts = long_contracts;
+                state.short_contracts = short_contracts;
+            }
+            None => {
+                snap.positions.remove(key);
+            }
+        }
+    }
+
     /// Return the current position snapshot for a wallet, or `None` if the wallet
     /// has never been observed.
     pub fn position(&self, wallet: &WalletAddress) -> Option<&PositionSnapshot> {
@@ -270,5 +296,62 @@ mod tests {
         let ts = SourceTimestamp(OffsetDateTime::from_unix_timestamp(900).unwrap());
         ledger.rewind_to(ts); // must not panic or mutate
         assert!(ledger.position(&w).is_some());
+    }
+}
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects
+)]
+mod restore_tests {
+    use super::*;
+    use pe_core_types::{MarketId, OutcomeId, VenueMarketId};
+
+    #[test]
+    fn restore_is_the_exact_inverse_of_one_ingest() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xm".into())), OutcomeId(0));
+        let mut ledger = PositionLedger::new();
+        let trade = |contracts: u64, side: Side| IncomingTrade {
+            wallet,
+            market_id: MarketId(VenueMarketId("0xm".into())),
+            outcome_id: OutcomeId(0),
+            side,
+            price: pe_core_types::Price(rust_decimal::Decimal::ONE),
+            contracts: pe_core_types::ContractQty(contracts),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            received_at: time::OffsetDateTime::UNIX_EPOCH,
+            source_trade_id: pe_core_types::SourceTradeId("t".into()),
+        };
+        // Entry created by the trade → restore(None) removes it entirely.
+        ledger.ingest(&trade(10, Side::Buy));
+        ledger.restore(wallet, &key, None);
+        assert!(
+            !ledger
+                .position(&wallet)
+                .unwrap()
+                .positions
+                .contains_key(&key)
+        );
+        // Existing position: capture, mutate via a partially-covering BUY, restore exactly.
+        ledger.ingest(&trade(4, Side::Sell)); // short 4
+        let prev = ledger
+            .position(&wallet)
+            .unwrap()
+            .positions
+            .get(&key)
+            .map(|st| (st.long_contracts, st.short_contracts));
+        assert_eq!(prev, Some((0, 4)));
+        ledger.ingest(&trade(10, Side::Buy)); // covers 4, long 6 — NOT trivially invertible
+        ledger.restore(wallet, &key, prev);
+        let st = ledger
+            .position(&wallet)
+            .unwrap()
+            .positions
+            .get(&key)
+            .cloned()
+            .unwrap();
+        assert_eq!((st.long_contracts, st.short_contracts), (0, 4));
     }
 }

@@ -21,10 +21,10 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Side, SourceTradeId, VenueMarketId};
+use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{
-    FillRecord, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
+    FillRecord, FillRow, LeaderPositionRow, PaperPositionRow, PaperStateDb, PaperStateError,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -35,7 +35,7 @@ use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 
 /// Errors from the authoritative Supabase boundary. On the trade path an
 /// [`SupabaseStateError`] from the RPC is the fail-closed trigger (the caller skips the
-/// trade; the event log holds the fill and replays on restart).
+/// trade; #511: the frozen record retries via v2 and the boot frame-walk converges).
 #[derive(Debug, thiserror::Error)]
 pub enum SupabaseStateError {
     #[error("supabase transport: {0}")]
@@ -68,48 +68,63 @@ const fn side_str(side: Side) -> &'static str {
     }
 }
 
-/// Parse a PostgREST scalar-RPC return (a JSON string or number) into a [`Decimal`] — never
-/// via `f64`. `NULL` maps to [`SupabaseStateError::Null`].
-fn decimal_from_rpc(
-    v: &serde_json::Value,
-    what: &'static str,
-) -> Result<Decimal, SupabaseStateError> {
-    match v {
-        serde_json::Value::String(s) => {
-            Decimal::from_str(s.trim()).map_err(|_| SupabaseStateError::Corrupt(s.clone()))
-        }
-        // The RPCs `RETURN text`, so a bare number is unexpected. Accept an exact integer
-        // without ever touching `f64` (CLAUDE.md: no f64 for money); refuse a float rather
-        // than round-trip it lossily.
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .map(Decimal::from)
-            .or_else(|| n.as_u64().map(Decimal::from))
-            .ok_or_else(|| {
-                SupabaseStateError::Corrupt(format!("{what}: non-integer numeric RPC return {n}"))
-            }),
-        serde_json::Value::Null => Err(SupabaseStateError::Null(what)),
-        other => Err(SupabaseStateError::Corrupt(other.to_string())),
-    }
+/// The canonical fill the authority holds for an idempotency key (#511): the
+/// `commit_fill_v2` `row` payload, parsed fail-closed. On `existing`, `event_seq` is the
+/// ORIGINAL frame's — the local mirror must record THESE fields, not the retry's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFill {
+    pub record: FillRecord,
+    pub event_seq: EventSeq,
+    pub source_trade_id: String,
+}
+
+/// `commit_fill_v2` outcome (#511). Money values are authority-canonical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillV2Outcome {
+    /// Newly applied under this key.
+    Applied {
+        bankroll: Decimal,
+        row: CanonicalFill,
+    },
+    /// The key already existed (an earlier attempt landed — including ambiguously);
+    /// `row` is the canonical fill to converge on.
+    Existing {
+        bankroll: Decimal,
+        row: CanonicalFill,
+    },
+    /// The market is settled and the key absent: refused, nothing inserted.
+    Settled { bankroll: Decimal },
+}
+
+/// `apply_resolution_v2` outcome (#511): credit is computed INSIDE the RPC from
+/// `paper_positions` under the bankroll lock; on `existing` these are the CANONICAL
+/// recorded values, so a crash-then-retry mirrors idempotently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionV2Outcome {
+    pub applied: bool,
+    pub credit: Decimal,
+    pub outcome_prices: Vec<Decimal>,
+    pub settled_at_unix: i64,
+    pub bankroll: Decimal,
 }
 
 /// Idempotent authoritative writes. Abstracted as a trait so scenario tests drive
 /// [`commit_fill_authoritative`] / [`apply_resolution_authoritative`] with an in-memory fake.
 pub trait SupabaseStateTrait: Send + Sync {
-    /// Apply a fill via the authoritative `commit_fill` RPC; returns the new bankroll.
-    fn commit_fill(
+    /// Commit a fill via the authoritative `commit_fill_v2` RPC (#511): typed outcome,
+    /// canonical row, lock-first settled refusal.
+    fn commit_fill_v2(
         &self,
         row: &SupabaseFillRow,
-    ) -> impl Future<Output = Result<Decimal, SupabaseStateError>> + Send;
-    /// Apply a resolution credit via the authoritative `apply_resolution` RPC; returns the
-    /// resulting bankroll (unchanged when the market was already settled).
-    fn apply_resolution(
+    ) -> impl Future<Output = Result<FillV2Outcome, SupabaseStateError>> + Send;
+    /// Apply a resolution via the authoritative `apply_resolution_v2` RPC (#511): the
+    /// credit is computed server-side under the bankroll lock.
+    fn apply_resolution_v2(
         &self,
         market_id: &MarketId,
         outcome_prices: &[Decimal],
-        credit: Decimal,
         settled_at_unix: i64,
-    ) -> impl Future<Output = Result<Decimal, SupabaseStateError>> + Send;
+    ) -> impl Future<Output = Result<ResolutionV2Outcome, SupabaseStateError>> + Send;
 }
 
 /// Production [`SupabaseStateTrait`]: PostgREST RPCs over reqwest, reusing the
@@ -143,11 +158,11 @@ impl SupabaseStateClient {
     }
 
     /// `POST {base}/rest/v1/rpc/{func}` with a JSON args object; decode the scalar return.
-    async fn post_rpc(
+    async fn post_rpc_json(
         &self,
         func: &'static str,
         body: &serde_json::Value,
-    ) -> Result<Decimal, SupabaseStateError> {
+    ) -> Result<serde_json::Value, SupabaseStateError> {
         // Count every authoritative RPC (both RPCs route through here); fetch/upsert (boot pull
         // + one-time backfill) deliberately do not, so the counter reflects the recurring rate.
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -169,8 +184,7 @@ impl SupabaseStateClient {
             let text = resp.text().await.unwrap_or_default();
             return Err(SupabaseStateError::Status(status.as_u16(), text));
         }
-        let value: serde_json::Value = resp.json().await.map_err(SupabaseStateError::Decode)?;
-        decimal_from_rpc(&value, func)
+        resp.json().await.map_err(SupabaseStateError::Decode)
     }
 
     /// Authenticated `GET {url}`, decoding the JSON body as `T`.
@@ -295,8 +309,83 @@ impl SupabaseStateClient {
     }
 }
 
+/// Raw `commit_fill_v2` jsonb response (fail-closed parse — every field validated).
+#[derive(Debug, Deserialize)]
+struct FillV2Resp {
+    outcome: String,
+    bankroll: String,
+    row: Option<FillV2RowJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FillV2RowJson {
+    idempotency_key: String,
+    source_trade_id: String,
+    market_id: String,
+    outcome_id: i64,
+    side: String,
+    contracts: i64,
+    fill_price: String,
+    event_seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionV2Resp {
+    outcome: String,
+    credit: String,
+    outcome_prices: Vec<String>,
+    settled_at_unix: i64,
+    bankroll: String,
+}
+
+/// Parse a decimal-string money field: fail closed on malformed or negative (#511).
+fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
+    let d = Decimal::from_str_exact(raw)
+        .map_err(|e| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {e}")))?;
+    if d < Decimal::ZERO {
+        return Err(SupabaseStateError::Corrupt(format!(
+            "{what}: negative {raw:?}"
+        )));
+    }
+    Ok(d)
+}
+
+fn canonical_fill(row: FillV2RowJson) -> Result<CanonicalFill, SupabaseStateError> {
+    let side = match row.side.as_str() {
+        "buy" => Side::Buy,
+        "sell" => Side::Sell,
+        other => {
+            return Err(SupabaseStateError::Corrupt(format!(
+                "v2 row side {other:?}"
+            )));
+        }
+    };
+    let contracts = u64::try_from(row.contracts)
+        .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row contracts {}", row.contracts)))?;
+    let event_seq = u64::try_from(row.event_seq)
+        .map_err(|_| SupabaseStateError::Corrupt(format!("v2 row event_seq {}", row.event_seq)))?;
+    let outcome_id = u16::try_from(row.outcome_id).map_err(|_| {
+        SupabaseStateError::Corrupt(format!("v2 row outcome_id {}", row.outcome_id))
+    })?;
+    Ok(CanonicalFill {
+        record: FillRecord {
+            idempotency_key: row.idempotency_key,
+            market_id: MarketId(pe_core_types::VenueMarketId(row.market_id)),
+            outcome_id: OutcomeId(outcome_id),
+            side,
+            contracts,
+            fill_price: Price(money(&row.fill_price, "v2 row fill_price")?),
+        },
+        event_seq: EventSeq(event_seq),
+        source_trade_id: row.source_trade_id,
+    })
+}
+
 impl SupabaseStateTrait for SupabaseStateClient {
-    async fn commit_fill(&self, row: &SupabaseFillRow) -> Result<Decimal, SupabaseStateError> {
+    async fn commit_fill_v2(
+        &self,
+        row: &SupabaseFillRow,
+    ) -> Result<FillV2Outcome, SupabaseStateError> {
         // Decimals as strings (no f64); the RPC casts text → numeric.
         let body = serde_json::json!({
             "p_idempotency_key": row.fill.idempotency_key,
@@ -310,26 +399,64 @@ impl SupabaseStateTrait for SupabaseStateClient {
             "p_entry_unix": row.entry_unix,
             "p_event_seq": row.fill.event_seq,
         });
-        self.post_rpc("commit_fill", &body).await
+        let value = self.post_rpc_json("commit_fill_v2", &body).await?;
+        let resp: FillV2Resp = serde_json::from_value(value)
+            .map_err(|e| SupabaseStateError::Corrupt(format!("commit_fill_v2 shape: {e}")))?;
+        let bankroll = money(&resp.bankroll, "commit_fill_v2 bankroll")?;
+        match (resp.outcome.as_str(), resp.row) {
+            ("applied", Some(row)) => Ok(FillV2Outcome::Applied {
+                bankroll,
+                row: canonical_fill(row)?,
+            }),
+            ("existing", Some(row)) => Ok(FillV2Outcome::Existing {
+                bankroll,
+                row: canonical_fill(row)?,
+            }),
+            ("settled", None) => Ok(FillV2Outcome::Settled { bankroll }),
+            (outcome, row) => Err(SupabaseStateError::Corrupt(format!(
+                "commit_fill_v2 outcome {outcome:?} with row.is_some()={}",
+                row.is_some()
+            ))),
+        }
     }
 
-    async fn apply_resolution(
+    async fn apply_resolution_v2(
         &self,
         market_id: &MarketId,
         outcome_prices: &[Decimal],
-        credit: Decimal,
         settled_at_unix: i64,
-    ) -> Result<Decimal, SupabaseStateError> {
+    ) -> Result<ResolutionV2Outcome, SupabaseStateError> {
         // `outcome_prices` as a jsonb array of text decimals — matches the sink's
         // `settled_markets.outcome_prices` shape (so `wallet_live_stats` reads agree).
         let prices: Vec<String> = outcome_prices.iter().map(|d| d.to_string()).collect();
         let body = serde_json::json!({
             "p_market_id": market_id.0.0,
             "p_outcome_prices": prices,
-            "p_credit": credit.to_string(),
             "p_settled_at_unix": settled_at_unix,
         });
-        self.post_rpc("apply_resolution", &body).await
+        let value = self.post_rpc_json("apply_resolution_v2", &body).await?;
+        let resp: ResolutionV2Resp = serde_json::from_value(value)
+            .map_err(|e| SupabaseStateError::Corrupt(format!("apply_resolution_v2 shape: {e}")))?;
+        let applied = match resp.outcome.as_str() {
+            "applied" => true,
+            "existing" => false,
+            other => {
+                return Err(SupabaseStateError::Corrupt(format!(
+                    "apply_resolution_v2 outcome {other:?}"
+                )));
+            }
+        };
+        let mut parsed_prices = Vec::with_capacity(resp.outcome_prices.len());
+        for p in &resp.outcome_prices {
+            parsed_prices.push(money(p, "apply_resolution_v2 outcome_price")?);
+        }
+        Ok(ResolutionV2Outcome {
+            applied,
+            credit: money(&resp.credit, "apply_resolution_v2 credit")?,
+            outcome_prices: parsed_prices,
+            settled_at_unix: resp.settled_at_unix,
+            bankroll: money(&resp.bankroll, "apply_resolution_v2 bankroll")?,
+        })
     }
 }
 
@@ -348,100 +475,127 @@ struct PositionRow {
 
 // ── Write-through paths (RPC first, SQLite mirror second) ───────────────────────
 
-/// Authoritative fill commit (issue #397): write the Supabase `commit_fill` RPC **first**
-/// (fail-closed — the `?` propagates an RPC error so the caller skips the trade; the event
-/// log already holds the fill and replays on restart), **then** mirror to local SQLite.
-/// Returns the authoritative (RPC) bankroll. A local SQLite mirror failure is logged, not
-/// propagated — the authoritative write already succeeded and SQLite self-heals on restart.
-///
-/// The RPC `.await` completes before `PaperStateDb::commit_fill` takes the SQLite mutex, so
-/// the lock is never held across the await (no cross-await lock, no `Send` hazard).
+/// Outcome of an authoritative fill commit (#511): the orchestrator marks the contract
+/// filled only on `Filled`; `RefusedSettled` is terminal (seen + typed flip written).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritativeFillOutcome {
+    Filled(Decimal),
+    RefusedSettled(Decimal),
+}
+
+/// Authoritative fill commit (#397, reshaped by #511): `commit_fill_v2` FIRST (fail-closed
+/// — an RPC error propagates and the caller runs the frozen-retry protocol; the frame is
+/// durable), then ONE local convergence transaction mirroring the CANONICAL row and the
+/// authority bankroll, then — only after the local transaction commits (#511 R3) — the
+/// successor-gated #510 watermark advance. A settled refusal writes the terminal refused
+/// disposition instead. The RPC `.await` completes before the SQLite mutex is taken.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
     source_trade_id: &SourceTradeId,
     leader: &LeaderPositionRow,
-    record: &FillRecord,
+    _record: &FillRecord,
     seq: EventSeq,
     sup_row: &SupabaseFillRow,
     flip: Option<pe_paper_state::DispatchFlip<'_>>,
-) -> Result<Decimal, SupabaseStateError> {
+) -> Result<AuthoritativeFillOutcome, SupabaseStateError> {
     // #510: snapshot the watermark BEFORE the external mutation — a getter failure fails
     // the fill closed here, never after the RPC has already debited Supabase.
     let wm_before = paper_state.last_supabase_applied_event_seq()?;
-    let new_bankroll = supabase.commit_fill(sup_row).await?;
-    // #510 successor-gated runtime advance: keep the catch-up watermark tracking the head so
-    // the next boot's catch-up is a no-op (instant restart). Frames are dense from seq 0, so
-    // the confirmed fill advances iff it is the immediate successor of the current watermark
-    // (`None` → seq 0). Any gap — a halted boot catch-up, an earlier RPC failure, a
-    // dispatcher-error or non-`wf|` frame — makes later seqs non-successors: the watermark
-    // FREEZES below the gap (no leapfrog is representable) and the next boot's catch-up,
-    // which walks real fills rows and advances through row-less frame seqs, closes it.
-    // Best-effort: a failed write is a bounded idempotent re-confirm at next boot.
-    let is_successor = match wm_before {
-        None => seq.0 == 0,
-        Some(wm) => wm.0.checked_add(1) == Some(seq.0),
-    };
-    if is_successor && let Err(e) = paper_state.set_supabase_applied_event_seq(seq) {
-        warn!(
-            error = %e,
-            seq = seq.0,
-            "authoritative fill: watermark advance failed (boot catch-up re-confirms idempotently)"
-        );
-    }
-    // #508 round-4: the local transaction (mirror + seen + dispatch flip) follows the
-    // authoritative RPC; a failure here surfaces and retries IN-PROCESS (bounded) — the
-    // dispatch flip must not silently wait for a restart. Restart recovery remains the
-    // durable backstop.
+    let outcome = supabase.commit_fill_v2(sup_row).await?;
+    // #508 round-4: the local disposition surfaces and retries IN-PROCESS (bounded); the
+    // durable backstop is the boot frame-walk (the frozen watermark marks the frame pending).
     let mut local = Ok(());
     for attempt in 1u32..=3 {
-        local = paper_state
-            .commit_fill_with_flip(source_trade_id, leader, record, seq, flip)
-            .map(|_| ());
+        local = match &outcome {
+            FillV2Outcome::Applied { bankroll, row }
+            | FillV2Outcome::Existing { bankroll, row } => paper_state.commit_fill_canonical(
+                Some(source_trade_id),
+                Some(leader),
+                &row.record,
+                row.event_seq,
+                seq,
+                *bankroll,
+                flip,
+            ),
+            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill(
+                source_trade_id,
+                Some(leader),
+                seq,
+                flip.map(|f| pe_paper_state::DispatchFlip {
+                    dispatch_id: f.dispatch_id,
+                    paper_outcome: "no_fill:market_settled",
+                }),
+            ),
+        };
         match &local {
             Ok(()) => break,
             Err(e) if attempt < 3 => {
                 tracing::error!(
                     error = %e,
                     attempt,
-                    "authoritative fill: local mirror/flip failed; retrying in-process"
+                    "authoritative fill: local disposition failed; retrying in-process"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             Err(_) => {}
         }
     }
-    if let Err(e) = local {
-        warn!(
+    match local {
+        Ok(()) => {
+            // #510 successor-gated runtime advance, AFTER the local disposition (#511 R3:
+            // advancing first would hide an unmirrored frame from the boot frame-walk).
+            // Frames are dense from seq 0; any gap freezes the watermark and the boot
+            // frame-walk — which resolves every frame above it through v2 — heals it.
+            let is_successor = match wm_before {
+                None => seq.0 == 0,
+                Some(wm) => wm.0.checked_add(1) == Some(seq.0),
+            };
+            if is_successor && let Err(e) = paper_state.set_supabase_applied_event_seq(seq) {
+                warn!(
+                    error = %e,
+                    seq = seq.0,
+                    "authoritative fill: watermark advance failed (boot frame-walk re-confirms)"
+                );
+            }
+        }
+        Err(e) => warn!(
             error = %e,
-            "authoritative fill committed to Supabase but local SQLite mirror/flip failed \
-             after in-process retries (heals on restart/reprocess)"
-        );
+            seq = seq.0,
+            "authoritative fill: authority committed but local disposition failed after \
+             in-process retries; watermark left frozen (boot frame-walk converges)"
+        ),
     }
-    Ok(new_bankroll)
+    Ok(match outcome {
+        FillV2Outcome::Applied { bankroll, .. } | FillV2Outcome::Existing { bankroll, .. } => {
+            AuthoritativeFillOutcome::Filled(bankroll)
+        }
+        FillV2Outcome::Settled { bankroll } => AuthoritativeFillOutcome::RefusedSettled(bankroll),
+    })
 }
 
-/// Authoritative resolution (issue #397): apply the `apply_resolution` RPC **first**
-/// (fail-closed — on error return `Err` so the caller leaves the market unsettled for the
-/// next tick to retry), **then** mirror to SQLite via the atomic
-/// [`ResolutionStore::settle_and_credit`]. Returns the authoritative (RPC) bankroll.
+/// Authoritative resolution (#397, reshaped by #511): `apply_resolution_v2` FIRST — the
+/// credit is computed INSIDE the RPC from `paper_positions` under the bankroll lock,
+/// closing the read-then-resolve TOCTOU — then the SQLite mirror applies the RETURNED
+/// canonical values (on `existing`, the originally recorded ones), so a crash-then-retry
+/// converges with no double credit. Fail-closed: an RPC error leaves the market unsettled
+/// for the next tick.
 pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     store: &mut ResolutionStore,
     market_id: &MarketId,
     outcome_prices: &[Decimal],
-    credit: Decimal,
     settled_at_unix: i64,
 ) -> Result<Decimal, SupabaseStateError> {
-    let bankroll = supabase
-        .apply_resolution(market_id, outcome_prices, credit, settled_at_unix)
+    let res = supabase
+        .apply_resolution_v2(market_id, outcome_prices, settled_at_unix)
         .await?;
     if let Err(e) = store.settle_and_credit(
         market_id.clone(),
-        outcome_prices.to_vec(),
-        credit,
-        settled_at_unix,
+        res.outcome_prices.clone(),
+        res.credit,
+        res.settled_at_unix,
     ) {
         warn!(
             error = %e,
@@ -450,61 +604,125 @@ pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
              (heals on restart/retry)"
         );
     }
-    Ok(bankroll)
+    Ok(res.bankroll)
 }
 
-// ── Boot: catch-up then pull ────────────────────────────────────────────────────
+// ── Boot: frame-walk then pull ──────────────────────────────────────────────────
 
-/// Catch up Supabase from the local fills beyond `watermark` (issue #397 boot step 3):
-/// replay each `list_fills()` row with `event_seq > watermark` through the idempotent
-/// `commit_fill` RPC, advancing the watermark along the confirmed prefix and **halting at
-/// the first failed apply** (the tail retries next boot). Returns `(new_watermark,
-/// fully_caught_up, committed)` — `fully_caught_up` is `false` when the loop broke early on a failed
-/// apply, so the caller knows Supabase is incomplete (its bankroll is then *overstated* —
-/// missing un-applied debits — and must not be pulled back into SQLite). Re-applying a fill
-/// already in `paper_fills` is a no-op debit (the RPC's insert gate), so a reset watermark
-/// replays safely.
-pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
+/// #511 unified boot frame-walk (replaces the #397/#510 fills-row catch-up): resolve every
+/// event-log FRAME above the successor-gated Supabase watermark through `commit_fill_v2`.
+/// The watermark freezes below the OLDEST unresolved frame even when later fills succeeded
+/// (non-successors never advance it), so the walk provably revisits every pending frame —
+/// the freeze IS the durable pending marker; no separate state exists.
+///
+/// Per frame: `applied`/`existing` → one local convergence transaction (canonical row +
+/// authority bankroll + seen; the leader long/short mirror is not in the frame and
+/// refreshes on the wallet's next processed trade); `settled` → the terminal refused
+/// disposition; non-`wf|` key → skip (cannot satisfy `paper_fills.leader_wallet`). The
+/// watermark advances sequentially after each LOCAL disposition commits, and the walk
+/// halts at the first failure (the tail stays pending for the next boot). Returns
+/// `(new_watermark, fully_resolved, resolved_count)`.
+pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
-    watermark: i64,
+    event_log_path: &std::path::Path,
 ) -> Result<(i64, bool, usize), SupabaseStateError> {
-    let mut new_wm = watermark;
-    let mut fully_caught_up = true;
-    let mut committed = 0usize;
-    for row in paper_state
-        .list_fills()?
-        .into_iter()
-        .filter(|f| f.event_seq > watermark)
-    {
-        match supabase_fill_from(&row) {
-            Some(sup) => match supabase.commit_fill(&sup).await {
-                Ok(_) => {
-                    new_wm = row.event_seq;
-                    committed += 1;
-                }
+    let wm_start = match paper_state.last_supabase_applied_event_seq()? {
+        Some(seq) => i64::try_from(seq.0).unwrap_or(i64::MAX),
+        None => -1,
+    };
+    let mut new_wm = wm_start;
+    let mut fully_resolved = true;
+    let mut resolved = 0usize;
+    if !event_log_path.exists() {
+        return Ok((new_wm, true, 0));
+    }
+    let replay = pe_event_log::Reader::replay(event_log_path).map_err(|e| {
+        SupabaseStateError::Corrupt(format!("open event log {}: {e}", event_log_path.display()))
+    })?;
+    for frame in replay {
+        let (seq, envelope) =
+            frame.map_err(|e| SupabaseStateError::Corrupt(format!("read event-log frame: {e}")))?;
+        let seq_i = i64::try_from(seq.0).unwrap_or(i64::MAX);
+        if seq_i <= new_wm {
+            continue;
+        }
+        let fill: pe_strategy_winner_follow::PaperFill = serde_json::from_slice(&envelope.payload)
+            .map_err(|e| {
+                SupabaseStateError::Corrupt(format!("decode PaperFill at seq {}: {e}", seq.0))
+            })?;
+        let fill_row = FillRow {
+            idempotency_key: fill.intent.idempotency_key.clone(),
+            market_id: fill.intent.market_id.clone(),
+            outcome_id: fill.intent.outcome_id,
+            side: fill.intent.side,
+            contracts: fill.intent.contracts.0,
+            fill_price: fill.simulated_fill_price,
+            event_seq: seq_i,
+        };
+        let disposition = match supabase_fill_from(&fill_row) {
+            // Non-`wf|` fill (no leader): cannot write `paper_fills.leader_wallet` (NOT
+            // NULL). Advance past it so it never blocks the prefix.
+            None => {
+                warn!(
+                    key = %fill_row.idempotency_key,
+                    "supabase boot frame-walk: skipping non-winner-follow fill (no leader)"
+                );
+                Ok(())
+            }
+            Some(sup) => match supabase.commit_fill_v2(&sup).await {
                 Err(e) => {
                     warn!(
                         error = %e,
-                        event_seq = row.event_seq,
-                        "supabase authoritative catch-up: commit_fill failed; halting at last confirmed prefix"
+                        event_seq = seq.0,
+                        "supabase boot frame-walk: commit_fill_v2 failed; halting at last \
+                         confirmed prefix"
                     );
-                    fully_caught_up = false;
+                    fully_resolved = false;
                     break;
                 }
+                Ok(outcome) => {
+                    resolved += 1;
+                    let trade_id = sup.source_trade_id.clone().map(SourceTradeId);
+                    match outcome {
+                        FillV2Outcome::Applied { bankroll, row }
+                        | FillV2Outcome::Existing { bankroll, row } => paper_state
+                            .commit_fill_canonical(
+                                trade_id.as_ref(),
+                                None,
+                                &row.record,
+                                row.event_seq,
+                                seq,
+                                bankroll,
+                                None,
+                            ),
+                        FillV2Outcome::Settled { .. } => match trade_id.as_ref() {
+                            Some(id) => paper_state.commit_refused_fill(id, None, seq, None),
+                            // A `wf|` key always embeds the trade id; defensive.
+                            None => Ok(()),
+                        },
+                    }
+                    .map_err(|e| (e, seq.0))
+                    .map_err(|(e, s)| {
+                        SupabaseStateError::Corrupt(format!("local disposition at seq {s}: {e}"))
+                    })
+                }
             },
-            // Non-`wf|` fill (no leader): cannot write `paper_fills.leader_wallet` (NOT NULL).
-            // Advance past it so it never blocks the prefix — matches the sink reconcile skip.
-            None => {
-                warn!(
-                    key = %row.idempotency_key,
-                    "supabase authoritative catch-up: skipping non-winner-follow fill (no leader)"
-                );
-                new_wm = row.event_seq;
-            }
+        };
+        if let Err(e) = disposition {
+            warn!(
+                error = %e,
+                event_seq = seq.0,
+                "supabase boot frame-walk: local disposition failed; halting (frame stays \
+                 pending; next boot retries)"
+            );
+            fully_resolved = false;
+            break;
         }
+        paper_state.set_supabase_applied_event_seq(seq)?;
+        new_wm = seq_i;
     }
-    Ok((new_wm, fully_caught_up, committed))
+    Ok((new_wm, fully_resolved, resolved))
 }
 
 /// Issue #397 authoritative boot: catch up Supabase from the local event-log fills, persist
@@ -519,18 +737,20 @@ pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
 pub async fn supabase_authoritative_boot(
     client: &SupabaseStateClient,
     paper_state: &PaperStateDb,
+    event_log_path: &std::path::Path,
 ) -> Result<(), SupabaseStateError> {
-    // 3. Catch up Supabase from local fills beyond the dedicated watermark. An ABSENT
-    //    watermark (`None` — fresh DB or SQLite loss) maps to `-1` so the `> watermark`
-    //    filter includes seq 0 (#510 absent-vs-zero).
+    // 3. #511: resolve every event-log frame above the successor-gated watermark through
+    //    `commit_fill_v2` (frames the runtime confirmed are below the watermark already;
+    //    an ABSENT watermark — fresh DB or SQLite loss — walks from seq 0). This REPLACES
+    //    both the blind local frame replay and the fills-row catch-up in authoritative
+    //    mode: local application is decided by the authority, so a refused frame can
+    //    never resurrect locally.
     let wm = match paper_state.last_supabase_applied_event_seq()? {
         Some(seq) => i64::try_from(seq.0).unwrap_or(i64::MAX),
         None => -1,
     };
-    let (new_wm, fully_caught_up, committed) = catch_up_supabase(client, paper_state, wm).await?;
-    if new_wm > wm {
-        paper_state.set_supabase_applied_event_seq(EventSeq(u64::try_from(new_wm).unwrap_or(0)))?;
-    }
+    let (new_wm, fully_caught_up, committed) =
+        resolve_event_frames(client, paper_state, event_log_path).await?;
     // #510 change 3: one summary line so a long replay is visible (the 2026-08-12 incident
     // looked like a hang) and a no-op boot (`replayed=0`) is the instant-restart proof.
     info!(
@@ -546,7 +766,7 @@ pub async fn supabase_authoritative_boot(
     // self-consistent with the local fills, and the un-applied tail is durable in the event log.
     if !fully_caught_up {
         warn!(
-            "supabase authoritative boot: catch-up halted before completing; skipping the \
+            "supabase authoritative boot: frame-walk halted before completing; skipping the \
              bankroll/positions pull (Supabase incomplete). Retaining local SQLite state; the \
              next boot completes catch-up."
         );

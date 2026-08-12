@@ -656,6 +656,9 @@ async fn scenario_dispatch_boot_resume_flips_seed_from_durable_fill() {
         )
         .unwrap();
 
+    // #511: dispatch recovery is disposition-aware and runs AFTER fill accounting heals
+    // (main.rs boot ordering) — replay the frame into the fills table first, as boot does.
+    pe_service::paper_recovery::reconcile_paper_state(&log_path, &state).unwrap();
     let resumed = resume_dispatch_seeds(&log_path, &state).unwrap();
     assert_eq!(resumed.flipped_fill, 1);
     assert_eq!(resumed.finalized_stuck, 0);

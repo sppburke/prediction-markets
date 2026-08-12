@@ -13,7 +13,8 @@ use std::time::Duration;
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig, classify_trade};
 use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, MarketOutcomeId, Price, Probability,
-    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
+    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
+    WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher};
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
@@ -30,7 +31,7 @@ use pe_venue_polymarket::{AskLevel, LadderError, LadderPlan, ladder_is_stale, pl
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::clob_book::ClobBookFetcher;
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
@@ -41,8 +42,10 @@ use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::{self, FillMode, LiveRuntimeConfig};
 use crate::snapshot_worker::{SnapshotHandle, enqueue_if_buy};
-use crate::supabase_sink::{SinkHandle, supabase_fill_from};
-use crate::supabase_state::{SupabaseStateClient, commit_fill_authoritative};
+use crate::supabase_sink::{SinkHandle, SupabaseFillRow, supabase_fill_from};
+use crate::supabase_state::{
+    AuthoritativeFillOutcome, SupabaseStateClient, commit_fill_authoritative,
+};
 
 /// Hot-path `/book` fetch timeout for the price-impact gate (#398 WS2). Tighter than the worker's
 /// 5 s per-request timeout so a slow book fails open (no cap) without stalling the trade.
@@ -55,6 +58,9 @@ const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
 const LOCAL_COMMIT_RETRIES: u32 = 3;
 const LOCAL_COMMIT_RETRY_DELAY_MS: u64 = 100;
 
+/// #511 parked-fill retry cadence (frozen v2 retries; matches the poll interval scale).
+const PARKED_RETRY_SECS: u64 = 30;
+
 /// Outcome of the enabled price-impact gate for one admitted signal (#508).
 enum GatePlan {
     /// The budget planner produced a within-band plan (quantity/VWAP/limit).
@@ -63,6 +69,38 @@ enum GatePlan {
     /// budget — a paper-only skip that must never suppress live targets (Decision 10). The
     /// best ask anchors the shared band gate.
     NothingAffordable { best_ask: Price },
+}
+
+/// Captured pre-admission state for exact rollback (#511): the leader ledger's
+/// pre-trade `(long, short)` for the touched key, or `None` when the trade created it.
+struct RollbackCtx {
+    wallet: WalletAddress,
+    key: MarketOutcomeId,
+    prev: Option<(u64, u64)>,
+}
+
+/// A post-frame fill whose authority commit has not reached a terminal outcome (#511).
+/// Everything needed to retry the FROZEN decision without re-running admission.
+struct ParkedFill {
+    leader: LeaderPositionRow,
+    record: FillRecord,
+    seq: EventSeq,
+    /// `Some` in authoritative mode (the frozen v2 request); `None` in legacy mode
+    /// (the frozen local commit is the terminal protocol).
+    sup_row: Option<SupabaseFillRow>,
+    dispatch_id: Option<String>,
+    filled_key: MarketOutcomeId,
+}
+
+/// Terminal-vs-parked result of a paper fill commit (#511).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaperCommitResult {
+    /// Applied (or converged on an existing canonical fill) — mark the contract filled.
+    Filled,
+    /// Authority/settled refusal — terminal typed no-fill; do NOT mark filled.
+    Refused,
+    /// No terminal outcome yet — frozen retry owns the trade (ticker + boot walk).
+    Parked,
 }
 
 /// Orchestrator configuration.
@@ -141,6 +179,14 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // Tracks (market, outcome) pairs we already hold a paper position in.
     // Prevents multiple leaders entering the same contract from stacking fills.
     filled_positions: HashSet<MarketOutcomeId>,
+    /// #511 parked post-frame fills: the frame is durable but the authority commit has
+    /// not reached a terminal outcome. Retried on a coarse ticker with the FROZEN
+    /// record via `commit_fill_v2` by idempotency key — never by re-running admission
+    /// (mutable gates would misclassify a redelivery). Keyed by `source_trade_id`
+    /// (1:1 with the signal-derived idempotency key for a given trade). In-memory
+    /// only: across a crash the frozen #510 watermark marks the frames pending and
+    /// the boot frame-walk resolves them.
+    parked: HashMap<SourceTradeId, ParkedFill>,
     // Copy-entry gate: admits only a leader's first-ever BUY entry into a market
     // (#290; price band removed in #339).
     entry_gate: CopyEntryGate,
@@ -259,6 +305,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             paper_fill_haircut_bps: config.paper_fill_haircut_bps,
             paper_fill_slippage_bps: config.paper_fill_slippage_bps,
             filled_positions,
+            parked: HashMap::new(),
             entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
             control_rx,
@@ -283,6 +330,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         tokio::pin!(shutdown);
         let mut trades_done = false;
         let mut control_done = false;
+        // #511 frozen-retry ticker: drives parked post-frame fills to a terminal outcome.
+        let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
+        parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             if trades_done {
@@ -296,6 +346,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         self.handle_trade(trade).await;
                     }
                     break;
+                }
+                _ = parked_tick.tick(), if !self.parked.is_empty() => {
+                    self.retry_parked().await;
                 }
                 result = self.control_rx.recv(), if !control_done => {
                     match result {
@@ -607,10 +660,34 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // Look up wallet in watchlist; skip non-watchlisted wallets.
         let quality = self.quality_for(&watchlist, &trade.wallet);
 
+        // #511: a parked post-frame fill owns this trade — the frozen-retry ticker
+        // resolves it via the authority; a redelivered copy must not re-run admission
+        // (or re-ingest the leader ledger).
+        if self.parked.contains_key(&trade.source_trade_id) {
+            return;
+        }
+
         // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
         // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
         // classification, not before.
         let position = self.position_ledger.position(&trade.wallet).cloned();
+
+        // #511 exact-rollback capture: the pre-trade (long, short) for the touched key.
+        // An abandoned-unseen exit restores this so redelivery re-admits byte-identically
+        // (`ingest` has no trade-id memory and classification reads pre-trade state).
+        let rb = RollbackCtx {
+            wallet: trade.wallet,
+            key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
+            prev: position
+                .as_ref()
+                .and_then(|s| {
+                    s.positions.get(&MarketOutcomeId::new(
+                        trade.market_id.clone(),
+                        trade.outcome_id,
+                    ))
+                })
+                .map(|st| (st.long_contracts, st.short_contracts)),
+        };
 
         // Advance position ledger after classification inputs are captured.
         self.position_ledger.ingest(&trade);
@@ -628,7 +705,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             &self.signal_config,
         ) else {
             // No signal: still mark seen + mirror the leader ledger (AC2).
-            self.commit_no_fill(&trade, &leader_row).await;
+            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
+                .await;
             return;
         };
 
@@ -646,7 +724,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 leader_price = %signal.leader_price.0,
                 "signal did not produce order",
             );
-            self.commit_no_fill(&trade, &leader_row).await;
+            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
+                .await;
             return;
         }
         // Record the admitted BUY entry so a same-session re-entry into this market is
@@ -678,7 +757,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     resolution_unix = ?resolution_unix,
                     "signal did not produce order",
                 );
-                self.commit_no_fill(&trade, &leader_row).await;
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "",
+                    &rb,
+                    Some(&signal.market_id),
+                )
+                .await;
                 return;
             }
         }
@@ -708,7 +795,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
-                    self.commit_no_fill(&trade, &leader_row).await;
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        "",
+                        &rb,
+                        Some(&signal.market_id),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -732,7 +827,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
-                    self.commit_no_fill(&trade, &leader_row).await;
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        "",
+                        &rb,
+                        Some(&signal.market_id),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -779,7 +882,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         leader_price = %signal.leader_price.0,
                         "signal did not produce order",
                     );
-                    self.commit_no_fill(&trade, &leader_row).await;
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        "",
+                        &rb,
+                        Some(&signal.market_id),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -800,7 +911,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 max_fill_price = %self.max_fill_price,
                 "signal did not produce order",
             );
-            self.commit_no_fill(&trade, &leader_row).await;
+            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
+                .await;
             return;
         }
 
@@ -820,7 +932,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 min_fill_price = %self.min_fill_price,
                 "signal did not produce order",
             );
-            self.commit_no_fill(&trade, &leader_row).await;
+            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
+                .await;
             return;
         }
 
@@ -830,9 +943,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         let dispatch_id = match self.stage_dispatch_if_targeted(&signal) {
             Ok(id) => id,
             Err(()) => {
-                self.entry_gate
-                    .unrecord_entry(signal.leader.0, &signal.market_id);
-                return; // staging failed: abandoned unseen (redelivery retries)
+                // Staging failed: abandoned unseen. #511: exact in-memory rollback so
+                // the held-cursor redelivery re-admits byte-identically.
+                self.rollback_admission(&rb, Some(&signal.market_id));
+                return;
             }
         };
 
@@ -847,8 +961,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 outcome = signal.outcome_id.0,
                 "signal did not produce order",
             );
-            self.commit_no_fill_flipping(&trade, &leader_row, dispatch_id.as_deref(), "paper_held")
-                .await;
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                dispatch_id.as_deref(),
+                "paper_held",
+                &rb,
+                Some(&signal.market_id),
+            )
+            .await;
             return;
         }
 
@@ -861,11 +982,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 outcome = signal.outcome_id.0,
                 "signal did not produce order",
             );
-            self.commit_no_fill_flipping(
+            self.no_fill_or_rollback(
                 &trade,
                 &leader_row,
                 dispatch_id.as_deref(),
                 "impact_absorbs_zero",
+                &rb,
+                Some(&signal.market_id),
             )
             .await;
             return;
@@ -896,8 +1019,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             Err(e) => {
                 info!(reason = %e, "signal did not produce order");
                 let reason = format!("paper_reject:{e}");
-                self.commit_no_fill_flipping(&trade, &leader_row, dispatch_id.as_deref(), &reason)
-                    .await;
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    dispatch_id.as_deref(),
+                    &reason,
+                    &rb,
+                    Some(&signal.market_id),
+                )
+                .await;
             }
             Ok(intent) => {
                 let now = SourceTimestamp(OffsetDateTime::now_utc());
@@ -924,11 +1054,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 {
                     Err(e) => {
                         error!(error = %e, "execution dispatcher failed");
-                        self.commit_no_fill_flipping(
+                        self.no_fill_or_rollback(
                             &trade,
                             &leader_row,
                             dispatch_id.as_deref(),
                             "paper_dispatch_error",
+                            &rb,
+                            Some(&signal.market_id),
                         )
                         .await;
                     }
@@ -937,18 +1069,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                             fill.intent.market_id.clone(),
                             fill.intent.outcome_id,
                         );
-                        // `false` = authoritative fail-closed skip: the Supabase RPC failed, so
-                        // neither the position nor the dedup advanced (the event log holds the
-                        // fill and replays on restart). Do not mark the contract filled.
-                        if self
-                            .commit_paper_fill(
-                                &trade,
-                                &leader_row,
-                                &fill,
-                                seq,
-                                dispatch_id.as_deref(),
-                            )
-                            .await
+                        // #511: Filled marks the contract; Refused is a terminal typed
+                        // no-fill; Parked means the frozen-retry protocol owns the trade.
+                        if PaperCommitResult::Filled
+                            == self
+                                .commit_paper_fill(
+                                    &trade,
+                                    &leader_row,
+                                    &fill,
+                                    seq,
+                                    dispatch_id.as_deref(),
+                                )
+                                .await
                         {
                             self.filled_positions.insert(filled_key);
                             info!(
@@ -975,6 +1107,38 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
+    /// Roll back the in-memory admission effects of an abandoned-unseen trade (#511
+    /// pre-frame failure): restore the leader ledger to the captured pre-trade state and
+    /// un-record the tentative same-session entry. Redelivery then re-runs a
+    /// byte-identical admission.
+    fn rollback_admission(&mut self, rb: &RollbackCtx, unrecord_market: Option<&MarketId>) {
+        self.position_ledger.restore(rb.wallet, &rb.key, rb.prev);
+        if let Some(market) = unrecord_market {
+            self.entry_gate.unrecord_entry(rb.wallet, market);
+        }
+    }
+
+    /// Terminal no-fill that STAYS terminal only if the seen-commit lands (#511): on
+    /// commit failure the trade is abandoned unseen, so the in-memory admission effects
+    /// are rolled back — the held cursor redelivers into a fresh identical admission.
+    async fn no_fill_or_rollback(
+        &mut self,
+        trade: &IncomingTrade,
+        leader: &LeaderPositionRow,
+        dispatch_id: Option<&str>,
+        no_fill_reason: &str,
+        rb: &RollbackCtx,
+        unrecord_market: Option<&MarketId>,
+    ) {
+        if self
+            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason)
+            .await
+        {
+            return;
+        }
+        self.rollback_admission(rb, unrecord_market);
+    }
+
     /// Build the leader-position mirror row for the `(market, outcome)` this trade
     /// touched, read from the in-memory ledger *after* the trade was ingested.
     fn leader_position_row(&self, trade: &IncomingTrade) -> LeaderPositionRow {
@@ -994,12 +1158,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
-    /// Commit dedup + leader-ledger mirror for a processed trade that produced no fill
-    /// (the pre-staging/zero-live-target path — untyped, as before #508).
-    async fn commit_no_fill(&self, trade: &IncomingTrade, leader: &LeaderPositionRow) {
-        self.commit_no_fill_flipping(trade, leader, None, "").await;
-    }
-
     /// [`Self::commit_no_fill`] that also flips a staged dispatch aggregate with a TYPED
     /// no-fill outcome (#508 Decision 10) in the same transaction. Every failed local
     /// finalization surfaces and retries in-process (bounded) — never a silent
@@ -1010,7 +1168,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         leader: &LeaderPositionRow,
         dispatch_id: Option<&str>,
         no_fill_reason: &str,
-    ) {
+    ) -> bool {
         let outcome = format!("no_fill:{no_fill_reason}");
         let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
             dispatch_id: id,
@@ -1022,7 +1180,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 leader,
                 flip,
             ) {
-                Ok(()) => return,
+                Ok(()) => return true,
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
                     error!(
                         error = %e,
@@ -1035,12 +1193,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     error!(
                         error = %e,
                         dispatch_id = ?dispatch_id,
-                        "paper-state no-fill commit failed after in-process retries; \
-                         restart recovery / redelivery is the backstop"
+                        "paper-state no-fill commit failed after in-process retries; the \
+                         trade is abandoned UNSEEN (#511: the caller rolls back the \
+                         in-memory admission and the held cursor redelivers it)"
                     );
                 }
             }
         }
+        false
     }
 
     /// Commit dedup + leader-ledger mirror + fill accounting, and update the in-memory
@@ -1048,12 +1208,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// fill committed (the caller then marks the contract filled); `false` only on an
     /// authoritative fail-closed skip.
     ///
-    /// Authoritative mode (issue #397, `self.supabase_state.is_some()`): the `commit_fill` RPC
-    /// is awaited FIRST (fail-closed — on RPC error, log + return `false`; the event log holds
-    /// the fill and replays on restart), then SQLite is mirrored and `self.bankroll` is set to
-    /// the RPC return. The RPC `.await` completes before the SQLite mutex is taken (inside
-    /// `PaperStateDb::commit_fill`), so the lock is never held across the await. Legacy mode:
-    /// SQLite stays authoritative with a best-effort Supabase sink mirror — behaviour unchanged.
+    /// Authoritative mode (#397/#511): `commit_fill_v2` first (typed outcome), then one
+    /// local convergence transaction; on RPC failure the FROZEN record is retried bounded
+    /// and then PARKED (#511 — never re-admitted; the ticker + boot frame-walk converge).
+    /// Legacy mode: SQLite authoritative with the same settled-refusal semantics.
     async fn commit_paper_fill(
         &mut self,
         trade: &IncomingTrade,
@@ -1061,7 +1219,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         fill: &PaperFill,
         seq: EventSeq,
         dispatch_id: Option<&str>,
-    ) -> bool {
+    ) -> PaperCommitResult {
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
             market_id: fill.intent.market_id.clone(),
@@ -1070,10 +1228,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             contracts: fill.intent.contracts.0,
             fill_price: fill.simulated_fill_price,
         };
+        let filled_key =
+            MarketOutcomeId::new(fill.intent.market_id.clone(), fill.intent.outcome_id);
 
         // Authoritative path (issue #397): Supabase RPC first, then SQLite mirror. The client
         // and Arc are cloned (cheap) so neither borrows `self` across the `.await`.
-        if let Some(supabase) = self.supabase_state.clone() {
+        if self.supabase_state.is_some() {
             let event_seq = i64::try_from(seq.0).unwrap_or(i64::MAX);
             let fill_row = FillRow {
                 idempotency_key: record.idempotency_key.clone(),
@@ -1091,52 +1251,55 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     key = %record.idempotency_key,
                     "authoritative fill: non-winner-follow key has no leader; skipping (fail-closed)"
                 );
-                return false;
+                return PaperCommitResult::Parked; // frame is durable; boot frame-walk skips it
             };
-            let paper_state = self.paper_state.clone();
-            let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
-                dispatch_id: id,
-                paper_outcome: "fill",
-            });
-            match commit_fill_authoritative(
-                &supabase,
-                &paper_state,
-                &trade.source_trade_id,
-                leader,
-                &record,
+            let parked = ParkedFill {
+                leader: leader.clone(),
+                record: record.clone(),
                 seq,
-                &sup_row,
-                flip,
-            )
-            .await
-            {
-                Ok(new_bankroll) => self.bankroll = new_bankroll,
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        "authoritative fill: Supabase commit_fill RPC failed; fail-closed skip \
-                         (event log holds the fill, replays on restart)"
-                    );
-                    return false;
+                sup_row: Some(sup_row),
+                dispatch_id: dispatch_id.map(str::to_owned),
+                filled_key,
+            };
+            // Bounded in-process attempts before parking (#508 round-4 posture).
+            let mut result = PaperCommitResult::Parked;
+            for attempt in 1u32..=3 {
+                result = self
+                    .attempt_parked_commit(trade.source_trade_id.clone(), &parked)
+                    .await;
+                if !matches!(result, PaperCommitResult::Parked) {
+                    break;
+                }
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(LOCAL_COMMIT_RETRY_DELAY_MS)).await;
                 }
             }
-            // Liquidity-at-fill capture (#350) stays alive in authoritative mode (its sink is a
-            // separate worker, not gated off with `run_sink`).
-            enqueue_if_buy(
-                self.snapshot_sink.as_ref(),
-                fill.intent.side,
-                &fill.intent.idempotency_key,
-                &fill.intent.market_id,
-                fill.intent.outcome_id,
-                OffsetDateTime::now_utc().unix_timestamp(),
-            );
-            return true;
+            if matches!(result, PaperCommitResult::Parked) {
+                error!(
+                    key = %record.idempotency_key,
+                    seq = seq.0,
+                    "authoritative fill: no terminal outcome after bounded retries; PARKED \
+                     (#511 frozen retry — ticker + boot frame-walk converge; never re-admitted)"
+                );
+                self.parked.insert(trade.source_trade_id.clone(), parked);
+            } else if let PaperCommitResult::Filled = result {
+                // Liquidity-at-fill capture (#350) stays alive in authoritative mode (its
+                // sink is a separate worker, not gated off with `run_sink`).
+                enqueue_if_buy(
+                    self.snapshot_sink.as_ref(),
+                    fill.intent.side,
+                    &fill.intent.idempotency_key,
+                    &fill.intent.market_id,
+                    fill.intent.outcome_id,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                );
+            }
+            return result;
         }
 
         // Legacy path: SQLite authoritative + best-effort Supabase sink mirror. A failed
-        // commit retries in-process (#508 round-4) and finally returns `false` — the
-        // caller must NOT mark the contract filled on an unacknowledged commit (the event
-        // log holds the fill; restart recovery / the fills PK dedup the redelivery).
+        // commit retries in-process (#508 round-4) and finally parks (#511) — the caller
+        // must NOT mark the contract filled on an unacknowledged commit.
         let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
             dispatch_id: id,
             paper_outcome: "fill",
@@ -1150,8 +1313,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 seq,
                 flip,
             ) {
-                Ok(b) => {
-                    committed = Some(b);
+                Ok(outcome) => {
+                    committed = Some(outcome);
                     break;
                 }
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
@@ -1161,14 +1324,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 Err(e) => {
                     error!(
                         error = %e,
-                        "paper-state commit_fill failed after in-process retries; fill NOT \
-                         acknowledged (event log holds it; restart recovery is the backstop)"
+                        "paper-state commit_fill failed after in-process retries; PARKED \
+                         (#511 frozen retry via the ticker)"
                     );
                 }
             }
         }
         match committed {
-            Some(new_bankroll) => {
+            Some(pe_paper_state::FillCommitOutcome::Applied(new_bankroll)) => {
                 self.bankroll = new_bankroll;
                 // Best-effort mirror to Supabase (issue #343). Never blocks the trade path.
                 if let Some(sink) = &self.sink {
@@ -1193,10 +1356,133 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     fill.intent.outcome_id,
                     OffsetDateTime::now_utc().unix_timestamp(),
                 );
+                PaperCommitResult::Filled
             }
-            None => return false,
+            Some(pe_paper_state::FillCommitOutcome::RefusedSettled(bankroll)) => {
+                self.bankroll = bankroll;
+                info!(
+                    key = %record.idempotency_key,
+                    market = %record.market_id,
+                    "fill refused: market already settled (terminal no-fill disposition)"
+                );
+                PaperCommitResult::Refused
+            }
+            None => {
+                self.parked.insert(
+                    trade.source_trade_id.clone(),
+                    ParkedFill {
+                        leader: leader.clone(),
+                        record,
+                        seq,
+                        sup_row: None,
+                        dispatch_id: dispatch_id.map(str::to_owned),
+                        filled_key,
+                    },
+                );
+                PaperCommitResult::Parked
+            }
         }
-        true
+    }
+
+    /// One bounded attempt to bring a frozen post-frame fill to a terminal outcome via
+    /// the authority (#511). Updates bankroll / filled-positions on success. Returns
+    /// `Parked` when no terminal outcome was reached.
+    async fn attempt_parked_commit(
+        &mut self,
+        source_trade_id: SourceTradeId,
+        parked: &ParkedFill,
+    ) -> PaperCommitResult {
+        let Some(supabase) = self.supabase_state.clone() else {
+            // Legacy: the frozen local commit is the terminal protocol.
+            let flip = parked
+                .dispatch_id
+                .as_deref()
+                .map(|id| pe_paper_state::DispatchFlip {
+                    dispatch_id: id,
+                    paper_outcome: "fill",
+                });
+            return match self.paper_state.commit_fill_with_flip(
+                &source_trade_id,
+                &parked.leader,
+                &parked.record,
+                parked.seq,
+                flip,
+            ) {
+                Ok(pe_paper_state::FillCommitOutcome::Applied(b)) => {
+                    self.bankroll = b;
+                    self.filled_positions.insert(parked.filled_key.clone());
+                    PaperCommitResult::Filled
+                }
+                Ok(pe_paper_state::FillCommitOutcome::RefusedSettled(b)) => {
+                    self.bankroll = b;
+                    PaperCommitResult::Refused
+                }
+                Err(e) => {
+                    error!(error = %e, "parked legacy fill commit failed; will retry");
+                    PaperCommitResult::Parked
+                }
+            };
+        };
+        let Some(sup_row) = parked.sup_row.as_ref() else {
+            // Unreachable: authoritative parks always carry the frozen v2 request.
+            error!("parked authoritative fill without a frozen request; will retry");
+            return PaperCommitResult::Parked;
+        };
+        let paper_state = self.paper_state.clone();
+        let flip = parked
+            .dispatch_id
+            .as_deref()
+            .map(|id| pe_paper_state::DispatchFlip {
+                dispatch_id: id,
+                paper_outcome: "fill",
+            });
+        match commit_fill_authoritative(
+            &supabase,
+            &paper_state,
+            &source_trade_id,
+            &parked.leader,
+            &parked.record,
+            parked.seq,
+            sup_row,
+            flip,
+        )
+        .await
+        {
+            Ok(AuthoritativeFillOutcome::Filled(bankroll)) => {
+                self.bankroll = bankroll;
+                self.filled_positions.insert(parked.filled_key.clone());
+                PaperCommitResult::Filled
+            }
+            Ok(AuthoritativeFillOutcome::RefusedSettled(bankroll)) => {
+                self.bankroll = bankroll;
+                info!(
+                    key = %parked.record.idempotency_key,
+                    market = %parked.record.market_id,
+                    "fill refused by authority: market already settled (terminal)"
+                );
+                PaperCommitResult::Refused
+            }
+            Err(e) => {
+                warn!(error = %e, key = %parked.record.idempotency_key, "authoritative fill attempt failed");
+                PaperCommitResult::Parked
+            }
+        }
+    }
+
+    /// #511 frozen-retry ticker: drive every parked fill toward a terminal outcome.
+    pub async fn retry_parked(&mut self) {
+        let ids: Vec<SourceTradeId> = self.parked.keys().cloned().collect();
+        for id in ids {
+            let Some(parked) = self.parked.remove(&id) else {
+                continue;
+            };
+            match self.attempt_parked_commit(id.clone(), &parked).await {
+                PaperCommitResult::Parked => {
+                    self.parked.insert(id, parked);
+                }
+                PaperCommitResult::Filled | PaperCommitResult::Refused => {}
+            }
+        }
     }
 
     fn quality_for(&self, watchlist: &Watchlist, wallet: &WalletAddress) -> ReconstructionQuality {

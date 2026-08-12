@@ -65,3 +65,15 @@ The archive is the rollback: restore Supabase rows with
 the archived `paper_state.db*` + `paper.log*` files back before starting the service.
 Archive tables are append-only across resets (`archived_at` distinguishes epochs) —
 never dropped by tooling.
+
+## #511: rebuild-state and RPC v1 notes
+
+- `--rebuild-state` is **refused in authoritative mode** (`PE_SUPABASE_AUTHORITATIVE=true`):
+  frame-only reconstruction cannot know authority dispositions (a refused or ambiguously
+  failed frame would resurrect locally and diverge from Supabase). Restore local state by
+  restarting the service — the boot frame-walk converges SQLite on the system of record.
+  In legacy mode, rebuild restores `settled_markets` from its own backup before replaying,
+  so replay refuses fills into already-settled markets.
+- The v1 RPCs (`commit_fill`, `apply_resolution`) are retained through the #511 rollback
+  window. Revoke their `service_role` execute grants in a later cycle once the #511 binary
+  has soaked (rollback to the pre-#511 binary requires them).

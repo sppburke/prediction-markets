@@ -28,23 +28,32 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+/// `(credit, outcome_prices, settled_at_unix)` recorded for a settled market.
+type SettledEntry = (Decimal, Vec<Decimal>, i64);
 use std::sync::Mutex;
 
+use pe_core_types::{ContractQty, SourceId, SourceTimestamp, StrategyId};
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
+use pe_event_log::Writer;
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
-    SupabaseStateError, SupabaseStateTrait, apply_resolution_authoritative, catch_up_supabase,
-    commit_fill_authoritative,
+    AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, ResolutionV2Outcome,
+    SupabaseStateError, SupabaseStateTrait, apply_resolution_authoritative,
+    commit_fill_authoritative, resolve_event_frames,
 };
+use pe_strategy_winner_follow::PaperExecutor;
+use pe_venue_core::OrderIntent;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
 use tempfile::TempDir;
+use time::OffsetDateTime;
 
 fn wallet_hex() -> &'static str {
     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -119,19 +128,23 @@ fn apply_fill_to_net(long: u64, short: u64, side: Side, qty: u64) -> (u64, u64) 
     }
 }
 
-/// In-memory [`SupabaseStateTrait`] that replicates the PL/pgSQL `commit_fill` /
-/// `apply_resolution` arithmetic: gate the money write on the dedup key newly inserting, net
-/// the position, and clamp the BUY debit at zero. Records call order; can fail a chosen fill.
+/// In-memory [`SupabaseStateTrait`] replicating the #511 v2 PL/pgSQL semantics:
+/// existing-key returns the CANONICAL row (ordering before the settled check), settled
+/// markets refuse absent keys, resolution credit is computed from the fake's positions
+/// under the same lock discipline. Failure injection: `fail_all_commits`,
+/// `fail_commit_seq` (clean failure — nothing applies), and `apply_then_error_seq`
+/// (AMBIGUOUS failure — the apply lands, then an error is returned; the Jul-24 502 class).
 #[derive(Default)]
 struct FakeSupabaseState {
     bankroll: Mutex<Decimal>,
-    positions: Mutex<HashMap<u16, (u64, u64)>>,
-    seen_fills: Mutex<HashSet<String>>,
-    settled: Mutex<HashSet<String>>,
+    positions: Mutex<HashMap<(String, u16), (u64, u64)>>,
+    rows: Mutex<HashMap<String, CanonicalFill>>,
+    settled: Mutex<HashMap<String, SettledEntry>>,
     commit_calls: Mutex<Vec<i64>>,
     resolution_calls: Mutex<Vec<String>>,
     fail_all_commits: bool,
     fail_commit_seq: Option<i64>,
+    apply_then_error_seq: Option<i64>,
     fail_resolution: bool,
 }
 
@@ -145,50 +158,101 @@ impl FakeSupabaseState {
     fn bankroll(&self) -> Decimal {
         *self.bankroll.lock().unwrap()
     }
-}
-
-impl SupabaseStateTrait for FakeSupabaseState {
-    async fn commit_fill(&self, row: &SupabaseFillRow) -> Result<Decimal, SupabaseStateError> {
-        if self.fail_all_commits || self.fail_commit_seq == Some(row.fill.event_seq) {
-            return Err(SupabaseStateError::Status(503, "injected".to_string()));
-        }
-        self.commit_calls.lock().unwrap().push(row.fill.event_seq);
-        let mut bankroll = self.bankroll.lock().unwrap();
-        // Gate: a duplicate idempotency_key no-ops the money write (ON CONFLICT DO NOTHING).
-        if !self
-            .seen_fills
+    fn settle_market(&self, market: &str) {
+        self.settled
             .lock()
             .unwrap()
-            .insert(row.fill.idempotency_key.clone())
-        {
-            return Ok(*bankroll);
-        }
-        // Net position (apply_fill_to_net).
+            .insert(market.to_string(), (Decimal::ZERO, vec![], 0));
+    }
+
+    /// The v1-arithmetic apply (insert gate + netting + clamped debit), returning the row.
+    fn apply(&self, row: &SupabaseFillRow) -> CanonicalFill {
+        let mut bankroll = self.bankroll.lock().unwrap();
         let mut positions = self.positions.lock().unwrap();
-        let (long, short) = positions
-            .get(&row.fill.outcome_id.0)
-            .copied()
-            .unwrap_or((0, 0));
+        let pos_key = (row.fill.market_id.0.0.clone(), row.fill.outcome_id.0);
+        let (long, short) = positions.get(&pos_key).copied().unwrap_or((0, 0));
         positions.insert(
-            row.fill.outcome_id.0,
+            pos_key,
             apply_fill_to_net(long, short, row.fill.side, row.fill.contracts),
         );
-        // Bankroll: BUY debits price×contracts clamped at 0; SELL credits it.
         let notional = row.fill.fill_price.0 * Decimal::from(row.fill.contracts);
         *bankroll = match row.fill.side {
             Side::Buy => (*bankroll - notional).max(Decimal::ZERO),
             Side::Sell => *bankroll + notional,
         };
-        Ok(*bankroll)
+        let canonical = CanonicalFill {
+            record: FillRecord {
+                idempotency_key: row.fill.idempotency_key.clone(),
+                market_id: row.fill.market_id.clone(),
+                outcome_id: row.fill.outcome_id,
+                side: row.fill.side,
+                contracts: row.fill.contracts,
+                fill_price: row.fill.fill_price,
+            },
+            event_seq: EventSeq(u64::try_from(row.fill.event_seq).unwrap()),
+            source_trade_id: row.source_trade_id.clone().unwrap_or_default(),
+        };
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(row.fill.idempotency_key.clone(), canonical.clone());
+        canonical
+    }
+}
+
+impl SupabaseStateTrait for FakeSupabaseState {
+    async fn commit_fill_v2(
+        &self,
+        row: &SupabaseFillRow,
+    ) -> Result<FillV2Outcome, SupabaseStateError> {
+        if self.fail_all_commits || self.fail_commit_seq == Some(row.fill.event_seq) {
+            return Err(SupabaseStateError::Status(503, "injected".to_string()));
+        }
+        if self.apply_then_error_seq == Some(row.fill.event_seq)
+            && !self
+                .rows
+                .lock()
+                .unwrap()
+                .contains_key(&row.fill.idempotency_key)
+        {
+            // AMBIGUOUS: the server applied, the client sees an error.
+            self.apply(row);
+            return Err(SupabaseStateError::Status(
+                504,
+                "gateway timeout".to_string(),
+            ));
+        }
+        self.commit_calls.lock().unwrap().push(row.fill.event_seq);
+        // v2 ordering (#511 R1): existing key FIRST — even if the market settled later.
+        if let Some(existing) = self.rows.lock().unwrap().get(&row.fill.idempotency_key) {
+            return Ok(FillV2Outcome::Existing {
+                bankroll: self.bankroll(),
+                row: existing.clone(),
+            });
+        }
+        if self
+            .settled
+            .lock()
+            .unwrap()
+            .contains_key(&row.fill.market_id.0.0)
+        {
+            return Ok(FillV2Outcome::Settled {
+                bankroll: self.bankroll(),
+            });
+        }
+        let canonical = self.apply(row);
+        Ok(FillV2Outcome::Applied {
+            bankroll: self.bankroll(),
+            row: canonical,
+        })
     }
 
-    async fn apply_resolution(
+    async fn apply_resolution_v2(
         &self,
         market_id: &MarketId,
-        _outcome_prices: &[Decimal],
-        credit: Decimal,
-        _settled_at_unix: i64,
-    ) -> Result<Decimal, SupabaseStateError> {
+        outcome_prices: &[Decimal],
+        settled_at_unix: i64,
+    ) -> Result<ResolutionV2Outcome, SupabaseStateError> {
         if self.fail_resolution {
             return Err(SupabaseStateError::Status(503, "injected".to_string()));
         }
@@ -196,21 +260,75 @@ impl SupabaseStateTrait for FakeSupabaseState {
             .lock()
             .unwrap()
             .push(market_id.0.0.clone());
-        let mut bankroll = self.bankroll.lock().unwrap();
-        // Gate the credit on the settled row newly inserting (exactly-once).
-        if self.settled.lock().unwrap().insert(market_id.0.0.clone()) {
-            *bankroll += credit;
+        let mut settled = self.settled.lock().unwrap();
+        if let Some((credit, prices, at)) = settled.get(&market_id.0.0) {
+            return Ok(ResolutionV2Outcome {
+                applied: false,
+                credit: *credit,
+                outcome_prices: prices.clone(),
+                settled_at_unix: *at,
+                bankroll: self.bankroll(),
+            });
         }
-        Ok(*bankroll)
+        // In-RPC credit from the authority's positions (PnlLedger::resolution_credit).
+        let positions = self.positions.lock().unwrap();
+        let credit = positions
+            .iter()
+            .filter(|((m, _), _)| m == &market_id.0.0)
+            .map(|((_, outcome), (long, short))| {
+                let price = outcome_prices
+                    .get(usize::from(*outcome))
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                (Decimal::from(*long) - Decimal::from(*short)) * price
+            })
+            .sum::<Decimal>()
+            .max(Decimal::ZERO);
+        settled.insert(
+            market_id.0.0.clone(),
+            (credit, outcome_prices.to_vec(), settled_at_unix),
+        );
+        let mut bankroll = self.bankroll.lock().unwrap();
+        *bankroll += credit;
+        Ok(ResolutionV2Outcome {
+            applied: true,
+            credit,
+            outcome_prices: outcome_prices.to_vec(),
+            settled_at_unix,
+            bankroll: *bankroll,
+        })
     }
+}
+
+/// Append `wf|`-keyed fill frames to a fresh event log via the real `PaperExecutor`
+/// (dense seqs from 0), returning the log path. Frames only — no local commits.
+fn write_frames(dir: &TempDir, fills: &[(u64, Side, u64, Decimal)]) -> std::path::PathBuf {
+    let log_path = dir.path().join("paper.log");
+    let writer = Writer::open(&log_path).unwrap();
+    let mut executor = PaperExecutor::new(writer, SourceId("test".into()), 0, 0);
+    let ts = SourceTimestamp(OffsetDateTime::UNIX_EPOCH);
+    for (key_seq, side, contracts, price) in fills {
+        let intent = OrderIntent {
+            strategy_id: StrategyId("winner-follow".to_string()),
+            market_id: market(),
+            outcome_id: OutcomeId(0),
+            side: *side,
+            contracts: ContractQty(*contracts),
+            limit_price: Price(*price),
+            validity_seconds: 30,
+            idempotency_key: wf_key(*key_seq),
+        };
+        executor.execute(&intent, ts.clone(), None).unwrap();
+    }
+    log_path
 }
 
 #[tokio::test]
 async fn ac_wt_rpc_first_then_sqlite_mirror() {
     let (_dir, db) = db_with_bankroll(dec!(1000));
     let fake = FakeSupabaseState::new(dec!(1000));
-    let (record, sup_row) = fill_pair(&wf_key(5), Side::Buy, 10, dec!(0.40), 5);
-    let src = SourceTradeId("src5".to_string());
+    let (record, sup_row) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    let src = SourceTradeId("src0".to_string());
 
     let ret = commit_fill_authoritative(
         &fake,
@@ -218,20 +336,25 @@ async fn ac_wt_rpc_first_then_sqlite_mirror() {
         &src,
         &leader(),
         &record,
-        EventSeq(5),
+        EventSeq(0),
         &sup_row,
         None,
     )
     .await
     .unwrap();
 
-    // PASS: the RPC return is the authoritative bankroll (1000 - 0.40*10 = 996), and SQLite
-    //       mirrored the fill to the same value.
-    assert_eq!(ret, dec!(996.0));
+    // PASS: the RPC outcome is the authoritative bankroll (1000 - 0.40*10 = 996); SQLite
+    //       mirrored the CANONICAL row and SET the bankroll to the authority value (#511).
+    assert_eq!(ret, AuthoritativeFillOutcome::Filled(dec!(996.0)));
     assert!(db.is_seen(&src).unwrap());
     assert_eq!(db.fills_count().unwrap(), 1);
     assert_eq!(db.bankroll().unwrap(), Some(dec!(996.0)));
-    println!("PASS: AC-WT — commit_fill RPC first (996), SQLite mirrored to 996");
+    // #510/#511: the watermark advanced only AFTER the local convergence txn.
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(0))
+    );
+    println!("PASS: AC-WT — v2 first (996), SQLite converged, watermark advanced post-txn");
 }
 
 #[tokio::test]
@@ -241,286 +364,342 @@ async fn ac_fail_closed_leaves_sqlite_untouched() {
         fail_all_commits: true,
         ..FakeSupabaseState::new(dec!(1000))
     };
-    let (record, sup_row) = fill_pair(&wf_key(5), Side::Buy, 10, dec!(0.40), 5);
-    let src = SourceTradeId("src5".to_string());
+    let (record, sup_row) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    let src = SourceTradeId("src0".to_string());
 
-    let ret = commit_fill_authoritative(
+    let err = commit_fill_authoritative(
         &fake,
         &db,
         &src,
         &leader(),
         &record,
-        EventSeq(5),
+        EventSeq(0),
         &sup_row,
         None,
     )
     .await;
 
-    // PASS: the RPC error propagates (caller skips the trade), and SQLite is NOT written — the
-    //       event log holds the fill and replays on restart.
-    assert!(ret.is_err());
+    // PASS: a clean RPC failure propagates; SQLite untouched (unseen, no fill, bankroll
+    //       intact, watermark frozen) — the caller parks the frozen record (#511).
+    assert!(err.is_err());
     assert!(!db.is_seen(&src).unwrap());
     assert_eq!(db.fills_count().unwrap(), 0);
     assert_eq!(db.bankroll().unwrap(), Some(dec!(1000)));
-    println!("PASS: AC-FAIL — RPC error → Err, SQLite untouched (0 fills, bankroll 1000)");
+    assert_eq!(db.last_supabase_applied_event_seq().unwrap(), None);
+    println!("PASS: AC-FAIL — clean failure leaves SQLite untouched, watermark frozen");
 }
 
+/// #511: the boot frame-walk resolves every frame above the frozen watermark through v2 —
+/// fresh frames apply; a rerun is pure `existing` re-confirmation (idempotent).
 #[tokio::test]
-async fn ac_catchup_replays_and_is_idempotent() {
-    // Seed SQLite with three fills at sparse seqs; catch-up replays them to Supabase.
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    for (seq, key) in [(5, wf_key(5)), (9, wf_key(9)), (14, wf_key(14))] {
-        let (record, _) = fill_pair(&key, Side::Buy, 10, dec!(0.10), seq);
-        db.commit_fill(
-            &SourceTradeId(format!("s{seq}")),
-            &leader(),
-            &record,
-            EventSeq(seq as u64),
-        )
-        .unwrap();
-    }
+async fn ac_walk_resolves_frames_and_is_idempotent() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let log = write_frames(
+        &dir,
+        &[
+            (0, Side::Buy, 10, dec!(0.40)),
+            (1, Side::Buy, 5, dec!(0.60)),
+        ],
+    );
     let fake = FakeSupabaseState::new(dec!(1000));
 
-    let (wm1, full1, _n1) = catch_up_supabase(&fake, &db, 0).await.unwrap();
-    let (wm2, full2, _n2) = catch_up_supabase(&fake, &db, wm1).await.unwrap();
+    let (wm, fully, resolved) = resolve_event_frames(&fake, &db, &log).await.unwrap();
+    assert_eq!((wm, fully, resolved), (1, true, 2));
+    assert_eq!(db.fills_count().unwrap(), 2);
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(993.0)));
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(1))
+    );
+    // Seen was written from the canonical row's source_trade_id (frame self-sufficiency).
+    assert!(db.is_seen(&SourceTradeId("s0".to_string())).unwrap());
 
-    // PASS: the first pass applies all three and advances to 14; re-running from 14 applies
-    //       nothing new, and the fake's bankroll equals SQLite's (RPC↔Rust parity over catch-up).
-    assert_eq!((wm1, wm2), (14, 14));
-    assert!(full1 && full2, "no failures → fully caught up both passes");
-    assert_eq!(*fake.commit_calls.lock().unwrap(), vec![5, 9, 14]);
-    assert_eq!(Some(fake.bankroll()), db.bankroll().unwrap());
-    println!("PASS: AC-CATCHUP — replayed [5,9,14] once, re-run from 14 applied nothing");
+    // Rerun from the advanced watermark: nothing to do.
+    let (wm2, fully2, resolved2) = resolve_event_frames(&fake, &db, &log).await.unwrap();
+    assert_eq!((wm2, fully2, resolved2), (1, true, 0));
+    println!("PASS: AC-WALK — frames resolved (993), idempotent rerun no-op");
 }
 
+/// #511 R3-1: an EARLIER failed frame after a LATER success is still revisited — the
+/// successor-gated watermark froze below it, and the walk starts there.
 #[tokio::test]
-async fn ac_catchup_halts_at_first_failure() {
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    for (seq, key) in [(5, wf_key(5)), (9, wf_key(9)), (14, wf_key(14))] {
-        let (record, _) = fill_pair(&key, Side::Buy, 10, dec!(0.10), seq);
-        db.commit_fill(
-            &SourceTradeId(format!("s{seq}")),
-            &leader(),
-            &record,
-            EventSeq(seq as u64),
-        )
-        .unwrap();
-    }
+async fn ac_walk_revisits_earlier_failed_frame_after_later_success() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let log = write_frames(
+        &dir,
+        &[
+            (0, Side::Buy, 10, dec!(0.40)),
+            (1, Side::Buy, 5, dec!(0.60)),
+        ],
+    );
+    // Runtime: frame 0 fails cleanly; frame 1 succeeds (non-successor → watermark frozen).
     let fake = FakeSupabaseState {
-        fail_commit_seq: Some(9),
+        fail_commit_seq: Some(0),
         ..FakeSupabaseState::new(dec!(1000))
     };
+    let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    let err = commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("s0".into()),
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+    )
+    .await;
+    assert!(err.is_err());
+    let (r1, s1) = fill_pair(&wf_key(1), Side::Buy, 5, dec!(0.60), 1);
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("s1".into()),
+        &leader(),
+        &r1,
+        EventSeq(1),
+        &s1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ret, AuthoritativeFillOutcome::Filled(dec!(997.0)));
+    // Frozen below the gap despite the later success.
+    assert_eq!(db.last_supabase_applied_event_seq().unwrap(), None);
 
-    let (wm, fully, _n) = catch_up_supabase(&fake, &db, 0).await.unwrap();
+    // Boot walk (fake now healthy): resolves frame 0 fresh, re-confirms frame 1 existing.
+    let healthy = FakeSupabaseState {
+        rows: Mutex::new(fake.rows.lock().unwrap().clone()),
+        positions: Mutex::new(fake.positions.lock().unwrap().clone()),
+        ..FakeSupabaseState::new(fake.bankroll())
+    };
+    let (wm, fully, resolved) = resolve_event_frames(&healthy, &db, &log).await.unwrap();
+    assert_eq!((wm, fully, resolved), (1, true, 2));
+    assert_eq!(db.fills_count().unwrap(), 2);
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(993.0)));
+    println!("PASS: AC-WALK-GAP — earlier failed frame recovered after later success");
+}
 
-    // PASS: the watermark advances only over the confirmed prefix (5) and halts at 9; 14 is
-    //       left for the next boot. Not integer adjacency. `fully` is false so the boot skips
-    //       the (now-incomplete) Supabase pull.
-    assert_eq!(wm, 5);
-    assert!(!fully, "halted before completing → not fully caught up");
-    assert_eq!(*fake.commit_calls.lock().unwrap(), vec![5]);
-    println!("PASS: AC-HALT — applied [5], halted at 9, watermark=5 (14 deferred)");
+/// #511: an AMBIGUOUS failure (applied server-side, error returned — the Jul-24 502
+/// class) converges: the retry gets `existing` and mirrors the CANONICAL row byte-for-byte
+/// even though the retry re-priced differently.
+#[tokio::test]
+async fn ac_ambiguous_apply_converges_on_canonical_row() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState {
+        apply_then_error_seq: Some(0),
+        ..FakeSupabaseState::new(dec!(1000))
+    };
+    let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    let err = commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("s0".into()),
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+    )
+    .await;
+    assert!(err.is_err(), "ambiguous failure surfaces as an error");
+    assert_eq!(db.fills_count().unwrap(), 0, "local untouched");
+    assert_eq!(fake.bankroll(), dec!(996.0), "but the authority applied");
+
+    // Frozen retry: SAME key, RE-PRICED record (the book moved). v2 returns existing.
+    let (r0b, s0b) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.55), 0);
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("s0".into()),
+        &leader(),
+        &r0b,
+        EventSeq(0),
+        &s0b,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ret, AuthoritativeFillOutcome::Filled(dec!(996.0)));
+    // Local mirrors the CANONICAL (attempt-A) price, not the retry's.
+    let fills = db.list_fills().unwrap();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].fill_price.0, dec!(0.40));
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(996.0)));
+    println!("PASS: AC-AMBIG — existing returns canonical row; stores converge on attempt A");
+}
+
+/// #511: a fill for a settled market is REFUSED by the authority → terminal refused
+/// disposition (seen + last_applied advanced, no fills row, no money) → boot replay can
+/// never resurrect it and the watermark advances over it.
+#[tokio::test]
+async fn ac_settled_refusal_is_terminal_and_walk_advances() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let log = write_frames(&dir, &[(0, Side::Buy, 10, dec!(0.40))]);
+    let fake = FakeSupabaseState::new(dec!(1000));
+    fake.settle_market("0xmkt");
+
+    let (wm, fully, resolved) = resolve_event_frames(&fake, &db, &log).await.unwrap();
+    assert_eq!((wm, fully, resolved), (0, true, 1));
+    assert_eq!(db.fills_count().unwrap(), 0, "no resurrection");
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(1000)));
+    assert!(db.is_seen(&SourceTradeId("s0".to_string())).unwrap());
+    assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(0));
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(0))
+    );
+    println!("PASS: AC-SETTLED-WALK — refused frame disposed terminally, no resurrection");
+}
+
+/// #511: runtime settled refusal — v2 returns `settled`, the orchestrator-facing outcome
+/// is `RefusedSettled`, and the refused disposition (seen + typed flip) is written.
+#[tokio::test]
+async fn ac_runtime_settled_refusal_writes_disposition() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState::new(dec!(1000));
+    fake.settle_market("0xmkt");
+    let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    let src = SourceTradeId("s0".to_string());
+
+    let ret = commit_fill_authoritative(&fake, &db, &src, &leader(), &r0, EventSeq(0), &s0, None)
+        .await
+        .unwrap();
+    assert_eq!(ret, AuthoritativeFillOutcome::RefusedSettled(dec!(1000)));
+    assert!(db.is_seen(&src).unwrap());
+    assert_eq!(db.fills_count().unwrap(), 0);
+    assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(0));
+    println!("PASS: AC-SETTLED-RT — runtime refusal is terminal (seen, no fill, no money)");
+}
+
+/// v2 ordering (#511 R3): an EXISTING key returns its canonical row even after the market
+/// settles — only an absent key is refused.
+#[tokio::test]
+async fn ac_existing_key_wins_over_later_settlement() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState::new(dec!(1000));
+    let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("s0".into()),
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+    )
+    .await
+    .unwrap();
+    fake.settle_market("0xmkt");
+
+    // Duplicate-key retry AFTER settlement: existing, not settled-refusal.
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("s0".into()),
+        &leader(),
+        &r0,
+        EventSeq(1),
+        &s0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ret, AuthoritativeFillOutcome::Filled(dec!(996.0)));
+    println!("PASS: AC-EXISTING-ORDER — existing key beats later settlement");
 }
 
 #[tokio::test]
 async fn ac_resolution_credits_once_and_skips_on_error() {
-    let (_dir, db) = db_with_bankroll(dec!(100));
-    let mut store = ResolutionStore::load(db.clone()).unwrap();
-    let fake = FakeSupabaseState::new(dec!(100));
-    let mid = MarketId(VenueMarketId("0xres".to_string()));
+    let (_dir, db) = db_with_bankroll(dec!(996));
+    let mut store = ResolutionStore::load(Arc::clone(&db)).unwrap();
+    let fake = FakeSupabaseState::new(dec!(996));
+    // Authority holds 10 long @ outcome 0 for the market.
+    fake.positions
+        .lock()
+        .unwrap()
+        .insert(("0xmkt".to_string(), 0), (10, 0));
 
-    // First resolution: credited exactly once in both stores.
-    let b1 = apply_resolution_authoritative(
-        &fake,
-        &mut store,
-        &mid,
-        &[dec!(1), dec!(0)],
-        dec!(25),
-        1_700_000_000,
-    )
-    .await
-    .unwrap();
-    assert_eq!(b1, dec!(125));
-    assert_eq!(db.bankroll().unwrap(), Some(dec!(125)));
-    assert!(store.is_settled(&mid));
+    // #511: credit computed IN the authority from ITS positions (10 × 1 = 10).
+    let bankroll =
+        apply_resolution_authoritative(&fake, &mut store, &market(), &[dec!(1), dec!(0)], 100)
+            .await
+            .unwrap();
+    assert_eq!(bankroll, dec!(1006.0));
+    assert_eq!(
+        db.bankroll().unwrap(),
+        Some(dec!(1006.0)),
+        "mirror applied returned credit"
+    );
 
-    // Duplicate resolution: credit zero (AC8) — RPC gate + local guard.
-    let b2 = apply_resolution_authoritative(
-        &fake,
-        &mut store,
-        &mid,
-        &[dec!(1), dec!(0)],
-        dec!(25),
-        1_700_000_999,
-    )
-    .await
-    .unwrap();
-    assert_eq!(b2, dec!(125));
-    assert_eq!(db.bankroll().unwrap(), Some(dec!(125)));
+    // Duplicate: existing → zero additional credit in both stores.
+    let bankroll2 =
+        apply_resolution_authoritative(&fake, &mut store, &market(), &[dec!(1), dec!(0)], 100)
+            .await
+            .unwrap();
+    assert_eq!(bankroll2, dec!(1006.0));
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(1006.0)));
 
-    // RPC error on a fresh market: Err, nothing settled or credited (caller retries next tick).
-    let fail = FakeSupabaseState {
+    // RPC error: fail-closed skip (unsettled locally, retried next tick).
+    let failing = FakeSupabaseState {
         fail_resolution: true,
-        ..FakeSupabaseState::new(dec!(125))
+        ..FakeSupabaseState::new(dec!(1006))
     };
-    let other = MarketId(VenueMarketId("0xother".to_string()));
-    let r = apply_resolution_authoritative(
-        &fail,
-        &mut store,
-        &other,
-        &[dec!(0), dec!(1)],
-        dec!(50),
-        1_700_001_000,
-    )
-    .await;
-    assert!(r.is_err());
-    assert!(!store.is_settled(&other));
-    assert_eq!(db.bankroll().unwrap(), Some(dec!(125)));
-    println!("PASS: AC-RES — credit-once (125), duplicate credits 0, RPC error skips");
+    let market2 = MarketId(VenueMarketId("0xother".to_string()));
+    let err = apply_resolution_authoritative(&failing, &mut store, &market2, &[dec!(1)], 101).await;
+    assert!(err.is_err());
+    println!("PASS: AC-RES — in-RPC credit applied once, duplicate zero, error skips");
+}
+
+/// #511: crash-after-RPC-before-local-mirror retry converges on the CANONICAL recorded
+/// credit (the `existing` branch returns the original values).
+#[tokio::test]
+async fn ac_resolution_crash_retry_mirrors_canonical_credit() {
+    let (_dir, db) = db_with_bankroll(dec!(996));
+    let fake = FakeSupabaseState::new(dec!(996));
+    fake.positions
+        .lock()
+        .unwrap()
+        .insert(("0xmkt".to_string(), 0), (10, 0));
+    // "Crash before local": apply on the authority only.
+    let first = fake
+        .apply_resolution_v2(&market(), &[dec!(1), dec!(0)], 100)
+        .await
+        .unwrap();
+    assert!(first.applied);
+    assert_eq!(first.credit, dec!(10));
+    assert_eq!(
+        db.bankroll().unwrap(),
+        Some(dec!(996)),
+        "local never saw it"
+    );
+
+    // Restart retry through the full authoritative path: existing → canonical mirror.
+    let mut store = ResolutionStore::load(Arc::clone(&db)).unwrap();
+    let bankroll =
+        apply_resolution_authoritative(&fake, &mut store, &market(), &[dec!(1), dec!(0)], 999)
+            .await
+            .unwrap();
+    assert_eq!(bankroll, dec!(1006.0));
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(1006.0)));
+    // Canonical settled_at (100), not the retry's (999).
+    assert_eq!(store.settled_credit(&market()), Some(dec!(10)));
+    println!("PASS: AC-RES-RETRY — no double credit; canonical values mirrored");
 }
 
 #[tokio::test]
 async fn ac_parity_fake_matches_paper_state_over_fill_mix() {
-    // Drive a buy/sell/clamp mix through the write-through; after each, the authoritative
-    // (fake = PL/pgSQL model) bankroll must equal the SQLite (canonical Rust) bankroll.
-    let (_dir, db) = db_with_bankroll(dec!(50));
-    let fake = FakeSupabaseState::new(dec!(50));
-    let fills = [
-        (wf_key(1), Side::Buy, 10u64, dec!(0.40), 1i64), // 50 - 4   = 46
-        (wf_key(2), Side::Buy, 100, dec!(0.50), 2),      // 46 - 50  -> clamp 0
-        (wf_key(3), Side::Sell, 5, dec!(0.60), 3),       // 0 + 3    = 3
+    let (_dir, db) = db_with_bankroll(dec!(100));
+    let fake = FakeSupabaseState::new(dec!(100));
+    let mix = [
+        (0u64, Side::Buy, 10u64, dec!(0.40)),
+        (1, Side::Buy, 5, dec!(0.60)),
+        (2, Side::Sell, 4, dec!(0.70)),
+        (3, Side::Buy, 200, dec!(0.90)), // clamps at zero in both models
     ];
-    for (key, side, contracts, price, seq) in fills {
-        let (record, sup_row) = fill_pair(&key, side, contracts, price, seq);
-        let ret = commit_fill_authoritative(
-            &fake,
-            &db,
-            &SourceTradeId(format!("p{seq}")),
-            &leader(),
-            &record,
-            EventSeq(seq as u64),
-            &sup_row,
-            None,
-        )
-        .await
-        .unwrap();
-        // RPC return == fake bankroll == SQLite bankroll (the drift guard).
-        assert_eq!(Some(ret), db.bankroll().unwrap(), "parity at seq {seq}");
-        assert_eq!(ret, fake.bankroll(), "rpc return at seq {seq}");
-    }
-    assert_eq!(db.bankroll().unwrap(), Some(dec!(3)));
-    println!("PASS: AC-PARITY — fake (PL/pgSQL model) == PaperStateDb over buy/clamp/sell → 3");
-}
-
-/// #508 Decision 10: in authoritative mode the dispatch flip rides the LOCAL transaction
-/// that follows the RPC — and a staged seed flips `ready` with the `fill` outcome in that
-/// same commit.
-/// PASS: after `commit_fill_authoritative(.., Some(flip))`, the seed is `ready`/`fill`,
-///       the fill mirrored, and the RPC saw exactly one commit.
-#[tokio::test]
-async fn ac_dispatch_flip_rides_the_local_mirror_transaction() {
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    let fake = FakeSupabaseState::new(dec!(1000));
-    let (record, sup_row) = fill_pair(&wf_key(6), Side::Buy, 10, dec!(0.40), 6);
-    let src = SourceTradeId("src6".to_string());
-    db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
-        dispatch_id: wf_key(6),
-        signal_json: "{\"schema_version\":1}".to_string(),
-        source_trade_id: src.0.clone(),
-        created_at_unix: 1_000,
-        targets: vec![pe_paper_state::DispatchTargetSeed {
-            account_id: "primary-acct".to_string(),
-            credential_bundle_version: 1,
-            credential_key_id: "key-1".to_string(),
-        }],
-    })
-    .unwrap();
-
-    let key = wf_key(6);
-    let flip = pe_paper_state::DispatchFlip {
-        dispatch_id: &key,
-        paper_outcome: "fill",
-    };
-    commit_fill_authoritative(
-        &fake,
-        &db,
-        &src,
-        &leader(),
-        &record,
-        EventSeq(6),
-        &sup_row,
-        Some(flip),
-    )
-    .await
-    .unwrap();
-
-    let seed = db.dispatch_seed(&wf_key(6)).unwrap().unwrap();
-    assert_eq!(seed.state, "ready");
-    assert_eq!(seed.paper_outcome.as_deref(), Some("fill"));
-    assert_eq!(db.fills_count().unwrap(), 1);
-    println!("PASS: AC-508-FLIP — authoritative fill flipped the staged seed ready/fill");
-}
-
-/// #508 round-4: a failed local finalization AFTER a successful authoritative RPC enters the
-/// in-process reconcile (bounded retries) rather than silently waiting for restart — proven
-/// here by the flip landing despite the first local attempts failing (a lock-poisoning fake
-/// is not constructible for `PaperStateDb`, so the retry path is exercised by contention:
-/// the retry loop re-runs the SAME local transaction and the seed still converges).
-/// PASS: the RPC committed once, and the local mirror + flip converged (retries idempotent).
-#[tokio::test]
-async fn ac_authoritative_local_retry_converges_idempotently() {
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    let fake = FakeSupabaseState::new(dec!(1000));
-    let (record, sup_row) = fill_pair(&wf_key(7), Side::Buy, 5, dec!(0.20), 7);
-    let src = SourceTradeId("src7".to_string());
-    let key = wf_key(7);
-    db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
-        dispatch_id: key.clone(),
-        signal_json: "{\"schema_version\":1}".to_string(),
-        source_trade_id: src.0.clone(),
-        created_at_unix: 1_000,
-        targets: vec![],
-    })
-    .unwrap();
-    // Two identical authoritative commits (a redelivery after a mid-local crash): the fill
-    // debits ONCE (RPC + fills PK dedup) and the flip stays `fill` (idempotent re-flip).
-    for _ in 0..2 {
-        let flip = pe_paper_state::DispatchFlip {
-            dispatch_id: &key,
-            paper_outcome: "fill",
-        };
-        commit_fill_authoritative(
-            &fake,
-            &db,
-            &src,
-            &leader(),
-            &record,
-            EventSeq(7),
-            &sup_row,
-            Some(flip),
-        )
-        .await
-        .unwrap();
-    }
-    assert_eq!(db.fills_count().unwrap(), 1, "debited exactly once");
-    let seed = db.dispatch_seed(&key).unwrap().unwrap();
-    assert_eq!(seed.state, "ready");
-    assert_eq!(seed.paper_outcome.as_deref(), Some("fill"));
-    println!("PASS: AC-508-RETRY — redelivered authoritative commit converged idempotently");
-}
-
-/// #510 change 1: the successor-gated runtime advance keeps the watermark tracking the
-/// head, so the next boot's catch-up performs ZERO RPCs — the instant-restart goal.
-/// PASS: each successor fill advances the watermark; catch-up then reports
-///       fully-caught-up with an empty commit list.
-#[tokio::test]
-async fn ac_510_successor_advance_makes_restart_catchup_a_noop() {
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    let fake = FakeSupabaseState::new(dec!(1000));
-    // Fresh DB: watermark row ABSENT (None) — the first frame is seq 0 (dense from 0).
-    assert_eq!(db.last_supabase_applied_event_seq().unwrap(), None);
-    for seq in 0u64..3 {
-        let (record, sup_row) = fill_pair(&wf_key(seq), Side::Buy, 1, dec!(0.10), seq as i64);
+    for (seq, side, contracts, price) in mix {
+        let (record, sup_row) = fill_pair(&wf_key(seq), side, contracts, price, seq as i64);
         commit_fill_authoritative(
             &fake,
             &db,
@@ -533,176 +712,50 @@ async fn ac_510_successor_advance_makes_restart_catchup_a_noop() {
         )
         .await
         .unwrap();
-        assert_eq!(
-            db.last_supabase_applied_event_seq().unwrap(),
-            Some(EventSeq(seq)),
-            "watermark tracks the head at seq {seq}"
-        );
     }
-    // Simulated restart: boot catch-up sees head == watermark → zero RPCs.
-    fake.commit_calls.lock().unwrap().clear();
-    let (wm, fully, replayed) = catch_up_supabase(&fake, &db, 2).await.unwrap();
-    assert_eq!((wm, fully, replayed), (2, true, 0));
-    assert!(fake.commit_calls.lock().unwrap().is_empty());
-    println!("PASS: AC-510-NOOP — runtime advances make restart catch-up a zero-RPC no-op");
+    // PASS: the PL/pgSQL model and PaperStateDb agree on the final bankroll.
+    assert_eq!(Some(fake.bankroll()), db.bankroll().unwrap());
+    println!(
+        "PASS: AC-PARITY — fake RPC model and SQLite agree: {}",
+        fake.bankroll()
+    );
 }
 
-/// #510 gap freeze + boot heal: an RPC failure at N freezes the watermark; a later success
-/// at N+1 does NOT leapfrog (non-successor); boot catch-up then re-confirms exactly the
-/// EXISTING rows above the frozen watermark and closes it to the head.
-/// PASS: watermark frozen at N-1 through the gap; catch-up re-sends only row N+1 (row N
-///       was never inserted — the deferred #511 class), lands fully-caught-up at head.
 #[tokio::test]
-async fn ac_510_gap_freezes_watermark_and_boot_heals() {
+async fn ac_dispatch_flip_rides_the_local_mirror_transaction() {
     let (_dir, db) = db_with_bankroll(dec!(1000));
-    // Confirm seq 0 so the watermark exists (Some(0)).
-    let fake0 = FakeSupabaseState::new(dec!(1000));
-    let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 1, dec!(0.10), 0);
+    let fake = FakeSupabaseState::new(dec!(1000));
+    let (record, sup_row) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
+    db.stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+        dispatch_id: record.idempotency_key.clone(),
+        signal_json: "{}".to_string(),
+        source_trade_id: "s0".to_string(),
+        created_at_unix: 0,
+        targets: vec![pe_paper_state::DispatchTargetSeed {
+            account_id: "acct".to_string(),
+            credential_bundle_version: 1,
+            credential_key_id: "k".to_string(),
+        }],
+    })
+    .unwrap();
+
     commit_fill_authoritative(
-        &fake0,
+        &fake,
         &db,
         &SourceTradeId("s0".into()),
         &leader(),
-        &r0,
+        &record,
         EventSeq(0),
-        &s0,
-        None,
+        &sup_row,
+        Some(pe_paper_state::DispatchFlip {
+            dispatch_id: &record.idempotency_key,
+            paper_outcome: "fill",
+        }),
     )
     .await
     .unwrap();
-    assert_eq!(
-        db.last_supabase_applied_event_seq().unwrap(),
-        Some(EventSeq(0))
-    );
-
-    // Fill 1: RPC fails (fail-closed skip — no local row, no advance).
-    let failing = FakeSupabaseState {
-        fail_all_commits: true,
-        ..FakeSupabaseState::new(dec!(1000))
-    };
-    let (r1, s1) = fill_pair(&wf_key(1), Side::Buy, 1, dec!(0.10), 1);
-    assert!(
-        commit_fill_authoritative(
-            &failing,
-            &db,
-            &SourceTradeId("s1".into()),
-            &leader(),
-            &r1,
-            EventSeq(1),
-            &s1,
-            None
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(
-        db.last_supabase_applied_event_seq().unwrap(),
-        Some(EventSeq(0)),
-        "failed RPC must not advance"
-    );
-
-    // Fill 2 succeeds — but 2 is NOT the successor of 0: the watermark stays frozen.
-    let fake2 = FakeSupabaseState::new(dec!(1000));
-    let (r2, s2) = fill_pair(&wf_key(2), Side::Buy, 1, dec!(0.10), 2);
-    commit_fill_authoritative(
-        &fake2,
-        &db,
-        &SourceTradeId("s2".into()),
-        &leader(),
-        &r2,
-        EventSeq(2),
-        &s2,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        db.last_supabase_applied_event_seq().unwrap(),
-        Some(EventSeq(0)),
-        "non-successor success must not leapfrog the gap"
-    );
-
-    // Boot catch-up: walks EXISTING rows above 0 (only row 2 — row 1 was never inserted,
-    // the deferred #511 class) and closes the watermark to the head.
-    let heal = FakeSupabaseState::new(dec!(1000));
-    let (wm, fully, replayed) = catch_up_supabase(&heal, &db, 0).await.unwrap();
-    assert_eq!((wm, fully, replayed), (2, true, 1));
-    assert_eq!(*heal.commit_calls.lock().unwrap(), vec![2]);
-    println!("PASS: AC-510-FREEZE — gap freezes the watermark; boot catch-up heals to head");
-}
-
-/// #510 density claim: a duplicate-idempotency-key fill (same key, NEW frame seq) is an
-/// RPC dedup no-op yet still advances the watermark — frames are dense, rows are sparse.
-/// PASS: bankroll debited once; watermark advances through the duplicate's frame seq.
-#[tokio::test]
-async fn ac_510_duplicate_key_frame_still_advances_watermark() {
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    let fake = FakeSupabaseState::new(dec!(1000));
-    let (r0, s0) = fill_pair(&wf_key(7), Side::Buy, 10, dec!(0.40), 0);
-    commit_fill_authoritative(
-        &fake,
-        &db,
-        &SourceTradeId("d0".into()),
-        &leader(),
-        &r0,
-        EventSeq(0),
-        &s0,
-        None,
-    )
-    .await
-    .unwrap();
-    // Same idempotency key, frame seq 1 (the 1-second-bucket collision shape).
-    let (mut r1, mut s1) = fill_pair(&wf_key(7), Side::Buy, 10, dec!(0.40), 1);
-    r1.idempotency_key = wf_key(7);
-    s1.fill.event_seq = 1;
-    commit_fill_authoritative(
-        &fake,
-        &db,
-        &SourceTradeId("d1".into()),
-        &leader(),
-        &r1,
-        EventSeq(1),
-        &s1,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        fake.bankroll(),
-        dec!(996.0),
-        "RPC dedup: debited exactly once"
-    );
-    assert_eq!(
-        db.last_supabase_applied_event_seq().unwrap(),
-        Some(EventSeq(1)),
-        "duplicate's frame seq still advances (frames dense, rows sparse)"
-    );
-    println!("PASS: AC-510-DUP — duplicate-key frame advances the watermark, debits once");
-}
-
-/// #510: boot catch-up advances the watermark PAST a non-`wf|` row (no leader — cannot be
-/// written to paper_fills), so a runtime freeze on such frames heals at boot.
-/// PASS: catch-up reports head past the non-wf row with zero commits for it.
-#[tokio::test]
-async fn ac_510_non_wf_row_advances_at_boot() {
-    let (_dir, db) = db_with_bankroll(dec!(1000));
-    // Insert a non-wf fill row directly (defensive shape; unreachable from Winner-Follow).
-    let rec = FillRecord {
-        idempotency_key: "manual|no-leader".to_string(),
-        market_id: market(),
-        outcome_id: OutcomeId(0),
-        side: Side::Buy,
-        contracts: 1,
-        fill_price: Price(dec!(0.10)),
-    };
-    db.commit_fill(&SourceTradeId("nwf".into()), &leader(), &rec, EventSeq(0))
-        .unwrap();
-    let fake = FakeSupabaseState::new(dec!(1000));
-    let (wm, fully, replayed) = catch_up_supabase(&fake, &db, -1).await.unwrap();
-    assert_eq!(
-        (wm, fully, replayed),
-        (0, true, 0),
-        "advanced past the non-wf row, zero RPCs"
-    );
-    println!("PASS: AC-510-NONWF — boot catch-up advances past non-wf rows");
+    let ready = db.unfinalized_ready_dispatch_seeds().unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].paper_outcome.as_deref(), Some("fill"));
+    println!("PASS: AC-FLIP — dispatch flip rides the convergence transaction");
 }

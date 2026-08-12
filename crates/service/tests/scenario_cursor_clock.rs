@@ -72,6 +72,33 @@ fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
 
 /// A two-trade `/activity` payload: A at `a_ts`, then B at `b_ts`. Field shape mirrors
 /// `trade_parser::parse_trades` (camelCase keys; `timestamp` in seconds).
+fn second_round_responses(
+    w: pe_core_types::WalletAddress,
+    a_ts: i64,
+    b_ts: i64,
+) -> HashMap<String, Vec<u8>> {
+    // Round 2 fetches from the HELD cursor (a_ts − 1) — same window, same payload.
+    let url = PolymarketEndpoint::UserTradeActivity {
+        user: format!("{w}"),
+        end: None,
+        start: Some(a_ts - 1),
+    }
+    .url(BASE_URL);
+    let mut responses = HashMap::new();
+    responses.insert(url, activity_payload(a_ts, b_ts));
+    responses
+}
+
+fn leader_row(w: pe_core_types::WalletAddress) -> pe_paper_state::LeaderPositionRow {
+    pe_paper_state::LeaderPositionRow {
+        wallet: w,
+        market_id: pe_core_types::MarketId(pe_core_types::VenueMarketId("0xmkt".into())),
+        outcome_id: pe_core_types::OutcomeId(0),
+        long_contracts: 0,
+        short_contracts: 0,
+    }
+}
+
 fn activity_payload(a_ts: i64, b_ts: i64) -> Vec<u8> {
     format!(
         r#"[{{"transactionHash":"0xAAA","conditionId":"0xcondA","outcomeIndex":0,"side":"BUY","size":40,"price":0.60,"timestamp":{a_ts}}},{{"transactionHash":"0xBBB","conditionId":"0xcondB","outcomeIndex":1,"side":"BUY","size":10,"price":0.45,"timestamp":{b_ts}}}]"#
@@ -120,12 +147,49 @@ async fn downtime_forward_sweep_reconstructs_real_last_trade() {
 
     poller.run().await;
 
-    // The forward sweep advanced the cursor to the real most-recent trade B (T0−2h) across the
-    // downtime gap — NOT left at the stale T0−80h seed, and NOT reset to `now`.
+    // #511 held cursor: the sweep DELIVERED A and B but nothing has marked them seen (this
+    // scenario isolates the poller), so the delivery cursor HOLDS at the seed — it is a
+    // correctness-preserving lower bound now, not a delivery high-water mark. The #357
+    // inactivity-clock claim moved to the ACTIVITY clock, which does advance to B.
+    assert_eq!(
+        db.cursor(&w).unwrap(),
+        Some(a_ts),
+        "delivery cursor holds below the unseen trades (#511)"
+    );
+    assert_eq!(
+        db.activity(&w).unwrap(),
+        Some(b_ts),
+        "activity clock advanced to real last trade B across the downtime gap (#357/#511)"
+    );
+
+    // Once the trades are durably seen (the orchestrator's job), the next sweep advances
+    // the delivery cursor to B — the #357 forward-sweep reconstruction completes.
+    for trade_id in ["0xAAA", "0xBBB"] {
+        db.commit_seen_no_fill_with_flip(
+            &pe_core_types::SourceTradeId(trade_id.to_string()),
+            &leader_row(w),
+            None,
+        )
+        .unwrap();
+    }
+    let (tx2, rx2) = mpsc::channel(16);
+    let poller2 = TradePoller::new(
+        TradePollerConfig {
+            base_url: BASE_URL.to_string(),
+            poll_interval_secs: 0,
+        },
+        LiveWatchlist::new(watchlist_of(w)),
+        FixtureFetcher::new(second_round_responses(w, a_ts, b_ts)),
+        tx2,
+        db.clone(),
+        new_shared_health(false),
+    );
+    poller2.run().await;
+    drop(rx2);
     assert_eq!(
         db.cursor(&w).unwrap(),
         Some(b_ts),
-        "cursor advanced to real last trade B via the forward sweep from the lower-bound seed"
+        "cursor advances to B once every trade in the window is seen"
     );
 
     // Both trades were re-delivered; the stale A is deduped downstream by the orchestrator's
@@ -141,4 +205,103 @@ async fn downtime_forward_sweep_reconstructs_real_last_trade() {
         "PASS: the forward sweep re-delivered both A and B (dedup is downstream)"
     );
     println!("PASS: downtime-forward-sweep-reconstructs-real-last-trade");
+}
+
+/// #511: an unseen trade hidden BEHIND a full first page (500 seen rows) must still hold
+/// the cursor — the poller rescans the window via the strict descending page endpoint
+/// under the data-derived end bound and finds it on page 2.
+///
+/// PASS: cursor holds at `unseen_ts − 1`; the unseen trade is delivered.
+/// FAIL: a full first page of seen rows advances the cursor over the hidden trade.
+#[tokio::test]
+async fn full_page_rescan_finds_unseen_trade_behind_500_seen_rows() {
+    let db =
+        Arc::new(PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("p.db")).unwrap());
+    let w = WalletAddress::from_hex("0xcccccccccccccccccccccccccccccccccccccccc").unwrap();
+    let base_ts: i64 = 1_900_000_000;
+    let unseen_ts = base_ts - 10; // older than every seen row → page 2 in DESC order
+    db.seed_cursor_if_absent(&w, unseen_ts).unwrap();
+
+    // 500 seen rows (newest-first ts base..base-499… all marked seen in the DB).
+    let row = |id: &str, ts: i64| {
+        format!(
+            r#"{{"transactionHash":"{id}","conditionId":"0xc","outcomeIndex":0,"side":"BUY","size":5,"price":0.5,"timestamp":{ts}}}"#
+        )
+    };
+    let mut seen_rows = Vec::new();
+    for i in 0..500i64 {
+        let id = format!("0xseen{i}");
+        db.commit_seen_no_fill_with_flip(
+            &pe_core_types::SourceTradeId(id.clone()),
+            &leader_row(w),
+            None,
+        )
+        .unwrap();
+        seen_rows.push(row(&id, base_ts - i));
+    }
+    let full_page = format!("[{}]", seen_rows.join(","));
+    let page2 = format!("[{}]", row("0xhidden", unseen_ts));
+
+    let start = unseen_ts - 1; // cursor_start(cursor)
+    let mut responses = HashMap::new();
+    responses.insert(
+        PolymarketEndpoint::UserTradeActivity {
+            user: format!("{w}"),
+            end: None,
+            start: Some(start),
+        }
+        .url(BASE_URL),
+        full_page.clone().into_bytes(),
+    );
+    // Paged rescan: fixed end = max ts of the initial page; DESC offsets 0 and 500.
+    responses.insert(
+        PolymarketEndpoint::UserTradeActivityPage {
+            user: format!("{w}"),
+            end: base_ts,
+            start: Some(start),
+            offset: 0,
+        }
+        .url(BASE_URL),
+        full_page.into_bytes(),
+    );
+    responses.insert(
+        PolymarketEndpoint::UserTradeActivityPage {
+            user: format!("{w}"),
+            end: base_ts,
+            start: Some(start),
+            offset: 500,
+        }
+        .url(BASE_URL),
+        page2.into_bytes(),
+    );
+
+    let (tx, mut rx) = mpsc::channel(600);
+    let poller = TradePoller::new(
+        TradePollerConfig {
+            base_url: BASE_URL.to_string(),
+            poll_interval_secs: 0,
+        },
+        LiveWatchlist::new(watchlist_of(w)),
+        FixtureFetcher::new(responses),
+        tx,
+        db.clone(),
+        new_shared_health(false),
+    );
+    poller.run().await;
+
+    // The hidden unseen trade was delivered, and the cursor held below it (MAX-upsert
+    // keeps the seeded unseen_ts against the candidate unseen_ts − 1).
+    let delivered = rx.recv().await.expect("hidden trade delivered");
+    assert_eq!(delivered.source_trade_id.0, "0xhidden");
+    assert_eq!(
+        db.cursor(&w).unwrap(),
+        Some(unseen_ts),
+        "cursor held at the unseen trade despite 500 seen rows in front (#511)"
+    );
+    assert_eq!(
+        db.activity(&w).unwrap(),
+        Some(base_ts),
+        "activity advanced to newest"
+    );
+    println!("PASS: full-page rescan found the hidden unseen trade and held the cursor");
 }
