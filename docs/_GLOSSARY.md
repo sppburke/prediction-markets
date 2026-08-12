@@ -840,3 +840,11 @@ Measurement-only shadow harness for BTC up/down latency-arb (issue #297, Strateg
 | `crypto_shadow_scalp_exit_fee_model` | conservative-if-charged | Scalp exit-leg fee = `taker_fee(exit_bid)`, charged **at the exit price**: the official sell-side taker fee is ambiguous between two Polymarket sources (see `crypto_fees_v2_rate` / `fees.rs` provenance), so charging it is the conservative branch — the assumption is stamped into the sweep output (`SCALP_FEE_PROVENANCE`). |
 | `maker_rebate_rate` | 0.20 | Crypto-category maker rebate rate. Source (in governing order): **(1)** the per-market Gamma `feeSchedule.rebateRate` — verified live 2026-06-09 on a `btc-up-or-down-5m` market: `feeSchedule = {"exponent": 1, "rate": 0.07, "takerOnly": true, "rebateRate": 0.2}` (`feeType = crypto_fees_v2`); the per-market value governs over the maker-rebates docs page per the `crypto_fees_v2_rate` 0.072 precedent; **(2)** the Polymarket maker-rebates docs page for the **pool structure** — rebates are a daily pro-rata, liquidity-weighted pool of collected fees, not a per-fill credit. The #310 sweep's `maker_rebate_per_share = 0.20 · taker_fee_per_share(fill)` is therefore an **upper-bound idealization** (read the MM column as a ceiling). Single source of truth: `crates/crypto-shadow/src/fees.rs`. |
 | `mm_fill_window_ms` | 1000 | #310 sweep MM fill window after a fire (node clock): the resting maker buy at the direction-side pre-move best bid fills iff a `taker_is_buy = false` print crosses at `price ≤ bid` within this window. **Deliberately decoupled from the cell's `window_ms`** so the MM column is comparable across cells. Front-of-queue assumed (v1). |
+
+- **Held delivery cursor (#511)** — `poll_cursors.last_ts_unix` never advances past a trade
+  the orchestrator has not durably marked seen (`min(unseen) − 1`; MAX-upsert holds by not
+  writing). Unprovable windows (unparseable row, failed/oversized paged rescan) freeze it.
+  Unseen trades WARN after 1h and are never abandoned.
+- **Activity clock (#511)** — `poll_cursors.last_activity_unix`: newest trade timestamp ever
+  observed per wallet (MAX-only, advances even while the delivery cursor holds). Feeds the
+  inactivity knockout; `NULL` falls back to the delivery cursor.

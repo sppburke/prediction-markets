@@ -71,6 +71,32 @@ impl PositionLedger {
         }
     }
 
+    /// Restore the exact pre-trade state for one `(wallet, market-outcome)` — the
+    /// inverse of a single `ingest` whose pre-trade `(long, short)` was captured by the
+    /// caller (#511 pre-frame rollback: an abandoned-unseen admission must leave the
+    /// ledger byte-identical so redelivery classifies identically). `prev = None` means
+    /// the trade created the entry — remove it.
+    pub fn restore(
+        &mut self,
+        wallet: WalletAddress,
+        key: &MarketOutcomeId,
+        prev: Option<(u64, u64)>,
+    ) {
+        let Some(snap) = self.snapshots.get_mut(&wallet) else {
+            return;
+        };
+        match prev {
+            Some((long_contracts, short_contracts)) => {
+                let state = snap.positions.entry(key.clone()).or_default();
+                state.long_contracts = long_contracts;
+                state.short_contracts = short_contracts;
+            }
+            None => {
+                snap.positions.remove(key);
+            }
+        }
+    }
+
     /// Return the current position snapshot for a wallet, or `None` if the wallet
     /// has never been observed.
     pub fn position(&self, wallet: &WalletAddress) -> Option<&PositionSnapshot> {

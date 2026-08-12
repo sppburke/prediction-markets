@@ -4,6 +4,15 @@
 //! parsed [`IncomingTrade`]s into a bounded mpsc channel for the orchestrator.
 //! This module contains all the I/O for Polymarket trade ingestion; the orchestrator
 //! itself is pure dispatch logic.
+//!
+//! #511 held cursor: the per-wallet delivery cursor NEVER advances past a trade the
+//! orchestrator has not durably marked seen — it is a correctness-preserving lower bound
+//! (the #357 "cursor is only ever a lower bound" invariant, now load-bearing), so every
+//! abandoned-unseen trade (RPC failure, staging failure, crash between enqueue and
+//! commit) is refetched until seen. The activity clock (`last_activity_unix`) advances
+//! independently so holding can never fake inactivity. A window whose completeness is
+//! unprovable (unparseable row, failed/oversized paged scan) FREEZES the cursor — loud,
+//! and self-healing via seen-dedup on the refetch.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +20,7 @@ use std::time::Duration;
 use pe_copy_signal_engine::IncomingTrade;
 use pe_paper_state::PaperStateDb;
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
+use std::collections::HashSet;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -106,24 +116,26 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             h.polymarket_last_event_at = Some(OffsetDateTime::now_utc());
                         }
-                        match trade_parser::parse_trades(&bytes, wallet) {
+                        match trade_parser::parse_trades_counted(&bytes, wallet) {
                             Err(e) => {
                                 warn!(wallet = %wallet, error = %e, "trade parse error")
                             }
-                            Ok(trades) => {
-                                // Advance the cursor to the newest trade observed this round.
-                                let max_ts =
-                                    trades.iter().map(|t| t.observed_at.unix_timestamp()).max();
-                                for trade in trades {
-                                    if self.tx.send(trade).await.is_err() {
-                                        // Channel closed; orchestrator is shutting down.
-                                        return;
+                            Ok((trades, malformed)) => {
+                                let mut window_complete = malformed == 0;
+                                let mut window = trades;
+                                // #511: a full first page means the window may be
+                                // truncated — an unseen trade behind 500 rows must
+                                // still hold the cursor. Rescan via the strict
+                                // descending page endpoint with a FIXED end bound.
+                                if window.len() >= PAGE_ROWS {
+                                    match self.paged_window(wallet, start).await {
+                                        Some(paged) => window = paged,
+                                        None => window_complete = false,
                                     }
                                 }
-                                if let Some(ts) = max_ts
-                                    && let Err(e) = self.paper_state.set_cursor(&wallet, ts)
-                                {
-                                    warn!(wallet = %wallet, error = %e, "paper-state set_cursor failed");
+                                if self.deliver_and_advance(wallet, window, window_complete).await {
+                                    // Channel closed; orchestrator is shutting down.
+                                    return;
                                 }
                             }
                         }
@@ -138,6 +150,146 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                 return;
             }
         }
+    }
+}
+
+impl<F: PageFetcher + Send + 'static> TradePoller<F> {
+    /// Rescan the window `(start, now]` with the strict descending page endpoint under a
+    /// FIXED end bound (#511): dedup by `source_trade_id`, stop at a short page. Returns
+    /// `None` when completeness is unprovable (page error, parse error, malformed row,
+    /// page cap) — the caller then FREEZES the cursor.
+    async fn paged_window(
+        &self,
+        wallet: pe_core_types::WalletAddress,
+        start: Option<i64>,
+    ) -> Option<Vec<IncomingTrade>> {
+        let end = OffsetDateTime::now_utc().unix_timestamp().saturating_add(1);
+        let mut seen_ids = HashSet::new();
+        let mut out = Vec::new();
+        for page in 0..POLLER_MAX_PAGES {
+            let url = PolymarketEndpoint::UserTradeActivityPage {
+                user: format!("{wallet}"),
+                end,
+                start,
+                offset: page.checked_mul(PAGE_ROWS_U32)?,
+            }
+            .url(&self.config.base_url);
+            let bytes = match self.fetcher.fetch_page(&url).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(wallet = %wallet, error = %e, page, "paged rescan fetch error; freezing cursor");
+                    return None;
+                }
+            };
+            let (trades, malformed) = match trade_parser::parse_trades_counted(&bytes, wallet) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(wallet = %wallet, error = %e, page, "paged rescan parse error; freezing cursor");
+                    return None;
+                }
+            };
+            if malformed > 0 {
+                warn!(wallet = %wallet, malformed, page, "paged rescan malformed rows; freezing cursor");
+                return None;
+            }
+            let n = trades.len();
+            for t in trades {
+                if seen_ids.insert(t.source_trade_id.clone()) {
+                    out.push(t);
+                }
+            }
+            if n < PAGE_ROWS {
+                return Some(out);
+            }
+        }
+        warn!(
+            wallet = %wallet,
+            max_pages = POLLER_MAX_PAGES,
+            "paged rescan exceeded the page cap; freezing cursor (window too large to prove)"
+        );
+        None
+    }
+
+    /// Deliver the window's unseen trades oldest-first, advance the activity clock, and
+    /// advance or hold the delivery cursor (#511). Returns `true` when the downstream
+    /// channel closed.
+    async fn deliver_and_advance(
+        &self,
+        wallet: pe_core_types::WalletAddress,
+        mut window: Vec<IncomingTrade>,
+        window_complete: bool,
+    ) -> bool {
+        // Oldest-first: ledger ingestion and Entry/Add classification are order-sensitive
+        // (paged rescans arrive newest-first).
+        window.sort_by_key(|t| t.observed_at.unix_timestamp());
+        // Activity clock: the newest observed trade, ALWAYS (independent of holds).
+        if let Some(ts) = window.iter().map(|t| t.observed_at.unix_timestamp()).max()
+            && let Err(e) = self.paper_state.set_activity(&wallet, ts)
+        {
+            warn!(wallet = %wallet, error = %e, "paper-state set_activity failed");
+        }
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        let mut min_unseen: Option<i64> = None;
+        let mut max_ts: Option<i64> = None;
+        let mut unseen = Vec::new();
+        for trade in window {
+            let ts = trade.observed_at.unix_timestamp();
+            max_ts = Some(max_ts.map_or(ts, |m: i64| m.max(ts)));
+            // Read failure ⇒ treat as unseen (fail closed: hold rather than lose).
+            let is_seen = self.paper_state.is_seen(&trade.source_trade_id).unwrap_or(false);
+            if !is_seen {
+                min_unseen = Some(min_unseen.map_or(ts, |m: i64| m.min(ts)));
+                if now_unix.saturating_sub(ts) > HELD_WARN_AFTER_SECS {
+                    warn!(
+                        wallet = %wallet,
+                        trade = %trade.source_trade_id,
+                        age_secs = now_unix.saturating_sub(ts),
+                        "trade unseen past the warn horizon; cursor held (never abandoned)"
+                    );
+                }
+                unseen.push(trade);
+            }
+        }
+        for trade in unseen {
+            if self.tx.send(trade).await.is_err() {
+                return true;
+            }
+        }
+        match cursor_advance(max_ts, min_unseen, window_complete) {
+            None => {}
+            Some(ts) => {
+                // MAX-upsert: a hold below the stored cursor keeps the stored value, and
+                // the boundary-second refetch (`cursor − 1`) keeps a held `ts == cursor`
+                // trade reachable.
+                if let Err(e) = self.paper_state.set_cursor(&wallet, ts) {
+                    warn!(wallet = %wallet, error = %e, "paper-state set_cursor failed");
+                }
+            }
+        }
+        false
+    }
+}
+
+/// One `/activity` response page (`limit=500` in [`PolymarketEndpoint`]).
+const PAGE_ROWS: usize = 500;
+const PAGE_ROWS_U32: u32 = 500;
+/// Paged-rescan cap, mirroring the canary's `ACTIVITY_MAX_PAGES` posture: a window this
+/// large (>5,500 trades) cannot be proven complete — freeze instead.
+const POLLER_MAX_PAGES: u32 = 11;
+/// Unseen trades older than this WARN every round (observability only; never abandoned).
+const HELD_WARN_AFTER_SECS: i64 = 3_600;
+
+/// #511 cursor decision, pure for tests: `None` = freeze/no-write (incomplete window or
+/// empty page); `Some(min_unseen − 1)` = hold below the oldest unseen trade;
+/// `Some(max_ts)` = the whole window is seen — advance.
+fn cursor_advance(max_ts: Option<i64>, min_unseen: Option<i64>, window_complete: bool) -> Option<i64> {
+    if !window_complete {
+        return None;
+    }
+    match (max_ts, min_unseen) {
+        (_, Some(unseen)) => Some(unseen.saturating_sub(1)),
+        (Some(max), None) => Some(max),
+        (None, None) => None,
     }
 }
 

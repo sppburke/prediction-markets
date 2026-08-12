@@ -327,7 +327,9 @@ pub async fn apply_evictions_and_backfill(
         expected_capacity.target,
     );
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
-    paper_state.set_cursors(&seeds)?;
+    // #511: insert-only — an existing (possibly HELD) delivery cursor is already a valid
+    // lower bound and must never be jumped by a re-admission seed; activity MAX-seeds.
+    paper_state.seed_cursors_if_absent(&seeds)?;
     Ok(live.replace(removed, candidates, expected_capacity.target))
 }
 
@@ -357,7 +359,8 @@ pub(crate) fn apply_ranked_membership_locked(
     let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
     let admissions = planned_admissions(&current.entries, &removed, incoming, cap);
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
-    paper_state.set_cursors(&seeds)?;
+    // #511: insert-only (see membership admission above).
+    paper_state.seed_cursors_if_absent(&seeds)?;
     let total = live.replace(&removed, incoming, cap);
     Ok((total, dropped))
 }
@@ -598,8 +601,14 @@ async fn maintenance_tick(
     let mut cursors: HashMap<WalletAddress, Option<i64>> =
         HashMap::with_capacity(live_wallets.len());
     for w in &live_wallets {
-        // A cursor read error self-heals to `None` (treated as just-admitted, not inactive).
-        cursors.insert(*w, paper_state.cursor(w).unwrap_or(None));
+        // #511: the inactivity clock is `last_activity_unix` (advanced every round even
+        // while the delivery cursor is HELD below an unseen trade), falling back to the
+        // cursor for unmigrated rows. A read error self-heals to `None` (just-admitted).
+        let activity = paper_state
+            .activity(w)
+            .unwrap_or(None)
+            .or_else(|| paper_state.cursor(w).unwrap_or(None));
+        cursors.insert(*w, activity);
     }
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.

@@ -60,17 +60,32 @@ pub fn parse_trades(
     bytes: &[u8],
     wallet: pe_core_types::WalletAddress,
 ) -> Result<Vec<IncomingTrade>, TradeParseError> {
+    parse_trades_counted(bytes, wallet).map(|(trades, _)| trades)
+}
+
+/// [`parse_trades`] that also reports how many rows were dropped as unparseable (#511):
+/// a dropped row is a trade the poller can never deliver or hold for, so the caller must
+/// FREEZE the cursor rather than advance over it (advancing would be the same silent-loss
+/// class the held cursor exists to close).
+pub fn parse_trades_counted(
+    bytes: &[u8],
+    wallet: pe_core_types::WalletAddress,
+) -> Result<(Vec<IncomingTrade>, usize), TradeParseError> {
     let response: TradeResponse = serde_json::from_slice(bytes)?;
     let now = OffsetDateTime::now_utc();
 
     let mut out = Vec::with_capacity(response.len());
+    let mut malformed = 0usize;
     for raw in response {
         match convert_trade(raw, wallet, now) {
             Ok(t) => out.push(t),
-            Err(e) => tracing::warn!(error = %e, "skipping unparseable trade"),
+            Err(e) => {
+                malformed += 1;
+                tracing::warn!(error = %e, "unparseable trade (cursor will freeze)");
+            }
         }
     }
-    Ok(out)
+    Ok((out, malformed))
 }
 
 /// Parse a live-canary page without dropping an individual malformed trade. Ordinary paper

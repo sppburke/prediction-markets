@@ -18,7 +18,7 @@
 //! Recovery only ever FLIPS existing staged seeds — it never reconstructs dispatch state
 //! from current accounts or configuration (the frozen `signal_json` is the sole identity).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -80,26 +80,45 @@ pub fn resume_dispatch_seeds(
         return Ok(out);
     }
 
-    // One event-log pass: the set of fill idempotency keys that are durably logged.
-    let mut logged_keys: HashSet<String> = HashSet::new();
+    // One event-log pass: fill idempotency key → frame seq for durably logged frames.
+    let mut logged_keys: HashMap<String, u64> = HashMap::new();
     if event_log_path.exists() {
         let replay = Reader::replay(event_log_path)
             .with_context(|| format!("open event log {}", event_log_path.display()))?;
         for frame in replay {
-            let (_seq, envelope) = frame.context("read event-log frame")?;
+            let (seq, envelope) = frame.context("read event-log frame")?;
             let fill: PaperFill =
                 serde_json::from_slice(&envelope.payload).context("decode PaperFill")?;
-            logged_keys.insert(fill.intent.idempotency_key);
+            logged_keys.insert(fill.intent.idempotency_key, seq.0);
         }
     }
+    let last_applied = paper_state
+        .last_applied_event_seq_opt()
+        .context("read last_applied")?;
 
     for seed in pending {
-        if logged_keys.contains(&seed.dispatch_id) {
-            // Rule 1: the paper fill is durable; only the flip was lost.
-            paper_state
-                .flip_dispatch_ready(&seed.dispatch_id, "fill")
-                .context("flip recovered fill seed")?;
-            out.flipped_fill += 1;
+        if let Some(&frame_seq) = logged_keys.get(&seed.dispatch_id) {
+            // Rule 1 (#511 disposition-aware): the frame is durable — flip by its
+            // DISPOSITION, not by mere existence. A fills row = the fill applied; a
+            // row-less frame at or below `last_applied` = the terminal settled refusal;
+            // a row-less frame ABOVE `last_applied` has no disposition yet (the boot
+            // frame-walk halted before it) — leave it pending for the next pass.
+            if paper_state
+                .fill_exists(&seed.dispatch_id)
+                .context("check fill disposition")?
+            {
+                paper_state
+                    .flip_dispatch_ready(&seed.dispatch_id, "fill")
+                    .context("flip recovered fill seed")?;
+                out.flipped_fill += 1;
+            } else if last_applied.is_some_and(|cursor| frame_seq <= cursor.0) {
+                paper_state
+                    .flip_dispatch_ready(&seed.dispatch_id, "no_fill:market_settled")
+                    .context("flip refused seed")?;
+                out.finalized_stuck += 1;
+            } else {
+                out.left_pending += 1;
+            }
             continue;
         }
         // Rules 2/3: decide by redelivery possibility from the frozen signal + poll cursor.

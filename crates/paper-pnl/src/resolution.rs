@@ -92,6 +92,41 @@ impl ResolutionStore {
         self.settled.contains_key(market_id)
     }
 
+    /// The credit recorded for a settled market, or `None` when not settled (#511:
+    /// the resolution tick logs the authority-computed credit after `apply_resolution_v2`).
+    pub fn settled_credit(&self, market_id: &MarketId) -> Option<Decimal> {
+        self.settled.get(market_id).map(|e| e.credit_applied)
+    }
+
+    /// Record a settlement in the in-memory map ONLY (#511 legacy path): the durable row
+    /// and credit were already written atomically by
+    /// `PaperStateDb::settle_and_credit_from_positions`; this keeps the store's view (and
+    /// `total_credits`) in sync without a second DB write. Idempotent.
+    pub fn note_settled(
+        &mut self,
+        market_id: MarketId,
+        outcome_prices: Vec<Decimal>,
+        credit_applied: Decimal,
+        settled_at_unix: i64,
+    ) -> Result<(), ResolutionStoreError> {
+        if self.settled.contains_key(&market_id) {
+            return Ok(());
+        }
+        self.total_credits = self
+            .total_credits
+            .checked_add(credit_applied)
+            .unwrap_or(self.total_credits);
+        self.settled.insert(
+            market_id,
+            Entry {
+                outcome_prices,
+                credit_applied,
+                settled_at_unix,
+            },
+        );
+        Ok(())
+    }
+
     /// Record a settlement: write the authoritative SQLite row and the in-memory map.
     /// Idempotent — a market already in the in-memory set returns early without rewriting.
     ///

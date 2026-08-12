@@ -79,7 +79,13 @@ CREATE TABLE IF NOT EXISTS bankroll (
 -- exclusive (`timestamp > start`), so the boundary second is re-included and deduped.
 CREATE TABLE IF NOT EXISTS poll_cursors (
     wallet_hex   TEXT    PRIMARY KEY NOT NULL,
-    last_ts_unix INTEGER NOT NULL
+    last_ts_unix INTEGER NOT NULL,
+    -- #511: real-activity clock, split from the delivery cursor. `last_ts_unix` is the
+    -- held delivery cursor (never advanced past an unseen trade); `last_activity_unix`
+    -- is the newest trade timestamp ever observed (MAX-only) and feeds the inactivity
+    -- knockout so holding a delivery cursor cannot fake idleness. NULL = unmigrated /
+    -- never observed; consumers fall back to `last_ts_unix`.
+    last_activity_unix INTEGER
 );
 
 -- Key/value scalars (currently: last_applied_event_seq reconciliation cursor).
