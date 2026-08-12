@@ -367,7 +367,29 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     sup_row: &SupabaseFillRow,
     flip: Option<pe_paper_state::DispatchFlip<'_>>,
 ) -> Result<Decimal, SupabaseStateError> {
+    // #510: snapshot the watermark BEFORE the external mutation — a getter failure fails
+    // the fill closed here, never after the RPC has already debited Supabase.
+    let wm_before = paper_state.last_supabase_applied_event_seq()?;
     let new_bankroll = supabase.commit_fill(sup_row).await?;
+    // #510 successor-gated runtime advance: keep the catch-up watermark tracking the head so
+    // the next boot's catch-up is a no-op (instant restart). Frames are dense from seq 0, so
+    // the confirmed fill advances iff it is the immediate successor of the current watermark
+    // (`None` → seq 0). Any gap — a halted boot catch-up, an earlier RPC failure, a
+    // dispatcher-error or non-`wf|` frame — makes later seqs non-successors: the watermark
+    // FREEZES below the gap (no leapfrog is representable) and the next boot's catch-up,
+    // which walks real fills rows and advances through row-less frame seqs, closes it.
+    // Best-effort: a failed write is a bounded idempotent re-confirm at next boot.
+    let is_successor = match wm_before {
+        None => seq.0 == 0,
+        Some(wm) => wm.0.checked_add(1) == Some(seq.0),
+    };
+    if is_successor && let Err(e) = paper_state.set_supabase_applied_event_seq(seq) {
+        warn!(
+            error = %e,
+            seq = seq.0,
+            "authoritative fill: watermark advance failed (boot catch-up re-confirms idempotently)"
+        );
+    }
     // #508 round-4: the local transaction (mirror + seen + dispatch flip) follows the
     // authoritative RPC; a failure here surfaces and retries IN-PROCESS (bounded) — the
     // dispatch flip must not silently wait for a restart. Restart recovery remains the
@@ -437,7 +459,7 @@ pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
 /// replay each `list_fills()` row with `event_seq > watermark` through the idempotent
 /// `commit_fill` RPC, advancing the watermark along the confirmed prefix and **halting at
 /// the first failed apply** (the tail retries next boot). Returns `(new_watermark,
-/// fully_caught_up)` — `fully_caught_up` is `false` when the loop broke early on a failed
+/// fully_caught_up, committed)` — `fully_caught_up` is `false` when the loop broke early on a failed
 /// apply, so the caller knows Supabase is incomplete (its bankroll is then *overstated* —
 /// missing un-applied debits — and must not be pulled back into SQLite). Re-applying a fill
 /// already in `paper_fills` is a no-op debit (the RPC's insert gate), so a reset watermark
@@ -446,9 +468,10 @@ pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
     watermark: i64,
-) -> Result<(i64, bool), SupabaseStateError> {
+) -> Result<(i64, bool, usize), SupabaseStateError> {
     let mut new_wm = watermark;
     let mut fully_caught_up = true;
+    let mut committed = 0usize;
     for row in paper_state
         .list_fills()?
         .into_iter()
@@ -456,7 +479,10 @@ pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
     {
         match supabase_fill_from(&row) {
             Some(sup) => match supabase.commit_fill(&sup).await {
-                Ok(_) => new_wm = row.event_seq,
+                Ok(_) => {
+                    new_wm = row.event_seq;
+                    committed += 1;
+                }
                 Err(e) => {
                     warn!(
                         error = %e,
@@ -478,7 +504,7 @@ pub async fn catch_up_supabase<S: SupabaseStateTrait + ?Sized>(
             }
         }
     }
-    Ok((new_wm, fully_caught_up))
+    Ok((new_wm, fully_caught_up, committed))
 }
 
 /// Issue #397 authoritative boot: catch up Supabase from the local event-log fills, persist
@@ -494,12 +520,25 @@ pub async fn supabase_authoritative_boot(
     client: &SupabaseStateClient,
     paper_state: &PaperStateDb,
 ) -> Result<(), SupabaseStateError> {
-    // 3. Catch up Supabase from local fills beyond the dedicated watermark.
-    let wm = i64::try_from(paper_state.last_supabase_applied_event_seq()?.0).unwrap_or(i64::MAX);
-    let (new_wm, fully_caught_up) = catch_up_supabase(client, paper_state, wm).await?;
+    // 3. Catch up Supabase from local fills beyond the dedicated watermark. An ABSENT
+    //    watermark (`None` — fresh DB or SQLite loss) maps to `-1` so the `> watermark`
+    //    filter includes seq 0 (#510 absent-vs-zero).
+    let wm = match paper_state.last_supabase_applied_event_seq()? {
+        Some(seq) => i64::try_from(seq.0).unwrap_or(i64::MAX),
+        None => -1,
+    };
+    let (new_wm, fully_caught_up, committed) = catch_up_supabase(client, paper_state, wm).await?;
     if new_wm > wm {
         paper_state.set_supabase_applied_event_seq(EventSeq(u64::try_from(new_wm).unwrap_or(0)))?;
     }
+    // #510 change 3: one summary line so a long replay is visible (the 2026-08-12 incident
+    // looked like a hang) and a no-op boot (`replayed=0`) is the instant-restart proof.
+    info!(
+        old_watermark = wm,
+        head = new_wm,
+        replayed = committed,
+        "supabase authoritative boot: catch-up summary"
+    );
 
     // If catch-up halted before completing, Supabase is missing some debits (its bankroll is
     // overstated), so the pull below must NOT overwrite the event-log-reconciled SQLite value.

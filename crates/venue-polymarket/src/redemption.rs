@@ -1565,12 +1565,15 @@ mod tests {
     #[tokio::test]
     async fn timeout_after_submit_is_ambiguous_and_reconcilable() {
         let state = FixtureState::default();
-        state.poll_delay_ms.store(100, Ordering::SeqCst);
+        // Margins matter: the submit round-trip must finish well inside `request_timeout`
+        // (or the ambiguity fires before tx-1 is captured — a real load-dependent flake),
+        // while every status poll must exceed it so the deadline lands in the poll phase.
+        state.poll_delay_ms.store(2_000, Ordering::SeqCst);
         let host = server(state.clone()).await;
         let client = RelayerTransportClient::new(
             host,
             credentials("good-key"),
-            policy(Duration::from_millis(10)),
+            policy(Duration::from_millis(250)),
         )
         .unwrap();
         let error = client

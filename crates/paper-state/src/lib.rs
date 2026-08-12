@@ -766,11 +766,14 @@ impl PaperStateDb {
     }
 
     /// The highest event-log `seq` whose fill has been applied to the **authoritative
-    /// Supabase** `commit_fill` RPC (issue #397). Defaults to `EventSeq(0)` before any
-    /// fill has been applied (or after a SQLite loss, forcing a safe full idempotent
-    /// replay). Kept separate from [`last_applied_event_seq`](Self::last_applied_event_seq)
-    /// so a local-only reconcile never advances the Supabase catch-up cursor.
-    pub fn last_supabase_applied_event_seq(&self) -> Result<EventSeq, PaperStateError> {
+    /// Supabase** `commit_fill` RPC (issue #397). `None` = the meta row is ABSENT — no
+    /// fill has ever been confirmed (fresh DB, or after a SQLite loss, forcing a safe
+    /// full idempotent replay that INCLUDES seq 0). `Some(EventSeq(0))` is distinct:
+    /// seq 0 itself is confirmed (#510 — the absent-vs-zero split lets catch-up and the
+    /// runtime successor gate treat the first frame correctly). Kept separate from
+    /// [`last_applied_event_seq`](Self::last_applied_event_seq) so a local-only
+    /// reconcile never advances the Supabase catch-up cursor.
+    pub fn last_supabase_applied_event_seq(&self) -> Result<Option<EventSeq>, PaperStateError> {
         let conn = self.lock();
         let raw: Option<i64> = conn
             .query_row(
@@ -779,12 +782,13 @@ impl PaperStateDb {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(EventSeq(raw.map(parse_u64).transpose()?.unwrap_or(0)))
+        Ok(raw.map(parse_u64).transpose()?.map(EventSeq))
     }
 
     /// Persist the Supabase authoritative catch-up watermark (issue #397). Set to the
-    /// event-log head at cutover (so the first authoritative boot's catch-up is a no-op)
-    /// and advanced as boot catch-up confirms each fill against Supabase.
+    /// event-log head at cutover (so the first authoritative boot's catch-up is a no-op),
+    /// advanced as boot catch-up confirms each fill against Supabase, and advanced at
+    /// runtime by `commit_fill_authoritative` on each confirmed successor fill (#510).
     pub fn set_supabase_applied_event_seq(&self, seq: EventSeq) -> Result<(), PaperStateError> {
         let conn = self.lock();
         conn.execute(
@@ -1790,12 +1794,20 @@ mod tests {
     }
 
     #[test]
-    fn supabase_watermark_round_trips_and_defaults_zero() {
+    fn supabase_watermark_round_trips_and_absent_is_none() {
         let (_dir, db) = db();
-        // Defaults to 0 before any set (or after a SQLite loss → safe full replay).
-        assert_eq!(db.last_supabase_applied_event_seq().unwrap(), EventSeq(0));
+        // Absent row = None (include seq 0 in catch-up); Some(0) is a distinct state (#510).
+        assert_eq!(db.last_supabase_applied_event_seq().unwrap(), None);
+        db.set_supabase_applied_event_seq(EventSeq(0)).unwrap();
+        assert_eq!(
+            db.last_supabase_applied_event_seq().unwrap(),
+            Some(EventSeq(0))
+        );
         db.set_supabase_applied_event_seq(EventSeq(42)).unwrap();
-        assert_eq!(db.last_supabase_applied_event_seq().unwrap(), EventSeq(42));
+        assert_eq!(
+            db.last_supabase_applied_event_seq().unwrap(),
+            Some(EventSeq(42))
+        );
         // Independent of the local reconciliation cursor.
         assert_eq!(db.last_applied_event_seq().unwrap(), EventSeq(0));
     }

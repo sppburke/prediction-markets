@@ -40,6 +40,19 @@ against the live box on first use, then corrected here.
    started`, no poll failures; then confirm behavior-specific log lines for the deploy
    (e.g. the first `full re-rank membership swap applied` after a ranking push).
 
+## #510 restart semantics (authoritative mode)
+
+Since #510 the authoritative catch-up watermark advances at runtime (successor-gated in
+`commit_fill_authoritative`), so a healthy restart's boot catch-up is a **zero-RPC no-op** —
+the boot log prints one summary line: `supabase authoritative boot: catch-up summary`
+(`old_watermark` / `head` / `replayed`). Expect `replayed=0` on a healthy restart; a non-zero
+count is the bounded gap-heal (an earlier RPC failure or halted boot froze the watermark) and
+completes idempotently. Diagnose with
+`sqlite3 paper_state.db "select key,value from meta where key like '%event_seq'"` —
+`last_supabase_applied_event_seq` tracks `last_applied_event_seq` in steady state.
+`--backfill-supabase` (one-time cutover tool) now performs a strict full fill sweep and
+aborts before seeding any cursor if the sweep halts (rerun to resume; fully idempotent).
+
 ## #508 Phase A config cutover (A0–A4)
 
 Every production update is a predicated compare-and-swap. Save each returned `value` and

@@ -246,9 +246,9 @@ create table if not exists fill_market_snapshots (
 -- Supabase. Single row (id = 1). No anon access (see RLS below).
 create table if not exists supabase_sink_hwm (
   id             integer     primary key default 1 check (id = 1),
-  last_event_seq bigint      not null default 0
+  last_event_seq bigint      not null default -1
 );
-insert into supabase_sink_hwm (id, last_event_seq) values (1, 0)
+insert into supabase_sink_hwm (id, last_event_seq) values (1, -1)
   on conflict (id) do nothing;
 
 -- Service runtime telemetry: the size of pe-service's current live watchlist (the wallets

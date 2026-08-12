@@ -281,8 +281,8 @@ async fn ac_catchup_replays_and_is_idempotent() {
     }
     let fake = FakeSupabaseState::new(dec!(1000));
 
-    let (wm1, full1) = catch_up_supabase(&fake, &db, 0).await.unwrap();
-    let (wm2, full2) = catch_up_supabase(&fake, &db, wm1).await.unwrap();
+    let (wm1, full1, _n1) = catch_up_supabase(&fake, &db, 0).await.unwrap();
+    let (wm2, full2, _n2) = catch_up_supabase(&fake, &db, wm1).await.unwrap();
 
     // PASS: the first pass applies all three and advances to 14; re-running from 14 applies
     //       nothing new, and the fake's bankroll equals SQLite's (RPC↔Rust parity over catch-up).
@@ -311,7 +311,7 @@ async fn ac_catchup_halts_at_first_failure() {
         ..FakeSupabaseState::new(dec!(1000))
     };
 
-    let (wm, fully) = catch_up_supabase(&fake, &db, 0).await.unwrap();
+    let (wm, fully, _n) = catch_up_supabase(&fake, &db, 0).await.unwrap();
 
     // PASS: the watermark advances only over the confirmed prefix (5) and halts at 9; 14 is
     //       left for the next boot. Not integer adjacency. `fully` is false so the boot skips
@@ -507,4 +507,202 @@ async fn ac_authoritative_local_retry_converges_idempotently() {
     assert_eq!(seed.state, "ready");
     assert_eq!(seed.paper_outcome.as_deref(), Some("fill"));
     println!("PASS: AC-508-RETRY — redelivered authoritative commit converged idempotently");
+}
+
+/// #510 change 1: the successor-gated runtime advance keeps the watermark tracking the
+/// head, so the next boot's catch-up performs ZERO RPCs — the instant-restart goal.
+/// PASS: each successor fill advances the watermark; catch-up then reports
+///       fully-caught-up with an empty commit list.
+#[tokio::test]
+async fn ac_510_successor_advance_makes_restart_catchup_a_noop() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState::new(dec!(1000));
+    // Fresh DB: watermark row ABSENT (None) — the first frame is seq 0 (dense from 0).
+    assert_eq!(db.last_supabase_applied_event_seq().unwrap(), None);
+    for seq in 0u64..3 {
+        let (record, sup_row) = fill_pair(&wf_key(seq), Side::Buy, 1, dec!(0.10), seq as i64);
+        commit_fill_authoritative(
+            &fake,
+            &db,
+            &SourceTradeId(format!("s{seq}")),
+            &leader(),
+            &record,
+            EventSeq(seq),
+            &sup_row,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.last_supabase_applied_event_seq().unwrap(),
+            Some(EventSeq(seq)),
+            "watermark tracks the head at seq {seq}"
+        );
+    }
+    // Simulated restart: boot catch-up sees head == watermark → zero RPCs.
+    fake.commit_calls.lock().unwrap().clear();
+    let (wm, fully, replayed) = catch_up_supabase(&fake, &db, 2).await.unwrap();
+    assert_eq!((wm, fully, replayed), (2, true, 0));
+    assert!(fake.commit_calls.lock().unwrap().is_empty());
+    println!("PASS: AC-510-NOOP — runtime advances make restart catch-up a zero-RPC no-op");
+}
+
+/// #510 gap freeze + boot heal: an RPC failure at N freezes the watermark; a later success
+/// at N+1 does NOT leapfrog (non-successor); boot catch-up then re-confirms exactly the
+/// EXISTING rows above the frozen watermark and closes it to the head.
+/// PASS: watermark frozen at N-1 through the gap; catch-up re-sends only row N+1 (row N
+///       was never inserted — the deferred #511 class), lands fully-caught-up at head.
+#[tokio::test]
+async fn ac_510_gap_freezes_watermark_and_boot_heals() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    // Confirm seq 0 so the watermark exists (Some(0)).
+    let fake0 = FakeSupabaseState::new(dec!(1000));
+    let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 1, dec!(0.10), 0);
+    commit_fill_authoritative(
+        &fake0,
+        &db,
+        &SourceTradeId("s0".into()),
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(0))
+    );
+
+    // Fill 1: RPC fails (fail-closed skip — no local row, no advance).
+    let failing = FakeSupabaseState {
+        fail_all_commits: true,
+        ..FakeSupabaseState::new(dec!(1000))
+    };
+    let (r1, s1) = fill_pair(&wf_key(1), Side::Buy, 1, dec!(0.10), 1);
+    assert!(
+        commit_fill_authoritative(
+            &failing,
+            &db,
+            &SourceTradeId("s1".into()),
+            &leader(),
+            &r1,
+            EventSeq(1),
+            &s1,
+            None
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(0)),
+        "failed RPC must not advance"
+    );
+
+    // Fill 2 succeeds — but 2 is NOT the successor of 0: the watermark stays frozen.
+    let fake2 = FakeSupabaseState::new(dec!(1000));
+    let (r2, s2) = fill_pair(&wf_key(2), Side::Buy, 1, dec!(0.10), 2);
+    commit_fill_authoritative(
+        &fake2,
+        &db,
+        &SourceTradeId("s2".into()),
+        &leader(),
+        &r2,
+        EventSeq(2),
+        &s2,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(0)),
+        "non-successor success must not leapfrog the gap"
+    );
+
+    // Boot catch-up: walks EXISTING rows above 0 (only row 2 — row 1 was never inserted,
+    // the deferred #511 class) and closes the watermark to the head.
+    let heal = FakeSupabaseState::new(dec!(1000));
+    let (wm, fully, replayed) = catch_up_supabase(&heal, &db, 0).await.unwrap();
+    assert_eq!((wm, fully, replayed), (2, true, 1));
+    assert_eq!(*heal.commit_calls.lock().unwrap(), vec![2]);
+    println!("PASS: AC-510-FREEZE — gap freezes the watermark; boot catch-up heals to head");
+}
+
+/// #510 density claim: a duplicate-idempotency-key fill (same key, NEW frame seq) is an
+/// RPC dedup no-op yet still advances the watermark — frames are dense, rows are sparse.
+/// PASS: bankroll debited once; watermark advances through the duplicate's frame seq.
+#[tokio::test]
+async fn ac_510_duplicate_key_frame_still_advances_watermark() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    let fake = FakeSupabaseState::new(dec!(1000));
+    let (r0, s0) = fill_pair(&wf_key(7), Side::Buy, 10, dec!(0.40), 0);
+    commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("d0".into()),
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+    )
+    .await
+    .unwrap();
+    // Same idempotency key, frame seq 1 (the 1-second-bucket collision shape).
+    let (mut r1, mut s1) = fill_pair(&wf_key(7), Side::Buy, 10, dec!(0.40), 1);
+    r1.idempotency_key = wf_key(7);
+    s1.fill.event_seq = 1;
+    commit_fill_authoritative(
+        &fake,
+        &db,
+        &SourceTradeId("d1".into()),
+        &leader(),
+        &r1,
+        EventSeq(1),
+        &s1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fake.bankroll(),
+        dec!(996.0),
+        "RPC dedup: debited exactly once"
+    );
+    assert_eq!(
+        db.last_supabase_applied_event_seq().unwrap(),
+        Some(EventSeq(1)),
+        "duplicate's frame seq still advances (frames dense, rows sparse)"
+    );
+    println!("PASS: AC-510-DUP — duplicate-key frame advances the watermark, debits once");
+}
+
+/// #510: boot catch-up advances the watermark PAST a non-`wf|` row (no leader — cannot be
+/// written to paper_fills), so a runtime freeze on such frames heals at boot.
+/// PASS: catch-up reports head past the non-wf row with zero commits for it.
+#[tokio::test]
+async fn ac_510_non_wf_row_advances_at_boot() {
+    let (_dir, db) = db_with_bankroll(dec!(1000));
+    // Insert a non-wf fill row directly (defensive shape; unreachable from Winner-Follow).
+    let rec = FillRecord {
+        idempotency_key: "manual|no-leader".to_string(),
+        market_id: market(),
+        outcome_id: OutcomeId(0),
+        side: Side::Buy,
+        contracts: 1,
+        fill_price: Price(dec!(0.10)),
+    };
+    db.commit_fill(&SourceTradeId("nwf".into()), &leader(), &rec, EventSeq(0))
+        .unwrap();
+    let fake = FakeSupabaseState::new(dec!(1000));
+    let (wm, fully, replayed) = catch_up_supabase(&fake, &db, -1).await.unwrap();
+    assert_eq!(
+        (wm, fully, replayed),
+        (0, true, 0),
+        "advanced past the non-wf row, zero RPCs"
+    );
+    println!("PASS: AC-510-NONWF — boot catch-up advances past non-wf rows");
 }
