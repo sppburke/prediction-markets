@@ -430,6 +430,14 @@ fn cell_to_decimal(v: Option<&serde_json::Value>) -> Option<Decimal> {
 /// Decode one ranking score cell: the exact `::text` alias when present (a malformed
 /// alias fails to `None` rather than silently degrading to f64), else the recorded-body
 /// [`cell_to_decimal`] fallback.
+///
+/// "Exact" is bounded by the workspace money type: [`Decimal`] carries at most 28
+/// fractional digits, and `from_str` rounds a longer literal at that capacity (verified
+/// on the locked rust_decimal 1.41.0). A schema-valid `numeric` with more than 28
+/// fractional digits can therefore still round differently from exact arithmetic —
+/// far past f64's ~16 significant digits, and unreachable from today's 4-dp reranker
+/// output. The boundary test pins both the 28-digit exactness and the 29-digit capacity
+/// rounding.
 fn exact_cell(text: Option<&str>, value: Option<&serde_json::Value>) -> Option<Decimal> {
     match text {
         Some(text) => Decimal::from_str(text.trim()).ok(),
@@ -551,8 +559,9 @@ async fn get_ranking(
 /// Fetch the latest ranking from Supabase and map it to a [`Watchlist`] plus the last-trade
 /// side-map (#357).
 ///
-/// `GET {base_url}/rest/v1/latest_ranking?order=rank&limit={limit}` with the SAME token in
-/// both the `apikey` and `Authorization: Bearer` headers (see [`auth_token`]). This is the
+/// `GET {base_url}/rest/v1/latest_ranking?select=<RANKING_EXACT_SELECT>&order=rank&limit={limit}`
+/// with the SAME token in both the `apikey` and `Authorization: Bearer` headers (see
+/// [`auth_token`]). This is the
 /// bootstrap + score-refresh path: it is intentionally NOT freshness-filtered (the bootstrap
 /// admits the top-`limit` by rank; freshness for live wallets is enforced by the poll cursor +
 /// maintenance tick, and the refresh must not drop live members). See [`fetch_candidates`].
@@ -931,6 +940,15 @@ mod tests {
             Some(1),
         );
         assert_eq!(map_row(&lossy_t).unwrap().leader_score_bps.0, 2);
+
+        // Capacity pin: Decimal holds 28 fractional digits exactly; from_str rounds the
+        // 29th digit, so a longer schema-valid literal is exact only to that bound.
+        let mut cap28 = row(HEX_A, json!(null), json!(null), Some(1));
+        cap28.hit_rate_text = Some("0.0001499999999999999999999999".to_string()); // 28 digits
+        assert_eq!(map_row(&cap28).unwrap().win_rate_bps.0, 1);
+        let mut cap29 = row(HEX_A, json!(null), json!(null), Some(1));
+        cap29.hit_rate_text = Some("0.00014999999999999999999999999".to_string()); // 29 digits
+        assert_eq!(map_row(&cap29).unwrap().win_rate_bps.0, 2);
     }
 
     #[test]
@@ -1036,7 +1054,14 @@ mod tests {
 
     async fn latest_ranking(
         axum::extract::State(state): axum::extract::State<CanaryRankingFixture>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
     ) -> axum::Json<serde_json::Value> {
+        // The production canary read requests the exact aliases (#514); the alias-free
+        // response below pins the recorded-body fallback path.
+        assert_eq!(
+            query.get("select").map(String::as_str),
+            Some(RANKING_EXACT_SELECT)
+        );
         axum::Json(json!([{
             "batch_id": 7,
             "rank": 1,

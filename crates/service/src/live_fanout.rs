@@ -367,11 +367,12 @@ async fn process_target(
         .iter()
         .find(|account| account.account_id.as_str() == target.account_id);
     let fresh = accounts.is_fresh(now.unix_timestamp());
+    let closure_reason = state.closures.reason(&target.account_id);
     let class = classify_target(
         &target.state,
         fresh,
         account.is_some_and(AccountContext::is_armed),
-        state.closures.reason(&target.account_id).is_some(),
+        closure_reason.is_some(),
     );
     match class {
         TargetClass::RecoverInFlight => {
@@ -388,7 +389,8 @@ async fn process_target(
             return Ok(PassControl::Continue);
         }
         TargetClass::PauseClosed => {
-            info!(account_id = %target.account_id, "live target remains pending while account admission is closed");
+            let reason = closure_reason.unwrap_or_default();
+            info!(account_id = %target.account_id, reason, "live target remains pending while account admission is closed");
             return Ok(PassControl::StopSeed);
         }
         TargetClass::Dispatch => {}
@@ -3006,13 +3008,13 @@ mod tests {
         stage(&db, "seed-inflight", 1, &["acct"]);
         db.set_dispatch_target_state("seed-inflight", "acct", "submitted", None, 5)
             .unwrap();
-        // Recovery runs even under a never-successful snapshot AND a closed admission
-        // (classify-first), and credential rotation retains the target non-terminally.
-        let snapshot = armed_snapshot("acct");
+        // Recovery runs even when the account is MISSING from a never-successful snapshot
+        // AND its admission is closed (classify-first), and credential rotation retains
+        // the target non-terminally through all of it.
         let mut state = fanout_state(
             &dir,
             db.clone(),
-            snapshot,
+            LiveAccountsSnapshot::default(),
             &format!("http://{address}"),
             Some(Identity::generate()),
         );

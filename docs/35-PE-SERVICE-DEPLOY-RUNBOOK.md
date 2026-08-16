@@ -24,37 +24,38 @@ against the live box on first use, then corrected here.
 
 ## Procedure
 
-1. **Build at the exact main SHA** being deployed (record it):
-   `git -C /home/sean/git/prediction-markets rev-parse --short HEAD && cargo build --release -p pe-service`
+Every step is bound to sha256 identity (#514): record **desired** = `sha256sum` of the
+local release build before shipping; on the VPS, **staged** = the hash of
+`/tmp/pe-service.new` and **installed** = the hash of the `ExecStart` binary.
+
+1. **Build at the exact main SHA** being deployed (record the git SHA and the desired
+   binary hash):
+   `git -C /home/sean/git/prediction-markets rev-parse --short HEAD && cargo build --release -p pe-service && sha256sum target/release/pe-service`
 2. **Ship**: `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new`
-3. **Stop** (operator, interactive sudo): `ssh -t … 'sudo systemctl stop pe-service'`
-4. **Backup + swap** (on the VPS, service stopped):
-   `cp <workdir>/target/release/pe-service <workdir>/target/release/pe-service.bak-<old-sha> && mv /tmp/pe-service.new <workdir>/target/release/pe-service && chmod +x <workdir>/target/release/pe-service`
-5. **Config deltas for this deploy** (see each PR's "Deployment impact"): update `.env` /
+3. **Preflight on the VPS** (before stopping anything): require `staged = desired` — a
+   mismatch or missing file means the scp is partial: re-run step 2. If
+   `installed = desired` already, the swap is complete (a resumed run): skip to step 6.
+4. **Stop** (operator, interactive sudo): `ssh -t … 'sudo systemctl stop pe-service'`
+5. **Backup + swap** (on the VPS, service stopped; `<old-sha>` = the git short SHA the
+   installed binary was built from, falling back to the first 12 hex of its sha256 when
+   unknown — the sha-derived name makes the backup once-only, so a rerun never clobbers
+   it):
+   `[ -f <workdir>/target/release/pe-service.bak-<old-sha> ] || cp -p <workdir>/target/release/pe-service <workdir>/target/release/pe-service.bak-<old-sha>`
+   `mv /tmp/pe-service.new <workdir>/target/release/pe-service && chmod +x <workdir>/target/release/pe-service`
+   then require `installed = desired` before proceeding.
+6. **Config deltas for this deploy** (see each PR's "Deployment impact"): update `.env` /
    TOML boot knobs (e.g. `PE_WATCHLIST_MEMBERSHIP_MODE=full_rerank`) and PATCH/INSERT the
    live `service_config` rows the new binary reads (seed `on conflict do nothing` never
    updates an existing row — changed defaults need a manual `PATCH`).
-6. **Start**: `ssh -t … 'sudo systemctl start pe-service'`
-7. **Verify**: `journalctl -u pe-service -n 100` — clean boot (no config-parse error /
+7. **Start**: `ssh -t … 'sudo systemctl start pe-service'` — a failed start rolls back
+   from the step-5 backup (see Rollback).
+8. **Verify**: `journalctl -u pe-service -n 100` — clean boot (no config-parse error /
    restart loop), watchlist seeded from `latest_ranking`, `service_config poll loop
    started`, no poll failures; then confirm behavior-specific log lines for the deploy
    (e.g. the first `full re-rank membership swap applied` after a ranking push).
 
-## Hash protocol (resumable swap)
-
-Binds every step above to sha256 identity so an interrupted deploy resumes at the right
-step instead of guessing (#514). Record three hashes: **desired** (the local release
-build), **staged** (`/tmp/pe-service.new` on the VPS), and **old-installed** (the current
-`ExecStart` binary).
-
-- Require `staged = desired` before stopping the service; a mismatch means the scp is
-  missing or partial — re-ship (step 2) and re-check.
-- `installed = desired` already ⇒ the swap is complete (a resumed run): skip stop/backup/
-  swap and go to start + verify.
-- Otherwise back up the old binary **once** as `pe-service.bak-<old-sha>` (sha-naming
-  makes the once-only property automatic — re-running never clobbers the backup), swap,
-  and require `installed = desired` post-swap before starting.
-- A failed start rolls back from the preserved `pe-service.bak-<old-sha>` (see Rollback).
+An interrupted deploy is resumed by re-running from step 3: the hash comparisons decide
+whether to re-ship, re-swap, or only start and verify — never guess from memory.
 
 ## #510 restart semantics (authoritative mode)
 
