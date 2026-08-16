@@ -219,7 +219,10 @@ fn live_accounts(rows: Vec<AccountRow>) -> LiveAccounts {
         .iter()
         .map(|row| credential(&row.account_id))
         .collect::<Vec<_>>();
-    LiveAccounts::new(LiveAccountsSnapshot::from_rows(rows, &credentials))
+    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &credentials);
+    // #514: staging requires a FRESH snapshot; the stale scenario opts out explicitly.
+    snapshot.fetched_at_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
+    LiveAccounts::new(snapshot)
 }
 
 fn standard_armed_accounts() -> LiveAccounts {
@@ -409,6 +412,50 @@ async fn scenario_dispatch_paper_fill_flips_ready_with_primary_first_targets() {
     assert_eq!(seed.paper_outcome.as_deref(), Some("fill"));
     assert_standard_targets(&state, dispatch_id);
     println!("PASS: paper fill flips ready/fill with frozen primary-first armed targets");
+}
+
+/// PASS: a stale (never-successful) accounts snapshot stages no dispatch aggregate while
+/// the paper fill still commits (#514 — no new live work while blind; paper unchanged).
+/// FAIL: a seed exists, or the paper fill is suppressed.
+#[tokio::test]
+async fn scenario_dispatch_stale_accounts_snapshot_stages_nothing_paper_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let state = open_paper_state(&dir);
+    let trade = entry_trade("stale-1", MARKET, dec!(0.50));
+    let dispatch_id = dispatch_id_for(&trade);
+    let rows = vec![
+        account_row("partner", false, true, 1, "live_tiny"),
+        account_row("primary-acct", true, true, 9, "live_tiny"),
+    ];
+    let credentials = rows
+        .iter()
+        .map(|row| credential(&row.account_id))
+        .collect::<Vec<_>>();
+    let snapshot = LiveAccountsSnapshot::from_rows(rows, &credentials);
+    assert!(
+        snapshot.fetched_at_unix.is_none(),
+        "armed accounts exist but the snapshot never had a successful fetch"
+    );
+    run_trade(
+        &dir,
+        state.clone(),
+        trade,
+        base_snapshot(),
+        Some(LiveAccounts::new(snapshot)),
+        HashMap::new(),
+        "0.50",
+    )
+    .await;
+    assert!(
+        state.dispatch_seed(&dispatch_id).unwrap().is_none(),
+        "no live aggregate is staged while blind"
+    );
+    assert_eq!(
+        state.list_fills().unwrap().len(),
+        1,
+        "paper execution is unchanged by the freshness gate"
+    );
+    println!("PASS: a stale accounts snapshot stages nothing while paper proceeds");
 }
 
 /// PASS: a zero-contract paper evaluation stages the live aggregate, records a typed

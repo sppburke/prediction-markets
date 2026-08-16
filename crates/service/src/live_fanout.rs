@@ -251,10 +251,52 @@ enum FanoutError {
     Executor(#[from] pe_execution_core::LiveExecutorError),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum PassControl {
     Continue,
     StopSeed,
     FreezePass,
+}
+
+/// Pre-network classification of one dispatch target (#514): decided from the target's
+/// durable state and the accounts snapshot BEFORE any credential, book, or order work, so
+/// a paused target provably performs none of it.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetClass {
+    /// `submitted`/`ambiguous`: reconcile the in-flight order. Never terminalized by the
+    /// snapshot, freshness, arming, closure, or credential-CAS gates — the order may
+    /// exist on the venue, so only venue reconciliation may decide its outcome.
+    RecoverInFlight,
+    /// `pending` under a stale/never-successful accounts snapshot: pause (no submission,
+    /// no terminalization) until the account evidence is fresh again.
+    PauseStale,
+    /// `pending` under a FRESH snapshot whose account is missing or unarmed: terminal.
+    NotArmed,
+    /// `pending`, fresh and armed, but the account's admission is closed: pause.
+    PauseClosed,
+    /// `pending`, fresh, armed, open: proceed to ordinary dispatch.
+    Dispatch,
+}
+
+fn classify_target(
+    target_state: &str,
+    snapshot_is_fresh: bool,
+    armed_account_present: bool,
+    admission_closed: bool,
+) -> TargetClass {
+    if target_state == "submitted" || target_state == "ambiguous" {
+        return TargetClass::RecoverInFlight;
+    }
+    if !snapshot_is_fresh {
+        return TargetClass::PauseStale;
+    }
+    if !armed_account_present {
+        return TargetClass::NotArmed;
+    }
+    if admission_closed {
+        return TargetClass::PauseClosed;
+    }
+    TargetClass::Dispatch
 }
 
 async fn run_dispatch_pass(
@@ -324,18 +366,38 @@ async fn process_target(
         .accounts
         .iter()
         .find(|account| account.account_id.as_str() == target.account_id);
+    let fresh = accounts.is_fresh(now.unix_timestamp());
+    let class = classify_target(
+        &target.state,
+        fresh,
+        account.is_some_and(AccountContext::is_armed),
+        state.closures.reason(&target.account_id).is_some(),
+    );
+    match class {
+        TargetClass::RecoverInFlight => {
+            // With no fresh account context the pass reconciles the order state only.
+            let context = if fresh { account } else { None };
+            return recover_in_flight_target(state, target, context, now).await;
+        }
+        TargetClass::PauseStale => {
+            warn!(account_id = %target.account_id, "live accounts snapshot is stale; pending target paused");
+            return Ok(PassControl::StopSeed);
+        }
+        TargetClass::NotArmed => {
+            terminalize(state, target, "not_armed", now)?;
+            return Ok(PassControl::Continue);
+        }
+        TargetClass::PauseClosed => {
+            info!(account_id = %target.account_id, "live target remains pending while account admission is closed");
+            return Ok(PassControl::StopSeed);
+        }
+        TargetClass::Dispatch => {}
+    }
     let Some(account) = account else {
-        terminalize(state, target, "not_armed", now)?;
-        return Ok(PassControl::Continue);
-    };
-    if !account.is_armed() {
-        terminalize(state, target, "not_armed", now)?;
-        return Ok(PassControl::Continue);
-    }
-    if let Some(reason) = state.closures.reason(&target.account_id) {
-        info!(account_id = %target.account_id, reason, "live target remains pending while account admission is closed");
+        // Unreachable by classification (Dispatch requires an armed account); fail closed
+        // without submitting.
         return Ok(PassControl::StopSeed);
-    }
+    };
 
     let credentials = match credentials_for_target(state, target).await {
         CredentialLoad::Ready(credentials) => credentials,
@@ -355,21 +417,6 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
     };
-
-    if target.state == "ambiguous" || target.state == "submitted" {
-        let outcome = recover_target(state, target, &venue, now).await?;
-        let transition = outcome_transition(&outcome);
-        persist_outcome(state, target, &outcome, now)?;
-        capture_account_state(state, account, &venue, false, now).await;
-        if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
-            reconcile_account_projection(state, account, now).await;
-        }
-        return Ok(if transition.freeze {
-            PassControl::FreezePass
-        } else {
-            PassControl::Continue
-        });
-    }
 
     let condition_id = PolymarketConditionId(signal.market_id.0.0.clone());
     let admission = match state.admission.build(&condition_id, now).await {
@@ -1114,6 +1161,59 @@ fn recovered_prepared(
     Ok(prepared)
 }
 
+/// Reconcile one `submitted`/`ambiguous` target (#514 classify-first). Runs before — and
+/// is never blocked or terminalized by — the freshness, arming, closure, and
+/// credential-CAS gates. Credential rotation genuinely occurs mid-flight (the single-row
+/// `account_credentials` upsert), so an unavailable/rotated frozen binding retains the
+/// target's non-terminal state, keeps dispatch frozen, and surfaces loudly for operator
+/// recovery. `context` is `Some` only when a fresh snapshot still carries the account;
+/// `None` reconciles the order state only (no account-state capture or projection).
+async fn recover_in_flight_target(
+    state: &mut FanoutState,
+    target: &DispatchTargetRow,
+    context: Option<&AccountContext>,
+    now: OffsetDateTime,
+) -> Result<PassControl, FanoutError> {
+    let credentials = match credentials_for_target(state, target).await {
+        CredentialLoad::Ready(credentials) => credentials,
+        CredentialLoad::Changed => {
+            error!(
+                account_id = %target.account_id,
+                dispatch_id = %target.dispatch_id,
+                "in-flight live order's frozen credential binding was rotated away; the \
+                 target is retained non-terminal and dispatch stays frozen until operator \
+                 recovery"
+            );
+            return Ok(PassControl::FreezePass);
+        }
+        CredentialLoad::Transient(reason) => {
+            warn!(account_id = %target.account_id, reason, "in-flight live credential load refused transiently; recovery retries");
+            return Ok(PassControl::StopSeed);
+        }
+    };
+    let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
+        Ok(venue) => venue,
+        Err(error) => {
+            warn!(account_id = %target.account_id, error = %error, "live V2 client construction failed; recovery retries");
+            return Ok(PassControl::StopSeed);
+        }
+    };
+    let outcome = recover_target(state, target, &venue, now).await?;
+    let transition = outcome_transition(&outcome);
+    persist_outcome(state, target, &outcome, now)?;
+    if let Some(account) = context {
+        capture_account_state(state, account, &venue, false, now).await;
+        if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
+            reconcile_account_projection(state, account, now).await;
+        }
+    }
+    Ok(if transition.freeze {
+        PassControl::FreezePass
+    } else {
+        PassControl::Continue
+    })
+}
+
 async fn recover_target(
     state: &FanoutState,
     target: &DispatchTargetRow,
@@ -1442,6 +1542,12 @@ impl ArmingProbe for StaticProbe {
 async fn drive_modes(state: &mut FanoutState, now: OffsetDateTime) {
     let snapshot = state.config.live_accounts.snapshot();
     if snapshot.accounts.is_empty() {
+        return;
+    }
+    // #514: no promotion/demotion is written from stale account evidence. New-order
+    // admission is separately paused by staging and target classification.
+    if !snapshot.is_fresh(now.unix_timestamp()) {
+        warn!("live accounts snapshot is stale; mode pass skipped");
         return;
     }
     let promotions = match fetch_promotions(state).await {
@@ -2212,12 +2318,17 @@ mod tests {
         LiveVenuePrepareRequest, LiveVenuePrepared, LiveVenueReconciliation,
         LiveVenueReconciliationError,
     };
+    use pe_core_types::SourceTimestamp;
     use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed};
+    use pe_trader_index::Watchlist;
     use pe_venue_polymarket::NEGRISK_COLLATERAL_ADAPTER;
     use rust_decimal_macros::dec;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::config::ServiceConfig;
+    use crate::live_accounts::{AccountRow, CredentialMetaRow, LiveAccountsSnapshot};
+    use crate::runtime_config::RuntimeConfig;
 
     #[test]
     fn outcome_to_target_state_mapping_and_freeze_rule() {
@@ -2700,6 +2811,257 @@ mod tests {
             &state,
             OffsetDateTime::UNIX_EPOCH
         ));
+    }
+
+    #[test]
+    fn target_classification_orders_recovery_before_every_gate() {
+        // In-flight targets recover regardless of freshness, arming, or closures (#514):
+        // the order may exist on the venue, so no gate may terminalize or bypass it.
+        for state in ["submitted", "ambiguous"] {
+            for fresh in [false, true] {
+                for armed in [false, true] {
+                    for closed in [false, true] {
+                        assert_eq!(
+                            classify_target(state, fresh, armed, closed),
+                            TargetClass::RecoverInFlight,
+                            "{state} fresh={fresh} armed={armed} closed={closed}"
+                        );
+                    }
+                }
+            }
+        }
+        // A pending target is paused while blind — staleness precedes the arming and
+        // closure gates, so a dead poller can never terminalize or dispatch it.
+        assert_eq!(
+            classify_target("pending", false, true, false),
+            TargetClass::PauseStale
+        );
+        assert_eq!(
+            classify_target("pending", false, false, true),
+            TargetClass::PauseStale
+        );
+        // Only a FRESH snapshot may terminalize a missing/unarmed pending target.
+        assert_eq!(
+            classify_target("pending", true, false, false),
+            TargetClass::NotArmed
+        );
+        assert_eq!(
+            classify_target("pending", true, true, true),
+            TargetClass::PauseClosed
+        );
+        assert_eq!(
+            classify_target("pending", true, true, false),
+            TargetClass::Dispatch
+        );
+    }
+
+    fn armed_account_row(id: &str) -> AccountRow {
+        AccountRow {
+            account_id: id.to_owned(),
+            is_primary: true,
+            enabled: true,
+            execution_order: 0,
+            requested_live_mode: "live_tiny".to_owned(),
+            effective_live_mode: "live_tiny".to_owned(),
+            live_price_impact_cap_bps: 100,
+            custody_wallet_address: None,
+            custody_wallet_kind: None,
+        }
+    }
+
+    fn armed_snapshot(id: &str) -> LiveAccountsSnapshot {
+        LiveAccountsSnapshot::from_rows(
+            vec![armed_account_row(id)],
+            &[CredentialMetaRow {
+                account_id: id.to_owned(),
+                bundle_version: 1,
+                key_id: "key".to_owned(),
+            }],
+        )
+    }
+
+    fn fanout_state(
+        dir: &tempfile::TempDir,
+        paper_state: Arc<PaperStateDb>,
+        snapshot: LiveAccountsSnapshot,
+        supabase_url: &str,
+        identity: Option<Identity>,
+    ) -> FanoutState {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let journal_path = dir.path().join("live.journal");
+        let journal = Arc::new(LiveJournal::open(&journal_path).unwrap());
+        let admission = LiveAdmissionBuilder::new(
+            http.clone(),
+            "http://127.0.0.1:9".to_owned(),
+            "http://127.0.0.1:9".to_owned(),
+        );
+        FanoutState {
+            config: LiveFanoutConfig {
+                paper_state,
+                live_accounts: LiveAccounts::new(snapshot),
+                live_watchlist: LiveWatchlist::new(Watchlist {
+                    entries: Vec::new(),
+                    snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                    active_count: 0,
+                    incubator_count: 0,
+                }),
+                runtime_config: LiveRuntimeConfig::new(RuntimeConfig::from_service_config(
+                    &ServiceConfig::default(),
+                )),
+                identity,
+                journal,
+                journal_path,
+                projection: LiveProjectionWriter::new(http.clone(), supabase_url, "anon", ""),
+                book_fetcher: Arc::new(ReqwestClobBookFetcher::new(http.clone())),
+                http,
+                supabase_url: supabase_url.to_owned(),
+                supabase_anon_key: "anon".to_owned(),
+                supabase_secret_key: String::new(),
+                gamma_base_url: "http://127.0.0.1:9".to_owned(),
+                clob_base_url: "http://127.0.0.1:9".to_owned(),
+                data_base_url: "http://127.0.0.1:9".to_owned(),
+                projection_reconcile_interval_secs: 3_600,
+            },
+            admission,
+            closures: AdmissionClosures::default(),
+            last_mode_unix: None,
+            last_redemption_unix: None,
+            last_projection_unix: None,
+            last_prune_unix: None,
+            account_state_inputs: HashMap::new(),
+        }
+    }
+
+    async fn counting_fallback(
+        State(hits): State<Arc<Mutex<Vec<String>>>>,
+        uri: axum::http::Uri,
+    ) -> Json<Vec<serde_json::Value>> {
+        hits.lock().unwrap().push(uri.path().to_owned());
+        Json(Vec::new())
+    }
+
+    #[tokio::test]
+    async fn stale_pending_target_pauses_with_zero_network_calls() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(counting_fallback)
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        stage(&db, "seed-stale", 1, &["acct"]);
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix =
+            Some(now.unix_timestamp() - crate::live_accounts::LIVE_ACCOUNTS_STALE_AFTER_SECS);
+        let mut state = fanout_state(
+            &dir,
+            db.clone(),
+            snapshot,
+            &format!("http://{address}"),
+            None,
+        );
+        let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
+        let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
+        let control = process_target(&mut state, &seed, &target, &projection_signal(), now)
+            .await
+            .unwrap();
+        assert_eq!(control, PassControl::StopSeed);
+        assert_eq!(
+            db.dispatch_targets("seed-stale").unwrap()[0].state,
+            "pending",
+            "a stale pending target is paused, never terminalized"
+        );
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "no credential/book/order call is made while stale"
+        );
+    }
+
+    async fn rotated_credential_row() -> Json<Vec<serde_json::Value>> {
+        Json(vec![serde_json::json!({
+            "account_id": "acct",
+            "bundle_version": 2,
+            "key_id": "key-2",
+            "sealed_bundle": "unused"
+        })])
+    }
+
+    #[tokio::test]
+    async fn rotated_credentials_never_terminalize_an_in_flight_target() {
+        let app = Router::new().route(
+            "/rest/v1/account_credentials",
+            get(rotated_credential_row),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        stage(&db, "seed-inflight", 1, &["acct"]);
+        db.set_dispatch_target_state("seed-inflight", "acct", "submitted", None, 5)
+            .unwrap();
+        // Recovery runs even under a never-successful snapshot AND a closed admission
+        // (classify-first), and credential rotation retains the target non-terminally.
+        let snapshot = armed_snapshot("acct");
+        let mut state = fanout_state(
+            &dir,
+            db.clone(),
+            snapshot,
+            &format!("http://{address}"),
+            Some(Identity::generate()),
+        );
+        state
+            .closures
+            .mode
+            .insert("acct".to_owned(), "closed".to_owned());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
+        let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
+        let control = process_target(&mut state, &seed, &target, &projection_signal(), now)
+            .await
+            .unwrap();
+        assert_eq!(control, PassControl::FreezePass, "dispatch stays frozen");
+        assert_eq!(
+            db.dispatch_targets("seed-inflight").unwrap()[0].state,
+            "submitted",
+            "the in-flight order is retained non-terminally"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_skips_the_mode_pass_and_fresh_does_not() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        // FRESH + unreachable Supabase: the pass runs and records the promotion-query
+        // closure — proving the stale skip below is the freshness gate, not inertness.
+        let fresh_dir = tempdir().unwrap();
+        let fresh_db = Arc::new(PaperStateDb::open(&fresh_dir.path().join("paper.db")).unwrap());
+        let mut fresh_snapshot = armed_snapshot("acct");
+        fresh_snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut fresh_state =
+            fanout_state(&fresh_dir, fresh_db, fresh_snapshot, "http://127.0.0.1:9", None);
+        drive_modes(&mut fresh_state, now).await;
+        assert!(fresh_state.closures.mode.contains_key("acct"));
+        // STALE: the pass returns before any evidence read or mode write.
+        let stale_dir = tempdir().unwrap();
+        let stale_db = Arc::new(PaperStateDb::open(&stale_dir.path().join("paper.db")).unwrap());
+        let mut stale_state = fanout_state(
+            &stale_dir,
+            stale_db,
+            armed_snapshot("acct"),
+            "http://127.0.0.1:9",
+            None,
+        );
+        drive_modes(&mut stale_state, now).await;
+        assert!(
+            stale_state.closures.mode.is_empty(),
+            "no mode decision is taken from stale evidence"
+        );
     }
 
     #[derive(Clone)]

@@ -467,6 +467,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return Ok(None);
         };
         let snapshot = live.snapshot();
+        // #514: no NEW live aggregates while blind — a stale/never-successful accounts
+        // snapshot stages nothing. Paper execution proceeds unchanged; in-flight recovery
+        // and redemption reconciliation do not gate on freshness.
+        if !snapshot.is_fresh(OffsetDateTime::now_utc().unix_timestamp()) {
+            warn!("live accounts snapshot is stale; dispatch staging paused (no new live aggregates)");
+            return Ok(None);
+        }
         let armed = snapshot.armed_targets();
         if armed.is_empty() {
             return Ok(None);

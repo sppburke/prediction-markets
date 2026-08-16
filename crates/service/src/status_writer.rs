@@ -58,6 +58,12 @@ pub struct LiveStatusBlock {
     pub pending_dispatch_seeds: usize,
     /// Ready, not-yet-finalized aggregates awaiting the live fan-out.
     pub ready_dispatch_seeds: usize,
+    /// Unix time of the last SUCCESSFUL accounts poll; `null` before one succeeds (#514).
+    /// A strictly advancing value across two snapshots proves the poll is decoding.
+    pub fetched_at_unix: Option<i64>,
+    /// Whether the accounts snapshot is stale (never-successful, too old, or
+    /// future-dated); while `true` the service stages no new live work (#514).
+    pub stale: bool,
     pub accounts: Vec<LiveAccountStatus>,
 }
 
@@ -116,6 +122,8 @@ pub fn build_snapshot(
                 .unfinalized_ready_dispatch_seeds()
                 .map(|v| v.len())
                 .unwrap_or(0),
+            fetched_at_unix: snapshot.fetched_at_unix,
+            stale: !snapshot.is_fresh(now_unix),
             accounts: snapshot
                 .accounts
                 .iter()

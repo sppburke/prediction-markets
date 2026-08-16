@@ -26,6 +26,11 @@ use crate::supabase_reader::{SupabaseError, auth_token};
 /// CLOB ≤ 5 req/s budgets; raising it requires re-validating those budgets.
 pub const LIVE_ARMED_ACCOUNTS_MAX: usize = 2;
 
+/// Snapshot staleness bound (#514): 4 × the 30 s accounts poll cadence
+/// ([`crate::config_poller::CONFIG_POLL_INTERVAL_SECS`]), the `_GLOSSARY.md` polled-source
+/// block threshold. Canonical: `docs/_GLOSSARY.md` `live_accounts_stale_after_secs`.
+pub const LIVE_ACCOUNTS_STALE_AFTER_SECS: i64 = 120;
+
 /// One `accounts` row as returned by PostgREST (service-role read), joined client-side
 /// with its credential-binding metadata. The sizing columns are deliberately absent: the
 /// poller never consumed them (the fan-out owns sizing and reads them with an exact
@@ -83,6 +88,10 @@ impl AccountContext {
 #[derive(Debug, Clone, Default)]
 pub struct LiveAccountsSnapshot {
     pub accounts: Vec<AccountContext>,
+    /// Unix time of the last SUCCESSFUL accounts fetch that produced this snapshot;
+    /// `None` = never successful (the `Default` posture when the boot fetch fails), which
+    /// is always stale (#514).
+    pub fetched_at_unix: Option<i64>,
 }
 
 impl LiveAccountsSnapshot {
@@ -122,7 +131,24 @@ impl LiveAccountsSnapshot {
                 .then(a.execution_order.cmp(&b.execution_order))
                 .then(a.account_id.cmp(&b.account_id))
         });
-        Self { accounts }
+        Self {
+            accounts,
+            fetched_at_unix: None,
+        }
+    }
+
+    /// Whether this snapshot is recent enough to admit NEW live work — dispatch staging,
+    /// pending-target dispatch, and effective-mode writes (#514). A never-successful
+    /// snapshot, an age ≥ [`LIVE_ACCOUNTS_STALE_AFTER_SECS`], or a future `fetched_at_unix`
+    /// all fail closed. In-flight order recovery and redemption reconciliation deliberately
+    /// do NOT gate on freshness: suppressing them would be the worse harm.
+    #[must_use]
+    pub fn is_fresh(&self, now_unix: i64) -> bool {
+        self.fetched_at_unix.is_some_and(|fetched| {
+            now_unix
+                .checked_sub(fetched)
+                .is_some_and(|age| (0..LIVE_ACCOUNTS_STALE_AFTER_SECS).contains(&age))
+        })
     }
 
     /// The armed dispatch targets in frozen execution order: primary first, then
@@ -201,7 +227,9 @@ pub async fn fetch_live_accounts(
     let rows: Vec<AccountRow> = fetch_json(client, &accounts_url(base_url), token).await?;
     let creds: Vec<CredentialMetaRow> =
         fetch_json(client, &credentials_url(base_url), token).await?;
-    Ok(LiveAccountsSnapshot::from_rows(rows, &creds))
+    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &creds);
+    snapshot.fetched_at_unix = Some(time::OffsetDateTime::now_utc().unix_timestamp());
+    Ok(snapshot)
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(
@@ -327,6 +355,31 @@ mod tests {
         assert_eq!(snap.accounts.len(), 1);
         assert_eq!(snap.accounts[0].account_id.as_str(), "sppburke");
         assert!(!snap.accounts[0].is_armed());
+    }
+
+    #[test]
+    fn freshness_fails_closed_on_never_future_and_threshold() {
+        let mut snap = LiveAccountsSnapshot::default();
+        // Never-successful (the failed-boot-fetch posture) is stale.
+        assert!(!snap.is_fresh(1_000));
+        snap.fetched_at_unix = Some(1_000);
+        assert!(snap.is_fresh(1_000));
+        assert!(snap.is_fresh(1_000 + LIVE_ACCOUNTS_STALE_AFTER_SECS - 1));
+        // Exactly the threshold is stale (age ≥ bound).
+        assert!(!snap.is_fresh(1_000 + LIVE_ACCOUNTS_STALE_AFTER_SECS));
+        // A future timestamp fails closed.
+        assert!(!snap.is_fresh(999));
+        // A later successful poll clears staleness.
+        snap.fetched_at_unix = Some(2_000);
+        assert!(snap.is_fresh(2_000 + LIVE_ACCOUNTS_STALE_AFTER_SECS - 1));
+    }
+
+    #[test]
+    fn staleness_bound_is_four_poll_intervals() {
+        assert_eq!(
+            u64::try_from(LIVE_ACCOUNTS_STALE_AFTER_SECS).unwrap(),
+            4 * crate::config_poller::CONFIG_POLL_INTERVAL_SECS
+        );
     }
 
     #[test]
