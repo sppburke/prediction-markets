@@ -40,6 +40,22 @@ against the live box on first use, then corrected here.
    started`, no poll failures; then confirm behavior-specific log lines for the deploy
    (e.g. the first `full re-rank membership swap applied` after a ranking push).
 
+## Hash protocol (resumable swap)
+
+Binds every step above to sha256 identity so an interrupted deploy resumes at the right
+step instead of guessing (#514). Record three hashes: **desired** (the local release
+build), **staged** (`/tmp/pe-service.new` on the VPS), and **old-installed** (the current
+`ExecStart` binary).
+
+- Require `staged = desired` before stopping the service; a mismatch means the scp is
+  missing or partial — re-ship (step 2) and re-check.
+- `installed = desired` already ⇒ the swap is complete (a resumed run): skip stop/backup/
+  swap and go to start + verify.
+- Otherwise back up the old binary **once** as `pe-service.bak-<old-sha>` (sha-naming
+  makes the once-only property automatic — re-running never clobbers the backup), swap,
+  and require `installed = desired` post-swap before starting.
+- A failed start rolls back from the preserved `pe-service.bak-<old-sha>` (see Rollback).
+
 ## #510 restart semantics (authoritative mode)
 
 Since #510 the authoritative catch-up watermark advances at runtime (successor-gated in
