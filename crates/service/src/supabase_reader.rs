@@ -5,9 +5,12 @@
 //! view and maps each row to a [`WatchlistEntry`]. The mapping is pure and unit-tested;
 //! [`fetch`] is the only I/O.
 //!
-//! Numeric columns are decoded losslessly: PostgREST may serialize `numeric` as either a
-//! JSON number or a string, so they are parsed through [`serde_json::Value`] →
-//! [`Decimal`] (via the exact decimal literal), never through `f64`.
+//! Numeric columns are decoded exactly through the query-level `::text` aliases
+//! (`hit_rate_text`/`ls_tstat_text`, [`RANKING_EXACT_SELECT`]): PostgREST serializes an
+//! uncast `numeric` as a JSON number, which `serde_json` (no `arbitrary_precision`)
+//! stores as **f64** — lossy at precision boundaries (#514). The alias-free
+//! [`serde_json::Value`] path remains as the fallback for previously recorded bodies
+//! (canary replay), and is best-effort at f64 precision only.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -100,6 +103,27 @@ struct RankingRow {
     /// poll cursor / inactivity clock (#357 PR-3); it never affects the row→entry map.
     #[serde(default)]
     last_trade_unix: Option<i64>,
+    /// Exact text projection of `hit_rate` ([`RANKING_EXACT_SELECT`], #514). Preferred
+    /// when present; absent on previously recorded alias-free bodies, which fall back to
+    /// the f64-precision `Value` path.
+    #[serde(default)]
+    hit_rate_text: Option<String>,
+    /// Exact text projection of `ls_tstat`; same preference/fallback as `hit_rate_text`.
+    #[serde(default)]
+    ls_tstat_text: Option<String>,
+}
+
+/// PostgREST select for every `latest_ranking` read: all columns plus exact `::text`
+/// aliases for the two numeric score columns (#514). Additive — no column enumeration —
+/// so a schema change cannot silently drop a column from the paper watchlist read.
+const RANKING_EXACT_SELECT: &str = "*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
+
+/// `latest_ranking` read URL shared by the ordinary fetch and the canary (#514).
+fn latest_ranking_url(base_url: &str, limit: usize) -> String {
+    format!(
+        "{}/rest/v1/latest_ranking?select={RANKING_EXACT_SELECT}&order=rank&limit={limit}",
+        base_url.trim_end_matches('/')
+    )
 }
 
 /// Strict canary-only ranking read. Unlike the ordinary paper reader, this rejects malformed,
@@ -110,11 +134,7 @@ pub async fn fetch_canary_observed(
     anon_key: &str,
     limit: usize,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>, Vec<RawHttpResponse>), SupabaseError> {
-    let ranking_url = format!(
-        "{}/rest/v1/latest_ranking?order=rank&limit={}",
-        base_url.trim_end_matches('/'),
-        limit
-    );
+    let ranking_url = latest_ranking_url(base_url, limit);
     let ranking = get_observation(client, &ranking_url, anon_key).await?;
     let mut observations = vec![ranking.clone()];
     let rows: Vec<RankingRow> = serde_json::from_slice(&ranking.body)
@@ -176,8 +196,8 @@ pub async fn fetch_canary_observed(
                 &observations,
             ));
         }
-        let hit_rate = cell_to_decimal(row.hit_rate.as_ref());
-        let score = cell_to_decimal(row.ls_tstat.as_ref());
+        let hit_rate = exact_cell(row.hit_rate_text.as_deref(), row.hit_rate.as_ref());
+        let score = exact_cell(row.ls_tstat_text.as_deref(), row.ls_tstat.as_ref());
         let score_fits = score
             .and_then(|value| (value * Decimal::from(LS_TSTAT_BPS_SCALE)).round().to_i32())
             .is_some();
@@ -391,14 +411,29 @@ async fn get_observation(
     Ok(observation)
 }
 
-/// Parse a PostgREST numeric cell (JSON number or string) into a [`Decimal`] without f64.
+/// Parse a PostgREST numeric cell (JSON number or string) into a [`Decimal`].
+///
+/// This path is best-effort, NOT lossless (#514): `serde_json` without
+/// `arbitrary_precision` stores a fractional JSON number as f64, so
+/// `Number::to_string` yields the f64 round-trip literal, not the column's exact value
+/// (e.g. `0.000149999999999999999999` arrives as `0.00015`). Exactness comes from the
+/// `::text` aliases ([`exact_cell`]); this fallback remains for previously recorded
+/// alias-free bodies.
 fn cell_to_decimal(v: Option<&serde_json::Value>) -> Option<Decimal> {
     match v {
-        // `Number::to_string` emits the exact decimal literal (e.g. "0.63"), which
-        // `Decimal::from_str` parses precisely — no float round-trip.
         Some(serde_json::Value::Number(n)) => Decimal::from_str(&n.to_string()).ok(),
         Some(serde_json::Value::String(s)) => Decimal::from_str(s.trim()).ok(),
         _ => None,
+    }
+}
+
+/// Decode one ranking score cell: the exact `::text` alias when present (a malformed
+/// alias fails to `None` rather than silently degrading to f64), else the recorded-body
+/// [`cell_to_decimal`] fallback.
+fn exact_cell(text: Option<&str>, value: Option<&serde_json::Value>) -> Option<Decimal> {
+    match text {
+        Some(text) => Decimal::from_str(text.trim()).ok(),
+        None => cell_to_decimal(value),
     }
 }
 
@@ -409,13 +444,13 @@ fn map_row(row: &RankingRow) -> Option<WatchlistEntry> {
     let wallet: WalletAddress =
         serde_json::from_value(serde_json::Value::String(row.wallet_hex.clone())).ok()?;
 
-    let win_rate_bps = cell_to_decimal(row.hit_rate.as_ref())
+    let win_rate_bps = exact_cell(row.hit_rate_text.as_deref(), row.hit_rate.as_ref())
         .map(|hr| (hr * Decimal::from(10_000)).round())
         .and_then(|d| d.to_i32())
         .unwrap_or(0)
         .clamp(0, 10_000);
 
-    let leader_score_bps = cell_to_decimal(row.ls_tstat.as_ref())
+    let leader_score_bps = exact_cell(row.ls_tstat_text.as_deref(), row.ls_tstat.as_ref())
         .map(|t| (t * Decimal::from(LS_TSTAT_BPS_SCALE)).round())
         .and_then(|d| d.to_i32())
         .unwrap_or(0);
@@ -528,16 +563,17 @@ pub async fn fetch(
     secret_key: &str,
     limit: usize,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
-    let url = format!(
-        "{}/rest/v1/latest_ranking?order=rank&limit={}",
-        base_url.trim_end_matches('/'),
-        limit
-    );
-    get_ranking(client, &url, auth_token(anon_key, secret_key)).await
+    get_ranking(
+        client,
+        &latest_ranking_url(base_url, limit),
+        auth_token(anon_key, secret_key),
+    )
+    .await
 }
 
 /// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` `latest_ranking`
-/// rows excluding `exclude`, optionally freshness-filtered, ordered by rank. Pure (no network)
+/// rows (with the [`RANKING_EXACT_SELECT`] score aliases, #514) excluding `exclude`,
+/// optionally freshness-filtered, ordered by rank. Pure (no network)
 /// so the `not.in.` and `gte` filters are unit-testable. Excluded wallets render as canonical
 /// lowercase `0x` hex (matching `latest_ranking.wallet_hex`) and are sorted + deduped for a
 /// deterministic, cache-friendly URL. An empty `exclude` omits that filter (PostgREST rejects
@@ -547,7 +583,7 @@ pub async fn fetch(
 /// only wallets that traded at/after `cutoff` are returned. NULL `last_trade_unix` fails `gte`
 /// and is excluded — a not-yet-populated bench pauses backfill, it never empties the live set.
 fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Option<i64>) -> String {
-    let mut filters: Vec<String> = Vec::new();
+    let mut filters: Vec<String> = vec![format!("select={RANKING_EXACT_SELECT}")];
     if !exclude.is_empty() {
         let mut hexes: Vec<String> = exclude.iter().map(ToString::to_string).collect();
         hexes.sort_unstable();
@@ -565,7 +601,7 @@ fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Optio
 /// `exclude` (the current live ∪ evicted set), ordered by rank. Used by the maintenance tick
 /// (issue #350 WS1 PR-D) to backfill freed live slots from the Supabase bench.
 ///
-/// `GET {base_url}/rest/v1/latest_ranking?wallet_hex=not.in.(<exclude>)&last_trade_unix=gte.<cutoff>&order=rank&limit={n}`
+/// `GET {base_url}/rest/v1/latest_ranking?select=<exact-aliases>&wallet_hex=not.in.(<exclude>)&last_trade_unix=gte.<cutoff>&order=rank&limit={n}`
 /// with the same token in both headers (see [`auth_token`]). The server-side `not.in.` filter
 /// is an over-fetch optimisation, not a correctness boundary: it is matched case-sensitively
 /// against `latest_ranking.wallet_hex` (canonical lowercase), and
@@ -727,6 +763,8 @@ mod tests {
             ls_tstat: Some(tstat),
             n_trades: n,
             last_trade_unix: None,
+            hit_rate_text: None,
+            ls_tstat_text: None,
         }
     }
 
@@ -800,10 +838,16 @@ mod tests {
         assert_eq!(auth_token("", ""), "");
     }
 
+    const EXACT_SELECT: &str =
+        "select=*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
+
     #[test]
     fn candidates_query_empty_exclude_omits_filter() {
         // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
-        assert_eq!(candidates_query(&[], 5, None), "order=rank&limit=5");
+        assert_eq!(
+            candidates_query(&[], 5, None),
+            format!("{EXACT_SELECT}&order=rank&limit=5")
+        );
     }
 
     #[test]
@@ -814,8 +858,10 @@ mod tests {
         let q = candidates_query(&[a, b, a], 3, None);
         assert_eq!(
             q,
-            "wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
-             0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
+            format!(
+                "{EXACT_SELECT}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
+                 0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
+            )
         );
     }
 
@@ -824,7 +870,7 @@ mod tests {
         // No exclude + a cutoff -> the gte filter precedes order/limit (#357).
         assert_eq!(
             candidates_query(&[], 5, Some(1_000)),
-            "last_trade_unix=gte.1000&order=rank&limit=5"
+            format!("{EXACT_SELECT}&last_trade_unix=gte.1000&order=rank&limit=5")
         );
     }
 
@@ -833,9 +879,83 @@ mod tests {
         let a = WalletAddress::from_hex(HEX_A).unwrap();
         assert_eq!(
             candidates_query(&[a], 3, Some(1_000)),
-            "wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
-             &last_trade_unix=gte.1000&order=rank&limit=3"
+            format!(
+                "{EXACT_SELECT}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
+                 &last_trade_unix=gte.1000&order=rank&limit=3"
+            )
         );
+    }
+
+    #[test]
+    fn every_latest_ranking_read_carries_the_exact_aliases() {
+        // All three read sites (#514): the shared ordinary/canary URL and the candidates
+        // query request the exact `::text` score projections.
+        assert_eq!(
+            latest_ranking_url("https://example.test/", 25),
+            format!("https://example.test/rest/v1/latest_ranking?{EXACT_SELECT}&order=rank&limit=25")
+        );
+        assert!(candidates_query(&[], 5, None).starts_with(EXACT_SELECT));
+    }
+
+    #[test]
+    fn exact_alias_beats_the_f64_value_path_at_the_bps_boundary() {
+        // Kelly `p` boundary (#514): the exact column value rounds to 1 bps, but the same
+        // value through serde_json's f64 number arrives as 0.00015 and rounds to 2 bps.
+        const BOUNDARY: &str = "0.000149999999999999999999";
+        let mut exact = row(HEX_A, json!(null), json!(null), Some(1));
+        exact.hit_rate_text = Some(BOUNDARY.to_string());
+        assert_eq!(map_row(&exact).unwrap().win_rate_bps.0, 1);
+        let lossy = row(
+            HEX_A,
+            serde_json::from_str::<serde_json::Value>(BOUNDARY).unwrap(),
+            json!(null),
+            Some(1),
+        );
+        assert_eq!(
+            map_row(&lossy).unwrap().win_rate_bps.0,
+            2,
+            "the alias-free Value path is f64-lossy — the aliases are load-bearing"
+        );
+
+        // `ls_tstat` boundary: exact 1.4999…e-3 × 1000 rounds to 1; via f64 it becomes
+        // 0.0015 × 1000 = 1.5 and banker's-rounds to 2, flipping watchlist ordering.
+        const TSTAT_BOUNDARY: &str = "0.001499999999999999999999";
+        let mut exact_t = row(HEX_A, json!(null), json!(null), Some(1));
+        exact_t.ls_tstat_text = Some(TSTAT_BOUNDARY.to_string());
+        assert_eq!(map_row(&exact_t).unwrap().leader_score_bps.0, 1);
+        let lossy_t = row(
+            HEX_A,
+            json!(null),
+            serde_json::from_str::<serde_json::Value>(TSTAT_BOUNDARY).unwrap(),
+            Some(1),
+        );
+        assert_eq!(map_row(&lossy_t).unwrap().leader_score_bps.0, 2);
+    }
+
+    #[test]
+    fn alias_absent_rows_fall_back_to_the_recorded_body_path() {
+        // Previously recorded (canary) bodies carry no aliases and must keep decoding.
+        let absent: RankingRow = serde_json::from_value(
+            json!({"wallet_hex": HEX_A, "hit_rate": 0.63, "ls_tstat": 2.5, "n_trades": 42}),
+        )
+        .unwrap();
+        assert_eq!(absent.hit_rate_text, None);
+        let entry = map_row(&absent).unwrap();
+        assert_eq!(entry.win_rate_bps.0, 6300);
+        assert_eq!(entry.leader_score_bps.0, 2500);
+        // An aliased body prefers the text cells over the numbers beside them.
+        let aliased: RankingRow = serde_json::from_value(json!({
+            "wallet_hex": HEX_A,
+            "hit_rate": 0.63,
+            "ls_tstat": 2.5,
+            "n_trades": 42,
+            "hit_rate_text": "0.63",
+            "ls_tstat_text": "2.5"
+        }))
+        .unwrap();
+        let entry = map_row(&aliased).unwrap();
+        assert_eq!(entry.win_rate_bps.0, 6300);
+        assert_eq!(entry.leader_score_bps.0, 2500);
     }
 
     #[test]
