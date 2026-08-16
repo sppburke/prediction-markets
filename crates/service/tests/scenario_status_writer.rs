@@ -114,6 +114,85 @@ fn ac_write_is_atomic_and_valid_json() {
 }
 
 #[test]
+fn ac_live_block_reports_freshness() {
+    use pe_service::live_accounts::{AccountRow, CredentialMetaRow, LiveAccountsSnapshot};
+    let (_dir, db) = seeded_db();
+    let rows = vec![AccountRow {
+        account_id: "sppburke".to_string(),
+        is_primary: true,
+        enabled: true,
+        execution_order: 0,
+        requested_live_mode: "off".to_string(),
+        effective_live_mode: "off".to_string(),
+        live_price_impact_cap_bps: 100,
+        custody_wallet_address: None,
+        custody_wallet_kind: None,
+    }];
+    let creds = vec![CredentialMetaRow {
+        account_id: "sppburke".to_string(),
+        bundle_version: 1,
+        key_id: "k".to_string(),
+    }];
+    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &creds);
+    snapshot.fetched_at_unix = Some(1_700_000_400);
+
+    // PASS: the exact live JSON contract (#514) — fetched_at_unix, stale, seed depths,
+    // and per-account rows. Age 100 s < the 120 s bound ⇒ fresh.
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        100,
+        0,
+        Some(&snapshot),
+    );
+    let v = serde_json::to_value(&snap).unwrap();
+    assert_eq!(v["live"]["fetched_at_unix"], 1_700_000_400);
+    assert_eq!(v["live"]["stale"], false);
+    assert_eq!(v["live"]["pending_dispatch_seeds"], 0);
+    assert_eq!(v["live"]["ready_dispatch_seeds"], 0);
+    assert_eq!(v["live"]["accounts"][0]["account_id"], "sppburke");
+    assert_eq!(v["live"]["accounts"][0]["armed"], false);
+
+    // Age exactly at the bound ⇒ stale.
+    snapshot.fetched_at_unix = Some(1_700_000_500 - 120);
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        100,
+        0,
+        Some(&snapshot),
+    );
+    let v = serde_json::to_value(&snap).unwrap();
+    assert_eq!(v["live"]["stale"], true);
+
+    // Never-successful ⇒ null fetched_at_unix and stale.
+    snapshot.fetched_at_unix = None;
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        100,
+        0,
+        Some(&snapshot),
+    );
+    let v = serde_json::to_value(&snap).unwrap();
+    assert_eq!(v["live"]["fetched_at_unix"], serde_json::Value::Null);
+    assert_eq!(v["live"]["stale"], true);
+    println!("PASS: live block reports fetched_at_unix + stale across fresh/boundary/never");
+}
+
+#[test]
 fn ac_uninitialised_bankroll_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let db = PaperStateDb::open(&dir.path().join("p.db")).unwrap(); // no init_bankroll

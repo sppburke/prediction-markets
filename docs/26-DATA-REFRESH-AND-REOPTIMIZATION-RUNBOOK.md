@@ -351,7 +351,9 @@ the last-known-good target and membership, then retry independently on the
 capacity worker's next 30-second retry. Check
 `status.json`: `watchlist_size` is actual membership and `watchlist_target_size` is the
 last safely applied runtime cap. The additive optional `live` block reports
-`pending_dispatch_seeds`, `ready_dispatch_seeds`, and per-account `account_id, is_primary, enabled,
+`pending_dispatch_seeds`, `ready_dispatch_seeds`, `fetched_at_unix` (last successful accounts
+poll; `null` before one succeeds), `stale` (`true` past `live_accounts_stale_after_secs` —
+no new live work is staged while stale, #514), and per-account `account_id, is_primary, enabled,
 requested_live_mode, effective_live_mode, armed` (#508). Installing this runtime-capacity support
 requires one normal `pe-service` restart; subsequent valid `service_config` edits hot-swap without
 a restart.
