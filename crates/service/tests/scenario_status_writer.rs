@@ -138,7 +138,17 @@ fn ac_live_block_reports_freshness() {
 
     // PASS: the exact live JSON contract (#514) — fetched_at_unix, stale, seed depths,
     // and per-account rows. Age 100 s < the 120 s bound ⇒ fresh.
-    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_500, 25, 100, 0, Some(&snapshot));
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        100,
+        0,
+        Some(&snapshot),
+    );
     let v = serde_json::to_value(&snap).unwrap();
     assert_eq!(v["live"]["fetched_at_unix"], 1_700_000_400);
     assert_eq!(v["live"]["stale"], false);
@@ -149,13 +159,33 @@ fn ac_live_block_reports_freshness() {
 
     // Age exactly at the bound ⇒ stale.
     snapshot.fetched_at_unix = Some(1_700_000_500 - 120);
-    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_500, 25, 100, 0, Some(&snapshot));
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        100,
+        0,
+        Some(&snapshot),
+    );
     let v = serde_json::to_value(&snap).unwrap();
     assert_eq!(v["live"]["stale"], true);
 
     // Never-successful ⇒ null fetched_at_unix and stale.
     snapshot.fetched_at_unix = None;
-    let snap = build_snapshot(&db, "paper", true, 1, 1_700_000_500, 25, 100, 0, Some(&snapshot));
+    let snap = build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        100,
+        0,
+        Some(&snapshot),
+    );
     let v = serde_json::to_value(&snap).unwrap();
     assert_eq!(v["live"]["fetched_at_unix"], serde_json::Value::Null);
     assert_eq!(v["live"]["stale"], true);

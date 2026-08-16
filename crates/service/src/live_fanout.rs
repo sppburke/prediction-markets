@@ -2307,6 +2307,7 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
 
+    use pe_core_types::SourceTimestamp;
     use pe_core_types::{
         ContractQty, LeaderAction, MarketId, OutcomeId, ProbabilityPpm, Quantity,
         ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
@@ -2318,7 +2319,6 @@ mod tests {
         LiveVenuePrepareRequest, LiveVenuePrepared, LiveVenueReconciliation,
         LiveVenueReconciliationError,
     };
-    use pe_core_types::SourceTimestamp;
     use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed};
     use pe_trader_index::Watchlist;
     use pe_venue_polymarket::NEGRISK_COLLATERAL_ADAPTER;
@@ -2436,7 +2436,10 @@ mod tests {
             );
         }
         // A NULL mode is the runtime fallback; kelly/contract ignore the dollar cell.
-        assert_eq!(settings(None, None, None).sizing_mode(fallback), Ok(fallback));
+        assert_eq!(
+            settings(None, None, None).sizing_mode(fallback),
+            Ok(fallback)
+        );
         assert_eq!(
             settings(Some("kelly"), Some("not-a-number"), None).sizing_mode(fallback),
             Ok(SizingMode::Kelly)
@@ -2994,10 +2997,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotated_credentials_never_terminalize_an_in_flight_target() {
-        let app = Router::new().route(
-            "/rest/v1/account_credentials",
-            get(rotated_credential_row),
-        );
+        let app = Router::new().route("/rest/v1/account_credentials", get(rotated_credential_row));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -3043,8 +3043,13 @@ mod tests {
         let fresh_db = Arc::new(PaperStateDb::open(&fresh_dir.path().join("paper.db")).unwrap());
         let mut fresh_snapshot = armed_snapshot("acct");
         fresh_snapshot.fetched_at_unix = Some(now.unix_timestamp());
-        let mut fresh_state =
-            fanout_state(&fresh_dir, fresh_db, fresh_snapshot, "http://127.0.0.1:9", None);
+        let mut fresh_state = fanout_state(
+            &fresh_dir,
+            fresh_db,
+            fresh_snapshot,
+            "http://127.0.0.1:9",
+            None,
+        );
         drive_modes(&mut fresh_state, now).await;
         assert!(fresh_state.closures.mode.contains_key("acct"));
         // STALE: the pass returns before any evidence read or mode write.

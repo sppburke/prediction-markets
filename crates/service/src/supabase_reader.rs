@@ -838,8 +838,7 @@ mod tests {
         assert_eq!(auth_token("", ""), "");
     }
 
-    const EXACT_SELECT: &str =
-        "select=*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
+    const EXACT_SELECT: &str = "select=*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
 
     #[test]
     fn candidates_query_empty_exclude_omits_filter() {
@@ -892,7 +891,9 @@ mod tests {
         // query request the exact `::text` score projections.
         assert_eq!(
             latest_ranking_url("https://example.test/", 25),
-            format!("https://example.test/rest/v1/latest_ranking?{EXACT_SELECT}&order=rank&limit=25")
+            format!(
+                "https://example.test/rest/v1/latest_ranking?{EXACT_SELECT}&order=rank&limit=25"
+            )
         );
         assert!(candidates_query(&[], 5, None).starts_with(EXACT_SELECT));
     }
