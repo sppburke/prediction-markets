@@ -27,7 +27,10 @@ use crate::supabase_reader::{SupabaseError, auth_token};
 pub const LIVE_ARMED_ACCOUNTS_MAX: usize = 2;
 
 /// One `accounts` row as returned by PostgREST (service-role read), joined client-side
-/// with its credential-binding metadata.
+/// with its credential-binding metadata. The sizing columns are deliberately absent: the
+/// poller never consumed them (the fan-out owns sizing and reads them with an exact
+/// `::text` cast), and the `numeric` dollar column decoded as a JSON number broke this
+/// DTO's `Option<String>` declaration, freezing the snapshot at its boot value (#514).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountRow {
     pub account_id: String,
@@ -36,9 +39,6 @@ pub struct AccountRow {
     pub execution_order: i64,
     pub requested_live_mode: String,
     pub effective_live_mode: String,
-    pub live_sizing_mode: Option<String>,
-    pub live_sizing_dollar_usd: Option<String>,
-    pub live_sizing_contracts: Option<i64>,
     pub live_price_impact_cap_bps: i64,
     pub custody_wallet_address: Option<String>,
     pub custody_wallet_kind: Option<String>,
@@ -170,6 +170,24 @@ impl LiveAccounts {
     }
 }
 
+/// PostgREST select for the `accounts` control read. Excludes the sizing columns
+/// ([`AccountRow`] explains why).
+fn accounts_url(base_url: &str) -> String {
+    format!(
+        "{}/rest/v1/accounts?select=account_id,is_primary,enabled,execution_order,\
+         requested_live_mode,effective_live_mode,live_price_impact_cap_bps,\
+         custody_wallet_address,custody_wallet_kind",
+        base_url.trim_end_matches('/')
+    )
+}
+
+fn credentials_url(base_url: &str) -> String {
+    format!(
+        "{}/rest/v1/account_credentials?select=account_id,bundle_version,key_id",
+        base_url.trim_end_matches('/')
+    )
+}
+
 /// Fetch the `accounts` control rows + credential metadata (service-role; PostgREST).
 /// A fetch failure keeps the last-known-good snapshot (the caller logs and retries on
 /// the next poll — the #398 config-poller posture).
@@ -180,16 +198,9 @@ pub async fn fetch_live_accounts(
     secret_key: &str,
 ) -> Result<LiveAccountsSnapshot, SupabaseError> {
     let token = auth_token(anon_key, secret_key);
-    let base = base_url.trim_end_matches('/');
-    let accounts_url = format!(
-        "{base}/rest/v1/accounts?select=account_id,is_primary,enabled,execution_order,\
-         requested_live_mode,effective_live_mode,live_sizing_mode,live_sizing_dollar_usd,\
-         live_sizing_contracts,live_price_impact_cap_bps,custody_wallet_address,custody_wallet_kind"
-    );
-    let creds_url =
-        format!("{base}/rest/v1/account_credentials?select=account_id,bundle_version,key_id");
-    let rows: Vec<AccountRow> = fetch_json(client, &accounts_url, token).await?;
-    let creds: Vec<CredentialMetaRow> = fetch_json(client, &creds_url, token).await?;
+    let rows: Vec<AccountRow> = fetch_json(client, &accounts_url(base_url), token).await?;
+    let creds: Vec<CredentialMetaRow> =
+        fetch_json(client, &credentials_url(base_url), token).await?;
     Ok(LiveAccountsSnapshot::from_rows(rows, &creds))
 }
 
@@ -247,9 +258,6 @@ mod tests {
             execution_order: order,
             requested_live_mode: mode.to_string(),
             effective_live_mode: mode.to_string(),
-            live_sizing_mode: None,
-            live_sizing_dollar_usd: None,
-            live_sizing_contracts: None,
             live_price_impact_cap_bps: 100,
             custody_wallet_address: None,
             custody_wallet_kind: None,
@@ -293,6 +301,45 @@ mod tests {
             .map(|a| a.account_id.as_str())
             .collect();
         assert_eq!(targets, vec!["primary-acct", "beta"]);
+    }
+
+    #[test]
+    fn real_postgrest_body_with_numeric_sizing_column_decodes() {
+        // The live `accounts` row that broke the poller (#514): `live_sizing_dollar_usd` is
+        // `numeric`, so PostgREST serializes it as a JSON NUMBER. A body that still carries
+        // the sizing columns must decode (the select omits them; serde ignores extras).
+        let body = r#"[{
+            "account_id": "sppburke",
+            "is_primary": true,
+            "enabled": true,
+            "execution_order": 0,
+            "requested_live_mode": "off",
+            "effective_live_mode": "off",
+            "live_sizing_mode": "dollar",
+            "live_sizing_dollar_usd": 1,
+            "live_sizing_contracts": null,
+            "live_price_impact_cap_bps": 100,
+            "custody_wallet_address": null,
+            "custody_wallet_kind": null
+        }]"#;
+        let rows: Vec<AccountRow> = serde_json::from_str(body).unwrap();
+        let snap = LiveAccountsSnapshot::from_rows(rows, &[cred("sppburke")]);
+        assert_eq!(snap.accounts.len(), 1);
+        assert_eq!(snap.accounts[0].account_id.as_str(), "sppburke");
+        assert!(!snap.accounts[0].is_armed());
+    }
+
+    #[test]
+    fn accounts_select_omits_the_sizing_columns() {
+        let url = accounts_url("https://example.test/");
+        for field in [
+            "live_sizing_mode",
+            "live_sizing_dollar_usd",
+            "live_sizing_contracts",
+        ] {
+            assert!(!url.contains(field), "{field} must not be selected");
+        }
+        assert!(url.starts_with("https://example.test/rest/v1/accounts?select=account_id,"));
     }
 
     #[test]

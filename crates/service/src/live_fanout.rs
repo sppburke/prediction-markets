@@ -1311,6 +1311,19 @@ impl AccountSettingsRow {
     }
 }
 
+/// PostgREST read for one account's sizing posture. `live_sizing_dollar_usd` is `numeric`,
+/// so PostgREST serializes it as a JSON number; the query-level `::text` cast makes it a
+/// JSON string so the money value decodes exactly via [`Decimal::from_str`]. An uncast
+/// number would traverse f64 (`serde_json` without `arbitrary_precision`), violating the
+/// no-f64 money rule — and broke decoding entirely against the `Option<String>` DTO,
+/// leaving arming permanently refused (#514).
+fn account_settings_url(base_url: &str, account_id: &str) -> String {
+    format!(
+        "{}/rest/v1/accounts?select=account_id,live_sizing_mode,live_sizing_dollar_usd::text,live_sizing_contracts&account_id=eq.{account_id}",
+        base_url.trim_end_matches('/')
+    )
+}
+
 async fn fetch_account_settings(
     state: &FanoutState,
     account_id: &str,
@@ -1319,14 +1332,23 @@ async fn fetch_account_settings(
         &state.config.supabase_anon_key,
         &state.config.supabase_secret_key,
     );
-    let url = format!(
-        "{}/rest/v1/accounts?select=account_id,live_sizing_mode,live_sizing_dollar_usd,live_sizing_contracts&account_id=eq.{account_id}",
-        state.config.supabase_url.trim_end_matches('/')
-    );
-    let response = state
-        .config
-        .http
-        .get(url)
+    fetch_account_settings_from(
+        &state.config.http,
+        &state.config.supabase_url,
+        token,
+        account_id,
+    )
+    .await
+}
+
+async fn fetch_account_settings_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    account_id: &str,
+) -> Result<AccountSettingsRow, &'static str> {
+    let response = client
+        .get(account_settings_url(base_url, account_id))
         .header("apikey", token)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
         .send()
@@ -2267,6 +2289,93 @@ mod tests {
     #[test]
     fn redemption_reconcile_cadence_is_named_five_minutes() {
         assert_eq!(REDEMPTION_RECONCILE_CADENCE_SECS, 300);
+    }
+
+    fn settings(
+        mode: Option<&str>,
+        dollar: Option<&str>,
+        contracts: Option<i64>,
+    ) -> AccountSettingsRow {
+        AccountSettingsRow {
+            account_id: "account".to_owned(),
+            live_sizing_mode: mode.map(str::to_owned),
+            live_sizing_dollar_usd: dollar.map(str::to_owned),
+            live_sizing_contracts: contracts,
+        }
+    }
+
+    #[test]
+    fn sizing_mode_parses_exact_dollars_and_fails_closed() {
+        let fallback = SizingMode::Kelly;
+        // Cast text decodes to the exact Decimal, whole or fractional.
+        assert_eq!(
+            settings(Some("dollar"), Some("1"), None).sizing_mode(fallback),
+            Ok(SizingMode::Dollar { usd: dec!(1) })
+        );
+        assert_eq!(
+            settings(Some("dollar"), Some("1.25"), None).sizing_mode(fallback),
+            Ok(SizingMode::Dollar { usd: dec!(1.25) })
+        );
+        // `dollar` with an absent/null/non-positive/malformed cell fails closed.
+        for dollar in [None, Some("0"), Some("-1"), Some("not-a-number")] {
+            assert_eq!(
+                settings(Some("dollar"), dollar, None).sizing_mode(fallback),
+                Err("live_sizing_dollar_invalid"),
+                "dollar cell {dollar:?}"
+            );
+        }
+        // A NULL mode is the runtime fallback; kelly/contract ignore the dollar cell.
+        assert_eq!(settings(None, None, None).sizing_mode(fallback), Ok(fallback));
+        assert_eq!(
+            settings(Some("kelly"), Some("not-a-number"), None).sizing_mode(fallback),
+            Ok(SizingMode::Kelly)
+        );
+        assert_eq!(
+            settings(Some("contract"), Some("not-a-number"), Some(3)).sizing_mode(fallback),
+            Ok(SizingMode::Contract { contracts: 3 })
+        );
+        assert_eq!(
+            settings(Some("bogus"), Some("1"), None).sizing_mode(fallback),
+            Err("live_sizing_mode_invalid")
+        );
+    }
+
+    async fn account_settings_page(
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        // The wire contract under test (#514): the money column is requested with the
+        // exact-text cast, and the response carries it as a JSON string.
+        assert_eq!(
+            query.get("select").map(String::as_str),
+            Some("account_id,live_sizing_mode,live_sizing_dollar_usd::text,live_sizing_contracts")
+        );
+        assert_eq!(query.get("account_id").map(String::as_str), Some("eq.acct"));
+        Json(vec![serde_json::json!({
+            "account_id": "acct",
+            "live_sizing_mode": "dollar",
+            "live_sizing_dollar_usd": "1.25",
+            "live_sizing_contracts": null
+        })])
+    }
+
+    #[tokio::test]
+    async fn account_settings_fetch_casts_the_money_column_and_sizes() {
+        let app = Router::new().route("/rest/v1/accounts", get(account_settings_page));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let row =
+            fetch_account_settings_from(&client, &format!("http://{address}"), "token", "acct")
+                .await
+                .unwrap();
+        assert_eq!(
+            row.sizing_mode(SizingMode::Kelly),
+            Ok(SizingMode::Dollar { usd: dec!(1.25) })
+        );
     }
 
     struct FakeVenue {
