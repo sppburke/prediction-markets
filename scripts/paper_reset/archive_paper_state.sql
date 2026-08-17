@@ -13,8 +13,8 @@
 -- What it deliberately does NOT touch:
 --   * supabase_sink_hwm  — single id=1 row must survive (read by --backfill-supabase).
 --   * service_config     — runtime knobs; `bankroll_usd` is a bookkeeping mirror
---                          only (nothing reads the row, #516) and is updated by the
---                          operator if the new starting bankroll differs.
+--                          (no runtime behavior consumes the parsed value, #516),
+--                          updated by the operator if the new starting bankroll differs.
 --   * latest_ranking / ranking_* — the wallet source is not paper state.
 --   * wallet_live_stats  — a plain view over paper_fills; empties by construction.
 --     The dashboard reads wallet_live_stats_mv (pg_cron refresh ≤2 min); the runbook

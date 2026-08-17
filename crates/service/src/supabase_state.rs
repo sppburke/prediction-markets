@@ -276,10 +276,10 @@ impl SupabaseStateClient {
     /// configured `db-max-rows` (1000 on this project), so the previous bare GET
     /// silently truncated the >1000-row cumulative table. The walk advances by the
     /// ACTUAL returned length and terminates only on an EMPTY page — correct even if
-    /// the server cap drops below the requested limit. Offset pagination assumes the
-    /// stable ordered set the boot already guarantees: it completes before any
-    /// current-process writer spawns, and deploy/backfill/reset hold the operational
-    /// exclusion (docs/35).
+    /// the server cap drops below the requested limit. Offset pagination assumes a
+    /// stable ordered set, which every legitimate writer's own sequencing guarantees:
+    /// this service's writers spawn only after boot completes, and backfill/reset run
+    /// with the service stopped per their runbooks (docs/34/35).
     pub async fn fetch_positions(&self) -> Result<Vec<PaperPositionRow>, SupabaseStateError> {
         self.fetch_positions_paged(PAPER_POSITIONS_PAGE_LIMIT, PAPER_POSITIONS_MAX_ROWS)
             .await
@@ -291,6 +291,7 @@ impl SupabaseStateClient {
         max_rows: usize,
     ) -> Result<Vec<PaperPositionRow>, SupabaseStateError> {
         let mut raw: Vec<PositionRow> = Vec::new();
+        let mut previous_first: Option<(String, i64)> = None;
         loop {
             let url = format!(
                 "{}/rest/v1/paper_positions?select=market_id,outcome_id,long_contracts,short_contracts\
@@ -299,8 +300,18 @@ impl SupabaseStateClient {
                 raw.len()
             );
             let page: Vec<PositionRow> = self.get_json(&url).await?;
-            if page.is_empty() {
+            let Some(first_row) = page.first() else {
                 break;
+            };
+            // A server ignoring `offset` re-serves the same PK-ordered page forever; the
+            // repeated first key fails it on the SECOND request instead of grinding to
+            // the row bound (with no writers, a later page can never begin at an
+            // already-seen key).
+            let first = (first_row.market_id.clone(), first_row.outcome_id);
+            if previous_first.replace(first.clone()) == Some(first) {
+                return Err(SupabaseStateError::Corrupt(
+                    "paper_positions page repeated; server ignored the offset".to_owned(),
+                ));
             }
             raw.extend(page);
             if raw.len() > max_rows {
@@ -865,6 +876,7 @@ mod tests {
         rows: usize,
         server_cap: usize,
         fail_at_offset: Option<usize>,
+        ignore_offset: bool,
         offsets: Arc<Mutex<Vec<usize>>>,
     }
 
@@ -878,11 +890,14 @@ mod tests {
             "stable PK ordering is part of the pagination contract"
         );
         let limit: usize = query.get("limit").unwrap().parse().unwrap();
-        let offset: usize = query.get("offset").unwrap().parse().unwrap();
+        let mut offset: usize = query.get("offset").unwrap().parse().unwrap();
         if fx.fail_at_offset.is_some_and(|fail| offset >= fail) {
             return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
         }
         fx.offsets.lock().unwrap().push(offset);
+        if fx.ignore_offset {
+            offset = 0;
+        }
         let take = limit.min(fx.server_cap).min(fx.rows.saturating_sub(offset));
         Ok(Json(
             (0..take)
@@ -913,6 +928,7 @@ mod tests {
             rows,
             server_cap,
             fail_at_offset: None,
+            ignore_offset: false,
             offsets: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -977,6 +993,18 @@ mod tests {
             client(&base).fetch_positions_paged(2, 4).await,
             Err(SupabaseStateError::Corrupt(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn positions_pull_fails_fast_when_the_server_ignores_the_offset() {
+        // An offset-ignoring server re-serves page 1 forever; the repeated first key
+        // fails the pull on the SECOND request, not at the 500k-row backstop.
+        let mut fx = fixture(10, usize::MAX);
+        fx.ignore_offset = true;
+        let base = serve(fx.clone()).await;
+        let error = client(&base).fetch_positions_paged(2, 500_000).await;
+        assert!(matches!(error, Err(SupabaseStateError::Corrupt(_))));
+        assert_eq!(*fx.offsets.lock().unwrap(), vec![0, 2]);
     }
 
     #[tokio::test]

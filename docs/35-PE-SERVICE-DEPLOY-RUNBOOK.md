@@ -26,7 +26,7 @@ against the live box on first use, then corrected here.
 
 Every step is bound to sha256 identity (#514): record **desired** = `sha256sum` of the
 local release build before shipping; on the VPS, **staged** = the hash of
-`/tmp/pe-service.new.<desired-sha12>` (hash-qualified — concurrent agents cannot clobber each other's staged binary, #516) and **installed** = the hash of the `ExecStart` binary. A deploy holds `flock -n /home/sean/.pe-deploy.lock` from preflight through verify-or-rollback; abort on contention. Backfill/reset/direct paper-state writes honor the same lock.
+`/tmp/pe-service.new.<desired-sha12>` (hash-qualified — concurrent agents cannot clobber each other's staged binary, #516) and **installed** = the hash of the `ExecStart` binary. A deploy holds the deploy lock from preflight through verify-or-rollback — acquire it as the FIRST step-3 action and keep the FD open for the whole run: `exec 9>/home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }` — aborting on contention. The lock serializes concurrent deploy agents on the VPS; backfill/reset (dev-box `psql` paths) are excluded instead by their own runbook precondition that the service is STOPPED while they run (docs/34).
 
 1. **Build at the exact main SHA** being deployed (record the git SHA and the desired
    binary hash):
