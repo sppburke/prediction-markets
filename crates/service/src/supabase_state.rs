@@ -61,6 +61,15 @@ pub enum SupabaseStateError {
     Serialize(#[from] serde_json::Error),
 }
 
+/// Requested page size for the boot `paper_positions` pull (the server may return
+/// fewer). Canonical: `docs/_GLOSSARY.md` `supabase_paper_positions_page_limit`.
+const PAPER_POSITIONS_PAGE_LIMIT: usize = 1_000;
+
+/// Inclusive bound on total pulled position rows — the runaway backstop that turns an
+/// ignored/repeating offset into a loud failure instead of an unbounded loop.
+/// Canonical: `docs/_GLOSSARY.md` `supabase_paper_positions_max_rows`.
+const PAPER_POSITIONS_MAX_ROWS: usize = 500_000;
+
 const fn side_str(side: Side) -> &'static str {
     match side {
         Side::Buy => "buy",
@@ -262,13 +271,45 @@ impl SupabaseStateClient {
     }
 
     /// The authoritative net positions, for the boot pull into the local cache.
+    ///
+    /// Pages through PostgREST (#516): the server caps ANY single response at its
+    /// configured `db-max-rows` (1000 on this project), so the previous bare GET
+    /// silently truncated the >1000-row cumulative table. The walk advances by the
+    /// ACTUAL returned length and terminates only on an EMPTY page — correct even if
+    /// the server cap drops below the requested limit. Offset pagination assumes the
+    /// stable ordered set the boot already guarantees: it completes before any
+    /// current-process writer spawns, and deploy/backfill/reset hold the operational
+    /// exclusion (docs/35).
     pub async fn fetch_positions(&self) -> Result<Vec<PaperPositionRow>, SupabaseStateError> {
-        let url = format!(
-            "{}/rest/v1/paper_positions?select=market_id,outcome_id,long_contracts,short_contracts",
-            self.base_url
-        );
-        let rows: Vec<PositionRow> = self.get_json(&url).await?;
-        rows.into_iter()
+        self.fetch_positions_paged(PAPER_POSITIONS_PAGE_LIMIT, PAPER_POSITIONS_MAX_ROWS)
+            .await
+    }
+
+    async fn fetch_positions_paged(
+        &self,
+        page_limit: usize,
+        max_rows: usize,
+    ) -> Result<Vec<PaperPositionRow>, SupabaseStateError> {
+        let mut raw: Vec<PositionRow> = Vec::new();
+        loop {
+            let url = format!(
+                "{}/rest/v1/paper_positions?select=market_id,outcome_id,long_contracts,short_contracts\
+                 &order=market_id.asc,outcome_id.asc&limit={page_limit}&offset={}",
+                self.base_url,
+                raw.len()
+            );
+            let page: Vec<PositionRow> = self.get_json(&url).await?;
+            if page.is_empty() {
+                break;
+            }
+            raw.extend(page);
+            if raw.len() > max_rows {
+                return Err(SupabaseStateError::Corrupt(format!(
+                    "paper_positions pull exceeded the {max_rows}-row bound"
+                )));
+            }
+        }
+        raw.into_iter()
             .map(|r| {
                 Ok(PaperPositionRow {
                     market_id: MarketId(VenueMarketId(r.market_id)),
@@ -801,4 +842,151 @@ pub async fn supabase_authoritative_boot(
         "supabase authoritative boot: pulled positions"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Query, State};
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    use super::*;
+
+    /// Fixture "table": `rows` total rows, returning at most `server_cap` per response
+    /// regardless of the requested limit (models PostgREST `db-max-rows`), failing with
+    /// 503 at offsets ≥ `fail_at_offset`.
+    #[derive(Clone)]
+    struct PositionsFixture {
+        rows: usize,
+        server_cap: usize,
+        fail_at_offset: Option<usize>,
+        offsets: Arc<Mutex<Vec<usize>>>,
+    }
+
+    async fn positions_page(
+        State(fx): State<PositionsFixture>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Result<Json<Vec<serde_json::Value>>, axum::http::StatusCode> {
+        assert_eq!(
+            query.get("order").map(String::as_str),
+            Some("market_id.asc,outcome_id.asc"),
+            "stable PK ordering is part of the pagination contract"
+        );
+        let limit: usize = query.get("limit").unwrap().parse().unwrap();
+        let offset: usize = query.get("offset").unwrap().parse().unwrap();
+        if fx.fail_at_offset.is_some_and(|fail| offset >= fail) {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        fx.offsets.lock().unwrap().push(offset);
+        let take = limit.min(fx.server_cap).min(fx.rows.saturating_sub(offset));
+        Ok(Json(
+            (0..take)
+                .map(|i| {
+                    serde_json::json!({
+                        "market_id": format!("0x{:064x}", offset + i),
+                        "outcome_id": 0,
+                        "long_contracts": 1,
+                        "short_contracts": 0
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    async fn serve(fixture: PositionsFixture) -> String {
+        let app = Router::new()
+            .route("/rest/v1/paper_positions", get(positions_page))
+            .with_state(fixture);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    fn fixture(rows: usize, server_cap: usize) -> PositionsFixture {
+        PositionsFixture {
+            rows,
+            server_cap,
+            fail_at_offset: None,
+            offsets: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn client(base: &str) -> SupabaseStateClient {
+        SupabaseStateClient::new(reqwest::Client::new(), base, "anon", "")
+    }
+
+    #[tokio::test]
+    async fn positions_pull_walks_pages_to_the_empty_terminator() {
+        let fx = fixture(5, usize::MAX);
+        let base = serve(fx.clone()).await;
+        let rows = client(&base)
+            .fetch_positions_paged(2, 500_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        // Offsets advance by the actual returned length; the short tail page (1 row)
+        // still forces one more request, which returns empty and terminates.
+        assert_eq!(*fx.offsets.lock().unwrap(), vec![0, 2, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn positions_pull_is_cap_agnostic_below_the_requested_limit() {
+        // The server returns FEWER rows than requested while more remain (the live
+        // project's db-max-rows behavior, T2-demonstrated in #516): a `len < limit`
+        // terminator would silently truncate here; the empty-page rule pulls everything.
+        let fx = fixture(5, 1);
+        let base = serve(fx.clone()).await;
+        let rows = client(&base)
+            .fetch_positions_paged(2, 500_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(*fx.offsets.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn positions_pull_page_failure_returns_err_with_no_partial_vector() {
+        let mut fx = fixture(5, usize::MAX);
+        fx.fail_at_offset = Some(2);
+        let base = serve(fx.clone()).await;
+        let error = client(&base).fetch_positions_paged(2, 500_000).await;
+        assert!(matches!(error, Err(SupabaseStateError::Status(503, _))));
+    }
+
+    #[tokio::test]
+    async fn positions_pull_row_bound_is_inclusive_and_fails_loudly() {
+        let fx = fixture(10, usize::MAX);
+        let base = serve(fx.clone()).await;
+        // Exactly at the bound is allowed…
+        assert_eq!(
+            client(&base)
+                .fetch_positions_paged(2, 10)
+                .await
+                .unwrap()
+                .len(),
+            10
+        );
+        // …one page past it fails closed.
+        assert!(matches!(
+            client(&base).fetch_positions_paged(2, 4).await,
+            Err(SupabaseStateError::Corrupt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_fetch_positions_pages_at_the_production_constant() {
+        // 1001 rows through the PUBLIC entry point at the production 1000-row limit:
+        // two nonempty pages then the empty terminator.
+        let fx = fixture(1_001, 1_000);
+        let base = serve(fx.clone()).await;
+        let rows = client(&base).fetch_positions().await.unwrap();
+        assert_eq!(rows.len(), 1_001);
+        assert_eq!(*fx.offsets.lock().unwrap(), vec![0, 1_000, 1_001]);
+    }
 }

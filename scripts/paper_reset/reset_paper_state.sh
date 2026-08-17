@@ -71,7 +71,7 @@ if [[ "$MODE" == "dry-run" ]]; then
  4. Re-seed the fresh bankroll (still on the VPS, service stopped):
       confirm PE_BANKROLL_USD (or bankroll_usd) in the service env = the fresh
       starting value, then run the service binary once with --backfill-supabase.
-      Update the service_config `bankroll_usd` row too (dashboard denominator).
+      Update the service_config `bankroll_usd` row too (bookkeeping mirror only; #516).
  5. START the service:
       ssh -t -i ~/.ssh/id_personal sean@82.22.32.225 'sudo systemctl start pe-service'
  6. Refresh the dashboard matview immediately (optional; pg_cron does it ≤2 min):

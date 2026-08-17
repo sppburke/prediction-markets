@@ -838,11 +838,20 @@ impl PaperStateDb {
             .map_err(|_| PaperStateError::Internal(format!("fills_count {n} exceeds usize::MAX")))
     }
 
-    /// Number of open net-position rows. Cheap `COUNT(*)` for the status snapshot, avoiding
-    /// loading every row via [`paper_positions`](Self::paper_positions).
+    /// Number of genuinely OPEN positions: net-nonzero rows whose market has not settled
+    /// (#516) — the same semantic as `/paper/positions` and portfolio valuation. The
+    /// `positions` table itself is cumulative by design: settlement credits the bankroll
+    /// and records `settled_markets` but never zeroes/deletes position rows, because
+    /// `apply_resolution_v2` computes the credit FROM those rows at settlement time.
     pub fn positions_count(&self) -> Result<usize, PaperStateError> {
         let conn = self.lock();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |row| row.get(0))?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM positions p \
+             WHERE (p.long_contracts > 0 OR p.short_contracts > 0) \
+               AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id)",
+            [],
+            |row| row.get(0),
+        )?;
         usize::try_from(n).map_err(|_| {
             PaperStateError::Internal(format!("positions_count {n} exceeds usize::MAX"))
         })
@@ -2068,10 +2077,33 @@ mod tests {
             EventSeq(1),
         )
         .unwrap();
+        // Open before settlement (#516: the count is open-only, not all-time rows)…
+        assert_eq!(db.positions_count().unwrap(), 1);
         db.record_settled_market(&market(), "[\"1\",\"0\"]", dec!(5), 1_700_000_000)
             .unwrap();
-        assert_eq!(db.positions_count().unwrap(), 1);
+        // …and no longer counted once its market settles, while the row itself is
+        // preserved (cumulative table — the hold-gate/settlement loader still sees it).
+        assert_eq!(db.positions_count().unwrap(), 0);
         assert_eq!(db.settled_count().unwrap(), 1);
+        assert_eq!(db.paper_positions().unwrap().len(), 1);
+
+        // A second, unsettled market stays counted; an unsettled zero-net row does not.
+        db.upsert_position(
+            &MarketId(VenueMarketId("0xopen".to_string())),
+            OutcomeId(0),
+            3,
+            0,
+        )
+        .unwrap();
+        db.upsert_position(
+            &MarketId(VenueMarketId("0xflat".to_string())),
+            OutcomeId(0),
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(db.positions_count().unwrap(), 1);
+        assert_eq!(db.paper_positions().unwrap().len(), 3);
     }
 
     #[test]

@@ -292,7 +292,7 @@ create table if not exists service_config (
 insert into service_config (key, value, value_type, description) values
   ('active_watchlist_size',                 '100',    'integer', 'Maximum top-ranked wallets pe-service actively follows; hot-reloaded every 30 seconds (1..200)'),
   ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
-  ('bankroll_usd',                          '10000',  'decimal', 'Starting-capital baseline (dashboard denominator); never re-credits the running bankroll'),
+  ('bankroll_usd',                          '10000',  'decimal', 'Bookkeeping mirror of the boot PE_BANKROLL_USD paper baseline: parsed into the runtime snapshot but consumed by nothing. The BOOT value seeds a fresh book (docs/34) and is the /paper/pnl denominator; editing this row re-credits nothing and has no live effect'),
   ('max_fill_price',                        '0.85',   'decimal', 'Skip BUYs at or above this current price'),
   ('min_fill_price',                        '0.15',   'decimal', 'Skip BUYs below this current price (run28 band lower bound; 0 disables)'),
   ('min_resolution_horizon_secs',           '60',     'integer', 'Min time-to-resolution copy floor (seconds)'),
@@ -322,8 +322,8 @@ insert into service_config (key, value, value_type, description) values
   ('kelly_fraction_above_default_human_approved', 'false', 'bool', 'Approval flag: allow a Kelly fraction above the mode default'),
   ('polymarket_fee_rate',                   '0.04',   'decimal', 'Polymarket BUY taker fee rate for net cost c'),
   ('slippage_rate',                         '0.01',   'decimal', 'Expected fill slippage rate added to c'),
-  ('sizing_mode',                           'dollar', 'text',    'Sizing mode: kelly | dollar | contract (#398 WS2); live boot default = dollar'),
-  ('sizing_dollar_usd',                     '25',     'decimal', 'USD per trade when sizing_mode=dollar (the $25-flat live default)'),
+  ('sizing_mode',                           'dollar', 'text',    'Shared PAPER sizing mode: kelly | dollar | contract (#398 WS2). Reaches ordinary-live only as the fallback when accounts.live_sizing_mode is NULL'),
+  ('sizing_dollar_usd',                     '25',     'decimal', 'USD per PAPER trade when sizing_mode=dollar. Live accounts size from accounts.live_sizing_dollar_usd; this value reaches live only via the NULL live_sizing_mode fallback'),
   ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)'),
   ('price_impact_cap_bps',                  '0',      'integer', 'Price-impact cap (bps of best ask), the sole policy size limit (#508); edits valid 1..=10000 — the seeded 0 is rejected at parse so boot stays gate-off until the A3 cutover UPDATE'),
   ('per_trade_cap',                         'mode_default', 'text', 'Per-trade cap: mode_default | unlimited | bps:N (#508); the safe boot seed — production flips to unlimited via the predicated A4 UPDATE only')

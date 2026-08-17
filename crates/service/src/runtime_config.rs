@@ -147,8 +147,10 @@ pub struct RuntimeConfig {
     /// Trading mode (`paper` | `shadow` | `live_tiny` | `promoted`). Transitions to a live mode
     /// are guarded by [`validate_mode_transition`].
     pub mode: String,
-    /// Configured starting-capital **baseline** (dashboard denominator); never writes the
-    /// running bankroll (no re-credit invariant, true by construction — there is no writer).
+    /// Mirror of the boot `PE_BANKROLL_USD` paper baseline (#516): parsed into every
+    /// runtime snapshot but consumed by nothing — the BOOT value seeds a fresh book
+    /// (docs/34) and is the `/paper/pnl` denominator. Editing the KV row re-credits
+    /// nothing and has no live effect.
     pub bankroll_usd: String,
     pub max_fill_price: String,
     /// Run28 entry-band lower bound on the current price (`"0"` disables) — the copy-time

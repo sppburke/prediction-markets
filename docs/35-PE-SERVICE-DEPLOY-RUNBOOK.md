@@ -26,12 +26,12 @@ against the live box on first use, then corrected here.
 
 Every step is bound to sha256 identity (#514): record **desired** = `sha256sum` of the
 local release build before shipping; on the VPS, **staged** = the hash of
-`/tmp/pe-service.new` and **installed** = the hash of the `ExecStart` binary.
+`/tmp/pe-service.new.<desired-sha12>` (hash-qualified — concurrent agents cannot clobber each other's staged binary, #516) and **installed** = the hash of the `ExecStart` binary. A deploy holds `flock -n /home/sean/.pe-deploy.lock` from preflight through verify-or-rollback; abort on contention. Backfill/reset/direct paper-state writes honor the same lock.
 
 1. **Build at the exact main SHA** being deployed (record the git SHA and the desired
    binary hash):
    `git -C /home/sean/git/prediction-markets rev-parse --short HEAD && cargo build --release -p pe-service && sha256sum target/release/pe-service`
-2. **Ship**: `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new`
+2. **Ship**: `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
 3. **Preflight on the VPS** (before stopping anything): require `staged = desired` — a
    mismatch or missing file means the scp is partial: re-run step 2. If
    `installed = desired` already, the swap is complete (a resumed run): skip to step 6.
@@ -41,7 +41,7 @@ local release build before shipping; on the VPS, **staged** = the hash of
    unknown — the sha-derived name makes the backup once-only, so a rerun never clobbers
    it):
    `[ -f <workdir>/target/release/pe-service.bak-<old-sha> ] || cp -p <workdir>/target/release/pe-service <workdir>/target/release/pe-service.bak-<old-sha>`
-   `mv /tmp/pe-service.new <workdir>/target/release/pe-service && chmod +x <workdir>/target/release/pe-service`
+   `mv /tmp/pe-service.new.<desired-sha12> <workdir>/target/release/pe-service && chmod +x <workdir>/target/release/pe-service`
    then require `installed = desired` before proceeding.
 6. **Config deltas for this deploy** (see each PR's "Deployment impact"): update `.env` /
    TOML boot knobs (e.g. `PE_WATCHLIST_MEMBERSHIP_MODE=full_rerank`) and PATCH/INSERT the
