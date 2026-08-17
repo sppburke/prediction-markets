@@ -73,7 +73,9 @@ fn ac_snapshot_reflects_state() {
             .map(|s| Decimal::from_str(s).unwrap()),
         Some(dec!(996))
     );
-    assert_eq!(snap.open_positions, 1);
+    // #516: `open_positions` counts genuinely open positions (net-nonzero AND market
+    // not settled). The seeded fill's market IS settled, so the truthful count is 0.
+    assert_eq!(snap.open_positions, 0);
     assert_eq!(snap.fills_total, 1);
     assert_eq!(snap.settled_total, 1);
     assert_eq!(snap.last_event_seq, 7);
@@ -86,7 +88,7 @@ fn ac_snapshot_reflects_state() {
     // RFC-3339 formatting of the injected unix instant (1_700_000_500 = 2023-11-14T22:21:40Z).
     assert_eq!(snap.updated_at, "2023-11-14T22:21:40Z");
     println!(
-        "PASS: status snapshot mirrors seeded paper-state (bankroll 996, 1 fill/pos, 1 settled)"
+        "PASS: status snapshot mirrors seeded paper-state (bankroll 996, 1 fill, settled ⇒ 0 open)"
     );
 }
 

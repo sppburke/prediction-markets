@@ -26,7 +26,10 @@ create table if not exists paper_bankroll (
 );
 
 -- Our own net paper positions per (market, outcome). PK matches the local `positions`
--- natural key. `bigint` contracts (the local column is INTEGER; values are small).
+-- natural key. CUMULATIVE by design (#516): settlement inserts `settled_markets` and
+-- credits the bankroll but never zeroes/deletes rows here — `apply_resolution_v2`
+-- computes its credit FROM these rows at settlement time. "Open" is always derived as
+-- net-nonzero AND market not settled. `bigint` contracts (the local column is INTEGER; values are small).
 create table if not exists paper_positions (
   market_id       text        not null,
   outcome_id      integer     not null,
