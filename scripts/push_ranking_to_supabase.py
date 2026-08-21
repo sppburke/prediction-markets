@@ -34,9 +34,8 @@ TEMPFAIL_EXIT = 75
 
 
 class CacheStaleError(Exception):
-    """The trade cache's newest trade is older than the staleness bound, i.e. the
-    backfill-before-push contract (docs/26) was not honoured. Pushing anyway would
-    filter out *every* wallet (none look "active"), so we abort instead."""
+    """The trade, resolution-content, or completed-CLOB-sweep freshness contract
+    (docs/26) was not honoured, so publication must fail closed."""
 
 
 class SupabaseRequestError(Exception):
@@ -68,6 +67,22 @@ def _newest_trade_unix(con: sqlite3.Connection) -> int | None:
     return None if row is None or row[0] is None else int(row[0])
 
 
+def _newest_resolution_fetch(con: sqlite3.Connection) -> int | None:
+    """Global resolution-content heartbeat from ``market_resolutions``."""
+    row = con.execute("SELECT MAX(fetched_at_unix) FROM market_resolutions").fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _clob_sweep_completed_at(con: sqlite3.Connection) -> tuple[str, int] | None:
+    """Return the CLOB sweep cursor value and its last update time, if present."""
+    row = con.execute(
+        "SELECT value, updated_at FROM source_cursor WHERE key = 'clob_closed'"
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0]), int(row[1])
+
+
 def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dict[str, int]:
     """Map lowercased ``wallet_hex`` -> its most recent ``timestamp_unix`` in the cache.
 
@@ -94,13 +109,16 @@ def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dic
 def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, now):
     """Drop ranked rows whose wallet has no cached trade within ``active_window_hours``.
 
-    Aborts with :class:`CacheStaleError` when the cache's global newest trade is older
-    than ``max_staleness_hours`` — a stale cache would spuriously drop every wallet, so we
-    refuse to push rather than silently empty the ranking. The ``wallet_hex`` comparison is
-    case-insensitive (both sides lowercased). Returns ``(kept_rows, dropped_count, last_trade_map)``
-    where ``last_trade_map`` is lowercased ``wallet_hex`` -> last ``timestamp_unix`` for every
-    queried wallet that has a cached trade (reused to stamp each pushed entry with its real last
-    trade, #357; a wallet with no cached trade is absent -> its entry's last_trade_unix is NULL).
+    Aborts with :class:`CacheStaleError` unless the newest trade, newest resolution
+    fetch, and successful CLOB completion marker are all within
+    ``max_staleness_hours``. The cursor probe accepts only a present row whose
+    value is exactly ``''``; a non-empty value proves an interrupted walk. The
+    ``wallet_hex`` comparison is case-insensitive (both sides lowercased).
+    Returns ``(kept_rows, dropped_count, last_trade_map)`` where
+    ``last_trade_map`` is lowercased ``wallet_hex`` -> last ``timestamp_unix``
+    for every queried wallet that has a cached trade (reused to stamp each
+    pushed entry with its real last trade, #357; a wallet with no cached trade
+    is absent -> its entry's last_trade_unix is NULL).
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -110,6 +128,40 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
             raise CacheStaleError(
                 f"cache {db_path!r} newest trade is {age}h old "
                 f"(> {max_staleness_hours}h bound) — backfill before pushing (docs/26)"
+            )
+        newest_resolution = _newest_resolution_fetch(con)
+        if (
+            newest_resolution is None
+            or now - newest_resolution > max_staleness_hours * 3600
+        ):
+            age = (
+                "unknown"
+                if newest_resolution is None
+                else f"{(now - newest_resolution) / 3600:.1f}"
+            )
+            raise CacheStaleError(
+                f"cache {db_path!r} newest resolution fetch is {age}h old "
+                f"(> {max_staleness_hours}h bound) — refresh resolutions before pushing "
+                "(docs/26)"
+            )
+        sweep = _clob_sweep_completed_at(con)
+        if sweep is None:
+            raise CacheStaleError(
+                f"cache {db_path!r} has no completed CLOB sweep marker — refresh "
+                "resolutions before pushing (docs/26)"
+            )
+        cursor_value, completed_at = sweep
+        if cursor_value != "":
+            raise CacheStaleError(
+                f"cache {db_path!r} CLOB sweep is incomplete (cursor={cursor_value!r}) — "
+                "refresh resolutions before pushing (docs/26)"
+            )
+        if now - completed_at > max_staleness_hours * 3600:
+            age = f"{(now - completed_at) / 3600:.1f}"
+            raise CacheStaleError(
+                f"cache {db_path!r} completed CLOB sweep is {age}h old "
+                f"(> {max_staleness_hours}h bound) — refresh resolutions before pushing "
+                "(docs/26)"
             )
         wallets_lower = sorted({r["wallet"].lower() for r in rows})
         last = _wallet_last_trade(con, wallets_lower)

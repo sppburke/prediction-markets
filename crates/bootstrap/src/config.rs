@@ -145,7 +145,8 @@ pub struct BootstrapConfig {
     )]
     pub polymarket_wallet_timeout_secs: u64,
 
-    /// Fetch market resolutions from Gamma after trade fetch (off by default).
+    /// Fetch market resolutions from the primary CLOB sweep plus auxiliary
+    /// Gamma schedule/liquidity stages after trade fetch (off by default).
     /// Env `PE_BOOTSTRAP_FETCH_RESOLUTIONS`: `"1"` or `"true"` to enable.
     #[serde(
         default,
@@ -193,9 +194,9 @@ pub struct BootstrapConfig {
     /// Warn when the CLOB token→condition coverage of resolved-with-winner
     /// markets falls below this percent after a `resolutions` run (issue #429).
     /// Default 90: a full CLOB closed-markets re-walk maps ~94%+ of winner
-    /// markets, so a value below 90 flags genuine token-map starvation (e.g. a
-    /// pre-re-walk cache — run `resolutions --reset-clob-cursor`). `0` disables
-    /// the warn. Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+    /// markets, so a value below 90 flags genuine token-map starvation; coverage
+    /// self-heals on the next cycle's full walk. `0` disables the warn. Canonical
+    /// default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_CLOB_TOKEN_COVERAGE_WARN_PCT` overrides.
     #[serde(
         default = "default_clob_token_coverage_warn_pct",

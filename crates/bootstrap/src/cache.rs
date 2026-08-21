@@ -318,6 +318,22 @@ pub struct CoverageReport {
     pub missing_schedule: usize,
 }
 
+/// Traded, scheduled, past-end markets that still have no terminal resolution.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResolutionAuditMissing {
+    /// Bounded repair population, ordered by market id for deterministic runs.
+    pub market_ids: Vec<String>,
+    /// Matching rows beyond the caller-provided repair cap.
+    pub clipped: usize,
+}
+
+impl ResolutionAuditMissing {
+    /// Total missing population before the repair cap was applied.
+    pub fn total(&self) -> usize {
+        self.market_ids.len().saturating_add(self.clipped)
+    }
+}
+
 impl CoverageReport {
     /// True when every gap count is zero — the cache is backtest-ready.
     pub fn is_clean(&self) -> bool {
@@ -887,8 +903,11 @@ impl WalletCache {
 
     // ── market_resolutions ────────────────────────────────────────────────────
 
-    /// Insert a single market resolution. Idempotent: `INSERT OR IGNORE` silently
-    /// skips if `market_id` is already present (first fetch wins).
+    /// Insert a single market resolution. Idempotent with one deliberate
+    /// exception (issue #519 review): an existing row keeps its values (first
+    /// fetch wins) UNLESS the stored `winning_outcome_id` is NULL and the new
+    /// insert carries an explicit winner — then the row upgrades in place, so a
+    /// row recorded while the venue's winner flag lagged can still heal.
     ///
     /// `winning_outcome_id = None` means voided/non-binary — backtest will not
     /// attempt to close positions on this market.
@@ -901,9 +920,15 @@ impl WalletCache {
     ) -> Result<(), BootstrapError> {
         let winner_i64: Option<i64> = winning_outcome_id.map(i64::from);
         self.conn.execute(
-            "INSERT OR IGNORE INTO market_resolutions \
+            "INSERT INTO market_resolutions \
              (market_id, winning_outcome_id, resolved_at_unix, fetched_at_unix) \
-             VALUES (?1, ?2, ?3, ?4)",
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(market_id) DO UPDATE SET \
+                 winning_outcome_id = excluded.winning_outcome_id, \
+                 resolved_at_unix = excluded.resolved_at_unix, \
+                 fetched_at_unix = excluded.fetched_at_unix \
+             WHERE market_resolutions.winning_outcome_id IS NULL \
+                 AND excluded.winning_outcome_id IS NOT NULL",
             params![market_id, winner_i64, resolved_at_unix, fetched_at_unix],
         )?;
         Ok(())
@@ -911,8 +936,8 @@ impl WalletCache {
 
     /// Insert a single market resolution, explicitly tagged with `source`.
     ///
-    /// Same idempotency contract as [`Self::insert_resolution`] (`INSERT OR IGNORE` on
-    /// `market_id`). The `source` column was added in the multi-source pipeline migration
+    /// Same idempotency contract as [`Self::insert_resolution`] (first value wins,
+    /// with the NULL-winner upgrade exception). The `source` column was added in the multi-source pipeline migration
     /// (issue #149) and lets the cache distinguish rows by their origin:
     /// `"polygon"` (on-chain `eth_getLogs`) and `"clob"` (Polymarket CLOB).
     /// (`"dune"` rows written before #335 may still exist in deployed caches; the
@@ -929,9 +954,16 @@ impl WalletCache {
     ) -> Result<(), BootstrapError> {
         let winner_i64: Option<i64> = winning_outcome_id.map(i64::from);
         self.conn.execute(
-            "INSERT OR IGNORE INTO market_resolutions \
+            "INSERT INTO market_resolutions \
              (market_id, winning_outcome_id, resolved_at_unix, fetched_at_unix, source) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(market_id) DO UPDATE SET \
+                 winning_outcome_id = excluded.winning_outcome_id, \
+                 resolved_at_unix = excluded.resolved_at_unix, \
+                 fetched_at_unix = excluded.fetched_at_unix, \
+                 source = excluded.source \
+             WHERE market_resolutions.winning_outcome_id IS NULL \
+                 AND excluded.winning_outcome_id IS NOT NULL",
             params![
                 market_id,
                 winner_i64,
@@ -1436,10 +1468,10 @@ impl WalletCache {
     /// `token_id` is the decimal-string uint256 form from Gamma `clobTokenIds` (or
     /// CLOB `/markets` `tokens[].token_id` — the same on-chain CTF positionId);
     /// `condition_id` is the normalised `0x`-prefixed market id; `outcome_index`
-    /// is the 0-based positional outcome ordinal (0=YES,1=NO for binary). `INSERT
-    /// OR REPLACE` keyed on `token_id` — a token belongs to exactly one condition,
-    /// and a re-sweep refreshes `fetched_at_unix`/`outcome_index` without
-    /// duplicating rows.
+    /// is the 0-based positional outcome ordinal (0=YES,1=NO for binary).
+    /// Conflicts update only when the immutable mapping differs. This preserves
+    /// the legacy-NULL `outcome_index` upgrade and a genuine remap while making
+    /// an identical full-universe re-walk a write no-op (issue #519).
     pub fn upsert_token_conditions_batch(
         &mut self,
         rows: &[(String, String, u16)],
@@ -1448,9 +1480,15 @@ impl WalletCache {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO token_conditions \
+                "INSERT INTO token_conditions \
                  (token_id, condition_id, outcome_index, fetched_at_unix) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(token_id) DO UPDATE SET \
+                     condition_id = excluded.condition_id, \
+                     outcome_index = excluded.outcome_index, \
+                     fetched_at_unix = excluded.fetched_at_unix \
+                 WHERE (token_conditions.condition_id, token_conditions.outcome_index) \
+                     IS NOT (excluded.condition_id, excluded.outcome_index)",
             )?;
             for (token_id, condition_id, outcome_index) in rows {
                 stmt.execute(params![
@@ -1481,8 +1519,8 @@ impl WalletCache {
     /// issue #429 migration and never repopulated. The CLOB closed-markets
     /// ingestion cross-check (issue #429) uses this to detect a CLOB `tokens[]`
     /// array order that diverges from the authoritative Gamma `clob_token_ids`
-    /// order *before* `upsert_token_conditions_batch`'s `INSERT OR REPLACE`
-    /// overwrites the prior row.
+    /// order before `upsert_token_conditions_batch`'s conditional upsert examines
+    /// the prior row.
     ///
     /// # Precondition
     /// Returns `None` when the token has not been mapped.
@@ -1528,6 +1566,53 @@ impl WalletCache {
             )
             .unwrap_or(0);
         (total, mapped)
+    }
+
+    /// Find traded markets whose known schedule ended before `past_end_before`
+    /// and which still have no `market_resolutions` row (issue #519).
+    ///
+    /// NULL schedules are excluded because production ranking is
+    /// `--scheduled-only`. The `EXISTS` probe is forced through
+    /// `idx_trades_market_id`, avoiding a heap scan of the trades table. The
+    /// returned repair set is bounded by the SQL `LIMIT`; `clipped` reports the
+    /// exact remaining population so a cap can never silently pass.
+    pub fn missing_resolution_audit(
+        &self,
+        past_end_before: i64,
+        limit: usize,
+    ) -> Result<ResolutionAuditMissing, BootstrapError> {
+        const PREDICATE: &str = "ms.end_date_unix IS NOT NULL \
+             AND ms.end_date_unix < ?1 \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM market_resolutions mr WHERE mr.market_id = ms.market_id \
+             ) \
+             AND EXISTS ( \
+                 SELECT 1 FROM trades t INDEXED BY idx_trades_market_id \
+                 WHERE t.market_id = ms.market_id \
+             )";
+        // ONE pass (issue #519 review): iterate every matching row, keep the
+        // first `limit` ids and count the remainder as `clipped` — no separate
+        // COUNT traversal of the 1.6M-row schedules table.
+        let rows_sql = format!(
+            "SELECT ms.market_id FROM market_schedules ms \
+             WHERE {PREDICATE} ORDER BY ms.market_id"
+        );
+        let mut stmt = self.conn.prepare(&rows_sql)?;
+        let rows = stmt.query_map(params![past_end_before], |row| row.get::<_, String>(0))?;
+        let mut market_ids = Vec::new();
+        let mut clipped = 0usize;
+        for row in rows {
+            let id = row?;
+            if market_ids.len() < limit {
+                market_ids.push(id);
+            } else {
+                clipped += 1;
+            }
+        }
+        Ok(ResolutionAuditMissing {
+            market_ids,
+            clipped,
+        })
     }
 
     /// Coverage of the CLOB price series over the resolved-with-winner universe (issue #429 PR3) —
@@ -2174,6 +2259,16 @@ impl WalletCache {
              VALUES (?1, ?2, ?3)",
             params![key, value, now],
         )?;
+        Ok(())
+    }
+
+    /// Delete the checkpoint row for `key`.
+    ///
+    /// Used before a CLOB rebuild or emergency reset so a failure before page 1
+    /// leaves no forged completion marker (issue #519).
+    pub fn delete_source_cursor(&mut self, key: &str) -> Result<(), BootstrapError> {
+        self.conn
+            .execute("DELETE FROM source_cursor WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -3634,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    fn token_conditions_batch_round_trips_and_replaces() {
+    fn token_conditions_batch_round_trips_and_remaps() {
         let dir = TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
         assert_eq!(cache.token_condition_count(), 0);
@@ -3654,20 +3749,77 @@ mod tests {
             cache.token_condition_outcome("222"),
             Some(("0xaa".to_string(), Some(1)))
         );
-        // INSERT OR REPLACE keyed on token_id: re-mapping a token updates, not dupes.
+        // A conflicting token mapping updates every mutable field without
+        // changing the table cardinality.
         cache
-            .upsert_token_conditions_batch(&[("111".to_string(), "0xcc".to_string(), 0)], 200)
+            .upsert_token_conditions_batch(&[("111".to_string(), "0xcc".to_string(), 2)], 200)
             .unwrap();
         assert_eq!(cache.token_condition_count(), 3);
-        let cond: String = cache
+        let row: (String, i64, i64) = cache
             .conn
             .query_row(
-                "SELECT condition_id FROM token_conditions WHERE token_id = '111'",
+                "SELECT condition_id, outcome_index, fetched_at_unix \
+                 FROM token_conditions WHERE token_id = '111'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("0xcc".to_owned(), 2, 200));
+    }
+
+    #[test]
+    fn null_winner_resolution_upgrades_but_real_values_are_first_write_wins() {
+        // Issue #519 review: a row recorded while the venue's winner flag lagged
+        // (NULL winner) must upgrade in place when the explicit winner arrives;
+        // a row that already carries a winner must never be overwritten.
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .insert_resolution_with_source("m-null", None, 100, 1, "clob")
+            .unwrap();
+        cache
+            .insert_resolution_with_source("m-null", Some(1), 200, 2, "clob")
+            .unwrap();
+        let (winner, resolved_at): (Option<i64>, i64) = cache
+            .conn
+            .query_row(
+                "SELECT winning_outcome_id, resolved_at_unix FROM market_resolutions \
+                 WHERE market_id = 'm-null'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(winner, Some(1));
+        assert_eq!(resolved_at, 200);
+
+        cache
+            .insert_resolution_with_source("m-set", Some(0), 100, 1, "clob")
+            .unwrap();
+        cache
+            .insert_resolution_with_source("m-set", Some(1), 200, 2, "clob")
+            .unwrap();
+        let winner: Option<i64> = cache
+            .conn
+            .query_row(
+                "SELECT winning_outcome_id FROM market_resolutions WHERE market_id = 'm-set'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(cond, "0xcc");
+        assert_eq!(winner, Some(0), "explicit winners are first-write-wins");
+        // A NULL re-insert over an existing winner must also be a no-op.
+        cache
+            .insert_resolution_with_source("m-set", None, 300, 3, "clob")
+            .unwrap();
+        let winner: Option<i64> = cache
+            .conn
+            .query_row(
+                "SELECT winning_outcome_id FROM market_resolutions WHERE market_id = 'm-set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(winner, Some(0));
     }
 
     #[test]
@@ -3791,7 +3943,7 @@ mod tests {
         // so the CLOB cross-check's `stored_idx.is_some_and(..)` skips it (no
         // divergence verdict) and overwrites it with the CLOB position on re-walk.
         let dir = TempDir::new().unwrap();
-        let cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
         cache
             .conn
             .execute(
@@ -3804,6 +3956,40 @@ mod tests {
             cache.token_condition_outcome("legacy"),
             Some(("0xc".to_string(), None))
         );
+        cache
+            .upsert_token_conditions_batch(&[("legacy".to_owned(), "0xc".to_owned(), 1)], 10)
+            .unwrap();
+        assert_eq!(
+            cache.token_condition_outcome("legacy"),
+            Some(("0xc".to_string(), Some(1)))
+        );
+        let fetched_at: i64 = cache
+            .conn
+            .query_row(
+                "SELECT fetched_at_unix FROM token_conditions WHERE token_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fetched_at, 10);
+    }
+
+    #[test]
+    fn identical_token_condition_reinsert_preserves_fetched_at() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        let row = [("t0".to_owned(), "0xc".to_owned(), 0)];
+        cache.upsert_token_conditions_batch(&row, 9).unwrap();
+        cache.upsert_token_conditions_batch(&row, 99).unwrap();
+        let fetched_at: i64 = cache
+            .conn
+            .query_row(
+                "SELECT fetched_at_unix FROM token_conditions WHERE token_id = 't0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fetched_at, 9);
     }
 
     #[test]
@@ -4992,6 +5178,75 @@ mod tests {
             cache.get_source_cursor("other_source").as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn source_cursor_delete_removes_only_requested_key() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        cache.set_source_cursor("clob_closed", "PAGE2").unwrap();
+        cache.set_source_cursor("other_source", "1").unwrap();
+        cache.delete_source_cursor("clob_closed").unwrap();
+        assert!(cache.get_source_cursor("clob_closed").is_none());
+        assert_eq!(
+            cache.get_source_cursor("other_source").as_deref(),
+            Some("1")
+        );
+        cache.delete_source_cursor("clob_closed").unwrap();
+    }
+
+    fn insert_audit_trade(cache: &WalletCache, id: &str, market_id: &str) {
+        cache
+            .conn
+            .execute(
+                "INSERT INTO trades (source_trade_id, wallet_hex, market_id, outcome_id, \
+                 side, price_str, contracts, timestamp_unix) \
+                 VALUES (?1, '0x0000000000000000000000000000000000000001', ?2, 0, \
+                         'buy', '0.5', 1, 1)",
+                params![id, market_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resolution_audit_selects_only_traded_scheduled_past_end_missing() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        for (id, end_date) in [
+            ("past", Some(1_000)),
+            ("null", None),
+            ("future", Some(9_000)),
+            ("resolved", Some(1_000)),
+            ("untraded", Some(1_000)),
+        ] {
+            cache.insert_schedule(id, end_date, 1).unwrap();
+        }
+        for id in ["past", "null", "future", "resolved"] {
+            insert_audit_trade(&cache, &format!("trade-{id}"), id);
+        }
+        cache
+            .insert_resolution("resolved", Some(0), 1_000, 1)
+            .unwrap();
+
+        let missing = cache.missing_resolution_audit(6_400, 10).unwrap();
+        assert_eq!(missing.market_ids, vec!["past"]);
+        assert_eq!(missing.clipped, 0);
+        assert_eq!(missing.total(), 1);
+    }
+
+    #[test]
+    fn resolution_audit_reports_exact_clipped_count() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = tmp_cache(&dir);
+        for id in ["m3", "m1", "m2"] {
+            cache.insert_schedule(id, Some(1_000), 1).unwrap();
+            insert_audit_trade(&cache, &format!("trade-{id}"), id);
+        }
+
+        let missing = cache.missing_resolution_audit(6_400, 2).unwrap();
+        assert_eq!(missing.market_ids, vec!["m1", "m2"]);
+        assert_eq!(missing.clipped, 1);
+        assert_eq!(missing.total(), 3);
     }
 
     // ── delete_resolutions_by_sources unit tests ──────────────────────────────

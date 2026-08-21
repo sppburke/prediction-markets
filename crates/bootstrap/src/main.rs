@@ -238,21 +238,18 @@ async fn main() {
             }
 
             "resolutions" => {
-                // `--reset-clob-cursor` (issue #429): clear the CLOB closed-market
-                // pagination checkpoint so the next run re-walks every page,
-                // mapping the full-universe token→condition map. This is a long
-                // operator run; use it once after deploying the token-map change,
-                // not on the cron `all` path.
+                // `--reset-clob-cursor` is an emergency-only lever for discarding
+                // an interrupted opaque cursor. Stop competing writers first.
                 if reset_clob_cursor {
                     if let Err(e) =
-                        cache.set_source_cursor(pe_bootstrap::clob::CLOB_CLOSED_CURSOR_KEY, "")
+                        cache.delete_source_cursor(pe_bootstrap::clob::CLOB_CLOSED_CURSOR_KEY)
                     {
                         tracing::error!(error = %e, "resolutions: failed to reset CLOB cursor");
                         std::process::exit(1);
                     }
                     tracing::info!(
-                        "resolutions: --reset-clob-cursor → cleared source_cursor.clob_closed; \
-                         CLOB will re-walk all closed-market pages (issue #429)"
+                        "resolutions: --reset-clob-cursor → deleted source_cursor.clob_closed; \
+                         CLOB will start from page 1"
                     );
                 }
                 let all_ids = cache.all_market_ids();
@@ -289,8 +286,17 @@ async fn main() {
                         0
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "resolutions: fatal");
-                        1
+                        let exit_code = resolutions_error_exit_code(&e);
+                        if exit_code == BootstrapError::TEMPFAIL_EXIT_CODE {
+                            tracing::warn!(
+                                error = %e,
+                                exit_code,
+                                "resolutions: audit incomplete"
+                            );
+                        } else {
+                            tracing::error!(error = %e, exit_code, "resolutions: fatal");
+                        }
+                        exit_code
                     }
                 }
             }
@@ -730,8 +736,8 @@ fn log_token_coverage(cache: &WalletCache, warn_pct: u8) {
             total,
             coverage_pct = pct,
             warn_pct,
-            "resolutions: CLOB token→condition coverage below threshold — run \
-             `pe-bootstrap resolutions --reset-clob-cursor` to re-walk and map the full universe (issue #429)"
+            "resolutions: CLOB token→condition coverage below threshold — coverage \
+             self-heals on the next cycle's full walk (issue #519)"
         );
     } else {
         tracing::info!(
@@ -793,4 +799,42 @@ fn wallets_from_cache(
                 .ok()
         })
         .collect())
+}
+
+fn resolutions_error_exit_code(error: &BootstrapError) -> i32 {
+    match error {
+        BootstrapError::ResolutionAuditIncomplete { .. } => BootstrapError::TEMPFAIL_EXIT_CODE,
+        _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolutions_error_exit_code;
+    use pe_bootstrap::error::BootstrapError;
+
+    #[test]
+    fn resolution_audit_incomplete_is_the_only_resolutions_tempfail() {
+        for error in [
+            BootstrapError::ResolutionAuditIncomplete {
+                still_missing: 1,
+                clipped: 0,
+            },
+            BootstrapError::ResolutionAuditIncomplete {
+                still_missing: 0,
+                clipped: 1,
+            },
+        ] {
+            assert_eq!(
+                resolutions_error_exit_code(&error),
+                BootstrapError::TEMPFAIL_EXIT_CODE
+            );
+        }
+        assert_eq!(
+            resolutions_error_exit_code(&BootstrapError::Clob {
+                message: "fatal".to_owned(),
+            }),
+            1
+        );
+    }
 }

@@ -44,9 +44,14 @@ use std::time::Duration;
 
 use cache::WalletCache;
 use error::BootstrapError;
+use pe_source_polymarket_public::PageFetcher;
+use time::OffsetDateTime;
 
 // Upper-bound block for funder discovery — both endpoints finalized, result is time-invariant.
 pub const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
+
+const RESOLUTION_AUDIT_REPAIR_LIMIT: usize = 5_000;
+const RESOLUTION_AUDIT_END_BUFFER_SECS: i64 = 3_600;
 
 /// Outcome of [`fetch_resolutions_and_schedules`] (issue #201).
 ///
@@ -98,18 +103,24 @@ impl ResolutionsReport {
 /// markets. `market_ids` scopes the run — pass `cache.all_market_ids()` for the
 /// full pipeline or just the wallets-newly-fetched market set for targeted backfill.
 ///
-/// `config.rebuild_resolutions = true` drops every imprecise-source row
-/// (`'gamma'`, `'clob'`) up front so the CLOB stage re-populates the `'clob'`
-/// rows. Retained `source='polygon'` rows are NOT deleted — they keep their exact
-/// block-timestamp `resolved_at_unix`. With the on-chain scan gone there is no
-/// precise re-derivation, so a rebuild re-fetches `'clob'` rows from CLOB only.
-/// Idempotent — safe on every run.
+/// `config.rebuild_resolutions = true` first deletes the CLOB cursor row, then
+/// drops every imprecise-source row (`'gamma'`, `'clob'`) so the CLOB stage
+/// re-populates from page 1. Retained `source='polygon'` rows are NOT deleted —
+/// they keep their exact block-timestamp `resolved_at_unix`. With the on-chain
+/// scan gone there is no precise re-derivation, so a rebuild re-fetches `'clob'`
+/// rows from CLOB only. Idempotent — safe on every run.
+///
+/// The final stage audits every traded, scheduled market whose end is more than
+/// one hour past and repairs missing terminal rows through the per-market CLOB
+/// endpoint. Any remaining or clipped population returns
+/// [`BootstrapError::ResolutionAuditIncomplete`].
 pub async fn fetch_resolutions_and_schedules(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     market_ids: &[String],
 ) -> Result<ResolutionsReport, BootstrapError> {
     if config.rebuild_resolutions {
+        cache.delete_source_cursor(clob::CLOB_CLOSED_CURSOR_KEY)?;
         let deleted = cache.delete_resolutions_by_sources(&["gamma", "clob"])?;
         tracing::info!(
             deleted,
@@ -118,11 +129,12 @@ pub async fn fetch_resolutions_and_schedules(
     }
 
     let mut stages_failed: Vec<&'static str> = Vec::new();
+    let clob_fetcher = build_clob_fetcher(config)?;
 
     // CLOB closed-market pagination — primary resolution source; hard-fail
     // (propagate). A CLOB outage aborts the run rather than silently producing a
     // resolutions pass missing the gold source (issue #369).
-    let clob_report = run_clob_closed_markets(config, cache).await?;
+    let clob_report = run_clob_closed_markets(&clob_fetcher, cache).await?;
 
     // The Gamma stages are fallback/auxiliary sources (issue #201): a failure in
     // one must NOT abort the others. Each is soft-failed — logged and recorded in
@@ -141,6 +153,14 @@ pub async fn fetch_resolutions_and_schedules(
         stages_failed.push("schedule_backfill");
     }
 
+    run_resolution_audit(
+        &clob_fetcher,
+        cache,
+        OffsetDateTime::now_utc().unix_timestamp(),
+        RESOLUTION_AUDIT_REPAIR_LIMIT,
+    )
+    .await?;
+
     Ok(ResolutionsReport {
         stages_failed,
         clob_order_mismatches: clob_report.order_mismatches,
@@ -150,19 +170,24 @@ pub async fn fetch_resolutions_and_schedules(
 /// CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).
 /// Primary, sole market-resolution source (issue #369). Also maps the
 /// full-universe token→condition map with positional `outcome_index` (issue #429).
-async fn run_clob_closed_markets(
+fn build_clob_fetcher(
     config: &BootstrapConfig,
-    cache: &mut WalletCache,
-) -> Result<clob::ClobReport, BootstrapError> {
+) -> Result<clob::ClobFetcher<pe_source_polymarket_public::ReqwestFetcher>, BootstrapError> {
     use pe_source_polymarket_public::ReqwestFetcher;
     let clob_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| BootstrapError::Internal)?;
-    let clob_fetcher = clob::ClobFetcher::new(
+    Ok(clob::ClobFetcher::new(
         config.clob_base_url.clone(),
-        ReqwestFetcher::new(clob_client),
-    );
+        ReqwestFetcher::new(clob_client).with_min_interval_ms(200),
+    ))
+}
+
+async fn run_clob_closed_markets<F: PageFetcher + Send + Sync>(
+    clob_fetcher: &clob::ClobFetcher<F>,
+    cache: &mut WalletCache,
+) -> Result<clob::ClobReport, BootstrapError> {
     let report = clob_fetcher.fetch_closed_markets(cache).await?;
     if report.order_mismatches > 0 {
         // Quarantined markets' token rows were skipped (never mispriced); surface
@@ -181,6 +206,107 @@ async fn run_clob_closed_markets(
         "bootstrap: clob closed markets fetched"
     );
     Ok(report)
+}
+
+/// Audit and repair the resolution population consumed by production ranking.
+/// Runs after every schedule writer so the query observes same-run Gamma rows.
+async fn run_resolution_audit<F: PageFetcher + Send + Sync>(
+    clob_fetcher: &clob::ClobFetcher<F>,
+    cache: &mut WalletCache,
+    now_unix: i64,
+    repair_limit: usize,
+) -> Result<(), BootstrapError> {
+    let cutoff = now_unix.saturating_sub(RESOLUTION_AUDIT_END_BUFFER_SECS);
+    let initial = cache.missing_resolution_audit(cutoff, repair_limit)?;
+    let missing = initial.total();
+    let clipped = initial.clipped;
+    let mut repaired = 0usize;
+    let mut voided = 0usize;
+
+    for condition_id in initial.market_ids {
+        let market = match clob_fetcher.fetch_market(&condition_id).await {
+            Ok(market) => market,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    market_id = condition_id,
+                    "resolutions_audit: per-market repair fetch failed"
+                );
+                continue;
+            }
+        };
+        if market.condition_id.as_deref() != Some(condition_id.as_str()) {
+            tracing::warn!(
+                market_id = condition_id,
+                returned_market_id = ?market.condition_id,
+                "resolutions_audit: per-market response identity mismatch"
+            );
+            continue;
+        }
+        if !market.closed {
+            tracing::warn!(
+                market_id = condition_id,
+                "resolutions_audit: per-market response is not closed"
+            );
+            continue;
+        }
+        let Some(resolved_at_unix) = market
+            .end_date_iso
+            .as_deref()
+            .and_then(clob::parse_iso_8601)
+        else {
+            tracing::warn!(
+                market_id = condition_id,
+                "resolutions_audit: per-market response has no valid end_date_iso"
+            );
+            continue;
+        };
+        let winner = match clob::classify_winner(&market.tokens) {
+            clob::WinnerVerdict::Resolved(idx) => Some(idx),
+            clob::WinnerVerdict::Voided => None,
+            clob::WinnerVerdict::Pending => {
+                // Flags not posted yet (or invalid payload): leave the market
+                // missing so this pass counts it in `still_missing` and the next
+                // cycle retries — never freeze a premature NULL (issue #519 review).
+                tracing::warn!(
+                    market_id = condition_id,
+                    "resolutions_audit: per-market winner flags pending"
+                );
+                continue;
+            }
+        };
+        cache.insert_resolution_with_source(
+            &condition_id,
+            winner,
+            resolved_at_unix,
+            now_unix,
+            "clob",
+        )?;
+        if winner.is_some() {
+            repaired += 1;
+        } else {
+            voided += 1;
+        }
+    }
+
+    let remaining = cache.missing_resolution_audit(cutoff, 0)?.total();
+    let still_missing = remaining.saturating_sub(clipped);
+    tracing::info!(
+        missing,
+        repaired,
+        voided,
+        still_missing,
+        clipped,
+        "resolutions_audit: missing={missing} repaired={repaired} voided={voided} \
+         still_missing={still_missing} clipped={clipped}"
+    );
+    if still_missing > 0 || clipped > 0 {
+        return Err(BootstrapError::ResolutionAuditIncomplete {
+            still_missing,
+            clipped,
+        });
+    }
+    Ok(())
 }
 
 /// Gamma schedules + liquidity for still-open markets (computed AFTER the CLOB
@@ -308,6 +434,29 @@ pub(crate) fn unresolved_market_ids(all: &[String], resolved: &HashSet<String>) 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn seed_audit_trade(cache: &WalletCache, id: &str, market_id: &str) {
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO trades (source_trade_id, wallet_hex, market_id, outcome_id, \
+                 side, price_str, contracts, timestamp_unix) \
+                 VALUES (?1, '0x0000000000000000000000000000000000000001', ?2, 0, \
+                         'buy', '0.5', 1, 1)",
+                rusqlite::params![id, market_id],
+            )
+            .unwrap();
+    }
+
+    fn audit_fetcher(
+        responses: HashMap<String, Vec<u8>>,
+    ) -> clob::ClobFetcher<pe_source_polymarket_public::FixtureFetcher> {
+        clob::ClobFetcher::new(
+            "https://clob.example".to_owned(),
+            pe_source_polymarket_public::FixtureFetcher::new(responses),
+        )
+    }
 
     #[test]
     fn unresolved_market_ids_empty_when_all_resolved() {
@@ -336,5 +485,113 @@ mod tests {
         let all: Vec<String> = Vec::new();
         let resolved: HashSet<String> = HashSet::new();
         assert!(unresolved_market_ids(&all, &resolved).is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_repairs_winner_and_records_voided_terminal_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        for id in ["winner", "voided"] {
+            seed_audit_trade(&cache, &format!("trade-{id}"), id);
+            cache.insert_schedule(id, Some(1_000), 1).unwrap();
+        }
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/winner".to_owned(),
+            br#"{"condition_id":"winner","end_date_iso":"1970-01-01T00:16:40Z","closed":true,"tokens":[{"winner":true},{"winner":false}]}"#.to_vec(),
+        );
+        responses.insert(
+            "https://clob.example/markets/voided".to_owned(),
+            br#"{"condition_id":"voided","end_date_iso":"1970-01-01T00:16:40Z","closed":true,"tokens":[{"winner":false},{"winner":false}]}"#.to_vec(),
+        );
+
+        run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.resolution_record("winner"),
+            Some((Some(0), 1_000, 10_000, "clob".to_owned()))
+        );
+        assert_eq!(
+            cache.resolution_record("voided"),
+            Some((None, 1_000, 10_000, "clob".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_unfetchable_market_is_incomplete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-missing", "missing");
+        cache.insert_schedule("missing", Some(1_000), 1).unwrap();
+
+        let error = run_resolution_audit(&audit_fetcher(HashMap::new()), &mut cache, 10_000, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BootstrapError::ResolutionAuditIncomplete {
+                still_missing: 1,
+                clipped: 0
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_clipped_population_is_incomplete_without_fetching() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        for id in ["m1", "m2"] {
+            seed_audit_trade(&cache, &format!("trade-{id}"), id);
+            cache.insert_schedule(id, Some(1_000), 1).unwrap();
+        }
+
+        let error = run_resolution_audit(&audit_fetcher(HashMap::new()), &mut cache, 10_000, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BootstrapError::ResolutionAuditIncomplete {
+                still_missing: 0,
+                clipped: 2
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_excludes_null_schedule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-null", "null");
+        cache.insert_schedule("null", None, 1).unwrap();
+
+        run_resolution_audit(&audit_fetcher(HashMap::new()), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+        assert!(cache.resolution_record("null").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_observes_schedule_inserted_immediately_before_stage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-same-run", "same-run");
+        cache
+            .insert_schedule_with_source("same-run", Some(1_000), 1, "gamma")
+            .unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/same-run".to_owned(),
+            br#"{"condition_id":"same-run","end_date_iso":"1970-01-01T00:16:40Z","closed":true,"tokens":[{"winner":false},{"winner":true}]}"#.to_vec(),
+        );
+
+        run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.resolution_record("same-run").map(|record| record.0),
+            Some(Some(1))
+        );
     }
 }
