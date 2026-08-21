@@ -67,7 +67,7 @@ not new discovery.)
 ### Commands
 
 ```bash
-# 1. Refresh trades + resolutions for all stale active wallets (incremental).
+# 1. Refresh stale active-wallet trades; configured resolution refreshes full-walk CLOB.
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap backfill
 
@@ -76,7 +76,7 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
   ./target/release/pe-bootstrap events
 
-# 3. (Optional) Run the resolution pipeline (CLOB → Gamma) explicitly.
+# 3. (Optional) Run the full CLOB resolution re-walk + Gamma auxiliaries explicitly.
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 PE_BOOTSTRAP_FETCH_RESOLUTIONS=1 \
   ./target/release/pe-bootstrap resolutions
@@ -109,7 +109,8 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 >   `&closed=true` returned 200 for a *headerless* request (a bare `reqwest::Client`, = the shipped
 >   Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and 403
 >   **only** for `Python-urllib/3.11`. So `pe-bootstrap`'s CLOB closed walk and the paper-pnl
->   resolution poller (both UA-less) do **not** 403; resolution ingestion is fine. The proven
+>   resolution poller (both UA-less) do **not** 403; transport was healthy during the 2026-06-24
+>   through 2026-08-21 cursor-wedge incident, while repeat resolution ingestion was not. The proven
 >   scripts' "browser UA required (else 403)" note is correct only because `urllib` auto-injects the
 >   blocklisted `Python-urllib` UA — any non-bot UA (or none) works.
 > - **Repeat-key batching works for BOTH variants.** `?condition_ids=A&condition_ids=B…&limit=500`
@@ -142,11 +143,13 @@ resolution pipeline — no RPC required, #369/#372).
 
 > **Backfill before pushing (issue #350 WS3).** The Supabase upload
 > (`scripts/push_ranking_to_supabase.py`, invoked by `scripts/rank_and_push.sh`)
-> now enforces this freshness. With `--db data/wallet_cache.db` (always passed by
-> `rank_and_push.sh`) it:
-> - **aborts the push** (non-zero exit, no Supabase write) when the cache's global
->   `MAX(timestamp_unix)` is older than `--max-cache-staleness-hours`
->   (`upload_max_cache_staleness_hours` = 24); and
+> now enforces three same-bound freshness probes. With `--db data/wallet_cache.db`
+> (always passed by `rank_and_push.sh`) it **aborts the push** (non-zero exit, no
+> Supabase write) unless the cache's global `MAX(trades.timestamp_unix)`, global
+> `MAX(market_resolutions.fetched_at_unix)`, and completed CLOB sweep marker are
+> all fresh under `--max-cache-staleness-hours`. Completion requires a present
+> `source_cursor['clob_closed']` row with `value=''`; a missing, non-empty, or
+> stale row fails closed. It also:
 > - **drops wallets** with no cached trade in the last `--active-window-hours`
 >   (`upload_active_window_hours` = 72) so idle wallets never reach the live set
 >   (the dropped count is logged; the comparison is case-insensitive).
@@ -157,7 +160,7 @@ resolution pipeline — no RPC required, #369/#372).
 > snapshot of the cache, so a stale cache yields stale clocks; backfilling immediately
 > before the push is mandatory.
 >
-> Because both checks read `wallet_cache.db`, **run Part 1 (backfill) immediately
+> Because these checks read `wallet_cache.db`, **run Part 1 (backfill) immediately
 > before Part 2's ranking push.** A stale cache would otherwise filter out every
 > wallet, leaving the live ranking empty — the abort guard turns that silent
 > failure into a loud one.
@@ -182,9 +185,11 @@ audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`) �
 `backfill --defer-activation` (trades only) → `events` → `resolutions` →
 **Step 0i** archive and delete every infra wallet's live wallet-keyed data
 before the ranker snapshot (and write a durable, non-liftable infra exclusion).
-`resolutions` also backfills missing schedule `end_date`s — the
-`resolutions` subcommand runs the full `fetch_resolutions_and_schedules`, so no
-separate `schedules` stage is needed (#383). **Stage 1** ranks the full trade
+`resolutions` performs a full CLOB closed-market re-walk, backfills missing
+schedule `end_date`s, then audits and repairs every traded, scheduled past-end
+market still missing a terminal row. The subcommand runs the full
+`fetch_resolutions_and_schedules`, so no separate `schedules` stage is needed
+(#383/#519). **Stage 1** ranks the full trade
 universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
 there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** record
@@ -272,8 +277,9 @@ directory deterministically owns that cycle's activation batch ID. A direct
 zero-argument invocation and the supervisor both honor an existing recovery
 pointer rather than allocating a new run.
 
-Exit 75 means a bounded transient operation exhausted its in-process retries.
-The loop waits 60 seconds while checking the run flag once per second, then:
+Exit 75 means a bounded transient operation exhausted its in-process retries or
+the resolution audit remained incomplete. The loop waits 60 seconds while
+checking the run flag once per second, then:
 
 - If `rank_and_push.pending` exists, it takes precedence. Recovery replays the
   same content-addressed Supabase request and completes only that run's
@@ -286,6 +292,11 @@ The loop waits 60 seconds while checking the run flag once per second, then:
 - Exit 75 without either pointer is fatal. Any nonzero code other than 75 is a
   permanent failure and stops the loop with the applicable pointer retained for
   diagnosis and an operator-directed retry.
+
+Resolution-audit incompleteness retries without a loop-level cap and logs each
+condition ID that failed repair. To stop a persistent retry, write the normal
+`stop` flag; the explicit operator escape is to verify the market terminal and
+manually insert its terminal NULL-winner row before resuming.
 
 Both pointers are regular, non-symlink, one-line repository-relative paths and
 are validated beneath `data/eval-results/cron-<UTC>/`. Successful completion

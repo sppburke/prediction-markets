@@ -2,9 +2,10 @@
 """Behaviour + drift guard for the active-only upload filter in
 `scripts/push_ranking_to_supabase.py` (issue #350 WS3).
 
-Stdlib-only (`unittest` + `sqlite3` + `tempfile`); builds a throwaway `trades` cache and
-asserts the recency filter and the stale-cache abort behave as specified. Also pins the
-argparse defaults to the `docs/_GLOSSARY.md` values so a silent drift fails CI.
+Stdlib-only (`unittest` + `sqlite3` + `tempfile`); builds a throwaway cache and
+asserts the trade/resolution/completed-sweep freshness gates and recency filter
+behave as specified. Also pins the argparse defaults to the
+`docs/_GLOSSARY.md` values so a silent drift fails CI.
 
 This test runs in CI as part of `.github/workflows/ci.yml` (Python drift-guard step).
 
@@ -27,9 +28,14 @@ HOUR = 3600
 NOW = 1_700_000_000  # fixed clock — determinism (no time.time() in assertions)
 
 
-def _make_cache(path: str, trades: list[tuple[str, int]]) -> None:
-    """Build a minimal `trades` cache. `trades` is a list of (wallet_hex, timestamp_unix);
-    mirrors the production schema's column set (only the two columns the filter reads)."""
+def _make_cache(
+    path: str,
+    trades: list[tuple[str, int]],
+    *,
+    resolution_fetched_at: int | None = NOW - HOUR,
+    cursor: tuple[str, int] | None = ("", NOW - HOUR),
+) -> None:
+    """Build the minimal production-shaped tables read by the publication gate."""
     con = sqlite3.connect(path)
     con.execute(
         "CREATE TABLE trades (source_trade_id TEXT, wallet_hex TEXT, market_id TEXT, "
@@ -37,6 +43,21 @@ def _make_cache(path: str, trades: list[tuple[str, int]]) -> None:
     )
     con.execute("CREATE INDEX idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix)")
     con.executemany("INSERT INTO trades (wallet_hex, timestamp_unix) VALUES (?, ?)", trades)
+    con.execute("CREATE TABLE market_resolutions (fetched_at_unix INTEGER NOT NULL)")
+    if resolution_fetched_at is not None:
+        con.execute(
+            "INSERT INTO market_resolutions (fetched_at_unix) VALUES (?)",
+            (resolution_fetched_at,),
+        )
+    con.execute(
+        "CREATE TABLE source_cursor (key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+        "updated_at INTEGER NOT NULL)"
+    )
+    if cursor is not None:
+        con.execute(
+            "INSERT INTO source_cursor (key, value, updated_at) VALUES ('clob_closed', ?, ?)",
+            cursor,
+        )
     con.commit()
     con.close()
 
@@ -101,6 +122,68 @@ class ActiveFilterTest(unittest.TestCase):
         rows = [{"wallet": "0xaaa"}]
         with self.assertRaises(pr.CacheStaleError):
             pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+
+    def test_missing_clob_cursor_aborts(self) -> None:
+        _make_cache(self.db, [("0xaaa", NOW - HOUR)], cursor=None)
+        with self.assertRaisesRegex(pr.CacheStaleError, "no completed CLOB sweep"):
+            pr.filter_active_rows([{"wallet": "0xaaa"}], self.db, 72, 24, NOW)
+
+    def test_stale_completed_clob_cursor_aborts(self) -> None:
+        _make_cache(
+            self.db,
+            [("0xaaa", NOW - HOUR)],
+            cursor=("", NOW - 48 * HOUR),
+        )
+        with self.assertRaisesRegex(pr.CacheStaleError, "completed CLOB sweep is 48.0h old"):
+            pr.filter_active_rows([{"wallet": "0xaaa"}], self.db, 72, 24, NOW)
+
+    def test_fresh_nonempty_clob_cursor_aborts(self) -> None:
+        _make_cache(
+            self.db,
+            [("0xaaa", NOW - HOUR)],
+            cursor=("PAGE2", NOW - HOUR),
+        )
+        with self.assertRaisesRegex(pr.CacheStaleError, "CLOB sweep is incomplete"):
+            pr.filter_active_rows([{"wallet": "0xaaa"}], self.db, 72, 24, NOW)
+
+    def test_fresh_completed_clob_cursor_probe(self) -> None:
+        _make_cache(self.db, [("0xaaa", NOW - HOUR)])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(pr._clob_sweep_completed_at(con), ("", NOW - HOUR))
+        finally:
+            con.close()
+
+    def test_stale_resolution_max_aborts(self) -> None:
+        _make_cache(
+            self.db,
+            [("0xaaa", NOW - HOUR)],
+            resolution_fetched_at=NOW - 48 * HOUR,
+        )
+        with self.assertRaisesRegex(pr.CacheStaleError, "newest resolution fetch is 48.0h old"):
+            pr.filter_active_rows([{"wallet": "0xaaa"}], self.db, 72, 24, NOW)
+
+    def test_missing_resolution_max_aborts(self) -> None:
+        _make_cache(
+            self.db,
+            [("0xaaa", NOW - HOUR)],
+            resolution_fetched_at=None,
+        )
+        with self.assertRaisesRegex(pr.CacheStaleError, "newest resolution fetch is unknown"):
+            pr.filter_active_rows([{"wallet": "0xaaa"}], self.db, 72, 24, NOW)
+
+    def test_fresh_resolution_max_probe_and_everything_passes(self) -> None:
+        _make_cache(self.db, [("0xaaa", NOW - HOUR)])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(pr._newest_resolution_fetch(con), NOW - HOUR)
+        finally:
+            con.close()
+        kept, dropped, _ = pr.filter_active_rows(
+            [{"wallet": "0xaaa"}], self.db, 72, 24, NOW
+        )
+        self.assertEqual(kept, [{"wallet": "0xaaa"}])
+        self.assertEqual(dropped, 0)
 
 
 class DefaultsDriftTest(unittest.TestCase):

@@ -456,6 +456,19 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNotNone(self._log("rank.log"), "ranking did not run after a partial resolutions")
         print("PASS: resolutions exit 2 (partial) → run continues to ranking")
 
+    def test_resolutions_audit_exit75_aborts_and_retains_cycle_pointer(self):
+        r = self._run(exit_env={"STUB_EXIT_resolutions": "75"})
+        self.assertEqual(r.returncode, 75, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIsNone(self._log("rank.log"), "ranking ran after incomplete resolution audit")
+        self.assertIsNone(self._log("push.log"), "publication ran after incomplete resolution audit")
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        self.assertTrue(cycle.is_file(), "audit tempfail lost the cycle recovery pointer")
+        self.assertIn("cron-", cycle.read_text())
+        boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertTrue(any(line.startswith("resolutions") for line in boot))
+        self.assertFalse(any(line.startswith("purge-infra") for line in boot))
+        print("PASS: resolutions exit 75 aborts before rank/push and retains cycle pointer")
+
     def test_backfill_fatal_exit1_aborts_before_ranking(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "1"})
         self.assertNotEqual(r.returncode, 0, "fatal backfill should abort the run")

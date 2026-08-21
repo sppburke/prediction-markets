@@ -1,18 +1,15 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Scenario: CLOB pagination resumes from the persisted cursor (issue #149).
+//! Scenario: CLOB re-walks each cycle and resumes an interrupted walk (issue #519).
 //!
 //! `ClobFetcher::fetch_closed_markets` writes
 //! `source_cursor.clob_closed` after every successful page so a crash
-//! mid-pagination does not waste the next daily run on re-fetching
-//! already-processed pages.
+//! mid-pagination resumes at the next page. A completed walk writes `""`, so
+//! the next invocation starts again at page 1.
 //!
-//! PASS criterion: with a two-page fixture, the first invocation advances
-//! the cursor to page 2's `next_cursor`. A second invocation, starting from
-//! that cursor, fetches only page 2 — proven by the fixture's URL
-//! coverage: page 1's URL is omitted from the second-run fixture so any
-//! attempt to fetch it would Fatal-error.
+//! PASS criteria: a complete two-page invocation stores `""`; a seeded
+//! mid-walk cursor fetches only page 2 and also stores `""` at completion.
 
 use std::collections::HashMap;
 
@@ -60,7 +57,7 @@ fn open_cache() -> (TempDir, WalletCache) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clob_first_run_walks_both_pages_advances_cursor_to_terminator() {
+async fn clob_first_run_walks_both_pages_and_marks_sweep_complete() {
     let (_dir, mut cache) = open_cache();
 
     let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
@@ -81,11 +78,8 @@ async fn clob_first_run_walks_both_pages_advances_cursor_to_terminator() {
         report.tokens_mapped, 0,
         "these fixture tokens carry no token_id, so none map (issue #429)"
     );
-    // After the second page, the cursor is the terminator.
-    assert_eq!(
-        cache.get_source_cursor("clob_closed").as_deref(),
-        Some("LTE=")
-    );
+    // After the second page, the cursor is the completion marker.
+    assert_eq!(cache.get_source_cursor("clob_closed").as_deref(), Some(""));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,11 +115,8 @@ async fn clob_resume_after_partial_run_skips_page1() {
     );
     assert_eq!(report.resolutions, 2, "only page 2's 2 resolutions");
 
-    // After the resume, the cursor is the terminator and all 4 markets are present.
-    assert_eq!(
-        cache.get_source_cursor("clob_closed").as_deref(),
-        Some("LTE=")
-    );
+    // After the resume, the cursor is complete and all 4 markets are present.
+    assert_eq!(cache.get_source_cursor("clob_closed").as_deref(), Some(""));
     let all_resolved = cache.resolved_market_ids();
     assert_eq!(all_resolved.len(), 4, "all 4 markets must be resolved now");
     for id in ["0xa1", "0xa2", "0xb1", "0xb2"] {
