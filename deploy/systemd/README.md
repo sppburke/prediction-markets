@@ -33,6 +33,14 @@ cp deploy/systemd/pe-rank-loop.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemd-analyze --user --recursive-errors=yes verify ~/.config/systemd/user/pe-rank-loop.service
 sudo loginctl enable-linger "$USER"   # one-time: keep the user manager alive across boots
+
+# Arm the flag BEFORE starting — a missing or `stop` flag makes the supervisor
+# exit cleanly at once, leaving the unit inactive.
+cd ~/prediction-markets
+loop_flag_tmp="data/eval-results/.rank_and_push.loop.$$"
+printf 'run\n' > "$loop_flag_tmp"
+mv "$loop_flag_tmp" data/eval-results/rank_and_push.loop
+
 systemctl --user enable --now pe-rank-loop
 ```
 
