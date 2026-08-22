@@ -1,4 +1,5 @@
-//! Scenario: `WalletCache::open()` drops the operator/funder/delta tables (#326 PR4).
+//! Scenario: `WalletCache::open()` drops the operator/funder/delta tables (#326 PR4)
+//! and the orphan `idx_wallets_weekly` index (#521).
 //!
 //! The reclaim removes `counterparty_edges` / `funder_edges` / `funder_lookup_done`
 //! / `delta_audit` (≈ half the production cache — `counterparty_edges` alone was
@@ -19,6 +20,16 @@ use tempfile::TempDir;
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap()
+        > 0
+}
+
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
         [name],
         |r| r.get::<_, i64>(0),
     )
@@ -109,4 +120,49 @@ fn fresh_open_never_creates_dropped_tables_and_is_idempotent() {
         );
     }
     println!("PASS: fresh_open_never_creates_dropped_tables_and_is_idempotent");
+}
+
+/// PASS: an existing cache carrying the legacy `idx_wallets_weekly` index loses
+///       it on the next `WalletCache::open()` (#521), and a fresh database
+///       never creates it — while the `last_funder_fetch_at` column the index
+///       covered remains in schema, so a rolled-back pre-#521 binary can still
+///       recreate the index.
+/// FAIL: a fresh open creates the index, the legacy index survives a reopen,
+///       or the column no longer supports the legacy index definition.
+#[test]
+fn open_drops_orphan_weekly_index_and_fresh_open_never_creates_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wallet_cache.db");
+
+    // Fresh open: modern schema must not contain the orphan index.
+    {
+        let _cache = WalletCache::open(&path).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            !index_exists(&conn, "idx_wallets_weekly"),
+            "fresh open must NOT create idx_wallets_weekly"
+        );
+        // Recreate the index exactly as the pre-#521 schema did — this is the
+        // statement a rolled-back binary runs, so it must still succeed against
+        // the retained `last_funder_fetch_at` column.
+        conn.execute_batch(
+            "CREATE INDEX idx_wallets_weekly \
+             ON wallets(is_active, last_funder_fetch_at) WHERE is_active = 1;",
+        )
+        .unwrap();
+        assert!(index_exists(&conn, "idx_wallets_weekly"));
+    }
+
+    // Reopen through WalletCache — the #521 migration drops the orphan index.
+    {
+        let _cache = WalletCache::open(&path).unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    assert!(
+        !index_exists(&conn, "idx_wallets_weekly"),
+        "idx_wallets_weekly must be DROPPED by WalletCache::open()"
+    );
+    println!("PASS: open_drops_orphan_weekly_index_and_fresh_open_never_creates_it");
 }

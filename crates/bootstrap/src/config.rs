@@ -21,7 +21,6 @@ use crate::{
 const DEFAULT_POLYMARKET_BASE_URL: &str = "https://data-api.polymarket.com";
 const DEFAULT_POLYMARKET_CONCURRENCY: usize = 16;
 const DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS: u64 = 300;
-const DEFAULT_FUNDER_CONCURRENCY: usize = 4;
 const DEFAULT_CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CLOB_CONCURRENCY: usize = 8;
 // Issue #429: CLOB token→condition coverage warn floor (percent).
@@ -239,15 +238,6 @@ pub struct BootstrapConfig {
     )]
     pub prices_history_coverage_warn_pct: u8,
 
-    /// Fetch funder edges via Etherscan after trade fetch (off by default).
-    /// Env `PE_BOOTSTRAP_FETCH_FUNDER_GRAPH`: `"1"` or `"true"` to enable.
-    #[serde(
-        default,
-        alias = "bootstrap_fetch_funder_graph",
-        deserialize_with = "deserialize_bool_or_01"
-    )]
-    pub fetch_funder_graph: bool,
-
     /// Skip the Polymarket trade-fetch step (off by default).
     /// Env `PE_BOOTSTRAP_SKIP_TRADE_FETCH`: `"1"` or `"true"` to enable.
     #[serde(
@@ -262,13 +252,12 @@ pub struct BootstrapConfig {
     /// When `false` (default), the main bootstrap pipeline still builds the
     /// watchlist for the current run but does **not** persist a row keyed at
     /// `now`. Keeps ad-hoc bootstrap runs (retries from the resolutions
-    /// watchdog, dev shells, funder-graph reruns) from polluting the snapshot
-    /// timeline with near-duplicate intra-day rows.
+    /// watchdog, dev shells) from polluting the snapshot timeline with
+    /// near-duplicate intra-day rows.
     ///
-    /// Set to `true` only in the official weekly refresh path, where a single
-    /// canonical `(snapshot_at_unix, wallet)` row-set per Sunday is the
-    /// intent. Backwards-compatible callers that want the old behavior can
-    /// opt in.
+    /// Set to `true` only in a deliberate snapshot-producing run, where a
+    /// single canonical `(snapshot_at_unix, wallet)` row-set is the intent.
+    /// Backwards-compatible callers that want the old behavior can opt in.
     ///
     /// Env `PE_BOOTSTRAP_WRITE_SNAPSHOT`: `"1"` or `"true"` to enable.
     /// (Field is named `write_snapshot` rather than `write_live_snapshot` so
@@ -283,61 +272,13 @@ pub struct BootstrapConfig {
     )]
     pub write_snapshot: bool,
 
-    /// Concurrent per-wallet funder-discovery fetches against the Etherscan API.
-    /// `PE_BOOTSTRAP_FUNDER_CONCURRENCY` overrides.
-    #[serde(
-        default = "default_funder_concurrency",
-        alias = "bootstrap_funder_concurrency"
-    )]
-    pub funder_concurrency: usize,
-
-    /// Per-run cap on the one-shot `pe-bootstrap funder` lookup (issue #201).
-    /// Mirrors `weekly_limit` (the Etherscan-API-budget throttle precedent), NOT
-    /// `backfill_limit`'s `0`: a bounded default keeps the one-shot funder short
-    /// and avoids the ~15h full-backlog surprise. `0` = no limit (explicit opt-in
-    /// for a full run). `PE_BOOTSTRAP_FUNDER_LIMIT` overrides.
-    #[serde(default = "default_funder_limit", alias = "bootstrap_funder_limit")]
-    pub funder_limit: usize,
-
-    /// Etherscan request-rate cap (req/s) for funder discovery (issue #201).
-    /// Default `3` = free-tier budget. Raise on a paid Etherscan tier to shorten
-    /// a full funder backlog. `PE_BOOTSTRAP_FUNDER_RATE_LIMIT_RPS` overrides.
-    #[serde(
-        default = "default_funder_rate_limit_rps",
-        alias = "bootstrap_funder_rate_limit_rps"
-    )]
-    pub funder_rate_limit_rps: u32,
-
-    /// Wallets per `topic[2]` filter in the batched `eth_getLogs` funder scan
-    /// (issue #203). Larger batches mean fewer block-range passes but bigger
-    /// request payloads (Alchemy caps topic-array size — validate before
-    /// raising). `PE_BOOTSTRAP_FUNDER_TOPIC_BATCH_SIZE` overrides.
-    #[serde(
-        default = "default_funder_topic_batch_size",
-        alias = "bootstrap_funder_topic_batch_size"
-    )]
-    pub funder_topic_batch_size: usize,
-
-    /// Block-range chunk size for the batched `eth_getLogs` funder scan
-    /// (issue #203). The bisect-on-cap fallback subdivides dense ranges that
-    /// exceed the provider response cap. `PE_BOOTSTRAP_FUNDER_BLOCK_CHUNK` overrides.
-    #[serde(
-        default = "default_funder_block_chunk",
-        alias = "bootstrap_funder_block_chunk"
-    )]
-    pub funder_block_chunk: u64,
-
     // ── Wallet pile (issue #166) ─────────────────────────────────────────────
     /// Per-run cap on `pe-bootstrap backfill`. `0` = no limit (process every
-    /// due wallet in the queue). Initial deployment runs with `0`; steady-state
-    /// daily timers set a positive value. `PE_BOOTSTRAP_BACKFILL_LIMIT` overrides.
+    /// due wallet in the queue). The loop's zero-argument cycles run with `0`;
+    /// set a positive value only to bound an ad-hoc run.
+    /// `PE_BOOTSTRAP_BACKFILL_LIMIT` overrides.
     #[serde(default = "default_backfill_limit", alias = "bootstrap_backfill_limit")]
     pub backfill_limit: usize,
-
-    /// Per-run cap on `pe-bootstrap weekly`. `0` = no limit.
-    /// `PE_BOOTSTRAP_WEEKLY_LIMIT` overrides.
-    #[serde(default = "default_weekly_limit", alias = "bootstrap_weekly_limit")]
-    pub weekly_limit: usize,
 
     // ── Winner-discovery (issue #324) ─────────────────────────────────────────
     /// Base URL for the Polymarket leaderboard endpoint. When absent, falls back
@@ -558,31 +499,6 @@ const fn default_polymarket_wallet_timeout_secs() -> u64 {
     DEFAULT_POLYMARKET_WALLET_TIMEOUT_SECS
 }
 
-const fn default_funder_concurrency() -> usize {
-    DEFAULT_FUNDER_CONCURRENCY
-}
-
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #201).
-const fn default_funder_limit() -> usize {
-    200
-}
-
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #201).
-/// `3` = Etherscan free-tier req/s budget.
-const fn default_funder_rate_limit_rps() -> u32 {
-    3
-}
-
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #203).
-const fn default_funder_topic_batch_size() -> usize {
-    1_000
-}
-
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" (issue #203).
-const fn default_funder_block_chunk() -> u64 {
-    10_000
-}
-
 fn default_gamma_base_url() -> String {
     crate::gamma::DEFAULT_GAMMA_BASE_URL.to_owned()
 }
@@ -592,11 +508,6 @@ fn default_gamma_base_url() -> String {
 /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults". `0` = unlimited.
 const fn default_backfill_limit() -> usize {
     0
-}
-
-/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
-const fn default_weekly_limit() -> usize {
-    200
 }
 
 fn default_clob_base_url() -> String {
@@ -721,16 +632,9 @@ impl Default for BootstrapConfig {
             prices_history_min_interval_ms: default_prices_history_min_interval_ms(),
             prices_history_token_limit: default_prices_history_token_limit(),
             prices_history_coverage_warn_pct: default_prices_history_coverage_warn_pct(),
-            fetch_funder_graph: false,
             skip_trade_fetch: false,
             write_snapshot: false,
-            funder_concurrency: default_funder_concurrency(),
-            funder_limit: default_funder_limit(),
-            funder_rate_limit_rps: default_funder_rate_limit_rps(),
-            funder_topic_batch_size: default_funder_topic_batch_size(),
-            funder_block_chunk: default_funder_block_chunk(),
             backfill_limit: default_backfill_limit(),
-            weekly_limit: default_weekly_limit(),
             leaderboard_base_url: None,
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
@@ -1036,8 +940,8 @@ mod tests {
     }
 
     /// Default config has the snapshot write gate OFF — keeps ad-hoc bootstrap
-    /// runs from polluting `leaderboard_snapshots`. The Sunday weekly refresh
-    /// path must explicitly opt in.
+    /// runs from polluting `leaderboard_snapshots`. A deliberate
+    /// snapshot-producing run must explicitly opt in.
     #[test]
     fn write_snapshot_defaults_false() {
         let cfg = BootstrapConfig::default();

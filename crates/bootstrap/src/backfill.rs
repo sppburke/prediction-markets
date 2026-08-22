@@ -5,8 +5,7 @@
 //!    a positive limit caps the per-run batch.
 //! 2. `PolymarketBulkFetcher::fetch_all` — incremental two-phase cursor walk
 //!    with per-wallet `last_polymarket_fetch_at` stamping. Returns a
-//!    [`FetchOutcome`] with the failed list AND a `new_trades` map of
-//!    wallets with at least one new inserted row.
+//!    [`FetchOutcome`] with the failed wallet list.
 //! 3. `fetch_resolutions_and_schedules` — resolution pipeline (CLOB → Gamma) on
 //!    the full cache market set so newly-discovered market_ids get their
 //!    resolution / schedule rows.
@@ -15,7 +14,6 @@
 //! 5. Return `Err(PartialFetch)` at the very end so `pe-bootstrap` exits
 //!    non-zero when any wallet failed, without aborting the pipeline.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
@@ -86,7 +84,6 @@ pub async fn run_backfill_with_policy(
     .with_stamp_on_success(true);
     let outcome = fetcher.fetch_all(&fetch_set, cache).await?;
     let failed_count = outcome.failed.len();
-    let failed_set: HashSet<WalletAddress> = outcome.failed.iter().copied().collect();
     if failed_count > 0 {
         tracing::warn!(
             attempted = outcome.attempted,
@@ -95,16 +92,7 @@ pub async fn run_backfill_with_policy(
         );
     }
 
-    // ── 3. Stamp last_polymarket_full_at for wallets that got a full fetch ──────
-    let full_fetch_run_at = OffsetDateTime::now_utc().unix_timestamp();
-    for wallet in &fetch_set {
-        if failed_set.contains(wallet) {
-            continue;
-        }
-        cache.update_last_polymarket_full_at(&wallet.to_string(), full_fetch_run_at)?;
-    }
-
-    // ── 4. Resolutions + activation tail ───────────────────────────────────────
+    // ── 3. Resolutions + activation tail ───────────────────────────────────────
     if config.fetch_resolutions {
         let market_ids = cache.all_market_ids();
         // Issue #201: optional Gamma stages soft-fail; a partial result is

@@ -628,7 +628,7 @@ async fn main() {
 
 /// Orchestrate all bootstrap phases in sequence.
 ///
-/// Exit codes: 0 = clean, 1 = fatal, 2 = soft-fail (partial fetch/funder; cache
+/// Exit codes: 0 = clean, 1 = fatal, 2 = soft-fail (partial fetch; cache
 /// durable; re-run to retry). The `strict` flag promotes soft-fail to fatal.
 async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: bool) -> i32 {
     // Step 0: one-shot migration (synchronous).

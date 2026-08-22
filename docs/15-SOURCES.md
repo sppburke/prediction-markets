@@ -110,7 +110,6 @@
 | Link | Last checked | Re-verify by |
 |---|---|---|
 | https://polygon.technology/ | 2026-05-07 | 2026-08-05 |
-| https://docs.etherscan.io/etherscan-v2/api-endpoints/accounts | 2026-05-04 | 2026-08-04 |
 | https://www.weather.gov/ | — | — |
 | https://aviationweather.gov/data/api/ | — | — |
 | https://rapidrefresh.noaa.gov/hrrr/ | — | — |

@@ -121,12 +121,12 @@ async fn scenario_first_run_full_fetch() {
 
 // ── Scenario 2 ────────────────────────────────────────────────────────────────
 //
-// PASS: second run with identical API response writes nothing new — cache
-//       count stays at 3.
+// PASS: warm run whose incremental pages are all empty writes nothing new —
+//       cache count stays at 3.
 // FAIL: cache count changes after the second run.
 
 #[tokio::test]
-async fn scenario_second_run_no_new_trades() {
+async fn scenario_empty_warm_run_inserts_nothing() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 
@@ -173,7 +173,7 @@ async fn scenario_second_run_no_new_trades() {
 // FAIL: wrong count or new trades missing.
 
 #[tokio::test]
-async fn scenario_second_run_with_new_trades() {
+async fn scenario_second_run_appends_only_unknown_trades() {
     let dir = TempDir::new().unwrap();
     let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
 

@@ -220,6 +220,9 @@ CREATE TABLE IF NOT EXISTS wallets (
     is_infra                 INTEGER NOT NULL DEFAULT 0,
     source_bits              INTEGER NOT NULL DEFAULT 0,
     last_polymarket_fetch_at INTEGER NULL,
+    -- Written by nothing since the funder-graph removal (#326/#521); retained in
+    -- fresh schema so a rolled-back binary can still create its
+    -- idx_wallets_weekly index against it.
     last_funder_fetch_at     INTEGER NULL,
     dune_first_seen_unix     INTEGER NULL,
     dune_closed_markets      INTEGER NULL,
@@ -230,8 +233,6 @@ CREATE TABLE IF NOT EXISTS wallets (
 CREATE INDEX IF NOT EXISTS idx_wallets_is_active ON wallets(is_active);
 CREATE INDEX IF NOT EXISTS idx_wallets_backfill
     ON wallets(is_active, last_polymarket_fetch_at) WHERE is_active = 1;
-CREATE INDEX IF NOT EXISTS idx_wallets_weekly
-    ON wallets(is_active, last_funder_fetch_at) WHERE is_active = 1;
 
 -- Issue #197: centralised filter for wallets that are simultaneously active
 -- AND not flagged as infrastructure. All wallet-selection queries should
@@ -486,12 +487,16 @@ impl WalletCache {
         // the cache (`counterparty_edges` alone was ~275M rows). Idempotent — a
         // no-op once dropped, and the tables are no longer in SCHEMA so fresh DBs
         // never recreate them. `token_conditions` + `market_fees` are KEPT (still
-        // written by the surviving `events` sweep).
+        // written by the surviving `events` sweep). #521 adds the orphan
+        // `idx_wallets_weekly` drop: its selector went with the `weekly`
+        // subcommand, and the `last_funder_fetch_at` column it covered stays in
+        // SCHEMA only so a rolled-back binary can recreate the index.
         conn.execute_batch(
             "DROP TABLE IF EXISTS counterparty_edges; \
              DROP TABLE IF EXISTS funder_edges; \
              DROP TABLE IF EXISTS funder_lookup_done; \
-             DROP TABLE IF EXISTS delta_audit;",
+             DROP TABLE IF EXISTS delta_audit; \
+             DROP INDEX IF EXISTS idx_wallets_weekly;",
         )?;
         // Migration: add `source` column to market_resolutions / market_schedules. DBs
         // created before this change keep `DEFAULT 'gamma'` — correct since every
@@ -531,25 +536,6 @@ impl WalletCache {
             "source",
             "TEXT NOT NULL DEFAULT 'clob'",
         )?;
-        // Migration (issue #176): add `last_polymarket_full_at` if absent. DBs
-        // created before this change keep NULL — picked up by the weekly
-        // paranoia full-fetch on first delta-mode run, which then stamps each
-        // successfully-fetched wallet. Mirrors the `event_at_unix` migration
-        // pattern (no DEFAULT clause; NULL means "needs full fetch").
-        let last_polymarket_full_at_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('wallets') WHERE name='last_polymarket_full_at'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
-        if !last_polymarket_full_at_exists {
-            conn.execute_batch(
-                "ALTER TABLE wallets ADD COLUMN last_polymarket_full_at INTEGER NULL",
-            )?;
-        }
-
         // Migration (issue #186): add `polymarket_contracts_seen` bitmask if
         // absent. Pre-migration rows default to 0 ("no V1/V2 attribution
         // available"); enumeration populates via UPSERT OR-merge on each
@@ -589,14 +575,8 @@ impl WalletCache {
         Ok(Self { conn })
     }
 
-    /// Insert trades not already present for `wallet_hex`. Idempotent on `source_trade_id`.
-    ///
-    /// Returns the count of rows actually inserted — `INSERT OR IGNORE`
-    /// returns 0 for duplicates and 1 for new rows, so the sum across the
-    /// batch is exactly the number of new trades persisted. Issue #176 uses
-    /// this count to populate `FetchOutcome::new_trades` for the delta-audit
-    /// `new_trades_fetched` column without a pre/post `MAX(timestamp_unix)`
-    /// snapshot pass.
+    /// Insert trades not already present for `wallet_hex`. Idempotent on
+    /// `source_trade_id` (`INSERT OR IGNORE` skips duplicates).
     ///
     /// `trades` ordering is unimportant. All inserts run in a single
     /// transaction for atomicity and write batching.
@@ -604,12 +584,11 @@ impl WalletCache {
         &mut self,
         wallet_hex: &str,
         trades: Vec<RawTrade>,
-    ) -> Result<usize, BootstrapError> {
+    ) -> Result<(), BootstrapError> {
         if trades.is_empty() {
-            return Ok(0);
+            return Ok(());
         }
         let tx = self.conn.transaction()?;
-        let mut inserted: usize = 0;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO trades \
@@ -619,7 +598,7 @@ impl WalletCache {
             for t in &trades {
                 let contracts_i64 =
                     i64::try_from(t.contracts.0).map_err(|_| BootstrapError::Internal)?;
-                let rows = stmt.execute(params![
+                stmt.execute(params![
                     t.source_trade_id.0,
                     wallet_hex,
                     t.market_id.0.0,
@@ -629,11 +608,10 @@ impl WalletCache {
                     contracts_i64,
                     t.timestamp.0.unix_timestamp(),
                 ])?;
-                inserted = inserted.saturating_add(rows);
             }
         }
         tx.commit()?;
-        Ok(inserted)
+        Ok(())
     }
 
     /// Return all `source_trade_id`s known for `wallet_hex`, newest-first.
@@ -2846,57 +2824,6 @@ impl WalletCache {
         Ok(())
     }
 
-    /// Set `last_funder_fetch_at = now_unix` for a single wallet.
-    pub fn update_last_funder_fetch(
-        &mut self,
-        wallet_hex: &str,
-        now_unix: i64,
-    ) -> Result<(), BootstrapError> {
-        self.conn.execute(
-            "UPDATE wallets SET last_funder_fetch_at = ?2 WHERE wallet_hex = ?1",
-            params![wallet_hex, now_unix],
-        )?;
-        Ok(())
-    }
-
-    /// Set `last_polymarket_full_at = now_unix` for a single wallet.
-    ///
-    /// Written by `backfill::run_backfill` after a Polymarket full-fetch
-    /// succeeds (the wallet was in the legacy due set or paranoia set, not
-    /// only in `delta_set`). Resets the 7-day paranoia clock for the wallet.
-    pub fn update_last_polymarket_full_at(
-        &mut self,
-        wallet_hex: &str,
-        now_unix: i64,
-    ) -> Result<(), BootstrapError> {
-        self.conn.execute(
-            "UPDATE wallets SET last_polymarket_full_at = ?2 WHERE wallet_hex = ?1",
-            params![wallet_hex, now_unix],
-        )?;
-        Ok(())
-    }
-
-    /// Select active wallets due for a Polymarket full-fetch (issue #176
-    /// paranoia backstop). Filters `is_active = 1` AND
-    /// (`last_polymarket_full_at IS NULL` OR `< now_unix - staleness_secs`).
-    /// Same NULLS-FIRST ordering as [`Self::select_backfill_due`].
-    pub fn wallets_due_for_full_fetch(
-        &self,
-        now_unix: i64,
-        staleness_secs: i64,
-    ) -> Result<Vec<String>, BootstrapError> {
-        let cutoff = now_unix - staleness_secs;
-        let mut stmt = self.conn.prepare(
-            "SELECT wallet_hex FROM active_tradeable_wallets \
-             WHERE (last_polymarket_full_at IS NULL OR last_polymarket_full_at < ?1) \
-             ORDER BY last_polymarket_full_at ASC NULLS FIRST, \
-                      dune_win_rate_bps DESC NULLS LAST, \
-                      dune_closed_markets DESC NULLS LAST",
-        )?;
-        let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
     /// Mark a wallet as infrastructure (sticky 0→1).
     pub fn mark_infra(&mut self, wallet_hex: &str) -> Result<(), BootstrapError> {
         self.conn.execute(
@@ -3004,36 +2931,6 @@ impl WalletCache {
         let base = "SELECT wallet_hex FROM active_tradeable_wallets \
                     WHERE (last_polymarket_fetch_at IS NULL OR last_polymarket_fetch_at < ?1) \
                     ORDER BY last_polymarket_fetch_at ASC NULLS FIRST, \
-                             dune_win_rate_bps DESC NULLS LAST, \
-                             dune_closed_markets DESC NULLS LAST";
-        let result = if limit == 0 {
-            let mut stmt = self.conn.prepare(base)?;
-            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        } else {
-            let limited = format!("{base} LIMIT ?2");
-            let mut stmt = self.conn.prepare(&limited)?;
-            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-            let rows = stmt.query_map(params![cutoff, limit_i64], |r| r.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(result)
-    }
-
-    /// Select active wallets due for weekly funder refresh.
-    ///
-    /// Same shape as [`Self::select_backfill_due`] but keyed on
-    /// `last_funder_fetch_at` with a 7-day staleness window by default.
-    pub fn select_weekly_due(
-        &self,
-        now_unix: i64,
-        staleness_secs: i64,
-        limit: usize,
-    ) -> Result<Vec<String>, BootstrapError> {
-        let cutoff = now_unix - staleness_secs;
-        let base = "SELECT wallet_hex FROM active_tradeable_wallets \
-                    WHERE (last_funder_fetch_at IS NULL OR last_funder_fetch_at < ?1) \
-                    ORDER BY last_funder_fetch_at ASC NULLS FIRST, \
                              dune_win_rate_bps DESC NULLS LAST, \
                              dune_closed_markets DESC NULLS LAST";
         let result = if limit == 0 {

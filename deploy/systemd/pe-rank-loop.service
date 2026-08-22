@@ -1,0 +1,18 @@
+[Unit]
+Description=prediction-edge ranking loop supervisor (issue #519 pipeline)
+
+[Service]
+ExecStart=/usr/bin/bash %h/prediction-markets/scripts/rank_and_push_loop.sh
+# The TERM trap converts the stop signal into an explicit numeric exit 143
+# (rank_and_push_loop.sh:80) — declare it a clean stop.
+SuccessExitStatus=143
+# 15s backstop beyond the script's own 30s group-teardown grace.
+TimeoutStopSec=45
+# The supervisor is its own retry engine (exit-75 path) and stops deliberately
+# on any other child failure for diagnosis; flag-driven stops already exit 0.
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

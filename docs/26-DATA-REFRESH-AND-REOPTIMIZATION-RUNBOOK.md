@@ -241,30 +241,44 @@ The Linux/Forge supervisor requires `flock`, `setsid`, an external `kill`, and
 negative process-group signaling. It fails before taking its singleton lock or
 launching a child if that preflight is unavailable.
 
-```bash
-cd /home/sean/git/prediction-markets
+The supervisor's process lifecycle and logging are owned by the user-mode
+systemd unit `deploy/systemd/pe-rank-loop.service` (issue #521): output goes to
+the journal, the script converts a stop signal into a clean numeric exit 143
+(declared by `SuccessExitStatus=143`), and `loginctl enable-linger` starts the
+unit at boot — the flag file still gates whether a boot-started supervisor
+cycles. Install per `deploy/systemd/README.md`. There is no unmanaged fallback
+launch: a detached supervisor would be a second production lifecycle, so if
+user systemd is unavailable, fix the unit before running the loop.
 
-# Enable atomically, then launch one supervisor.
+```bash
+cd ~/prediction-markets
+
+# Enable the flag atomically, then hand lifetime to systemd.
 loop_flag_tmp="data/eval-results/.rank_and_push.loop.$$"
 printf 'run\n' > "$loop_flag_tmp"
 mv "$loop_flag_tmp" data/eval-results/rank_and_push.loop
-nohup bash scripts/rank_and_push_loop.sh \
-  > data/eval-results/rank-and-push-loop.log 2>&1 < /dev/null &
+systemctl --user enable --now pe-rank-loop
 ```
 
 The flag accepts exactly `run` or `stop`. Missing means a clean stop; empty or
 any other value is fatal. The supervisor checks only between completed cycles:
 
 ```bash
-# Graceful: finish the current full cycle, then stop.
+# Graceful: finish the current full cycle, then stop (unit ends inactive/exit 0).
 loop_flag_tmp="data/eval-results/.rank_and_push.loop.$$"
 printf 'stop\n' > "$loop_flag_tmp"
 mv "$loop_flag_tmp" data/eval-results/rank_and_push.loop
 
-# Immediate: terminate the supervisor; it TERM-signals the entire current
-# one-shot process group, waits, and escalates to KILL after its bounded grace.
-kill -TERM "$(tr -cd '0-9' < data/eval-results/.rank_and_push_loop.lock)"
+# Immediate: systemd sends TERM; the supervisor TERM-signals the entire current
+# one-shot process group, waits, escalates to KILL after its bounded grace, and
+# exits 143. systemd's own KILL backstop fires at TimeoutStopSec=45.
+systemctl --user stop pe-rank-loop
 ```
+
+Status and logs: `systemctl --user is-active pe-rank-loop` and
+`journalctl --user -u pe-rank-loop`. A non-75 child failure stops the
+supervisor deliberately for diagnosis (`Restart=no`); restart with
+`systemctl --user start pe-rank-loop` after resolving it.
 
 After an immediate stop, verify no loop, wrapper, bootstrap, or ranking Python
 descendant remains; neither `.rank_and_push.lock` nor the cache mutation lock is
@@ -302,8 +316,9 @@ Both pointers are regular, non-symlink, one-line repository-relative paths and
 are validated beneath `data/eval-results/cron-<UTC>/`. Successful completion
 compare-and-clears only a pointer that still names the run being completed. If
 the pointer changed or became malformed, the wrapper warns and preserves it.
-Rollback writes `stop`, waits for termination, and restores the backed-up prior
-scheduler only if one existed.
+Rollback writes `stop`, waits until `systemctl --user is-active pe-rank-loop`
+reports `inactive`, then runs `systemctl --user disable pe-rank-loop` if the
+loop should not return at boot.
 
 Inspect recovery state without changing it:
 
