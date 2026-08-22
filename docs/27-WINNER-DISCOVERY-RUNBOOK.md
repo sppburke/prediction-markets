@@ -58,12 +58,18 @@ cohort.
 
 ## Leaderboard slices
 
-Four API slices are always fetched:
+Eight API slices are always fetched per category — `{profit, volume}` ×
+`{day, week, monthly, allTime}` (`SORT_WINDOW_SLICES` in
+`crates/bootstrap/src/leaderboard_discovery.rs`):
 
 | Sort | Window |
 |---|---|
+| `profit` | `day` |
+| `profit` | `week` |
 | `profit` | `monthly` |
 | `profit` | `allTime` |
+| `volume` | `day` |
+| `volume` | `week` |
 | `volume` | `monthly` |
 | `volume` | `allTime` |
 

@@ -60,7 +60,6 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 | `PE_DUNE_API_KEY` | Dune Analytics API key | **[req]** | — |
 | `PE_DUNE_NAMESPACE` | Dune query namespace (your username) | **[req]** | — |
 | `PE_DUNE_SIM_API_KEY` | Second Dune key for activity queries | | same as `PE_DUNE_API_KEY` |
-| `PE_ETHERSCAN_API_KEY` | Etherscan V2 API key (chain 137) | **[req]** | — |
 | `PE_BOOTSTRAP_OUTPUT` | Path for bootstrap SQLite output | **[req]** | — |
 | `PE_BOOTSTRAP_CACHE_PATH` | Path for wallet cache SQLite | **[req]** | — |
 | `PE_BOOTSTRAP_WALLET_SET_PATH` | Path for wallet set JSON | **[req]** | — |
@@ -117,7 +116,7 @@ path's live credentials in the ordinary `.env`.
 The binaries have a dependency order:
 
 ```
-1. pe-bootstrap  (reads from Dune, Etherscan, Polygon, Polymarket)
+1. pe-bootstrap  (reads from Polymarket)
        ↓  writes wallet_cache.db
 2. pe-backtest   (reads wallet_cache.db; self-contained — no live network)
    OR
@@ -135,9 +134,9 @@ Runs the full walk-forward simulation on historical data. No live credentials ne
 ```bash
 # 1. Set required bootstrap vars in .env
 #    PE_DUNE_API_KEY, PE_DUNE_NAMESPACE,
-#    PE_ETHERSCAN_API_KEY, PE_BOOTSTRAP_OUTPUT, PE_BOOTSTRAP_CACHE_PATH,
+#    PE_BOOTSTRAP_OUTPUT, PE_BOOTSTRAP_CACHE_PATH,
 #    PE_BOOTSTRAP_WALLET_SET_PATH, PE_BOOTSTRAP_FETCH_RESOLUTIONS=1,
-#    PE_BOOTSTRAP_FETCH_FUNDER_GRAPH=1, PE_BACKTEST_OUTPUT_DIR
+#    PE_BACKTEST_OUTPUT_DIR
 
 # 2. Run bootstrap (takes ~2-4 hours on first run; ~20-30 min on re-runs with cache)
 cargo run --release --bin pe-bootstrap

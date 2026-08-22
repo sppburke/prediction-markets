@@ -47,9 +47,6 @@ use error::BootstrapError;
 use pe_source_polymarket_public::PageFetcher;
 use time::OffsetDateTime;
 
-// Upper-bound block for funder discovery — both endpoints finalized, result is time-invariant.
-pub const FUNDER_DISCOVERY_TO_BLOCK: u64 = 80_000_000;
-
 const RESOLUTION_AUDIT_REPAIR_LIMIT: usize = 5_000;
 const RESOLUTION_AUDIT_END_BUFFER_SECS: i64 = 3_600;
 
@@ -60,7 +57,7 @@ const RESOLUTION_AUDIT_END_BUFFER_SECS: i64 = 3_600;
 /// records the stage name here rather than aborting the pipeline. The primary
 /// CLOB stage hard-fails (propagates `Err`) — see [`fetch_resolutions_and_schedules`].
 /// A non-empty `stages_failed` ⇒ the caller should treat the run as partial
-/// (exit 2), matching the backfill/weekly convention.
+/// (exit 2), matching the backfill convention.
 #[derive(Debug, Default, Clone)]
 pub struct ResolutionsReport {
     /// Names of optional stages that soft-failed this run (e.g. `"clob"`).

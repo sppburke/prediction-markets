@@ -5,10 +5,10 @@
 //! `leaderboard_snapshots` row-set, and writes `watchlist.json`.
 //!
 //! Standalone contract: this phase reads whatever trades are currently in `cache`
-//! — it does **not** re-fetch trades, re-enumerate wallets, or run the funder-graph
-//! pass. Operators invoke `pe-bootstrap watchlist` when they want to recompute the
-//! seed watchlist from the cache's current state (e.g., after a manual cache edit,
-//! after `pe-bootstrap backfill` completes, or when debugging filter changes).
+//! — it does **not** re-fetch trades or re-enumerate wallets. Operators invoke
+//! `pe-bootstrap watchlist` when they want to recompute the seed watchlist from
+//! the cache's current state (e.g., after a manual cache edit, after
+//! `pe-bootstrap backfill` completes, or when debugging filter changes).
 
 use std::path::{Path, PathBuf};
 

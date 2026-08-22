@@ -1,9 +1,9 @@
 //! Operator-level scenario tests for the decomposed pe-bootstrap phases (issue #195).
 //!
 //! Verifies the independent invocability and correctness of the phase functions
-//! `fetch`, `watchlist_phase`, and the `weekly` exit-code arm. No network calls;
-//! deterministic. (The Dune `enumerate` / `seed-historical` phases were removed
-//! in #335; their scenarios went with them.)
+//! `fetch` and `watchlist_phase`. No network calls; deterministic. (The Dune
+//! `enumerate` / `seed-historical` phases were removed in #335; their scenarios
+//! went with them.)
 //!
 //! PASS criteria are stated inline above each test.
 
@@ -66,7 +66,6 @@ fn config_with_dir(dir: &TempDir) -> BootstrapConfig {
         output_path: dir.path().join("watchlist.json"),
         polymarket_base_url: BASE_URL.to_owned(),
         // Disable optional phases so tests stay local.
-        fetch_funder_graph: false,
         fetch_resolutions: false,
         write_snapshot: false,
         // Very loose post-filter so test fixtures pass through.
@@ -230,27 +229,5 @@ async fn scenario_watchlist_empty_wallets_writes_empty_json() {
     assert!(
         report.output_path.exists(),
         "watchlist.json must be written even for empty list"
-    );
-}
-
-// ── Scenario 7: weekly exit-2 logic — PartialFetch error variant ─────────────
-//
-// PASS: BootstrapError::PartialFetch { failed_wallets: N } matches the arm that
-//       main.rs uses to produce exit 2 for weekly partial failures.
-// FAIL: The variant is missing or the match arm would not compile.
-
-#[test]
-fn scenario_weekly_partial_error_matches_exit2_arm() {
-    // Verifies that the error type returned by run_weekly on partial failure
-    // matches the arm in main.rs that produces exit 2. This ensures the
-    // type-level contract is preserved even without running a real Etherscan call.
-    let err = BootstrapError::PartialFetch { failed_wallets: 3 };
-    let exit_code = match err {
-        BootstrapError::PartialFetch { .. } => 2i32,
-        _ => 1i32,
-    };
-    assert_eq!(
-        exit_code, 2,
-        "PartialFetch must map to exit 2 in caller dispatch"
     );
 }

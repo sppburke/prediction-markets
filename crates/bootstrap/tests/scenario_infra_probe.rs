@@ -417,10 +417,9 @@ async fn retroactive_dry_run_does_not_update() {
 
 // ── Scenario 8: active_tradeable_wallets view excludes infra wallets ─────────
 //
-// PASS: select_backfill_due / select_weekly_due / wallets_with_source_bit /
-//       wallets_due_for_full_fetch all exclude wallets with is_infra = 1
-//       even when those wallets satisfy the other criteria.
-// FAIL: an infra wallet appears in any of the four selector outputs.
+// PASS: select_backfill_due / wallets_with_source_bit both exclude wallets
+//       with is_infra = 1 even when those wallets satisfy the other criteria.
+// FAIL: an infra wallet appears in either selector output.
 
 #[tokio::test]
 async fn view_excludes_infra_wallets_from_all_selectors() {
@@ -469,24 +468,10 @@ async fn view_excludes_infra_wallets_from_all_selectors() {
         "select_backfill_due must exclude is_infra=1"
     );
 
-    let weekly_due = cache.select_weekly_due(now, staleness, 0).unwrap();
-    assert!(weekly_due.contains(&normal.to_string()));
-    assert!(
-        !weekly_due.contains(&flagged.to_string()),
-        "select_weekly_due must exclude is_infra=1"
-    );
-
     let by_source = cache.wallets_with_source_bit(SRC_WALLET_SET_JSON).unwrap();
     assert!(by_source.contains(&normal.to_string()));
     assert!(
         !by_source.contains(&flagged.to_string()),
         "wallets_with_source_bit must exclude is_infra=1"
-    );
-
-    let full_due = cache.wallets_due_for_full_fetch(now, staleness).unwrap();
-    assert!(full_due.contains(&normal.to_string()));
-    assert!(
-        !full_due.contains(&flagged.to_string()),
-        "wallets_due_for_full_fetch must exclude is_infra=1"
     );
 }

@@ -1,7 +1,7 @@
 //! Wallet pile orchestration (issue #166).
 //!
 //! Free functions over `&mut WalletCache` that implement the activation rule
-//! and the staleness queries used by the `backfill` and `weekly` subcommands.
+//! and the staleness queries used by the `backfill` subcommand.
 //!
 //! Bit definitions for `wallets.source_bits`:
 //!
@@ -43,9 +43,8 @@ pub enum ActivationPolicy {
     Deferred,
 }
 
-/// Default staleness windows.
+/// Default staleness window.
 pub const BACKFILL_STALENESS_SECS: i64 = 86_400; // 1 day
-pub const WEEKLY_STALENESS_SECS: i64 = 7 * 86_400; // 7 days
 
 // Source bit masks (kept as `i64` so they line up with the SQLite column type).
 pub const SRC_WALLET_SET_JSON: i64 = 0b0000001;
@@ -143,38 +142,14 @@ pub fn write_activation_audit_csv(
 
 /// Select active wallets due for Polymarket backfill (1-day staleness).
 ///
-/// `limit = 0` returns every due wallet (no cap). Used by the daily timer.
+/// `limit = 0` returns every due wallet (no cap). Used by each loop cycle's
+/// backfill stage.
 pub fn select_backfill_due(
     cache: &WalletCache,
     now_unix: i64,
     limit: usize,
 ) -> Result<Vec<String>, BootstrapError> {
     cache.select_backfill_due(now_unix, BACKFILL_STALENESS_SECS, limit)
-}
-
-/// Select active wallets due for weekly funder refresh (7-day staleness).
-pub fn select_weekly_due(
-    cache: &WalletCache,
-    now_unix: i64,
-    limit: usize,
-) -> Result<Vec<String>, BootstrapError> {
-    cache.select_weekly_due(now_unix, WEEKLY_STALENESS_SECS, limit)
-}
-
-/// Select active wallets due for a Polymarket *full-fetch* (paranoia backstop
-/// for the delta-backfill flow, issue #176).
-///
-/// Unlike [`select_backfill_due`] (1-day staleness, every due wallet enters
-/// the fetch set), this picks wallets whose `last_polymarket_full_at` is NULL
-/// or older than `staleness_secs` ago. The canonical config window is 7 days
-/// so no wallet stays "delta-only" for more than a week even if the on-chain
-/// scanner misses it.
-pub fn select_full_fetch_due(
-    cache: &WalletCache,
-    now_unix: i64,
-    staleness_secs: i64,
-) -> Result<Vec<String>, BootstrapError> {
-    cache.wallets_due_for_full_fetch(now_unix, staleness_secs)
 }
 
 /// Update `last_polymarket_fetch_at` for a wallet.
@@ -184,15 +159,6 @@ pub fn update_last_polymarket_fetch(
     now_unix: i64,
 ) -> Result<(), BootstrapError> {
     cache.update_last_polymarket_fetch(wallet_hex, now_unix)
-}
-
-/// Update `last_funder_fetch_at` for a wallet.
-pub fn update_last_funder_fetch(
-    cache: &mut WalletCache,
-    wallet_hex: &str,
-    now_unix: i64,
-) -> Result<(), BootstrapError> {
-    cache.update_last_funder_fetch(wallet_hex, now_unix)
 }
 
 #[cfg(test)]
@@ -560,31 +526,5 @@ mod tests {
         apply_activation_rules(&mut cache).unwrap();
         let due = select_backfill_due(&cache, 1_700_000_000, 3).unwrap();
         assert_eq!(due.len(), 3);
-    }
-
-    // ── select_weekly_due ────────────────────────────────────────────────────
-
-    #[test]
-    fn select_weekly_due_uses_seven_day_window() {
-        let (_dir, mut cache) = tmp_cache();
-        cache
-            .upsert_wallet(&hex(50), SRC_LEADERBOARD, false, None, None, None)
-            .unwrap();
-        apply_activation_rules(&mut cache).unwrap();
-
-        let now: i64 = 1_700_000_000;
-        // Stamp 3 days ago — NOT due yet (weekly = 7d).
-        cache
-            .update_last_funder_fetch(&hex(50), now - 3 * 86_400)
-            .unwrap();
-        let due = select_weekly_due(&cache, now, 0).unwrap();
-        assert!(due.is_empty(), "3-day-old funder fetch is fresh for weekly");
-
-        // Stamp 8 days ago — due.
-        cache
-            .update_last_funder_fetch(&hex(50), now - 8 * 86_400)
-            .unwrap();
-        let due = select_weekly_due(&cache, now, 0).unwrap();
-        assert_eq!(due, vec![hex(50)]);
     }
 }

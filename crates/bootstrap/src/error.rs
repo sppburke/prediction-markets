@@ -7,8 +7,6 @@ pub enum BootstrapError {
         source_name: &'static str,
         message: String,
     },
-    #[error("etherscan: {message}")]
-    Etherscan { message: String },
     #[error("polymarket fetch for {wallet}: {message}")]
     Polymarket { wallet: String, message: String },
     #[error("trade parse for {wallet}: {message}")]
@@ -21,8 +19,6 @@ pub enum BootstrapError {
     Json(#[from] serde_json::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("missing required environment variable '{0}' — set it in .env or export it")]
-    MissingEnv(String),
     #[error("config: {0}")]
     Config(Box<figment::Error>),
     #[error("parse: {message}")]
@@ -49,10 +45,6 @@ pub enum BootstrapError {
     Datadash { message: String },
     #[error("purge: {message}")]
     Purge { message: String },
-    #[error("funder: {message}")]
-    Funder { message: String },
-    #[error("url parse: {0}")]
-    UrlParse(#[from] url::ParseError),
     /// Operator-misconfig / invariant violation surfaced from a runtime check
     /// (e.g. `wallet_from_block > to_block` at the start of the OnChain
     /// enumeration arm). Separate from `Parse` (which is for input parsing)
