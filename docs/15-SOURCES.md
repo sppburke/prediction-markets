@@ -98,7 +98,7 @@
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
-| https://clob.polymarket.com/markets/{condition_id} | 2026-08-21 | 2026-10-20 |
+| https://clob.polymarket.com/markets/{condition_id} | 2026-08-22 | 2026-10-21 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-06-23 | 2026-08-22 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-06-23 | 2026-08-22 |

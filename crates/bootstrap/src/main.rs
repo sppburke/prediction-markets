@@ -817,11 +817,11 @@ mod tests {
     fn resolution_audit_incomplete_is_the_only_resolutions_tempfail() {
         for error in [
             BootstrapError::ResolutionAuditIncomplete {
-                still_missing: 1,
+                blocked: 1,
                 clipped: 0,
             },
             BootstrapError::ResolutionAuditIncomplete {
-                still_missing: 0,
+                blocked: 0,
                 clipped: 1,
             },
         ] {

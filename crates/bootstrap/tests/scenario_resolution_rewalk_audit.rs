@@ -214,14 +214,14 @@ fn unresolved_audit_exits_75_and_logs_counts() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(logs.contains("resolutions_audit"), "logs were: {logs}");
-    assert!(logs.contains("\"still_missing\":1"), "logs were: {logs}");
+    assert!(logs.contains("\"blocked\":1"), "logs were: {logs}");
     assert!(logs.contains("\"clipped\":0"), "logs were: {logs}");
 }
 
 #[tokio::test]
 async fn audit_rejects_per_market_identity_mismatch() {
-    // Issue #519 review: a per-market response whose condition_id differs from
-    // the requested market must repair NOTHING and count as still missing.
+    // Issue #519 review (#523 update): a per-market response whose condition_id
+    // differs from the requested market must repair NOTHING and block the audit.
     let dir = TempDir::new().unwrap();
     let cache_path = dir.path().join("cache.db");
     let mut cache = WalletCache::open(&cache_path).unwrap();
@@ -257,10 +257,10 @@ async fn audit_rejects_per_market_identity_mismatch() {
 
     match result {
         Err(pe_bootstrap::error::BootstrapError::ResolutionAuditIncomplete {
-            still_missing,
+            blocked,
             clipped,
         }) => {
-            assert_eq!(still_missing, 1);
+            assert_eq!(blocked, 1);
             assert_eq!(clipped, 0);
         }
         other => panic!("expected ResolutionAuditIncomplete, got {other:?}"),
@@ -320,5 +320,174 @@ async fn audit_observes_schedule_inserted_by_gamma_in_the_same_run() {
             .iter()
             .any(|request| request.contains("GET /markets/same-run HTTP")),
         "the last-stage audit must observe and repair Gamma's same-run schedule"
+    );
+}
+
+// ── Issue #523: mixed non-blocking classes pass end to end ───────────────────
+//
+// PASS: one run over lagged + extended + inactive + open_unknown + pending
+//       markets exits Ok, writes no resolution rows, and leaves the seeded
+//       schedule columns (end_date_unix, fetched_at_unix, source) unchanged.
+// FAIL: any resolution row appears, the run errors, or a schedule row mutates.
+
+#[tokio::test]
+async fn audit_mixed_non_blocking_classes_pass_without_writes() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&cache_path).unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
+    let markets: [(&str, &str); 5] = [
+        (
+            "lag",
+            r#"{"condition_id":"lag","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"active":true,"tokens":[]}"#,
+        ),
+        (
+            "ext",
+            r#"{"condition_id":"ext","end_date_iso":"2100-01-01T00:00:00Z","closed":false,"active":true,"tokens":[]}"#,
+        ),
+        (
+            "inact",
+            r#"{"condition_id":"inact","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"active":false,"tokens":[]}"#,
+        ),
+        (
+            "unk",
+            r#"{"condition_id":"unk","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"tokens":[]}"#,
+        ),
+        (
+            "pend",
+            r#"{"condition_id":"pend","end_date_iso":"1970-01-01T00:16:40Z","closed":true,"tokens":[{"token_id":"1","winner":true},{"token_id":"2"}]}"#,
+        ),
+    ];
+    let mut routes = vec![Route {
+        needle: "GET /markets?closed=true&limit=1000 HTTP",
+        status: "200 OK",
+        body: r#"{"data":[],"next_cursor":"LTE="}"#,
+    }];
+    for (id, _) in markets {
+        insert_trade(&cache, &format!("trade-{id}"), id);
+        cache
+            .insert_schedule(id, Some(now.saturating_sub(7_200)), now)
+            .unwrap();
+    }
+    routes.extend([
+        Route {
+            needle: "GET /markets/lag HTTP",
+            status: "200 OK",
+            body: markets[0].1,
+        },
+        Route {
+            needle: "GET /markets/ext HTTP",
+            status: "200 OK",
+            body: markets[1].1,
+        },
+        Route {
+            needle: "GET /markets/inact HTTP",
+            status: "200 OK",
+            body: markets[2].1,
+        },
+        Route {
+            needle: "GET /markets/unk HTTP",
+            status: "200 OK",
+            body: markets[3].1,
+        },
+        Route {
+            needle: "GET /markets/pend HTTP",
+            status: "200 OK",
+            body: markets[4].1,
+        },
+    ]);
+    let seeded: Vec<_> = markets
+        .iter()
+        .map(|(id, _)| (*id, cache.schedule_record(id).unwrap()))
+        .collect();
+
+    let (base_url, _, server) = start_server(routes, 8);
+    let config = BootstrapConfig {
+        cache_path,
+        clob_base_url: base_url.clone(),
+        gamma_base_url: base_url,
+        ..BootstrapConfig::default()
+    };
+
+    let result = fetch_resolutions_and_schedules(
+        &config,
+        &mut cache,
+        &markets
+            .iter()
+            .map(|(id, _)| (*id).into())
+            .collect::<Vec<String>>(),
+    )
+    .await;
+    drop(server); // detach: exact request counts must never gate completion
+
+    assert!(result.is_ok(), "non-blocking classes must pass: {result:?}");
+    for (id, before) in seeded {
+        assert!(
+            cache.resolution_record(id).is_none(),
+            "{id}: no resolution row may be written"
+        );
+        assert_eq!(
+            cache.schedule_record(id),
+            Some(before.clone()),
+            "{id}: schedule columns must be untouched"
+        );
+    }
+}
+
+// ── Issue #523: paginated record missing `closed` keeps schedule + tokens ────
+//
+// PASS: a walk page whose market lacks the `closed` field still inserts the
+//       schedule row and maps its tokens; no resolution row is written.
+// FAIL: the market is skipped entirely (coverage regression) or a resolution
+//       row appears.
+
+#[tokio::test]
+async fn walk_record_missing_closed_keeps_schedule_and_tokens() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&cache_path).unwrap();
+
+    // Future end date keeps the market out of the audit's missing set, so the
+    // walk behavior is isolated.
+    let (base_url, _, server) = start_server(
+        vec![Route {
+            needle: "GET /markets?closed=true&limit=1000 HTTP",
+            status: "200 OK",
+            body: r#"{"data":[{"condition_id":"0xnc","end_date_iso":"2100-01-01T00:00:00Z","tokens":[{"token_id":"55","winner":null},{"token_id":"56","winner":null}]}],"next_cursor":"LTE="}"#,
+        }],
+        3,
+    );
+    let config = BootstrapConfig {
+        cache_path: cache_path.clone(),
+        clob_base_url: base_url.clone(),
+        gamma_base_url: base_url,
+        ..BootstrapConfig::default()
+    };
+
+    let result = fetch_resolutions_and_schedules(&config, &mut cache, &[]).await;
+    drop(server);
+
+    assert!(
+        result.is_ok(),
+        "absent closed must not abort the walk: {result:?}"
+    );
+    assert!(
+        cache.schedule_record("0xnc").is_some(),
+        "schedule insertion must proceed for a closed-less record"
+    );
+    assert!(cache.resolution_record("0xnc").is_none());
+    drop(cache);
+    let conn = rusqlite::Connection::open(&cache_path).unwrap();
+    let mapped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM token_conditions WHERE condition_id = '0xnc'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mapped, 2,
+        "token mapping must proceed for a closed-less record"
     );
 }

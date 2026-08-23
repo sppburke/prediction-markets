@@ -32,13 +32,10 @@ pub enum BootstrapError {
     #[error("clob: {message}")]
     Clob { message: String },
     #[error(
-        "resolution audit incomplete: {still_missing} attempted market(s) still missing, \
-         {clipped} market(s) clipped by the repair cap"
+        "resolution audit blocked: {blocked} market(s) whose available venue truth could not \
+         be recorded, {clipped} market(s) clipped by the repair cap"
     )]
-    ResolutionAuditIncomplete {
-        still_missing: usize,
-        clipped: usize,
-    },
+    ResolutionAuditIncomplete { blocked: usize, clipped: usize },
     #[error("leaderboard: {message}")]
     Leaderboard { message: String },
     #[error("datadash: {message}")]

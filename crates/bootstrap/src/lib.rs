@@ -108,9 +108,16 @@ impl ResolutionsReport {
 /// rows from CLOB only. Idempotent — safe on every run.
 ///
 /// The final stage audits every traded, scheduled market whose end is more than
-/// one hour past and repairs missing terminal rows through the per-market CLOB
-/// endpoint. Any remaining or clipped population returns
-/// [`BootstrapError::ResolutionAuditIncomplete`].
+/// one hour past, repairing missing terminal rows through the per-market CLOB
+/// endpoint and classifying every other missing market by venue truth (issue
+/// #523). Only OUR-side inability to record available venue truth — fetch
+/// failures, identity mismatches, contradictory payloads, unrecordable terminal
+/// states, or a clipped population — returns
+/// [`BootstrapError::ResolutionAuditIncomplete`] (exit 75). Venue-side
+/// incompleteness (open lagged/extended/inactive markets, closed markets whose
+/// winner flags are not posted yet) is counted, writes nothing, and is retried
+/// automatically next cycle because audit membership derives from the absence
+/// of a resolution row.
 pub async fn fetch_resolutions_and_schedules(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -205,105 +212,226 @@ async fn run_clob_closed_markets<F: PageFetcher + Send + Sync>(
     Ok(report)
 }
 
+/// Per-market outcome of one audit pass (issue #523). Every attempted id maps
+/// to exactly one disposition through one total match over the parsed response
+/// state, so the fail-closed overflow is structural: any combination not
+/// explicitly enumerated lands in `Blocked`. Non-blocking dispositions write
+/// nothing — the market stays in the missing set and is retried next cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditDisposition {
+    /// Venue closed with a complete winning vector — terminal row written.
+    Repaired,
+    /// Venue closed with a complete all-false vector — terminal NULL row written.
+    Voided,
+    /// Open (`active=true`), past its venue end date — ordinary venue lag.
+    Lagged,
+    /// Open (`active=true`), venue end date in the future — our stored schedule
+    /// end is stale (write-once); not actually due. The schedule row is
+    /// deliberately untouched (look-ahead contract, `docs/26`).
+    Extended,
+    /// Open, `active=false` — delisted/inactive venue inventory.
+    Inactive,
+    /// Open, but `active` absent or the venue end date unparseable — no terminal
+    /// truth exists to record, so missing diagnostic metadata must not block.
+    OpenUnknown,
+    /// Closed, winner flags absent/incomplete — venue has not exposed a usable
+    /// winner yet; never write a premature NULL (issue #519 review).
+    Pending,
+    /// Our-side inability to record available venue truth — fails the audit.
+    Blocked,
+}
+
+/// Aggregate audit counters, returned for the caller's log line and for the
+/// test-only accounting identity (counts sum to the attempted population).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AuditCounts {
+    repaired: usize,
+    voided: usize,
+    lagged: usize,
+    extended: usize,
+    inactive: usize,
+    open_unknown: usize,
+    pending: usize,
+    blocked: usize,
+}
+
+impl AuditCounts {
+    fn record(&mut self, disposition: AuditDisposition) {
+        let slot = match disposition {
+            AuditDisposition::Repaired => &mut self.repaired,
+            AuditDisposition::Voided => &mut self.voided,
+            AuditDisposition::Lagged => &mut self.lagged,
+            AuditDisposition::Extended => &mut self.extended,
+            AuditDisposition::Inactive => &mut self.inactive,
+            AuditDisposition::OpenUnknown => &mut self.open_unknown,
+            AuditDisposition::Pending => &mut self.pending,
+            AuditDisposition::Blocked => &mut self.blocked,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> usize {
+        self.repaired
+            + self.voided
+            + self.lagged
+            + self.extended
+            + self.inactive
+            + self.open_unknown
+            + self.pending
+            + self.blocked
+    }
+}
+
 /// Audit and repair the resolution population consumed by production ranking.
 /// Runs after every schedule writer so the query observes same-run Gamma rows.
+///
+/// Ordered classification (issue #523) — blocking is reserved for OUR-side
+/// inability to record available venue truth; each blocked market warns
+/// individually with a typed reason (the docs/26 operator escape needs the
+/// identity), while non-blocking classes are summary-counted only. Cache write
+/// errors propagate via `?` as fatal exit 1, unchanged.
 async fn run_resolution_audit<F: PageFetcher + Send + Sync>(
     clob_fetcher: &clob::ClobFetcher<F>,
     cache: &mut WalletCache,
     now_unix: i64,
     repair_limit: usize,
-) -> Result<(), BootstrapError> {
+) -> Result<AuditCounts, BootstrapError> {
     let cutoff = now_unix.saturating_sub(RESOLUTION_AUDIT_END_BUFFER_SECS);
     let initial = cache.missing_resolution_audit(cutoff, repair_limit)?;
     let missing = initial.total();
     let clipped = initial.clipped;
-    let mut repaired = 0usize;
-    let mut voided = 0usize;
+    let mut counts = AuditCounts::default();
 
     for condition_id in initial.market_ids {
-        let market = match clob_fetcher.fetch_market(&condition_id).await {
-            Ok(market) => market,
+        let disposition = match clob_fetcher.fetch_market(&condition_id).await {
             Err(error) => {
                 tracing::warn!(
                     error = %error,
                     market_id = condition_id,
-                    "resolutions_audit: per-market repair fetch failed"
+                    reason = "fetch_failed",
+                    "resolutions_audit: blocked"
                 );
-                continue;
+                AuditDisposition::Blocked
             }
-        };
-        if market.condition_id.as_deref() != Some(condition_id.as_str()) {
-            tracing::warn!(
-                market_id = condition_id,
-                returned_market_id = ?market.condition_id,
-                "resolutions_audit: per-market response identity mismatch"
-            );
-            continue;
-        }
-        if !market.closed {
-            tracing::warn!(
-                market_id = condition_id,
-                "resolutions_audit: per-market response is not closed"
-            );
-            continue;
-        }
-        let Some(resolved_at_unix) = market
-            .end_date_iso
-            .as_deref()
-            .and_then(clob::parse_iso_8601)
-        else {
-            tracing::warn!(
-                market_id = condition_id,
-                "resolutions_audit: per-market response has no valid end_date_iso"
-            );
-            continue;
-        };
-        let winner = match clob::classify_winner(&market.tokens) {
-            clob::WinnerVerdict::Resolved(idx) => Some(idx),
-            clob::WinnerVerdict::Voided => None,
-            clob::WinnerVerdict::Pending => {
-                // Flags not posted yet (or invalid payload): leave the market
-                // missing so this pass counts it in `still_missing` and the next
-                // cycle retries — never freeze a premature NULL (issue #519 review).
+            Ok(market) if market.condition_id.as_deref() != Some(condition_id.as_str()) => {
                 tracing::warn!(
                     market_id = condition_id,
-                    "resolutions_audit: per-market winner flags pending"
+                    returned_market_id = ?market.condition_id,
+                    reason = "identity_mismatch",
+                    "resolutions_audit: blocked"
                 );
-                continue;
+                AuditDisposition::Blocked
+            }
+            Ok(market) => {
+                let analysis = clob::analyze_winners(&market.tokens);
+                let venue_end = market
+                    .end_date_iso
+                    .as_deref()
+                    .and_then(clob::parse_iso_8601);
+                match market.closed {
+                    None => {
+                        tracing::warn!(
+                            market_id = condition_id,
+                            reason = "closed_field_absent",
+                            "resolutions_audit: blocked"
+                        );
+                        AuditDisposition::Blocked
+                    }
+                    Some(true) => match analysis.verdict {
+                        clob::WinnerVerdict::Invalid => {
+                            tracing::warn!(
+                                market_id = condition_id,
+                                reason = "invalid_winner_payload",
+                                "resolutions_audit: blocked"
+                            );
+                            AuditDisposition::Blocked
+                        }
+                        clob::WinnerVerdict::Pending => AuditDisposition::Pending,
+                        clob::WinnerVerdict::Resolved(_) | clob::WinnerVerdict::Voided => {
+                            match venue_end {
+                                // Terminal truth exists but we cannot faithfully
+                                // record it — the wedge class the gate must catch.
+                                None => {
+                                    tracing::warn!(
+                                        market_id = condition_id,
+                                        reason = "unparseable_end_date",
+                                        "resolutions_audit: blocked"
+                                    );
+                                    AuditDisposition::Blocked
+                                }
+                                Some(resolved_at_unix) => {
+                                    let winner = match analysis.verdict {
+                                        clob::WinnerVerdict::Resolved(idx) => Some(idx),
+                                        _ => None,
+                                    };
+                                    cache.insert_resolution_with_source(
+                                        &condition_id,
+                                        winner,
+                                        resolved_at_unix,
+                                        now_unix,
+                                        "clob",
+                                    )?;
+                                    if winner.is_some() {
+                                        AuditDisposition::Repaired
+                                    } else {
+                                        AuditDisposition::Voided
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Some(false) if analysis.has_explicit_winner => {
+                        tracing::warn!(
+                            market_id = condition_id,
+                            reason = "open_with_explicit_winner",
+                            "resolutions_audit: blocked"
+                        );
+                        AuditDisposition::Blocked
+                    }
+                    Some(false) => match (market.active, venue_end) {
+                        (Some(true), Some(end)) if end > now_unix => AuditDisposition::Extended,
+                        (Some(true), Some(_)) => AuditDisposition::Lagged,
+                        (Some(false), _) => AuditDisposition::Inactive,
+                        (Some(true) | None, None) | (None, Some(_)) => {
+                            AuditDisposition::OpenUnknown
+                        }
+                    },
+                }
             }
         };
-        cache.insert_resolution_with_source(
-            &condition_id,
-            winner,
-            resolved_at_unix,
-            now_unix,
-            "clob",
-        )?;
-        if winner.is_some() {
-            repaired += 1;
-        } else {
-            voided += 1;
-        }
+        counts.record(disposition);
     }
 
-    let remaining = cache.missing_resolution_audit(cutoff, 0)?.total();
-    let still_missing = remaining.saturating_sub(clipped);
+    let AuditCounts {
+        repaired,
+        voided,
+        lagged,
+        extended,
+        inactive,
+        open_unknown,
+        pending,
+        blocked,
+    } = counts;
     tracing::info!(
         missing,
         repaired,
         voided,
-        still_missing,
+        lagged,
+        extended,
+        inactive,
+        open_unknown,
+        pending,
+        blocked,
         clipped,
         "resolutions_audit: missing={missing} repaired={repaired} voided={voided} \
-         still_missing={still_missing} clipped={clipped}"
+         lagged={lagged} extended={extended} inactive={inactive} \
+         open_unknown={open_unknown} pending={pending} blocked={blocked} clipped={clipped}"
     );
-    if still_missing > 0 || clipped > 0 {
-        return Err(BootstrapError::ResolutionAuditIncomplete {
-            still_missing,
-            clipped,
-        });
+    if blocked > 0 || clipped > 0 {
+        return Err(BootstrapError::ResolutionAuditIncomplete { blocked, clipped });
     }
-    Ok(())
+    Ok(counts)
 }
 
 /// Gamma schedules + liquidity for still-open markets (computed AFTER the CLOB
@@ -485,6 +613,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // Also the issue #523 proof that `active` is irrelevant to terminal
+    // handling: neither fixture carries the field, and both still record.
     async fn resolution_audit_repairs_winner_and_records_voided_terminal_row() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
@@ -529,7 +659,7 @@ mod tests {
         assert!(matches!(
             error,
             BootstrapError::ResolutionAuditIncomplete {
-                still_missing: 1,
+                blocked: 1,
                 clipped: 0
             }
         ));
@@ -550,10 +680,190 @@ mod tests {
         assert!(matches!(
             error,
             BootstrapError::ResolutionAuditIncomplete {
-                still_missing: 0,
+                blocked: 0,
                 clipped: 2
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_partial_winner_vector_stays_pending_and_writes_nothing() {
+        // Issue #523: `[true, absent]` must never resolve — a wrongly recorded
+        // winner is permanent. Pending is non-blocking: the run succeeds.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-p", "partial");
+        cache.insert_schedule("partial", Some(1_000), 1).unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/partial".to_owned(),
+            br#"{"condition_id":"partial","end_date_iso":"1970-01-01T00:16:40Z","closed":true,"active":false,"tokens":[{"winner":true},{}]}"#.to_vec(),
+        );
+
+        let counts = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.total(), 1);
+        assert!(cache.resolution_record("partial").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_invalid_winner_payload_blocks() {
+        // Issue #523: `[true, true, absent]` is contradictory — Invalid, blocked.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-i", "invalid");
+        cache.insert_schedule("invalid", Some(1_000), 1).unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/invalid".to_owned(),
+            br#"{"condition_id":"invalid","end_date_iso":"1970-01-01T00:16:40Z","closed":true,"tokens":[{"winner":true},{"winner":true},{}]}"#.to_vec(),
+        );
+
+        let error = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BootstrapError::ResolutionAuditIncomplete {
+                blocked: 1,
+                clipped: 0
+            }
+        ));
+        assert!(cache.resolution_record("invalid").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_open_market_with_explicit_winner_blocks() {
+        // Issue #523: an open response carrying an explicit winner is
+        // contradictory venue state — fail closed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-ow", "open-winner");
+        cache
+            .insert_schedule("open-winner", Some(1_000), 1)
+            .unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/open-winner".to_owned(),
+            br#"{"condition_id":"open-winner","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"active":true,"tokens":[{"winner":true},{"winner":false}]}"#.to_vec(),
+        );
+
+        let error = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BootstrapError::ResolutionAuditIncomplete {
+                blocked: 1,
+                clipped: 0
+            }
+        ));
+        assert!(cache.resolution_record("open-winner").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_terminal_with_unparseable_end_blocks() {
+        // Issue #523: terminal venue truth we cannot faithfully record — the
+        // wedge class the gate exists for.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-be", "bad-end");
+        cache.insert_schedule("bad-end", Some(1_000), 1).unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/bad-end".to_owned(),
+            br#"{"condition_id":"bad-end","end_date_iso":"not a date","closed":true,"tokens":[{"winner":true},{"winner":false}]}"#.to_vec(),
+        );
+
+        let error = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BootstrapError::ResolutionAuditIncomplete {
+                blocked: 1,
+                clipped: 0
+            }
+        ));
+        assert!(cache.resolution_record("bad-end").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_absent_closed_field_blocks() {
+        // Issue #523: presence-preserving `closed` — venue schema drift fails
+        // closed instead of collapsing into `false`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-nc", "no-closed");
+        cache.insert_schedule("no-closed", Some(1_000), 1).unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/no-closed".to_owned(),
+            br#"{"condition_id":"no-closed","end_date_iso":"1970-01-01T00:16:40Z","tokens":[]}"#
+                .to_vec(),
+        );
+
+        let error = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BootstrapError::ResolutionAuditIncomplete {
+                blocked: 1,
+                clipped: 0
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_open_classes_are_non_blocking_and_accounted() {
+        // Issue #523: lagged / extended / inactive / open_unknown all pass,
+        // write nothing, and the counters account for the whole attempted
+        // population (the test-only accounting identity).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let fixtures: [(&str, &[u8]); 4] = [
+            (
+                "lag",
+                br#"{"condition_id":"lag","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"active":true,"tokens":[{"winner":false},{}]}"#,
+            ),
+            (
+                "ext",
+                br#"{"condition_id":"ext","end_date_iso":"2100-01-01T00:00:00Z","closed":false,"active":true,"tokens":[]}"#,
+            ),
+            (
+                "inact",
+                br#"{"condition_id":"inact","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"active":false,"tokens":[]}"#,
+            ),
+            (
+                "unk",
+                br#"{"condition_id":"unk","end_date_iso":"1970-01-01T00:16:40Z","closed":false,"tokens":[]}"#,
+            ),
+        ];
+        let mut responses = HashMap::new();
+        for (id, body) in fixtures {
+            seed_audit_trade(&cache, &format!("trade-{id}"), id);
+            cache.insert_schedule(id, Some(1_000), 1).unwrap();
+            responses.insert(format!("https://clob.example/markets/{id}"), body.to_vec());
+        }
+
+        let counts = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(counts.lagged, 1);
+        assert_eq!(counts.extended, 1);
+        assert_eq!(counts.inactive, 1);
+        assert_eq!(counts.open_unknown, 1);
+        assert_eq!(
+            counts.total(),
+            4,
+            "every attempted id maps to one disposition"
+        );
+        for (id, _) in fixtures {
+            assert!(cache.resolution_record(id).is_none());
+        }
     }
 
     #[tokio::test]
