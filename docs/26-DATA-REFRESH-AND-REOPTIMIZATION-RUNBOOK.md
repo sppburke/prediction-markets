@@ -292,7 +292,10 @@ zero-argument invocation and the supervisor both honor an existing recovery
 pointer rather than allocating a new run.
 
 Exit 75 means a bounded transient operation exhausted its in-process retries or
-the resolution audit remained incomplete. The loop waits 60 seconds while
+the resolution audit was blocked (`blocked > 0 || clipped > 0`: a market whose
+available venue truth could not be recorded — fetch failure, identity mismatch,
+contradictory payload, unrecordable terminal state — or a repair-cap clip). The
+loop waits 60 seconds while
 checking the run flag once per second, then:
 
 - If `rank_and_push.pending` exists, it takes precedence. Recovery replays the
@@ -307,10 +310,17 @@ checking the run flag once per second, then:
   permanent failure and stops the loop with the applicable pointer retained for
   diagnosis and an operator-directed retry.
 
-Resolution-audit incompleteness retries without a loop-level cap and logs each
-condition ID that failed repair. To stop a persistent retry, write the normal
-`stop` flag; the explicit operator escape is to verify the market terminal and
-manually insert its terminal NULL-winner row before resuming.
+Markets the venue itself has not resolved (open lagged/extended/inactive, or
+closed with winner flags not yet posted) do NOT block publication: they are
+counted in the audit summary (`lagged`/`extended`/`inactive`/`open_unknown`/
+`pending`), write nothing, and are retried by later ordinary cycles because
+audit membership derives from the absence of a resolution row. A blocked audit
+retries without a loop-level cap and logs each blocked condition ID with a
+typed reason; clipped overflow is identified by count only. To stop a
+persistent retry, write the normal `stop` flag; the operator escape — manually
+inserting a terminal NULL-winner row — is permitted only after independently
+verifying the market terminal, with the evidence and source recorded, and never
+for a merely open or pending market.
 
 Both pointers are regular, non-symlink, one-line repository-relative paths and
 are validated beneath `data/eval-results/cron-<UTC>/`. Successful completion

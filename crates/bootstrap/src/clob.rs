@@ -246,10 +246,21 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 // actually settled. Skipping leaves the market unresolved until a
                 // later run parses a clean `end_date_iso` (issue #369: CLOB is the
                 // sole resolution source — there is no on-chain backfill).
-                if market.closed
+                //
+                // An identity-valid record with the `closed` field ABSENT warns
+                // and suppresses only this resolution insertion (issue #523) —
+                // the schedule insert above and the token mapping below proceed
+                // unchanged, preserving coverage.
+                if market.closed.is_none() {
+                    warn!(
+                        market_id = condition_id,
+                        "clob: paginated record missing `closed` — resolution suppressed"
+                    );
+                }
+                if market.closed == Some(true)
                     && let Some(resolved_at) = end_date_unix
                 {
-                    match classify_winner(&market.tokens) {
+                    match analyze_winners(&market.tokens).verdict {
                         WinnerVerdict::Resolved(idx) => {
                             cache.insert_resolution_with_source(
                                 &condition_id,
@@ -270,11 +281,11 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                             )?;
                             resolutions += 1;
                         }
-                        // Winner flags not posted yet (or an invalid multi-winner
-                        // payload): record NOTHING so the market stays missing and
-                        // the next walk / audit pass retries it (issue #519 review —
-                        // a delayed flag must never be frozen as a terminal void).
-                        WinnerVerdict::Pending => pending_winners += 1,
+                        // Winner flags not posted yet, or a contradictory payload:
+                        // record NOTHING so the market stays missing and the next
+                        // walk / audit pass retries it (issue #519 review — a
+                        // delayed flag must never be frozen as a terminal void).
+                        WinnerVerdict::Pending | WinnerVerdict::Invalid => pending_winners += 1,
                     }
                 }
 
@@ -398,21 +409,22 @@ fn build_page_url(base_url: &str, cursor: Option<&str>) -> String {
     }
 }
 
-/// Walk `tokens` and return the index of the first `winner=true` entry, or
-/// `None` if every token has `winner=false` (market closed but voided).
+/// Winner classification for a market's `tokens[]` (issues #519/#523).
 ///
-/// Index is taken positionally because CLOB returns tokens in YES/NO order
-/// for binary markets; multi-outcome markets follow the same convention.
-/// Tri-state winner classification for a closed market's `tokens[]` (issue #519):
+/// Verdict precedence — contradiction detection runs FIRST, so an invalid
+/// payload can never hide behind an absent flag:
 ///
-/// - `Resolved(idx)` — exactly one token carries an explicit `winner=true`.
-/// - `Voided` — tokens are present and EVERY token carries an explicit
-///   `winner=false`: the venue settled the market with no winning leg
-///   (voided / non-binary). Recorded as a terminal NULL-winner row.
-/// - `Pending` — no tokens, any token with an absent `winner` flag, or
-///   multiple `winner=true` legs (invalid payload). NOTHING is recorded: the
-///   market stays missing, so the next walk / audit pass retries it. This is
-///   the fail-closed arm — a delayed flag must never be frozen as a void.
+/// - `Invalid` — two or more explicit `winner=true` legs, or a winner index
+///   beyond `u16` (contradictory payload; `[true, true, absent]` is `Invalid`,
+///   not `Pending`). The audit fails closed on this; the walk skips it.
+/// - `Pending` — no tokens, or any token with an absent `winner` flag (and no
+///   contradiction). NOTHING is recorded: a partial vector like `[true, absent]`
+///   must never resolve, because a wrongly recorded winner is permanent
+///   (`insert_resolution_with_source` upgrades only NULL winners). The market
+///   stays missing and the next walk / audit pass retries it.
+/// - `Resolved(idx)` — a COMPLETE flag vector with exactly one `winner=true`.
+/// - `Voided` — a COMPLETE flag vector with every leg `winner=false`: the
+///   venue settled with no winning leg. Recorded as a terminal NULL-winner row.
 ///
 /// Index is taken positionally because CLOB returns tokens in YES/NO order
 /// for binary markets; multi-outcome markets follow the same convention.
@@ -421,22 +433,50 @@ pub(crate) enum WinnerVerdict {
     Resolved(u16),
     Voided,
     Pending,
+    Invalid,
 }
 
-pub(crate) fn classify_winner(tokens: &[ClobToken]) -> WinnerVerdict {
-    if tokens.is_empty() || tokens.iter().any(|t| t.winner.is_none()) {
-        return WinnerVerdict::Pending;
-    }
+/// Full winner analysis: the terminal verdict plus whether ANY explicit
+/// `winner=true` leg exists — the audit's open-market branch blocks on an
+/// explicit winner inside a `closed=false` response (issue #523), and token
+/// fields are private to this module, so this is the one shared analysis for
+/// both the paginated walk and the audit.
+pub(crate) struct WinnerAnalysis {
+    pub(crate) verdict: WinnerVerdict,
+    pub(crate) has_explicit_winner: bool,
+}
+
+pub(crate) fn analyze_winners(tokens: &[ClobToken]) -> WinnerAnalysis {
     let winners: Vec<usize> = tokens
         .iter()
         .enumerate()
         .filter(|(_, t)| t.winner == Some(true))
         .map(|(i, _)| i)
         .collect();
-    match winners[..] {
-        [only] => u16::try_from(only).map_or(WinnerVerdict::Pending, WinnerVerdict::Resolved),
-        [] => WinnerVerdict::Voided,
-        _ => WinnerVerdict::Pending,
+    let has_explicit_winner = !winners.is_empty();
+    let verdict = match winners.as_slice() {
+        [_, _, ..] => WinnerVerdict::Invalid,
+        [only] => match u16::try_from(*only) {
+            Err(_) => WinnerVerdict::Invalid,
+            Ok(idx) => {
+                if tokens.iter().any(|t| t.winner.is_none()) {
+                    WinnerVerdict::Pending
+                } else {
+                    WinnerVerdict::Resolved(idx)
+                }
+            }
+        },
+        [] => {
+            if tokens.is_empty() || tokens.iter().any(|t| t.winner.is_none()) {
+                WinnerVerdict::Pending
+            } else {
+                WinnerVerdict::Voided
+            }
+        }
+    };
+    WinnerAnalysis {
+        verdict,
+        has_explicit_winner,
     }
 }
 
@@ -464,8 +504,15 @@ pub(crate) struct ClobMarket {
     pub(crate) condition_id: Option<String>,
     #[serde(default)]
     pub(crate) end_date_iso: Option<String>,
-    #[serde(default)]
-    pub(crate) closed: bool,
+    /// Presence-preserving (issue #523): `None` means the field was absent from
+    /// the response — the audit fails closed on that, and the paginated walk
+    /// suppresses resolution insertion only. A defaulted `bool` would silently
+    /// collapse venue schema drift into `false`.
+    pub(crate) closed: Option<bool>,
+    /// Presence-preserving (issue #523): splits the audit's open-market classes
+    /// (`active=false` = delisted/inactive inventory). Absence classifies as
+    /// `open_unknown`, never as a specific class.
+    pub(crate) active: Option<bool>,
     #[serde(default)]
     pub(crate) tokens: Vec<ClobToken>,
 }
@@ -502,19 +549,22 @@ mod tests {
     #[test]
     fn classify_yes_picks_zero() {
         let tokens = vec![tok(Some(true)), tok(Some(false))];
-        assert_eq!(classify_winner(&tokens), WinnerVerdict::Resolved(0));
+        assert_eq!(analyze_winners(&tokens).verdict, WinnerVerdict::Resolved(0));
+        assert!(analyze_winners(&tokens).has_explicit_winner);
     }
 
     #[test]
     fn classify_no_picks_one() {
         let tokens = vec![tok(Some(false)), tok(Some(true))];
-        assert_eq!(classify_winner(&tokens), WinnerVerdict::Resolved(1));
+        assert_eq!(analyze_winners(&tokens).verdict, WinnerVerdict::Resolved(1));
     }
 
     #[test]
     fn classify_all_explicit_false_is_voided() {
         let tokens = vec![tok(Some(false)), tok(Some(false))];
-        assert_eq!(classify_winner(&tokens), WinnerVerdict::Voided);
+        let analysis = analyze_winners(&tokens);
+        assert_eq!(analysis.verdict, WinnerVerdict::Voided);
+        assert!(!analysis.has_explicit_winner);
     }
 
     #[test]
@@ -523,16 +573,43 @@ mod tests {
         // posted yet must classify Pending — recording it as Voided would freeze
         // a NULL row that INSERT-time idempotency could never upgrade.
         let tokens = vec![tok(None), tok(Some(false))];
-        assert_eq!(classify_winner(&tokens), WinnerVerdict::Pending);
-        assert_eq!(classify_winner(&[]), WinnerVerdict::Pending);
+        assert_eq!(analyze_winners(&tokens).verdict, WinnerVerdict::Pending);
+        assert_eq!(analyze_winners(&[]).verdict, WinnerVerdict::Pending);
     }
 
     #[test]
-    fn classify_two_winners_is_pending() {
-        // Should never happen in production; an invalid payload is retried,
-        // never recorded as either a winner or a void.
+    fn classify_sole_winner_with_absent_flag_is_pending_never_resolved() {
+        // Issue #523: a partial vector must NOT resolve — a wrongly recorded
+        // winner is permanent (the resolution upsert upgrades only NULL
+        // winners), so `[true, absent]` stays Pending and retries.
+        let tokens = vec![tok(Some(true)), tok(None)];
+        let analysis = analyze_winners(&tokens);
+        assert_eq!(analysis.verdict, WinnerVerdict::Pending);
+        assert!(analysis.has_explicit_winner);
+    }
+
+    #[test]
+    fn classify_two_winners_is_invalid_even_with_absent_flags() {
+        // Issue #523: contradiction detection runs BEFORE absent-flag handling,
+        // so `[true, true, absent]` cannot hide behind Pending.
         let tokens = vec![tok(Some(true)), tok(Some(true))];
-        assert_eq!(classify_winner(&tokens), WinnerVerdict::Pending);
+        assert_eq!(analyze_winners(&tokens).verdict, WinnerVerdict::Invalid);
+        let with_absent = vec![tok(Some(true)), tok(Some(true)), tok(None)];
+        assert_eq!(
+            analyze_winners(&with_absent).verdict,
+            WinnerVerdict::Invalid
+        );
+    }
+
+    #[test]
+    fn classify_sole_winner_beyond_u16_range_is_invalid() {
+        // Issue #523: the promised index-overflow branch, proved rather than
+        // assumed — a sole explicit winner whose position exceeds `u16` blocks.
+        let mut tokens: Vec<ClobToken> = (0..usize::from(u16::MAX) + 2)
+            .map(|_| tok(Some(false)))
+            .collect();
+        tokens[usize::from(u16::MAX) + 1] = tok(Some(true));
+        assert_eq!(analyze_winners(&tokens).verdict, WinnerVerdict::Invalid);
     }
 
     #[test]
