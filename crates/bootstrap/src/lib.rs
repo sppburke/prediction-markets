@@ -867,6 +867,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolution_audit_open_active_with_unparseable_end_is_open_unknown() {
+        // Issue #523: missing diagnostic metadata on an OPEN market never
+        // blocks — active=true with a malformed venue end is open_unknown.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-ue", "unk-end");
+        cache.insert_schedule("unk-end", Some(1_000), 1).unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/unk-end".to_owned(),
+            br#"{"condition_id":"unk-end","end_date_iso":"not a date","closed":false,"active":true,"tokens":[]}"#.to_vec(),
+        );
+
+        let counts = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(counts.open_unknown, 1);
+        assert!(cache.resolution_record("unk-end").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolution_audit_closed_pending_with_unparseable_end_stays_pending() {
+        // Issue #523 precedence proof: winner classification runs BEFORE the
+        // end-date requirement, so incomplete flags stay non-blocking Pending
+        // even when the end date is malformed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        seed_audit_trade(&cache, "trade-pb", "pend-bad-end");
+        cache
+            .insert_schedule("pend-bad-end", Some(1_000), 1)
+            .unwrap();
+        let mut responses = HashMap::new();
+        responses.insert(
+            "https://clob.example/markets/pend-bad-end".to_owned(),
+            br#"{"condition_id":"pend-bad-end","end_date_iso":"not a date","closed":true,"tokens":[{"winner":true},{}]}"#.to_vec(),
+        );
+
+        let counts = run_resolution_audit(&audit_fetcher(responses), &mut cache, 10_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(counts.pending, 1);
+        assert!(cache.resolution_record("pend-bad-end").is_none());
+    }
+
+    #[tokio::test]
     async fn resolution_audit_excludes_null_schedule() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();

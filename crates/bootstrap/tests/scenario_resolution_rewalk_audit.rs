@@ -410,18 +410,18 @@ async fn audit_mixed_non_blocking_classes_pass_without_writes() {
         ..BootstrapConfig::default()
     };
 
-    let result = fetch_resolutions_and_schedules(
-        &config,
-        &mut cache,
-        &markets
-            .iter()
-            .map(|(id, _)| (*id).into())
-            .collect::<Vec<String>>(),
-    )
-    .await;
+    // Empty `market_ids` keeps the Gamma stages workless (they operate on the
+    // scoped ids), isolating the audit — which queries the cache directly — so
+    // a clean report proves the whole run, not just the audit's Ok.
+    let result = fetch_resolutions_and_schedules(&config, &mut cache, &[]).await;
     drop(server); // detach: exact request counts must never gate completion
 
-    assert!(result.is_ok(), "non-blocking classes must pass: {result:?}");
+    let report = result.expect("non-blocking classes must pass");
+    assert!(
+        !report.has_failures(),
+        "no stage may soft-fail: {:?}",
+        report.stages_failed
+    );
     for (id, before) in seeded {
         assert!(
             cache.resolution_record(id).is_none(),
@@ -454,7 +454,7 @@ async fn walk_record_missing_closed_keeps_schedule_and_tokens() {
         vec![Route {
             needle: "GET /markets?closed=true&limit=1000 HTTP",
             status: "200 OK",
-            body: r#"{"data":[{"condition_id":"0xnc","end_date_iso":"2100-01-01T00:00:00Z","tokens":[{"token_id":"55","winner":null},{"token_id":"56","winner":null}]}],"next_cursor":"LTE="}"#,
+            body: r#"{"data":[{"condition_id":"0xnc","end_date_iso":"2100-01-01T00:00:00Z","tokens":[{"token_id":"55","winner":null},{"token_id":"56","winner":null}]},{"condition_id":"0xopen","end_date_iso":"2100-01-01T00:00:00Z","closed":false,"active":true,"tokens":[{"token_id":"57","winner":null}]},{"condition_id":"0xmulti","end_date_iso":"2100-01-01T00:00:00Z","closed":true,"tokens":[{"token_id":"58","winner":true},{"token_id":"59","winner":true}]}],"next_cursor":"LTE="}"#,
         }],
         3,
     );
@@ -477,6 +477,15 @@ async fn walk_record_missing_closed_keeps_schedule_and_tokens() {
         "schedule insertion must proceed for a closed-less record"
     );
     assert!(cache.resolution_record("0xnc").is_none());
+    // closed=false and closed-with-Invalid-winners records: schedule kept, no
+    // resolution — Invalid flows through the same skip arm as Pending.
+    for id in ["0xopen", "0xmulti"] {
+        assert!(
+            cache.schedule_record(id).is_some(),
+            "{id}: schedule expected"
+        );
+        assert!(cache.resolution_record(id).is_none(), "{id}: no resolution");
+    }
     drop(cache);
     let conn = rusqlite::Connection::open(&cache_path).unwrap();
     let mapped: i64 = conn
