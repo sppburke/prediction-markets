@@ -796,59 +796,47 @@ async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
     println!("PASS: survivor-bench-exhausted-still-evicts-and-shrinks-below-cap");
 }
 
-// ── full-rerank-swap-to-fewer-survivors-than-cap ────────────────────────────────
-// Scenario: the survivor-filtered read (#518) returns far fewer rows than
-// `active_watchlist_size`. This is the normal post-#518 shape — production runs a cap of 100
-// against 23-36 survivors — and it happens at the deploy restart, not only at a batch swap.
-// PASS: the swap applies, membership equals the survivor count, every wallet outside it is
-//       dropped, and the applied capacity target remains the cap.
-// FAIL: the swap is rejected for under-filling, or membership is padded back up to the cap.
+// ── full-rerank-swap-on-a-batch-with-no-survivors ───────────────────────────────
+// Scenario: #518 makes an empty survivor-filtered read reachable in normal operation — a batch
+// whose rows all fail the gate, or one carrying no verdict at all. Retaining the previous set
+// would keep copying wallets the CURRENT batch calls ineligible, and forever, because the batch
+// marker never advances past it.
+// PASS: the swap applies an empty membership, every previous wallet is dropped, and the applied
+//       capacity target is untouched — matching the cold-boot stance for the same condition.
+// FAIL: membership survives the swap, or the applied target moves.
 #[tokio::test]
-async fn full_rerank_swap_admits_fewer_survivors_than_the_cap() {
+async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
     let (_dir, db) = temp_db();
     let lock = Mutex::new(());
 
-    // 100 wallets live today (the pre-#518 unfiltered top-cap).
-    let before: Vec<WatchlistEntry> = (1..=100u8)
+    let before: Vec<WatchlistEntry> = (1..=27u8)
         .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
         .collect();
     let live = LiveWatchlist::new(watchlist(before));
-
-    // The next survivor-filtered read yields 27 — the live batch-61 count.
-    const SURVIVORS: u8 = 27;
-    let survivors: Vec<WatchlistEntry> = (1..=SURVIVORS)
-        .map(|n| entry(wallet(n), 3_000 - i32::from(n)))
-        .collect();
-    let side: HashMap<WalletAddress, i64> = (1..=SURVIVORS)
-        .map(|n| (wallet(n), NOW - i64::from(n)))
-        .collect();
-
     let (applied, epoch) = capacity(100);
+
     let (size, dropped) =
-        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &survivors, &side)
+        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &[], &HashMap::new())
             .await
             .unwrap();
 
     assert_eq!(
-        size,
-        usize::from(SURVIVORS),
-        "membership is the survivor count, not the cap"
+        size, 0,
+        "the ranker endorsed nobody, so the live set is empty"
     );
     assert_eq!(
         dropped.len(),
-        100 - usize::from(SURVIVORS),
-        "every non-survivor was dropped"
+        27,
+        "every previously live wallet was dropped"
+    );
+    assert!(
+        live.snapshot().entries.is_empty(),
+        "no wallet is still copied"
     );
     assert_eq!(
         applied.load(),
         epoch,
-        "`active_watchlist_size` stays a cap; under-filling it never moves the applied target"
+        "an empty batch never moves the applied capacity target"
     );
-    let snap = live.snapshot();
-    let admitted: HashSet<WalletAddress> = survivors.iter().map(|e| e.wallet).collect();
-    assert!(
-        snap.entries.iter().all(|e| admitted.contains(&e.wallet)),
-        "no gate-failed wallet survived the swap"
-    );
-    println!("PASS: full-rerank-swap-admits-fewer-survivors-than-the-cap");
+    println!("PASS: full-rerank-swap-on-a-batch-with-no-survivors-empties-the-live-set");
 }

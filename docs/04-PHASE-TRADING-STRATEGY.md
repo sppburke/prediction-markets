@@ -67,8 +67,10 @@ Each observed leader trade is classified as `Entry`, `Add`, `Trim`, `Exit`, `Fli
 
 Do not copy unless ALL are true:
 
-1. leader passed the ranker's eligibility verdict (`survives`, #518) and is in the active
-   top-`active_watchlist_size` survivors at decision time;
+1. leader was admitted from a batch in which it carried the ranker's eligibility verdict
+   (`survives`, #518) and is in the active watchlist, which holds **up to**
+   `active_watchlist_size` survivors — membership is re-derived at each batch transition, so a
+   wallet whose verdict flips is dropped at the next swap, not mid-batch;
 2. the event is a first-ever BUY `Entry`; SELLs and all later actions are blocked by the production copy-entry gate;
 3. current price is within `max_slippage_from_leader_bps` of leader's observed entry;
 4. market liquidity can fill the follower order without exceeding adverse-selection limits;

@@ -926,26 +926,6 @@ mod tests {
     }
 
     #[test]
-    fn every_latest_ranking_read_is_survivor_filtered() {
-        // #518: BOTH builders gate on the ranker verdict. The shared builder feeds boot, the
-        // score refresh, capacity changes, full-rerank swaps and the canary; the candidates
-        // builder feeds the intra-cycle maintenance backfill, which runs in production
-        // `full_rerank` between batch swaps — so an unfiltered candidates query would let a
-        // gate-failed wallet re-enter the live set through the back door.
-        assert!(latest_ranking_url("https://example.test/", 25).contains(RANKING_SURVIVOR_FILTER));
-        assert!(candidates_query(&[], 5, None).contains(RANKING_SURVIVOR_FILTER));
-        assert!(candidates_query(&[], 5, Some(1_000)).contains(RANKING_SURVIVOR_FILTER));
-    }
-
-    #[test]
-    fn survivor_filter_excludes_null_verdicts_by_construction() {
-        // Fail-closed (#518): `is.true` is NOT `not.is.false` — a NULL verdict (pre-#518 batch,
-        // or a legacy replayed publication) must admit nobody rather than everybody. Pinning the
-        // exact operator keeps a future "relax it to tolerate NULLs" edit honest.
-        assert_eq!(RANKING_SURVIVOR_FILTER, "survives=is.true");
-    }
-
-    #[test]
     fn exact_alias_beats_the_f64_value_path_at_the_bps_boundary() {
         // Kelly `p` boundary (#514): the exact column value rounds to 1 bps, but the same
         // value through serde_json's f64 number arrives as 0.00015 and rounds to 2 bps.

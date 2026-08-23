@@ -136,7 +136,7 @@ A ledger event is one of buy/open, add, trim, exit, flip, settlement, merge/spli
 | Max uncopiable profit | ≤ 35 % | ≤ 50 % |
 | Max drawdown in follower sim | per bankroll tier | observation only |
 | Min simulated follower turnover | ≥ 0.35 bankroll/day | not required |
-| Watchlist size | top `active_watchlist_size` (= 100 default) | up to `incubator_watchlist_size` (= 250) |
+| Watchlist size | **up to** `active_watchlist_size` (= 100 default) survivors | up to `incubator_watchlist_size` (= 250) |
 
 The incubator list is for research and paper-copying; it cannot receive meaningful live capital until promoted.
 
