@@ -63,10 +63,26 @@ def main() -> int:
             "hit_rate": "0.6",
             "avg_price": "0.4",
             "last_trade_unix": 1700000000,
+            "survives": True,
         },
         {
             "rank": 2,
             "wallet_hex": "0xbbb",
+            "ls_edge": None,
+            "ls_tstat": None,
+            "fill_rate": None,
+            "n_trades": None,
+            "hit_rate": None,
+            "avg_price": None,
+            "last_trade_unix": None,
+            "survives": False,
+        },
+        # #518: a legacy durable request predates the verdict key entirely. `jsonb_to_recordset`
+        # null-fills the absent column, so the row stores SQL NULL and — being neither true nor
+        # false — can never authorize live admission through the fail-closed reader filter.
+        {
+            "rank": 3,
+            "wallet_hex": "0xccc",
             "ls_edge": None,
             "ls_tstat": None,
             "fill_rate": None,
@@ -97,8 +113,22 @@ def main() -> int:
             f"(select count(*) from ranking_entries where batch_id = {batch_id}),"
             f"(select count(*) from latest_ranking where batch_id = {batch_id});",
         ).stdout.strip()
-        if counts != "1|2|2":
+        if counts != "1|3|3":
             raise AssertionError(f"expected one complete latest batch, got {counts!r}")
+
+        # #518: the ranker verdict round-trips through the RPC exactly — true, false, and an
+        # absent key as SQL NULL. This is the only proof that the publication path persists the
+        # column, so it must run against a real Postgres (this script SKIPs without one).
+        verdicts = psql(
+            url,
+            "select coalesce(survives::text, 'NULL') from ranking_entries "
+            f"where batch_id = {batch_id} order by rank;",
+        ).stdout.split()
+        if verdicts != ["true", "false", "NULL"]:
+            raise AssertionError(
+                f"expected survives = true/false/NULL by rank, got {verdicts!r}"
+            )
+        print("PASS: survives persists as true/false, absent key -> SQL NULL")
 
         # A malformed request must leave no visible batch row.
         bad_batch = dict(batch)

@@ -257,6 +257,22 @@ def _num(r, k):
     return float(v) if v not in ("", None) else None
 
 
+def _bool(r, k):
+    """Parse a CSV cell to bool, mapping blank/missing to ``None`` (SQL NULL).
+
+    The ranker stores a Python bool (`latency_shift_rerank.py`), which ``csv.DictWriter``
+    renders as ``True``/``False`` — normalise case before matching. Anything else raises:
+    an unparseable verdict must never degrade silently to ``False``, which would drop a
+    genuine survivor out of the live watchlist."""
+    v = r.get(k, "")
+    if v in ("", None):
+        return None
+    normalized = str(v).strip().lower()
+    if normalized in ("true", "false"):
+        return normalized == "true"
+    raise ValueError(f"{k}: expected 'true' or 'false', got {v!r}")
+
+
 def build_entries(top, last_trade_map):
     """Build the `ranking_entries` rows for one batch.
 
@@ -273,6 +289,8 @@ def build_entries(top, last_trade_map):
             "n_trades": int(float(r["n_filled"])) if r.get("n_filled") else None,
             "hit_rate": _num(r, "hit_rate"), "avg_price": _num(r, "avg_price"),
             "last_trade_unix": last_trade_map.get(r["wallet"].lower()),
+            # The ranker's eligibility verdict (#518): pe-service admits only `true` rows.
+            "survives": _bool(r, "survives"),
         })
     return entries
 
@@ -483,10 +501,21 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
         print(f"active-filter: dropped {dropped} wallet(s) idle > {a.active_window_hours}h "
               f"per {a.db}; {len(rows)} remain")
 
+    # #518: the ranker's verdict is the single quality authority for live admission, so a
+    # batch that cannot state it must never be published. Checked BEFORE the sort — a sort key
+    # mixing None with bools raises at comparison time — and before any durable/network write.
+    unverdicted = [r.get("wallet", "?") for r in rows if _bool(r, "survives") is None]
+    if unverdicted:
+        raise ValueError(
+            f"ranked CSV has no `survives` verdict for {len(unverdicted)} row(s) "
+            f"(first: {unverdicted[0]}); refusing to publish a batch that cannot state "
+            f"eligibility"
+        )
+
     def key_fn(row):
         tstat = row.get("tstat_net_ls", "")
         return (
-            row.get("survives", "").lower() == "true",
+            _bool(row, "survives"),
             float(tstat) if tstat not in ("", None) else -9.0,
         )
 
@@ -540,7 +569,7 @@ def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
     _, latest = _req(
         "GET",
         f"{url}/rest/v1/latest_ranking"
-        f"?select=batch_id,rank&order=rank.asc&limit={len(entries)}",
+        f"?select=batch_id,rank,survives&order=rank.asc&limit={len(entries)}",
         key,
     )
     expected_ranks = list(range(1, len(entries) + 1))
@@ -552,6 +581,20 @@ def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
         raise ValueError(
             f"latest_ranking did not expose exact batch {batch_id} "
             f"with ranks 1..{len(entries)}"
+        )
+    # The rank/batch assertion above already proves an exact, ordered 1..N response, so each
+    # row lines up with its submitted entry by position. Confirm the verdict round-tripped
+    # (#518): a legacy replayed request submitted no verdict, so `None` vs stored SQL NULL
+    # matches and passes; a fresh batch must store exactly what it sent.
+    mismatched = [
+        row.get("rank")
+        for row, entry in zip(latest, entries)
+        if row.get("survives") != entry.get("survives")
+    ]
+    if mismatched:
+        raise ValueError(
+            f"batch {batch_id} stored the wrong `survives` verdict for "
+            f"{len(mismatched)} rank(s) (first: {mismatched[0]})"
         )
     print(f"latest_ranking rows: {len(latest)} (batch_id={batch_id})")
 

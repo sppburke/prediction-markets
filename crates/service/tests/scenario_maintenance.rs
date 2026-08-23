@@ -738,3 +738,117 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
     assert_eq!(db.cursor(&newcomer).unwrap(), None);
     println!("PASS: cursor prerequisite fails closed before membership publication");
 }
+
+// ── survivor-bench-exhausted-shrinks-below-cap ──────────────────────────────────
+// Scenario: after #518 the bench is survivor-filtered, so between batch swaps every surviving
+// wallet is already live and the candidate fetch legitimately returns nothing. The tick must
+// still evict, leaving membership BELOW the applied cap until the next batch restores it.
+// PASS: the evicted wallet is gone, membership is 2 of a cap of 25, and the applied target is
+//       unchanged (a cap, not the followed count).
+// FAIL: eviction is suppressed by the empty bench, or the applied target moves.
+#[tokio::test]
+async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    let keep_a = wallet(1);
+    let keep_b = wallet(2);
+    let leaving = wallet(3);
+    let live = LiveWatchlist::new(watchlist(vec![
+        entry(keep_a, 300),
+        entry(keep_b, 200),
+        entry(leaving, 100),
+    ]));
+
+    let (applied, epoch) = capacity(25);
+    let removed: HashSet<WalletAddress> = [leaving].into_iter().collect();
+
+    // The survivor-filtered bench yields nobody: all survivors are already live.
+    let size = apply_evictions_and_backfill(
+        &live,
+        &db,
+        &lock,
+        &applied,
+        epoch,
+        &removed,
+        &[],
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(size, 2, "eviction applied even with an empty candidate set");
+    let snap = live.snapshot();
+    assert!(
+        !snap.entries.iter().any(|e| e.wallet == leaving),
+        "the evicted wallet left the live set"
+    );
+    assert!(
+        snap.entries.iter().any(|e| e.wallet == keep_a)
+            && snap.entries.iter().any(|e| e.wallet == keep_b),
+        "the remaining survivors stayed live"
+    );
+    assert_eq!(
+        applied.load(),
+        epoch,
+        "`active_watchlist_size` is a pure cap: membership below it never moves the applied target"
+    );
+    println!("PASS: survivor-bench-exhausted-still-evicts-and-shrinks-below-cap");
+}
+
+// ── full-rerank-swap-to-fewer-survivors-than-cap ────────────────────────────────
+// Scenario: the survivor-filtered read (#518) returns far fewer rows than
+// `active_watchlist_size`. This is the normal post-#518 shape — production runs a cap of 100
+// against 23-36 survivors — and it happens at the deploy restart, not only at a batch swap.
+// PASS: the swap applies, membership equals the survivor count, every wallet outside it is
+//       dropped, and the applied capacity target remains the cap.
+// FAIL: the swap is rejected for under-filling, or membership is padded back up to the cap.
+#[tokio::test]
+async fn full_rerank_swap_admits_fewer_survivors_than_the_cap() {
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    // 100 wallets live today (the pre-#518 unfiltered top-cap).
+    let before: Vec<WatchlistEntry> = (1..=100u8)
+        .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
+        .collect();
+    let live = LiveWatchlist::new(watchlist(before));
+
+    // The next survivor-filtered read yields 27 — the live batch-61 count.
+    const SURVIVORS: u8 = 27;
+    let survivors: Vec<WatchlistEntry> = (1..=SURVIVORS)
+        .map(|n| entry(wallet(n), 3_000 - i32::from(n)))
+        .collect();
+    let side: HashMap<WalletAddress, i64> = (1..=SURVIVORS)
+        .map(|n| (wallet(n), NOW - i64::from(n)))
+        .collect();
+
+    let (applied, epoch) = capacity(100);
+    let (size, dropped) =
+        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &survivors, &side)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        size,
+        usize::from(SURVIVORS),
+        "membership is the survivor count, not the cap"
+    );
+    assert_eq!(
+        dropped.len(),
+        100 - usize::from(SURVIVORS),
+        "every non-survivor was dropped"
+    );
+    assert_eq!(
+        applied.load(),
+        epoch,
+        "`active_watchlist_size` stays a cap; under-filling it never moves the applied target"
+    );
+    let snap = live.snapshot();
+    let admitted: HashSet<WalletAddress> = survivors.iter().map(|e| e.wallet).collect();
+    assert!(
+        snap.entries.iter().all(|e| admitted.contains(&e.wallet)),
+        "no gate-failed wallet survived the swap"
+    );
+    println!("PASS: full-rerank-swap-admits-fewer-survivors-than-the-cap");
+}

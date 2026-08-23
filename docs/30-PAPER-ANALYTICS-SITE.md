@@ -35,8 +35,11 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   (`paper_fills` ⋈ `settled_markets`) against historical ranker stats
   (`latest_ranking`) on `lower(leader_wallet) = lower(wallet_hex)`. Live realized
   P&L mirrors `paper-pnl::value_fill`: `side_sign · (resolved_price − fill_price)
-  · contracts`. The FULL OUTER join keeps both admitted-but-not-yet-traded and
-  aged-out wallets visible.
+  · contracts`. The FULL OUTER join keeps both ranking-only and
+  aged-out wallets visible. Since #518 a ranking-only row is a **bench** row: the batch
+  carries 200 wallets with a pass/fail `survives` verdict and only survivors are admitted,
+  so a ranking-only row may never have been followed at all. The view does not project
+  `survives`, so the site cannot distinguish the two — surfacing it needs a view change.
 - **`wallet_live_stats_mv` materialized view** (`scripts/supabase_wallet_live_stats_mv.sql`):
   a periodically-refreshed cache of `wallet_live_stats` (the aggregation is expensive and was
   recomputed on every page view). `pg_cron` runs `refresh materialized view concurrently`

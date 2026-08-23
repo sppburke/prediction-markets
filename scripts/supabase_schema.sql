@@ -42,6 +42,12 @@ create index if not exists idx_ranking_entries_wallet on ranking_entries (wallet
 -- Nullable + idempotent so an existing project gains the column with no rebuild; the VPS
 -- seeds each admitted wallet's poll cursor (the inactivity clock) from this value.
 alter table ranking_entries add column if not exists last_trade_unix bigint;
+-- Ranker eligibility verdict (#518): the pass-2 ranker's own pass/fail for this wallet. The
+-- published batch is a 200-row BENCH — survivors first, then rows that failed the gate — and
+-- pe-service admits ONLY `true` rows to the live watchlist. Nullable + idempotent for the same
+-- reason as the column above; NULL means "no verdict recorded" (a pre-#518 batch or a legacy
+-- replayed publication) and is NOT admitted, because missing evidence never confers eligibility.
+alter table ranking_entries add column if not exists survives boolean;
 
 -- Atomic, idempotent ranking publication. PostgREST executes each RPC request in one
 -- transaction: the new epoch is therefore invisible until all entries exist, and any
@@ -90,7 +96,8 @@ begin
       n_trades        integer,
       hit_rate        numeric,
       avg_price       numeric,
-      last_trade_unix bigint
+      last_trade_unix bigint,
+      survives        boolean
     );
   if v_distinct_ranks <> v_expected or v_min_rank <> 1 or v_max_rank <> v_expected then
     raise exception 'entry ranks must be unique and contiguous from 1';
@@ -121,12 +128,12 @@ begin
 
   insert into ranking_entries (
     batch_id, rank, wallet_hex, ls_edge, ls_tstat, fill_rate, n_trades,
-    hit_rate, avg_price, last_trade_unix
+    hit_rate, avg_price, last_trade_unix, survives
   )
   select
     v_batch_id, entry.rank, entry.wallet_hex, entry.ls_edge, entry.ls_tstat,
     entry.fill_rate, entry.n_trades, entry.hit_rate, entry.avg_price,
-    entry.last_trade_unix
+    entry.last_trade_unix, entry.survives
   from jsonb_to_recordset(p_entries) as entry(
     rank            integer,
     wallet_hex      text,
@@ -136,7 +143,8 @@ begin
     n_trades        integer,
     hit_rate        numeric,
     avg_price       numeric,
-    last_trade_unix bigint
+    last_trade_unix bigint,
+    survives        boolean
   )
   on conflict (batch_id, rank) do nothing;
 

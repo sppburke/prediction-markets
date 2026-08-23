@@ -648,9 +648,16 @@ async fn maintenance_tick(
             // (its inactivity clock) from the wallet's real last trade in the apply step.
             Ok((w, candidate_last_trade)) => {
                 if w.entries.is_empty() {
+                    // Expected steady state after #518: the bench is survivor-filtered, and
+                    // every survivor is already live, so there is normally nobody left to
+                    // backfill with and the live set sits below `cap` until the next batch.
+                    // Carry the counts so an UNEXPECTED empty bench stays diagnosable.
                     warn!(
-                        "maintenance: freshness-filtered candidate fetch returned 0; backfill \
-                         paused (bench may predate the last_trade_unix populate push)"
+                        freed,
+                        live_total = live_wallets.len(),
+                        evicted = evictions.len(),
+                        "maintenance: candidate fetch returned 0; backfill paused (no surviving \
+                         bench rows outside the live set, or the bench predates last_trade_unix)"
                     );
                 }
                 (w.entries, candidate_last_trade)
