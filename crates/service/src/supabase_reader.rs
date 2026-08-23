@@ -118,10 +118,18 @@ struct RankingRow {
 /// so a schema change cannot silently drop a column from the paper watchlist read.
 const RANKING_EXACT_SELECT: &str = "*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
 
+/// Survivor gate applied to EVERY `latest_ranking` read (#518). The published batch is a
+/// 200-row bench; only rows carrying the ranker's `survives` verdict are Leaders, so only they
+/// may reach the live watchlist. Fail-closed by construction: `is.true` excludes SQL NULL, so a
+/// batch with no verdict (pre-#518, or a legacy replayed publication) admits nobody rather than
+/// admitting everybody. `active_watchlist_size` is therefore a pure cap, not the followed count.
+const RANKING_SURVIVOR_FILTER: &str = "survives=is.true";
+
 /// `latest_ranking` read URL shared by the ordinary fetch and the canary (#514).
 fn latest_ranking_url(base_url: &str, limit: usize) -> String {
     format!(
-        "{}/rest/v1/latest_ranking?select={RANKING_EXACT_SELECT}&order=rank&limit={limit}",
+        "{}/rest/v1/latest_ranking\
+         ?select={RANKING_EXACT_SELECT}&{RANKING_SURVIVOR_FILTER}&order=rank&limit={limit}",
         base_url.trim_end_matches('/')
     )
 }
@@ -559,12 +567,14 @@ async fn get_ranking(
 /// Fetch the latest ranking from Supabase and map it to a [`Watchlist`] plus the last-trade
 /// side-map (#357).
 ///
-/// `GET {base_url}/rest/v1/latest_ranking?select=<RANKING_EXACT_SELECT>&order=rank&limit={limit}`
+/// `GET {base_url}/rest/v1/latest_ranking?select=<RANKING_EXACT_SELECT>&survives=is.true&order=rank&limit={limit}`
 /// with the SAME token in both the `apikey` and `Authorization: Bearer` headers (see
 /// [`auth_token`]). This is the
 /// bootstrap + score-refresh path: it is intentionally NOT freshness-filtered (the bootstrap
-/// admits the top-`limit` by rank; freshness for live wallets is enforced by the poll cursor +
-/// maintenance tick, and the refresh must not drop live members). See [`fetch_candidates`].
+/// admits the top-`limit` SURVIVORS by rank; freshness for live wallets is enforced by the poll
+/// cursor + maintenance tick, and the refresh must not drop live members). It IS survivor-filtered
+/// (#518), so `limit` caps survivors rather than selecting the raw top-`limit`, and a batch with
+/// no verdict yields zero rows. See [`fetch_candidates`].
 pub async fn fetch(
     client: &reqwest::Client,
     base_url: &str,
@@ -580,8 +590,9 @@ pub async fn fetch(
     .await
 }
 
-/// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` `latest_ranking`
-/// rows (with the [`RANKING_EXACT_SELECT`] score aliases, #514) excluding `exclude`,
+/// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` SURVIVING
+/// `latest_ranking` rows ([`RANKING_SURVIVOR_FILTER`], #518; with the
+/// [`RANKING_EXACT_SELECT`] score aliases, #514) excluding `exclude`,
 /// optionally freshness-filtered, ordered by rank. Pure (no network)
 /// so the `not.in.` and `gte` filters are unit-testable. Excluded wallets render as canonical
 /// lowercase `0x` hex (matching `latest_ranking.wallet_hex`) and are sorted + deduped for a
@@ -592,7 +603,10 @@ pub async fn fetch(
 /// only wallets that traded at/after `cutoff` are returned. NULL `last_trade_unix` fails `gte`
 /// and is excluded — a not-yet-populated bench pauses backfill, it never empties the live set.
 fn candidates_query(exclude: &[WalletAddress], n: usize, freshness_cutoff: Option<i64>) -> String {
-    let mut filters: Vec<String> = vec![format!("select={RANKING_EXACT_SELECT}")];
+    let mut filters: Vec<String> = vec![
+        format!("select={RANKING_EXACT_SELECT}"),
+        RANKING_SURVIVOR_FILTER.to_string(),
+    ];
     if !exclude.is_empty() {
         let mut hexes: Vec<String> = exclude.iter().map(ToString::to_string).collect();
         hexes.sort_unstable();
@@ -848,13 +862,16 @@ mod tests {
     }
 
     const EXACT_SELECT: &str = "select=*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
+    /// Select + survivor gate, in the order both builders emit them (#514, #518).
+    const EXACT_SELECT_SURVIVORS: &str =
+        "select=*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text&survives=is.true";
 
     #[test]
     fn candidates_query_empty_exclude_omits_filter() {
         // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
         assert_eq!(
             candidates_query(&[], 5, None),
-            format!("{EXACT_SELECT}&order=rank&limit=5")
+            format!("{EXACT_SELECT_SURVIVORS}&order=rank&limit=5")
         );
     }
 
@@ -867,7 +884,7 @@ mod tests {
         assert_eq!(
             q,
             format!(
-                "{EXACT_SELECT}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
+                "{EXACT_SELECT_SURVIVORS}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
                  0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
             )
         );
@@ -878,7 +895,7 @@ mod tests {
         // No exclude + a cutoff -> the gte filter precedes order/limit (#357).
         assert_eq!(
             candidates_query(&[], 5, Some(1_000)),
-            format!("{EXACT_SELECT}&last_trade_unix=gte.1000&order=rank&limit=5")
+            format!("{EXACT_SELECT_SURVIVORS}&last_trade_unix=gte.1000&order=rank&limit=5")
         );
     }
 
@@ -888,7 +905,7 @@ mod tests {
         assert_eq!(
             candidates_query(&[a], 3, Some(1_000)),
             format!(
-                "{EXACT_SELECT}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
+                "{EXACT_SELECT_SURVIVORS}&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
                  &last_trade_unix=gte.1000&order=rank&limit=3"
             )
         );
@@ -901,7 +918,8 @@ mod tests {
         assert_eq!(
             latest_ranking_url("https://example.test/", 25),
             format!(
-                "https://example.test/rest/v1/latest_ranking?{EXACT_SELECT}&order=rank&limit=25"
+                "https://example.test/rest/v1/latest_ranking\
+                 ?{EXACT_SELECT_SURVIVORS}&order=rank&limit=25"
             )
         );
         assert!(candidates_query(&[], 5, None).starts_with(EXACT_SELECT));
@@ -1110,6 +1128,31 @@ mod tests {
         assert_eq!(watchlist.entries.len(), 1);
         assert_eq!(cursors.len(), 1);
         assert_eq!(evidence.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn canary_ranking_rejects_an_empty_survivor_filtered_response() {
+        // #518 makes an EMPTY 2xx reachable for the first time: the survivor filter yields no
+        // rows when the newest batch carries no verdicts (pre-#518, or a legacy replayed
+        // publication) or endorses nobody. The canary must treat that as an observed-contract
+        // failure, not as "no wallets to copy". The fixture returns a decoded empty LIST — an
+        // empty BODY would fail one step earlier, at deserialization, and prove nothing here.
+        let app = axum::Router::new().route(
+            "/rest/v1/latest_ranking",
+            axum::routing::get(|| async { axum::Json(Vec::<serde_json::Value>::new()) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{address}");
+
+        let error = fetch_canary_observed(&reqwest::Client::new(), &base, "anon", 100)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SupabaseError::CanaryObserved { reason, .. } if reason.contains("empty")),
+            "expected the empty-ranking contract failure, got: {error:?}"
+        );
     }
 
     #[tokio::test]

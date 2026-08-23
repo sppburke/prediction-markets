@@ -575,10 +575,44 @@ async fn maintenance_tick(
                             );
                             return;
                         }
-                        Ok(_) => warn!(
-                            "full_rerank: top fetch returned 0 rows; keeping membership, \
-                             will retry next tick"
-                        ),
+                        // #518 made this branch reachable in normal operation: the read is
+                        // survivor-filtered, so a batch whose rows all fail the gate — or one
+                        // that carries no verdict at all — legitimately returns zero rows.
+                        // Retaining the previous set here would keep copying wallets the CURRENT
+                        // batch says are ineligible, and would do so forever, because the marker
+                        // never advances. Apply the empty membership instead: it matches the
+                        // cold-boot stance (`main.rs` refuses to start on an empty filtered
+                        // read) and the fail-closed contract — the ranker endorsing nobody means
+                        // copying nobody. Open positions keep resolving; only new copies stop.
+                        Ok((incoming, incoming_last_trade)) => {
+                            match apply_full_rerank_swap(
+                                live,
+                                paper_state,
+                                writer_lock,
+                                applied_capacity,
+                                capacity_epoch,
+                                &incoming.entries,
+                                &incoming_last_trade,
+                            )
+                            .await
+                            {
+                                Ok((live_total, dropped)) => {
+                                    evicted.clear();
+                                    *batch_marker = latest;
+                                    warn!(
+                                        batch_id = latest.unwrap_or(-1),
+                                        dropped = dropped.len(),
+                                        live_total,
+                                        "full_rerank: batch has no surviving rows; live set \
+                                         emptied (fail-closed — the ranker endorsed nobody)"
+                                    );
+                                }
+                                Err(e) => warn!(error = %e,
+                                    "full_rerank: empty-batch swap rejected; keeping membership, \
+                                     will retry next tick"),
+                            }
+                            return;
+                        }
                         Err(e) => warn!(error = %e,
                             "full_rerank: top fetch failed; keeping membership, will retry next tick"),
                     }
@@ -648,9 +682,16 @@ async fn maintenance_tick(
             // (its inactivity clock) from the wallet's real last trade in the apply step.
             Ok((w, candidate_last_trade)) => {
                 if w.entries.is_empty() {
+                    // Expected steady state after #518: the bench is survivor-filtered, and
+                    // every survivor is already live, so there is normally nobody left to
+                    // backfill with and the live set sits below `cap` until the next batch.
+                    // Carry the counts so an UNEXPECTED empty bench stays diagnosable.
                     warn!(
-                        "maintenance: freshness-filtered candidate fetch returned 0; backfill \
-                         paused (bench may predate the last_trade_unix populate push)"
+                        freed,
+                        live_total = live_wallets.len(),
+                        evicted = evictions.len(),
+                        "maintenance: candidate fetch returned 0; backfill paused (no surviving \
+                         bench rows outside the live set, or the bench predates last_trade_unix)"
                     );
                 }
                 (w.entries, candidate_last_trade)

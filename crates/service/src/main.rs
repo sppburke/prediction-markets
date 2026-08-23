@@ -165,12 +165,15 @@ async fn main() -> Result<()> {
         "watchlist bootstrapped from supabase"
     );
 
-    // Fail fast if Supabase returned no wallets — there is no fallback source (#370). An empty
-    // `latest_ranking` means the authoritative `rank_and_push` cron has not populated it yet;
+    // Fail fast if Supabase returned no wallets — there is no fallback source (#370). The read is
+    // survivor-filtered (#518), so "empty" now has two causes: `latest_ranking` itself is empty
+    // (the authoritative `rank_and_push` cron has not populated it), or the newest batch carries
+    // no surviving rows (no verdict recorded, or the ranker endorsed nobody). Both fail closed:
     // refuse to boot rather than run with an empty watchlist.
     anyhow::ensure!(
         !initial_watchlist.entries.is_empty(),
-        "no wallets to copy: Supabase `latest_ranking` is empty (is the rank_and_push cron populating it?)"
+        "no wallets to copy: Supabase `latest_ranking` returned no SURVIVING rows \
+         (is rank_and_push populating it, and does the newest batch carry `survives` verdicts?)"
     );
 
     let live_watchlist = LiveWatchlist::new(initial_watchlist);

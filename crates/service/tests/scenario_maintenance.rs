@@ -738,3 +738,105 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
     assert_eq!(db.cursor(&newcomer).unwrap(), None);
     println!("PASS: cursor prerequisite fails closed before membership publication");
 }
+
+// ── survivor-bench-exhausted-shrinks-below-cap ──────────────────────────────────
+// Scenario: after #518 the bench is survivor-filtered, so between batch swaps every surviving
+// wallet is already live and the candidate fetch legitimately returns nothing. The tick must
+// still evict, leaving membership BELOW the applied cap until the next batch restores it.
+// PASS: the evicted wallet is gone, membership is 2 of a cap of 25, and the applied target is
+//       unchanged (a cap, not the followed count).
+// FAIL: eviction is suppressed by the empty bench, or the applied target moves.
+#[tokio::test]
+async fn survivor_bench_exhausted_still_evicts_and_shrinks_below_cap() {
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    let keep_a = wallet(1);
+    let keep_b = wallet(2);
+    let leaving = wallet(3);
+    let live = LiveWatchlist::new(watchlist(vec![
+        entry(keep_a, 300),
+        entry(keep_b, 200),
+        entry(leaving, 100),
+    ]));
+
+    let (applied, epoch) = capacity(25);
+    let removed: HashSet<WalletAddress> = [leaving].into_iter().collect();
+
+    // The survivor-filtered bench yields nobody: all survivors are already live.
+    let size = apply_evictions_and_backfill(
+        &live,
+        &db,
+        &lock,
+        &applied,
+        epoch,
+        &removed,
+        &[],
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(size, 2, "eviction applied even with an empty candidate set");
+    let snap = live.snapshot();
+    assert!(
+        !snap.entries.iter().any(|e| e.wallet == leaving),
+        "the evicted wallet left the live set"
+    );
+    assert!(
+        snap.entries.iter().any(|e| e.wallet == keep_a)
+            && snap.entries.iter().any(|e| e.wallet == keep_b),
+        "the remaining survivors stayed live"
+    );
+    assert_eq!(
+        applied.load(),
+        epoch,
+        "`active_watchlist_size` is a pure cap: membership below it never moves the applied target"
+    );
+    println!("PASS: survivor-bench-exhausted-still-evicts-and-shrinks-below-cap");
+}
+
+// ── full-rerank-swap-on-a-batch-with-no-survivors ───────────────────────────────
+// Scenario: #518 makes an empty survivor-filtered read reachable in normal operation — a batch
+// whose rows all fail the gate, or one carrying no verdict at all. Retaining the previous set
+// would keep copying wallets the CURRENT batch calls ineligible, and forever, because the batch
+// marker never advances past it.
+// PASS: the swap applies an empty membership, every previous wallet is dropped, and the applied
+//       capacity target is untouched — matching the cold-boot stance for the same condition.
+// FAIL: membership survives the swap, or the applied target moves.
+#[tokio::test]
+async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
+    let (_dir, db) = temp_db();
+    let lock = Mutex::new(());
+
+    let before: Vec<WatchlistEntry> = (1..=27u8)
+        .map(|n| entry(wallet(n), 2_000 - i32::from(n)))
+        .collect();
+    let live = LiveWatchlist::new(watchlist(before));
+    let (applied, epoch) = capacity(100);
+
+    let (size, dropped) =
+        apply_full_rerank_swap(&live, &db, &lock, &applied, epoch, &[], &HashMap::new())
+            .await
+            .unwrap();
+
+    assert_eq!(
+        size, 0,
+        "the ranker endorsed nobody, so the live set is empty"
+    );
+    assert_eq!(
+        dropped.len(),
+        27,
+        "every previously live wallet was dropped"
+    );
+    assert!(
+        live.snapshot().entries.is_empty(),
+        "no wallet is still copied"
+    );
+    assert_eq!(
+        applied.load(),
+        epoch,
+        "an empty batch never moves the applied capacity target"
+    );
+    println!("PASS: full-rerank-swap-on-a-batch-with-no-survivors-empties-the-live-set");
+}

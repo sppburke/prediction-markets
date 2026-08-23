@@ -12,11 +12,12 @@ This test runs in CI as part of `.github/workflows/ci.yml` (Python drift-guard s
 Run: `python3 scripts/test_push_ranking_filter.py`
   or: `pytest scripts/test_push_ranking_filter.py -v`
 """
+import io
 import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import chdir
+from contextlib import chdir, redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -218,9 +219,31 @@ class BuildEntriesTest(unittest.TestCase):
         self.assertNotIn("batch_id", entries[0])                         # RPC injects atomically
         self.assertIsNone(entries[1]["ls_edge"])                        # blank numeric -> NULL
 
+    def test_entries_carry_the_ranker_verdict(self) -> None:
+        # The producer writes a Python bool through csv.DictWriter, so the file literally holds
+        # `True`/`False` (#518) — case normalisation is load-bearing, not cosmetic.
+        top = [
+            {"wallet": "0xaaa", "survives": "True"},
+            {"wallet": "0xbbb", "survives": "False"},
+            {"wallet": "0xccc"},  # key absent entirely -> SQL NULL, never admitted
+        ]
+        entries = pr.build_entries(top, last_trade_map={})
+        self.assertIs(entries[0]["survives"], True)
+        self.assertIs(entries[1]["survives"], False)
+        self.assertIsNone(entries[2]["survives"])
+
+    def test_unparseable_verdict_raises_instead_of_degrading_to_false(self) -> None:
+        # Silently reading a malformed verdict as False would drop a genuine survivor out of the
+        # live watchlist; fail closed at parse time instead.
+        with self.assertRaises(ValueError):
+            pr.build_entries([{"wallet": "0xaaa", "survives": "yes"}], last_trade_map={})
+
 
 class PublishRequestTest(unittest.TestCase):
-    def _request(self, keep_batches=0):
+    def _request(self, keep_batches=0, verdicts=(True, False)):
+        """Build a publish request. `verdicts=None` reproduces the LEGACY pre-#518 shape,
+        where the key is absent from every entry — the durable-recovery case that must keep
+        validating and replaying unchanged."""
         batch = {
             "git_sha": "abc123",
             "band_lo": 0.15,
@@ -255,6 +278,9 @@ class PublishRequestTest(unittest.TestCase):
                 "last_trade_unix": None,
             },
         ]
+        if verdicts is not None:
+            for entry, verdict in zip(entries, verdicts):
+                entry["survives"] = verdict
         return pr.build_publish_request(batch, entries, keep_batches)
 
     def test_request_round_trip_and_content_hash_tamper_detection(self):
@@ -311,11 +337,66 @@ class PublishRequestTest(unittest.TestCase):
             self.assertEqual(request["entries"][0]["wallet_hex"], "0xaaa")
             self.assertEqual(pending_path.read_text(), f"{request_path}\n")
 
+    def test_prepare_refuses_a_batch_that_cannot_state_eligibility(self):
+        # #518 fail-closed at the cheapest point: a ranked file with no verdict column is
+        # rejected during preparation, before anything durable or networked happens. Publishing
+        # it would store NULLs, which the reader filter then refuses — a silently empty
+        # watchlist instead of a loud, local failure.
+        with tempfile.TemporaryDirectory() as tmp, chdir(tmp):
+            csv_path = Path("data/eval-results/cron-test/latency_shift_ranked.csv")
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text("wallet,tstat_net_ls\n0xaaa,2.5\n", encoding="utf-8")
+            request_path = csv_path.with_name("ranking_publish_request.json")
+            with (
+                mock.patch.object(
+                    sys, "argv",
+                    ["push", "--ranked-csv", str(csv_path), "--request-file", str(request_path),
+                     "--prepare-only"],
+                ),
+                mock.patch.dict("os.environ", {}, clear=True),
+                mock.patch.object(pr, "_request_once") as network,
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                # Preparation failures are a clean permanent exit (1), never a traceback and
+                # never the retryable 75 — a malformed ranked file will not fix itself.
+                self.assertEqual(pr.main(), 1)
+            self.assertIn("survives", stderr.getvalue())
+            network.assert_not_called()
+            self.assertFalse(request_path.exists(), "no durable request written")
+
+    def test_prepare_accepts_the_producers_literal_boolean_spelling(self):
+        # End-to-end through main(): the ranker's own `True`/`False` spelling must reach the
+        # entry payload as real booleans.
+        with tempfile.TemporaryDirectory() as tmp, chdir(tmp):
+            csv_path = Path("data/eval-results/cron-test/latency_shift_ranked.csv")
+            csv_path.parent.mkdir(parents=True)
+            csv_path.write_text(
+                "wallet,survives,tstat_net_ls\n0xaaa,True,2.5\n0xbbb,False,1.0\n",
+                encoding="utf-8",
+            )
+            request_path = csv_path.with_name("ranking_publish_request.json")
+            with (
+                mock.patch.object(
+                    sys, "argv",
+                    ["push", "--ranked-csv", str(csv_path), "--request-file", str(request_path),
+                     "--prepare-only"],
+                ),
+                mock.patch.dict("os.environ", {}, clear=True),
+                mock.patch.object(pr, "_request_once") as network,
+            ):
+                self.assertEqual(pr.main(), 0)
+            network.assert_not_called()
+            entries = pr.load_publish_request(str(request_path))["entries"]
+            self.assertIs(entries[0]["survives"], True)
+            self.assertIs(entries[1]["survives"], False)
+            # Survivors sort ahead of failures, so rank 1 is the surviving wallet.
+            self.assertEqual(entries[0]["wallet_hex"], "0xaaa")
+
     def test_rpc_publication_verifies_exact_returned_batch(self):
         request = self._request(keep_batches=0)
         latest = [
-            {"batch_id": 42, "rank": 1},
-            {"batch_id": 42, "rank": 2},
+            {"batch_id": 42, "rank": 1, "survives": True},
+            {"batch_id": 42, "rank": 2, "survives": False},
         ]
         with mock.patch.object(
             pr,
@@ -332,6 +413,40 @@ class PublishRequestTest(unittest.TestCase):
         self.assertTrue(rpc.args[1].endswith("/rest/v1/rpc/publish_ranking_batch"))
         self.assertEqual(rpc.kwargs["body"]["p_publish_key"], request["publish_key"])
         self.assertNotIn("batch_id", rpc.kwargs["body"]["p_entries"][0])
+        self.assertIs(rpc.kwargs["body"]["p_entries"][0]["survives"], True)
+        # The post-publication read must ask for the verdict, or it cannot verify it (#518).
+        self.assertIn("survives", request_mock.call_args_list[1].args[1])
+
+    def test_rpc_publication_rejects_a_mismatched_stored_verdict(self):
+        # The batch committed, but the stored verdict is not what this request sent — a real
+        # defect in the publication path. Fail loudly rather than shipping a batch whose
+        # eligibility column silently disagrees with the ranker.
+        request = self._request(keep_batches=0)
+        latest = [
+            {"batch_id": 42, "rank": 1, "survives": False},   # submitted True
+            {"batch_id": 42, "rank": 2, "survives": False},
+        ]
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, latest)]):
+            with self.assertRaises(ValueError) as caught:
+                pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret")
+        self.assertIn("survives", str(caught.exception))
+
+    def test_legacy_request_without_verdict_still_validates_and_verifies(self):
+        # A durable request recorded before #518 carries no verdict key. It must still validate
+        # (no entry-key whitelist), replay, and pass verification: absent submitted value vs
+        # stored SQL NULL is a match, so the upgrade can never wedge publication recovery.
+        request = self._request(keep_batches=0, verdicts=None)
+        pr.validate_publish_request(request)
+        self.assertNotIn("survives", request["entries"][0])
+        latest = [
+            {"batch_id": 42, "rank": 1, "survives": None},
+            {"batch_id": 42, "rank": 2, "survives": None},
+        ]
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, latest)]):
+            self.assertEqual(
+                pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret"),
+                42,
+            )
 
     def test_retry_transient_only_with_bounded_exponential_backoff(self):
         transient = pr.SupabaseRequestError("timeout", retryable=True)
