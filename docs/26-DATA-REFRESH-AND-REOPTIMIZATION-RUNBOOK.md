@@ -202,6 +202,25 @@ checkpointed and the WAL file releases its disk footprint. The checkpoint is alw
 attempted last, including re-pushes and runs that skip purge. A busy/error result warns
 without failing the already-complete Supabase publish; the next run retries it.
 
+> **Purge I/O priority (#527).** Both purge entry points — Step 0i `purge-infra` and the
+> Stage 4 ordinary `purge` — run the cache mutator under `ionice -c3` (idle block-I/O
+> class): the 2026-08-23 bulk purge saturated the cache disk at normal priority and
+> starved SSH until a power cycle. The dependency fails closed: when a run can reach a
+> purge site and `ionice` is not on `PATH`, the wrapper exits 2 before the run lock,
+> cycle directory, or any cache state; an `ionice` execution failure is fatal at the
+> infra site and a post-publication warning at the ordinary site — a purge never falls
+> back to normal priority. Trade-off: under competing I/O an idle-class purge can take
+> longer or stall entirely, which is preferred over starving the control plane; ranking
+> and publication are never behind it (ordinary purge runs after the publish). Ordinary
+> purge stays disarmed (`PE_BOOTSTRAP_PURGE_ENABLED=false`) until #527 Phase 2 witnesses
+> one real bulk-mode run complete under idle priority with control-plane probes intact —
+> the gate is an organically produced disabled report whose delete set reaches the
+> canonical `purge_bulk_min_wallets`; wiring-only incremental runs do not qualify.
+> Rollback: atomically write the loop flag to `stop` (natural run-down — a unit stop
+> needs the owner's explicit authorization for the active process), keep ordinary purge
+> false, and keep the priority wrapper; if the wrapper itself must be reverted, leave the
+> loop stopped, because `purge-infra` is armed on every invocation.
+
 Production defaults are baked in (override via flags): `--universe-from-trades`,
 `HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
 mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_prod_min_trl`

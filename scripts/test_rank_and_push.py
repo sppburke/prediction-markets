@@ -874,6 +874,129 @@ class RankAndPushScenario(unittest.TestCase):
                         "--skip-rank must not prune a positions file it did not generate")
         print("PASS: --skip-rank leaves a reused positions file untouched")
 
+    # ── #527: both purge entry points run at idle I/O priority, fail closed ──────────
+    def _install_ionice_stub(self):
+        """PATH-prepended ionice stub: logs argv to ./ionice.log, then either exits with
+        STUB_IONICE_EXIT_<subcommand> (subcommand = first arg after the pe-bootstrap
+        path, dashes as underscores) or execs the wrapped command unchanged — so every
+        downstream stub log stays byte-identical to an un-prefixed invocation."""
+        bindir = self.root / "ionice-bin"
+        bindir.mkdir(exist_ok=True)
+        _write_exec(
+            bindir / "ionice",
+            "#!/usr/bin/env bash\n"
+            'echo "$*" >> ionice.log\n'
+            'if [[ "${1:-}" != "-c3" ]]; then echo "ionice-stub: expected -c3, got: $*" >&2; exit 64; fi\n'
+            "shift\n"
+            'sub="${2:-}"\n'
+            'key="STUB_IONICE_EXIT_${sub//-/_}"\n'
+            'code="${!key:-}"\n'
+            'if [[ -n "$code" ]]; then exit "$code"; fi\n'
+            'exec "$@"\n',
+        )
+        return {"PATH": f"{bindir}:{os.environ['PATH']}"}
+
+    def _path_without_ionice(self):
+        """A PATH mirroring every tool on the ambient PATH except ionice, so `command -v
+        ionice` genuinely fails while everything else the wrapper needs still resolves."""
+        bindir = self.root / "no-ionice-bin"
+        bindir.mkdir(exist_ok=True)
+        seen = set()
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            directory = Path(entry)
+            if not directory.is_dir():
+                continue
+            for tool in directory.iterdir():
+                if tool.name in seen or tool.name == "ionice":
+                    continue
+                seen.add(tool.name)
+                try:
+                    (bindir / tool.name).symlink_to(tool)
+                except OSError:
+                    continue
+        return {"PATH": str(bindir)}
+
+    def test_purge_stages_run_under_idle_ionice(self):
+        r = self._run(exit_env=self._install_ionice_stub())
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertEqual(
+            (self._log("ionice.log") or "").splitlines(),
+            [
+                "-c3 target/release/pe-bootstrap purge-infra",
+                "-c3 target/release/pe-bootstrap purge",
+            ],
+            "exactly the two purge stages must run under ionice -c3, nothing else",
+        )
+        boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertIn("purge-infra", boot)
+        self.assertIn("purge", boot)
+        print("PASS: both purge stages — and only they — run under ionice -c3")
+
+    def test_missing_ionice_fails_before_lock_when_purge_reachable(self):
+        r = self._run(exit_env=self._path_without_ionice())
+        self.assertEqual(r.returncode, 2, f"missing ionice should exit 2\nstderr={r.stderr}")
+        self.assertIn("ionice not found", r.stderr)
+        self._assert_preflight_left_no_pipeline_state()
+        print("PASS: absent ionice fails closed before lock, output directory, or refresh")
+
+    def test_missing_ionice_ok_for_pure_repush(self):
+        # Purge is unreachable on the re-push shape, so the ionice preflight must not fire.
+        out = self.root / "data" / "eval-results" / "prior"
+        out.mkdir()
+        (out / "latency_shift_ranked.csv").write_text("wallet\n0xabc\n")
+        r = self._run(
+            "--skip-discovery", "--skip-backfill", "--skip-rank", "--out-dir", str(out),
+            exit_env=self._path_without_ionice(),
+        )
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIsNone(self._log("ionice.log"), "re-push invoked ionice")
+        self.assertIsNotNone(self._log("push.log"), "re-push did not push")
+        print("PASS: ionice is a conditional dependency — absent tool still allows a re-push")
+
+    def test_infra_ionice_failure_is_fatal_before_ranking(self):
+        env = self._install_ionice_stub()
+        env["STUB_IONICE_EXIT_purge_infra"] = "9"
+        r = self._run(exit_env=env)
+        self.assertEqual(r.returncode, 9, f"infra ionice failure must abort\nstderr={r.stderr}")
+        boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertNotIn("purge-infra", boot, "infra purge ran directly despite ionice failure")
+        self.assertIsNone(self._log("rank.log"), "ranking ran after fatal infra-purge failure")
+        self.assertIsNone(self._log("push.log"), "publish ran after fatal infra-purge failure")
+        print("PASS: infra-purge ionice failure is fatal before ranking, no unprioritized fallback")
+
+    def test_ordinary_ionice_failure_warns_after_publish(self):
+        env = self._install_ionice_stub()
+        env["STUB_IONICE_EXIT_purge"] = "9"
+        r = self._run(exit_env=env)
+        self.assertEqual(r.returncode, 0, f"ordinary ionice failure must stay nonfatal\nstderr={r.stderr}")
+        self.assertIn("[purge] WARN exit 9", r.stderr)
+        self.assertIsNotNone(self._log("push.log"), "publish did not complete")
+        boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertIn("purge-infra", boot)
+        self.assertNotIn("purge", boot, "ordinary purge ran directly despite ionice failure")
+        print("PASS: ordinary-purge ionice failure warns after publish, no unprioritized fallback")
+
+    def test_resume_pending_purge_tail_is_prioritized(self):
+        env = self._install_ionice_stub()
+        first = self._run(exit_env={**env, "STUB_PUSH_EXIT": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        self.assertEqual(
+            (self._log("ionice.log") or "").splitlines(),
+            ["-c3 target/release/pe-bootstrap purge-infra"],
+            "failed-push run should have prioritized only the infra purge",
+        )
+        resumed = self._run("--resume-pending", exit_env=env)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(
+            (self._log("ionice.log") or "").splitlines(),
+            [
+                "-c3 target/release/pe-bootstrap purge-infra",
+                "-c3 target/release/pe-bootstrap purge",
+            ],
+            "resume must prioritize exactly the one ordinary purge tail, no infra rerun",
+        )
+        print("PASS: publication resume runs its single ordinary-purge tail under ionice -c3")
+
     def test_wrapper_passes_bash_syntax_check(self):
         r = subprocess.run(["bash", "-n", str(WRAPPER)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"bash -n failed: {r.stderr}")
