@@ -49,5 +49,12 @@ systemctl --user enable --now pe-rank-loop
 ```bash
 systemctl --user is-enabled pe-rank-loop
 systemctl --user is-active pe-rank-loop
+systemctl --user show pe-rank-loop -p ExecStartPre -p TimeoutStartUSec -p Restart
 journalctl --user -u pe-rank-loop -n 100
 ```
+
+The `ExecStartPre` wait covers the boot race against the storage mount (issue
+#528): while the script path is absent the unit stays `activating`, and if the
+path never appears within `TimeoutStartSec` the start fails visibly (no main
+process, no automatic restart). A manual `systemctl --user start` behaves the
+same way — the flag file is only evaluated once the supervisor actually runs.
