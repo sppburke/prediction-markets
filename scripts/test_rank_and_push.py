@@ -964,6 +964,19 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNone(self._log("push.log"), "publish ran after fatal infra-purge failure")
         print("PASS: infra-purge ionice failure is fatal before ranking, no unprioritized fallback")
 
+    def test_infra_purge_partial_exit2_continues_through_ionice(self):
+        # Child (not ionice) soft-fails with the pe-bootstrap partial code 2: the stage
+        # must WARN and the run must still rank and publish — ionice's exec preserves
+        # the child's exit code, and run_refresh_stage's 2-branch must keep owning it.
+        env = self._install_ionice_stub()
+        env["STUB_EXIT_purge_infra"] = "2"
+        r = self._run(exit_env=env)
+        self.assertEqual(r.returncode, 0, f"partial infra purge must not abort\nstderr={r.stderr}")
+        self.assertIn("[purge-infra] WARN exit 2", r.stderr)
+        self.assertIsNotNone(self._log("rank.log"), "ranking did not run after partial infra purge")
+        self.assertIsNotNone(self._log("push.log"), "publish did not run after partial infra purge")
+        print("PASS: infra-purge partial (exit 2) still warns and continues under ionice")
+
     def test_ordinary_ionice_failure_warns_after_publish(self):
         env = self._install_ionice_stub()
         env["STUB_IONICE_EXIT_purge"] = "9"

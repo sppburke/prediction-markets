@@ -210,8 +210,10 @@ without failing the already-complete Supabase publish; the next run retries it.
 > cycle directory, or any cache state; an `ionice` execution failure is fatal at the
 > infra site and a post-publication warning at the ordinary site — a purge never falls
 > back to normal priority. Trade-off: under competing I/O an idle-class purge can take
-> longer or stall entirely, which is preferred over starving the control plane; ranking
-> and publication are never behind it (ordinary purge runs after the publish). Ordinary
+> longer or stall entirely, which is preferred over starving the control plane. Ordinary
+> purge cannot delay an already-completed publication (it runs after the push), but
+> Step 0i `purge-infra` remains a prerequisite for ranking and may lengthen or stall
+> the cycle. Ordinary
 > purge stays disarmed (`PE_BOOTSTRAP_PURGE_ENABLED=false`) until #527 Phase 2 witnesses
 > one real bulk-mode run complete under idle priority with control-plane probes intact —
 > the gate is an organically produced disabled report whose delete set reaches the
