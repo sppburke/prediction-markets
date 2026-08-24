@@ -246,7 +246,11 @@ systemd unit `deploy/systemd/pe-rank-loop.service` (issue #521): output goes to
 the journal, the script converts a stop signal into a clean numeric exit 143
 (declared by `SuccessExitStatus=143`), and `loginctl enable-linger` starts the
 unit at boot — the flag file still gates whether a boot-started supervisor
-cycles. Install per `deploy/systemd/README.md`. There is no unmanaged fallback
+cycles. At boot the unit first waits for the repository's storage mount
+(`ExecStartPre` path wait, issue #528); until the path appears the unit is
+`activating`, and if it never appears within the unit's `TimeoutStartSec` the
+start fails visibly with no main process and no automatic restart — inspect
+the mount, then `systemctl --user start pe-rank-loop`. Install per `deploy/systemd/README.md`. There is no unmanaged fallback
 launch: a detached supervisor would be a second production lifecycle, so if
 user systemd is unavailable, fix the unit before running the loop.
 

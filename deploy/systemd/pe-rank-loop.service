@@ -2,6 +2,13 @@
 Description=prediction-edge ranking loop supervisor (issue #519 pipeline)
 
 [Service]
+# The repository lives on a separately mounted volume that can finish mounting
+# after the user manager starts this unit at boot (85 ms race observed
+# 2026-08-23: exit 127, issue #528). A user manager cannot order against
+# system mounts, so wait for the script path, bounded by TimeoutStartSec —
+# expiry is a visible startup failure with no main process and no restart.
+ExecStartPre=/bin/sh -c 'until [ -x "%h/prediction-markets/scripts/rank_and_push_loop.sh" ]; do sleep 2; done'
+TimeoutStartSec=2min
 ExecStart=/usr/bin/bash %h/prediction-markets/scripts/rank_and_push_loop.sh
 # The TERM trap converts the stop signal into an explicit numeric exit 143
 # (rank_and_push_loop.sh:80) — declare it a clean stop.
