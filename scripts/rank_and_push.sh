@@ -343,6 +343,22 @@ if [[ "$SKIP_DISCOVERY" == "0" || "$SKIP_BACKFILL" == "0" \
   }
 fi
 
+# Both purge entry points (Step 0i purge-infra, Stage 4 ordinary purge) run the cache
+# mutator at idle block-I/O priority: the 2026-08-23 bulk purge saturated the cache disk
+# at normal priority and starved the control plane until a power cycle (#527). Resolve
+# the tool up front and fail closed before the run lock — a purge must never silently
+# run at normal priority, so no `ionice -t` and no fallback. The condition below is the
+# union of the two call sites' reachability (resume forces SKIP_RANK=1 but still runs
+# the ordinary post-publication purge).
+IONICE_BIN=""
+if [[ "$SKIP_PURGE" == "0" && ( "$SKIP_RANK" == "0" || "$RESUME_PENDING" == "1" ) ]]; then
+  IONICE_BIN="$(command -v ionice || true)"
+  [[ -n "$IONICE_BIN" && -x "$IONICE_BIN" ]] || {
+    echo "FATAL: ionice not found — purge stages require idle I/O priority (#527). Install util-linux or pass --skip-purge." >&2
+    exit 2
+  }
+fi
+
 # ── Single-run lock (PID-based) ──────────────────────────────────────────────────────────
 # A full run (≈496K wallets, 30–90 min) must never overlap the next cron tick. A live holder
 # aborts the new run; a stale lock from a crashed run (PID not alive) is reclaimed. The trap
@@ -548,7 +564,9 @@ else
     exit 2
   }
   export PE_BOOTSTRAP_CACHE_PATH="$DB"
-  run_refresh_stage "purge-infra" "$PE_BOOTSTRAP_BIN" purge-infra "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  # Idle I/O priority (#527): ionice failure here is fatal via run_refresh_stage — the
+  # purge never falls back to normal priority.
+  run_refresh_stage "purge-infra" "$IONICE_BIN" -c3 "$PE_BOOTSTRAP_BIN" purge-infra "${BOOTSTRAP_CONFIG_ARGS[@]}"
 fi
 
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
@@ -660,8 +678,10 @@ elif [[ "$RESUME_PENDING" == "0" && ( "$SKIP_BACKFILL" == "1" || "$SKIP_RANK" ==
 else
   echo "── Stage 4/5: purge proven-loser & dead-weight wallets (issue #385) ───────────"
   prc=0
+  # Idle I/O priority (#527): an ionice failure surfaces as the stage's nonfatal WARN —
+  # the purge is skipped rather than ever running at normal priority.
   PE_BOOTSTRAP_CACHE_PATH="$DB" PE_BOOTSTRAP_PURGE_DECISION_CSV="$RANKED_CSV" \
-    "$PE_BOOTSTRAP_BIN" purge "${BOOTSTRAP_CONFIG_ARGS[@]}" || prc=$?
+    "$IONICE_BIN" -c3 "$PE_BOOTSTRAP_BIN" purge "${BOOTSTRAP_CONFIG_ARGS[@]}" || prc=$?
   case "$prc" in
     0) echo "   [purge] ok" ;;
     *) echo "   [purge] WARN exit $prc — purge stage failed; Supabase publish already complete, continuing" >&2 ;;
