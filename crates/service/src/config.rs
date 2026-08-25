@@ -821,10 +821,6 @@ mode = "shadow"
                 d.entry_gate_fail_closed.to_string(),
             ),
             (
-                "trade_poll_interval_secs",
-                d.trade_poll_interval_secs.to_string(),
-            ),
-            (
                 "position_reseed_interval_secs",
                 d.position_reseed_interval_secs.to_string(),
             ),

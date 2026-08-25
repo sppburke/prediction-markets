@@ -306,7 +306,6 @@ insert into service_config (key, value, value_type, description) values
   ('min_resolution_horizon_secs',           '60',     'integer', 'Min time-to-resolution copy floor (seconds)'),
   ('max_resolution_horizon_secs',           '172800', 'integer', 'Max time-to-resolution, 48 h (run28 cutover; seconds)'),
   ('entry_gate_fail_closed',                'false',  'bool',    'Block copies for wallets whose market history could not be fetched'),
-  ('trade_poll_interval_secs',              '30',     'integer', 'Leader trade poll interval (seconds)'),
   ('position_reseed_interval_secs',         '300',    'integer', 'Held-position reseed interval (seconds)'),
   ('position_page_limit',                   '500',    'integer', 'Position fetch page size'),
   ('position_size_threshold',               '1',      'integer', 'Min contracts to treat a position as held'),
