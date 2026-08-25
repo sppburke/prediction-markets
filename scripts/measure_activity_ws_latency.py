@@ -24,10 +24,15 @@ async def main():
                     continue
                 p = it.get("payload") or {}
                 payload_keys.update(p.keys())
-                ts = p.get("timestamp")
+                raw_ts = p.get("timestamp")
                 if sample is None and p.get("proxyWallet"):
                     sample = {k: str(v)[:70] for k, v in p.items()}
-                if isinstance(ts, (int, float)) and ts > 0:
+                # The feed sends timestamps as STRING seconds (docs/15) — parse both.
+                try:
+                    ts = float(raw_ts)
+                except (TypeError, ValueError):
+                    ts = 0
+                if ts > 0:
                     t = ts / 1000.0 if ts > 1e12 else float(ts)
                     lag = now - t
                     if -5 < lag < 600:

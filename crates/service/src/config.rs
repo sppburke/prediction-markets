@@ -582,6 +582,8 @@ impl Default for ServiceConfig {
 pub enum ServiceConfigError {
     #[error("load config: {0}")]
     Figment(Box<figment::Error>),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl From<figment::Error> for ServiceConfigError {
@@ -649,6 +651,15 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "polymarket_clob_base_url",
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
+    // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
+    // value is a config error, not a posture. One hour is far beyond any honest
+    // calibration (the ranker's latency shift is 2s).
+    if cfg.copy_latency_budget_secs == 0 || cfg.copy_latency_budget_secs > 3_600 {
+        return Err(ServiceConfigError::Invalid(format!(
+            "copy_latency_budget_secs must be in 1..=3600, got {}",
+            cfg.copy_latency_budget_secs
+        )));
+    }
     Ok(cfg)
 }
 
@@ -658,6 +669,19 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_latency_budget_bounds_are_enforced() {
+        // #530 review F6: the budget parameterizes a fail-closed rule; absurd
+        // values are config errors (0 disables it silently; >1h is nonsense and
+        // the huge-u64 wrap class).
+        for bad in ["0", "5000", "99999999999999999999"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("svc.toml");
+            std::fs::write(&path, format!("copy_latency_budget_secs = {bad}\n")).unwrap();
+            assert!(load(Some(&path)).is_err(), "budget {bad} must be rejected");
+        }
+    }
 
     #[test]
     fn default_values() {

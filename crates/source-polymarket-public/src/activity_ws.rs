@@ -241,6 +241,35 @@ pub fn backoff_secs(consecutive_reconnects: u32) -> u64 {
     (1u64 << exp).min(ACTIVITY_WS_BACKOFF_CAP_SECS)
 }
 
+/// Driver-owned reconnect accounting (#530 review F3): ONE persistent counter
+/// across connection cycles — a fresh [`ActivityWsPolicy`] per connection must
+/// not reset backoff, or connect-success/immediate-death cycles hammer at 1s
+/// forever (the measured zombie mode makes this a real shape, not a hypothesis).
+#[derive(Debug, Clone, Default)]
+pub struct ReconnectBackoff {
+    consecutive: u32,
+}
+
+impl ReconnectBackoff {
+    /// A cycle ended without progress: returns this failure's backoff and
+    /// advances the counter.
+    pub fn on_cycle_failed(&mut self) -> u64 {
+        let backoff = backoff_secs(self.consecutive);
+        self.consecutive = self.consecutive.saturating_add(1);
+        backoff
+    }
+
+    /// Progress was made (a valid frame arrived): reset.
+    pub fn on_valid_frame(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Completed reconnect attempts since the last valid frame (observability).
+    pub fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
+}
+
 // ── Transport ────────────────────────────────────────────────────────────────
 
 use futures::{SinkExt as _, StreamExt as _};
@@ -395,6 +424,17 @@ mod tests {
         assert_eq!(p.staleness(320), WsStaleness::Dead);
         p.on_frame(320, true);
         assert_eq!(p.staleness(320), WsStaleness::Fresh);
+    }
+
+    #[test]
+    fn reconnect_backoff_accumulates_across_cycles_and_resets_on_frames() {
+        let mut rb = ReconnectBackoff::default();
+        assert_eq!(rb.on_cycle_failed(), 1);
+        assert_eq!(rb.on_cycle_failed(), 2);
+        assert_eq!(rb.on_cycle_failed(), 4);
+        assert_eq!(rb.consecutive(), 3);
+        rb.on_valid_frame();
+        assert_eq!(rb.on_cycle_failed(), 1, "progress resets the ladder");
     }
 
     #[test]

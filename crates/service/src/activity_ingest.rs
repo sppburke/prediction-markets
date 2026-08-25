@@ -11,10 +11,17 @@
 //! Failure semantics (review-settled single state machine):
 //! - full trade channel → `send().await` blocks → TCP backpressure on the
 //!   websocket reader; no watchlisted trade is dropped.
-//! - source-log append/sync failure → sink poisons; websocket delivery blocks
-//!   (REST carries the trades); reconnect cycles retry `try_reopen`.
-//! - subscription silence → resubscribe once, then reconnect with capped
-//!   exponential backoff (soak-proven zombie mode).
+//! - source-log append/sync failure → sink poisons and THIS task enters a
+//!   bounded-backoff reopen/revalidate loop, holding the current trade until
+//!   it durably appends (#530 review F4/F1: websocket delivery must block
+//!   while poisoned; the trade is retained, never assumed onto REST).
+//! - watched payload fails normalization → skipped here; the REST path parses
+//!   the same shape with the same converter, so the poller either delivers it
+//!   or freezes the wallet cursor on it (#511) — the existing no-silent-loss
+//!   posture, not a new assumption.
+//! - subscription silence → resubscribe once, then reconnect; reconnect
+//!   backoff is a DRIVER-owned persistent counter (#530 review F3), so
+//!   connect-success/immediate-death cycles escalate instead of hammering.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -24,7 +31,7 @@ use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
 use pe_event_log::{ContentType, EnvelopeIn};
 use pe_source_polymarket_public::{
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ActivityWsPolicy, ActivityWsStream,
-    PolicyAction, parse_activity_frame,
+    PolicyAction, ReconnectBackoff, backoff_secs, parse_activity_frame,
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -36,6 +43,12 @@ use crate::trade_parser;
 
 /// Source id stamped on every websocket envelope in the source event log.
 pub const ACTIVITY_WS_SOURCE_ID: &str = "polymarket-activity-ws";
+
+/// Outcome of one connection's read loop.
+struct CycleEnd {
+    shutdown: bool,
+    saw_valid_frame: bool,
+}
 
 pub struct ActivityIngest {
     live_watchlist: LiveWatchlist,
@@ -61,23 +74,22 @@ impl ActivityIngest {
 
     /// Run until the trade channel closes (service shutdown).
     pub async fn run(mut self) {
-        let mut reconnects_for_backoff: u32 = 0;
+        let mut backoff = ReconnectBackoff::default();
         loop {
             let stream = match ActivityWsStream::connect_and_subscribe().await {
                 Ok(s) => s,
                 Err(error) => {
-                    let backoff = pe_source_polymarket_public::backoff_secs(reconnects_for_backoff);
-                    reconnects_for_backoff = reconnects_for_backoff.saturating_add(1);
-                    warn!(error = %error, backoff_secs = backoff, "activity ws connect failed");
+                    let sleep_secs = backoff.on_cycle_failed();
+                    warn!(error = %error, backoff_secs = sleep_secs, "activity ws connect failed");
                     self.set_health(|h| {
                         h.ws_connected = false;
-                        h.ws_consecutive_reconnects = h.ws_consecutive_reconnects.saturating_add(1);
+                        h.ws_consecutive_reconnects = backoff.consecutive();
                     });
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
                     continue;
                 }
             };
-            // A (re)connect cycle is also the sink-recovery point.
+            // A (re)connect cycle is also a sink-recovery point.
             let sink_ok = self.sink.try_reopen();
             self.set_health(|h| {
                 h.ws_connected = true;
@@ -87,26 +99,29 @@ impl ActivityIngest {
 
             let mut policy =
                 ActivityWsPolicy::connected(OffsetDateTime::now_utc().unix_timestamp());
-            if self.read_loop(stream, &mut policy).await {
-                return; // channel closed → shutdown
+            let end = self.read_loop(stream, &mut policy).await;
+            if end.shutdown {
+                return;
             }
-            reconnects_for_backoff = policy.consecutive_reconnects().saturating_add(1);
+            if end.saw_valid_frame {
+                backoff.on_valid_frame();
+            }
+            let sleep_secs = backoff.on_cycle_failed();
             self.set_health(|h| {
                 h.ws_connected = false;
-                h.ws_consecutive_reconnects = reconnects_for_backoff;
+                h.ws_consecutive_reconnects = backoff.consecutive();
             });
-            let backoff =
-                pe_source_polymarket_public::backoff_secs(reconnects_for_backoff.saturating_sub(1));
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
     }
 
-    /// Read frames until reconnect is required. Returns `true` on shutdown.
+    /// Read frames until reconnect is required or the service shuts down.
     async fn read_loop(
         &mut self,
         mut stream: ActivityWsStream,
         policy: &mut ActivityWsPolicy,
-    ) -> bool {
+    ) -> CycleEnd {
+        let mut saw_valid_frame = false;
         loop {
             match tokio::time::timeout(Duration::from_secs(1), stream.next_text()).await {
                 Err(_elapsed) => {
@@ -117,22 +132,34 @@ impl ActivityIngest {
                             info!("activity ws silent; resubscribing");
                             if let Err(error) = stream.resubscribe().await {
                                 warn!(error = %error, "resubscribe failed; reconnecting");
-                                return false;
+                                return CycleEnd {
+                                    shutdown: false,
+                                    saw_valid_frame,
+                                };
                             }
                         }
-                        PolicyAction::Reconnect { backoff_secs } => {
-                            warn!(backoff_secs, "activity ws silence persisted; reconnecting");
-                            return false;
+                        PolicyAction::Reconnect { .. } => {
+                            warn!("activity ws silence persisted; reconnecting");
+                            return CycleEnd {
+                                shutdown: false,
+                                saw_valid_frame,
+                            };
                         }
                     }
                 }
                 Ok(Ok(None)) => {
                     warn!("activity ws closed by peer");
-                    return false;
+                    return CycleEnd {
+                        shutdown: false,
+                        saw_valid_frame,
+                    };
                 }
                 Ok(Err(error)) => {
                     warn!(error = %error, "activity ws read error");
-                    return false;
+                    return CycleEnd {
+                        shutdown: false,
+                        saw_valid_frame,
+                    };
                 }
                 Ok(Ok(Some(text))) => {
                     let now = OffsetDateTime::now_utc();
@@ -143,6 +170,7 @@ impl ActivityIngest {
                             warn!(error = %error, "unparseable activity frame");
                         }
                         Ok((trades, malformed)) => {
+                            saw_valid_frame = true;
                             policy.on_frame(now.unix_timestamp(), true);
                             self.set_health(|h| {
                                 h.ws_last_frame_at = Some(now);
@@ -152,8 +180,11 @@ impl ActivityIngest {
                             if malformed > 0 {
                                 warn!(malformed, "activity payloads without proxyWallet");
                             }
-                            if self.deliver(trades).await {
-                                return true;
+                            if self.deliver(trades, now).await {
+                                return CycleEnd {
+                                    shutdown: true,
+                                    saw_valid_frame,
+                                };
                             }
                         }
                     }
@@ -167,6 +198,7 @@ impl ActivityIngest {
     async fn deliver(
         &mut self,
         trades: Vec<pe_source_polymarket_public::ActivityTradeRaw>,
+        frame_received_at: OffsetDateTime,
     ) -> bool {
         if trades.is_empty() {
             return false;
@@ -182,30 +214,19 @@ impl ActivityIngest {
             if !watched.contains(&wallet) {
                 continue;
             }
-            // Normalize FIRST (pure), then durable-append, then deliver — the
-            // append-before-decision-delivery contract.
-            let trade = match trade_parser::parse_ws_trade(&raw.payload_json) {
+            // Normalize FIRST (pure, with the frame receipt injected — replay
+            // passes the envelope's recorded instant instead, review F7), then
+            // durable-append, then deliver.
+            let trade = match trade_parser::parse_ws_trade(&raw.payload_json, frame_received_at) {
                 Ok(t) => t,
                 Err(error) => {
                     warn!(error = %error, wallet = %wallet,
-                        "watched ws payload failed normalization; REST backstop will carry it");
+                        "watched ws payload failed normalization; the REST path (same parser) delivers or cursor-freezes it (#511)");
                     continue;
                 }
             };
-            let envelope = EnvelopeIn {
-                source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_string()),
-                schema_version: ACTIVITY_WS_SCHEMA_VERSION,
-                parser_version: ACTIVITY_WS_PARSER_VERSION,
-                observed_at: SourceTimestamp(trade.observed_at),
-                received_at: ReceivedAt(trade.received_at),
-                content_type: ContentType::Json,
-                payload: raw.payload_json,
-            };
-            if let Err(error) = self.sink.append_durable(envelope) {
-                self.set_health(|h| h.ws_sink_poisoned = true);
-                warn!(error = %error, trade = %trade.source_trade_id,
-                    "source log append failed; sink poisoned — REST fallback carries the trade");
-                continue;
+            if self.append_with_recovery(&raw.payload_json, &trade).await {
+                return true;
             }
             // Bounded channel: a full queue blocks here → TCP backpressure on
             // the reader; a watchlisted trade is never dropped.
@@ -214,6 +235,53 @@ impl ActivityIngest {
             }
         }
         false
+    }
+
+    /// Durably append one watched payload, entering the poison-recovery loop on
+    /// failure: bounded-backoff reopen + full revalidation, retrying THIS
+    /// payload until it lands (#530 review F4/F1 — delivery blocks while
+    /// poisoned; the trade is retained, not assumed onto the REST path).
+    /// Returns `true` on shutdown (trade channel closed).
+    async fn append_with_recovery(&mut self, payload: &[u8], trade: &IncomingTrade) -> bool {
+        let envelope = |payload: &[u8], trade: &IncomingTrade| EnvelopeIn {
+            source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_string()),
+            schema_version: ACTIVITY_WS_SCHEMA_VERSION,
+            parser_version: ACTIVITY_WS_PARSER_VERSION,
+            observed_at: SourceTimestamp(trade.observed_at),
+            received_at: ReceivedAt(trade.received_at),
+            content_type: ContentType::Json,
+            payload: payload.to_vec(),
+        };
+        match self.sink.append_durable(envelope(payload, trade)) {
+            Ok(_) => return false,
+            Err(error) => {
+                self.set_health(|h| h.ws_sink_poisoned = true);
+                warn!(error = %error, trade = %trade.source_trade_id,
+                    "source log append failed; sink poisoned — holding delivery and retrying reopen");
+            }
+        }
+        let mut attempt: u32 = 0;
+        loop {
+            if self.trade_tx.is_closed() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_secs(backoff_secs(attempt))).await;
+            attempt = attempt.saturating_add(1);
+            if !self.sink.try_reopen() {
+                continue;
+            }
+            match self.sink.append_durable(envelope(payload, trade)) {
+                Ok(_) => {
+                    self.set_health(|h| h.ws_sink_poisoned = false);
+                    info!(trade = %trade.source_trade_id,
+                        "source log recovered; held payload appended durably");
+                    return false;
+                }
+                Err(error) => {
+                    warn!(error = %error, "source log re-poisoned immediately after reopen");
+                }
+            }
+        }
     }
 
     fn set_health(&self, f: impl FnOnce(&mut crate::health::HealthState)) {

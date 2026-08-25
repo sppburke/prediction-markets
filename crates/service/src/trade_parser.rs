@@ -165,12 +165,18 @@ pub fn parse_trades_strict(
 /// The wallet comes from the payload's own `proxyWallet` (the websocket is a
 /// platform-wide firehose; there is no per-wallet request context). All other
 /// normalization is byte-identical to the REST path via [`convert_trade`].
-pub fn parse_ws_trade(payload: &[u8]) -> Result<IncomingTrade, TradeParseError> {
+/// `received_at` is INJECTED (review F7): live ingest passes the frame receipt
+/// instant; source-log replay passes the envelope's recorded `received_at`, so
+/// replay reconstructs the exact original trade.
+pub fn parse_ws_trade(
+    payload: &[u8],
+    received_at: OffsetDateTime,
+) -> Result<IncomingTrade, TradeParseError> {
     let raw: RawTrade = serde_json::from_slice(payload)?;
     let wallet_hex = raw.proxy_wallet.clone().unwrap_or_default();
     let wallet = WalletAddress::from_hex(&wallet_hex)
         .map_err(|_| TradeParseError::InvalidWallet { value: wallet_hex })?;
-    let mut trade = convert_trade(raw, wallet, OffsetDateTime::now_utc())?;
+    let mut trade = convert_trade(raw, wallet, received_at)?;
     trade.provenance = TradeProvenance::ActivityWs;
     Ok(trade)
 }
@@ -298,7 +304,11 @@ mod tests {
             "fee":"0","eventSlug":"slug","title":"T","pseudonym":"p","bio":""}"#;
         let rest = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY",
             "size":50.7,"price":0.65,"timestamp":1704067200,"outcomeIndex":1}]"#;
-        let w = parse_ws_trade(ws).unwrap();
+        let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+        let w = parse_ws_trade(ws, t).unwrap();
+        // Same payload + same injected instant => fully identical (replay determinism).
+        let w2 = parse_ws_trade(ws, t).unwrap();
+        assert_eq!(w.received_at, w2.received_at);
         let r = &parse_trades(rest, dummy_wallet()).unwrap()[0];
         assert_eq!(w.wallet, r.wallet);
         assert_eq!(w.market_id.0.0, r.market_id.0.0);
@@ -316,14 +326,15 @@ mod tests {
     fn ws_payload_without_valid_wallet_rejected() {
         let ws = br#"{"proxyWallet":"nonsense","conditionId":"0xcond","side":"BUY",
             "size":"1","price":"0.5","timestamp":"1704067200","transactionHash":"0xabc"}"#;
+        let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
         assert!(matches!(
-            parse_ws_trade(ws),
+            parse_ws_trade(ws, t),
             Err(TradeParseError::InvalidWallet { .. })
         ));
         let ws_missing = br#"{"conditionId":"0xcond","side":"BUY","size":"1",
             "price":"0.5","timestamp":"1704067200","transactionHash":"0xabc"}"#;
         assert!(matches!(
-            parse_ws_trade(ws_missing),
+            parse_ws_trade(ws_missing, t),
             Err(TradeParseError::InvalidWallet { .. })
         ));
     }

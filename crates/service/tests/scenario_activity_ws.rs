@@ -79,6 +79,12 @@ fn market_b() -> MarketId {
     ))
 }
 
+fn market_c() -> MarketId {
+    MarketId(VenueMarketId(
+        "0x4444444444444444444444444444444444444444".to_string(),
+    ))
+}
+
 fn make_watchlist(wallet: WalletAddress) -> Watchlist {
     let quality = ReconstructionQuality::new(100).unwrap();
     let score = BasisPoints(200);
@@ -125,7 +131,16 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
+/// Path wrapper so the harness can be 'static for tokio::spawn (WS4) while
+/// keeping the TempDir alive at each call site.
+struct DirHandle(std::path::PathBuf);
+impl DirHandle {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+fn make_dispatcher(dir: &DirHandle) -> ExecutionDispatcher {
     let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
     let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
     ExecutionDispatcher::paper_only(paper_executor)
@@ -153,12 +168,14 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
 
 /// Run `trades` through a fresh orchestrator with the given #530 posture.
 async fn run_trades_ws(
-    dir: &TempDir,
+    dir: std::path::PathBuf,
     paper_state: Arc<PaperStateDb>,
     activity_ws_enabled: bool,
     health: SharedHealth,
     trades: Vec<IncomingTrade>,
 ) {
+    let dir_guard = DirHandle(dir);
+    let dir = &dir_guard;
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, "0.50");
 
@@ -227,7 +244,7 @@ async fn ws1_duplicate_ws_then_rest_yields_one_decision() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let now = OffsetDateTime::now_utc();
     run_trades_ws(
-        &dir,
+        dir.path().to_path_buf(),
         paper_state.clone(),
         true,
         healthy_ws_health(),
@@ -258,7 +275,7 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
     let now = OffsetDateTime::now_utc();
     let stale_id = SourceTradeId("0xstale".to_string());
     run_trades_ws(
-        &dir,
+        dir.path().to_path_buf(),
         paper_state.clone(),
         true,
         healthy_ws_health(),
@@ -272,6 +289,14 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
             ),
             // Fresh websocket observation in another market: must still fill.
             trade_at("0xfresh", market_b(), now, TradeProvenance::ActivityWs),
+            // Fractional boundary (review F6): 2.5s old with a 2s budget IS stale —
+            // whole-second truncation would have admitted it (2 > 2 false).
+            trade_at(
+                "0xboundary",
+                market_c(),
+                now - time::Duration::milliseconds(2_500),
+                TradeProvenance::RestPoll,
+            ),
         ],
     )
     .await;
@@ -294,6 +319,14 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
         "recorded age must reflect the observation age (got {age})"
     );
     assert_eq!(reason, "stale_fallback_past_copy_budget");
+    let boundary_id = SourceTradeId("0xboundary".to_string());
+    assert!(
+        paper_state
+            .no_copy_disposition(&boundary_id)
+            .unwrap()
+            .is_some(),
+        "a 2.5s-old fallback trade must be stale under a 2s budget (no truncation)"
+    );
     // The stale trade still advanced the leader ledger (bookkeeping intact).
     let rows = paper_state.leader_positions().unwrap();
     assert!(
@@ -312,7 +345,7 @@ async fn ws3_disabled_mode_processes_old_rest_trades_unchanged() {
     let now = OffsetDateTime::now_utc();
     let id = SourceTradeId("0xlegacy".to_string());
     run_trades_ws(
-        &dir,
+        dir.path().to_path_buf(),
         paper_state.clone(),
         false, // flag off
         new_shared_health_with_ws(false, false, 90),
@@ -335,10 +368,10 @@ async fn ws3_disabled_mode_processes_old_rest_trades_unchanged() {
     );
 }
 
-// ── WS4: dual-unhealthy ⇒ refused before any state write ─────────────────────
+// ── WS4: dual-unhealthy ⇒ the trade is HELD, then admits exactly once ────────
 
 #[tokio::test]
-async fn ws4_dual_unhealthy_leaves_trade_unseen_for_redelivery() {
+async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let health = healthy_ws_health();
@@ -351,8 +384,12 @@ async fn ws4_dual_unhealthy_leaves_trade_unseen_for_redelivery() {
     }
     let now = OffsetDateTime::now_utc();
     let id = SourceTradeId("0xblocked".to_string());
-    run_trades_ws(
-        &dir,
+
+    // Run the orchestrator concurrently: the blocked trade must be HELD (review
+    // F1 — dropping it would orphan a websocket trade behind the poll cursor),
+    // with no state write while both sources are unhealthy.
+    let run = tokio::spawn(run_trades_ws(
+        dir.path().to_path_buf(),
         paper_state.clone(),
         true,
         health.clone(),
@@ -362,42 +399,32 @@ async fn ws4_dual_unhealthy_leaves_trade_unseen_for_redelivery() {
             now,
             TradeProvenance::ActivityWs,
         )],
-    )
-    .await;
-    assert_eq!(paper_fill_count(&dir), 0, "blocked trade must not fill");
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    assert!(
+        !run.is_finished(),
+        "orchestrator must hold the blocked trade, not drop it"
+    );
+    assert_eq!(paper_fill_count(&dir), 0, "no fill while blocked");
     assert!(
         !paper_state.is_seen(&id).unwrap(),
-        "blocked trade must stay unseen so redelivery admits it"
-    );
-    assert!(
-        paper_state.leader_positions().unwrap().is_empty(),
-        "blocked trade must not touch the leader ledger"
+        "no state write while blocked"
     );
 
-    // Recovery: sources healthy again → the redelivered trade admits exactly once.
+    // Recovery: one source healthy again -> the HELD trade admits exactly once.
     {
         let mut h = health.lock().unwrap();
         h.poll_error_streak = 0;
-        h.ws_connected = true;
-        h.ws_last_valid_frame_at = Some(OffsetDateTime::now_utc());
+        h.poll_last_round_at = Some(OffsetDateTime::now_utc());
     }
-    run_trades_ws(
-        &dir,
-        paper_state.clone(),
-        true,
-        health,
-        vec![trade_at(
-            "0xblocked",
-            market(),
-            now,
-            TradeProvenance::ActivityWs,
-        )],
-    )
-    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        .await
+        .expect("orchestrator must finish after recovery")
+        .unwrap();
     assert_eq!(
         paper_fill_count(&dir),
         1,
-        "redelivery after recovery fills once"
+        "held trade fills exactly once after recovery"
     );
     assert!(paper_state.is_seen(&id).unwrap());
 }
@@ -422,7 +449,8 @@ fn ws5_source_log_replay_reconstructs_identical_trades() {
             let (raws, malformed) = parse_activity_frame(frame).unwrap();
             assert_eq!((raws.len(), malformed), (1, 0));
             let raw = &raws[0];
-            let trade = trade_parser::parse_ws_trade(&raw.payload_json).unwrap();
+            let received = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+            let trade = trade_parser::parse_ws_trade(&raw.payload_json, received).unwrap();
             sink.append_durable(EnvelopeIn {
                 source_id: SourceId("polymarket-activity-ws".to_string()),
                 schema_version: ACTIVITY_WS_SCHEMA_VERSION,
@@ -443,7 +471,9 @@ fn ws5_source_log_replay_reconstructs_identical_trades() {
         .map(|item| {
             let (_seq, env) = item.unwrap();
             assert_eq!(env.schema_version, ACTIVITY_WS_SCHEMA_VERSION);
-            trade_parser::parse_ws_trade(&env.payload).unwrap()
+            // Review F7: replay injects the envelope's recorded receipt instant,
+            // reconstructing the EXACT original trade (received_at included).
+            trade_parser::parse_ws_trade(&env.payload, env.received_at.0).unwrap()
         })
         .collect();
 
@@ -458,7 +488,9 @@ fn ws5_source_log_replay_reconstructs_identical_trades() {
         assert_eq!(orig.contracts, replay.contracts);
         assert_eq!(orig.observed_at, replay.observed_at);
         assert_eq!(orig.provenance, replay.provenance);
-        // received_at is stamped at parse time by design; identity is the decision
-        // inputs above, which drive fan-in and dedup.
+        assert_eq!(
+            orig.received_at, replay.received_at,
+            "replay must reconstruct the exact original (envelope receipt injected)"
+        );
     }
 }

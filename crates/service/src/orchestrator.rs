@@ -663,16 +663,40 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let now = OffsetDateTime::now_utc();
-            h.polymarket_last_event_at = Some(now);
-            h.copy_admission_blocked(now)
+            h.copy_admission_blocked(OffsetDateTime::now_utc())
         };
         if admission_blocked {
             warn!(
                 trade = %trade.source_trade_id,
-                "copy admission blocked: both trade sources unhealthy (#530); trade left unseen for redelivery"
+                "copy admission blocked: both trade sources unhealthy (#530); holding the trade until a source recovers"
             );
-            return;
+            // #530 review F1: dropping the refused trade would orphan it — a
+            // websocket-delivered trade behind the poll cursor is never refetched
+            // (the cursor is a bandwidth bound, not a redelivery guarantee). Hold
+            // THIS trade instead: the bounded channel backpressures upstream,
+            // order is preserved, and nothing stages while both sources are
+            // unhealthy. Shutdown still works (the service aborts this task).
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let unblocked = {
+                    let h = self
+                        .health
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    !h.copy_admission_blocked(OffsetDateTime::now_utc())
+                };
+                if unblocked {
+                    break;
+                }
+            }
+        }
+        // Liveness marks only for trades that passed (or outlasted) the gate.
+        {
+            let mut h = self
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            h.polymarket_last_event_at = Some(OffsetDateTime::now_utc());
         }
 
         // INPUT DEDUP: the first action after recording freshness, before any
@@ -737,8 +761,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // ONE transaction, so the held cursor (#511) advances — but stages no
         // copy. Copying it late is the padded-watchlist loss class.
         if self.activity_ws_enabled && trade.provenance == TradeProvenance::RestPoll {
-            let age_secs = (OffsetDateTime::now_utc() - trade.observed_at).whole_seconds();
-            if age_secs > self.copy_latency_budget_secs as i64 {
+            let age = OffsetDateTime::now_utc() - trade.observed_at;
+            let age_secs = age.whole_seconds();
+            // Full-Duration compare (#530 review F6): 2.5s old with a 2s budget IS
+            // stale; whole-second truncation would admit up to budget+1s. The budget
+            // is bounds-checked at config load; try_from is belt-and-suspenders.
+            let budget = time::Duration::seconds(
+                i64::try_from(self.copy_latency_budget_secs).unwrap_or(i64::MAX),
+            );
+            if age > budget {
                 let disposition = pe_paper_state::NoCopyDisposition {
                     provenance: "rest_poll".to_string(),
                     age_secs,

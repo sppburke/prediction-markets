@@ -22,8 +22,9 @@ use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::AppliedWatchlistCapacity;
 
 /// #530: split trade-source health for the observability surface. Ages are in
-/// seconds; `None` = never. Written even when the websocket is disabled so the
-/// posture is explicit.
+/// seconds; `None` = never. Emitted ONLY when the websocket is enabled — with the
+/// flag off, `status.json` stays byte-identical to pre-#530 (review F8; the
+/// disabled posture IS the rollback contract).
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceHealthStatus {
     pub activity_ws_enabled: bool,
@@ -42,7 +43,8 @@ pub struct SourceHealthStatus {
 pub struct StatusSnapshot {
     /// RFC-3339 UTC instant this snapshot was written.
     pub updated_at: String,
-    /// #530: split websocket / REST-poll source health.
+    /// #530: split websocket / REST-poll source health (enabled mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_health: Option<SourceHealthStatus>,
     pub uptime_secs: u64,
     /// Execution mode string (`shadow` | `paper` | `live_tiny` | `promoted`).
@@ -192,22 +194,33 @@ pub async fn run_status_writer(
             .as_ref()
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0);
-        let source_health = health.as_ref().map(|h| {
-            let now = OffsetDateTime::now_utc();
-            let h = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let age = |t: Option<OffsetDateTime>| t.map(|t| (now - t).whole_seconds());
-            SourceHealthStatus {
-                activity_ws_enabled: h.activity_ws_enabled,
-                ws_connected: h.ws_connected,
-                ws_last_frame_age_secs: age(h.ws_last_frame_at),
-                ws_last_valid_frame_age_secs: age(h.ws_last_valid_frame_at),
-                ws_consecutive_reconnects: h.ws_consecutive_reconnects,
-                ws_sink_poisoned: h.ws_sink_poisoned,
-                poll_last_round_age_secs: age(h.poll_last_round_at),
-                poll_error_streak: h.poll_error_streak,
-                copy_admission_blocked: h.copy_admission_blocked(now),
-            }
-        });
+        let source_health = health
+            .as_ref()
+            .and_then(|h| {
+                {
+                    let g = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !g.activity_ws_enabled {
+                        return None;
+                    }
+                }
+                Some(h)
+            })
+            .map(|h| {
+                let now = OffsetDateTime::now_utc();
+                let h = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let age = |t: Option<OffsetDateTime>| t.map(|t| (now - t).whole_seconds());
+                SourceHealthStatus {
+                    activity_ws_enabled: h.activity_ws_enabled,
+                    ws_connected: h.ws_connected,
+                    ws_last_frame_age_secs: age(h.ws_last_frame_at),
+                    ws_last_valid_frame_age_secs: age(h.ws_last_valid_frame_at),
+                    ws_consecutive_reconnects: h.ws_consecutive_reconnects,
+                    ws_sink_poisoned: h.ws_sink_poisoned,
+                    poll_last_round_age_secs: age(h.poll_last_round_at),
+                    poll_error_streak: h.poll_error_streak,
+                    copy_admission_blocked: h.copy_admission_blocked(now),
+                }
+            });
         let mut snap = build_snapshot(
             &paper_state,
             &mode,
