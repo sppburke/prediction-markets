@@ -4,6 +4,7 @@
 //! current positions, closed positions, user activity) on a configurable
 //! interval, emitting raw `SourceEvent` payloads for downstream parsing.
 
+pub mod activity_ws;
 pub mod clob_prices_history;
 pub mod config;
 pub mod connector;
@@ -12,6 +13,12 @@ pub mod fetcher;
 pub mod gamma_markets;
 pub mod live_admission;
 
+pub use activity_ws::{
+    ACTIVITY_WS_BACKOFF_CAP_SECS, ACTIVITY_WS_DEAD_SECS, ACTIVITY_WS_PARSER_VERSION,
+    ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SILENCE_RESUBSCRIBE_SECS, ACTIVITY_WS_STALE_SECS,
+    ACTIVITY_WS_SUBSCRIBE, ACTIVITY_WS_URL, ActivityTradeRaw, ActivityWsError, ActivityWsPolicy,
+    ActivityWsStream, PolicyAction, WsStaleness, backoff_secs, parse_activity_frame,
+};
 pub use clob_prices_history::{
     CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS,
     ClobPricesHistoryClient, ClobPricesHistoryError, PricePoint,
