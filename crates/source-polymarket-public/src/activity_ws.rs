@@ -285,9 +285,27 @@ pub struct ActivityWsStream {
     inner: WsInner,
 }
 
+/// Install the process-default rustls crypto provider exactly once.
+///
+/// The dependency graph carries TWO providers — `ring` (reqwest's
+/// `rustls-tls`) and `aws-lc-rs` (tokio-tungstenite's
+/// `rustls-tls-webpki-roots`) — so rustls 0.23 has no implicit default and
+/// `ClientConfig::builder()` PANICS on first use. That panic crash-looped
+/// pe-service on the 2026-08-25 #530 deploy (rustls crypto/mod.rs:249);
+/// tests never caught it because every websocket test uses fake streams.
+/// Pinning `ring` adds no compilation (both are already built).
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Err = a default was already installed elsewhere — equally fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl ActivityWsStream {
     /// Dial [`ACTIVITY_WS_URL`] and send [`ACTIVITY_WS_SUBSCRIBE`].
     pub async fn connect_and_subscribe() -> Result<Self, ActivityWsError> {
+        ensure_crypto_provider();
         let (inner, _response) = tokio_tungstenite::connect_async(ACTIVITY_WS_URL)
             .await
             .map_err(|e| ActivityWsError::Transport {
@@ -424,6 +442,19 @@ mod tests {
         assert_eq!(p.staleness(320), WsStaleness::Dead);
         p.on_frame(320, true);
         assert_eq!(p.staleness(320), WsStaleness::Fresh);
+    }
+
+    #[test]
+    fn crypto_provider_installs_and_tls_config_builds() {
+        // Regression for the 2026-08-25 crash-loop: without an installed
+        // process default, this exact builder call panics under the dual-
+        // provider graph. No network involved.
+        ensure_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        let roots = rustls::RootCertStore::empty();
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     }
 
     #[test]

@@ -22,6 +22,7 @@ pe-source-core = { path = "../source-core", version = "0.1.0" }
 futures = { workspace = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
