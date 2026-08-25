@@ -46,6 +46,7 @@ fn make_trade(wallet: WalletAddress, side: Side, contracts: u64, ts_unix: i64) -
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(format!("{wallet:?}-{side:?}-{contracts}-{ts_unix}")),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

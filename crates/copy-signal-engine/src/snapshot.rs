@@ -10,6 +10,22 @@ use pe_core_types::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Transport a trade observation arrived on (#530). The stale-fallback
+/// admission rule and the split health surfaces key on this: a REST-fallback
+/// observation older than the calibrated copy budget is admitted for
+/// bookkeeping but stages no copy, while websocket observations are the
+/// primary low-latency path. Serde-defaulted to `RestPoll` so fixtures and
+/// recordings from before the field existed replay unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeProvenance {
+    /// Observed by the REST `/activity` poller (today's always-on fallback).
+    #[default]
+    RestPoll,
+    /// Observed on the live-data activity websocket (primary push path).
+    ActivityWs,
+}
+
 /// A freshly observed trade from a leader wallet to be classified.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingTrade {
@@ -24,6 +40,9 @@ pub struct IncomingTrade {
     #[serde(with = "time::serde::rfc3339")]
     pub received_at: OffsetDateTime,
     pub source_trade_id: SourceTradeId,
+    /// Which transport observed this trade (#530). Defaulted for pre-field recordings.
+    #[serde(default)]
+    pub provenance: TradeProvenance,
 }
 
 /// Net contract exposure on each side for one `(market, outcome)` bucket.

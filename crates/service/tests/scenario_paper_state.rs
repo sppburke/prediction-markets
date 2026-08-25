@@ -97,6 +97,7 @@ fn trade(source_trade_id: &str, side: Side, contracts: u64, observed_unix: i64) 
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(source_trade_id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

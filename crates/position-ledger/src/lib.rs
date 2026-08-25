@@ -126,6 +126,7 @@ impl Default for PositionLedger {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use pe_copy_signal_engine::TradeProvenance;
     use pe_core_types::{ContractQty, OutcomeId, Price, SourceTradeId};
     use rust_decimal_macros::dec;
     use time::OffsetDateTime;
@@ -153,6 +154,7 @@ mod tests {
             observed_at: ts,
             received_at: ts,
             source_trade_id: SourceTradeId("t1".to_string()),
+            provenance: TradeProvenance::RestPoll,
         }
     }
 
@@ -306,6 +308,7 @@ mod tests {
 )]
 mod restore_tests {
     use super::*;
+    use pe_copy_signal_engine::TradeProvenance;
     use pe_core_types::{MarketId, OutcomeId, VenueMarketId};
 
     #[test]
@@ -323,6 +326,7 @@ mod restore_tests {
             observed_at: time::OffsetDateTime::UNIX_EPOCH,
             received_at: time::OffsetDateTime::UNIX_EPOCH,
             source_trade_id: pe_core_types::SourceTradeId("t".into()),
+            provenance: TradeProvenance::RestPoll,
         };
         // Entry created by the trade → restore(None) removes it entirely.
         ledger.ingest(&trade(10, Side::Buy));

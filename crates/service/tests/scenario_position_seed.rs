@@ -52,6 +52,7 @@ fn buy_trade(wallet: WalletAddress, contracts: u64, trade_id: &str) -> IncomingT
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(trade_id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

@@ -100,6 +100,7 @@ fn entry_trade(id: &str, market: &str, price: Decimal) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

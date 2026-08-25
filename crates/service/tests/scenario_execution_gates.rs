@@ -95,6 +95,7 @@ fn entry_trade(id: &str, market_id: MarketId, price: Decimal) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
@@ -571,6 +572,7 @@ fn bestask_trade(id: &str, side: Side, leader_price: Decimal) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

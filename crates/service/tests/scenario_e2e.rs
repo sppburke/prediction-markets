@@ -96,6 +96,7 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId("trade_a1".to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
