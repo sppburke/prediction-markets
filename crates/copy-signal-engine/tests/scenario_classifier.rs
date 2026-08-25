@@ -3,6 +3,7 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::collections::HashMap;
 
 use pe_copy_signal_engine::{

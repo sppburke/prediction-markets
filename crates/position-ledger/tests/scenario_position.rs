@@ -12,6 +12,7 @@
 )]
 
 use pe_copy_signal_engine::IncomingTrade;
+use pe_copy_signal_engine::TradeProvenance;
 use pe_core_types::{
     ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId,
     WalletAddress,

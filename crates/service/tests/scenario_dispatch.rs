@@ -16,6 +16,7 @@
     clippy::too_many_arguments
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;

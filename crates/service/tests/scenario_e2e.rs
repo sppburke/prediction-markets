@@ -23,6 +23,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::str::FromStr;
 use std::sync::Arc;
 

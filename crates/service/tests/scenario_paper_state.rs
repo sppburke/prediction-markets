@@ -20,6 +20,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};

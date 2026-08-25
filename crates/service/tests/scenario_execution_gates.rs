@@ -19,6 +19,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
