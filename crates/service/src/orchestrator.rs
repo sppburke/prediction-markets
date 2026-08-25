@@ -659,7 +659,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // it stays unseen, so the held cursor / firehose backstop redelivers it
         // exactly once when a source recovers.
         let admission_blocked = {
-            let mut h = self
+            let h = self
                 .health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
