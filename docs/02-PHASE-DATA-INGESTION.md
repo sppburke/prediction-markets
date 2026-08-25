@@ -141,9 +141,9 @@ Stale and block thresholds come from `_GLOSSARY.md` ("Source freshness defaults"
 
 ## Winner-Follow ingestion priority
 
-Before specialized weather/crypto/sports/macro source gateways, build the trader-intelligence ingestion path. The crate is `source-trader` (not `source-trader-polymarket`/`source-trader-kalshi`); venue-specific behavior lives in submodules `source_trader::polymarket` and `source_trader::kalshi`.
+Before specialized weather/crypto/sports/macro source gateways, build the trader-intelligence ingestion path. As built, the Polymarket owner is `source-polymarket-public` (REST endpoints, the attributed live-data activity websocket in `activity_ws`, and shared fetch/parse machinery); the historical `source-trader` naming below is the original plan shape, retained for the endpoint inventory.
 
-### `source-trader::polymarket`
+### Polymarket trader ingestion (`source-polymarket-public`)
 
 - leaderboard snapshots by category, offset, and time window;
 - public user trades by wallet/profile address;
@@ -163,7 +163,7 @@ Before specialized weather/crypto/sports/macro source gateways, build the trader
 
 ### Polling and streaming discipline
 
-- Polymarket leader watchlist trade polling uses adaptive intervals: sub-second only for top active leaders and markets that have just printed; slower intervals for dormant leaders. Concrete defaults: 500 ms for top-10 active leaders with markets traded in the last 60 s; 5 s for top-50; 30 s for tail watchlist.
+- Primary trade observation is the attributed live-data activity websocket (#530): one platform-wide subscription, watchlist filtering by hash lookup — observation cost is flat in watchlist size, so no adaptive per-wallet polling tiers are needed. The REST `/activity` poll runs always-on at `trade_poll_interval_secs` as the correctness backstop.
 - Every poll result is diffed against the last event hash; duplicate trade events are ignored by the deterministic idempotency key in `_GLOSSARY.md` ("Idempotency").
-- WebSocket streams are used for market-state latency, but public trader identification is reconstructed from Data API/profile endpoints and public transaction metadata when needed.
+- The CLOB market websocket remains wallet-anonymous (market-state only); attributed trader identity comes from the live-data activity feed's `proxyWallet` (#530) with the Data API as the polled backstop.
 - All scanner loops respect the budgets in `_GLOSSARY.md` ("Venue rate limits"); rate-limit handling is a first-class event, not an exception swallowed by retry logic.

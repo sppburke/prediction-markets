@@ -53,9 +53,31 @@ local release build before shipping; on the VPS, **staged** = the hash of
    restart loop), watchlist seeded from `latest_ranking`, `service_config poll loop
    started`, no poll failures; then confirm behavior-specific log lines for the deploy
    (e.g. the first `full re-rank membership swap applied` after a ranking push).
+   **With `polymarket_activity_ws_enabled=true` (#530), additionally verify the
+   source-health block in `status.json`**: `ws_connected=true`, a fresh
+   `ws_last_valid_frame_age_secs`, `ws_sink_poisoned=false`, a fresh
+   `poll_last_round_age_secs` with `poll_error_streak=0`, and
+   `copy_admission_blocked=false`; `/health/ready` must carry none of
+   `activity_ws_stale`, `activity_ws_dead`, `activity_ws_sink_poisoned`,
+   `copy_admission_blocked`. Then observe one websocket-observed copy (or a
+   `stale fallback observation` line proving the budget rule) before declaring
+   the enabled deploy healthy. **Deployment one-time note (#530)**: delete the
+   retired runtime row `delete from service_config where key='trade_poll_interval_secs';`
+   (boot-owned only now).
 
 An interrupted deploy is resumed by re-running from step 3: the hash comparisons decide
 whether to re-ship, re-swap, or only start and verify — never guess from memory.
+
+## #530 websocket rollback ordering
+
+Disabling `polymarket_activity_ws_enabled` (or rolling back to a pre-#530 binary)
+reverts observation to poll-only — proven byte-identical by scenario WS3. **Reverse
+dependency order is mandatory**: while a Δ=2 ranking batch is latest, the flag stays
+enabled so stale REST observations keep failing closed; first restore and publish a
+Δ=20 ranking, verify the newest `ranking_batches.latency_shift_secs = 20` and that
+pe-service applied that batch, and only then disable the flag or roll the binary
+back. Disabling first would copy Δ=2-selected wallets at poll latency — the
+padded-watchlist loss class.
 
 ## #510 restart semantics (authoritative mode)
 

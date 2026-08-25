@@ -17,7 +17,7 @@ Responsibilities:
 - market WebSocket;
 - user WebSocket;
 - sports WebSocket;
-- RTDS connector where useful;
+- (RTDS attributed-trade ingestion is a SOURCE concern, not a venue one: `source-polymarket-public::activity_ws` owns it — #530. The venue adapter keeps market/user/sports sockets and order paths only.)
 - signed order submission;
 - market and event discovery;
 - book snapshots/deltas;

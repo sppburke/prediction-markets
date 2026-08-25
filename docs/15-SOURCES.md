@@ -38,10 +38,26 @@
 
 ## Polymarket
 
-> **WebSocket design note (2026-06-03, issue #282 Phase 2 verification).**
-> `wss://ws-live-data.polymarket.com` (RTDS) provides comments, crypto prices, and equity prices only — no trade data.
+> **SUPERSEDED (2026-08-25, issue #530 re-verification): RTDS DOES carry attributed trades.**
+> The 2026-06-03 conclusion below no longer holds for `wss://ws-live-data.polymarket.com`:
+> subscribing `{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}`
+> streams **every platform trade with `proxyWallet`** (the identity axis `latest_ranking`
+> ranks), plus `conditionId`, `asset`, `outcome`/`outcomeIndex`, `price`, `size`, `side`,
+> `timestamp` (seconds, as a string), `transactionHash`, and profile fields; `fee` is
+> optional per trade. No authentication. Measured 2026-08-24: p50 0.80s / p95 1.32s /
+> p99 1.41s trade-timestamp→receipt over 6,293 trades; a 14h soak found the stream live
+> only ~113/840 minutes on ping-alive sockets (subscription lapses silently — 1,442
+> thirty-second silences vs 16 hard disconnects), so silence-triggered resubscribe /
+> reconnect and the always-on REST poll fallback are load-bearing. **Unofficial UI feed,
+> no documented contract**: re-check the endpoint, subscription shape, and payload keys
+> before each deploy that relies on it (`scripts/probe_activity_ws.py`). Owner:
+> `source-polymarket-public::activity_ws` (transport/envelope/policy); the service's
+> `trade_parser` normalizes identically to the REST path. The CLOB market channel
+> remains wallet-anonymous — the note below stands for THAT feed.
+> Last checked: 2026-08-25.
+>
+> **Historical (2026-06-03, issue #282 Phase 2 verification — CLOB channel still true; RTDS part superseded above).**
 > `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include the **wallet address**; wallet-level trade identification is impossible from the frame alone.
-> No Polymarket WebSocket supports per-wallet trade subscriptions. The REST `/activity` poll remains the primary ingestion path (issue #282 Open risk #1 materialized). Phase 2 RTDS ingestion is deferred.
 >
 > **Correction (2026-06-09, issue #300 live capture).** A live `last_trade_price` market-channel frame **does** carry `transaction_hash` — verified against 2,581 captured frames (100% present, one unique hash per print, zero collisions). The earlier note that it omits `transaction_hash` is superseded; only the wallet address is absent, so wallet-level identity still requires an on-chain tx lookup, but the print is uniquely keyable. Full frame shape: `{market, asset_id, price, size, side, timestamp, fee_rate_bps, event_type, transaction_hash}` — `market` is the condition_id (authoritative, present on every print). `pe-crypto-shadow` keys `clob_trades` on `transaction_hash` and attributes via `market`.
 >

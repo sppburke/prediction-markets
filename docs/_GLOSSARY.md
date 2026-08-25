@@ -34,6 +34,16 @@ End-to-end target from `leader_trade_observed_at` (gateway receive) to `follower
 
 If running p95 over the prior hour exceeds budget by 50 % for two consecutive 5-minute windows, the **copy-latency kill switch** (see `19-WINNER-FOLLOW-STRATEGY.md`) blocks new entries until p95 returns under budget.
 
+> **Two latency metrics, deliberately distinct (#530).** The budget above measures
+> `gateway receive → venue ack` (the service's internal span). The ranker's latency
+> shift (Δ, `LATENCY_SHIFT_SECS`) calibrates against a LONGER span: `leader trade
+> timestamp → durable paper fill`, which additionally includes the venue's own feed
+> delay (measured p50 0.80s / p95 1.32s on the activity websocket). Δ is set to that
+> full span's measured p95, conservatively rounded (currently 2s), never below
+> measurement; the +1-week re-check artifact reports the full denominator (admitted
+> copies, fills, no-fill dispositions, missing spans, clock exclusions; NTP-checked;
+> nearest-rank p95; rounded up to whole seconds).
+
 Per-stage budgets are illustrative and refined by `latency-attribution-profiler`:
 
 | Stage | p95 budget |
@@ -280,7 +290,13 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_request_timeout_secs` | 10 | Per-request HTTP timeout before the request is abandoned |
 | `polymarket_max_retries` | 3 | Retries on network errors and 5xx (4 total attempts: initial + 3 retries) |
 | `polymarket_channel_capacity` | 256 | Bounded mpsc channel capacity between trade poller and orchestrator |
-| `trade_poll_interval_secs` | 30 | Seconds between Polymarket trade poll rounds (one round = all watchlisted wallets) |
+| `trade_poll_interval_secs` | 30 | Seconds between Polymarket trade poll rounds (one round = all watchlisted wallets, fetched sequentially — revisit time = round duration + this sleep). BOOT-OWNED (TOML/env only; the former runtime-config surface was inert and removed in #530). With the activity websocket enabled the poll is the always-on correctness backstop, not the latency path |
+| `polymarket_activity_ws_enabled` | false | #530: websocket-primary trade observation via the unofficial live-data feed (`docs/15` entry + re-check policy). Boot-owned; false = poll-only, byte-identical to pre-#530 (the rollback posture). Never disable while a Δ=2 batch is latest — reverse-order rollback: restore a Δ=20 batch first |
+| `copy_latency_budget_secs` | 2 | #530: while websocket-primary, a REST-fallback observation older than this is admitted with a typed no-copy disposition (`no_copy_dispositions`) and stages no copy. Matches the deployed ranker `LATENCY_SHIFT_SECS`; re-checked at +1 week against the measured span artifact |
+| `activity_ws_silence_resubscribe_secs` | 30 | #530: silence on a live socket before re-sending the subscription (soak-proven zombie mode). Code constant in `source-polymarket-public::activity_ws` |
+| `activity_ws_stale_secs` | 120 | #530: no valid frame for this long ⇒ websocket source STALE (readiness issue; stale + unhealthy poll = copy admission blocked) |
+| `activity_ws_dead_secs` | 300 | #530: no valid frame for this long ⇒ websocket source DEAD |
+| `poll_unhealthy_error_streak` | 3 | #530: consecutive all-error poll rounds at which the REST source counts unhealthy (round-age bound: 3 × `trade_poll_interval_secs`) |
 | `polymarket_clob_base_url` | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL for order submission and status polling |
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
