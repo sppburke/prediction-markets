@@ -23,6 +23,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -96,6 +97,7 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId("trade_a1".to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
@@ -169,6 +171,8 @@ async fn scenario_e2e_clean_exit() {
         trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -240,6 +244,8 @@ async fn scenario_graceful_shutdown() {
         trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),

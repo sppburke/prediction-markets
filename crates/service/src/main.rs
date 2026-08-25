@@ -29,7 +29,7 @@ use pe_service::config_poller::{
     fetch_service_config, run_capacity_worker, run_config_poll_loop,
 };
 use pe_service::entry_gate::CopyEntryGateConfig;
-use pe_service::health::new_shared_health;
+use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
@@ -291,7 +291,11 @@ async fn main() -> Result<()> {
 
     let dispatcher = ExecutionDispatcher::paper_only(paper_executor);
 
-    let health = new_shared_health(false);
+    let health = new_shared_health_with_ws(
+        false,
+        cfg.polymarket_activity_ws_enabled,
+        i64::try_from(cfg.trade_poll_interval_secs.saturating_mul(3)).unwrap_or(i64::MAX),
+    );
 
     // Bounded channel per _GLOSSARY.md defaults.
     let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
@@ -382,6 +386,31 @@ async fn main() -> Result<()> {
             reseed_fetcher,
             control_tx.clone(),
         )))
+    } else {
+        None
+    };
+
+    // #530: websocket-primary ingest task (flag-gated). Owns the source event
+    // log; a boot-time open failure fails boot — enabled mode must satisfy the
+    // raw-evidence invariant. Disabled mode spawns nothing (poll-only,
+    // byte-identical to pre-#530 behavior — the rollback posture).
+    let activity_ingest_task = if cfg.polymarket_activity_ws_enabled {
+        let sink = pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+            .with_context(|| {
+                format!(
+                    "open source event log {}",
+                    cfg.source_event_log_path.display()
+                )
+            })?;
+        Some(tokio::spawn(
+            pe_service::activity_ingest::ActivityIngest::new(
+                live_watchlist.clone(),
+                sink,
+                trade_tx.clone(),
+                health.clone(),
+            )
+            .run(),
+        ))
     } else {
         None
     };
@@ -590,6 +619,8 @@ async fn main() -> Result<()> {
             signal_config: Default::default(),
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
+            activity_ws_enabled: cfg.polymarket_activity_ws_enabled,
+            copy_latency_budget_secs: cfg.copy_latency_budget_secs,
             max_fill_price,
             min_fill_price,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
@@ -760,6 +791,7 @@ async fn main() -> Result<()> {
             cfg.supabase_authoritative,
             supabase_rpc_calls,
             live_accounts.clone(),
+            Some(health.clone()),
         )))
     } else {
         None
@@ -802,6 +834,9 @@ async fn main() -> Result<()> {
 
     info!("orchestrator stopped; cleaning up");
     trade_task.abort();
+    if let Some(t) = activity_ingest_task {
+        t.abort();
+    }
     http_task.abort();
     resolution_task.abort();
     if let Some(t) = reseed_task {

@@ -160,7 +160,6 @@ pub struct RuntimeConfig {
     pub min_resolution_horizon_secs: u64,
     pub max_resolution_horizon_secs: u64,
     pub entry_gate_fail_closed: bool,
-    pub trade_poll_interval_secs: u64,
     pub position_reseed_interval_secs: u64,
     pub position_page_limit: u32,
     pub position_size_threshold: u32,
@@ -211,7 +210,6 @@ impl RuntimeConfig {
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
             entry_gate_fail_closed: cfg.entry_gate_fail_closed,
-            trade_poll_interval_secs: cfg.trade_poll_interval_secs,
             position_reseed_interval_secs: cfg.position_reseed_interval_secs,
             position_page_limit: cfg.position_page_limit,
             position_size_threshold: cfg.position_size_threshold,
@@ -336,11 +334,6 @@ pub fn parse_config(
         &map,
         "entry_gate_fail_closed",
         &mut out.entry_gate_fail_closed,
-    );
-    apply_parsed(
-        &map,
-        "trade_poll_interval_secs",
-        &mut out.trade_poll_interval_secs,
     );
     apply_parsed(
         &map,
@@ -939,12 +932,12 @@ mod tests {
     fn unparseable_field_keeps_last_known_good() {
         let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
         let rows = vec![
-            row("trade_poll_interval_secs", "not_a_number", "integer"),
+            row("position_page_limit", "not_a_number", "integer"),
             row("max_fill_price", "not_a_decimal", "decimal"),
             row("paper_fill_haircut_bps", "777", "integer"), // a valid one still applies
         ];
         let out = parse_config(&rows, &boot, false);
-        assert_eq!(out.trade_poll_interval_secs, boot.trade_poll_interval_secs);
+        assert_eq!(out.position_page_limit, boot.position_page_limit);
         assert_eq!(out.max_fill_price, boot.max_fill_price);
         assert_eq!(out.paper_fill_haircut_bps, 777);
     }

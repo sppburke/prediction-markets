@@ -66,6 +66,19 @@ pub enum PaperStateError {
 
 /// One leader's net position in a `(market, outcome)`, mirroring the in-memory
 /// `PositionState`. The service tier groups these into `PositionSnapshot`s.
+/// Typed no-copy disposition for a stale fallback-path trade (#530).
+#[derive(Debug, Clone)]
+pub struct NoCopyDisposition {
+    /// `"rest_poll"` or `"activity_ws"` (schema CHECK-enforced).
+    pub provenance: String,
+    /// Observation age at admission (now − trade timestamp), seconds.
+    pub age_secs: i64,
+    /// Short machine-readable reason, e.g. `"stale_fallback_past_copy_budget"`.
+    pub reason: String,
+    /// Wall-clock admission time (audit only; never a decision input).
+    pub recorded_at_unix: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderPositionRow {
     pub wallet: WalletAddress,
@@ -315,6 +328,42 @@ impl PaperStateDb {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Commit a stale REST-fallback trade with its typed no-copy disposition (#530):
+    /// `mark_seen` + `upsert_leader_position` + the disposition row, one transaction.
+    /// The trade is fully admitted for bookkeeping — the held delivery cursor advances
+    /// through `is_seen` exactly as for any processed trade — but no copy is staged.
+    pub fn commit_seen_no_copy(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        disposition: &NoCopyDisposition,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx_mark_seen(&tx, source_trade_id)?;
+        tx_upsert_leader(&tx, leader)?;
+        tx_record_no_copy_disposition(&tx, source_trade_id, disposition)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read back a no-copy disposition (audit/scenario surface).
+    pub fn no_copy_disposition(
+        &self,
+        source_trade_id: &SourceTradeId,
+    ) -> Result<Option<(String, i64, String)>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT provenance, age_secs, reason FROM no_copy_dispositions
+              WHERE source_trade_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![source_trade_id.0])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+            None => Ok(None),
+        }
     }
 
     /// Commit a processed trade that produced a paper fill. One transaction:
@@ -1466,6 +1515,26 @@ fn tx_flip_dispatch_ready(
         }
     }
     Ok(flipped)
+}
+
+fn tx_record_no_copy_disposition(
+    tx: &Transaction<'_>,
+    source_trade_id: &SourceTradeId,
+    d: &NoCopyDisposition,
+) -> Result<(), PaperStateError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO no_copy_dispositions
+             (source_trade_id, provenance, age_secs, reason, recorded_at_unix)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            source_trade_id.0,
+            d.provenance,
+            d.age_secs,
+            d.reason,
+            d.recorded_at_unix
+        ],
+    )?;
+    Ok(())
 }
 
 fn tx_mark_seen(

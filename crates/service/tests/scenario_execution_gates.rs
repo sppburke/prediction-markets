@@ -19,6 +19,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -95,6 +96,7 @@ fn entry_trade(id: &str, market_id: MarketId, price: Decimal) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
@@ -224,6 +226,8 @@ async fn run_gate_capped(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -571,6 +575,7 @@ fn bestask_trade(id: &str, side: Side, leader_price: Decimal) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
@@ -599,6 +604,8 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
         rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -812,6 +819,8 @@ async fn live_mode_never_fetches_book_ac6() {
         rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::LiveTiny,
             signal_config: SignalConfig::default(),

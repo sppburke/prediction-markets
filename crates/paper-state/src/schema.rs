@@ -36,6 +36,19 @@ CREATE TABLE IF NOT EXISTS seen_trades (
     source_trade_id TEXT PRIMARY KEY NOT NULL
 );
 
+-- #530: durable typed record of an admitted trade that staged NO copy because it
+-- arrived on the REST fallback older than the calibrated copy budget (websocket-
+-- primary mode only). Written in the same transaction as seen/ledger advancement
+-- so the held delivery cursor provably advances through is_seen; provenance, age,
+-- and reason are retained for audit and replay.
+CREATE TABLE IF NOT EXISTS no_copy_dispositions (
+    source_trade_id  TEXT    PRIMARY KEY NOT NULL,
+    provenance       TEXT    NOT NULL CHECK(provenance IN ('rest_poll', 'activity_ws')),
+    age_secs         INTEGER NOT NULL,
+    reason           TEXT    NOT NULL,
+    recorded_at_unix INTEGER NOT NULL
+);
+
 -- Output dedup + replay anchor: one row per recorded paper fill, keyed by the
 -- strategy idempotency key. `event_seq` ties the row to its event-log frame.
 CREATE TABLE IF NOT EXISTS fills (

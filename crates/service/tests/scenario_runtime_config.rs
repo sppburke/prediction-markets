@@ -18,6 +18,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -86,6 +87,7 @@ fn entry_trade(id: &str, hex: &str, price: Decimal) -> IncomingTrade {
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
@@ -153,6 +155,8 @@ async fn run_with(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -316,6 +320,8 @@ async fn run_gate_with(
         rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),

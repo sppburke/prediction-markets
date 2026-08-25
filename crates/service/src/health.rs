@@ -24,17 +24,113 @@ pub struct HealthState {
     /// events is intentional and must not flag the source as stale/dead — that
     /// would make `/health/ready` permanently red and hide a genuine feed break.
     pub polygon_enabled: bool,
+
+    // ── #530: activity-websocket vs REST-poll health split ───────────────────
+    // `polymarket_last_event_at` (above) is the LEGACY liveness mark — refreshed
+    // by successful poll fetches and by gate-passing trades (pre-#530 semantics,
+    // unchanged). The fields below separate transport health so an always-on poller can never
+    // mask a silently dead websocket (the soak-proven zombie mode) and vice
+    // versa. Mirrors the `polygon_enabled` skip-when-disabled precedent.
+    /// Whether the activity websocket is configured (`polymarket_activity_ws_enabled`).
+    pub activity_ws_enabled: bool,
+    /// Socket currently established and subscribed.
+    pub ws_connected: bool,
+    /// Last frame of ANY kind on the socket.
+    pub ws_last_frame_at: Option<OffsetDateTime>,
+    /// Last frame that parsed (staleness/health keys on THIS one).
+    pub ws_last_valid_frame_at: Option<OffsetDateTime>,
+    /// Completed reconnects since the last valid frame.
+    pub ws_consecutive_reconnects: u32,
+    /// Source event log append/sync failed; websocket delivery is blocked until
+    /// the log reopens and revalidates (REST fallback carries the trades).
+    pub ws_sink_poisoned: bool,
+    /// Last SUCCESSFUL poll round (even an empty one) — round health, not trade health.
+    pub poll_last_round_at: Option<OffsetDateTime>,
+    /// When the poller started its first round — bounds the never-succeeded case:
+    /// `None` last-round is unhealthy once this is older than the stale bound
+    /// (#530 review F2: without it, a poller that never succeeds is healthy forever).
+    pub poll_started_at: Option<OffsetDateTime>,
+    /// Consecutive failed poll rounds.
+    pub poll_error_streak: u32,
+    /// Poll round age beyond which the poll source counts unhealthy
+    /// (3 × the configured poll interval, resolved at boot).
+    pub poll_round_stale_secs: i64,
+}
+
+/// Consecutive failed poll rounds at which the REST source counts unhealthy.
+/// Canonical home: `docs/_GLOSSARY.md` (`poll_unhealthy_error_streak`).
+pub const POLL_UNHEALTHY_ERROR_STREAK: u32 = 3;
+
+impl HealthState {
+    /// REST poll source unhealthy: error streak at threshold, or the last
+    /// successful round is older than the stale bound (never-successful counts
+    /// as unhealthy once the process has been up longer than the bound —
+    /// callers pass `now`; boot seeds `poll_last_round_at = None`).
+    pub fn poll_unhealthy(&self, now: OffsetDateTime) -> bool {
+        if self.poll_error_streak >= POLL_UNHEALTHY_ERROR_STREAK {
+            return true;
+        }
+        match (self.poll_last_round_at, self.poll_started_at) {
+            (Some(t), _) => (now - t).whole_seconds() > self.poll_round_stale_secs,
+            // Never succeeded: unhealthy once the poller has been running longer
+            // than the stale bound. Before the poller starts (or in poll-less
+            // tests) there is nothing to distrust yet.
+            (None, Some(started)) => (now - started).whole_seconds() > self.poll_round_stale_secs,
+            (None, None) => false,
+        }
+    }
+
+    /// Websocket source stale-or-worse (#530): no valid frame within the stale
+    /// window, or the sink is poisoned. Only meaningful when enabled.
+    pub fn ws_stale_or_worse(&self, now: OffsetDateTime) -> bool {
+        if self.ws_sink_poisoned {
+            return true;
+        }
+        match self.ws_last_valid_frame_at {
+            Some(t) => {
+                (now - t).whole_seconds() >= pe_source_polymarket_public::ACTIVITY_WS_STALE_SECS
+            }
+            None => !self.ws_connected,
+        }
+    }
+
+    /// Dual-unhealthy admission block (#530): with the websocket enabled, BOTH
+    /// transports unhealthy means no new copy work may stage — queued inputs
+    /// drain as refusals without state writes, and redelivery (held cursor /
+    /// firehose backstop) admits each trade exactly once on recovery.
+    pub fn copy_admission_blocked(&self, now: OffsetDateTime) -> bool {
+        self.activity_ws_enabled && self.ws_stale_or_worse(now) && self.poll_unhealthy(now)
+    }
 }
 
 pub type SharedHealth = Arc<Mutex<HealthState>>;
 
 pub fn new_shared_health(polygon_enabled: bool) -> SharedHealth {
+    new_shared_health_with_ws(polygon_enabled, false, 90)
+}
+
+/// [`new_shared_health`] with the #530 websocket/poll-split posture.
+pub fn new_shared_health_with_ws(
+    polygon_enabled: bool,
+    activity_ws_enabled: bool,
+    poll_round_stale_secs: i64,
+) -> SharedHealth {
     Arc::new(Mutex::new(HealthState {
         polygon_status: SourceStatus::Healthy,
         polymarket_last_event_at: None,
         polygon_last_event_at: None,
         event_log_writable: true,
         polygon_enabled,
+        activity_ws_enabled,
+        ws_connected: false,
+        ws_last_frame_at: None,
+        ws_last_valid_frame_at: None,
+        ws_consecutive_reconnects: 0,
+        ws_sink_poisoned: false,
+        poll_last_round_at: None,
+        poll_started_at: None,
+        poll_error_streak: 0,
+        poll_round_stale_secs,
     }))
 }
 
@@ -91,6 +187,32 @@ pub async fn ready(State(health): State<SharedHealth>) -> (StatusCode, Json<Read
         issues.push("event_log_not_writable");
     }
 
+    // #530: websocket-source issues (skip-when-disabled, like polygon above) and
+    // the dual-unhealthy admission block.
+    {
+        let h = health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if h.activity_ws_enabled {
+            if h.ws_sink_poisoned {
+                issues.push("activity_ws_sink_poisoned");
+            }
+            let valid_age = h.ws_last_valid_frame_at.map(|t| (now - t).whole_seconds());
+            if valid_age.is_none_or(|a| a >= pe_source_polymarket_public::ACTIVITY_WS_DEAD_SECS)
+                && !h.ws_connected
+                || valid_age
+                    .is_some_and(|a| a >= pe_source_polymarket_public::ACTIVITY_WS_DEAD_SECS)
+            {
+                issues.push("activity_ws_dead");
+            } else if h.ws_stale_or_worse(now) {
+                issues.push("activity_ws_stale");
+            }
+            if h.copy_admission_blocked(now) {
+                issues.push("copy_admission_blocked");
+            }
+        }
+    }
+
     let ready = issues.is_empty();
     let status = if ready {
         StatusCode::OK
@@ -128,5 +250,61 @@ mod tests {
     async fn polygon_enabled_flags_stale_when_silent() {
         // WS configured but no events: a genuine staleness signal must still fire.
         assert_eq!(ready_issues(true).await, vec!["polygon_source_stale"]);
+    }
+
+    fn ws_base() -> HealthState {
+        HealthState {
+            polygon_status: SourceStatus::Healthy,
+            polymarket_last_event_at: None,
+            polygon_last_event_at: None,
+            event_log_writable: true,
+            polygon_enabled: false,
+            activity_ws_enabled: true,
+            ws_connected: false,
+            ws_last_frame_at: None,
+            ws_last_valid_frame_at: None,
+            ws_consecutive_reconnects: 0,
+            ws_sink_poisoned: false,
+            poll_last_round_at: None,
+            poll_started_at: None,
+            poll_error_streak: 0,
+            poll_round_stale_secs: 90,
+        }
+    }
+
+    #[test]
+    fn poll_never_succeeded_becomes_unhealthy_after_stale_bound() {
+        // #530 review F2a: without poll_started_at, a poller that never succeeds
+        // stays healthy forever and dual-unhealthy can never engage.
+        let mut h = ws_base();
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        assert!(
+            !h.poll_unhealthy(t0),
+            "pre-start there is nothing to distrust"
+        );
+        h.poll_started_at = Some(t0);
+        assert!(!h.poll_unhealthy(t0 + time::Duration::seconds(90)));
+        assert!(
+            h.poll_unhealthy(t0 + time::Duration::seconds(91)),
+            "never-succeeded past the stale bound is unhealthy"
+        );
+    }
+
+    #[test]
+    fn dual_unhealthy_requires_both_sources_down() {
+        let mut h = ws_base();
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        h.poll_started_at = Some(t0);
+        h.poll_error_streak = POLL_UNHEALTHY_ERROR_STREAK;
+        // ws never connected + no valid frame => stale-or-worse.
+        assert!(h.copy_admission_blocked(t0));
+        // A healthy poll round clears the block.
+        h.poll_error_streak = 0;
+        h.poll_last_round_at = Some(t0);
+        assert!(!h.copy_admission_blocked(t0));
+        // Disabled websocket mode never blocks (legacy posture).
+        h.poll_error_streak = POLL_UNHEALTHY_ERROR_STREAK;
+        h.activity_ws_enabled = false;
+        assert!(!h.copy_admission_blocked(t0));
     }
 }

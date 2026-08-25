@@ -305,3 +305,41 @@ async fn full_page_rescan_finds_unseen_trade_behind_500_seen_rows() {
     );
     println!("PASS: full-page rescan found the hidden unseen trade and held the cursor");
 }
+
+// #530: a stale REST-fallback trade admitted with a typed no-copy disposition is a
+// fully seen trade — `is_seen` flips in the same transaction (so the held delivery
+// cursor advances exactly as in the sweep test above) — and the disposition row is
+// durably readable with provenance, age, and reason for audit/replay.
+#[test]
+fn no_copy_disposition_is_seen_and_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pe_paper_state::PaperStateDb::open(&dir.path().join("p.db")).unwrap();
+    let w = wallet();
+    let id = pe_core_types::SourceTradeId("0xSTALE".to_string());
+
+    assert!(!db.is_seen(&id).unwrap());
+    db.commit_seen_no_copy(
+        &id,
+        &leader_row(w),
+        &pe_paper_state::NoCopyDisposition {
+            provenance: "rest_poll".to_string(),
+            age_secs: 47,
+            reason: "stale_fallback_past_copy_budget".to_string(),
+            recorded_at_unix: 1_787_600_000,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        db.is_seen(&id).unwrap(),
+        "disposition commit must mark seen atomically"
+    );
+    let (provenance, age, reason) = db.no_copy_disposition(&id).unwrap().unwrap();
+    assert_eq!(provenance, "rest_poll");
+    assert_eq!(age, 47);
+    assert_eq!(reason, "stale_fallback_past_copy_budget");
+    // A normally-seen trade has no disposition row.
+    let other = pe_core_types::SourceTradeId("0xNORMAL".to_string());
+    db.commit_seen_no_fill(&other, &leader_row(w)).unwrap();
+    assert!(db.no_copy_disposition(&other).unwrap().is_none());
+}

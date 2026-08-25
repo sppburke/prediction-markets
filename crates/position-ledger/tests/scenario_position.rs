@@ -12,6 +12,7 @@
 )]
 
 use pe_copy_signal_engine::IncomingTrade;
+use pe_copy_signal_engine::TradeProvenance;
 use pe_core_types::{
     ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId,
     WalletAddress,
@@ -46,6 +47,7 @@ fn make_trade(wallet: WalletAddress, side: Side, contracts: u64, ts_unix: i64) -
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(format!("{wallet:?}-{side:?}-{contracts}-{ts_unix}")),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

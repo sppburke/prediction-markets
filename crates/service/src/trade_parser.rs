@@ -1,10 +1,19 @@
-//! Parse Polymarket `UserTradeActivity` API responses into typed [`IncomingTrade`]s.
+//! Parse Polymarket trade observations into typed [`IncomingTrade`]s.
+//!
+//! ONE normalization path serves both transports (#530): the REST
+//! `/activity?type=TRADE` poller and the live-data activity websocket carry the
+//! same camelCase payload shape, so both funnel through [`convert_trade`] and
+//! produce identical trades by construction — the transport differs only in
+//! [`TradeProvenance`]. The websocket sends its numerics as JSON strings where
+//! REST sends numbers; the flexible deserializers below accept both.
 
-use pe_copy_signal_engine::IncomingTrade;
-use pe_core_types::{ContractQty, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId};
+use pe_copy_signal_engine::{IncomingTrade, TradeProvenance};
+use pe_core_types::{
+    ContractQty, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
+};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -20,6 +29,8 @@ pub enum TradeParseError {
     InvalidTimestamp(i64),
     #[error("trade omitted outcomeIndex")]
     MissingOutcomeIndex,
+    #[error("invalid proxyWallet '{value}'")]
+    InvalidWallet { value: String },
 }
 
 // ── JSON DTOs ─────────────────────────────────────────────────────────────────
@@ -42,12 +53,52 @@ struct RawTrade {
     size: Decimal,
     /// Yes-outcome price in [0, 1].
     price: Decimal,
-    /// Unix timestamp in seconds or milliseconds — normalised below.
+    /// Unix timestamp in seconds or milliseconds — normalised below. REST sends
+    /// a number; the websocket sends a decimal string; both accepted.
+    #[serde(deserialize_with = "de_i64_flexible")]
     timestamp: i64,
     /// Outcome index: 0 = YES, 1 = NO. Older records may omit it; ordinary ingestion preserves
     /// its historical outcome-zero default while the canary's strict parser rejects the omission.
-    #[serde(default)]
+    /// REST sends a number; the websocket sends a decimal string; both accepted.
+    #[serde(default, deserialize_with = "de_opt_u16_flexible")]
     outcome_index: Option<u16>,
+    /// Trading wallet — present on websocket payloads; the REST caller already
+    /// knows which wallet it polled, so it is optional here.
+    #[serde(default)]
+    proxy_wallet: Option<String>,
+}
+
+/// Accept an integer from either a JSON number or a decimal string.
+fn de_i64_flexible<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flex {
+        Num(i64),
+        Str(String),
+    }
+    match Flex::deserialize(d)? {
+        Flex::Num(n) => Ok(n),
+        Flex::Str(s) => s.trim().parse::<i64>().map_err(serde::de::Error::custom),
+    }
+}
+
+/// Accept an optional u16 from either a JSON number or a decimal string.
+fn de_opt_u16_flexible<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flex {
+        Num(u16),
+        Str(String),
+    }
+    match Option::<Flex>::deserialize(d)? {
+        None => Ok(None),
+        Some(Flex::Num(n)) => Ok(Some(n)),
+        Some(Flex::Str(s)) => s
+            .trim()
+            .parse::<u16>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -108,6 +159,28 @@ pub fn parse_trades_strict(
         .collect()
 }
 
+/// Parse one websocket activity payload (a single JSON object, not an array)
+/// into an [`IncomingTrade`] with [`TradeProvenance::ActivityWs`].
+///
+/// The wallet comes from the payload's own `proxyWallet` (the websocket is a
+/// platform-wide firehose; there is no per-wallet request context). All other
+/// normalization is byte-identical to the REST path via [`convert_trade`].
+/// `received_at` is INJECTED (review F7): live ingest passes the frame receipt
+/// instant; source-log replay passes the envelope's recorded `received_at`, so
+/// replay reconstructs the exact original trade.
+pub fn parse_ws_trade(
+    payload: &[u8],
+    received_at: OffsetDateTime,
+) -> Result<IncomingTrade, TradeParseError> {
+    let raw: RawTrade = serde_json::from_slice(payload)?;
+    let wallet_hex = raw.proxy_wallet.clone().unwrap_or_default();
+    let wallet = WalletAddress::from_hex(&wallet_hex)
+        .map_err(|_| TradeParseError::InvalidWallet { value: wallet_hex })?;
+    let mut trade = convert_trade(raw, wallet, received_at)?;
+    trade.provenance = TradeProvenance::ActivityWs;
+    Ok(trade)
+}
+
 fn convert_trade(
     raw: RawTrade,
     wallet: pe_core_types::WalletAddress,
@@ -153,6 +226,7 @@ fn convert_trade(
         observed_at,
         received_at,
         source_trade_id: SourceTradeId(raw.transaction_hash),
+        provenance: TradeProvenance::RestPoll,
     })
 }
 
@@ -217,6 +291,52 @@ mod tests {
             Err(TradeParseError::InvalidSide(_))
         ));
         assert!(parse_trades(json, dummy_wallet()).unwrap().is_empty());
+    }
+
+    // #530: the SAME trade observed via websocket (string numerics, proxyWallet in
+    // payload, extra UI fields) and via REST (numbers, wallet from request context)
+    // must normalize identically — dedup-equivalence by construction.
+    #[test]
+    fn ws_payload_normalizes_identically_to_rest() {
+        let ws = br#"{"proxyWallet":"0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "conditionId":"0xcond","side":"BUY","size":"50.7","price":"0.65",
+            "timestamp":"1704067200","transactionHash":"0xabc","outcomeIndex":"1",
+            "fee":"0","eventSlug":"slug","title":"T","pseudonym":"p","bio":""}"#;
+        let rest = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY",
+            "size":50.7,"price":0.65,"timestamp":1704067200,"outcomeIndex":1}]"#;
+        let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+        let w = parse_ws_trade(ws, t).unwrap();
+        // Same payload + same injected instant => fully identical (replay determinism).
+        let w2 = parse_ws_trade(ws, t).unwrap();
+        assert_eq!(w.received_at, w2.received_at);
+        let r = &parse_trades(rest, dummy_wallet()).unwrap()[0];
+        assert_eq!(w.wallet, r.wallet);
+        assert_eq!(w.market_id.0.0, r.market_id.0.0);
+        assert_eq!(w.outcome_id, r.outcome_id);
+        assert_eq!(w.side, r.side);
+        assert_eq!(w.price, r.price);
+        assert_eq!(w.contracts, r.contracts);
+        assert_eq!(w.observed_at, r.observed_at);
+        assert_eq!(w.source_trade_id, r.source_trade_id);
+        assert_eq!(w.provenance, TradeProvenance::ActivityWs);
+        assert_eq!(r.provenance, TradeProvenance::RestPoll);
+    }
+
+    #[test]
+    fn ws_payload_without_valid_wallet_rejected() {
+        let ws = br#"{"proxyWallet":"nonsense","conditionId":"0xcond","side":"BUY",
+            "size":"1","price":"0.5","timestamp":"1704067200","transactionHash":"0xabc"}"#;
+        let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+        assert!(matches!(
+            parse_ws_trade(ws, t),
+            Err(TradeParseError::InvalidWallet { .. })
+        ));
+        let ws_missing = br#"{"conditionId":"0xcond","side":"BUY","size":"1",
+            "price":"0.5","timestamp":"1704067200","transactionHash":"0xabc"}"#;
+        assert!(matches!(
+            parse_ws_trade(ws_missing, t),
+            Err(TradeParseError::InvalidWallet { .. })
+        ));
     }
 
     // Issue #159: outcomeIndex > 255 must parse, matching the bootstrap-side DTO.

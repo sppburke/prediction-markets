@@ -38,16 +38,32 @@
 
 ## Polymarket
 
-> **WebSocket design note (2026-06-03, issue #282 Phase 2 verification).**
-> `wss://ws-live-data.polymarket.com` (RTDS) provides comments, crypto prices, and equity prices only — no trade data.
+> **SUPERSEDED (2026-08-25, issue #530 re-verification): RTDS DOES carry attributed trades.**
+> The 2026-06-03 conclusion below no longer holds for `wss://ws-live-data.polymarket.com`:
+> subscribing `{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}`
+> streams **every platform trade with `proxyWallet`** (the identity axis `latest_ranking`
+> ranks), plus `conditionId`, `asset`, `outcome`/`outcomeIndex`, `price`, `size`, `side`,
+> `timestamp` (seconds, as a string), `transactionHash`, and profile fields; `fee` is
+> optional per trade. No authentication. Measured 2026-08-24: p50 0.80s / p95 1.32s /
+> p99 1.41s trade-timestamp→receipt over 6,293 trades; a 14h soak found the stream live
+> only ~113/840 minutes on ping-alive sockets (subscription lapses silently — 1,442
+> thirty-second silences vs 16 hard disconnects), so silence-triggered resubscribe /
+> reconnect and the always-on REST poll fallback are load-bearing. **Unofficial UI feed,
+> no documented contract**: re-check the endpoint, subscription shape, and payload keys
+> before each deploy that relies on it (`scripts/probe_activity_ws.py`). Owner:
+> `source-polymarket-public::activity_ws` (transport/envelope/policy); the service's
+> `trade_parser` normalizes identically to the REST path. The CLOB market channel
+> remains wallet-anonymous — the note below stands for THAT feed.
+> Last checked: 2026-08-25.
+>
+> **Historical (2026-06-03, issue #282 Phase 2 verification — CLOB channel still true; RTDS part superseded above).**
 > `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include the **wallet address**; wallet-level trade identification is impossible from the frame alone.
-> No Polymarket WebSocket supports per-wallet trade subscriptions. The REST `/activity` poll remains the primary ingestion path (issue #282 Open risk #1 materialized). Phase 2 RTDS ingestion is deferred.
 >
 > **Correction (2026-06-09, issue #300 live capture).** A live `last_trade_price` market-channel frame **does** carry `transaction_hash` — verified against 2,581 captured frames (100% present, one unique hash per print, zero collisions). The earlier note that it omits `transaction_hash` is superseded; only the wallet address is absent, so wallet-level identity still requires an on-chain tx lookup, but the print is uniquely keyable. Full frame shape: `{market, asset_id, price, size, side, timestamp, fee_rate_bps, event_type, transaction_hash}` — `market` is the condition_id (authoritative, present on every print). `pe-crypto-shadow` keys `clob_trades` on `transaction_hash` and attributes via `market`.
 >
 > **Heartbeat contract (2026-06-10, issue #317, `wss-overview`).** The CLOB market **and** user channels require an **application-level** heartbeat: the client sends the text message `PING` every ~10s and the server replies the text `PONG`; the troubleshooting section attributes "connection drops after about 10 seconds" to a missing heartbeat. This is **not** a WS protocol Ping frame — it is a literal text payload. `pe-crypto-shadow` sends `Message::Text("PING")` every `crypto_shadow_clob_ping_interval_secs` (10) and filters the `PONG` reply (case-insensitive — sports channel lowercases it) out of the frame stream. The same page documents dynamic-subscription ops `{"operation":"subscribe"|"unsubscribe"}`; the harness intentionally does not use `unsubscribe` (prune applies at the next reconnect — a filed follow-up). The heartbeat lives only on this overview page, which is why it was missed until #317 (the `market-channel` page, checked 2026-06-09, has no heartbeat section).
 >
-> **`/activity` indexing latency measured (2026-06-14).** The REST `data-api.polymarket.com/activity` feed (the only *wallet-attributed* trade source) indexes a trade within **~1–4s of its `timestamp`** — proven lower bound p50 1.2s / p95 3.8s / p99 5.2s / max 23s, from 4,655 live trades (`scripts/measure_activity_latency.py`, jitter-free lower-bound method). End-to-end copy latency (indexing + a 5–10s poll + order placement) ≈ **~10–20s**, so a **1-minute** TTR floor is reliably copyable for near-resolution first-bets. Full methodology + run record: `docs/29-ACTIVITY-LATENCY-MEASUREMENT.md`.
+> **`/activity` indexing latency measured (2026-06-14).** The REST `data-api.polymarket.com/activity` feed (the wallet-attributed FALLBACK source since #530; the activity websocket above is primary) indexes a trade within **~1–4s of its `timestamp`** — proven lower bound p50 1.2s / p95 3.8s / p99 5.2s / max 23s, from 4,655 live trades (`scripts/measure_activity_latency.py`, jitter-free lower-bound method). End-to-end FALLBACK-path copy latency (indexing + the 30s production poll + order placement) ≈ **~20–35s**, so a **1-minute** TTR floor is reliably copyable for near-resolution first-bets. Full methodology + run record: `docs/29-ACTIVITY-LATENCY-MEASUREMENT.md`.
 >
 > **CLOB `/book` is public/no-auth (2026-06-16, issue #350 WS2 PR-G live re-confirm).** `GET https://clob.polymarket.com/book?token_id=<id>` returns HTTP **200 with no auth header**; a bogus token id returns **404** `{"error":"No orderbook exists for the requested token id"}`. Body shape: `asks`/`bids` are arrays of `{price, size}` where **both fields are strings** (Decimal-safe), plus scalar string meta (`market`, `asset_id`, `tick_size`, `min_order_size`, `last_trade_price`, `timestamp`, `hash`) and `neg_risk` (bool). Asks are returned **high→low price** (best/lowest ask is not at index 0). `crates/service/src/clob_book.rs` parses the ask side only (liquidity capture is buy-only) into `Decimal`, deriving `best_ask` as the minimum price.
 >

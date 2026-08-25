@@ -74,8 +74,21 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     /// a restart, #339), fetches trades for every wallet in sequence, then sleeps for
     /// `poll_interval_secs`. Returns when the downstream channel is closed.
     pub async fn run(self) {
+        {
+            let mut h = self
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            h.poll_started_at = Some(OffsetDateTime::now_utc());
+        }
         loop {
             let watchlist = self.live_watchlist.snapshot();
+            // #530 poll-round health: distinguishes "round ran and reached the
+            // API" from "a trade was admitted" (the conflation the health split
+            // fixes). Any successful fetch marks the round good; an all-error
+            // round grows the streak.
+            let mut round_fetch_ok = 0usize;
+            let mut round_fetch_err = 0usize;
             for entry in &watchlist.entries {
                 let wallet = entry.wallet;
                 // Timestamp cursor: the stored cursor is the newest observed_at (whole
@@ -102,7 +115,10 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                 .url(&self.config.base_url);
 
                 match self.fetcher.fetch_page(&url).await {
-                    Err(e) => warn!(wallet = %wallet, error = %e, "trade fetch error"),
+                    Err(e) => {
+                        round_fetch_err += 1;
+                        warn!(wallet = %wallet, error = %e, "trade fetch error");
+                    }
                     Ok(bytes) => {
                         // A successful fetch means the Polymarket source is reachable —
                         // mark liveness even when the wallet had no new trades. The
@@ -118,9 +134,14 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                         }
                         match trade_parser::parse_trades_counted(&bytes, wallet) {
                             Err(e) => {
+                                // #530 review F2: an HTTP 200 whose body does not
+                                // parse is NOT a usable round — count it as an error
+                                // so a parser-breaking API change degrades poll health.
+                                round_fetch_err += 1;
                                 warn!(wallet = %wallet, error = %e, "trade parse error")
                             }
                             Ok((trades, malformed)) => {
+                                round_fetch_ok += 1;
                                 let mut window_complete = malformed == 0;
                                 let mut window = trades;
                                 // #511: a full first page means the window may be
@@ -151,6 +172,21 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                             }
                         }
                     }
+                }
+            }
+
+            // #530: commit the round's health verdict. An empty watchlist round
+            // proves nothing either way, so it leaves both fields untouched.
+            if round_fetch_ok > 0 || round_fetch_err > 0 {
+                let mut h = self
+                    .health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if round_fetch_ok > 0 {
+                    h.poll_last_round_at = Some(OffsetDateTime::now_utc());
+                    h.poll_error_streak = 0;
+                } else {
+                    h.poll_error_streak = h.poll_error_streak.saturating_add(1);
                 }
             }
 

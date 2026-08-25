@@ -228,7 +228,18 @@ Production defaults are baked in (override via flags): `--universe-from-trades`,
 mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_prod_min_trl`
 — replaces the per-month activity gates, which production zeroes; run28 cutover
 2026-07-03), `--scheduled-only` (no resolved-at look-ahead), `floor_tstat=2.0`,
-`top_n=200`.
+`top_n=200`, latency shift Δ=2s (#530: the measured websocket-path copy speed —
+batch-68 sweep: survivors/active 290/12 at 2s vs 185/6 at the old 20s; tape ties
+resolve deterministically via `(timestamp_unix, source_trade_id)`).
+
+> **Δ deploy ordering (#530).** The ranker's Δ=2 assumes the service copies at
+> websocket speed. Deploying a Δ-lowering ranker change follows SERVICE-FIRST
+> order: pe-service ships with `polymarket_activity_ws_enabled=true` and its
+> stale-fallback budget verified (docs/35), and only then does the forge
+> checkout pull the new `LATENCY_SHIFT_SECS`. Rollback is the reverse (docs/35
+> "#530 websocket rollback ordering"). The +1-week re-check compares the
+> measured leader→fill p95 span artifact against 2s and raises Δ only if
+> measurement demands it.
 
 > **First full-universe run — stage the half-life.** For the first run after moving to
 > the full trade universe, override with `--half-life-days 0` (decay off) so a

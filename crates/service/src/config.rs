@@ -73,6 +73,30 @@ pub struct ServiceConfig {
     #[serde(default = "default_event_log_path")]
     pub event_log_path: PathBuf,
 
+    /// #530: enable the live-data activity websocket as the primary trade
+    /// observation path (`wss://ws-live-data.polymarket.com`, attributed
+    /// firehose). Boot-owned; default OFF — disabled mode is byte-identical to
+    /// poll-only operation, which is also the rollback path. NEVER disable
+    /// while a Δ=2 ranking batch is latest (reverse-order rollback: restore a
+    /// Δ=20 batch first — see issue #530).
+    #[serde(default)]
+    pub polymarket_activity_ws_enabled: bool,
+
+    /// #530: append-only event log for raw websocket source frames (watchlist-
+    /// filtered), separate from the paper fill log so existing consumers stay
+    /// byte-identical. Written durably (append+sync) BEFORE decision delivery.
+    #[serde(default = "default_source_event_log_path")]
+    pub source_event_log_path: PathBuf,
+
+    /// #530: the calibrated copy budget in seconds. While the websocket path is
+    /// enabled, a REST-fallback observation older than this is admitted for
+    /// bookkeeping with a typed no-copy disposition and stages no copy — the
+    /// ranker's latency shift assumes copies happen at websocket speed, so
+    /// copying older observations is the padded-watchlist loss class. Matches
+    /// the deployed `LATENCY_SHIFT_SECS`; re-checked at +1 week (issue #530).
+    #[serde(default = "default_copy_latency_budget_secs")]
+    pub copy_latency_budget_secs: u64,
+
     /// Base path for the rolling JSONL observability logs. Its directory + file stem name the
     /// full-stream files (`<stem>.<date>.jsonl`); an `errors.<date>.jsonl` (WARN+ERROR only) is
     /// written alongside. Both rotate daily, keeping `log_retention_days` files.
@@ -421,6 +445,14 @@ const fn default_position_size_threshold() -> u32 {
     1
 }
 
+fn default_source_event_log_path() -> PathBuf {
+    PathBuf::from("source_events.log")
+}
+
+const fn default_copy_latency_budget_secs() -> u64 {
+    2
+}
+
 fn default_event_log_path() -> PathBuf {
     PathBuf::from("./paper.log")
 }
@@ -492,6 +524,9 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            polymarket_activity_ws_enabled: false,
+            source_event_log_path: default_source_event_log_path(),
+            copy_latency_budget_secs: default_copy_latency_budget_secs(),
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
@@ -547,6 +582,8 @@ impl Default for ServiceConfig {
 pub enum ServiceConfigError {
     #[error("load config: {0}")]
     Figment(Box<figment::Error>),
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 impl From<figment::Error> for ServiceConfigError {
@@ -579,6 +616,9 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "position_page_limit",
         "position_size_threshold",
         "event_log_path",
+        "polymarket_activity_ws_enabled",
+        "source_event_log_path",
+        "copy_latency_budget_secs",
         "jsonl_log_path",
         "status_path",
         "status_interval_secs",
@@ -611,6 +651,15 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "polymarket_clob_base_url",
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
+    // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
+    // value is a config error, not a posture. One hour is far beyond any honest
+    // calibration (the ranker's latency shift is 2s).
+    if cfg.copy_latency_budget_secs == 0 || cfg.copy_latency_budget_secs > 3_600 {
+        return Err(ServiceConfigError::Invalid(format!(
+            "copy_latency_budget_secs must be in 1..=3600, got {}",
+            cfg.copy_latency_budget_secs
+        )));
+    }
     Ok(cfg)
 }
 
@@ -620,6 +669,19 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_latency_budget_bounds_are_enforced() {
+        // #530 review F6: the budget parameterizes a fail-closed rule; absurd
+        // values are config errors (0 disables it silently; >1h is nonsense and
+        // the huge-u64 wrap class).
+        for bad in ["0", "5000", "99999999999999999999"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("svc.toml");
+            std::fs::write(&path, format!("copy_latency_budget_secs = {bad}\n")).unwrap();
+            assert!(load(Some(&path)).is_err(), "budget {bad} must be rejected");
+        }
+    }
 
     #[test]
     fn default_values() {
@@ -781,10 +843,6 @@ mode = "shadow"
             (
                 "entry_gate_fail_closed",
                 d.entry_gate_fail_closed.to_string(),
-            ),
-            (
-                "trade_poll_interval_secs",
-                d.trade_poll_interval_secs.to_string(),
             ),
             (
                 "position_reseed_interval_secs",

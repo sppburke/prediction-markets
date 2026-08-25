@@ -17,14 +17,35 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing::warn;
 
+use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::AppliedWatchlistCapacity;
+
+/// #530: split trade-source health for the observability surface. Ages are in
+/// seconds; `None` = never. Emitted ONLY when the websocket is enabled — with the
+/// flag off, `status.json` stays byte-identical to pre-#530 (review F8; the
+/// disabled posture IS the rollback contract).
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceHealthStatus {
+    pub activity_ws_enabled: bool,
+    pub ws_connected: bool,
+    pub ws_last_frame_age_secs: Option<i64>,
+    pub ws_last_valid_frame_age_secs: Option<i64>,
+    pub ws_consecutive_reconnects: u32,
+    pub ws_sink_poisoned: bool,
+    pub poll_last_round_age_secs: Option<i64>,
+    pub poll_error_streak: u32,
+    pub copy_admission_blocked: bool,
+}
 
 /// One snapshot of pe-service health, serialized to `status.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSnapshot {
     /// RFC-3339 UTC instant this snapshot was written.
     pub updated_at: String,
+    /// #530: split websocket / REST-poll source health (enabled mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_health: Option<SourceHealthStatus>,
     pub uptime_secs: u64,
     /// Execution mode string (`shadow` | `paper` | `live_tiny` | `promoted`).
     pub mode: String,
@@ -93,6 +114,7 @@ pub fn build_snapshot(
     live_accounts: Option<&crate::live_accounts::LiveAccountsSnapshot>,
 ) -> StatusSnapshot {
     StatusSnapshot {
+        source_health: None,
         updated_at: OffsetDateTime::from_unix_timestamp(now_unix)
             .ok()
             .and_then(|t| t.format(&Rfc3339).ok())
@@ -162,6 +184,7 @@ pub async fn run_status_writer(
     authoritative: bool,
     supabase_rpc_calls: Option<Arc<AtomicU64>>,
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
+    health: Option<SharedHealth>,
 ) {
     let started_at = Instant::now();
     let mut ticker = tokio::time::interval(interval);
@@ -171,7 +194,34 @@ pub async fn run_status_writer(
             .as_ref()
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0);
-        let snap = build_snapshot(
+        let source_health = health
+            .as_ref()
+            .and_then(|h| {
+                {
+                    let g = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !g.activity_ws_enabled {
+                        return None;
+                    }
+                }
+                Some(h)
+            })
+            .map(|h| {
+                let now = OffsetDateTime::now_utc();
+                let h = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let age = |t: Option<OffsetDateTime>| t.map(|t| (now - t).whole_seconds());
+                SourceHealthStatus {
+                    activity_ws_enabled: h.activity_ws_enabled,
+                    ws_connected: h.ws_connected,
+                    ws_last_frame_age_secs: age(h.ws_last_frame_at),
+                    ws_last_valid_frame_age_secs: age(h.ws_last_valid_frame_at),
+                    ws_consecutive_reconnects: h.ws_consecutive_reconnects,
+                    ws_sink_poisoned: h.ws_sink_poisoned,
+                    poll_last_round_age_secs: age(h.poll_last_round_at),
+                    poll_error_streak: h.poll_error_streak,
+                    copy_admission_blocked: h.copy_admission_blocked(now),
+                }
+            });
+        let mut snap = build_snapshot(
             &paper_state,
             &mode,
             authoritative,
@@ -182,6 +232,7 @@ pub async fn run_status_writer(
             calls,
             live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
         );
+        snap.source_health = source_health;
         if let Err(e) = write_snapshot(&path, &snap) {
             warn!(error = %e, path = %path.display(), "status writer: write failed");
         }

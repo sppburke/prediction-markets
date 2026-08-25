@@ -1,8 +1,12 @@
 # 29 — Polymarket `/activity` Attribution-Latency Measurement
 
-**What & why.** Copy-trading a *named* leader on Polymarket can only use the REST
-`data-api.polymarket.com/activity?user=<wallet>` feed — the CLOB WebSocket print is
-wallet-anonymous (`docs/15-SOURCES.md`, issues #282/#300). The binding question for
+**What & why.** *(2026-08-25, #530: the REST-only premise is superseded — the
+live-data activity websocket carries attributed trades; see the addendum at the end.
+The CLOB market channel remains wallet-anonymous, and this file's REST measurement
+stays authoritative for the fallback path.)* Copy-trading a *named* leader on
+Polymarket historically used the REST `data-api.polymarket.com/activity?user=<wallet>`
+feed — the CLOB WebSocket print is wallet-anonymous (`docs/15-SOURCES.md`, issues
+#282/#300). The binding question for
 copying **near-resolution first-bets** (first buy in a market placed minutes before it
 resolves — a high-conviction signal) is: *how long after a leader's trade can our poller
 actually see it?* That visibility lag sets the lowest reliable time-to-resolution (TTR)
@@ -47,9 +51,10 @@ to ~23s).**
 
 ## Implication for the copy-trade TTR floor
 
-End-to-end observe→act latency = `/activity` indexing (~1–4s, p99 5s) + the live poller's
-interval (5–10s, `service.trade_poll_interval_secs`) + order placement (~1–5s) ≈ **~10–20s
-typical, < ~30s at the tail.**
+End-to-end observe→act latency on the POLL path = `/activity` indexing (~1–4s, p99 5s)
++ the poller's revisit time (round duration + `trade_poll_interval_secs`, 30s in
+production) + order placement ≈ **~20–35s typical**. This is the fallback path's
+budget; the websocket path below is the primary (#530).
 
 - A **1-minute TTR floor is reliably copyable** (≥ ~40s of margin after worst-case latency).
 - Sub-minute breaks down (a 30s-TTR trade observed at +15–20s leaves too little to fill).
@@ -69,3 +74,31 @@ by latency-shifted fill pricing in the ranking, not by this floor.
   the added ~2.3 req/s caused 0 errors. If anything this biases the latency *high*.
 - Re-run before trusting for a new regime: `python3 scripts/measure_activity_latency.py
   --duration-secs 900`.
+
+
+## Addendum (2026-08-25, issue #530): attributed websocket measurements
+
+`wss://ws-live-data.polymarket.com`, subscription
+`{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}`,
+streams every platform trade with `proxyWallet` (docs/15 entry + re-check policy).
+
+- **Latency** (trade `timestamp` → local receipt, NTP-synced, 120s capture,
+  6,293 trades): p50 0.80s / p90 1.25s / p95 1.32s / p99 1.41s / max 1.52s.
+  Stable across a 14h soak (median minute-p95 1.31s; worst single minute 6.49s).
+- **Continuity**: the stream was live only ~113/840 soak minutes; sockets stay
+  ping-alive while the subscription silently lapses (1,442 thirty-second silences
+  vs 16 hard disconnects). Consequence: silence-triggered resubscribe/reconnect
+  (`source-polymarket-public::activity_ws` policy) and the always-on REST poll
+  fallback are load-bearing.
+- **Payload**: `proxyWallet`, `conditionId`, `asset`, `outcome`/`outcomeIndex`,
+  `price`, `size`, `side`, `timestamp` (string seconds), `transactionHash`;
+  `fee` optional per trade; schema otherwise stable all night.
+- **End-to-end websocket-primary paper copy** ≈ feed (p95 1.32s) + best-ask fetch
+  (p50 64ms from the VPS) + commit round-trip (p50 163ms) ≈ **1.0s p50 / 1.6s p95**,
+  the basis for `LATENCY_SHIFT_SECS = 2` (conservative rounding; +1-week re-check
+  per `_GLOSSARY.md`).
+
+Harnesses: `scripts/probe_activity_ws.py` (feed discovery/attribution re-check),
+`scripts/measure_activity_ws_latency.py` (latency), `scripts/soak_activity_ws.py`
+(continuity + bench-wallet reaction capture). Re-run the probe before each deploy
+relying on the feed (unofficial contract).

@@ -3,6 +3,7 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::collections::HashMap;
 
 use pe_copy_signal_engine::{
@@ -82,6 +83,7 @@ fn incoming(w: WalletAddress, mkt: MarketId, side: Side, contracts: u64) -> Inco
         observed_at: NOW,
         received_at: NOW,
         source_trade_id: trade_id(1),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 

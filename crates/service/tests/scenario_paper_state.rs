@@ -20,6 +20,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use pe_copy_signal_engine::TradeProvenance;
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
@@ -97,6 +98,7 @@ fn trade(source_trade_id: &str, side: Side, contracts: u64, observed_unix: i64) 
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(source_trade_id.to_string()),
+        provenance: TradeProvenance::RestPoll,
     }
 }
 
@@ -168,6 +170,8 @@ async fn run_trades(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode,
             signal_config: SignalConfig::default(),
