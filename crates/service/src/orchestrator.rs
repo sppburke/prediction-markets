@@ -10,7 +10,9 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig, classify_trade};
+use pe_copy_signal_engine::{
+    IncomingTrade, LeaderSignal, SignalConfig, TradeProvenance, classify_trade,
+};
 use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, MarketOutcomeId, Price, Probability,
     ReconstructionQuality, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
@@ -148,6 +150,12 @@ pub struct OrchestratorConfig {
     /// live targets stage a dispatch aggregate. `None` (tests / Supabase off) = zero
     /// targets = the Phase-A baseline path (no seeds).
     pub live_accounts: Option<crate::live_accounts::LiveAccounts>,
+    /// #530: websocket-primary mode. Gates the stale-fallback no-copy rule and the
+    /// dual-unhealthy admission block; `false` keeps poll-only behavior byte-identical.
+    pub activity_ws_enabled: bool,
+    /// #530: calibrated copy budget (seconds). In websocket-primary mode a REST-fallback
+    /// observation older than this is admitted with a typed no-copy disposition.
+    pub copy_latency_budget_secs: u64,
 }
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
@@ -166,6 +174,8 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     mid_price_cache: MidPriceCache<F>,
     max_resolution_horizon_secs: u64,
     min_resolution_horizon_secs: u64,
+    activity_ws_enabled: bool,
+    copy_latency_budget_secs: u64,
     // Skip BUYs whose FILL price is >= this (issue #142 parity). ZERO disables.
     max_fill_price: Decimal,
     // Skip BUYs whose FILL price is < this (run28 band lower, #468 parity). ZERO disables.
@@ -298,6 +308,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             health,
             market_end_cache,
             mid_price_cache,
+            activity_ws_enabled: config.activity_ws_enabled,
+            copy_latency_budget_secs: config.copy_latency_budget_secs,
             max_resolution_horizon_secs: config.max_resolution_horizon_secs,
             min_resolution_horizon_secs: config.min_resolution_horizon_secs,
             max_fill_price: config.max_fill_price,
@@ -641,13 +653,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             // a live edit. They stay boot-frozen on both sides; changing them needs a restart.
         }
 
-        // Mark polymarket freshness.
-        {
+        // Mark polymarket freshness; in the same lock, evaluate the #530
+        // dual-unhealthy admission block (websocket stale-or-worse AND the poll
+        // source unhealthy). A blocked trade is refused BEFORE any state write -
+        // it stays unseen, so the held cursor / firehose backstop redelivers it
+        // exactly once when a source recovers.
+        let admission_blocked = {
             let mut h = self
                 .health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            h.polymarket_last_event_at = Some(OffsetDateTime::now_utc());
+            let now = OffsetDateTime::now_utc();
+            h.polymarket_last_event_at = Some(now);
+            h.copy_admission_blocked(now)
+        };
+        if admission_blocked {
+            warn!(
+                trade = %trade.source_trade_id,
+                "copy admission blocked: both trade sources unhealthy (#530); trade left unseen for redelivery"
+            );
+            return;
         }
 
         // INPUT DEDUP: the first action after recording freshness, before any
@@ -704,6 +729,40 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // Snapshot the leader's post-ingest position for this (market, outcome) so it
         // is mirrored into paper-state on every processed trade — fill or no fill.
         let leader_row = self.leader_position_row(&trade);
+
+        // #530 stale-fallback fail-closed rule (websocket-primary mode only): the
+        // ranker's latency shift assumes copies happen at websocket speed, so a
+        // REST-fallback observation older than the calibrated budget is admitted
+        // for bookkeeping — seen-state, leader ledger, and a typed disposition in
+        // ONE transaction, so the held cursor (#511) advances — but stages no
+        // copy. Copying it late is the padded-watchlist loss class.
+        if self.activity_ws_enabled && trade.provenance == TradeProvenance::RestPoll {
+            let age_secs = (OffsetDateTime::now_utc() - trade.observed_at).whole_seconds();
+            if age_secs > self.copy_latency_budget_secs as i64 {
+                let disposition = pe_paper_state::NoCopyDisposition {
+                    provenance: "rest_poll".to_string(),
+                    age_secs,
+                    reason: "stale_fallback_past_copy_budget".to_string(),
+                    recorded_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                };
+                info!(
+                    trade = %trade.source_trade_id,
+                    age_secs,
+                    budget_secs = self.copy_latency_budget_secs,
+                    "stale fallback observation: admitted with no-copy disposition"
+                );
+                if let Err(e) = self.paper_state.commit_seen_no_copy(
+                    &trade.source_trade_id,
+                    &leader_row,
+                    &disposition,
+                ) {
+                    error!(error = %e, trade = %trade.source_trade_id,
+                        "no-copy disposition commit failed; rolling back admission");
+                    self.rollback_admission(&rb, None);
+                }
+                return;
+            }
+        }
 
         let Some(signal) = classify_trade(
             &trade,

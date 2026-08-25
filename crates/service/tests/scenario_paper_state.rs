@@ -170,6 +170,8 @@ async fn run_trades(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode,
             signal_config: SignalConfig::default(),

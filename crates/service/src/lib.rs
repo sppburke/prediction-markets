@@ -2,6 +2,7 @@
 //! Library target for `pe-service` — exposes internal modules for scenario tests.
 //! Production code lives in `main.rs`.
 
+pub mod activity_ingest;
 pub mod clob_book;
 pub mod config;
 pub mod config_poller;
@@ -28,6 +29,7 @@ pub mod paper_recovery;
 pub mod position_seeder;
 pub mod runtime_config;
 pub mod snapshot_worker;
+pub mod source_event_sink;
 pub mod status_writer;
 pub mod supabase_backfill;
 pub mod supabase_reader;

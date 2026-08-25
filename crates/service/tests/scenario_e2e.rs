@@ -171,6 +171,8 @@ async fn scenario_e2e_clean_exit() {
         trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -242,6 +244,8 @@ async fn scenario_graceful_shutdown() {
         trade_rx,
         LiveWatchlist::new(make_watchlist(wallet)),
         OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),

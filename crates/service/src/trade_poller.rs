@@ -76,6 +76,12 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
     pub async fn run(self) {
         loop {
             let watchlist = self.live_watchlist.snapshot();
+            // #530 poll-round health: distinguishes "round ran and reached the
+            // API" from "a trade was admitted" (the conflation the health split
+            // fixes). Any successful fetch marks the round good; an all-error
+            // round grows the streak.
+            let mut round_fetch_ok = 0usize;
+            let mut round_fetch_err = 0usize;
             for entry in &watchlist.entries {
                 let wallet = entry.wallet;
                 // Timestamp cursor: the stored cursor is the newest observed_at (whole
@@ -102,8 +108,12 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                 .url(&self.config.base_url);
 
                 match self.fetcher.fetch_page(&url).await {
-                    Err(e) => warn!(wallet = %wallet, error = %e, "trade fetch error"),
+                    Err(e) => {
+                        round_fetch_err += 1;
+                        warn!(wallet = %wallet, error = %e, "trade fetch error");
+                    }
                     Ok(bytes) => {
+                        round_fetch_ok += 1;
                         // A successful fetch means the Polymarket source is reachable —
                         // mark liveness even when the wallet had no new trades. The
                         // orchestrator advances this too on each trade, but a sparse
@@ -151,6 +161,21 @@ impl<F: PageFetcher + Send + 'static> TradePoller<F> {
                             }
                         }
                     }
+                }
+            }
+
+            // #530: commit the round's health verdict. An empty watchlist round
+            // proves nothing either way, so it leaves both fields untouched.
+            if round_fetch_ok > 0 || round_fetch_err > 0 {
+                let mut h = self
+                    .health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if round_fetch_ok > 0 {
+                    h.poll_last_round_at = Some(OffsetDateTime::now_utc());
+                    h.poll_error_streak = 0;
+                } else {
+                    h.poll_error_streak = h.poll_error_streak.saturating_add(1);
                 }
             }
 
