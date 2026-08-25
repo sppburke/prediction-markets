@@ -173,9 +173,13 @@ def main() -> int:
             if duck_tapes is not None:
                 ts_arr, px_arr = duck_tapes.get((mid, oid), ([], []))
             else:
+                # Deterministic tie order (#530): equal-timestamp trades must resolve
+                # identically across runs and engines — source_trade_id is the cache's
+                # PRIMARY KEY, so (timestamp, id) is a total order.
                 cur = conn.execute(
                     "SELECT timestamp_unix, price_str FROM trades "
-                    "WHERE market_id = ? AND outcome_id = ? ORDER BY timestamp_unix ASC",
+                    "WHERE market_id = ? AND outcome_id = ? "
+                    "ORDER BY timestamp_unix ASC, source_trade_id ASC",
                     (mid, oid),
                 )
                 tape = cur.fetchall()

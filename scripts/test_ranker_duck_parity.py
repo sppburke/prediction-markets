@@ -19,9 +19,10 @@ Fixture edge cases (each must be handled identically by both engines): first-buy
 dedup (a later same-market buy is ignored), a sell (side filter), out-of-window,
 out-of-band, unresolved market, a non-numeric `price_str`, and an exact
 `price_str="1.0"` (the open-interval `0<price<1` boundary). Timestamps within a
-(wallet,market) and within a (market,outcome) tape are DISTINCT, so the first-buy
-and tape order are deterministic in both engines (the rare exact-tie is a documented
-sub-1e-9 residual, deferred to the real-DB diff).
+(wallet,market) and within a (market,outcome) tape are DISTINCT except in the
+dedicated equal-timestamp tie test: tape order is total via the (timestamp_unix,
+source_trade_id) secondary key (#530), so exact ties resolve identically across
+engines and repeated runs — no residual.
 
 Deterministic: fixed window + as-of + timestamps; no clock, no RNG, no network.
 Requires duckdb (skips with a clear message if unavailable).
@@ -76,6 +77,14 @@ def W(c: str) -> str:
     return "0x" + c * 40
 
 
+_TID = iter(range(1, 10_000))
+
+
+def tid() -> str:
+    """Unique source_trade_id per fixture row (the real cache's PRIMARY KEY)."""
+    return f"t{next(_TID):06d}"
+
+
 # (wallet, market, outcome_id, price_str, entry_ts, winning_outcome_id) — buys.
 # end_date = entry+3600 for every market -> ttr 1h (inside [30s, 72h)).
 _QUALIFYING = [
@@ -109,27 +118,28 @@ _NONQUALIFYING = [
 def build_parity_cache(path: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
-                 "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER)")
+                 "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
+                 "source_trade_id TEXT PRIMARY KEY)")
     conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                  "resolved_at_unix INTEGER)")
     conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
 
     markets: dict[str, tuple[int, int]] = {}
     for w, mid, oid, px, t, win in _QUALIFYING + _NONQUALIFYING:
-        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                     (w, "buy", mid, oid, px, 100, t))
+        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                     (w, "buy", mid, oid, px, 100, t, tid()))
         markets.setdefault(mid, (win, t + 3600))
     # A sell that the side='buy' filter must ignore.
-    conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                 (W("a"), "sell", "MA1", 1, "0.55", 100, ts(2026, 2, 6)))
+    conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                 (W("a"), "sell", "MA1", 1, "0.55", 100, ts(2026, 2, 6), tid()))
 
     # Pass-2 tapes: a same-(market,outcome) fill ~25s after each qualifying entry, plus a
     # decoy earlier/later trade so bisect has to find the right index. DISTINCT timestamps.
     for w, mid, oid, px, t, win in _QUALIFYING:
-        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                     (w, "buy", mid, oid, f"{float(px) + 0.01:.3f}", 50, t + 25))  # the fill
-        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                     (W("z"), "buy", mid, oid, f"{float(px) + 0.02:.3f}", 50, t + 200))  # later decoy
+        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                     (w, "buy", mid, oid, f"{float(px) + 0.01:.3f}", 50, t + 25, tid()))  # the fill
+        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                     (W("z"), "buy", mid, oid, f"{float(px) + 0.02:.3f}", 50, t + 200, tid()))  # later decoy
 
     for mid, (win, end) in markets.items():
         if mid == "MC_UNRES":
@@ -307,12 +317,13 @@ class DuckParityTest(unittest.TestCase):
             t = ts(2026, 2, 10)
             conn = sqlite3.connect(db)
             conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
-                         "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER)")
+                         "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
+                         "source_trade_id TEXT PRIMARY KEY)")
             conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                          "resolved_at_unix INTEGER)")
             conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
-            conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)", (W("a"), "buy", "M1", 0, "0.30", 100, t))
-            conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)", (W("a"), "buy", "M1", 1, "0.70", 200, t))
+            conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)", (W("a"), "buy", "M1", 0, "0.30", 100, t, tid()))
+            conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)", (W("a"), "buy", "M1", 1, "0.70", 200, t, tid()))
             conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", ("M1", 1, t + 7200))
             conn.execute("INSERT INTO market_schedules VALUES (?,?)", ("M1", t + 3600))
             conn.commit()
@@ -329,6 +340,63 @@ class DuckParityTest(unittest.TestCase):
             self.assertIn(got, valid, f"frankenrow {got} mixes columns across tied rows")
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_equal_timestamp_tape_tie_is_deterministic(self) -> None:
+        """#530: two same-(market,outcome,timestamp) tape trades at different prices must
+        resolve identically across repeated runs and both engines, picking the ascending
+        source_trade_id (inserted in REVERSED id order to catch insertion-order leakage)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "tie.db")
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
+                         "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
+                         "source_trade_id TEXT PRIMARY KEY)")
+            conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
+                         "resolved_at_unix INTEGER)")
+            conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
+            t0 = ts(2026, 2, 5)
+            entry_px = ("0.50", "0.55")       # distinct -> nonzero pass-1 variance
+            tie_lo = ("0.40", "0.45")          # ascending-id winner per market
+            tie_hi = ("0.60", "0.65")
+            entries = []
+            for i, mid in enumerate(("MT1", "MT2")):
+                entry = t0 + i * 28 * 86400    # two active months -> pass-1 eligible
+                entries.append(entry)
+                conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                             (W("e"), "buy", mid, 1, entry_px[i], 100, entry, f"tie-entry-{i}"))
+                # REVERSED insertion: the lexically LATER id lands first with the higher price.
+                conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                             (W("e"), "buy", mid, 1, tie_hi[i], 50, entry + 25, f"tie-{i}-b"))
+                conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                             (W("e"), "buy", mid, 1, tie_lo[i], 50, entry + 25, f"tie-{i}-a"))
+                conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", (mid, 1, entry + 7200))
+                conn.execute("INSERT INTO market_schedules VALUES (?,?)", (mid, entry + 3600))
+            conn.commit()
+            conn.close()
+
+            outputs = []
+            for engine in (["sqlite", "sqlite"] + (["duck", "duck"] if HAVE_DUCKDB else [])):
+                out = str(Path(tmp) / f"out-{engine}-{len(outputs)}")
+                os.makedirs(out)
+                pq = str(Path(tmp) / "pq")
+                if engine == "duck" and not os.path.isdir(pq):
+                    export(db, pq)
+                self.assertEqual(run_pass1(db, out, engine, pq), 0)
+                self.assertEqual(run_pass2(db, out, engine, pq), 0)
+                outputs.append(Path(out, "latency_shift_ranked.csv").read_bytes())
+            for other in outputs[1:]:
+                self.assertEqual(outputs[0], other,
+                                 "equal-timestamp tie resolved differently across runs/engines")
+            row = read_rows(str(Path(tmp) / "out-sqlite-0" / "latency_shift_ranked.csv"))[0]
+            # Ascending-id winner is price 0.40 (+1c slip = 0.41): net = (1 - 0.41)/0.41.
+            # Ascending-id winners are 0.40/0.45 (+1c slip); recompute the decayed mean
+            # through the ranker's own functions with pass-2's exact anchor.
+            nets = [(1.0 - 0.41) / 0.41, (1.0 - 0.46) / 0.46]
+            weights = ls.decay_weights(entries, ls.parse_as_of(AS_OF_ISO), 30.0)
+            mean, _, _, _ = ls.weighted_stats(nets, weights)
+            actual = row["mean_net_ls"]
+            self.assertTrue(_num_eq(actual, f"{mean:.6f}"),
+                            f"tie fill used the wrong trade: mean_net_ls={actual} != {mean:.6f}")
+
     def test_bad_threads_env_falls_back(self) -> None:
         """A non-integer PE_RANKER_DUCKDB_THREADS (operator typo) must NOT crash get_engine —
         it falls back to the default thread cap, since this runs before any SQLite fallback

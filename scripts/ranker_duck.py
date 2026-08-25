@@ -303,7 +303,7 @@ def duck_load_tapes(con, mo_keys):
             FROM trades t
             JOIN cand_keys k
               ON t.market_id = k.market_id AND t.outcome_id = k.outcome_id
-            ORDER BY t.market_id, t.outcome_id, t.timestamp_unix
+            ORDER BY t.market_id, t.outcome_id, t.timestamp_unix, t.source_trade_id
             """
         ).fetchall()
     finally:
