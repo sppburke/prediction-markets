@@ -71,6 +71,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 # passed as text with a `::jsonb` cast, so no extra type-conversion features are needed.
 tokio-postgres = "0.7"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 alloy-primitives = { version = "=1.5.7", default-features = false, features = ["std"] }
 hmac = "0.12"
 sha2 = "0.10"
