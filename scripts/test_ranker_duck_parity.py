@@ -163,20 +163,6 @@ def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str) -> int:
         return rk.main()
 
 
-def run_pass2(db: str, out_dir: str, engine: str, parquet_dir: str) -> int:
-    argv = ["latency_shift_rerank.py", "--db", db,
-            "--ranked-csv", str(Path(out_dir) / "ranked_72hr_buyandhold.csv"),
-            "--positions-csv", str(Path(out_dir) / "qualifying_positions_72hr.csv"),
-            "--out-dir", out_dir, "--as-of", AS_OF_ISO,
-            "--latency-shift-secs", "20", "--fill-window-secs", "120",
-            "--floor-tstat", "0.0", "--min-fill-rate", "0.0",
-            "--min-avg-per-month", "1", "--min-active-months", "2"]
-    env = {"PE_RANKER_ENGINE": engine, "PE_RANKER_PARQUET_DIR": parquet_dir,
-           "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}
-    with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", argv):
-        return ls.main()
-
-
 def export(db: str, parquet_dir: str) -> None:
     argv = ["export_trades_parquet.py", "--db", db, "--out-dir", parquet_dir]
     with mock.patch.object(sys, "argv", argv):
@@ -215,7 +201,7 @@ def positions_set(path: str) -> set[tuple]:
 
 class DuckParityTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
-    def test_pass1_and_pass2_parity(self) -> None:
+    def test_pass1_parity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "cache.db")
             pq = str(Path(tmp) / "parquet")
@@ -259,50 +245,6 @@ class DuckParityTest(unittest.TestCase):
             self.assertTrue(ranked_ok, "ranked stats diverge beyond rtol 1e-9")
             self.assertTrue(order_ok, f"ranked order differs: {order_sql} != {order_duck}")
 
-            # AC: pass-2 latency-shift ranking identical across engines.
-            self.assertEqual(run_pass2(db, out_sql, "sqlite", pq), 0)
-            self.assertEqual(run_pass2(db, out_duck, "duck", pq), 0)
-            l_sql = {r["wallet"]: r for r in read_rows(str(Path(out_sql) / "latency_shift_ranked.csv"))}
-            l_duck = {r["wallet"]: r for r in read_rows(str(Path(out_duck) / "latency_shift_ranked.csv"))}
-            self.assertEqual(set(l_sql), set(l_duck), "pass-2 wallet sets differ")
-            ls_ok = True
-            for w in l_sql:
-                for col in LS_NUMERIC:
-                    if not _num_eq(l_sql[w][col], l_duck[w][col]):
-                        ls_ok = False
-                        print(f"  LS DIVERGE {w}.{col}: {l_sql[w][col]} != {l_duck[w][col]}")
-                if l_sql[w]["survives"] != l_duck[w]["survives"]:
-                    ls_ok = False
-            print(f"{'PASS' if ls_ok else 'FAIL'}: pass2_latency_shift_identical "
-                  f"(wallets={len(l_sql)}, rtol=1e-9)")
-            self.assertTrue(ls_ok, "pass-2 stats diverge beyond rtol 1e-9")
-
-    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
-    def test_pass2_duck_batching_matches_sqlite(self) -> None:
-        """Pass-2's duck tape load is chunked (#391). With a tiny DUCK_TAPE_BATCH_PAIRS that splits
-        the candidate pairs across MANY batches, the latency-shift ranking must still equal the
-        SQLite (single-stream) result — batching across pair boundaries never changes a fill."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db = str(Path(tmp) / "cache.db")
-            pq = str(Path(tmp) / "parquet")
-            out_sql = str(Path(tmp) / "sql")
-            out_duck = str(Path(tmp) / "duck")
-            build_parity_cache(db)
-            self.assertEqual(run_pass1(db, out_sql, "sqlite", pq), 0)
-            export(db, pq)
-            self.assertEqual(run_pass1(db, out_duck, "duck", pq), 0)
-            self.assertEqual(run_pass2(db, out_sql, "sqlite", pq), 0)
-            # batch size 2 over the fixture's 13 candidate (market,outcome) pairs => ~7 batches
-            with mock.patch.object(ls, "DUCK_TAPE_BATCH_PAIRS", 2):
-                self.assertEqual(run_pass2(db, out_duck, "duck", pq), 0)
-            l_sql = {r["wallet"]: r for r in read_rows(str(Path(out_sql) / "latency_shift_ranked.csv"))}
-            l_duck = {r["wallet"]: r for r in read_rows(str(Path(out_duck) / "latency_shift_ranked.csv"))}
-            self.assertEqual(set(l_sql), set(l_duck), "pass-2 wallet sets differ under batching")
-            ok = all(_num_eq(l_sql[w][c], l_duck[w][c]) for w in l_sql for c in LS_NUMERIC)
-            print(f"{'PASS' if ok else 'FAIL'}: pass2_duck_batching_matches_sqlite "
-                  f"(batch=2 over {len(l_sql)} wallets, multi-batch)")
-            self.assertTrue(ok, "pass-2 duck batched output diverges from SQLite")
-
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_duck_firstbuy_tie_is_atomic(self) -> None:
         """Two buys for the SAME (wallet, market) at the SAME timestamp but DIFFERENT
@@ -338,64 +280,6 @@ class DuckParityTest(unittest.TestCase):
             valid = {(0, 0.30, 100), (1, 0.70, 200)}
             print(f"{'PASS' if got in valid else 'FAIL'}: duck_firstbuy_tie_atomic (picked {got})")
             self.assertIn(got, valid, f"frankenrow {got} mixes columns across tied rows")
-
-    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
-    def test_equal_timestamp_tape_tie_is_deterministic(self) -> None:
-        """#530: two same-(market,outcome,timestamp) tape trades at different prices must
-        resolve identically across repeated runs and both engines, picking the ascending
-        source_trade_id (inserted in REVERSED id order to catch insertion-order leakage)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db = str(Path(tmp) / "tie.db")
-            conn = sqlite3.connect(db)
-            conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
-                         "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                         "source_trade_id TEXT PRIMARY KEY)")
-            conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
-                         "resolved_at_unix INTEGER)")
-            conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
-            t0 = ts(2026, 2, 5)
-            entry_px = ("0.50", "0.55")       # distinct -> nonzero pass-1 variance
-            tie_lo = ("0.40", "0.45")          # ascending-id winner per market
-            tie_hi = ("0.60", "0.65")
-            entries = []
-            for i, mid in enumerate(("MT1", "MT2")):
-                entry = t0 + i * 28 * 86400    # two active months -> pass-1 eligible
-                entries.append(entry)
-                conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
-                             (W("e"), "buy", mid, 1, entry_px[i], 100, entry, f"tie-entry-{i}"))
-                # REVERSED insertion: the lexically LATER id lands first with the higher price.
-                conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
-                             (W("e"), "buy", mid, 1, tie_hi[i], 50, entry + 25, f"tie-{i}-b"))
-                conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
-                             (W("e"), "buy", mid, 1, tie_lo[i], 50, entry + 25, f"tie-{i}-a"))
-                conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", (mid, 1, entry + 7200))
-                conn.execute("INSERT INTO market_schedules VALUES (?,?)", (mid, entry + 3600))
-            conn.commit()
-            conn.close()
-
-            outputs = []
-            for engine in (["sqlite", "sqlite"] + (["duck", "duck"] if HAVE_DUCKDB else [])):
-                out = str(Path(tmp) / f"out-{engine}-{len(outputs)}")
-                os.makedirs(out)
-                pq = str(Path(tmp) / "pq")
-                if engine == "duck" and not os.path.isdir(pq):
-                    export(db, pq)
-                self.assertEqual(run_pass1(db, out, engine, pq), 0)
-                self.assertEqual(run_pass2(db, out, engine, pq), 0)
-                outputs.append(Path(out, "latency_shift_ranked.csv").read_bytes())
-            for other in outputs[1:]:
-                self.assertEqual(outputs[0], other,
-                                 "equal-timestamp tie resolved differently across runs/engines")
-            row = read_rows(str(Path(tmp) / "out-sqlite-0" / "latency_shift_ranked.csv"))[0]
-            # Ascending-id winner is price 0.40 (+1c slip = 0.41): net = (1 - 0.41)/0.41.
-            # Ascending-id winners are 0.40/0.45 (+1c slip); recompute the decayed mean
-            # through the ranker's own functions with pass-2's exact anchor.
-            nets = [(1.0 - 0.41) / 0.41, (1.0 - 0.46) / 0.46]
-            weights = ls.decay_weights(entries, ls.parse_as_of(AS_OF_ISO), 30.0)
-            mean, _, _, _ = ls.weighted_stats(nets, weights)
-            actual = row["mean_net_ls"]
-            self.assertTrue(_num_eq(actual, f"{mean:.6f}"),
-                            f"tie fill used the wrong trade: mean_net_ls={actual} != {mean:.6f}")
 
     def test_bad_threads_env_falls_back(self) -> None:
         """A non-integer PE_RANKER_DUCKDB_THREADS (operator typo) must NOT crash get_engine —

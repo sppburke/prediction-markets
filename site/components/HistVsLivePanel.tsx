@@ -52,7 +52,8 @@ export function HistVsLivePanel({ row }: { row: WalletLiveStats }) {
       <Row label="Open" hist="—" live={formatInt(row.live_open_fills)} />
       <Row label="Wins" hist="—" live={formatInt(row.live_wins)} />
       <Row label="t-stat / rank" hist={formatTstat(row.ls_tstat)} live={`#${formatInt(row.rank)}`} />
-      <Row label="Avg price / fill-rate" hist={formatPrice(row.avg_price)} live={formatPct(row.fill_rate)} />
+      <Row label="Avg entry price" hist={formatPrice(row.avg_price)} live="—" />
+      <Row label="Repricing coverage" hist={formatPct(row.fill_rate)} live="—" />
       <Row label="Last trade (UTC)" hist={formatDate(row.last_trade_unix)} live="—" />
       <div className="grid grid-cols-3 items-center gap-2 border-t border-border pt-3 text-sm tabular-nums">
         <div className="text-xs font-semibold text-muted">Realized P&amp;L</div>

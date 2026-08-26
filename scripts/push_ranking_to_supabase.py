@@ -429,6 +429,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ttr-floor-secs", type=int, default=30)
     ap.add_argument("--ttr-max-secs", type=int, default=259200)
     ap.add_argument("--latency-shift-secs", type=int, default=20)
+    ap.add_argument("--manifest-file", default=None,
+                    help="pass-2 oracle_manifest.json; its canonical sha256 is stored as "
+                         "ranking_batches.config_hash (#536 replay binding)")
     ap.add_argument("--universe-size", type=int, default=0)
     ap.add_argument("--git-sha", default="")
     ap.add_argument("--notes", default="")
@@ -524,8 +527,17 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
     if not top:
         raise ValueError("no rows to push (empty CSV, or the active filter removed all)")
 
+    config_hash = None
+    if a.manifest_file:
+        with open(a.manifest_file, encoding="utf-8") as mf:
+            manifest = json.load(mf)
+        config_hash = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     batch = {
         "git_sha": a.git_sha or None,
+        "config_hash": config_hash,
         "band_lo": a.band_lo,
         "band_hi": a.band_hi,
         "ttr_floor_secs": a.ttr_floor_secs,
@@ -597,6 +609,22 @@ def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
             f"{len(mismatched)} rank(s) (first: {mismatched[0]})"
         )
     print(f"latest_ranking rows: {len(latest)} (batch_id={batch_id})")
+
+    # #536: the stored config_hash must round-trip exactly (None for legacy replays).
+    submitted_hash = request["batch"].get("config_hash")
+    if submitted_hash is not None:
+        _, stored = _req(
+            "GET",
+            f"{url}/rest/v1/ranking_batches?select=config_hash&batch_id=eq.{batch_id}&limit=1",
+            key,
+        )
+        stored_hash = stored[0].get("config_hash") if stored else None
+        if stored_hash != submitted_hash:
+            raise ValueError(
+                f"batch {batch_id} stored config_hash {stored_hash!r} != submitted "
+                f"{submitted_hash!r}"
+            )
+        print(f"config_hash round-trip verified ({submitted_hash[:16]}…)")
 
     # Bound the append-only ranking_batches history (#411). Best-effort — the atomic
     # publication and exact verification already succeeded, so cleanup self-heals later.

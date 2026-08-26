@@ -195,7 +195,16 @@ market still missing a terminal row. The subcommand runs the full
 (#383/#519). **Stage 1** ranks the full trade
 universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
-there is no curated pre-gate); **Stage 2** rerank (adds `hit_rate`); **Stage 3** record
+there is no curated pre-gate); **Stage 2** rerank in three sub-stages (#536): **2a**
+emit the per-token reference fetch windows for the candidate positions; **2b**
+`pe-bootstrap prices-history --targets-csv` fetches only the uncovered remainder of
+minute reference prices into the isolated ranker price store (write-once + range
+algebra ⇒ resumable; transient page failures are a partial and pass-2's
+terminal-coverage gate then exits 75 so the supervisor retries — a partially fetched
+cycle can never publish); **2c** pass-2 reprices every candidate position at the
+latest reference sample at-or-before `entry+Δ` (adds `hit_rate`, writes the
+per-position `oracle_outcomes.csv` and the versioned `oracle_manifest.json` whose
+canonical hash the push stores as `ranking_batches.config_hash`); **Stage 3** record
 the exact publication request, atomically publish it through the idempotent
 `publish_ranking_batch` RPC, and verify that exact batch is `latest_ranking`; **Stage 4**
 purge proven-loser
@@ -204,6 +213,17 @@ and dead-weight wallets when armed; **Stage 5** run
 checkpointed and the WAL file releases its disk footprint. The checkpoint is always
 attempted last, including re-pushes and runs that skip purge. A busy/error result warns
 without failing the already-complete Supabase publish; the next run retries it.
+
+
+**Oracle rollback (#536):** reverting the ranker code alone does NOT restore the
+prior ranking — `latest_ranking` always serves the maximum `batch_id`. To roll back
+externally: stop the loop, restore the prior revision, run the one-shot with a unique
+`--notes "rollback-of=<batch-id>"` (the note is hashed into the content-addressed
+publish key, guaranteeing a NEW batch even same-day with unchanged inputs — a
+same-day revert without it can reproduce an old key and silently fail to advance the
+epoch), then verify a strictly larger `batch_id` is `latest_ranking` and service
+membership converged. The additive `ranker_price_*` tables are inert thereafter.
+
 
 > **Purge I/O priority (#527).** Both purge entry points — Step 0i `purge-infra` and the
 > Stage 4 ordinary `purge` — run the cache mutator under `ionice -c3` (idle block-I/O

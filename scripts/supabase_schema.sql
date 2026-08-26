@@ -31,9 +31,10 @@ create table if not exists ranking_entries (
   wallet_hex  text    not null,
   ls_edge     numeric,                         -- latency-shifted mean net return
   ls_tstat    numeric,                         -- latency-shifted net t-stat
-  fill_rate   numeric,                         -- fraction of positions fillable at entry+Δ
-  n_trades    integer,                         -- filled positions in the eval window
-  hit_rate    numeric,
+  fill_rate   numeric,                         -- repricing coverage: fraction of positions repriced
+                                               -- at the minute reference (#536; name kept for wire compat)
+  n_trades    integer,                         -- repriced positions in the eval window
+  hit_rate    numeric,                         -- outcome rate among repriced positions (Kelly p input)
   avg_price   numeric,
   primary key (batch_id, rank)
 );

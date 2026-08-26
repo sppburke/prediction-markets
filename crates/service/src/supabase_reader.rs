@@ -460,6 +460,9 @@ fn map_row(row: &RankingRow) -> Option<WatchlistEntry> {
     let wallet: WalletAddress =
         serde_json::from_value(serde_json::Value::String(row.wallet_hex.clone())).ok()?;
 
+    // `hit_rate` is the outcome rate among REPRICED positions (#536: the ranker's minute
+    // reference oracle decides which positions count) — downstream this is the Kelly
+    // probability input for Kelly-mode sizing and probability-bearing canary decisions.
     let win_rate_bps = exact_cell(row.hit_rate_text.as_deref(), row.hit_rate.as_ref())
         .map(|hr| (hr * Decimal::from(10_000)).round())
         .and_then(|d| d.to_i32())

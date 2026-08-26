@@ -339,8 +339,7 @@ fi
 # Fail before the run lock, logical-cycle directory, or pointer when this
 # invocation will need the Rust cache mutator. A pure research re-push can still
 # omit the binary because every bootstrap stage is skipped.
-if [[ "$SKIP_DISCOVERY" == "0" || "$SKIP_BACKFILL" == "0" \
-      || ( "$SKIP_PURGE" == "0" && "$SKIP_RANK" == "0" ) \
+if [[ "$SKIP_DISCOVERY" == "0" || "$SKIP_BACKFILL" == "0" || "$SKIP_RANK" == "0" \
       || ( "$SKIP_PURGE" == "0" && "$RESUME_PENDING" == "1" ) ]]; then
   [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
     echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
@@ -607,7 +606,23 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --min-active-months "$MIN_ACTIVE_MONTHS" \
     --floor-tstat "$FLOOR_TSTAT" --scheduled-only
 
-  echo "── Stage 2/3: pass-2 latency-shift rerank (adds hit_rate) ─────────────────────"
+  echo "── Stage 2a/3: emit reference-oracle fetch targets (#536) ─────────────────────"
+  TARGETS_CSV="$OUT_DIR/oracle_targets.csv"
+  "$PYTHON_BIN" scripts/latency_shift_rerank.py \
+    --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
+    --out-dir "$OUT_DIR" \
+    --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
+    --floor-tstat "$FLOOR_TSTAT" --emit-targets "$TARGETS_CSV"
+
+  echo "── Stage 2b/3: targeted reference fetch into the ranker price store (#536) ────"
+  # Write-once + range algebra => resumable; transient page failures return partial
+  # (exit 2, WARN + continue) and pass-2's terminal-coverage gate then exits 75 so the
+  # supervisor retries the cycle — a partially fetched cycle can never publish.
+  export PE_BOOTSTRAP_CACHE_PATH="$DB"
+  run_refresh_stage "reference-fetch" "$PE_BOOTSTRAP_BIN" prices-history \
+    --targets-csv "$TARGETS_CSV" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+
+  echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
   "$PYTHON_BIN" scripts/latency_shift_rerank.py \
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
@@ -615,7 +630,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
     --min-active-months "$MIN_ACTIVE_MONTHS" \
-    --floor-tstat "$FLOOR_TSTAT"
+    --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"
 fi
@@ -652,6 +667,7 @@ else
   TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
   PUSH_ARGS+=(
     --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N"
+    --manifest-file "$OUT_DIR/oracle_manifest.json"
     --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX"
     --ttr-max-secs "$TTR_MAX_SECS"
     --latency-shift-secs "$LATENCY_SHIFT_SECS"

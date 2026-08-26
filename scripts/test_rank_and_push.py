@@ -344,6 +344,9 @@ class RankAndPushScenario(unittest.TestCase):
                 "events",
                 "resolutions",
                 "purge-infra",
+                # #536: the targeted reference fetch runs between the rank passes
+                # (stage 2b) — after purge-infra, before the post-publish purge.
+                "prices-history",
                 "purge",
             ],
             "Step-0 stages ran out of canonical order, or the final purge stage (#385) is missing",

@@ -153,7 +153,7 @@ class RefOracleScenario(unittest.TestCase):
             (ENTRIES[2] + SHIFT, "0.60"),
         ])
         self.add_full_coverage()
-        r, out = self.run_pass2("--fill-oracle", "ref")
+        r, out = self.run_pass2()
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         row = self.read_row(out)
         self.assertEqual(row["n_total"], "3")
@@ -167,7 +167,7 @@ class RefOracleScenario(unittest.TestCase):
     def test_uncovered_pair_exits_tempfail_75(self):
         self.add_points([(ENTRIES[0] + SHIFT - 30, "0.40")])
         # No page rows at all → the fail-closed gate must hold publication.
-        r, _ = self.run_pass2("--fill-oracle", "ref")
+        r, _ = self.run_pass2()
         self.assertEqual(r.returncode, 75, r.stderr + r.stdout)
         self.assertIn("TEMPFAIL(75)", r.stdout)
         print("PASS: un-terminal coverage exits 75 (supervised retry), never publishes")
@@ -178,40 +178,39 @@ class RefOracleScenario(unittest.TestCase):
         con.commit()
         con.close()
         # Unmapped pairs carry no coverage requirement and simply never reprice.
-        r, out = self.run_pass2("--fill-oracle", "ref")
+        r, out = self.run_pass2()
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         row = self.read_row(out)
         self.assertEqual((row["n_total"], row["n_filled"]), ("3", "0"))
         self.assertEqual(row["survives"], "False")
         print("PASS: unmapped pair → all positions not repriced, never a crash")
 
-    def test_print_oracle_default_untouched_by_new_flags(self):
-        # Default mode must not require the new tables at all: point the run at a db
-        # with a trades tape and no ranker tables.
-        plain = self.root / "plain.db"
-        con = sqlite3.connect(plain)
-        con.execute("CREATE TABLE trades (source_trade_id TEXT PRIMARY KEY, wallet_hex TEXT, "
-                    "market_id TEXT, outcome_id INTEGER, side TEXT, price_str TEXT, "
-                    "contracts INTEGER, timestamp_unix INTEGER)")
-        for k, ts in enumerate(ENTRIES):
-            con.execute("INSERT INTO trades VALUES (?, '0xother', '0xm', 0, 'buy', '0.45', 1, ?)",
-                        (f"t{k}", ts + SHIFT + 5))
-        con.commit()
-        con.close()
-        r = subprocess.run(
-            [sys.executable, str(SCRIPT), "--db", str(plain),
-             "--ranked-csv", str(self.ranked), "--positions-csv", str(self.positions),
-             "--out-dir", str(self.root / "out2"),
-             "--latency-shift-secs", str(SHIFT), "--fill-window-secs", str(WINDOW),
-             "--half-life-days", "0", "--min-trl", "0", "--min-active-months", "0",
-             "--min-avg-per-month", "0", "--floor-tstat", "2.0"],
-            capture_output=True, text=True, timeout=120)
+    def test_outcomes_artifact_regenerates_published_aggregates(self):
+        self.add_points([
+            (ENTRIES[0] + SHIFT - 30, "0.40"),
+            (ENTRIES[2] + SHIFT, "0.60"),
+        ])
+        self.add_full_coverage()
+        r, out = self.run_pass2()
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        with open(self.root / "out2" / "latency_shift_ranked.csv", newline="") as f:
-            row = list(csv.DictReader(f))[0]
-        self.assertEqual(row["n_filled"], "3", "legacy print path must fill from the tape")
-        print("PASS: default print oracle unchanged, no new-table dependency")
-
+        row = self.read_row(out)
+        # Recompute from the artifact alone.
+        with open(out / "oracle_outcomes.csv", newline="") as f:
+            recs = list(csv.DictReader(f))
+        self.assertEqual(len(recs), 3)
+        repriced = [x for x in recs if x["outcome"] == "repriced"]
+        self.assertEqual(str(len(repriced)), row["n_filled"])
+        self.assertAlmostEqual(len(repriced) / len(recs), float(row["fill_rate"]), places=4)
+        hit = sum(float(x["payoff"]) for x in repriced) / len(repriced)
+        self.assertAlmostEqual(hit, float(row["hit_rate"]), places=4)
+        # The manifest binds the exact outputs by digest.
+        import hashlib, json
+        man = json.load(open(out / "oracle_manifest.json"))
+        for name, key in (("latency_shift_ranked.csv", "latency_shift_ranked_sha256"),
+                          ("oracle_outcomes.csv", "oracle_outcomes_sha256")):
+            digest = hashlib.sha256((out / name).read_bytes()).hexdigest()
+            self.assertEqual(digest, man["outputs"][key], name)
+        print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
