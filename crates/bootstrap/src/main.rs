@@ -18,11 +18,14 @@ async fn main() {
     // ── Subcommand dispatch ──────────────────────────────────────────────────
     // Precedence: named subcommands > flag-style args > positional TOML path.
     //
-    // Exit-code convention (uniform across all subcommands):
-    //   0 = success (clean)
-    //   1 = fatal error
-    //   2 = partial (soft-fail): pipeline ran, some wallets/fetches failed;
-    //       cache is durable, re-run to retry failed items.
+    // Exit-code vocabulary (commands emit a subset, not uniform behavior):
+    //   0  = success (clean)
+    //   1  = permanent failure (fatal)
+    //   2  = partial (soft-fail): pipeline ran, some wallets/fetches failed;
+    //        cache is durable, re-run to retry failed items.
+    //   75 = temporary failure (tempfail): a bounded retryable operation
+    //        exhausted its in-process retries; the production loop supervisor
+    //        retries the cycle. Currently emitted by `events` and `resolutions`.
 
     // ── Subcommands that take [--strict] [<toml-path>] ──────────────────────
     let known_sub = matches!(
@@ -288,10 +291,13 @@ async fn main() {
                     Err(e) => {
                         let exit_code = resolutions_error_exit_code(&e);
                         if exit_code == BootstrapError::TEMPFAIL_EXIT_CODE {
+                            // Neutral label: this lane now carries BOTH audit
+                            // incompleteness and exhausted-transient CLOB walk
+                            // failures (#534); the `error` field distinguishes them.
                             tracing::warn!(
                                 error = %e,
                                 exit_code,
-                                "resolutions: audit incomplete"
+                                "resolutions: temporary failure"
                             );
                         } else {
                             tracing::error!(error = %e, exit_code, "resolutions: fatal");
@@ -803,8 +809,12 @@ fn wallets_from_cache(
 
 fn resolutions_error_exit_code(error: &BootstrapError) -> i32 {
     match error {
+        // The audit gate's typed incompleteness is a temporary condition (#523/#524).
         BootstrapError::ResolutionAuditIncomplete { .. } => BootstrapError::TEMPFAIL_EXIT_CODE,
-        _ => 1,
+        // Everything else delegates to the generic mapping, which sends the typed
+        // temporary `TransientSource` (e.g. an exhausted-transient CLOB page walk,
+        // #534) to tempfail 75 and every permanent error to 1.
+        _ => error.exit_code(),
     }
 }
 
@@ -814,7 +824,7 @@ mod tests {
     use pe_bootstrap::error::BootstrapError;
 
     #[test]
-    fn resolution_audit_incomplete_is_the_only_resolutions_tempfail() {
+    fn resolutions_tempfail_covers_audit_incomplete_and_transient_source() {
         for error in [
             BootstrapError::ResolutionAuditIncomplete {
                 blocked: 1,
@@ -824,15 +834,26 @@ mod tests {
                 blocked: 0,
                 clipped: 1,
             },
+            BootstrapError::TransientSource {
+                source_name: "polymarket-clob",
+                message: "fetch url: transient error (after 5 page retries)".to_owned(),
+            },
         ] {
             assert_eq!(
                 resolutions_error_exit_code(&error),
                 BootstrapError::TEMPFAIL_EXIT_CODE
             );
         }
+        // Permanent failures — fatal fetch/parse, cache — stay exit 1.
         assert_eq!(
             resolutions_error_exit_code(&BootstrapError::Clob {
                 message: "fatal".to_owned(),
+            }),
+            1
+        );
+        assert_eq!(
+            resolutions_error_exit_code(&BootstrapError::Cache {
+                message: "disk".to_owned(),
             }),
             1
         );

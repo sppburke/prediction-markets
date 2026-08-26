@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::clob::ClobFetcher;
+use pe_bootstrap::error::BootstrapError;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::PageFetcher;
 use tempfile::TempDir;
@@ -133,12 +134,19 @@ async fn clob_walk_rides_through_rate_limited() {
     println!("PASS: CLOB walk rode through 2 RateLimited responses (honoured retry_after)");
 }
 
-// PASS: a persistently transient page aborts (Err) after the retry budget — but
-//       only after retrying more than the single initial attempt.
-// FAIL: it aborts on the first attempt, or never aborts.
+// PASS: a persistently transient page aborts after the retry budget with the
+//       typed temporary error (`TransientSource`, exit 75), exactly six fetch
+//       attempts (1 initial + CLOB_PAGE_MAX_RETRIES), the "(after N page
+//       retries)" suffix, and an unchanged seeded page cursor.
+// FAIL: any other variant/exit code, a different attempt count, or a mutated
+//       cursor (#534: transience must survive exhaustion so the loop
+//       supervisor retries instead of stopping).
 #[tokio::test(start_paused = true)]
-async fn clob_walk_aborts_after_exhausting_retries() {
+async fn clob_walk_exhausted_transient_is_tempfail_and_preserves_cursor() {
     let (_dir, mut cache) = open_cache();
+    cache
+        .set_source_cursor("clob_closed", "mid-walk-cursor")
+        .unwrap();
     let calls = Arc::new(AtomicU32::new(0));
     let fetcher = FlakyFetcher {
         fail_n: u32::MAX,
@@ -148,20 +156,48 @@ async fn clob_walk_aborts_after_exhausting_retries() {
     };
     let clob = ClobFetcher::new("https://clob.example".to_owned(), fetcher);
 
-    let res = clob.fetch_closed_markets(&mut cache).await;
+    let err = clob
+        .fetch_closed_markets(&mut cache)
+        .await
+        .expect_err("a persistently transient page must abort after the retry budget");
     assert!(
-        res.is_err(),
-        "a persistently transient page must abort after the retry budget"
+        matches!(
+            err,
+            BootstrapError::TransientSource {
+                source_name: "polymarket-clob",
+                ..
+            }
+        ),
+        "expected TransientSource from polymarket-clob, got {err:?}"
     );
     assert!(
-        calls.load(Ordering::SeqCst) > 1,
-        "must have retried before aborting (not a single attempt)"
+        err.to_string().ends_with("(after 5 page retries)"),
+        "message must preserve the retry-count suffix: {err}"
     );
-    println!("PASS: CLOB walk aborts after exhausting page-level retries");
+    assert_eq!(
+        err.exit_code(),
+        BootstrapError::TEMPFAIL_EXIT_CODE,
+        "exhausted transience must map to the supervised tempfail exit"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        6,
+        "1 initial attempt + 5 budgeted retries"
+    );
+    assert_eq!(
+        cache.get_source_cursor("clob_closed").as_deref(),
+        Some("mid-walk-cursor"),
+        "the failed page's cursor must be preserved for resume"
+    );
+    println!(
+        "PASS: exhausted-transient CLOB walk returns TransientSource (exit 75), \
+         6 attempts, cursor preserved"
+    );
 }
 
-// PASS: a `Fatal` (4xx) error aborts immediately with exactly one fetch attempt.
-// FAIL: a Fatal error is retried.
+// PASS: a `Fatal` (4xx) error aborts immediately with exactly one fetch
+//       attempt, as the permanent `Clob` variant (exit 1).
+// FAIL: a Fatal error is retried, or maps to the temporary lane.
 #[tokio::test(start_paused = true)]
 async fn clob_walk_aborts_immediately_on_fatal() {
     let (_dir, mut cache) = open_cache();
@@ -174,12 +210,19 @@ async fn clob_walk_aborts_immediately_on_fatal() {
     };
     let clob = ClobFetcher::new("https://clob.example".to_owned(), fetcher);
 
-    let res = clob.fetch_closed_markets(&mut cache).await;
-    assert!(res.is_err(), "a Fatal fetch error must abort the walk");
+    let err = clob
+        .fetch_closed_markets(&mut cache)
+        .await
+        .expect_err("a Fatal fetch error must abort the walk");
+    assert!(
+        matches!(err, BootstrapError::Clob { .. }),
+        "fatal fetch failures stay the permanent Clob variant, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 1, "fatal failures stay exit 1");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
         "Fatal must abort immediately — never retried"
     );
-    println!("PASS: CLOB walk aborts immediately on a Fatal error (no retry)");
+    println!("PASS: CLOB walk aborts immediately on a Fatal error (Clob, exit 1, no retry)");
 }

@@ -456,13 +456,20 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNotNone(self._log("rank.log"), "ranking did not run after a partial resolutions")
         print("PASS: resolutions exit 2 (partial) → run continues to ranking")
 
-    def test_resolutions_audit_exit75_aborts_and_retains_cycle_pointer(self):
+    def test_resolutions_temporary_failure_exit75_aborts_and_retains_cycle_pointer(self):
+        # Exit 75 from the resolutions stage covers both temporary conditions:
+        # the incomplete resolution audit AND an exhausted-transient CLOB page
+        # walk (#534). The wrapper seam is identical for both.
         r = self._run(exit_env={"STUB_EXIT_resolutions": "75"})
         self.assertEqual(r.returncode, 75, f"stdout={r.stdout}\nstderr={r.stderr}")
-        self.assertIsNone(self._log("rank.log"), "ranking ran after incomplete resolution audit")
-        self.assertIsNone(self._log("push.log"), "publication ran after incomplete resolution audit")
+        self.assertIsNone(self._log("rank.log"), "ranking ran after a resolutions temporary failure")
+        self.assertIsNone(self._log("push.log"), "publication ran after a resolutions temporary failure")
         cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
-        self.assertTrue(cycle.is_file(), "audit tempfail lost the cycle recovery pointer")
+        self.assertTrue(cycle.is_file(), "resolutions tempfail lost the cycle recovery pointer")
+        # The stage label must reflect the temporary-failure semantics: the loop
+        # retries exit 75, so the wrapper must not call it FATAL (#534).
+        self.assertIn("[resolutions] TEMPFAIL exit 75", r.stderr)
+        self.assertNotIn("[resolutions] FATAL", r.stderr)
         self.assertIn("cron-", cycle.read_text())
         boot = (self._log("pe_bootstrap.log") or "").splitlines()
         self.assertTrue(any(line.startswith("resolutions") for line in boot))
