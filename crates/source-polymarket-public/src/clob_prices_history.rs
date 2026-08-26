@@ -383,7 +383,10 @@ mod tests {
         // Points, with the raw body returned for provenance hashing.
         let body = br#"{"history":[{"t":1000,"p":0.4}]}"#.to_vec();
         let mut map = HashMap::new();
-        map.insert(build_prices_history_url(BASE, "tok", 1_000, 2_000, 60), body.clone());
+        map.insert(
+            build_prices_history_url(BASE, "tok", 1_000, 2_000, 60),
+            body.clone(),
+        );
         let page = rt()
             .block_on(client(map).fetch_prices_history_classified("tok", 1_000, 2_000))
             .unwrap();

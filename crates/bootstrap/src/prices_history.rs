@@ -321,7 +321,10 @@ fn parse_targets_csv(
                 });
             }
         };
-        per_token.entry(token.to_owned()).or_default().push((start, end));
+        per_token
+            .entry(token.to_owned())
+            .or_default()
+            .push((start, end));
     }
     Ok(per_token)
 }
@@ -426,8 +429,12 @@ pub async fn run_targeted_prices_history(
                 // bounds; anything else is an anomaly — leave no ledger row, retry later.
                 if points.iter().any(|p| p.t < lo || p.t > hi) {
                     report.transient_failures += 1;
-                    tracing::warn!(token, lo, hi,
-                        "prices-history targeted: out-of-envelope sample — page not recorded");
+                    tracing::warn!(
+                        token,
+                        lo,
+                        hi,
+                        "prices-history targeted: out-of-envelope sample — page not recorded"
+                    );
                     continue;
                 }
                 let rows: Vec<(i64, String)> =
@@ -503,7 +510,11 @@ mod targeted_tests {
         assert_eq!(pages[0], (0, 80_000));
         assert_eq!(pages[1], (80_001, 160_001));
         assert_eq!(pages[2], (160_002, 200_000));
-        assert!(pages.iter().all(|(lo, hi)| hi - lo <= RANKER_PAGE_MAX_SPAN_SECS));
+        assert!(
+            pages
+                .iter()
+                .all(|(lo, hi)| hi - lo <= RANKER_PAGE_MAX_SPAN_SECS)
+        );
         assert_eq!(paginate(5, 5, RANKER_PAGE_MAX_SPAN_SECS), vec![(5, 5)]);
     }
 
@@ -513,7 +524,10 @@ mod targeted_tests {
             parse_targets_csv("token_id,start_ts,end_ts\nA,10,20\nA,30,40\nB,5,5\n").unwrap();
         assert_eq!(parsed["A"], vec![(10, 20), (30, 40)]);
         assert_eq!(parsed["B"], vec![(5, 5)]);
-        assert!(parse_targets_csv("A,20,10\n").is_err(), "inverted bounds are a bug");
+        assert!(
+            parse_targets_csv("A,20,10\n").is_err(),
+            "inverted bounds are a bug"
+        );
         assert!(parse_targets_csv("A,x,10\n").is_err());
         assert!(parse_targets_csv("A,1\n").is_err());
     }

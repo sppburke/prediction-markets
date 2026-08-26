@@ -1400,9 +1400,8 @@ impl WalletCache {
         }
         let tx = self.conn.transaction()?;
         {
-            let mut existing_stmt = tx.prepare(
-                "SELECT price FROM ranker_price_points WHERE token_id = ?1 AND t = ?2",
-            )?;
+            let mut existing_stmt =
+                tx.prepare("SELECT price FROM ranker_price_points WHERE token_id = ?1 AND t = ?2")?;
             let mut insert_stmt = tx.prepare(
                 "INSERT INTO ranker_price_points (token_id, t, price, fetched_at_unix) \
                  VALUES (?1, ?2, ?3, ?4)",
