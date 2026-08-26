@@ -174,6 +174,9 @@ class RankAndPushScenario(unittest.TestCase):
             '    tpath = a[a.index("--emit-targets") + 1]\n'
             '    open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
             '    sys.exit(int(os.environ.get("STUB_EXIT_emit", "0")))\n'
+            'rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
+            "if rc:\n"
+            "    sys.exit(rc)  # the real coverage gate exits before writing any output\n"
             'open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
             'if not os.environ.get("STUB_NO_MANIFEST"):\n'
             '    import hashlib, json\n'
@@ -181,7 +184,7 @@ class RankAndPushScenario(unittest.TestCase):
             '    open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
             '        {"oracle": "clob-minute-reference",\n'
             '         "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
-            'sys.exit(int(os.environ.get("STUB_EXIT_rerank", "0")))\n',
+            "sys.exit(0)\n",
         )
         # Fake push: log argv, emulate durable request/pending writes, and optionally
         # return the requested status (including EX_TEMPFAIL=75).

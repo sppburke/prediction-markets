@@ -298,7 +298,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Parse the targets file: a `token_id,start_ts,end_ts` header line then one row per
 /// merged backward window. The emitter is our own pass-2, so a malformed row is a bug —
-/// fatal, never skipped.
+/// fatal, never skipped. Bounds must satisfy `0 <= start <= end < i64::MAX`: unix-second
+/// windows can never legitimately sit at the integer extremes, and the guard makes the
+/// downstream `-1`/`+1` request padding and `+1` coverage algebra provably exact.
 fn parse_targets_csv(
     content: &str,
 ) -> Result<std::collections::BTreeMap<String, Vec<(i64, i64)>>, BootstrapError> {
@@ -319,7 +321,7 @@ fn parse_targets_csv(
             }
         };
         let (start, end) = match (start.parse::<i64>(), end.parse::<i64>()) {
-            (Ok(s), Ok(e)) if s <= e => (s, e),
+            (Ok(s), Ok(e)) if 0 <= s && s <= e && e < i64::MAX => (s, e),
             _ => {
                 return Err(BootstrapError::Invalid {
                     message: format!("targets line {} has invalid bounds: {line:?}", idx + 1),
@@ -402,12 +404,9 @@ pub async fn run_targeted_prices_history(
             async move {
                 // Padded request envelope: the venue's after/before bounds are exclusive,
                 // so fetch [lo-1, hi+1] to guarantee the logical page's edge seconds.
+                // Exact by the parse-time bound guard (0 <= lo <= hi < i64::MAX).
                 let res = client
-                    .fetch_prices_history_classified(
-                        &token,
-                        lo.saturating_sub(1),
-                        hi.saturating_add(1),
-                    )
+                    .fetch_prices_history_classified(&token, lo - 1, hi + 1)
                     .await;
                 (token, lo, hi, res)
             }
@@ -453,10 +452,7 @@ pub async fn run_targeted_prices_history(
                 // [lo-1, hi+1]; anything further out is an anomaly — no ledger row,
                 // retry later. Padding samples at exactly lo-1/hi+1 belong to the
                 // neighbouring logical page and are clamped out of this one.
-                if points
-                    .iter()
-                    .any(|p| p.t < lo.saturating_sub(1) || p.t > hi.saturating_add(1))
-                {
+                if points.iter().any(|p| p.t < lo - 1 || p.t > hi + 1) {
                     report.transient_failures += 1;
                     tracing::warn!(
                         token,
@@ -574,6 +570,13 @@ mod targeted_tests {
         );
         assert!(parse_targets_csv("A,x,10\n").is_err());
         assert!(parse_targets_csv("A,1\n").is_err());
+        // Integer extremes are corruption, rejected where the data enters — this is
+        // what makes the -1/+1 request padding and +1 coverage algebra exact.
+        assert!(parse_targets_csv("A,-1,10\n").is_err(), "negative start");
+        assert!(
+            parse_targets_csv(&format!("A,10,{}\n", i64::MAX)).is_err(),
+            "end at i64::MAX"
+        );
     }
 
     #[test]
