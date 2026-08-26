@@ -264,13 +264,12 @@ pub(crate) fn subtract_covered(needed: &[(i64, i64)], covered: &[(i64, i64)]) ->
     out
 }
 
-/// Split one inclusive range into CONTIGUOUS logical pages sharing their boundary
-/// seconds (`…(a,b),(b,c)…`), each spanning at most `max_span` seconds. The venue
-/// documents `startTs` as "after" and `endTs` as "before" (exclusive bounds), so the
-/// fetch pads every REQUEST one second beyond the logical page on both sides — the
-/// ledger records only the logical page, and shared boundaries mean no second falls
-/// between pages (#536 review: disjoint pages left a two-second seam hole that the
-/// ledger nevertheless claimed as covered).
+/// Split one inclusive range into DISJOINT logical pages (`…(a,b),(b+1,c)…`), each
+/// spanning at most `max_span` seconds. The venue documents `startTs` as "after" and
+/// `endTs` as "before" (exclusive bounds), so the fetch pads every REQUEST one second
+/// beyond the logical page on both sides — the padding alone guarantees the page's edge
+/// seconds (#536 review: unpadded exclusive bounds lost them), and disjoint pages give
+/// every committed sample exactly one owning ledger row.
 fn paginate(lo: i64, hi: i64, max_span: i64) -> Vec<(i64, i64)> {
     let mut pages = Vec::new();
     let mut cursor = lo;
@@ -280,7 +279,7 @@ fn paginate(lo: i64, hi: i64, max_span: i64) -> Vec<(i64, i64)> {
         if end == hi {
             break;
         }
-        cursor = end; // shared boundary: the next logical page starts where this one ends
+        cursor = end + 1; // end < hi here, so no overflow
     }
     pages
 }
@@ -404,7 +403,11 @@ pub async fn run_targeted_prices_history(
                 // Padded request envelope: the venue's after/before bounds are exclusive,
                 // so fetch [lo-1, hi+1] to guarantee the logical page's edge seconds.
                 let res = client
-                    .fetch_prices_history_classified(&token, lo - 1, hi + 1)
+                    .fetch_prices_history_classified(
+                        &token,
+                        lo.saturating_sub(1),
+                        hi.saturating_add(1),
+                    )
                     .await;
                 (token, lo, hi, res)
             }
@@ -449,9 +452,11 @@ pub async fn run_targeted_prices_history(
                 // Envelope guard: samples must lie inside the PADDED request
                 // [lo-1, hi+1]; anything further out is an anomaly — no ledger row,
                 // retry later. Padding samples at exactly lo-1/hi+1 belong to the
-                // neighbouring logical page and are clamped out of this one (the
-                // shared-boundary seconds lo/hi themselves are kept).
-                if points.iter().any(|p| p.t < lo - 1 || p.t > hi + 1) {
+                // neighbouring logical page and are clamped out of this one.
+                if points
+                    .iter()
+                    .any(|p| p.t < lo.saturating_sub(1) || p.t > hi.saturating_add(1))
+                {
                     report.transient_failures += 1;
                     tracing::warn!(
                         token,
@@ -536,16 +541,18 @@ mod targeted_tests {
     }
 
     #[test]
-    fn paginate_shares_boundaries_and_bounds_every_page() {
+    fn paginate_is_disjoint_and_gapless() {
         let pages = paginate(0, 200_000, RANKER_PAGE_MAX_SPAN_SECS);
         assert_eq!(
             pages,
-            vec![(0, 80_000), (80_000, 160_000), (160_000, 200_000)]
+            vec![(0, 80_000), (80_001, 160_001), (160_002, 200_000)]
         );
-        // Contiguous shared boundaries: no second can fall between logical pages even
-        // under the venue's exclusive request bounds (#536 review seam-hole fix).
+        // Disjoint but gapless: every second belongs to exactly one logical page, so
+        // each committed sample has exactly one owning ledger row; the padded request
+        // envelope (not page overlap) is what guarantees the edge seconds under the
+        // venue's exclusive bounds (#536 review).
         for w in pages.windows(2) {
-            assert_eq!(w[0].1, w[1].0);
+            assert_eq!(w[0].1 + 1, w[1].0);
         }
         assert!(
             pages

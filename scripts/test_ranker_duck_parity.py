@@ -11,7 +11,8 @@ BIGINT/VARCHAR behaviour is exercised, then:
   * runs pass-1 under the DuckDB engine -> CSVs;
   * asserts the qualifying-positions set is identical and the ranked stats are
     identical to rtol 1e-9 (the parity guarantee);
-  * (pass-2 parity moved to test_latency_shift_ref_oracle.py at the #536 cutover)
+  * (pass-2 lost its DuckDB path at the #536 cutover — it reads the SQLite ranker
+    price store only, so no pass-2 parity claim exists to test)
   * asserts `get_engine` auto-detect falls back to SQLite on a missing/stale snapshot.
 
 Fixture edge cases (each must be handled identically by both engines): first-buy

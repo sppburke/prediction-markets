@@ -203,6 +203,8 @@ class RefOracleScenario(unittest.TestCase):
         self.assertAlmostEqual(len(repriced) / len(recs), float(row["fill_rate"]), places=4)
         hit = sum(float(x["payoff"]) for x in repriced) / len(repriced)
         self.assertAlmostEqual(hit, float(row["hit_rate"]), places=4)
+        # Every mapped row carries the token_id provenance link into the price store.
+        self.assertTrue(all(x["token_id"] == "TOK" for x in recs))
         # The manifest binds the exact outputs by digest.
         import hashlib, json
         man = json.load(open(out / "oracle_manifest.json"))
@@ -210,7 +212,18 @@ class RefOracleScenario(unittest.TestCase):
                           ("oracle_outcomes.csv", "oracle_outcomes_sha256")):
             digest = hashlib.sha256((out / name).read_bytes()).hexdigest()
             self.assertEqual(digest, man["outputs"][key], name)
+        # No stage-2a targets file in this run: the input key must be present and null.
+        self.assertIn("oracle_targets_sha256", man["inputs"])
+        self.assertIsNone(man["inputs"]["oracle_targets_sha256"])
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
+
+    def test_nonpositive_fill_window_is_fatal(self):
+        # #536 review M2: staleness bound 0 would admit every stale sample; reject
+        # at argument parse, before any output is written.
+        r, out = self.run_pass2("--fill-window-secs", "0")
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
+        self.assertFalse((out / "latency_shift_ranked.csv").exists())
+        print("PASS: --fill-window-secs 0 rejected as fatal before any output")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -528,7 +528,8 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
         raise ValueError("no rows to push (empty CSV, or the active filter removed all)")
 
     config_hash = None
-    if a.manifest_file:
+    if a.manifest_file is not None:
+        # "" is a caller bug, not "no manifest": open() fails loudly below (#536).
         with open(a.manifest_file, encoding="utf-8") as mf:
             manifest = json.load(mf)
         # #536: config_hash must BIND the manifest to the ranking actually being
@@ -662,7 +663,8 @@ def main() -> int:
 
     try:
         if a.resume_request:
-            if a.ranked_csv or a.request_file or a.pending_file or a.prepare_only:
+            if (a.ranked_csv or a.request_file or a.pending_file or a.prepare_only
+                    or a.manifest_file is not None):
                 raise ValueError(
                     "--resume-request cannot be combined with ranking preparation arguments"
                 )

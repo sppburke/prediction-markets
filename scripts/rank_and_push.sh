@@ -674,10 +674,18 @@ else
     --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
     --request-file "$PUBLISH_REQUEST_FILE"
   )
-  # #536: bind the oracle manifest into config_hash when this run produced one; a
-  # pre-cutover directory re-pushed via --skip-rank has no manifest and publishes
-  # config_hash = null (the documented legacy-replay shape).
-  [[ -f "$OUT_DIR/oracle_manifest.json" ]] && PUSH_ARGS+=(--manifest-file "$OUT_DIR/oracle_manifest.json")
+  # #536: bind the oracle manifest into config_hash. A fresh rerank ALWAYS writes it
+  # (stage 2c, before the ranked CSV is considered complete), so its absence there is
+  # corruption — fail closed, never silently publish provenance-less. Only a
+  # pre-cutover directory re-pushed via --skip-rank legitimately has none and
+  # publishes config_hash = null (the documented legacy-replay shape).
+  MANIFEST_FILE="$OUT_DIR/oracle_manifest.json"
+  if [[ -f "$MANIFEST_FILE" ]]; then
+    PUSH_ARGS+=(--manifest-file "$MANIFEST_FILE")
+  elif [[ "$SKIP_RANK" == "0" ]]; then
+    echo "FATAL: fresh rerank left no $MANIFEST_FILE — refusing provenance-less publish" >&2
+    exit 1
+  fi
 
   # Parameterized research/re-push invocations never own the singleton production
   # recovery pointer. The complete zero-argument cycle is its sole normal writer.

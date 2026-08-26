@@ -94,11 +94,12 @@ async fn main() {
                 audit_csv = Some(std::path::PathBuf::from(v));
             } else if a == "--targets-csv" {
                 // A bare flag must never silently fall through to the legacy
-                // prices-history workflow (#536 review): usage error, exit 2,
-                // before any cache acquisition.
+                // prices-history workflow (#536 review). Usage error is FATAL
+                // (exit 1): this binary's exit 2 means "partial, retry", and a
+                // supervisor must never retry a malformed invocation.
                 if i + 1 >= rest.len() {
                     eprintln!("error: --targets-csv requires a file path");
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 i += 1;
                 flag_values.insert(rest[i]);

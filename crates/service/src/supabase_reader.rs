@@ -95,7 +95,8 @@ struct RankingRow {
     /// Latency-shifted net-edge t-stat. → `leader_score_bps` (ordering only).
     #[serde(default)]
     ls_tstat: Option<serde_json::Value>,
-    /// Number of filled positions in the eligibility window. → `closed_trades_in_window`.
+    /// Number of REPRICED positions (reference-oracle sample found, #536) in the
+    /// eligibility window. → `closed_trades_in_window`.
     #[serde(default)]
     n_trades: Option<i64>,
     /// Wallet's real last on-chain trade time (unix seconds), stamped by the ranker (#357).
