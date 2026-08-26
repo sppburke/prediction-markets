@@ -28,6 +28,7 @@
 use pe_source_core::SourceError;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::fetcher::PageFetcher;
 
@@ -128,11 +129,55 @@ impl<F: PageFetcher + Send + Sync> ClobPricesHistoryClient<F> {
 
         let parsed: PricesHistoryResponseRaw = serde_json::from_slice(&bytes)
             .map_err(|e| ClobPricesHistoryError::Parse(e.to_string()))?;
-        Ok(parsed
-            .history
-            .into_iter()
-            .map(|r| PricePoint { t: r.t, price: r.p })
-            .collect())
+        points_from_response(parsed)
+    }
+
+    /// Targeted-path twin of [`Self::fetch_prices_history`] with exhaustive response
+    /// classification (#536): valid points, valid empty (durable no-series truth), or a 4xx
+    /// rejection (invalid request — the caller's bug, surfaced instead of collapsed to empty).
+    /// Transient/rate-limited failures and malformed bodies still error. The raw body is
+    /// returned for provenance hashing.
+    ///
+    /// # Errors
+    /// [`ClobPricesHistoryError::Fetch`] on a non-fatal source error (transient/rate-limited);
+    /// [`ClobPricesHistoryError::Parse`] on a malformed response body.
+    pub async fn fetch_prices_history_classified(
+        &self,
+        token_id: &str,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Result<ClassifiedPage, ClobPricesHistoryError> {
+        let url = build_prices_history_url(
+            &self.base_url,
+            token_id,
+            start_ts,
+            end_ts,
+            self.fidelity_minutes,
+        );
+        let bytes = match self.fetcher.fetch_page(&url).await {
+            Ok(b) => b,
+            Err(SourceError::Fatal { message }) => {
+                return Ok(ClassifiedPage {
+                    outcome: ClassifiedPricesHistory::Rejected {
+                        message: format!("fetch {url}: {message}"),
+                    },
+                    body: Vec::new(),
+                });
+            }
+            Err(e) => return Err(ClobPricesHistoryError::Fetch(e.to_string())),
+        };
+        let parsed: PricesHistoryResponseRaw = serde_json::from_slice(&bytes)
+            .map_err(|e| ClobPricesHistoryError::Parse(e.to_string()))?;
+        let points = points_from_response(parsed)?;
+        let outcome = if points.is_empty() {
+            ClassifiedPricesHistory::Empty
+        } else {
+            ClassifiedPricesHistory::Points(points)
+        };
+        Ok(ClassifiedPage {
+            outcome,
+            body: bytes,
+        })
     }
 }
 
@@ -155,44 +200,74 @@ pub(crate) fn build_prices_history_url(
 /// Serde DTO for the `/prices-history` response: `{"history":[{"t","p"}]}`. `history` defaults to empty
 /// so a `{}` or `{"history":null}`-style body degrades to no points rather than erroring.
 #[derive(Deserialize)]
-struct PricesHistoryResponseRaw {
-    #[serde(default)]
-    history: Vec<MarketPriceRaw>,
+struct PricesHistoryResponseRaw<'a> {
+    #[serde(default, borrow)]
+    history: Vec<MarketPriceRaw<'a>>,
 }
 
-/// One `{"t":<unix>,"p":<float>}` point. `p` is decoded into [`Decimal`] at the boundary via
-/// [`deserialize_price`] (CLOB sends it as a JSON float) so no `f64` enters the price domain.
+/// One `{"t":<unix>,"p":<number>}` point. `p` is captured as the raw JSON lexeme and parsed
+/// exactly into [`Decimal`] by [`parse_price_lexeme`] — no `f64` intermediary ever touches the
+/// price domain (#536; the prior path routed floats through `Decimal::from_f64`, against the
+/// no-raw-float rule).
 #[derive(Deserialize)]
-struct MarketPriceRaw {
+struct MarketPriceRaw<'a> {
     t: i64,
-    #[serde(deserialize_with = "deserialize_price")]
-    p: Decimal,
+    #[serde(borrow)]
+    p: &'a RawValue,
 }
 
-/// Deserialize the CLOB `p` field — a JSON float in practice, but a string or int is also accepted —
-/// into [`Decimal`]. Mirrors `gamma_markets::deserialize_decimal_flexible` but is non-optional (a
-/// price point with no parseable price is a malformed body, so it errors rather than dropping silently).
-fn deserialize_price<'de, D>(d: D) -> Result<Decimal, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use rust_decimal::prelude::FromPrimitive;
-    use serde::de::Error as DeError;
+/// Parse the CLOB `p` lexeme — a JSON number in practice; a quoted string or integer is also
+/// accepted — exactly into [`Decimal`]. Scientific notation falls back to
+/// [`Decimal::from_scientific`]. A price point with no parseable price is a malformed body, so it
+/// errors rather than dropping silently.
+fn parse_price_lexeme(raw: &RawValue) -> Result<Decimal, String> {
+    let lexeme = raw.get().trim();
+    let lexeme = lexeme
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(lexeme);
+    lexeme
+        .parse::<Decimal>()
+        .or_else(|_| Decimal::from_scientific(lexeme))
+        .map_err(|e| format!("price lexeme {lexeme:?}: {e}"))
+}
 
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Flex {
-        Str(String),
-        Float(f64),
-        Int(i64),
-    }
+/// Convert one parsed response body into points, erroring on the first unparseable price.
+fn points_from_response(
+    parsed: PricesHistoryResponseRaw<'_>,
+) -> Result<Vec<PricePoint>, ClobPricesHistoryError> {
+    parsed
+        .history
+        .into_iter()
+        .map(|r| {
+            parse_price_lexeme(r.p)
+                .map(|price| PricePoint { t: r.t, price })
+                .map_err(ClobPricesHistoryError::Parse)
+        })
+        .collect()
+}
 
-    match Flex::deserialize(d)? {
-        Flex::Str(s) => s.parse::<Decimal>().map_err(DeError::custom),
-        Flex::Float(f) => Decimal::from_f64(f)
-            .ok_or_else(|| DeError::custom(format!("price f64 {f} → Decimal failed"))),
-        Flex::Int(i) => Ok(Decimal::from(i)),
-    }
+/// Exhaustive classification of one targeted `/prices-history` page fetch (#536).
+///
+/// The targeted ranker-oracle path must never conflate "the venue says there is no series"
+/// with "our request was invalid" — the official error contract defines 4xx as invalid
+/// filters, i.e. the caller's bug, never "no history".
+#[derive(Debug)]
+pub enum ClassifiedPricesHistory {
+    /// Valid HTTP 200 with at least one point.
+    Points(Vec<PricePoint>),
+    /// Valid HTTP 200 with an empty history — durable no-series truth.
+    Empty,
+    /// A 4xx rejection: an invalid request. The targeted caller treats this as fatal.
+    Rejected { message: String },
+}
+
+/// One classified page plus the raw response body (empty for [`ClassifiedPricesHistory::Rejected`],
+/// where only the error message is available) for provenance hashing by the caller.
+#[derive(Debug)]
+pub struct ClassifiedPage {
+    pub outcome: ClassifiedPricesHistory,
+    pub body: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -214,16 +289,32 @@ mod tests {
         );
     }
 
+    fn one_price(body: &str) -> Decimal {
+        let raw: MarketPriceRaw = serde_json::from_str(body).unwrap();
+        parse_price_lexeme(raw.p).unwrap()
+    }
+
     #[test]
-    fn deserialize_price_accepts_float_string_int() {
-        // CLOB sends `p` as a float; a string or int is tolerated. All decode to Decimal (no f64
-        // leaks into the price domain).
-        let raw: MarketPriceRaw = serde_json::from_str(r#"{"t":1,"p":0.62}"#).unwrap();
-        assert_eq!(raw.p, Decimal::new(62, 2));
-        let raw: MarketPriceRaw = serde_json::from_str(r#"{"t":2,"p":"0.38"}"#).unwrap();
-        assert_eq!(raw.p, Decimal::new(38, 2));
-        let raw: MarketPriceRaw = serde_json::from_str(r#"{"t":3,"p":1}"#).unwrap();
-        assert_eq!(raw.p, Decimal::ONE);
+    fn price_lexeme_parses_float_string_int_exactly() {
+        // CLOB sends `p` as a JSON number; a string or int is tolerated. All parse from the
+        // raw lexeme into Decimal — no f64 intermediary (#536).
+        assert_eq!(one_price(r#"{"t":1,"p":0.62}"#), Decimal::new(62, 2));
+        assert_eq!(one_price(r#"{"t":2,"p":"0.38"}"#), Decimal::new(38, 2));
+        assert_eq!(one_price(r#"{"t":3,"p":1}"#), Decimal::ONE);
+    }
+
+    #[test]
+    fn price_lexeme_preserves_precision_and_scientific() {
+        // A lexeme beyond f64's exact range survives digit-for-digit…
+        assert_eq!(
+            one_price(r#"{"t":1,"p":0.1234567890123456789012345678}"#).to_string(),
+            "0.1234567890123456789012345678"
+        );
+        // …and scientific notation falls back to Decimal::from_scientific.
+        assert_eq!(one_price(r#"{"t":2,"p":5e-4}"#), Decimal::new(5, 4));
+        // Unparseable lexemes error rather than dropping silently.
+        let raw: MarketPriceRaw = serde_json::from_str(r#"{"t":3,"p":"nope"}"#).unwrap();
+        assert!(parse_price_lexeme(raw.p).is_err());
     }
 
     #[test]
@@ -281,5 +372,38 @@ mod tests {
             .block_on(client(HashMap::new()).fetch_prices_history("missing", 0, 1))
             .unwrap();
         assert!(points.is_empty(), "4xx token must yield an empty series");
+    }
+
+    #[test]
+    fn classified_fetch_distinguishes_points_empty_and_rejected() {
+        // Points, with the raw body returned for provenance hashing.
+        let body = br#"{"history":[{"t":1000,"p":0.4}]}"#.to_vec();
+        let mut map = HashMap::new();
+        map.insert(build_prices_history_url(BASE, "tok", 1_000, 2_000, 60), body.clone());
+        let page = rt()
+            .block_on(client(map).fetch_prices_history_classified("tok", 1_000, 2_000))
+            .unwrap();
+        assert!(matches!(&page.outcome, ClassifiedPricesHistory::Points(p) if p.len() == 1));
+        assert_eq!(page.body, body, "raw body must round-trip for hashing");
+
+        // Valid empty history — durable no-series truth, body retained.
+        let mut map = HashMap::new();
+        map.insert(
+            build_prices_history_url(BASE, "tok", 1_000, 2_000, 60),
+            br#"{"history":[]}"#.to_vec(),
+        );
+        let page = rt()
+            .block_on(client(map).fetch_prices_history_classified("tok", 1_000, 2_000))
+            .unwrap();
+        assert!(matches!(page.outcome, ClassifiedPricesHistory::Empty));
+
+        // A 4xx surfaces as Rejected — never collapsed to empty on the targeted path.
+        let page = rt()
+            .block_on(client(HashMap::new()).fetch_prices_history_classified("missing", 0, 1))
+            .unwrap();
+        assert!(matches!(
+            page.outcome,
+            ClassifiedPricesHistory::Rejected { .. }
+        ));
     }
 }

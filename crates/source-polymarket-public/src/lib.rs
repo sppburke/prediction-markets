@@ -21,8 +21,8 @@ pub use activity_ws::{
     parse_activity_frame,
 };
 pub use clob_prices_history::{
-    CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS,
-    ClobPricesHistoryClient, ClobPricesHistoryError, PricePoint,
+    CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS, ClassifiedPage,
+    ClassifiedPricesHistory, ClobPricesHistoryClient, ClobPricesHistoryError, PricePoint,
 };
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
