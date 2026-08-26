@@ -112,8 +112,12 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     /// abort a ~1,457-page walk. `Fatal` errors abort immediately (a 4xx is not
     /// retryable); `Transient` backs off exponentially and `RateLimited` waits the
     /// server's `retry_after` (floored at [`CLOB_RATE_LIMIT_MIN_WAIT_SECS`]). Both
-    /// retryable arms share one budget: after [`CLOB_PAGE_MAX_RETRIES`] the error
-    /// propagates so a genuinely persistent failure still surfaces.
+    /// retryable arms share one budget: after [`CLOB_PAGE_MAX_RETRIES`] the
+    /// exhausted `Transient`/`RateLimited` error returns as
+    /// [`BootstrapError::TransientSource`] — the typed temporary error whose
+    /// generic exit-code mapping is the tempfail 75 the loop supervisor retries
+    /// (#534; mirrors the events-walk precedent). Fatal fetch and response-parse
+    /// failures remain [`BootstrapError::Clob`] (permanent, exit 1).
     async fn fetch_page_with_retry(&self, url: &str) -> Result<Vec<u8>, BootstrapError> {
         let mut attempt: u32 = 0;
         loop {
@@ -127,7 +131,13 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 }
                 Err(e) => {
                     if attempt >= CLOB_PAGE_MAX_RETRIES {
-                        return Err(BootstrapError::Clob {
+                        // Exhausted transient/rate-limited retries: a sustained upstream
+                        // outage, not a permanent contract failure. The typed temporary
+                        // error carries exit 75 so the loop supervisor retries the cycle
+                        // instead of stopping (#534; the 2026-08-26 CLOB degradation
+                        // killed the loop through the old `Clob` mapping here).
+                        return Err(BootstrapError::TransientSource {
+                            source_name: "polymarket-clob",
                             message: format!("fetch {url}: {e} (after {attempt} page retries)"),
                         });
                     }

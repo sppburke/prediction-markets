@@ -122,8 +122,11 @@ PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
 >   `pe-service`, and `pe-paper-pnl` — including the *open* passes, which the stale
 >   `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" comment wrongly excludes.
 
-**Exit codes** (all `pe-bootstrap` subcommands): `0` = success, `1` = fatal,
-`2` = partial (some wallets failed — safe to re-run; it retries the failures).
+**Exit codes** (a vocabulary — each `pe-bootstrap` subcommand emits a subset):
+`0` = success, `1` = permanent failure, `2` = partial (durable soft-fail — safe
+to re-run; it retries the failures), `75` = temporary failure (a bounded
+retryable operation exhausted its in-process retries; the production loop
+supervisor retries the cycle — currently emitted by `events` and `resolutions`).
 Add `--strict` to turn a partial into a fatal if you want CI-style hard failure.
 
 ### Verify the backfill landed

@@ -114,8 +114,10 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
 - **`CacheMutationLock`** is held only during the DB-write window inside
   `winner-discovery` and released before `backfill` starts, so no lock
   conflict with parallel `pe-bootstrap` invocations.
-- **Exit codes** follow the rest of the `pe-bootstrap` convention: 0 = success,
-  1 = fatal error, 2 = partial failure.
+- **Exit codes** follow the shared `pe-bootstrap` vocabulary (each command emits
+  a subset): 0 = success, 1 = permanent failure, 2 = partial failure,
+  75 = temporary failure (loop-supervised retry; emitted by `events` and
+  `resolutions`, not by the discovery commands).
 
 ## Related docs
 

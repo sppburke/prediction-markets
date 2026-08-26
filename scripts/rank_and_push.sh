@@ -486,9 +486,12 @@ if [[ -z "$AS_OF" ]]; then
 fi
 
 # ── Step 0: data refresh ─────────────────────────────────────────────────────────────────
-# Run one pe-bootstrap stage with the uniform exit-code convention
-# (crates/bootstrap/src/main.rs:21-25): 0 = clean, 2 = partial soft-fail (cache durable,
-# failures retried next run) → WARN + continue, 1/other = fatal → abort the whole run.
+# Run one pe-bootstrap stage with the shared exit-code vocabulary
+# (crates/bootstrap/src/main.rs dispatch comment): 0 = clean, 2 = partial soft-fail (cache
+# durable, failures retried next run) → WARN + continue, anything else → abort the run with
+# that code. Propagating the code verbatim is load-bearing for 75 (temporary failure, #534:
+# events page exhaustion, resolutions audit-incomplete or exhausted-transient CLOB walk):
+# the loop supervisor retries a 75 cycle, while 1 (permanent) stops the loop.
 # NEVER pass --strict: it turns a tolerable partial (2) into a fatal (1). backfill and
 # resolutions routinely return 2 at full scale, so swallowing 2 is load-bearing for cron.
 run_refresh_stage() {
@@ -499,6 +502,7 @@ run_refresh_stage() {
   case "$rc" in
     0) echo "   [$label] ok" ;;
     2) echo "   [$label] WARN exit 2 (partial); cache durable, continuing" >&2 ;;
+    75) echo "   [$label] TEMPFAIL exit 75 (temporary failure); aborting run for supervised retry" >&2; exit "$rc" ;;
     *) echo "   [$label] FATAL exit $rc — aborting run" >&2; exit "$rc" ;;
   esac
 }
