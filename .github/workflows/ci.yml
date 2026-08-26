@@ -97,6 +97,7 @@ jobs:
           python3 scripts/test_rank_and_push.py
           python3 scripts/test_rank_and_push_loop.py
           python3 scripts/test_ranker_duck_parity.py
+          python3 scripts/test_latency_shift_ref_oracle.py
           python3 scripts/test_probe_gamma_ua.py
           python3 scripts/test_ranker_interfaces.py
           python3 scripts/test_ranker_suff_stats.py

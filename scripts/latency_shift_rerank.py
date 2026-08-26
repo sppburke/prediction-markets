@@ -61,6 +61,15 @@ def parse_args():
     p.add_argument("--latency-shift-secs", type=float, default=20.0,
                    help="Δ: re-price at the first same-(market,outcome) trade at >= entry+Δ "
                         "(default 20s ~ p95 end-to-end copy latency, docs/29)")
+    p.add_argument("--fill-oracle", choices=("print", "ref"), default="print",
+                   help="fill oracle: 'print' (legacy: next cached trade print at >= entry+Δ "
+                        "within the window) or 'ref' (#536: latest minute reference price at "
+                        "<= entry+Δ, staleness <= the window, from ranker_price_points — "
+                        "at-or-before, no look-ahead). Default print until the gated cutover.")
+    p.add_argument("--emit-targets", default=None, metavar="PATH",
+                   help="write the per-token merged backward fetch windows "
+                        "(token_id,start_ts,end_ts) for the candidate positions and exit "
+                        "(#536: consumed by `pe-bootstrap prices-history --targets-csv`).")
     p.add_argument("--fill-window-secs", type=float, default=120.0,
                    help="the next same-(market,outcome) trade must fall within entry+Δ .. "
                         "entry+Δ+this; later => UNFILLABLE (illiquid, no realistic copy). "
@@ -103,6 +112,74 @@ def load_candidates(ranked_csv: str, floor_tstat: float) -> set[str]:
     return out
 
 
+
+# ─── Reference-oracle helpers (#536) ─────────────────────────────────────────────
+
+def map_pair_tokens(db: str, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """(market_id, outcome_id) → CLOB token_id via token_conditions (positional
+    outcome_index; NULL rows skipped, never mispriced). Unmapped pairs are simply
+    absent — their positions are unfillable under the reference oracle (honest)."""
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.execute("PRAGMA busy_timeout=30000;")
+    out: dict[tuple[str, str], str] = {}
+    markets = sorted({m for m, _ in pairs})
+    want = set(pairs)
+    for i in range(0, len(markets), 800):
+        chunk = markets[i:i + 800]
+        ph = ",".join("?" * len(chunk))
+        for cid, oi, tid in con.execute(
+                f"SELECT condition_id, outcome_index, token_id FROM token_conditions "
+                f"WHERE condition_id IN ({ph}) AND outcome_index IS NOT NULL", chunk):
+            key = (cid, str(int(oi)))
+            if key in want:
+                out[key] = tid
+    con.close()
+    return out
+
+
+def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sorted disjoint union of inclusive integer ranges (adjacent ranges merge)."""
+    merged: list[tuple[int, int]] = []
+    for lo, hi in sorted(ranges):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def subtract_ranges(needed: list[tuple[int, int]],
+                    covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """`needed` minus the union of `covered`, all bounds inclusive — the python twin of
+    the fetch side's range algebra, used only for the fail-closed publication gate."""
+    out: list[tuple[int, int]] = []
+    covered = merge_ranges(covered)
+    for lo, hi in merge_ranges(needed):
+        cursor = lo
+        for c_lo, c_hi in covered:
+            if c_hi < cursor:
+                continue
+            if c_lo > hi:
+                break
+            if c_lo > cursor:
+                out.append((cursor, c_lo - 1))
+            cursor = max(cursor, c_hi + 1)
+            if cursor > hi:
+                break
+        if cursor <= hi:
+            out.append((cursor, hi))
+    return out
+
+
+def pair_windows(positions: list[dict], shift: float, fill_window: float) -> list[tuple[int, int]]:
+    """Merged backward decision windows for one pair's positions, padded one second
+    each side (the venue documents after/before filtering; the lookup clamps locally)."""
+    return merge_ranges([
+        (int(p["entry_ts"] + shift - fill_window) - 1, int(p["entry_ts"] + shift) + 1)
+        for p in positions
+    ])
+
+
 def main() -> int:
     a = parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
@@ -140,6 +217,35 @@ def main() -> int:
     conn = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
     conn.execute("PRAGMA busy_timeout=30000;")
 
+    # ── Reference-oracle plumbing (#536) ──
+    token_of: dict[tuple[str, str], str] = {}
+    if a.emit_targets or a.fill_oracle == "ref":
+        token_of = map_pair_tokens(a.db, list(by_mo.keys()))
+        unmapped = sum(1 for k in by_mo if k not in token_of)
+        if unmapped:
+            log(f"token mapping missing for {unmapped}/{len(by_mo)} pairs — those positions "
+                f"are unfillable under the reference oracle")
+
+    if a.emit_targets:
+        rows_out = 0
+        with open(a.emit_targets, "w", newline="") as tf:
+            tf.write("token_id,start_ts,end_ts\n")
+            per_token: dict[str, list[tuple[int, int]]] = {}
+            for key, positions in by_mo.items():
+                tok = token_of.get(key)
+                if tok is None:
+                    continue
+                per_token.setdefault(tok, []).extend(
+                    pair_windows(positions, a.latency_shift_secs, a.fill_window_secs))
+            for tok in sorted(per_token):
+                for lo, hi in merge_ranges(per_token[tok]):
+                    tf.write(f"{tok},{lo},{hi}\n")
+                    rows_out += 1
+        log(f"wrote {rows_out} merged target window(s) for {len(per_token)} token(s) "
+            f"to {a.emit_targets}")
+        conn.close()
+        return 0
+
     # Per-wallet accumulators
     net_ls: dict[str, list[float]] = {}     # latency-shifted net per filled position
     entry_ts_ls: dict[str, list[int]] = {}  # entry_ts per FILLED position (parallel to net_ls) -> decay weight
@@ -151,69 +257,146 @@ def main() -> int:
     shift = a.latency_shift_secs
     fill_window = a.fill_window_secs
 
-    # DuckDB read-layer (#375): tape prices come back as RAW strings, so the float()/0<p<1 fill
-    # logic below is byte-identical to the SQLite per-pair scan, and the bisect+fill loop is the
-    # same for both engines. Tapes are loaded in bounded batches (not one fetch) — see #391 below.
-    engine = ranker_duck.get_engine()
-    use_duck = engine is not None
-    log("tape engine: DuckDB (Parquet read-layer, #375)" if use_duck
-        else "tape engine: SQLite (per-(market,outcome) scan)")
+    if a.fill_oracle == "ref":
+        # ── Reference oracle (#536) ──
+        # Fail-closed publication gate: every needed window must be terminal in
+        # ranker_price_pages ('complete' or valid-'empty'). Any un-terminal remainder
+        # exits 75 — the supervised tempfail lane — so a partially fetched cycle can
+        # never publish a selectively biased batch (ranges carry unequal position
+        # counts; no ratio threshold is safe). Selection statistics are never
+        # rewritten by this operational gate: validated-empty, unmapped, stale, and
+        # invalid-price positions simply count as not repriced.
+        page_cov: dict[str, list[tuple[int, int]]] = {}
+        for tok in sorted(set(token_of.values())):
+            page_cov[tok] = [(int(l), int(h)) for l, h in conn.execute(
+                "SELECT start_ts, end_ts FROM ranker_price_pages "
+                "WHERE token_id = ? AND fidelity_minutes = 1", (tok,))]
+        uncovered_pairs = 0
+        for key, positions in by_mo.items():
+            tok = token_of.get(key)
+            if tok is None:
+                continue  # unmapped: honestly unfillable, no coverage requirement
+            needed = pair_windows(positions, shift, fill_window)
+            if subtract_ranges(needed, page_cov.get(tok, [])):
+                uncovered_pairs += 1
+        if uncovered_pairs:
+            log(f"TEMPFAIL(75): {uncovered_pairs} pair(s) have un-terminal reference "
+                f"coverage — the targeted fetch stage retries the remainder next attempt")
+            conn.close()
+            return 75
+        log(f"reference coverage terminal for all {len(by_mo)} candidate pairs — scoring")
 
-    # Duck loads tapes in bounded batches of (market,outcome) pairs and drops each batch before the
-    # next, so pass-2 never holds every candidate tape at once (#391). SQLite already streams one
-    # pair at a time, so it runs as a single batch. The bisect/fill loop is identical for both.
-    mo_items = list(by_mo.items())
-    batches = ([mo_items[k:k + DUCK_TAPE_BATCH_PAIRS] for k in range(0, len(mo_items), DUCK_TAPE_BATCH_PAIRS)]
-               if use_duck else [mo_items])
-
-    i = 0
-    for batch in batches:
-        duck_tapes = ranker_duck.duck_load_tapes(engine, [k for k, _ in batch]) if use_duck else None
-        for (mid, oid), positions in batch:
-            if duck_tapes is not None:
-                ts_arr, px_arr = duck_tapes.get((mid, oid), ([], []))
+        i = 0
+        for (mid, oid), positions in by_mo.items():
+            tok = token_of.get((mid, oid))
+            if tok is None:
+                ts_arr, px_arr = [], []
             else:
-                # Deterministic tie order (#530): equal-timestamp trades must resolve
-                # identically across runs and engines — source_trade_id is the cache's
-                # PRIMARY KEY, so (timestamp, id) is a total order.
-                cur = conn.execute(
-                    "SELECT timestamp_unix, price_str FROM trades "
-                    "WHERE market_id = ? AND outcome_id = ? "
-                    "ORDER BY timestamp_unix ASC, source_trade_id ASC",
-                    (mid, oid),
-                )
-                tape = cur.fetchall()
-                ts_arr = [row[0] for row in tape]
-                px_arr = [row[1] for row in tape]
+                lo = int(min(p["entry_ts"] for p in positions) + shift - fill_window) - 1
+                hi = int(max(p["entry_ts"] for p in positions) + shift) + 1
+                rows_pts = conn.execute(
+                    "SELECT t, price FROM ranker_price_points "
+                    "WHERE token_id = ? AND t >= ? AND t <= ? ORDER BY t",
+                    (tok, lo, hi),
+                ).fetchall()
+                ts_arr = [int(t) for t, _ in rows_pts]
+                px_arr = [px for _, px in rows_pts]
             for pos in positions:
                 w = pos["wallet"]
                 n_total[w] = n_total.get(w, 0) + 1
                 target = pos["entry_ts"] + shift
-                idx = bisect.bisect_left(ts_arr, target)
+                # Latest sample at-or-before entry+Δ (at-or-before per repository
+                # precedent — forward selection would be look-ahead), staleness
+                # bounded by the window, strictly before actual resolution.
+                idx = bisect.bisect_right(ts_arr, target) - 1
                 filled = False
-                within_window = fill_window <= 0 or (idx < len(ts_arr) and ts_arr[idx] <= target + fill_window)
-                if idx < len(ts_arr) and ts_arr[idx] < pos["resolved_at"] and within_window:
-                    try:
-                        fill_price = float(px_arr[idx])
-                    except (TypeError, ValueError):
-                        fill_price = None
-                    if fill_price is not None and 0.0 < fill_price < 1.0:
-                        eff = min(fill_price + slip, 0.999)
-                        net = (pos["payoff"] - eff) / eff
-                        net_ls.setdefault(w, []).append(net)
-                        entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
-                        g = time.gmtime(pos["entry_ts"])
-                        months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
-                        n_filled[w] = n_filled.get(w, 0) + 1
-                        payoffs.setdefault(w, []).append(pos["payoff"])
-                        fill_delays.append(ts_arr[idx] - target)
-                        filled = True
+                if idx >= 0:
+                    t_smp = ts_arr[idx]
+                    if target - t_smp <= fill_window and t_smp < pos["resolved_at"]:
+                        try:
+                            fill_price = float(px_arr[idx])
+                        except (TypeError, ValueError):
+                            fill_price = None
+                        if fill_price is not None and 0.0 < fill_price < 1.0:
+                            eff = min(fill_price + slip, 0.999)
+                            net = (pos["payoff"] - eff) / eff
+                            net_ls.setdefault(w, []).append(net)
+                            entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
+                            g = time.gmtime(pos["entry_ts"])
+                            months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
+                            n_filled[w] = n_filled.get(w, 0) + 1
+                            payoffs.setdefault(w, []).append(pos["payoff"])
+                            fill_delays.append(target - t_smp)
+                            filled = True
                 if not filled:
-                    pass  # unfillable: no same-outcome trade between entry+Δ and resolution
+                    pass  # not repriced: no fresh-enough reference sample at entry+Δ
             i += 1
             if i % 2000 == 0:
                 log(f"  {i}/{len(by_mo)} market-outcomes processed")
-        duck_tapes = None  # drop this batch's tapes before loading the next (bounds peak memory)
+    else:
+        # DuckDB read-layer (#375): tape prices come back as RAW strings, so the float()/0<p<1 fill
+        # logic below is byte-identical to the SQLite per-pair scan, and the bisect+fill loop is the
+        # same for both engines. Tapes are loaded in bounded batches (not one fetch) — see #391 below.
+        engine = ranker_duck.get_engine()
+        use_duck = engine is not None
+        log("tape engine: DuckDB (Parquet read-layer, #375)" if use_duck
+            else "tape engine: SQLite (per-(market,outcome) scan)")
+
+        # Duck loads tapes in bounded batches of (market,outcome) pairs and drops each batch before the
+        # next, so pass-2 never holds every candidate tape at once (#391). SQLite already streams one
+        # pair at a time, so it runs as a single batch. The bisect/fill loop is identical for both.
+        mo_items = list(by_mo.items())
+        batches = ([mo_items[k:k + DUCK_TAPE_BATCH_PAIRS] for k in range(0, len(mo_items), DUCK_TAPE_BATCH_PAIRS)]
+                   if use_duck else [mo_items])
+
+        i = 0
+        for batch in batches:
+            duck_tapes = ranker_duck.duck_load_tapes(engine, [k for k, _ in batch]) if use_duck else None
+            for (mid, oid), positions in batch:
+                if duck_tapes is not None:
+                    ts_arr, px_arr = duck_tapes.get((mid, oid), ([], []))
+                else:
+                    # Deterministic tie order (#530): equal-timestamp trades must resolve
+                    # identically across runs and engines — source_trade_id is the cache's
+                    # PRIMARY KEY, so (timestamp, id) is a total order.
+                    cur = conn.execute(
+                        "SELECT timestamp_unix, price_str FROM trades "
+                        "WHERE market_id = ? AND outcome_id = ? "
+                        "ORDER BY timestamp_unix ASC, source_trade_id ASC",
+                        (mid, oid),
+                    )
+                    tape = cur.fetchall()
+                    ts_arr = [row[0] for row in tape]
+                    px_arr = [row[1] for row in tape]
+                for pos in positions:
+                    w = pos["wallet"]
+                    n_total[w] = n_total.get(w, 0) + 1
+                    target = pos["entry_ts"] + shift
+                    idx = bisect.bisect_left(ts_arr, target)
+                    filled = False
+                    within_window = fill_window <= 0 or (idx < len(ts_arr) and ts_arr[idx] <= target + fill_window)
+                    if idx < len(ts_arr) and ts_arr[idx] < pos["resolved_at"] and within_window:
+                        try:
+                            fill_price = float(px_arr[idx])
+                        except (TypeError, ValueError):
+                            fill_price = None
+                        if fill_price is not None and 0.0 < fill_price < 1.0:
+                            eff = min(fill_price + slip, 0.999)
+                            net = (pos["payoff"] - eff) / eff
+                            net_ls.setdefault(w, []).append(net)
+                            entry_ts_ls.setdefault(w, []).append(pos["entry_ts"])
+                            g = time.gmtime(pos["entry_ts"])
+                            months.setdefault(w, set()).add((g.tm_year, g.tm_mon))
+                            n_filled[w] = n_filled.get(w, 0) + 1
+                            payoffs.setdefault(w, []).append(pos["payoff"])
+                            fill_delays.append(ts_arr[idx] - target)
+                            filled = True
+                    if not filled:
+                        pass  # unfillable: no same-outcome trade between entry+Δ and resolution
+                i += 1
+                if i % 2000 == 0:
+                    log(f"  {i}/{len(by_mo)} market-outcomes processed")
+            duck_tapes = None  # drop this batch's tapes before loading the next (bounds peak memory)
 
     # Shared decay anchor: explicit --as-of (parsed identically to pass-1), else the
     # latest filled entry, so every wallet decays against one anchor. half_life <= 0
@@ -281,7 +464,9 @@ def main() -> int:
             f.write(r["wallet"] + "\n")
     if fill_delays:
         fd = sorted(fill_delays)
-        log(f"fill-delay (s past entry+Δ): p50={fd[len(fd)//2]:.0f} "
+        label = ("reference-sample staleness (s before entry+Δ)" if a.fill_oracle == "ref"
+                 else "fill-delay (s past entry+Δ)")
+        log(f"{label}: p50={fd[len(fd)//2]:.0f} "
             f"p90={fd[int(len(fd)*0.9)]:.0f} max={fd[-1]:.0f}")
     if basket:
         log(f"basket={len(basket)}  mean fill_rate={statistics.fmean([r['fill_rate'] for r in basket]):.3f}  "
