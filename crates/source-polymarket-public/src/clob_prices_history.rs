@@ -162,6 +162,7 @@ impl<F: PageFetcher + Send + Sync> ClobPricesHistoryClient<F> {
                         message: format!("fetch {url}: {message}"),
                     },
                     body: Vec::new(),
+                    url,
                 });
             }
             Err(e) => return Err(ClobPricesHistoryError::Fetch(e.to_string())),
@@ -177,6 +178,7 @@ impl<F: PageFetcher + Send + Sync> ClobPricesHistoryClient<F> {
         Ok(ClassifiedPage {
             outcome,
             body: bytes,
+            url,
         })
     }
 }
@@ -263,11 +265,13 @@ pub enum ClassifiedPricesHistory {
 }
 
 /// One classified page plus the raw response body (empty for [`ClassifiedPricesHistory::Rejected`],
-/// where only the error message is available) for provenance hashing by the caller.
+/// where only the error message is available) and the exact request URL, for provenance
+/// recording by the caller.
 #[derive(Debug)]
 pub struct ClassifiedPage {
     pub outcome: ClassifiedPricesHistory,
     pub body: Vec<u8>,
+    pub url: String,
 }
 
 #[cfg(test)]
