@@ -595,5 +595,51 @@ class PruneOldBatchesTest(unittest.TestCase):
         )
 
 
+class ManifestBindingTest(unittest.TestCase):
+    """#536: config_hash must bind the manifest to the ranking actually published."""
+
+    def _prep(self, tamper: bool):
+        import argparse
+        import json as _json
+        import tempfile
+        from pathlib import Path
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ranked = root / "latency_shift_ranked.csv"
+        ranked.write_text(
+            "wallet,n_total,n_filled,fill_rate,active_months,mean_net_ls,"
+            "tstat_net_ls,n_eff,hit_rate,survives\n"
+            "0x" + "a" * 40 + ",5,5,1.0,2,0.5,3.0,5.0,0.8,True\n"
+        )
+        import hashlib as _hashlib
+
+        digest = _hashlib.sha256(ranked.read_bytes()).hexdigest()
+        manifest = root / "oracle_manifest.json"
+        manifest.write_text(_json.dumps({
+            "oracle": "clob-minute-reference",
+            "outputs": {"latency_shift_ranked_sha256": "0" * 64 if tamper else digest},
+        }))
+        return argparse.Namespace(
+            ranked_csv=str(ranked), manifest_file=str(manifest), db=None,
+            top_n=200, band_lo=0.15, band_hi=0.85, ttr_floor_secs=30,
+            ttr_max_secs=172800, latency_shift_secs=2, universe_size=0,
+            git_sha="test", notes="", keep_batches=0,
+            active_window_hours=72, max_cache_staleness_hours=24,
+        )
+
+    def test_matching_manifest_produces_config_hash(self) -> None:
+        req = pr.prepare_publish_request(self._prep(tamper=False), 1_700_000_000)
+        self.assertIsNotNone(req["batch"]["config_hash"])
+        print("PASS: matching manifest digest -> config_hash populated")
+
+    def test_mismatched_manifest_refuses_to_publish(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            pr.prepare_publish_request(self._prep(tamper=True), 1_700_000_000)
+        self.assertIn("refusing to publish", str(ctx.exception))
+        print("PASS: manifest/ranking digest mismatch refuses publication")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

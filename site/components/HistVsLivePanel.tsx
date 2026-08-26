@@ -47,7 +47,7 @@ export function HistVsLivePanel({ row }: { row: WalletLiveStats }) {
       </div>
       <Row label="Win rate" hist={formatPct(row.hit_rate)} live={formatPct(row.live_win_rate)} />
       <Row label="Edge (hist · paper ¢/trade)" hist={formatEdge(row.ls_edge)} live={formatCents(row.live_edge, { sign: true })} />
-      <Row label="Trades" hist={formatInt(row.n_trades)} live={formatInt(row.live_total_fills)} />
+      <Row label="Repriced (hist) / fills (live)" hist={formatInt(row.n_trades)} live={formatInt(row.live_total_fills)} />
       <Row label="Settled" hist="—" live={formatInt(row.live_settled_count)} />
       <Row label="Open" hist="—" live={formatInt(row.live_open_fills)} />
       <Row label="Wins" hist="—" live={formatInt(row.live_wins)} />

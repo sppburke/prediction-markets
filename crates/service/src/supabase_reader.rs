@@ -89,7 +89,7 @@ struct RankingRow {
     #[serde(default)]
     rank: Option<i64>,
     wallet_hex: String,
-    /// Mean payoff among filled positions ∈ [0,1] = Kelly `p`. → `win_rate_bps`.
+    /// Mean payoff among REPRICED positions ∈ [0,1] = Kelly `p` (#536). → `win_rate_bps`.
     #[serde(default)]
     hit_rate: Option<serde_json::Value>,
     /// Latency-shifted net-edge t-stat. → `leader_score_bps` (ordering only).

@@ -11,8 +11,7 @@ BIGINT/VARCHAR behaviour is exercised, then:
   * runs pass-1 under the DuckDB engine -> CSVs;
   * asserts the qualifying-positions set is identical and the ranked stats are
     identical to rtol 1e-9 (the parity guarantee);
-  * runs pass-2 (`latency_shift_rerank`) under both engines and asserts the
-    latency-shifted ranking is identical;
+  * (pass-2 parity moved to test_latency_shift_ref_oracle.py at the #536 cutover)
   * asserts `get_engine` auto-detect falls back to SQLite on a missing/stale snapshot.
 
 Fixture edge cases (each must be handled identically by both engines): first-buy
@@ -46,7 +45,6 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import export_trades_parquet as exp  # noqa: E402
-import latency_shift_rerank as ls  # noqa: E402
 import rank_72hr_buyandhold as rk  # noqa: E402
 import ranker_duck  # noqa: E402
 
@@ -65,8 +63,6 @@ AS_OF_ISO = "2026-04-01"
 RANKED_NUMERIC = ["n", "active_months", "avg_per_active_month", "mean_gross",
                   "std_gross", "tstat_gross", "mean_net", "std_net", "tstat_net",
                   "n_eff", "hit_rate", "avg_price", "avg_ttr_hours"]
-LS_NUMERIC = ["n_total", "n_filled", "fill_rate", "active_months", "mean_net_ls",
-              "tstat_net_ls", "n_eff", "hit_rate"]
 
 
 def ts(y: int, m: int, d: int, hh: int = 12) -> int:

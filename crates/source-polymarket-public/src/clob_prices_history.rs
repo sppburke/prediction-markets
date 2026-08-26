@@ -167,9 +167,19 @@ impl<F: PageFetcher + Send + Sync> ClobPricesHistoryClient<F> {
             }
             Err(e) => return Err(ClobPricesHistoryError::Fetch(e.to_string())),
         };
-        let parsed: PricesHistoryResponseRaw = serde_json::from_slice(&bytes)
+        // Strict shape for the targeted path (#536 review): a valid empty series is a
+        // PRESENT empty `history` array; a body with no `history` key (schema drift, a
+        // proxy error page) must never become durable no-series truth.
+        #[derive(Deserialize)]
+        struct StrictResponseRaw<'a> {
+            #[serde(borrow)]
+            history: Vec<MarketPriceRaw<'a>>,
+        }
+        let parsed: StrictResponseRaw = serde_json::from_slice(&bytes)
             .map_err(|e| ClobPricesHistoryError::Parse(e.to_string()))?;
-        let points = points_from_response(parsed)?;
+        let points = points_from_response(PricesHistoryResponseRaw {
+            history: parsed.history,
+        })?;
         let outcome = if points.is_empty() {
             ClassifiedPricesHistory::Empty
         } else {
@@ -403,6 +413,18 @@ mod tests {
             .block_on(client(map).fetch_prices_history_classified("tok", 1_000, 2_000))
             .unwrap();
         assert!(matches!(page.outcome, ClassifiedPricesHistory::Empty));
+
+        // A body with no `history` key must never become durable no-series truth on
+        // the targeted path (#536 review): strict shape, parse error.
+        let mut map = HashMap::new();
+        map.insert(
+            build_prices_history_url(BASE, "tok", 1_000, 2_000, 60),
+            b"{}".to_vec(),
+        );
+        let err = rt()
+            .block_on(client(map).fetch_prices_history_classified("tok", 1_000, 2_000))
+            .unwrap_err();
+        assert!(matches!(err, ClobPricesHistoryError::Parse(_)));
 
         // A 4xx surfaces as Rejected — never collapsed to empty on the targeted path.
         let page = rt()

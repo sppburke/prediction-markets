@@ -667,7 +667,6 @@ else
   TTR_MAX_SECS="$("$PYTHON_BIN" -c "print(int(float('$TTR_HOURS')*3600))")"
   PUSH_ARGS+=(
     --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N"
-    --manifest-file "$OUT_DIR/oracle_manifest.json"
     --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX"
     --ttr-max-secs "$TTR_MAX_SECS"
     --latency-shift-secs "$LATENCY_SHIFT_SECS"
@@ -675,6 +674,11 @@ else
     --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
     --request-file "$PUBLISH_REQUEST_FILE"
   )
+  # #536: bind the oracle manifest into config_hash when this run produced one; a
+  # pre-cutover directory re-pushed via --skip-rank has no manifest and publishes
+  # config_hash = null (the documented legacy-replay shape).
+  [[ -f "$OUT_DIR/oracle_manifest.json" ]] && PUSH_ARGS+=(--manifest-file "$OUT_DIR/oracle_manifest.json")
+
   # Parameterized research/re-push invocations never own the singleton production
   # recovery pointer. The complete zero-argument cycle is its sole normal writer.
   if [[ "$INVOCATION_ARGC" -eq 0 ]]; then

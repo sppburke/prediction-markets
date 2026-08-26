@@ -271,4 +271,3 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     finally:
         con.unregister("universe")
     return df
-

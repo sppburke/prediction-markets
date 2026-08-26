@@ -531,6 +531,16 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
     if a.manifest_file:
         with open(a.manifest_file, encoding="utf-8") as mf:
             manifest = json.load(mf)
+        # #536: config_hash must BIND the manifest to the ranking actually being
+        # published — a stale/mixed run directory must never publish ranking A under
+        # the replay identity of ranking B.
+        actual = hashlib.sha256(open(a.ranked_csv, "rb").read()).hexdigest()
+        declared = manifest.get("outputs", {}).get("latency_shift_ranked_sha256")
+        if declared != actual:
+            raise ValueError(
+                f"manifest binds ranking {str(declared)[:16]}… but --ranked-csv digests "
+                f"{actual[:16]}… — mixed or stale run directory; refusing to publish"
+            )
         config_hash = hashlib.sha256(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

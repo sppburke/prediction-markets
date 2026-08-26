@@ -80,7 +80,7 @@ def parse_args():
     p.add_argument("--fill-window-secs", type=float, default=120.0,
                    help="reference-sample staleness bound: the chosen sample must be at "
                         "most this many seconds before entry+Δ; older => NOT REPRICED. "
-                        "0 = no bound.")
+                        "Must be positive (the bound also anchors the fetch windows).")
     p.add_argument("--slip-cents", type=float, default=1.0,
                    help="entry slippage in cents on the repriced fill basis")
     p.add_argument("--half-life-days", type=float, default=DEFAULT_HALF_LIFE_DAYS,
@@ -198,6 +198,10 @@ def pair_windows(positions: list[dict], shift: float, fill_window: float) -> lis
 
 def main() -> int:
     a = parse_args()
+    if a.fill_window_secs <= 0:
+        log("FATAL: --fill-window-secs must be positive — the staleness bound also "
+            "anchors the backward fetch windows (#536 review)")
+        return 1
     os.makedirs(a.out_dir, exist_ok=True)
     slip = a.slip_cents / 100.0
     cand = load_candidates(a.ranked_csv, a.floor_tstat)
@@ -296,8 +300,8 @@ def main() -> int:
     outcomes_path = os.path.join(a.out_dir, "oracle_outcomes.csv")
     outcomes_fh = open(outcomes_path, "w", newline="")
     outcomes = csv.writer(outcomes_fh)
-    outcomes.writerow(["wallet", "market_id", "outcome_id", "entry_ts", "payoff",
-                       "resolved_at", "sample_t", "sample_price", "outcome"])
+    outcomes.writerow(["wallet", "market_id", "outcome_id", "token_id", "entry_ts",
+                       "payoff", "resolved_at", "sample_t", "sample_price", "outcome"])
 
     i = 0
     for (mid, oid), positions in by_mo.items():
@@ -352,7 +356,9 @@ def main() -> int:
                         staleness.append(target - t_smp)
                         reason = "repriced"
                         sample_t, sample_px = t_smp, px_arr[idx]
-            outcomes.writerow([w, mid, oid, pos["entry_ts"], pos["payoff"],
+            # token_id + sample_t uniquely locate the covering validated page in
+            # ranker_price_pages — the per-position provenance chain (#536 review).
+            outcomes.writerow([w, mid, oid, tok or "", pos["entry_ts"], pos["payoff"],
                                pos["resolved_at"], sample_t, sample_px, reason])
         i += 1
         if i % 2000 == 0:
@@ -433,6 +439,13 @@ def main() -> int:
         "inputs": {
             "ranked_csv_sha256": sha256_file(a.ranked_csv),
             "positions_csv_sha256": sha256_file(a.positions_csv),
+            # The cycle's target file (stage 2a) when present — binds which windows
+            # the reference store was asked to cover (#536 review).
+            "oracle_targets_sha256": (
+                sha256_file(os.path.join(a.out_dir, "oracle_targets.csv"))
+                if os.path.exists(os.path.join(a.out_dir, "oracle_targets.csv"))
+                else None
+            ),
         },
         "outputs": {
             "latency_shift_ranked_sha256": sha256_file(ranked_path),

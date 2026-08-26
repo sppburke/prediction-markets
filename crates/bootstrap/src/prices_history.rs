@@ -264,7 +264,13 @@ pub(crate) fn subtract_covered(needed: &[(i64, i64)], covered: &[(i64, i64)]) ->
     out
 }
 
-/// Split one inclusive range into pages spanning at most `max_span` seconds.
+/// Split one inclusive range into CONTIGUOUS logical pages sharing their boundary
+/// seconds (`…(a,b),(b,c)…`), each spanning at most `max_span` seconds. The venue
+/// documents `startTs` as "after" and `endTs` as "before" (exclusive bounds), so the
+/// fetch pads every REQUEST one second beyond the logical page on both sides — the
+/// ledger records only the logical page, and shared boundaries mean no second falls
+/// between pages (#536 review: disjoint pages left a two-second seam hole that the
+/// ledger nevertheless claimed as covered).
 fn paginate(lo: i64, hi: i64, max_span: i64) -> Vec<(i64, i64)> {
     let mut pages = Vec::new();
     let mut cursor = lo;
@@ -274,7 +280,7 @@ fn paginate(lo: i64, hi: i64, max_span: i64) -> Vec<(i64, i64)> {
         if end == hi {
             break;
         }
-        cursor = end.saturating_add(1);
+        cursor = end; // shared boundary: the next logical page starts where this one ends
     }
     pages
 }
@@ -395,18 +401,32 @@ pub async fn run_targeted_prices_history(
         .map(|(token, lo, hi)| {
             let client = Arc::clone(&client);
             async move {
-                let res = client.fetch_prices_history_classified(&token, lo, hi).await;
+                // Padded request envelope: the venue's after/before bounds are exclusive,
+                // so fetch [lo-1, hi+1] to guarantee the logical page's edge seconds.
+                let res = client
+                    .fetch_prices_history_classified(&token, lo - 1, hi + 1)
+                    .await;
                 (token, lo, hi, res)
             }
         })
         .buffer_unordered(concurrency);
 
-    use pe_source_polymarket_public::ClassifiedPricesHistory;
+    use pe_source_polymarket_public::{ClassifiedPricesHistory, ClobPricesHistoryError};
 
     use crate::cache::{RankerPageStatus, RankerPricePage};
     while let Some((token, lo, hi, res)) = stream.next().await {
         let page = match res {
             Ok(p) => p,
+            Err(ClobPricesHistoryError::Parse(message)) => {
+                // A malformed body is a contract break, never a blip: retrying forever
+                // under the transient lane would loop the supervisor (#536 review).
+                return Err(BootstrapError::Invalid {
+                    message: format!(
+                        "prices-history targeted: malformed response for {token} \
+                         [{lo},{hi}]: {message}"
+                    ),
+                });
+            }
             Err(e) => {
                 report.transient_failures += 1;
                 tracing::warn!(token, lo, hi, error = %e,
@@ -414,6 +434,7 @@ pub async fn run_targeted_prices_history(
                 continue;
             }
         };
+
         let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
         let (status, rows) = match page.outcome {
             ClassifiedPricesHistory::Rejected { message } => {
@@ -425,9 +446,12 @@ pub async fn run_targeted_prices_history(
                 });
             }
             ClassifiedPricesHistory::Points(points) => {
-                // Envelope guard: the venue must only return samples inside the requested
-                // bounds; anything else is an anomaly — leave no ledger row, retry later.
-                if points.iter().any(|p| p.t < lo || p.t > hi) {
+                // Envelope guard: samples must lie inside the PADDED request
+                // [lo-1, hi+1]; anything further out is an anomaly — no ledger row,
+                // retry later. Padding samples at exactly lo-1/hi+1 belong to the
+                // neighbouring logical page and are clamped out of this one (the
+                // shared-boundary seconds lo/hi themselves are kept).
+                if points.iter().any(|p| p.t < lo - 1 || p.t > hi + 1) {
                     report.transient_failures += 1;
                     tracing::warn!(
                         token,
@@ -437,9 +461,17 @@ pub async fn run_targeted_prices_history(
                     );
                     continue;
                 }
-                let rows: Vec<(i64, String)> =
-                    points.iter().map(|p| (p.t, p.price.to_string())).collect();
-                (RankerPageStatus::Complete, rows)
+                let rows: Vec<(i64, String)> = points
+                    .iter()
+                    .filter(|p| p.t >= lo && p.t <= hi)
+                    .map(|p| (p.t, p.price.to_string()))
+                    .collect();
+                let status = if rows.is_empty() {
+                    RankerPageStatus::Empty
+                } else {
+                    RankerPageStatus::Complete
+                };
+                (status, rows)
             }
             ClassifiedPricesHistory::Empty => (RankerPageStatus::Empty, Vec::new()),
         };
@@ -504,12 +536,17 @@ mod targeted_tests {
     }
 
     #[test]
-    fn paginate_bounds_every_page_under_the_cap() {
+    fn paginate_shares_boundaries_and_bounds_every_page() {
         let pages = paginate(0, 200_000, RANKER_PAGE_MAX_SPAN_SECS);
-        assert_eq!(pages.len(), 3);
-        assert_eq!(pages[0], (0, 80_000));
-        assert_eq!(pages[1], (80_001, 160_001));
-        assert_eq!(pages[2], (160_002, 200_000));
+        assert_eq!(
+            pages,
+            vec![(0, 80_000), (80_000, 160_000), (160_000, 200_000)]
+        );
+        // Contiguous shared boundaries: no second can fall between logical pages even
+        // under the venue's exclusive request bounds (#536 review seam-hole fix).
+        for w in pages.windows(2) {
+            assert_eq!(w[0].1, w[1].0);
+        }
         assert!(
             pages
                 .iter()

@@ -92,7 +92,14 @@ async fn main() {
                 audit_csv = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--audit-csv=") {
                 audit_csv = Some(std::path::PathBuf::from(v));
-            } else if a == "--targets-csv" && i + 1 < rest.len() {
+            } else if a == "--targets-csv" {
+                // A bare flag must never silently fall through to the legacy
+                // prices-history workflow (#536 review): usage error, exit 2,
+                // before any cache acquisition.
+                if i + 1 >= rest.len() {
+                    eprintln!("error: --targets-csv requires a file path");
+                    std::process::exit(2);
+                }
                 i += 1;
                 flag_values.insert(rest[i]);
                 targets_csv = Some(std::path::PathBuf::from(rest[i]));
