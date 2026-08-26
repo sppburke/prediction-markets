@@ -116,8 +116,8 @@
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/markets/{condition_id} | 2026-08-22 | 2026-10-21 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
-| https://clob.polymarket.com/prices-history?market={tokenId} | 2026-06-23 | 2026-08-22 |
-| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-06-23 | 2026-08-22 |
+| https://clob.polymarket.com/prices-history?market={tokenId} | 2026-08-26 | 2026-10-25 |
+| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-08-26 | 2026-10-25 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 

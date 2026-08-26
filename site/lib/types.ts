@@ -17,9 +17,9 @@ export interface WalletLiveStats {
   rank: Numeric; // null if aged out of the current batch
   ls_edge: Numeric;
   ls_tstat: Numeric;
-  fill_rate: Numeric; // fraction 0..1
-  n_trades: Numeric;
-  hit_rate: Numeric; // fraction 0..1 — historical win-rate (no win_rate_bps column)
+  fill_rate: Numeric; // repricing coverage 0..1 (#536: fraction of positions repriced at the minute reference; wire name kept)
+  n_trades: Numeric; // repriced positions in the eval window
+  hit_rate: Numeric; // fraction 0..1 — outcome rate among repriced positions (no win_rate_bps column)
   avg_price: Numeric; // mid price 0..1
   last_trade_unix: Numeric; // epoch s of the wallet's real last on-chain trade at the last rank push (#357); null if aged out / pre-#357 batch
 }

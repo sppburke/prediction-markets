@@ -153,6 +153,47 @@ CREATE TABLE IF NOT EXISTS market_price_history (
     PRIMARY KEY (market_id, token_id, t)
 );
 
+-- Ranker fill-oracle minute price reference (#536), ISOLATED from market_price_history
+-- because true-CLV (`_TRUE_CLV_SQL`) and the mark index read every `source='clob'` row
+-- there — dense minute rows would silently change both — and its write-once PK omits
+-- `source`, so coarse and minute points would collide. `token_id` alone keys points
+-- (`token_conditions.token_id` is globally unique); market/outcome mapping lives in the
+-- per-run targets and retained outcome artifacts. Points are write-once; a conflicting
+-- duplicate (same token+t, different price) rolls back its whole page (commit_ranker_price_page).
+CREATE TABLE IF NOT EXISTS ranker_price_points (
+    token_id        TEXT    NOT NULL,
+    t               INTEGER NOT NULL,
+    price           TEXT    NOT NULL,
+    fetched_at_unix INTEGER NOT NULL,
+    PRIMARY KEY (token_id, t)
+);
+
+-- Append-only ledger of VALIDATED fetched pages for ranker_price_points (#536). One row per
+-- bounded request page, written in the SAME transaction as its points — or neither. Coverage
+-- is computed by range algebra over terminal rows at the active fidelity (union-subtract), so
+-- shifting target-merge boundaries can never orphan or double-count coverage, and a lone
+-- pre-existing point can never masquerade as completeness (the legacy presence-based-resume
+-- failure mode). `status`: 'complete' (points > 0) or 'empty' (valid HTTP 200 with zero points
+-- — durable no-series truth; a 4xx is NEVER recorded here). Full external-input provenance per
+-- page; `parser_version` is provenance only — deliberately OUTSIDE the coverage identity so a
+-- code deploy never invalidates fetched truth, while a fidelity change (in the PK) does.
+CREATE TABLE IF NOT EXISTS ranker_price_pages (
+    token_id         TEXT    NOT NULL,
+    start_ts         INTEGER NOT NULL,
+    end_ts           INTEGER NOT NULL,
+    fidelity_minutes INTEGER NOT NULL,
+    status           TEXT    NOT NULL CHECK (status IN ('complete','empty')),
+    point_count      INTEGER NOT NULL,
+    raw_sha256       TEXT    NOT NULL,
+    source_id        TEXT    NOT NULL,
+    schema_version   INTEGER NOT NULL,
+    parser_version   INTEGER NOT NULL,
+    observed_at_unix INTEGER NOT NULL,
+    fetched_at_unix  INTEGER NOT NULL,
+    request_envelope TEXT    NOT NULL,
+    PRIMARY KEY (token_id, start_ts, end_ts, fidelity_minutes)
+);
+
 -- Maps Polymarket conditionId → Gamma event (issue #206). One condition belongs
 -- to exactly one event; events group multiple markets (e.g. neg-risk bundles),
 -- which is the unit the sign-randomization skill test randomizes over. Populated
@@ -450,6 +491,50 @@ pub struct PriceBackfillTarget {
     /// Close reference, unix seconds: `market_schedules.end_date_unix` when known, else
     /// `market_resolutions.resolved_at_unix`. The fetch window is `[close_ref − window, close_ref]`.
     pub close_ref_unix: i64,
+}
+
+/// Terminal status of one validated targeted price page (#536).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RankerPageStatus {
+    /// A valid response with at least one point.
+    Complete,
+    /// A valid HTTP 200 with zero points — durable no-series truth. Never a 4xx.
+    Empty,
+}
+
+impl RankerPageStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+/// One validated targeted price page (#536): coverage identity + full external-input
+/// provenance for `ranker_price_pages`. Written atomically with its points by
+/// [`WalletCache::commit_ranker_price_page`].
+#[derive(Clone, Debug)]
+pub struct RankerPricePage {
+    /// CLOB token/asset id (globally unique; `token_conditions.token_id`).
+    pub token_id: String,
+    /// Requested page bounds, unix seconds (padded beyond the decision window by the caller).
+    pub start_ts: i64,
+    pub end_ts: i64,
+    /// Coverage identity: a fidelity change invalidates coverage; a code deploy does not.
+    pub fidelity_minutes: u32,
+    pub status: RankerPageStatus,
+    pub point_count: usize,
+    /// Hex sha256 of the raw response body.
+    pub raw_sha256: String,
+    pub source_id: String,
+    pub schema_version: u32,
+    /// Provenance only — deliberately outside the coverage identity.
+    pub parser_version: u32,
+    pub observed_at_unix: i64,
+    pub fetched_at_unix: i64,
+    /// The request URL (the full envelope for a parameterless GET).
+    pub request_envelope: String,
 }
 
 /// Minimum points in a `(market, token)` series for it to count as "usable" in
@@ -1285,6 +1370,132 @@ impl WalletCache {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically commit one validated targeted price page and its points (#536): the point
+    /// inserts and exactly one `ranker_price_pages` row happen in a single transaction — or
+    /// neither (a crash, cap hit, or conflict leaves no ledger row, so range subtraction
+    /// re-requests the page). Points are write-once: a duplicate `(token_id, t)` from an
+    /// overlapping padded request is accepted only when its price string is byte-identical;
+    /// a conflicting value rolls back the entire page and returns a typed error — upstream
+    /// serving two values for one sample is data corruption, never silently resolved.
+    ///
+    /// # Precondition
+    /// `page.status` must agree with `points` (`Complete` ⇔ non-empty); a mismatch is a
+    /// caller bug and errors without writing.
+    pub fn commit_ranker_price_page(
+        &mut self,
+        page: &RankerPricePage,
+        points: &[(i64, String)],
+    ) -> Result<(), BootstrapError> {
+        let complete = matches!(page.status, RankerPageStatus::Complete);
+        if complete == points.is_empty() {
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "ranker price page status {:?} disagrees with {} point(s)",
+                    page.status,
+                    points.len()
+                ),
+            });
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut existing_stmt =
+                tx.prepare("SELECT price FROM ranker_price_points WHERE token_id = ?1 AND t = ?2")?;
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO ranker_price_points (token_id, t, price, fetched_at_unix) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (t, price) in points {
+                let existing: Option<String> = existing_stmt
+                    .query_row(params![page.token_id, t], |row| row.get(0))
+                    .optional()?;
+                match existing {
+                    Some(prior) if prior != *price => {
+                        return Err(BootstrapError::Invalid {
+                            message: format!(
+                                "conflicting duplicate price point token={} t={t}: \
+                                 stored {prior:?} vs fetched {price:?} — page rolled back",
+                                page.token_id
+                            ),
+                        });
+                    }
+                    Some(_) => {} // byte-identical duplicate from an overlapping page: keep once
+                    None => {
+                        insert_stmt.execute(params![
+                            page.token_id,
+                            t,
+                            price,
+                            page.fetched_at_unix
+                        ])?;
+                    }
+                }
+            }
+            tx.execute(
+                "INSERT INTO ranker_price_pages \
+                 (token_id, start_ts, end_ts, fidelity_minutes, status, point_count, raw_sha256, \
+                  source_id, schema_version, parser_version, observed_at_unix, fetched_at_unix, \
+                  request_envelope) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    page.token_id,
+                    page.start_ts,
+                    page.end_ts,
+                    page.fidelity_minutes,
+                    page.status.as_str(),
+                    i64::try_from(page.point_count).map_err(|_| BootstrapError::Internal)?,
+                    page.raw_sha256,
+                    page.source_id,
+                    page.schema_version,
+                    page.parser_version,
+                    page.observed_at_unix,
+                    page.fetched_at_unix,
+                    page.request_envelope,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The union-ready validated ranges for one token at one fidelity (#536), ordered by
+    /// `start_ts`. Range subtraction over these decides what still needs fetching —
+    /// independent of how any cycle's targets happened to merge.
+    pub fn ranker_price_covered_ranges(
+        &self,
+        token_id: &str,
+        fidelity_minutes: u32,
+    ) -> Result<Vec<(i64, i64)>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT start_ts, end_ts FROM ranker_price_pages \
+             WHERE token_id = ?1 AND fidelity_minutes = ?2 ORDER BY start_ts",
+        )?;
+        let rows = stmt
+            .query_map(params![token_id, fidelity_minutes], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Points for one token in `[lo, hi]` inclusive, ordered by `t` (#536; test/audit reader —
+    /// pass-2 reads the table directly over its read-only connection).
+    pub fn ranker_price_points_between(
+        &self,
+        token_id: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Vec<(i64, String)>, BootstrapError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t, price FROM ranker_price_points \
+             WHERE token_id = ?1 AND t >= ?2 AND t <= ?3 ORDER BY t",
+        )?;
+        let rows = stmt
+            .query_map(params![token_id, lo, hi], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// The `(market, token)` price-history backfill targets (issue #421 PR4): every resolved
@@ -3592,6 +3803,131 @@ mod tests {
             timestamp: SourceTimestamp(OffsetDateTime::from_unix_timestamp(ts).unwrap()),
             source_trade_id: SourceTradeId(id.to_owned()),
         }
+    }
+
+    // ── ranker price pages (#536) ─────────────────────────────────────────────
+
+    fn ranker_page(token: &str, start: i64, end: i64, n: usize) -> RankerPricePage {
+        RankerPricePage {
+            token_id: token.to_owned(),
+            start_ts: start,
+            end_ts: end,
+            fidelity_minutes: 1,
+            status: if n == 0 {
+                RankerPageStatus::Empty
+            } else {
+                RankerPageStatus::Complete
+            },
+            point_count: n,
+            raw_sha256: "ab".repeat(32),
+            source_id: "polymarket-clob-prices-history".to_owned(),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at_unix: 1_700_000_000,
+            fetched_at_unix: 1_700_000_000,
+            request_envelope: "https://clob.example/prices-history?market=tok".to_owned(),
+        }
+    }
+
+    #[test]
+    fn ranker_price_page_commits_points_and_ledger_atomically() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        let points = vec![(100_i64, "0.5".to_owned()), (160, "0.55".to_owned())];
+        cache
+            .commit_ranker_price_page(&ranker_page("tok", 90, 200, 2), &points)
+            .unwrap();
+        assert_eq!(
+            cache.ranker_price_points_between("tok", 0, 300).unwrap(),
+            points
+        );
+        assert_eq!(
+            cache.ranker_price_covered_ranges("tok", 1).unwrap(),
+            vec![(90, 200)]
+        );
+        // A valid-empty page records durable no-series truth with zero points.
+        cache
+            .commit_ranker_price_page(&ranker_page("tok", 200, 300, 0), &[])
+            .unwrap();
+        assert_eq!(
+            cache.ranker_price_covered_ranges("tok", 1).unwrap(),
+            vec![(90, 200), (200, 300)]
+        );
+        // Different fidelity → separate coverage identity.
+        assert!(
+            cache
+                .ranker_price_covered_ranges("tok", 60)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ranker_price_page_conflicting_duplicate_rolls_back_whole_page() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache
+            .commit_ranker_price_page(
+                &ranker_page("tok", 0, 100, 1),
+                &[(50_i64, "0.5".to_owned())],
+            )
+            .unwrap();
+        // An overlapping page with a byte-identical duplicate is accepted once…
+        cache
+            .commit_ranker_price_page(
+                &ranker_page("tok", 40, 140, 2),
+                &[(50_i64, "0.5".to_owned()), (110, "0.6".to_owned())],
+            )
+            .unwrap();
+        // …but a conflicting value rolls back the ENTIRE page: no new point, no ledger row.
+        let err = cache
+            .commit_ranker_price_page(
+                &ranker_page("tok", 100, 220, 2),
+                &[(110_i64, "0.7".to_owned()), (170, "0.8".to_owned())],
+            )
+            .unwrap_err();
+        assert!(matches!(err, BootstrapError::Invalid { .. }));
+        assert_eq!(
+            cache.ranker_price_points_between("tok", 0, 300).unwrap(),
+            vec![(50, "0.5".to_owned()), (110, "0.6".to_owned())],
+            "the conflicting page must leave no points behind"
+        );
+        assert_eq!(
+            cache.ranker_price_covered_ranges("tok", 1).unwrap(),
+            vec![(0, 100), (40, 140)],
+            "the conflicting page must leave no coverage row"
+        );
+        // Retry after rollback with the corrected value succeeds.
+        cache
+            .commit_ranker_price_page(
+                &ranker_page("tok", 100, 220, 2),
+                &[(110_i64, "0.6".to_owned()), (170, "0.8".to_owned())],
+            )
+            .unwrap();
+        assert_eq!(
+            cache.ranker_price_covered_ranges("tok", 1).unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn ranker_price_page_status_must_agree_with_points() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        let err = cache
+            .commit_ranker_price_page(&ranker_page("tok", 0, 100, 0), &[(1, "0.5".to_owned())])
+            .unwrap_err();
+        assert!(matches!(err, BootstrapError::Invalid { .. }));
+        let err = cache
+            .commit_ranker_price_page(&ranker_page("tok", 0, 100, 1), &[])
+            .unwrap_err();
+        assert!(matches!(err, BootstrapError::Invalid { .. }));
+        assert!(
+            cache
+                .ranker_price_covered_ranges("tok", 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── market_events (issue #206) ────────────────────────────────────────────

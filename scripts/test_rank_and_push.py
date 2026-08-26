@@ -130,6 +130,10 @@ class RankAndPushScenario(unittest.TestCase):
             '  printf missing >> pe_bootstrap_cycle.log\n'
             'fi\n'
             'printf "\\n" >> pe_bootstrap_cycle.log\n'
+            'if [[ "$1" == "prices-history" ]]; then\n'
+            '  t=""; n=$#; for ((j=1; j<=n; j++)); do [[ "${!j}" == "--targets-csv" ]] && { k=$((j+1)); t="${!k}"; }; done\n'
+            '  if [[ -n "$t" && -f "$t" ]]; then echo present >> targets_seen.log; else echo absent >> targets_seen.log; fi\n'
+            'fi\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -155,6 +159,9 @@ class RankAndPushScenario(unittest.TestCase):
             'open(os.path.join(out, "qualifying_positions_72hr.csv"), "w").write("wallet,outcome_id\\n0xabc,1\\n")\n',
         )
         # Fake pass-2 rerank: log argv, emit latency_shift_ranked.csv (non-empty).
+        # Models BOTH #536 invocations: stage 2a (--emit-targets writes the targets
+        # file, no ranking; STUB_EXIT_emit) and stage 2c (writes ranking + manifest;
+        # STUB_EXIT_rerank).
         _write_exec(
             self.root / "scripts" / "latency_shift_rerank.py",
             "#!/usr/bin/env python3\n"
@@ -163,7 +170,21 @@ class RankAndPushScenario(unittest.TestCase):
             'open("rerank.log", "a").write(" ".join(a) + "\\n")\n'
             'out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
             "os.makedirs(out, exist_ok=True)\n"
-            'open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n',
+            'if "--emit-targets" in a:\n'
+            '    tpath = a[a.index("--emit-targets") + 1]\n'
+            '    open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
+            '    sys.exit(int(os.environ.get("STUB_EXIT_emit", "0")))\n'
+            'rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
+            "if rc:\n"
+            "    sys.exit(rc)  # the real coverage gate exits before writing any output\n"
+            'open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
+            'if not os.environ.get("STUB_NO_MANIFEST"):\n'
+            '    import hashlib, json\n'
+            '    ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
+            '    open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
+            '        {"oracle": "clob-minute-reference",\n'
+            '         "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
+            "sys.exit(0)\n",
         )
         # Fake push: log argv, emulate durable request/pending writes, and optionally
         # return the requested status (including EX_TEMPFAIL=75).
@@ -344,6 +365,9 @@ class RankAndPushScenario(unittest.TestCase):
                 "events",
                 "resolutions",
                 "purge-infra",
+                # #536: the targeted reference fetch runs between the rank passes
+                # (stage 2b) — after purge-infra, before the post-publish purge.
+                "prices-history",
                 "purge",
             ],
             "Step-0 stages ran out of canonical order, or the final purge stage (#385) is missing",
@@ -476,6 +500,55 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(any(line.startswith("purge-infra") for line in boot))
         print("PASS: resolutions exit 75 aborts before rank/push and retains cycle pointer")
 
+    def test_reference_stages_flow_targets_manifest_and_push(self):
+        # #536 stage 2a→2b→2c data flow: the emit call writes the targets file, the
+        # targeted fetch consumes an EXISTING file, the full rerank writes the
+        # manifest, and the push binds it via --manifest-file.
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        rerank = (self._log("rerank.log") or "").splitlines()
+        self.assertEqual(len(rerank), 2, "expected the emit call then the full rerank")
+        self.assertIn("--emit-targets", rerank[0])
+        self.assertNotIn("--emit-targets", rerank[1])
+        self.assertIn("--git-sha", rerank[1])
+        boot = self._log("pe_bootstrap.log") or ""
+        self.assertIn("prices-history --targets-csv", boot)
+        self.assertEqual((self._log("targets_seen.log") or "").strip(), "present",
+                         "the targeted fetch must consume a real targets file")
+        push = self._log("push.log") or ""
+        self.assertIn("--manifest-file", push)
+        print("PASS: 2a targets -> 2b fetch(consumed) -> 2c manifest -> push binding")
+
+    def test_reference_fetch_partial_then_rerank_tempfail_holds_publication(self):
+        # Fetch partial (exit 2 continues) then the coverage gate tempfails (75):
+        # publication must not run and the cycle pointer must survive for the retry.
+        r = self._run(exit_env={"STUB_EXIT_prices_history": "2", "STUB_EXIT_rerank": "75"})
+        self.assertEqual(r.returncode, 75, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertIsNone(self._log("push.log"), "publication ran despite un-terminal coverage")
+        rerank = (self._log("rerank.log") or "").splitlines()
+        self.assertEqual(len(rerank), 2, "the coverage-gate rerank itself must have run")
+        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
+        self.assertTrue(cycle.is_file(), "tempfail lost the cycle recovery pointer")
+        self.assertIn("[reference-fetch] WARN exit 2", r.stdout + r.stderr)
+        print("PASS: fetch partial -> rerank 75 -> no publication, pointer retained")
+
+    def test_reference_fetch_fatal_aborts_before_rerank(self):
+        r = self._run(exit_env={"STUB_EXIT_prices_history": "1"})
+        self.assertEqual(r.returncode, 1, f"stderr={r.stderr}")
+        rerank = (self._log("rerank.log") or "").splitlines()
+        self.assertEqual(len(rerank), 1, "only the emit call may precede a fatal fetch")
+        self.assertIsNone(self._log("push.log"), "publication ran despite a fatal fetch")
+        print("PASS: fatal reference fetch aborts before the full rerank and push")
+
+    def test_fresh_run_without_manifest_fails_closed_before_push(self):
+        # #536: a fresh rerank always writes the manifest before success, so exit 0
+        # with no manifest is corruption -- never a silent config_hash = null publish.
+        r = self._run(exit_env={"STUB_NO_MANIFEST": "1"})
+        self.assertEqual(r.returncode, 1, f"stderr={r.stderr}")
+        self.assertIn("refusing provenance-less publish", r.stderr)
+        self.assertIsNone(self._log("push.log"), "published without an oracle manifest")
+        print("PASS: fresh run with missing manifest fails closed before publication")
+
     def test_backfill_fatal_exit1_aborts_before_ranking(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "1"})
         self.assertNotEqual(r.returncode, 0, "fatal backfill should abort the run")
@@ -545,7 +618,10 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
         self.assertIsNone(self._log("pe_bootstrap.log"), "Step 0 ran during a pure re-push")
         self.assertIsNone(self._log("rank.log"), "ranking ran during a pure re-push")
-        self.assertIsNotNone(self._log("push.log"), "re-push did not push")
+        push = self._log("push.log") or ""
+        self.assertTrue(push, "re-push did not push")
+        self.assertNotIn("--manifest-file", push,
+                         "legacy pre-cutover re-push must publish config_hash = null")
         print("PASS: --skip-discovery --skip-backfill --skip-rank → re-push only")
 
     def test_transient_push_retains_request_and_resume_runs_only_tail(self):

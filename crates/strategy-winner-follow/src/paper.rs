@@ -24,7 +24,11 @@ const PARSER_VERSION: u32 = 1;
 /// replay (`pe_service::paper_recovery`) keeps working across the additive schema evolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FillSource {
-    /// The fresh CLOB best-ask observed at copy time (paper `clob_best_ask` BUY).
+    /// A fresh CLOB book price observed at copy time (paper `clob_best_ask` BUY). With the
+    /// price-impact gate disabled this is the best ask; with the gate enabled (the production
+    /// posture since the #508 A3 cutover) it is the exact executable ladder volume-weighted
+    /// price — both carry this same tag, so comparisons must qualify by the captured
+    /// `fill_mode` and `price_impact_cap_bps`, never by this tag alone (#536 review).
     ClobBestAsk,
     /// The `clob_best_ask_fallback_haircut_bps` fallback for a BUY with no usable ask (empty /
     /// errored / timed-out book, missing CLOB token, or a degenerate best-ask). Production

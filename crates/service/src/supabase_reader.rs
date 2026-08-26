@@ -89,13 +89,14 @@ struct RankingRow {
     #[serde(default)]
     rank: Option<i64>,
     wallet_hex: String,
-    /// Mean payoff among filled positions ∈ [0,1] = Kelly `p`. → `win_rate_bps`.
+    /// Mean payoff among REPRICED positions ∈ [0,1] = Kelly `p` (#536). → `win_rate_bps`.
     #[serde(default)]
     hit_rate: Option<serde_json::Value>,
     /// Latency-shifted net-edge t-stat. → `leader_score_bps` (ordering only).
     #[serde(default)]
     ls_tstat: Option<serde_json::Value>,
-    /// Number of filled positions in the eligibility window. → `closed_trades_in_window`.
+    /// Number of REPRICED positions (reference-oracle sample found, #536) in the
+    /// eligibility window. → `closed_trades_in_window`.
     #[serde(default)]
     n_trades: Option<i64>,
     /// Wallet's real last on-chain trade time (unix seconds), stamped by the ranker (#357).
@@ -460,6 +461,9 @@ fn map_row(row: &RankingRow) -> Option<WatchlistEntry> {
     let wallet: WalletAddress =
         serde_json::from_value(serde_json::Value::String(row.wallet_hex.clone())).ok()?;
 
+    // `hit_rate` is the outcome rate among REPRICED positions (#536: the ranker's minute
+    // reference oracle decides which positions count) — downstream this is the Kelly
+    // probability input for Kelly-mode sizing and probability-bearing canary decisions.
     let win_rate_bps = exact_cell(row.hit_rate_text.as_deref(), row.hit_rate.as_ref())
         .map(|hr| (hr * Decimal::from(10_000)).round())
         .and_then(|d| d.to_i32())

@@ -48,7 +48,7 @@ const COLUMNS: Col[] = [
     ),
   },
   { key: "rank", label: "Rank", group: "hist", sort: (r) => num(r.rank), cell: (r) => formatInt(r.rank) },
-  { key: "n_trades", label: "Hist trades", group: "hist", sort: (r) => num(r.n_trades), cell: (r) => formatInt(r.n_trades) },
+  { key: "n_trades", label: "Repriced", group: "hist", sort: (r) => num(r.n_trades), cell: (r) => formatInt(r.n_trades) },
   { key: "hit_rate", label: "Hist win%", group: "hist", sort: (r) => num(r.hit_rate), cell: (r) => formatPct(r.hit_rate) },
   { key: "ls_edge", label: "Hist edge", group: "hist", sort: (r) => num(r.ls_edge), cell: (r) => formatEdge(r.ls_edge) },
   { key: "ls_tstat", label: "Hist t", group: "hist", sort: (r) => num(r.ls_tstat), cell: (r) => formatTstat(r.ls_tstat) },
