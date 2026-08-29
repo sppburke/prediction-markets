@@ -26,6 +26,19 @@ cargo build --release -p pe-bootstrap
   defaults `cache_path` to `wallet_cache.db` (`crates/bootstrap/src/config.rs:469`),
   so either pass a config TOML with `cache_path = "data/wallet_cache.db"` or set
   `PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db` (`rank_and_push.sh` exports this for you).
+- **SQLite scratch space (`SQLITE_TMPDIR`).** Bundled SQLite writes its working files —
+  the `VACUUM` temp database and the external-sort spill of every `CREATE INDEX` on a
+  large table — into the system temp directory, NOT beside the cache. On a host whose
+  root filesystem is a different (smaller, or failure-prone) device than the cache
+  volume, point `SQLITE_TMPDIR` at a writable directory on the CACHE volume, e.g.
+  `SQLITE_TMPDIR=/mnt/storage/tmp` in `.env` (the wrapper exports its whole `.env` to
+  every stage). Proven necessary on 2026-08-27: forge's root SD card remounted
+  read-only mid-purge, and because the default temp dir lived there, the bulk purge's
+  `VACUUM` and its index rebuild both failed while the deletes (which write only to the
+  cache volume) succeeded — leaving 38.5 GiB of unreclaimed free pages, an absent
+  `trades` index, and a subsequent cycle that silently paid a multi-hour rebuild.
+  Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
+  path is demonstrably writable.
 - **Market resolutions (no RPC).** The resolution pipeline is CLOB → Gamma:
   the Polymarket CLOB `/markets?closed=true` listing is the sole resolution
   source (#369; key-free), with Gamma supplying open-market schedules/liquidity.
