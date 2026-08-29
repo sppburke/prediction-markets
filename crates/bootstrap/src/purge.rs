@@ -31,12 +31,20 @@
 //! candidate state. An armed purge on a globally stale
 //! cache (no fresh backfill) is refused.
 //!
-//! **Bulk-delete index dance (issue #401).** An armed run drops the two
-//! non-lookup `trades` secondary indexes around the chunked delete and rebuilds
-//! them once on the VACUUM-compacted table (`drop → delete → VACUUM → recreate`),
-//! so per-row index churn becomes a single bulk build. The recreate runs even on
-//! a mid-run delete/VACUUM error (recreate-then-propagate). The lookup index
-//! `idx_trades_wallet_ts` and the PK are kept. Dry runs touch no indexes.
+//! **Bulk-delete index dance (issue #401) + reclamation contract (#538).** An
+//! armed BULK run (delete-set ≥ threshold) drops the two non-lookup `trades`
+//! secondary indexes around the chunked delete, reclaims free pages, and
+//! rebuilds the indexes once (`drop → delete → reclaim → recreate`), so per-row
+//! index churn becomes a single bulk build. Maintenance vocabulary is distinct
+//! from delete classification: reclamation is `incremental_vacuum` on a
+//! converted db, or the one-time conversion `VACUUM` on a legacy mode-0 db.
+//! The recreate runs even on a mid-run delete/reclaim error
+//! (recreate-then-propagate). A `reclamation_pending` marker commits BEFORE the
+//! index drop and clears only after reclaim AND recreate succeed; a later purge
+//! finding it set runs RECOVERY — reclaim + idempotent index creation with NO
+//! index drop (schema-on-open already healed any absence) — regardless of that
+//! run's delete-set size. The lookup index `idx_trades_wallet_ts` and the PK
+//! are kept. Dry runs touch neither indexes nor the marker.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -61,9 +69,11 @@ struct Decisions {
 
 /// Run the purge stage (issue #385). `dry_run` (the CLI `--dry-run`) forces a
 /// report-only pass; an armed delete additionally requires `purge_enabled`.
-/// The bulk index-drop + VACUUM (issue #401) run only when the delete-set is at
-/// least `purge_bulk_min_wallets`; a smaller armed purge deletes incrementally
-/// with the indexes live and no VACUUM. Returns the [`PurgeReport`] to log.
+/// The bulk index-drop + free-page reclamation (issue #401/#538) run only when
+/// the delete-set is at least `purge_bulk_min_wallets`; a smaller armed purge
+/// deletes with the indexes live and no reclamation — unless a prior
+/// `reclamation_pending` marker forces the drop-free recovery path. Returns the
+/// [`PurgeReport`] to log.
 pub fn run_purge(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -215,25 +225,71 @@ fn execute_purge_rows(
         );
     }
 
+    // #538 fail-closed marker read: an error here aborts — a pending recovery
+    // must never be silently skipped because the marker could not be read.
+    let recovery_pending = if armed {
+        cache.reclamation_pending()?
+    } else {
+        false
+    };
+
     let bulk =
         armed && u64::try_from(rows.len()).unwrap_or(u64::MAX) >= config.purge_bulk_min_wallets;
     let report = if bulk {
+        // Marker commits BEFORE the index drop so an interrupted run is retried
+        // by the next purge invocation (#538).
+        cache.set_reclamation_pending()?;
         cache.drop_trades_bulk_delete_indexes()?;
+        // Ordering contract (#538): capture all three results; recreation is
+        // attempted unconditionally after RETURNED delete/reclaim errors (never
+        // an early `?`); propagate delete → reclaim → recreate. Schema-on-open
+        // remains the process-death backstop.
         let purge_res = cache.purge_wallets(rows, now_unix, false);
-        let vacuum_res = if purge_res.is_ok() {
-            cache.vacuum()
+        let reclaim_res = if purge_res.is_ok() {
+            cache.reclaim_free_pages()
         } else {
-            Ok(())
+            Err(BootstrapError::Invalid {
+                message: "reclamation skipped: bulk delete failed".to_owned(),
+            })
         };
         let recreate_res = cache.create_trades_bulk_delete_indexes();
         let report = purge_res?;
-        vacuum_res?;
+        let reclamation = reclaim_res?;
         recreate_res?;
-        tracing::info!(stage = label, "purge: bulk mode complete");
+        cache.clear_reclamation_pending()?;
+        tracing::info!(
+            stage = label,
+            auto_vacuum_before = reclamation.auto_vacuum_before,
+            path = ?reclamation.path,
+            freelist_before = reclamation.freelist_before,
+            freelist_after = reclamation.freelist_after,
+            page_count_before = reclamation.page_count_before,
+            page_count_after = reclamation.page_count_after,
+            "purge: bulk mode complete"
+        );
         report
     } else if armed {
         let report = cache.purge_wallets(rows, now_unix, false)?;
-        tracing::info!(stage = label, "purge: incremental mode complete");
+        if recovery_pending {
+            // Recovery ≠ bulk (#538): indexes stay LIVE — no `DROP INDEX`
+            // (schema-on-open already healed any absence). Reclaim, then
+            // idempotent creation, then clear; a clear failure propagates and
+            // leaves recovery pending.
+            let reclamation = cache.reclaim_free_pages()?;
+            cache.create_trades_bulk_delete_indexes()?;
+            cache.clear_reclamation_pending()?;
+            tracing::info!(
+                stage = label,
+                auto_vacuum_before = reclamation.auto_vacuum_before,
+                path = ?reclamation.path,
+                freelist_before = reclamation.freelist_before,
+                freelist_after = reclamation.freelist_after,
+                page_count_before = reclamation.page_count_before,
+                page_count_after = reclamation.page_count_after,
+                "purge: pending reclamation recovered"
+            );
+        }
+        tracing::info!(stage = label, "purge: subthreshold mode complete");
         report
     } else {
         cache.purge_wallets(rows, now_unix, true)?
@@ -345,4 +401,57 @@ fn parse_decision_csv(
         }
     }
     Ok(Decisions { eligible, rule_a })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    static RECOVERY_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn recovery_trace_collect(sql: &str) {
+        RECOVERY_TRACE.lock().unwrap().push(sql.to_owned());
+    }
+
+    #[test]
+    fn reclamation_pending_recovers_without_index_drop() {
+        // #538 recovery contract: with the marker set and an empty delete set,
+        // the armed subthreshold path reclaims, ensures indexes idempotently,
+        // and clears the marker — WITHOUT ever issuing `DROP INDEX` (schema-on-
+        // open already healed any absence; a second drop/rebuild would repeat
+        // the multi-hour bulk cost for nothing).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        cache.set_reclamation_pending().unwrap();
+
+        let config = BootstrapConfig {
+            purge_enabled: true,
+            purge_archive_enabled: false,
+            cache_path: dir.path().join("c.db"),
+            ..BootstrapConfig::default()
+        };
+        RECOVERY_TRACE.lock().unwrap().clear();
+        cache.install_sql_trace(Some(recovery_trace_collect));
+        let (report, bulk) =
+            execute_purge_rows(&config, &mut cache, &[], 1_700_000_000, true, "purge").unwrap();
+        cache.install_sql_trace(None);
+
+        assert!(!bulk, "empty delete set is subthreshold");
+        assert_eq!(report.tombstones_written, 0);
+        assert!(
+            !cache.reclamation_pending().unwrap(),
+            "recovery cleared the marker"
+        );
+        let stmts = RECOVERY_TRACE.lock().unwrap().clone();
+        assert!(
+            stmts.iter().any(|q| q.contains("incremental_vacuum")),
+            "recovery reclaimed: {stmts:?}"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|q| q.to_uppercase().contains("DROP INDEX")),
+            "recovery must never drop indexes: {stmts:?}"
+        );
+    }
 }

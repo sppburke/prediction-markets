@@ -61,8 +61,9 @@ pub(crate) const INCREMENTAL_STOP_THRESHOLD: usize = 3;
 const PURGE_CHUNK: usize = 1_000;
 
 /// DDL for the two non-lookup `trades` secondary indexes that an armed
-/// `pe-bootstrap purge` drops before its bulk delete and rebuilds after VACUUM
-/// (issue #401). Shared by `SCHEMA` (assembled via `concatcp!` below) and
+/// `pe-bootstrap purge` drops before its bulk delete and rebuilds after
+/// free-page reclamation (#401; conversion `VACUUM` or `incremental_vacuum`
+/// per #538). Shared by `SCHEMA` (assembled via `concatcp!` below) and
 /// [`WalletCache::create_trades_bulk_delete_indexes`] so the on-open definition
 /// and the rebuild physically cannot diverge — the `CREATE INDEX IF NOT EXISTS`
 /// SCHEMA-on-open backstop heals an *absent* index, never a *divergent* one.
@@ -245,6 +246,16 @@ CREATE TABLE IF NOT EXISTS source_cursor (
     key        TEXT    PRIMARY KEY NOT NULL,
     value      TEXT    NOT NULL,
     updated_at INTEGER NOT NULL
+);
+
+-- Cache-level maintenance markers (#538). Distinct from `source_cursor` (whose
+-- contract is source-resume checkpoints): rows here are fail-closed invariants —
+-- a read error must surface, never read as absent. Sole key today:
+-- `reclamation_pending` (set before a bulk purge's index drop, cleared only after
+-- free-page reclamation AND index recreation both succeed).
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
 );
 
 -- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
@@ -438,6 +449,31 @@ pub struct ArchiveReport {
     pub manifest_written: usize,
 }
 
+/// Which maintenance statement [`WalletCache::reclaim_free_pages`] ran (#538).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclamationPath {
+    /// `PRAGMA incremental_vacuum` on an already-incremental db — work
+    /// proportional to the freelist.
+    Incremental,
+    /// Full `VACUUM` on a legacy mode-0 db — the one-time conversion to
+    /// incremental auto-vacuum (whole-file rewrite).
+    ConversionVacuum,
+}
+
+/// Measurements from one [`WalletCache::reclaim_free_pages`] run (#538). The
+/// purge orchestrator logs this; the cache exposes no sibling pragma getters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclamationReport {
+    /// `PRAGMA auto_vacuum` before the run (0 = legacy, 2 = incremental).
+    pub auto_vacuum_before: i64,
+    /// Statement selected from that mode.
+    pub path: ReclamationPath,
+    pub freelist_before: i64,
+    pub freelist_after: i64,
+    pub page_count_before: i64,
+    pub page_count_after: i64,
+}
+
 /// Outcome of [`WalletCache::purge_wallets`] (issue #385). In `dry_run` mode the
 /// `*_deleted` counts are estimates (trades via `wallets.trade_count`, snapshots
 /// via `COUNT`) of what an armed run *would* remove; nothing is written.
@@ -566,6 +602,12 @@ impl WalletCache {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
+        // #538: request incremental auto-vacuum BEFORE any DDL. Three db states:
+        // a FRESH db is created in incremental mode by this pragma alone; an
+        // EXISTING mode-0 db is unaffected until a `VACUUM` on a connection
+        // holding this pragma converts it (reclaim_free_pages' mode-0 path); an
+        // already-incremental db is a no-op. Never inside a transaction.
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
         conn.execute_batch(SCHEMA)?;
         // Migration (#326 PR4): drop the operator/funder/delta tables. They fed
         // only the deleted operator-graph machinery; dropping reclaims the bulk of
@@ -2940,12 +2982,87 @@ impl WalletCache {
         Ok(main_cols.into_iter().map(|(n, _)| n).collect())
     }
 
-    /// `VACUUM` the database to reclaim freed pages (issue #385). Must run OUTSIDE
-    /// any transaction — the purge orchestrator calls this after the chunked
-    /// deletes commit.
-    pub fn vacuum(&mut self) -> Result<(), BootstrapError> {
-        self.conn.execute_batch("VACUUM")?;
+    /// Reclaim freed pages (#538) — the single maintenance owner (replaces the
+    /// former unconditional `vacuum()`). Must run OUTSIDE any transaction — the
+    /// purge orchestrator calls this after the chunked deletes commit.
+    ///
+    /// Path selection by the db's PERSISTED auto-vacuum mode:
+    /// - mode 2 (incremental): `PRAGMA incremental_vacuum;` drains the whole
+    ///   freelist — work proportional to the freelist, not the file.
+    /// - mode 0 (legacy): full `VACUUM`, which doubles as the one-time
+    ///   conversion to incremental mode (the open pragma is already set on this
+    ///   connection).
+    pub fn reclaim_free_pages(&mut self) -> Result<ReclamationReport, BootstrapError> {
+        let read_i64 = |conn: &Connection, sql: &str| -> Result<i64, BootstrapError> {
+            Ok(conn.query_row(sql, [], |r| r.get(0))?)
+        };
+        let auto_vacuum_before = read_i64(&self.conn, "PRAGMA auto_vacuum")?;
+        let freelist_before = read_i64(&self.conn, "PRAGMA freelist_count")?;
+        let page_count_before = read_i64(&self.conn, "PRAGMA page_count")?;
+        let path = if auto_vacuum_before == 2 {
+            // Stepped pragma: pages are freed as the cursor advances, so the
+            // rows must be driven to exhaustion — execute_batch alone leaves
+            // part of the freelist behind.
+            let mut stmt = self.conn.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+            drop(rows);
+            drop(stmt);
+            ReclamationPath::Incremental
+        } else {
+            self.conn.execute_batch("VACUUM")?;
+            ReclamationPath::ConversionVacuum
+        };
+        Ok(ReclamationReport {
+            auto_vacuum_before,
+            path,
+            freelist_before,
+            freelist_after: read_i64(&self.conn, "PRAGMA freelist_count")?,
+            page_count_before,
+            page_count_after: read_i64(&self.conn, "PRAGMA page_count")?,
+        })
+    }
+
+    /// Set the fail-closed `reclamation_pending` marker (#538). Committed BEFORE
+    /// a bulk purge's index drop so a failed/interrupted reclamation is retried
+    /// by the next purge invocation instead of silently persisting bloat.
+    pub fn set_reclamation_pending(&mut self) -> Result<(), BootstrapError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('reclamation_pending', '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [],
+        )?;
         Ok(())
+    }
+
+    /// Read the marker. Fail-closed contract: a query ERROR propagates (never
+    /// coerced to absent); only a genuinely missing row reads as `false`.
+    pub fn reclamation_pending(&self) -> Result<bool, BootstrapError> {
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'reclamation_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
+    }
+
+    /// Clear the marker after reclamation AND index recreation both succeeded.
+    /// A clear failure is returned — recovery stays pending.
+    pub fn clear_reclamation_pending(&mut self) -> Result<(), BootstrapError> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'reclamation_pending'", [])?;
+        Ok(())
+    }
+
+    /// Test-only (#538): install/remove a SQL trace so in-crate tests can prove
+    /// which maintenance statement ran (`incremental_vacuum` vs bare `VACUUM`,
+    /// and the absence of `DROP INDEX` on the recovery path).
+    #[cfg(test)]
+    pub(crate) fn install_sql_trace(&mut self, f: Option<fn(&str)>) {
+        self.conn.trace(f);
     }
 
     /// Drop the two non-lookup `trades` secondary indexes (`idx_trades_market_id`
@@ -5742,5 +5859,67 @@ mod tests {
         let lb = cache.load_rank_index_cache(200).unwrap();
         assert_eq!(la[&("m".to_owned(), 0u16)], vec![1_i64]);
         assert_eq!(lb[&("m".to_owned(), 0u16)], vec![2_i64]);
+    }
+
+    // ── #538: reclamation path selection (trace-proven) ───────────────────────
+
+    static RECLAIM_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn reclaim_trace_collect(sql: &str) {
+        RECLAIM_TRACE.lock().unwrap().push(sql.to_owned());
+    }
+
+    #[test]
+    fn reclaim_incremental_path_trace_proven() {
+        // A fresh db is born incremental (open pragma), so reclamation must issue
+        // `PRAGMA incremental_vacuum` and never a bare `VACUUM` (#538).
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        // Build then drain a freelist: insert junk rows, delete them.
+        cache
+            .conn
+            .execute_batch(
+                "CREATE TABLE junk (x BLOB); \
+                 INSERT INTO junk SELECT randomblob(4096) FROM \
+                   (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 200) \
+                    SELECT i FROM n); \
+                 DROP TABLE junk;",
+            )
+            .unwrap();
+        RECLAIM_TRACE.lock().unwrap().clear();
+        cache.install_sql_trace(Some(reclaim_trace_collect));
+        let report = cache.reclaim_free_pages().unwrap();
+        cache.install_sql_trace(None);
+
+        assert_eq!(report.auto_vacuum_before, 2, "fresh db is born incremental");
+        assert_eq!(report.path, ReclamationPath::Incremental);
+        assert_eq!(report.freelist_after, 0, "freelist drained");
+        assert!(
+            report.page_count_after < report.page_count_before,
+            "incremental_vacuum truncates the file"
+        );
+        let stmts = RECLAIM_TRACE.lock().unwrap().clone();
+        assert!(
+            stmts.iter().any(|q| q.contains("incremental_vacuum")),
+            "incremental_vacuum was issued: {stmts:?}"
+        );
+        assert!(
+            !stmts
+                .iter()
+                .any(|q| q.trim_start().to_uppercase().starts_with("VACUUM")),
+            "no bare VACUUM on the incremental path: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn reclamation_marker_roundtrip_fail_closed_shape() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        assert!(!cache.reclamation_pending().unwrap());
+        cache.set_reclamation_pending().unwrap();
+        assert!(cache.reclamation_pending().unwrap());
+        cache.set_reclamation_pending().unwrap(); // idempotent upsert
+        assert!(cache.reclamation_pending().unwrap());
+        cache.clear_reclamation_pending().unwrap();
+        assert!(!cache.reclamation_pending().unwrap());
     }
 }
