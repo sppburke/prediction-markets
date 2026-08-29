@@ -240,7 +240,7 @@ membership converged. The additive `ranker_price_*` tables are inert thereafter.
 > purge stays disarmed (`PE_BOOTSTRAP_PURGE_ENABLED=false`) until #527 Phase 2 witnesses
 > one real bulk-mode run complete under idle priority with control-plane probes intact —
 > the gate is an organically produced disabled report whose delete set reaches the
-> canonical `purge_bulk_min_wallets`; wiring-only incremental runs do not qualify.
+> canonical `purge_bulk_min_wallets`; wiring-only subthreshold runs do not qualify.
 > Rollback: atomically write the loop flag to `stop` (natural run-down — a unit stop
 > needs the owner's explicit authorization for the active process), keep ordinary purge
 > false, and keep the priority wrapper; if the wrapper itself must be reverted, leave the

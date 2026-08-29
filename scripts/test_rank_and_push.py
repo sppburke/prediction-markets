@@ -549,6 +549,85 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNone(self._log("push.log"), "published without an oracle manifest")
         print("PASS: fresh run with missing manifest fails closed before publication")
 
+    def _purge_status_lines(self):
+        # #538: one JSONL line per purge invocation, in the per-run artifact dir.
+        import glob as _glob
+        import json as _json
+        lines = []
+        for path in _glob.glob(str(self.root / "data/eval-results/cron-*/purge_status.jsonl")):
+            with open(path) as fh:
+                lines += [_json.loads(l) for l in fh if l.strip()]
+        return lines
+
+    def test_purge_status_jsonl_records_every_outcome(self):
+        # #538: journald died mid-incident and took the only purge failure signal
+        # with it. Every purge invocation must land one durable JSONL record in
+        # the run dir — success AND failure, both entry points, without altering
+        # any existing exit policy.
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 0, "info"), ("purge", 0, "info")],
+            f"clean run records both purge stages: {recs}",
+        )
+        for x in recs:
+            self.assertIn("ts", x)
+            self.assertEqual(x["message"], "purge stage exit")
+        print("PASS: clean run appends purge-infra + purge status lines (exit 0)")
+
+    def test_purge_status_jsonl_on_infra_tempfail_and_fatal(self):
+        # Exit 75 aborts inside run_refresh_stage's case arm — the record must
+        # exist anyway (append happens before dispatch).
+        r = self._run(exit_env={"STUB_EXIT_purge_infra": "75"})
+        self.assertEqual(r.returncode, 75)
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 75, "warn")],
+            f"tempfail recorded before the abort: {recs}",
+        )
+        print("PASS: purge-infra exit 75 recorded despite the in-arm abort")
+
+    def test_purge_status_jsonl_on_infra_partial_and_fatal(self):
+        # Exit 2 (partial: WARN + continue) and exit 1 (fatal: in-arm abort) must
+        # both be durably recorded (#538 review: suppressing records on exactly
+        # these arms would otherwise pass).
+        r = self._run(exit_env={"STUB_EXIT_purge_infra": "2"})
+        self.assertEqual(r.returncode, 0, "infra exit 2 is WARN + continue")
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 2, "warn"), ("purge", 0, "info")],
+            f"partial infra recorded, run continued to the ordinary purge: {recs}",
+        )
+
+        self.setUp()  # fresh sandbox for the fatal case
+        r = self._run(exit_env={"STUB_EXIT_purge_infra": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 1, "warn")],
+            f"fatal infra recorded before the in-arm abort: {recs}",
+        )
+        print("PASS: purge-infra exits 2 and 1 both leave durable status records")
+
+    def test_purge_status_jsonl_on_ordinary_purge_failure(self):
+        # The ordinary purge is non-fatal (post-publication); its failure must
+        # still be durably recorded and the run must still succeed.
+        r = self._run(exit_env={"STUB_EXIT_purge": "1"})
+        self.assertEqual(r.returncode, 0, "ordinary purge failure stays non-fatal")
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 0, "info"), ("purge", 1, "warn")],
+            f"ordinary purge failure recorded: {recs}",
+        )
+        self.assertIn("[purge] WARN exit 1", r.stderr)
+        print("PASS: ordinary purge failure recorded as warn; run still exits 0")
+
     def test_backfill_fatal_exit1_aborts_before_ranking(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "1"})
         self.assertNotEqual(r.returncode, 0, "fatal backfill should abort the run")

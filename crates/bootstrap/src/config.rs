@@ -415,8 +415,11 @@ pub struct BootstrapConfig {
 
     /// Delete-set size (wallet count) at/above which an armed `pe-bootstrap purge`
     /// runs in **bulk mode** — drop the two non-lookup `trades` indexes, delete,
-    /// VACUUM, rebuild (issue #401). Below it, an armed purge runs **incremental**:
-    /// indexes stay live and no VACUUM runs, so cheap daily purges plateau the
+    /// reclaim free pages, rebuild (issue #401; reclamation per #538 is
+    /// `incremental_vacuum`, or the one-time conversion `VACUUM` on a legacy
+    /// mode-0 db). Below it, an armed purge runs **subthreshold**: indexes stay
+    /// live and no reclamation runs (unless `reclamation_pending` forces the
+    /// drop-free recovery), so cheap daily purges plateau the
     /// file. Default 5_000. Canonical default in `docs/_GLOSSARY.md`.
     /// `PE_BOOTSTRAP_PURGE_BULK_MIN_WALLETS`.
     #[serde(

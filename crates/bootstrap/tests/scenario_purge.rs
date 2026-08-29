@@ -66,8 +66,9 @@ fn freelist_count(cache: &WalletCache) -> i64 {
         .unwrap()
 }
 
-/// `PRAGMA page_count` — total pages in the main DB file (issue #401). Only VACUUM
-/// shrinks it; a plain DELETE leaves it unchanged (freed pages go to the freelist).
+/// `PRAGMA page_count` — total pages in the main DB file (issue #401). Only
+/// free-page reclamation (conversion VACUUM / incremental_vacuum, #538) shrinks
+/// it; a plain DELETE leaves it unchanged (freed pages go to the freelist).
 fn page_count(cache: &WalletCache) -> i64 {
     cache
         .raw_conn_for_test()
@@ -600,7 +601,7 @@ fn drop_then_create_trades_indexes_roundtrips() {
 
 #[test]
 fn armed_run_purge_keeps_trades_indexes_intact() {
-    // PASS: after a full armed run_purge in BULK mode (drop → delete → VACUUM →
+    // PASS: after a full armed run_purge in BULK mode (drop → delete → reclaim →
     // recreate) all three trades indexes are present and the covering index keeps
     // its 5-column order — the drop/rebuild dance leaves a correct schema. Forced
     // bulk via threshold=1 (issue #401), since the 2-wallet delete-set would
@@ -697,7 +698,8 @@ fn schema_on_open_heals_dropped_trades_indexes() {
 fn run_purge_bulk_mode_vacuums_and_reclaims() {
     // PASS: an armed purge whose delete-set >= purge_bulk_min_wallets runs in BULK
     // mode — the two non-lookup indexes are dropped+rebuilt (present afterward) AND
-    // VACUUM reclaims the freed pages (freelist_count == 0 and page_count shrinks).
+    // free-page reclamation (#538: incremental_vacuum here — a fresh test db is
+    // born auto_vacuum=INCREMENTAL) drains the freelist and shrinks the file.
     let dir = TempDir::new().unwrap();
     let mut cache = open_cache(&dir);
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -733,23 +735,28 @@ fn run_purge_bulk_mode_vacuums_and_reclaims() {
         idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
         "covering index rebuilt"
     );
-    // VACUUM ran: freelist drained to zero and the file shrank.
-    assert_eq!(freelist_count(&cache), 0, "bulk VACUUM drains the freelist");
+    // Reclamation ran: freelist drained to zero and the file shrank.
+    assert_eq!(
+        freelist_count(&cache),
+        0,
+        "bulk reclamation drains the freelist"
+    );
     let pages_after = page_count(&cache);
     assert!(
         pages_after < pages_before,
-        "bulk VACUUM shrinks the file (after {pages_after} !< before {pages_before})"
+        "bulk reclamation shrinks the file (after {pages_after} !< before {pages_before})"
     );
     println!(
-        "PASS: bulk-mode run_purge rebuilds both indexes and VACUUM reclaims (freelist 0, file shrank {pages_before}→{pages_after} pages)"
+        "PASS: bulk-mode run_purge rebuilds both indexes and reclamation drains the freelist (file shrank {pages_before}→{pages_after} pages)"
     );
 }
 
 #[test]
-fn run_purge_incremental_mode_keeps_indexes_no_vacuum() {
+fn run_purge_subthreshold_mode_keeps_indexes_no_reclamation() {
     // PASS: an armed purge whose delete-set < purge_bulk_min_wallets runs in
-    // INCREMENTAL mode — the two secondary indexes are never dropped (present) and
-    // NO VACUUM runs (freelist_count > 0 and page_count unchanged).
+    // SUBTHRESHOLD mode — the two secondary indexes are never dropped (present) and
+    // no reclamation runs (freelist_count > 0 and page_count unchanged; #538
+    // recovery reclamation fires here only when reclamation_pending is set).
     let dir = TempDir::new().unwrap();
     let mut cache = open_cache(&dir);
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -784,19 +791,172 @@ fn run_purge_incremental_mode_keeps_indexes_no_vacuum() {
         idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
         "covering index live"
     );
-    // No VACUUM: freed pages sit on the freelist and the file does not shrink.
+    // No reclamation: freed pages sit on the freelist and the file does not shrink.
     assert!(
         freelist_count(&cache) > 0,
-        "incremental delete frees pages to the freelist (no VACUUM)"
+        "subthreshold delete frees pages to the freelist (no reclamation)"
     );
     assert_eq!(
         page_count(&cache),
         pages_before,
-        "incremental mode does not VACUUM ⇒ page_count unchanged"
+        "subthreshold mode does not reclaim ⇒ page_count unchanged"
     );
     println!(
-        "PASS: incremental-mode run_purge keeps both indexes live and skips VACUUM (freelist > 0, file unchanged at {pages_before} pages)"
+        "PASS: subthreshold run_purge keeps both indexes live and skips reclamation (freelist > 0, file unchanged at {pages_before} pages)"
     );
+}
+
+// ── #538: incremental reclamation + pending-marker recovery ──────────────────
+
+#[test]
+fn legacy_mode0_db_converts_via_full_vacuum() {
+    // PASS: a pre-existing auto_vacuum=NONE db (created WITHOUT the open pragma,
+    // like the production cache) stays mode 0 through open, and the first bulk
+    // purge's reclamation takes the full-VACUUM path — the one-time conversion —
+    // after which the db reads back auto_vacuum=2 (incremental).
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("cache.db");
+    {
+        // Raw pre-creation with any DDL fixes the header at mode 0.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE legacy_seed (x INTEGER);")
+            .unwrap();
+    }
+    let mut cache = WalletCache::open(&db_path).unwrap();
+    let av: i64 = cache
+        .raw_conn_for_test()
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(av, 0, "existing non-empty db stays mode 0 through open");
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let wfresh = wallet_hex(0xb); // fresh eligible winner: passes the staleness guard, spared
+    let wd = wallet_hex(0xd);
+    active_with_trade(&mut cache, &wfresh, now, now - 3_600);
+    dead_weight_with_n_trades(&mut cache, &wd, now, now - 30 * DAY, 1_000);
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
+    );
+
+    run_purge(&cfg_with_bulk_min(csv, true, 1), &mut cache, false).unwrap();
+
+    let av_after: i64 = cache
+        .raw_conn_for_test()
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        av_after, 2,
+        "conversion VACUUM flipped the db to incremental"
+    );
+    assert_eq!(
+        freelist_count(&cache),
+        0,
+        "conversion VACUUM drained the freelist"
+    );
+    let idx = trades_index_names(&cache);
+    assert!(idx.contains("idx_trades_market_id"));
+    assert!(idx.contains("idx_trades_buy_market_outcome_wallet_ts"));
+    println!("PASS: legacy mode-0 db converted to incremental via the bulk purge's full VACUUM");
+}
+
+#[test]
+fn bulk_error_ordering_recreates_then_propagates() {
+    // PASS: an injected mid-delete failure (tombstone table dropped) makes the
+    // bulk purge return Err, but the recreate-then-propagate contract still
+    // rebuilds both indexes, reclamation is skipped, and reclamation_pending
+    // stays SET so the next purge recovers (#538 ordering contract).
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    // A rule-A proven loser: its delete writes a tombstone -> the injection point.
+    let wl = wallet_hex(0xa);
+    active_with_trade(&mut cache, &wl, now, now - 3_600);
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000a,-9.0,-0.5,40,True\n",
+    );
+    cache
+        .raw_conn_for_test()
+        .execute_batch("DROP TABLE purged_wallets;")
+        .unwrap();
+
+    let config = BootstrapConfig {
+        purge_archive_enabled: false,
+        ..cfg_with_bulk_min(csv, true, 1)
+    };
+    let err = run_purge(&config, &mut cache, false).unwrap_err();
+    assert!(
+        format!("{err}").contains("purged_wallets"),
+        "the DELETE stage's error wins the precedence (got: {err})"
+    );
+
+    let idx = trades_index_names(&cache);
+    assert!(
+        idx.contains("idx_trades_market_id")
+            && idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
+        "recreate-then-propagate rebuilt both indexes despite the delete error"
+    );
+    assert!(
+        cache.reclamation_pending().unwrap(),
+        "marker stays set after a failed bulk run — recovery owed"
+    );
+    println!("PASS: failed bulk delete still recreates indexes and leaves reclamation_pending set");
+}
+
+#[test]
+fn infra_purge_never_services_pending_recovery() {
+    // #538 H-finding regression: purge-infra runs PRE-ranking and is fatal to
+    // the cycle — a pending marker must NOT trigger reclamation there.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    cache.set_reclamation_pending().unwrap();
+
+    let config = BootstrapConfig {
+        purge_archive_enabled: false,
+        cache_path: dir.path().join("cache.db"),
+        ..BootstrapConfig::default()
+    };
+    run_infra_purge(&config, &mut cache, false).unwrap();
+    assert!(
+        cache.reclamation_pending().unwrap(),
+        "infra purge must leave the marker for the ordinary post-publication purge"
+    );
+    println!("PASS: purge-infra ignores reclamation_pending (recovery deferred to Stage 4)");
+}
+
+#[test]
+fn reclamation_pending_recovery_via_subthreshold_purge() {
+    // PASS (end-to-end shape of the #538 recovery; the no-DROP-INDEX proof is the
+    // in-crate trace test): with the marker set and an empty delete set, an armed
+    // subthreshold purge reclaims, ensures indexes, and clears the marker.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let wfresh = wallet_hex(0xb); // fresh eligible wallet satisfies the staleness guard
+    active_with_trade(&mut cache, &wfresh, now, now - 3_600);
+    cache.set_reclamation_pending().unwrap();
+    let csv = write_csv(
+        &dir,
+        "wallet,tstat_net,mean_net,n_eff,eligible\n\
+         0x000000000000000000000000000000000000000b,5.0,0.2,40,True\n",
+    );
+
+    let report = run_purge(&cfg(csv, true), &mut cache, false).unwrap();
+    assert_eq!(report.proven_losers_deleted + report.dead_weight_deleted, 0);
+    assert!(
+        !cache.reclamation_pending().unwrap(),
+        "recovery cleared the marker"
+    );
+    assert_eq!(
+        freelist_count(&cache),
+        0,
+        "recovery reclamation drained the freelist"
+    );
+    println!("PASS: subthreshold purge with pending marker recovers reclamation and clears it");
 }
 
 // ── archive-before-DELETE (item 3.7, 2026-07-01 decision record / #417) ────────

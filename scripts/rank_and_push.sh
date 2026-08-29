@@ -493,11 +493,26 @@ fi
 # the loop supervisor retries a 75 cycle, while 1 (permanent) stops the loop.
 # NEVER pass --strict: it turns a tolerable partial (2) into a fatal (1). backfill and
 # resolutions routinely return 2 at full scale, so swallowing 2 is load-bearing for cron.
+# #538: durable purge-stage record. journald died mid-incident on 2026-08-27 and
+# took the only failure signal with it; this JSONL line lands in the per-run
+# artifact dir on the data disk and records EVERY outcome (0/2/75/fatal). Append
+# failure warns and never alters the captured exit code or any stage policy.
+append_purge_status() {
+  local stage="$1" rc="$2" level="info"
+  [[ "$rc" -ne 0 ]] && level="warn"
+  printf '{"ts":"%s","level":"%s","message":"purge stage exit","stage":"%s","exit_code":%d}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$stage" "$rc" \
+    >> "$OUT_DIR/purge_status.jsonl" 2>/dev/null \
+    || echo "   [$stage] WARN: purge_status.jsonl append failed" >&2
+}
+
 run_refresh_stage() {
   local label="$1"; shift
   echo "   [$label] running: $*"
   local rc=0
   "$@" || rc=$?
+  # #538: record purge stages BEFORE case dispatch — the 75/fatal arms exit here.
+  [[ "$label" == "purge-infra" ]] && append_purge_status "$label" "$rc"
   case "$rc" in
     0) echo "   [$label] ok" ;;
     2) echo "   [$label] WARN exit 2 (partial); cache durable, continuing" >&2 ;;
@@ -719,6 +734,7 @@ else
   # the purge is skipped rather than ever running at normal priority.
   PE_BOOTSTRAP_CACHE_PATH="$DB" PE_BOOTSTRAP_PURGE_DECISION_CSV="$RANKED_CSV" \
     "$IONICE_BIN" -c3 "$PE_BOOTSTRAP_BIN" purge "${BOOTSTRAP_CONFIG_ARGS[@]}" || prc=$?
+  append_purge_status "purge" "$prc"
   case "$prc" in
     0) echo "   [purge] ok" ;;
     *) echo "   [purge] WARN exit $prc — purge stage failed; Supabase publish already complete, continuing" >&2 ;;
@@ -726,7 +742,8 @@ else
 fi
 
 # ── Stage 5/5 (final): checkpoint + truncate the SQLite WAL ─────────────────────────────────
-# Bulk purge/VACUUM and the earlier refresh stages can leave a large committed WAL after their
+# Bulk purge reclamation (conversion VACUUM or incremental_vacuum, #538) and the earlier refresh
+# stages can leave a large committed WAL after their
 # writer processes exit. Run TRUNCATE only after every DB-mutating stage has finished and while
 # this wrapper still owns the single-run PID lock. SQLite coordinates the checkpoint with any
 # other connections; a busy/error result is a WARN, never a reason to fail the already-complete
