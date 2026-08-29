@@ -3057,6 +3057,13 @@ impl WalletCache {
         Ok(())
     }
 
+    /// Test-only (#538): mutable raw connection for in-crate tests (interrupt
+    /// handle acquisition, fixture DDL). Mirrors `raw_conn_for_test`.
+    #[cfg(test)]
+    pub(crate) fn raw_conn_mut_for_test(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Test-only (#538): install/remove a SQL trace so in-crate tests can prove
     /// which maintenance statement ran (`incremental_vacuum` vs bare `VACUUM`,
     /// and the absence of `DROP INDEX` on the recovery path).

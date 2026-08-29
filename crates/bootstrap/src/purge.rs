@@ -40,11 +40,14 @@
 //! converted db, or the one-time conversion `VACUUM` on a legacy mode-0 db.
 //! The recreate runs even on a mid-run delete/reclaim error
 //! (recreate-then-propagate). A `reclamation_pending` marker commits BEFORE the
-//! index drop and clears only after reclaim AND recreate succeed; a later purge
-//! finding it set runs RECOVERY — reclaim + idempotent index creation with NO
-//! index drop (schema-on-open already healed any absence) — regardless of that
-//! run's delete-set size. The lookup index `idx_trades_wallet_ts` and the PK
-//! are kept. Dry runs touch neither indexes nor the marker.
+//! index drop and clears only after reclaim AND recreate succeed. Recovery is
+//! serviced only by the ordinary post-publication purge: a subthreshold/empty
+//! run recovers via reclaim + idempotent index creation with NO index drop
+//! (schema-on-open already healed any absence), while an above-threshold run
+//! subsumes recovery in its normal bulk maintenance. `purge-infra`
+//! (pre-ranking, cycle-fatal) never services recovery. The lookup index
+//! `idx_trades_wallet_ts` and the PK are kept. Dry runs touch neither indexes
+//! nor the marker.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -416,6 +419,86 @@ mod tests {
     static RECOVERY_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     fn recovery_trace_collect(sql: &str) {
         RECOVERY_TRACE.lock().unwrap().push(sql.to_owned());
+    }
+
+    static INTERRUPT_ON_RECLAIM: std::sync::Mutex<Option<rusqlite::InterruptHandle>> =
+        std::sync::Mutex::new(None);
+    fn interrupt_on_reclaim(sql: &str) {
+        if sql.contains("incremental_vacuum")
+            && let Some(h) = INTERRUPT_ON_RECLAIM.lock().unwrap().as_ref()
+        {
+            h.interrupt();
+        }
+    }
+
+    #[test]
+    fn bulk_reclaim_failure_recreates_and_retains_marker() {
+        // #538 ordering precedence, reclaim half: the connection's own interrupt
+        // handle fires from the SQL trace the moment `incremental_vacuum` starts
+        // — a deterministic OperationInterrupted with no new fault machinery.
+        // The bulk run must propagate the RECLAIM error, still attempt index
+        // recreation, and leave `reclamation_pending` set.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("c.db")).unwrap();
+        // Non-empty freelist so the pragma has real steps to be interrupted in.
+        cache
+            .raw_conn_mut_for_test()
+            .execute_batch(
+                "CREATE TABLE junk (x BLOB); \
+                 INSERT INTO junk SELECT randomblob(4096) FROM \
+                   (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 200) \
+                    SELECT i FROM n); \
+                 DROP TABLE junk;",
+            )
+            .unwrap();
+        *INTERRUPT_ON_RECLAIM.lock().unwrap() =
+            Some(cache.raw_conn_mut_for_test().get_interrupt_handle());
+        cache.install_sql_trace(Some(interrupt_on_reclaim));
+
+        let config = BootstrapConfig {
+            purge_enabled: true,
+            purge_archive_enabled: false,
+            purge_bulk_min_wallets: 1,
+            cache_path: dir.path().join("c.db"),
+            ..BootstrapConfig::default()
+        };
+        let rows = [PurgeRow {
+            wallet_hex: "0x00000000000000000000000000000000000000dd".to_owned(),
+            reason: PurgeReason::DeadWeight,
+        }];
+        let err = execute_purge_rows(&config, &mut cache, &rows, 1_700_000_000, true, "purge")
+            .unwrap_err();
+        cache.install_sql_trace(None);
+        *INTERRUPT_ON_RECLAIM.lock().unwrap() = None;
+
+        assert!(
+            format!("{err}").to_lowercase().contains("interrupt"),
+            "the RECLAIM stage's error wins after a successful delete (got: {err})"
+        );
+        assert!(
+            cache.reclamation_pending().unwrap(),
+            "marker retained after a failed reclamation — recovery owed"
+        );
+        // Recreate-then-propagate: both indexes exist despite the reclaim error.
+        let names: Vec<String> = {
+            let conn = cache.raw_conn_mut_for_test();
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='trades'")
+                .unwrap();
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<String>>();
+            drop(stmt);
+            names
+        };
+        assert!(names.iter().any(|n| n == "idx_trades_market_id"));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "idx_trades_buy_market_outcome_wallet_ts")
+        );
     }
 
     #[test]

@@ -752,7 +752,7 @@ fn run_purge_bulk_mode_vacuums_and_reclaims() {
 }
 
 #[test]
-fn run_purge_incremental_mode_keeps_indexes_no_vacuum() {
+fn run_purge_subthreshold_mode_keeps_indexes_no_reclamation() {
     // PASS: an armed purge whose delete-set < purge_bulk_min_wallets runs in
     // SUBTHRESHOLD mode — the two secondary indexes are never dropped (present) and
     // no reclamation runs (freelist_count > 0 and page_count unchanged; #538
