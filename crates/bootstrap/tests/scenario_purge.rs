@@ -66,8 +66,9 @@ fn freelist_count(cache: &WalletCache) -> i64 {
         .unwrap()
 }
 
-/// `PRAGMA page_count` — total pages in the main DB file (issue #401). Only VACUUM
-/// shrinks it; a plain DELETE leaves it unchanged (freed pages go to the freelist).
+/// `PRAGMA page_count` — total pages in the main DB file (issue #401). Only
+/// free-page reclamation (conversion VACUUM / incremental_vacuum, #538) shrinks
+/// it; a plain DELETE leaves it unchanged (freed pages go to the freelist).
 fn page_count(cache: &WalletCache) -> i64 {
     cache
         .raw_conn_for_test()
@@ -600,7 +601,7 @@ fn drop_then_create_trades_indexes_roundtrips() {
 
 #[test]
 fn armed_run_purge_keeps_trades_indexes_intact() {
-    // PASS: after a full armed run_purge in BULK mode (drop → delete → VACUUM →
+    // PASS: after a full armed run_purge in BULK mode (drop → delete → reclaim →
     // recreate) all three trades indexes are present and the covering index keeps
     // its 5-column order — the drop/rebuild dance leaves a correct schema. Forced
     // bulk via threshold=1 (issue #401), since the 2-wallet delete-set would
@@ -790,18 +791,18 @@ fn run_purge_incremental_mode_keeps_indexes_no_vacuum() {
         idx.contains("idx_trades_buy_market_outcome_wallet_ts"),
         "covering index live"
     );
-    // No VACUUM: freed pages sit on the freelist and the file does not shrink.
+    // No reclamation: freed pages sit on the freelist and the file does not shrink.
     assert!(
         freelist_count(&cache) > 0,
-        "incremental delete frees pages to the freelist (no VACUUM)"
+        "subthreshold delete frees pages to the freelist (no reclamation)"
     );
     assert_eq!(
         page_count(&cache),
         pages_before,
-        "incremental mode does not VACUUM ⇒ page_count unchanged"
+        "subthreshold mode does not reclaim ⇒ page_count unchanged"
     );
     println!(
-        "PASS: incremental-mode run_purge keeps both indexes live and skips VACUUM (freelist > 0, file unchanged at {pages_before} pages)"
+        "PASS: subthreshold run_purge keeps both indexes live and skips reclamation (freelist > 0, file unchanged at {pages_before} pages)"
     );
 }
 
@@ -887,8 +888,11 @@ fn bulk_error_ordering_recreates_then_propagates() {
         purge_archive_enabled: false,
         ..cfg_with_bulk_min(csv, true, 1)
     };
-    let err = run_purge(&config, &mut cache, false);
-    assert!(err.is_err(), "delete failure must propagate");
+    let err = run_purge(&config, &mut cache, false).unwrap_err();
+    assert!(
+        format!("{err}").contains("purged_wallets"),
+        "the DELETE stage's error wins the precedence (got: {err})"
+    );
 
     let idx = trades_index_names(&cache);
     assert!(
@@ -901,6 +905,27 @@ fn bulk_error_ordering_recreates_then_propagates() {
         "marker stays set after a failed bulk run — recovery owed"
     );
     println!("PASS: failed bulk delete still recreates indexes and leaves reclamation_pending set");
+}
+
+#[test]
+fn infra_purge_never_services_pending_recovery() {
+    // #538 H-finding regression: purge-infra runs PRE-ranking and is fatal to
+    // the cycle — a pending marker must NOT trigger reclamation there.
+    let dir = TempDir::new().unwrap();
+    let mut cache = open_cache(&dir);
+    cache.set_reclamation_pending().unwrap();
+
+    let config = BootstrapConfig {
+        purge_archive_enabled: false,
+        cache_path: dir.path().join("cache.db"),
+        ..BootstrapConfig::default()
+    };
+    run_infra_purge(&config, &mut cache, false).unwrap();
+    assert!(
+        cache.reclamation_pending().unwrap(),
+        "infra purge must leave the marker for the ordinary post-publication purge"
+    );
+    println!("PASS: purge-infra ignores reclamation_pending (recovery deferred to Stage 4)");
 }
 
 #[test]

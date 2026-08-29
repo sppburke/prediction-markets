@@ -227,7 +227,12 @@ fn execute_purge_rows(
 
     // #538 fail-closed marker read: an error here aborts — a pending recovery
     // must never be silently skipped because the marker could not be read.
-    let recovery_pending = if armed {
+    // Recovery is serviced ONLY at the ordinary post-publication purge ("purge"):
+    // purge-infra runs PRE-ranking and is fatal to the cycle, so a multi-hour
+    // recovery there would turn deferred maintenance into a ranking outage. An
+    // above-threshold run needs no recovery arm — its normal bulk maintenance
+    // drains the entire freelist (backlog included) and clears the marker.
+    let recovery_pending = if armed && label == "purge" {
         cache.reclamation_pending()?
     } else {
         false

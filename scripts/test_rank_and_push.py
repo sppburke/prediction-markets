@@ -590,6 +590,30 @@ class RankAndPushScenario(unittest.TestCase):
         )
         print("PASS: purge-infra exit 75 recorded despite the in-arm abort")
 
+    def test_purge_status_jsonl_on_infra_partial_and_fatal(self):
+        # Exit 2 (partial: WARN + continue) and exit 1 (fatal: in-arm abort) must
+        # both be durably recorded (#538 review: suppressing records on exactly
+        # these arms would otherwise pass).
+        r = self._run(exit_env={"STUB_EXIT_purge_infra": "2"})
+        self.assertEqual(r.returncode, 0, "infra exit 2 is WARN + continue")
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 2, "warn"), ("purge", 0, "info")],
+            f"partial infra recorded, run continued to the ordinary purge: {recs}",
+        )
+
+        self.setUp()  # fresh sandbox for the fatal case
+        r = self._run(exit_env={"STUB_EXIT_purge_infra": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        recs = self._purge_status_lines()
+        self.assertEqual(
+            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
+            [("purge-infra", 1, "warn")],
+            f"fatal infra recorded before the in-arm abort: {recs}",
+        )
+        print("PASS: purge-infra exits 2 and 1 both leave durable status records")
+
     def test_purge_status_jsonl_on_ordinary_purge_failure(self):
         # The ordinary purge is non-fatal (post-publication); its failure must
         # still be durably recorded and the run must still succeed.
