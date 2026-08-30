@@ -297,17 +297,36 @@ class DuckParityTest(unittest.TestCase):
         the smaller source_trade_id in BOTH engines, regardless of physical insertion order.
         Two dbs carry the same two tied rows inserted in opposite orders; the SQLite scan
         (rank_72hr_buyandhold.scan_and_filter_sqlite) and the DuckDB extraction must all
-        pick the identical row — eliminating the measured ±11-wallet churn class."""
-        t = ts(2026, 2, 10)
-        # (source_trade_id, outcome_id, price_str, contracts) in the production id shape.
-        # tid_hi > tid_lo both as TEXT and through the duck hex-slice key — the difference
-        # sits in the LAST slice so the test also exercises the h4 comparison. The 0.70 row
-        # carries the SMALLER id and must win regardless of insertion order.
-        tid_lo, tid_hi = f"0x{1:064x}", f"0x{2:064x}"
-        rows = [(tid_hi, 0, "0.30", 100), (tid_lo, 1, "0.70", 200)]
-        want = (1, "0.70", 200)  # the min-source_trade_id row
+        pick the identical row — eliminating the measured ±11-wallet churn class.
 
-        for order_name, insert_rows in (("forward", rows), ("reversed", rows[::-1])):
+        The id pairs differ at BOUNDARY-SENSITIVE hex digits: the last digit of each of
+        the duck key's four 16-digit slices plus the first digit of the last slice. A
+        slice offset/length typo (e.g. 35 -> 34 in ranker_duck's fb0 key) leaves some
+        digit uncovered, turning exactly one of these pairs insertion-order-dependent —
+        so this test regression-pins the slice arithmetic, not just h4."""
+        t = ts(2026, 2, 10)
+
+        def pair_at(hex_idx: int) -> tuple[str, str]:
+            """Two production-shape ids equal everywhere except hex digit `hex_idx`
+            (0-based within the 64 digits after '0x'): lo has '1' there, hi has '2'."""
+            base = ["0"] * 64
+            base[hex_idx] = "1"
+            lo = "0x" + "".join(base)
+            base[hex_idx] = "2"
+            return lo, "0x" + "".join(base)
+
+        # h1 last digit, h2 last, h3 last, h4 first, h4 last.
+        boundary_digits = (15, 31, 47, 48, 63)
+        want = (1, "0.70", 200)  # the min-source_trade_id row carries the 0.70 side
+
+        for hex_idx in boundary_digits:
+            tid_lo, tid_hi = pair_at(hex_idx)
+            rows = [(tid_hi, 0, "0.30", 100), (tid_lo, 1, "0.70", 200)]
+            self._assert_tie_pick(t, rows, want, f"digit{hex_idx}")
+
+    def _assert_tie_pick(self, t, rows, want, label) -> None:
+        for order_name, insert_rows in ((f"{label}/forward", rows),
+                                        (f"{label}/reversed", rows[::-1])):
             with tempfile.TemporaryDirectory() as tmp:
                 db = str(Path(tmp) / "tie.db")
                 pq = str(Path(tmp) / "pq")
@@ -352,6 +371,31 @@ class DuckParityTest(unittest.TestCase):
                 self.assertEqual(sq, want, f"[{order_name}] SQLite pick {sq} != {want}")
                 self.assertEqual(dk, want, f"[{order_name}] DuckDB pick {dk} != {want}")
                 print(f"PASS: tie deterministic [{order_name}]: both engines picked {want}")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_slice_key_premise_rejects_malformed_ids(self) -> None:
+        """The duck extract must halt with RuntimeError BEFORE running the slice-key query
+        when any source_trade_id is not `0x` + 64 lowercase hex — pinning the fail-closed
+        guard for all three malformation classes, including short-but-hex (which would
+        CAST silently but order differently from the SQLite engine's TEXT comparison)."""
+        import duckdb as _d
+
+        for label, bad_id in (("short-hex", "0xabc"),
+                              ("uppercase", "0x" + "A" * 64),
+                              ("non-hex", "t-lo")):
+            con = _d.connect()
+            con.execute("CREATE TABLE trades(wallet_hex VARCHAR, side VARCHAR, "
+                        "market_id VARCHAR, outcome_id BIGINT, price_str VARCHAR, "
+                        "contracts BIGINT, timestamp_unix BIGINT, "
+                        "source_trade_id VARCHAR NOT NULL)")
+            con.execute("INSERT INTO trades VALUES ('0xa','buy','M1',1,'0.50',10,1000,?)",
+                        [bad_id])
+            with self.assertRaisesRegex(RuntimeError, "premise violated",
+                                        msg=f"{label} id must halt the extract"):
+                ranker_duck.duck_extract_positions(
+                    con, ["0xa"], 0, 2_000_000_000, 30, 259200, True, 0.0, 1.0)
+            con.close()
+            print(f"PASS: slice-key premise rejects {label}")
 
     def test_bad_threads_env_falls_back(self) -> None:
         """A non-integer PE_RANKER_DUCKDB_THREADS (operator typo) must NOT crash get_engine —
