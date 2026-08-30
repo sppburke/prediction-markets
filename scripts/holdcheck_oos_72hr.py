@@ -49,7 +49,7 @@ def main():
     for i,w in enumerate(wallets):
         bymkt={}
         for mid,oid,side,ps,contracts,ts in c.execute(
-            "SELECT market_id,outcome_id,side,price_str,contracts,timestamp_unix FROM trades WHERE wallet_hex=? ORDER BY timestamp_unix",(w,)):
+            "SELECT market_id,outcome_id,side,price_str,contracts,timestamp_unix FROM trades WHERE wallet_hex=? ORDER BY timestamp_unix, source_trade_id",(w,)):
             bymkt.setdefault(mid,[]).append((ts,side,int(oid),ps,int(contracts)))
         for mid,trs in bymkt.items():
             end=sch.get(mid); r=res.get(mid)

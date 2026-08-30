@@ -47,6 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import export_trades_parquet as exp  # noqa: E402
 import rank_72hr_buyandhold as rk  # noqa: E402
+from collections import defaultdict  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 import ranker_duck  # noqa: E402
 
 try:
@@ -78,8 +80,9 @@ _TID = iter(range(1, 10_000))
 
 
 def tid() -> str:
-    """Unique source_trade_id per fixture row (the real cache's PRIMARY KEY)."""
-    return f"t{next(_TID):06d}"
+    """Unique source_trade_id per fixture row (the real cache's PRIMARY KEY), in the
+    production shape `0x` + 64 lowercase hex — the duck slice key asserts that format."""
+    return f"0x{next(_TID):064x}"
 
 
 # (wallet, market, outcome_id, price_str, entry_ts, winning_outcome_id) — buys.
@@ -116,7 +119,8 @@ def build_parity_cache(path: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                  "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                 "source_trade_id TEXT PRIMARY KEY)")
+                 "source_trade_id TEXT PRIMARY KEY NOT NULL)")
+    conn.execute("CREATE INDEX idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix)")
     conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                  "resolved_at_unix INTEGER)")
     conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
@@ -210,6 +214,15 @@ class DuckParityTest(unittest.TestCase):
             export(db, pq)
             self.assertEqual(run_pass1(db, out_duck, "duck", pq), 0)
 
+            # AC (#530): the exported snapshot carries source_trade_id with zero NULLs
+            # — the tie key must exist and be total in the DuckDB path's real input.
+            import duckdb as _d
+            nn = _d.connect().execute(
+                f"SELECT count(*) FILTER (WHERE source_trade_id IS NULL), count(*) "
+                f"FROM read_parquet('{pq}/trades.parquet')").fetchone()
+            self.assertEqual(nn[0], 0, "NULL source_trade_id in exported snapshot")
+            self.assertGreater(nn[1], 0)
+
             # AC: identical qualifying-positions SET.
             ps_sql = positions_set(str(Path(out_sql) / "qualifying_positions_72hr.csv"))
             ps_duck = positions_set(str(Path(out_duck) / "qualifying_positions_72hr.csv"))
@@ -247,9 +260,9 @@ class DuckParityTest(unittest.TestCase):
         """Two buys for the SAME (wallet, market) at the SAME timestamp but DIFFERENT
         outcome_id/price/contracts: the GROUP BY `arg_min(struct_pack(...))` dedup (#387) must
         return ONE source row's columns ATOMICALLY — never a frankenrow mixing columns across
-        the tied rows (which a column-independent `arg_min` per column would risk). Either valid
-        whole row passes (the pick is arbitrary on an exact tie, as in the SQLite path), so this
-        is deterministic; a mixed row fails."""
+        the tied rows. #530 Phase C: the tie now resolves DETERMINISTICALLY to the row with
+        the smaller `source_trade_id` (the (ts, id-slices) arg_min key), so exactly one
+        specific row passes — the previously-accepted "either row" is a regression."""
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "tie.db")
             pq = str(Path(tmp) / "pq")
@@ -257,7 +270,7 @@ class DuckParityTest(unittest.TestCase):
             conn = sqlite3.connect(db)
             conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                          "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                         "source_trade_id TEXT PRIMARY KEY)")
+                         "source_trade_id TEXT PRIMARY KEY NOT NULL)")
             conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                          "resolved_at_unix INTEGER)")
             conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
@@ -274,9 +287,115 @@ class DuckParityTest(unittest.TestCase):
             self.assertEqual(len(df), 1, "expected exactly one first-buy position")
             row = df.iloc[0]
             got = (int(row["outcome_id"]), round(float(row["price"]), 9), int(row["contracts"]))
-            valid = {(0, 0.30, 100), (1, 0.70, 200)}
-            print(f"{'PASS' if got in valid else 'FAIL'}: duck_firstbuy_tie_atomic (picked {got})")
-            self.assertIn(got, valid, f"frankenrow {got} mixes columns across tied rows")
+            # First-inserted row has the smaller sequential source_trade_id -> it wins.
+            print(f"{'PASS' if got == (0, 0.30, 100) else 'FAIL'}: duck_firstbuy_tie_atomic (picked {got})")
+            self.assertEqual(got, (0, 0.30, 100),
+                             f"tie must resolve to the min-source_trade_id row, got {got}")
+
+    def test_tie_deterministic_across_engines_and_insertion_order(self) -> None:
+        """#530 Phase C acceptance: equal-timestamp first-buy ties resolve to the row with
+        the smaller source_trade_id in BOTH engines, regardless of physical insertion order.
+        Two dbs carry the same two tied rows inserted in opposite orders; the SQLite scan
+        (rank_72hr_buyandhold.scan_and_filter_sqlite) and the DuckDB extraction must all
+        pick the identical row — eliminating the measured ±11-wallet churn class.
+
+        The id pairs differ at BOUNDARY-SENSITIVE hex digits: the last digit of each of
+        the duck key's four 16-digit slices plus the first digit of the last slice. A
+        slice offset/length typo (e.g. 35 -> 34 in ranker_duck's fb0 key) leaves some
+        digit uncovered, turning exactly one of these pairs insertion-order-dependent —
+        so this test regression-pins the slice arithmetic, not just h4."""
+        t = ts(2026, 2, 10)
+
+        def pair_at(hex_idx: int) -> tuple[str, str]:
+            """Two production-shape ids equal everywhere except hex digit `hex_idx`
+            (0-based within the 64 digits after '0x'): lo has '1' there, hi has '2'."""
+            base = ["0"] * 64
+            base[hex_idx] = "1"
+            lo = "0x" + "".join(base)
+            base[hex_idx] = "2"
+            return lo, "0x" + "".join(base)
+
+        # h1 last digit, h2 last, h3 last, h4 first, h4 last.
+        boundary_digits = (15, 31, 47, 48, 63)
+        want = (1, "0.70", 200)  # the min-source_trade_id row carries the 0.70 side
+
+        for hex_idx in boundary_digits:
+            tid_lo, tid_hi = pair_at(hex_idx)
+            rows = [(tid_hi, 0, "0.30", 100), (tid_lo, 1, "0.70", 200)]
+            self._assert_tie_pick(t, rows, want, f"digit{hex_idx}")
+
+    def _assert_tie_pick(self, t, rows, want, label) -> None:
+        for order_name, insert_rows in ((f"{label}/forward", rows),
+                                        (f"{label}/reversed", rows[::-1])):
+            with tempfile.TemporaryDirectory() as tmp:
+                db = str(Path(tmp) / "tie.db")
+                pq = str(Path(tmp) / "pq")
+                conn = sqlite3.connect(db)
+                conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
+                             "outcome_id INTEGER, price_str TEXT, contracts INTEGER, "
+                             "timestamp_unix INTEGER, source_trade_id TEXT PRIMARY KEY NOT NULL)")
+                conn.execute("CREATE TABLE market_resolutions (market_id TEXT, "
+                             "winning_outcome_id INTEGER, resolved_at_unix INTEGER)")
+                conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
+                for stid, oid, price, qty in insert_rows:
+                    conn.execute(
+                        "INSERT INTO trades (wallet_hex, side, market_id, outcome_id, price_str, "
+                        "contracts, timestamp_unix, source_trade_id) VALUES (?,?,?,?,?,?,?,?)",
+                        (W("a"), "buy", "M1", oid, price, qty, t, stid))
+                conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", ("M1", 1, t + 7200))
+                conn.execute("INSERT INTO market_schedules VALUES (?,?)", ("M1", t + 3600))
+                conn.commit()
+
+                # SQLite engine pick — a namespace carrying exactly the fields
+                # scan_and_filter_sqlite reads (the real Params has unrelated CLI fields).
+                prm = SimpleNamespace(win_start=ts(2026, 1, 1), win_end=ts(2026, 4, 1),
+                                      scheduled_only=True, min_ttr_secs=30,
+                                      ttr_secs=259200, price_min=0.0, price_max=1.0)
+                res = {"M1": (1, t + 7200)}
+                sched = {"M1": t + 3600}
+                diag = defaultdict(int)
+                pos = rk.scan_and_filter_sqlite(conn, W("a"), prm, res, sched, diag)
+                conn.close()
+                self.assertEqual(len(pos), 1)
+                sq = (int(pos[0]["outcome_id"]), f'{pos[0]["price"]:.2f}', int(pos[0]["contracts"]))
+
+                # DuckDB engine pick.
+                export(db, pq)
+                con = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0)
+                df = ranker_duck.duck_extract_positions(
+                    con, [W("a")], ts(2026, 1, 1), ts(2026, 4, 1), 30, 259200, True, 0.0, 1.0)
+                self.assertEqual(len(df), 1)
+                r = df.iloc[0]
+                dk = (int(r["outcome_id"]), f'{float(r["price"]):.2f}', int(r["contracts"]))
+
+                self.assertEqual(sq, want, f"[{order_name}] SQLite pick {sq} != {want}")
+                self.assertEqual(dk, want, f"[{order_name}] DuckDB pick {dk} != {want}")
+                print(f"PASS: tie deterministic [{order_name}]: both engines picked {want}")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_slice_key_premise_rejects_malformed_ids(self) -> None:
+        """The duck extract must halt with RuntimeError BEFORE running the slice-key query
+        when any source_trade_id is not `0x` + 64 lowercase hex — pinning the fail-closed
+        guard for all three malformation classes, including short-but-hex (which would
+        CAST silently but order differently from the SQLite engine's TEXT comparison)."""
+        import duckdb as _d
+
+        for label, bad_id in (("short-hex", "0xabc"),
+                              ("uppercase", "0x" + "A" * 64),
+                              ("non-hex", "t-lo")):
+            con = _d.connect()
+            con.execute("CREATE TABLE trades(wallet_hex VARCHAR, side VARCHAR, "
+                        "market_id VARCHAR, outcome_id BIGINT, price_str VARCHAR, "
+                        "contracts BIGINT, timestamp_unix BIGINT, "
+                        "source_trade_id VARCHAR NOT NULL)")
+            con.execute("INSERT INTO trades VALUES ('0xa','buy','M1',1,'0.50',10,1000,?)",
+                        [bad_id])
+            with self.assertRaisesRegex(RuntimeError, "premise violated",
+                                        msg=f"{label} id must halt the extract"):
+                ranker_duck.duck_extract_positions(
+                    con, ["0xa"], 0, 2_000_000_000, 30, 259200, True, 0.0, 1.0)
+            con.close()
+            print(f"PASS: slice-key premise rejects {label}")
 
     def test_bad_threads_env_falls_back(self) -> None:
         """A non-integer PE_RANKER_DUCKDB_THREADS (operator typo) must NOT crash get_engine —
