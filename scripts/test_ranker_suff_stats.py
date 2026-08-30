@@ -34,7 +34,7 @@ def _make_con():
     # source_trade_id mirrors the real cache PK — the #530 tie-order key reads it.
     con.execute("CREATE TABLE trades(wallet_hex VARCHAR, market_id VARCHAR, outcome_id BIGINT, "
                 "timestamp_unix BIGINT, side VARCHAR, price_str VARCHAR, contracts BIGINT, "
-                "source_trade_id VARCHAR)")
+                "source_trade_id VARCHAR NOT NULL)")
     con.executemany(
         "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
         [
