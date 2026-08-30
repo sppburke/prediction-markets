@@ -174,6 +174,29 @@ def get_engine(force: str | None = None,
     return con
 
 
+def _assert_slice_key_premise(con) -> None:
+    """Fail the extract loudly if any `source_trade_id` is not `0x` + 64 lowercase hex.
+
+    The first-buy tie key encodes the id as four fixed-width UBIGINT hex slices (see fb0),
+    which orders identically to the SQLite engine's TEXT comparison ONLY for ids of that
+    exact shape: a shorter all-hex id would cast silently but order differently, and mixed
+    case would flip the TEXT order. Malformed ids must therefore stop the rank (a format
+    change in source ids is a source-contract change to surface, never to paper over) —
+    fail-closed, mirroring the resolver-evidence rule. One id-column scan per extract
+    (~70s on the production tape); raises RuntimeError with the violation count.
+    """
+    bad = con.execute(
+        "SELECT count(*) FROM trades "
+        "WHERE NOT regexp_full_match(source_trade_id, '0x[0-9a-f]{64}')"
+    ).fetchone()[0]
+    if bad:
+        raise RuntimeError(
+            f"duck tie-key premise violated: {bad} source_trade_id row(s) are not "
+            "'0x'+64-lowercase-hex; the slice key would diverge from SQLite TEXT order "
+            "(#530). Rank halted — inspect the tape/export before re-running."
+        )
+
+
 def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
                            scheduled_only, price_min, price_max, *, materialize_as=None):
     """Return a pandas DataFrame of QUALIFYING first-buy positions across `wallets` —
@@ -193,8 +216,12 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     The universe is registered as a typed relation and INNER-joined, so the DuckDB
     universe is identical to the SQLite `wallets` list by construction (case/validation
     quirks can't diverge). First-buy dedup is a hash `GROUP BY ... arg_min(struct_pack,
-    timestamp_unix)` (NOT a `ROW_NUMBER` window) so it spills to disk instead of OOM-ing on
+    <key>)` (NOT a `ROW_NUMBER` window) so it spills to disk instead of OOM-ing on
     the full-universe scan (#387); `struct_pack` keeps the chosen row's columns atomic.
+    The arg_min key is `(timestamp_unix, source_trade_id)` (#530 Phase C) with the id
+    encoded as four fixed-width UBIGINT hex slices — see the fb0 comment for why — which
+    requires every id to be `0x` + 64 lowercase hex; `_assert_slice_key_premise` fails
+    the extract loudly if the tape ever violates that.
 
     When `materialize_as` is set (a bare SQL identifier), the result is written to a DuckDB temp
     TABLE of that name and the function returns `None` instead of a pandas DataFrame — the Phase-A
@@ -203,6 +230,7 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     """
     import pandas as pd
 
+    _assert_slice_key_premise(con)
     # Explicit object dtype: pandas 3.0's default `str` dtype is not recognised by
     # duckdb's pandas scan; object -> VARCHAR is the supported path.
     con.register("universe",
@@ -219,13 +247,24 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
             -- arg_min KEY is (timestamp_unix, source_trade_id) — struct comparison is
             -- lexicographic by field order — so an exact timestamp tie resolves by the unique
             -- trade id, deterministically and identically to the SQLite engine's ORDER BY.
+            -- The id rides as four fixed-width UBIGINT hex slices, NOT a VARCHAR: DuckDB's
+            -- string aggregate state cannot spill, and a `tid := source_trade_id` key OOMs
+            -- the production envelope on the real tape (152M rows / 39.1M groups @ 8GB,
+            -- duckdb 1.4.5 — measured on forge, #530). For ids that are uniformly `0x` +
+            -- 64 lowercase hex (asserted above) the slice tuple orders EXACTLY like the
+            -- SQLite engine's TEXT comparison: equal length, and hex-digit ASCII order
+            -- matches numeric order.
             SELECT t.wallet_hex, t.market_id,
                    min(t.timestamp_unix) AS timestamp_unix,
                    arg_min(struct_pack(outcome_id := t.outcome_id,
                                        price_str  := t.price_str,
                                        contracts  := t.contracts),
-                           struct_pack(ts  := t.timestamp_unix,
-                                       tid := t.source_trade_id)) AS firstbuy
+                           struct_pack(ts := t.timestamp_unix,
+                                       h1 := ('0x' || substr(t.source_trade_id,  3, 16))::UBIGINT,
+                                       h2 := ('0x' || substr(t.source_trade_id, 19, 16))::UBIGINT,
+                                       h3 := ('0x' || substr(t.source_trade_id, 35, 16))::UBIGINT,
+                                       h4 := ('0x' || substr(t.source_trade_id, 51, 16))::UBIGINT)
+                           ) AS firstbuy
             FROM trades t
             JOIN universe u ON u.wallet_hex = t.wallet_hex
             WHERE t.side = 'buy'

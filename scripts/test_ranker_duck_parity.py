@@ -80,8 +80,9 @@ _TID = iter(range(1, 10_000))
 
 
 def tid() -> str:
-    """Unique source_trade_id per fixture row (the real cache's PRIMARY KEY)."""
-    return f"t{next(_TID):06d}"
+    """Unique source_trade_id per fixture row (the real cache's PRIMARY KEY), in the
+    production shape `0x` + 64 lowercase hex — the duck slice key asserts that format."""
+    return f"0x{next(_TID):064x}"
 
 
 # (wallet, market, outcome_id, price_str, entry_ts, winning_outcome_id) — buys.
@@ -260,8 +261,8 @@ class DuckParityTest(unittest.TestCase):
         outcome_id/price/contracts: the GROUP BY `arg_min(struct_pack(...))` dedup (#387) must
         return ONE source row's columns ATOMICALLY — never a frankenrow mixing columns across
         the tied rows. #530 Phase C: the tie now resolves DETERMINISTICALLY to the row with
-        the smaller `source_trade_id` (the composite arg_min key), so exactly one specific
-        row passes — the previously-accepted "either row" is a regression."""
+        the smaller `source_trade_id` (the (ts, id-slices) arg_min key), so exactly one
+        specific row passes — the previously-accepted "either row" is a regression."""
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "tie.db")
             pq = str(Path(tmp) / "pq")
@@ -298,10 +299,13 @@ class DuckParityTest(unittest.TestCase):
         (rank_72hr_buyandhold.scan_and_filter_sqlite) and the DuckDB extraction must all
         pick the identical row — eliminating the measured ±11-wallet churn class."""
         t = ts(2026, 2, 10)
-        # (source_trade_id, outcome_id, price_str, contracts): "t-hi" < "t-lo" lexically,
-        # so the 0.70 row is the deterministic winner regardless of insertion order.
-        rows = [("t-lo", 0, "0.30", 100), ("t-hi", 1, "0.70", 200)]
-        want = (1, "0.70", 200)  # the min-source_trade_id ("t-hi") row
+        # (source_trade_id, outcome_id, price_str, contracts) in the production id shape.
+        # tid_hi > tid_lo both as TEXT and through the duck hex-slice key — the difference
+        # sits in the LAST slice so the test also exercises the h4 comparison. The 0.70 row
+        # carries the SMALLER id and must win regardless of insertion order.
+        tid_lo, tid_hi = f"0x{1:064x}", f"0x{2:064x}"
+        rows = [(tid_hi, 0, "0.30", 100), (tid_lo, 1, "0.70", 200)]
+        want = (1, "0.70", 200)  # the min-source_trade_id row
 
         for order_name, insert_rows in (("forward", rows), ("reversed", rows[::-1])):
             with tempfile.TemporaryDirectory() as tmp:
