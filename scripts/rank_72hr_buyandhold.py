@@ -378,7 +378,10 @@ def scan_and_filter_sqlite(conn, w, prm, res, sched, diag):
     qualifying rows are collected into a list instead of being scored in place."""
     cur = conn.execute(
         "SELECT market_id, outcome_id, price_str, contracts, timestamp_unix "
-        "FROM trades WHERE wallet_hex = ? AND side = 'buy' ORDER BY timestamp_unix ASC",
+        "FROM trades WHERE wallet_hex = ? AND side = 'buy' "
+        # #530 Phase C: source_trade_id (PK, unique) breaks equal-timestamp ties so
+        # the first-buy pick is deterministic and identical across engines/runs.
+        "ORDER BY timestamp_unix ASC, source_trade_id ASC",
         (w,),
     )
     # first-ever buy per market

@@ -47,6 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import export_trades_parquet as exp  # noqa: E402
 import rank_72hr_buyandhold as rk  # noqa: E402
+from collections import defaultdict  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 import ranker_duck  # noqa: E402
 
 try:
@@ -247,9 +249,9 @@ class DuckParityTest(unittest.TestCase):
         """Two buys for the SAME (wallet, market) at the SAME timestamp but DIFFERENT
         outcome_id/price/contracts: the GROUP BY `arg_min(struct_pack(...))` dedup (#387) must
         return ONE source row's columns ATOMICALLY — never a frankenrow mixing columns across
-        the tied rows (which a column-independent `arg_min` per column would risk). Either valid
-        whole row passes (the pick is arbitrary on an exact tie, as in the SQLite path), so this
-        is deterministic; a mixed row fails."""
+        the tied rows. #530 Phase C: the tie now resolves DETERMINISTICALLY to the row with
+        the smaller `source_trade_id` (the composite arg_min key), so exactly one specific
+        row passes — the previously-accepted "either row" is a regression."""
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "tie.db")
             pq = str(Path(tmp) / "pq")
@@ -274,9 +276,68 @@ class DuckParityTest(unittest.TestCase):
             self.assertEqual(len(df), 1, "expected exactly one first-buy position")
             row = df.iloc[0]
             got = (int(row["outcome_id"]), round(float(row["price"]), 9), int(row["contracts"]))
-            valid = {(0, 0.30, 100), (1, 0.70, 200)}
-            print(f"{'PASS' if got in valid else 'FAIL'}: duck_firstbuy_tie_atomic (picked {got})")
-            self.assertIn(got, valid, f"frankenrow {got} mixes columns across tied rows")
+            # First-inserted row has the smaller sequential source_trade_id -> it wins.
+            print(f"{'PASS' if got == (0, 0.30, 100) else 'FAIL'}: duck_firstbuy_tie_atomic (picked {got})")
+            self.assertEqual(got, (0, 0.30, 100),
+                             f"tie must resolve to the min-source_trade_id row, got {got}")
+
+    def test_tie_deterministic_across_engines_and_insertion_order(self) -> None:
+        """#530 Phase C acceptance: equal-timestamp first-buy ties resolve to the row with
+        the smaller source_trade_id in BOTH engines, regardless of physical insertion order.
+        Two dbs carry the same two tied rows inserted in opposite orders; the SQLite scan
+        (rank_72hr_buyandhold.scan_and_filter_sqlite) and the DuckDB extraction must all
+        pick the identical row — eliminating the measured ±11-wallet churn class."""
+        t = ts(2026, 2, 10)
+        # (source_trade_id, outcome_id, price_str, contracts): "t-hi" < "t-lo" lexically,
+        # so the 0.70 row is the deterministic winner regardless of insertion order.
+        rows = [("t-lo", 0, "0.30", 100), ("t-hi", 1, "0.70", 200)]
+        want = (1, "0.70", 200)  # the min-source_trade_id ("t-hi") row
+
+        for order_name, insert_rows in (("forward", rows), ("reversed", rows[::-1])):
+            with tempfile.TemporaryDirectory() as tmp:
+                db = str(Path(tmp) / "tie.db")
+                pq = str(Path(tmp) / "pq")
+                conn = sqlite3.connect(db)
+                conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
+                             "outcome_id INTEGER, price_str TEXT, contracts INTEGER, "
+                             "timestamp_unix INTEGER, source_trade_id TEXT PRIMARY KEY)")
+                conn.execute("CREATE TABLE market_resolutions (market_id TEXT, "
+                             "winning_outcome_id INTEGER, resolved_at_unix INTEGER)")
+                conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
+                for stid, oid, price, qty in insert_rows:
+                    conn.execute(
+                        "INSERT INTO trades (wallet_hex, side, market_id, outcome_id, price_str, "
+                        "contracts, timestamp_unix, source_trade_id) VALUES (?,?,?,?,?,?,?,?)",
+                        (W("a"), "buy", "M1", oid, price, qty, t, stid))
+                conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", ("M1", 1, t + 7200))
+                conn.execute("INSERT INTO market_schedules VALUES (?,?)", ("M1", t + 3600))
+                conn.commit()
+
+                # SQLite engine pick — a namespace carrying exactly the fields
+                # scan_and_filter_sqlite reads (the real Params has unrelated CLI fields).
+                prm = SimpleNamespace(win_start=ts(2026, 1, 1), win_end=ts(2026, 4, 1),
+                                      scheduled_only=True, min_ttr_secs=30,
+                                      ttr_secs=259200, price_min=0.0, price_max=1.0)
+                res = {"M1": (1, t + 7200)}
+                sched = {"M1": t + 3600}
+                diag = defaultdict(int)
+                pos = rk.scan_and_filter_sqlite(conn, W("a"), prm, res, sched, diag)
+                conn.close()
+                self.assertEqual(len(pos), 1)
+                sq = (int(pos[0]["outcome_id"]), f'{pos[0]["price"]:.2f}', int(pos[0]["contracts"]))
+
+                # DuckDB engine pick.
+                export(db, pq)
+                con = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0)
+                df = ranker_duck.duck_extract_positions(
+                    con, [W("a")], ts(2026, 1, 1), ts(2026, 4, 1), 30, 259200, True, 0.0, 1.0)
+                self.assertEqual(len(df), 1)
+                r = df.iloc[0]
+                dk = (int(r["outcome_id"]), f'{float(r["price"]):.2f}', int(r["contracts"]))
+
+                self.assertEqual(sq, want, f"[{order_name}] SQLite pick {sq} != {want}")
+                self.assertEqual(dk, want, f"[{order_name}] DuckDB pick {dk} != {want}")
+                print(f"PASS: tie deterministic [{order_name}]: both engines picked {want}")
 
     def test_bad_threads_env_falls_back(self) -> None:
         """A non-integer PE_RANKER_DUCKDB_THREADS (operator typo) must NOT crash get_engine —

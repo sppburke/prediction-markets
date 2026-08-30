@@ -106,22 +106,24 @@ def expected_qualifying() -> dict[str, list[tuple[float, float]]]:
 def build_core_cache(path: str) -> None:
     """Synthetic cache with exactly wallets WA + WB and their markets."""
     conn = sqlite3.connect(path)
+    # source_trade_id mirrors the real cache PK — the #530 tie-order key reads it.
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
-                 "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER)")
+                 "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
+                 "source_trade_id TEXT PRIMARY KEY)")
     conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                  "resolved_at_unix INTEGER)")
     conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
 
     markets: dict[str, tuple[int, int]] = {}  # market_id -> (winning_outcome_id, end_date_unix)
-    for w, mid, oid, price, t, win in _QUALIFYING + _NONQUALIFYING:
-        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                     (w, "buy", mid, oid, f"{price:.2f}", 100, t))
+    for n, (w, mid, oid, price, t, win) in enumerate(_QUALIFYING + _NONQUALIFYING):
+        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                     (w, "buy", mid, oid, f"{price:.2f}", 100, t, f"core{n:04d}"))
         end = t + 3600
         # First insertion of a market_id pins its schedule/resolution (first buy's clock).
         markets.setdefault(mid, (win, end))
     # A sell that must be ignored by the side='buy' filter (no phantom position).
-    conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                 (WA, "sell", "MA1", 1, "0.55", 100, ts(2026, 2, 7)))
+    conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                 (WA, "sell", "MA1", 1, "0.55", 100, ts(2026, 2, 7), "core-sell"))
 
     for mid, (win, end) in markets.items():
         conn.execute("INSERT INTO market_resolutions VALUES (?,?,?)", (mid, win, end + 3600))
@@ -135,11 +137,12 @@ def build_messy_cache(path: str) -> None:
     malformed wallet_hex (short + NULL)."""
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
-                 "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER)")
+                 "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
+                 "source_trade_id TEXT PRIMARY KEY)")
     rows = [WA, WA, WB, "0x" + "d" * 40, "0x" + "C" * 40, "0xabc", None]
-    for wh in rows:
-        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
-                     (wh, "buy", "M", 1, "0.50", 1, ts(2026, 2, 1)))
+    for n, wh in enumerate(rows):
+        conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
+                     (wh, "buy", "M", 1, "0.50", 1, ts(2026, 2, 1), f"messy{n:02d}"))
     conn.commit()
     conn.close()
 

@@ -31,24 +31,26 @@ def _make_con():
     view names ``duck_extract_positions`` reads. Built via explicit DDL + parameterised INSERT
     so NULLs (voided markets) and column types are exact (avoids pandas-3.0 str-dtype scans)."""
     con = duckdb.connect()
+    # source_trade_id mirrors the real cache PK — the #530 tie-order key reads it.
     con.execute("CREATE TABLE trades(wallet_hex VARCHAR, market_id VARCHAR, outcome_id BIGINT, "
-                "timestamp_unix BIGINT, side VARCHAR, price_str VARCHAR, contracts BIGINT)")
+                "timestamp_unix BIGINT, side VARCHAR, price_str VARCHAR, contracts BIGINT, "
+                "source_trade_id VARCHAR)")
     con.executemany(
-        "INSERT INTO trades VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",
         [
             # 0xa / M1: a SELL before the buy (must be ignored), then the first BUY (won).
-            ("0xa", "M1", 1, 500, "sell", "0.40", 10),
-            ("0xa", "M1", 1, 1000, "buy", "0.40", 10),
+            ("0xa", "M1", 1, 500, "sell", "0.40", 10, "ss01"),
+            ("0xa", "M1", 1, 1000, "buy", "0.40", 10, "ss02"),
             # 0xa / M2: BUY, lost (winning outcome = 2).
-            ("0xa", "M2", 1, 2000, "buy", "0.60", 5),
+            ("0xa", "M2", 1, 2000, "buy", "0.60", 5, "ss03"),
             # 0xa / M4: VOIDED market (winning_outcome_id NULL) -> excluded.
-            ("0xa", "M4", 1, 2500, "buy", "0.50", 8),
+            ("0xa", "M4", 1, 2500, "buy", "0.50", 8, "ss04"),
             # 0xb / M3: BUY, won. A later pre-resolution trade (t=3000 < resolved 3400) moves the
             # close proxy to 0.80 while the FIRST buy (t=1500) stays the entry.
-            ("0xb", "M3", 1, 1500, "buy", "0.55", 20),
-            ("0xb", "M3", 1, 3000, "buy", "0.80", 5),
+            ("0xb", "M3", 1, 1500, "buy", "0.55", 20, "ss05"),
+            ("0xb", "M3", 1, 3000, "buy", "0.80", 5, "ss06"),
             # 0xb / M5: invalid price (>1) -> excluded by the valid-price filter.
-            ("0xb", "M5", 1, 1600, "buy", "1.50", 3),
+            ("0xb", "M5", 1, 1600, "buy", "1.50", 3, "ss07"),
         ],
     )
     con.execute("CREATE TABLE market_resolutions(market_id VARCHAR, winning_outcome_id BIGINT, "

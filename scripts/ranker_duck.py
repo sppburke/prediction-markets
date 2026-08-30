@@ -215,14 +215,17 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
             -- at full-universe scale u_buys is ~every buy-trade and the window's full sort
             -- OOMs (#387), whereas DuckDB spills hash aggregates to disk. arg_min over a
             -- struct_pack keeps the picked outcome_id/price_str/contracts ATOMIC (all from the
-            -- one min-timestamp row) — matching the window's single-row pick; an exact tie on
-            -- timestamp resolves arbitrarily in both engines (documented sub-1e-9 residual).
+            -- one min-key row) — matching the window's single-row pick. #530 Phase C: the
+            -- arg_min KEY is (timestamp_unix, source_trade_id) — struct comparison is
+            -- lexicographic by field order — so an exact timestamp tie resolves by the unique
+            -- trade id, deterministically and identically to the SQLite engine's ORDER BY.
             SELECT t.wallet_hex, t.market_id,
                    min(t.timestamp_unix) AS timestamp_unix,
                    arg_min(struct_pack(outcome_id := t.outcome_id,
                                        price_str  := t.price_str,
                                        contracts  := t.contracts),
-                           t.timestamp_unix) AS firstbuy
+                           struct_pack(ts  := t.timestamp_unix,
+                                       tid := t.source_trade_id)) AS firstbuy
             FROM trades t
             JOIN universe u ON u.wallet_hex = t.wallet_hex
             WHERE t.side = 'buy'
