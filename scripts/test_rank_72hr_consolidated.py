@@ -109,7 +109,8 @@ def build_core_cache(path: str) -> None:
     # source_trade_id mirrors the real cache PK — the #530 tie-order key reads it.
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                  "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                 "source_trade_id TEXT PRIMARY KEY)")
+                 "source_trade_id TEXT PRIMARY KEY NOT NULL)")
+    conn.execute("CREATE INDEX idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix)")
     conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                  "resolved_at_unix INTEGER)")
     conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
@@ -138,7 +139,7 @@ def build_messy_cache(path: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                  "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                 "source_trade_id TEXT PRIMARY KEY)")
+                 "source_trade_id TEXT PRIMARY KEY NOT NULL)")
     rows = [WA, WA, WB, "0x" + "d" * 40, "0x" + "C" * 40, "0xabc", None]
     for n, wh in enumerate(rows):
         conn.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?)",

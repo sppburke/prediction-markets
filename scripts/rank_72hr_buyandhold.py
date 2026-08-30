@@ -376,23 +376,25 @@ def scan_and_filter_sqlite(conn, w, prm, res, sched, diag):
     the list of qualifying position dicts that `process_wallet_positions` consumes.
     Identical filtering to the pre-#375 inline loop — the only change is that the
     qualifying rows are collected into a list instead of being scored in place."""
+    # #530 Phase C: equal-timestamp ties break on source_trade_id (PK, unique) so
+    # the first-buy pick is deterministic and identical across engines/runs. The
+    # tie-break runs IN THIS LOOP — the ORDER BY stays timestamp-only so the
+    # (wallet_hex, timestamp_unix) index keeps serving it without a temp sort.
     cur = conn.execute(
-        "SELECT market_id, outcome_id, price_str, contracts, timestamp_unix "
-        "FROM trades WHERE wallet_hex = ? AND side = 'buy' "
-        # #530 Phase C: source_trade_id (PK, unique) breaks equal-timestamp ties so
-        # the first-buy pick is deterministic and identical across engines/runs.
-        "ORDER BY timestamp_unix ASC, source_trade_id ASC",
+        "SELECT market_id, outcome_id, price_str, contracts, timestamp_unix, source_trade_id "
+        "FROM trades WHERE wallet_hex = ? AND side = 'buy' ORDER BY timestamp_unix ASC",
         (w,),
     )
-    # first-ever buy per market
+    # first-ever buy per market; on a timestamp tie, the smaller source_trade_id wins.
     first: dict = {}
-    for mid, oid, price_str, contracts, ts in cur:
-        if mid not in first:
-            first[mid] = (oid, price_str, contracts, ts)
+    for mid, oid, price_str, contracts, ts, stid in cur:
+        held = first.get(mid)
+        if held is None or (ts == held[3] and stid < held[4]):
+            first[mid] = (oid, price_str, contracts, ts, stid)
     diag["first_buys"] += len(first)
 
     positions: list[dict] = []
-    for mid, (oid, price_str, contracts, ts) in first.items():
+    for mid, (oid, price_str, contracts, ts, _stid) in first.items():
         # entry date must be in window
         if not (prm.win_start <= ts < prm.win_end):
             diag["out_of_window"] += 1

@@ -118,7 +118,8 @@ def build_parity_cache(path: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                  "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                 "source_trade_id TEXT PRIMARY KEY)")
+                 "source_trade_id TEXT PRIMARY KEY NOT NULL)")
+    conn.execute("CREATE INDEX idx_trades_wallet_ts ON trades(wallet_hex, timestamp_unix)")
     conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                  "resolved_at_unix INTEGER)")
     conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
@@ -212,6 +213,15 @@ class DuckParityTest(unittest.TestCase):
             export(db, pq)
             self.assertEqual(run_pass1(db, out_duck, "duck", pq), 0)
 
+            # AC (#530): the exported snapshot carries source_trade_id with zero NULLs
+            # — the tie key must exist and be total in the DuckDB path's real input.
+            import duckdb as _d
+            nn = _d.connect().execute(
+                f"SELECT count(*) FILTER (WHERE source_trade_id IS NULL), count(*) "
+                f"FROM read_parquet('{pq}/trades.parquet')").fetchone()
+            self.assertEqual(nn[0], 0, "NULL source_trade_id in exported snapshot")
+            self.assertGreater(nn[1], 0)
+
             # AC: identical qualifying-positions SET.
             ps_sql = positions_set(str(Path(out_sql) / "qualifying_positions_72hr.csv"))
             ps_duck = positions_set(str(Path(out_duck) / "qualifying_positions_72hr.csv"))
@@ -259,7 +269,7 @@ class DuckParityTest(unittest.TestCase):
             conn = sqlite3.connect(db)
             conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                          "outcome_id INTEGER, price_str TEXT, contracts INTEGER, timestamp_unix INTEGER, "
-                         "source_trade_id TEXT PRIMARY KEY)")
+                         "source_trade_id TEXT PRIMARY KEY NOT NULL)")
             conn.execute("CREATE TABLE market_resolutions (market_id TEXT, winning_outcome_id INTEGER, "
                          "resolved_at_unix INTEGER)")
             conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
@@ -300,7 +310,7 @@ class DuckParityTest(unittest.TestCase):
                 conn = sqlite3.connect(db)
                 conn.execute("CREATE TABLE trades (wallet_hex TEXT, side TEXT, market_id TEXT, "
                              "outcome_id INTEGER, price_str TEXT, contracts INTEGER, "
-                             "timestamp_unix INTEGER, source_trade_id TEXT PRIMARY KEY)")
+                             "timestamp_unix INTEGER, source_trade_id TEXT PRIMARY KEY NOT NULL)")
                 conn.execute("CREATE TABLE market_resolutions (market_id TEXT, "
                              "winning_outcome_id INTEGER, resolved_at_unix INTEGER)")
                 conn.execute("CREATE TABLE market_schedules (market_id TEXT, end_date_unix INTEGER)")
