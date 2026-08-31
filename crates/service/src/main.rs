@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
     // Record the ranking batch observed at boot BEFORE fetching the watchlist, so a batch
     // landing in between reads as a transition on the first maintenance tick (full_rerank
     // then swaps immediately) rather than being pinned as already-seen. Best-effort: `None`
-    // simply restores the first-tick pin behavior.
+    // makes the first full-rerank tick apply whatever batch it observes (#542).
     let boot_batch_marker = supabase_reader::fetch_latest_batch_id(
         &reqwest::Client::new(),
         &cfg.supabase_url,

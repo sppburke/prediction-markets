@@ -298,8 +298,10 @@ fn planned_admissions(
 ///
 /// This is the single owner of that computation (#542): the structural apply publishes exactly
 /// this admission set under the writer lock, and the preparer installs exactly this set before
-/// the lock is taken, so the two can never disagree — including on duplicate wallets or an
-/// over-long incoming slice, which [`planned_admissions`] resolves the same way for both.
+/// the lock is taken, so the two can never disagree. Duplicate wallets and an incoming slice
+/// longer than `cap` (neither is produced by the `limit`-bounded ranking reads) resolve the same
+/// way on both sides because [`planned_admissions`] and [`LiveWatchlist::replace`] share the
+/// same walk.
 pub(crate) fn ranked_membership_change(
     current: &[WatchlistEntry],
     incoming: &[WatchlistEntry],
@@ -420,22 +422,14 @@ pub async fn apply_full_rerank_swap(
 /// Cross-tick ranking-batch memory.
 ///
 /// `marker` is the batch whose rows were last applied (or, in knockout mode, last observed).
-/// `capacity_generation` is the capacity epoch membership was last synced under: a capacity
-/// transition publishes rows from its own `latest_ranking` read, which can predate the batch
-/// this loop last applied, so the next tick treats the newest batch as a transition again and
-/// re-applies it (#542). Idempotent when nothing changed — same rows, no additions to prepare.
+/// `capacity_generation` is the capacity epoch full-rerank membership was last synced under: a
+/// capacity transition publishes rows from its own `latest_ranking` read, which can predate the
+/// batch this loop last applied, so the next full-rerank tick re-applies the newest batch even
+/// when the marker already names it (#542). The marker itself is never erased — it still decides
+/// whether a tick is a genuine batch transition, which is what clears the eviction memory.
 struct BatchSync {
     marker: Option<i64>,
     capacity_generation: u64,
-}
-
-impl BatchSync {
-    fn resync_if_capacity_changed(&mut self, capacity_epoch: WatchlistCapacityEpoch) {
-        if capacity_epoch.generation != self.capacity_generation {
-            self.marker = None;
-            self.capacity_generation = capacity_epoch.generation;
-        }
-    }
 }
 
 /// Run the maintenance tick loop until the process exits.
@@ -555,8 +549,9 @@ async fn maintenance_tick(
     now_unix: i64,
 ) {
     let cap = capacity_epoch.target;
-    sync.resync_if_capacity_changed(capacity_epoch);
-    let batch_marker = &mut sync.marker;
+    // A capacity transition since the last sync means membership may reflect an older
+    // `latest_ranking` read than the batch this loop last applied (#542).
+    let capacity_changed = capacity_epoch.generation != sync.capacity_generation;
 
     // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
     // legacy tick ran it first; a review finding on the first draft caught the reorder).
@@ -568,12 +563,14 @@ async fn maintenance_tick(
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
         Ok(latest) => match cfg.membership_mode {
             MembershipMode::Knockout => {
-                if latest.is_some() && latest != *batch_marker {
-                    if batch_marker.is_some() {
+                if latest.is_some() && latest != sync.marker {
+                    if sync.marker.is_some() {
                         evicted.clear();
                     }
-                    *batch_marker = latest;
+                    sync.marker = latest;
                 }
+                // Knockout membership is never batch-applied, so there is nothing to re-sync.
+                sync.capacity_generation = capacity_epoch.generation;
             }
             MembershipMode::FullRerank => {
                 // Every transition applies the batch it triggered on — including the first tick
@@ -581,7 +578,7 @@ async fn maintenance_tick(
                 // the rows, the preparation, and the committed marker to one batch identifier;
                 // the moving `latest_ranking` view could otherwise return a newer batch's rows.
                 if let Some(batch_id) = latest
-                    && latest != *batch_marker
+                    && (latest != sync.marker || capacity_changed)
                 {
                     match supabase_reader::fetch_batch(
                         client, base_url, anon_key, secret_key, batch_id, cap,
@@ -639,9 +636,14 @@ async fn maintenance_tick(
                                 }
                             }
                             // Memoryless by design: the ranker's verdict overrides demotion
-                            // memory at each batch; the knockout resumes next tick.
-                            evicted.clear();
-                            *batch_marker = latest;
+                            // memory at each batch transition; the knockout resumes next tick.
+                            // A capacity re-sync of the same batch is not a transition and
+                            // keeps this batch's eviction memory.
+                            if latest != sync.marker {
+                                evicted.clear();
+                            }
+                            sync.marker = latest;
+                            sync.capacity_generation = capacity_epoch.generation;
                             if incoming.entries.is_empty() {
                                 // #518 made this reachable in normal operation: the read is
                                 // survivor-filtered, so a batch whose rows all fail the gate —
@@ -1402,8 +1404,9 @@ mod tests {
         async fn capacity_transition_forces_a_resync_to_the_newest_batch() {
             // Capacity may have published rows read from `latest_ranking` before the batch
             // this loop last applied. The changed capacity generation makes the next tick
-            // re-apply the newest batch — preparing whatever that adds — then go quiet.
-            let (a, b) = (wallet(1), wallet(2));
+            // re-apply the newest batch — preparing whatever that adds — then go quiet. The
+            // re-sync is not a batch transition: the eviction memory survives it.
+            let (a, b, knocked_out) = (wallet(1), wallet(2), wallet(9));
             let mut fake = Fake::new(Some(2));
             fake.ranking_entries = vec![row(2, 1, a), row(2, 2, b)];
             let (activity_hits, position_hits) = (
@@ -1411,7 +1414,7 @@ mod tests {
                 Arc::clone(&fake.position_hits),
             );
             let h = harness(fake, &[a]).await;
-            let mut evicted = HashSet::new();
+            let mut evicted = set(&[knocked_out]);
             let mut sync = BatchSync {
                 marker: Some(2),
                 capacity_generation: 0,
@@ -1426,6 +1429,11 @@ mod tests {
             assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
             assert_eq!(members(&h.live), set(&[a, b]));
             assert_eq!((sync.marker, sync.capacity_generation), (Some(2), 7));
+            assert_eq!(
+                evicted,
+                set(&[knocked_out]),
+                "a re-sync must keep eviction memory"
+            );
 
             let before = (
                 activity_hits.load(Ordering::SeqCst),
@@ -1441,6 +1449,31 @@ mod tests {
                 ),
                 before
             );
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_transition_clears_eviction_memory_despite_capacity_change() {
+            // In knockout mode a capacity change is irrelevant to batch tracking: a genuine new
+            // batch observed on the same tick still clears the eviction memory, exactly as
+            // before, because the marker was never erased.
+            let (live_wallet, knocked_out) = (wallet(1), wallet(9));
+            let fake = Fake::new(Some(2));
+            let h = harness(fake, &[live_wallet]).await;
+            let mut evicted = set(&[knocked_out]);
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: 0,
+            };
+            h.applied.store(WatchlistCapacityEpoch {
+                generation: 7,
+                target: CAP,
+            });
+
+            h.tick_synced(MembershipMode::Knockout, &mut evicted, &mut sync)
+                .await;
+            assert!(evicted.is_empty(), "a new batch clears eviction memory");
+            assert_eq!((sync.marker, sync.capacity_generation), (Some(2), 7));
+            assert!(h.controls().is_empty());
         }
 
         #[tokio::test]

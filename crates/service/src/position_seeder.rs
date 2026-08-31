@@ -140,8 +140,9 @@ async fn fetch_positions_for_wallet<F: PageFetcher>(
             break;
         }
 
-        // A full final permitted page means the snapshot is knowably incomplete. Fail rather
-        // than return a truncated portfolio (the organic canary's precedent, `organic_canary.rs`).
+        // A full final permitted page means completeness cannot be proven without another page.
+        // Fail rather than return a possibly truncated portfolio (the organic canary's
+        // precedent, `organic_canary.rs`).
         if page_num + 1 >= POSITION_MAX_PAGES {
             return Err(anyhow::anyhow!(
                 "position fetch hit the {POSITION_MAX_PAGES}-page cap with a full final page; \
