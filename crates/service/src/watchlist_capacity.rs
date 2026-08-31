@@ -1,34 +1,29 @@
 //! Supabase-backed runtime watchlist-capacity changes.
 //!
 //! A config-driven grow is deliberately more than an `ArcSwap` replacement: every newly
-//! admitted wallet has its prior-market history and current positions loaded first, those maps
-//! are applied by the single-owner orchestrator, and only then is the new membership generation
-//! published. Shrinks use the same atomic full-rerank primitive. Any failure leaves membership
-//! and the last-known-good capacity unchanged for the worker's independent 30-second retry.
+//! admitted wallet is prepared through the shared [`crate::watchlist_admission`] preparer — its
+//! prior-market history and current positions are loaded, applied by the single-owner
+//! orchestrator, and acknowledged — and only then is the new membership generation published.
+//! Shrinks use the same atomic full-rerank primitive. Any failure leaves membership and the
+//! last-known-good capacity unchanged for the worker's independent 30-second retry.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
-use pe_source_polymarket_public::ReqwestFetcher;
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
 
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
-use crate::orchestrator_control::OrchestratorControl;
-use crate::position_seeder::seed_all;
 use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
 use crate::supabase_refresh::{HttpWatchlistPublisher, WatchlistSizePublisher};
-use crate::wallet_history::WalletHistoryLoader;
-use crate::watchlist_maintenance::{MembershipApplyError, apply_ranked_membership_locked};
-
-/// Maximum time to wait for the orchestrator to apply pre-admission history and positions.
-const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
+use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
+use crate::watchlist_maintenance::{
+    MembershipApplyError, apply_ranked_membership_locked, ranked_membership_change,
+};
 
 /// Failure surface for one capacity transition. Every variant is fail-soft to the caller.
 #[derive(Debug, thiserror::Error)]
@@ -39,18 +34,8 @@ enum CapacityError {
     EmptyRanking { target: usize },
     #[error("latest_ranking returned duplicate wallets ({unique} unique of {rows} rows)")]
     DuplicateRanking { unique: usize, rows: usize },
-    #[error("build admission HTTP client: {0}")]
-    BuildClient(reqwest::Error),
-    #[error("market history unavailable for {missing} newly admitted wallet(s)")]
-    MissingHistory { missing: usize },
-    #[error("current positions unavailable for {missing} newly admitted wallet(s)")]
-    MissingPositions { missing: usize },
-    #[error("orchestrator control channel closed before admission preparation")]
-    ControlClosed,
-    #[error("orchestrator admission preparation acknowledgement closed")]
-    AcknowledgementClosed,
-    #[error("orchestrator admission preparation exceeded {0} seconds")]
-    AcknowledgementTimeout(u64),
+    #[error("prepare admissions: {0}")]
+    Admission(#[from] AdmissionError),
     #[error("capacity request was superseded before membership commit")]
     Superseded,
     #[error("{missing} newly admitted wallet(s) were not admission-ready at commit")]
@@ -66,15 +51,11 @@ pub struct SupabaseWatchlistCapacity {
     writer_lock: Arc<Mutex<()>>,
     applied_capacity: AppliedWatchlistCapacity,
     desired_capacity: watch::Receiver<CapacityRequest>,
-    control_tx: mpsc::Sender<OrchestratorControl>,
+    preparer: AdmissionPreparer,
     client: reqwest::Client,
     supabase_url: String,
     supabase_anon_key: String,
     supabase_secret_key: String,
-    polymarket_base_url: String,
-    wallet_history_path: PathBuf,
-    position_page_limit: u32,
-    position_size_threshold: u32,
 }
 
 impl SupabaseWatchlistCapacity {
@@ -86,15 +67,11 @@ impl SupabaseWatchlistCapacity {
         writer_lock: Arc<Mutex<()>>,
         applied_capacity: AppliedWatchlistCapacity,
         desired_capacity: watch::Receiver<CapacityRequest>,
-        control_tx: mpsc::Sender<OrchestratorControl>,
+        preparer: AdmissionPreparer,
         client: reqwest::Client,
         supabase_url: String,
         supabase_anon_key: String,
         supabase_secret_key: String,
-        polymarket_base_url: String,
-        wallet_history_path: PathBuf,
-        position_page_limit: u32,
-        position_size_threshold: u32,
     ) -> Self {
         Self {
             live,
@@ -102,93 +79,12 @@ impl SupabaseWatchlistCapacity {
             writer_lock,
             applied_capacity,
             desired_capacity,
-            control_tx,
+            preparer,
             client,
             supabase_url,
             supabase_anon_key,
             supabase_secret_key,
-            polymarket_base_url,
-            wallet_history_path,
-            position_page_limit,
-            position_size_threshold,
         }
-    }
-
-    async fn prepare_additions(&self, additions: &[WalletAddress]) -> Result<(), CapacityError> {
-        if additions.is_empty() {
-            return Ok(());
-        }
-
-        // Match startup's bounded HTTP posture. The history loader persists its merged sidecar,
-        // making a retry incremental; position snapshots include successful empty portfolios.
-        let history_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(CapacityError::BuildClient)?;
-        let history_fetcher = ReqwestFetcher::new(history_client);
-        let mut history = WalletHistoryLoader::load(
-            additions,
-            &self.polymarket_base_url,
-            &self.wallet_history_path,
-            &history_fetcher,
-        )
-        .await;
-        let missing_history = additions
-            .iter()
-            .filter(|wallet| !history.contains_key(wallet))
-            .count();
-        if missing_history > 0 {
-            return Err(CapacityError::MissingHistory {
-                missing: missing_history,
-            });
-        }
-        let addition_set: HashSet<WalletAddress> = additions.iter().copied().collect();
-        history.retain(|wallet, _| addition_set.contains(wallet));
-
-        let position_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(CapacityError::BuildClient)?;
-        let position_fetcher = ReqwestFetcher::new(position_client);
-        let positions = seed_all(
-            additions,
-            &self.polymarket_base_url,
-            self.position_page_limit,
-            self.position_size_threshold,
-            &position_fetcher,
-        )
-        .await;
-        let missing_positions = additions
-            .iter()
-            .filter(|wallet| !positions.contains_key(wallet))
-            .count();
-        if missing_positions > 0 {
-            return Err(CapacityError::MissingPositions {
-                missing: missing_positions,
-            });
-        }
-
-        let (acknowledged, acknowledgement) = oneshot::channel();
-        let command = OrchestratorControl::PrepareAdmissions {
-            history,
-            positions,
-            acknowledged,
-        };
-        tokio::time::timeout(
-            Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
-            async {
-                self.control_tx
-                    .send(command)
-                    .await
-                    .map_err(|_| CapacityError::ControlClosed)?;
-                acknowledgement
-                    .await
-                    .map_err(|_| CapacityError::AcknowledgementClosed)
-            },
-        )
-        .await
-        .map_err(|_| CapacityError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS))??;
-        Ok(())
     }
 
     async fn apply_inner(&self, request: CapacityRequest) -> Result<usize, CapacityError> {
@@ -206,42 +102,24 @@ impl SupabaseWatchlistCapacity {
         }
         validate_unique_ranking(&incoming.entries)?;
 
-        let initially_ready: HashSet<WalletAddress> = self
-            .live
-            .snapshot()
-            .entries
-            .iter()
-            .map(|entry| entry.wallet)
-            .collect();
-        let additions: Vec<WalletAddress> = incoming
-            .entries
-            .iter()
-            .map(|entry| entry.wallet)
-            .filter(|wallet| !initially_ready.contains(wallet))
-            .collect();
-        self.prepare_additions(&additions).await?;
+        let (_, additions) =
+            ranked_membership_change(&self.live.snapshot().entries, &incoming.entries, target);
+        self.preparer.prepare(&additions).await?;
+        let prepared: HashSet<WalletAddress> = additions.iter().copied().collect();
 
-        let admission_ready: HashSet<WalletAddress> = initially_ready
-            .into_iter()
-            .chain(additions.iter().copied())
-            .collect();
         let _writer = self.writer_lock.lock().await;
         if *self.desired_capacity.borrow() != request {
             return Err(CapacityError::Superseded);
         }
-        let current_now: HashSet<WalletAddress> = self
-            .live
-            .snapshot()
-            .entries
+        // Readiness is proven only by THIS attempt (#542). The admissions the locked apply will
+        // publish are recomputed against current membership: a wallet that was live when the
+        // additions were planned but has since been evicted by maintenance is a genuine new
+        // admission that was never prepared; the worker retries and prepares it next round.
+        let (_, required) =
+            ranked_membership_change(&self.live.snapshot().entries, &incoming.entries, target);
+        let missing_ready = required
             .iter()
-            .map(|entry| entry.wallet)
-            .collect();
-        let missing_ready = incoming
-            .entries
-            .iter()
-            .take(target)
-            .map(|entry| entry.wallet)
-            .filter(|wallet| !current_now.contains(wallet) && !admission_ready.contains(wallet))
+            .filter(|wallet| !prepared.contains(wallet))
             .count();
         if missing_ready > 0 {
             return Err(CapacityError::UnpreparedAdmission {
@@ -311,13 +189,17 @@ impl WatchlistCapacityApplier for SupabaseWatchlistCapacity {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::config_poller::capacity_request_channel;
+    use crate::orchestrator_control::OrchestratorControl;
     use axum::{Json, Router, routing::get};
     use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
     use tempfile::TempDir;
     use tokio::sync::Notify;
+    use tokio::sync::mpsc;
 
     fn entry(wallet: WalletAddress) -> WatchlistEntry {
         WatchlistEntry {
@@ -352,6 +234,137 @@ mod tests {
 
         let distinct = vec![entry(WalletAddress([7; 20])), entry(WalletAddress([8; 20]))];
         assert!(validate_unique_ranking(&distinct).is_ok());
+    }
+
+    #[tokio::test]
+    async fn wallet_evicted_during_preparation_is_not_readmitted_unprepared() {
+        // Capacity plans against a live set {existing, departing} and prepares only the
+        // newcomer. While that preparation is in flight, maintenance evicts `departing`. The
+        // final readiness check must see `departing` as an unprepared admission and refuse to
+        // publish; the worker's next attempt then plans it as an addition and prepares it.
+        let existing = WalletAddress([1; 20]);
+        let departing = WalletAddress([2; 20]);
+        let newcomer = WalletAddress([3; 20]);
+        let ranking: Vec<serde_json::Value> = [existing, departing, newcomer]
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "wallet_hex": w.to_string(),
+                    "hit_rate": "0.60",
+                    "ls_tstat": "2.0",
+                    "n_trades": 10,
+                    "last_trade_unix": 1_700_000_100_i64
+                })
+            })
+            .collect();
+        let app = Router::new()
+            .route(
+                "/rest/v1/latest_ranking",
+                get(move || {
+                    let ranking = ranking.clone();
+                    async move { Json(ranking) }
+                }),
+            )
+            .route(
+                "/activity",
+                get(|| async { Json(Vec::<serde_json::Value>::new()) }),
+            )
+            .route(
+                "/positions",
+                get(|| async { Json(Vec::<serde_json::Value>::new()) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{address}");
+
+        let live = LiveWatchlist::new(watchlist(vec![entry(existing), entry(departing)]));
+        let temp = TempDir::new().unwrap();
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(2);
+        let (requests, desired_rx) = capacity_request_channel(2, Arc::clone(&writer_lock));
+        let request = requests.request(3).await;
+
+        // The control consumer records each prepared set and, on the FIRST attempt only,
+        // evicts `departing` from the live set before acknowledging.
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        let prepared_sets = Arc::new(std::sync::Mutex::new(Vec::<Vec<WalletAddress>>::new()));
+        let control = {
+            let live = live.clone();
+            let prepared_sets = Arc::clone(&prepared_sets);
+            tokio::spawn(async move {
+                let mut attempts = 0;
+                while let Some(command) = control_rx.recv().await {
+                    let OrchestratorControl::PrepareAdmissions {
+                        positions,
+                        acknowledged,
+                        ..
+                    } = command
+                    else {
+                        panic!("capacity transition sent a periodic reseed")
+                    };
+                    let mut wallets: Vec<WalletAddress> = positions.keys().copied().collect();
+                    wallets.sort_unstable_by_key(|w| w.0);
+                    prepared_sets
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(wallets);
+                    attempts += 1;
+                    if attempts == 1 {
+                        let removed: HashSet<WalletAddress> = [departing].into_iter().collect();
+                        live.replace(&removed, &[], 2);
+                    }
+                    acknowledged.send(()).unwrap();
+                }
+            })
+        };
+
+        let preparer = AdmissionPreparer::new(
+            control_tx,
+            reqwest::Client::new(),
+            base_url.clone(),
+            temp.path().join("history.json"),
+            500,
+            1,
+        );
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            Arc::clone(&paper_state),
+            Arc::clone(&writer_lock),
+            applied.clone(),
+            desired_rx,
+            preparer,
+            reqwest::Client::new(),
+            base_url,
+            "anon".to_string(),
+            String::new(),
+        );
+
+        let first = applier.apply(request).await.unwrap_err();
+        assert!(
+            first.contains("not admission-ready"),
+            "expected an unprepared-admission refusal, got: {first}"
+        );
+        assert_eq!(
+            live.snapshot().entries.len(),
+            1,
+            "membership must be unchanged"
+        );
+        assert_eq!(applied.load().target, 2, "applied target must be unchanged");
+
+        // The retry plans against the current set, so `departing` is now a prepared addition.
+        assert_eq!(applier.apply(request).await.unwrap(), 3);
+        assert_eq!(live.snapshot().entries.len(), 3);
+        assert_eq!(applied.load(), request);
+        assert_eq!(
+            *prepared_sets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![vec![newcomer], vec![departing, newcomer]]
+        );
+        control.abort();
+        server.abort();
     }
 
     #[tokio::test]
@@ -443,21 +456,25 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
+        let preparer = AdmissionPreparer::new(
+            control_tx,
+            reqwest::Client::new(),
+            base_url.clone(),
+            temp.path().join("history.json"),
+            500,
+            1,
+        );
         let applier = SupabaseWatchlistCapacity::new(
             live.clone(),
             Arc::clone(&paper_state),
             Arc::clone(&writer_lock),
             applied.clone(),
             desired_rx,
-            control_tx,
+            preparer,
             client,
-            base_url.clone(),
+            base_url,
             "anon".to_string(),
             String::new(),
-            base_url,
-            temp.path().join("history.json"),
-            500,
-            1,
         );
         let apply = tokio::spawn(async move { applier.apply(request).await });
 

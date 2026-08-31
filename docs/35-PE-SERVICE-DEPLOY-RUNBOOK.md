@@ -52,7 +52,9 @@ local release build before shipping; on the VPS, **staged** = the hash of
 8. **Verify**: `journalctl -u pe-service -n 100` — clean boot (no config-parse error /
    restart loop), watchlist seeded from `latest_ranking`, `service_config poll loop
    started`, no poll failures; then confirm behavior-specific log lines for the deploy
-   (e.g. the first `full re-rank membership swap applied` after a ranking push).
+   (e.g. the first `full re-rank membership swap applied` after a ranking push — since
+   #542 a swap or backfill that admits anyone is preceded by
+   `hot-watchlist admission state prepared`; a swap with no such line admitted nobody).
    **With `polymarket_activity_ws_enabled=true` (#530), additionally verify the
    source-health block in `status.json`**: `ws_connected=true`, a fresh
    `ws_last_valid_frame_age_secs`, `ws_sink_poisoned=false`, a fresh

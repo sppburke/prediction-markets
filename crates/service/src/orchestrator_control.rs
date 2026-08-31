@@ -1,9 +1,10 @@
 //! Control-plane messages applied by the single-owner orchestrator loop.
 //!
-//! Runtime watchlist growth must initialize a newly followed wallet's first-entry history and
-//! current leader positions before that wallet becomes visible in [`crate::live_watchlist`].
-//! This channel preserves the orchestrator's single ownership of those mutable ledgers while an
-//! acknowledgement gives the capacity controller a strict seed-before-membership ordering.
+//! Every runtime watchlist addition must initialize the newly followed wallet's first-entry
+//! history and current leader positions before that wallet becomes visible in
+//! [`crate::live_watchlist`]. This channel preserves the orchestrator's single ownership of
+//! those mutable ledgers while an acknowledgement gives the shared admission preparer
+//! ([`crate::watchlist_admission`]) a strict seed-before-membership ordering.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,8 +16,9 @@ use tokio::sync::oneshot;
 pub enum OrchestratorControl {
     /// Periodic replacement snapshots from the public positions API.
     PositionReseed(HashMap<WalletAddress, PositionSnapshot>),
-    /// History and position seeds for wallets about to be admitted by a runtime capacity change.
-    /// The controller waits for `acknowledged` before publishing the new membership generation.
+    /// History and position seeds for wallets about to be admitted by a capacity change, a
+    /// full-rerank swap, or a knockout backfill. The preparer waits for `acknowledged` before
+    /// the caller publishes the new membership generation.
     PrepareAdmissions {
         /// Conservative prior-market sets for every newly admitted wallet.
         history: HashMap<WalletAddress, HashSet<MarketId>>,

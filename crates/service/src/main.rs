@@ -51,6 +51,7 @@ use pe_service::supabase_state::{
 };
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_service::wallet_history::WalletHistoryLoader;
+use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
@@ -138,7 +139,7 @@ async fn main() -> Result<()> {
     // Record the ranking batch observed at boot BEFORE fetching the watchlist, so a batch
     // landing in between reads as a transition on the first maintenance tick (full_rerank
     // then swaps immediately) rather than being pinned as already-seen. Best-effort: `None`
-    // simply restores the first-tick pin behavior.
+    // makes the first full-rerank tick apply whatever batch it observes (#542).
     let boot_batch_marker = supabase_reader::fetch_latest_batch_id(
         &reqwest::Client::new(),
         &cfg.supabase_url,
@@ -199,8 +200,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // One-time snapshot driving the startup position seed and wallet-history backfill. Runtime
-    // capacity growth separately prepares newly admitted wallets before publishing membership.
+    // One-time snapshot driving the startup position seed and wallet-history backfill. Every
+    // runtime addition (capacity growth, full-rerank swap, knockout backfill) is separately
+    // prepared through the shared admission preparer before membership is published (#542).
     let wallets: Vec<_> = live_watchlist
         .snapshot()
         .entries
@@ -371,6 +373,18 @@ async fn main() -> Result<()> {
     // admission preparation for runtime watchlist growth. Capacity 2 keeps both bounded while
     // allowing one of each class to queue.
     let (control_tx, control_rx) = mpsc::channel(2);
+
+    // One preparer owns every post-boot admission load (#542). Capacity and maintenance share it,
+    // so their attempts are serialized and each publishes only wallets already installed in the
+    // copy-entry gate and the leader position ledger.
+    let admission_preparer = AdmissionPreparer::new(
+        control_tx.clone(),
+        reqwest::Client::new(),
+        cfg.polymarket_base_url.clone(),
+        cfg.wallet_market_history_path.clone(),
+        cfg.position_page_limit,
+        cfg.position_size_threshold,
+    );
     let reseed_task = if cfg.position_reseed_interval_secs > 0 {
         // Reads the CURRENT watchlist each round (not the boot list) so wallets admitted
         // post-boot — backfill or full-re-rank swaps — get leader-ledger seeds too.
@@ -714,6 +728,7 @@ async fn main() -> Result<()> {
             watchlist_writer_lock.clone(),
             maint_cfg,
             applied_watchlist_capacity.clone(),
+            admission_preparer.clone(),
             boot_batch_marker,
         )))
     } else {
@@ -740,15 +755,11 @@ async fn main() -> Result<()> {
             watchlist_writer_lock.clone(),
             applied_watchlist_capacity.clone(),
             capacity_request_rx.clone(),
-            control_tx,
+            admission_preparer,
             capacity_http_client,
             cfg.supabase_url.clone(),
             cfg.supabase_anon_key.clone(),
             cfg.supabase_secret_key.clone(),
-            cfg.polymarket_base_url.clone(),
-            cfg.wallet_market_history_path.clone(),
-            cfg.position_page_limit,
-            cfg.position_size_threshold,
         );
         let worker = tokio::spawn(run_capacity_worker(
             capacity_applier,

@@ -39,5 +39,6 @@ pub mod supabase_state;
 pub mod trade_parser;
 pub mod trade_poller;
 pub mod wallet_history;
+pub mod watchlist_admission;
 pub mod watchlist_capacity;
 pub mod watchlist_maintenance;

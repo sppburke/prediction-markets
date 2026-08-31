@@ -36,9 +36,19 @@
 //!   the knockout-only policy was the worst tested; full re-rank the most robust). Memoryless
 //!   by design: the ranker's verdict overrides live demotion memory at each batch (the evicted
 //!   set clears), while the knockout above still runs BETWEEN batches as the intra-cycle
-//!   safety rail — a readmitted bleeder is re-demotable on the next tick. A failed top fetch
-//!   leaves the batch marker unadvanced so the swap retries next tick; the boot-observed batch
-//!   never triggers a swap (boot already seeded exactly that batch's top-`cap`).
+//!   safety rail — a readmitted bleeder is re-demotable on the next tick. A failed fetch,
+//!   admission preparation, or structural apply leaves the batch marker unadvanced so the swap
+//!   retries next tick.
+//!
+//! ## Admission preparation (#542)
+//!
+//! Both membership paths publish only wallets the shared [`crate::watchlist_admission`] preparer
+//! has already installed in the copy-entry gate and the leader position ledger. Publishing an
+//! unprepared wallet lets its next BUY read as a first-ever entry — an absent position snapshot
+//! classifies an Add as an Entry, and an absent history is fail-open by default.
+//!
+//! The full-rerank read is pinned to the batch identifier that triggered the transition, so the
+//! rows applied and the marker committed always name one batch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,6 +67,7 @@ use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use crate::supabase_reader;
+use crate::watchlist_admission::AdmissionPreparer;
 
 /// Who owns watchlist MEMBERSHIP between ranking batches. See the module docs; canonical
 /// default in `docs/_GLOSSARY.md` (`watchlist_membership_mode`). Boot-frozen (env/TOML) —
@@ -282,6 +293,35 @@ fn planned_admissions(
     admitted
 }
 
+/// The exact membership change an incoming ranked set produces against `current`: the wallets
+/// dropped because they fall outside the incoming top-`cap`, and the wallets newly admitted.
+///
+/// This is the single owner of that computation (#542): the structural apply publishes exactly
+/// this admission set under the writer lock, and the preparer installs exactly this set before
+/// the lock is taken, so the two can never disagree. Duplicate wallets and an incoming slice
+/// longer than `cap` (neither is produced by the `limit`-bounded ranking reads) resolve the same
+/// way on both sides because [`planned_admissions`] and [`LiveWatchlist::replace`] share the
+/// same walk.
+pub(crate) fn ranked_membership_change(
+    current: &[WatchlistEntry],
+    incoming: &[WatchlistEntry],
+    cap: usize,
+) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
+    let incoming_set: HashSet<WalletAddress> = incoming
+        .iter()
+        .take(cap)
+        .map(|entry| entry.wallet)
+        .collect();
+    let dropped: Vec<WalletAddress> = current
+        .iter()
+        .map(|entry| entry.wallet)
+        .filter(|wallet| !incoming_set.contains(wallet))
+        .collect();
+    let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
+    let admissions = planned_admissions(current, &removed, incoming, cap);
+    (dropped, admissions)
+}
+
 fn admission_seeds(
     admissions: &[WalletAddress],
     last_trade: &HashMap<WalletAddress, i64>,
@@ -345,19 +385,8 @@ pub(crate) fn apply_ranked_membership_locked(
     cap: usize,
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     let current = live.snapshot();
-    let incoming_set: HashSet<WalletAddress> = incoming
-        .iter()
-        .take(cap)
-        .map(|entry| entry.wallet)
-        .collect();
-    let dropped: Vec<WalletAddress> = current
-        .entries
-        .iter()
-        .map(|entry| entry.wallet)
-        .filter(|wallet| !incoming_set.contains(wallet))
-        .collect();
+    let (dropped, admissions) = ranked_membership_change(&current.entries, incoming, cap);
     let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
-    let admissions = planned_admissions(&current.entries, &removed, incoming, cap);
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     // #511: insert-only (see membership admission above).
     paper_state.seed_cursors_if_absent(&seeds)?;
@@ -390,6 +419,19 @@ pub async fn apply_full_rerank_swap(
     )
 }
 
+/// Cross-tick ranking-batch memory.
+///
+/// `marker` is the batch whose rows were last applied (or, in knockout mode, last observed).
+/// `capacity_generation` is the capacity epoch full-rerank membership was last synced under: a
+/// capacity transition publishes rows from its own `latest_ranking` read, which can predate the
+/// batch this loop last applied, so the next full-rerank tick re-applies the newest batch even
+/// when the marker already names it (#542). The marker itself is never erased — it still decides
+/// whether a tick is a genuine batch transition, which is what clears the eviction memory.
+struct BatchSync {
+    marker: Option<i64>,
+    capacity_generation: u64,
+}
+
 /// Run the maintenance tick loop until the process exits.
 ///
 /// `cfg.interval_secs == 0` disables the tick (returns immediately). The first tick fires one
@@ -406,6 +448,7 @@ pub async fn run_maintenance_loop(
     writer_lock: Arc<Mutex<()>>,
     cfg: MaintenanceConfig,
     applied_capacity: AppliedWatchlistCapacity,
+    preparer: AdmissionPreparer,
     initial_batch_marker: Option<i64>,
 ) {
     if cfg.interval_secs == 0 {
@@ -425,8 +468,13 @@ pub async fn run_maintenance_loop(
     // Seeded with the batch observed at boot (fetched BEFORE the boot watchlist so a batch
     // landing in between reads as a transition, never as already-seen — review finding on
     // the first draft): a batch pushed between boot and the first tick now swaps on that
-    // first tick instead of being pinned as current and skipped until the next batch.
-    let mut batch_marker: Option<i64> = initial_batch_marker;
+    // first tick instead of being pinned as current and skipped until the next batch. A `None`
+    // marker (the boot batch read failed) is an ordinary transition too (#542): the first tick
+    // applies the batch it triggers on rather than adopting the identifier without applying it.
+    let mut sync = BatchSync {
+        marker: initial_batch_marker,
+        capacity_generation: applied_capacity.load().generation,
+    };
     loop {
         tokio::time::sleep(interval).await;
         let capacity_epoch = applied_capacity.load();
@@ -439,10 +487,12 @@ pub async fn run_maintenance_loop(
             &secret_key,
             &writer_lock,
             &applied_capacity,
+            &preparer,
             &cfg,
             capacity_epoch,
             &mut evicted,
-            &mut batch_marker,
+            &mut sync,
+            OffsetDateTime::now_utc().unix_timestamp(),
         )
         .await;
     }
@@ -491,13 +541,17 @@ async fn maintenance_tick(
     secret_key: &str,
     writer_lock: &Mutex<()>,
     applied_capacity: &AppliedWatchlistCapacity,
+    preparer: &AdmissionPreparer,
     cfg: &MaintenanceConfig,
     capacity_epoch: WatchlistCapacityEpoch,
     evicted: &mut HashSet<WalletAddress>,
-    batch_marker: &mut Option<i64>,
+    sync: &mut BatchSync,
+    now_unix: i64,
 ) {
-    let now_unix = OffsetDateTime::now_utc().unix_timestamp();
     let cap = capacity_epoch.target;
+    // A capacity transition since the last sync means membership may reflect an older
+    // `latest_ranking` read than the batch this loop last applied (#542).
+    let capacity_changed = capacity_epoch.generation != sync.capacity_generation;
 
     // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
     // legacy tick ran it first; a review finding on the first draft caught the reorder).
@@ -509,22 +563,40 @@ async fn maintenance_tick(
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
         Ok(latest) => match cfg.membership_mode {
             MembershipMode::Knockout => {
-                if latest.is_some() && latest != *batch_marker {
-                    if batch_marker.is_some() {
+                if latest.is_some() && latest != sync.marker {
+                    if sync.marker.is_some() {
                         evicted.clear();
                     }
-                    *batch_marker = latest;
+                    sync.marker = latest;
                 }
+                // Knockout membership is never batch-applied, so there is nothing to re-sync.
+                sync.capacity_generation = capacity_epoch.generation;
             }
             MembershipMode::FullRerank => {
-                if latest.is_some() && batch_marker.is_none() {
-                    // Boot alignment: startup already seeded exactly this batch's top-cap.
-                    *batch_marker = latest;
-                } else if latest.is_some() && latest != *batch_marker {
-                    match supabase_reader::fetch(client, base_url, anon_key, secret_key, cap).await
+                // Every transition applies the batch it triggered on — including the first tick
+                // after a failed boot batch read (#542). The pinned `ranking_entries` read binds
+                // the rows, the preparation, and the committed marker to one batch identifier;
+                // the moving `latest_ranking` view could otherwise return a newer batch's rows.
+                if let Some(batch_id) = latest
+                    && (latest != sync.marker || capacity_changed)
+                {
+                    match supabase_reader::fetch_batch(
+                        client, base_url, anon_key, secret_key, batch_id, cap,
+                    )
+                    .await
                     {
-                        Ok((incoming, incoming_last_trade)) if !incoming.entries.is_empty() => {
-                            let swap = apply_full_rerank_swap(
+                        Ok((incoming, incoming_last_trade)) => {
+                            let (_, additions) = ranked_membership_change(
+                                &live.snapshot().entries,
+                                &incoming.entries,
+                                cap,
+                            );
+                            if let Err(error) = preparer.prepare(&additions).await {
+                                warn!(%error, batch_id,
+                                    "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
+                                return;
+                            }
+                            let (live_total, dropped) = match apply_full_rerank_swap(
                                 live,
                                 paper_state,
                                 writer_lock,
@@ -533,8 +605,8 @@ async fn maintenance_tick(
                                 &incoming.entries,
                                 &incoming_last_trade,
                             )
-                            .await;
-                            let (live_total, dropped) = match swap {
+                            .await
+                            {
                                 Ok(applied) => applied,
                                 Err(error) => {
                                     warn!(%error,
@@ -564,57 +636,44 @@ async fn maintenance_tick(
                                 }
                             }
                             // Memoryless by design: the ranker's verdict overrides demotion
-                            // memory at each batch; the knockout resumes next tick.
-                            evicted.clear();
-                            *batch_marker = latest;
-                            info!(
-                                batch_id = latest.unwrap_or(-1),
-                                dropped = dropped.len(),
-                                live_total,
-                                "full re-rank membership swap applied"
-                            );
-                            return;
-                        }
-                        // #518 made this branch reachable in normal operation: the read is
-                        // survivor-filtered, so a batch whose rows all fail the gate — or one
-                        // that carries no verdict at all — legitimately returns zero rows.
-                        // Retaining the previous set here would keep copying wallets the CURRENT
-                        // batch says are ineligible, and would do so forever, because the marker
-                        // never advances. Apply the empty membership instead: it matches the
-                        // cold-boot stance (`main.rs` refuses to start on an empty filtered
-                        // read) and the fail-closed contract — the ranker endorsing nobody means
-                        // copying nobody. Open positions keep resolving; only new copies stop.
-                        Ok((incoming, incoming_last_trade)) => {
-                            match apply_full_rerank_swap(
-                                live,
-                                paper_state,
-                                writer_lock,
-                                applied_capacity,
-                                capacity_epoch,
-                                &incoming.entries,
-                                &incoming_last_trade,
-                            )
-                            .await
-                            {
-                                Ok((live_total, dropped)) => {
-                                    evicted.clear();
-                                    *batch_marker = latest;
-                                    warn!(
-                                        batch_id = latest.unwrap_or(-1),
-                                        dropped = dropped.len(),
-                                        live_total,
-                                        "full_rerank: batch has no surviving rows; live set \
-                                         emptied (fail-closed — the ranker endorsed nobody)"
-                                    );
-                                }
-                                Err(e) => warn!(error = %e,
-                                    "full_rerank: empty-batch swap rejected; keeping membership, \
-                                     will retry next tick"),
+                            // memory at each batch transition; the knockout resumes next tick.
+                            // A capacity re-sync of the same batch is not a transition and
+                            // keeps this batch's eviction memory.
+                            if latest != sync.marker {
+                                evicted.clear();
+                            }
+                            sync.marker = latest;
+                            sync.capacity_generation = capacity_epoch.generation;
+                            if incoming.entries.is_empty() {
+                                // #518 made this reachable in normal operation: the read is
+                                // survivor-filtered, so a batch whose rows all fail the gate —
+                                // or one that carries no verdict at all — legitimately returns
+                                // zero rows. Retaining the previous set would keep copying
+                                // wallets the CURRENT batch says are ineligible. Applying the
+                                // empty membership matches the cold-boot stance (`main.rs`
+                                // refuses to start on an empty filtered read) and the
+                                // fail-closed contract. Open positions keep resolving; only
+                                // new copies stop.
+                                warn!(
+                                    batch_id,
+                                    dropped = dropped.len(),
+                                    live_total,
+                                    "full_rerank: batch has no surviving rows; live set emptied \
+                                     (fail-closed — the ranker endorsed nobody)"
+                                );
+                            } else {
+                                info!(
+                                    batch_id,
+                                    admitted = additions.len(),
+                                    dropped = dropped.len(),
+                                    live_total,
+                                    "full re-rank membership swap applied"
+                                );
                             }
                             return;
                         }
-                        Err(e) => warn!(error = %e,
-                            "full_rerank: top fetch failed; keeping membership, will retry next tick"),
+                        Err(e) => warn!(error = %e, batch_id,
+                            "full_rerank: pinned batch fetch failed; keeping membership, will retry next tick"),
                     }
                 }
             }
@@ -705,7 +764,21 @@ async fn maintenance_tick(
         (Vec::new(), HashMap::new())
     };
 
+    // The freed slots are filled from `candidates` by `planned_admissions`, which is a pure
+    // function of the same inputs the writer-locked apply re-reads under the unchanged capacity
+    // epoch. Prepare exactly those wallets first (#542); on failure apply the decided evictions
+    // with no backfill and let the next tick retry the freed slots.
     let removed: HashSet<WalletAddress> = next_evicted.iter().copied().collect();
+    let planned = planned_admissions(&live_snapshot.entries, &removed, &candidates, cap);
+    let (candidates, candidate_last_trade) = match preparer.prepare(&planned).await {
+        Ok(()) => (candidates, candidate_last_trade),
+        Err(error) => {
+            warn!(%error,
+                "maintenance: admission preparation failed; evicting without backfill");
+            (Vec::new(), HashMap::new())
+        }
+    };
+
     let live_total = match apply_evictions_and_backfill(
         live,
         paper_state,
@@ -888,5 +961,540 @@ mod tests {
             knockout_decision(last, Some(&thin), &cfg(), NOW),
             Some(KnockoutReason::Inactivity)
         );
+    }
+
+    /// End-to-end `maintenance_tick` drives against a fake Supabase + Polymarket (#542): proves
+    /// that every membership path prepares its exact additions through the shared preparer
+    /// BEFORE publishing, and that a preparation failure never publishes an unprepared wallet.
+    #[allow(clippy::panic)]
+    mod tick {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::extract::{Query, State};
+        use axum::http::StatusCode;
+        use axum::{Json, Router, routing::get};
+        use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
+        use pe_trader_index::WatchlistTier;
+        use tempfile::TempDir;
+        use tokio::sync::mpsc;
+
+        use super::*;
+        use crate::orchestrator_control::OrchestratorControl;
+
+        const CAP: usize = 3;
+
+        fn wallet(byte: u8) -> WalletAddress {
+            WalletAddress([byte; 20])
+        }
+
+        fn row(batch_id: i64, rank: i64, wallet: WalletAddress) -> serde_json::Value {
+            serde_json::json!({
+                "batch_id": batch_id,
+                "rank": rank,
+                "wallet_hex": wallet.to_string(),
+                "hit_rate": "0.60",
+                "ls_tstat": "2.0",
+                "n_trades": 10,
+                "last_trade_unix": NOW - 60,
+            })
+        }
+
+        fn entry(wallet: WalletAddress) -> WatchlistEntry {
+            WatchlistEntry {
+                wallet,
+                tier: WatchlistTier::Active,
+                leader_score_bps: BasisPoints(0),
+                lcb_5pct_bps: BasisPoints(0),
+                win_rate_bps: BasisPoints(0),
+                closed_trades_in_window: 0,
+                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            }
+        }
+
+        fn live(wallets: &[WalletAddress]) -> LiveWatchlist {
+            let entries: Vec<WatchlistEntry> = wallets.iter().copied().map(entry).collect();
+            let active_count = entries.len();
+            LiveWatchlist::new(Watchlist {
+                entries,
+                snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                active_count,
+                incubator_count: 0,
+            })
+        }
+
+        fn members(live: &LiveWatchlist) -> HashSet<WalletAddress> {
+            live.snapshot().entries.iter().map(|e| e.wallet).collect()
+        }
+
+        /// Fake Supabase + Polymarket. `ranking_entries` is served filtered by the `batch_id`
+        /// query the pinned read sends; `latest_ranking` serves the knockout bench.
+        #[derive(Clone)]
+        struct Fake {
+            latest_batch: Option<i64>,
+            ranking_entries: Vec<serde_json::Value>,
+            latest_ranking: Vec<serde_json::Value>,
+            history_ok: bool,
+            activity_hits: Arc<AtomicUsize>,
+            position_hits: Arc<AtomicUsize>,
+        }
+
+        impl Fake {
+            fn new(latest_batch: Option<i64>) -> Self {
+                Self {
+                    latest_batch,
+                    ranking_entries: Vec::new(),
+                    latest_ranking: Vec::new(),
+                    history_ok: true,
+                    activity_hits: Arc::new(AtomicUsize::new(0)),
+                    position_hits: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+
+            async fn serve(self) -> String {
+                async fn batches(State(fake): State<Fake>) -> Json<serde_json::Value> {
+                    Json(match fake.latest_batch {
+                        Some(id) => serde_json::json!([{ "batch_id": id }]),
+                        None => serde_json::json!([]),
+                    })
+                }
+                async fn entries(
+                    State(fake): State<Fake>,
+                    Query(q): Query<HashMap<String, String>>,
+                ) -> Json<Vec<serde_json::Value>> {
+                    let pinned = q
+                        .get("batch_id")
+                        .and_then(|v| v.strip_prefix("eq."))
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .expect("pinned read must carry batch_id=eq.N");
+                    Json(
+                        fake.ranking_entries
+                            .iter()
+                            .filter(|r| r["batch_id"].as_i64() == Some(pinned))
+                            .cloned()
+                            .collect(),
+                    )
+                }
+                async fn latest(State(fake): State<Fake>) -> Json<Vec<serde_json::Value>> {
+                    Json(fake.latest_ranking.clone())
+                }
+                async fn activity(
+                    State(fake): State<Fake>,
+                ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+                    fake.activity_hits.fetch_add(1, Ordering::SeqCst);
+                    if fake.history_ok {
+                        Ok(Json(Vec::new()))
+                    } else {
+                        Err(StatusCode::NOT_FOUND)
+                    }
+                }
+                async fn positions(State(fake): State<Fake>) -> Json<Vec<serde_json::Value>> {
+                    fake.position_hits.fetch_add(1, Ordering::SeqCst);
+                    Json(Vec::new())
+                }
+                let app = Router::new()
+                    .route("/rest/v1/ranking_batches", get(batches))
+                    .route("/rest/v1/ranking_entries", get(entries))
+                    .route("/rest/v1/latest_ranking", get(latest))
+                    .route(
+                        "/rest/v1/wallet_lifecycle_events",
+                        axum::routing::post(|| async { StatusCode::CREATED }),
+                    )
+                    .route("/activity", get(activity))
+                    .route("/positions", get(positions))
+                    .with_state(self);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                std::mem::drop(tokio::spawn(async move {
+                    let _ = axum::serve(listener, app).await;
+                }));
+                format!("http://{address}")
+            }
+        }
+
+        /// `(prepared wallets, live membership when the orchestrator applied them)`.
+        type ControlLog = Vec<(HashSet<WalletAddress>, HashSet<WalletAddress>)>;
+
+        /// Everything one tick needs. The control consumer acknowledges every preparation and
+        /// records `(prepared wallets, live membership at that moment)` so a test can prove
+        /// the prepared wallet was not yet published.
+        struct Harness {
+            live: LiveWatchlist,
+            paper_state: Arc<PaperStateDb>,
+            preparer: crate::watchlist_admission::AdmissionPreparer,
+            applied: AppliedWatchlistCapacity,
+            writer_lock: Mutex<()>,
+            client: reqwest::Client,
+            base_url: String,
+            controls: Arc<StdMutex<ControlLog>>,
+            _temp: TempDir,
+        }
+
+        async fn harness(fake: Fake, initial: &[WalletAddress]) -> Harness {
+            let base_url = fake.serve().await;
+            let temp = TempDir::new().unwrap();
+            let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+            let live = live(initial);
+            let (control_tx, mut control_rx) = mpsc::channel(2);
+            let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
+            let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
+            std::mem::drop(tokio::spawn(async move {
+                while let Some(message) = control_rx.recv().await {
+                    match message {
+                        OrchestratorControl::PrepareAdmissions {
+                            history,
+                            positions,
+                            acknowledged,
+                        } => {
+                            assert_eq!(
+                                history.keys().copied().collect::<HashSet<_>>(),
+                                positions.keys().copied().collect::<HashSet<_>>()
+                            );
+                            control_log
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((
+                                    positions.keys().copied().collect(),
+                                    members(&control_live),
+                                ));
+                            acknowledged.send(()).unwrap();
+                        }
+                        OrchestratorControl::PositionReseed(_) => {
+                            panic!("maintenance sent a periodic reseed")
+                        }
+                    }
+                }
+            }));
+            let preparer = crate::watchlist_admission::AdmissionPreparer::new(
+                control_tx,
+                reqwest::Client::new(),
+                base_url.clone(),
+                temp.path().join("history.json"),
+                500,
+                1,
+            );
+            Harness {
+                live,
+                paper_state,
+                preparer,
+                applied: AppliedWatchlistCapacity::new(CAP),
+                writer_lock: Mutex::new(()),
+                client: reqwest::Client::new(),
+                base_url,
+                controls,
+                _temp: temp,
+            }
+        }
+
+        impl Harness {
+            async fn tick(
+                &self,
+                mode: MembershipMode,
+                evicted: &mut HashSet<WalletAddress>,
+                marker: &mut Option<i64>,
+            ) {
+                let mut sync = BatchSync {
+                    marker: *marker,
+                    capacity_generation: self.applied.load().generation,
+                };
+                self.tick_synced(mode, evicted, &mut sync).await;
+                *marker = sync.marker;
+            }
+
+            async fn tick_synced(
+                &self,
+                mode: MembershipMode,
+                evicted: &mut HashSet<WalletAddress>,
+                sync: &mut BatchSync,
+            ) {
+                let cfg = MaintenanceConfig {
+                    membership_mode: mode,
+                    ..cfg()
+                };
+                maintenance_tick(
+                    &self.live,
+                    &self.paper_state,
+                    &self.client,
+                    &self.base_url,
+                    "anon",
+                    "",
+                    &self.writer_lock,
+                    &self.applied,
+                    &self.preparer,
+                    &cfg,
+                    self.applied.load(),
+                    evicted,
+                    sync,
+                    NOW,
+                )
+                .await;
+            }
+
+            fn controls(&self) -> ControlLog {
+                self.controls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            }
+        }
+
+        fn set(wallets: &[WalletAddress]) -> HashSet<WalletAddress> {
+            wallets.iter().copied().collect()
+        }
+
+        #[tokio::test]
+        async fn full_rerank_prepares_exact_additions_before_publishing() {
+            let (a, b) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, a), row(2, 2, b)];
+            let h = harness(fake, &[a]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            // Only the newcomer was prepared, and membership was still the old set when the
+            // orchestrator applied its maps.
+            assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
+            assert_eq!(members(&h.live), set(&[a, b]));
+            assert_eq!(marker, Some(2));
+            assert_eq!(h.paper_state.cursor(&b).unwrap(), Some(NOW - 60));
+        }
+
+        #[tokio::test]
+        async fn full_rerank_preparation_failure_keeps_membership_and_marker() {
+            let (a, b) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, b)];
+            fake.history_ok = false;
+            let position_hits = Arc::clone(&fake.position_hits);
+            let h = harness(fake, &[a]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert!(h.controls().is_empty());
+            assert_eq!(
+                members(&h.live),
+                set(&[a]),
+                "unprepared wallet was published"
+            );
+            assert_eq!(marker, Some(1), "marker advanced past an unapplied batch");
+            assert_eq!(position_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(h.paper_state.cursor(&b).unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn full_rerank_zero_survivor_batch_empties_membership_with_no_requests() {
+            let a = wallet(1);
+            let fake = Fake::new(Some(2));
+            let (activity_hits, position_hits) = (
+                Arc::clone(&fake.activity_hits),
+                Arc::clone(&fake.position_hits),
+            );
+            let h = harness(fake, &[a]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert!(h.controls().is_empty());
+            assert!(members(&h.live).is_empty());
+            assert_eq!(marker, Some(2));
+            assert_eq!(activity_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(position_hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn full_rerank_absent_marker_applies_the_pinned_batch() {
+            // A failed boot batch read used to stamp the marker without applying its batch;
+            // the first tick now performs the ordinary pinned, prepared apply.
+            let (a, b) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(5));
+            fake.ranking_entries = vec![row(5, 1, b)];
+            let h = harness(fake, &[a]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), None);
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
+            assert_eq!(members(&h.live), set(&[b]));
+            assert_eq!(marker, Some(5));
+        }
+
+        #[tokio::test]
+        async fn full_rerank_applies_the_triggering_batch_not_a_newer_one() {
+            // Batch 3 is published between the trigger read (batch 2) and the row read. The
+            // moving `latest_ranking` view would serve batch 3; the pinned read serves batch 2
+            // and the marker names the batch whose rows were applied.
+            let (a, b, c) = (wallet(1), wallet(2), wallet(3));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, b), row(3, 1, c)];
+            fake.latest_ranking = vec![row(3, 1, c)];
+            let h = harness(fake, &[a]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
+            assert_eq!(members(&h.live), set(&[b]));
+            assert_eq!(marker, Some(2));
+        }
+
+        #[tokio::test]
+        async fn knockout_prepares_planned_backfill_before_publishing() {
+            let (idle, bench) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(1));
+            fake.latest_ranking = vec![row(1, 1, bench)];
+            let h = harness(fake, &[idle]).await;
+            // Idle past the 72h threshold with no stats → inactivity eviction.
+            h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(h.controls(), vec![(set(&[bench]), set(&[idle]))]);
+            assert_eq!(members(&h.live), set(&[bench]));
+            assert!(evicted.contains(&idle));
+            assert_eq!(h.paper_state.cursor(&bench).unwrap(), Some(NOW - 60));
+        }
+
+        #[tokio::test]
+        async fn knockout_preparation_failure_evicts_without_backfill() {
+            let (idle, bench) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(1));
+            fake.latest_ranking = vec![row(1, 1, bench)];
+            fake.history_ok = false;
+            let h = harness(fake, &[idle]).await;
+            h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert!(h.controls().is_empty());
+            assert!(
+                members(&h.live).is_empty(),
+                "decided eviction must still apply"
+            );
+            assert!(evicted.contains(&idle));
+            assert_eq!(h.paper_state.cursor(&bench).unwrap(), None);
+        }
+
+        #[test]
+        fn preparation_set_equals_published_set_for_duplicates_past_the_cap() {
+            // `[A, A, B]` at cap 2: the top-`cap` slice holds only A, but `planned_admissions`
+            // walks the whole slice and admits B too. One owner computes both sides, so the
+            // preparer installs B before the structural apply publishes it.
+            let (a, b) = (wallet(1), wallet(2));
+            let incoming = vec![entry(a), entry(a), entry(b)];
+            let (dropped, admissions) = ranked_membership_change(&[], &incoming, 2);
+            assert!(dropped.is_empty());
+            assert_eq!(admissions, vec![a, b]);
+            let live = live(&[]);
+            assert_eq!(live.replace(&HashSet::new(), &incoming, 2), 2);
+            assert_eq!(members(&live), set(&[a, b]));
+        }
+
+        #[tokio::test]
+        async fn capacity_transition_forces_a_resync_to_the_newest_batch() {
+            // Capacity may have published rows read from `latest_ranking` before the batch
+            // this loop last applied. The changed capacity generation makes the next tick
+            // re-apply the newest batch — preparing whatever that adds — then go quiet. The
+            // re-sync is not a batch transition: the eviction memory survives it.
+            let (a, b, knocked_out) = (wallet(1), wallet(2), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, a), row(2, 2, b)];
+            let (activity_hits, position_hits) = (
+                Arc::clone(&fake.activity_hits),
+                Arc::clone(&fake.position_hits),
+            );
+            let h = harness(fake, &[a]).await;
+            let mut evicted = set(&[knocked_out]);
+            let mut sync = BatchSync {
+                marker: Some(2),
+                capacity_generation: 0,
+            };
+            h.applied.store(WatchlistCapacityEpoch {
+                generation: 7,
+                target: CAP,
+            });
+
+            h.tick_synced(MembershipMode::FullRerank, &mut evicted, &mut sync)
+                .await;
+            assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
+            assert_eq!(members(&h.live), set(&[a, b]));
+            assert_eq!((sync.marker, sync.capacity_generation), (Some(2), 7));
+            assert_eq!(
+                evicted,
+                set(&[knocked_out]),
+                "a re-sync must keep eviction memory"
+            );
+
+            let before = (
+                activity_hits.load(Ordering::SeqCst),
+                position_hits.load(Ordering::SeqCst),
+            );
+            h.tick_synced(MembershipMode::FullRerank, &mut evicted, &mut sync)
+                .await;
+            assert_eq!(h.controls().len(), 1, "a synced tick must not re-prepare");
+            assert_eq!(
+                (
+                    activity_hits.load(Ordering::SeqCst),
+                    position_hits.load(Ordering::SeqCst)
+                ),
+                before
+            );
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_transition_clears_eviction_memory_despite_capacity_change() {
+            // In knockout mode a capacity change is irrelevant to batch tracking: a genuine new
+            // batch observed on the same tick still clears the eviction memory, exactly as
+            // before, because the marker was never erased.
+            let (live_wallet, knocked_out) = (wallet(1), wallet(9));
+            let fake = Fake::new(Some(2));
+            let h = harness(fake, &[live_wallet]).await;
+            let mut evicted = set(&[knocked_out]);
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: 0,
+            };
+            h.applied.store(WatchlistCapacityEpoch {
+                generation: 7,
+                target: CAP,
+            });
+
+            h.tick_synced(MembershipMode::Knockout, &mut evicted, &mut sync)
+                .await;
+            assert!(evicted.is_empty(), "a new batch clears eviction memory");
+            assert_eq!((sync.marker, sync.capacity_generation), (Some(2), 7));
+            assert!(h.controls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn eviction_only_tick_issues_no_preparation_requests() {
+            let idle = wallet(1);
+            let fake = Fake::new(Some(1));
+            let (activity_hits, position_hits) = (
+                Arc::clone(&fake.activity_hits),
+                Arc::clone(&fake.position_hits),
+            );
+            let h = harness(fake, &[idle]).await;
+            h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert!(h.controls().is_empty());
+            assert!(members(&h.live).is_empty());
+            assert_eq!(activity_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(position_hits.load(Ordering::SeqCst), 0);
+        }
     }
 }
