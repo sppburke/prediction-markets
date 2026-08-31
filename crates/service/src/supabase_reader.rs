@@ -59,6 +59,9 @@ pub enum SupabaseError {
     Decode(reqwest::Error),
     #[error("supabase response JSON failed: {0}")]
     Json(serde_json::Error),
+    /// A batch-pinned `ranking_entries` read returned a row from another batch (#542).
+    #[error("ranking_entries returned batch {found:?} while pinned to batch {expected}")]
+    BatchMismatch { expected: i64, found: Option<i64> },
     #[error("supabase canary observation failed: {reason}")]
     CanaryObserved {
         reason: String,
@@ -131,6 +134,19 @@ fn latest_ranking_url(base_url: &str, limit: usize) -> String {
     format!(
         "{}/rest/v1/latest_ranking\
          ?select={RANKING_EXACT_SELECT}&{RANKING_SURVIVOR_FILTER}&order=rank&limit={limit}",
+        base_url.trim_end_matches('/')
+    )
+}
+
+/// Batch-pinned survivor read over the `ranking_entries` base table (#542). `latest_ranking` is
+/// `select e.* from ranking_entries e where e.batch_id = (select max(batch_id) …)`
+/// (`scripts/supabase_schema.sql`), so the same columns, select aliases, survivor filter, and
+/// rank ordering apply — only the moving `max(batch_id)` predicate is replaced by an explicit one.
+fn batch_ranking_url(base_url: &str, batch_id: i64, limit: usize) -> String {
+    format!(
+        "{}/rest/v1/ranking_entries\
+         ?select={RANKING_EXACT_SELECT}&batch_id=eq.{batch_id}&{RANKING_SURVIVOR_FILTER}\
+         &order=rank&limit={limit}",
         base_url.trim_end_matches('/')
     )
 }
@@ -552,6 +568,16 @@ async fn get_ranking(
     url: &str,
     token: &str,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
+    Ok(to_watchlist(&get_ranking_rows(client, url, token).await?))
+}
+
+/// Issue the authenticated ranking `GET` and decode its rows, without mapping them. Shared by
+/// [`get_ranking`] and [`fetch_batch`], which validates batch identity before mapping.
+async fn get_ranking_rows(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<Vec<RankingRow>, SupabaseError> {
     let resp = client
         .get(url)
         .header("apikey", token)
@@ -564,7 +590,39 @@ async fn get_ranking(
     if !status.is_success() {
         return Err(SupabaseError::Status(status.as_u16()));
     }
-    let rows: Vec<RankingRow> = resp.json().await.map_err(SupabaseError::Decode)?;
+    resp.json().await.map_err(SupabaseError::Decode)
+}
+
+/// Fetch one ranking batch's surviving rows, pinned to `batch_id`, and map them exactly as
+/// [`fetch`] maps the `latest_ranking` view.
+///
+/// `latest_ranking` is a moving view over `max(batch_id)` (`scripts/supabase_schema.sql`), so a
+/// full re-rank that triggers on batch `B` and then reads the view can apply rows from a newer
+/// batch while committing the marker `B` (#542). Reading the `ranking_entries` base table pinned
+/// to `B` makes the trigger, the applied rows, and the marker name one batch. Every returned row
+/// must carry `B`; anything else fails closed.
+pub async fn fetch_batch(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    batch_id: i64,
+    limit: usize,
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
+    let rows = get_ranking_rows(
+        client,
+        &batch_ranking_url(base_url, batch_id, limit),
+        auth_token(anon_key, secret_key),
+    )
+    .await?;
+    for row in &rows {
+        if row.batch_id != Some(batch_id) {
+            return Err(SupabaseError::BatchMismatch {
+                expected: batch_id,
+                found: row.batch_id,
+            });
+        }
+    }
     Ok(to_watchlist(&rows))
 }
 
@@ -1132,6 +1190,51 @@ mod tests {
         assert_eq!(watchlist.entries.len(), 1);
         assert_eq!(cursors.len(), 1);
         assert_eq!(evidence.len(), 2);
+    }
+
+    #[test]
+    fn batch_ranking_url_pins_the_base_table_to_one_batch() {
+        let url = batch_ranking_url("https://x.supabase.co/", 42, 7);
+        assert_eq!(
+            url,
+            format!(
+                "https://x.supabase.co/rest/v1/ranking_entries?select={RANKING_EXACT_SELECT}\
+                 &batch_id=eq.42&{RANKING_SURVIVOR_FILTER}&order=rank&limit=7"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_batch_rejects_rows_from_another_batch() {
+        // A row carrying a different (or absent) batch id must fail closed: the caller binds
+        // the applied rows and the committed marker to the pinned identifier.
+        let app = axum::Router::new().route(
+            "/rest/v1/ranking_entries",
+            axum::routing::get(|| async {
+                axum::Json(json!([
+                    {"batch_id": 2, "rank": 1, "wallet_hex": "0x1111111111111111111111111111111111111111"},
+                    {"batch_id": 3, "rank": 1, "wallet_hex": "0x2222222222222222222222222222222222222222"}
+                ]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{address}");
+
+        let error = fetch_batch(&reqwest::Client::new(), &base, "anon", "", 2, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SupabaseError::BatchMismatch {
+                    expected: 2,
+                    found: Some(3)
+                }
+            ),
+            "expected a batch mismatch, got: {error:?}"
+        );
     }
 
     #[tokio::test]

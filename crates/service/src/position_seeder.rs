@@ -21,8 +21,9 @@ use tracing::warn;
 use crate::orchestrator_control::OrchestratorControl;
 
 /// Safety backstop: stop paginating after this many pages per wallet.
-/// A wallet exceeding `page_limit × POSITION_MAX_PAGES` live positions gets partial coverage;
-/// a `warn!` is emitted so hub-like wallets are visible in logs.
+/// A wallet whose response rows exceed `page_limit × POSITION_MAX_PAGES` cannot be snapshotted
+/// completely, so the fetch fails rather than returning a truncated portfolio (#542): a missing
+/// open position classifies the leader's next BUY as a first Entry.
 const POSITION_MAX_PAGES: u32 = 20;
 
 // ── DTO ───────────────────────────────────────────────────────────────────────
@@ -56,7 +57,20 @@ pub fn parse_positions(
     bytes: &[u8],
     wallet: WalletAddress,
 ) -> Result<PositionSnapshot, PositionParseError> {
+    parse_positions_counted(bytes, wallet).map(|(snapshot, _)| snapshot)
+}
+
+/// Parse a page and also report the number of rows the response actually carried.
+///
+/// Pagination must advance on the decoded row count, never on the retained position count:
+/// dust rows are skipped and duplicate `(market, outcome)` keys collapse, so a full page can
+/// retain fewer entries than `limit` and would otherwise be read as "history exhausted" (#542).
+fn parse_positions_counted(
+    bytes: &[u8],
+    wallet: WalletAddress,
+) -> Result<(PositionSnapshot, usize), PositionParseError> {
     let raw: Vec<RawPosition> = serde_json::from_slice(bytes)?;
+    let decoded_rows = raw.len();
     let mut positions = HashMap::new();
     for item in raw {
         let qty: u64 = match item.size.floor().to_u64() {
@@ -73,7 +87,7 @@ pub fn parse_positions(
             },
         );
     }
-    Ok(PositionSnapshot { wallet, positions })
+    Ok((PositionSnapshot { wallet, positions }, decoded_rows))
 }
 
 /// Parse live-canary positions without the ordinary parser's legacy outcome-zero default.
@@ -115,23 +129,24 @@ async fn fetch_positions_for_wallet<F: PageFetcher>(
             .await
             .map_err(|e| anyhow::anyhow!("fetch page {page_num}: {e}"))?;
 
-        let snap = parse_positions(&bytes, wallet)
+        let (snap, decoded_rows) = parse_positions_counted(&bytes, wallet)
             .map_err(|e| anyhow::anyhow!("parse page {page_num}: {e}"))?;
 
-        let page_count = snap.positions.len() as u32;
         all_positions.extend(snap.positions);
 
-        if page_count < page_limit {
+        // Short page → the wallet's positions are exhausted. Counted on decoded rows, not on
+        // retained entries, so a page filtered down to fewer positions still continues.
+        if decoded_rows < page_limit as usize {
             break;
         }
 
+        // A full final permitted page means the snapshot is knowably incomplete. Fail rather
+        // than return a truncated portfolio (the organic canary's precedent, `organic_canary.rs`).
         if page_num + 1 >= POSITION_MAX_PAGES {
-            warn!(
-                wallet = %wallet,
-                pages = POSITION_MAX_PAGES,
-                "position fetch hit page cap; wallet may have more open positions"
-            );
-            break;
+            return Err(anyhow::anyhow!(
+                "position fetch hit the {POSITION_MAX_PAGES}-page cap with a full final page; \
+                 snapshot is incomplete"
+            ));
         }
 
         offset = offset.saturating_add(page_limit);
@@ -327,33 +342,107 @@ mod tests {
         assert_eq!(map[&w].positions[&key].long_contracts, 100);
     }
 
+    /// Register `pages` full pages of one row each at `limit = 1`, condition IDs `0xcondNNNN`.
+    fn full_pages(w: WalletAddress, base: &str, pages: u32) -> HashMap<String, Vec<u8>> {
+        (0..pages)
+            .map(|page_num| {
+                let url = PolymarketEndpoint::CurrentPositions {
+                    user: w.to_string(),
+                    limit: Some(1),
+                    offset: Some(page_num),
+                    redeemable: Some(false),
+                    size_threshold: Some(1),
+                }
+                .url(base);
+                let body = format!(
+                    r#"[{{"conditionId":"0xcond{page_num:04}","outcomeIndex":0,"size":"5"}}]"#
+                )
+                .into_bytes();
+                (url, body)
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn max_pages_cap_stops_and_returns() {
-        // Register POSITION_MAX_PAGES pages of 1 item each (each returns page_limit=1 items).
-        // The function must stop at the cap and return without error.
+    async fn full_final_page_at_cap_fails_instead_of_truncating() {
+        // POSITION_MAX_PAGES full pages: the snapshot is knowably incomplete, so the fetch
+        // must fail rather than hand a truncated portfolio to classification (#542).
         let w = wallet();
         let base = "https://api.example.com";
-        let mut responses = HashMap::new();
-        for page_num in 0..POSITION_MAX_PAGES {
-            let url = PolymarketEndpoint::CurrentPositions {
-                user: w.to_string(),
-                limit: Some(1),
-                offset: Some(page_num),
-                redeemable: Some(false),
-                size_threshold: Some(1),
-            }
-            .url(base);
-            responses.insert(
-                url,
-                format!(r#"[{{"conditionId":"0xcond{page_num:04}","outcomeIndex":0,"size":"5"}}]"#)
-                    .into_bytes(),
-            );
+        let fetcher = FixtureFetcher::new(full_pages(w, base, POSITION_MAX_PAGES));
+        let error = fetch_positions_for_wallet(w, base, 1, 1, &fetcher)
+            .await
+            .expect_err("a full final permitted page must fail");
+        assert!(
+            error.to_string().contains("snapshot is incomplete"),
+            "unexpected error: {error}"
+        );
+        // seed_all keeps its warn-and-omit contract for the failed wallet.
+        let map = seed_all(&[w], base, 1, 1, &fetcher).await;
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn short_page_before_the_cap_succeeds() {
+        let w = wallet();
+        let base = "https://api.example.com";
+        let mut responses = full_pages(w, base, POSITION_MAX_PAGES - 1);
+        let last = PolymarketEndpoint::CurrentPositions {
+            user: w.to_string(),
+            limit: Some(1),
+            offset: Some(POSITION_MAX_PAGES - 1),
+            redeemable: Some(false),
+            size_threshold: Some(1),
         }
+        .url(base);
+        responses.insert(last, b"[]".to_vec());
         let fetcher = FixtureFetcher::new(responses);
         let snap = fetch_positions_for_wallet(w, base, 1, 1, &fetcher)
             .await
             .unwrap();
-        // 20 distinct conditionIds → 20 entries.
-        assert_eq!(snap.positions.len() as u32, POSITION_MAX_PAGES);
+        assert_eq!(
+            snap.positions.len(),
+            usize::try_from(POSITION_MAX_PAGES - 1).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_full_page_continues_pagination() {
+        // Page 0 is FULL (3 decoded rows) but retains 1 position: one dust row and two
+        // non-dust rows sharing a `(market, outcome)` key. Counting retained positions would
+        // read the page as short and lose page 1.
+        let w = wallet();
+        let base = "https://api.example.com";
+        let page_url = |offset: u32| {
+            PolymarketEndpoint::CurrentPositions {
+                user: w.to_string(),
+                limit: Some(3),
+                offset: Some(offset),
+                redeemable: Some(false),
+                size_threshold: Some(1),
+            }
+            .url(base)
+        };
+        let mut responses = HashMap::new();
+        responses.insert(
+            page_url(0),
+            br#"[{"conditionId":"0xdust","outcomeIndex":0,"size":"0.4"},
+                 {"conditionId":"0xdup","outcomeIndex":0,"size":"5"},
+                 {"conditionId":"0xdup","outcomeIndex":0,"size":"7"}]"#
+                .to_vec(),
+        );
+        responses.insert(
+            page_url(3),
+            br#"[{"conditionId":"0xreal","outcomeIndex":1,"size":"42"}]"#.to_vec(),
+        );
+        let fetcher = FixtureFetcher::new(responses);
+        let snap = fetch_positions_for_wallet(w, base, 3, 1, &fetcher)
+            .await
+            .unwrap();
+        let real = MarketOutcomeId::new(MarketId(VenueMarketId("0xreal".into())), OutcomeId(1));
+        let dup = MarketOutcomeId::new(MarketId(VenueMarketId("0xdup".into())), OutcomeId(0));
+        assert_eq!(snap.positions[&real].long_contracts, 42);
+        assert_eq!(snap.positions[&dup].long_contracts, 7);
+        assert_eq!(snap.positions.len(), 2);
     }
 }

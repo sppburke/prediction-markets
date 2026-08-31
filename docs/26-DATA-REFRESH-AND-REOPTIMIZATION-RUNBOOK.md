@@ -450,11 +450,17 @@ effect is to truncate the separate `wallet_cache.db-wal` file.
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
 `knockout` (legacy — the maintenance tick's eviction/backfill is the sole membership
 path) or `full_rerank` (each batch transition wholesale-replaces the live
-top-`active_watchlist_size` SURVIVORS — the cutover production mode). Every read is
+top-`active_watchlist_size` SURVIVORS — the cutover production mode; the rows are read
+from `ranking_entries` pinned to the triggering `batch_id`, never from the moving view, so
+the applied rows and the committed marker name one batch, #542). Every read is
 gated on the ranker's `survives` verdict (#518), so the published batch is a bench and
 `active_watchlist_size` caps the survivors admitted from it rather than selecting a raw
 top-N; membership converges at the deploy restart itself, because boot seeds the live set
-from the same filtered read. `active_watchlist_size` is
+from the same filtered read. Every post-boot addition on either path is prepared first
+(#542): its prior-market history and current positions are loaded and applied by the
+orchestrator before the wallet is published (log line `hot-watchlist admission state
+prepared`, then `full re-rank membership swap applied` / `maintenance tick applied`); a
+preparation failure publishes no additions and the tick retries. `active_watchlist_size` is
 Supabase-authoritative (default 100, valid `1..=200`) and is polled every 30 seconds. A
 grow fetches the requested top-N and preloads all newly admitted wallets' prior-market
 history and current positions before the atomic membership swap; a shrink uses the same

@@ -90,9 +90,9 @@ impl CopyEntryGate {
     /// Merge preloaded history for wallets about to join the live set.
     ///
     /// Union semantics preserve both startup history and same-session entries already recorded
-    /// by [`Self::record_entry`]. The capacity controller calls this through the orchestrator
-    /// before atomically admitting a hot-grown wallet, so it never passes through the
-    /// absent-wallet fail-open path merely because membership changed at runtime.
+    /// by [`Self::record_entry`]. The shared admission preparer calls this through the
+    /// orchestrator before any runtime addition is published, so a wallet never passes through
+    /// the absent-wallet fail-open path merely because membership changed at runtime.
     pub fn merge_history(&mut self, additional: HashMap<WalletAddress, HashSet<MarketId>>) {
         for (wallet, markets) in additional {
             self.history.entry(wallet).or_default().extend(markets);

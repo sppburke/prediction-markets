@@ -660,6 +660,13 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
             cfg.copy_latency_budget_secs
         )));
     }
+    // #542: pagination advances on the decoded row count against this limit; a zero limit can
+    // never observe a short page, so every wallet would fail at the page cap.
+    if cfg.position_page_limit == 0 {
+        return Err(ServiceConfigError::Invalid(
+            "position_page_limit must be at least 1, got 0".to_owned(),
+        ));
+    }
     Ok(cfg)
 }
 
@@ -681,6 +688,14 @@ mod tests {
             std::fs::write(&path, format!("copy_latency_budget_secs = {bad}\n")).unwrap();
             assert!(load(Some(&path)).is_err(), "budget {bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn zero_position_page_limit_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.toml");
+        std::fs::write(&path, "position_page_limit = 0\n").unwrap();
+        assert!(load(Some(&path)).is_err());
     }
 
     #[test]
