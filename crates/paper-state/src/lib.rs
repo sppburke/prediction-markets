@@ -1027,6 +1027,31 @@ impl PaperStateDb {
         Ok(())
     }
 
+    /// Promote SEEDED history rows to complete for wallets whose causal bracket
+    /// was just accepted (#544 activation fix). The bracket's complete fixed-end
+    /// activity catch-up is the reconciliation the plan requires to extend and
+    /// validate the one-time sidecar seed; a wallet with NO seed row stays
+    /// incomplete (fail-closed — runtime admission owns unseeded wallets).
+    pub fn mark_seeded_history_validated(
+        &self,
+        wallets: &[WalletAddress],
+        proof_json: &str,
+        validated_at_unix: i64,
+    ) -> Result<usize, PaperStateError> {
+        serde_json::from_str::<serde_json::Value>(proof_json)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut promoted = 0usize;
+        for wallet in wallets {
+            promoted += tx.execute(
+                "UPDATE wallet_history_status_v2                      SET complete = 1, proof_json = ?2, updated_at_unix = ?3                  WHERE wallet_hex = ?1 AND complete = 0",
+                params![wallet.to_string(), proof_json, validated_at_unix],
+            )?;
+        }
+        tx.commit()?;
+        Ok(promoted)
+    }
+
     /// Install one all-or-nothing set of accepted causal position brackets.
     pub fn record_position_validations(
         &self,
@@ -4093,5 +4118,34 @@ mod tests {
         db.set_dispatch_target_state("d7", "a", "submitted", None, 1)
             .unwrap();
         assert_eq!(db.dispatch_targets("d7").unwrap()[0].state, "submitted");
+    }
+
+    #[test]
+    fn seeded_history_promotes_only_existing_incomplete_rows() {
+        // #544 activation fix: an accepted bracket promotes the conservative
+        // sidecar seed to complete; an unseeded wallet gains no row at all.
+        let dir = tempfile::tempdir().unwrap();
+        let db = PaperStateDb::open(&dir.path().join("p.db")).unwrap();
+        let seeded = WalletAddress::from_hex(&format!("0x{}", "a".repeat(40))).unwrap();
+        let unseeded = WalletAddress::from_hex(&format!("0x{}", "b".repeat(40))).unwrap();
+        db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: seeded,
+            complete: false,
+            proof_json: "{\"seed\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+        let promoted = db
+            .mark_seeded_history_validated(&[seeded, unseeded], "{\"t\":1}", 2)
+            .unwrap();
+        assert_eq!(promoted, 1);
+        assert!(db.wallet_history_complete(&seeded).unwrap());
+        assert!(!db.wallet_history_complete(&unseeded).unwrap());
+        // Idempotent: a second promotion changes nothing.
+        assert_eq!(
+            db.mark_seeded_history_validated(&[seeded], "{\"t\":2}", 3)
+                .unwrap(),
+            0
+        );
     }
 }
