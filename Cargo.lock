@@ -3583,6 +3583,7 @@ dependencies = [
  "anyhow",
  "const_format",
  "figment",
+ "fs2",
  "futures",
  "pe-core-types",
  "pe-source-core",

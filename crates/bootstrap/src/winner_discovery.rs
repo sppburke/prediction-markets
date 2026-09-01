@@ -2,10 +2,8 @@
 //! (issues #324, #365).
 //!
 //! `run_winner_discovery` runs all enabled discovery sources in sequence and
-//! returns aggregate counts. [`CacheMutationLock`] is scoped inside each
-//! [`crate::wallet_discovery::run_source_discovery`] call and released before
-//! this function returns — callers may safely invoke `pe-bootstrap backfill`
-//! afterwards without a lock conflict.
+//! returns aggregate counts. The binary owns one central cache mutation lock
+//! across the complete read-write command (#544).
 //!
 //! Failure policy: the leaderboard source propagates errors (fatal to
 //! `pe-bootstrap all`). The **datadash** source **soft-fails** — a
@@ -14,8 +12,6 @@
 //! (e.g. a broken cache) still propagate. (The Radion source was retired once its
 //! upstream `traders/analysis` endpoint was removed.)
 //!
-//! [`CacheMutationLock`]: crate::lock::CacheMutationLock
-
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;

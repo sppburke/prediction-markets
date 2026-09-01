@@ -16,13 +16,22 @@ fn wallet_hex(byte: u8) -> String {
 }
 
 fn run_cli(root: &Path, cache_path: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+    run_cli_with_env(root, cache_path, args, &[])
+}
+
+fn run_cli_with_env(
+    root: &Path,
+    cache_path: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"));
+    command
         .args(args)
         .env("PE_BOOTSTRAP_OUTPUT", root.join("watchlist.json"))
         .env("PE_BOOTSTRAP_CACHE_PATH", cache_path)
-        .env("PE_BOOTSTRAP_PURGE_ARCHIVE_ENABLED", "false")
-        .output()
-        .unwrap()
+        .env("PE_BOOTSTRAP_PURGE_ARCHIVE_ENABLED", "false");
+    command.envs(extra_env.iter().copied()).output().unwrap()
 }
 
 fn upsert(cache: &mut WalletCache, wallet: &str) {
@@ -107,7 +116,7 @@ fn activate_next_cli_is_audited_idempotent_and_locks_before_open() {
 }
 
 #[test]
-fn purge_infra_cli_reports_then_deletes_only_infrastructure() {
+fn purge_infra_cli_is_report_only_until_shared_purge_flag_is_enabled() {
     let dir = TempDir::new().unwrap();
     let cache_path = dir.path().join("cache.db");
     let infra = wallet_hex(0x51);
@@ -129,7 +138,21 @@ fn purge_infra_cli_reports_then_deletes_only_infrastructure() {
             .conn_for_test_wallet_exists(&infra)
     );
 
-    let deleted = run_cli(dir.path(), &cache_path, &["purge-infra"]);
+    let disabled = run_cli(dir.path(), &cache_path, &["purge-infra"]);
+    assert!(disabled.status.success());
+    assert!(
+        WalletCache::open(&cache_path)
+            .unwrap()
+            .conn_for_test_wallet_exists(&infra),
+        "PE_BOOTSTRAP_PURGE_ENABLED=false deleted infrastructure"
+    );
+
+    let deleted = run_cli_with_env(
+        dir.path(),
+        &cache_path,
+        &["purge-infra"],
+        &[("PE_BOOTSTRAP_PURGE_ENABLED", "true")],
+    );
     assert!(
         deleted.status.success(),
         "stderr={}",
@@ -139,6 +162,164 @@ fn purge_infra_cli_reports_then_deletes_only_infrastructure() {
     assert!(!cache.conn_for_test_wallet_exists(&infra));
     assert!(cache.conn_for_test_wallet_exists(&regular));
     assert!(cache.is_purged(&infra).unwrap());
+
+    let status =
+        std::fs::read_to_string(dir.path().join("eval-results/purge_status.jsonl")).unwrap();
+    assert_eq!(status.lines().count(), 3);
+    assert!(
+        status
+            .lines()
+            .all(|line| line.contains("\"stage\":\"purge-infra\""))
+    );
+}
+
+#[test]
+fn ordinary_purge_cli_is_report_only_when_shared_flag_is_disabled() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let wallet = wallet_hex(0x53);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    {
+        let mut cache = WalletCache::open(&cache_path).unwrap();
+        upsert(&mut cache, &wallet);
+        cache.conn_for_test_insert_trade(&wallet, "fresh", now);
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "UPDATE wallets SET is_active=1, last_polymarket_fetch_at=?1 \
+                 WHERE wallet_hex=?2",
+                rusqlite::params![now, wallet],
+            )
+            .unwrap();
+    }
+    let decision_csv = dir.path().join("decisions.csv");
+    std::fs::write(
+        &decision_csv,
+        format!("wallet,tstat_net,mean_net,n_eff,eligible\n{wallet},-3.0,-0.5,50,True\n"),
+    )
+    .unwrap();
+
+    let output = run_cli_with_env(
+        dir.path(),
+        &cache_path,
+        &["purge"],
+        &[(
+            "PE_BOOTSTRAP_PURGE_DECISION_CSV",
+            decision_csv.to_str().unwrap(),
+        )],
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cache = WalletCache::open(&cache_path).unwrap();
+    assert!(cache.conn_for_test_wallet_exists(&wallet));
+    assert!(!cache.is_purged(&wallet).unwrap());
+    let status =
+        std::fs::read_to_string(dir.path().join("eval-results/purge_status.jsonl")).unwrap();
+    assert!(status.contains("\"stage\":\"purge\""));
+    assert!(status.contains("\"exit_code\":0"));
+}
+
+#[test]
+fn every_locking_cli_entry_refuses_before_creating_the_cache() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("blocked.db");
+    let _holder = CacheMutationLock::acquire(&cache_path).unwrap();
+    let subcommands = [
+        "all",
+        "fetch",
+        "watchlist",
+        "resolutions",
+        "schedules",
+        "events",
+        "backfill",
+        "classify-infra",
+        "winner-discovery",
+        "prices-history",
+        "purge",
+        "activate-next",
+        "purge-infra",
+        "clear-infra-exclusion",
+        "recover-reclamation",
+        "reclamation-evidence",
+    ];
+
+    for subcommand in subcommands {
+        let output = run_cli(dir.path(), &cache_path, &[subcommand]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{subcommand} did not fail on the held cache lock; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !cache_path.exists(),
+            "{subcommand} created/opened the cache before lock acquisition"
+        );
+    }
+
+    let no_argument_all = run_cli(dir.path(), &cache_path, &[]);
+    assert_eq!(no_argument_all.status.code(), Some(1));
+    assert!(
+        !cache_path.exists(),
+        "no-argument all created the cache before lock acquisition"
+    );
+}
+
+#[test]
+fn reclamation_evidence_cli_reports_and_enforces_activation_gate() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    WalletCache::open(&cache_path).unwrap();
+    let eval_results = dir.path().join("eval-results");
+    std::fs::create_dir(&eval_results).unwrap();
+    std::fs::write(
+        eval_results.join("purge_status.jsonl"),
+        "{\"stage\":\"purge\",\"exit_code\":0}\n",
+    )
+    .unwrap();
+    let sqlite_tmpdir = dir.path().join("sqlite-tmp");
+    std::fs::create_dir(&sqlite_tmpdir).unwrap();
+
+    let ready = run_cli_with_env(
+        dir.path(),
+        &cache_path,
+        &["reclamation-evidence"],
+        &[("SQLITE_TMPDIR", sqlite_tmpdir.to_str().unwrap())],
+    );
+    assert!(
+        ready.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(report["activation_ready"], true);
+    assert_eq!(report["reclamation_pending"], false);
+    assert_eq!(report["latest_purge_status_records"][0]["stage"], "purge");
+    assert_eq!(
+        report["sqlite_tmpdir"]["resolved_path"],
+        sqlite_tmpdir.to_str().unwrap()
+    );
+
+    rusqlite::Connection::open(&cache_path)
+        .unwrap()
+        .execute_batch("DROP INDEX idx_trades_market_id;")
+        .unwrap();
+    let blocked = run_cli_with_env(
+        dir.path(),
+        &cache_path,
+        &["reclamation-evidence"],
+        &[("SQLITE_TMPDIR", sqlite_tmpdir.to_str().unwrap())],
+    );
+    assert_eq!(blocked.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(report["activation_ready"], false);
+    assert_eq!(
+        report["missing_required_trades_indexes"],
+        serde_json::json!(["idx_trades_market_id"])
+    );
 }
 
 #[test]

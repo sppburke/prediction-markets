@@ -30,6 +30,7 @@ pub mod pile;
 pub mod polymarket;
 pub mod prices_history;
 pub mod purge;
+pub mod reclamation_evidence;
 pub mod wallet_discovery;
 pub mod wallet_set;
 pub mod watchlist_phase;

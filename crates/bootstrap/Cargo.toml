@@ -32,6 +32,7 @@ anyhow          = { workspace = true }
 const_format    = { workspace = true }
 figment         = { workspace = true }
 futures         = { workspace = true }
+fs2             = { workspace = true }
 reqwest         = { workspace = true }
 rusqlite        = { version = "0.32", features = ["bundled"] }
 rust_decimal    = { workspace = true }

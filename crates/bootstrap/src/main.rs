@@ -1,7 +1,7 @@
 use pe_bootstrap::{
     BootstrapConfig, backfill, cache::WalletCache, config, coverage, error::BootstrapError, fetch,
-    fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge, run_schedule_backfill,
-    watchlist_phase, winner_discovery,
+    fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge, reclamation_evidence,
+    run_schedule_backfill, watchlist_phase, winner_discovery,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -46,6 +46,8 @@ async fn main() {
                 | "activate-next"
                 | "purge-infra"
                 | "clear-infra-exclusion"
+                | "recover-reclamation"
+                | "reclamation-evidence"
         )
     );
 
@@ -142,6 +144,35 @@ async fn main() {
             }
         };
 
+        // Reclamation evidence is read-only but deliberately excludes all
+        // cache writers while it captures the activation gate (#544).
+        if sub == "reclamation-evidence" {
+            let _cache_mutation_lock =
+                acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
+            let eval_results_dir =
+                reclamation_evidence::eval_results_dir_for_cache(&bootstrap_config.cache_path);
+            let exit = match reclamation_evidence::capture(
+                &bootstrap_config.cache_path,
+                &eval_results_dir,
+            ) {
+                Ok(report) => match serde_json::to_string(&report) {
+                    Ok(rendered) => {
+                        println!("{rendered}");
+                        if report.activation_ready { 0 } else { 2 }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "reclamation-evidence: encode failed");
+                        1
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "reclamation-evidence: fatal");
+                    1
+                }
+            };
+            std::process::exit(exit);
+        }
+
         // `coverage` (issue #208) is a read-only probe: open the cache
         // READ_ONLY, never CREATE/migrate it, and never take the
         // CacheMutationLock. Handle it before the shared read-write open below
@@ -165,28 +196,10 @@ async fn main() {
             std::process::exit(exit);
         }
 
-        // Serialize standalone mutators before opening the shared cache RW.
-        // Discovery owns its narrower per-source lock internally; these commands
-        // have no nested acquisition and hold this guard for their full mutation.
-        let _cache_mutation_lock = if matches!(
-            sub,
-            "activate-next"
-                | "backfill"
-                | "purge"
-                | "purge-infra"
-                | "clear-infra-exclusion"
-                | "prices-history"
-        ) {
-            match pe_bootstrap::lock::CacheMutationLock::acquire(&bootstrap_config.cache_path) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::error!(error = %e, subcommand = sub, "bootstrap: cache mutation lock failed");
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            None
-        };
+        // Every named command below opens WalletCache read-write (including
+        // `all`), so the one central guard must precede that open (#544).
+        // Genuine readers return above through `open_read_only`.
+        let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
@@ -604,6 +617,29 @@ async fn main() {
                 }
             },
 
+            "recover-reclamation" => match purge::recover_pending_reclamation(&mut cache) {
+                Ok(Some(report)) => {
+                    tracing::info!(
+                        auto_vacuum_before = report.auto_vacuum_before,
+                        path = ?report.path,
+                        freelist_before = report.freelist_before,
+                        freelist_after = report.freelist_after,
+                        page_count_before = report.page_count_before,
+                        page_count_after = report.page_count_after,
+                        "recover-reclamation: complete"
+                    );
+                    0
+                }
+                Ok(None) => {
+                    tracing::info!("recover-reclamation: no pending marker");
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "recover-reclamation: fatal");
+                    1
+                }
+            },
+
             "clear-infra-exclusion" => {
                 if !confirm {
                     tracing::error!("clear-infra-exclusion: --confirm is required");
@@ -644,6 +680,13 @@ async fn main() {
 
             _ => unreachable!("known_sub filter restricts to known subcommand names"),
         };
+        if matches!(sub, "purge" | "purge-infra") {
+            let eval_results_dir =
+                reclamation_evidence::eval_results_dir_for_cache(&bootstrap_config.cache_path);
+            if let Err(error) = purge::append_direct_purge_status(&eval_results_dir, sub, exit) {
+                tracing::warn!(error = %error, subcommand = sub, "purge status append failed");
+            }
+        }
         std::process::exit(exit);
     }
 
@@ -671,7 +714,9 @@ async fn main() {
         }
     };
 
-    // No-arg → run "all" with strict=false (soft-fail default).
+    // No-arg → run "all" with strict=false (soft-fail default). It follows the
+    // same central lock-before-open contract as the named `all` command (#544).
+    let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
     let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
         Ok(c) => c,
         Err(e) => {
@@ -681,6 +726,23 @@ async fn main() {
     };
     let exit = handle_all(&bootstrap_config, &mut cache, false).await;
     std::process::exit(exit);
+}
+
+fn acquire_cache_lock_or_exit(
+    cache_path: &std::path::Path,
+    subcommand: &str,
+) -> pe_bootstrap::lock::CacheMutationLock {
+    match pe_bootstrap::lock::CacheMutationLock::acquire(cache_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                subcommand,
+                "bootstrap: cache mutation lock failed"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Orchestrate all bootstrap phases in sequence.

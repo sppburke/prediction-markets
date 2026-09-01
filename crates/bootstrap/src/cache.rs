@@ -73,6 +73,14 @@ const IDX_TRADES_BUY_MARKET_OUTCOME_WALLET_TS_DDL: &str =
     "CREATE INDEX IF NOT EXISTS idx_trades_buy_market_outcome_wallet_ts
     ON trades(side, market_id, outcome_id, wallet_hex, timestamp_unix);";
 
+/// Explicit indexes required before Forge cache activation (#544). The trades
+/// primary-key auto-index is additionally reported in the complete inventory.
+pub const REQUIRED_TRADES_INDEXES: [&str; 3] = [
+    "idx_trades_wallet_ts",
+    "idx_trades_market_id",
+    "idx_trades_buy_market_outcome_wallet_ts",
+];
+
 const SCHEMA: &str = concatcp!(
     "
 PRAGMA journal_mode = WAL;
@@ -472,6 +480,15 @@ pub struct ReclamationReport {
     pub freelist_after: i64,
     pub page_count_before: i64,
     pub page_count_after: i64,
+}
+
+/// Read-only cache evidence captured before Forge activation (#544).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheReclamationEvidence {
+    pub reclamation_pending: bool,
+    pub freelist_pages: i64,
+    pub trades_indexes: Vec<String>,
+    pub missing_required_trades_indexes: Vec<String>,
 }
 
 /// Outcome of [`WalletCache::purge_wallets`] (issue #385). In `dry_run` mode the
@@ -3047,6 +3064,32 @@ impl WalletCache {
             )
             .optional()?;
         Ok(row.is_some())
+    }
+
+    /// Capture the marker, freelist, and complete trades-index inventory using
+    /// the current read-only-compatible connection (#544).
+    pub fn reclamation_evidence(&self) -> Result<CacheReclamationEvidence, BootstrapError> {
+        let freelist_pages = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'trades' ORDER BY name",
+        )?;
+        let trades_indexes = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let missing_required_trades_indexes = REQUIRED_TRADES_INDEXES
+            .iter()
+            .filter(|required| !trades_indexes.iter().any(|actual| actual == **required))
+            .map(|name| (*name).to_owned())
+            .collect();
+        Ok(CacheReclamationEvidence {
+            reclamation_pending: self.reclamation_pending()?,
+            freelist_pages,
+            trades_indexes,
+            missing_required_trades_indexes,
+        })
     }
 
     /// Clear the marker after reclamation AND index recreation both succeeded.
