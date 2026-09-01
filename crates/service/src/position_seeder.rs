@@ -518,7 +518,17 @@ fn commit_direct(
         .map_err(|source| CausalPositionError::Activity { wallet, source })?
     {
         let result = engine
-            .commit(bucket, &bracket_context(activity, source_log_generation)?)
+            // Bracket catch-up is never copy-eligible (`copy_eligible: false`
+            // above), so no pending decision is created and the frozen basis is
+            // inert; a zero basis keeps that invariant explicit (#544).
+            .commit(
+                bucket,
+                &bracket_context(activity, source_log_generation)?,
+                crate::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: pe_core_types::Probability::ZERO,
+                    bankroll: rust_decimal::Decimal::ZERO,
+                },
+            )
             .map_err(|error| CausalPositionError::BucketCommit {
                 wallet,
                 message: error.to_string(),

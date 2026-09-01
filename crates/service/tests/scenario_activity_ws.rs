@@ -1753,6 +1753,10 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
         gate_result: "admitted".to_owned(),
+        frozen_basis: pe_service::bucket_commit::FrozenDecisionBasis {
+            win_rate_p: pe_core_types::Probability::ZERO,
+            bankroll: rust_decimal::Decimal::ZERO,
+        },
         applied_configuration_hash: applied_configuration.canonical_hash(),
         applied_configuration,
         decision_inputs: serde_json::json!({"source_window":"complete"}),

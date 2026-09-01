@@ -431,9 +431,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 // final membership recheck/publication so a wallet cannot become
                 // visible from a proof invalidated between those two operations.
                 let writer_lock = self.watchlist_writer_lock.clone();
+                // Freeze the mutable decision basis atomically with this commit
+                // (#544 review round 3): a later watchlist refresh or bankroll
+                // move cannot change what a resumed continuation decides.
+                let frozen_basis = {
+                    let watchlist = self.live_watchlist.snapshot();
+                    let leader = aggregates
+                        .first()
+                        .map(|aggregate| TraderId(aggregate.group_id.components().wallet));
+                    crate::bucket_commit::FrozenDecisionBasis {
+                        win_rate_p: leader
+                            .map(|leader| self.win_rate_p_for(&watchlist, &leader))
+                            .unwrap_or(Probability::ZERO),
+                        bankroll: self.bankroll,
+                    }
+                };
                 let result = if let Some(writer_lock) = writer_lock {
                     let _writer_guard = writer_lock.lock().await;
-                    let result = self.bucket_engine.commit(aggregates, &context);
+                    let result = self
+                        .bucket_engine
+                        .commit(aggregates, &context, frozen_basis);
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -447,7 +464,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 } else {
                     // Scenario/unit construction may omit the production writer lock;
                     // those harnesses have no competing membership writer.
-                    let result = self.bucket_engine.commit(aggregates, &context);
+                    let result = self
+                        .bucket_engine
+                        .commit(aggregates, &context, frozen_basis);
                     if let Ok(result) = &result
                         && result.newly_fenced.is_some()
                     {
@@ -1823,7 +1842,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // within-band, within-budget maximum. The no-affordable-shares arm returned above.
         let book_cap_contracts = gate_plan.map(|plan| plan.shares.atomic() / 1_000_000);
 
-        let p = self.win_rate_p_for(&watchlist, &signal.leader);
+        // A resumed continuation evaluates under its frozen basis; only a fresh
+        // decision reads the live watchlist and bankroll (#544 review round 3).
+        let p = pending
+            .as_ref()
+            .map(|continuation| continuation.frozen_basis.win_rate_p)
+            .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
+        let sizing_bankroll = pending
+            .as_ref()
+            .map(|continuation| continuation.frozen_basis.bankroll)
+            .unwrap_or(self.bankroll);
         let snapshot = zeroed_risk_snapshot();
         // Sizing basis: pass the leader's price as the RAW `current_price` (Kelly cost `c`,
         // per-trade cap, exposure bps) and `fill_basis` as the dollar-sizing price, so the
@@ -1836,7 +1864,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             signal.leader_price,
             p,
             snapshot,
-            self.bankroll,
+            sizing_bankroll,
             self.mode,
             book_cap_contracts,
             Some(fill_basis),

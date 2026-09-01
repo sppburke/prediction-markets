@@ -127,6 +127,12 @@ fn combo_effect(activity_type: &str, transaction_hash: &str, epoch: i64) -> Acti
     }))
 }
 
+fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
+    pe_service::bucket_commit::FrozenDecisionBasis {
+        win_rate_p: pe_core_types::Probability::ZERO,
+        bankroll: rust_decimal::Decimal::ZERO,
+    }
+}
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
     BucketDecisionContext {
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
@@ -181,12 +187,14 @@ fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
                 100,
             )],
             &context(100, true),
+            zero_basis(),
         )
         .unwrap();
     engine
         .commit(
             vec![pair_effect("MERGE", "0x02", MARKET_A, "500000.125000", 101)],
             &context(101, false),
+            zero_basis(),
         )
         .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 6_000_000_000_000);
@@ -196,7 +204,9 @@ fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
         position_row("REDEEM", "0x03", MARKET_A, 0, "", "0.000001", "0", 102),
         position_row("REDEEM", "0x04", MARKET_A, 1, "", "1.250000", "0", 102),
     ];
-    engine.commit(redemptions, &context(102, false)).unwrap();
+    engine
+        .commit(redemptions, &context(102, false), zero_basis())
+        .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 5_999_999_999_999);
     assert_eq!(state(&engine, MARKET_A, 1).atomic(), 5_999_998_750_000);
     assert_eq!(paper.fills_count().unwrap(), 0, "non-trades create no fill");
@@ -235,7 +245,9 @@ fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
             "isCombo": false,
         }),
     ]);
-    engine.commit(vec![trade], &context(150, true)).unwrap();
+    engine
+        .commit(vec![trade], &context(150, true), zero_basis())
+        .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     let row = paper.open_decision_pending().unwrap().remove(0);
     let frozen = DecisionContinuationV2::from_durable(&row).unwrap();
@@ -276,7 +288,9 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         } else {
             vec![first, second]
         };
-        let result = engine.commit(groups, &context(200, true)).unwrap();
+        let result = engine
+            .commit(groups, &context(200, true), zero_basis())
+            .unwrap();
         assert!(result.pending.is_empty());
         assert!(
             result
@@ -304,7 +318,9 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         position_row("TRADE", "0x31", MARKET_A, 0, "BUY", "1", "0.4", 210),
         position_row("TRADE", "0x32", MARKET_A, 0, "BUY", "2", "0.6", 210),
     ];
-    engine.commit(groups, &context(210, true)).unwrap();
+    engine
+        .commit(groups, &context(210, true), zero_basis())
+        .unwrap();
     drop(engine);
     drop(paper);
     let restarted = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
@@ -316,6 +332,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
                 "TRADE", "0x33", MARKET_A, 1, "BUY", "1", "0.5", 211,
             )],
             &context(211, false),
+            zero_basis(),
         )
         .unwrap();
     assert_eq!(
@@ -337,7 +354,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
         } else {
             vec![buy, sell]
         };
-        let result = engine.commit(groups, &no_copy).unwrap();
+        let result = engine.commit(groups, &no_copy, zero_basis()).unwrap();
         assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
         (
             paper.leader_positions().unwrap(),
@@ -354,6 +371,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
             .commit(
                 vec![pair_effect("SPLIT", "0x37", MARKET_A, "2", 251)],
                 &context(251, true),
+                zero_basis(),
             )
             .unwrap();
         let split = pair_effect("SPLIT", "0x38", MARKET_A, "0.500000", 252);
@@ -363,7 +381,9 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
         } else {
             vec![split, merge]
         };
-        let result = engine.commit(groups, &context(252, false)).unwrap();
+        let result = engine
+            .commit(groups, &context(252, false), zero_basis())
+            .unwrap();
         assert_eq!(state(&engine, MARKET_A, 0).atomic(), 2_000_000);
         assert_eq!(state(&engine, MARKET_A, 1).atomic(), 2_000_000);
         (
@@ -385,6 +405,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
                 position_row("TRADE", "0x42", MARKET_B, 0, "BUY", "2.75", "0.6", 300),
             ],
             &context(300, true),
+            zero_basis(),
         )
         .unwrap();
     assert_eq!(result.pending.len(), 2);
@@ -455,7 +476,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
     let conversion = pair_effect("CONVERSION", "0x51", MARKET_A, "1", 400);
     let trade = position_row("TRADE", "0x52", MARKET_B, 0, "BUY", "7", "0.5", 400);
     let result = engine
-        .commit(vec![trade, conversion], &context(400, true))
+        .commit(vec![trade, conversion], &context(400, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::Conversion));
     assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
@@ -467,6 +488,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
                 "TRADE", "0x53", MARKET_B, 0, "BUY", "0.000001", "0.5", 401,
             )],
             &context(401, false),
+            zero_basis(),
         )
         .unwrap();
     assert!(
@@ -482,6 +504,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
         .commit(
             vec![pair_effect("MERGE", "0x61", MARKET_A, "0.000001", 500)],
             &context(500, true),
+            zero_basis(),
         )
         .unwrap();
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::Underflow));
@@ -493,6 +516,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
         .commit(
             vec![combo_effect("FUTURE_POSITION_EFFECT", "0x62", 501)],
             &context(501, true),
+            zero_basis(),
         )
         .unwrap();
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::UnknownEffect));
@@ -503,6 +527,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
         .commit(
             vec![combo_effect("CONVERSION", "0x63", 502)],
             &context(502, true),
+            zero_basis(),
         )
         .unwrap();
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::Conversion));
@@ -515,7 +540,7 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
     let split = pair_effect("SPLIT", "0x65", MARKET_A, "1", 550);
     let sell = position_row("TRADE", "0x66", MARKET_A, 0, "SELL", "2", "0.5", 550);
     let result = engine
-        .commit(vec![sell, split], &context(550, true))
+        .commit(vec![sell, split], &context(550, true), zero_basis())
         .unwrap();
     assert_eq!(
         result.newly_fenced,
@@ -532,7 +557,7 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
         pair_effect("SPLIT", "0x67", MARKET_A, "1.250000", 551),
         position_row("TRADE", "0x68", MARKET_B, 0, "BUY", "2.750000", "0.5", 551),
     ];
-    let result = engine.commit(disjoint, &no_copy).unwrap();
+    let result = engine.commit(disjoint, &no_copy, zero_basis()).unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_250_000);
     assert_eq!(state(&engine, MARKET_A, 1).atomic(), 1_250_000);
@@ -547,12 +572,16 @@ fn changed_or_late_equal_second_groups_fence_without_reapplying_prior_state() {
     no_copy.copy_eligible = false;
     let original = position_row("TRADE", "0x71", MARKET_A, 0, "BUY", "1.250000", "0.4", 600);
     let original_id = original.group_id.key().clone();
-    engine.commit(vec![original], &no_copy).unwrap();
+    engine
+        .commit(vec![original], &no_copy, zero_basis())
+        .unwrap();
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_250_000);
 
     let changed = position_row("TRADE", "0x71", MARKET_A, 0, "BUY", "9.000000", "0.4", 600);
     assert_eq!(changed.group_id.key(), &original_id);
-    let result = engine.commit(vec![changed], &no_copy).unwrap();
+    let result = engine
+        .commit(vec![changed], &no_copy, zero_basis())
+        .unwrap();
     assert_eq!(
         result.newly_fenced,
         Some(WalletFenceCause::RevisedAggregate)
@@ -562,9 +591,9 @@ fn changed_or_late_equal_second_groups_fence_without_reapplying_prior_state() {
 
     let (_dir, paper, mut engine) = fresh();
     let first = position_row("TRADE", "0x81", MARKET_A, 0, "BUY", "2", "0.4", 700);
-    engine.commit(vec![first], &no_copy).unwrap();
+    engine.commit(vec![first], &no_copy, zero_basis()).unwrap();
     let late = position_row("TRADE", "0x82", MARKET_B, 0, "BUY", "5", "0.6", 700);
-    let result = engine.commit(vec![late], &no_copy).unwrap();
+    let result = engine.commit(vec![late], &no_copy, zero_basis()).unwrap();
     assert_eq!(
         result.newly_fenced,
         Some(WalletFenceCause::LateEqualSecondGroup)

@@ -170,6 +170,12 @@ fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommit
     (dir, paper, engine)
 }
 
+fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
+    pe_service::bucket_commit::FrozenDecisionBasis {
+        win_rate_p: pe_core_types::Probability::ZERO,
+        bankroll: rust_decimal::Decimal::ZERO,
+    }
+}
 fn context(epoch: i64) -> BucketDecisionContext {
     BucketDecisionContext {
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
@@ -247,7 +253,9 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
         );
         let hook = Arc::new(move |step: usize, engine: &mut BucketCommitEngine| {
             if step == target_step {
-                engine.commit(vec![mutation.clone()], &context(20)).unwrap();
+                engine
+                    .commit(vec![mutation.clone()], &context(20), zero_basis())
+                    .unwrap();
             }
         });
         let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
@@ -430,7 +438,9 @@ async fn later_activity_atomically_invalidates_an_accepted_proof() {
     assert!(paper.position_validation_current(&wallet).unwrap());
 
     let mutation = aggregate(activity(wallet, 9, "1.000000", "0xlater", 20), wallet);
-    engine.commit(vec![mutation], &context(20)).unwrap();
+    engine
+        .commit(vec![mutation], &context(20), zero_basis())
+        .unwrap();
     assert!(
         !paper.position_validation_current(&wallet).unwrap(),
         "the activity commit and validation invalidation share one SQLite transaction"
@@ -648,7 +658,14 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                 } => {
                     let _ = committed.send(
                         engine
-                            .commit(aggregates, &context)
+                            .commit(
+                                aggregates,
+                                &context,
+                                pe_service::bucket_commit::FrozenDecisionBasis {
+                                    win_rate_p: pe_core_types::Probability::ZERO,
+                                    bankroll: rust_decimal::Decimal::ZERO,
+                                },
+                            )
                             .map_err(|error| error.to_string()),
                     );
                 }

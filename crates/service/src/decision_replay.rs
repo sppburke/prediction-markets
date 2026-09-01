@@ -1,6 +1,6 @@
 //! Pure replay and validation for post-boundary `decision_pending` evidence.
 
-use pe_core_types::{EventSeq, Price, SourceTradeId};
+use pe_core_types::{EventSeq, Price, Side, SourceTradeId};
 use pe_paper_state::{DecisionPendingRow, DecisionPendingState};
 use pe_venue_polymarket::LadderPlan;
 use serde::{Deserialize, Serialize};
@@ -379,6 +379,12 @@ pub struct ReplayedDecision {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayDecisionError {
+    #[error(
+        "terminal evidence is not bound to the frozen continuation (market/outcome/side/idempotency)"
+    )]
+    ContinuationBinding,
+    #[error("authority outcome contradicts the terminal disposition")]
+    AuthorityBinding,
     #[error("decision_pending row is not terminal")]
     OpenRow,
     #[error("frozen decision continuation: {0}")]
@@ -430,6 +436,39 @@ pub fn replay_decision_pending(
     {
         return Err(ReplayDecisionError::TerminalMismatch);
     }
+    // Semantic binding (#544 review round 3): a self-consistent document that
+    // describes a DIFFERENT market/outcome/side than the frozen continuation —
+    // or an authority outcome that contradicts the terminal disposition — must
+    // fail, or a recomputed-hash forgery replays as valid.
+    if let Some(fill) = post_boundary.body.terminal.fill.as_ref() {
+        if fill.market_id != continuation.market_id.0.0
+            || fill.outcome_id != continuation.outcome_id.0
+            || !fill.side.eq_ignore_ascii_case(match continuation.side {
+                Side::Buy => "buy",
+                Side::Sell => "sell",
+            })
+        {
+            return Err(ReplayDecisionError::ContinuationBinding);
+        }
+        if !fill
+            .idempotency_key
+            .contains(continuation.market_id.0.0.as_str())
+            && !fill
+                .idempotency_key
+                .contains(continuation.source_trade_id.0.as_str())
+        {
+            return Err(ReplayDecisionError::ContinuationBinding);
+        }
+    }
+    let disposition = post_boundary.body.terminal.disposition.as_str();
+    let authority_outcome = post_boundary.body.authority.outcome.as_str();
+    let authority_contradicts = (disposition == "fill"
+        && matches!(authority_outcome, "refused_settled" | "error"))
+        || (disposition.starts_with("no_fill") && authority_outcome == "applied")
+        || (disposition == "fill" && post_boundary.body.terminal.fill.is_none());
+    if authority_contradicts {
+        return Err(ReplayDecisionError::AuthorityBinding);
+    }
     Ok(ReplayedDecision {
         continuation,
         post_boundary,
@@ -475,6 +514,10 @@ mod tests {
             reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
             action_confidence_ppm: ProbabilityPpm(1_000_000),
             gate_result: "admitted".to_owned(),
+            frozen_basis: crate::bucket_commit::FrozenDecisionBasis {
+                win_rate_p: pe_core_types::Probability::ZERO,
+                bankroll: rust_decimal::Decimal::ZERO,
+            },
             applied_configuration_hash: applied_configuration.canonical_hash(),
             applied_configuration,
             decision_inputs: json!({"fixed_end": 1_700_000_010_i64, "pages": 1}),
@@ -552,7 +595,9 @@ mod tests {
             "fill",
             AuthorityEvidence::commit_fill_v2("applied", dec!(996)),
             TerminalDispositionEvidence::fill(
-                "winner-follow:fill".to_owned(),
+                // Canonical wf| key shape: the semantic binding requires the
+                // market or source id inside the key, as production keys carry.
+                format!("wf|0xleader|g2:fill|0x{}|0|buy|1700000000", "2".repeat(40)),
                 format!("0x{}", "2".repeat(40)),
                 0,
                 "buy",

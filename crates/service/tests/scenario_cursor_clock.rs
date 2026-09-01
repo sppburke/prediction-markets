@@ -170,7 +170,14 @@ async fn run_once(
                 );
                 let _ = committed.send(
                     engine
-                        .commit(aggregates, &context)
+                        .commit(
+                            aggregates,
+                            &context,
+                            pe_service::bucket_commit::FrozenDecisionBasis {
+                                win_rate_p: pe_core_types::Probability::ZERO,
+                                bankroll: rust_decimal::Decimal::ZERO,
+                            },
+                        )
                         .map_err(|error| error.to_string()),
                 );
             }

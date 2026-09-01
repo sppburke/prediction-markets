@@ -157,6 +157,13 @@ fn install_pending(
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
         gate_result: "admitted".to_owned(),
+        // Freeze the config-A world's mutable basis: the watchlist's 7000 bps
+        // win rate and the seeded $10k bankroll — a resumed continuation must
+        // decide under these even after live state changes (#544 round 3).
+        frozen_basis: pe_service::bucket_commit::FrozenDecisionBasis {
+            win_rate_p: pe_core_types::Probability(rust_decimal_macros::dec!(0.70)),
+            bankroll: rust_decimal::Decimal::from(10_000u32),
+        },
         applied_configuration_hash: applied_configuration.canonical_hash(),
         applied_configuration,
         decision_inputs: serde_json::json!({"fixed_end": source_epoch + 10, "pages": 1}),

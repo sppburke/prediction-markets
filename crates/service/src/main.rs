@@ -1131,17 +1131,28 @@ async fn main() -> Result<()> {
     // Mark appenders stopping before the final snapshot; their guards flush and join last.
     task_status.advance_phase(ShutdownPhase::Complete);
     shutdown.advance(ShutdownPhase::FinalStatus);
-    shutdown_timed_out |=
-        !join_named_until(&mut supervisor, &[TaskName::StatusWriter], deadline).await;
+    // The final status write gets its own minimum budget even when earlier
+    // phases exhausted the shared deadline (#544 review round 3): the last
+    // snapshot is the restart operator's primary evidence and must not be
+    // aborted just because a producer overspent.
+    let final_status_deadline =
+        deadline.max(tokio::time::Instant::now() + pe_service::supervisor::POST_ABORT_JOIN_BOUND);
+    shutdown_timed_out |= !join_named_until(
+        &mut supervisor,
+        &[TaskName::StatusWriter],
+        final_status_deadline,
+    )
+    .await;
     drop(log_guards);
     task_status.mark_stopped(TaskName::JsonTracingFullAppender);
     task_status.mark_stopped(TaskName::JsonTracingErrorAppender);
     shutdown.advance(ShutdownPhase::Complete);
     if !supervisor.join_all_bounded().await {
-        // A pinned non-yielding task cannot be joined; exiting is the bounded
-        // fallback — durable state recovers on the next start (#544 review).
-        error!("final join bound expired with unjoined owners; exiting");
-        shutdown_timed_out = true;
+        // A pinned non-yielding task never observes abort, and dropping the
+        // runtime would wait on it forever: force the bounded exit the plan
+        // promises — durable state recovers on the next start (#544 review).
+        eprintln!("pe-service: final join bound expired with unjoined owners; forcing exit");
+        std::process::exit(70);
     }
 
     info!("pe-service stopped");

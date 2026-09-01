@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance, classify_leader_action};
 use pe_core_types::{
-    LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ProbabilityPpm,
+    LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
     ReconstructionQuality, ShareAmount, Side, SourceTradeId, WalletAddress,
 };
 use pe_paper_state::{
@@ -21,6 +21,7 @@ use pe_position_ledger::{
     LedgerEffect, LedgerError, LedgerMutation, PositionLedger, WalletFenceCause,
 };
 use pe_source_polymarket_public::ActivityAggregate;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -54,6 +55,17 @@ pub struct BucketCommitResult {
     pub already_committed: bool,
 }
 
+/// Mutable decision inputs the orchestrator freezes atomically with the bucket
+/// transaction (#544 review round 3): the leader's win-rate probability and the
+/// pre-sizing bankroll. A resumed continuation evaluates under these, never a
+/// refreshed live watchlist or bankroll, so the same durable checkpoint always
+/// reproduces the same decision.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrozenDecisionBasis {
+    pub win_rate_p: Probability,
+    pub bankroll: Decimal,
+}
+
 /// Versioned, self-contained continuation frozen by the bucket transaction.
 /// Inputs read after this boundary are appended to paper/source logs and the
 /// terminal `decision_pending` transition; offline replay never executes it.
@@ -77,6 +89,7 @@ pub struct DecisionContinuationV2 {
     pub gate_result: String,
     pub applied_configuration_hash: String,
     pub applied_configuration: RuntimeConfig,
+    pub frozen_basis: FrozenDecisionBasis,
     pub decision_inputs: Value,
 }
 
@@ -220,6 +233,7 @@ impl BucketCommitEngine {
         &mut self,
         mut aggregates: Vec<ActivityAggregate>,
         context: &BucketDecisionContext,
+        frozen_basis: FrozenDecisionBasis,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let first = aggregates.first().ok_or(BucketCommitError::Empty)?;
         let wallet = first.group_id.components().wallet;
@@ -508,6 +522,7 @@ impl BucketCommitEngine {
                                 u32::from(context.reconstruction_quality.get()) * 10_000,
                             ),
                             gate_result: "admitted".to_owned(),
+                            frozen_basis,
                             applied_configuration_hash: context
                                 .applied_configuration
                                 .canonical_hash(),
