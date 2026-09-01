@@ -178,6 +178,12 @@ impl BucketCommitEngine {
         &self.ledger
     }
 
+    /// Move the validated boot ledger into the runtime orchestrator owner.
+    #[must_use]
+    pub fn into_ledger(self) -> PositionLedger {
+        self.ledger
+    }
+
     pub(crate) fn ledger_mut(&mut self) -> &mut PositionLedger {
         &mut self.ledger
     }

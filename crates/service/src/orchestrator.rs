@@ -283,29 +283,80 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     );
                 }
             }
+            OrchestratorControl::PrepareValidatedAdmissions {
+                validations,
+                acknowledged,
+            } => {
+                let result = validations
+                    .iter()
+                    .try_for_each(|validation| {
+                        if self.bucket_engine.is_fenced(&validation.wallet) {
+                            return Err(format!("wallet {} is fenced", validation.wallet));
+                        }
+                        let capture = crate::position_seeder::ledger_capture(
+                            self.bucket_engine.ledger(),
+                            validation.wallet,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        if capture.hash != validation.ledger_hash {
+                            return Err(format!(
+                                "wallet {} ledger changed before admission install",
+                                validation.wallet
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .and_then(|()| {
+                        self.paper_state
+                            .record_position_validations(&validations)
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = acknowledged.send(result);
+            }
+            OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                let result =
+                    crate::position_seeder::ledger_capture(self.bucket_engine.ledger(), wallet)
+                        .map_err(|error| error.to_string());
+                let _ = captured.send(result);
+            }
             OrchestratorControl::CommitActivityBucket {
                 aggregates,
                 context,
                 committed,
             } => {
-                let result = self.bucket_engine.commit(aggregates, &context);
-                if let Ok(result) = &result
-                    && result.newly_fenced.is_some()
-                {
-                    let mut fenced = HashSet::new();
-                    fenced.insert(result.wallet);
-                    if let Some(writer_lock) = &self.watchlist_writer_lock {
-                        let _writer_guard = writer_lock.lock().await;
+                // Every position-changing commit invalidates an accepted bracket in
+                // the same SQLite transaction. Serialize that commit against the
+                // final membership recheck/publication so a wallet cannot become
+                // visible from a proof invalidated between those two operations.
+                let writer_lock = self.watchlist_writer_lock.clone();
+                let result = if let Some(writer_lock) = writer_lock {
+                    let _writer_guard = writer_lock.lock().await;
+                    let result = self.bucket_engine.commit(aggregates, &context);
+                    if let Ok(result) = &result
+                        && result.newly_fenced.is_some()
+                    {
+                        let mut fenced = HashSet::new();
+                        fenced.insert(result.wallet);
                         self.live_watchlist.remove_fenced(&fenced);
-                    } else {
-                        // Scenario/unit construction may omit the production writer lock;
-                        // those harnesses have no competing membership writer.
+                        // #544 Phase 3 integration: the base service has no
+                        // membership/projection dirty sender to notify here. Its
+                        // owning projection lane must attach that coalescing sender
+                        // at this post-commit, post-removal boundary.
+                    }
+                    result
+                } else {
+                    // Scenario/unit construction may omit the production writer lock;
+                    // those harnesses have no competing membership writer.
+                    let result = self.bucket_engine.commit(aggregates, &context);
+                    if let Ok(result) = &result
+                        && result.newly_fenced.is_some()
+                    {
+                        let mut fenced = HashSet::new();
+                        fenced.insert(result.wallet);
                         self.live_watchlist.remove_fenced(&fenced);
                     }
-                    // #544 Phase 3 integration: the base service has no membership/projection
-                    // dirty sender to notify here. Its owning projection lane must attach that
-                    // coalescing sender at this post-commit, post-removal boundary.
-                }
+                    result
+                };
                 if let Ok(result) = &result {
                     for source_trade_id in &result.pending {
                         match self.load_pending_continuation(source_trade_id) {

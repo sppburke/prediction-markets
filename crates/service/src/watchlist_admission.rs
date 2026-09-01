@@ -11,6 +11,7 @@ use pe_paper_state::PaperStateDb;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::orchestrator_control::OrchestratorControl;
+use crate::position_seeder::CausalPositionValidator;
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
 
@@ -26,6 +27,10 @@ pub enum AdmissionError {
     AcknowledgementClosed,
     #[error("orchestrator admission preparation exceeded {0} seconds")]
     AcknowledgementTimeout(u64),
+    #[error("causal current-position validation unavailable: {0}")]
+    PositionValidation(String),
+    #[error("orchestrator rejected the accepted position brackets: {0}")]
+    ValidationInstall(String),
 }
 
 /// Shared serialized admission coordinator. Its durable checks are repeated by
@@ -39,6 +44,7 @@ struct Preparer {
     control_tx: mpsc::Sender<OrchestratorControl>,
     paper_state: Arc<PaperStateDb>,
     attempt: Mutex<()>,
+    validator: Option<CausalPositionValidator>,
 }
 
 impl AdmissionPreparer {
@@ -51,6 +57,23 @@ impl AdmissionPreparer {
                 control_tx,
                 paper_state,
                 attempt: Mutex::new(()),
+                validator: None,
+            }),
+        }
+    }
+
+    /// Production constructor with the five-step causal positions bracket.
+    pub fn with_validator(
+        control_tx: mpsc::Sender<OrchestratorControl>,
+        paper_state: Arc<PaperStateDb>,
+        validator: CausalPositionValidator,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Preparer {
+                control_tx,
+                paper_state,
+                attempt: Mutex::new(()),
+                validator: Some(validator),
             }),
         }
     }
@@ -90,20 +113,54 @@ impl AdmissionPreparer {
             return Err(AdmissionError::MissingHistory { missing });
         }
 
-        let (acknowledged, acknowledgement) = oneshot::channel();
-        let command = OrchestratorControl::PrepareAdmissions {
-            wallets: additions.to_vec(),
-            acknowledged,
+        let command = if let Some(validator) = &preparer.validator {
+            let accepted = validator
+                .validate_via_control(additions, &preparer.control_tx)
+                .await
+                .map_err(|error| AdmissionError::PositionValidation(error.to_string()))?;
+            let validations = accepted
+                .into_iter()
+                .map(|acceptance| acceptance.validation)
+                .collect();
+            let (acknowledged, acknowledgement) = oneshot::channel();
+            preparer
+                .control_tx
+                .send(OrchestratorControl::PrepareValidatedAdmissions {
+                    validations,
+                    acknowledged,
+                })
+                .await
+                .map_err(|_| AdmissionError::ControlClosed)?;
+            return tokio::time::timeout(
+                Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
+                acknowledgement,
+            )
+            .await
+            .map_err(|_| {
+                AdmissionError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS)
+            })?
+            .map_err(|_| AdmissionError::AcknowledgementClosed)?
+            .map_err(AdmissionError::ValidationInstall);
+        } else {
+            let (acknowledged, acknowledgement) = oneshot::channel();
+            (
+                OrchestratorControl::PrepareAdmissions {
+                    wallets: additions.to_vec(),
+                    acknowledged,
+                },
+                acknowledgement,
+            )
         };
         tokio::time::timeout(
             Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
             async {
                 preparer
                     .control_tx
-                    .send(command)
+                    .send(command.0)
                     .await
                     .map_err(|_| AdmissionError::ControlClosed)?;
-                acknowledgement
+                command
+                    .1
                     .await
                     .map_err(|_| AdmissionError::AcknowledgementClosed)
             },

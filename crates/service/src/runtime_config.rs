@@ -159,7 +159,6 @@ pub struct RuntimeConfig {
     pub demotion_cb_alpha: String,
     pub min_resolution_horizon_secs: u64,
     pub max_resolution_horizon_secs: u64,
-    pub position_page_limit: u32,
     pub paper_fill_haircut_bps: u32,
     pub paper_fill_slippage_bps: u32,
     /// Paper fill-price mode (#486): `ClobBestAsk` (best-ask BUY fill) or `LeaderHaircut`
@@ -206,7 +205,6 @@ impl RuntimeConfig {
             demotion_cb_alpha: cfg.demotion_cb_alpha.clone(),
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
-            position_page_limit: cfg.position_page_limit,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
             paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
             fill_mode: FillMode::parse(&cfg.fill_mode).unwrap_or_else(|| {
@@ -324,7 +322,6 @@ pub fn parse_config(
         "max_resolution_horizon_secs",
         &mut out.max_resolution_horizon_secs,
     );
-    apply_parsed(&map, "position_page_limit", &mut out.position_page_limit);
     apply_parsed(
         &map,
         "paper_fill_haircut_bps",
@@ -911,12 +908,10 @@ mod tests {
     fn unparseable_field_keeps_last_known_good() {
         let boot = RuntimeConfig::from_service_config(&ServiceConfig::default());
         let rows = vec![
-            row("position_page_limit", "not_a_number", "integer"),
             row("max_fill_price", "not_a_decimal", "decimal"),
             row("paper_fill_haircut_bps", "777", "integer"), // a valid one still applies
         ];
         let out = parse_config(&rows, &boot, false);
-        assert_eq!(out.position_page_limit, boot.position_page_limit);
         assert_eq!(out.max_fill_price, boot.max_fill_price);
         assert_eq!(out.paper_fill_haircut_bps, 777);
     }

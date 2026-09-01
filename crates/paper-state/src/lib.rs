@@ -204,6 +204,18 @@ pub struct WalletHistoryStatusRecord {
     pub updated_at_unix: i64,
 }
 
+/// One accepted five-step activity/current-position bracket (#544).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionValidationRecord {
+    pub wallet: WalletAddress,
+    pub ledger_hash: String,
+    pub positions_proof_hash: String,
+    pub activity_bounds_json: String,
+    pub source_log_generation: String,
+    pub proof_json: String,
+    pub recorded_at_unix: i64,
+}
+
 /// Frozen continuation created in the same transaction as an admitted entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionPendingRecord {
@@ -615,6 +627,7 @@ impl PaperStateDb {
             )
             .optional()?
             .is_some();
+        let mut invalidates_position_validation = false;
 
         for record in &bucket.dispositions {
             let existing: Option<(String, String, String, String, i64, String, String)> = tx
@@ -661,7 +674,9 @@ impl PaperStateDb {
                         record.source_trade_id.0.clone(),
                     ));
                 }
+                invalidates_position_validation |= retained_revision;
             } else {
+                invalidates_position_validation = true;
                 tx.execute(
                     "INSERT INTO activity_groups \
                          (source_trade_id, transaction_hash, wallet_hex, source_epoch, \
@@ -899,6 +914,12 @@ impl PaperStateDb {
                 params![bucket.wallet.to_string(), bucket.source_epoch],
             )?;
         }
+        if invalidates_position_validation {
+            tx.execute(
+                "DELETE FROM position_validations WHERE wallet_hex = ?1",
+                params![bucket.wallet.to_string()],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -969,6 +990,80 @@ impl PaperStateDb {
             ],
         )?;
         Ok(())
+    }
+
+    /// Install one all-or-nothing set of accepted causal position brackets.
+    pub fn record_position_validations(
+        &self,
+        validations: &[PositionValidationRecord],
+    ) -> Result<(), PaperStateError> {
+        for validation in validations {
+            serde_json::from_str::<serde_json::Value>(&validation.activity_bounds_json)?;
+            serde_json::from_str::<serde_json::Value>(&validation.proof_json)?;
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for validation in validations {
+            tx.execute(
+                "INSERT INTO position_validations \
+                     (wallet_hex, ledger_hash, positions_proof_hash, activity_bounds_json, \
+                      source_log_generation, proof_json, recorded_at_unix) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(wallet_hex) DO UPDATE SET \
+                     ledger_hash = excluded.ledger_hash, \
+                     positions_proof_hash = excluded.positions_proof_hash, \
+                     activity_bounds_json = excluded.activity_bounds_json, \
+                     source_log_generation = excluded.source_log_generation, \
+                     proof_json = excluded.proof_json, \
+                     recorded_at_unix = excluded.recorded_at_unix",
+                params![
+                    validation.wallet.to_string(),
+                    validation.ledger_hash,
+                    validation.positions_proof_hash,
+                    validation.activity_bounds_json,
+                    validation.source_log_generation,
+                    validation.proof_json,
+                    validation.recorded_at_unix,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return the currently accepted bracket, if no later activity invalidated it.
+    pub fn position_validation(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Option<PositionValidationRecord>, PaperStateError> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT ledger_hash, positions_proof_hash, activity_bounds_json, \
+                    source_log_generation, proof_json, recorded_at_unix \
+             FROM position_validations WHERE wallet_hex = ?1",
+            params![wallet.to_string()],
+            |row| {
+                Ok(PositionValidationRecord {
+                    wallet: *wallet,
+                    ledger_hash: row.get(0)?,
+                    positions_proof_hash: row.get(1)?,
+                    activity_bounds_json: row.get(2)?,
+                    source_log_generation: row.get(3)?,
+                    proof_json: row.get(4)?,
+                    recorded_at_unix: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(PaperStateError::from)
+    }
+
+    /// Whether a causal position bracket is still current for publication.
+    pub fn position_validation_current(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<bool, PaperStateError> {
+        Ok(self.position_validation(wallet)?.is_some())
     }
 
     /// Complete-history wallet set used to initialize the bucket gate owner.

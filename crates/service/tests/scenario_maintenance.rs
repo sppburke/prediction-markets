@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
-use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{PaperStateDb, PositionValidationRecord, WalletHistoryStatusRecord};
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::runtime_config::{
@@ -143,6 +143,20 @@ fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
         })
         .unwrap();
     }
+    db.record_position_validations(
+        &(u8::MIN..=u8::MAX)
+            .map(|n| PositionValidationRecord {
+                wallet: wallet(n),
+                ledger_hash: format!("ledger-{n}"),
+                positions_proof_hash: format!("positions-{n}"),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                proof_json: "{\"scenario\":true}".to_owned(),
+                recorded_at_unix: 1,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     (dir, db)
 }
 

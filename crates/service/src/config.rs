@@ -51,11 +51,6 @@ pub struct ServiceConfig {
     #[serde(default = "default_trade_poll_interval_secs")]
     pub trade_poll_interval_secs: u64,
 
-    /// Maximum positions to fetch per page for the causal positions bracket.
-    /// See `docs/_GLOSSARY.md`: `position_page_limit`.
-    #[serde(default = "default_position_page_limit")]
-    pub position_page_limit: u32,
-
     // ── Logging / persistence ────────────────────────────────────────────────
     /// Path to the BLAKE3-chained binary event log.
     #[serde(default = "default_event_log_path")]
@@ -409,10 +404,6 @@ const fn default_demotion_pnl_window_secs() -> u64 {
     2_592_000 // 30 d
 }
 
-const fn default_position_page_limit() -> u32 {
-    500
-}
-
 fn default_source_event_log_path() -> PathBuf {
     PathBuf::from("source_events.log")
 }
@@ -498,7 +489,6 @@ impl Default for ServiceConfig {
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
-            position_page_limit: default_position_page_limit(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
             status_path: default_status_path(),
@@ -576,7 +566,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "polymarket_base_url",
         "polymarket_channel_capacity",
         "trade_poll_interval_secs",
-        "position_page_limit",
         "event_log_path",
         "polymarket_activity_ws_enabled",
         "source_event_log_path",
@@ -620,13 +609,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
             cfg.copy_latency_budget_secs
         )));
     }
-    // #542: pagination advances on the decoded row count against this limit; a zero limit can
-    // never observe a short page, so every wallet would fail at the page cap.
-    if cfg.position_page_limit == 0 {
-        return Err(ServiceConfigError::Invalid(
-            "position_page_limit must be at least 1, got 0".to_owned(),
-        ));
-    }
     Ok(cfg)
 }
 
@@ -651,14 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_position_page_limit_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("svc.toml");
-        std::fs::write(&path, "position_page_limit = 0\n").unwrap();
-        assert!(load(Some(&path)).is_err());
-    }
-
-    #[test]
     fn default_values() {
         let cfg = ServiceConfig::default();
         assert_eq!(cfg.bind, "127.0.0.1:8080");
@@ -674,7 +648,6 @@ mod tests {
         assert_eq!(cfg.fill_mode, "clob_best_ask");
         assert_eq!(cfg.clob_best_ask_fallback_haircut_bps, 100);
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
-        assert_eq!(cfg.position_page_limit, 500);
         assert_eq!(cfg.max_resolution_horizon_secs, 172_800);
         assert_eq!(cfg.min_resolution_horizon_secs, 60);
         assert_eq!(cfg.max_fill_price, "0.85");
@@ -808,7 +781,6 @@ mode = "shadow"
                 "max_resolution_horizon_secs",
                 d.max_resolution_horizon_secs.to_string(),
             ),
-            ("position_page_limit", d.position_page_limit.to_string()),
             (
                 "paper_fill_haircut_bps",
                 d.paper_fill_haircut_bps.to_string(),
@@ -900,6 +872,7 @@ mode = "shadow"
             // those inert seed rows until their owning lane removes them.
             .chain([
                 "entry_gate_fail_closed",
+                "position_page_limit",
                 "position_reseed_interval_secs",
                 "position_size_threshold",
             ])

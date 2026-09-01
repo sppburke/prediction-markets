@@ -1,43 +1,561 @@
-//! Strict Polymarket positions-API parsing for read-only reconciliation evidence.
+//! Causal current-position validation for watchlist admission (#544).
 //!
-//! Parsing is isolated in [`parse_positions`]; the paginated HTTP fetch lives in
-//! the private [`fetch_positions_for_wallet`]; [`seed_all`] sequences wallets
-//! warn-and-continuing on per-wallet failures. The service no longer runs a
-//! wholesale-replacement reseed loop (#544); Lane D may reuse this parser for
-//! causal before/after position brackets.
+//! The ordered activity ledger remains the sole position owner. This module
+//! performs the five-step activity/positions bracket and installs only an
+//! accepted proof; it never overlays or reseeds the ledger.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-use pe_copy_signal_engine::{PositionSnapshot, PositionState};
+use pe_copy_signal_engine::{PositionSnapshot, PositionState, SignalConfig};
 use pe_core_types::{
-    MarketId, MarketOutcomeId, OutcomeId, ShareAmount, VenueMarketId, WalletAddress,
+    MarketId, MarketOutcomeId, OutcomeId, ReconstructionQuality, ShareAmount, VenueMarketId,
+    WalletAddress,
 };
-use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
+use pe_paper_state::{PaperStateDb, PositionValidationRecord};
+use pe_position_ledger::PositionLedger;
+use pe_source_polymarket_public::{
+    CompleteActivityRead, CompletePositionsRead, PositionClassification, ReconciliationFetcher,
+    fetch_complete_activity, fetch_complete_positions,
+};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use thiserror::Error;
-use tracing::warn;
+use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
 
-/// Safety backstop: stop paginating after this many pages per wallet.
-/// A wallet whose response rows exceed `page_limit × POSITION_MAX_PAGES` cannot be snapshotted
-/// completely, so the fetch fails rather than returning a truncated portfolio (#542): a missing
-/// open position classifies the leader's next BUY as a first Entry.
-const POSITION_MAX_PAGES: u32 = 20;
+use crate::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
+use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
 
-// ── DTO ───────────────────────────────────────────────────────────────────────
+#[cfg(feature = "scenario")]
+type BracketStepHook = Arc<dyn Fn(usize, &mut BucketCommitEngine) + Send + Sync>;
 
-#[derive(Deserialize)]
+/// An accepted proof waiting for the orchestrator's final ledger-hash recheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionAcceptance {
+    pub validation: PositionValidationRecord,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CausalPositionError {
+    #[error("activity catch-up for {wallet}: {source}")]
+    Activity {
+        wallet: WalletAddress,
+        source: pe_source_polymarket_public::ActivityReadError,
+    },
+    #[error("positions read for {wallet}: {source}")]
+    Positions {
+        wallet: WalletAddress,
+        source: pe_source_polymarket_public::PositionReadError,
+    },
+    #[error("activity bucket proof encoding failed: {0}")]
+    ProofEncoding(#[from] serde_json::Error),
+    #[error("activity bucket commit failed for {wallet}: {message}")]
+    BucketCommit {
+        wallet: WalletAddress,
+        message: String,
+    },
+    #[error("wallet {wallet} became durably fenced during validation")]
+    Fenced { wallet: WalletAddress },
+    #[error("activity changed between bracket steps for {wallet}")]
+    InterveningActivity { wallet: WalletAddress },
+    #[error("current-position semantic proofs changed for {wallet}")]
+    PositionRevision { wallet: WalletAddress },
+    #[error("activity ledger changed between bracket steps for {wallet}")]
+    LedgerRevision { wallet: WalletAddress },
+    #[error("activity fixed end moved backwards for {wallet}: previous {previous}, next {next}")]
+    NonMonotonicActivityBounds {
+        wallet: WalletAddress,
+        previous: i64,
+        next: i64,
+    },
+    #[error("stable current positions do not match the activity ledger for {wallet}")]
+    StableMismatch { wallet: WalletAddress },
+    #[error("orchestrator control channel closed during position validation")]
+    ControlClosed,
+    #[error("orchestrator dropped a position-validation acknowledgement")]
+    AcknowledgementClosed,
+    #[error("ledger proof contains multiple assets for {condition_id} outcome {outcome}")]
+    DuplicateOutcome { condition_id: String, outcome: u16 },
+    #[error("ledger proof component is too long")]
+    ProofComponentTooLong,
+    #[error("paper-state position proof install failed: {0}")]
+    PaperState(#[from] pe_paper_state::PaperStateError),
+    #[error("reconstruction quality invariant failed")]
+    ReconstructionQuality,
+}
+
+/// Shared real/fake-source bracket implementation.
+#[derive(Clone)]
+pub struct CausalPositionValidator {
+    fetcher: Arc<dyn ReconciliationFetcher>,
+    base_url: Arc<str>,
+    source_log_generation: Arc<str>,
+    now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    #[cfg(feature = "scenario")]
+    step_hook: Option<BracketStepHook>,
+}
+
+impl CausalPositionValidator {
+    pub fn new(
+        fetcher: Arc<dyn ReconciliationFetcher>,
+        base_url: impl Into<Arc<str>>,
+        source_log_generation: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            fetcher,
+            base_url: base_url.into(),
+            source_log_generation: source_log_generation.into(),
+            now: Arc::new(|| time::OffsetDateTime::now_utc().unix_timestamp()),
+            #[cfg(feature = "scenario")]
+            step_hook: None,
+        }
+    }
+
+    /// Deterministic bracket clock for hermetic scenario tests.
+    #[cfg(feature = "scenario")]
+    #[must_use]
+    pub fn with_clock(mut self, now: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Inject a deterministic mutation between bracket steps in scenario tests.
+    #[cfg(feature = "scenario")]
+    #[must_use]
+    pub fn with_step_hook(mut self, hook: BracketStepHook) -> Self {
+        self.step_hook = Some(hook);
+        self
+    }
+
+    /// Validate every wallet through the live orchestrator owner. The caller
+    /// sends all returned acceptances in one final installation command.
+    pub async fn validate_via_control(
+        &self,
+        wallets: &[WalletAddress],
+        control_tx: &mpsc::Sender<OrchestratorControl>,
+    ) -> Result<Vec<AdmissionAcceptance>, CausalPositionError> {
+        let mut accepted = Vec::with_capacity(wallets.len());
+        for wallet in wallets {
+            accepted.push(self.validate_one_control(*wallet, control_tx).await?);
+        }
+        Ok(accepted)
+    }
+
+    /// Boot-time form used before producers start. The same bucket engine is
+    /// moved into the orchestrator after the atomic proof installation.
+    pub async fn validate_direct(
+        &self,
+        wallets: &[WalletAddress],
+        engine: &mut BucketCommitEngine,
+        paper_state: &PaperStateDb,
+    ) -> Result<Vec<AdmissionAcceptance>, CausalPositionError> {
+        let mut accepted = Vec::with_capacity(wallets.len());
+        for wallet in wallets {
+            accepted.push(self.validate_one_direct(*wallet, engine).await?);
+        }
+        let records = accepted
+            .iter()
+            .map(|acceptance| acceptance.validation.clone())
+            .collect::<Vec<_>>();
+        for record in &records {
+            let current = ledger_capture(engine.ledger(), record.wallet)?;
+            if current.hash != record.ledger_hash || engine.is_fenced(&record.wallet) {
+                return Err(CausalPositionError::LedgerRevision {
+                    wallet: record.wallet,
+                });
+            }
+        }
+        paper_state.record_position_validations(&records)?;
+        Ok(accepted)
+    }
+
+    async fn validate_one_control(
+        &self,
+        wallet: WalletAddress,
+        control_tx: &mpsc::Sender<OrchestratorControl>,
+    ) -> Result<AdmissionAcceptance, CausalPositionError> {
+        let first_activity = self.activity(wallet).await?;
+        self.commit_control(wallet, &first_activity, control_tx, false)
+            .await?;
+        let first_ledger = capture_control(wallet, control_tx).await?;
+        let first_mapping = first_activity
+            .asset_mapping()
+            .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+        let first_positions = self.positions(wallet, &first_mapping).await?;
+
+        let second_activity = self.activity(wallet).await?;
+        if self
+            .commit_control(wallet, &second_activity, control_tx, true)
+            .await?
+        {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let second_ledger = capture_control(wallet, control_tx).await?;
+        let second_mapping = second_activity
+            .asset_mapping()
+            .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+        let second_positions = self.positions(wallet, &second_mapping).await?;
+
+        let final_activity = self.activity(wallet).await?;
+        if self
+            .commit_control(wallet, &final_activity, control_tx, true)
+            .await?
+        {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let final_ledger = capture_control(wallet, control_tx).await?;
+        self.finish(
+            wallet,
+            [&first_activity, &second_activity, &final_activity],
+            [&first_ledger, &second_ledger, &final_ledger],
+            &first_positions,
+            &second_positions,
+        )
+    }
+
+    async fn validate_one_direct(
+        &self,
+        wallet: WalletAddress,
+        engine: &mut BucketCommitEngine,
+    ) -> Result<AdmissionAcceptance, CausalPositionError> {
+        let first_activity = self.activity(wallet).await?;
+        commit_direct(
+            wallet,
+            &first_activity,
+            engine,
+            false,
+            &self.source_log_generation,
+        )?;
+        let first_ledger = ledger_capture(engine.ledger(), wallet)?;
+        self.run_step_hook(1, engine);
+        let first_mapping = first_activity
+            .asset_mapping()
+            .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+        let first_positions = self.positions(wallet, &first_mapping).await?;
+        self.run_step_hook(2, engine);
+
+        let second_activity = self.activity(wallet).await?;
+        if commit_direct(
+            wallet,
+            &second_activity,
+            engine,
+            true,
+            &self.source_log_generation,
+        )? {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let second_ledger = ledger_capture(engine.ledger(), wallet)?;
+        self.run_step_hook(3, engine);
+        let second_mapping = second_activity
+            .asset_mapping()
+            .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+        let second_positions = self.positions(wallet, &second_mapping).await?;
+        self.run_step_hook(4, engine);
+
+        let final_activity = self.activity(wallet).await?;
+        if commit_direct(
+            wallet,
+            &final_activity,
+            engine,
+            true,
+            &self.source_log_generation,
+        )? {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let final_ledger = ledger_capture(engine.ledger(), wallet)?;
+        self.finish(
+            wallet,
+            [&first_activity, &second_activity, &final_activity],
+            [&first_ledger, &second_ledger, &final_ledger],
+            &first_positions,
+            &second_positions,
+        )
+    }
+
+    #[cfg(feature = "scenario")]
+    fn run_step_hook(&self, step: usize, engine: &mut BucketCommitEngine) {
+        if let Some(hook) = &self.step_hook {
+            hook(step, engine);
+        }
+    }
+
+    #[cfg(not(feature = "scenario"))]
+    fn run_step_hook(&self, _step: usize, _engine: &mut BucketCommitEngine) {}
+
+    async fn activity(
+        &self,
+        wallet: WalletAddress,
+    ) -> Result<CompleteActivityRead, CausalPositionError> {
+        fetch_complete_activity(
+            self.fetcher.as_ref(),
+            &self.base_url,
+            wallet,
+            None,
+            (self.now)(),
+        )
+        .await
+        .map_err(|source| CausalPositionError::Activity { wallet, source })
+    }
+
+    async fn positions(
+        &self,
+        wallet: WalletAddress,
+        mapping: &pe_source_polymarket_public::ActivityAssetMapping,
+    ) -> Result<CompletePositionsRead, CausalPositionError> {
+        fetch_complete_positions(self.fetcher.as_ref(), &self.base_url, wallet, mapping)
+            .await
+            .map_err(|source| CausalPositionError::Positions { wallet, source })
+    }
+
+    async fn commit_control(
+        &self,
+        wallet: WalletAddress,
+        activity: &CompleteActivityRead,
+        control_tx: &mpsc::Sender<OrchestratorControl>,
+        count_change: bool,
+    ) -> Result<bool, CausalPositionError> {
+        let mut changed = false;
+        for bucket in activity
+            .buckets()
+            .map_err(|source| CausalPositionError::Activity { wallet, source })?
+        {
+            let (committed, acknowledgement) = oneshot::channel();
+            control_tx
+                .send(OrchestratorControl::CommitActivityBucket {
+                    aggregates: bucket,
+                    context: bracket_context(activity, &self.source_log_generation)?,
+                    committed,
+                })
+                .await
+                .map_err(|_| CausalPositionError::ControlClosed)?;
+            let result = acknowledgement
+                .await
+                .map_err(|_| CausalPositionError::AcknowledgementClosed)?
+                .map_err(|message| CausalPositionError::BucketCommit { wallet, message })?;
+            if result.newly_fenced.is_some() {
+                return Err(CausalPositionError::Fenced { wallet });
+            }
+            changed |= count_change && !result.already_committed;
+        }
+        Ok(changed)
+    }
+
+    fn finish(
+        &self,
+        wallet: WalletAddress,
+        activities: [&CompleteActivityRead; 3],
+        ledgers: [&AdmissionLedgerCapture; 3],
+        first_positions: &CompletePositionsRead,
+        second_positions: &CompletePositionsRead,
+    ) -> Result<AdmissionAcceptance, CausalPositionError> {
+        for pair in activities.windows(2) {
+            if pair[1].fixed_end < pair[0].fixed_end {
+                return Err(CausalPositionError::NonMonotonicActivityBounds {
+                    wallet,
+                    previous: pair[0].fixed_end,
+                    next: pair[1].fixed_end,
+                });
+            }
+        }
+        if !first_positions.semantically_equal(second_positions) {
+            return Err(CausalPositionError::PositionRevision { wallet });
+        }
+        if ledgers[0].hash != ledgers[1].hash || ledgers[1].hash != ledgers[2].hash {
+            return Err(CausalPositionError::LedgerRevision { wallet });
+        }
+        let position_balances = ordinary_position_balances(first_positions)?;
+        if position_balances != ledgers[2].positive_ordinary_balances
+            || ledgers[2].has_positive_short
+        {
+            return Err(CausalPositionError::StableMismatch { wallet });
+        }
+
+        let activity_bounds = activities
+            .iter()
+            .map(|activity| {
+                activity
+                    .pages
+                    .iter()
+                    .map(|page| {
+                        json!({
+                            "request_url": page.request_url,
+                            "bounds": page.bounds,
+                            "offset": page.offset,
+                            "row_count": page.row_count,
+                            "canonical_page_hash": page.canonical_page_hash,
+                            "raw_page_hash": page.raw_page_hash,
+                            "received_at": page.received_at,
+                            "schema_version": page.schema_version,
+                            "parser_version": page.parser_version,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let proof = json!({
+            "version": 1,
+            "wallet": wallet,
+            "positions_semantic_hash": first_positions.semantic_hash(),
+            "ledger_hash": ledgers[2].hash,
+            "source_log_generation": self.source_log_generation,
+            "activity_walks": activity_bounds,
+            "positions_pages": [
+                first_positions.pages,
+                second_positions.pages,
+            ],
+        });
+        Ok(AdmissionAcceptance {
+            validation: PositionValidationRecord {
+                wallet,
+                ledger_hash: ledgers[2].hash.clone(),
+                positions_proof_hash: first_positions.semantic_hash().to_owned(),
+                activity_bounds_json: serde_json::to_string(&activity_bounds)?,
+                source_log_generation: self.source_log_generation.to_string(),
+                proof_json: serde_json::to_string(&proof)?,
+                recorded_at_unix: (self.now)(),
+            },
+        })
+    }
+}
+
+fn bracket_context(
+    activity: &CompleteActivityRead,
+    source_log_generation: &str,
+) -> Result<BucketDecisionContext, CausalPositionError> {
+    let reconstruction_quality =
+        ReconstructionQuality::new(100).map_err(|_| CausalPositionError::ReconstructionQuality)?;
+    Ok(BucketDecisionContext {
+        applied_configuration_hash: "causal-position-bracket-v1".to_owned(),
+        decision_inputs_json: serde_json::to_string(&json!({
+            "fixed_end": activity.fixed_end,
+            "pages": activity.pages,
+            "source_log_generation": source_log_generation,
+        }))?,
+        reconstruction_quality,
+        signal_config: SignalConfig::default(),
+        copy_eligible: false,
+        recorded_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        history_status: None,
+    })
+}
+
+fn commit_direct(
+    wallet: WalletAddress,
+    activity: &CompleteActivityRead,
+    engine: &mut BucketCommitEngine,
+    count_change: bool,
+    source_log_generation: &str,
+) -> Result<bool, CausalPositionError> {
+    let mut changed = false;
+    for bucket in activity
+        .buckets()
+        .map_err(|source| CausalPositionError::Activity { wallet, source })?
+    {
+        let result = engine
+            .commit(bucket, &bracket_context(activity, source_log_generation)?)
+            .map_err(|error| CausalPositionError::BucketCommit {
+                wallet,
+                message: error.to_string(),
+            })?;
+        if result.newly_fenced.is_some() {
+            return Err(CausalPositionError::Fenced { wallet });
+        }
+        changed |= count_change && !result.already_committed;
+    }
+    Ok(changed)
+}
+
+/// Canonical exact ledger proof for one wallet.
+pub fn ledger_capture(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+) -> Result<AdmissionLedgerCapture, CausalPositionError> {
+    let mut all = BTreeMap::<(String, u16), (ShareAmount, ShareAmount)>::new();
+    if let Some(snapshot) = ledger.position(&wallet) {
+        for (key, state) in &snapshot.positions {
+            all.insert(
+                (key.market().to_string(), key.outcome().0),
+                (state.long_contracts, state.short_contracts),
+            );
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"prediction-edge/admission-ledger/v1\0");
+    hash_part(&mut hasher, wallet.to_string().as_bytes())?;
+    let mut positive_ordinary_balances = BTreeMap::new();
+    let mut has_positive_short = false;
+    for ((condition_id, outcome), (long, short)) in all {
+        hash_part(&mut hasher, condition_id.as_bytes())?;
+        hash_part(&mut hasher, &outcome.to_be_bytes())?;
+        hash_part(&mut hasher, &long.atomic().to_be_bytes())?;
+        hash_part(&mut hasher, &short.atomic().to_be_bytes())?;
+        if long > ShareAmount::ZERO {
+            positive_ordinary_balances.insert((condition_id, outcome), long);
+        }
+        has_positive_short |= short > ShareAmount::ZERO;
+    }
+    Ok(AdmissionLedgerCapture {
+        wallet,
+        hash: hasher.finalize().to_hex().to_string(),
+        positive_ordinary_balances,
+        has_positive_short,
+    })
+}
+
+fn ordinary_position_balances(
+    read: &CompletePositionsRead,
+) -> Result<BTreeMap<(String, u16), ShareAmount>, CausalPositionError> {
+    let mut balances = BTreeMap::new();
+    for position in &read.positions {
+        if position.classification == PositionClassification::Combo
+            || position.size == ShareAmount::ZERO
+        {
+            continue;
+        }
+        let key = (position.condition_id.0.clone(), position.outcome.0);
+        if balances.insert(key.clone(), position.size).is_some() {
+            return Err(CausalPositionError::DuplicateOutcome {
+                condition_id: key.0,
+                outcome: key.1,
+            });
+        }
+    }
+    Ok(balances)
+}
+
+fn hash_part(hasher: &mut blake3::Hasher, value: &[u8]) -> Result<(), CausalPositionError> {
+    let len = u64::try_from(value.len()).map_err(|_| CausalPositionError::ProofComponentTooLong)?;
+    hasher.update(&len.to_be_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+async fn capture_control(
+    wallet: WalletAddress,
+    control_tx: &mpsc::Sender<OrchestratorControl>,
+) -> Result<AdmissionLedgerCapture, CausalPositionError> {
+    let (captured, acknowledgement) = oneshot::channel();
+    control_tx
+        .send(OrchestratorControl::CaptureAdmissionLedger { wallet, captured })
+        .await
+        .map_err(|_| CausalPositionError::ControlClosed)?;
+    acknowledgement
+        .await
+        .map_err(|_| CausalPositionError::AcknowledgementClosed)?
+        .map_err(|message| CausalPositionError::BucketCommit { wallet, message })
+}
+
+// Retained only for the isolated stopped canary, whose authenticated posture
+// needs strict `outcomeIndex` parsing but does not mutate the ordinary ledger.
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawPosition {
+struct CanaryRawPosition {
     condition_id: String,
-    #[serde(default)]
     outcome_index: Option<u16>,
     size: Decimal,
 }
 
-// ── Errors ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum PositionParseError {
     #[error("failed to deserialize positions response: {0}")]
     Json(#[from] serde_json::Error),
@@ -47,398 +565,35 @@ pub enum PositionParseError {
     InvalidAmount { value: Decimal, reason: String },
 }
 
-// ── Parse ─────────────────────────────────────────────────────────────────────
-
-/// Parse a flat-array positions response into a [`PositionSnapshot`].
-///
-/// Exact zero positions are skipped. Holdings are always long
-/// (`short_contracts = 0`), as the API returns only outcome tokens held.
-pub fn parse_positions(
+pub fn parse_positions_strict(
     bytes: &[u8],
     wallet: WalletAddress,
 ) -> Result<PositionSnapshot, PositionParseError> {
-    parse_positions_counted(bytes, wallet).map(|(snapshot, _)| snapshot)
-}
-
-/// Parse a page and also report the number of rows the response actually carried.
-///
-/// Pagination must advance on the decoded row count, never on the retained position count:
-/// zero rows are skipped and duplicate `(market, outcome)` keys collapse, so a full page can
-/// retain fewer entries than `limit` and would otherwise be read as "history exhausted" (#542).
-fn parse_positions_counted(
-    bytes: &[u8],
-    wallet: WalletAddress,
-) -> Result<(PositionSnapshot, usize), PositionParseError> {
-    let raw: Vec<RawPosition> = serde_json::from_slice(bytes)?;
-    let decoded_rows = raw.len();
+    let raw: Vec<CanaryRawPosition> = serde_json::from_slice(bytes)?;
     let mut positions = HashMap::new();
     for item in raw {
-        let qty = ShareAmount::from_decimal_exact(item.size).map_err(|error| {
+        let outcome = item
+            .outcome_index
+            .ok_or(PositionParseError::MissingOutcomeIndex)?;
+        let amount = ShareAmount::from_decimal_exact(item.size).map_err(|error| {
             PositionParseError::InvalidAmount {
                 value: item.size,
                 reason: error.to_string(),
             }
         })?;
-        if qty == ShareAmount::ZERO {
+        if amount == ShareAmount::ZERO {
             continue;
         }
-        let market_id = MarketId(VenueMarketId(item.condition_id));
-        let key = MarketOutcomeId::new(market_id, OutcomeId(item.outcome_index.unwrap_or(0)));
         positions.insert(
-            key,
+            MarketOutcomeId::new(
+                MarketId(VenueMarketId(item.condition_id)),
+                OutcomeId(outcome),
+            ),
             PositionState {
-                long_contracts: qty,
+                long_contracts: amount,
                 short_contracts: ShareAmount::ZERO,
             },
         );
     }
-    Ok((PositionSnapshot { wallet, positions }, decoded_rows))
-}
-
-/// Parse live-canary positions without the ordinary parser's legacy outcome-zero default.
-pub fn parse_positions_strict(
-    bytes: &[u8],
-    wallet: WalletAddress,
-) -> Result<PositionSnapshot, PositionParseError> {
-    let raw: Vec<RawPosition> = serde_json::from_slice(bytes)?;
-    if raw.iter().any(|position| position.outcome_index.is_none()) {
-        return Err(PositionParseError::MissingOutcomeIndex);
-    }
-    parse_positions(bytes, wallet)
-}
-
-// ── Fetch ─────────────────────────────────────────────────────────────────────
-
-async fn fetch_positions_for_wallet<F: PageFetcher>(
-    wallet: WalletAddress,
-    base_url: &str,
-    page_limit: u32,
-    size_threshold: u32,
-    fetcher: &F,
-) -> Result<PositionSnapshot, anyhow::Error> {
-    let mut all_positions: HashMap<MarketOutcomeId, PositionState> = HashMap::new();
-    let mut offset: u32 = 0;
-
-    for page_num in 0..POSITION_MAX_PAGES {
-        let url = PolymarketEndpoint::CurrentPositions {
-            user: wallet.to_string(),
-            limit: Some(page_limit),
-            offset: Some(offset),
-            redeemable: Some(false),
-            size_threshold: Some(size_threshold),
-        }
-        .url(base_url);
-
-        let bytes = fetcher
-            .fetch_page(&url)
-            .await
-            .map_err(|e| anyhow::anyhow!("fetch page {page_num}: {e}"))?;
-
-        let (snap, decoded_rows) = parse_positions_counted(&bytes, wallet)
-            .map_err(|e| anyhow::anyhow!("parse page {page_num}: {e}"))?;
-
-        all_positions.extend(snap.positions);
-
-        // Short page → the wallet's positions are exhausted. Counted on decoded rows, not on
-        // retained entries, so a page filtered down to fewer positions still continues.
-        if decoded_rows < page_limit as usize {
-            break;
-        }
-
-        // A full final permitted page means completeness cannot be proven without another page.
-        // Fail rather than return a possibly truncated portfolio (the organic canary's
-        // precedent, `organic_canary.rs`).
-        if page_num + 1 >= POSITION_MAX_PAGES {
-            return Err(anyhow::anyhow!(
-                "position fetch hit the {POSITION_MAX_PAGES}-page cap with a full final page; \
-                 snapshot is incomplete"
-            ));
-        }
-
-        offset = offset.saturating_add(page_limit);
-    }
-
-    Ok(PositionSnapshot {
-        wallet,
-        positions: all_positions,
-    })
-}
-
-// ── seed_all ──────────────────────────────────────────────────────────────────
-
-/// Fetch positions for all `wallets` sequentially; warn-and-continue on per-wallet failure.
-///
-/// Returns a map for every wallet whose fetch succeeded (including wallets with no open
-/// positions). A wallet absent from the returned map had a fetch or parse failure; the
-/// caller should retain the existing ledger state for that wallet.
-pub async fn seed_all<F: PageFetcher>(
-    wallets: &[WalletAddress],
-    base_url: &str,
-    page_limit: u32,
-    size_threshold: u32,
-    fetcher: &F,
-) -> HashMap<WalletAddress, PositionSnapshot> {
-    let mut out = HashMap::new();
-    for &wallet in wallets {
-        match fetch_positions_for_wallet(wallet, base_url, page_limit, size_threshold, fetcher)
-            .await
-        {
-            Ok(snap) => {
-                out.insert(wallet, snap);
-            }
-            Err(e) => {
-                warn!(
-                    wallet = %wallet,
-                    error = %e,
-                    "position seed failed for wallet; retaining existing ledger state"
-                );
-            }
-        }
-    }
-    out
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use std::collections::HashMap;
-
-    use pe_source_polymarket_public::FixtureFetcher;
-
-    use super::*;
-
-    fn wallet() -> WalletAddress {
-        serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
-    }
-
-    #[test]
-    fn parse_basic() {
-        let w = wallet();
-        let bytes = br#"[{"conditionId":"0xccc","outcomeIndex":0,"size":"150"}]"#;
-        let snap = parse_positions(bytes, w).unwrap();
-        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(0));
-        let state = snap.positions[&key];
-        assert_eq!(
-            state.long_contracts,
-            pe_core_types::ShareAmount::from_whole(150).unwrap()
-        );
-        assert_eq!(state.short_contracts, pe_core_types::ShareAmount::ZERO);
-    }
-
-    #[test]
-    fn parse_fractional_position_is_exact() {
-        let w = wallet();
-        let bytes = br#"[{"conditionId":"0xccc","outcomeIndex":0,"size":"0.4"}]"#;
-        let snap = parse_positions(bytes, w).unwrap();
-        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(0));
-        assert_eq!(
-            snap.positions[&key].long_contracts,
-            ShareAmount::from_decimal_exact(Decimal::new(4, 1)).unwrap()
-        );
-    }
-
-    #[test]
-    fn parse_fractional_size_is_not_floored() {
-        let w = wallet();
-        let bytes = br#"[{"conditionId":"0xccc","outcomeIndex":1,"size":"75.8"}]"#;
-        let snap = parse_positions(bytes, w).unwrap();
-        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(1));
-        assert_eq!(
-            snap.positions[&key].long_contracts,
-            ShareAmount::from_decimal_exact(Decimal::new(758, 1)).unwrap()
-        );
-    }
-
-    #[test]
-    fn parse_empty_array() {
-        let w = wallet();
-        let snap = parse_positions(b"[]", w).unwrap();
-        assert!(snap.positions.is_empty());
-    }
-
-    #[test]
-    fn ordinary_missing_outcome_index_keeps_legacy_default() {
-        let w = wallet();
-        let bytes = br#"[{"conditionId":"0xccc","size":"10"}]"#;
-        let snap = parse_positions(bytes, w).unwrap();
-        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(0));
-        assert!(snap.positions.contains_key(&key));
-        assert!(matches!(
-            parse_positions_strict(bytes, w),
-            Err(PositionParseError::MissingOutcomeIndex)
-        ));
-    }
-
-    #[tokio::test]
-    async fn seed_all_failure_omits_wallet() {
-        // FixtureFetcher returns Fatal for unknown URLs → seed_all omits the wallet.
-        let w = wallet();
-        let fetcher = FixtureFetcher::new(HashMap::new());
-        let map = seed_all(&[w], "https://api.example.com", 500, 1, &fetcher).await;
-        assert!(map.is_empty(), "failed wallet should be omitted from map");
-    }
-
-    #[tokio::test]
-    async fn seed_all_success_empty_included() {
-        // A wallet with no positions (empty array) is still included in the returned map.
-        let w = wallet();
-        let url = PolymarketEndpoint::CurrentPositions {
-            user: w.to_string(),
-            limit: Some(500),
-            offset: Some(0),
-            redeemable: Some(false),
-            size_threshold: Some(1),
-        }
-        .url("https://api.example.com");
-        let mut responses = HashMap::new();
-        responses.insert(url, b"[]".to_vec());
-        let fetcher = FixtureFetcher::new(responses);
-        let map = seed_all(&[w], "https://api.example.com", 500, 1, &fetcher).await;
-        assert!(map.contains_key(&w));
-        assert!(map[&w].positions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn seed_all_positions_returned() {
-        let w = wallet();
-        let url = PolymarketEndpoint::CurrentPositions {
-            user: w.to_string(),
-            limit: Some(500),
-            offset: Some(0),
-            redeemable: Some(false),
-            size_threshold: Some(1),
-        }
-        .url("https://api.example.com");
-        let mut responses = HashMap::new();
-        responses.insert(
-            url,
-            br#"[{"conditionId":"0xaaa","outcomeIndex":0,"size":"100"}]"#.to_vec(),
-        );
-        let fetcher = FixtureFetcher::new(responses);
-        let map = seed_all(&[w], "https://api.example.com", 500, 1, &fetcher).await;
-        assert_eq!(map.len(), 1);
-        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xaaa".into())), OutcomeId(0));
-        assert_eq!(
-            map[&w].positions[&key].long_contracts,
-            pe_core_types::ShareAmount::from_whole(100).unwrap()
-        );
-    }
-
-    /// Register `pages` full pages of one row each at `limit = 1`, condition IDs `0xcondNNNN`.
-    fn full_pages(w: WalletAddress, base: &str, pages: u32) -> HashMap<String, Vec<u8>> {
-        (0..pages)
-            .map(|page_num| {
-                let url = PolymarketEndpoint::CurrentPositions {
-                    user: w.to_string(),
-                    limit: Some(1),
-                    offset: Some(page_num),
-                    redeemable: Some(false),
-                    size_threshold: Some(1),
-                }
-                .url(base);
-                let body = format!(
-                    r#"[{{"conditionId":"0xcond{page_num:04}","outcomeIndex":0,"size":"5"}}]"#
-                )
-                .into_bytes();
-                (url, body)
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn full_final_page_at_cap_fails_instead_of_truncating() {
-        // POSITION_MAX_PAGES full pages: the snapshot is knowably incomplete, so the fetch
-        // must fail rather than hand a truncated portfolio to classification (#542).
-        let w = wallet();
-        let base = "https://api.example.com";
-        let fetcher = FixtureFetcher::new(full_pages(w, base, POSITION_MAX_PAGES));
-        let error = fetch_positions_for_wallet(w, base, 1, 1, &fetcher)
-            .await
-            .expect_err("a full final permitted page must fail");
-        assert!(
-            error.to_string().contains("snapshot is incomplete"),
-            "unexpected error: {error}"
-        );
-        // seed_all keeps its warn-and-omit contract for the failed wallet.
-        let map = seed_all(&[w], base, 1, 1, &fetcher).await;
-        assert!(map.is_empty());
-    }
-
-    #[tokio::test]
-    async fn short_page_before_the_cap_succeeds() {
-        let w = wallet();
-        let base = "https://api.example.com";
-        let mut responses = full_pages(w, base, POSITION_MAX_PAGES - 1);
-        let last = PolymarketEndpoint::CurrentPositions {
-            user: w.to_string(),
-            limit: Some(1),
-            offset: Some(POSITION_MAX_PAGES - 1),
-            redeemable: Some(false),
-            size_threshold: Some(1),
-        }
-        .url(base);
-        responses.insert(last, b"[]".to_vec());
-        let fetcher = FixtureFetcher::new(responses);
-        let snap = fetch_positions_for_wallet(w, base, 1, 1, &fetcher)
-            .await
-            .unwrap();
-        assert_eq!(
-            snap.positions.len(),
-            usize::try_from(POSITION_MAX_PAGES - 1).unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn filtered_full_page_continues_pagination() {
-        // Page 0 is FULL (3 decoded rows) but retains 2 positions: one fractional row and two
-        // rows sharing a `(market, outcome)` key. Counting retained positions would
-        // read the page as short and lose page 1.
-        let w = wallet();
-        let base = "https://api.example.com";
-        let page_url = |offset: u32| {
-            PolymarketEndpoint::CurrentPositions {
-                user: w.to_string(),
-                limit: Some(3),
-                offset: Some(offset),
-                redeemable: Some(false),
-                size_threshold: Some(1),
-            }
-            .url(base)
-        };
-        let mut responses = HashMap::new();
-        responses.insert(
-            page_url(0),
-            br#"[{"conditionId":"0xdust","outcomeIndex":0,"size":"0.4"},
-                 {"conditionId":"0xdup","outcomeIndex":0,"size":"5"},
-                 {"conditionId":"0xdup","outcomeIndex":0,"size":"7"}]"#
-                .to_vec(),
-        );
-        responses.insert(
-            page_url(3),
-            br#"[{"conditionId":"0xreal","outcomeIndex":1,"size":"42"}]"#.to_vec(),
-        );
-        let fetcher = FixtureFetcher::new(responses);
-        let snap = fetch_positions_for_wallet(w, base, 3, 1, &fetcher)
-            .await
-            .unwrap();
-        let real = MarketOutcomeId::new(MarketId(VenueMarketId("0xreal".into())), OutcomeId(1));
-        let dup = MarketOutcomeId::new(MarketId(VenueMarketId("0xdup".into())), OutcomeId(0));
-        assert_eq!(
-            snap.positions[&real].long_contracts,
-            pe_core_types::ShareAmount::from_whole(42).unwrap()
-        );
-        assert_eq!(
-            snap.positions[&dup].long_contracts,
-            pe_core_types::ShareAmount::from_whole(7).unwrap()
-        );
-        let fractional =
-            MarketOutcomeId::new(MarketId(VenueMarketId("0xdust".into())), OutcomeId(0));
-        assert_eq!(
-            snap.positions[&fractional].long_contracts,
-            ShareAmount::from_decimal_exact(Decimal::new(4, 1)).unwrap()
-        );
-        assert_eq!(snap.positions.len(), 3);
-    }
+    Ok(PositionSnapshot { wallet, positions })
 }

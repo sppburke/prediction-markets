@@ -13,6 +13,7 @@ pub mod endpoint;
 pub mod fetcher;
 pub mod gamma_markets;
 pub mod live_admission;
+pub mod reconciliation;
 
 pub use activity::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityAggregationError,
@@ -37,7 +38,9 @@ pub use clob_prices_history::{
 };
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
-pub use endpoint::{LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint};
+pub use endpoint::{
+    LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint, PositionPartition,
+};
 pub use fetcher::{FixtureFetcher, HttpRequestContext, PageFetcher, ReqwestFetcher};
 pub use gamma_markets::{
     GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarkets, GammaMarketsClient,
@@ -46,5 +49,12 @@ pub use gamma_markets::{
 pub use live_admission::{
     LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveFeeEvidence, LiveMarketError,
     LiveMarketEvidence, validate_live_market,
+};
+pub use reconciliation::{
+    ACTIVITY_MAX_OFFSET, ActivityAssetIdentity, ActivityAssetMapping, ActivityReadError,
+    ActivityRequestBounds, CanonicalPosition, CompleteActivityRead, CompletePositionsRead,
+    POSITION_PROOF_VERSION, POSITIONS_MAX_OFFSET, PositionClassification, PositionReadError,
+    RECONCILIATION_PAGE_LIMIT, ReconciliationFetcher, ReconciliationPageEvidence,
+    fetch_complete_activity, fetch_complete_positions,
 };
 pub mod canary;

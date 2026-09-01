@@ -12,9 +12,11 @@ use axum::{Router, routing::get};
 use pe_core_types::SourceId;
 use pe_event_log::Writer;
 use pe_execution_core::{ExecutionDispatcher, LiveJournal};
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
+use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
+use pe_service::position_seeder::CausalPositionValidator;
 use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
@@ -250,9 +252,8 @@ async fn main() -> Result<()> {
     let leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
 
-    // The version-two activity/gate records are the sole membership authority (#544).
-    // Fenced wallets and wallets without proven-complete reconciled history are removed
-    // before any producer or maintenance reader can observe the boot generation.
+    // Filter previously fenced or history-incomplete ranked wallets before the
+    // bracket. One such wallet cannot block restart of the remaining valid set.
     let complete_history = paper_state
         .complete_history_wallets()
         .context("load complete durable wallet history set")?;
@@ -275,6 +276,48 @@ async fn main() -> Result<()> {
         !live_watchlist.snapshot().entries.is_empty(),
         "no wallets eligible after durable fence/history filtering"
     );
+
+    // Validate the initial evaluation universe before any producer can observe it.
+    // The installed migration record names the immutable version-two source-log
+    // generation to which every accepted bracket is bound.
+    let migration = MigrationMetadata::read(&cfg.paper_state_db_path)
+        .context("read installed migration metadata for position validation")?
+        .context("installed migration metadata missing for position validation")?;
+    anyhow::ensure!(
+        migration.phase == MigrationPhase::Installed,
+        "position validation requires installed migration metadata, found {}",
+        migration.phase
+    );
+    let activation = migration
+        .activation_tails
+        .as_ref()
+        .context("installed migration metadata omitted activation tails")?;
+    let source_log_generation = serde_json::to_string(&serde_json::json!({
+        "path": activation.source.path,
+        "physical_tail": activation.source.physical_tail,
+        "last_sequence": activation.source.last_sequence.map(|sequence| sequence.0),
+        "last_hash": activation.source.last_hash.to_hex().to_string(),
+    }))
+    .context("encode source-log generation for position validation")?;
+    let position_fetcher = Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    let position_validator = CausalPositionValidator::new(
+        position_fetcher,
+        cfg.polymarket_base_url.clone(),
+        source_log_generation,
+    );
+    let mut boot_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
+        .context("load boot activity ledger owner")?;
+    let boot_wallets = live_watchlist
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<Vec<_>>();
+    position_validator
+        .validate_direct(&boot_wallets, &mut boot_engine, &paper_state)
+        .await
+        .context("causal current-position validation for boot universe")?;
+    let leader_ledger = boot_engine.into_ledger();
 
     // Publish only the durable-authority-filtered initial watched count.
     if !cfg.supabase_url.is_empty() && !cfg.supabase_secret_key.is_empty() {
@@ -330,7 +373,11 @@ async fn main() -> Result<()> {
 
     // Runtime admissions prove durable history and recheck the fence under the shared
     // watchlist-writer lock before publication. Lane D adds the causal positions bracket.
-    let admission_preparer = AdmissionPreparer::new(control_tx.clone(), paper_state.clone());
+    let admission_preparer = AdmissionPreparer::with_validator(
+        control_tx.clone(),
+        paper_state.clone(),
+        position_validator,
+    );
 
     // #530: websocket-primary ingest task (flag-gated). Owns the source event
     // log; a boot-time open failure fails boot — enabled mode must satisfy the

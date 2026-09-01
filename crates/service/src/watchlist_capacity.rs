@@ -189,6 +189,27 @@ impl WatchlistCapacityApplier for SupabaseWatchlistCapacity {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
+    fn fake_accept_validations(paper_state: &PaperStateDb, wallets: &[WalletAddress]) {
+        // Mirror the real orchestrator's successful acceptance so the publication
+        // recheck sees a current causal position validation; the bracket itself is
+        // proven in scenario_position_bracket.rs.
+        let validations: Vec<pe_paper_state::PositionValidationRecord> = wallets
+            .iter()
+            .map(|wallet| pe_paper_state::PositionValidationRecord {
+                wallet: *wallet,
+                ledger_hash: "test-ledger".to_owned(),
+                positions_proof_hash: "test-proof".to_owned(),
+                activity_bounds_json: "{}".to_owned(),
+                source_log_generation: "test-gen".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 0,
+            })
+            .collect();
+        paper_state
+            .record_position_validations(&validations)
+            .unwrap();
+    }
+
     use std::time::Duration;
 
     use super::*;
@@ -303,6 +324,7 @@ mod tests {
         let control = {
             let live = live.clone();
             let prepared_sets = Arc::clone(&prepared_sets);
+            let fake_paper_state = Arc::clone(&paper_state);
             tokio::spawn(async move {
                 let mut attempts = 0;
                 while let Some(command) = control_rx.recv().await {
@@ -315,6 +337,7 @@ mod tests {
                     };
                     let mut wallets = wallets;
                     wallets.sort_unstable_by_key(|w| w.0);
+                    fake_accept_validations(&fake_paper_state, &wallets);
                     prepared_sets
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -439,6 +462,7 @@ mod tests {
         let prepared = Arc::new(Notify::new());
         let release_ack = Arc::new(Notify::new());
         let live_at_control = live.clone();
+        let fake_paper_state = Arc::clone(&paper_state);
         let prepared_task = Arc::clone(&prepared);
         let release_task = Arc::clone(&release_ack);
         let control = tokio::spawn(async move {
@@ -450,12 +474,17 @@ mod tests {
                 } => {
                     assert_eq!(live_at_control.snapshot().entries.len(), 1);
                     assert_eq!(wallets, vec![newcomer]);
+                    fake_accept_validations(&fake_paper_state, &wallets);
                     prepared_task.notify_one();
                     release_task.notified().await;
                     acknowledged.send(()).unwrap();
                 }
                 OrchestratorControl::CommitActivityBucket { .. } => {
                     panic!("capacity transition sent an activity bucket")
+                }
+                OrchestratorControl::PrepareValidatedAdmissions { .. }
+                | OrchestratorControl::CaptureAdmissionLedger { .. } => {
+                    panic!("legacy admission test sent a causal-bracket command")
                 }
             }
         });

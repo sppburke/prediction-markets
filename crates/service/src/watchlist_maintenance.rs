@@ -141,6 +141,8 @@ pub enum MembershipApplyError {
     FencedAdmission { wallet: WalletAddress },
     #[error("newly admitted wallet {wallet} lacks complete reconciled history")]
     IncompleteHistory { wallet: WalletAddress },
+    #[error("newly admitted wallet {wallet} lacks a current causal position validation")]
+    UnvalidatedPosition { wallet: WalletAddress },
 }
 
 fn remove_loaded_fences(
@@ -166,6 +168,9 @@ fn recheck_admissions(
         }
         if !paper_state.wallet_history_complete(wallet)? {
             return Err(MembershipApplyError::IncompleteHistory { wallet: *wallet });
+        }
+        if !paper_state.position_validation_current(wallet)? {
+            return Err(MembershipApplyError::UnvalidatedPosition { wallet: *wallet });
         }
     }
     Ok(())
@@ -1195,6 +1200,7 @@ mod tests {
             let (control_tx, mut control_rx) = mpsc::channel(2);
             let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
+            let fake_paper_state = Arc::clone(&paper_state);
             std::mem::drop(tokio::spawn(async move {
                 while let Some(message) = control_rx.recv().await {
                     match message {
@@ -1202,6 +1208,26 @@ mod tests {
                             wallets,
                             acknowledged,
                         } => {
+                            // Mirror the real orchestrator's successful acceptance: a
+                            // prepared wallet gains a current causal position validation,
+                            // or the publication recheck would (correctly) reject it. The
+                            // bracket itself is proven in scenario_position_bracket.rs.
+                            let validations: Vec<pe_paper_state::PositionValidationRecord> =
+                                wallets
+                                    .iter()
+                                    .map(|wallet| pe_paper_state::PositionValidationRecord {
+                                        wallet: *wallet,
+                                        ledger_hash: "test-ledger".to_owned(),
+                                        positions_proof_hash: "test-proof".to_owned(),
+                                        activity_bounds_json: "{}".to_owned(),
+                                        source_log_generation: "test-gen".to_owned(),
+                                        proof_json: "{}".to_owned(),
+                                        recorded_at_unix: 0,
+                                    })
+                                    .collect();
+                            fake_paper_state
+                                .record_position_validations(&validations)
+                                .unwrap();
                             control_log
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1210,6 +1236,10 @@ mod tests {
                         }
                         OrchestratorControl::CommitActivityBucket { .. } => {
                             panic!("maintenance sent an activity bucket")
+                        }
+                        OrchestratorControl::PrepareValidatedAdmissions { .. }
+                        | OrchestratorControl::CaptureAdmissionLedger { .. } => {
+                            panic!("legacy admission test sent a causal-bracket command")
                         }
                     }
                 }

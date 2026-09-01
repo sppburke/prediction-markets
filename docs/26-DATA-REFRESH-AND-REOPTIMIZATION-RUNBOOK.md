@@ -455,16 +455,17 @@ from `ranking_entries` pinned to the triggering `batch_id`, never from the movin
 the applied rows and the committed marker name one batch, #542). Every read is
 gated on the ranker's `survives` verdict (#518), so the published batch is a bench and
 `active_watchlist_size` caps the survivors admitted from it rather than selecting a raw
-top-N; membership converges at the deploy restart itself, because boot seeds the live set
-from the same filtered read. Every post-boot addition on either path is prepared first
-(#542): its prior-market history and current positions are loaded and applied by the
-orchestrator before the wallet is published (log line `hot-watchlist admission state
-prepared`, then `full re-rank membership swap applied` / `maintenance tick applied`); a
-preparation failure publishes no additions and the tick retries. `active_watchlist_size` is
+top-N; membership converges at the deploy restart itself, because boot validates the live
+set from the same filtered read. Every post-boot addition on either path is prepared first
+(#542/#544): its prior-market history is complete and its current positions pass the
+five-step causal bracket before the orchestrator records the validation and the wallet is
+published (log line `hot-watchlist admission state prepared`, then `full re-rank membership
+swap applied` / `maintenance tick applied`); a preparation failure publishes no additions
+and the tick retries. `active_watchlist_size` is
 Supabase-authoritative (default 100, valid `1..=200`) and is polled every 30 seconds. A
-grow fetches the requested top-N and preloads all newly admitted wallets' prior-market
-history and current positions before the atomic membership swap; a shrink uses the same
-atomic swap. Invalid values, Supabase failures, or incomplete admission preparation keep
+grow fetches the requested top-N and validates all newly admitted wallets' prior-market
+history and current positions before the atomic validation/membership swap; a shrink uses
+the same atomic membership swap. Invalid values, Supabase failures, or incomplete admission preparation keep
 the last-known-good target and membership, then retry independently on the
 capacity worker's next 30-second retry. Check
 `status.json`: `watchlist_size` is actual membership and `watchlist_target_size` is the

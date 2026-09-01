@@ -168,6 +168,18 @@ CREATE TABLE IF NOT EXISTS wallet_fences (
     fenced_at_unix   INTEGER NOT NULL
 );
 
+-- Accepted causal activity/positions brackets. A position-changing activity
+-- commit invalidates the row before a later membership publication can use it.
+CREATE TABLE IF NOT EXISTS position_validations (
+    wallet_hex            TEXT PRIMARY KEY NOT NULL,
+    ledger_hash           TEXT NOT NULL,
+    positions_proof_hash  TEXT NOT NULL,
+    activity_bounds_json  TEXT NOT NULL,
+    source_log_generation TEXT NOT NULL,
+    proof_json             TEXT NOT NULL,
+    recorded_at_unix       INTEGER NOT NULL
+);
+
 -- Single-row current bankroll (decimal stored as text for exactness).
 CREATE TABLE IF NOT EXISTS bankroll (
     id           INTEGER PRIMARY KEY CHECK(id = 0),
