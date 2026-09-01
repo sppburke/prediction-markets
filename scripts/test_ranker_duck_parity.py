@@ -201,6 +201,62 @@ def positions_set(path: str) -> set[tuple]:
 
 
 class DuckParityTest(unittest.TestCase):
+    def test_v2_repaired_payouts_do_not_change_v1_ranking_or_survivors(self) -> None:
+        """#544 boundary: stored repaired payouts are replay evidence only.
+
+        The frozen v1 fixture is ranked, then every market receives a v2 payout
+        vector opposite its legacy winner (plus one fifty-fifty row). The v1
+        qualifying positions, metrics, survivor verdicts, and output basket must
+        remain byte-identical; #545 alone may switch the economic reader.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            base = str(Path(tmp) / "base")
+            repaired = str(Path(tmp) / "repaired")
+            pq = str(Path(tmp) / "unused")
+            build_parity_cache(db)
+            self.assertEqual(run_pass1(db, base, "sqlite", pq), 0)
+
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE clob_payout_evidence_v2 ("
+                "market_id TEXT PRIMARY KEY NOT NULL, "
+                "is_50_50_outcome INTEGER NULL, payout_status TEXT NOT NULL, "
+                "payout_vector_json TEXT NULL, closed INTEGER NULL, tokens_json TEXT NOT NULL, "
+                "raw_page_sha256 TEXT NOT NULL, coverage_generation INTEGER NOT NULL, "
+                "page_ordinal INTEGER NOT NULL, schema_version INTEGER NOT NULL, "
+                "parser_version INTEGER NOT NULL, fetched_at_unix INTEGER NOT NULL, "
+                "origin TEXT NOT NULL)"
+            )
+            resolutions = list(conn.execute(
+                "SELECT market_id, winning_outcome_id FROM market_resolutions ORDER BY market_id"
+            ))
+            for index, (market_id, legacy_winner) in enumerate(resolutions):
+                if index == 0:
+                    is_fifty, vector = 1, '["0.5","0.5"]'
+                else:
+                    is_fifty = 0
+                    vector = '["0","1"]' if int(legacy_winner) == 0 else '["1","0"]'
+                conn.execute(
+                    "INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (market_id, is_fifty, "resolved", vector, 1, "[]", "a" * 64,
+                     1, 0, 2, 2, 1_788_266_850, "clob_closed_walk_v2"),
+                )
+            conn.commit()
+            conn.close()
+
+            self.assertEqual(run_pass1(db, repaired, "sqlite", pq), 0)
+            outputs = (
+                "qualifying_positions_72hr.csv",
+                "ranked_72hr_buyandhold.csv",
+                "ranked_72hr_buyandhold.txt",
+                "250_72hr_buyandhold_variance.txt",
+            )
+            for name in outputs:
+                before = (Path(base) / name).read_bytes()
+                after = (Path(repaired) / name).read_bytes()
+                self.assertEqual(before, after, f"v2 payout evidence changed {name}")
+
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_pass1_parity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

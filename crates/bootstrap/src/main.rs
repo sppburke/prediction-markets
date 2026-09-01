@@ -283,9 +283,13 @@ async fn main() {
                         tracing::error!(error = %e, "resolutions: failed to reset CLOB cursor");
                         std::process::exit(1);
                     }
+                    if let Err(e) = cache.reset_clob_payout_walk_v2() {
+                        tracing::error!(error = %e, "resolutions: failed to reset v2 CLOB payout walk");
+                        std::process::exit(1);
+                    }
                     tracing::info!(
-                        "resolutions: --reset-clob-cursor → deleted source_cursor.clob_closed; \
-                         CLOB will start from page 1"
+                        "resolutions: --reset-clob-cursor → deleted legacy cursor and incomplete \
+                         v2 payout staging; CLOB will start from page 1"
                     );
                 }
                 let all_ids = cache.all_market_ids();

@@ -126,6 +126,7 @@ pub async fn fetch_resolutions_and_schedules(
 ) -> Result<ResolutionsReport, BootstrapError> {
     if config.rebuild_resolutions {
         cache.delete_source_cursor(clob::CLOB_CLOSED_CURSOR_KEY)?;
+        cache.reset_clob_payout_walk_v2()?;
         let deleted = cache.delete_resolutions_by_sources(&["gamma", "clob"])?;
         tracing::info!(
             deleted,

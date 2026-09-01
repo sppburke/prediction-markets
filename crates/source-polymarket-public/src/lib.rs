@@ -7,6 +7,7 @@
 pub mod activity;
 pub mod activity_ws;
 pub mod clob_prices_history;
+pub mod clob_resolution;
 pub mod config;
 pub mod connector;
 pub mod endpoint;
@@ -35,6 +36,15 @@ pub use activity_ws::{
 pub use clob_prices_history::{
     CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS, ClassifiedPage,
     ClassifiedPricesHistory, ClobPricesHistoryClient, ClobPricesHistoryError, PricePoint,
+};
+pub use clob_resolution::{
+    BinaryPayoutVector, CLOB_END_CURSOR, CLOB_RESOLUTION_PARSER_VERSION,
+    CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageCounts, ClobCoverageManifest,
+    ClobCoverageManifestError, ClobCoveragePage, ClobMarket, ClobMarketsPage, ClobPayoutResolution,
+    ClobPayoutUnresolvedReason, ClobResolutionEvidence, ClobResolutionParseError, ClobTerminalKind,
+    ClobTerminalProof, ClobToken, ClobTokenPrice, ClobWinnerAnalysis, ClobWinnerVerdict,
+    analyze_clob_winners, hash_clob_page_sha256, is_clob_terminal_cursor, parse_clob_end_date,
+    parse_clob_market, parse_clob_markets_page,
 };
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;

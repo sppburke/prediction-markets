@@ -1,0 +1,21 @@
+{
+  "active": true,
+  "closed": true,
+  "condition_id": "0x12a0cb60174abc437bf1178367c72d11f069e1a3add20b148fb0ab4279b772b2",
+  "end_date_iso": "2024-09-10T00:00:00Z",
+  "is_50_50_outcome": false,
+  "tokens": [
+    {
+      "token_id": "10715043962341292242163832255523703116280692082153281340642602592290195499485",
+      "outcome": "Yes",
+      "price": 0,
+      "winner": false
+    },
+    {
+      "token_id": "80085489243215790077454313513728486445319747473476157602131800551595373270758",
+      "outcome": "No",
+      "price": 1,
+      "winner": true
+    }
+  ]
+}
