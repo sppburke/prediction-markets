@@ -391,6 +391,7 @@ impl Coordinator {
     async fn run(mut self) {
         loop {
             let observation = tokio::select! {
+                biased;
                 () = self.trade_tx.closed() => return,
                 received = self.fan_in.recv() => match received {
                     Some(observation) => observation,
@@ -554,6 +555,28 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["0xa".to_string(), "0xb".to_string()]);
+    }
+
+    /// A receiver closed before the coordinator runs wins over buffered fan-in
+    /// work: nothing is appended for a destination that no longer exists.
+    #[tokio::test(start_paused = true)]
+    async fn coordinator_prefers_closed_receiver_over_buffered_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = SourceEventSink::open(&path).unwrap();
+        let (fan_in_tx, fan_in_rx) = mpsc::channel(8);
+        let (trade_tx, trade_rx) = mpsc::channel(8);
+        fan_in_tx.send(observation("0xa")).await.unwrap();
+        drop(trade_rx);
+        Coordinator {
+            sink,
+            trade_tx,
+            health: new_shared_health_with_ws(false, true, 90),
+            fan_in: fan_in_rx,
+        }
+        .run()
+        .await;
+        assert_eq!(LogReader::replay(&path).unwrap().count(), 0);
     }
 
     /// A closed trade channel ends the coordinator (orderly), even mid-recovery.
