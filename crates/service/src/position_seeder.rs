@@ -194,6 +194,16 @@ impl CausalPositionValidator {
             }
         }
         paper_state.record_position_validations(&records)?;
+        // The accepted bracket IS the plan's history-validating reconciliation:
+        // promote each wallet's SEEDED (conservative) history row to complete.
+        // Unseeded wallets stay incomplete and are filtered fail-closed (#544
+        // activation fix — without this the first v2 boot can never publish).
+        let wallets: Vec<WalletAddress> = records.iter().map(|record| record.wallet).collect();
+        paper_state.mark_seeded_history_validated(
+            &wallets,
+            "{\"source\":\"causal_position_bracket_v2\"}",
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
         Ok(accepted)
     }
 

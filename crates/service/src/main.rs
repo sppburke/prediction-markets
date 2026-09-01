@@ -342,30 +342,19 @@ async fn main() -> Result<()> {
     let leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
 
-    // Filter previously fenced or history-incomplete ranked wallets before the
-    // bracket. One such wallet cannot block restart of the remaining valid set.
-    let complete_history = paper_state
-        .complete_history_wallets()
-        .context("load complete durable wallet history set")?;
-    let mut unavailable: std::collections::HashSet<_> = paper_state
+    // Durable fences are decision boundaries and filter BEFORE the bracket;
+    // history completeness filters AFTER it — the bracket's complete fixed-end
+    // activity catch-up is the reconciliation that promotes the one-time
+    // conservative sidecar seed, so at the first v2 boot nothing is complete
+    // until the bracket has run (#544 activation fix: the previous pre-bracket
+    // non-empty assertion made the first migration boot fail closed forever).
+    let fenced: std::collections::HashSet<_> = paper_state
         .wallet_fences()
         .context("load durable wallet fences")?
         .into_iter()
         .map(|fence| fence.wallet)
         .collect();
-    unavailable.extend(
-        live_watchlist
-            .snapshot()
-            .entries
-            .iter()
-            .filter(|entry| !complete_history.contains(&entry.wallet))
-            .map(|entry| entry.wallet),
-    );
-    live_watchlist.remove_fenced(&unavailable);
-    anyhow::ensure!(
-        !live_watchlist.snapshot().entries.is_empty(),
-        "no wallets eligible after durable fence/history filtering"
-    );
+    live_watchlist.remove_fenced(&fenced);
 
     // Validate the initial evaluation universe before any producer can observe it.
     // The installed migration record names the immutable version-two source-log
@@ -412,6 +401,22 @@ async fn main() -> Result<()> {
         .context("causal current-position validation for boot universe")?;
     let leader_ledger = boot_engine.into_ledger();
     drop(boot_position_validator);
+
+    let complete_history = paper_state
+        .complete_history_wallets()
+        .context("reload durable history completeness after boot brackets")?;
+    let history_incomplete: std::collections::HashSet<_> = live_watchlist
+        .snapshot()
+        .entries
+        .iter()
+        .filter(|entry| !complete_history.contains(&entry.wallet))
+        .map(|entry| entry.wallet)
+        .collect();
+    live_watchlist.remove_fenced(&history_incomplete);
+    anyhow::ensure!(
+        !live_watchlist.snapshot().entries.is_empty(),
+        "no wallets eligible after durable fence/history filtering"
+    );
 
     if migration_boot.session.is_some() {
         let activation_obligations =
