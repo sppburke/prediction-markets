@@ -7,7 +7,7 @@
 use rust_decimal::Decimal;
 
 use pe_core_types::{EventSeq, Price, ReceivedAt, Side, SourceId, SourceTimestamp};
-use pe_event_log::{ContentType, EnvelopeIn, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, PoisonReason, Writer};
 use pe_venue_core::OrderIntent;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +100,11 @@ impl PaperExecutor {
             haircut_bps,
             slippage_bps,
         }
+    }
+
+    /// Typed durability state consumed by the service readiness/producer owner (#544).
+    pub fn poisoned(&self) -> Option<&PoisonReason> {
+        self.writer.poisoned()
     }
 
     /// Record a paper fill to the event-log, using `observed_fill_price` when the caller

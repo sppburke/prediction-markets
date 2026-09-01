@@ -101,7 +101,8 @@ CREATE TABLE IF NOT EXISTS poll_cursors (
     last_activity_unix INTEGER
 );
 
--- Key/value scalars (currently: last_applied_event_seq reconciliation cursor).
+-- Key/value metadata. Existing cursors are INTEGER; #544's migration-bootstrap record is
+-- canonical JSON text. SQLite's ordinary (non-STRICT) affinity preserves both storage classes.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY NOT NULL,
     value INTEGER NOT NULL

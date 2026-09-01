@@ -35,9 +35,11 @@ pub mod envelope;
 pub mod error;
 mod frame;
 pub mod reader;
+pub mod scanner;
 pub mod writer;
 
 pub use envelope::{ContentType, EnvelopeIn, EventEnvelope};
-pub use error::LogError;
+pub use error::{LogError, PoisonReason};
 pub use reader::Reader;
+pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
 pub use writer::Writer;

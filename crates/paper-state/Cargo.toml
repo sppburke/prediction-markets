@@ -16,12 +16,16 @@ workspace = true
 scenario = []
 
 [dependencies]
+blake3 = { workspace = true }
 pe-core-types = { path = "../core-types", version = "0.1.0" }
+pe-event-log = { path = "../event-log", version = "0.1.0" }
 # rusqlite is declared per-crate (matching `bootstrap`) rather than as a
 # workspace dependency: it is the only crate that links SQLite, and `bundled`
 # vendors the C library so the build is hermetic. Already gate-clean (MIT).
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

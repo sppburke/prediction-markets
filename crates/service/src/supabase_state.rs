@@ -59,6 +59,9 @@ pub enum SupabaseStateError {
     PaperState(#[from] PaperStateError),
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// Boot frame reconciliation stopped below the verified log head.
+    #[error("authoritative boot frame walk incomplete at watermark {last_watermark}")]
+    IncompleteFrameWalk { last_watermark: i64 },
 }
 
 /// Requested page size for the boot `paper_positions` pull (the server may return
@@ -134,6 +137,17 @@ pub trait SupabaseStateTrait: Send + Sync {
         outcome_prices: &[Decimal],
         settled_at_unix: i64,
     ) -> impl Future<Output = Result<ResolutionV2Outcome, SupabaseStateError>> + Send;
+}
+
+/// Complete authoritative boot reads, split from runtime RPCs for deterministic failure injection.
+pub trait SupabaseBootTrait: SupabaseStateTrait {
+    fn fetch_boot_bankroll(
+        &self,
+    ) -> impl Future<Output = Result<Option<Decimal>, SupabaseStateError>> + Send;
+
+    fn fetch_boot_positions(
+        &self,
+    ) -> impl Future<Output = Result<Vec<PaperPositionRow>, SupabaseStateError>> + Send;
 }
 
 /// Production [`SupabaseStateTrait`]: PostgREST RPCs over reqwest, reusing the
@@ -358,6 +372,16 @@ impl SupabaseStateClient {
         }]);
         self.post_upsert("paper_positions", "market_id,outcome_id", &body)
             .await
+    }
+}
+
+impl SupabaseBootTrait for SupabaseStateClient {
+    async fn fetch_boot_bankroll(&self) -> Result<Option<Decimal>, SupabaseStateError> {
+        self.fetch_bankroll().await
+    }
+
+    async fn fetch_boot_positions(&self) -> Result<Vec<PaperPositionRow>, SupabaseStateError> {
+        self.fetch_positions().await
     }
 }
 
@@ -786,8 +810,8 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
 /// the RPC gate credits zero, the SQLite `settle_and_credit` mirror inserts+credits once),
 /// which also avoids a fragile jsonb→text round-trip. Fail-closed: a pull error aborts boot
 /// (refuse to run authoritative without the authority).
-pub async fn supabase_authoritative_boot(
-    client: &SupabaseStateClient,
+pub async fn supabase_authoritative_boot<S: SupabaseBootTrait + ?Sized>(
+    client: &S,
     paper_state: &PaperStateDb,
     event_log_path: &std::path::Path,
 ) -> Result<(), SupabaseStateError> {
@@ -812,42 +836,24 @@ pub async fn supabase_authoritative_boot(
         "supabase authoritative boot: catch-up summary"
     );
 
-    // If catch-up halted before completing, Supabase is missing some debits (its bankroll is
-    // overstated), so the pull below must NOT overwrite the event-log-reconciled SQLite value.
-    // Keep the local state; the next boot retries catch-up. Not fatal — the local cache is
-    // self-consistent with the local fills, and the un-applied tail is durable in the event log.
+    // A partial walk leaves authority below the durable log head. Boot must fail so no producer
+    // can turn that uncertainty into seen/no-fill state (#544).
     if !fully_caught_up {
-        warn!(
-            "supabase authoritative boot: frame-walk halted before completing; skipping the \
-             bankroll/positions pull (Supabase incomplete). Retaining local SQLite state; the \
-             next boot completes catch-up."
-        );
-        return Ok(());
+        return Err(SupabaseStateError::IncompleteFrameWalk {
+            last_watermark: new_wm,
+        });
     }
 
-    // 4. Pull authoritative bankroll + positions Supabase → local (catch-up complete, so the
-    //    Supabase values are the authority).
-    match client.fetch_bankroll().await? {
-        Some(bankroll) => {
-            paper_state.set_bankroll(bankroll)?;
-            info!(bankroll = %bankroll, "supabase authoritative boot: pulled bankroll");
-        }
-        // Fail-closed: an authoritative boot with no `paper_bankroll` row cannot establish the
-        // authority. Refuse to boot rather than warn-and-trade with a stale local balance (an
-        // un-backfilled deploy: flag on without `--backfill-supabase`). Mirrors the existing
-        // "hard-fail if Supabase empty" boot precedent for the watchlist.
-        None => return Err(SupabaseStateError::Uninitialised("paper_bankroll")),
-    }
-    let positions = client.fetch_positions().await?;
+    // Fetch and validate the complete remote snapshot in memory before touching SQLite. The
+    // paper-state owner applies bankroll + delete-all + insert-all in one transaction.
+    let bankroll = client
+        .fetch_boot_bankroll()
+        .await?
+        .ok_or(SupabaseStateError::Uninitialised("paper_bankroll"))?;
+    let positions = client.fetch_boot_positions().await?;
     let n = positions.len();
-    for pos in positions {
-        paper_state.upsert_position(
-            &pos.market_id,
-            pos.outcome_id,
-            pos.long_contracts,
-            pos.short_contracts,
-        )?;
-    }
+    paper_state.replace_authoritative_state(bankroll, &positions)?;
+    info!(bankroll = %bankroll, "supabase authoritative boot: pulled bankroll");
     info!(
         positions = n,
         "supabase authoritative boot: pulled positions"
@@ -913,9 +919,14 @@ mod tests {
         ))
     }
 
+    async fn bankroll_row() -> Json<Vec<serde_json::Value>> {
+        Json(vec![serde_json::json!({ "bankroll_str": "123.45" })])
+    }
+
     async fn serve(fixture: PositionsFixture) -> String {
         let app = Router::new()
             .route("/rest/v1/paper_positions", get(positions_page))
+            .route("/rest/v1/paper_bankroll", get(bankroll_row))
             .with_state(fixture);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1016,5 +1027,54 @@ mod tests {
         let rows = client(&base).fetch_positions().await.unwrap();
         assert_eq!(rows.len(), 1_001);
         assert_eq!(*fx.offsets.lock().unwrap(), vec![0, 1_000, 1_001]);
+    }
+
+    #[tokio::test]
+    async fn authoritative_boot_atomically_replaces_and_deletes_stale_positions() {
+        let fx = fixture(2, 1);
+        let base = serve(fx).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        db.set_bankroll(Decimal::ONE).unwrap();
+        db.upsert_position(
+            &MarketId(VenueMarketId("0xstale".to_owned())),
+            OutcomeId(0),
+            9,
+            0,
+        )
+        .unwrap();
+
+        supabase_authoritative_boot(&client(&base), &db, &dir.path().join("absent-paper.log"))
+            .await
+            .unwrap();
+
+        assert_eq!(db.bankroll().unwrap(), Some(Decimal::new(12_345, 2)));
+        let positions = db.paper_positions().unwrap();
+        assert_eq!(positions.len(), 2);
+        assert!(
+            positions
+                .iter()
+                .all(|row| row.market_id.to_string() != "0xstale")
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_boot_mid_page_failure_leaves_prior_local_state_untouched() {
+        let mut fx = fixture(5, usize::MAX);
+        fx.fail_at_offset = Some(2);
+        let base = serve(fx).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let stale = MarketId(VenueMarketId("0xstale".to_owned()));
+        db.set_bankroll(Decimal::ONE).unwrap();
+        db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+
+        let result =
+            supabase_authoritative_boot(&client(&base), &db, &dir.path().join("absent-paper.log"))
+                .await;
+
+        assert!(matches!(result, Err(SupabaseStateError::Status(503, _))));
+        assert_eq!(db.bankroll().unwrap(), Some(Decimal::ONE));
+        assert_eq!(db.paper_positions().unwrap()[0].market_id, stale);
     }
 }

@@ -63,8 +63,7 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
     }
 
     let mut len_rest = [0u8; 3];
-    r.read_exact(&mut len_rest)
-        .map_err(|_| FrameReadError::Truncated { byte_offset })?;
+    read_exact_frame(r, &mut len_rest, byte_offset)?;
 
     let len_raw = u32::from_le_bytes([first[0], len_rest[0], len_rest[1], len_rest[2]]);
     if len_raw > MAX_FRAME_BYTES {
@@ -73,15 +72,16 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
             len: len_raw,
         });
     }
-    let len = len_raw as usize;
+    let len = usize::try_from(len_raw).map_err(|_| FrameReadError::FrameTooLarge {
+        byte_offset,
+        len: len_raw,
+    })?;
 
     let mut compressed = vec![0u8; len];
-    r.read_exact(&mut compressed)
-        .map_err(|_| FrameReadError::Truncated { byte_offset })?;
+    read_exact_frame(r, &mut compressed, byte_offset)?;
 
     let mut crc_buf = [0u8; 4];
-    r.read_exact(&mut crc_buf)
-        .map_err(|_| FrameReadError::Truncated { byte_offset })?;
+    read_exact_frame(r, &mut crc_buf, byte_offset)?;
 
     let stored_crc = u32::from_le_bytes(crc_buf);
     let computed_crc = crc32fast::hash(&compressed);
@@ -93,6 +93,20 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
         .map_err(|e| FrameReadError::Decompress(e.to_string()))?;
 
     Ok(Some(decompressed))
+}
+
+fn read_exact_frame(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    byte_offset: u64,
+) -> Result<(), FrameReadError> {
+    reader.read_exact(buffer).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            FrameReadError::Truncated { byte_offset }
+        } else {
+            FrameReadError::Io(error)
+        }
+    })
 }
 
 #[derive(Debug)]

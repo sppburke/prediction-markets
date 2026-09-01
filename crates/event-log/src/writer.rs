@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -6,85 +7,126 @@ use blake3::Hash;
 use fs2::FileExt;
 use pe_core_types::EventSeq;
 
-use crate::LogError;
-use crate::envelope::{
-    ChainError, EnvelopeIn, EventEnvelope, HashInput, compute_hashes, verify_chain,
-};
-use crate::frame::{
-    FrameReadError, HEADER_LEN, MAX_FRAME_BYTES, read_frame, verify_file_header, write_file_header,
-    write_frame,
-};
+use crate::envelope::{EnvelopeIn, EventEnvelope, HashInput, compute_hashes};
+use crate::frame::{write_file_header, write_frame};
+use crate::scanner::inspect_open;
+use crate::{LogError, PoisonReason};
+
+trait DurableWrite: Write + Send + Sync {
+    fn sync_all(&self) -> std::io::Result<()>;
+}
+
+impl DurableWrite for File {
+    fn sync_all(&self) -> std::io::Result<()> {
+        File::sync_all(self)
+    }
+}
 
 /// Single-writer handle for an append-only event log file.
 ///
-/// Acquires an OS advisory exclusive lock on open; the lock is released when dropped.
-/// Per-append fsync is skipped by default for throughput; call `sync()` at commit boundaries.
-#[derive(Debug)]
+/// Acquires an OS advisory exclusive lock on open. A partial final frame is truncated and
+/// synchronized only after the shared scanner proves the preceding physical prefix. Any uncertain
+/// append, flush, or synchronization permanently poisons this instance (#544).
 pub struct Writer {
     path: PathBuf,
-    inner: BufWriter<File>,
+    inner: BufWriter<Box<dyn DurableWrite>>,
     next_seq: u64,
     last_hash: Hash,
+    poison_reason: Option<PoisonReason>,
+}
+
+impl fmt::Debug for Writer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Writer")
+            .field("path", &self.path)
+            .field("next_seq", &self.next_seq)
+            .field("last_hash", &self.last_hash)
+            .field("poison_reason", &self.poison_reason)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Writer {
-    /// Open (or create) the log at `path`, verify or write the file header, and acquire an
-    /// exclusive advisory lock. Returns `LogError::Locked` if another writer holds the lock.
+    /// Open or create the log and acquire its exclusive advisory writer lock.
     #[tracing::instrument(skip_all, fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
         let path = path.as_ref();
-
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
 
-        file.try_lock_exclusive().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
                 LogError::Locked {
                     path: path.to_owned(),
                 }
             } else {
-                LogError::Io(e)
+                LogError::Io(error)
             }
         })?;
 
         let file_len = file.metadata()?.len();
-
         if file_len == 0 {
-            let mut buf = BufWriter::new(file);
-            write_file_header(&mut buf)?;
-            buf.flush()?;
-            return Ok(Self {
-                path: path.to_owned(),
-                inner: buf,
-                next_seq: 0,
-                last_hash: Hash::from_bytes([0u8; 32]),
-            });
+            write_file_header(&mut file)?;
+            file.flush()?;
+            file.sync_all()?;
+            return Ok(Self::from_file(
+                path.to_owned(),
+                file,
+                0,
+                Hash::from_bytes([0; 32]),
+            ));
         }
 
-        // Existing file: scan from the beginning to find seq and last_hash, then seek to end.
-        let (next_seq, last_hash) = scan_existing(path, &file)?;
-        let mut file = file;
-        file.seek(SeekFrom::End(0))?;
-
-        Ok(Self {
-            path: path.to_owned(),
-            inner: BufWriter::new(file),
+        let scan = inspect_open(path, &file)?;
+        if scan.incomplete_tail.is_some() {
+            file.set_len(scan.verified_tail.physical_tail)?;
+        }
+        // A new instance clears a prior instance's synchronization uncertainty only after the
+        // complete scanner-verified prefix itself is synchronized.
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(scan.verified_tail.physical_tail))?;
+        let next_seq = match scan.verified_tail.last_sequence {
+            None => 0,
+            Some(last) => last.0.checked_add(1).ok_or(LogError::SequenceOverflow)?,
+        };
+        Ok(Self::from_file(
+            path.to_owned(),
+            file,
             next_seq,
-            last_hash,
-        })
+            scan.verified_tail.last_hash,
+        ))
     }
 
-    /// Append a new event. Computes seq, prev_hash, raw_payload_hash, and this_hash; writes one frame.
-    /// Returns the assigned `EventSeq`. Does not fsync; call `sync()` at commit boundaries.
+    fn from_file(path: PathBuf, file: File, next_seq: u64, last_hash: Hash) -> Self {
+        Self {
+            path,
+            inner: BufWriter::new(Box::new(file)),
+            next_seq,
+            last_hash,
+            poison_reason: None,
+        }
+    }
+
+    /// Reason this writer can no longer prove its durable byte state.
+    pub fn poisoned(&self) -> Option<&PoisonReason> {
+        self.poison_reason.as_ref()
+    }
+
+    /// Append a new event. Does not fsync; call [`sync`](Self::sync) at commit boundaries.
     #[tracing::instrument(skip(self, envelope_in), fields(path = %self.path.display()))]
     pub fn append(&mut self, envelope_in: EnvelopeIn) -> Result<EventSeq, LogError> {
+        self.ensure_healthy()?;
         let seq = EventSeq(self.next_seq);
+        let next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(LogError::SequenceOverflow)?;
         let prev_hash = self.last_hash;
-
         let (raw_payload_hash, _canonical, this_hash) = compute_hashes(HashInput {
             seq,
             source_id: &envelope_in.source_id,
@@ -96,7 +138,6 @@ impl Writer {
             prev_hash: &prev_hash,
             payload: &envelope_in.payload,
         })?;
-
         let envelope = EventEnvelope {
             seq,
             source_id: envelope_in.source_id,
@@ -110,102 +151,168 @@ impl Writer {
             this_hash,
             payload: envelope_in.payload,
         };
-
         let json = serde_json::to_vec(&envelope)?;
-        write_frame(&mut self.inner, &json)?;
-
-        self.next_seq += 1;
+        if let Err(error) = write_frame(&mut self.inner, &json) {
+            if matches!(&error, LogError::Io(_)) {
+                self.poison_reason = Some(PoisonReason::Append);
+            }
+            return Err(error);
+        }
+        self.next_seq = next_seq;
         self.last_hash = this_hash;
-
         Ok(seq)
     }
 
-    /// Flush the write buffer and issue fsync. Call this at transaction commit boundaries.
-    pub fn sync(&mut self) -> Result<(), LogError> {
-        self.inner.flush()?;
-        self.inner.get_ref().sync_all()?;
+    /// Flush buffered frame bytes. A failure permanently poisons the writer.
+    pub fn flush(&mut self) -> Result<(), LogError> {
+        self.ensure_healthy()?;
+        if let Err(error) = self.inner.flush() {
+            self.poison_reason = Some(PoisonReason::Flush);
+            return Err(LogError::Io(error));
+        }
         Ok(())
+    }
+
+    /// Flush and issue `fsync`. A failure permanently poisons the writer.
+    pub fn sync(&mut self) -> Result<(), LogError> {
+        self.flush()?;
+        if let Err(error) = self.inner.get_ref().sync_all() {
+            self.poison_reason = Some(PoisonReason::Synchronize);
+            return Err(LogError::Io(error));
+        }
+        Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<(), LogError> {
+        match self.poison_reason {
+            Some(reason) => Err(LogError::Poisoned { reason }),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        if let Err(e) = self.sync() {
-            tracing::error!(path = %self.path.display(), error = %e, "Writer::drop failed to sync");
+        if self.poison_reason.is_none()
+            && let Err(error) = self.sync()
+        {
+            tracing::error!(path = %self.path.display(), error = %error, "Writer::drop failed to sync");
         }
     }
 }
 
-/// Scan an existing file (from the beginning) to determine next_seq and last_hash.
-fn scan_existing(path: &Path, file: &File) -> Result<(u64, Hash), LogError> {
-    use std::io::BufReader;
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
 
-    let mut reader = BufReader::new(file);
-    verify_file_header(path, &mut reader)?;
+    use std::io;
 
-    let mut seq: u64 = 0;
-    let mut prev_hash = Hash::from_bytes([0u8; 32]);
-    let mut byte_offset = HEADER_LEN;
+    use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
+    use time::OffsetDateTime;
 
-    loop {
-        match read_frame(&mut reader, byte_offset) {
-            Ok(None) => break,
-            Ok(Some(json)) => {
-                let frame_json_len = json.len() as u64;
-                let envelope: EventEnvelope = serde_json::from_slice(&json)?;
+    use super::*;
+    use crate::ContentType;
 
-                match verify_chain(&envelope, &prev_hash) {
-                    Ok(()) => {}
-                    Err(ChainError::PrevHashMismatch { expected, actual }) => {
-                        return Err(LogError::ChainBroken {
-                            at_seq: envelope.seq,
-                            byte_offset,
-                            expected,
-                            actual,
-                        });
-                    }
-                    Err(_) => {
-                        return Err(LogError::ChainBroken {
-                            at_seq: envelope.seq,
-                            byte_offset,
-                            expected: prev_hash.to_hex().to_string(),
-                            actual: envelope.this_hash.to_hex().to_string(),
-                        });
-                    }
-                }
+    #[derive(Debug, Clone, Copy)]
+    enum Fault {
+        Write,
+        Flush,
+        Sync,
+    }
 
-                prev_hash = envelope.this_hash;
-                seq = envelope.seq.0 + 1;
-                // Advance offset by frame overhead + compressed size approximation.
-                // Exact tracking is not needed here; we seek to EOF after scanning.
-                byte_offset += 4 + frame_json_len + 4;
+    struct FaultingTarget {
+        fault: Fault,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FaultingTarget {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if matches!(self.fault, Fault::Write) {
+                return Err(io::Error::other("injected write uncertainty"));
             }
-            Err(FrameReadError::Truncated { byte_offset: off }) => {
-                return Err(LogError::Truncated {
-                    at: EventSeq(seq),
-                    byte_offset: off,
-                });
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if matches!(self.fault, Fault::Flush) {
+                return Err(io::Error::other("injected flush uncertainty"));
             }
-            Err(FrameReadError::CrcMismatch { byte_offset: off }) => {
-                return Err(LogError::CrcMismatch {
-                    at_seq: EventSeq(seq),
-                    byte_offset: off,
-                });
-            }
-            Err(FrameReadError::FrameTooLarge {
-                byte_offset: off,
-                len,
-            }) => {
-                return Err(LogError::FrameTooLarge {
-                    byte_offset: off,
-                    len,
-                    max: MAX_FRAME_BYTES,
-                });
-            }
-            Err(FrameReadError::Decompress(msg)) => return Err(LogError::Compress(msg)),
-            Err(FrameReadError::Io(e)) => return Err(LogError::Io(e)),
+            Ok(())
         }
     }
 
-    Ok((seq, prev_hash))
+    impl DurableWrite for FaultingTarget {
+        fn sync_all(&self) -> io::Result<()> {
+            if matches!(self.fault, Fault::Sync) {
+                return Err(io::Error::other("injected sync uncertainty"));
+            }
+            Ok(())
+        }
+    }
+
+    fn writer(fault: Fault) -> Writer {
+        Writer {
+            path: PathBuf::from("injected.log"),
+            inner: BufWriter::with_capacity(
+                1,
+                Box::new(FaultingTarget {
+                    fault,
+                    bytes: Vec::new(),
+                }),
+            ),
+            next_seq: 0,
+            last_hash: Hash::from_bytes([0; 32]),
+            poison_reason: None,
+        }
+    }
+
+    fn envelope() -> EnvelopeIn {
+        EnvelopeIn {
+            source_id: SourceId("test".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+            content_type: ContentType::Raw,
+            payload: vec![1; 32],
+        }
+    }
+
+    #[test]
+    fn append_uncertainty_poisons_later_appends() {
+        let mut writer = writer(Fault::Write);
+        assert!(writer.append(envelope()).is_err());
+        assert_eq!(writer.poisoned(), Some(&PoisonReason::Append));
+        assert!(matches!(
+            writer.append(envelope()),
+            Err(LogError::Poisoned {
+                reason: PoisonReason::Append
+            })
+        ));
+    }
+
+    #[test]
+    fn flush_uncertainty_poisons_later_appends() {
+        let mut writer = writer(Fault::Flush);
+        assert!(writer.append(envelope()).is_ok());
+        assert!(writer.flush().is_err());
+        assert_eq!(writer.poisoned(), Some(&PoisonReason::Flush));
+        assert!(matches!(
+            writer.append(envelope()),
+            Err(LogError::Poisoned { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_uncertainty_poisons_later_appends() {
+        let mut writer = writer(Fault::Sync);
+        assert!(writer.append(envelope()).is_ok());
+        assert!(writer.sync().is_err());
+        assert_eq!(writer.poisoned(), Some(&PoisonReason::Synchronize));
+        assert!(matches!(
+            writer.append(envelope()),
+            Err(LogError::Poisoned { .. })
+        ));
+    }
 }

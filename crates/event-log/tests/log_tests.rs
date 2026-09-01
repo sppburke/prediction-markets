@@ -4,7 +4,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use pe_core_types::{EventSeq, ReceivedAt, SourceId, SourceTimestamp};
-use pe_event_log::{ContentType, EnvelopeIn, LogError, Reader, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, LogError, Reader, Scanner, Writer};
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
@@ -31,6 +31,31 @@ fn make_envelope(payload: Vec<u8>) -> EnvelopeIn {
         content_type: ContentType::Raw,
         payload,
     }
+}
+
+fn rewrite_single_frame_json(path: &std::path::Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let bytes = std::fs::read(path).unwrap();
+    let len = usize::try_from(u32::from_le_bytes(bytes[5..9].try_into().unwrap())).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&bytes[9..9 + len]).unwrap()).unwrap();
+    edit(&mut json);
+    let encoded = serde_json::to_vec(&json).unwrap();
+    let compressed = zstd::encode_all(encoded.as_slice(), 3).unwrap();
+    let compressed_len = u32::try_from(compressed.len()).unwrap();
+    let mut rewritten = b"EDGE\x01".to_vec();
+    rewritten.extend_from_slice(&compressed_len.to_le_bytes());
+    rewritten.extend_from_slice(&compressed);
+    rewritten.extend_from_slice(&crc32fast::hash(&compressed).to_le_bytes());
+    std::fs::write(path, rewritten).unwrap();
+}
+
+fn write_single_raw_frame(path: &std::path::Path, compressed: &[u8]) {
+    let length = u32::try_from(compressed.len()).unwrap();
+    let mut bytes = b"EDGE\x01".to_vec();
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(compressed);
+    bytes.extend_from_slice(&crc32fast::hash(compressed).to_le_bytes());
+    std::fs::write(path, bytes).unwrap();
 }
 
 // ── wire format ──────────────────────────────────────────────────────────────
@@ -76,6 +101,52 @@ fn raw_payload_hash_matches_blake3_of_payload() {
     let (_, envelope) = Reader::replay(&path).unwrap().next().unwrap().unwrap();
 
     assert_eq!(envelope.raw_payload_hash, blake3::hash(&payload));
+}
+
+#[test]
+fn stored_raw_payload_hash_tamper_is_rejected_even_with_valid_crc() {
+    let dir = tmp_dir();
+    let path = dir.path().join("raw_hash_tamper.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"payload".to_vec())).unwrap();
+    }
+    rewrite_single_frame_json(&path, |json| {
+        json["raw_payload_hash"] = serde_json::Value::String("00".repeat(32));
+    });
+
+    assert!(matches!(
+        Reader::replay(&path),
+        Err(LogError::RawPayloadHashMismatch { .. })
+    ));
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        Writer::open(&path),
+        Err(LogError::RawPayloadHashMismatch { .. })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn sequence_gap_is_rejected_before_chain_validation() {
+    let dir = tmp_dir();
+    let path = dir.path().join("sequence_gap.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"payload".to_vec())).unwrap();
+    }
+    rewrite_single_frame_json(&path, |json| {
+        json["seq"] = serde_json::Value::from(1);
+    });
+
+    assert!(matches!(
+        Reader::replay(&path),
+        Err(LogError::SequenceMismatch {
+            expected: EventSeq(0),
+            actual: EventSeq(1),
+            ..
+        })
+    ));
 }
 
 // ── EventSeq ─────────────────────────────────────────────────────────────────
@@ -200,22 +271,53 @@ fn crc_tamper_flipping_byte_yields_crc_mismatch() {
             file_bytes[9] ^= 0xFF;
             std::fs::write(&path, &file_bytes).unwrap();
 
-            let mut iter = Reader::replay(&path).unwrap();
-            let result = iter.next().unwrap();
+            let result = Reader::replay(&path);
             prop_assert!(
                 matches!(result, Err(LogError::CrcMismatch { .. })),
                 "expected CrcMismatch"
             );
-            // Iterator should stop after the error.
-            prop_assert!(iter.next().is_none());
         }
     });
+}
+
+#[test]
+fn valid_checksum_with_bad_zstd_or_envelope_decode_is_fatal() {
+    let dir = tmp_dir();
+    let zstd_path = dir.path().join("bad-zstd.log");
+    write_single_raw_frame(&zstd_path, b"not a zstd block");
+    assert!(matches!(
+        Writer::open(&zstd_path),
+        Err(LogError::Decompress { .. })
+    ));
+
+    let json_path = dir.path().join("bad-json.log");
+    let compressed = zstd::encode_all(b"not an envelope".as_slice(), 3).unwrap();
+    write_single_raw_frame(&json_path, &compressed);
+    assert!(matches!(
+        Writer::open(&json_path),
+        Err(LogError::EnvelopeDecode { .. })
+    ));
+}
+
+#[test]
+fn oversized_frame_claim_is_fatal_without_mutation() {
+    let dir = tmp_dir();
+    let path = dir.path().join("oversized.log");
+    let mut bytes = b"EDGE\x01".to_vec();
+    bytes.extend_from_slice(&(64_u32 * 1024 * 1024 + 1).to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(matches!(
+        Writer::open(&path),
+        Err(LogError::FrameTooLarge { .. })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
 // ── Chain tamper test ─────────────────────────────────────────────────────────
 
 #[test]
-fn chain_tamper_fabricated_prev_hash_yields_chain_broken() {
+fn donor_frame_tamper_is_rejected_before_it_can_join_the_chain() {
     use proptest::prelude::*;
 
     proptest!(|(
@@ -261,17 +363,12 @@ fn chain_tamper_fabricated_prev_hash_yields_chain_broken() {
                 tampered.extend_from_slice(&bytes2[5..frame2_end]);
                 std::fs::write(&tampered_path, &tampered).unwrap();
 
-                let mut iter = Reader::replay(&tampered_path).unwrap();
-                // Frame 0 should succeed.
-                let r0 = iter.next();
-                if let Some(Ok(_)) = r0 {
-                    // Frame 1 should fail with ChainBroken.
-                    let r1 = iter.next();
-                    prop_assert!(
-                        matches!(r1, Some(Err(LogError::ChainBroken { .. }))),
-                        "expected ChainBroken for frame1, got {r1:?}"
-                    );
-                }
+                // Preflight rejects the duplicate sequence before exposing frame 0.
+                let result = Reader::replay(&tampered_path);
+                prop_assert!(
+                    matches!(result, Err(LogError::SequenceMismatch { .. })),
+                    "expected SequenceMismatch for donor frame"
+                );
             }
         }
     });
@@ -280,7 +377,7 @@ fn chain_tamper_fabricated_prev_hash_yields_chain_broken() {
 // ── Truncation test ───────────────────────────────────────────────────────────
 
 #[test]
-fn truncation_yields_complete_frames_then_truncated_error() {
+fn replay_preflight_rejects_truncation_before_exposing_a_valid_prefix() {
     let dir = tmp_dir();
     let path = dir.path().join("trunc.log");
 
@@ -297,31 +394,116 @@ fn truncation_yields_complete_frames_then_truncated_error() {
     let trunc_len = full_bytes.len() / 2;
     std::fs::write(&path, &full_bytes[..trunc_len]).unwrap();
 
-    let mut complete = 0usize;
-    let mut saw_truncated = false;
+    assert!(matches!(
+        Reader::replay(&path),
+        Err(LogError::Truncated { .. })
+    ));
+}
 
-    let iter = Reader::replay(&path).unwrap();
-    for result in iter {
-        match result {
-            Ok(_) => complete += 1,
-            Err(LogError::Truncated { .. }) => {
-                saw_truncated = true;
-                break;
-            }
-            Err(LogError::CrcMismatch { .. }) => {
-                // Also acceptable at truncation boundary.
-                saw_truncated = true;
-                break;
-            }
-            Err(e) => panic!("unexpected error: {e}"),
+#[test]
+fn every_source_or_paper_frame_truncation_repairs_only_an_incomplete_tail() {
+    let dir = tmp_dir();
+    let canonical = dir.path().join("canonical.log");
+    {
+        let mut writer = Writer::open(&canonical).unwrap();
+        writer
+            .append(make_envelope(b"canonical fixture".to_vec()))
+            .unwrap();
+        writer.sync().unwrap();
+    }
+    let bytes = std::fs::read(&canonical).unwrap();
+
+    for cut in 1..bytes.len() {
+        let path = dir.path().join(format!("cut-{cut}.log"));
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        if cut < 5 {
+            assert!(matches!(
+                Writer::open(&path),
+                Err(LogError::BadHeader { .. })
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        } else if cut == 5 {
+            drop(Writer::open(&path).unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        } else {
+            let outcome = Scanner::inspect(&path).unwrap();
+            assert_eq!(outcome.verified_tail.physical_tail, 5);
+            assert!(outcome.incomplete_tail.is_some());
+            drop(Writer::open(&path).unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), b"EDGE\x01");
         }
     }
+}
 
-    assert!(
-        complete < N,
-        "expected fewer than {N} complete frames, got {complete}"
+#[test]
+fn interior_crc_damage_is_fatal_and_never_truncated() {
+    let dir = tmp_dir();
+    let path = dir.path().join("interior.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(vec![1; 64])).unwrap();
+        writer.append(make_envelope(vec![2; 64])).unwrap();
+        writer.sync().unwrap();
+    }
+    let mut damaged = std::fs::read(&path).unwrap();
+    damaged[9] ^= 0xff;
+    std::fs::write(&path, &damaged).unwrap();
+
+    assert!(matches!(
+        Writer::open(&path),
+        Err(LogError::CrcMismatch {
+            at_seq: EventSeq(0),
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), damaged);
+}
+
+#[test]
+fn property_large_frame_truncations_repair_to_the_verified_prefix() {
+    use proptest::prelude::*;
+
+    proptest!(|(payload in proptest::collection::vec(any::<u8>(), 1_024..=8_192), fraction in 1usize..=99)| {
+        let dir = tmp_dir();
+        let canonical = dir.path().join("large.log");
+        {
+            let mut writer = Writer::open(&canonical).unwrap();
+            writer.append(make_envelope(payload)).unwrap();
+            writer.sync().unwrap();
+        }
+        let bytes = std::fs::read(&canonical).unwrap();
+        let body_len = bytes.len() - 5;
+        let cut = 5 + body_len.saturating_mul(fraction) / 100;
+        let path = dir.path().join("large-truncated.log");
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        drop(Writer::open(&path).unwrap());
+        prop_assert_eq!(std::fs::read(&path).unwrap(), b"EDGE\x01");
+    });
+}
+
+#[test]
+fn scanner_reports_exact_physical_tail_sequence_hash_and_resolved_path() {
+    let dir = tmp_dir();
+    let path = dir.path().join("tail-binding.log");
+    {
+        let mut writer = Writer::open(&path).unwrap();
+        writer.append(make_envelope(b"one".to_vec())).unwrap();
+        writer.append(make_envelope(b"two".to_vec())).unwrap();
+        writer.sync().unwrap();
+    }
+    let binding = Reader::verified_tail(&path).unwrap();
+    let envelopes = Reader::replay(&path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(binding.path, std::fs::canonicalize(&path).unwrap());
+    assert_eq!(
+        binding.physical_tail,
+        std::fs::metadata(&path).unwrap().len()
     );
-    assert!(saw_truncated || complete < N, "expected truncated error");
+    assert_eq!(binding.last_sequence, Some(EventSeq(1)));
+    assert_eq!(binding.last_hash, envelopes[1].1.this_hash);
 }
 
 // ── Tail test ─────────────────────────────────────────────────────────────────
@@ -533,6 +715,38 @@ fn cross_version_replay_fixture_validates() {
     let (seq, env) = results[0].as_ref().unwrap();
     assert_eq!(seq.0, 0);
     assert_eq!(env.payload, b"fixture payload v1");
+}
+
+#[test]
+fn nonempty_version_one_prefix_and_version_two_tail_replay_by_envelope_version() {
+    let dir = tmp_dir();
+    let path = dir.path().join("mixed-versions.log");
+    let time = fixed_time();
+    let mut writer = Writer::open(&path).unwrap();
+    for version in [1, 2] {
+        writer
+            .append(EnvelopeIn {
+                source_id: SourceId("versioned-source".to_owned()),
+                schema_version: version,
+                parser_version: version,
+                observed_at: SourceTimestamp(time),
+                received_at: ReceivedAt(time),
+                content_type: ContentType::Json,
+                payload: format!("{{\"version\":{version}}}").into_bytes(),
+            })
+            .unwrap();
+    }
+    writer.sync().unwrap();
+    drop(writer);
+
+    let frames = Reader::replay(&path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames[0].1.schema_version, 1);
+    assert_eq!(frames[1].1.schema_version, 2);
+    assert_eq!(frames[0].0, EventSeq(0));
+    assert_eq!(frames[1].0, EventSeq(1));
 }
 
 fn generate_fixture(path: &std::path::Path) {

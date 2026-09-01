@@ -27,8 +27,10 @@
 //! short blocking call on the async worker is acceptable for v1; revisit with
 //! `spawn_blocking` if RTDS volume (issue #282 Phase 2) makes it material.
 
+mod migration;
 mod schema;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
@@ -40,6 +42,10 @@ use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
 
+pub use migration::{
+    BoundaryField, BoundaryMismatch, DurableLogBindings, DurableLogName, MigrationMetadata,
+    MigrationPhase, MigrationRecord, verify_log_bindings, verify_side_main_path,
+};
 pub use schema::SCHEMA_VERSION;
 use schema::{
     BANKROLL_ROW_ID, META_LAST_APPLIED_EVENT_SEQ, META_LAST_SUPABASE_APPLIED_EVENT_SEQ, SCHEMA,
@@ -62,6 +68,49 @@ pub enum PaperStateError {
     /// An internal invariant was violated (e.g. a poisoned lock or arithmetic overflow).
     #[error("internal invariant violated: {0}")]
     Internal(String),
+    /// Filesystem synchronization failed while persisting boot metadata.
+    #[error("paper-state synchronization failed: {0}")]
+    Synchronization(#[from] std::io::Error),
+    /// Migration metadata JSON was malformed or could not be encoded.
+    #[error("paper-state migration metadata encoding failed: {0}")]
+    MigrationEncoding(#[from] serde_json::Error),
+    /// A resume attempt addressed a side main other than the exact recorded path.
+    #[error(
+        "paper-state migration side path mismatch: expected {}, got {}",
+        expected.display(),
+        actual.display()
+    )]
+    MigrationSidePathMismatch {
+        expected: std::path::PathBuf,
+        actual: std::path::PathBuf,
+    },
+    /// The schema-v1 bootstrap path could not find the existing `meta` owner.
+    #[error("paper-state migration meta table is missing")]
+    MigrationMetaMissing,
+    /// The immutable migration record already exists with different content.
+    #[error("paper-state immutable migration record differs from the requested record")]
+    MigrationRecordConflict,
+    /// A migration record was required but absent.
+    #[error("paper-state migration record is missing")]
+    MigrationRecordMissing,
+    /// Fixed-main and side-main migration records do not agree.
+    #[error("paper-state fixed and side migration records diverge")]
+    MigrationRecordDivergent,
+    /// The requested phase transition is not the next state-machine edge.
+    #[error("invalid paper-state migration phase transition from {from} to {to}")]
+    MigrationPhaseTransition { from: String, to: String },
+    /// A synchronized metadata write could not checkpoint every WAL frame.
+    #[error(
+        "paper-state migration checkpoint incomplete: busy={busy}, log={log}, checkpointed={checkpointed}"
+    )]
+    MigrationCheckpointIncomplete {
+        busy: i64,
+        log: i64,
+        checkpointed: i64,
+    },
+    /// A supplied authoritative replacement contains duplicate position keys.
+    #[error("authoritative positions contain duplicate key {market_id}/{outcome_id}")]
+    DuplicateAuthoritativePosition { market_id: String, outcome_id: u16 },
 }
 
 /// One leader's net position in a `(market, outcome)`, mirroring the in-memory
@@ -1085,6 +1134,88 @@ impl PaperStateDb {
                 to_i64(short_contracts)?,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Atomically replace the complete authoritative bankroll/positions snapshot (#544).
+    ///
+    /// All keys and integer conversions are validated before the transaction begins. The single
+    /// transaction then replaces the bankroll, deletes every prior position, and inserts the
+    /// complete fetched set, so a failed pull or failed replacement cannot expose a partial page.
+    pub fn replace_authoritative_state(
+        &self,
+        bankroll: Decimal,
+        positions: &[PaperPositionRow],
+    ) -> Result<(), PaperStateError> {
+        self.replace_authoritative_state_inner(bankroll, positions, None)
+    }
+
+    /// Scenario seam for proving rollback after an injected mid-replacement failure (#544).
+    #[cfg(feature = "scenario")]
+    pub fn replace_authoritative_state_failing_after(
+        &self,
+        bankroll: Decimal,
+        positions: &[PaperPositionRow],
+        inserted_rows: usize,
+    ) -> Result<(), PaperStateError> {
+        self.replace_authoritative_state_inner(bankroll, positions, Some(inserted_rows))
+    }
+
+    fn replace_authoritative_state_inner(
+        &self,
+        bankroll: Decimal,
+        positions: &[PaperPositionRow],
+        fail_after: Option<usize>,
+    ) -> Result<(), PaperStateError> {
+        let mut keys = BTreeSet::new();
+        let mut encoded = Vec::with_capacity(positions.len());
+        for position in positions {
+            let key = (position.market_id.to_string(), position.outcome_id.0);
+            if !keys.insert(key.clone()) {
+                return Err(PaperStateError::DuplicateAuthoritativePosition {
+                    market_id: key.0,
+                    outcome_id: key.1,
+                });
+            }
+            encoded.push((
+                key.0,
+                i64::from(position.outcome_id.0),
+                to_i64(position.long_contracts)?,
+                to_i64(position.short_contracts)?,
+            ));
+        }
+
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
+            params![BANKROLL_ROW_ID, bankroll.to_string()],
+        )?;
+        tx.execute("DELETE FROM positions", [])?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO positions \
+                 (market_id, outcome_id, long_contracts, short_contracts) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (index, (market_id, outcome_id, long_contracts, short_contracts)) in
+                encoded.into_iter().enumerate()
+            {
+                if fail_after == Some(index) {
+                    return Err(PaperStateError::Internal(
+                        "injected authoritative replacement failure".to_owned(),
+                    ));
+                }
+                statement.execute(params![
+                    market_id,
+                    outcome_id,
+                    long_contracts,
+                    short_contracts
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2260,6 +2391,78 @@ mod tests {
         assert_eq!(pos.len(), 1);
         assert_eq!(pos[0].long_contracts, 0);
         assert_eq!(pos[0].short_contracts, 5);
+    }
+
+    #[test]
+    fn authoritative_replacement_deletes_stale_rows_atomically() {
+        let (_dir, db) = db();
+        db.set_bankroll(dec!(10)).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        let replacement = PaperPositionRow {
+            market_id: MarketId(VenueMarketId("0xfresh".to_owned())),
+            outcome_id: OutcomeId(1),
+            long_contracts: 7,
+            short_contracts: 2,
+        };
+
+        db.replace_authoritative_state(dec!(42.5), std::slice::from_ref(&replacement))
+            .unwrap();
+
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(42.5)));
+        assert_eq!(db.paper_positions().unwrap(), vec![replacement]);
+    }
+
+    #[test]
+    fn invalid_authoritative_replacement_leaves_prior_state_untouched() {
+        let (_dir, db) = db();
+        db.set_bankroll(dec!(10)).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        let duplicate = PaperPositionRow {
+            market_id: market(),
+            outcome_id: OutcomeId(1),
+            long_contracts: 7,
+            short_contracts: 2,
+        };
+        let result = db.replace_authoritative_state(dec!(99), &[duplicate.clone(), duplicate]);
+
+        assert!(matches!(
+            result,
+            Err(PaperStateError::DuplicateAuthoritativePosition { .. })
+        ));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(10)));
+        assert_eq!(db.paper_positions().unwrap()[0].long_contracts, 5);
+    }
+
+    #[cfg(feature = "scenario")]
+    #[test]
+    fn mid_transaction_authoritative_replacement_failure_rolls_back_every_write() {
+        let (_dir, db) = db();
+        db.set_bankroll(dec!(10)).unwrap();
+        db.upsert_position(&market(), OutcomeId(0), 5, 0).unwrap();
+        let replacements = [
+            PaperPositionRow {
+                market_id: MarketId(VenueMarketId("0xfresh-1".to_owned())),
+                outcome_id: OutcomeId(0),
+                long_contracts: 7,
+                short_contracts: 2,
+            },
+            PaperPositionRow {
+                market_id: MarketId(VenueMarketId("0xfresh-2".to_owned())),
+                outcome_id: OutcomeId(1),
+                long_contracts: 8,
+                short_contracts: 3,
+            },
+        ];
+
+        assert!(
+            db.replace_authoritative_state_failing_after(dec!(99), &replacements, 1)
+                .is_err()
+        );
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(10)));
+        let prior = db.paper_positions().unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].market_id, market());
+        assert_eq!(prior[0].long_contracts, 5);
     }
 
     #[test]
