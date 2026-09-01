@@ -6,69 +6,125 @@
 > [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
-deploying it to the VPS. Until this file, the procedure lived only in session memory —
-fields marked *(verify)* are recorded from operator history and must be confirmed
-against the live box on first use, then corrected here.
+deploying it to the VPS with one restart and no stop-before-swap window.
 
 ## Facts
 
 | item | value |
 |---|---|
 | VPS | `82.22.32.225`, user `sean` (`ssh -i ~/.ssh/id_personal sean@82.22.32.225` — never root) |
-| unit | systemd **system** unit `pe-service` — start/stop needs interactive sudo (`ssh -t … 'sudo systemctl <verb> pe-service'`); a coding agent cannot restart it non-interactively |
-| binary path | `target/release/pe-service` under the service checkout *(verify via `systemctl cat pe-service` → `ExecStart`/`WorkingDirectory`)* |
-| backup convention | before overwrite: `cp target/release/pe-service target/release/pe-service.bak-<old-sha>` (e.g. `pe-service.bak-a166f05`, `pe-service.bak-da17c16`) |
-| env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop) |
-| build box | the VPS has no cargo — build on the dev box and `scp`, or build in a VPS-compatible container. Dev box: `cargo build --release -p pe-service` at the target main SHA (rustc 1.95.0) |
-| logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path` |
+| unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Restart needs interactive sudo (`ssh -t … 'sudo systemctl restart pe-service'`); a coding agent cannot restart it non-interactively |
+| binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
+| backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
+| env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
+| build box | the VPS has no cargo — build on the dev box and `scp`. Dev box: `cargo build --release -p pe-service` at the target main SHA (rustc 1.95.0) |
+| logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path`; `status.json` in the working directory |
+
+## Topology (#546)
+
+One `pe-service` process on the VPS runs **three coequal activity-websocket readers** over the same
+endpoint and **one coordinator** that owns the source event log; there is no per-reader unit, no Forge
+activity reader, and no cross-host failover. A VPS reboot stops all three readers until the enabled
+unit starts the process again. Forge's independent ranking loop (`pe-rank-loop`,
+[`26-…RUNBOOK.md`](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md) "Continuous Forge supervisor",
+[`deploy/systemd/README.md`](../deploy/systemd/README.md)) is not in the copy path: its reboot pauses
+new ranking publication only.
 
 ## Procedure
 
-Every step is bound to sha256 identity (#514): record **desired** = `sha256sum` of the
-local release build before shipping; on the VPS, **staged** = the hash of
-`/tmp/pe-service.new.<desired-sha12>` (hash-qualified — concurrent agents cannot clobber each other's staged binary, #516) and **installed** = the hash of the `ExecStart` binary. A deploy holds the deploy lock from preflight through verify-or-rollback — acquire it as the FIRST step-3 action and keep the FD open for the whole run: `exec 9>/home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }` — aborting on contention. The lock serializes concurrent deploy agents on the VPS; backfill/reset (dev-box `psql` paths) are excluded instead by their own runbook precondition that the service is STOPPED while they run (docs/34).
+Every step is bound to sha256 identity (#514): **desired** = hash of the local release build;
+**staged** = hash of `/tmp/pe-service.new.<desired-sha12>` on the VPS (hash-qualified so concurrent
+agents cannot clobber each other's staged binary, #516); **installed** = hash of the `ExecStart`
+binary; **running** = hash of `/proc/<MainPID>/exe`. A deploy holds the deploy lock from preflight
+through verify-or-rollback — acquire it as the FIRST VPS action and keep the descriptor open for the
+whole run: `exec 9>/home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }`.
+The lock serializes concurrent deploy agents on the VPS; backfill/reset (dev-box `psql` paths) are
+excluded instead by their own runbook precondition that the service is STOPPED while they run (docs/34).
 
-1. **Build at the exact main SHA** being deployed (record the git SHA and the desired
-   binary hash):
-   `git -C /home/sean/git/prediction-markets rev-parse --short HEAD && cargo build --release -p pe-service && sha256sum target/release/pe-service`
-2. **Ship**: `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
-3. **Preflight on the VPS** (before stopping anything): require `staged = desired` — a
-   mismatch or missing file means the scp is partial: re-run step 2. If
-   `installed = desired` already, the swap is complete (a resumed run): skip to step 6.
-4. **Stop** (operator, interactive sudo): `ssh -t … 'sudo systemctl stop pe-service'`
-5. **Backup + swap** (on the VPS, service stopped; `<old-sha>` = the git short SHA the
-   installed binary was built from, falling back to the first 12 hex of its sha256 when
-   unknown — the sha-derived name makes the backup once-only, so a rerun never clobbers
-   it):
-   `[ -f <workdir>/target/release/pe-service.bak-<old-sha> ] || cp -p <workdir>/target/release/pe-service <workdir>/target/release/pe-service.bak-<old-sha>`
-   `mv /tmp/pe-service.new.<desired-sha12> <workdir>/target/release/pe-service && chmod +x <workdir>/target/release/pe-service`
-   then require `installed = desired` before proceeding.
-6. **Config deltas for this deploy** (see each PR's "Deployment impact"): update `.env` /
-   TOML boot knobs (e.g. `PE_WATCHLIST_MEMBERSHIP_MODE=full_rerank`) and PATCH/INSERT the
-   live `service_config` rows the new binary reads (seed `on conflict do nothing` never
-   updates an existing row — changed defaults need a manual `PATCH`).
-7. **Start**: `ssh -t … 'sudo systemctl start pe-service'` — a failed start rolls back
-   from the step-5 backup (see Rollback).
-8. **Verify**: `journalctl -u pe-service -n 100` — clean boot (no config-parse error /
-   restart loop), watchlist seeded from `latest_ranking`, `service_config poll loop
-   started`, no poll failures; then confirm behavior-specific log lines for the deploy
-   (e.g. the first `full re-rank membership swap applied` after a ranking push — since
-   #542 a swap or backfill that admits anyone is preceded by
-   `hot-watchlist admission state prepared`; a swap with no such line admitted nobody).
-   **With `polymarket_activity_ws_enabled=true` (#530), additionally verify the
-   source-health block in `status.json`**: `ws_connected=true`, a fresh
-   `ws_last_valid_frame_age_secs`, `ws_sink_poisoned=false`, a fresh
-   `poll_last_round_age_secs` with `poll_error_streak=0`, and
-   `copy_admission_blocked=false`; `/health/ready` must carry none of
-   `activity_ws_stale`, `activity_ws_dead`, `activity_ws_sink_poisoned`,
-   `copy_admission_blocked`. Then observe one websocket-observed copy (or a
-   `stale fallback observation` line proving the budget rule) before declaring
-   the enabled deploy healthy. **Deployment one-time note (#530)**: delete the
-   retired runtime row `delete from service_config where key='trade_poll_interval_secs';`
-   (boot-owned only now).
+Since #546 the binary is replaced **while the old process keeps running** — Linux keeps the old inode
+open under it — and activated by **one** `systemctl restart`. Every step is resumable: the hash
+comparisons decide what remains; never guess from memory.
 
-An interrupted deploy is resumed by re-running from step 3: the hash comparisons decide
-whether to re-ship, re-swap, or only start and verify — never guess from memory.
+1. **Build at the exact main SHA** being deployed (record the git SHA and the desired hash):
+   `git -C /home/sean/git/prediction-markets rev-parse HEAD && cargo build --release -p pe-service && sha256sum target/release/pe-service`
+2. **Ship** hash-qualified:
+   `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
+3. **Preflight on the VPS** (read-only; lock first):
+
+   ```bash
+   exec 9>/home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }
+   cd /home/sean/prediction-markets
+   systemctl is-enabled pe-service; systemctl is-active pe-service
+   systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory -p FragmentPath -p DropInPaths -p UnitFileState -p WantedBy -p Restart -p RestartUSec -p KillSignal
+   pid=$(systemctl show pe-service -p MainPID --value)
+   sha256sum target/release/pe-service "/proc/$pid/exe" /tmp/pe-service.new.<desired-sha12> .env smoke-test/service.toml
+   stat -c '%d %n' target/release /tmp     # equal device ids ⇒ the rename below is atomic
+   jq '.source_health, {bankroll,open_positions,fills_total,last_event_seq,watchlist_size}' status.json
+   stat -c '%s %Y' smoke-test/source_events.log
+   ```
+
+   Expected contract: `enabled`, `active`, `UnitFileState=enabled`, `WantedBy=multi-user.target`,
+   `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2`, staged = desired, installed = running.
+   If installed = running = desired already, the deploy is complete (a resumed run): go to step 6.
+   If installed = desired but running is prior, go to step 5. Any unit-policy or ownership drift
+   stops the deploy for a reviewed correction; only enablement drift may be repaired in place with
+   `sudo systemctl enable pe-service` (no `--now`, no restart).
+4. **Baseline + atomic swap** (the old process keeps running on its open inode):
+
+   ```bash
+   art=/home/sean/.pe-deploy-artifacts/<desired-sha12>; install -d -m 0700 "$art"; umask 077
+   cp status.json "$art/status.before.json"
+   systemctl show pe-service -p InvocationID -p MainPID -p ExecStart -p WorkingDirectory > "$art/unit.before"
+   sqlite3 -readonly paper_state.db ".backup '$art/paper.before.db'"
+   [ -f target/release/pe-service.bak-<prior-sha12> ] || cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>
+   sha256sum target/release/pe-service.bak-<prior-sha12>       # = prior (= installed = running)
+   chmod 0755 /tmp/pe-service.new.<desired-sha12>
+   mv -T --no-copy /tmp/pe-service.new.<desired-sha12> target/release/pe-service && sync -f target/release/pe-service
+   sha256sum target/release/pe-service "/proc/$pid/exe"        # installed = desired; running still = prior
+   ```
+
+5. **Config deltas for this deploy** (see each PR's "Deployment impact": `.env` / TOML boot knobs,
+   PATCH/INSERT of the live `service_config` rows the new binary reads — seed `on conflict do nothing`
+   never updates an existing row), then **one activation** (operator, interactive sudo):
+   `ssh -t … 'sudo systemctl restart pe-service'`. Immediately before it, re-read the installed and
+   running hashes and `InvocationID`: if the running hash is already desired (the unit re-activated on
+   its own after a crash), do not restart again.
+6. **Verify**:
+
+   ```bash
+   systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory
+   pid=$(systemctl show pe-service -p MainPID --value); sha256sum "/proc/$pid/exe" .env smoke-test/service.toml
+   journalctl -u pe-service -n 100
+   jq '.source_health' status.json; curl -s localhost:8080/health/ready
+   ```
+
+   A new `InvocationID`, PID, and start timestamp prove activation; `NRestarts` must not increase
+   afterwards (no restart loop); running hash = desired; `ExecStart`, `WorkingDirectory`, and the
+   `.env` / `service.toml` hashes equal step 3; clean boot (no config-parse error, watchlist seeded from
+   `latest_ranking`, `service_config poll loop started`, no poll failures; since #542 an admitting
+   swap or backfill is preceded by `hot-watchlist admission state prepared`).
+   **With `polymarket_activity_ws_enabled=true` (#530/#546)**: two consecutive `status.json`
+   publications, each paired immediately with `/health/ready`, must show all three
+   `source_health.ws_readers` records, `ws_live_reader_count >= 2`, `ws_sink_poisoned=false`,
+   `copy_admission_blocked=false`, and at least two readers' `normalized_activity_rows_total`
+   advancing between the publications; readiness must carry none of `activity_ws_unavailable`,
+   `activity_ws_redundancy_degraded`, `activity_ws_sink_poisoned`, `copy_admission_blocked`; the
+   source log's size/mtime must advance (append-only file; no content inspection here). Then the
+   duplicate invariant on paper state — both queries must return nothing, whatever unrelated activity
+   happened meanwhile:
+
+   ```bash
+   sqlite3 -readonly paper_state.db "select source_trade_id, count(*) from fills group by 1 having count(*) > 1; select source_trade_id, count(*) from dispatch_seeds group by 1 having count(*) > 1;"
+   ```
+
+   For any watched `source_trade_id` observed after activation, tie its seen row, fill, seed, and
+   targets to that identifier; otherwise record `not observed`. If the second publication cannot
+   establish two live readers, roll back instead of waiting. Record the readers'
+   `consecutive_reconnects` and drop cadence: a churn pattern is the evidence for any keepalive
+   follow-up (the first-party client sends `ping` every 5 s; `pe-service` does not).
+
+**Deployment one-time note (#530)**: delete the retired runtime row
+`delete from service_config where key='trade_poll_interval_secs';` (boot-owned only now).
 
 ## #530 websocket rollback ordering
 
@@ -151,7 +207,7 @@ row.
 Install the service-scoped age identity at a root-owned path with mode `0600`. Install the committed
 `pe-service` drop-in that maps it as `LoadCredential=pe-age-identity:<identity-path>`, then run
 `systemctl daemon-reload` and verify the effective unit with `systemctl cat pe-service`. Deploy the
-Phase-D binary in that same stop/swap/start operation. Its first boot records the arming fence, so no
+Phase-D binary in that same swap/restart operation. Its first boot records the arming fence, so no
 earlier promotion review can arm an account.
 
 ### Arm one account
@@ -172,6 +228,16 @@ earlier promotion review can arm an account.
 
 ## Rollback
 
-Stop the service, `mv target/release/pe-service.bak-<old-sha>` back over the binary,
-revert any config deltas the old binary does not understand (unknown `service_config`
-keys are ignored by old binaries — safe to leave), start, verify boot per step 7.
+The same swap, reversed, plus one restart — triggered by any missing reader record, fewer than two
+live readers on the second bounded check, sink poison, a restart loop, an unexplained financial-state
+change, or a hash mismatch:
+
+```bash
+cp -p target/release/pe-service.bak-<prior-sha12> /tmp/pe-service.rollback.<prior-sha12>
+mv -T --no-copy /tmp/pe-service.rollback.<prior-sha12> target/release/pe-service && sync -f target/release/pe-service
+sha256sum target/release/pe-service                          # = prior
+```
+
+Revert any config deltas the old binary does not understand (unknown `service_config` keys are
+ignored by old binaries — safe to leave), then `ssh -t … 'sudo systemctl restart pe-service'` and
+verify per step 6. There is no schema, database, ranker, or host rollback.

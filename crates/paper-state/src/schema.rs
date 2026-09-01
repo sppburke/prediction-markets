@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS seen_trades (
     source_trade_id TEXT PRIMARY KEY NOT NULL
 );
 
--- #530: durable typed record of an admitted trade that staged NO copy because it
--- arrived on the REST fallback older than the calibrated copy budget (websocket-
+-- #530/#546: durable typed record of an admitted trade that staged NO copy because
+-- it was older than the calibrated copy budget on either transport (websocket-
 -- primary mode only). Written in the same transaction as seen/ledger advancement
 -- so the held delivery cursor provably advances through is_seen; provenance, age,
 -- and reason are retained for audit and replay.

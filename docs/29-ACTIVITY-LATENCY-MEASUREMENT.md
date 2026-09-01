@@ -87,9 +87,13 @@ streams every platform trade with `proxyWallet` (docs/15 entry + re-check policy
   Stable across a 14h soak (median minute-p95 1.31s; worst single minute 6.49s).
 - **Continuity**: the stream was live only ~113/840 soak minutes; sockets stay
   ping-alive while the subscription silently lapses (1,442 thirty-second silences
-  vs 16 hard disconnects). Consequence: silence-triggered resubscribe/reconnect
-  (`source-polymarket-public::activity_ws` policy) and the always-on REST poll
-  fallback are load-bearing.
+  vs 16 hard disconnects). 2026-08-31 (#546): the stall is connection-local — one
+  of several parallel connections freezes while the others deliver every watched
+  row; re-subscribing does not revive it; a fresh connection delivers within ~0.8 s;
+  the largest activity gap on a healthy connection was 4.775 s. Consequence: three
+  independent readers per process with a 30 s normalized-row timeout and direct
+  reconnect (`pe-service::activity_ingest`; constants in `_GLOSSARY.md`) and the
+  always-on REST poll fallback are load-bearing.
 - **Payload**: `proxyWallet`, `conditionId`, `asset`, `outcome`/`outcomeIndex`,
   `price`, `size`, `side`, `timestamp` (string seconds), `transactionHash`;
   `fee` optional per trade; schema otherwise stable all night.
@@ -101,4 +105,5 @@ streams every platform trade with `proxyWallet` (docs/15 entry + re-check policy
 Harnesses: `scripts/probe_activity_ws.py` (feed discovery/attribution re-check),
 `scripts/measure_activity_ws_latency.py` (latency), `scripts/soak_activity_ws.py`
 (continuity + bench-wallet reaction capture). Re-run the probe before each deploy
-relying on the feed (unofficial contract).
+relying on the feed (officially listed endpoint; the first-party client publishes
+the subscription/payload contract; no published continuity guarantee — `docs/15`).

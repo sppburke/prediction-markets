@@ -18,7 +18,9 @@ name = "pe_service"
 path = "src/lib.rs"
 
 [features]
-scenario = []
+# Deterministic scenario seams (in-process activity websocket peers, orchestrator age clock and
+# one-shot faults); enables the source crate's matching seam so both exist only in scenario builds.
+scenario = ["pe-source-polymarket-public/scenario"]
 
 [lints]
 workspace = true
@@ -61,6 +63,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 base64.workspace = true
+# Paused-clock scenario tests drive the reader timers with the production constants (#546).
+tokio = { workspace = true, features = ["test-util"] }
 rust_decimal_macros = { workspace = true }
 tempfile = { workspace = true }
 # Live-Postgres parity + AC9 concurrency harness (issue #397 follow-up), `scenario` feature;

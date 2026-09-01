@@ -1,21 +1,38 @@
-//! Scenario tests for websocket-primary ingestion (#530).
+//! Scenario tests for websocket-primary ingestion (#530, #546).
 //!
-//! Scenarios (v5 artifact acceptance):
-//!   WS1 — the same fill delivered via websocket then REST (one `source_trade_id`)
-//!         produces exactly one decision and one leader-ledger ingest.
-//!   WS2 — websocket-primary mode: a STALE REST-fallback observation commits the
-//!         typed no-copy disposition (seen + ledger + disposition, one transaction)
-//!         and stages no fill, while a fresh websocket observation still fills.
-//!   WS3 — flag disabled: an old REST observation processes byte-identically to
-//!         the pre-#530 path (fills; no disposition row) — the rollback posture.
-//!   WS4 — dual-unhealthy admission block: the trade is refused BEFORE any state
-//!         write (not seen, no ledger row), so redelivery admits it exactly once.
-//!   WS5 — source-log replay: envelopes appended by the sink replay through the
-//!         event-log `Reader` and the production websocket parser into trades
-//!         identical to the originals (fan-in/dedup equivalence from the log).
+//! Reader-pool scenarios run three real readers over in-process pipes
+//! (`ActivityWsPeer`, scenario feature) with the PRODUCTION timing constants
+//! under a paused tokio clock: time moves only by explicit `advance`, one
+//! boundary at a time, after the runtime has settled. Health ages are wall
+//! clock, so derived-liveness assertions pass an explicit instant to the pure
+//! rule; the reader's own deadline is tokio-`Instant` based and is what the
+//! paused clock drives.
 //!
-//! Staleness margins are 30x the budget (60s vs 2s), so wall-clock jitter cannot
-//! flip an assertion; the stale rule itself has clock-free unit coverage.
+//!   R1  — acks, keepalive text, unrelated topics, envelope errors, missing
+//!         payloads, and parser-rejected payloads never refresh liveness; the
+//!         socket drops at exactly 30 s; re-dials follow the 1 s, 2 s backoff.
+//!   R2  — a mixed frame delivers the watched row once, uses a parser-accepted
+//!         unwatched row for liveness only, records only the watched row.
+//!   R4  — one permanently silent slot re-dials while the other two deliver a
+//!         watched row through the durable source log to ONE decision; a
+//!         distinct identifier is also delivered; no polling input exists.
+//!   R5  — each slot's reconnect backoff is independent.
+//!   R6  — three byte-identical reader copies with a one-shot staging fault on
+//!         the first copy: three raw envelopes, one seen row, one leader delta,
+//!         one fill, one dispatch seed, the frozen armed targets; then the
+//!         source log replays into a fresh orchestrator to the same result.
+//!   R7  — full fan-in: the reader retains its frame, item, and socket, reads
+//!         no second frame, derives non-live at 30 s, drains in order once
+//!         capacity returns (stale rows become `activity_ws` no-copies), then
+//!         drops and re-dials.
+//!   R8  — the early gate applies the strict `age > budget` rule to BOTH
+//!         provenances with a fixed clock; exact-boundary rows stay eligible.
+//!   R9  — fresh at the early gate, stale immediately before staging: no-copy
+//!         with the entry retained; a one-shot no-copy commit fault rolls the
+//!         admission back so a later trade stages exactly once.
+//!   R10 — closed downstream ends the pool orderly; external abort stops every
+//!         reader; neither re-dials.
+//!   WS1–WS5 (#530) are retained unchanged in intent.
 //!
 //! Run with: cargo nextest run -p pe-service --features scenario
 
@@ -27,8 +44,10 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
@@ -39,17 +58,22 @@ use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
+use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer};
 use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
-use pe_service::health::{SharedHealth, new_shared_health_with_ws};
+use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
+use pe_service::live_accounts::{
+    AccountRow, CredentialMetaRow, LiveAccounts, LiveAccountsSnapshot,
+};
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
-use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::trade_parser;
 use pe_source_polymarket_public::{
-    ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, FixtureFetcher, parse_activity_frame,
+    ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SUBSCRIBE, ActivityWsError,
+    ActivityWsPeer, FixtureFetcher, parse_activity_frame,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -59,30 +83,45 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 // ── Helpers (mirrors scenario_paper_state.rs; scenario files are self-contained) ──
 
+const LEADER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const STRANGER: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 fn leader_wallet() -> WalletAddress {
-    serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
+    serde_json::from_str(&format!("\"{LEADER}\"")).unwrap()
+}
+
+fn market_with(hex: char) -> MarketId {
+    MarketId(VenueMarketId(format!("0x{}", hex.to_string().repeat(40))))
 }
 
 fn market() -> MarketId {
-    MarketId(VenueMarketId(
-        "0x2222222222222222222222222222222222222222".to_string(),
-    ))
+    market_with('2')
 }
 
 fn market_b() -> MarketId {
-    MarketId(VenueMarketId(
-        "0x3333333333333333333333333333333333333333".to_string(),
-    ))
+    market_with('3')
 }
 
 fn market_c() -> MarketId {
-    MarketId(VenueMarketId(
-        "0x4444444444444444444444444444444444444444".to_string(),
-    ))
+    market_with('4')
+}
+
+fn market_d() -> MarketId {
+    market_with('5')
+}
+
+fn id(s: &str) -> SourceTradeId {
+    SourceTradeId(s.to_string())
+}
+
+fn now_unix() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp()
 }
 
 fn make_watchlist(wallet: WalletAddress) -> Watchlist {
@@ -124,6 +163,22 @@ fn trade_at(
     }
 }
 
+/// One real-shape websocket activity payload (string numerics, as the feed sends them).
+fn payload(tx: &str, wallet: &str, market: &MarketId, observed_unix: i64) -> String {
+    format!(
+        r#"{{"proxyWallet":"{wallet}","conditionId":"{market}","side":"BUY","size":"100","price":"0.50","timestamp":"{observed_unix}","transactionHash":"{tx}","outcomeIndex":"0"}}"#
+    )
+}
+
+/// One websocket text frame (array form) carrying the given activity payloads.
+fn activity_frame(payloads: &[String]) -> String {
+    let frames: Vec<String> = payloads
+        .iter()
+        .map(|p| format!(r#"{{"topic":"activity","type":"trades","payload":{p}}}"#))
+        .collect();
+    format!("[{}]", frames.join(","))
+}
+
 fn flat_fill_config() -> WinnerFollowConfig {
     WinnerFollowConfig {
         sizing_mode: SizingMode::Dollar { usd: dec!(100) },
@@ -131,17 +186,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-/// Path wrapper so the harness can be 'static for tokio::spawn (WS4) while
-/// keeping the TempDir alive at each call site.
-struct DirHandle(std::path::PathBuf);
-impl DirHandle {
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-fn make_dispatcher(dir: &DirHandle) -> ExecutionDispatcher {
-    let paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
+fn make_dispatcher(dir: &Path) -> ExecutionDispatcher {
+    let paper_writer = Writer::open(dir.join("paper.log")).unwrap();
     let paper_executor = PaperExecutor::new(paper_writer, SourceId("test.paper".into()), 500, 100);
     ExecutionDispatcher::paper_only(paper_executor)
 }
@@ -166,30 +212,101 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
 
-/// Run `trades` through a fresh orchestrator with the given #530 posture.
-async fn run_trades_ws(
-    dir: std::path::PathBuf,
-    paper_state: Arc<PaperStateDb>,
-    activity_ws_enabled: bool,
-    health: SharedHealth,
-    trades: Vec<IncomingTrade>,
-) {
-    let dir_guard = DirHandle(dir);
-    let dir = &dir_guard;
-    let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
-    let mid_price_cache = mid_cache_for(&markets, "0.50");
+fn healthy_ws_health() -> SharedHealth {
+    new_shared_health_with_ws(false, true, 90)
+}
 
-    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
-    for t in trades {
-        trade_tx.send(t).await.unwrap();
+fn paper_fill_count(dir: &Path) -> usize {
+    let path = dir.join("paper.log");
+    if !path.exists() {
+        return 0;
     }
-    drop(trade_tx);
+    Reader::replay(&path).unwrap().count()
+}
 
-    let orch = Orchestrator::new(
+fn leader_long(paper_state: &PaperStateDb, market_id: &MarketId) -> Option<u64> {
+    paper_state
+        .leader_positions()
+        .unwrap()
+        .iter()
+        .find(|r| r.wallet == leader_wallet() && r.market_id == *market_id)
+        .map(|r| r.long_contracts)
+}
+
+// ── Armed live accounts (mirrors scenario_dispatch.rs) ────────────────────────
+
+fn account_row(
+    id: &str,
+    primary: bool,
+    enabled: bool,
+    execution_order: i64,
+    mode: &str,
+) -> AccountRow {
+    AccountRow {
+        account_id: id.to_string(),
+        is_primary: primary,
+        enabled,
+        execution_order,
+        requested_live_mode: mode.to_string(),
+        effective_live_mode: mode.to_string(),
+        live_price_impact_cap_bps: 100,
+        custody_wallet_address: None,
+        custody_wallet_kind: None,
+    }
+}
+
+fn standard_armed_accounts() -> LiveAccounts {
+    let rows = vec![
+        account_row("partner", false, true, 1, "live_tiny"),
+        account_row("primary-acct", true, true, 9, "live_tiny"),
+        account_row("bench", false, false, 0, "live_tiny"),
+    ];
+    let credentials: Vec<CredentialMetaRow> = rows
+        .iter()
+        .map(|row| CredentialMetaRow {
+            account_id: row.account_id.clone(),
+            bundle_version: 1,
+            key_id: "key-1".to_string(),
+        })
+        .collect();
+    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &credentials);
+    snapshot.fetched_at_unix = Some(now_unix());
+    LiveAccounts::new(snapshot)
+}
+
+// ── Orchestrator fixture ─────────────────────────────────────────────────────
+
+struct OrchOpts {
+    ws_enabled: bool,
+    live_accounts: Option<LiveAccounts>,
+    hooks: Option<Arc<ScenarioHooks>>,
+    markets: Vec<MarketId>,
+}
+
+impl OrchOpts {
+    fn ws(markets: Vec<MarketId>) -> Self {
+        Self {
+            ws_enabled: true,
+            live_accounts: None,
+            hooks: None,
+            markets,
+        }
+    }
+}
+
+fn build_orchestrator(
+    dir: &Path,
+    paper_state: Arc<PaperStateDb>,
+    trade_rx: mpsc::Receiver<IncomingTrade>,
+    health: SharedHealth,
+    opts: OrchOpts,
+) -> Orchestrator<FixtureFetcher, FixtureClobBookFetcher> {
+    let mid_price_cache = mid_cache_for(&opts.markets, "0.50");
+    let mut orch = Orchestrator::new(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
-            activity_ws_enabled,
+            activity_ws_enabled: opts.ws_enabled,
             copy_latency_budget_secs: 2,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
@@ -204,7 +321,7 @@ async fn run_trades_ws(
             clob_best_ask_fallback_haircut_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
-            live_accounts: None,
+            live_accounts: opts.live_accounts,
         },
         HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
@@ -221,19 +338,1053 @@ async fn run_trades_ws(
         Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .unwrap();
-    orch.run(std::future::pending::<()>()).await;
-}
-
-fn paper_fill_count(dir: &TempDir) -> usize {
-    let path = dir.path().join("paper.log");
-    if !path.exists() {
-        return 0;
+    if let Some(hooks) = opts.hooks {
+        orch.set_scenario_hooks(hooks);
     }
-    Reader::replay(&path).unwrap().count()
+    orch
 }
 
-fn healthy_ws_health() -> SharedHealth {
-    new_shared_health_with_ws(false, true, 90)
+/// Run `trades` (in order) through a fresh orchestrator to completion.
+async fn run_trades(
+    dir: &Path,
+    paper_state: Arc<PaperStateDb>,
+    health: SharedHealth,
+    opts: OrchOpts,
+    trades: Vec<IncomingTrade>,
+) {
+    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
+    for t in trades {
+        trade_tx.send(t).await.unwrap();
+    }
+    drop(trade_tx);
+    build_orchestrator(dir, paper_state, trade_rx, health, opts)
+        .run(std::future::pending::<()>())
+        .await;
+}
+
+fn spawn_orchestrator(
+    orch: Orchestrator<FixtureFetcher, FixtureClobBookFetcher>,
+) -> (JoinHandle<()>, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(orch.run(async move {
+        rx.await.ok();
+    }));
+    (task, tx)
+}
+
+// ── Reader-pool fixture: three real readers over in-process pipes ─────────────
+
+/// Dial fixture: every dial for a slot is recorded with its (paused) instant;
+/// a successful dial hands the reader a fresh pipe and parks the server half
+/// here for the test to drive. Slots in `failing` refuse to connect.
+#[derive(Default)]
+struct PipeNet {
+    dials: Mutex<Vec<(usize, Instant)>>,
+    servers: Mutex<Vec<(usize, ActivityWsPeer)>>,
+    failing: Mutex<HashSet<usize>>,
+}
+
+impl PipeNet {
+    fn dialer(self: &Arc<Self>) -> Dialer {
+        let net = Arc::clone(self);
+        Arc::new(move |slot| {
+            let net = Arc::clone(&net);
+            Box::pin(async move {
+                net.dials.lock().unwrap().push((slot, Instant::now()));
+                if net.failing.lock().unwrap().contains(&slot) {
+                    return Err(ActivityWsError::Transport {
+                        message: "connection refused".to_string(),
+                    });
+                }
+                let (client, server) = ActivityWsPeer::pair().await?;
+                net.servers.lock().unwrap().push((slot, server));
+                Ok(client)
+            })
+        })
+    }
+
+    fn dial_count(&self, slot: usize) -> usize {
+        self.dials
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _)| *s == slot)
+            .count()
+    }
+
+    fn dial_times(&self, slot: usize) -> Vec<Instant> {
+        self.dials
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _)| *s == slot)
+            .map(|(_, t)| *t)
+            .collect()
+    }
+
+    /// The oldest not-yet-taken server half for `slot`, with the production
+    /// subscription frame already asserted and consumed.
+    fn take_server(&self, slot: usize) -> ActivityWsPeer {
+        let mut servers = self.servers.lock().unwrap();
+        let idx = servers
+            .iter()
+            .position(|(s, _)| *s == slot)
+            .expect("a connection exists for this slot");
+        let mut server = servers.remove(idx).1;
+        assert_eq!(
+            server.try_recv_text().as_deref(),
+            Some(ACTIVITY_WS_SUBSCRIBE),
+            "every connection starts with the production subscription"
+        );
+        server
+    }
+}
+
+struct Pool {
+    net: Arc<PipeNet>,
+    health: SharedHealth,
+    source_log: PathBuf,
+    task: JoinHandle<()>,
+    _dir: TempDir,
+}
+
+impl Pool {
+    fn reader(&self, slot: usize) -> ReaderHealth {
+        self.health.lock().unwrap().ws_readers[slot].clone()
+    }
+
+    fn live_count(&self) -> usize {
+        self.health
+            .lock()
+            .unwrap()
+            .ws_live_reader_count(OffsetDateTime::now_utc())
+    }
+
+    /// Source-log contents in order, as trade identifiers.
+    fn source_log_ids(&self) -> Vec<String> {
+        Reader::replay(&self.source_log)
+            .unwrap()
+            .map(|item| {
+                let (_seq, env) = item.unwrap();
+                trade_parser::parse_ws_trade(&env.payload, env.received_at.0)
+                    .unwrap()
+                    .source_trade_id
+                    .0
+            })
+            .collect()
+    }
+}
+
+/// Start the production ingest owner over pipes and settle until all three
+/// slots have dialed (at the paused clock's t0).
+async fn start_pool_with(
+    net: Arc<PipeNet>,
+    capacity: usize,
+) -> (Pool, mpsc::Receiver<IncomingTrade>) {
+    let dir = tempfile::tempdir().unwrap();
+    let source_log = dir.path().join("source.log");
+    let sink = SourceEventSink::open(&source_log).unwrap();
+    let (trade_tx, trade_rx) = mpsc::channel(capacity);
+    let health = healthy_ws_health();
+    let ingest = ActivityIngest::with_dialer(
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        sink,
+        trade_tx,
+        health.clone(),
+        net.dialer(),
+    );
+    let task = tokio::spawn(ingest.run());
+    settle().await;
+    for slot in 0..3 {
+        assert_eq!(net.dial_count(slot), 1, "all three slots dial immediately");
+    }
+    (
+        Pool {
+            net,
+            health,
+            source_log,
+            task,
+            _dir: dir,
+        },
+        trade_rx,
+    )
+}
+
+async fn start_pool(capacity: usize) -> (Pool, mpsc::Receiver<IncomingTrade>) {
+    start_pool_with(Arc::new(PipeNet::default()), capacity).await
+}
+
+/// Let every runnable task make progress (no time passes under a paused clock).
+async fn settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Yield until `pred` holds (bounded) — for chains that cross several tasks.
+async fn settle_until(mut pred: impl FnMut() -> bool) -> bool {
+    for _ in 0..4_000 {
+        if pred() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    pred()
+}
+
+async fn advance(d: Duration) {
+    tokio::time::advance(d).await;
+    settle().await;
+}
+
+fn wall_now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
+}
+
+// ── R1: only normalized rows refresh liveness; exact drop; backoff schedule ───
+
+#[tokio::test(start_paused = true)]
+async fn r1_only_normalized_rows_refresh_liveness_drop_is_exact_and_backoff_follows() {
+    let (pool, _trade_rx) = start_pool(64).await;
+    let mut server = pool.net.take_server(0);
+
+    let non_refreshing: Vec<String> = vec![
+        String::new(),                                             // empty keepalive
+        r#"{"status":"subscribed"}"#.to_string(),                  // acknowledgement
+        "pong".to_string(),                                        // keepalive/heartbeat text
+        r#"{"topic":"comments","type":"new","payload":{}}"#.to_string(), // unrelated topic
+        "{not json".to_string(),                                   // envelope parse error
+        r#"{"topic":"activity","type":"trades"}"#.to_string(),     // missing payload
+        // Payloads rejected by the current production normalizer:
+        activity_frame(&[
+            r#"{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conditionId":"0xc","side":"BUY","size":"1","price":"0.5","timestamp":"1704067200"}"#.to_string(),
+        ]), // missing required field (transactionHash)
+        activity_frame(&[payload("0xr1", "nonsense", &market(), 1_704_067_200)]), // invalid wallet
+        activity_frame(&[payload("0xr2", LEADER, &market(), 1_704_067_200).replace("\"BUY\"", "\"HOLD\"")]), // invalid side
+        activity_frame(&[payload("0xr3", LEADER, &market(), 1_704_067_200).replace("\"1704067200\"", "\"soon\"")]), // invalid timestamp
+        activity_frame(&[payload("0xr4", LEADER, &market(), 1_704_067_200).replace("\"size\":\"100\"", "\"size\":\"99999999999999999999999999\"")]), // size beyond u64
+    ];
+    let mut elapsed = Duration::ZERO;
+    for input in &non_refreshing {
+        advance(Duration::from_secs(1)).await;
+        elapsed += Duration::from_secs(1);
+        server.send_text(input).await.unwrap();
+        settle().await;
+        let r = pool.reader(0);
+        assert!(r.connected, "{input:?}: still connected");
+        assert!(
+            r.last_wire_frame_at.is_some(),
+            "{input:?}: wire health advances"
+        );
+        assert!(
+            r.last_normalized_activity_at.is_none(),
+            "{input:?}: must not refresh normalized liveness"
+        );
+        assert_eq!(r.normalized_activity_rows_total, 0, "{input:?}");
+        assert!(!r.is_live(wall_now()), "{input:?}: never live");
+    }
+
+    // 29.999 s after connect: still holding the socket.
+    advance(Duration::from_millis(29_999) - elapsed).await;
+    assert!(pool.reader(0).connected);
+    assert_eq!(pool.net.dial_count(0), 1);
+    // Exactly 30 s: dropped without a close handshake; the re-dial waits 1 s.
+    advance(Duration::from_millis(1)).await;
+    assert!(!pool.reader(0).connected, "drops at the exact 30s boundary");
+    assert!(
+        server.recv_text().await.is_none(),
+        "the peer sees end-of-stream"
+    );
+    assert_eq!(pool.net.dial_count(0), 1);
+    advance(Duration::from_millis(999)).await;
+    assert_eq!(
+        pool.net.dial_count(0),
+        1,
+        "backoff is 1s after the first failure"
+    );
+    advance(Duration::from_millis(1)).await;
+    assert_eq!(pool.net.dial_count(0), 2);
+    assert_eq!(pool.reader(0).consecutive_reconnects, 1);
+    assert!(pool.reader(0).connected);
+    assert!(
+        pool.reader(0).last_normalized_activity_at.is_none(),
+        "a new connection is not live until its first normalized row"
+    );
+
+    // Second silent cycle: 30 s, then a 2 s backoff.
+    let mut server = pool.net.take_server(0);
+    advance(Duration::from_secs(30)).await;
+    assert!(server.recv_text().await.is_none());
+    advance(Duration::from_millis(1_999)).await;
+    assert_eq!(pool.net.dial_count(0), 2);
+    advance(Duration::from_millis(1)).await;
+    assert_eq!(pool.net.dial_count(0), 3);
+    assert_eq!(pool.reader(0).consecutive_reconnects, 2);
+    pool.task.abort();
+}
+
+// ── R2: normalize once, deliver only the watched row, unwatched rows keep liveness ──
+
+#[tokio::test(start_paused = true)]
+async fn r2_mixed_frame_delivers_watched_row_once_and_unwatched_rows_only_refresh_liveness() {
+    let (pool, mut trade_rx) = start_pool(64).await;
+    let mut server = pool.net.take_server(0);
+    advance(Duration::from_secs(29)).await; // one second from the deadline
+
+    let frame = activity_frame(&[
+        payload("0xwatched", LEADER, &market(), now_unix()),
+        payload("0xstranger", STRANGER, &market_b(), now_unix()),
+        payload("0xbad", LEADER, &market(), now_unix()).replace("\"BUY\"", "\"HOLD\""),
+    ]);
+    server.send_text(&frame).await.unwrap();
+    settle().await;
+
+    let delivered = trade_rx.try_recv().expect("the watched row is delivered");
+    assert_eq!(delivered.source_trade_id.0, "0xwatched");
+    assert_eq!(delivered.wallet, leader_wallet());
+    assert_eq!(delivered.provenance, TradeProvenance::ActivityWs);
+    assert!(
+        trade_rx.try_recv().is_err(),
+        "unwatched and rejected rows are never delivered"
+    );
+    let r = pool.reader(0);
+    assert_eq!(
+        r.normalized_activity_rows_total, 2,
+        "two payloads passed the normalizer, one was rejected"
+    );
+    assert!(r.is_live(wall_now()));
+    assert_eq!(pool.source_log_ids(), vec!["0xwatched".to_string()]);
+
+    // The frame refreshed the deadline: 29 more silent seconds keep the socket.
+    advance(Duration::from_secs(29)).await;
+    assert!(pool.reader(0).connected);
+    // A parser-accepted UNWATCHED row alone refreshes liveness (a quiet watched
+    // cohort must not look like a quiet platform) and delivers nothing.
+    server
+        .send_text(&activity_frame(&[payload(
+            "0xstranger2",
+            STRANGER,
+            &market_b(),
+            now_unix(),
+        )]))
+        .await
+        .unwrap();
+    settle().await;
+    advance(Duration::from_secs(29)).await;
+    assert!(pool.reader(0).connected);
+    assert_eq!(pool.reader(0).normalized_activity_rows_total, 3);
+    assert!(trade_rx.try_recv().is_err());
+    assert_eq!(pool.source_log_ids().len(), 1);
+    advance(Duration::from_secs(1)).await;
+    assert!(!pool.reader(0).connected, "30s after the last accepted row");
+    pool.task.abort();
+}
+
+// ── R4: one silent slot never interrupts delivery; one decision per identifier ──
+
+#[tokio::test(start_paused = true)]
+async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
+    let (pool, trade_rx) = start_pool(64).await;
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let orch = build_orchestrator(
+        dir.path(),
+        paper_state.clone(),
+        trade_rx,
+        pool.health.clone(),
+        OrchOpts::ws(vec![market(), market_b()]),
+    );
+    let (orch_task, shutdown) = spawn_orchestrator(orch);
+    let mut s0 = pool.net.take_server(0);
+    let mut s1 = pool.net.take_server(1); // silent forever
+    let mut s2 = pool.net.take_server(2);
+
+    advance(Duration::from_secs(1)).await;
+    let frame = activity_frame(&[payload("0xsame", LEADER, &market(), now_unix())]);
+    s0.send_text(&frame).await.unwrap();
+    s2.send_text(&frame).await.unwrap();
+    assert!(
+        settle_until(
+            || paper_fill_count(dir.path()) == 1 && paper_state.is_seen(&id("0xsame")).unwrap()
+        )
+        .await,
+        "two reader copies reach one decision with no polling input"
+    );
+    // A distinct identifier delivered by one reader only is also copied.
+    s2.send_text(&activity_frame(&[payload(
+        "0xother",
+        LEADER,
+        &market_b(),
+        now_unix(),
+    )]))
+    .await
+    .unwrap();
+    assert!(settle_until(|| paper_state.is_seen(&id("0xother")).unwrap()).await);
+    assert!(
+        paper_state
+            .no_copy_disposition(&id("0xother"))
+            .unwrap()
+            .is_none(),
+        "delivered fresh: admitted without a stale disposition"
+    );
+    // The same leader's second entry reaches the strategy, which sizes it to zero
+    // under the existing per-leader Kelly rule ("no edge") — delivery is proven by
+    // admission, not by a second fill.
+    assert_eq!(paper_fill_count(dir.path()), 1);
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(100),
+        "one leader delta"
+    );
+    assert_eq!(leader_long(&paper_state, &market_b()), Some(100));
+
+    // Keep 0 and 2 alive past slot 1's deadline with parser-accepted unwatched rows.
+    advance(Duration::from_secs(24)).await; // t = 25 s
+    for s in [&mut s0, &mut s2] {
+        s.send_text(&activity_frame(&[payload(
+            "0xnoise",
+            STRANGER,
+            &market_b(),
+            now_unix(),
+        )]))
+        .await
+        .unwrap();
+    }
+    settle().await;
+    advance(Duration::from_secs(5)).await; // t = 30 s: slot 1 drops
+    assert!(!pool.reader(1).connected);
+    assert!(s1.recv_text().await.is_none());
+    assert_eq!(pool.net.dial_count(1), 1);
+    advance(Duration::from_secs(1)).await; // t = 31 s: slot 1 re-dials alone
+    assert_eq!(pool.net.dial_count(1), 2);
+    assert_eq!(pool.net.dial_count(0), 1);
+    assert_eq!(pool.net.dial_count(2), 1);
+    assert_eq!(
+        pool.live_count(),
+        2,
+        "two live readers, one reconnected-not-live"
+    );
+    {
+        let h = pool.health.lock().unwrap();
+        assert!(
+            readiness_issues(&h, wall_now())
+                .iter()
+                .all(|i| !i.starts_with("activity_ws")),
+            "two live readers is healthy"
+        );
+    }
+    let mut ids = pool.source_log_ids();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "0xother".to_string(),
+            "0xsame".to_string(),
+            "0xsame".to_string()
+        ],
+        "every watched reader copy is raw evidence; unwatched rows are not recorded"
+    );
+    shutdown.send(()).unwrap();
+    orch_task.await.unwrap();
+    pool.task.abort();
+}
+
+// ── R5: independent per-slot backoff ─────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn r5_each_reader_has_independent_reconnect_backoff() {
+    let net = Arc::new(PipeNet::default());
+    net.failing.lock().unwrap().insert(1);
+    let (pool, _trade_rx) = start_pool_with(Arc::clone(&net), 64).await;
+    let t0 = net.dial_times(1)[0];
+    let mut s0 = net.take_server(0);
+    assert!(pool.reader(0).connected && !pool.reader(1).connected);
+
+    // Slot 1: 1 s, 2 s, 4 s ladder; slots 0 and 2 keep their first connection.
+    advance(Duration::from_secs(1)).await;
+    assert_eq!(net.dial_times(1), vec![t0, t0 + Duration::from_secs(1)]);
+    advance(Duration::from_secs(2)).await;
+    assert_eq!(net.dial_times(1).len(), 3);
+    assert_eq!(net.dial_times(1)[2], t0 + Duration::from_secs(3));
+    // Progress on slot 0 must not reset slot 1's ladder.
+    s0.send_text(&activity_frame(&[payload(
+        "0xnoise",
+        STRANGER,
+        &market_b(),
+        now_unix(),
+    )]))
+    .await
+    .unwrap();
+    settle().await;
+    assert_eq!(pool.reader(0).consecutive_reconnects, 0);
+    assert_eq!(pool.reader(1).consecutive_reconnects, 3);
+    advance(Duration::from_secs(4)).await;
+    assert_eq!(net.dial_times(1)[3], t0 + Duration::from_secs(7));
+    assert_eq!(pool.reader(1).consecutive_reconnects, 4);
+    assert_eq!(net.dial_count(0), 1);
+    assert_eq!(net.dial_count(2), 1);
+
+    // Slot 1 recovers on its own schedule: connected, not live until a row.
+    net.failing.lock().unwrap().clear();
+    advance(Duration::from_secs(8)).await;
+    assert_eq!(net.dial_times(1)[4], t0 + Duration::from_secs(15));
+    let r1 = pool.reader(1);
+    assert!(r1.connected && !r1.is_live(wall_now()));
+    assert_eq!(
+        r1.consecutive_reconnects, 4,
+        "reset only by a normalized row"
+    );
+    let mut s1 = net.take_server(1);
+    s1.send_text(&activity_frame(&[payload(
+        "0xnoise2",
+        STRANGER,
+        &market_b(),
+        now_unix(),
+    )]))
+    .await
+    .unwrap();
+    settle().await;
+    assert_eq!(pool.reader(1).consecutive_reconnects, 0);
+    assert!(pool.reader(1).is_live(wall_now()));
+    pool.task.abort();
+}
+
+// ── R6: three byte-identical copies → one decision; source-log replay agrees ──
+
+#[tokio::test(start_paused = true)]
+async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to_the_same() {
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks
+        .fail_next_stage_seed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (pool, trade_rx) = start_pool(64).await;
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let orch = build_orchestrator(
+        dir.path(),
+        paper_state.clone(),
+        trade_rx,
+        pool.health.clone(),
+        OrchOpts {
+            hooks: Some(Arc::clone(&hooks)),
+            live_accounts: Some(standard_armed_accounts()),
+            ..OrchOpts::ws(vec![market()])
+        },
+    );
+    let (orch_task, shutdown) = spawn_orchestrator(orch);
+
+    let row = payload("0xthree", LEADER, &market(), now_unix());
+    let frame = activity_frame(std::slice::from_ref(&row));
+    for slot in 0..3 {
+        pool.net.take_server(slot).send_text(&frame).await.unwrap();
+    }
+    assert!(
+        settle_until(|| paper_state.fills_count().unwrap() == 1
+            && pool.source_log_ids().len() == 3)
+        .await
+    );
+    // Give the third copy time to reach the seen check.
+    settle().await;
+    settle().await;
+
+    let assert_one_decision = |state: &PaperStateDb, paper_dir: &Path| {
+        assert!(
+            state.is_seen(&id("0xthree")).unwrap(),
+            "one committed seen row"
+        );
+        assert_eq!(leader_long(state, &market()), Some(100), "one leader delta");
+        assert_eq!(
+            state.fills_count().unwrap(),
+            1,
+            "exactly one eligible paper fill"
+        );
+        assert_eq!(paper_fill_count(paper_dir), 1);
+        let mut seeds = state.pending_dispatch_seeds().unwrap();
+        seeds.extend(state.unfinalized_ready_dispatch_seeds().unwrap());
+        assert_eq!(seeds.len(), 1, "one dispatch seed");
+        assert_eq!(seeds[0].source_trade_id, "0xthree");
+        let targets = state.dispatch_targets(&seeds[0].dispatch_id).unwrap();
+        let mut accounts: Vec<&str> = targets.iter().map(|t| t.account_id.as_str()).collect();
+        accounts.sort_unstable();
+        assert_eq!(
+            accounts,
+            vec!["partner", "primary-acct"],
+            "one target per eligible armed account with a credential binding"
+        );
+    };
+    assert!(
+        !hooks
+            .fail_next_stage_seed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the one-shot staging fault was consumed by the first copy"
+    );
+    assert_one_decision(&paper_state, dir.path());
+    shutdown.send(()).unwrap();
+    orch_task.await.unwrap();
+    pool.task.abort();
+    settle().await;
+
+    // Replay: three ordered envelopes, each byte-identical raw row with its own receipt.
+    let envelopes: Vec<_> = Reader::replay(&pool.source_log)
+        .unwrap()
+        .map(|item| item.unwrap())
+        .collect();
+    assert_eq!(envelopes.len(), 3, "three raw observations retained");
+    let reference =
+        trade_parser::parse_ws_trade(row.as_bytes(), envelopes[0].1.received_at.0).unwrap();
+    let mut replayed = Vec::new();
+    for (i, (_seq, env)) in envelopes.iter().enumerate() {
+        assert_eq!(env.source_id.0, ACTIVITY_WS_SOURCE_ID);
+        assert_eq!(env.schema_version, ACTIVITY_WS_SCHEMA_VERSION);
+        assert_eq!(env.parser_version, ACTIVITY_WS_PARSER_VERSION);
+        assert_eq!(
+            env.payload,
+            row.as_bytes(),
+            "envelope {i}: exact raw row bytes"
+        );
+        let t = trade_parser::parse_ws_trade(&env.payload, env.received_at.0).unwrap();
+        assert_eq!(
+            t.received_at, env.received_at.0,
+            "envelope {i}: its own receipt time"
+        );
+        assert_eq!(t.source_trade_id, reference.source_trade_id);
+        assert_eq!(t.wallet, reference.wallet);
+        assert_eq!(t.market_id.0.0, reference.market_id.0.0);
+        assert_eq!(t.outcome_id, reference.outcome_id);
+        assert_eq!(t.side, reference.side);
+        assert_eq!(t.price, reference.price);
+        assert_eq!(t.contracts, reference.contracts);
+        assert_eq!(t.observed_at, reference.observed_at);
+        assert_eq!(t.provenance, TradeProvenance::ActivityWs);
+        replayed.push(t);
+    }
+
+    // Fresh state, same fault: replay reproduces the single decision.
+    let dir2 = tempfile::tempdir().unwrap();
+    let paper2 = Arc::new(PaperStateDb::open(&dir2.path().join("p.db")).unwrap());
+    assert_eq!(paper2.fills_count().unwrap(), 0);
+    assert!(!paper2.is_seen(&id("0xthree")).unwrap());
+    assert!(paper2.pending_dispatch_seeds().unwrap().is_empty());
+    let hooks2 = Arc::new(ScenarioHooks::default());
+    hooks2
+        .fail_next_stage_seed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    run_trades(
+        dir2.path(),
+        paper2.clone(),
+        healthy_ws_health(),
+        OrchOpts {
+            hooks: Some(Arc::clone(&hooks2)),
+            live_accounts: Some(standard_armed_accounts()),
+            ..OrchOpts::ws(vec![market()])
+        },
+        replayed,
+    )
+    .await;
+    assert!(
+        !hooks2
+            .fail_next_stage_seed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "replay consumed the fault exactly once"
+    );
+    assert_one_decision(&paper2, dir2.path());
+}
+
+// ── R7: saturation retains the frame, item, and socket; drains in order ──────
+
+#[tokio::test(start_paused = true)]
+async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops() {
+    // Trade channel capacity 1 ⇒ fan-in capacity 1.
+    let (pool, trade_rx) = start_pool(1).await;
+    let mut server = pool.net.take_server(0);
+    let stale_unix = now_unix() - 60;
+    let rows: Vec<String> = ["0xa", "0xb", "0xc", "0xd"]
+        .iter()
+        .map(|tx| payload(tx, LEADER, &market(), stale_unix))
+        .collect();
+    server.send_text(&activity_frame(&rows)).await.unwrap();
+    assert!(
+        settle_until(|| pool.reader(0).fan_in_blocked).await,
+        "the fourth row blocks on the full fan-in (b is held on the full trade channel, c waits in the fan-in)"
+    );
+    let before = pool.reader(0);
+    assert!(before.connected && before.is_live(wall_now()));
+    assert_eq!(
+        pool.source_log_ids(),
+        vec!["0xa".to_string(), "0xb".to_string()]
+    );
+
+    // No second wire frame is read while blocked.
+    server
+        .send_text(&activity_frame(&[payload(
+            "0xe",
+            STRANGER,
+            &market_b(),
+            now_unix(),
+        )]))
+        .await
+        .unwrap();
+    settle().await;
+    assert_eq!(pool.reader(0).normalized_activity_rows_total, 0);
+    assert!(pool.reader(0).fan_in_blocked);
+
+    // 30 s later: non-live by the derived rule, still connected, item and socket retained.
+    advance(Duration::from_secs(30)).await;
+    let r = pool.reader(0);
+    assert!(r.connected && r.fan_in_blocked);
+    assert_eq!(
+        r.last_normalized_activity_at,
+        before.last_normalized_activity_at
+    );
+    assert!(!r.is_live(wall_now() + time::Duration::seconds(30)));
+    assert_eq!(pool.net.dial_count(0), 1, "no reconnect while blocked");
+
+    // Release capacity: an orchestrator drains every retained row IN ORDER; each
+    // stale websocket row is seen with an `activity_ws` no-copy disposition.
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let orch = build_orchestrator(
+        dir.path(),
+        paper_state.clone(),
+        trade_rx,
+        pool.health.clone(),
+        OrchOpts::ws(vec![market()]),
+    );
+    let (orch_task, shutdown) = spawn_orchestrator(orch);
+    let all = ["0xa", "0xb", "0xc", "0xd"];
+    assert!(settle_until(|| all.iter().all(|t| paper_state.is_seen(&id(t)).unwrap())).await);
+    assert_eq!(
+        pool.source_log_ids(),
+        all.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "retained rows landed in order without eviction"
+    );
+    for t in all {
+        let (provenance, age, reason) = paper_state.no_copy_disposition(&id(t)).unwrap().unwrap();
+        assert_eq!(provenance, "activity_ws");
+        assert!(age >= 60, "{t}: age {age}");
+        assert_eq!(reason, "stale_activity_ws_past_copy_budget");
+    }
+    assert_eq!(paper_fill_count(dir.path()), 0, "no fill");
+    assert!(
+        paper_state.pending_dispatch_seeds().unwrap().is_empty(),
+        "no seed"
+    );
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(400),
+        "leader bookkeeping kept"
+    );
+
+    // After the drain the deadline check drops the socket BEFORE the next read, so
+    // the second frame is never consumed; the slot re-dials after its backoff.
+    assert!(settle_until(|| !pool.reader(0).connected).await);
+    assert!(!pool.reader(0).fan_in_blocked);
+    assert!(server.recv_text().await.is_none());
+    assert_eq!(pool.reader(0).normalized_activity_rows_total, 4);
+    advance(Duration::from_secs(1)).await;
+    assert_eq!(pool.net.dial_count(0), 2);
+    shutdown.send(()).unwrap();
+    orch_task.await.unwrap();
+    pool.task.abort();
+}
+
+// ── R8: strict budget for both provenances at the early gate (fixed clock) ───
+
+#[tokio::test]
+async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+    let hooks = Arc::new(ScenarioHooks::default());
+    // Stale rows consume one instant (early gate); eligible rows consume two
+    // (early gate + the pre-staging re-check).
+    hooks.age_clock.lock().unwrap().extend([t, t, t, t, t, t]);
+    run_trades(
+        dir.path(),
+        paper_state.clone(),
+        healthy_ws_health(),
+        OrchOpts {
+            hooks: Some(Arc::clone(&hooks)),
+            ..OrchOpts::ws(vec![market(), market_b(), market_c(), market_d()])
+        },
+        vec![
+            trade_at(
+                "0xws60",
+                market(),
+                t - time::Duration::seconds(60),
+                TradeProvenance::ActivityWs,
+            ),
+            trade_at(
+                "0xrest60",
+                market_b(),
+                t - time::Duration::seconds(60),
+                TradeProvenance::RestPoll,
+            ),
+            // Exact boundary (age == budget) stays eligible for both provenances.
+            trade_at(
+                "0xwsedge",
+                market_c(),
+                t - time::Duration::seconds(2),
+                TradeProvenance::ActivityWs,
+            ),
+            trade_at(
+                "0xrestedge",
+                market_d(),
+                t - time::Duration::seconds(2),
+                TradeProvenance::RestPoll,
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        hooks.age_clock.lock().unwrap().is_empty(),
+        "every check sampled once"
+    );
+    // Both boundary rows are admitted as eligible (seen, no disposition, both sampled
+    // twice). The first fills; the second reaches the strategy and is sized to zero by
+    // the existing per-leader Kelly rule — stale rows never get that far.
+    assert_eq!(
+        paper_fill_count(dir.path()),
+        1,
+        "a boundary row fills; stale rows never do"
+    );
+    assert_eq!(
+        paper_state
+            .no_copy_disposition(&id("0xws60"))
+            .unwrap()
+            .unwrap(),
+        (
+            "activity_ws".to_string(),
+            60,
+            "stale_activity_ws_past_copy_budget".to_string()
+        )
+    );
+    assert_eq!(
+        paper_state
+            .no_copy_disposition(&id("0xrest60"))
+            .unwrap()
+            .unwrap(),
+        (
+            "rest_poll".to_string(),
+            60,
+            "stale_fallback_past_copy_budget".to_string()
+        )
+    );
+    for t in ["0xws60", "0xrest60", "0xwsedge", "0xrestedge"] {
+        assert!(paper_state.is_seen(&id(t)).unwrap(), "{t} seen");
+    }
+    assert!(
+        paper_state
+            .no_copy_disposition(&id("0xwsedge"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        paper_state
+            .no_copy_disposition(&id("0xrestedge"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(100),
+        "stale rows still mirror the leader"
+    );
+}
+
+// ── R9: fresh early, stale before staging; commit fault rolls back cleanly ───
+
+#[tokio::test]
+async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back() {
+    let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+
+    // Part 1: fresh at the early gate, stale at the pre-staging re-check.
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks.age_clock.lock().unwrap().extend([
+        t,                              // 0xlate early: age 1s, fresh
+        t + time::Duration::seconds(5), // 0xlate final: age 6s, stale
+        t,                              // 0xsecond early: fresh; then NotFirstEntry
+    ]);
+    run_trades(
+        dir.path(),
+        paper_state.clone(),
+        healthy_ws_health(),
+        OrchOpts {
+            hooks: Some(Arc::clone(&hooks)),
+            ..OrchOpts::ws(vec![market()])
+        },
+        vec![
+            trade_at(
+                "0xlate",
+                market(),
+                t - time::Duration::seconds(1),
+                TradeProvenance::ActivityWs,
+            ),
+            trade_at(
+                "0xsecond",
+                market(),
+                t - time::Duration::seconds(1),
+                TradeProvenance::ActivityWs,
+            ),
+        ],
+    )
+    .await;
+    assert!(hooks.age_clock.lock().unwrap().is_empty());
+    assert!(paper_state.is_seen(&id("0xlate")).unwrap());
+    assert_eq!(
+        paper_state
+            .no_copy_disposition(&id("0xlate"))
+            .unwrap()
+            .unwrap(),
+        (
+            "activity_ws".to_string(),
+            6,
+            "stale_activity_ws_past_copy_budget".to_string()
+        )
+    );
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(200),
+        "both rows mirror the leader"
+    );
+    assert_eq!(
+        paper_fill_count(dir.path()),
+        0,
+        "no fill, no seed, no target"
+    );
+    assert!(paper_state.pending_dispatch_seeds().unwrap().is_empty());
+    // The same-session entry was retained: the second entry into this market is
+    // NotFirstEntry (seen, no disposition, no fill).
+    assert!(paper_state.is_seen(&id("0xsecond")).unwrap());
+    assert!(
+        paper_state
+            .no_copy_disposition(&id("0xsecond"))
+            .unwrap()
+            .is_none()
+    );
+
+    // Part 2: the one-shot no-copy commit fault leaves the trade unseen and restores
+    // both the leader ledger and the tentative entry, so a distinct new trade for the
+    // same leader and market stages exactly once.
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks
+        .fail_next_no_copy_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let t2 = t + time::Duration::seconds(100);
+    hooks.age_clock.lock().unwrap().extend([
+        t,                              // 0xrb early: fresh
+        t + time::Duration::seconds(5), // 0xrb final: stale → commit fault → rollback
+        t2,                             // 0xnew early: fresh
+        t2,                             // 0xnew final: fresh → stages
+    ]);
+    run_trades(
+        dir.path(),
+        paper_state.clone(),
+        healthy_ws_health(),
+        OrchOpts {
+            hooks: Some(Arc::clone(&hooks)),
+            ..OrchOpts::ws(vec![market()])
+        },
+        vec![
+            trade_at(
+                "0xrb",
+                market(),
+                t - time::Duration::seconds(1),
+                TradeProvenance::ActivityWs,
+            ),
+            trade_at(
+                "0xnew",
+                market(),
+                t2 - time::Duration::seconds(1),
+                TradeProvenance::ActivityWs,
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        !hooks
+            .fail_next_no_copy_commit
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "fault consumed exactly once"
+    );
+    assert!(hooks.age_clock.lock().unwrap().is_empty());
+    assert!(
+        !paper_state.is_seen(&id("0xrb")).unwrap(),
+        "rolled back unseen"
+    );
+    assert!(
+        paper_state
+            .no_copy_disposition(&id("0xrb"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(paper_state.is_seen(&id("0xnew")).unwrap());
+    assert_eq!(
+        paper_fill_count(dir.path()),
+        1,
+        "the new trade stages exactly once"
+    );
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(100),
+        "the rolled-back ingest was restored: only the new trade advanced the ledger"
+    );
+}
+
+// ── R10: shutdown paths ───────────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn r10a_closed_trade_channel_ends_the_pool_orderly_without_redials() {
+    let (pool, trade_rx) = start_pool(8).await;
+    let mut servers: Vec<ActivityWsPeer> = (0..3).map(|s| pool.net.take_server(s)).collect();
+    drop(trade_rx);
+    servers[0]
+        .send_text(&activity_frame(&[payload(
+            "0xlast",
+            LEADER,
+            &market(),
+            now_unix(),
+        )]))
+        .await
+        .unwrap();
+    // The coordinator appends, finds the trade channel closed, and exits; the
+    // owner aborts every reader and returns.
+    assert!(settle_until(|| pool.task.is_finished()).await);
+    assert_eq!(pool.source_log_ids(), vec!["0xlast".to_string()]);
+    advance(Duration::from_secs(120)).await;
+    for slot in 0..3 {
+        assert_eq!(
+            pool.net.dial_count(slot),
+            1,
+            "slot {slot}: no re-dial after shutdown"
+        );
+    }
+    for server in &mut servers {
+        assert!(server.recv_text().await.is_none(), "every socket is gone");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn r10b_external_abort_of_the_owner_stops_every_reader() {
+    let (pool, _trade_rx) = start_pool(8).await;
+    let mut servers: Vec<ActivityWsPeer> = (0..3).map(|s| pool.net.take_server(s)).collect();
+    pool.task.abort();
+    settle().await;
+    advance(Duration::from_secs(120)).await;
+    for slot in 0..3 {
+        assert_eq!(
+            pool.net.dial_count(slot),
+            1,
+            "slot {slot}: aborted, not re-dialed"
+        );
+    }
+    for server in &mut servers {
+        assert!(server.recv_text().await.is_none());
+    }
 }
 
 // ── WS1: websocket + REST duplicate ⇒ exactly one decision ───────────────────
@@ -243,25 +1394,25 @@ async fn ws1_duplicate_ws_then_rest_yields_one_decision() {
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let now = OffsetDateTime::now_utc();
-    run_trades_ws(
-        dir.path().to_path_buf(),
+    run_trades(
+        dir.path(),
         paper_state.clone(),
-        true,
         healthy_ws_health(),
+        OrchOpts::ws(vec![market()]),
         vec![
             trade_at("0xdup", market(), now, TradeProvenance::ActivityWs),
             trade_at("0xdup", market(), now, TradeProvenance::RestPoll),
         ],
     )
     .await;
-    assert_eq!(paper_fill_count(&dir), 1, "duplicate must not double-fill");
-    let rows = paper_state.leader_positions().unwrap();
     assert_eq!(
-        rows.iter()
-            .find(|r| r.wallet == leader_wallet())
-            .unwrap()
-            .long_contracts,
-        100,
+        paper_fill_count(dir.path()),
+        1,
+        "duplicate must not double-fill"
+    );
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(100),
         "leader ledger must ingest the duplicate exactly once"
     );
 }
@@ -274,11 +1425,11 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let now = OffsetDateTime::now_utc();
     let stale_id = SourceTradeId("0xstale".to_string());
-    run_trades_ws(
-        dir.path().to_path_buf(),
+    run_trades(
+        dir.path(),
         paper_state.clone(),
-        true,
         healthy_ws_health(),
+        OrchOpts::ws(vec![market(), market_b(), market_c()]),
         vec![
             // 60s old on the fallback path: 30x the 2s budget.
             trade_at(
@@ -301,7 +1452,7 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
     )
     .await;
     assert_eq!(
-        paper_fill_count(&dir),
+        paper_fill_count(dir.path()),
         1,
         "only the fresh websocket trade may fill"
     );
@@ -328,10 +1479,9 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
         "a 2.5s-old fallback trade must be stale under a 2s budget (no truncation)"
     );
     // The stale trade still advanced the leader ledger (bookkeeping intact).
-    let rows = paper_state.leader_positions().unwrap();
-    assert!(
-        rows.iter()
-            .any(|r| r.market_id == market() && r.long_contracts == 100),
+    assert_eq!(
+        leader_long(&paper_state, &market()),
+        Some(100),
         "stale trade must still mirror the leader position"
     );
 }
@@ -344,11 +1494,14 @@ async fn ws3_disabled_mode_processes_old_rest_trades_unchanged() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
     let now = OffsetDateTime::now_utc();
     let id = SourceTradeId("0xlegacy".to_string());
-    run_trades_ws(
-        dir.path().to_path_buf(),
+    run_trades(
+        dir.path(),
         paper_state.clone(),
-        false, // flag off
         new_shared_health_with_ws(false, false, 90),
+        OrchOpts {
+            ws_enabled: false,
+            ..OrchOpts::ws(vec![market()])
+        },
         vec![trade_at(
             "0xlegacy",
             market(),
@@ -358,7 +1511,7 @@ async fn ws3_disabled_mode_processes_old_rest_trades_unchanged() {
     )
     .await;
     assert_eq!(
-        paper_fill_count(&dir),
+        paper_fill_count(dir.path()),
         1,
         "legacy path must fill as before #530"
     );
@@ -377,8 +1530,7 @@ async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
     let health = healthy_ws_health();
     {
         let mut h = health.lock().unwrap();
-        // Websocket stale-or-worse: never connected, no valid frame.
-        h.ws_connected = false;
+        // Websocket unavailable: no reader ever normalized a row (the default).
         // REST unhealthy: error streak at the threshold.
         h.poll_error_streak = 3;
     }
@@ -388,24 +1540,30 @@ async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
     // Run the orchestrator concurrently: the blocked trade must be HELD (review
     // F1 — dropping it would orphan a websocket trade behind the poll cursor),
     // with no state write while both sources are unhealthy.
-    let run = tokio::spawn(run_trades_ws(
-        dir.path().to_path_buf(),
-        paper_state.clone(),
-        true,
-        health.clone(),
-        vec![trade_at(
-            "0xblocked",
-            market(),
-            now,
-            TradeProvenance::ActivityWs,
-        )],
-    ));
+    let dir_path = dir.path().to_path_buf();
+    let run_state = paper_state.clone();
+    let run_health = health.clone();
+    let run = tokio::spawn(async move {
+        run_trades(
+            &dir_path,
+            run_state,
+            run_health,
+            OrchOpts::ws(vec![market()]),
+            vec![trade_at(
+                "0xblocked",
+                market(),
+                now,
+                TradeProvenance::ActivityWs,
+            )],
+        )
+        .await;
+    });
     tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     assert!(
         !run.is_finished(),
         "orchestrator must hold the blocked trade, not drop it"
     );
-    assert_eq!(paper_fill_count(&dir), 0, "no fill while blocked");
+    assert_eq!(paper_fill_count(dir.path()), 0, "no fill while blocked");
     assert!(
         !paper_state.is_seen(&id).unwrap(),
         "no state write while blocked"
@@ -422,7 +1580,7 @@ async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
         .expect("orchestrator must finish after recovery")
         .unwrap();
     assert_eq!(
-        paper_fill_count(&dir),
+        paper_fill_count(dir.path()),
         1,
         "held trade fills exactly once after recovery"
     );
@@ -446,19 +1604,19 @@ fn ws5_source_log_replay_reconstructs_identical_trades() {
     {
         let mut sink = SourceEventSink::open(&path).unwrap();
         for frame in frames {
-            let (raws, malformed) = parse_activity_frame(frame).unwrap();
-            assert_eq!((raws.len(), malformed), (1, 0));
-            let raw = &raws[0];
+            let (payloads, missing) = parse_activity_frame(frame).unwrap();
+            assert_eq!((payloads.len(), missing), (1, 0));
+            let raw = payloads[0];
             let received = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
-            let trade = trade_parser::parse_ws_trade(&raw.payload_json, received).unwrap();
+            let trade = trade_parser::parse_ws_trade(raw, received).unwrap();
             sink.append_durable(EnvelopeIn {
-                source_id: SourceId("polymarket-activity-ws".to_string()),
+                source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_string()),
                 schema_version: ACTIVITY_WS_SCHEMA_VERSION,
                 parser_version: ACTIVITY_WS_PARSER_VERSION,
                 observed_at: SourceTimestamp(trade.observed_at),
                 received_at: ReceivedAt(trade.received_at),
                 content_type: ContentType::Json,
-                payload: raw.payload_json.clone(),
+                payload: raw.to_vec(),
             })
             .unwrap();
             originals.push(trade);

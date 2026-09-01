@@ -141,7 +141,7 @@ Stale and block thresholds come from `_GLOSSARY.md` ("Source freshness defaults"
 
 ## Winner-Follow ingestion priority
 
-Before specialized weather/crypto/sports/macro source gateways, build the trader-intelligence ingestion path. As built, the Polymarket owner is `source-polymarket-public` (REST endpoints, the attributed live-data activity websocket in `activity_ws`, and shared fetch/parse machinery); the historical `source-trader` naming below is the original plan shape, retained for the endpoint inventory.
+Before specialized weather/crypto/sports/macro source gateways, build the trader-intelligence ingestion path. As built, the Polymarket owner is `source-polymarket-public` (REST endpoints, the attributed live-data activity websocket in `activity_ws` — read by three concurrent readers per service process since #546 — and shared fetch/parse machinery); the historical `source-trader` naming below is the original plan shape, retained for the endpoint inventory.
 
 ### Polymarket trader ingestion (`source-polymarket-public`)
 

@@ -66,7 +66,7 @@ pub enum PaperStateError {
 
 /// One leader's net position in a `(market, outcome)`, mirroring the in-memory
 /// `PositionState`. The service tier groups these into `PositionSnapshot`s.
-/// Typed no-copy disposition for a stale fallback-path trade (#530).
+/// Typed no-copy disposition for a stale observation from either transport (#530/#546).
 #[derive(Debug, Clone)]
 pub struct NoCopyDisposition {
     /// `"rest_poll"` or `"activity_ws"` (schema CHECK-enforced).

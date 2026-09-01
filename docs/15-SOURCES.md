@@ -47,14 +47,26 @@
 > optional per trade. No authentication. Measured 2026-08-24: p50 0.80s / p95 1.32s /
 > p99 1.41s trade-timestamp→receipt over 6,293 trades; a 14h soak found the stream live
 > only ~113/840 minutes on ping-alive sockets (subscription lapses silently — 1,442
-> thirty-second silences vs 16 hard disconnects), so silence-triggered resubscribe /
-> reconnect and the always-on REST poll fallback are load-bearing. **Unofficial UI feed,
-> no documented contract**: re-check the endpoint, subscription shape, and payload keys
-> before each deploy that relies on it (`scripts/probe_activity_ws.py`). Owner:
-> `source-polymarket-public::activity_ws` (transport/envelope/policy); the service's
-> `trade_parser` normalizes identically to the REST path. The CLOB market channel
-> remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-08-25.
+> thirty-second silences vs 16 hard disconnects). Read-only experiments on 2026-08-31 (#546)
+> showed the failure is connection-local: one of three or four parallel connections stalled
+> while the others kept delivering every watched row, re-sending the subscription did not
+> revive a stalled connection, a fresh connection delivered its first trade 0.6 s after a
+> 187 ms handshake, and the largest activity gap on a healthy connection was 4.775 s. So
+> `pe-service` runs `activity_ws_reader_count` independent readers with a
+> `activity_ws_normalized_activity_timeout_secs` normalized-row timeout and direct reconnect
+> (`_GLOSSARY.md`); the always-on REST poll remains the whole-process backstop. This is an
+> **officially listed real-time data endpoint** (`docs.polymarket.com/getting-started/api`,
+> "Real-Time Data") **whose activity subscription and payload are published by the
+> first-party client** (`github.com/Polymarket/real-time-data-client`, `src/client.ts`:
+> `DEFAULT_HOST`, `{"action":"subscribe",…}`, and a 5 s literal `ping` keepalive that
+> `pe-service` deliberately does not send — no evidence ties it to delivery), **without
+> published completeness, uptime, ordering, continuity, or resume guarantees**: re-check the
+> endpoint, subscription shape, and payload keys before each deploy that relies on it
+> (`scripts/probe_activity_ws.py`). Owner: `source-polymarket-public::activity_ws`
+> (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
+> fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
+> market channel remains wallet-anonymous — the note below stands for THAT feed.
+> Last checked: 2026-08-31.
 >
 > **Historical (2026-06-03, issue #282 Phase 2 verification — CLOB channel still true; RTDS part superseded above).**
 > `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include the **wallet address**; wallet-level trade identification is impossible from the frame alone.
