@@ -13,18 +13,17 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use pe_paper_state::PaperStateDb;
-use serde::Serialize;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-use tracing::warn;
-
 use crate::health::{HealthState, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::{
     AppliedWatchlistCapacity, LiveRuntimeConfig, RuntimeConfigStatus, RuntimeConfigStatusSnapshot,
 };
 use crate::supabase_refresh::{WatchlistProjectionStatus, WatchlistProjectionStatusSnapshot};
+use crate::supervisor::{TaskStateSnapshot, TaskStatus};
+use pe_paper_state::PaperStateDb;
+use serde::Serialize;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// #530/#546: split trade-source health for the observability surface. Ages
 /// are in seconds; `None` = never. Emitted ONLY when the websocket is enabled —
@@ -117,6 +116,15 @@ impl SourceHealthStatus {
 /// One snapshot of pe-service health, serialized to `status.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSnapshot {
+    /// Checked-out Git object embedded by the clean-build identity boundary (#544).
+    pub revision: String,
+    /// Canonical identity of the complete runtime configuration actually applied.
+    pub applied_config_hash: String,
+    /// Sticky state of every named production owner.
+    pub tasks: Vec<TaskStateSnapshot>,
+    /// Latest typed status sampling error; financial fields retain their last-good values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_error: Option<StatusWriterIssue>,
     /// RFC-3339 UTC instant this snapshot was written.
     pub updated_at: String,
     /// #530: split websocket / REST-poll source health (enabled mode only).
@@ -153,6 +161,43 @@ pub struct StatusSnapshot {
     /// accounts poll is configured. Present-but-empty when configured with no accounts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live: Option<LiveStatusBlock>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusWriterIssue {
+    pub kind: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StatusWriterError {
+    #[error("write status snapshot {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Clone)]
+struct FinancialValues {
+    bankroll: Option<String>,
+    open_positions: usize,
+    fills_total: usize,
+    settled_total: usize,
+    last_event_seq: u64,
+}
+
+fn read_financial_values(
+    paper_state: &PaperStateDb,
+) -> Result<FinancialValues, pe_paper_state::PaperStateError> {
+    Ok(FinancialValues {
+        bankroll: paper_state.bankroll()?.map(|value| value.to_string()),
+        open_positions: paper_state.positions_count()?,
+        fills_total: paper_state.fills_count()?,
+        settled_total: paper_state.settled_count()?,
+        last_event_seq: paper_state.last_applied_event_seq()?.0,
+    })
 }
 
 /// Additive live-execution status (#508): dispatch-aggregate depth + one row per account.
@@ -197,6 +242,10 @@ pub fn build_snapshot(
     live_accounts: Option<&crate::live_accounts::LiveAccountsSnapshot>,
 ) -> StatusSnapshot {
     StatusSnapshot {
+        revision: crate::build_info::embedded().source_revision.to_owned(),
+        applied_config_hash: String::new(),
+        tasks: Vec::new(),
+        status_error: None,
         source_health: None,
         updated_at: OffsetDateTime::from_unix_timestamp(now_unix)
             .ok()
@@ -256,12 +305,12 @@ pub fn write_snapshot(path: &Path, snapshot: &StatusSnapshot) -> std::io::Result
     std::fs::rename(&tmp, path)
 }
 
-/// Periodic status-writer task: every `interval`, build + atomically write the snapshot.
-/// Best-effort — a write error is logged (to `errors.jsonl`), never fatal.
+/// Periodic status-writer task. A write error is a typed owner failure; financial read errors
+/// remain visible while retaining the most recent complete financial sample (#544).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_status_writer(
     path: PathBuf,
-    interval: Duration,
+    interval: Option<Duration>,
     paper_state: Arc<PaperStateDb>,
     watchlist: LiveWatchlist,
     applied_capacity: AppliedWatchlistCapacity,
@@ -272,11 +321,23 @@ pub async fn run_status_writer(
     supabase_rpc_calls: Option<Arc<AtomicU64>>,
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
     health: Option<SharedHealth>,
-) {
+    task_status: TaskStatus,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), StatusWriterError> {
     let started_at = Instant::now();
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = interval.map(tokio::time::interval);
+    let mut last_good_financials = None;
+    tokio::pin!(shutdown);
     loop {
-        ticker.tick().await;
+        let final_write = tokio::select! {
+            () = &mut shutdown => true,
+            () = async {
+                match &mut ticker {
+                    Some(ticker) => { ticker.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => false,
+        };
         let calls = supabase_rpc_calls
             .as_ref()
             .map(|c| c.load(Ordering::Relaxed))
@@ -288,6 +349,16 @@ pub async fn run_status_writer(
             })
         });
         let applied_config = runtime_config.snapshot();
+        let status_error = match read_financial_values(&paper_state) {
+            Ok(values) => {
+                last_good_financials = Some(values);
+                None
+            }
+            Err(error) => Some(StatusWriterIssue {
+                kind: "paper_state_read",
+                message: error.to_string(),
+            }),
+        };
         let mut snap = build_snapshot(
             &paper_state,
             &applied_config.mode,
@@ -300,10 +371,25 @@ pub async fn run_status_writer(
             live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
         );
         snap.source_health = source_health;
-        snap.runtime_config = Some(runtime_config_status.snapshot().as_ref().clone());
+        let runtime_status = runtime_config_status.snapshot();
+        snap.applied_config_hash = runtime_status.applied_hash.clone();
+        snap.runtime_config = Some(runtime_status.as_ref().clone());
         snap.watchlist_projection = Some(projection_status.snapshot().as_ref().clone());
-        if let Err(e) = write_snapshot(&path, &snap) {
-            warn!(error = %e, path = %path.display(), "status writer: write failed");
+        snap.tasks = task_status.snapshot();
+        snap.status_error = status_error;
+        if let Some(values) = &last_good_financials {
+            snap.bankroll.clone_from(&values.bankroll);
+            snap.open_positions = values.open_positions;
+            snap.fills_total = values.fills_total;
+            snap.settled_total = values.settled_total;
+            snap.last_event_seq = values.last_event_seq;
+        }
+        write_snapshot(&path, &snap).map_err(|source| StatusWriterError::Write {
+            path: path.clone(),
+            source,
+        })?;
+        if final_write {
+            return Ok(());
         }
     }
 }
@@ -312,7 +398,12 @@ pub async fn run_status_writer(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::config::ServiceConfig;
     use crate::health::{ReaderHealth, new_shared_health_with_ws};
+    use crate::runtime_config::RuntimeConfig;
+    use crate::supervisor::TaskName;
+    use pe_core_types::SourceTimestamp;
+    use pe_trader_index::Watchlist;
 
     fn t0() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()
@@ -399,5 +490,55 @@ mod tests {
             json.get("source_health").is_none(),
             "byte-identical disabled shape"
         );
+    }
+
+    #[tokio::test]
+    async fn final_snapshot_carries_build_config_task_and_projection_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let config = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        let runtime = LiveRuntimeConfig::new(config.clone());
+        let runtime_status = RuntimeConfigStatus::new(&config);
+        let task_status = TaskStatus::new();
+        task_status.register(TaskName::Orchestrator);
+        let watchlist = LiveWatchlist::new(Watchlist {
+            entries: Vec::new(),
+            snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            active_count: 0,
+            incubator_count: 0,
+        });
+
+        run_status_writer(
+            path.clone(),
+            None,
+            paper_state,
+            watchlist,
+            AppliedWatchlistCapacity::new(config.active_watchlist_size),
+            runtime,
+            runtime_status.clone(),
+            WatchlistProjectionStatus::default(),
+            false,
+            None,
+            None,
+            None,
+            task_status,
+            async {},
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            value["revision"],
+            crate::build_info::embedded().source_revision
+        );
+        assert_eq!(
+            value["applied_config_hash"],
+            runtime_status.snapshot().applied_hash
+        );
+        assert_eq!(value["tasks"][0]["name"], "orchestrator");
+        assert!(value["watchlist_projection"].is_object());
     }
 }

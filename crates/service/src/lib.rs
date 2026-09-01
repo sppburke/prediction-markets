@@ -2,8 +2,12 @@
 //! Library target for `pe-service` — exposes internal modules for scenario tests.
 //! Production code lives in `main.rs`.
 
+#[path = "../build_identity.rs"]
+pub mod build_identity;
+
 pub mod activity_ingest;
 pub mod bucket_commit;
+pub mod build_info;
 pub mod clob_book;
 pub mod config;
 pub mod config_poller;
@@ -38,6 +42,7 @@ pub mod supabase_reader;
 pub mod supabase_refresh;
 pub mod supabase_sink;
 pub mod supabase_state;
+pub mod supervisor;
 pub mod trade_parser;
 pub mod trade_poller;
 pub mod watchlist_admission;

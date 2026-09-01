@@ -13,8 +13,8 @@
 //! gate cares about), then fall back to `&closed=true` (resolved markets, for the
 //! dashboard).
 //!
-//! Cache semantics: absent from map → not yet fetched; a stored [`MarketResolution`]
-//! with `resolution_unix = None` means we could not determine a resolution time.
+//! Cache semantics: absent from map → not yet validated. Failed, empty, or invalid responses are
+//! returned as unknown but remain absent, so the next ordinary signal retries (#544).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,6 +54,10 @@ pub struct MarketEndCache {
     inner: Arc<Mutex<HashMap<MarketId, MarketResolution>>>,
     client: reqwest::Client,
     gamma_base_url: String,
+    #[cfg(test)]
+    scripted: Option<Arc<Mutex<std::collections::VecDeque<Option<MarketResolution>>>>>,
+    #[cfg(test)]
+    fetch_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MarketEndCache {
@@ -67,6 +71,10 @@ impl MarketEndCache {
             inner: Arc::new(Mutex::new(HashMap::new())),
             client,
             gamma_base_url,
+            #[cfg(test)]
+            scripted: None,
+            #[cfg(test)]
+            fetch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -80,13 +88,12 @@ impl MarketEndCache {
             }
         }
 
-        let res = self.fetch(market_id).await;
+        let fetched = self.fetch(market_id).await;
+        let res = fetched.clone().unwrap_or_default();
 
-        // Cache the result (even an unknown) so we don't re-fetch on every signal.
-        self.inner
-            .lock()
-            .await
-            .insert(market_id.clone(), res.clone());
+        if let Some(validated) = fetched {
+            self.inner.lock().await.insert(market_id.clone(), validated);
+        }
         res
     }
 
@@ -96,20 +103,32 @@ impl MarketEndCache {
         self.resolution(market_id).await.resolution_unix
     }
 
-    async fn fetch(&self, market_id: &MarketId) -> MarketResolution {
+    async fn fetch(&self, market_id: &MarketId) -> Option<MarketResolution> {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            self.fetch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return scripted.lock().await.pop_front().flatten();
+        }
         // Open markets answer the plain query; resolved markets need `&closed=true`.
-        if let Some(m) = self.query(market_id, false).await {
-            return extract(&m);
+        match self.query(market_id, false).await {
+            Ok(Some(m)) => return validated_resolution(&m),
+            Ok(None) => {}
+            Err(()) => return None,
         }
-        if let Some(m) = self.query(market_id, true).await {
-            return extract(&m);
+        match self.query(market_id, true).await {
+            Ok(Some(m)) => validated_resolution(&m),
+            Ok(None) | Err(()) => None,
         }
-        MarketResolution::default()
     }
 
     /// Fetch a single market object by condition id. `closed` toggles the
     /// `&closed=true` filter required to surface resolved markets.
-    async fn query(&self, market_id: &MarketId, closed: bool) -> Option<GammaMarketRaw> {
+    async fn query(
+        &self,
+        market_id: &MarketId,
+        closed: bool,
+    ) -> Result<Option<GammaMarketRaw>, ()> {
         let url = if closed {
             format!(
                 "{}/markets?condition_ids={}&closed=true",
@@ -122,16 +141,20 @@ impl MarketEndCache {
             )
         };
         let bytes = match self.client.get(&url).send().await {
-            Ok(r) => match r.bytes().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(%market_id, error = %e, "market-resolution: response body error");
-                    return None;
+                    return Err(());
                 }
             },
+            Ok(r) => {
+                warn!(%market_id, status = %r.status(), "market-resolution: response status error");
+                return Err(());
+            }
             Err(e) => {
                 warn!(%market_id, error = %e, "market-resolution: fetch error");
-                return None;
+                return Err(());
             }
         };
 
@@ -139,11 +162,16 @@ impl MarketEndCache {
             Ok(v) => v,
             Err(e) => {
                 warn!(%market_id, error = %e, "market-resolution: JSON parse error");
-                return None;
+                return Err(());
             }
         };
-        markets.into_iter().next()
+        Ok(markets.into_iter().next())
     }
+}
+
+fn validated_resolution(market: &GammaMarketRaw) -> Option<MarketResolution> {
+    let resolution = extract(market);
+    resolution.resolution_unix.map(|_| resolution)
 }
 
 /// Build a [`MarketResolution`] from a raw market: prefer the exact resolution
@@ -214,6 +242,7 @@ mod tests {
             uma_resolution_status: None,
         };
         assert_eq!(extract(&m).resolution_unix, None);
+        assert!(validated_resolution(&m).is_none());
     }
 
     #[test]
@@ -224,5 +253,33 @@ mod tests {
             Some(1_780_705_800)
         );
         assert_eq!(parse_timestamp("not-a-date"), None);
+    }
+
+    #[tokio::test]
+    async fn transient_failure_is_not_cached_but_valid_evidence_is() {
+        let fetch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cache = MarketEndCache {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            client: reqwest::Client::new(),
+            gamma_base_url: "unused".to_owned(),
+            scripted: Some(Arc::new(Mutex::new(
+                [
+                    None,
+                    Some(MarketResolution {
+                        resolution_unix: Some(1_780_705_800),
+                        status: Some("open".to_owned()),
+                    }),
+                ]
+                .into_iter()
+                .collect(),
+            ))),
+            fetch_calls: fetch_calls.clone(),
+        };
+        let market = MarketId(pe_core_types::VenueMarketId("condition-1".to_owned()));
+
+        assert_eq!(cache.resolution_unix(&market).await, None);
+        assert_eq!(cache.resolution_unix(&market).await, Some(1_780_705_800));
+        assert_eq!(cache.resolution_unix(&market).await, Some(1_780_705_800));
+        assert_eq!(fetch_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

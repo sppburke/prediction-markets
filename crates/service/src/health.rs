@@ -12,6 +12,8 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
+use crate::supervisor::{ShutdownPhase, TaskStatus};
+
 /// Maximum seconds between source events before the source is considered stale.
 ///
 /// See `docs/_GLOSSARY.md`: `source_freshness_window_seconds`.
@@ -62,8 +64,16 @@ pub struct HealthState {
     pub polymarket_last_event_at: Option<OffsetDateTime>,
     pub polygon_last_event_at: Option<OffsetDateTime>,
     pub event_log_writable: bool,
+    /// Source-log writer crossed an uncertain append/sync boundary.
+    pub source_durability_uncertain: bool,
     /// Paper executor crossed an uncertain sync boundary and is permanently poisoned.
     pub paper_durability_uncertain: bool,
+    /// Ordinary live journal crossed an uncertain append/sync boundary.
+    pub live_durability_uncertain: bool,
+    /// A requested capacity generation has not yet been atomically published.
+    pub configuration_generation_pending: bool,
+    /// Named owner lifecycle and sticky failures.
+    pub task_status: TaskStatus,
     /// Whether the live Polygon WS source is configured. When `false` (empty
     /// `polygon_ws_url`, i.e. "etherscan-only mode"), the absence of polygon
     /// events is intentional and must not flag the source as stale/dead — that
@@ -103,6 +113,13 @@ pub struct HealthState {
 pub const POLL_UNHEALTHY_ERROR_STREAK: u32 = 3;
 
 impl HealthState {
+    /// Recompute the compatibility aggregate after any typed writer state changes.
+    pub fn refresh_event_log_writable(&mut self) {
+        self.event_log_writable = !(self.source_durability_uncertain
+            || self.paper_durability_uncertain
+            || self.live_durability_uncertain);
+    }
+
     /// REST poll source unhealthy: error streak at threshold, or the last
     /// successful round is older than the stale bound (never-successful counts
     /// as unhealthy once the process has been up longer than the bound —
@@ -159,7 +176,11 @@ pub fn new_shared_health_with_ws(
         polymarket_last_event_at: None,
         polygon_last_event_at: None,
         event_log_writable: true,
+        source_durability_uncertain: false,
         paper_durability_uncertain: false,
+        live_durability_uncertain: false,
+        configuration_generation_pending: false,
+        task_status: TaskStatus::new(),
         polygon_enabled,
         activity_ws_enabled,
         ws_readers: Default::default(),
@@ -220,6 +241,18 @@ pub fn readiness_issues(
     }
     if h.paper_durability_uncertain {
         issues.push("paper_durability_uncertain");
+    }
+    if h.live_durability_uncertain {
+        issues.push("live_journal_durability_uncertain");
+    }
+    if h.configuration_generation_pending {
+        issues.push("configuration_generation_pending");
+    }
+    if h.task_status.critical_failed() {
+        issues.push("critical_task_failed");
+    }
+    if h.task_status.phase() != ShutdownPhase::Running {
+        issues.push("coordinated_shutdown");
     }
 
     // #530/#546: websocket-source issues (skip-when-disabled, like polygon above)
@@ -310,7 +343,11 @@ mod tests {
             polymarket_last_event_at: Some(t0()),
             polygon_last_event_at: None,
             event_log_writable: true,
+            source_durability_uncertain: false,
             paper_durability_uncertain: false,
+            live_durability_uncertain: false,
+            configuration_generation_pending: false,
+            task_status: TaskStatus::new(),
             polygon_enabled: false,
             activity_ws_enabled: true,
             ws_readers: Default::default(),
@@ -446,5 +483,21 @@ mod tests {
         // ...but a poisoned sink fails the whole pool closed again.
         h.ws_sink_poisoned = true;
         assert!(h.copy_admission_blocked(t0(), m0));
+    }
+
+    #[test]
+    fn every_durable_writer_uncertainty_flips_the_live_readiness_aggregate() {
+        for set_uncertain in [
+            |health: &mut HealthState| health.source_durability_uncertain = true,
+            |health: &mut HealthState| health.paper_durability_uncertain = true,
+            |health: &mut HealthState| health.live_durability_uncertain = true,
+        ] {
+            let mut health = ws_base();
+            health.activity_ws_enabled = false;
+            set_uncertain(&mut health);
+            health.refresh_event_log_writable();
+            assert!(!health.event_log_writable);
+            assert!(readiness_issues(&health, t0(), m0()).contains(&"event_log_not_writable"));
+        }
     }
 }

@@ -251,6 +251,16 @@ pub struct TradePoller {
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TradePollerOwnerError {
+    #[error("fixed-end reconciliation owner failed: {0}")]
+    Reconciliation(String),
+    #[error("activity reconciliation trigger channel closed")]
+    TriggerChannelClosed,
+    #[error("trade poll interval is zero")]
+    ZeroPollInterval,
+}
+
 impl TradePoller {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -289,7 +299,16 @@ impl TradePoller {
 
     /// Run on the pre-existing poll cadence; durable websocket triggers coalesce
     /// while that cadence elapses and never create a per-row fetch loop.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
+        let _ = self.run_until(std::future::pending::<()>()).await;
+    }
+
+    /// Production entry point. A shutdown request is honored only between complete fixed-end
+    /// reconciliation rounds, so a partially applied wallet round is never manufactured.
+    pub async fn run_until(
+        mut self,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), TradePollerOwnerError> {
         {
             let mut health = self
                 .health
@@ -297,22 +316,23 @@ impl TradePoller {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             health.poll_started_at = Some(OffsetDateTime::now_utc());
         }
+        tokio::pin!(shutdown);
         loop {
             self.drain_triggers();
-            if !self.poll_round().await {
-                return;
-            }
+            self.poll_round().await?;
             if self.config.poll_interval_secs == 0 {
-                return;
+                return Err(TradePollerOwnerError::ZeroPollInterval);
             }
             let cadence = tokio::time::sleep(Duration::from_secs(self.config.poll_interval_secs));
             tokio::pin!(cadence);
             loop {
                 tokio::select! {
+                    biased;
+                    () = &mut shutdown => return Ok(()),
                     () = &mut cadence => break,
                     trigger = self.trigger_rx.recv() => match trigger {
                         Some(trigger) => self.obligations.insert(trigger),
-                        None => return,
+                        None => return Err(TradePollerOwnerError::TriggerChannelClosed),
                     }
                 }
             }
@@ -325,8 +345,7 @@ impl TradePoller {
         }
     }
 
-    /// `true` means another cadence is safe; `false` means a critical owner closed.
-    async fn poll_round(&mut self) -> bool {
+    async fn poll_round(&mut self) -> Result<(), TradePollerOwnerError> {
         let snapshot = self.live_watchlist.snapshot();
         let mut wallets: Vec<WalletAddress> =
             snapshot.entries.iter().map(|entry| entry.wallet).collect();
@@ -346,7 +365,7 @@ impl TradePoller {
                 }
                 Err(error) => {
                     warn!(wallet = %wallet, error = %error, "fixed-end activity reconciliation owner stopped");
-                    return false;
+                    return Err(TradePollerOwnerError::Reconciliation(error.to_string()));
                 }
             }
         }
@@ -365,7 +384,7 @@ impl TradePoller {
                 health.poll_error_streak = health.poll_error_streak.saturating_add(1);
             }
         }
-        true
+        Ok(())
     }
 
     async fn reconcile_wallet(

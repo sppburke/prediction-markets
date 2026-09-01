@@ -259,6 +259,16 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum OrchestratorRunError {
+    #[error("decision-pending recovery failed: {0}")]
+    PendingRecovery(String),
+    #[error("{channel} input channel closed before coordinated shutdown")]
+    PrematureInputClosure { channel: &'static str },
+    #[error("paper durability became uncertain")]
+    PaperDurabilityUncertain,
+}
+
 impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
@@ -577,6 +587,59 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                             }
                         },
                         None => trades_done = true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Supervised production loop. Once `shutdown` resolves this owner drains both accepted
+    /// input channels and every parked durable continuation before returning. A channel closure
+    /// before coordinated shutdown is a typed critical failure.
+    pub async fn run_coordinated(
+        mut self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), OrchestratorRunError> {
+        tokio::pin!(shutdown);
+        self.resume_pending_before_producers()
+            .await
+            .map_err(|error| OrchestratorRunError::PendingRecovery(error.to_string()))?;
+        let mut draining = false;
+        let mut trades_done = false;
+        let mut control_done = false;
+        let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
+        parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            if self.intake_stopped {
+                return Err(OrchestratorRunError::PaperDurabilityUncertain);
+            }
+            if draining && trades_done && control_done && self.parked.is_empty() {
+                return Ok(());
+            }
+
+            tokio::select! {
+                biased;
+                _ = &mut shutdown, if !draining => draining = true,
+                _ = parked_tick.tick(), if !self.parked.is_empty() => {
+                    self.retry_parked().await;
+                }
+                result = self.control_rx.recv(), if !control_done => {
+                    match result {
+                        Some(message) => self.apply_control_message(message).await,
+                        None if draining => control_done = true,
+                        None => return Err(OrchestratorRunError::PrematureInputClosure {
+                            channel: "orchestrator_control",
+                        }),
+                    }
+                }
+                result = self.trade_rx.recv(), if !trades_done => {
+                    match result {
+                        Some(trade) => self.handle_trade(trade).await,
+                        None if draining => trades_done = true,
+                        None => return Err(OrchestratorRunError::PrematureInputClosure {
+                            channel: "trade_input",
+                        }),
                     }
                 }
             }
@@ -1409,7 +1472,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             health.paper_durability_uncertain = true;
-                            health.event_log_writable = false;
+                            health.refresh_event_log_writable();
                         }
                         self.rollback_admission(&rb, None);
                         self.intake_stopped = true;

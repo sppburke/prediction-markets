@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
+use crate::health::SharedHealth;
 use crate::runtime_config::{
     AppliedWatchlistCapacity, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
     WatchlistCapacityEpoch, parse_config,
@@ -86,6 +87,34 @@ pub fn capacity_request_channel(
 pub struct CapacityApplyResult {
     request: CapacityRequest,
     actual: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CapacityWorkerError {
+    #[error("capacity request channel closed")]
+    RequestChannelClosed,
+    #[error("capacity result channel closed")]
+    ResultChannelClosed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigPollError {
+    #[error("capacity result channel closed")]
+    CapacityResultChannelClosed,
+}
+
+fn publish_generation_health(
+    health: Option<&SharedHealth>,
+    capacity_requests: &CapacityRequestHandle,
+    applied_capacity: &AppliedWatchlistCapacity,
+) {
+    if let Some(health) = health {
+        let mut health = health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        health.configuration_generation_pending =
+            capacity_requests.current() != applied_capacity.load();
+    }
 }
 
 /// PostgREST URL selecting every `service_config` row.
@@ -247,12 +276,12 @@ pub async fn run_capacity_worker<A: WatchlistCapacityApplier>(
     applied_capacity: AppliedWatchlistCapacity,
     mut requests: watch::Receiver<CapacityRequest>,
     results: mpsc::Sender<CapacityApplyResult>,
-) {
+) -> Result<(), CapacityWorkerError> {
     loop {
         let request = *requests.borrow_and_update();
         if applied_capacity.load() == request {
             if requests.changed().await.is_err() {
-                return;
+                return Err(CapacityWorkerError::RequestChannelClosed);
             }
             continue;
         }
@@ -263,7 +292,7 @@ pub async fn run_capacity_worker<A: WatchlistCapacityApplier>(
             biased;
             changed = requests.changed() => {
                 if changed.is_err() {
-                    return;
+                    return Err(CapacityWorkerError::RequestChannelClosed);
                 }
                 continue;
             }
@@ -279,7 +308,7 @@ pub async fn run_capacity_worker<A: WatchlistCapacityApplier>(
                     .await
                     .is_err()
                 {
-                    return;
+                    return Err(CapacityWorkerError::ResultChannelClosed);
                 }
             }
             Ok(actual) => warn!(
@@ -303,7 +332,7 @@ pub async fn run_capacity_worker<A: WatchlistCapacityApplier>(
         tokio::select! {
             changed = requests.changed() => {
                 if changed.is_err() {
-                    return;
+                    return Err(CapacityWorkerError::RequestChannelClosed);
                 }
             }
             () = tokio::time::sleep(Duration::from_secs(CAPACITY_RETRY_INTERVAL_SECS)) => {}
@@ -324,19 +353,20 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     mut capacity_results: mpsc::Receiver<CapacityApplyResult>,
     interval_secs: u64,
     clob_creds_present: bool,
-) {
+    health: Option<SharedHealth>,
+) -> Result<(), ConfigPollError> {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await; // consume interval's immediate first tick; boot already fetched once
-    let mut results_open = true;
     info!(interval_secs, "service_config poll loop started");
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 poll_once(&live, &status, &fetcher, &capacity_requests, clob_creds_present).await;
+                publish_generation_health(health.as_ref(), &capacity_requests, &applied_capacity);
             }
-            result = capacity_results.recv(), if results_open => {
+            result = capacity_results.recv() => {
                 match result {
                     // Publish every result that still describes the membership actually applied.
                     // The desired request may already be newer; retaining this intermediate
@@ -354,13 +384,14 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
                             actual = result.actual,
                             "runtime watchlist capacity applied"
                         );
+                        publish_generation_health(health.as_ref(), &capacity_requests, &applied_capacity);
                     }
                     Some(result) => info!(
                         target = result.request.target,
                         generation = result.request.generation,
                         "ignoring superseded capacity completion"
                     ),
-                    None => results_open = false,
+                    None => return Err(ConfigPollError::CapacityResultChannelClosed),
                 }
             }
         }
@@ -558,6 +589,54 @@ mod tests {
         first_started: Arc<Notify>,
     }
 
+    struct ImmediateApplier(AppliedWatchlistCapacity);
+
+    impl WatchlistCapacityApplier for ImmediateApplier {
+        async fn apply(&self, request: CapacityRequest) -> Result<usize, String> {
+            self.0.store(request);
+            Ok(request.target)
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_and_config_result_channel_loss_are_typed_owner_errors() {
+        let applied = AppliedWatchlistCapacity::new(100);
+        let (_requests, request_rx) = request_channel(150);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        drop(result_rx);
+        assert!(matches!(
+            run_capacity_worker(
+                ImmediateApplier(applied.clone()),
+                applied,
+                request_rx,
+                result_tx,
+            )
+            .await,
+            Err(CapacityWorkerError::ResultChannelClosed)
+        ));
+
+        let live = LiveRuntimeConfig::new(boot());
+        let applied = AppliedWatchlistCapacity::new(100);
+        let (requests, _request_rx) = request_channel(100);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        drop(result_tx);
+        assert!(matches!(
+            run_config_poll_loop(
+                live.clone(),
+                RuntimeConfigStatus::new(&live.snapshot()),
+                OkFetcher(Vec::new()),
+                requests,
+                applied,
+                result_rx,
+                3_600,
+                false,
+                None,
+            )
+            .await,
+            Err(ConfigPollError::CapacityResultChannelClosed)
+        ));
+    }
+
     impl WatchlistCapacityApplier for CancellableApplier {
         async fn apply(&self, request: CapacityRequest) -> Result<usize, String> {
             self.calls
@@ -668,6 +747,7 @@ mod tests {
             results_rx,
             3_600,
             false,
+            None,
         ));
 
         let intermediate = requests.request(150).await;

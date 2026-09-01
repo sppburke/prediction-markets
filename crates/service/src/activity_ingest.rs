@@ -148,6 +148,22 @@ pub struct ActivityIngest {
     health: SharedHealth,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ActivityIngestError {
+    #[error("activity reader slot {slot} exited")]
+    ReaderExited { slot: usize },
+    #[error("activity source-log coordinator exited")]
+    CoordinatorExited,
+    #[error("activity child join failed: {0}")]
+    Join(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActivityChild {
+    Reader(usize),
+    Coordinator,
+}
+
 struct ReaderConfig {
     live_watchlist: LiveWatchlist,
     dialer: Dialer,
@@ -219,20 +235,39 @@ impl ActivityIngest {
     /// aborted and drained. Dropping this future (external abort) drops the
     /// set, which aborts its children without joining them.
     pub async fn run(self) {
+        let _ = self.run_until(std::future::pending::<()>()).await;
+    }
+
+    /// Production owner entry point with an explicit coordinated-shutdown branch.
+    ///
+    /// Every nested child is aborted and then joined before this future returns. A reader row
+    /// retained only in memory may be dropped on shutdown; a row already appended remains a
+    /// durable reconciliation obligation and restart recovers it.
+    pub async fn run_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), ActivityIngestError> {
         let (fan_in_tx, fan_in_rx) = mpsc::channel(self.trigger_tx.max_capacity());
         let mut tasks = JoinSet::new();
+        let health = self.health.clone();
         let fan_in_guard = if let Some(reader) = self.reader {
             for slot in 0..ACTIVITY_WS_READER_COUNT {
-                tasks.spawn(
+                let dialer = reader.dialer.clone();
+                let live_watchlist = reader.live_watchlist.clone();
+                let reader_health = health.clone();
+                let fan_in = fan_in_tx.clone();
+                tasks.spawn(async move {
                     Reader {
                         slot,
-                        dialer: reader.dialer.clone(),
-                        live_watchlist: reader.live_watchlist.clone(),
-                        health: self.health.clone(),
-                        fan_in: fan_in_tx.clone(),
+                        dialer,
+                        live_watchlist,
+                        health: reader_health,
+                        fan_in,
                     }
-                    .run(),
-                );
+                    .run()
+                    .await;
+                    ActivityChild::Reader(slot)
+                });
             }
             None
         } else {
@@ -241,7 +276,7 @@ impl ActivityIngest {
             Some(fan_in_tx.clone())
         };
         drop(fan_in_tx);
-        tasks.spawn(
+        tasks.spawn(async move {
             Coordinator {
                 sink: self.sink,
                 trigger_tx: self.trigger_tx,
@@ -249,14 +284,39 @@ impl ActivityIngest {
                 fan_in: fan_in_rx,
                 source_rx: self.source_rx.rx,
             }
-            .run(),
-        );
-        if tasks.join_next().await.is_some() {
-            info!("activity ingest child finished; stopping the reader pool");
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-        }
+            .run()
+            .await;
+            ActivityChild::Coordinator
+        });
+        tokio::pin!(shutdown);
+        let exit = tokio::select! {
+            biased;
+            () = &mut shutdown => None,
+            joined = tasks.join_next() => Some(joined),
+        };
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
         drop(fan_in_guard);
+        {
+            let mut current = health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for reader in &mut current.ws_readers {
+                reader.connected = false;
+                reader.fan_in_blocked = false;
+            }
+        }
+        match exit {
+            None => Ok(()),
+            Some(Some(Ok(ActivityChild::Reader(slot)))) => {
+                Err(ActivityIngestError::ReaderExited { slot })
+            }
+            Some(Some(Ok(ActivityChild::Coordinator))) => {
+                Err(ActivityIngestError::CoordinatorExited)
+            }
+            Some(Some(Err(error))) => Err(ActivityIngestError::Join(error.to_string())),
+            Some(None) => Err(ActivityIngestError::CoordinatorExited),
+        }
     }
 }
 
@@ -559,7 +619,11 @@ impl Coordinator {
         match self.sink.append_durable(duplicate_envelope(&envelope)) {
             Ok(seq) => return Ok(seq),
             Err(error) => {
-                self.set_health(|h| h.ws_sink_poisoned = true);
+                self.set_health(|h| {
+                    h.ws_sink_poisoned = true;
+                    h.source_durability_uncertain = true;
+                    h.refresh_event_log_writable();
+                });
                 warn!(error = %error, ?slot, trade = %label,
                     "source log append failed; sink poisoned — holding delivery and retrying reopen");
             }
@@ -576,7 +640,11 @@ impl Coordinator {
             }
             match self.sink.append_durable(duplicate_envelope(&envelope)) {
                 Ok(seq) => {
-                    self.set_health(|h| h.ws_sink_poisoned = false);
+                    self.set_health(|h| {
+                        h.ws_sink_poisoned = false;
+                        h.source_durability_uncertain = false;
+                        h.refresh_event_log_writable();
+                    });
                     info!(trade = %label,
                         "source log recovered; held payload appended durably");
                     return Ok(seq);

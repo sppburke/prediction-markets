@@ -27,7 +27,7 @@ use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrate
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
 use tokio::sync::{mpsc, watch};
-use tracing::info;
+use tracing::{error, info, warn};
 
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
 use pe_service::clob_book::ReqwestClobBookFetcher;
@@ -54,6 +54,10 @@ use pe_service::supabase_state::{
     SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
     supabase_authoritative_boot_observed,
 };
+use pe_service::supervisor::{
+    SHUTDOWN_DEADLINE, ShutdownController, ShutdownPhase, TaskEvent, TaskExit, TaskFailure,
+    TaskName, TaskResult, TaskSupervisor, cancel_at, cancel_result_at,
+};
 use pe_service::trade_poller::{
     TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
 };
@@ -64,6 +68,42 @@ use time::OffsetDateTime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|argument| argument == "--version") {
+        println!("{}", pe_service::build_info::version_line());
+        return Ok(());
+    }
+    if let Some(position) = args
+        .iter()
+        .position(|argument| argument == "--verify-staged-revision")
+    {
+        let expected = args
+            .get(position + 1)
+            .context("--verify-staged-revision requires a full Git object identity")?;
+        pe_service::build_info::verify_staged_revision(expected)
+            .context("verify staged binary identity")?;
+        println!("{}", pe_service::build_info::version_line());
+        return Ok(());
+    }
+    if let Some(position) = args
+        .iter()
+        .position(|argument| argument == "--verify-staged-identity")
+    {
+        let expected_revision = args.get(position + 1).context(
+            "--verify-staged-identity requires a full Git object identity and BLAKE3 digest",
+        )?;
+        let expected_hash = args.get(position + 2).context(
+            "--verify-staged-identity requires a full Git object identity and BLAKE3 digest",
+        )?;
+        let actual_hash =
+            pe_service::build_info::verify_staged_identity(expected_revision, expected_hash)
+                .context("verify staged binary identity and bytes")?;
+        println!(
+            "{} artifact_blake3={actual_hash}",
+            pe_service::build_info::version_line()
+        );
+        return Ok(());
+    }
     // --report: load config, compute P&L snapshot, print, exit.
     if env::args().any(|a| a == "--report") {
         return run_report();
@@ -84,8 +124,8 @@ async fn main() -> Result<()> {
     let cfg = load_config()?;
 
     // Hold the rolling-log worker guards for the whole process; dropping them flushes the
-    // non-blocking writers (losing buffered lines), so keep `_log_guards` alive until exit.
-    let _log_guards =
+    // non-blocking writers (losing buffered lines), so keep `log_guards` alive until exit.
+    let log_guards =
         pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
     info!("pe-service starting");
 
@@ -449,9 +489,21 @@ async fn main() -> Result<()> {
         cfg.polymarket_activity_ws_enabled,
         i64::try_from(cfg.trade_poll_interval_secs.saturating_mul(3)).unwrap_or(i64::MAX),
     );
+    let task_status = health
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .task_status
+        .clone();
+    let (shutdown, _) = ShutdownController::new();
+    let mut supervisor = TaskSupervisor::new(task_status.clone());
+    supervisor.register_external(TaskName::JsonTracingFullAppender);
+    supervisor.register_external(TaskName::JsonTracingErrorAppender);
+    let listener = tokio::net::TcpListener::bind(&cfg.bind)
+        .await
+        .with_context(|| format!("bind {}", cfg.bind))?;
 
     // Bounded channel per _GLOSSARY.md defaults.
-    let (_trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
+    let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
     // Seed the delivery cursor without mutating the ordered activity ledger. The positions API
     // is no longer an overwrite authority (#544).
@@ -503,9 +555,10 @@ async fn main() -> Result<()> {
     let activity_watchlist = live_watchlist.clone();
     let activity_health = health.clone();
     let activity_ws_enabled = cfg.polymarket_activity_ws_enabled;
-    let activity_ingest_task = tokio::spawn(async move {
+    let activity_shutdown = shutdown.subscribe();
+    supervisor.spawn(TaskName::ActivityIngest, async move {
         if start.wait_for(|started| *started).await.is_err() {
-            return;
+            return Ok(TaskExit::ChannelClosed("producer_start"));
         }
         let ingest = if activity_ws_enabled {
             pe_service::activity_ingest::ActivityIngest::new(
@@ -523,7 +576,11 @@ async fn main() -> Result<()> {
                 activity_health,
             )
         };
-        ingest.run().await;
+        ingest
+            .run_until(activity_shutdown.wait_for(ShutdownPhase::StopProducers))
+            .await
+            .map(|()| TaskExit::CleanShutdown)
+            .map_err(TaskFailure::typed)
     });
 
     // Polymarket trade poller task. Reads the live wallet set per poll round (#339).
@@ -535,9 +592,10 @@ async fn main() -> Result<()> {
     let poller_ws_enabled = cfg.polymarket_activity_ws_enabled;
     let poller_copy_latency_budget_secs = cfg.copy_latency_budget_secs;
     let poller_control_tx = control_tx.clone();
-    let trade_task = tokio::spawn(async move {
+    let public_poll_shutdown = shutdown.subscribe();
+    supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
-            return;
+            return Ok(TaskExit::ChannelClosed("producer_start"));
         }
         TradePoller::new(
             TradePollerConfig {
@@ -556,8 +614,10 @@ async fn main() -> Result<()> {
             Default::default(),
             obligations,
         )
-        .run()
-        .await;
+        .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
+        .await
+        .map(|()| TaskExit::CleanShutdown)
+        .map_err(TaskFailure::typed)
     });
 
     // Orchestrator.
@@ -572,7 +632,7 @@ async fn main() -> Result<()> {
     // `merge-duplicates` upsert from `run_sink` must not race them. With `sink_handle = None`
     // the orchestrator's `send_fill` and `tick_resolution`'s `send_resolution` are suppressed
     // automatically; the liquidity-snapshot worker (#350) keeps its own gate and stays alive.
-    let (sink_handle, sink_task) =
+    let sink_handle =
         if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() && !cfg.supabase_authoritative
         {
             if cfg.supabase_secret_key.is_empty() {
@@ -590,16 +650,15 @@ async fn main() -> Result<()> {
                 &cfg.supabase_secret_key,
             );
             let dropped = handle.dropped_counter();
-            let task = tokio::spawn(run_sink(
-                writer,
-                paper_state.clone(),
-                rx,
-                Duration::from_secs(cfg.supabase_sink_reconcile_interval_secs),
-                dropped,
-            ));
-            (Some(handle), Some(task))
+            let sink_state = paper_state.clone();
+            let reconcile_interval = Duration::from_secs(cfg.supabase_sink_reconcile_interval_secs);
+            supervisor.spawn(TaskName::SupabaseAnalyticsSink, async move {
+                run_sink(writer, sink_state, rx, reconcile_interval, dropped).await;
+                Ok(TaskExit::ChannelClosed("supabase_sink_events"))
+            });
+            Some(handle)
         } else {
-            (None, None)
+            None
         };
 
     // Liquidity-at-fill capture (issue #350 WS2 PR-H): off-hot-path Gamma + CLOB /book snapshot
@@ -622,28 +681,34 @@ async fn main() -> Result<()> {
             .with_base_url(cfg.polymarket_clob_base_url.clone()),
     );
 
-    let (snapshot_handle, snapshot_task) =
-        if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
-            let (handle, rx) = SnapshotHandle::channel(cfg.snapshot_channel_capacity);
-            let writer = SupabaseWriter::new(
-                reqwest::Client::new(),
-                &cfg.supabase_url,
-                &cfg.supabase_anon_key,
-                &cfg.supabase_secret_key,
-            );
-            let dropped = handle.dropped_counter();
-            let task = tokio::spawn(run_snapshot_worker(
+    let snapshot_handle = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
+        let (handle, rx) = SnapshotHandle::channel(cfg.snapshot_channel_capacity);
+        let writer = SupabaseWriter::new(
+            reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        );
+        let dropped = handle.dropped_counter();
+        let snapshot_mid_cache = mid_price_cache.clone();
+        let snapshot_book_fetcher = book_fetcher.clone();
+        let snapshot_state = paper_state.clone();
+        supervisor.spawn(TaskName::LiquiditySnapshotWorker, async move {
+            run_snapshot_worker(
                 rx,
-                mid_price_cache.clone(),
-                book_fetcher.clone(),
-                paper_state.clone(),
+                snapshot_mid_cache,
+                snapshot_book_fetcher,
+                snapshot_state,
                 Some(writer),
                 dropped,
-            ));
-            (Some(handle), Some(task))
-        } else {
-            (None, None)
-        };
+            )
+            .await;
+            Ok(TaskExit::ChannelClosed("liquidity_snapshot_requests"))
+        });
+        Some(handle)
+    } else {
+        None
+    };
 
     // #508: live account contexts — one boot fetch (best-effort; empty on failure) plus a
     // 30 s refresh loop, mirroring the config poller's last-known-good posture. With no
@@ -671,14 +736,22 @@ async fn main() -> Result<()> {
             }
         };
         let live = pe_service::live_accounts::LiveAccounts::new(initial);
-        tokio::spawn(pe_service::live_accounts::run_live_accounts_poller(
+        let accounts_poller = pe_service::live_accounts::run_live_accounts_poller(
             live.clone(),
             accounts_http_client,
             cfg.supabase_url.clone(),
             cfg.supabase_anon_key.clone(),
             cfg.supabase_secret_key.clone(),
             CONFIG_POLL_INTERVAL_SECS,
-        ));
+        );
+        supervisor.spawn(
+            TaskName::LiveAccountsPoller,
+            cancel_at(
+                accounts_poller,
+                shutdown.subscribe(),
+                ShutdownPhase::StopProducers,
+            ),
+        );
         Some(live)
     };
 
@@ -686,7 +759,7 @@ async fn main() -> Result<()> {
     // redemption posture, and retention. A missing age identity is warned exactly once and
     // passed as `None`; the mode machine then cannot arm, while the paper orchestrator remains
     // fully operational. The account-tagged journal is a mode-0600 sibling of the paper log.
-    let live_fanout_task = if let Some(live_accounts) = live_accounts.clone() {
+    if let Some(live_accounts) = live_accounts.clone() {
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
             Err(error) => {
@@ -695,49 +768,58 @@ async fn main() -> Result<()> {
             }
         };
         let journal_path = live_journal_path(&cfg.event_log_path);
-        match LiveJournal::open(&journal_path) {
-            Ok(journal) => {
-                let live_http_client = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(20))
-                    .build()
-                    .context("build bounded ordinary-live HTTP client")?;
-                let projection = pe_service::live_projections::LiveProjectionWriter::new(
-                    live_http_client.clone(),
-                    &cfg.supabase_url,
-                    &cfg.supabase_anon_key,
-                    &cfg.supabase_secret_key,
-                );
-                Some(tokio::spawn(pe_service::live_fanout::run_live_fanout(
-                    pe_service::live_fanout::LiveFanoutConfig {
-                        paper_state: paper_state.clone(),
-                        live_accounts,
-                        live_watchlist: live_watchlist.clone(),
-                        runtime_config: live_runtime_config.clone(),
-                        identity,
-                        journal: Arc::new(journal),
-                        journal_path,
-                        projection,
-                        book_fetcher: book_fetcher.clone(),
-                        http: live_http_client,
-                        supabase_url: cfg.supabase_url.clone(),
-                        supabase_anon_key: cfg.supabase_anon_key.clone(),
-                        supabase_secret_key: cfg.supabase_secret_key.clone(),
-                        gamma_base_url: cfg.gamma_base_url.clone(),
-                        clob_base_url: cfg.polymarket_clob_base_url.clone(),
-                        data_base_url: cfg.polymarket_base_url.clone(),
-                        projection_reconcile_interval_secs: cfg
-                            .supabase_sink_reconcile_interval_secs,
-                    },
-                )))
+        let journal = LiveJournal::open(&journal_path).with_context(|| {
+            format!("open and validate live journal {}", journal_path.display())
+        })?;
+        let live_http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("build bounded ordinary-live HTTP client")?;
+        let projection = pe_service::live_projections::LiveProjectionWriter::new(
+            live_http_client.clone(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        );
+        let fanout_config = pe_service::live_fanout::LiveFanoutConfig {
+            paper_state: paper_state.clone(),
+            live_accounts,
+            live_watchlist: live_watchlist.clone(),
+            runtime_config: live_runtime_config.clone(),
+            identity,
+            journal: Arc::new(journal),
+            journal_path,
+            projection,
+            book_fetcher: book_fetcher.clone(),
+            http: live_http_client,
+            supabase_url: cfg.supabase_url.clone(),
+            supabase_anon_key: cfg.supabase_anon_key.clone(),
+            supabase_secret_key: cfg.supabase_secret_key.clone(),
+            gamma_base_url: cfg.gamma_base_url.clone(),
+            clob_base_url: cfg.polymarket_clob_base_url.clone(),
+            data_base_url: cfg.polymarket_base_url.clone(),
+            projection_reconcile_interval_secs: cfg.supabase_sink_reconcile_interval_secs,
+        };
+        let fanout_health = health.clone();
+        let fanout_shutdown = shutdown.subscribe();
+        supervisor.spawn(TaskName::LiveFanout, async move {
+            let result = pe_service::live_fanout::run_live_fanout_until(
+                fanout_config,
+                fanout_shutdown.wait_for(ShutdownPhase::StopSinks),
+            )
+            .await;
+            if result.is_err() {
+                let mut health = fanout_health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                health.live_durability_uncertain = true;
+                health.refresh_event_log_writable();
             }
-            Err(error) => {
-                tracing::warn!(path = %journal_path.display(), error = %error, "ordinary live journal unavailable; live fan-out disabled");
-                None
-            }
-        }
-    } else {
-        None
-    };
+            result
+                .map(|()| TaskExit::CleanShutdown)
+                .map_err(TaskFailure::typed)
+        });
+    }
 
     let mut orch = Orchestrator::new(
         trade_rx,
@@ -778,6 +860,13 @@ async fn main() -> Result<()> {
     orch.resume_pending_before_producers()
         .await
         .context("resume decision_pending before source producers")?;
+    let orchestrator_shutdown = shutdown.subscribe();
+    supervisor.spawn(TaskName::Orchestrator, async move {
+        orch.run_coordinated(orchestrator_shutdown.wait_for(ShutdownPhase::DrainOrchestrator))
+            .await
+            .map(|()| TaskExit::CleanShutdown)
+            .map_err(TaskFailure::typed)
+    });
     producer_start_tx
         .send(true)
         .map_err(|_| anyhow::anyhow!("source producer start gate closed"))?;
@@ -789,17 +878,19 @@ async fn main() -> Result<()> {
     // Resolution polling task: periodically fetch Gamma for closed markets. In authoritative
     // mode (issue #397) it credits via the `apply_resolution` RPC; `sink_handle` is `None`,
     // so the best-effort `send_resolution` nudge is suppressed.
-    let resolution_task = spawn_resolution_task(
+    let resolution_poller = run_resolution_poller(
         paper_state.clone(),
         cfg.gamma_base_url.clone(),
         cfg.gamma_resolution_poll_interval_secs,
-        sink_handle,
+        sink_handle.clone(),
         supabase_state,
+        shutdown.subscribe().wait_for(ShutdownPhase::StopProducers),
     );
+    supervisor.spawn(TaskName::ResolutionPoller, resolution_poller);
 
     // Live-watchlist refresh task (#339): poll Supabase on the configured interval and refresh
     // the scores of the live set (score-update-only, #350 WS1). Spawned only when configured.
-    let supabase_task = Some(tokio::spawn(run_supabase_refresh_loop(
+    let refresh = run_supabase_refresh_loop(
         live_watchlist.clone(),
         paper_state.clone(),
         reqwest::Client::new(),
@@ -811,11 +902,15 @@ async fn main() -> Result<()> {
         watchlist_writer_lock.clone(),
         projection_dirty_rx,
         projection_status.clone(),
-    )));
+    );
+    supervisor.spawn(
+        TaskName::WatchlistRefresh,
+        cancel_at(refresh, shutdown.subscribe(), ShutdownPhase::StopProducers),
+    );
 
     // Watchlist maintenance tick (#350 WS1 PR-D): inactivity + underperformance knockout +
     // atomic backfill. Spawned only when Supabase is configured and the interval is non-zero.
-    let maintenance_task = if !cfg.supabase_url.is_empty() && cfg.maintenance_interval_secs > 0 {
+    if !cfg.supabase_url.is_empty() && cfg.maintenance_interval_secs > 0 {
         let demotion_cb_alpha = Decimal::from_str(&cfg.demotion_cb_alpha)
             .with_context(|| format!("parse demotion_cb_alpha '{}'", cfg.demotion_cb_alpha))?;
         let membership_mode =
@@ -835,7 +930,7 @@ async fn main() -> Result<()> {
             bench_overfetch: cfg.bench_overfetch,
             membership_mode,
         };
-        Some(tokio::spawn(run_maintenance_loop(
+        let maintenance = run_maintenance_loop(
             live_watchlist.clone(),
             paper_state.clone(),
             reqwest::Client::new(),
@@ -847,18 +942,22 @@ async fn main() -> Result<()> {
             applied_watchlist_capacity.clone(),
             admission_preparer.clone(),
             boot_batch_marker,
-        )))
-    } else {
-        None
-    };
+        );
+        supervisor.spawn(
+            TaskName::WatchlistMaintenance,
+            cancel_at(
+                maintenance,
+                shutdown.subscribe(),
+                ShutdownPhase::StopProducers,
+            ),
+        );
+    }
 
     // Service-config polling remains fixed at 30 seconds while a separate latest-only worker
     // performs slow admission preparation. The poller stays the sole RuntimeConfig writer; the
     // capacity worker commits membership + its applied epoch under the structural mutex and sends
     // a small completion back to the poller.
-    let (config_poll_task, capacity_task) = if cfg.supabase_url.is_empty() {
-        (None, None)
-    } else {
+    if !cfg.supabase_url.is_empty() {
         let (capacity_requests, capacity_request_rx) =
             capacity_request_channel(initial_watchlist_size, watchlist_writer_lock.clone());
         let (capacity_result_tx, capacity_result_rx) = mpsc::channel(4);
@@ -872,23 +971,27 @@ async fn main() -> Result<()> {
             watchlist_writer_lock.clone(),
             applied_watchlist_capacity.clone(),
             capacity_request_rx.clone(),
-            admission_preparer,
+            admission_preparer.clone(),
             capacity_http_client,
             cfg.supabase_url.clone(),
             cfg.supabase_anon_key.clone(),
             cfg.supabase_secret_key.clone(),
         );
-        let worker = tokio::spawn(run_capacity_worker(
+        let worker = run_capacity_worker(
             capacity_applier,
             applied_watchlist_capacity.clone(),
             capacity_request_rx,
             capacity_result_tx,
-        ));
+        );
+        supervisor.spawn(
+            TaskName::CapacityWorker,
+            cancel_result_at(worker, shutdown.subscribe(), ShutdownPhase::StopProducers),
+        );
         let config_http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
             .context("build bounded service-config HTTP client")?;
-        let poller = tokio::spawn(run_config_poll_loop(
+        let poller = run_config_poll_loop(
             live_runtime_config.clone(),
             runtime_config_status.clone(),
             SupabaseConfigFetcher::new(
@@ -902,31 +1005,42 @@ async fn main() -> Result<()> {
             capacity_result_rx,
             CONFIG_POLL_INTERVAL_SECS,
             clob_creds_present,
-        ));
-        (Some(poller), Some(worker))
-    };
-
-    // Status snapshot task (issue #184 follow-up): every `status_interval_secs`, atomically
-    // rewrite `status.json` with current health (bankroll, counts, watchlist size, Supabase RPC
-    // count, uptime) — the agent-friendly "how is it doing?" file. `0` disables it.
-    let status_task = if cfg.status_interval_secs > 0 {
-        Some(tokio::spawn(pe_service::status_writer::run_status_writer(
-            cfg.status_path.clone(),
-            Duration::from_secs(cfg.status_interval_secs),
-            paper_state.clone(),
-            live_watchlist.clone(),
-            applied_watchlist_capacity.clone(),
-            live_runtime_config.clone(),
-            runtime_config_status.clone(),
-            projection_status.clone(),
-            cfg.supabase_authoritative,
-            supabase_rpc_calls,
-            live_accounts.clone(),
             Some(health.clone()),
-        )))
-    } else {
-        None
-    };
+        );
+        supervisor.spawn(
+            TaskName::RuntimeConfigPoller,
+            cancel_result_at(poller, shutdown.subscribe(), ShutdownPhase::StopProducers),
+        );
+    }
+
+    // A zero interval disables periodic writes but retains the critical owner so coordinated
+    // shutdown still publishes one final identity/task snapshot (#544).
+    let status_interval =
+        (cfg.status_interval_secs > 0).then(|| Duration::from_secs(cfg.status_interval_secs));
+    // Register the final two owners before the status writer's immediate first tick.
+    task_status.register(TaskName::HttpServer);
+    let status_writer = pe_service::status_writer::run_status_writer(
+        cfg.status_path.clone(),
+        status_interval,
+        paper_state.clone(),
+        live_watchlist.clone(),
+        applied_watchlist_capacity.clone(),
+        live_runtime_config.clone(),
+        runtime_config_status.clone(),
+        projection_status.clone(),
+        cfg.supabase_authoritative,
+        supabase_rpc_calls,
+        live_accounts.clone(),
+        Some(health.clone()),
+        task_status.clone(),
+        shutdown.subscribe().wait_for(ShutdownPhase::FinalStatus),
+    );
+    supervisor.spawn(TaskName::StatusWriter, async move {
+        status_writer
+            .await
+            .map(|()| TaskExit::CleanShutdown)
+            .map_err(TaskFailure::typed)
+    });
 
     // Shared state for paper API handlers.
     let paper_api_state = Arc::new(PaperApiState {
@@ -944,56 +1058,145 @@ async fn main() -> Result<()> {
         .route("/paper/positions", get(pe_service::paper_api::positions))
         .route("/paper/fills", get(pe_service::paper_api::fills))
         .route("/paper/status", get(pe_service::paper_api::status))
-        .with_state(health)
+        .with_state(health.clone())
         .layer(axum::Extension(paper_api_state));
-    let listener = tokio::net::TcpListener::bind(&cfg.bind)
-        .await
-        .with_context(|| format!("bind {}", cfg.bind))?;
     info!(bind = %cfg.bind, "pe-service listening");
-    let http_task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!(error = %e, "http server error");
-        }
+    let http_shutdown = shutdown.subscribe();
+    supervisor.spawn(TaskName::HttpServer, async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(http_shutdown.wait_for(ShutdownPhase::StopHttp))
+            .await
+            .map(|()| TaskExit::CleanShutdown)
+            .map_err(TaskFailure::typed)
     });
 
-    // Run orchestrator until ctrl_c.
-    orch.run(async {
-        tokio::signal::ctrl_c().await.ok();
-        info!("shutdown signal received");
-    })
-    .await;
+    let initial_failure = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("wait for shutdown signal")?;
+                info!("shutdown signal received");
+                break None;
+            }
+            event = supervisor.observe_next() => {
+                let Some(event) = event else {
+                    break Some("all production owners exited".to_owned());
+                };
+                log_task_event(&event);
+                if event.initiates_shutdown() {
+                    break Some(format_task_failure(&event));
+                }
+            }
+        }
+    };
 
-    info!("orchestrator stopped; cleaning up");
-    trade_task.abort();
-    activity_ingest_task.abort();
-    http_task.abort();
-    resolution_task.abort();
-    if let Some(t) = supabase_task {
-        t.abort();
-    }
-    if let Some(t) = maintenance_task {
-        t.abort();
-    }
-    if let Some(t) = sink_task {
-        t.abort();
-    }
-    if let Some(t) = snapshot_task {
-        t.abort();
-    }
-    if let Some(t) = status_task {
-        t.abort();
-    }
-    if let Some(t) = config_poll_task {
-        t.abort();
-    }
-    if let Some(t) = capacity_task {
-        t.abort();
-    }
-    if let Some(t) = live_fanout_task {
-        t.abort();
-    }
+    // One application-wide deadline bounds every drain and join. A timeout aborts only the named
+    // stragglers and immediately joins those abort completions; no task is detached (#544).
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
+    advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
+    let producers = [
+        TaskName::ActivityIngest,
+        TaskName::PublicActivityPoll,
+        TaskName::ResolutionPoller,
+        TaskName::LiveAccountsPoller,
+        TaskName::WatchlistRefresh,
+        TaskName::WatchlistMaintenance,
+        TaskName::CapacityWorker,
+        TaskName::RuntimeConfigPoller,
+    ];
+    let mut shutdown_timed_out = !join_named_until(&mut supervisor, &producers, deadline).await;
+    drop(producer_start_tx);
+    drop(admission_preparer);
+    drop(control_tx);
+    drop(trade_tx);
+
+    advance_shutdown(&shutdown, &task_status, ShutdownPhase::DrainOrchestrator);
+    shutdown_timed_out |=
+        !join_named_until(&mut supervisor, &[TaskName::Orchestrator], deadline).await;
+    drop(sink_handle);
+
+    advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopSinks);
+    let sinks = [
+        TaskName::LiveFanout,
+        TaskName::SupabaseAnalyticsSink,
+        TaskName::LiquiditySnapshotWorker,
+    ];
+    shutdown_timed_out |= !join_named_until(&mut supervisor, &sinks, deadline).await;
+
+    advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopHttp);
+    shutdown_timed_out |=
+        !join_named_until(&mut supervisor, &[TaskName::HttpServer], deadline).await;
+
+    // Mark appenders stopping before the final snapshot; their guards flush and join last.
+    task_status.advance_phase(ShutdownPhase::Complete);
+    shutdown.advance(ShutdownPhase::FinalStatus);
+    shutdown_timed_out |=
+        !join_named_until(&mut supervisor, &[TaskName::StatusWriter], deadline).await;
+    drop(log_guards);
+    task_status.mark_stopped(TaskName::JsonTracingFullAppender);
+    task_status.mark_stopped(TaskName::JsonTracingErrorAppender);
+    shutdown.advance(ShutdownPhase::Complete);
+    supervisor.join_all().await;
+
     info!("pe-service stopped");
+    if shutdown_timed_out {
+        anyhow::bail!("coordinated shutdown exceeded {SHUTDOWN_DEADLINE:?}");
+    }
+    if let Some(failure) = initial_failure {
+        anyhow::bail!("critical production owner failed: {failure}");
+    }
     Ok(())
+}
+
+fn advance_shutdown(
+    controller: &ShutdownController,
+    task_status: &pe_service::supervisor::TaskStatus,
+    phase: ShutdownPhase,
+) {
+    task_status.advance_phase(phase);
+    controller.advance(phase);
+}
+
+fn format_task_failure(event: &TaskEvent) -> String {
+    event.failure.as_ref().map_or_else(
+        || format!("{} exited", event.name),
+        |failure| format!("{}: {:?}: {}", event.name, failure.kind, failure.message),
+    )
+}
+
+fn log_task_event(event: &TaskEvent) {
+    if event.failure.is_some() {
+        match event.class {
+            pe_service::supervisor::TaskClass::Critical => {
+                error!(task = %event.name, failure = %format_task_failure(event), "critical owner exited")
+            }
+            pe_service::supervisor::TaskClass::BestEffortAnalytics
+            | pe_service::supervisor::TaskClass::BestEffortObservability => {
+                warn!(task = %event.name, failure = %format_task_failure(event), "best-effort owner degraded")
+            }
+        }
+    } else {
+        info!(task = %event.name, "owner joined after coordinated shutdown");
+    }
+}
+
+async fn join_named_until(
+    supervisor: &mut TaskSupervisor,
+    names: &[TaskName],
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        if !names.iter().any(|name| supervisor.is_running(*name)) {
+            return true;
+        }
+        match tokio::time::timeout_at(deadline, supervisor.observe_next()).await {
+            Ok(Some(event)) => log_task_event(&event),
+            Ok(None) => return true,
+            Err(_) => {
+                supervisor.abort_and_join(names).await;
+                return false;
+            }
+        }
+    }
 }
 
 fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
@@ -1005,7 +1208,7 @@ fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
 }
 
 fn build_identity() -> &'static str {
-    env!("PE_BUILD_COMMIT")
+    pe_service::build_info::embedded().source_revision
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1193,32 +1396,35 @@ fn load_config() -> Result<ServiceConfig> {
 }
 
 /// Periodically fetch Gamma resolutions for all open positions and credit the bankroll.
-fn spawn_resolution_task(
+async fn run_resolution_poller(
     paper_state: Arc<PaperStateDb>,
     gamma_base_url: String,
     poll_interval_secs: u64,
     sink: Option<SinkHandle>,
     supabase_state: Option<SupabaseStateClient>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let fetcher = GammaResolutionFetcher::new(
-            gamma_base_url,
-            ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50),
-        );
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
-            if let Err(e) = tick_resolution(
-                &paper_state,
-                &fetcher,
-                sink.as_ref(),
-                supabase_state.as_ref(),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "resolution poll error");
-            }
+    shutdown: impl std::future::Future<Output = ()>,
+) -> TaskResult {
+    let fetcher = GammaResolutionFetcher::new(
+        gamma_base_url,
+        ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(50),
+    );
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return Ok(TaskExit::CleanShutdown),
+            () = tokio::time::sleep(Duration::from_secs(poll_interval_secs.max(1))) => {}
         }
-    })
+        if let Err(error) = tick_resolution(
+            &paper_state,
+            &fetcher,
+            sink.as_ref(),
+            supabase_state.as_ref(),
+        )
+        .await
+        {
+            warn!(error = %error, "resolution poll error");
+        }
+    }
 }
 
 async fn tick_resolution(
