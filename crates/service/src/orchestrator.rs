@@ -153,9 +153,22 @@ pub struct OrchestratorConfig {
     /// #530: websocket-primary mode. Gates the stale-fallback no-copy rule and the
     /// dual-unhealthy admission block; `false` keeps poll-only behavior byte-identical.
     pub activity_ws_enabled: bool,
-    /// #530: calibrated copy budget (seconds). In websocket-primary mode a REST-fallback
-    /// observation older than this is admitted with a typed no-copy disposition.
+    /// #530/#546: calibrated copy budget (seconds). In websocket-primary mode an observation
+    /// from either source older than this is admitted with a typed no-copy disposition — at
+    /// the early gate and again immediately before dispatch staging.
     pub copy_latency_budget_secs: u64,
+}
+
+/// Scenario-only deterministic seams (#546): fixed admission-clock instants consumed in
+/// order by each copy-budget check, and one-shot faults immediately before the two durable
+/// writes whose rollback the fan-in acceptance suite must prove. Compiled only with the
+/// `scenario` feature; production has no clock injection and no fault path.
+#[cfg(feature = "scenario")]
+#[derive(Debug, Default)]
+pub struct ScenarioHooks {
+    pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
+    pub fail_next_stage_seed: std::sync::atomic::AtomicBool,
+    pub fail_next_no_copy_commit: std::sync::atomic::AtomicBool,
 }
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
@@ -176,6 +189,8 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     min_resolution_horizon_secs: u64,
     activity_ws_enabled: bool,
     copy_latency_budget_secs: u64,
+    #[cfg(feature = "scenario")]
+    scenario_hooks: Option<Arc<ScenarioHooks>>,
     // Skip BUYs whose FILL price is >= this (issue #142 parity). ZERO disables.
     max_fill_price: Decimal,
     // Skip BUYs whose FILL price is < this (run28 band lower, #468 parity). ZERO disables.
@@ -310,6 +325,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             mid_price_cache,
             activity_ws_enabled: config.activity_ws_enabled,
             copy_latency_budget_secs: config.copy_latency_budget_secs,
+            #[cfg(feature = "scenario")]
+            scenario_hooks: None,
             max_resolution_horizon_secs: config.max_resolution_horizon_secs,
             min_resolution_horizon_secs: config.min_resolution_horizon_secs,
             max_fill_price: config.max_fill_price,
@@ -331,6 +348,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             clob_best_ask_fallback_haircut_bps: config.clob_best_ask_fallback_haircut_bps,
             live_accounts: config.live_accounts,
         })
+    }
+
+    /// Install the scenario-only clock/fault seams (#546). Scenario builds only.
+    #[cfg(feature = "scenario")]
+    pub fn set_scenario_hooks(&mut self, hooks: Arc<ScenarioHooks>) {
+        self.scenario_hooks = Some(hooks);
+    }
+
+    /// Wall clock for the copy-budget checks; scenario builds may pop fixed instants.
+    fn admission_now(&self) -> OffsetDateTime {
+        #[cfg(feature = "scenario")]
+        if let Some(instant) = self
+            .scenario_hooks
+            .as_ref()
+            .and_then(|h| h.age_clock.lock().ok()?.pop_front())
+        {
+            return instant;
+        }
+        OffsetDateTime::now_utc()
+    }
+
+    #[cfg(feature = "scenario")]
+    fn take_scenario_fault(
+        &self,
+        select: impl FnOnce(&ScenarioHooks) -> &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        self.scenario_hooks
+            .as_ref()
+            .is_some_and(|h| select(h).swap(false, std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Run the dispatch loop until the trade channel closes OR until the
@@ -521,6 +567,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             created_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
             targets,
         };
+        #[cfg(feature = "scenario")]
+        if self.take_scenario_fault(|h| &h.fail_next_stage_seed) {
+            error!(dispatch_id = %dispatch_id,
+                "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
+            return Err(());
+        }
         match self.paper_state.stage_dispatch_seed(&record) {
             Ok(_staged_or_reused) => Ok(Some(dispatch_id)),
             Err(e) => {
@@ -663,7 +715,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            h.copy_admission_blocked(OffsetDateTime::now_utc())
+            h.copy_admission_blocked(OffsetDateTime::now_utc(), tokio::time::Instant::now())
         };
         if admission_blocked {
             warn!(
@@ -683,7 +735,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         .health
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    !h.copy_admission_blocked(OffsetDateTime::now_utc())
+                    !h.copy_admission_blocked(
+                        OffsetDateTime::now_utc(),
+                        tokio::time::Instant::now(),
+                    )
                 };
                 if unblocked {
                     break;
@@ -754,45 +809,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // is mirrored into paper-state on every processed trade — fill or no fill.
         let leader_row = self.leader_position_row(&trade);
 
-        // #530 stale-fallback fail-closed rule (websocket-primary mode only): the
-        // ranker's latency shift assumes copies happen at websocket speed, so a
-        // REST-fallback observation older than the calibrated budget is admitted
-        // for bookkeeping — seen-state, leader ledger, and a typed disposition in
-        // ONE transaction, so the held cursor (#511) advances — but stages no
-        // copy. Copying it late is the padded-watchlist loss class.
-        if self.activity_ws_enabled && trade.provenance == TradeProvenance::RestPoll {
-            let age = OffsetDateTime::now_utc() - trade.observed_at;
-            let age_secs = age.whole_seconds();
-            // Full-Duration compare (#530 review F6): 2.5s old with a 2s budget IS
-            // stale; whole-second truncation would admit up to budget+1s. The budget
-            // is bounds-checked at config load; try_from is belt-and-suspenders.
-            let budget = time::Duration::seconds(
-                i64::try_from(self.copy_latency_budget_secs).unwrap_or(i64::MAX),
-            );
-            if age > budget {
-                let disposition = pe_paper_state::NoCopyDisposition {
-                    provenance: "rest_poll".to_string(),
-                    age_secs,
-                    reason: "stale_fallback_past_copy_budget".to_string(),
-                    recorded_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
-                };
-                info!(
-                    trade = %trade.source_trade_id,
-                    age_secs,
-                    budget_secs = self.copy_latency_budget_secs,
-                    "stale fallback observation: admitted with no-copy disposition"
-                );
-                if let Err(e) = self.paper_state.commit_seen_no_copy(
-                    &trade.source_trade_id,
-                    &leader_row,
-                    &disposition,
-                ) {
-                    error!(error = %e, trade = %trade.source_trade_id,
-                        "no-copy disposition commit failed; rolling back admission");
-                    self.rollback_admission(&rb, None);
-                }
-                return;
-            }
+        // #530/#546 copy-budget rule (websocket-primary mode only): an observation from
+        // EITHER source older than the calibrated budget is admitted for bookkeeping but
+        // stages no copy (`stale_no_copy`). Checked here and again immediately before
+        // dispatch staging.
+        if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+            self.commit_no_copy_or_rollback(&trade, &leader_row, &disposition, &rb, None);
+            return;
         }
 
         let Some(signal) = classify_trade(
@@ -1039,6 +1062,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // ── Shared gates end here. Stage the dispatch aggregate (#508 Decision 10) ──
         // Every rejection ABOVE suppressed all destinations pre-staging (no aggregate).
         // Every decision BELOW is paper-only and must never suppress live targets.
+        // #546: re-check the copy budget with a FRESH time sample immediately before
+        // staging. Channel and awaited-gate delay (book fetch, resolution lookup, the
+        // admission hold) must not turn an observation that was fresh at the early gate
+        // into a stale fill or dispatch. The recorded same-session entry is deliberately
+        // kept: this leader did enter the market.
+        if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+            self.commit_no_copy_or_rollback(
+                &trade,
+                &leader_row,
+                &disposition,
+                &rb,
+                Some(&signal.market_id),
+            );
+            return;
+        }
+
         let dispatch_id = match self.stage_dispatch_if_targeted(&signal) {
             Ok(id) => id,
             Err(()) => {
@@ -1203,6 +1242,78 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     }
                 }
             }
+        }
+    }
+
+    /// #530/#546 copy-budget rule (websocket-primary mode only): the ranker's latency shift
+    /// assumes copies happen at websocket speed, so an observation from EITHER source older
+    /// than the calibrated budget is admitted for bookkeeping — seen-state, leader ledger,
+    /// and a typed disposition in ONE transaction, so the held cursor (#511) advances — but
+    /// stages no copy. Copying it late is the padded-watchlist loss class. Strict
+    /// full-`Duration` compare (#530 review F6): 2.5s old with a 2s budget IS stale;
+    /// whole-second truncation would admit up to budget+1s. `now` is sampled ONCE per
+    /// decision and stamps both `age_secs` and `recorded_at_unix`.
+    fn stale_no_copy(
+        &self,
+        trade: &IncomingTrade,
+        now: OffsetDateTime,
+    ) -> Option<pe_paper_state::NoCopyDisposition> {
+        if !self.activity_ws_enabled {
+            return None;
+        }
+        let age = now - trade.observed_at;
+        // The budget is bounds-checked at config load; try_from is belt-and-suspenders.
+        let budget = time::Duration::seconds(
+            i64::try_from(self.copy_latency_budget_secs).unwrap_or(i64::MAX),
+        );
+        if age <= budget {
+            return None;
+        }
+        let (provenance, reason) = match trade.provenance {
+            TradeProvenance::RestPoll => ("rest_poll", "stale_fallback_past_copy_budget"),
+            TradeProvenance::ActivityWs => ("activity_ws", "stale_activity_ws_past_copy_budget"),
+        };
+        Some(pe_paper_state::NoCopyDisposition {
+            provenance: provenance.to_string(),
+            age_secs: age.whole_seconds(),
+            reason: reason.to_string(),
+            recorded_at_unix: now.unix_timestamp(),
+        })
+    }
+
+    /// Commit a typed no-copy admission (seen + leader + disposition, atomically). On failure
+    /// the trade is abandoned unseen and the in-memory admission effects are rolled back, so
+    /// the next reader copy or redelivery re-runs a byte-identical admission.
+    fn commit_no_copy_or_rollback(
+        &mut self,
+        trade: &IncomingTrade,
+        leader: &LeaderPositionRow,
+        disposition: &pe_paper_state::NoCopyDisposition,
+        rb: &RollbackCtx,
+        unrecord_market: Option<&MarketId>,
+    ) {
+        info!(
+            trade = %trade.source_trade_id,
+            provenance = %disposition.provenance,
+            age_secs = disposition.age_secs,
+            budget_secs = self.copy_latency_budget_secs,
+            reason = %disposition.reason,
+            "stale observation: admitted with no-copy disposition"
+        );
+        #[cfg(feature = "scenario")]
+        if self.take_scenario_fault(|h| &h.fail_next_no_copy_commit) {
+            error!(trade = %trade.source_trade_id,
+                "scenario fault: no-copy disposition commit failed; rolling back admission");
+            self.rollback_admission(rb, unrecord_market);
+            return;
+        }
+        if let Err(e) =
+            self.paper_state
+                .commit_seen_no_copy(&trade.source_trade_id, leader, disposition)
+        {
+            error!(error = %e, trade = %trade.source_trade_id,
+                "no-copy disposition commit failed; rolling back admission");
+            self.rollback_admission(rb, unrecord_market);
         }
     }
 

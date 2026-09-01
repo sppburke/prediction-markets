@@ -10,12 +10,13 @@ use pe_core_types::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-/// Transport a trade observation arrived on (#530). The stale-fallback
-/// admission rule and the split health surfaces key on this: a REST-fallback
-/// observation older than the calibrated copy budget is admitted for
-/// bookkeeping but stages no copy, while websocket observations are the
-/// primary low-latency path. Serde-defaulted to `RestPoll` so fixtures and
-/// recordings from before the field existed replay unchanged.
+/// Transport a trade observation arrived on (#530). The copy-budget admission
+/// rule and the split health surfaces key on this: in websocket-primary mode an
+/// observation from either source older than the calibrated copy budget is
+/// admitted for bookkeeping but stages no copy (#546), and the disposition
+/// records which transport carried it; websocket observations are the primary
+/// low-latency path. Serde-defaulted to `RestPoll` so fixtures and recordings
+/// from before the field existed replay unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradeProvenance {

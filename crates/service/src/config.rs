@@ -88,12 +88,15 @@ pub struct ServiceConfig {
     #[serde(default = "default_source_event_log_path")]
     pub source_event_log_path: PathBuf,
 
-    /// #530: the calibrated copy budget in seconds. While the websocket path is
-    /// enabled, a REST-fallback observation older than this is admitted for
-    /// bookkeeping with a typed no-copy disposition and stages no copy — the
-    /// ranker's latency shift assumes copies happen at websocket speed, so
-    /// copying older observations is the padded-watchlist loss class. Matches
-    /// the deployed `LATENCY_SHIFT_SECS`; re-checked at +1 week (issue #530).
+    /// #530/#546: the calibrated copy budget in seconds. While the websocket path
+    /// is enabled, an observation from EITHER source (REST poll or activity
+    /// websocket) older than this is admitted for bookkeeping with a typed
+    /// no-copy disposition and stages no copy — checked at the early admission
+    /// gate and again immediately before dispatch staging, so channel or gate
+    /// delay cannot turn a fresh observation into a stale copy. The ranker's
+    /// latency shift assumes copies happen at websocket speed, so copying older
+    /// observations is the padded-watchlist loss class. Matches the deployed
+    /// `LATENCY_SHIFT_SECS`; re-checked at +1 week (issue #530).
     #[serde(default = "default_copy_latency_budget_secs")]
     pub copy_latency_budget_secs: u64,
 

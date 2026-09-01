@@ -27,6 +27,13 @@ pub struct SourceEventSink {
     path: PathBuf,
     writer: Option<Writer>,
     poisoned: bool,
+    /// Crate-private one-shot faults for the coordinator's module tests only
+    /// (#546): fail the next append / the next reopen exactly once. Absent from
+    /// production builds.
+    #[cfg(test)]
+    fail_next_append: bool,
+    #[cfg(test)]
+    fail_next_reopen: bool,
 }
 
 impl SourceEventSink {
@@ -41,13 +48,37 @@ impl SourceEventSink {
             path,
             writer: Some(writer),
             poisoned: false,
+            #[cfg(test)]
+            fail_next_append: false,
+            #[cfg(test)]
+            fail_next_reopen: false,
         })
+    }
+
+    /// Arm one append failure (poisons like a real append/sync error).
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&mut self) {
+        self.fail_next_append = true;
+    }
+
+    /// Arm one reopen failure (the sink stays poisoned for that attempt).
+    #[cfg(test)]
+    pub(crate) fn fail_next_reopen(&mut self) {
+        self.fail_next_reopen = true;
     }
 
     /// Durably append one source event (append + sync). On any failure the
     /// sink poisons: the writer is discarded and every subsequent append fails
     /// until [`Self::try_reopen`] succeeds.
     pub fn append_durable(&mut self, envelope: EnvelopeIn) -> Result<EventSeq, LogError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_append) {
+            self.writer = None;
+            self.poisoned = true;
+            return Err(LogError::Io(std::io::Error::other(
+                "injected append failure",
+            )));
+        }
         let Some(writer) = self.writer.as_mut() else {
             return Err(LogError::Io(std::io::Error::other(
                 "source event sink poisoned",
@@ -77,6 +108,10 @@ impl SourceEventSink {
     pub fn try_reopen(&mut self) -> bool {
         if !self.poisoned && self.writer.is_some() {
             return true;
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_reopen) {
+            return false;
         }
         match Writer::open(&self.path) {
             Ok(writer) => {

@@ -1,29 +1,32 @@
-//! Polymarket UI live-data websocket transport (#530).
+//! Polymarket live-data activity websocket transport (#530, #546).
 //!
-//! `wss://ws-live-data.polymarket.com` streams every platform trade with wallet
+//! `wss://ws-live-data.polymarket.com` is the officially listed real-time
+//! data endpoint whose activity subscription and payload are published by the
+//! first-party client, without published completeness, uptime, ordering,
+//! continuity, or resume guarantees (`docs/15-SOURCES.md` carries the entry
+//! and the re-check policy). It streams every platform trade with wallet
 //! attribution (`proxyWallet` — the same identity axis the REST `/activity`
 //! endpoint reports), measured at p50 0.80s / p95 1.32s versus the leader's
-//! trade timestamp. It is an **unofficial UI feed** with no documented
-//! contract: `docs/15-SOURCES.md` carries its entry, re-check policy, and the
-//! 14-hour soak evidence behind the policy constants below. The CLOB market
-//! websocket remains wallet-anonymous (#282/#300) — this feed is the only
-//! attributed push path.
+//! trade timestamp. The CLOB market websocket remains wallet-anonymous
+//! (#282/#300) — this feed is the only attributed push path.
 //!
-//! Division of ownership: this module owns the transport (connect), the frame
-//! envelope (subscription protocol, topic routing, raw payload extraction) and
-//! the reconnect/resubscribe **policy** (a pure, clock-injected state machine —
-//! the 14h soak proved subscriptions silently lapse on ping-alive sockets, so
-//! silence handling is load-bearing, not hardening). Normalization of a payload
-//! into an `IncomingTrade` is owned by the service's trade parser, shared with
-//! the REST path so both produce identical trades by construction.
+//! Division of ownership: this module owns the transport (dial + subscribe,
+//! read), the frame envelope (topic routing, exact payload extraction), the
+//! policy constants, and the per-connection reconnect backoff. Normalizing a
+//! payload into an `IncomingTrade` and deciding liveness from normalized rows
+//! belong to the service's `activity_ingest`, which runs
+//! [`ACTIVITY_WS_READER_COUNT`] independent readers over this transport: a
+//! connection can stay open and acknowledged while delivering no activity
+//! (#546 experiments, 2026-08-31), so only a parser-accepted activity row
+//! proves a reader alive.
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-/// Feed endpoint. Unofficial; re-check before each deploy per `docs/15`.
+/// Feed endpoint. Re-check the first-party contract per `docs/15` before a deploy that relies on it.
 pub const ACTIVITY_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 
-/// Subscription frame sent once per (re)connect and on each resubscribe.
+/// Subscription frame sent once per (re)connect.
 pub const ACTIVITY_WS_SUBSCRIBE: &str =
     r#"{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}"#;
 
@@ -32,13 +35,18 @@ pub const ACTIVITY_WS_SCHEMA_VERSION: u32 = 1;
 /// Version of the envelope parser below.
 pub const ACTIVITY_WS_PARSER_VERSION: u32 = 1;
 
-/// Silence (no frame on a live socket) before re-sending the subscription.
-/// Canonical home: `docs/_GLOSSARY.md` (`activity_ws_silence_resubscribe_secs`).
-pub const ACTIVITY_WS_SILENCE_RESUBSCRIBE_SECS: i64 = 30;
-/// No valid frame for this long ⇒ the websocket source is STALE (health).
-pub const ACTIVITY_WS_STALE_SECS: i64 = 120;
-/// No valid frame for this long ⇒ the websocket source is DEAD (health).
-pub const ACTIVITY_WS_DEAD_SECS: i64 = 300;
+/// Independent reader connections per service process (#546). Three keeps two
+/// live readers after the measured connection-local silent failure.
+/// Canonical home: `docs/_GLOSSARY.md` (`activity_ws_reader_count`).
+pub const ACTIVITY_WS_READER_COUNT: usize = 3;
+/// A reader with no normalized activity row for this long is not live. While
+/// reading, it drops its socket at the deadline and re-dials after its own
+/// backoff; while blocked on a full fan-in send it keeps the socket and its
+/// retained row (health still derives it non-live) and drops only after that
+/// frame drains. Six times the largest activity gap measured on a healthy
+/// connection (4.775s, #546).
+/// Canonical home: `docs/_GLOSSARY.md` (`activity_ws_normalized_activity_timeout_secs`).
+pub const ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS: u64 = 30;
 /// Reconnect backoff doubles from 1s and is capped here.
 pub const ACTIVITY_WS_BACKOFF_CAP_SECS: u64 = 60;
 
@@ -48,6 +56,12 @@ pub enum ActivityWsError {
     Json(#[from] serde_json::Error),
     #[error("websocket: {message}")]
     Transport { message: String },
+}
+
+fn transport(error: impl std::fmt::Display) -> ActivityWsError {
+    ActivityWsError::Transport {
+        message: error.to_string(),
+    }
 }
 
 // ── Frame envelope ───────────────────────────────────────────────────────────
@@ -64,30 +78,16 @@ struct ActivityFrame<'a> {
     payload: Option<&'a RawValue>,
 }
 
-/// Probe for the one field the ingest filter needs before normalization.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WalletProbe {
-    proxy_wallet: String,
-}
-
-/// One activity trade lifted from a frame: the filter key plus the exact
-/// payload bytes (normalization happens in the service's trade parser).
-#[derive(Debug, Clone)]
-pub struct ActivityTradeRaw {
-    /// Lowercased `proxyWallet` — the watchlist filter key.
-    pub proxy_wallet: String,
-    /// The exact payload object bytes as received.
-    pub payload_json: Vec<u8>,
-}
-
-/// Parse one websocket text frame into its activity-trade payloads.
+/// Parse one websocket text frame into the exact activity payload bytes it
+/// carries.
 ///
-/// Returns the extracted trades plus the count of activity payloads that were
-/// present but unusable (no `proxyWallet`): those are counted, never silently
-/// ignored, so the ingest task can surface parse-health. Non-activity frames
-/// and empty keepalive frames contribute nothing and are not errors.
-pub fn parse_activity_frame(raw: &str) -> Result<(Vec<ActivityTradeRaw>, usize), ActivityWsError> {
+/// Returns the payload slices (borrowed from `raw`, byte-identical to the
+/// wire) plus the count of activity frames that carried no payload. Empty
+/// keepalives, acknowledgements, and other topics contribute nothing and are
+/// not errors. Whether a payload is a usable trade is decided exactly once
+/// downstream by the service normalizer; this envelope layer makes no
+/// field-level claim, so it can never certify a payload the normalizer rejects.
+pub fn parse_activity_frame(raw: &str) -> Result<(Vec<&[u8]>, usize), ActivityWsError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok((Vec::new(), 0));
@@ -98,142 +98,23 @@ pub fn parse_activity_frame(raw: &str) -> Result<(Vec<ActivityTradeRaw>, usize),
         vec![serde_json::from_str(trimmed)?]
     };
 
-    let mut out = Vec::new();
-    let mut malformed = 0usize;
+    let mut payloads = Vec::new();
+    let mut missing = 0usize;
     for frame in frames {
         let is_activity_trade =
             frame.topic.as_deref() == Some("activity") && frame.kind.as_deref() == Some("trades");
         if !is_activity_trade {
             continue;
         }
-        let Some(payload) = frame.payload else {
-            malformed += 1;
-            continue;
-        };
-        match serde_json::from_str::<WalletProbe>(payload.get()) {
-            Ok(probe) if !probe.proxy_wallet.is_empty() => out.push(ActivityTradeRaw {
-                proxy_wallet: probe.proxy_wallet.to_lowercase(),
-                payload_json: payload.get().as_bytes().to_vec(),
-            }),
-            _ => malformed += 1,
+        match frame.payload {
+            Some(payload) => payloads.push(payload.get().as_bytes()),
+            None => missing += 1,
         }
     }
-    Ok((out, malformed))
+    Ok((payloads, missing))
 }
 
-// ── Reconnect / resubscribe policy (pure, clock-injected) ────────────────────
-
-/// What the transport loop must do next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyAction {
-    /// Keep reading.
-    None,
-    /// Re-send [`ACTIVITY_WS_SUBSCRIBE`] on the live socket (silent lapse).
-    Resubscribe,
-    /// Drop the socket and reconnect after `backoff_secs`.
-    Reconnect { backoff_secs: u64 },
-}
-
-/// Health classification of the websocket source, for the service health split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WsStaleness {
-    Fresh,
-    /// ≥ [`ACTIVITY_WS_STALE_SECS`] without a valid frame.
-    Stale,
-    /// ≥ [`ACTIVITY_WS_DEAD_SECS`] without a valid frame.
-    Dead,
-}
-
-/// Pure state machine driving silence → resubscribe → reconnect, from the 14h
-/// soak's measured failure mode: the subscription lapses while the socket stays
-/// ping-alive (1,442 silence windows vs 16 hard disconnects). All transitions
-/// take an explicit `now_unix` so behavior is fully deterministic in tests.
-#[derive(Debug, Clone)]
-pub struct ActivityWsPolicy {
-    last_frame_unix: i64,
-    last_valid_frame_unix: i64,
-    resubscribed_this_silence: bool,
-    consecutive_reconnects: u32,
-}
-
-impl ActivityWsPolicy {
-    /// State for a socket that just connected (and subscribed) at `now_unix`.
-    pub fn connected(now_unix: i64) -> Self {
-        Self {
-            last_frame_unix: now_unix,
-            last_valid_frame_unix: now_unix,
-            resubscribed_this_silence: false,
-            consecutive_reconnects: 0,
-        }
-    }
-
-    /// Record a received frame; `valid` = it parsed and contained activity trades
-    /// or was a recognized non-activity frame (anything except a parse failure).
-    pub fn on_frame(&mut self, now_unix: i64, valid: bool) {
-        self.last_frame_unix = now_unix;
-        self.resubscribed_this_silence = false;
-        if valid {
-            self.last_valid_frame_unix = now_unix;
-            self.consecutive_reconnects = 0;
-        }
-    }
-
-    /// Record a completed reconnect attempt (socket re-established, re-subscribed).
-    pub fn on_reconnected(&mut self, now_unix: i64) {
-        self.consecutive_reconnects = self.consecutive_reconnects.saturating_add(1);
-        self.last_frame_unix = now_unix;
-        self.resubscribed_this_silence = false;
-    }
-
-    /// Decide the next action for a silent interval ending at `now_unix`.
-    ///
-    /// First silence past the threshold gets one resubscribe on the live socket;
-    /// if silence persists past a second threshold interval, reconnect with
-    /// exponential backoff. A frame at any point resets the episode.
-    pub fn tick(&mut self, now_unix: i64) -> PolicyAction {
-        let silent_for = now_unix.saturating_sub(self.last_frame_unix);
-        if silent_for < ACTIVITY_WS_SILENCE_RESUBSCRIBE_SECS {
-            return PolicyAction::None;
-        }
-        if !self.resubscribed_this_silence {
-            self.resubscribed_this_silence = true;
-            return PolicyAction::Resubscribe;
-        }
-        if silent_for >= 2 * ACTIVITY_WS_SILENCE_RESUBSCRIBE_SECS {
-            return PolicyAction::Reconnect {
-                backoff_secs: backoff_secs(self.consecutive_reconnects),
-            };
-        }
-        PolicyAction::None
-    }
-
-    /// Health classification from the age of the last VALID frame.
-    pub fn staleness(&self, now_unix: i64) -> WsStaleness {
-        let age = now_unix.saturating_sub(self.last_valid_frame_unix);
-        if age >= ACTIVITY_WS_DEAD_SECS {
-            WsStaleness::Dead
-        } else if age >= ACTIVITY_WS_STALE_SECS {
-            WsStaleness::Stale
-        } else {
-            WsStaleness::Fresh
-        }
-    }
-
-    /// Age of the last frame of any kind (observability surface).
-    pub fn last_frame_age_secs(&self, now_unix: i64) -> i64 {
-        now_unix.saturating_sub(self.last_frame_unix)
-    }
-
-    /// Age of the last valid frame (observability surface).
-    pub fn last_valid_frame_age_secs(&self, now_unix: i64) -> i64 {
-        now_unix.saturating_sub(self.last_valid_frame_unix)
-    }
-
-    /// Completed reconnects since the last valid frame (observability surface).
-    pub fn consecutive_reconnects(&self) -> u32 {
-        self.consecutive_reconnects
-    }
-}
+// ── Reconnect backoff (per reader, persistent across connection cycles) ──────
 
 /// Exponential backoff: 1s, 2s, 4s, … capped at [`ACTIVITY_WS_BACKOFF_CAP_SECS`].
 pub fn backoff_secs(consecutive_reconnects: u32) -> u64 {
@@ -241,10 +122,11 @@ pub fn backoff_secs(consecutive_reconnects: u32) -> u64 {
     (1u64 << exp).min(ACTIVITY_WS_BACKOFF_CAP_SECS)
 }
 
-/// Driver-owned reconnect accounting (#530 review F3): ONE persistent counter
-/// across connection cycles — a fresh [`ActivityWsPolicy`] per connection must
-/// not reset backoff, or connect-success/immediate-death cycles hammer at 1s
-/// forever (the measured zombie mode makes this a real shape, not a hypothesis).
+/// Reader-owned reconnect accounting (#530 review F3): ONE persistent counter
+/// across connection cycles, so connect-success/immediate-silence cycles
+/// escalate instead of hammering at 1s forever. Only a normalized activity
+/// row counts as progress (#546): connect, acknowledgement, keepalive, and
+/// envelope-level parsing prove nothing about delivery.
 #[derive(Debug, Clone, Default)]
 pub struct ReconnectBackoff {
     consecutive: u32,
@@ -259,12 +141,12 @@ impl ReconnectBackoff {
         backoff
     }
 
-    /// Progress was made (a valid frame arrived): reset.
-    pub fn on_valid_frame(&mut self) {
+    /// Progress was made (a payload passed the production normalizer): reset.
+    pub fn on_normalized_row(&mut self) {
         self.consecutive = 0;
     }
 
-    /// Completed reconnect attempts since the last valid frame (observability).
+    /// Completed reconnect attempts since the last normalized row (observability).
     pub fn consecutive(&self) -> u32 {
         self.consecutive
     }
@@ -273,14 +155,21 @@ impl ReconnectBackoff {
 // ── Transport ────────────────────────────────────────────────────────────────
 
 use futures::{SinkExt as _, StreamExt as _};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-type WsInner =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+/// Object-safe byte stream under the websocket framing: production is TLS over
+/// TCP; scenario builds may substitute an in-process pipe (see [`ActivityWsPeer`]).
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
-/// A connected, subscribed live-data socket. The service's ingest task drives
-/// it (read loop, policy ticks via timeout, health); this type only owns the
-/// wire mechanics so the protocol lives beside its constants.
+type WsInner = WebSocketStream<MaybeTlsStream<Box<dyn AsyncStream>>>;
+
+/// A connected, subscribed live-data socket. The service's reader drives it
+/// (read loop, normalized-row deadline, health); this type only owns the wire
+/// mechanics so the protocol lives beside its constants.
 pub struct ActivityWsStream {
     inner: WsInner,
 }
@@ -303,45 +192,112 @@ fn ensure_crypto_provider() {
 }
 
 impl ActivityWsStream {
-    /// Dial [`ACTIVITY_WS_URL`] and send [`ACTIVITY_WS_SUBSCRIBE`].
+    /// Dial [`ACTIVITY_WS_URL`] (TCP, then TLS + websocket handshake) and send
+    /// [`ACTIVITY_WS_SUBSCRIBE`]. Production is fixed to this endpoint.
     pub async fn connect_and_subscribe() -> Result<Self, ActivityWsError> {
         ensure_crypto_provider();
-        let (inner, _response) = tokio_tungstenite::connect_async(ACTIVITY_WS_URL)
+        let request = ACTIVITY_WS_URL.into_client_request().map_err(transport)?;
+        let host = request
+            .uri()
+            .host()
+            .ok_or_else(|| transport("activity websocket url has no host"))?
+            .to_owned();
+        let port = request.uri().port_u16().unwrap_or(443);
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
             .await
-            .map_err(|e| ActivityWsError::Transport {
-                message: e.to_string(),
-            })?;
+            .map_err(transport)?;
+        let stream: Box<dyn AsyncStream> = Box::new(tcp);
+        let (inner, _response) =
+            tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
+                .await
+                .map_err(transport)?;
+        Self::subscribed(inner).await
+    }
+
+    async fn subscribed(inner: WsInner) -> Result<Self, ActivityWsError> {
         let mut stream = Self { inner };
-        stream.resubscribe().await?;
+        stream
+            .inner
+            .send(Message::Text(ACTIVITY_WS_SUBSCRIBE.into()))
+            .await
+            .map_err(transport)?;
         Ok(stream)
     }
 
-    /// Re-send the subscription on the live socket (silent-lapse recovery).
-    pub async fn resubscribe(&mut self) -> Result<(), ActivityWsError> {
-        self.inner
-            .send(Message::Text(ACTIVITY_WS_SUBSCRIBE.into()))
-            .await
-            .map_err(|e| ActivityWsError::Transport {
-                message: e.to_string(),
-            })
+    /// Next frame; `Ok(None)` means the socket closed. Ping/pong and binary
+    /// frames surface as [`WireFrame::NonText`] (tungstenite answers pings on
+    /// read) so the reader can count them as transport liveness without ever
+    /// treating them as activity. Cancel safe: partial-frame state lives in the
+    /// stream, not in this future.
+    pub async fn next_frame(&mut self) -> Result<Option<WireFrame>, ActivityWsError> {
+        match self.inner.next().await {
+            None => Ok(None),
+            Some(Ok(Message::Text(text))) => Ok(Some(WireFrame::Text(text.to_string()))),
+            Some(Ok(Message::Close(_))) => Ok(None),
+            Some(Ok(_)) => Ok(Some(WireFrame::NonText)),
+            Some(Err(e)) => Err(transport(e)),
+        }
+    }
+}
+
+/// One frame received on the socket.
+#[derive(Debug)]
+pub enum WireFrame {
+    /// A text frame: the only kind that can carry activity payloads.
+    Text(String),
+    /// Ping, pong, or binary: proof the transport is alive, never activity.
+    NonText,
+}
+
+/// Scenario-only server half of an in-process activity socket pair. Tests use
+/// it to observe exactly what a reader sends and to deliver frames, closes, or
+/// silence without any network; production never constructs one.
+#[cfg(feature = "scenario")]
+pub struct ActivityWsPeer {
+    inner: WebSocketStream<tokio::io::DuplexStream>,
+}
+
+#[cfg(feature = "scenario")]
+impl ActivityWsPeer {
+    /// Client/server pair over a duplex pipe. The client half is a real
+    /// [`ActivityWsStream`] that has already sent the production subscription.
+    pub async fn pair() -> Result<(ActivityWsStream, Self), ActivityWsError> {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let client_io: Box<dyn AsyncStream> = Box::new(client_io);
+        let client =
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
+                .await;
+        let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        Ok((
+            ActivityWsStream::subscribed(client).await?,
+            Self { inner: server },
+        ))
     }
 
-    /// Next text frame; `Ok(None)` means the socket closed. Ping/pong and
-    /// binary frames are skipped (tungstenite answers pings on read).
-    pub async fn next_text(&mut self) -> Result<Option<String>, ActivityWsError> {
+    /// Next text frame from the reader; `None` once the reader dropped its socket.
+    pub async fn recv_text(&mut self) -> Option<String> {
         loop {
             match self.inner.next().await {
-                None => return Ok(None),
-                Some(Ok(Message::Text(text))) => return Ok(Some(text.to_string())),
-                Some(Ok(Message::Close(_))) => return Ok(None),
+                Some(Ok(Message::Text(text))) => return Some(text.to_string()),
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => {
-                    return Err(ActivityWsError::Transport {
-                        message: e.to_string(),
-                    });
-                }
             }
         }
+    }
+
+    /// A text frame that is already available without waiting, else `None`.
+    pub fn try_recv_text(&mut self) -> Option<String> {
+        use futures::FutureExt as _;
+        self.recv_text().now_or_never().flatten()
+    }
+
+    /// Deliver one text frame to the reader.
+    pub async fn send_text(&mut self, text: &str) -> Result<(), ActivityWsError> {
+        self.inner
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(transport)
     }
 }
 
@@ -356,92 +312,54 @@ mod tests {
         "timestamp":"1787603429","transactionHash":"0xhash","outcomeIndex":"1","fee":"0"}}"#;
 
     #[test]
-    fn parses_single_activity_frame_lowercases_wallet_keeps_raw_payload() {
-        let (trades, malformed) = parse_activity_frame(TRADE).unwrap();
-        assert_eq!(malformed, 0);
-        assert_eq!(trades.len(), 1);
-        assert_eq!(
-            trades[0].proxy_wallet,
-            "0xabc0000000000000000000000000000000000001"
-        );
-        // Raw payload bytes preserved exactly (replay invariant).
-        let payload = std::str::from_utf8(&trades[0].payload_json).unwrap();
-        assert!(payload.contains(r#""proxyWallet":"0xAbC"#));
-        assert!(payload.contains(r#""fee":"0""#));
+    fn parses_single_activity_frame_keeps_exact_payload_bytes() {
+        let (payloads, missing) = parse_activity_frame(TRADE).unwrap();
+        assert_eq!(missing, 0);
+        assert_eq!(payloads.len(), 1);
+        // Raw payload bytes preserved exactly (replay invariant): no lowercasing,
+        // no re-serialization.
+        let payload = std::str::from_utf8(payloads[0]).unwrap();
+        assert!(payload.starts_with(r#"{"proxyWallet":"0xAbC"#));
+        assert!(payload.ends_with(r#""fee":"0"}"#));
     }
 
     #[test]
     fn array_frame_and_non_activity_topics() {
         let frame = format!(r#"[{TRADE},{{"topic":"comments","type":"new","payload":{{}}}}]"#);
-        let (trades, malformed) = parse_activity_frame(&frame).unwrap();
-        assert_eq!((trades.len(), malformed), (1, 0));
+        let (payloads, missing) = parse_activity_frame(&frame).unwrap();
+        assert_eq!((payloads.len(), missing), (1, 0));
     }
 
     #[test]
-    fn empty_keepalive_frame_is_not_an_error() {
-        let (trades, malformed) = parse_activity_frame("").unwrap();
-        assert!(trades.is_empty());
-        assert_eq!(malformed, 0);
+    fn empty_keepalive_and_acknowledgement_frames_carry_nothing() {
+        for frame in ["", "   ", r#"{"status":"ok"}"#, r#"{"type":"pong"}"#] {
+            let (payloads, missing) = parse_activity_frame(frame).unwrap();
+            assert!(payloads.is_empty(), "frame {frame:?} must carry no payload");
+            assert_eq!(missing, 0, "frame {frame:?} is not an activity frame");
+        }
     }
 
     #[test]
-    fn activity_payload_without_wallet_is_counted_malformed() {
+    fn activity_frame_without_payload_is_counted_missing() {
+        let frame = r#"{"topic":"activity","type":"trades"}"#;
+        let (payloads, missing) = parse_activity_frame(frame).unwrap();
+        assert!(payloads.is_empty());
+        assert_eq!(missing, 1);
+    }
+
+    #[test]
+    fn envelope_layer_makes_no_field_claims() {
+        // A payload without a wallet is still an activity payload at this layer;
+        // the service normalizer is the single acceptance boundary (#546).
         let frame = r#"{"topic":"activity","type":"trades","payload":{"price":"0.5"}}"#;
-        let (trades, malformed) = parse_activity_frame(frame).unwrap();
-        assert!(trades.is_empty());
-        assert_eq!(malformed, 1);
+        let (payloads, missing) = parse_activity_frame(frame).unwrap();
+        assert_eq!((payloads.len(), missing), (1, 0));
+        assert_eq!(payloads[0], br#"{"price":"0.5"}"#);
     }
 
     #[test]
-    fn optional_fee_absent_still_parses() {
-        let frame = r#"{"topic":"activity","type":"trades",
-            "payload":{"proxyWallet":"0xa","conditionId":"0xc","side":"SELL",
-            "size":"1","price":"0.5","timestamp":"1787603429","transactionHash":"0xh"}}"#;
-        let (trades, malformed) = parse_activity_frame(frame).unwrap();
-        assert_eq!((trades.len(), malformed), (1, 0));
-    }
-
-    #[test]
-    fn policy_silence_resubscribes_once_then_reconnects_with_backoff() {
-        let mut p = ActivityWsPolicy::connected(1000);
-        assert_eq!(p.tick(1000 + 29), PolicyAction::None);
-        assert_eq!(p.tick(1000 + 30), PolicyAction::Resubscribe);
-        // Still inside the same silence episode: no duplicate resubscribe.
-        assert_eq!(p.tick(1000 + 45), PolicyAction::None);
-        assert_eq!(
-            p.tick(1000 + 60),
-            PolicyAction::Reconnect { backoff_secs: 1 }
-        );
-        p.on_reconnected(1000 + 61);
-        assert_eq!(p.tick(1000 + 91), PolicyAction::Resubscribe);
-        assert_eq!(
-            p.tick(1000 + 121),
-            PolicyAction::Reconnect { backoff_secs: 2 }
-        );
-    }
-
-    #[test]
-    fn policy_frame_resets_the_silence_episode_and_backoff() {
-        let mut p = ActivityWsPolicy::connected(1000);
-        assert_eq!(p.tick(1030), PolicyAction::Resubscribe);
-        p.on_frame(1031, true);
-        assert_eq!(p.tick(1060), PolicyAction::None);
-        assert_eq!(p.consecutive_reconnects(), 0);
-        assert_eq!(p.tick(1061), PolicyAction::Resubscribe);
-    }
-
-    #[test]
-    fn staleness_thresholds() {
-        let mut p = ActivityWsPolicy::connected(0);
-        assert_eq!(p.staleness(119), WsStaleness::Fresh);
-        assert_eq!(p.staleness(120), WsStaleness::Stale);
-        assert_eq!(p.staleness(299), WsStaleness::Stale);
-        assert_eq!(p.staleness(300), WsStaleness::Dead);
-        // Invalid frames advance last_frame but NOT last_valid_frame.
-        p.on_frame(200, false);
-        assert_eq!(p.staleness(320), WsStaleness::Dead);
-        p.on_frame(320, true);
-        assert_eq!(p.staleness(320), WsStaleness::Fresh);
+    fn malformed_frame_is_an_error() {
+        assert!(parse_activity_frame("{not json").is_err());
     }
 
     #[test]
@@ -458,13 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_backoff_accumulates_across_cycles_and_resets_on_frames() {
+    fn reconnect_backoff_accumulates_across_cycles_and_resets_on_normalized_rows() {
         let mut rb = ReconnectBackoff::default();
         assert_eq!(rb.on_cycle_failed(), 1);
         assert_eq!(rb.on_cycle_failed(), 2);
         assert_eq!(rb.on_cycle_failed(), 4);
         assert_eq!(rb.consecutive(), 3);
-        rb.on_valid_frame();
+        rb.on_normalized_row();
         assert_eq!(rb.on_cycle_failed(), 1, "progress resets the ladder");
     }
 
