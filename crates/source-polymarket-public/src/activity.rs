@@ -437,6 +437,33 @@ impl FlexibleU16 {
     }
 }
 
+/// Exact-lexeme decimal capture (#544 review): plain serde routes fractional JSON
+/// numbers through `f64`, silently rounding excess precision (for example
+/// `10000000000000.000001` loses its final atomic share). Capturing the raw token
+/// and parsing it with `Decimal::from_str_exact` preserves every digit; scientific
+/// notation and unrepresentable magnitudes reject with a typed error instead of
+/// rounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactDecimal(Decimal);
+
+impl<'de> Deserialize<'de> for ExactDecimal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw: Box<serde_json::value::RawValue> = Box::deserialize(deserializer)?;
+        let lexeme = raw.get().trim();
+        let unquoted = lexeme
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or(lexeme);
+        Decimal::from_str_exact(unquoted)
+            .map(ExactDecimal)
+            .map_err(|error| {
+                serde::de::Error::custom(format_args!(
+                    "numeric token {lexeme} is not an exactly representable decimal: {error}"
+                ))
+            })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawActivity {
@@ -459,11 +486,11 @@ struct RawActivity {
     #[serde(default)]
     side: Option<String>,
     #[serde(default)]
-    price: Option<Decimal>,
+    price: Option<ExactDecimal>,
     #[serde(default)]
-    size: Option<Decimal>,
+    size: Option<ExactDecimal>,
     #[serde(default, alias = "usdc_size")]
-    usdc_size: Option<Decimal>,
+    usdc_size: Option<ExactDecimal>,
     #[serde(default, alias = "is_combo")]
     is_combo: Option<bool>,
 }
@@ -532,7 +559,8 @@ fn normalize_row(
     let outcome = parse_outcome(raw.outcome_index, outcome_label_present)?;
     let price_decimal = raw
         .price
-        .ok_or(ActivityValidationError::MissingField { field: "price" })?;
+        .ok_or(ActivityValidationError::MissingField { field: "price" })?
+        .0;
     let price =
         Price::new(price_decimal).map_err(|error| ActivityValidationError::InvalidPrice {
             value: price_decimal,
@@ -540,7 +568,8 @@ fn normalize_row(
         })?;
     let share_decimal = raw
         .size
-        .ok_or(ActivityValidationError::MissingField { field: "size" })?;
+        .ok_or(ActivityValidationError::MissingField { field: "size" })?
+        .0;
     let share_amount = ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
         ActivityValidationError::InvalidShareAmount {
             value: share_decimal,
@@ -549,7 +578,8 @@ fn normalize_row(
     })?;
     let collateral_decimal = raw
         .usdc_size
-        .ok_or(ActivityValidationError::MissingField { field: "usdcSize" })?;
+        .ok_or(ActivityValidationError::MissingField { field: "usdcSize" })?
+        .0;
     let source_usdc_amount =
         CollateralAmount::from_decimal_exact(collateral_decimal).map_err(|error| {
             ActivityValidationError::InvalidCollateralAmount {
@@ -1150,5 +1180,44 @@ mod tests {
             project_legacy_contract_qty_v1(ShareAmount::from_atomic(1)).unwrap(),
             ContractQty(0)
         );
+    }
+
+    #[test]
+    fn exact_decimal_preserves_excess_precision_number_token() {
+        // Plain-serde f64 routing rounds this to 10000000000000 (loses one atomic
+        // share); the raw-lexeme path must keep it exact (#544 review).
+        let row = r#"{"size":10000000000000.000001}"#;
+        #[derive(Deserialize)]
+        struct Probe {
+            size: ExactDecimal,
+        }
+        let probe: Probe = serde_json::from_str(row).unwrap();
+        assert_eq!(
+            probe.size.0,
+            Decimal::from_str_exact("10000000000000.000001").unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_decimal_rejects_scientific_and_overflow_tokens() {
+        #[derive(Deserialize)]
+        struct Probe {
+            #[allow(dead_code)]
+            size: ExactDecimal,
+        }
+        // Scientific notation hides excess precision behind rounding: reject.
+        assert!(serde_json::from_str::<Probe>(r#"{"size":1.00000000000000000001e13}"#).is_err());
+        // A quoted magnitude beyond Decimal must reject, not panic or saturate.
+        assert!(
+            serde_json::from_str::<Probe>(r#"{"size":"79228162514264337593543950335999"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn share_amount_rejects_decimal_max_without_panicking() {
+        // Decimal::MAX * ATOMIC_SCALE overflowed with a panicking multiply before
+        // the checked_mul fix (#544 review).
+        assert!(ShareAmount::from_decimal_exact(Decimal::MAX).is_err());
     }
 }

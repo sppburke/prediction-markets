@@ -171,11 +171,41 @@ impl MigrationMetadata {
             });
         }
         verify_side_main_path(record, &record.side_main_path)?;
-        let connection = open_bootstrap(path)?;
-        match read_record(&connection)? {
-            None => write_record(path, connection, record),
-            Some(existing) if existing == *record => write_record(path, connection, &existing),
-            Some(_) => Err(PaperStateError::MigrationRecordConflict),
+        let mut connection = open_bootstrap(path)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        // One IMMEDIATE transaction makes read-check-insert atomic across
+        // connections: two concurrent first writers serialize on the write
+        // lock, and the loser sees the winner's record instead of silently
+        // replacing the supposedly immutable boundary (#544 review).
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![MIGRATION_RECORD_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => {
+                let encoded = serde_json::to_string(&StoredRecord::from(record))?;
+                transaction.execute(
+                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                    params![MIGRATION_RECORD_KEY, encoded],
+                )?;
+                transaction.commit()?;
+                finalize_record_write(path, connection)
+            }
+            Some(encoded) => {
+                let stored: MigrationRecord =
+                    serde_json::from_str::<StoredRecord>(&encoded)?.try_into()?;
+                transaction.commit()?;
+                if stored == *record {
+                    finalize_record_write(path, connection)
+                } else {
+                    Err(PaperStateError::MigrationRecordConflict)
+                }
+            }
         }
     }
 
@@ -195,6 +225,16 @@ impl MigrationMetadata {
             return Err(PaperStateError::MigrationPhaseTransition {
                 from: expected.to_string(),
                 to: next.to_string(),
+            });
+        }
+        // The tails edge is data-bearing and must go through
+        // `record_activation_tails`, which binds the tails in the same write —
+        // the generic edge would otherwise reach `ActivationTailsRecorded`
+        // with `activation_tails == None` (#544 review).
+        if next == MigrationPhase::ActivationTailsRecorded {
+            return Err(PaperStateError::MigrationPhaseTransition {
+                from: expected.to_string(),
+                to: format!("{next} (requires record_activation_tails)"),
             });
         }
         let connection = open_bootstrap(path)?;
@@ -425,7 +465,12 @@ fn write_record(
         params![MIGRATION_RECORD_KEY, encoded],
     )?;
     transaction.commit()?;
+    finalize_record_write(path, connection)
+}
 
+/// Checkpoint-truncate the WAL, close, and fsync the main file plus parent
+/// directory — the shared durable tail of every migration-record write.
+fn finalize_record_write(path: &Path, connection: Connection) -> Result<(), PaperStateError> {
     let (busy, log, checkpointed): (i64, i64, i64) =
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -717,5 +762,68 @@ mod tests {
             Err(PaperStateError::MigrationSidePathMismatch { .. })
         ));
         assert_eq!(MigrationMetadata::read(&wrong_side).unwrap(), None);
+    }
+
+    #[test]
+    fn advance_phase_rejects_the_data_bearing_tails_edge() {
+        // SideStateBuilt -> ActivationTailsRecorded must go through
+        // record_activation_tails, or the record reaches that phase with
+        // activation_tails == None (#544 review).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixed.db");
+        drop(PaperStateDb::open(&path).unwrap());
+        drop(PaperStateDb::open(&record(dir.path()).side_main_path).unwrap());
+        let first = record(dir.path());
+        MigrationMetadata::record_once(&path, &first).unwrap();
+        MigrationMetadata::advance_phase(
+            &path,
+            MigrationPhase::BoundaryRecorded,
+            MigrationPhase::VersionTwoInputsAppending,
+        )
+        .unwrap();
+        MigrationMetadata::advance_phase(
+            &path,
+            MigrationPhase::VersionTwoInputsAppending,
+            MigrationPhase::SideStateBuilt,
+        )
+        .unwrap();
+        let refused = MigrationMetadata::advance_phase(
+            &path,
+            MigrationPhase::SideStateBuilt,
+            MigrationPhase::ActivationTailsRecorded,
+        );
+        assert!(matches!(
+            refused,
+            Err(PaperStateError::MigrationPhaseTransition { .. })
+        ));
+        let stored = MigrationMetadata::read(&path).unwrap().unwrap();
+        assert_eq!(stored.phase, MigrationPhase::SideStateBuilt);
+        assert!(stored.activation_tails.is_none());
+    }
+
+    #[test]
+    fn concurrent_record_once_writers_cannot_replace_the_boundary() {
+        // Two first writers race; exactly one record survives and the loser sees
+        // a typed conflict — never a silent overwrite (#544 review).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixed.db");
+        drop(PaperStateDb::open(&path).unwrap());
+        drop(PaperStateDb::open(&record(dir.path()).side_main_path).unwrap());
+        let a = record(dir.path());
+        let mut b = record(dir.path());
+        b.input_hashes
+            .insert("sidecar".to_owned(), "different".to_owned());
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let (ra, rb) = std::thread::scope(|scope| {
+            let ta = scope.spawn(|| MigrationMetadata::record_once(&path_a, &a));
+            let tb = scope.spawn(|| MigrationMetadata::record_once(&path_b, &b));
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
+        let winners = [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count();
+        assert_eq!(winners, 1, "exactly one writer must win: {ra:?} / {rb:?}");
+        let stored = MigrationMetadata::read(&path).unwrap().unwrap();
+        assert!(stored == a || stored == b);
     }
 }

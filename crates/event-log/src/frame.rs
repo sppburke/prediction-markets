@@ -43,6 +43,16 @@ pub fn write_frame(w: &mut impl Write, json_bytes: &[u8]) -> Result<(), LogError
 
     let len = u32::try_from(compressed.len())
         .map_err(|_| LogError::Compress("compressed frame exceeds 4 GiB".into()))?;
+    // Enforce the scan-side bound at write time (#544 review): a frame the writer
+    // accepts must always be one its own scanner re-admits, or an append could
+    // succeed and then make the log unopenable.
+    if len > MAX_FRAME_BYTES {
+        return Err(LogError::FrameTooLarge {
+            byte_offset: 0,
+            len,
+            max: MAX_FRAME_BYTES,
+        });
+    }
     let crc = crc32fast::hash(&compressed);
 
     w.write_all(&len.to_le_bytes())?;

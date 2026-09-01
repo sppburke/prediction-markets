@@ -102,4 +102,13 @@ pub enum LogError {
         len: u32,
         max: u32,
     },
+
+    #[error(
+        "log {path} verified tail {actual_tail} does not match the trusted expected tail {expected_tail}; refusing destructive repair"
+    )]
+    ExpectedTailMismatch {
+        path: std::path::PathBuf,
+        expected_tail: u64,
+        actual_tail: u64,
+    },
 }

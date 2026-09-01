@@ -50,6 +50,14 @@ impl fmt::Debug for Writer {
 impl Writer {
     /// Open or create the log and acquire its exclusive advisory writer lock.
     #[tracing::instrument(skip_all, fields(path = %path.as_ref().display()))]
+    /// Open for append, repairing a scanner-proven incomplete final frame by truncation.
+    ///
+    /// Repair is heuristic at the wire level: a torn final write and a tampered final
+    /// length prefix are indistinguishable byte patterns, so ordinary open bounds the
+    /// loss to the final frame (interior damage stays fatal — the chain hash covers
+    /// every verified frame). Callers holding a trusted tail binding (migration and
+    /// activation paths) must use [`Self::open_with_expected_tail`], which refuses
+    /// destructive repair when the verified prefix disagrees with the binding (#544).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
@@ -100,6 +108,31 @@ impl Writer {
             next_seq,
             scan.verified_tail.last_hash,
         ))
+    }
+
+    /// Open for append with a trusted external tail binding: destructive repair is
+    /// permitted only when the scanner-verified prefix equals the binding exactly, so
+    /// a tampered or shortened prefix fails closed instead of being "repaired" away.
+    /// Migration and activation paths, which hold stored bindings, must use this
+    /// entry; ordinary startup without a binding uses [`Self::open`] (#544 review).
+    pub fn open_with_expected_tail(
+        path: impl AsRef<Path>,
+        expected: &crate::scanner::LogTailBinding,
+    ) -> Result<Self, LogError> {
+        let path = path.as_ref();
+        let scan = crate::scanner::Scanner::inspect(path)?;
+        let tail = &scan.verified_tail;
+        if tail.physical_tail != expected.physical_tail
+            || tail.last_sequence != expected.last_sequence
+            || tail.last_hash != expected.last_hash
+        {
+            return Err(LogError::ExpectedTailMismatch {
+                path: path.to_owned(),
+                expected_tail: expected.physical_tail,
+                actual_tail: tail.physical_tail,
+            });
+        }
+        Self::open(path)
     }
 
     fn from_file(path: PathBuf, file: File, next_seq: u64, last_hash: Hash) -> Self {

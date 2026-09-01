@@ -62,7 +62,11 @@ macro_rules! exact_amount {
                 if value.is_sign_negative() {
                     return Err(Error::OutOfRange { field: $field });
                 }
-                let scaled = value * Decimal::from(ATOMIC_SCALE);
+                // checked_mul: a near-MAX Decimal (reachable from untrusted source
+                // payloads since #544's parser) must reject, never panic (#544 review).
+                let scaled = value
+                    .checked_mul(Decimal::from(ATOMIC_SCALE))
+                    .ok_or(Error::OutOfRange { field: $field })?;
                 if scaled.fract() != Decimal::ZERO {
                     return Err(Error::ScaleError {
                         max_dp: 6,

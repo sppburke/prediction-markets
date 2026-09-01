@@ -766,3 +766,54 @@ fn generate_fixture(path: &std::path::Path) {
     })
     .unwrap();
 }
+
+#[test]
+fn write_rejects_frame_its_scanner_would_refuse() {
+    // The writer must never append a frame the reopen scan rejects (#544 review):
+    // an incompressible payload past MAX_FRAME_BYTES fails the append with
+    // FrameTooLarge instead of succeeding and making the log unopenable.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.log");
+    let mut writer = Writer::open(&path).unwrap();
+    let mut rng_bytes = vec![0u8; (64 * 1024 * 1024) + 1024];
+    // Deterministic incompressible-ish pattern (no RNG in tests): multiply-xor walk.
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    for chunk in rng_bytes.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = (x >> (8 * (i as u64 % 8))) as u8;
+        }
+    }
+    let result = writer.append(make_envelope(rng_bytes));
+    assert!(matches!(result, Err(LogError::FrameTooLarge { .. })));
+    // The log stays openable and empty of the oversized frame.
+    drop(writer);
+    let binding = Scanner::verify(&path).unwrap();
+    assert_eq!(binding.last_sequence, None);
+}
+
+#[test]
+fn open_with_expected_tail_refuses_repair_on_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bound.log");
+    let mut writer = Writer::open(&path).unwrap();
+    writer.append(make_envelope(b"{}".to_vec())).unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+    let good = Scanner::verify(&path).unwrap();
+    // Damage the final length prefix the way the review's tamper repro does.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let header = 5; // MAGIC + VERSION
+    bytes[header] = bytes[header].wrapping_add(1);
+    std::fs::write(&path, &bytes).unwrap();
+    // Ordinary open would truncate-repair; the binding-gated open must refuse.
+    let refused = Writer::open_with_expected_tail(&path, &good);
+    assert!(matches!(
+        refused,
+        Err(LogError::ExpectedTailMismatch { .. }) | Err(LogError::ChainBroken { .. })
+    ));
+    // And the file was not mutated by the refusal.
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
