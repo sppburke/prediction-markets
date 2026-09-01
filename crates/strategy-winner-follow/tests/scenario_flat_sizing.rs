@@ -10,9 +10,9 @@
 
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
-    BasisPoints, ContractQty, LeaderAction, MarketId, OutcomeId, Price, Probability,
-    ProbabilityPpm, Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId,
-    VenueMarketId, WalletAddress,
+    BasisPoints, LeaderAction, MarketId, OutcomeId, Price, Probability, ProbabilityPpm,
+    ReconstructionQuality, ShareAmount, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
+    WalletAddress,
 };
 use pe_risk_engine::{ConcentrationCaps, RiskBlock, RiskSnapshot, snapshot::TradingMode};
 use pe_source_core::SourceStatus;
@@ -58,7 +58,7 @@ fn make_signal_at_price(
         action,
         leader_side: Side::Buy,
         leader_price,
-        leader_size: Quantity(ContractQty(100)),
+        leader_size: ShareAmount::from_whole(100).unwrap(),
         observed_at: NOW,
         received_at: NOW,
         reconstruction_quality: quality(100),

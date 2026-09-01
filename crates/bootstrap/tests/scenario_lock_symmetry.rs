@@ -1,8 +1,7 @@
-//! Scenario: `CacheMutationLock` symmetry (issue #193).
+//! Scenario: persistent `CacheMutationLock` symmetry (issues #193, #544).
 //!
-//! The wallet-mutating subcommands (`winner-discovery`, `backfill`, and the
-//! `--backfill-v1-attribution` migration) must not run concurrently against the
-//! same cache — each acquires `CacheMutationLock` first. This test pins the
+//! Wallet-cache mutators must not run concurrently against the same cache; the
+//! binary acquires `CacheMutationLock` centrally before every writable open. This test pins the
 //! contract: if a sweep is "running" (modelled by holding the lock manually), a
 //! second cache-mutating subcommand's lock-acquire fails fast with the
 //! documented operator-facing error.
@@ -47,10 +46,9 @@ fn cache_lock_refuses_concurrent_acquire_from_any_caller() {
 }
 
 /// PASS: after the holder drops the guard, a fresh acquire succeeds. This
-///       is the normal post-sweep state: when an enumeration arm finishes
-///       (or the subcommand exits), the next mutator can proceed without
-///       operator intervention.
-/// FAIL: the lock file persists after Drop or the reclaim path errors.
+///       is the normal post-sweep state: the persistent inode remains but the
+///       next mutator can proceed without operator intervention.
+/// FAIL: the kernel lock remains held after Drop.
 #[test]
 fn cache_lock_released_on_drop_allows_subsequent_acquire() {
     let dir = TempDir::new().unwrap();
@@ -81,7 +79,7 @@ fn cache_lock_error_message_guides_operator_remediation() {
                 "operator-remediation phrase must be present; got: {message}"
             );
             assert!(
-                message.contains("refusing to mutate cursor state"),
+                message.contains("refusing to open the cache read-write"),
                 "explanation of what's blocked must be present; got: {message}"
             );
         }

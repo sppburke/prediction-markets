@@ -22,10 +22,11 @@
 use pe_copy_signal_engine::TradeProvenance;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
+    BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
@@ -42,6 +43,7 @@ use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::runtime_config::FillMode;
+use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
@@ -92,10 +94,11 @@ fn entry_trade(id: &str, market_id: MarketId, price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -112,8 +115,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
 }
 
 /// First-entry gate with the given fail-closed posture (no band since #339).
-fn band_config(fail_closed: bool) -> CopyEntryGateConfig {
-    CopyEntryGateConfig { fail_closed }
+fn band_config(_fail_closed: bool) -> CopyEntryGateConfig {
+    CopyEntryGateConfig
 }
 
 /// Mid-price cache fixture quoting `price` for both outcomes of every market in `markets`,
@@ -125,8 +128,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
         // Single-id `OpenOnly` batch URL the shared GammaMarketsClient builds (#382 Phase 3b);
         // the orchestrator fetches one market per signal, so each is a batch-of-one.
         let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
-        let body =
-            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        let body = format!(
+            r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{m}-0\",\"{m}-1\"]"}}]"#
+        );
         fx.insert(url, body.into_bytes());
     }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
@@ -212,9 +216,35 @@ async fn run_gate_capped(
 ) -> usize {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    if !history.is_empty() {
+        let wallets: Vec<_> = history
+            .iter()
+            .map(|(wallet, markets)| serde_json::json!({ "wallet": wallet, "markets": markets }))
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({ "wallets": wallets })).unwrap();
+        paper_state.import_legacy_wallet_history(&bytes, 1).unwrap();
+    }
+    paper_state
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"test\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
 
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, mid_price);
+    let ask = mid_price.parse::<Decimal>().unwrap();
+    let books = trades
+        .iter()
+        .map(|trade| {
+            (
+                format!("{}-{}", trade.market_id, trade.outcome_id.0),
+                book(&[(ask, dec!(10000))]),
+            )
+        })
+        .collect();
 
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
@@ -228,6 +258,7 @@ async fn run_gate_capped(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -242,12 +273,11 @@ async fn run_gate_capped(
             // #486: pin the pre-feature haircut basis (no /book fetch) so these existing gate
             // scenarios stay on the ×1.05 fill; the best-ask path is exercised separately below.
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: gate_config,
             runtime_config: None,
             live_accounts: None,
         },
-        history,
         WinnerFollowStrategy::new(flat_fill_config()),
         make_dispatcher(dir),
         paper_state,
@@ -259,7 +289,7 @@ async fn run_gate_capped(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
@@ -333,40 +363,36 @@ async fn sell_is_rejected_without_consuming_first_entry_history() {
     println!("PASS: SELL is rejected without consuming first-entry history; later BUY fills once");
 }
 
-// ── Fail-open / fail-closed posture ───────────────────────────────────────────
+// ── Durable history posture ──────────────────────────────────────────────────
 
-/// PASS: with the leader ABSENT from the history map and the gate fail-open, an
-///       in-band first entry is admitted (one fill).
-/// FAIL: zero fills (fail-open wrongly blocked an unknown wallet).
+/// A complete reconciled wallet with no prior markets admits its first entry.
 #[tokio::test]
-async fn fail_open_admits_absent_wallet() {
+async fn complete_history_admits_first_entry_without_prior_markets() {
     let dir = TempDir::new().unwrap();
     let fills = run_gate(
         &dir,
         band_config(false),
-        HashMap::new(), // leader absent → unknown history
-        vec![entry_trade("fail-open", market("0xnew"), dec!(0.60))],
+        HashMap::new(),
+        vec![entry_trade("complete-empty", market("0xnew"), dec!(0.60))],
     )
     .await;
     assert_eq!(fills, 1);
-    println!("PASS: fail-open admits an entry from a wallet absent from history (1 fill)");
+    println!("PASS: complete empty history admits the first entry (1 fill)");
 }
 
-/// PASS: with the leader ABSENT from the history map and the gate fail-closed, an
-///       in-band entry is blocked (zero fills).
-/// FAIL: any fill (fail-closed wrongly admitted an unknown wallet).
+/// Missing reconciled history blocks the membership preparation boundary before
+/// any orchestrator acknowledgement can be requested.
 #[tokio::test]
-async fn fail_closed_blocks_absent_wallet() {
+async fn incomplete_history_blocks_admission_preparation() {
     let dir = TempDir::new().unwrap();
-    let fills = run_gate(
-        &dir,
-        band_config(true),
-        HashMap::new(), // leader absent → unknown history
-        vec![entry_trade("fail-closed", market("0xnew"), dec!(0.60))],
-    )
-    .await;
-    assert_eq!(fills, 0);
-    println!("PASS: fail-closed blocks an entry from a wallet absent from history (0 fills)");
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    let (control_tx, _control_rx) = mpsc::channel(1);
+    let preparer = AdmissionPreparer::new(control_tx, paper_state);
+    assert!(matches!(
+        preparer.prepare(&[leader_wallet()]).await,
+        Err(AdmissionError::MissingHistory { missing: 1 })
+    ));
+    println!("PASS: incomplete durable history blocks admission preparation");
 }
 
 // ── Current-price cap scenarios (#339) ────────────────────────────────────────
@@ -513,10 +539,9 @@ async fn max_cap_rejects_leader_whose_fill_exceeds_cap() {
 }
 
 // ── Best-ask fill basis (#486) ────────────────────────────────────────────────
-// A paper BUY in `clob_best_ask` mode fills at the fresh CLOB best-ask (sizing + band-gate key
-// off it); no usable ask falls back to `leader × (1 + fallback_haircut)`. The production
-// copy-entry gate rejects SELLs before this path; every non-paper mode takes the boot-frozen
-// haircut with no `/book` fetch.
+// A paper BUY in `clob_best_ask` mode fills from the mandatory fresh CLOB ladder evidence (sizing +
+// band-gate key off it); no usable ask fails closed. The production copy-entry gate rejects SELLs
+// before this path; every retired non-paper mode is rejected before `/book` or fill resolution.
 
 const BA_HEX: &str = "0xbestask";
 const BA_TOKEN: &str = "0xbestask-0"; // outcome 0's token (mid_cache_with_tokens emits "{hex}-{i}")
@@ -528,7 +553,20 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .iter()
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
+        response_blake3: String::new(),
         fetched_at_ms: 0,
+    }
+}
+
+struct CountingBookFetcher {
+    inner: FixtureClobBookFetcher,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ClobBookFetcher for CountingBookFetcher {
+    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_book(token_id).await
     }
 }
 
@@ -571,10 +609,11 @@ fn bestask_trade(id: &str, side: Side, leader_price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side,
         price: Price(leader_price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -593,6 +632,14 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
 ) -> (usize, Option<(u64, Decimal, FillSource)>) {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    paper_state
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"test\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
 
     let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
     tx.send(bestask_trade("ba-1", side, leader_price))
@@ -606,6 +653,7 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -616,12 +664,11 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
         make_dispatcher(dir),
         paper_state.clone(),
@@ -651,7 +698,7 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
     // Dust level 0.50 @ size 0 must NOT set the basis; the usable best-ask is 0.55.
     let books = HashMap::from([(
         BA_TOKEN.to_string(),
-        book(&[(dec!(0.50), dec!(0)), (dec!(0.55), dec!(10))]),
+        book(&[(dec!(0.50), dec!(0)), (dec!(0.55), dec!(1000))]),
     )]);
     let (fills, first) = run_bestask(
         &dir,
@@ -674,12 +721,10 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
     println!("PASS: AC1/AC7(i) — best-ask BUY fills at 0.55 (181 ct, ClobBestAsk), replay-stable");
 }
 
-/// AC2: a paper BUY with no usable ask (empty book, or a `/book` fetch error) falls back to
-/// `leader × (1 + 1%)` and is tagged `Fallback`, keeping the position.
-/// PASS: both the empty-book and fetch-error cases record 0.505 (0.50 × 1.01), source Fallback.
+/// #544: a paper BUY with no usable ask (empty book or fetch error) fails closed before fill
+/// resolution. The retired `Fallback` tag remains decode-only for historical replay.
 #[tokio::test]
-async fn best_ask_fallback_on_no_usable_ask() {
-    // (b) empty ask book → fallback.
+async fn best_ask_unusable_book_fails_closed_without_fallback() {
     let dir_empty = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir_empty,
@@ -693,12 +738,9 @@ async fn best_ask_fallback_on_no_usable_ask() {
         )]))),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (_c, price, source) = first.expect("empty-book fill recorded");
-    assert_eq!(price, dec!(0.505), "empty book → leader × 1.01 fallback");
-    assert_eq!(source, FillSource::Fallback);
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
 
-    // (c) /book fetch error (token absent from the fixture map) → fallback.
     let dir_err = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir_err,
@@ -709,11 +751,52 @@ async fn best_ask_fallback_on_no_usable_ask() {
         Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (_c, price, source) = first.expect("fetch-error fill recorded");
-    assert_eq!(price, dec!(0.505), "fetch error → leader × 1.01 fallback");
-    assert_eq!(source, FillSource::Fallback);
-    println!("PASS: AC2 — no usable ask (empty book / fetch error) → 0.505 fallback (Fallback)");
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
+    println!("PASS: #544 — no usable ask fails closed; no fallback fill is constructed");
+}
+
+/// The mandatory 100 bps gate performs exactly one request, and unusable or stale evidence
+/// fails closed without a second fill-resolution fetch (#544).
+#[tokio::test]
+async fn mandatory_cap_uses_exactly_one_book_request_and_fails_closed() {
+    let error_calls = Arc::new(AtomicUsize::new(0));
+    let error_fetcher = Arc::new(CountingBookFetcher {
+        inner: FixtureClobBookFetcher::new(HashMap::new()),
+        calls: Arc::clone(&error_calls),
+    });
+    let error_dir = TempDir::new().unwrap();
+    let (error_fills, _) = run_bestask(
+        &error_dir,
+        FillMode::ClobBestAsk,
+        Side::Buy,
+        dec!(0.50),
+        Decimal::ZERO,
+        error_fetcher,
+    )
+    .await;
+    assert_eq!(error_fills, 0);
+    assert_eq!(error_calls.load(Ordering::SeqCst), 1);
+
+    let stale_calls = Arc::new(AtomicUsize::new(0));
+    let mut stale = book(&[(dec!(0.50), dec!(1000))]);
+    stale.fetched_at_ms = 1;
+    let stale_fetcher = Arc::new(CountingBookFetcher {
+        inner: FixtureClobBookFetcher::new(HashMap::from([(BA_TOKEN.to_owned(), stale)])),
+        calls: Arc::clone(&stale_calls),
+    });
+    let stale_dir = TempDir::new().unwrap();
+    let (stale_fills, _) = run_bestask(
+        &stale_dir,
+        FillMode::ClobBestAsk,
+        Side::Buy,
+        dec!(0.50),
+        Decimal::ZERO,
+        stale_fetcher,
+    )
+    .await;
+    assert_eq!(stale_fills, 0);
+    assert_eq!(stale_calls.load(Ordering::SeqCst), 1);
 }
 
 /// AC3: the band gate keys on the ASK. A leader BUY at 0.80 (below the 0.85 cap) whose best-ask
@@ -756,14 +839,14 @@ async fn sell_entry_is_rejected_before_best_ask_fetch() {
     println!("PASS: AC4 — SELL entry rejected before /book fetch, 0 fills");
 }
 
-/// AC5: `leader_haircut` mode ignores the `/book` entirely and records the boot-frozen 5% haircut
-/// fill, tagged `LeaderHaircut` — byte-identical to the pre-#486 behaviour (rollback).
+/// AC5: `leader_haircut` mode still uses the mandatory `/book` admission/cap evidence but records
+/// the boot-frozen 5% haircut fill, tagged `LeaderHaircut`.
 /// PASS: recorded price == 0.525 (0.50 × 1.05), contracts == 190, source LeaderHaircut.
 #[tokio::test]
 async fn leader_haircut_mode_records_haircut_fill() {
     let dir = TempDir::new().unwrap();
-    // A book is present but must be ignored in leader_haircut mode.
-    let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.55), dec!(100))]))]);
+    // Ample in-band depth keeps the mandatory gate non-binding for this fill-basis assertion.
+    let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.50), dec!(1000))]))]);
     let (fills, first) = run_bestask(
         &dir,
         FillMode::LeaderHaircut,
@@ -821,6 +904,7 @@ async fn live_mode_never_fetches_book_ac6() {
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::LiveTiny,
             signal_config: SignalConfig::default(),
@@ -833,12 +917,11 @@ async fn live_mode_never_fetches_book_ac6() {
             // clob_best_ask is set deliberately: the mode gate — not the fill mode — must suppress
             // the fetch in a live mode.
             fill_mode: FillMode::ClobBestAsk,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
         make_live_dispatcher(&dir),
         paper_state.clone(),

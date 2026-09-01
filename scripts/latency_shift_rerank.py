@@ -103,6 +103,8 @@ def parse_args():
     p.add_argument("--target-n", type=int, default=25)
     p.add_argument("--git-sha", default="unknown",
                    help="code revision recorded in the run manifest (the wrapper passes it)")
+    p.add_argument("--pipeline-versions-file", required=False,
+                   help="JSON emitted by pe-bootstrap pipeline-versions; required when writing the run manifest")
     return p.parse_args()
 
 
@@ -419,6 +421,17 @@ def main() -> int:
     # Versioned run manifest: canonical JSON whose sha256 the publisher stores in
     # `ranking_batches.config_hash` (#536 replay binding). The publish request is
     # deliberately NOT part of the manifest (it would hash-cycle through config_hash).
+    if not a.pipeline_versions_file:
+        raise ValueError("--pipeline-versions-file is required when writing the run manifest")
+    with open(a.pipeline_versions_file, encoding="utf-8") as versions_file:
+        pipeline_versions = json.load(versions_file)
+    required_versions = {
+        "source", "activity_schema", "activity_parser", "clob_resolution_schema",
+        "clob_resolution_parser", "cache_schema", "configuration",
+    }
+    missing_versions = sorted(required_versions - pipeline_versions.keys())
+    if missing_versions:
+        raise ValueError(f"pipeline versions omitted {missing_versions}")
     manifest = {
         "oracle": ORACLE_NAME,
         "oracle_version": ORACLE_VERSION,
@@ -436,6 +449,11 @@ def main() -> int:
         "min_active_months": a.min_active_months,
         "min_avg_per_month": a.min_avg_per_month,
         "git_sha": a.git_sha,
+        "versions": {
+            **{key: pipeline_versions[key] for key in sorted(required_versions)},
+            "ranker": ORACLE_VERSION,
+            "oracle_parser": ORACLE_PARSER_VERSION,
+        },
         "inputs": {
             "ranked_csv_sha256": sha256_file(a.ranked_csv),
             "positions_csv_sha256": sha256_file(a.positions_csv),

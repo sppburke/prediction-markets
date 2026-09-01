@@ -24,6 +24,8 @@ float_arithmetic = "deny"
 [dependencies]
 pe-core-types        = { path = "../core-types",        version = "0.1.0" }
 pe-copy-signal-engine = { path = "../copy-signal-engine", version = "0.1.0" }
+pe-source-polymarket-public = { path = "../source-polymarket-public", version = "0.1.0" }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 rust_decimal        = { workspace = true }

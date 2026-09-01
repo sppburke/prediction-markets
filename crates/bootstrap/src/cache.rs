@@ -27,12 +27,22 @@ use pe_core_types::{
     ContractQty, MarketId, OutcomeId, Price, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
+use pe_source_polymarket_public::{
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
+    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
+    ClobCoveragePage, ClobPayoutResolution, ClobResolutionEvidence,
+};
 use pe_trader_index::snapshot::RawTrade;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::error::BootstrapError;
+
+/// Legacy wallet-cache generation understood by the pre-#544 trade readers.
+pub const CACHE_SCHEMA_VERSION_V1: i64 = 1;
+/// Trustworthy activity/payout wallet-cache generation introduced by #544.
+pub const CACHE_SCHEMA_VERSION_V2: i64 = 2;
 
 /// Row tuple for [`WalletCache::upsert_wallets_bulk`].
 ///
@@ -72,6 +82,14 @@ const IDX_TRADES_MARKET_ID_DDL: &str =
 const IDX_TRADES_BUY_MARKET_OUTCOME_WALLET_TS_DDL: &str =
     "CREATE INDEX IF NOT EXISTS idx_trades_buy_market_outcome_wallet_ts
     ON trades(side, market_id, outcome_id, wallet_hex, timestamp_unix);";
+
+/// Explicit indexes required before Forge cache activation (#544). The trades
+/// primary-key auto-index is additionally reported in the complete inventory.
+pub const REQUIRED_TRADES_INDEXES: [&str; 3] = [
+    "idx_trades_wallet_ts",
+    "idx_trades_market_id",
+    "idx_trades_buy_market_outcome_wallet_ts",
+];
 
 const SCHEMA: &str = concatcp!(
     "
@@ -240,6 +258,108 @@ CREATE TABLE IF NOT EXISTS market_liquidity (
     market_id        TEXT    PRIMARY KEY NOT NULL,
     liquidity_usd_str TEXT   NOT NULL,
     fetched_at_unix  INTEGER NOT NULL
+);
+
+-- Version-two CLOB payout evidence (#544). The final table is installed only
+-- from a complete page-one-to-terminal staging walk in `complete_clob_payout_walk_v2`.
+-- It is intentionally separate from legacy `market_resolutions` and
+-- `source_cursor`: neither legacy rows nor their cursor can satisfy these
+-- non-null coverage-generation/origin constraints or seed the v2 walk state.
+CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
+    generation                  INTEGER PRIMARY KEY NOT NULL,
+    manifest_json               TEXT    NOT NULL,
+    walked_start_cursor         TEXT    NULL,
+    walked_end_cursor           TEXT    NULL,
+    page_count                  INTEGER NOT NULL,
+    market_count                INTEGER NOT NULL,
+    closed_market_count         INTEGER NOT NULL,
+    resolved_payout_count       INTEGER NOT NULL,
+    unresolved_payout_count     INTEGER NOT NULL,
+    explicit_fifty_fifty_count  INTEGER NOT NULL,
+    terminal_kind               TEXT    NOT NULL CHECK (
+        terminal_kind IN ('end_cursor','empty_cursor','missing_cursor')
+    ),
+    terminal_page_sha256        TEXT    NOT NULL,
+    schema_version              INTEGER NOT NULL CHECK (schema_version = 2),
+    parser_version              INTEGER NOT NULL CHECK (parser_version = 2),
+    completed_at_unix           INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS clob_payout_evidence_v2 (
+    market_id              TEXT    PRIMARY KEY NOT NULL,
+    is_50_50_outcome       INTEGER NULL CHECK (is_50_50_outcome IN (0,1)),
+    payout_status          TEXT    NOT NULL CHECK (payout_status IN (
+        'resolved','unresolved_open','unresolved_incomplete',
+        'unresolved_conflicting','unresolved_malformed_price'
+    )),
+    payout_vector_json     TEXT    NULL,
+    closed                 INTEGER NULL CHECK (closed IN (0,1)),
+    tokens_json            TEXT    NOT NULL,
+    raw_page_sha256        TEXT    NOT NULL,
+    coverage_generation    INTEGER NOT NULL,
+    page_ordinal           INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL CHECK (schema_version = 2),
+    parser_version         INTEGER NOT NULL CHECK (parser_version = 2),
+    fetched_at_unix        INTEGER NOT NULL,
+    origin                 TEXT    NOT NULL CHECK (origin = 'clob_closed_walk_v2'),
+    CHECK (
+        (payout_status = 'resolved' AND payout_vector_json IN (
+            '[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]'
+        )) OR
+        (payout_status != 'resolved' AND payout_vector_json IS NULL)
+    ),
+    FOREIGN KEY (coverage_generation)
+        REFERENCES clob_payout_coverage_manifests_v2(generation)
+);
+
+-- One active v2 walk. `next_cursor` is independently derived from v2 page
+-- commits; it is never copied from `source_cursor.clob_closed`.
+CREATE TABLE IF NOT EXISTS clob_payout_walk_state_v2 (
+    singleton          INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    generation         INTEGER NOT NULL,
+    next_cursor        TEXT    NULL,
+    next_page_ordinal  INTEGER NOT NULL,
+    started_at_unix    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS clob_payout_walk_pages_v2 (
+    generation                  INTEGER NOT NULL,
+    page_ordinal                INTEGER NOT NULL,
+    request_cursor              TEXT    NULL,
+    returned_next_cursor        TEXT    NULL,
+    raw_sha256                  TEXT    NOT NULL,
+    market_count                INTEGER NOT NULL,
+    closed_market_count         INTEGER NOT NULL,
+    resolved_payout_count       INTEGER NOT NULL,
+    unresolved_payout_count     INTEGER NOT NULL,
+    explicit_fifty_fifty_count  INTEGER NOT NULL,
+    PRIMARY KEY (generation, page_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS clob_payout_evidence_staging_v2 (
+    generation             INTEGER NOT NULL,
+    market_id              TEXT    NOT NULL,
+    is_50_50_outcome       INTEGER NULL CHECK (is_50_50_outcome IN (0,1)),
+    payout_status          TEXT    NOT NULL CHECK (payout_status IN (
+        'resolved','unresolved_open','unresolved_incomplete',
+        'unresolved_conflicting','unresolved_malformed_price'
+    )),
+    payout_vector_json     TEXT    NULL,
+    closed                 INTEGER NULL CHECK (closed IN (0,1)),
+    tokens_json            TEXT    NOT NULL,
+    raw_page_sha256        TEXT    NOT NULL,
+    page_ordinal           INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL CHECK (schema_version = 2),
+    parser_version         INTEGER NOT NULL CHECK (parser_version = 2),
+    fetched_at_unix        INTEGER NOT NULL,
+    origin                 TEXT    NOT NULL CHECK (origin = 'clob_closed_walk_v2'),
+    CHECK (
+        (payout_status = 'resolved' AND payout_vector_json IN (
+            '[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]'
+        )) OR
+        (payout_status != 'resolved' AND payout_vector_json IS NULL)
+    ),
+    PRIMARY KEY (generation, market_id)
 );
 
 CREATE TABLE IF NOT EXISTS source_cursor (
@@ -474,6 +594,15 @@ pub struct ReclamationReport {
     pub page_count_after: i64,
 }
 
+/// Read-only cache evidence captured before Forge activation (#544).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheReclamationEvidence {
+    pub reclamation_pending: bool,
+    pub freelist_pages: i64,
+    pub trades_indexes: Vec<String>,
+    pub missing_required_trades_indexes: Vec<String>,
+}
+
 /// Outcome of [`WalletCache::purge_wallets`] (issue #385). In `dry_run` mode the
 /// `*_deleted` counts are estimates (trades via `wallets.trade_count`, snapshots
 /// via `COUNT`) of what an armed run *would* remove; nothing is written.
@@ -595,6 +724,59 @@ pub struct WalletCache {
     conn: Connection,
 }
 
+/// Independent resume state for the version-two CLOB payout walk (#544).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClobPayoutWalkStateV2 {
+    pub generation: u64,
+    pub next_cursor: Option<String>,
+    pub next_page_ordinal: u64,
+}
+
+/// Canonical SQLite row shape shared with the Parquet/DuckDB/Python readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredClobPayoutEvidenceV2 {
+    pub market_id: String,
+    pub is_50_50_outcome: Option<bool>,
+    pub payout: ClobPayoutResolution,
+    pub closed: Option<bool>,
+    pub tokens_json: String,
+    pub raw_page_sha256: String,
+    pub coverage_generation: u64,
+    pub page_ordinal: u64,
+    pub schema_version: u32,
+    pub parser_version: u32,
+    pub fetched_at_unix: i64,
+    pub origin: String,
+}
+
+/// Exact version-two activity aggregate stored in the cache (#544).
+///
+/// The API has no version-one variant: sealed transaction-hash rows are read
+/// only through the frozen-payload verifier in `cache_migration`, so a caller
+/// cannot accidentally mix a legacy trade into v2 ranking/state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredActivityAggregateV2 {
+    pub source_trade_id: SourceTradeId,
+    pub generation: u64,
+    pub semantic_revision: String,
+    pub components_json: String,
+    pub wallet_hex: String,
+    pub transaction_hash: String,
+    pub activity_type: String,
+    pub condition_id: Option<String>,
+    pub asset: Option<String>,
+    pub outcome_id: Option<u16>,
+    pub side: Option<Side>,
+    pub row_count: u64,
+    pub share_amount: Decimal,
+    pub price_weighted_share_amount: Decimal,
+    pub source_usdc_amount: Decimal,
+    pub source_time_unix: i64,
+    pub is_combo: bool,
+    pub schema_version: u32,
+    pub parser_version: u32,
+}
+
 impl WalletCache {
     /// Open or create the SQLite database at `path`. Runs schema migrations.
     pub fn open(path: &Path) -> Result<Self, BootstrapError> {
@@ -602,6 +784,23 @@ impl WalletCache {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found == CACHE_SCHEMA_VERSION_V2 {
+            // A v2 cache deliberately has no legacy `trades`,
+            // `market_resolutions`, or `source_cursor` table. Running the v1
+            // CREATE-on-open batch would recreate generation-blind owners and
+            // defeat sealing, so v2 opens only the already-installed schema.
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+            return Ok(Self { conn });
+        }
+        if found != 0 && found != CACHE_SCHEMA_VERSION_V1 {
+            return Err(BootstrapError::Cache {
+                message: format!(
+                    "wallet-cache schema version {found} is unsupported; expected {} or {}",
+                    CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2
+                ),
+            });
+        }
         // #538: request incremental auto-vacuum BEFORE any DDL. Three db states:
         // a FRESH db is created in incremental mode by this pragma alone; an
         // EXISTING mode-0 db is unaffected until a `VACUUM` on a connection
@@ -682,7 +881,203 @@ impl WalletCache {
             )?;
         }
 
+        if found == 0 {
+            conn.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION_V1)?;
+        }
+
         Ok(Self { conn })
+    }
+
+    /// Return the on-disk cache schema generation.
+    pub fn schema_version(&self) -> Result<i64, BootstrapError> {
+        self.conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(BootstrapError::from)
+    }
+
+    /// Store one exact reconciled v2 aggregate under its `g2:` identity.
+    ///
+    /// Consumers cannot observe the generation through the typed read until its
+    /// coverage manifest is installed. Legacy transaction-hash rows have no
+    /// path into this method.
+    pub fn insert_activity_aggregate_v2(
+        &mut self,
+        generation: u64,
+        aggregate: &ActivityAggregate,
+    ) -> Result<(), BootstrapError> {
+        self.require_v2_schema()?;
+        let source_trade_id = aggregate.group_id.key();
+        if !source_trade_id.0.starts_with("g2:") {
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "version-two activity identity must start with g2:, got {}",
+                    source_trade_id.0
+                ),
+            });
+        }
+        let components = aggregate.group_id.components();
+        let components_json = serde_json::to_string(components)?;
+        let side = components.side.map(|value| match value {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        });
+        let changed = self.conn.execute(
+            "INSERT INTO activity_groups_v2 \
+                 (source_trade_id, coverage_generation, semantic_revision, components_json, \
+                  wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id, \
+                  side, row_count, share_amount_str, price_weighted_share_amount_str, \
+                  source_usdc_amount_str, source_time_unix, is_combo, schema_version, \
+                  parser_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     ?15, ?16, ?17, ?18, ?19) \
+             ON CONFLICT(source_trade_id) DO UPDATE SET \
+                 coverage_generation = excluded.coverage_generation, \
+                 semantic_revision = excluded.semantic_revision, \
+                 components_json = excluded.components_json, \
+                 wallet_hex = excluded.wallet_hex, \
+                 transaction_hash = excluded.transaction_hash, \
+                 activity_type = excluded.activity_type, \
+                 condition_id = excluded.condition_id, \
+                 asset = excluded.asset, outcome_id = excluded.outcome_id, side = excluded.side, \
+                 row_count = excluded.row_count, share_amount_str = excluded.share_amount_str, \
+                 price_weighted_share_amount_str = excluded.price_weighted_share_amount_str, \
+                 source_usdc_amount_str = excluded.source_usdc_amount_str, \
+                 source_time_unix = excluded.source_time_unix, is_combo = excluded.is_combo, \
+                 schema_version = excluded.schema_version, parser_version = excluded.parser_version \
+             WHERE activity_groups_v2.semantic_revision = excluded.semantic_revision",
+            params![
+                source_trade_id.0,
+                to_i64_u64(generation, "activity coverage generation")?,
+                aggregate.semantic_revision.as_str(),
+                components_json,
+                components.wallet.to_string(),
+                components.transaction_hash,
+                components.activity_type.as_str(),
+                components.condition_id.as_ref().map(ToString::to_string),
+                components.asset.as_ref().map(ToString::to_string),
+                components.outcome.map(|value| i64::from(value.0)),
+                side,
+                to_i64_u64(aggregate.row_count, "activity row count")?,
+                aggregate.share_sum.to_decimal().to_string(),
+                aggregate.price_weighted_share_sum.0.to_string(),
+                aggregate.source_usdc_sum.to_decimal().to_string(),
+                aggregate.source_time.0.unix_timestamp(),
+                i64::from(aggregate.is_combo),
+                i64::from(ACTIVITY_SCHEMA_VERSION),
+                i64::from(ACTIVITY_PARSER_VERSION),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "activity group {} was replayed with a different semantic revision",
+                    source_trade_id.0
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Load only version-two activity aggregates. Sealed v1 rows are
+    /// structurally outside this query and therefore cannot seed a v2 consumer.
+    pub fn activity_aggregates_v2(&self) -> Result<Vec<StoredActivityAggregateV2>, BootstrapError> {
+        self.require_v2_schema()?;
+        let mut statement = self.conn.prepare(
+            "SELECT source_trade_id, coverage_generation, semantic_revision, components_json, \
+                    wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id, \
+                    side, row_count, share_amount_str, price_weighted_share_amount_str, \
+                    source_usdc_amount_str, source_time_unix, is_combo, schema_version, \
+                    parser_version \
+             FROM activity_groups_v2
+             WHERE coverage_generation = (
+                 SELECT MAX(generation) FROM activity_coverage_manifests_v2
+             )
+             ORDER BY source_time_unix, source_trade_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, i64>(18)?,
+            ))
+        })?;
+        let mut aggregates = Vec::new();
+        for row in rows {
+            let row = row?;
+            if !row.0.starts_with("g2:") {
+                return Err(BootstrapError::Cache {
+                    message: format!("non-g2 identity in activity_groups_v2: {}", row.0),
+                });
+            }
+            aggregates.push(StoredActivityAggregateV2 {
+                source_trade_id: SourceTradeId(row.0),
+                generation: to_u64_i64(row.1, "activity coverage generation")?,
+                semantic_revision: row.2,
+                components_json: row.3,
+                wallet_hex: row.4,
+                transaction_hash: row.5,
+                activity_type: row.6,
+                condition_id: row.7,
+                asset: row.8,
+                outcome_id: row.9.map(parse_u16_i64).transpose()?,
+                side: row
+                    .10
+                    .map(|value| match value.as_str() {
+                        "buy" => Ok(Side::Buy),
+                        "sell" => Ok(Side::Sell),
+                        _ => Err(BootstrapError::Cache {
+                            message: format!("invalid v2 activity side {value}"),
+                        }),
+                    })
+                    .transpose()?,
+                row_count: to_u64_i64(row.11, "activity row count")?,
+                share_amount: parse_decimal(&row.12, "activity share amount")?,
+                price_weighted_share_amount: parse_decimal(
+                    &row.13,
+                    "activity price-weighted share amount",
+                )?,
+                source_usdc_amount: parse_decimal(&row.14, "activity source USDC amount")?,
+                source_time_unix: row.15,
+                is_combo: row.16 != 0,
+                schema_version: u32::try_from(row.17).map_err(|_| BootstrapError::Cache {
+                    message: "invalid v2 activity schema version".to_owned(),
+                })?,
+                parser_version: u32::try_from(row.18).map_err(|_| BootstrapError::Cache {
+                    message: "invalid v2 activity parser version".to_owned(),
+                })?,
+            });
+        }
+        Ok(aggregates)
+    }
+
+    fn require_v2_schema(&self) -> Result<(), BootstrapError> {
+        let found = self.schema_version()?;
+        if found == CACHE_SCHEMA_VERSION_V2 {
+            Ok(())
+        } else {
+            Err(BootstrapError::Cache {
+                message: format!(
+                    "version-two cache API requires schema {}, found {found}",
+                    CACHE_SCHEMA_VERSION_V2
+                ),
+            })
+        }
     }
 
     /// Open the cache **read-only**, skipping schema creation and migrations.
@@ -2455,6 +2850,494 @@ impl WalletCache {
             .ok()
     }
 
+    // ── version-two CLOB payout evidence ────────────────────────────────────
+
+    /// Return the independent v2 CLOB walk state. This never reads the legacy
+    /// `source_cursor` table, so a v1 cursor cannot seed v2 coverage (#544).
+    pub fn clob_payout_walk_state_v2(
+        &self,
+    ) -> Result<Option<ClobPayoutWalkStateV2>, BootstrapError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT generation, next_cursor, next_page_ordinal \
+                 FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(generation, next_cursor, next_page_ordinal)| {
+            Ok(ClobPayoutWalkStateV2 {
+                generation: u64::try_from(generation).map_err(|_| BootstrapError::Cache {
+                    message: "negative clob payout walk generation".to_owned(),
+                })?,
+                next_cursor: normalize_stored_cursor(next_cursor),
+                next_page_ordinal: u64::try_from(next_page_ordinal).map_err(|_| {
+                    BootstrapError::Cache {
+                        message: "negative clob payout page ordinal".to_owned(),
+                    }
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Start a new page-one v2 walk, or return its own durable resume state.
+    /// Stale staging without an active state is discarded; installed evidence
+    /// remains authoritative until a later complete manifest replaces it.
+    pub fn begin_or_resume_clob_payout_walk_v2(
+        &mut self,
+        started_at_unix: i64,
+    ) -> Result<ClobPayoutWalkStateV2, BootstrapError> {
+        if let Some(state) = self.clob_payout_walk_state_v2()? {
+            return Ok(state);
+        }
+        let tx = self.conn.transaction()?;
+        let last_generation: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation = last_generation
+            .checked_add(1)
+            .ok_or_else(|| BootstrapError::Cache {
+                message: "clob payout generation overflow".to_owned(),
+            })?;
+        tx.execute("DELETE FROM clob_payout_evidence_staging_v2", [])?;
+        tx.execute("DELETE FROM clob_payout_walk_pages_v2", [])?;
+        tx.execute(
+            "INSERT INTO clob_payout_walk_state_v2 \
+             (singleton, generation, next_cursor, next_page_ordinal, started_at_unix) \
+             VALUES (1, ?1, NULL, 0, ?2)",
+            params![generation, started_at_unix],
+        )?;
+        tx.commit()?;
+        Ok(ClobPayoutWalkStateV2 {
+            generation: u64::try_from(generation).map_err(|_| BootstrapError::Cache {
+                message: "negative clob payout walk generation".to_owned(),
+            })?,
+            next_cursor: None,
+            next_page_ordinal: 0,
+        })
+    }
+
+    /// Discard only an incomplete v2 staging walk. Installed evidence and its
+    /// coverage manifest remain untouched until a later complete walk replaces
+    /// them. Used by the explicit CLOB cursor-reset/rebuild controls.
+    pub fn reset_clob_payout_walk_v2(&mut self) -> Result<(), BootstrapError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM clob_payout_evidence_staging_v2", [])?;
+        tx.execute("DELETE FROM clob_payout_walk_pages_v2", [])?;
+        tx.execute("DELETE FROM clob_payout_walk_state_v2", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically stage one parsed page and advance only the v2 cursor.
+    /// The page must match the active generation, ordinal, and expected cursor;
+    /// callers cannot use a legacy cursor or an arbitrary evidence row here.
+    pub fn commit_clob_payout_page_v2(
+        &mut self,
+        generation: u64,
+        page: &ClobCoveragePage,
+        evidence: &[ClobResolutionEvidence],
+        fetched_at_unix: i64,
+    ) -> Result<ClobPayoutWalkStateV2, BootstrapError> {
+        let generation_i64 = checked_i64(generation, "clob payout generation")?;
+        let page_ordinal_i64 = checked_i64(page.ordinal, "clob payout page ordinal")?;
+        let mut stored_rows = Vec::with_capacity(evidence.len());
+        for item in evidence {
+            let Some(market_id) = item
+                .condition_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let tokens_json =
+                item.canonical_tokens_json()
+                    .map_err(|error| BootstrapError::Clob {
+                        message: error.to_string(),
+                    })?;
+            stored_rows.push((
+                market_id.to_owned(),
+                bool_to_sql(item.is_50_50_outcome),
+                item.payout.storage_status(),
+                item.payout.payout_vector_json(),
+                bool_to_sql(item.closed),
+                tokens_json,
+            ));
+        }
+
+        let tx = self.conn.transaction()?;
+        let active = tx
+            .query_row(
+                "SELECT generation, next_cursor, next_page_ordinal \
+                 FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| BootstrapError::Cache {
+                message: "clob payout page arrived without an active v2 walk".to_owned(),
+            })?;
+        if active.0 != generation_i64
+            || active.2 != page_ordinal_i64
+            || normalize_stored_cursor(active.1)
+                != normalize_stored_cursor(page.request_cursor.clone())
+        {
+            return Err(BootstrapError::Cache {
+                message: format!(
+                    "clob payout page does not match active v2 walk: generation={generation}, \
+                     ordinal={}, cursor={:?}",
+                    page.ordinal, page.request_cursor
+                ),
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO clob_payout_walk_pages_v2 \
+             (generation, page_ordinal, request_cursor, returned_next_cursor, raw_sha256, \
+              market_count, closed_market_count, resolved_payout_count, \
+              unresolved_payout_count, explicit_fifty_fifty_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                generation_i64,
+                page_ordinal_i64,
+                normalize_stored_cursor(page.request_cursor.clone()),
+                page.returned_next_cursor,
+                page.raw_sha256,
+                checked_i64(page.market_count, "clob payout market count")?,
+                checked_i64(page.closed_market_count, "clob payout closed count")?,
+                checked_i64(page.resolved_payout_count, "clob payout resolved count")?,
+                checked_i64(page.unresolved_payout_count, "clob payout unresolved count")?,
+                checked_i64(
+                    page.explicit_fifty_fifty_count,
+                    "clob payout fifty-fifty count",
+                )?,
+            ],
+        )?;
+        {
+            let mut statement = tx.prepare(
+                "INSERT INTO clob_payout_evidence_staging_v2 \
+                 (generation, market_id, is_50_50_outcome, payout_status, \
+                  payout_vector_json, closed, tokens_json, raw_page_sha256, \
+                  page_ordinal, schema_version, parser_version, fetched_at_unix, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                         'clob_closed_walk_v2') \
+                 ON CONFLICT(generation, market_id) DO UPDATE SET \
+                    is_50_50_outcome = excluded.is_50_50_outcome, \
+                    payout_status = excluded.payout_status, \
+                    payout_vector_json = excluded.payout_vector_json, \
+                    closed = excluded.closed, \
+                    tokens_json = excluded.tokens_json, \
+                    raw_page_sha256 = excluded.raw_page_sha256, \
+                    page_ordinal = excluded.page_ordinal, \
+                    schema_version = excluded.schema_version, \
+                    parser_version = excluded.parser_version, \
+                    fetched_at_unix = excluded.fetched_at_unix, \
+                    origin = excluded.origin",
+            )?;
+            for (market_id, is_fifty_fifty, payout_status, payout_vector, closed, tokens) in
+                stored_rows
+            {
+                statement.execute(params![
+                    generation_i64,
+                    market_id,
+                    is_fifty_fifty,
+                    payout_status,
+                    payout_vector,
+                    closed,
+                    tokens,
+                    page.raw_sha256,
+                    page_ordinal_i64,
+                    i64::from(CLOB_RESOLUTION_SCHEMA_VERSION),
+                    i64::from(CLOB_RESOLUTION_PARSER_VERSION),
+                    fetched_at_unix,
+                ])?;
+            }
+        }
+        let next_page_ordinal =
+            page.ordinal
+                .checked_add(1)
+                .ok_or_else(|| BootstrapError::Cache {
+                    message: "clob payout page ordinal overflow".to_owned(),
+                })?;
+        tx.execute(
+            "UPDATE clob_payout_walk_state_v2 \
+             SET next_cursor = ?1, next_page_ordinal = ?2 WHERE singleton = 1",
+            params![
+                normalize_stored_cursor(page.returned_next_cursor.clone()),
+                checked_i64(next_page_ordinal, "clob payout next page ordinal")?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ClobPayoutWalkStateV2 {
+            generation,
+            next_cursor: normalize_stored_cursor(page.returned_next_cursor.clone()),
+            next_page_ordinal,
+        })
+    }
+
+    /// Load the persisted page chain for the active generation.
+    pub fn clob_payout_coverage_pages_v2(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<ClobCoveragePage>, BootstrapError> {
+        let mut statement = self.conn.prepare(
+            "SELECT page_ordinal, request_cursor, returned_next_cursor, raw_sha256, \
+                    market_count, closed_market_count, resolved_payout_count, \
+                    unresolved_payout_count, explicit_fifty_fifty_count \
+             FROM clob_payout_walk_pages_v2 WHERE generation = ?1 \
+             ORDER BY page_ordinal",
+        )?;
+        let rows = statement.query_map(
+            params![checked_i64(generation, "clob payout generation")?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )?;
+        let mut pages = Vec::new();
+        for row in rows {
+            let row = row?;
+            pages.push(ClobCoveragePage {
+                ordinal: checked_u64(row.0, "clob payout page ordinal")?,
+                request_cursor: normalize_stored_cursor(row.1),
+                returned_next_cursor: row.2,
+                raw_sha256: row.3,
+                market_count: checked_u64(row.4, "clob payout market count")?,
+                closed_market_count: checked_u64(row.5, "clob payout closed count")?,
+                resolved_payout_count: checked_u64(row.6, "clob payout resolved count")?,
+                unresolved_payout_count: checked_u64(row.7, "clob payout unresolved count")?,
+                explicit_fifty_fifty_count: checked_u64(row.8, "clob payout fifty-fifty count")?,
+            });
+        }
+        Ok(pages)
+    }
+
+    /// Atomically install staged evidence only after the persisted page chain
+    /// validates as one complete page-one-to-terminal coverage manifest.
+    pub fn complete_clob_payout_walk_v2(
+        &mut self,
+        manifest: &ClobCoverageManifest,
+        completed_at_unix: i64,
+    ) -> Result<(), BootstrapError> {
+        let pages = self.clob_payout_coverage_pages_v2(manifest.generation)?;
+        let expected =
+            ClobCoverageManifest::complete(manifest.generation, pages).map_err(|error| {
+                BootstrapError::Cache {
+                    message: error.to_string(),
+                }
+            })?;
+        if &expected != manifest
+            || manifest.schema_version != CLOB_RESOLUTION_SCHEMA_VERSION
+            || manifest.parser_version != CLOB_RESOLUTION_PARSER_VERSION
+        {
+            return Err(BootstrapError::Cache {
+                message: "clob payout manifest does not match persisted v2 page evidence"
+                    .to_owned(),
+            });
+        }
+        let manifest_json = serde_json::to_string(manifest)?;
+        let terminal_kind = match manifest.terminal_proof.kind {
+            pe_source_polymarket_public::ClobTerminalKind::EndCursor => "end_cursor",
+            pe_source_polymarket_public::ClobTerminalKind::EmptyCursor => "empty_cursor",
+            pe_source_polymarket_public::ClobTerminalKind::MissingCursor => "missing_cursor",
+        };
+        let generation = checked_i64(manifest.generation, "clob payout generation")?;
+        let tx = self.conn.transaction()?;
+        let active_generation = tx
+            .query_row(
+                "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| BootstrapError::Cache {
+                message: "clob payout completion has no active v2 walk".to_owned(),
+            })?;
+        if active_generation != generation {
+            return Err(BootstrapError::Cache {
+                message: "clob payout completion generation is not active".to_owned(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO clob_payout_coverage_manifests_v2 \
+             (generation, manifest_json, walked_start_cursor, walked_end_cursor, page_count, \
+              market_count, closed_market_count, resolved_payout_count, \
+              unresolved_payout_count, explicit_fifty_fifty_count, terminal_kind, \
+              terminal_page_sha256, schema_version, parser_version, completed_at_unix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                generation,
+                manifest_json,
+                manifest.walked_start_cursor,
+                manifest.walked_end_cursor,
+                checked_i64(manifest.counts.pages, "clob payout page count")?,
+                checked_i64(manifest.counts.markets, "clob payout market count")?,
+                checked_i64(
+                    manifest.counts.closed_markets,
+                    "clob payout closed market count",
+                )?,
+                checked_i64(
+                    manifest.counts.resolved_payouts,
+                    "clob payout resolved count",
+                )?,
+                checked_i64(
+                    manifest.counts.unresolved_payouts,
+                    "clob payout unresolved count",
+                )?,
+                checked_i64(
+                    manifest.counts.explicit_fifty_fifty,
+                    "clob payout fifty-fifty count",
+                )?,
+                terminal_kind,
+                manifest.terminal_proof.terminal_page_sha256,
+                i64::from(manifest.schema_version),
+                i64::from(manifest.parser_version),
+                completed_at_unix,
+            ],
+        )?;
+        tx.execute("DELETE FROM clob_payout_evidence_v2", [])?;
+        tx.execute(
+            "INSERT INTO clob_payout_evidence_v2 \
+             (market_id, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+              tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
+              schema_version, parser_version, fetched_at_unix, origin) \
+             SELECT market_id, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+                    tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
+                    parser_version, fetched_at_unix, origin \
+             FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
+            params![generation],
+        )?;
+        tx.execute(
+            "DELETE FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
+            params![generation],
+        )?;
+        tx.execute(
+            "DELETE FROM clob_payout_walk_pages_v2 WHERE generation = ?1",
+            params![generation],
+        )?;
+        tx.execute(
+            "DELETE FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read and revalidate the newest installed coverage manifest.
+    pub fn latest_clob_payout_coverage_manifest_v2(
+        &self,
+    ) -> Result<Option<ClobCoverageManifest>, BootstrapError> {
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT manifest_json FROM clob_payout_coverage_manifests_v2 \
+                 ORDER BY generation DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let manifest: ClobCoverageManifest = serde_json::from_str(&stored)?;
+        let validated = ClobCoverageManifest::complete(manifest.generation, manifest.pages.clone())
+            .map_err(|error| BootstrapError::Cache {
+                message: error.to_string(),
+            })?;
+        if validated != manifest {
+            return Err(BootstrapError::Cache {
+                message: "stored clob payout coverage manifest failed validation".to_owned(),
+            });
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Read one installed v2 payout row into the canonical Rust shape.
+    pub fn clob_payout_evidence_v2(
+        &self,
+        market_id: &str,
+    ) -> Result<Option<StoredClobPayoutEvidenceV2>, BootstrapError> {
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT market_id, is_50_50_outcome, payout_status, payout_vector_json, \
+                        closed, tokens_json, raw_page_sha256, coverage_generation, \
+                        page_ordinal, schema_version, parser_version, fetched_at_unix, origin \
+                 FROM clob_payout_evidence_v2 WHERE market_id = ?1",
+                params![market_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let payout = ClobPayoutResolution::from_storage(&stored.2, stored.3.as_deref()).map_err(
+            |error| BootstrapError::Cache {
+                message: error.to_string(),
+            },
+        )?;
+        Ok(Some(StoredClobPayoutEvidenceV2 {
+            market_id: stored.0,
+            is_50_50_outcome: sql_to_bool(stored.1, "is_50_50_outcome")?,
+            payout,
+            closed: sql_to_bool(stored.4, "closed")?,
+            tokens_json: stored.5,
+            raw_page_sha256: stored.6,
+            coverage_generation: checked_u64(stored.7, "clob payout generation")?,
+            page_ordinal: checked_u64(stored.8, "clob payout page ordinal")?,
+            schema_version: u32::try_from(stored.9).map_err(|_| BootstrapError::Cache {
+                message: "invalid clob payout schema version".to_owned(),
+            })?,
+            parser_version: u32::try_from(stored.10).map_err(|_| BootstrapError::Cache {
+                message: "invalid clob payout parser version".to_owned(),
+            })?,
+            fetched_at_unix: stored.11,
+            origin: stored.12,
+        }))
+    }
+
     // ── source_cursor ─────────────────────────────────────────────────────────
 
     /// Read a checkpoint value previously written by [`Self::set_source_cursor`].
@@ -3049,6 +3932,32 @@ impl WalletCache {
         Ok(row.is_some())
     }
 
+    /// Capture the marker, freelist, and complete trades-index inventory using
+    /// the current read-only-compatible connection (#544).
+    pub fn reclamation_evidence(&self) -> Result<CacheReclamationEvidence, BootstrapError> {
+        let freelist_pages = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'trades' ORDER BY name",
+        )?;
+        let trades_indexes = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let missing_required_trades_indexes = REQUIRED_TRADES_INDEXES
+            .iter()
+            .filter(|required| !trades_indexes.iter().any(|actual| actual == **required))
+            .map(|name| (*name).to_owned())
+            .collect();
+        Ok(CacheReclamationEvidence {
+            reclamation_pending: self.reclamation_pending()?,
+            freelist_pages,
+            trades_indexes,
+            missing_required_trades_indexes,
+        })
+    }
+
     /// Clear the marker after reclamation AND index recreation both succeeded.
     /// A clear failure is returned — recovery stays pending.
     pub fn clear_reclamation_pending(&mut self) -> Result<(), BootstrapError> {
@@ -3636,6 +4545,30 @@ impl WalletCache {
     }
 }
 
+fn to_i64_u64(value: u64, field: &str) -> Result<i64, BootstrapError> {
+    i64::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("{field} exceeds SQLite integer range"),
+    })
+}
+
+fn to_u64_i64(value: i64, field: &str) -> Result<u64, BootstrapError> {
+    u64::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("{field} is negative"),
+    })
+}
+
+fn parse_u16_i64(value: i64) -> Result<u16, BootstrapError> {
+    u16::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("v2 activity outcome {value} is outside u16 range"),
+    })
+}
+
+fn parse_decimal(value: &str, field: &str) -> Result<Decimal, BootstrapError> {
+    Decimal::from_str(value).map_err(|error| BootstrapError::Cache {
+        message: format!("invalid {field} {value:?}: {error}"),
+    })
+}
+
 /// Resolved-market record loaded from the `market_resolutions` table.
 ///
 /// Only rows with `winning_outcome_id IS NOT NULL` are materialised in the
@@ -3888,6 +4821,41 @@ fn add_column_if_missing(
         conn.execute_batch(&sql)?;
     }
     Ok(())
+}
+
+fn normalize_stored_cursor(cursor: Option<String>) -> Option<String> {
+    cursor.filter(|value| !value.is_empty())
+}
+
+const fn bool_to_sql(value: Option<bool>) -> Option<i64> {
+    match value {
+        Some(true) => Some(1),
+        Some(false) => Some(0),
+        None => None,
+    }
+}
+
+fn sql_to_bool(value: Option<i64>, field: &str) -> Result<Option<bool>, BootstrapError> {
+    match value {
+        Some(1) => Ok(Some(true)),
+        Some(0) => Ok(Some(false)),
+        None => Ok(None),
+        Some(other) => Err(BootstrapError::Cache {
+            message: format!("invalid {field} boolean value {other}"),
+        }),
+    }
+}
+
+fn checked_i64(value: u64, field: &str) -> Result<i64, BootstrapError> {
+    i64::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("{field} exceeds SQLite INTEGER range"),
+    })
+}
+
+fn checked_u64(value: i64, field: &str) -> Result<u64, BootstrapError> {
+    u64::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("{field} is negative"),
+    })
 }
 
 fn side_to_str(s: &Side) -> &'static str {

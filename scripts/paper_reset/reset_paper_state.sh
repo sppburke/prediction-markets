@@ -12,7 +12,7 @@
 #   1. STOP pe-service on the VPS                                (manual, sudo)
 #   2. Supabase archive+delete (this script, --execute)          (fail-closed, 1 txn)
 #   3. VPS: rotate paper_state.db(+-wal/-shm), paper.log,        (manual/ssh, service
-#      paper.live.log into an archive dir                         stopped!)
+#      live_journal.log into an archive dir                       stopped!)
 #   4. VPS: set the fresh bankroll (PE_BANKROLL_USD / .env),
 #      then `pe-service --backfill-supabase` re-seeds paper_bankroll
 #   5. START pe-service                                          (manual, sudo)
@@ -61,7 +61,7 @@ if [[ "$MODE" == "dry-run" ]]; then
         set -e; cd <service-workdir> &&
         mkdir -p archive-$(date +%Y%m%d) &&
         for f in paper_state.db paper_state.db-wal paper_state.db-shm \
-                 paper.log paper.live.log; do
+                 paper.log live_journal.log; do
           if [ -e "$f" ]; then mv "$f" archive-$(date +%Y%m%d)/; fi
         done &&
         ls -la archive-$(date +%Y%m%d)/'

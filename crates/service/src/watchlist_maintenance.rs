@@ -43,9 +43,8 @@
 //! ## Admission preparation (#542)
 //!
 //! Both membership paths publish only wallets the shared [`crate::watchlist_admission`] preparer
-//! has already installed in the copy-entry gate and the leader position ledger. Publishing an
-//! unprepared wallet lets its next BUY read as a first-ever entry — an absent position snapshot
-//! classifies an Add as an Entry, and an absent history is fail-open by default.
+//! has validated against durable reconciled history and the monotonic fence set. The publication
+//! lock repeats those checks; the causal positions bracket extends the same serialized attempt.
 //!
 //! The full-rerank read is pinned to the batch identifier that triggered the transition, so the
 //! rows applied and the marker committed always name one batch.
@@ -138,6 +137,43 @@ pub enum MembershipApplyError {
     /// SQLite rejected the all-or-nothing cursor batch.
     #[error("persist admission cursors: {0}")]
     Cursor(#[from] PaperStateError),
+    #[error("newly admitted wallet {wallet} is durably fenced")]
+    FencedAdmission { wallet: WalletAddress },
+    #[error("newly admitted wallet {wallet} lacks complete reconciled history")]
+    IncompleteHistory { wallet: WalletAddress },
+    #[error("newly admitted wallet {wallet} lacks a current causal position validation")]
+    UnvalidatedPosition { wallet: WalletAddress },
+}
+
+fn remove_loaded_fences(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+) -> Result<(), MembershipApplyError> {
+    let fenced: HashSet<_> = paper_state
+        .wallet_fences()?
+        .into_iter()
+        .map(|record| record.wallet)
+        .collect();
+    live.remove_fenced(&fenced);
+    Ok(())
+}
+
+fn recheck_admissions(
+    paper_state: &PaperStateDb,
+    admissions: &[WalletAddress],
+) -> Result<(), MembershipApplyError> {
+    for wallet in admissions {
+        if paper_state.is_wallet_fenced(wallet)? {
+            return Err(MembershipApplyError::FencedAdmission { wallet: *wallet });
+        }
+        if !paper_state.wallet_history_complete(wallet)? {
+            return Err(MembershipApplyError::IncompleteHistory { wallet: *wallet });
+        }
+        if !paper_state.position_validation_current(wallet)? {
+            return Err(MembershipApplyError::UnvalidatedPosition { wallet: *wallet });
+        }
+    }
+    Ok(())
 }
 
 fn stale_capacity_error(
@@ -359,6 +395,7 @@ pub async fn apply_evictions_and_backfill(
     if applied != expected_capacity {
         return Err(stale_capacity_error(expected_capacity, applied));
     }
+    remove_loaded_fences(live, paper_state)?;
     let current = live.snapshot();
     let admissions = planned_admissions(
         &current.entries,
@@ -366,6 +403,7 @@ pub async fn apply_evictions_and_backfill(
         candidates,
         expected_capacity.target,
     );
+    recheck_admissions(paper_state, &admissions)?;
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
     // #511: insert-only — an existing (possibly HELD) delivery cursor is already a valid
     // lower bound and must never be jumped by a re-admission seed; activity MAX-seeds.
@@ -384,9 +422,11 @@ pub(crate) fn apply_ranked_membership_locked(
     incoming_last_trade: &HashMap<WalletAddress, i64>,
     cap: usize,
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
+    remove_loaded_fences(live, paper_state)?;
     let current = live.snapshot();
     let (dropped, admissions) = ranked_membership_change(&current.entries, incoming, cap);
     let removed: HashSet<WalletAddress> = dropped.iter().copied().collect();
+    recheck_admissions(paper_state, &admissions)?;
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     // #511: insert-only (see membership admission above).
     paper_state.seed_cursors_if_absent(&seeds)?;
@@ -1131,47 +1171,82 @@ mod tests {
         }
 
         async fn harness(fake: Fake, initial: &[WalletAddress]) -> Harness {
+            // `history_ok = false` means newcomers lack complete reconciled history, so the
+            // durable seed is restricted to already-member wallets — preparation must then
+            // fail closed on the durable gate (`AdmissionError::MissingHistory`), never on
+            // the fake transport alone.
+            let history_wallets: HashSet<WalletAddress> = fake
+                .ranking_entries
+                .iter()
+                .chain(fake.latest_ranking.iter())
+                .filter_map(|row| row.get("wallet_hex").and_then(serde_json::Value::as_str))
+                .filter_map(|hex| WalletAddress::from_hex(hex).ok())
+                .filter(|wallet| fake.history_ok || initial.contains(wallet))
+                .collect();
             let base_url = fake.serve().await;
             let temp = TempDir::new().unwrap();
             let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+            for wallet in history_wallets {
+                paper_state
+                    .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                        wallet,
+                        complete: true,
+                        proof_json: "{\"test\":true}".to_owned(),
+                        updated_at_unix: NOW,
+                    })
+                    .unwrap();
+            }
             let live = live(initial);
             let (control_tx, mut control_rx) = mpsc::channel(2);
             let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
+            let fake_paper_state = Arc::clone(&paper_state);
             std::mem::drop(tokio::spawn(async move {
                 while let Some(message) = control_rx.recv().await {
                     match message {
                         OrchestratorControl::PrepareAdmissions {
-                            history,
-                            positions,
+                            wallets,
                             acknowledged,
                         } => {
-                            assert_eq!(
-                                history.keys().copied().collect::<HashSet<_>>(),
-                                positions.keys().copied().collect::<HashSet<_>>()
-                            );
+                            // Mirror the real orchestrator's successful acceptance: a
+                            // prepared wallet gains a current causal position validation,
+                            // or the publication recheck would (correctly) reject it. The
+                            // bracket itself is proven in scenario_position_bracket.rs.
+                            let validations: Vec<pe_paper_state::PositionValidationRecord> =
+                                wallets
+                                    .iter()
+                                    .map(|wallet| pe_paper_state::PositionValidationRecord {
+                                        wallet: *wallet,
+                                        ledger_hash: "test-ledger".to_owned(),
+                                        positions_proof_hash: "test-proof".to_owned(),
+                                        activity_bounds_json: "{}".to_owned(),
+                                        source_log_generation: "test-gen".to_owned(),
+                                        proof_json: "{}".to_owned(),
+                                        recorded_at_unix: 0,
+                                    })
+                                    .collect();
+                            fake_paper_state
+                                .record_position_validations(&validations)
+                                .unwrap();
                             control_log
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push((
-                                    positions.keys().copied().collect(),
-                                    members(&control_live),
-                                ));
+                                .push((wallets.into_iter().collect(), members(&control_live)));
                             acknowledged.send(()).unwrap();
                         }
-                        OrchestratorControl::PositionReseed(_) => {
-                            panic!("maintenance sent a periodic reseed")
+                        OrchestratorControl::CommitActivityBucket { .. } => {
+                            panic!("maintenance sent an activity bucket")
+                        }
+                        OrchestratorControl::PrepareValidatedAdmissions { .. }
+                        | OrchestratorControl::CaptureAdmissionLedger { .. } => {
+                            panic!("legacy admission test sent a causal-bracket command")
                         }
                     }
                 }
             }));
             let preparer = crate::watchlist_admission::AdmissionPreparer::new(
                 control_tx,
-                reqwest::Client::new(),
-                base_url.clone(),
-                temp.path().join("history.json"),
-                500,
-                1,
+                Arc::clone(&paper_state),
             );
             Harness {
                 live,

@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{PaperStateDb, PositionValidationRecord, WalletHistoryStatusRecord};
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::runtime_config::{
@@ -132,6 +132,31 @@ fn stats(
 fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    // These scenarios isolate maintenance/cursor behavior. Give every synthetic
+    // wallet the durable prerequisite now required at the publication boundary.
+    for n in u8::MIN..=u8::MAX {
+        db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(n),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    }
+    db.record_position_validations(
+        &(u8::MIN..=u8::MAX)
+            .map(|n| PositionValidationRecord {
+                wallet: wallet(n),
+                ledger_hash: format!("ledger-{n}"),
+                positions_proof_hash: format!("positions-{n}"),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                proof_json: "{\"scenario\":true}".to_owned(),
+                recorded_at_unix: 1,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     (dir, db)
 }
 

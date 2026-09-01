@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use pe_core_types::{
-    ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, Side, SourceTradeId, WalletAddress,
+    MarketId, MarketOutcomeId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, WalletAddress,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -35,28 +35,34 @@ pub struct IncomingTrade {
     pub outcome_id: OutcomeId,
     pub side: Side,
     pub price: Price,
-    pub contracts: ContractQty,
+    /// Exact six-decimal leader share amount. The field name is retained for
+    /// wire compatibility with version-one frames; its type is no longer a
+    /// whole-contract projection (#544).
+    pub contracts: ShareAmount,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub received_at: OffsetDateTime,
     pub source_trade_id: SourceTradeId,
+    /// Venue transaction hash retained separately from the v2 `g2:` identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<String>,
     /// Which transport observed this trade (#530). Defaulted for pre-field recordings.
     #[serde(default)]
     pub provenance: TradeProvenance,
 }
 
 /// Net contract exposure on each side for one `(market, outcome)` bucket.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PositionState {
-    /// Unmatched Buy (long) contracts.
-    pub long_contracts: u64,
-    /// Unmatched Sell (short) contracts.
-    pub short_contracts: u64,
+    /// Exact unmatched Buy (long) shares.
+    pub long_contracts: ShareAmount,
+    /// Exact unmatched Sell (short) shares.
+    pub short_contracts: ShareAmount,
 }
 
 /// Current open positions for a single wallet across all `(market, outcome)` buckets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PositionSnapshot {
     pub wallet: WalletAddress,
     pub positions: HashMap<MarketOutcomeId, PositionState>,

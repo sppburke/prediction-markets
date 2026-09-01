@@ -123,6 +123,32 @@ struct AccountStateInputs {
 
 /// Start the first-boot arming fence, then drive mode, redemption, retention, and ordered fan-out.
 pub async fn run_live_fanout(config: LiveFanoutConfig) {
+    let _ = run_live_fanout_until(config, std::future::pending()).await;
+}
+
+/// Live fan-out owner failure surfaced to the named supervisor (#544).
+#[derive(Debug, thiserror::Error)]
+pub enum LiveFanoutOwnerError {
+    #[error("record first-boot fence: {0}")]
+    FirstBootFence(#[source] pe_paper_state::PaperStateError),
+    #[error("read recovery state during shutdown: {0}")]
+    ShutdownRecovery(#[source] pe_paper_state::PaperStateError),
+    #[error("drain live recovery during shutdown: {0}")]
+    ShutdownDrain(String),
+    #[error("inspect live journal poison state: {0}")]
+    JournalState(#[source] pe_execution_core::LiveJournalError),
+    #[error("live journal is poisoned")]
+    JournalPoisoned,
+    #[error("verify live journal tail: {0}")]
+    VerifyJournal(#[source] pe_execution_core::LiveJournalError),
+}
+
+/// Run until the supervisor closes this sink, then finish only known in-flight recovery work and
+/// verify the journal tail before returning (#544).
+pub async fn run_live_fanout_until(
+    config: LiveFanoutConfig,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), LiveFanoutOwnerError> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     match config.paper_state.record_live_executor_first_boot(now) {
         Ok(fence) => info!(
@@ -130,8 +156,7 @@ pub async fn run_live_fanout(config: LiveFanoutConfig) {
             "ordinary live executor first-boot fence ready"
         ),
         Err(error) => {
-            error!(error = %error, "live executor fence could not be recorded; fan-out stopped");
-            return;
+            return Err(LiveFanoutOwnerError::FirstBootFence(error));
         }
     }
     let admission = LiveAdmissionBuilder::new(
@@ -153,8 +178,21 @@ pub async fn run_live_fanout(config: LiveFanoutConfig) {
     state.last_projection_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
     let mut ticker = tokio::time::interval(Duration::from_secs(FANOUT_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            () = &mut shutdown => break,
+        }
+        if state
+            .config
+            .journal
+            .poisoned()
+            .map_err(LiveFanoutOwnerError::JournalState)?
+            .is_some()
+        {
+            return Err(LiveFanoutOwnerError::JournalPoisoned);
+        }
         let now = OffsetDateTime::now_utc();
         let projection_interval =
             i64::try_from(state.config.projection_reconcile_interval_secs.max(1))
@@ -169,7 +207,7 @@ pub async fn run_live_fanout(config: LiveFanoutConfig) {
         }
         match recovery_is_pending(&state.config.paper_state) {
             Ok(true) => {
-                if let Err(error) = run_dispatch_pass(&mut state, now).await {
+                if let Err(error) = run_recovery_pass(&mut state, now).await {
                     error!(error = %error, "live recovery-first pass failed; fan-out remains frozen");
                 }
                 // A submitted/ambiguous reservation is the only work allowed on this tick.
@@ -218,6 +256,26 @@ pub async fn run_live_fanout(config: LiveFanoutConfig) {
             state.last_prune_unix = Some(now.unix_timestamp());
         }
     }
+
+    if recovery_is_pending(&state.config.paper_state)
+        .map_err(LiveFanoutOwnerError::ShutdownRecovery)?
+    {
+        run_recovery_pass(&mut state, OffsetDateTime::now_utc())
+            .await
+            .map_err(|error| LiveFanoutOwnerError::ShutdownDrain(error.to_string()))?;
+    }
+    if state
+        .config
+        .journal
+        .poisoned()
+        .map_err(LiveFanoutOwnerError::JournalState)?
+        .is_some()
+    {
+        return Err(LiveFanoutOwnerError::JournalPoisoned);
+    }
+    LiveJournal::verified_tail(&state.config.journal_path)
+        .map_err(LiveFanoutOwnerError::VerifyJournal)?;
+    Ok(())
 }
 
 fn recovery_is_pending(
@@ -329,6 +387,38 @@ async fn run_dispatch_pass(
                 // oldest target on the next tick.
                 PassControl::StopSeed => return Ok(()),
                 PassControl::FreezePass => return Ok(()),
+            }
+        }
+        state
+            .config
+            .paper_state
+            .finalize_dispatch_if_terminal(&seed.dispatch_id, now.unix_timestamp())?;
+    }
+    Ok(())
+}
+
+/// Reconcile only already-submitted/ambiguous orders. This is the recovery-first and shutdown
+/// path; it can never turn a pending target into a new venue submission (#544).
+async fn run_recovery_pass(
+    state: &mut FanoutState,
+    now: OffsetDateTime,
+) -> Result<(), FanoutError> {
+    for seed in state
+        .config
+        .paper_state
+        .unfinalized_ready_dispatch_seeds()?
+    {
+        let signal = parse_frozen_signal(&seed)?;
+        for target in state
+            .config
+            .paper_state
+            .dispatch_targets(&seed.dispatch_id)?
+            .into_iter()
+            .filter(|target| target.state == "submitted" || target.state == "ambiguous")
+        {
+            if process_target(state, &seed, &target, &signal, now).await? == PassControl::FreezePass
+            {
+                return Ok(());
             }
         }
         state
@@ -506,8 +596,8 @@ async fn process_target(
             return Ok(PassControl::Continue);
         }
     };
-    let minimum_price = parse_band_price(&runtime.min_fill_price, Price::ZERO);
-    let maximum_price = parse_band_price(&runtime.max_fill_price, Price(Decimal::ONE));
+    let minimum_price = parse_band_price(runtime.min_fill_price, Price::ZERO);
+    let maximum_price = parse_band_price(runtime.max_fill_price, Price(Decimal::ONE));
     let (minimum_price, maximum_price) = match (minimum_price, maximum_price) {
         (Ok(minimum), Ok(maximum)) => (minimum, maximum),
         _ => {
@@ -625,8 +715,7 @@ fn unix_ms(now: OffsetDateTime) -> u64 {
     u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
-fn parse_band_price(raw: &str, disabled: Price) -> Result<Price, ()> {
-    let value = Decimal::from_str(raw).map_err(|_| ())?;
+fn parse_band_price(value: Decimal, disabled: Price) -> Result<Price, ()> {
     if value == Decimal::ZERO {
         return Ok(disabled);
     }
@@ -2311,9 +2400,8 @@ mod tests {
 
     use pe_core_types::SourceTimestamp;
     use pe_core_types::{
-        ContractQty, LeaderAction, MarketId, OutcomeId, ProbabilityPpm, Quantity,
-        ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
-        WalletAddress,
+        LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ReconstructionQuality, Side,
+        SourceTradeId, TraderId, VenueId, VenueMarketId, WalletAddress,
     };
     use pe_execution_core::{
         LiveAccountReadFailure, LiveOrderRejectKind, LivePostClassification, LivePostParseError,
@@ -2631,7 +2719,7 @@ mod tests {
             action: LeaderAction::Entry,
             leader_side: Side::Buy,
             leader_price: Price(dec!(0.50)),
-            leader_size: Quantity(ContractQty(10)),
+            leader_size: pe_core_types::ShareAmount::from_whole(10).unwrap(),
             observed_at: OffsetDateTime::UNIX_EPOCH,
             received_at: OffsetDateTime::UNIX_EPOCH,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),

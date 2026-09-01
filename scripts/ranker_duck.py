@@ -25,8 +25,11 @@ Engine selection (env, overridable by the caller):
 """
 from __future__ import annotations
 
+import json
 import os
 import time
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 # Parquet snapshot file names (one per ranker read table).
 TRADES_PARQUET = "trades.parquet"
@@ -40,6 +43,9 @@ REQUIRED_PARQUET = (TRADES_PARQUET, RESOLUTIONS_PARQUET, SCHEDULES_PARQUET)
 # token_conditions.outcome_index).
 MARKET_PRICE_HISTORY_PARQUET = "market_price_history.parquet"
 TOKEN_CONDITIONS_PARQUET = "token_conditions.parquet"
+# #544: stored-only v2 payout evidence. Registration never changes ranker
+# queries; #545 owns switching any economic consumer to this view.
+CLOB_PAYOUT_EVIDENCE_V2_PARQUET = "clob_payout_evidence_v2.parquet"
 
 DEFAULT_PARQUET_DIR = "data/parquet"
 DEFAULT_MAX_AGE_HOURS = 4.0
@@ -170,8 +176,120 @@ def get_engine(force: str | None = None,
             f"CREATE VIEW token_conditions AS SELECT * FROM read_parquet('{_q(tc_path)}');"
         )
         log(f"registered optional view token_conditions ({TOKEN_CONDITIONS_PARQUET})")
+    payout_path = os.path.join(parquet_dir, CLOB_PAYOUT_EVIDENCE_V2_PARQUET)
+    if os.path.exists(payout_path):
+        con.execute(
+            "CREATE VIEW clob_payout_evidence_v2 AS SELECT * "
+            f"FROM read_parquet('{_q(payout_path)}');"
+        )
+        log("registered optional view clob_payout_evidence_v2 "
+            f"({CLOB_PAYOUT_EVIDENCE_V2_PARQUET})")
     log(f"engine=duck over {parquet_dir} (memory_limit={mem}, threads={threads_desc})")
     return con
+
+
+@dataclass(frozen=True)
+class ClobPayoutEvidenceV2:
+    """Canonical #544 row returned identically by SQLite or DuckDB.
+
+    The payout vector remains its canonical JSON bytes (an array of exact
+    decimal strings); converting it to Python float would break reader parity.
+    """
+
+    market_id: str
+    is_50_50_outcome: bool | None
+    payout_status: str
+    payout_vector_json: str | None
+    closed: bool | None
+    tokens_json: str
+    raw_page_sha256: str
+    coverage_generation: int
+    page_ordinal: int
+    schema_version: int
+    parser_version: int
+    fetched_at_unix: int
+    origin: str
+
+
+def _canonical_payout_vector(value: str) -> str:
+    try:
+        raw = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid clob payout vector JSON: {exc}") from exc
+    if (not isinstance(raw, list) or len(raw) != 2
+            or any(not isinstance(item, str) for item in raw)):
+        raise ValueError("clob payout vector must contain exactly two decimal strings")
+    try:
+        decimals = [Decimal(item) for item in raw]
+    except InvalidOperation as exc:
+        raise ValueError("clob payout vector contains a non-decimal string") from exc
+    if tuple(decimals) not in {
+        (Decimal(1), Decimal(0)),
+        (Decimal(0), Decimal(1)),
+        (Decimal("0.5"), Decimal("0.5")),
+    }:
+        raise ValueError("binary CLOB payout must be [1,0], [0,1], or [0.5,0.5]")
+
+    def spelling(item: Decimal) -> str:
+        normalized = format(item.normalize(), "f")
+        return "0" if Decimal(normalized) == 0 else normalized
+
+    canonical = json.dumps([spelling(item) for item in decimals], separators=(",", ":"))
+    if canonical != value:
+        raise ValueError("clob payout vector is not in canonical storage form")
+    return canonical
+
+
+def load_clob_payout_evidence_v2(con, market_id: str) -> ClobPayoutEvidenceV2 | None:
+    """Read one v2 payout row from either sqlite3 or DuckDB.
+
+    This reader is intentionally unused by ranking/evaluation in #544. It
+    validates the stored canonical shape for replay and reader parity only.
+    """
+    row = con.execute(
+        "SELECT market_id, is_50_50_outcome, payout_status, payout_vector_json, "
+        "closed, tokens_json, raw_page_sha256, coverage_generation, page_ordinal, "
+        "schema_version, parser_version, fetched_at_unix, origin "
+        "FROM clob_payout_evidence_v2 WHERE market_id = ?",
+        [market_id],
+    ).fetchone()
+    if row is None:
+        return None
+    status = str(row[2])
+    vector = None if row[3] is None else _canonical_payout_vector(str(row[3]))
+    if (status == "resolved") != (vector is not None):
+        raise ValueError("resolved payout status/vector presence mismatch")
+    allowed = {"resolved", "unresolved_open", "unresolved_incomplete",
+               "unresolved_conflicting", "unresolved_malformed_price"}
+    if status not in allowed:
+        raise ValueError(f"unknown clob payout status {status!r}")
+    if int(row[9]) != 2 or int(row[10]) != 2:
+        raise ValueError("unsupported clob payout schema/parser version")
+    if str(row[12]) != "clob_closed_walk_v2":
+        raise ValueError("clob payout row did not originate in the v2 closed-market walk")
+
+    def optional_bool(value, field: str) -> bool | None:
+        if value is None:
+            return None
+        if int(value) not in (0, 1):
+            raise ValueError(f"invalid {field} boolean {value!r}")
+        return bool(int(value))
+
+    return ClobPayoutEvidenceV2(
+        market_id=str(row[0]),
+        is_50_50_outcome=optional_bool(row[1], "is_50_50_outcome"),
+        payout_status=status,
+        payout_vector_json=vector,
+        closed=optional_bool(row[4], "closed"),
+        tokens_json=str(row[5]),
+        raw_page_sha256=str(row[6]),
+        coverage_generation=int(row[7]),
+        page_ordinal=int(row[8]),
+        schema_version=int(row[9]),
+        parser_version=int(row[10]),
+        fetched_at_unix=int(row[11]),
+        origin=str(row[12]),
+    )
 
 
 def _assert_slice_key_premise(con) -> None:

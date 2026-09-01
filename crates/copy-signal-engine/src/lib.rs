@@ -15,7 +15,7 @@ pub mod config;
 pub mod signal;
 pub mod snapshot;
 
-pub use classifier::classify_trade;
+pub use classifier::{classify_leader_action, classify_trade};
 pub use config::SignalConfig;
 pub use signal::LeaderSignal;
 pub use snapshot::{IncomingTrade, PositionSnapshot, PositionState, TradeProvenance};

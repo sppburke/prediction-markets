@@ -1,0 +1,18 @@
+[
+  {
+    "proxyWallet": "0xfd9b763674cb096cacec059fcfe60ae82aae09e8",
+    "asset": "82474696549130542383104061200782087590711637544881666586439653268073770672093",
+    "conditionId": "0x3f19d2f61d608fca86bbeab555dc434e41eb81d92d9e4a1c2c42c8cff35075ac",
+    "size": 0.12,
+    "avgPrice": 0.5,
+    "initialValue": 0.06,
+    "currentValue": 0,
+    "cashPnl": -0.06,
+    "percentPnl": -100,
+    "redeemable": true,
+    "title": "Solana Up or Down - August 8, 9:00PM-9:05PM ET",
+    "outcome": "Down",
+    "outcomeIndex": 1,
+    "negativeRisk": true
+  }
+]

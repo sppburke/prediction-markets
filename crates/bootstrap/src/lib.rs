@@ -12,6 +12,7 @@
 
 pub mod backfill;
 pub mod cache;
+pub mod cache_migration;
 pub mod chain;
 pub mod clob;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod pile;
 pub mod polymarket;
 pub mod prices_history;
 pub mod purge;
+pub mod reclamation_evidence;
 pub mod wallet_discovery;
 pub mod wallet_set;
 pub mod watchlist_phase;
@@ -125,6 +127,7 @@ pub async fn fetch_resolutions_and_schedules(
 ) -> Result<ResolutionsReport, BootstrapError> {
     if config.rebuild_resolutions {
         cache.delete_source_cursor(clob::CLOB_CLOSED_CURSOR_KEY)?;
+        cache.reset_clob_payout_walk_v2()?;
         let deleted = cache.delete_resolutions_by_sources(&["gamma", "clob"])?;
         tracing::info!(
             deleted,
@@ -169,6 +172,28 @@ pub async fn fetch_resolutions_and_schedules(
         stages_failed,
         clob_order_mismatches: clob_report.order_mismatches,
     })
+}
+
+/// Populate only the schema-v2 CLOB payout generation on a side cache. Unlike
+/// the legacy `resolutions` workflow, this never reads or writes the sealed v1
+/// resolution/cursor owners (#544).
+pub async fn populate_clob_payout_v2(
+    config: &BootstrapConfig,
+    cache: &mut WalletCache,
+) -> Result<pe_source_polymarket_public::ClobCoverageManifest, BootstrapError> {
+    if cache.schema_version()? != cache::CACHE_SCHEMA_VERSION_V2 {
+        return Err(BootstrapError::Invalid {
+            message: "CLOB payout v2 population requires a schema-v2 side cache".to_owned(),
+        });
+    }
+    let fetcher = build_clob_fetcher(config)?;
+    fetcher
+        .fetch_closed_markets(cache)
+        .await?
+        .coverage_manifest
+        .ok_or_else(|| BootstrapError::Clob {
+            message: "terminal CLOB walk omitted its coverage manifest".to_owned(),
+        })
 }
 
 /// CLOB closed-market pagination → `source='clob'` (`end_date_iso` approx).

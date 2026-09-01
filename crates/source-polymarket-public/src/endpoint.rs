@@ -2,6 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 
+const POSITION_CHANGING_ACTIVITY_TYPES: &str = "TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION";
+
+/// Explicit `/positions` partition used by a complete reconciliation read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionPartition {
+    NotRedeemable,
+    Redeemable,
+}
+
+impl PositionPartition {
+    #[must_use]
+    pub const fn redeemable(self) -> bool {
+        match self {
+            Self::NotRedeemable => false,
+            Self::Redeemable => true,
+        }
+    }
+}
+
 /// Sort dimension for the `/v1/leaderboard` endpoint (API `orderBy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -124,6 +144,19 @@ pub enum PolymarketEndpoint {
         start: Option<i64>,
         offset: u32,
     },
+    /// Fixed-end position-changing activity response, starting at offset zero (#544).
+    UserPositionActivity {
+        user: String,
+        end: i64,
+        start: Option<i64>,
+    },
+    /// Strict offset page over all five position-changing activity types (#544).
+    UserPositionActivityPage {
+        user: String,
+        end: i64,
+        start: Option<i64>,
+        offset: u32,
+    },
     /// Live open positions for a single wallet via `/positions`.
     ///
     /// `redeemable`: when `Some(false)`, restrict to live (unresolved) positions.
@@ -135,6 +168,12 @@ pub enum PolymarketEndpoint {
         offset: Option<u32>,
         redeemable: Option<bool>,
         size_threshold: Option<u32>,
+    },
+    /// One exact page of an explicit current-position reconciliation partition (#544).
+    CurrentPositionsReconciliationPage {
+        user: String,
+        partition: PositionPartition,
+        offset: u32,
     },
     ClosedPositions {
         user: String,
@@ -149,7 +188,12 @@ impl PolymarketEndpoint {
             Self::UserTradeActivity { .. } | Self::UserTradeActivityPage { .. } => {
                 "user_trade_activity"
             }
-            Self::CurrentPositions { .. } => "current_positions",
+            Self::UserPositionActivity { .. } | Self::UserPositionActivityPage { .. } => {
+                "user_position_activity"
+            }
+            Self::CurrentPositions { .. } | Self::CurrentPositionsReconciliationPage { .. } => {
+                "current_positions"
+            }
             Self::ClosedPositions { .. } => "closed_positions",
         }
     }
@@ -194,6 +238,29 @@ impl PolymarketEndpoint {
                 }
                 url
             }
+            Self::UserPositionActivity { user, end, start } => {
+                let mut url = format!(
+                    "{base}/activity?user={user}&type={POSITION_CHANGING_ACTIVITY_TYPES}&limit=500&offset=0&sortDirection=DESC&end={end}"
+                );
+                if let Some(start) = start {
+                    url.push_str(&format!("&start={start}"));
+                }
+                url
+            }
+            Self::UserPositionActivityPage {
+                user,
+                end,
+                start,
+                offset,
+            } => {
+                let mut url = format!(
+                    "{base}/activity?user={user}&type={POSITION_CHANGING_ACTIVITY_TYPES}&limit=500&offset={offset}&sortDirection=DESC&end={end}"
+                );
+                if let Some(start) = start {
+                    url.push_str(&format!("&start={start}"));
+                }
+                url
+            }
             Self::CurrentPositions {
                 user,
                 limit,
@@ -216,6 +283,14 @@ impl PolymarketEndpoint {
                 }
                 url
             }
+            Self::CurrentPositionsReconciliationPage {
+                user,
+                partition,
+                offset,
+            } => format!(
+                "{base}/positions?user={user}&sizeThreshold=0&includeArchived=true&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable={}&offset={offset}",
+                partition.redeemable()
+            ),
             Self::ClosedPositions { user } => {
                 format!("{base}/closed-positions?user={user}")
             }
@@ -328,6 +403,19 @@ mod tests {
     }
 
     #[test]
+    fn current_positions_reconciliation_page_has_fixed_complete_query() {
+        let ep = PolymarketEndpoint::CurrentPositionsReconciliationPage {
+            user: "0xabc".into(),
+            partition: PositionPartition::Redeemable,
+            offset: 10_000,
+        };
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/positions?user=0xabc&sizeThreshold=0&includeArchived=true&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable=true&offset=10000"
+        );
+    }
+
+    #[test]
     fn user_trade_activity_with_start_cursor() {
         let ep = PolymarketEndpoint::UserTradeActivity {
             user: "0xabc".into(),
@@ -337,6 +425,35 @@ mod tests {
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
             "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE&limit=500&offset=0&start=1700000000"
+        );
+    }
+
+    #[test]
+    fn user_position_activity_has_fixed_end_and_all_five_types() {
+        let ep = PolymarketEndpoint::UserPositionActivity {
+            user: "0xabc".into(),
+            end: 1_700_000_100,
+            start: Some(1_700_000_000),
+        };
+        assert_eq!(ep.key(), "user_position_activity");
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end=1700000100&start=1700000000"
+        );
+    }
+
+    #[test]
+    fn user_position_activity_page_keeps_offset_and_optional_start() {
+        let ep = PolymarketEndpoint::UserPositionActivityPage {
+            user: "0xabc".into(),
+            end: 1_700_000_100,
+            start: None,
+            offset: 500,
+        };
+        assert_eq!(ep.key(), "user_position_activity");
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=500&sortDirection=DESC&end=1700000100"
         );
     }
 }

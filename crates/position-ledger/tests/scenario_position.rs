@@ -14,7 +14,7 @@
 use pe_copy_signal_engine::IncomingTrade;
 use pe_copy_signal_engine::TradeProvenance;
 use pe_core_types::{
-    ContractQty, MarketId, MarketOutcomeId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId,
+    MarketId, MarketOutcomeId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
 use pe_position_ledger::PositionLedger;
@@ -43,21 +43,22 @@ fn make_trade(wallet: WalletAddress, side: Side, contracts: u64, ts_unix: i64) -
         outcome_id: OutcomeId(0),
         side,
         price: Price(dec!(0.55)),
-        contracts: ContractQty(contracts),
+        contracts: ShareAmount::from_whole(contracts).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(format!("{wallet:?}-{side:?}-{contracts}-{ts_unix}")),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
 
-fn state(ledger: &PositionLedger, wallet: &WalletAddress) -> (u64, u64) {
+fn state(ledger: &PositionLedger, wallet: &WalletAddress) -> (ShareAmount, ShareAmount) {
     let key = MarketOutcomeId::new(market_1(), OutcomeId(0));
     ledger
         .position(wallet)
         .and_then(|snap| snap.positions.get(&key).copied())
         .map(|s| (s.long_contracts, s.short_contracts))
-        .unwrap_or((0, 0))
+        .unwrap_or((ShareAmount::ZERO, ShareAmount::ZERO))
 }
 
 // ── Scenario ──────────────────────────────────────────────────────────────────
@@ -80,37 +81,63 @@ fn scenario_position_evolution() {
     let b = wallet_b();
 
     // t=1000: wallet A opens long
-    ledger.ingest(&make_trade(a, Side::Buy, 10, 1_000));
-    assert_eq!(state(&ledger, &a), (10, 0), "t=1000 after buy 10");
-    assert_eq!(state(&ledger, &b), (0, 0), "t=1000 wallet B unaffected");
-
-    // t=1001: wallet A trims
-    ledger.ingest(&make_trade(a, Side::Sell, 3, 1_001));
-    assert_eq!(state(&ledger, &a), (7, 0), "t=1001 after sell 3");
-
-    // t=1002: wallet A sells more than long — flips to short
-    ledger.ingest(&make_trade(a, Side::Sell, 10, 1_002));
-    assert_eq!(state(&ledger, &a), (0, 3), "t=1002 after sell 10 (flip)");
-
-    // t=1003: wallet A covers 1 contract of short
-    ledger.ingest(&make_trade(a, Side::Buy, 1, 1_003));
-    assert_eq!(state(&ledger, &a), (0, 2), "t=1003 after buy 1 (cover 1)");
-
-    // t=1004: wallet A buys 5 — covers remaining 2 shorts and opens 3 long
-    ledger.ingest(&make_trade(a, Side::Buy, 5, 1_004));
+    ledger.ingest(&make_trade(a, Side::Buy, 10, 1_000)).unwrap();
     assert_eq!(
         state(&ledger, &a),
-        (3, 0),
+        (ShareAmount::from_whole(10).unwrap(), ShareAmount::ZERO),
+        "t=1000 after buy 10"
+    );
+    assert_eq!(
+        state(&ledger, &b),
+        (ShareAmount::ZERO, ShareAmount::ZERO),
+        "t=1000 wallet B unaffected"
+    );
+
+    // t=1001: wallet A trims
+    ledger.ingest(&make_trade(a, Side::Sell, 3, 1_001)).unwrap();
+    assert_eq!(
+        state(&ledger, &a),
+        (ShareAmount::from_whole(7).unwrap(), ShareAmount::ZERO),
+        "t=1001 after sell 3"
+    );
+
+    // t=1002: wallet A sells more than long — flips to short
+    ledger
+        .ingest(&make_trade(a, Side::Sell, 10, 1_002))
+        .unwrap();
+    assert_eq!(
+        state(&ledger, &a),
+        (ShareAmount::ZERO, ShareAmount::from_whole(3).unwrap()),
+        "t=1002 after sell 10 (flip)"
+    );
+
+    // t=1003: wallet A covers 1 contract of short
+    ledger.ingest(&make_trade(a, Side::Buy, 1, 1_003)).unwrap();
+    assert_eq!(
+        state(&ledger, &a),
+        (ShareAmount::ZERO, ShareAmount::from_whole(2).unwrap()),
+        "t=1003 after buy 1 (cover 1)"
+    );
+
+    // t=1004: wallet A buys 5 — covers remaining 2 shorts and opens 3 long
+    ledger.ingest(&make_trade(a, Side::Buy, 5, 1_004)).unwrap();
+    assert_eq!(
+        state(&ledger, &a),
+        (ShareAmount::from_whole(3).unwrap(), ShareAmount::ZERO),
         "t=1004 after buy 5 (cover+open)"
     );
 
     // wallet B independent trade
-    ledger.ingest(&make_trade(b, Side::Buy, 5, 1_000));
-    assert_eq!(state(&ledger, &b), (5, 0), "wallet B long=5");
+    ledger.ingest(&make_trade(b, Side::Buy, 5, 1_000)).unwrap();
+    assert_eq!(
+        state(&ledger, &b),
+        (ShareAmount::from_whole(5).unwrap(), ShareAmount::ZERO),
+        "wallet B long=5"
+    );
     // wallet A state unchanged by wallet B
     assert_eq!(
         state(&ledger, &a),
-        (3, 0),
+        (ShareAmount::from_whole(3).unwrap(), ShareAmount::ZERO),
         "wallet A unaffected by wallet B"
     );
 }

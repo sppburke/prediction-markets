@@ -30,9 +30,9 @@ use pe_core_types::{
 };
 use pe_event_log::{Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
-use pe_service::clob_book::FixtureClobBookFetcher;
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -94,10 +94,11 @@ fn trade(source_trade_id: &str, side: Side, contracts: u64, observed_unix: i64) 
         outcome_id: OutcomeId(0),
         side,
         price: Price(dec!(0.50)),
-        contracts: ContractQty(contracts),
+        contracts: pe_core_types::ShareAmount::from_whole(contracts).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(source_trade_id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -123,7 +124,7 @@ fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::Orchestr
 /// Copy-entry gate disabled for these correctness tests: fail-open (no band since #339).
 /// Paired with an empty history map so every first Entry is admitted.
 fn disabled_entry_gate() -> CopyEntryGateConfig {
-    CopyEntryGateConfig { fail_closed: false }
+    CopyEntryGateConfig
 }
 
 /// Mid-price cache fixture quoting `price` for both outcomes of every market in `markets`,
@@ -135,8 +136,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
         // Single-id `OpenOnly` batch URL the shared GammaMarketsClient builds (#382 Phase 3b);
         // the orchestrator fetches one market per signal, so each is a batch-of-one.
         let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
-        let body =
-            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        let body = format!(
+            r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{m}-0\",\"{m}-1\"]"}}]"#
+        );
         fx.insert(url, body.into_bytes());
     }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
@@ -156,9 +158,33 @@ async fn run_trades(
     strategy_cfg: WinnerFollowConfig,
     trades: Vec<IncomingTrade>,
 ) {
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
     // Quote every traded market at 0.50 so an admitted signal can fetch a current price.
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, "0.50");
+    let books = trades
+        .iter()
+        .map(|trade| {
+            (
+                format!("{}-{}", trade.market_id, trade.outcome_id.0),
+                OrderBook {
+                    asks: vec![BookLevel {
+                        price: dec!(0.50),
+                        size: dec!(10000),
+                    }],
+                    response_blake3: String::new(),
+                    fetched_at_ms: 0,
+                },
+            )
+        })
+        .collect();
 
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
@@ -172,6 +198,7 @@ async fn run_trades(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode,
             signal_config: SignalConfig::default(),
@@ -184,12 +211,11 @@ async fn run_trades(
             // #486: pin the pre-feature haircut basis so this existing assertion stays byte-
             // identical (no /book fetch; leader × 1.05).
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(strategy_cfg),
         make_dispatcher(dir),
         paper_state,
@@ -201,7 +227,7 @@ async fn run_trades(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
@@ -224,7 +250,13 @@ fn leader_long(paper_state: &PaperStateDb) -> u64 {
             r.wallet == leader_wallet() && r.market_id == market() && r.outcome_id == OutcomeId(0)
         })
         .expect("leader position row");
-    row.long_contracts
+    row.long_contracts.atomic()
+}
+
+fn whole_shares(value: u64) -> u64 {
+    pe_core_types::ShareAmount::from_whole(value)
+        .unwrap()
+        .atomic()
 }
 
 // ── AC1 ──────────────────────────────────────────────────────────────────────
@@ -255,7 +287,7 @@ async fn ac1_duplicate_trade_fills_and_ingests_once() {
     assert_eq!(paper_fill_count(&dir), 1, "exactly one PaperFill");
     assert_eq!(
         leader_long(&paper_state),
-        100,
+        whole_shares(100),
         "leader ledger ingested once"
     );
     assert!(
@@ -294,7 +326,7 @@ async fn ac2_no_fill_trade_is_still_deduped() {
     assert_eq!(paper_fill_count(&dir), 0, "no fill in Shadow mode");
     assert_eq!(
         leader_long(&paper_state),
-        100,
+        whole_shares(100),
         "leader ledger ingested once despite no fill"
     );
     assert!(
@@ -329,7 +361,7 @@ async fn ac4_leader_ledger_rehydrates_on_restart() {
             vec![trade("entry-tx", Side::Buy, 100, 1_700_000_000)],
         )
         .await;
-        assert_eq!(leader_long(&paper_state), 100);
+        assert_eq!(leader_long(&paper_state), whole_shares(100));
     }
 
     // "Restart": reopen the persisted DB and rebuild the in-memory ledger.
@@ -340,7 +372,11 @@ async fn ac4_leader_ledger_rehydrates_on_restart() {
         .position(&leader_wallet())
         .and_then(|snap| snap.positions.get(&key).copied())
         .expect("rehydrated leader position");
-    assert_eq!(state.long_contracts, 100, "leader position rehydrated");
+    assert_eq!(
+        state.long_contracts,
+        pe_core_types::ShareAmount::from_whole(100).unwrap(),
+        "leader position rehydrated"
+    );
     assert!(
         restarted
             .is_seen(&SourceTradeId("entry-tx".to_string()))

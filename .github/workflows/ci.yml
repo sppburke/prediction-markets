@@ -77,6 +77,9 @@ jobs:
 
       - run: cargo test --doc --workspace --all-features
 
+      - name: Install Python analytics deps (needed by in-test cross-reader parity, #544)
+        run: python3 -m pip install -r scripts/requirements.txt
+
       - run: cargo nextest run --workspace --all-features
 
       - run: cargo deny check
@@ -84,9 +87,6 @@ jobs:
       - run: cargo audit
 
       - run: cargo metadata --locked --format-version 1 > /dev/null
-
-      - name: Install Python analytics deps
-        run: python3 -m pip install -r scripts/requirements.txt
 
       - name: Python drift-guard tests
         run: |

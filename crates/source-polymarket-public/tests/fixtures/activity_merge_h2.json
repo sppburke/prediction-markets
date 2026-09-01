@@ -1,0 +1,25 @@
+[
+  {
+    "proxyWallet": "0xcf0aca0d7a395202aec661c3666be9cc098e320a",
+    "timestamp": 1787935383,
+    "conditionId": "0x2248856c9fd39c8f9a770ccc48129876b5c008211fcc2200498eb5220d613b43",
+    "type": "MERGE",
+    "size": 187.8314,
+    "usdcSize": 187.8314,
+    "transactionHash": "0x777d637249476649ab07f841f7de69330423b82627055203e135be5dd3012b27",
+    "price": 0,
+    "asset": "",
+    "side": "",
+    "outcomeIndex": 999,
+    "title": "Dota 2: Team Synapse vs Nemiga Gaming (BO3) - EPL Masters Play-In Group A",
+    "slug": "dota2-synaps-nemiga-2026-08-28",
+    "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/dota2-7ffacddb21.jpg",
+    "eventSlug": "dota2-synaps-nemiga-2026-08-28",
+    "outcome": "",
+    "name": "howtoplaydota",
+    "pseudonym": "Rash-Rayon",
+    "bio": "",
+    "profileImage": "",
+    "profileImageOptimized": ""
+  }
+]

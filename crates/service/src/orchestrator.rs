@@ -5,8 +5,7 @@
 //! cache (Gamma), and the CLOB `/book` fetcher — read on every paper `clob_best_ask` BUY for the
 //! best-ask fill basis (#486) and, when the price-impact gate is on, for the size cap (#398 WS2).
 
-use std::collections::{HashMap, HashSet};
-use std::str::FromStr as _;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +17,10 @@ use pe_core_types::{
     ReconstructionQuality, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
     WalletAddress,
 };
-use pe_execution_core::{DispatchResult, ExecutionDispatcher};
-use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
+use pe_execution_core::{DispatchResult, ExecutionDispatcher, ExecutionError};
+use pe_paper_state::{
+    FillRecord, FillRow, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence,
+};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
@@ -32,11 +33,16 @@ use pe_trader_index::Watchlist;
 use pe_venue_polymarket::{AskLevel, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
+use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV2};
 use crate::clob_book::ClobBookFetcher;
-use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
+use crate::decision_replay::{
+    AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
+    MarketPriceEvidence, TerminalDispositionEvidence, ladder_plan_blake3, replay_decision_pending,
+};
+use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
@@ -73,12 +79,99 @@ enum GatePlan {
     NothingAffordable { best_ask: Price },
 }
 
+struct GatePlanEvidence {
+    gate: GatePlan,
+    book: BookEvidence,
+    checked_at_unix_ms: u64,
+}
+
+struct GatePlanFailure {
+    reason: &'static str,
+    book: Box<BookEvidence>,
+    checked_at_unix_ms: Option<u64>,
+}
+
+fn book_failure(
+    token_id: Option<&str>,
+    outcome: &str,
+    response_blake3: Option<&str>,
+    fetched_at_unix_ms: Option<u64>,
+    reason: &str,
+) -> BookEvidence {
+    BookEvidence {
+        request_token_id: token_id.map(str::to_owned),
+        outcome: outcome.to_owned(),
+        response_blake3: response_blake3.map(str::to_owned),
+        fetched_at_unix_ms,
+        best_ask: None,
+        vwap_basis: None,
+        ladder_plan_blake3: None,
+        reason: Some(reason.to_owned()),
+    }
+}
+
+fn unix_millis(instant: OffsetDateTime) -> i64 {
+    i64::try_from(instant.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
+fn record_clock(
+    evidence: &mut Option<DecisionEvidenceAccumulator>,
+    purpose: &str,
+    instant: OffsetDateTime,
+) {
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.record_clock(purpose, unix_millis(instant));
+    }
+}
+
+pub(crate) fn render_pending_evidence(
+    evidence: Option<&DecisionEvidenceAccumulator>,
+    authority: AuthorityEvidence,
+    terminal: TerminalDispositionEvidence,
+) -> Result<Option<(String, i64)>, serde_json::Error> {
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    let terminal_at = OffsetDateTime::now_utc();
+    let mut complete = evidence.clone();
+    complete.record_clock("terminal_transition", unix_millis(terminal_at));
+    let json = complete.render(authority, terminal)?;
+    Ok(Some((json, terminal_at.unix_timestamp())))
+}
+
+pub(crate) fn pending_terminal(value: &(String, i64)) -> PendingTerminalEvidence<'_> {
+    PendingTerminalEvidence {
+        post_commit_inputs_json: &value.0,
+        updated_at_unix: value.1,
+    }
+}
+
+pub(crate) fn recorded_fill_terminal(
+    record: &FillRecord,
+    seq: EventSeq,
+) -> TerminalDispositionEvidence {
+    let side = match record.side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    };
+    TerminalDispositionEvidence::fill(
+        record.idempotency_key.clone(),
+        record.market_id.to_string(),
+        record.outcome_id.0,
+        side,
+        record.contracts,
+        record.fill_price,
+        seq,
+    )
+}
+
 /// Captured pre-admission state for exact rollback (#511): the leader ledger's
 /// pre-trade `(long, short)` for the touched key, or `None` when the trade created it.
 struct RollbackCtx {
     wallet: WalletAddress,
     key: MarketOutcomeId,
-    prev: Option<(u64, u64)>,
+    prev: Option<(ShareAmount, ShareAmount)>,
+    enabled: bool,
 }
 
 /// A post-frame fill whose authority commit has not reached a terminal outcome (#511).
@@ -92,6 +185,7 @@ struct ParkedFill {
     sup_row: Option<SupabaseFillRow>,
     dispatch_id: Option<String>,
     filled_key: MarketOutcomeId,
+    decision_evidence: Option<DecisionEvidenceAccumulator>,
 }
 
 /// Terminal-vs-parked result of a paper fill commit (#511).
@@ -103,6 +197,10 @@ enum PaperCommitResult {
     Refused,
     /// No terminal outcome yet — frozen retry owns the trade (ticker + boot walk).
     Parked,
+    /// Remote authority committed but the local mirror failed (#544 review):
+    /// financial state is uncertain — the caller fails readiness and stops
+    /// producer intake; the durable frame + idempotent RPC reconverge at boot.
+    DurabilityUncertain,
 }
 
 /// Orchestrator configuration.
@@ -136,9 +234,9 @@ pub struct OrchestratorConfig {
     /// with sizing/band-gates keyed off it) or `LeaderHaircut` (the pre-#486 boot-frozen haircut).
     /// Refreshed per event from the runtime-config snapshot when `runtime_config` is `Some`.
     pub fill_mode: FillMode,
-    /// Fallback BUY haircut (bps) applied to the leader price when a `clob_best_ask` fill has no
-    /// usable best-ask (#486). Refreshed per event alongside `fill_mode`.
-    pub clob_best_ask_fallback_haircut_bps: u32,
+    /// Mandatory price-impact ceiling in basis points (#544). Valid values are `1..=10_000`;
+    /// unusable book evidence fails closed before paper fill resolution.
+    pub price_impact_cap_bps: i32,
     /// Copy-entry gate config (first-entry/fail-closed posture). The per-wallet
     /// market history is supplied separately to [`Orchestrator::new`].
     pub entry_gate_config: CopyEntryGateConfig,
@@ -157,6 +255,10 @@ pub struct OrchestratorConfig {
     /// from either source older than this is admitted with a typed no-copy disposition — at
     /// the early gate and again immediately before dispatch staging.
     pub copy_latency_budget_secs: u64,
+    /// Shared structural membership-writer lock. Production supplies the same
+    /// lock used by refresh/maintenance so a newly durable fence is removed
+    /// from the published generation before the bucket acknowledgement (#544).
+    pub watchlist_writer_lock: Option<Arc<Mutex<()>>>,
 }
 
 /// Scenario-only deterministic seams (#546): fixed admission-clock instants consumed in
@@ -173,7 +275,7 @@ pub struct ScenarioHooks {
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     trade_rx: mpsc::Receiver<IncomingTrade>,
-    position_ledger: PositionLedger,
+    bucket_engine: BucketCommitEngine,
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
@@ -214,7 +316,6 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     parked: HashMap<SourceTradeId, ParkedFill>,
     // Copy-entry gate: admits only a leader's first-ever BUY entry into a market
     // (#290; price band removed in #339).
-    entry_gate: CopyEntryGate,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
@@ -234,46 +335,153 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // rebuild at the top of `handle_trade` reads one snapshot. `None` in tests (boot config).
     runtime_config: Option<LiveRuntimeConfig>,
     // Live CLOB /book fetcher for the price-impact gate (#398 WS2). Shared `Arc` with the snapshot
-    // worker so the 5 rps rate gate is global. Consulted only when `price_impact_cap_bps != 0`.
+    // worker so the 5 rps rate gate is global. Consulted for every admitted signal.
     book_fetcher: Arc<B>,
-    // Price-impact gate cap in bps, rebuilt per event from the runtime-config snapshot. `0`
-    // disables the gate (fail-open; no `/book` fetch).
+    // Mandatory price-impact gate cap in bps, rebuilt per event from the runtime-config snapshot.
     price_impact_cap_bps: i32,
     // Paper fill-price mode (#486), rebuilt per event from the runtime-config snapshot. Gates
     // whether a paper BUY fetches the CLOB best-ask (`ClobBestAsk`) or uses the boot-frozen
     // haircut (`LeaderHaircut`).
     fill_mode: FillMode,
-    // Fallback BUY haircut (bps) for a `clob_best_ask` fill with no usable ask (#486), rebuilt
-    // per event alongside `fill_mode`.
-    clob_best_ask_fallback_haircut_bps: u32,
     // Live account contexts (#508): armed targets stage dispatch aggregates. `None` in
     // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
+    /// Set at the first uncertain paper sync boundary. Dropping the receiver
+    /// then backpressures/stops every producer; supervisor owns process exit.
+    intake_stopped: bool,
+    watchlist_writer_lock: Option<Arc<Mutex<()>>>,
+    /// Open production continuations loaded before producers. The durable row
+    /// remains the owner; this queue only preserves its causal boot order.
+    pending_boot: VecDeque<IncomingTrade>,
+    pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
 }
 
-fn apply_control_message(
-    entry_gate: &mut CopyEntryGate,
-    position_ledger: &mut PositionLedger,
-    message: OrchestratorControl,
-) {
-    match message {
-        OrchestratorControl::PositionReseed(map) => {
-            let wallets = map.len();
-            position_ledger.overlay(map);
-            info!(wallets, "leader ledger reseeded from live positions API");
-        }
-        OrchestratorControl::PrepareAdmissions {
-            history,
-            positions,
-            acknowledged,
-        } => {
-            let wallets = positions.len();
-            entry_gate.merge_history(history);
-            position_ledger.overlay(positions);
-            // The acknowledgement is intentionally last: membership remains unpublished until
-            // both single-owner ledgers contain the admission prerequisites.
-            let _ = acknowledged.send(());
-            info!(wallets, "hot-watchlist admission state prepared");
+#[derive(Debug, thiserror::Error)]
+pub enum OrchestratorRunError {
+    #[error("decision-pending recovery failed: {0}")]
+    PendingRecovery(String),
+    #[error("{channel} input channel closed before coordinated shutdown")]
+    PrematureInputClosure { channel: &'static str },
+    #[error("paper durability became uncertain")]
+    PaperDurabilityUncertain,
+}
+
+impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
+    async fn apply_control_message(&mut self, message: OrchestratorControl) {
+        match message {
+            OrchestratorControl::PrepareAdmissions {
+                wallets,
+                acknowledged,
+            } => {
+                if wallets
+                    .iter()
+                    .all(|wallet| !self.bucket_engine.is_fenced(wallet))
+                {
+                    let _ = acknowledged.send(());
+                } else {
+                    warn!(
+                        wallets = wallets.len(),
+                        "admission invalidated by durable wallet fence"
+                    );
+                }
+            }
+            OrchestratorControl::PrepareValidatedAdmissions {
+                validations,
+                acknowledged,
+            } => {
+                let result = validations
+                    .iter()
+                    .try_for_each(|validation| {
+                        if self.bucket_engine.is_fenced(&validation.wallet) {
+                            return Err(format!("wallet {} is fenced", validation.wallet));
+                        }
+                        let capture = crate::position_seeder::ledger_capture(
+                            self.bucket_engine.ledger(),
+                            validation.wallet,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        if capture.hash != validation.ledger_hash {
+                            return Err(format!(
+                                "wallet {} ledger changed before admission install",
+                                validation.wallet
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .and_then(|()| {
+                        self.paper_state
+                            .record_position_validations(&validations)
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = acknowledged.send(result);
+            }
+            OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                let result =
+                    crate::position_seeder::ledger_capture(self.bucket_engine.ledger(), wallet)
+                        .map_err(|error| error.to_string());
+                let _ = captured.send(result);
+            }
+            OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context,
+                committed,
+            } => {
+                // Every position-changing commit invalidates an accepted bracket in
+                // the same SQLite transaction. Serialize that commit against the
+                // final membership recheck/publication so a wallet cannot become
+                // visible from a proof invalidated between those two operations.
+                let writer_lock = self.watchlist_writer_lock.clone();
+                let result = if let Some(writer_lock) = writer_lock {
+                    let _writer_guard = writer_lock.lock().await;
+                    // Freeze the mutable decision basis UNDER the writer lock
+                    // (#544 review round 3): capture is linearized against a
+                    // concurrent refresh, and later watchlist/bankroll moves
+                    // cannot change what a resumed continuation decides.
+                    let frozen_basis = self.freeze_decision_basis(&aggregates);
+                    let result = self
+                        .bucket_engine
+                        .commit(aggregates, &context, frozen_basis);
+                    if let Ok(result) = &result
+                        && result.newly_fenced.is_some()
+                    {
+                        let mut fenced = HashSet::new();
+                        fenced.insert(result.wallet);
+                        // The attached bounded latest-only notifier marks the effective
+                        // projection dirty after this post-commit removal (#544).
+                        self.live_watchlist.remove_fenced(&fenced);
+                    }
+                    result
+                } else {
+                    // Scenario/unit construction may omit the production writer lock;
+                    // those harnesses have no competing membership writer to
+                    // linearize the basis capture against.
+                    let frozen_basis = self.freeze_decision_basis(&aggregates);
+                    let result = self
+                        .bucket_engine
+                        .commit(aggregates, &context, frozen_basis);
+                    if let Ok(result) = &result
+                        && result.newly_fenced.is_some()
+                    {
+                        let mut fenced = HashSet::new();
+                        fenced.insert(result.wallet);
+                        self.live_watchlist.remove_fenced(&fenced);
+                    }
+                    result
+                };
+                if let Ok(result) = &result {
+                    for source_trade_id in &result.pending {
+                        match self.load_pending_continuation(source_trade_id) {
+                            Ok(Some(trade)) => self.handle_trade(trade).await,
+                            Ok(None) => {}
+                            Err(error) => {
+                                error!(%error, trade = %source_trade_id, "load committed decision continuation failed");
+                            }
+                        }
+                    }
+                }
+                let result = result.map_err(|error| error.to_string());
+                let _ = committed.send(result);
+            }
         }
     }
 }
@@ -284,7 +492,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         trade_rx: mpsc::Receiver<IncomingTrade>,
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
-        history_map: HashMap<WalletAddress, HashSet<MarketId>>,
         strategy: WinnerFollowStrategy,
         dispatcher: ExecutionDispatcher,
         paper_state: Arc<PaperStateDb>,
@@ -300,6 +507,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
+        if !(1..=10_000).contains(&config.price_impact_cap_bps) {
+            return Err(anyhow::anyhow!(
+                "price_impact_cap_bps must be in 1..=10_000"
+            ));
+        }
 
         // Seed the dedup set from any positions already in the DB (crash-restart safety).
         let filled_positions: HashSet<MarketOutcomeId> = paper_state
@@ -310,9 +522,36 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .map(|p| MarketOutcomeId::new(p.market_id, p.outcome_id))
             .collect();
 
+        let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
+            .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
+        for row in paper_state
+            .decision_pending_history()
+            .map_err(|error| anyhow::anyhow!("load decision continuation history: {error}"))?
+            .into_iter()
+            .filter(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
+        {
+            replay_decision_pending(&row).map_err(|error| {
+                anyhow::anyhow!("verify terminal pending {}: {error}", row.source_trade_id)
+            })?;
+        }
+        let mut pending_boot = VecDeque::new();
+        let mut pending_continuations = HashMap::new();
+        for row in paper_state
+            .open_decision_pending()
+            .map_err(|error| anyhow::anyhow!("load open decision continuations: {error}"))?
+        {
+            let continuation = DecisionContinuationV2::from_durable(&row).map_err(|error| {
+                anyhow::anyhow!("decode pending {}: {error}", row.source_trade_id)
+            })?;
+            let trade = continuation.incoming_trade().map_err(|error| {
+                anyhow::anyhow!("rebuild pending {}: {error}", row.source_trade_id)
+            })?;
+            pending_continuations.insert(row.source_trade_id, continuation);
+            pending_boot.push_back(trade);
+        }
         Ok(Self {
             trade_rx,
-            position_ledger: leader_ledger,
+            bucket_engine,
             live_watchlist,
             signal_config: config.signal_config,
             strategy,
@@ -335,7 +574,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             paper_fill_slippage_bps: config.paper_fill_slippage_bps,
             filled_positions,
             parked: HashMap::new(),
-            entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
             control_rx,
             sink,
@@ -343,10 +581,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             supabase_state,
             runtime_config: config.runtime_config,
             book_fetcher,
-            price_impact_cap_bps: 0,
+            price_impact_cap_bps: config.price_impact_cap_bps,
             fill_mode: config.fill_mode,
-            clob_best_ask_fallback_haircut_bps: config.clob_best_ask_fallback_haircut_bps,
             live_accounts: config.live_accounts,
+            intake_stopped: false,
+            watchlist_writer_lock: config.watchlist_writer_lock,
+            pending_boot,
+            pending_continuations,
         })
     }
 
@@ -369,6 +610,29 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         OffsetDateTime::now_utc()
     }
 
+    fn load_pending_continuation(
+        &mut self,
+        source_trade_id: &SourceTradeId,
+    ) -> Result<Option<IncomingTrade>, anyhow::Error> {
+        let row = self
+            .paper_state
+            .open_decision_pending()
+            .map_err(|error| anyhow::anyhow!("read open continuations: {error}"))?
+            .into_iter()
+            .find(|row| &row.source_trade_id == source_trade_id);
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let continuation = DecisionContinuationV2::from_durable(&row)
+            .map_err(|error| anyhow::anyhow!("decode pending {source_trade_id}: {error}"))?;
+        let trade = continuation
+            .incoming_trade()
+            .map_err(|error| anyhow::anyhow!("rebuild pending {source_trade_id}: {error}"))?;
+        self.pending_continuations
+            .insert(source_trade_id.clone(), continuation);
+        Ok(Some(trade))
+    }
+
     #[cfg(feature = "scenario")]
     fn take_scenario_fault(
         &self,
@@ -384,8 +648,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     ///
     /// On shutdown, remaining trades already buffered in the channel are drained
     /// and processed before returning — no in-flight fills are lost.
+    pub async fn resume_pending_before_producers(&mut self) -> Result<(), anyhow::Error> {
+        // Production boot recovery runs before either producer receiver is polled.
+        // `handle_trade` detects the durable pending owner and skips ledger/gate/history.
+        while let Some(trade) = self.pending_boot.pop_front() {
+            self.handle_trade(trade).await;
+            if self.intake_stopped {
+                return Err(anyhow::anyhow!(
+                    "paper durability became uncertain while resuming decision_pending"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
+        if let Err(error) = self.resume_pending_before_producers().await {
+            error!(%error, "decision_pending boot recovery failed");
+            return;
+        }
         let mut trades_done = false;
         let mut control_done = false;
         // #511 frozen-retry ticker: drives parked post-frame fills to a terminal outcome.
@@ -410,18 +692,72 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 }
                 result = self.control_rx.recv(), if !control_done => {
                     match result {
-                        Some(message) => apply_control_message(
-                            &mut self.entry_gate,
-                            &mut self.position_ledger,
-                            message,
-                        ),
+                        Some(message) => self.apply_control_message(message).await,
                         None => control_done = true,
                     }
                 }
                 result = self.trade_rx.recv(), if !trades_done => {
                     match result {
-                        Some(trade) => self.handle_trade(trade).await,
+                        Some(trade) => {
+                            self.handle_trade(trade).await;
+                            if self.intake_stopped {
+                                trades_done = true;
+                            }
+                        },
                         None => trades_done = true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Supervised production loop. Once `shutdown` resolves this owner drains both accepted
+    /// input channels and every parked durable continuation before returning. A channel closure
+    /// before coordinated shutdown is a typed critical failure.
+    pub async fn run_coordinated(
+        mut self,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), OrchestratorRunError> {
+        tokio::pin!(shutdown);
+        self.resume_pending_before_producers()
+            .await
+            .map_err(|error| OrchestratorRunError::PendingRecovery(error.to_string()))?;
+        let mut draining = false;
+        let mut trades_done = false;
+        let mut control_done = false;
+        let mut parked_tick = tokio::time::interval(Duration::from_secs(PARKED_RETRY_SECS));
+        parked_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            if self.intake_stopped {
+                return Err(OrchestratorRunError::PaperDurabilityUncertain);
+            }
+            if draining && trades_done && control_done && self.parked.is_empty() {
+                return Ok(());
+            }
+
+            tokio::select! {
+                biased;
+                _ = &mut shutdown, if !draining => draining = true,
+                _ = parked_tick.tick(), if !self.parked.is_empty() => {
+                    self.retry_parked().await;
+                }
+                result = self.control_rx.recv(), if !control_done => {
+                    match result {
+                        Some(message) => self.apply_control_message(message).await,
+                        None if draining => control_done = true,
+                        None => return Err(OrchestratorRunError::PrematureInputClosure {
+                            channel: "orchestrator_control",
+                        }),
+                    }
+                }
+                result = self.trade_rx.recv(), if !trades_done => {
+                    match result {
+                        Some(trade) => self.handle_trade(trade).await,
+                        None if draining => trades_done = true,
+                        None => return Err(OrchestratorRunError::PrematureInputClosure {
+                            channel: "trade_input",
+                        }),
                     }
                 }
             }
@@ -439,9 +775,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// affording no whole share both produce no order. The planner budget follows the sizing
     /// mode: `Dollar` plans within its USD notional; `Contract` caps at the requested count
     /// within the available bankroll; `Kelly` plans the full in-band depth within bankroll.
-    async fn plan_impact_gate(&self, signal: &LeaderSignal) -> Result<GatePlan, &'static str> {
-        let cap_bps =
-            u64::try_from(self.price_impact_cap_bps).map_err(|_| "impact gate cap invalid")?;
+    async fn plan_impact_gate(
+        &self,
+        signal: &LeaderSignal,
+        sizing_bankroll: Decimal,
+    ) -> Result<GatePlanEvidence, GatePlanFailure> {
+        let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
+            reason: "impact gate cap invalid",
+            book: Box::new(book_failure(
+                None,
+                "not_read",
+                None,
+                None,
+                "impact gate cap invalid",
+            )),
+            checked_at_unix_ms: None,
+        })?;
         let snaps = self
             .mid_price_cache
             .fetch_snapshots(std::slice::from_ref(&signal.market_id))
@@ -451,7 +800,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .get(usize::from(signal.outcome_id.0))
                 .cloned()
         }) else {
-            return Err("price-impact book unusable: missing CLOB token (fail closed)");
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: missing CLOB token (fail closed)",
+                book: Box::new(book_failure(
+                    None,
+                    "missing_token",
+                    None,
+                    None,
+                    "outcome had no CLOB token id",
+                )),
+                checked_at_unix_ms: None,
+            });
         };
         let book = match tokio::time::timeout(
             Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
@@ -461,20 +820,74 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         {
             Ok(Ok(book)) => book,
             Ok(Err(_)) => {
-                return Err("price-impact book unusable: /book fetch failed (fail closed)");
+                return Err(GatePlanFailure {
+                    reason: "price-impact book unusable: /book fetch failed (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "fetch_failed",
+                        None,
+                        None,
+                        "/book fetch failed",
+                    )),
+                    checked_at_unix_ms: None,
+                });
             }
             Err(_) => {
-                return Err("price-impact book unusable: /book fetch timed out (fail closed)");
+                return Err(GatePlanFailure {
+                    reason: "price-impact book unusable: /book fetch timed out (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "fetch_timed_out",
+                        None,
+                        None,
+                        "/book fetch timed out",
+                    )),
+                    checked_at_unix_ms: None,
+                });
             }
         };
         let Some(ladder) = book.ladder() else {
-            return Err("price-impact book unusable: corrupt ask levels (fail closed)");
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: corrupt ask levels (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "corrupt_ladder",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "ask levels could not form an exact ladder",
+                )),
+                checked_at_unix_ms: None,
+            });
         };
         let Some(best) = ladder.first().map(|l| l.price) else {
-            return Err("price-impact book unusable: empty ask book (fail closed)");
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: empty ask book (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "empty_ladder",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "ask ladder was empty",
+                )),
+                checked_at_unix_ms: None,
+            });
         };
-        if ladder_is_stale(crate::clob_book::now_unix_ms(), book.fetched_at_ms) {
-            return Err("price-impact book unusable: stale snapshot (fail closed)");
+        let checked_at_unix_ms = crate::clob_book::now_unix_ms();
+        if ladder_is_stale(checked_at_unix_ms, book.fetched_at_ms) {
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: stale snapshot (fail closed)",
+                book: Box::new(BookEvidence {
+                    request_token_id: Some(token_id),
+                    outcome: "stale".to_owned(),
+                    response_blake3: Some(book.response_blake3),
+                    fetched_at_unix_ms: Some(book.fetched_at_ms),
+                    best_ask: Some(best.0.normalize().to_string()),
+                    vwap_basis: None,
+                    ladder_plan_blake3: None,
+                    reason: Some("snapshot exceeded the ladder age bound".to_owned()),
+                }),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            });
         }
         // Inclusive band ceiling: best × (1 + cap/10_000), clamped into the Price domain —
         // the same edge semantic as the analytics `absorbable_usd_100bps` column.
@@ -482,35 +895,108 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             * (Decimal::from(10_000u32 + u32::try_from(cap_bps).unwrap_or(10_000))
                 / Decimal::from(10_000u32)))
         .min(Decimal::ONE);
-        let ceiling =
-            Price::new(ceiling_raw).map_err(|_| "price-impact band ceiling not constructible")?;
+        let ceiling = Price::new(ceiling_raw).map_err(|_| GatePlanFailure {
+            reason: "price-impact band ceiling not constructible",
+            book: Box::new(book_failure(
+                Some(&token_id),
+                "arithmetic_failure",
+                Some(&book.response_blake3),
+                Some(book.fetched_at_ms),
+                "price-impact band ceiling not constructible",
+            )),
+            checked_at_unix_ms: Some(checked_at_unix_ms),
+        })?;
         // Planner budget from the sizing mode; 6-dp truncation never overstates the budget.
         let to_budget = |d: Decimal| {
             CollateralAmount::from_decimal_exact(
                 d.max(Decimal::ZERO)
                     .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
             )
-            .map_err(|_| "impact budget not constructible")
+            .map_err(|_| GatePlanFailure {
+                reason: "impact budget not constructible",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "arithmetic_failure",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "impact budget not constructible",
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            })
         };
         let (budget, max_shares) = match self.strategy.config().sizing_mode {
             SizingMode::Dollar { usd } => (to_budget(usd)?, None),
-            SizingMode::Contract { contracts } => (to_budget(self.bankroll)?, Some(contracts)),
-            SizingMode::Kelly => (to_budget(self.bankroll)?, None),
+            SizingMode::Contract { contracts } => (to_budget(sizing_bankroll)?, Some(contracts)),
+            SizingMode::Kelly => (to_budget(sizing_bankroll)?, None),
         };
-        let max_price = Price::new(Decimal::ONE).map_err(|_| "price domain invariant broken")?;
+        let max_price = Price::new(Decimal::ONE).map_err(|_| GatePlanFailure {
+            reason: "price domain invariant broken",
+            book: Box::new(book_failure(
+                Some(&token_id),
+                "arithmetic_failure",
+                Some(&book.response_blake3),
+                Some(book.fetched_at_ms),
+                "price domain invariant broken",
+            )),
+            checked_at_unix_ms: Some(checked_at_unix_ms),
+        })?;
         match plan_budget_buy(&ladder, budget, max_shares, Price::ZERO, max_price, ceiling) {
-            Ok(plan) => Ok(GatePlan::Planned(plan)),
+            Ok(plan) => Ok(GatePlanEvidence {
+                book: BookEvidence {
+                    request_token_id: Some(token_id),
+                    outcome: "planned".to_owned(),
+                    response_blake3: Some(book.response_blake3),
+                    fetched_at_unix_ms: Some(book.fetched_at_ms),
+                    best_ask: Some(plan.best_ask.0.normalize().to_string()),
+                    vwap_basis: plan.vwap().map(|value| value.0.normalize().to_string()),
+                    ladder_plan_blake3: Some(ladder_plan_blake3(&plan)),
+                    reason: None,
+                },
+                gate: GatePlan::Planned(plan),
+                checked_at_unix_ms,
+            }),
             // Decision 10 taxonomy (#508): a SUCCESSFUL read whose in-band depth cannot
             // absorb the paper budget is a PAPER-ONLY decision — it must never suppress
             // otherwise-admissible live targets, so it is not a shared rejection. The
             // best ask from the successful read anchors the shared band gate.
-            Err(LadderError::NothingAffordable) => {
-                Ok(GatePlan::NothingAffordable { best_ask: best })
-            }
+            Err(LadderError::NothingAffordable) => Ok(GatePlanEvidence {
+                book: BookEvidence {
+                    request_token_id: Some(token_id),
+                    outcome: "nothing_affordable".to_owned(),
+                    response_blake3: Some(book.response_blake3),
+                    fetched_at_unix_ms: Some(book.fetched_at_ms),
+                    best_ask: Some(best.0.normalize().to_string()),
+                    vwap_basis: None,
+                    ladder_plan_blake3: None,
+                    reason: Some("budget afforded no whole share".to_owned()),
+                },
+                gate: GatePlan::NothingAffordable { best_ask: best },
+                checked_at_unix_ms,
+            }),
             Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
-                Err("price-impact ladder walk failed (fail closed)")
+                Err(GatePlanFailure {
+                    reason: "price-impact ladder walk failed (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "ladder_rejected",
+                        Some(&book.response_blake3),
+                        Some(book.fetched_at_ms),
+                        "ladder walk did not satisfy the price band",
+                    )),
+                    checked_at_unix_ms: Some(checked_at_unix_ms),
+                })
             }
-            Err(LadderError::Amount) => Err("price-impact ladder arithmetic failed (fail closed)"),
+            Err(LadderError::Amount) => Err(GatePlanFailure {
+                reason: "price-impact ladder arithmetic failed (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "arithmetic_failure",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "ladder arithmetic failed",
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            }),
         }
     }
 
@@ -520,7 +1006,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// no target exists (no aggregate; the Phase-A baseline path). A staging failure is a
     /// hard skip signalled as `Err` — the caller abandons the trade without marking it
     /// seen, so a redelivery can retry the whole admission.
-    fn stage_dispatch_if_targeted(&self, signal: &LeaderSignal) -> Result<Option<String>, ()> {
+    fn stage_dispatch_if_targeted(
+        &self,
+        signal: &LeaderSignal,
+        evidence: &mut Option<DecisionEvidenceAccumulator>,
+    ) -> Result<Option<String>, ()> {
         let Some(live) = self.live_accounts.as_ref() else {
             return Ok(None);
         };
@@ -528,7 +1018,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // #514: no NEW live aggregates while blind — a stale/never-successful accounts
         // snapshot stages nothing. Paper execution proceeds unchanged; in-flight recovery
         // and redemption reconciliation do not gate on freshness.
-        if !snapshot.is_fresh(OffsetDateTime::now_utc().unix_timestamp()) {
+        let accounts_at = OffsetDateTime::now_utc();
+        record_clock(evidence, "live_accounts_freshness", accounts_at);
+        if !snapshot.is_fresh(accounts_at.unix_timestamp()) {
             warn!(
                 "live accounts snapshot is stale; dispatch staging paused (no new live aggregates)"
             );
@@ -560,11 +1052,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             "price_impact_cap_bps": self.price_impact_cap_bps,
             "mode": format!("{:?}", self.mode),
         });
+        let staged_at = OffsetDateTime::now_utc();
+        record_clock(evidence, "dispatch_seed_created", staged_at);
         let record = pe_paper_state::DispatchSeedRecord {
             dispatch_id: dispatch_id.clone(),
             signal_json: frozen.to_string(),
             source_trade_id: signal.source_trade_id.0.clone(),
-            created_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            created_at_unix: staged_at.unix_timestamp(),
             targets,
         };
         #[cfg(feature = "scenario")]
@@ -573,7 +1067,21 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
             return Err(());
         }
-        match self.paper_state.stage_dispatch_seed(&record) {
+        let pending = match render_pending_evidence(
+            evidence.as_ref(),
+            AuthorityEvidence::not_read("dispatch_staged_before_fill_authority"),
+            TerminalDispositionEvidence::dispatch_staged(dispatch_id.clone()),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, dispatch_id = %dispatch_id, "encode dispatch decision evidence failed");
+                return Err(());
+            }
+        };
+        match self
+            .paper_state
+            .stage_dispatch_seed_pending(&record, pending.as_ref().map(pending_terminal))
+        {
             Ok(_staged_or_reused) => Ok(Some(dispatch_id)),
             Err(e) => {
                 error!(
@@ -587,118 +1095,100 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
-    /// Resolve the paper fill basis + its provenance for `signal` (#486).
-    ///
-    /// Paper mode with `fill_mode == ClobBestAsk` and a BUY fetches the fresh CLOB `/book` for the
-    /// signal's outcome token and returns the best-ask ([`FillSource::ClobBestAsk`]) when usable,
-    /// else the `clob_best_ask_fallback_haircut_bps` fallback ([`FillSource::Fallback`]). The
-    /// production copy-entry gate rejects SELLs before this method. Its defensive non-BUY branch
-    /// retains the generic executor's SELL haircut but is unreachable from Winner-Follow.
-    /// `LeaderHaircut` mode and every non-paper mode return the boot-frozen haircut price
-    /// ([`FillSource::LeaderHaircut`]), byte-identical to the pre-#486 basis. Only the paper-mode
-    /// result is threaded to the executor as `observed_fill_price`; other modes pass `None` and
-    /// the executor recomputes the identical haircut.
-    async fn resolve_fill_price(
+    /// Resolve the local paper fill basis for paths that do not use the mandatory CLOB plan.
+    /// A paper `clob_best_ask` BUY is rejected before this point unless the single impact-gate
+    /// request produced a usable ladder basis (#544).
+    fn resolve_fill_price(
         &self,
         signal: &LeaderSignal,
     ) -> Result<(Price, FillSource), PaperExecutionError> {
-        // Non-paper modes and the leader_haircut fill mode: the boot-frozen local haircut, no fetch.
-        if self.mode != ExecutionMode::Paper || self.fill_mode != FillMode::ClobBestAsk {
-            let price = PaperExecutor::fill_price(
-                signal.leader_side,
-                signal.leader_price,
-                self.paper_fill_haircut_bps,
-                self.paper_fill_slippage_bps,
-            )?;
-            return Ok((price, FillSource::LeaderHaircut));
-        }
-        // clob_best_ask paper mode. The best-ask is the BUY-side price the copy would cross, and
-        // the `/book` has no bids, so only a BUY fetches; a SELL falls through to the shared SELL
-        // haircut branch below.
-        if signal.leader_side == Side::Buy
-            && let Some(ask) = self.fetch_best_ask(signal).await
-        {
-            return Ok((ask, FillSource::ClobBestAsk));
-        }
-        // Fallback: leader_price × (1 + clob_best_ask_fallback_haircut_bps/10_000) on a BUY, or the
-        // shared SELL slippage branch. The SELL branch of `fill_price` ignores the haircut arg and
-        // applies only `slippage_bps`, so pass the boot-frozen `paper_fill_slippage_bps` to keep a
-        // SELL byte-identical to the pre-#486 fill; the haircut arg is dead there and drives a BUY.
         let price = PaperExecutor::fill_price(
             signal.leader_side,
             signal.leader_price,
-            self.clob_best_ask_fallback_haircut_bps,
+            self.paper_fill_haircut_bps,
             self.paper_fill_slippage_bps,
         )?;
-        Ok((price, FillSource::Fallback))
+        Ok((price, FillSource::LeaderHaircut))
     }
 
-    /// Fetch the fresh CLOB best-ask (positive price AND positive size) for `signal`'s outcome
-    /// token, or `None` on any non-usable outcome — missing CLOB token, `/book` fetch error or
-    /// timeout, empty book, a best-ask that fails `Price::new`, or a zero / zero-size level — so
-    /// the caller takes the fallback haircut (#486). The 2 s timeout mirrors the price-impact gate.
-    async fn fetch_best_ask(&self, signal: &LeaderSignal) -> Option<Price> {
-        // The outcome's CLOB token id (served from the mid cache, warm from the mid gate above).
-        let snaps = self
-            .mid_price_cache
-            .fetch_snapshots(std::slice::from_ref(&signal.market_id))
-            .await;
-        let token_id = snaps.get(&signal.market_id).and_then(|s| {
-            s.clob_token_ids
-                .get(usize::from(signal.outcome_id.0))
-                .cloned()
-        })?;
-        let book = match tokio::time::timeout(
-            Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
-            self.book_fetcher.fetch_book(&token_id),
-        )
-        .await
-        {
-            Ok(Ok(book)) => book,
-            Ok(Err(e)) => {
-                info!(error = %e, market = %signal.market_id, "best-ask /book fetch failed; using fallback haircut");
-                return None;
-            }
-            Err(_) => {
-                info!(market = %signal.market_id, "best-ask /book fetch timed out; using fallback haircut");
-                return None;
-            }
-        };
-        // `OrderBook::best_ask` ignores level size, so compute the min price among positive-size
-        // levels here: a zero-size dust level must not set the fill basis (and slip a copy past the
-        // band gate). A non-positive best-ask (unreachable at 0.01 ticks) is guarded defensively.
-        let best_ask = book
-            .asks
-            .iter()
-            .filter(|l| l.size > Decimal::ZERO && l.price > Decimal::ZERO)
-            .map(|l| l.price)
-            .min()?;
-        Price::new(best_ask).ok()
+    fn apply_runtime_snapshot(&mut self, rc: &runtime_config::RuntimeConfig) {
+        self.strategy.set_config(rc.winner_follow_config());
+        if let Some(mode) = runtime_config::parse_execution_mode(&rc.mode) {
+            self.mode = mode;
+        }
+        self.max_fill_price = rc.max_fill_price;
+        self.min_fill_price = rc.min_fill_price;
+        self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
+        self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
+        self.price_impact_cap_bps = rc.price_impact_cap_bps;
+        self.fill_mode = rc.fill_mode;
     }
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
-        // #398 WS1: rebuild the runtime-mutable knobs from the latest Supabase config snapshot,
-        // once per event, so an admin edit takes effect within one poll with no restart. Reads
-        // only — the running `self.bankroll` (owned by the fill-commit path, #397) is untouched.
-        if let Some(rc) = self.runtime_config.as_ref().map(|live| live.snapshot()) {
-            self.strategy.set_config(rc.winner_follow_config());
-            if let Some(m) = runtime_config::parse_execution_mode(&rc.mode) {
-                self.mode = m;
+        let source_trade_id = trade.source_trade_id.clone();
+        let pending_owned = self.pending_continuations.contains_key(&source_trade_id);
+        self.handle_trade_once(trade).await;
+        if pending_owned {
+            match self.paper_state.is_decision_pending_open(&source_trade_id) {
+                Ok(true) => {
+                    error!(trade = %source_trade_id, "decision_pending continuation remained open; stopping producer intake for boot recovery");
+                    self.intake_stopped = true;
+                }
+                Ok(false) => {
+                    self.pending_continuations.remove(&source_trade_id);
+                }
+                Err(error) => {
+                    error!(%error, trade = %source_trade_id, "verify decision_pending terminal transition failed");
+                    self.intake_stopped = true;
+                }
             }
-            if let Ok(price) = Decimal::from_str(&rc.max_fill_price) {
-                self.max_fill_price = price;
-            }
-            if let Ok(price) = Decimal::from_str(&rc.min_fill_price) {
-                self.min_fill_price = price;
-            }
-            self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
-            self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
-            self.entry_gate.set_fail_closed(rc.entry_gate_fail_closed);
-            self.price_impact_cap_bps = rc.price_impact_cap_bps;
-            // #486: fill mode + fallback haircut ARE runtime-mutable — the executor is a pure
-            // recorder of the orchestrator-resolved basis, so no boot-frozen executor knob desyncs.
-            self.fill_mode = rc.fill_mode;
-            self.clob_best_ask_fallback_haircut_bps = rc.clob_best_ask_fallback_haircut_bps;
+        }
+    }
+
+    async fn handle_trade_once(&mut self, mut trade: IncomingTrade) {
+        let pending = match self
+            .pending_continuations
+            .get(&trade.source_trade_id)
+            .cloned()
+        {
+            Some(continuation) => match self
+                .paper_state
+                .is_decision_pending_open(&trade.source_trade_id)
+            {
+                Ok(true) => {
+                    match continuation.incoming_trade() {
+                        Ok(frozen_trade) => trade = frozen_trade,
+                        Err(error) => {
+                            error!(%error, trade = %trade.source_trade_id, "invalid durable continuation");
+                            return;
+                        }
+                    }
+                    Some(continuation)
+                }
+                Ok(false) => {
+                    self.pending_continuations.remove(&trade.source_trade_id);
+                    None
+                }
+                Err(error) => {
+                    error!(%error, trade = %trade.source_trade_id, "read pending continuation state failed");
+                    return;
+                }
+            },
+            None => None,
+        };
+        let mut decision_evidence = pending.as_ref().map(DecisionEvidenceAccumulator::new);
+        // New decisions use the current hot snapshot. A committed continuation instead
+        // reinstalls its complete frozen 17-key snapshot before any post-boundary read.
+        let applied_runtime = pending
+            .as_ref()
+            .map(|continuation| continuation.applied_configuration.clone())
+            .or_else(|| {
+                self.runtime_config
+                    .as_ref()
+                    .map(|live| live.snapshot().as_ref().clone())
+            });
+        if let Some(rc) = applied_runtime.as_ref() {
+            self.apply_runtime_snapshot(rc);
             // NOTE: paper_fill_haircut/slippage_bps are deliberately NOT refreshed here. The
             // `PaperExecutor` that records the fill bakes them in at boot with no runtime setter,
             // so refreshing only the sizing side would desync sizing from the recorded fill after
@@ -710,7 +1200,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // source unhealthy). A blocked trade is refused BEFORE any state write -
         // it stays unseen, so the held cursor / firehose backstop redelivers it
         // exactly once when a source recovers.
-        let admission_blocked = {
+        let admission_blocked = pending.is_none() && {
             let h = self
                 .health
                 .lock()
@@ -758,12 +1248,84 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // ledger/cluster mutation. A trade already processed (RTDS then poll
         // backstop, or a re-poll) must not advance the leader ledger a second time.
         match self.paper_state.is_seen(&trade.source_trade_id) {
+            Ok(true) if pending.is_some() => {}
             Ok(true) => return,
             Ok(false) => {}
             Err(e) => {
                 error!(error = %e, "paper-state is_seen failed; skipping trade");
                 return;
             }
+        }
+
+        // A durable fence is an immediate decision boundary (#544). Legacy v1 deliveries
+        // still advance the exact ledger when their effect is known, but must not read the
+        // watchlist, classify, mutate the entry gate, fetch market/book evidence, fill, or seed.
+        if self.bucket_engine.is_fenced(&trade.wallet) {
+            if pending.is_some() {
+                let leader = self.leader_position_row(&trade);
+                let fenced_at = self.admission_now();
+                record_clock(
+                    &mut decision_evidence,
+                    "wallet_fence_terminal_check",
+                    fenced_at,
+                );
+                let disposition = pe_paper_state::NoCopyDisposition {
+                    provenance: "reconciled_rest".to_owned(),
+                    age_secs: 0,
+                    reason: "wallet_fenced_before_dispatch".to_owned(),
+                    recorded_at_unix: fenced_at.unix_timestamp(),
+                };
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader,
+                    &disposition,
+                    &RollbackCtx {
+                        wallet: trade.wallet,
+                        key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
+                        prev: None,
+                        enabled: false,
+                    },
+                    None,
+                    decision_evidence.as_ref(),
+                );
+                return;
+            }
+            let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+            let previous = self
+                .bucket_engine
+                .ledger()
+                .position(&trade.wallet)
+                .and_then(|snapshot| snapshot.positions.get(&key))
+                .map(|state| (state.long_contracts, state.short_contracts));
+            let rollback = RollbackCtx {
+                wallet: trade.wallet,
+                key,
+                prev: previous,
+                enabled: true,
+            };
+            if let Err(error) = self.bucket_engine.ledger_mut().ingest(&trade) {
+                error!(%error, trade = %trade.source_trade_id, "fenced-wallet ledger advance failed");
+                return;
+            }
+            let leader = self.leader_position_row(&trade);
+            let provenance = match trade.provenance {
+                TradeProvenance::RestPoll => "rest_poll",
+                TradeProvenance::ActivityWs => "activity_ws",
+            };
+            self.commit_no_copy_or_rollback(
+                &trade,
+                &leader,
+                &pe_paper_state::NoCopyDisposition {
+                    provenance: provenance.to_owned(),
+                    age_secs: 0,
+                    reason: "wallet_fenced".to_owned(),
+                    recorded_at_unix: self.admission_now().unix_timestamp(),
+                },
+                &rollback,
+                None,
+                decision_evidence.as_ref(),
+            );
+            return;
         }
 
         // One consistent watchlist snapshot for this event (ArcSwap hot path): every
@@ -780,80 +1342,127 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return;
         }
 
-        // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
-        // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
-        // classification, not before.
-        let position = self.position_ledger.position(&trade.wallet).cloned();
-
-        // #511 exact-rollback capture: the pre-trade (long, short) for the touched key.
-        // An abandoned-unseen exit restores this so redelivery re-admits byte-identically
-        // (`ingest` has no trade-id memory and classification reads pre-trade state).
-        let rb = RollbackCtx {
-            wallet: trade.wallet,
-            key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
-            prev: position
-                .as_ref()
-                .and_then(|s| {
-                    s.positions.get(&MarketOutcomeId::new(
-                        trade.market_id.clone(),
-                        trade.outcome_id,
-                    ))
-                })
-                .map(|st| (st.long_contracts, st.short_contracts)),
+        let (rb, leader_row, signal) = if let Some(continuation) = pending.as_ref() {
+            let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+            (
+                RollbackCtx {
+                    wallet: trade.wallet,
+                    key,
+                    prev: None,
+                    enabled: false,
+                },
+                self.leader_position_row(&trade),
+                LeaderSignal {
+                    leader: TraderId(trade.wallet),
+                    venue: VenueId::polymarket(),
+                    market_id: trade.market_id.clone(),
+                    outcome_id: trade.outcome_id,
+                    action: continuation.pre_bucket_action,
+                    leader_side: trade.side,
+                    leader_price: trade.price,
+                    leader_size: trade.contracts,
+                    observed_at: trade.observed_at,
+                    received_at: trade.received_at,
+                    reconstruction_quality: continuation.reconstruction_quality,
+                    source_trade_id: trade.source_trade_id.clone(),
+                    action_confidence_ppm: continuation.action_confidence_ppm,
+                },
+            )
+        } else {
+            // Capture pre-trade state, then advance the legacy v1 ledger exactly once.
+            let position = self.bucket_engine.ledger().position(&trade.wallet).cloned();
+            let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+            let rb = RollbackCtx {
+                wallet: trade.wallet,
+                key: key.clone(),
+                prev: position
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.positions.get(&key))
+                    .map(|state| (state.long_contracts, state.short_contracts)),
+                enabled: true,
+            };
+            if let Err(error) = self.bucket_engine.ledger_mut().ingest(&trade) {
+                error!(%error, trade = %trade.source_trade_id, "leader ledger rejected trade");
+                return;
+            }
+            let leader_row = self.leader_position_row(&trade);
+            // Preserve version-one admission ordering: its stale bookkeeping
+            // disposition predates classification/gate and remains non-consuming.
+            if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader_row,
+                    &disposition,
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                );
+                return;
+            }
+            let Some(signal) = classify_trade(
+                &trade,
+                position.as_ref(),
+                &watchlist,
+                quality,
+                VenueId::polymarket(),
+                &self.signal_config,
+            ) else {
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "classification_rejected",
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            };
+            if let Some(reason) = self.bucket_engine.entry_gate().admit(&signal) {
+                info!(
+                    reason = %reason,
+                    market = %signal.market_id,
+                    leader_price = %signal.leader_price.0,
+                    "signal did not produce order",
+                );
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "entry_gate_rejected",
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            }
+            // Legacy v1 remains an in-memory projection; v2 history was already
+            // consumed atomically by the bucket transaction.
+            self.bucket_engine
+                .entry_gate_mut()
+                .record_entry(signal.leader.0, &signal.market_id);
+            (rb, leader_row, signal)
         };
 
-        // Advance position ledger after classification inputs are captured.
-        self.position_ledger.ingest(&trade);
-
-        // Snapshot the leader's post-ingest position for this (market, outcome) so it
-        // is mirrored into paper-state on every processed trade — fill or no fill.
-        let leader_row = self.leader_position_row(&trade);
-
-        // #530/#546 copy-budget rule (websocket-primary mode only): an observation from
-        // EITHER source older than the calibrated budget is admitted for bookkeeping but
-        // stages no copy (`stale_no_copy`). Checked here and again immediately before
-        // dispatch staging.
-        if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
-            self.commit_no_copy_or_rollback(&trade, &leader_row, &disposition, &rb, None);
-            return;
+        // Staleness is intentionally post-pending: it is a continuation input and
+        // cannot cause the ledger/gate/history portion to be reapplied on restart.
+        if pending.is_some() {
+            let stale_at = self.admission_now();
+            record_clock(&mut decision_evidence, "initial_staleness_gate", stale_at);
+            if let Some(disposition) = self.stale_no_copy(&trade, stale_at) {
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader_row,
+                    &disposition,
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                );
+                return;
+            }
         }
-
-        let Some(signal) = classify_trade(
-            &trade,
-            position.as_ref(),
-            &watchlist,
-            quality,
-            VenueId::polymarket(),
-            &self.signal_config,
-        ) else {
-            // No signal: still mark seen + mirror the leader ledger (AC2).
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
-                .await;
-            return;
-        };
-
-        // NOTE (#508): the hold/already-filled gate historically ran HERE, before the
-        // first-BUY entry gate. It is now a PAPER-ONLY decision relocated after dispatch
-        // staging (below), so a paper-held position can never suppress live targets.
-        // `entry_gate.record_entry`'s pre-staging side effect is deliberately kept.
-
-        // Copy-entry gate: copy only a leader's first-ever BUY entry into a market
-        // (#290; price band removed in #339).
-        if let Some(reason) = self.entry_gate.admit(&signal) {
-            info!(
-                reason = %reason,
-                market = %signal.market_id,
-                leader_price = %signal.leader_price.0,
-                "signal did not produce order",
-            );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
-                .await;
-            return;
-        }
-        // Record the admitted BUY entry so a same-session re-entry into this market is
-        // blocked even if a later gate or the strategy rejects this signal.
-        self.entry_gate
-            .record_entry(signal.leader.0, &signal.market_id);
 
         // Resolution-horizon gate (#290, #339): copy only markets whose resolution time
         // (umaEndDate, else the always-present endDate) is known AND sits within
@@ -862,11 +1471,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // we cannot confirm the horizon, so we do not enter. One lookup serves both
         // bounds.
         if self.max_resolution_horizon_secs > 0 || self.min_resolution_horizon_secs > 0 {
-            let resolution_unix = self
-                .market_end_cache
-                .resolution_unix(&signal.market_id)
-                .await;
-            let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+            let resolution = self.market_end_cache.resolution(&signal.market_id).await;
+            let resolution_unix = resolution.resolution_unix;
+            if let Some(evidence) = decision_evidence.as_mut() {
+                evidence.record_market_end(MarketEndEvidence {
+                    market_id: signal.market_id.to_string(),
+                    resolution_unix,
+                    source: resolution
+                        .source
+                        .unwrap_or_else(|| "gamma.unavailable".to_owned()),
+                });
+            }
+            let horizon_at = OffsetDateTime::now_utc();
+            record_clock(
+                &mut decision_evidence,
+                "resolution_horizon_gate",
+                horizon_at,
+            );
+            let now_unix = horizon_at.unix_timestamp();
             if let Some(reason) = check_resolution_horizon(
                 resolution_unix,
                 now_unix,
@@ -883,9 +1505,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     &trade,
                     &leader_row,
                     None,
-                    "",
+                    reason,
                     &rb,
                     Some(&signal.market_id),
+                    decision_evidence.as_ref(),
                 )
                 .await;
                 return;
@@ -909,8 +1532,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .get(&signal.market_id)
                 .and_then(|prices| prices.get(usize::from(signal.outcome_id.0)).copied());
             match px.and_then(|d| Price::new(d).ok()) {
-                Some(p) => p,
+                Some(p) => {
+                    if let Some(evidence) = decision_evidence.as_mut() {
+                        evidence.record_market_price(MarketPriceEvidence {
+                            market_id: signal.market_id.to_string(),
+                            outcome_id: signal.outcome_id.0,
+                            mid_price: Some(p.0.normalize().to_string()),
+                            source: "gamma.outcome_prices".to_owned(),
+                        });
+                    }
+                    p
+                }
                 None => {
+                    if let Some(evidence) = decision_evidence.as_mut() {
+                        evidence.record_market_price(MarketPriceEvidence {
+                            market_id: signal.market_id.to_string(),
+                            outcome_id: signal.outcome_id.0,
+                            mid_price: None,
+                            source: "gamma.outcome_prices_unavailable".to_owned(),
+                        });
+                    }
                     info!(
                         reason = "current market price unavailable",
                         market = %signal.market_id,
@@ -921,9 +1562,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         &trade,
                         &leader_row,
                         None,
-                        "",
+                        "current_market_price_unavailable",
                         &rb,
                         Some(&signal.market_id),
+                        decision_evidence.as_ref(),
                     )
                     .await;
                     return;
@@ -931,49 +1573,74 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
         };
 
-        // Price-impact gate (#508 Phase A): when enabled (`price_impact_cap_bps ≥ 1`), ONE
-        // `/book` fetch produces the executable-ladder plan that feeds the band gate, the
-        // size cap, and (in `clob_best_ask` paper mode) the VWAP fill basis. An unusable
-        // book — missing token, fetch error/timeout, corrupt/empty/stale — fails CLOSED
-        // (skip; the #398 fail-open posture is retired), as does an in-band ladder that
-        // affords no whole share.
-        let gate: Option<GatePlan> = if self.price_impact_cap_bps > 0 {
-            match self.plan_impact_gate(&signal).await {
-                Ok(outcome) => Some(outcome),
-                Err(reason) => {
-                    // Shared-gate rejection (#508 Decision 10): an UNUSABLE admission
-                    // quote suppresses every destination, pre-staging — no aggregate.
-                    info!(
-                        reason,
-                        market = %signal.market_id,
-                        outcome = signal.outcome_id.0,
-                        "signal did not produce order",
-                    );
-                    self.no_fill_or_rollback(
-                        &trade,
-                        &leader_row,
-                        None,
-                        "",
-                        &rb,
-                        Some(&signal.market_id),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        } else {
-            None
+        // Mandatory price-impact gate (#508 Phase A, #544): ONE `/book` fetch produces the
+        // executable-ladder plan that feeds the band gate, the size cap, and (in
+        // `clob_best_ask` paper mode) the VWAP fill basis. An unusable book — missing token,
+        // fetch error/timeout, corrupt/empty/stale — fails CLOSED (skip), as does an in-band
+        // ladder that affords no whole share.
+        // A resumed continuation evaluates under its frozen basis; only a fresh
+        // decision reads the live watchlist and bankroll (#544 review round 3).
+        // Selected BEFORE the impact gate so ladder budget, VWAP, and strategy
+        // sizing all share one basis.
+        let p = pending
+            .as_ref()
+            .map(|continuation| continuation.frozen_basis.win_rate_p)
+            .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
+        let sizing_bankroll = match pending.as_ref() {
+            Some(continuation) => continuation.frozen_basis.bankroll,
+            None => self.bankroll,
         };
+        let gate_evidence = match self.plan_impact_gate(&signal, sizing_bankroll).await {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                if let Some(evidence) = decision_evidence.as_mut() {
+                    evidence.record_book(*failure.book);
+                    if let Some(checked_at) = failure.checked_at_unix_ms {
+                        evidence.record_clock(
+                            "book_staleness_check",
+                            i64::try_from(checked_at).unwrap_or(i64::MAX),
+                        );
+                    }
+                }
+                // Shared-gate rejection (#508 Decision 10): an UNUSABLE admission quote
+                // suppresses every destination, pre-staging — no aggregate.
+                info!(
+                    reason = failure.reason,
+                    market = %signal.market_id,
+                    outcome = signal.outcome_id.0,
+                    "signal did not produce order",
+                );
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    failure.reason,
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Some(evidence) = decision_evidence.as_mut() {
+            evidence.record_book(gate_evidence.book.clone());
+            evidence.record_clock(
+                "book_staleness_check",
+                i64::try_from(gate_evidence.checked_at_unix_ms).unwrap_or(i64::MAX),
+            );
+        }
+        let gate = gate_evidence.gate;
         let gate_plan: Option<&LadderPlan> = match &gate {
-            Some(GatePlan::Planned(plan)) => Some(plan),
+            GatePlan::Planned(plan) => Some(plan),
             _ => None,
         };
 
         // Realistic fill basis (#339 revisited, #486, #508): the price the copy will ACTUALLY
-        // fill at. With the impact gate enabled in paper `clob_best_ask` mode, a BUY prices at
+        // fill at. With the mandatory impact gate in paper `clob_best_ask` mode, a BUY prices at
         // the planned ladder VWAP (`estimated_ladder_spend / shares` — multi-level exact, from
         // the same single `/book` fetch as the gate). Otherwise: in paper `clob_best_ask` mode
-        // a BUY resolves to the fresh CLOB best-ask (else the fallback haircut); other modes
+        // a BUY uses the same successful CLOB evidence; other modes
         // use the leader price adjusted by the boot-frozen paper haircut
         // (`PaperExecutor::fill_price`). Size and band-gate against THIS, so notional ==
         // `sizing_dollar_usd` and the gates check the price actually paid. In paper mode the
@@ -987,7 +1654,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // Zero-absorb reads still anchor the SHARED band gate on the successful best ask
         // (#508 Decision 10 — the paper-only skip happens after staging, below).
         let zero_absorb_basis = match &gate {
-            Some(GatePlan::NothingAffordable { best_ask }) if clob_basis_applies => Some(*best_ask),
+            GatePlan::NothingAffordable { best_ask } if clob_basis_applies => Some(*best_ask),
             _ => None,
         };
         let (fill_basis, fill_source) = if let Some(vwap) = planned_vwap_basis {
@@ -995,7 +1662,25 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         } else if let Some(best_ask) = zero_absorb_basis {
             (best_ask, FillSource::ClobBestAsk)
         } else {
-            match self.resolve_fill_price(&signal).await {
+            if clob_basis_applies {
+                info!(
+                    reason = "price-impact book supplied no usable fill basis (fail closed)",
+                    market = %signal.market_id,
+                    "signal did not produce order",
+                );
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "",
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            }
+            match self.resolve_fill_price(&signal) {
                 Ok(pair) => pair,
                 Err(_) => {
                     info!(
@@ -1011,6 +1696,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         "",
                         &rb,
                         Some(&signal.market_id),
+                        decision_evidence.as_ref(),
                     )
                     .await;
                     return;
@@ -1033,8 +1719,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 max_fill_price = %self.max_fill_price,
                 "signal did not produce order",
             );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                "fill_price_at_or_above_max",
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
             return;
         }
 
@@ -1054,8 +1748,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 min_fill_price = %self.min_fill_price,
                 "signal did not produce order",
             );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                "fill_price_below_min",
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
             return;
         }
 
@@ -1067,18 +1769,25 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // admission hold) must not turn an observation that was fresh at the early gate
         // into a stale fill or dispatch. The recorded same-session entry is deliberately
         // kept: this leader did enter the market.
-        if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+        let dispatch_stale_at = self.admission_now();
+        record_clock(
+            &mut decision_evidence,
+            "pre_dispatch_staleness_gate",
+            dispatch_stale_at,
+        );
+        if let Some(disposition) = self.stale_no_copy(&trade, dispatch_stale_at) {
             self.commit_no_copy_or_rollback(
                 &trade,
                 &leader_row,
                 &disposition,
                 &rb,
                 Some(&signal.market_id),
+                decision_evidence.as_ref(),
             );
             return;
         }
 
-        let dispatch_id = match self.stage_dispatch_if_targeted(&signal) {
+        let dispatch_id = match self.stage_dispatch_if_targeted(&signal, &mut decision_evidence) {
             Ok(id) => id,
             Err(()) => {
                 // Staging failed: abandoned unseen. #511: exact in-memory rollback so
@@ -1106,6 +1815,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 "paper_held",
                 &rb,
                 Some(&signal.market_id),
+                decision_evidence.as_ref(),
             )
             .await;
             return;
@@ -1113,7 +1823,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
         // Paper-only zero-absorb skip (#508 Decision 10): the successful admission quote
         // could not absorb one whole share of the paper budget.
-        if matches!(&gate, Some(GatePlan::NothingAffordable { .. })) {
+        if matches!(&gate, GatePlan::NothingAffordable { .. }) {
             info!(
                 reason = "impact band absorbs no whole share of the paper budget (paper-only)",
                 market = %signal.market_id,
@@ -1127,16 +1837,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 "impact_absorbs_zero",
                 &rb,
                 Some(&signal.market_id),
+                decision_evidence.as_ref(),
             )
             .await;
             return;
         }
 
-        // Size cap from the ladder plan (#508): the planned whole-share quantity IS the
-        // within-band, within-budget maximum. Gate off → `None` (no cap; no `/book` fetch).
+        // Size cap from the mandatory ladder plan (#508): the planned whole-share quantity IS the
+        // within-band, within-budget maximum. The no-affordable-shares arm returned above.
         let book_cap_contracts = gate_plan.map(|plan| plan.shares.atomic() / 1_000_000);
 
-        let p = self.win_rate_p_for(&watchlist, &signal.leader);
         let snapshot = zeroed_risk_snapshot();
         // Sizing basis: pass the leader's price as the RAW `current_price` (Kelly cost `c`,
         // per-trade cap, exposure bps) and `fill_basis` as the dollar-sizing price, so the
@@ -1149,7 +1859,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             signal.leader_price,
             p,
             snapshot,
-            self.bankroll,
+            sizing_bankroll,
             self.mode,
             book_cap_contracts,
             Some(fill_basis),
@@ -1164,11 +1874,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     &reason,
                     &rb,
                     Some(&signal.market_id),
+                    decision_evidence.as_ref(),
                 )
                 .await;
             }
             Ok(intent) => {
-                let now = SourceTimestamp(OffsetDateTime::now_utc());
+                let execution_at = OffsetDateTime::now_utc();
+                record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
+                if let Some(evidence) = decision_evidence.as_ref() {
+                    let checkpoint = match evidence.checkpoint_json() {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => {
+                            error!(%error, trade = %trade.source_trade_id,
+                                "encode pre-dispatch decision evidence failed; stopping producer intake");
+                            self.intake_stopped = true;
+                            return;
+                        }
+                    };
+                    if let Err(error) = self.paper_state.checkpoint_decision_pending(
+                        &trade.source_trade_id,
+                        &checkpoint,
+                        execution_at.unix_timestamp(),
+                    ) {
+                        error!(%error, trade = %trade.source_trade_id,
+                            "persist pre-dispatch decision evidence failed; stopping producer intake");
+                        self.intake_stopped = true;
+                        return;
+                    }
+                }
+                let now = SourceTimestamp(execution_at);
                 // Exact recorded basis (#508): when the ladder plan priced this BUY and the
                 // strategy sized BELOW the planned quantity (Kelly/Contract clamps), re-price
                 // the VWAP over the ladder prefix actually consumed by the final count, so
@@ -1190,6 +1924,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     .execute(&intent, self.mode, now, observed_fill_price)
                     .await
                 {
+                    Err(ExecutionError::PaperDurabilityUncertain { reason }) => {
+                        error!(%reason, "paper durability uncertain; stopping producer intake");
+                        {
+                            let mut health = self
+                                .health
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            health.paper_durability_uncertain = true;
+                            health.refresh_event_log_writable();
+                        }
+                        self.rollback_admission(&rb, None);
+                        self.intake_stopped = true;
+                    }
                     Err(e) => {
                         error!(error = %e, "execution dispatcher failed");
                         self.no_fill_or_rollback(
@@ -1199,6 +1946,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                             "paper_dispatch_error",
                             &rb,
                             Some(&signal.market_id),
+                            decision_evidence.as_ref(),
                         )
                         .await;
                     }
@@ -1217,6 +1965,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                                     &fill,
                                     seq,
                                     dispatch_id.as_deref(),
+                                    decision_evidence.as_ref(),
                                 )
                                 .await
                         {
@@ -1291,6 +2040,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         disposition: &pe_paper_state::NoCopyDisposition,
         rb: &RollbackCtx,
         unrecord_market: Option<&MarketId>,
+        evidence: Option<&DecisionEvidenceAccumulator>,
     ) {
         info!(
             trade = %trade.source_trade_id,
@@ -1307,10 +2057,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             self.rollback_admission(rb, unrecord_market);
             return;
         }
-        if let Err(e) =
-            self.paper_state
-                .commit_seen_no_copy(&trade.source_trade_id, leader, disposition)
-        {
+        let pending = match render_pending_evidence(
+            evidence,
+            AuthorityEvidence::not_read("terminal_before_fill_authority"),
+            TerminalDispositionEvidence::no_copy(&disposition.reason),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode no-copy decision evidence failed");
+                self.rollback_admission(rb, unrecord_market);
+                return;
+            }
+        };
+        if let Err(e) = self.paper_state.commit_seen_no_copy_with_pending(
+            &trade.source_trade_id,
+            leader,
+            disposition,
+            pending.as_ref().map(pending_terminal),
+        ) {
             error!(error = %e, trade = %trade.source_trade_id,
                 "no-copy disposition commit failed; rolling back admission");
             self.rollback_admission(rb, unrecord_market);
@@ -1322,15 +2086,30 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// un-record the tentative same-session entry. Redelivery then re-runs a
     /// byte-identical admission.
     fn rollback_admission(&mut self, rb: &RollbackCtx, unrecord_market: Option<&MarketId>) {
-        self.position_ledger.restore(rb.wallet, &rb.key, rb.prev);
-        if let Some(market) = unrecord_market {
-            self.entry_gate.unrecord_entry(rb.wallet, market);
+        if !rb.enabled {
+            return;
+        }
+        self.bucket_engine
+            .ledger_mut()
+            .restore(rb.wallet, &rb.key, rb.prev);
+        if unrecord_market.is_some() {
+            match self.paper_state.gate_history() {
+                Ok(history) => {
+                    *self.bucket_engine.entry_gate_mut() =
+                        crate::entry_gate::CopyEntryGate::new(CopyEntryGateConfig, history);
+                }
+                Err(error) => {
+                    error!(%error, "rebuild durable entry-gate projection after rollback failed");
+                    self.intake_stopped = true;
+                }
+            }
         }
     }
 
     /// Terminal no-fill that STAYS terminal only if the seen-commit lands (#511): on
     /// commit failure the trade is abandoned unseen, so the in-memory admission effects
     /// are rolled back — the held cursor redelivers into a fresh identical admission.
+    #[allow(clippy::too_many_arguments)]
     async fn no_fill_or_rollback(
         &mut self,
         trade: &IncomingTrade,
@@ -1339,9 +2118,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         no_fill_reason: &str,
         rb: &RollbackCtx,
         unrecord_market: Option<&MarketId>,
+        evidence: Option<&DecisionEvidenceAccumulator>,
     ) {
         if self
-            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason)
+            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason, evidence)
             .await
         {
             return;
@@ -1354,11 +2134,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     fn leader_position_row(&self, trade: &IncomingTrade) -> LeaderPositionRow {
         let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
         let (long, short) = self
-            .position_ledger
+            .bucket_engine
+            .ledger()
             .position(&trade.wallet)
             .and_then(|snap| snap.positions.get(&key))
             .map(|st| (st.long_contracts, st.short_contracts))
-            .unwrap_or((0, 0));
+            .unwrap_or((ShareAmount::ZERO, ShareAmount::ZERO));
         LeaderPositionRow {
             wallet: trade.wallet,
             market_id: trade.market_id.clone(),
@@ -1378,17 +2159,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         leader: &LeaderPositionRow,
         dispatch_id: Option<&str>,
         no_fill_reason: &str,
+        evidence: Option<&DecisionEvidenceAccumulator>,
     ) -> bool {
+        let durable_reason = if no_fill_reason.is_empty() {
+            "no_order"
+        } else {
+            no_fill_reason
+        };
+        let pending = match render_pending_evidence(
+            evidence,
+            AuthorityEvidence::not_read("terminal_before_fill_authority"),
+            TerminalDispositionEvidence::no_fill(durable_reason),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode no-fill decision evidence failed");
+                return false;
+            }
+        };
         let outcome = format!("no_fill:{no_fill_reason}");
         let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
             dispatch_id: id,
             paper_outcome: &outcome,
         });
         for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self.paper_state.commit_seen_no_fill_with_flip(
+            match self.paper_state.commit_seen_no_fill_with_flip_pending(
                 &trade.source_trade_id,
                 leader,
                 flip,
+                pending.as_ref().map(pending_terminal),
             ) {
                 Ok(()) => return true,
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
@@ -1429,6 +2228,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         fill: &PaperFill,
         seq: EventSeq,
         dispatch_id: Option<&str>,
+        decision_evidence: Option<&DecisionEvidenceAccumulator>,
     ) -> PaperCommitResult {
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
@@ -1470,6 +2270,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 sup_row: Some(sup_row),
                 dispatch_id: dispatch_id.map(str::to_owned),
                 filled_key,
+                decision_evidence: decision_evidence.cloned(),
             };
             // Bounded in-process attempts before parking (#508 round-4 posture).
             let mut result = PaperCommitResult::Parked;
@@ -1514,14 +2315,38 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             dispatch_id: id,
             paper_outcome: "fill",
         });
+        let fill_pending = match render_pending_evidence(
+            decision_evidence,
+            AuthorityEvidence::local("committed"),
+            recorded_fill_terminal(&record, seq),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode fill decision evidence failed");
+                return PaperCommitResult::Parked;
+            }
+        };
+        let settled_pending = match render_pending_evidence(
+            decision_evidence,
+            AuthorityEvidence::local("settled_refusal"),
+            TerminalDispositionEvidence::settled_refusal(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode refusal decision evidence failed");
+                return PaperCommitResult::Parked;
+            }
+        };
         let mut committed = None;
         for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self.paper_state.commit_fill_with_flip(
+            match self.paper_state.commit_fill_with_flip_pending(
                 &trade.source_trade_id,
                 leader,
                 &record,
                 seq,
                 flip,
+                fill_pending.as_ref().map(pending_terminal),
+                settled_pending.as_ref().map(pending_terminal),
             ) {
                 Ok(outcome) => {
                     committed = Some(outcome);
@@ -1587,6 +2412,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         sup_row: None,
                         dispatch_id: dispatch_id.map(str::to_owned),
                         filled_key,
+                        decision_evidence: decision_evidence.cloned(),
                     },
                 );
                 PaperCommitResult::Parked
@@ -1611,12 +2437,36 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     dispatch_id: id,
                     paper_outcome: "fill",
                 });
-            return match self.paper_state.commit_fill_with_flip(
+            let fill_pending = match render_pending_evidence(
+                parked.decision_evidence.as_ref(),
+                AuthorityEvidence::local("committed"),
+                recorded_fill_terminal(&parked.record, parked.seq),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    error!(%error, trade = %source_trade_id, "encode parked fill evidence failed");
+                    return PaperCommitResult::Parked;
+                }
+            };
+            let settled_pending = match render_pending_evidence(
+                parked.decision_evidence.as_ref(),
+                AuthorityEvidence::local("settled_refusal"),
+                TerminalDispositionEvidence::settled_refusal(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    error!(%error, trade = %source_trade_id, "encode parked refusal evidence failed");
+                    return PaperCommitResult::Parked;
+                }
+            };
+            return match self.paper_state.commit_fill_with_flip_pending(
                 &source_trade_id,
                 &parked.leader,
                 &parked.record,
                 parked.seq,
                 flip,
+                fill_pending.as_ref().map(pending_terminal),
+                settled_pending.as_ref().map(pending_terminal),
             ) {
                 Ok(pe_paper_state::FillCommitOutcome::Applied(b)) => {
                     self.bankroll = b;
@@ -1655,6 +2505,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             parked.seq,
             sup_row,
             flip,
+            parked.decision_evidence.as_ref(),
         )
         .await
         {
@@ -1662,6 +2513,28 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 self.bankroll = bankroll;
                 self.filled_positions.insert(parked.filled_key.clone());
                 PaperCommitResult::Filled
+            }
+            Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll)) => {
+                // Remote committed, local did not converge: financial state is
+                // uncertain. Do NOT advance in-memory bankroll/positions past
+                // durable local truth; fail readiness and stop producer intake —
+                // the durable frame + idempotent RPC reconverge at boot (#544).
+                error!(
+                    key = %parked.record.idempotency_key,
+                    market = %parked.record.market_id,
+                    authority_bankroll = %bankroll,
+                    "authoritative fill uncertain: remote committed, local mirror failed; stopping producers"
+                );
+                {
+                    let mut health = self
+                        .health
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    health.paper_durability_uncertain = true;
+                    health.refresh_event_log_writable();
+                }
+                self.intake_stopped = true;
+                PaperCommitResult::DurabilityUncertain
             }
             Ok(AuthoritativeFillOutcome::RefusedSettled(bankroll)) => {
                 self.bankroll = bankroll;
@@ -1690,6 +2563,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 PaperCommitResult::Parked => {
                     self.parked.insert(id, parked);
                 }
+                // Uncertainty keeps the frozen obligation: boot reconverges it.
+                PaperCommitResult::DurabilityUncertain => {
+                    self.parked.insert(id, parked);
+                }
                 PaperCommitResult::Filled | PaperCommitResult::Refused => {}
             }
         }
@@ -1707,6 +2584,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// Empirical win-rate probability for a leader, sourced from the watchlist's
     /// `win_rate_bps` (wins / closed_trades × 10 000). Falls back to `Probability::ZERO`
     /// if the leader is not in the watchlist (signal will produce no edge → NoEdge error).
+    /// Capture the mutable decision basis for one bucket's leader (#544).
+    fn freeze_decision_basis(
+        &self,
+        aggregates: &[pe_source_polymarket_public::ActivityAggregate],
+    ) -> crate::bucket_commit::FrozenDecisionBasis {
+        let watchlist = self.live_watchlist.snapshot();
+        let leader = aggregates
+            .first()
+            .map(|aggregate| TraderId(aggregate.group_id.components().wallet));
+        crate::bucket_commit::FrozenDecisionBasis {
+            win_rate_p: leader
+                .map(|leader| self.win_rate_p_for(&watchlist, &leader))
+                .unwrap_or(Probability::ZERO),
+            bankroll: self.bankroll,
+        }
+    }
+
     fn win_rate_p_for(&self, watchlist: &Watchlist, leader: &TraderId) -> Probability {
         let bps = watchlist
             .entries
@@ -1812,22 +2706,7 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
-    use pe_copy_signal_engine::{LeaderSignal, PositionSnapshot, PositionState};
-    use pe_core_types::{
-        ContractQty, LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ProbabilityPpm,
-        Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
-        WalletAddress,
-    };
-    use pe_position_ledger::PositionLedger;
-    use rust_decimal_macros::dec;
-    use time::OffsetDateTime;
-    use tokio::sync::oneshot;
-
-    use super::{apply_control_message, check_resolution_horizon};
-    use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig, GateReject};
-    use crate::orchestrator_control::OrchestratorControl;
+    use super::check_resolution_horizon;
 
     const NOW: i64 = 1_700_000_000;
 
@@ -1892,66 +2771,5 @@ mod tests {
             check_resolution_horizon(Some(NOW + 1), NOW, 259_200, 0),
             None
         );
-    }
-
-    #[tokio::test]
-    async fn admission_control_acknowledges_only_after_both_ledgers_are_ready() {
-        let wallet = WalletAddress([9; 20]);
-        let market = MarketId(VenueMarketId("0xknown".to_string()));
-        let outcome = MarketOutcomeId::new(market.clone(), OutcomeId(0));
-        let mut gate =
-            CopyEntryGate::new(CopyEntryGateConfig { fail_closed: true }, HashMap::new());
-        let mut ledger = PositionLedger::new();
-        let (acknowledged, acknowledgement) = oneshot::channel();
-        apply_control_message(
-            &mut gate,
-            &mut ledger,
-            OrchestratorControl::PrepareAdmissions {
-                history: HashMap::from([(wallet, HashSet::from([market.clone()]))]),
-                positions: HashMap::from([(
-                    wallet,
-                    PositionSnapshot {
-                        wallet,
-                        positions: HashMap::from([(
-                            outcome,
-                            PositionState {
-                                long_contracts: 7,
-                                short_contracts: 0,
-                            },
-                        )]),
-                    },
-                )]),
-                acknowledged,
-            },
-        );
-        acknowledgement.await.unwrap();
-
-        assert_eq!(
-            ledger
-                .position(&wallet)
-                .unwrap()
-                .positions
-                .values()
-                .next()
-                .unwrap()
-                .long_contracts,
-            7
-        );
-        let signal = LeaderSignal {
-            leader: TraderId(wallet),
-            venue: VenueId::polymarket(),
-            market_id: market,
-            outcome_id: OutcomeId(0),
-            action: LeaderAction::Entry,
-            leader_side: Side::Buy,
-            leader_price: Price(dec!(0.50)),
-            leader_size: Quantity(ContractQty(1)),
-            observed_at: OffsetDateTime::UNIX_EPOCH,
-            received_at: OffsetDateTime::UNIX_EPOCH,
-            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-            source_trade_id: SourceTradeId("control-test".to_string()),
-            action_confidence_ppm: ProbabilityPpm(1_000_000),
-        };
-        assert_eq!(gate.admit(&signal), Some(GateReject::NotFirstEntry));
     }
 }

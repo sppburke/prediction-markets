@@ -1,345 +1,374 @@
-//! Scenario: real-last-trade clock — poll-cursor forward-sweep reconstruction (#357).
-//!
-//! Proves the #357 design's correctness claim. A poll cursor seeded to a wallet's *real last
-//! trade* (a lower bound) — even one 80h in the past, left stale by a downtime gap — drives the
-//! poller's forward `/activity` sweep to reconstruct every trade since, advancing the cursor (the
-//! inactivity clock) to the real most-recent trade. The cursor is only ever a lower bound; the
-//! poller reconstructs truth. Re-delivered already-seen trades are deduped downstream by the
-//! orchestrator's persistent `is_seen` — not exercised here, which isolates the poller.
-//!
-//! Deterministic: fixed timestamps, a [`FixtureFetcher`] (no network) keyed by the exact URL the
-//! poller builds from the seeded cursor, single-shot poll (`poll_interval_secs = 0`), and a
-//! tempfile-backed [`PaperStateDb`].
-//!
-//! Run with: cargo nextest run -p pe-service --features scenario
+//! Scenario: durable websocket obligations hold and revisit the fixed source second (#544).
 
 #![cfg(feature = "scenario")]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::arithmetic_side_effects
-)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
-use pe_paper_state::PaperStateDb;
-use pe_service::health::new_shared_health;
+use pe_copy_signal_engine::SignalConfig;
+use pe_core_types::{
+    BasisPoints, ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress,
+};
+use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
+use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
+use pe_position_ledger::PositionLedger;
+use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, SourceLogHandle};
+use pe_service::bucket_commit::BucketCommitEngine;
+use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::trade_poller::{TradePoller, TradePollerConfig};
-use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
+use pe_service::orchestrator_control::OrchestratorControl;
+use pe_service::source_event_sink::SourceEventSink;
+use pe_service::trade_poller::{
+    ACTIVITY_POLL_SOURCE_ID, ReconciliationObligations, TradePoller, TradePollerConfig,
+    rebuild_reconciliation_obligations,
+};
+use pe_source_core::SourceError;
+use pe_source_polymarket_public::{
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ReconciliationFetcher,
+    parse_activity_trade_observation,
+};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
-use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
-const T0: i64 = 1_900_000_000; // fixed "now" reference (seconds; < 9_999_999_999 → never read as ms)
-const H80: i64 = 80 * 3600;
-const H2: i64 = 2 * 3600;
 const BASE_URL: &str = "https://data.example.test";
+const WALLET: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-fn wallet() -> WalletAddress {
-    let mut b = [0u8; 20];
-    b[0] = 0x11;
-    WalletAddress(b)
+struct QueueFetcher {
+    pages: Mutex<VecDeque<Vec<u8>>>,
+    calls: AtomicUsize,
 }
 
-fn watchlist_of(w: WalletAddress) -> Watchlist {
-    let entries = vec![WatchlistEntry {
-        wallet: w,
-        tier: WatchlistTier::Active,
-        leader_score_bps: BasisPoints(100),
-        lcb_5pct_bps: BasisPoints(100),
-        win_rate_bps: BasisPoints(7_000),
-        closed_trades_in_window: 0,
-        reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-    }];
+impl QueueFetcher {
+    fn new(pages: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            pages: Mutex::new(pages.into_iter().collect()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ReconciliationFetcher for QueueFetcher {
+    fn fetch<'a>(
+        &'a self,
+        _url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| SourceError::Fatal {
+                    message: "unexpected page fetch".to_owned(),
+                })
+        })
+    }
+}
+
+async fn settle_until(mut predicate: impl FnMut() -> bool) {
+    for _ in 0..1_000 {
+        if predicate() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(predicate(), "condition did not settle");
+}
+
+fn wallet() -> WalletAddress {
+    WalletAddress::from_hex(WALLET).unwrap()
+}
+
+fn watchlist() -> Watchlist {
     Watchlist {
-        entries,
+        entries: vec![WatchlistEntry {
+            wallet: wallet(),
+            tier: WatchlistTier::Active,
+            leader_score_bps: BasisPoints(100),
+            lcb_5pct_bps: BasisPoints(100),
+            win_rate_bps: BasisPoints(7_000),
+            closed_trades_in_window: 1,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        }],
         snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
         active_count: 1,
         incubator_count: 0,
     }
 }
 
-fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
-    let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
-    (dir, db)
-}
-
-/// A two-trade `/activity` payload: A at `a_ts`, then B at `b_ts`. Field shape mirrors
-/// `trade_parser::parse_trades` (camelCase keys; `timestamp` in seconds).
-fn second_round_responses(
-    w: pe_core_types::WalletAddress,
-    a_ts: i64,
-    b_ts: i64,
-) -> HashMap<String, Vec<u8>> {
-    // Round 2 fetches from the HELD cursor (a_ts − 1) — same window, same payload.
-    let url = PolymarketEndpoint::UserTradeActivity {
-        user: format!("{w}"),
-        end: None,
-        start: Some(a_ts - 1),
-    }
-    .url(BASE_URL);
-    let mut responses = HashMap::new();
-    responses.insert(url, activity_payload(a_ts, b_ts));
-    responses
-}
-
-fn leader_row(w: pe_core_types::WalletAddress) -> pe_paper_state::LeaderPositionRow {
-    pe_paper_state::LeaderPositionRow {
-        wallet: w,
-        market_id: pe_core_types::MarketId(pe_core_types::VenueMarketId("0xmkt".into())),
-        outcome_id: pe_core_types::OutcomeId(0),
-        long_contracts: 0,
-        short_contracts: 0,
-    }
-}
-
-fn activity_payload(a_ts: i64, b_ts: i64) -> Vec<u8> {
+fn ws_payload(epoch: i64) -> Vec<u8> {
     format!(
-        r#"[{{"transactionHash":"0xAAA","conditionId":"0xcondA","outcomeIndex":0,"side":"BUY","size":40,"price":0.60,"timestamp":{a_ts}}},{{"transactionHash":"0xBBB","conditionId":"0xcondB","outcomeIndex":1,"side":"BUY","size":10,"price":0.45,"timestamp":{b_ts}}}]"#
+        r#"{{"proxyWallet":"{WALLET}","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":"{epoch}","transactionHash":"0xabc","outcomeIndex":"0"}}"#
     )
     .into_bytes()
 }
 
-#[tokio::test]
-async fn downtime_forward_sweep_reconstructs_real_last_trade() {
-    let (_dir, db) = temp_db();
-    let w = wallet();
-
-    // Wallet traded A at T0−80h, then B at T0−2h; the service was DOWN when B happened, so the
-    // persisted shutdown cursor is the stale T0−80h (B never observed). #357 keeps that real
-    // lower-bound seed rather than resetting it to `now`.
-    let a_ts = T0 - H80;
-    let b_ts = T0 - H2;
-    db.set_cursor(&w, a_ts).unwrap();
-
-    // The poller fetches `/activity` from `start = cursor − 1` (the endpoint's `start` is
-    // exclusive; trade_poller's `cursor_start` steps back one second). Key the fixture by that
-    // exact URL — built via the same public endpoint helper — so the test also asserts the fetch
-    // window opens at the seeded lower bound, not at `now`.
-    let url = PolymarketEndpoint::UserTradeActivity {
-        user: format!("{w}"),
-        end: None,
-        start: Some(a_ts - 1),
-    }
-    .url(BASE_URL);
-    let mut responses = HashMap::new();
-    responses.insert(url, activity_payload(a_ts, b_ts));
-    let fetcher = FixtureFetcher::new(responses);
-
-    let (tx, mut rx) = mpsc::channel(16);
-    let poller = TradePoller::new(
-        TradePollerConfig {
-            base_url: BASE_URL.to_string(),
-            poll_interval_secs: 0, // single-shot: one round, then return
-        },
-        LiveWatchlist::new(watchlist_of(w)),
-        fetcher,
-        tx,
-        db.clone(),
-        new_shared_health(false),
-    );
-
-    poller.run().await;
-
-    // #511 held cursor: the sweep DELIVERED A and B but nothing has marked them seen (this
-    // scenario isolates the poller), so the delivery cursor HOLDS at the seed — it is a
-    // correctness-preserving lower bound now, not a delivery high-water mark. The #357
-    // inactivity-clock claim moved to the ACTIVITY clock, which does advance to B.
-    assert_eq!(
-        db.cursor(&w).unwrap(),
-        Some(a_ts),
-        "delivery cursor holds below the unseen trades (#511)"
-    );
-    assert_eq!(
-        db.activity(&w).unwrap(),
-        Some(b_ts),
-        "activity clock advanced to real last trade B across the downtime gap (#357/#511)"
-    );
-
-    // Once the trades are durably seen (the orchestrator's job), the next sweep advances
-    // the delivery cursor to B — the #357 forward-sweep reconstruction completes.
-    for trade_id in ["0xAAA", "0xBBB"] {
-        db.commit_seen_no_fill_with_flip(
-            &pe_core_types::SourceTradeId(trade_id.to_string()),
-            &leader_row(w),
-            None,
-        )
-        .unwrap();
-    }
-    let (tx2, rx2) = mpsc::channel(16);
-    let poller2 = TradePoller::new(
-        TradePollerConfig {
-            base_url: BASE_URL.to_string(),
-            poll_interval_secs: 0,
-        },
-        LiveWatchlist::new(watchlist_of(w)),
-        FixtureFetcher::new(second_round_responses(w, a_ts, b_ts)),
-        tx2,
-        db.clone(),
-        new_shared_health(false),
-    );
-    poller2.run().await;
-    drop(rx2);
-    assert_eq!(
-        db.cursor(&w).unwrap(),
-        Some(b_ts),
-        "cursor advances to B once every trade in the window is seen"
-    );
-
-    // Both trades were re-delivered; the stale A is deduped downstream by the orchestrator's
-    // persistent `is_seen` (out of scope here).
-    let mut got: Vec<String> = Vec::new();
-    while let Ok(t) = rx.try_recv() {
-        got.push(t.source_trade_id.0);
-    }
-    got.sort();
-    assert_eq!(
-        got,
-        vec!["0xAAA".to_string(), "0xBBB".to_string()],
-        "PASS: the forward sweep re-delivered both A and B (dedup is downstream)"
-    );
-    println!("PASS: downtime-forward-sweep-reconstructs-real-last-trade");
-}
-
-/// #511: an unseen trade hidden BEHIND a full first page (500 seen rows) must still hold
-/// the cursor — the poller rescans the window via the strict descending page endpoint
-/// under the data-derived end bound and finds it on page 2.
-///
-/// PASS: cursor holds at `unseen_ts − 1`; the unseen trade is delivered.
-/// FAIL: a full first page of seen rows advances the cursor over the hidden trade.
-#[tokio::test]
-async fn full_page_rescan_finds_unseen_trade_behind_500_seen_rows() {
-    let db =
-        Arc::new(PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("p.db")).unwrap());
-    let w = WalletAddress::from_hex("0xcccccccccccccccccccccccccccccccccccccccc").unwrap();
-    let base_ts: i64 = 1_900_000_000;
-    let unseen_ts = base_ts - 10; // older than every seen row → page 2 in DESC order
-    db.seed_cursor_if_absent(&w, unseen_ts).unwrap();
-
-    // 500 seen rows (newest-first ts base..base-499… all marked seen in the DB).
-    let row = |id: &str, ts: i64| {
-        format!(
-            r#"{{"transactionHash":"{id}","conditionId":"0xc","outcomeIndex":0,"side":"BUY","size":5,"price":0.5,"timestamp":{ts}}}"#
-        )
-    };
-    let mut seen_rows = Vec::new();
-    for i in 0..500i64 {
-        let id = format!("0xseen{i}");
-        db.commit_seen_no_fill_with_flip(
-            &pe_core_types::SourceTradeId(id.clone()),
-            &leader_row(w),
-            None,
-        )
-        .unwrap();
-        seen_rows.push(row(&id, base_ts - i));
-    }
-    let full_page = format!("[{}]", seen_rows.join(","));
-    let page2 = format!("[{}]", row("0xhidden", unseen_ts));
-
-    let start = unseen_ts - 1; // cursor_start(cursor)
-    let mut responses = HashMap::new();
-    responses.insert(
-        PolymarketEndpoint::UserTradeActivity {
-            user: format!("{w}"),
-            end: None,
-            start: Some(start),
-        }
-        .url(BASE_URL),
-        full_page.clone().into_bytes(),
-    );
-    // Paged rescan: fixed end = max ts of the initial page; DESC offsets 0 and 500.
-    responses.insert(
-        PolymarketEndpoint::UserTradeActivityPage {
-            user: format!("{w}"),
-            end: base_ts,
-            start: Some(start),
-            offset: 0,
-        }
-        .url(BASE_URL),
-        full_page.into_bytes(),
-    );
-    responses.insert(
-        PolymarketEndpoint::UserTradeActivityPage {
-            user: format!("{w}"),
-            end: base_ts,
-            start: Some(start),
-            offset: 500,
-        }
-        .url(BASE_URL),
-        page2.into_bytes(),
-    );
-
-    let (tx, mut rx) = mpsc::channel(600);
-    let poller = TradePoller::new(
-        TradePollerConfig {
-            base_url: BASE_URL.to_string(),
-            poll_interval_secs: 0,
-        },
-        LiveWatchlist::new(watchlist_of(w)),
-        FixtureFetcher::new(responses),
-        tx,
-        db.clone(),
-        new_shared_health(false),
-    );
-    poller.run().await;
-
-    // The hidden unseen trade was delivered, and the cursor held below it (MAX-upsert
-    // keeps the seeded unseen_ts against the candidate unseen_ts − 1).
-    let delivered = rx.recv().await.expect("hidden trade delivered");
-    assert_eq!(delivered.source_trade_id.0, "0xhidden");
-    assert_eq!(
-        db.cursor(&w).unwrap(),
-        Some(unseen_ts),
-        "cursor held at the unseen trade despite 500 seen rows in front (#511)"
-    );
-    assert_eq!(
-        db.activity(&w).unwrap(),
-        Some(base_ts),
-        "activity advanced to newest"
-    );
-    println!("PASS: full-page rescan found the hidden unseen trade and held the cursor");
-}
-
-// #530: a stale REST-fallback trade admitted with a typed no-copy disposition is a
-// fully seen trade — `is_seen` flips in the same transaction (so the held delivery
-// cursor advances exactly as in the sweep test above) — and the disposition row is
-// durably readable with provenance, age, and reason for audit/replay.
-#[test]
-fn no_copy_disposition_is_seen_and_durable() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = pe_paper_state::PaperStateDb::open(&dir.path().join("p.db")).unwrap();
-    let w = wallet();
-    let id = pe_core_types::SourceTradeId("0xSTALE".to_string());
-
-    assert!(!db.is_seen(&id).unwrap());
-    db.commit_seen_no_copy(
-        &id,
-        &leader_row(w),
-        &pe_paper_state::NoCopyDisposition {
-            provenance: "rest_poll".to_string(),
-            age_secs: 47,
-            reason: "stale_fallback_past_copy_budget".to_string(),
-            recorded_at_unix: 1_787_600_000,
-        },
+fn rest_payload(epoch: i64) -> Vec<u8> {
+    format!(
+        r#"[{{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","usdcSize":"2.5","price":"0.5","timestamp":"{epoch}","transactionHash":"0xabc","outcomeIndex":"0"}}]"#
     )
-    .unwrap();
+    .into_bytes()
+}
 
-    assert!(
-        db.is_seen(&id).unwrap(),
-        "disposition commit must mark seen atomically"
+fn append_ws(path: &std::path::Path, payload: Vec<u8>, epoch: i64) {
+    let timestamp = OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+    let mut writer = Writer::open(path).unwrap();
+    writer
+        .append(EnvelopeIn {
+            source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_owned()),
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            content_type: ContentType::Json,
+            payload,
+        })
+        .unwrap();
+    writer.sync().unwrap();
+}
+
+async fn run_once(
+    source_log_path: &std::path::Path,
+    paper_state: Arc<PaperStateDb>,
+    obligations: ReconciliationObligations,
+    response: Vec<u8>,
+    now: OffsetDateTime,
+) {
+    let sink = SourceEventSink::open(source_log_path).unwrap();
+    let (source_log, source_rx) = SourceLogHandle::channel(4);
+    let (trigger_tx, trigger_rx) = mpsc::channel(4);
+    let health = new_shared_health_with_ws(false, true, 90);
+    let ingest =
+        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    let (control_tx, mut control_rx) = mpsc::channel(2);
+    let control_paper = paper_state.clone();
+    let control_source_log = source_log_path.to_owned();
+    let control = tokio::spawn(async move {
+        let mut engine = BucketCommitEngine::load(control_paper, PositionLedger::new()).unwrap();
+        while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context,
+                committed,
+            } = command
+            {
+                assert!(
+                    Reader::replay(&control_source_log)
+                        .unwrap()
+                        .map(|item| item.unwrap().1.source_id.0)
+                        .any(|source| source == ACTIVITY_POLL_SOURCE_ID),
+                    "bucket delivery cannot precede its raw polling page"
+                );
+                let _ = committed.send(
+                    engine
+                        .commit(
+                            aggregates,
+                            &context,
+                            pe_service::bucket_commit::FrozenDecisionBasis {
+                                win_rate_p: pe_core_types::Probability::ZERO,
+                                bankroll: rust_decimal::Decimal::ZERO,
+                            },
+                        )
+                        .map_err(|error| error.to_string()),
+                );
+            }
+        }
+    });
+    TradePoller::new(
+        TradePollerConfig {
+            base_url: BASE_URL.to_owned(),
+            poll_interval_secs: 0,
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 2,
+        },
+        LiveWatchlist::new(watchlist()),
+        Arc::new(QueueFetcher::new([response])),
+        source_log,
+        trigger_rx,
+        control_tx,
+        paper_state,
+        health,
+        SignalConfig::default(),
+        pe_service::runtime_config::LiveRuntimeConfig::new(
+            pe_service::runtime_config::RuntimeConfig::from_service_config(
+                &pe_service::config::ServiceConfig::default(),
+            ),
+        ),
+        obligations,
+    )
+    .with_clock(Arc::new(move || now))
+    .run()
+    .await;
+    ingest.await.unwrap();
+    control.await.unwrap();
+}
+
+#[tokio::test]
+async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_log = dir.path().join("source.log");
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    let epoch = 1_900_000_000;
+    let now = OffsetDateTime::from_unix_timestamp(epoch + 3).unwrap();
+    paper_state
+        .set_cursor(&wallet(), epoch.saturating_add(20))
+        .unwrap();
+    for _reader in 0..3 {
+        append_ws(&source_log, ws_payload(epoch), epoch);
+    }
+
+    let obligations = rebuild_reconciliation_obligations(&source_log, &paper_state).unwrap();
+    assert_eq!(obligations.len(), 1, "three reader copies coalesce");
+    run_once(
+        &source_log,
+        paper_state.clone(),
+        obligations,
+        b"[]".to_vec(),
+        now,
+    )
+    .await;
+    assert_eq!(
+        paper_state.cursor(&wallet()).unwrap(),
+        Some(epoch.saturating_add(20)),
+        "a cursor already ahead cannot abandon the fixed source second"
     );
-    let (provenance, age, reason) = db.no_copy_disposition(&id).unwrap().unwrap();
-    assert_eq!(provenance, "rest_poll");
-    assert_eq!(age, 47);
-    assert_eq!(reason, "stale_fallback_past_copy_budget");
-    // A normally-seen trade has no disposition row.
-    let other = pe_core_types::SourceTradeId("0xNORMAL".to_string());
-    db.commit_seen_no_fill(&other, &leader_row(w)).unwrap();
-    assert!(db.no_copy_disposition(&other).unwrap().is_none());
+    let after_restart = rebuild_reconciliation_obligations(&source_log, &paper_state).unwrap();
+    assert_eq!(after_restart.len(), 1, "unindexed group survives restart");
+
+    run_once(
+        &source_log,
+        paper_state.clone(),
+        after_restart,
+        rest_payload(epoch),
+        now,
+    )
+    .await;
+    assert!(
+        rebuild_reconciliation_obligations(&source_log, &paper_state)
+            .unwrap()
+            .is_empty()
+    );
+    let positions = paper_state.leader_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].long_contracts.atomic(), 5_000_000);
+    let group_id = parse_activity_trade_observation(&ws_payload(epoch))
+        .unwrap()
+        .group_id
+        .key()
+        .clone();
+    let (provenance, age, reason) = paper_state
+        .no_copy_disposition(&group_id)
+        .unwrap()
+        .expect("slow websocket catch-up is ledger-only");
+    assert_eq!(provenance, "activity_ws");
+    assert!(age > 2);
+    assert_eq!(reason, "stale_activity_ws_past_copy_budget");
+
+    let sources: Vec<String> = Reader::replay(&source_log)
+        .unwrap()
+        .map(|item| item.unwrap().1.source_id.0)
+        .collect();
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|source| source.as_str() == ACTIVITY_WS_SOURCE_ID)
+            .count(),
+        3
+    );
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|source| source.as_str() == ACTIVITY_POLL_SOURCE_ID)
+            .count(),
+        2,
+        "both the pre-index and indexed polling responses were recorded"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_log_path = dir.path().join("source.log");
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let sink = SourceEventSink::open(&source_log_path).unwrap();
+    let (source_log, source_rx) = SourceLogHandle::channel(4);
+    let (trigger_tx, trigger_rx) = mpsc::channel(8);
+    let trigger_inject = trigger_tx.clone();
+    let health = new_shared_health_with_ws(false, true, 90);
+    let ingest =
+        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    let (control_tx, _control_rx) = mpsc::channel(1);
+    let fetcher = Arc::new(QueueFetcher::new([b"[]".to_vec(), b"[]".to_vec()]));
+    let now = OffsetDateTime::from_unix_timestamp(1_900_000_003).unwrap();
+    let poller = tokio::spawn(
+        TradePoller::new(
+            TradePollerConfig {
+                base_url: BASE_URL.to_owned(),
+                poll_interval_secs: 20,
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 2,
+            },
+            LiveWatchlist::new(watchlist()),
+            fetcher.clone(),
+            source_log,
+            trigger_rx,
+            control_tx,
+            paper_state,
+            health,
+            SignalConfig::default(),
+            pe_service::runtime_config::LiveRuntimeConfig::new(
+                pe_service::runtime_config::RuntimeConfig::from_service_config(
+                    &pe_service::config::ServiceConfig::default(),
+                ),
+            ),
+            ReconciliationObligations::default(),
+        )
+        .with_clock(Arc::new(move || now))
+        .run(),
+    );
+    settle_until(|| fetcher.calls() == 1).await;
+
+    for received_at in [1_900_000_001, 1_900_000_002, 1_900_000_003] {
+        trigger_inject
+            .send(pe_service::activity_ingest::ReconciliationTrigger {
+                wallet: wallet(),
+                source_time: OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap(),
+                source_trade_id: pe_core_types::SourceTradeId("g2:same".to_owned()),
+                provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
+                received_at: OffsetDateTime::from_unix_timestamp(received_at).unwrap(),
+            })
+            .await
+            .unwrap();
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(
+        fetcher.calls(),
+        1,
+        "reader rows do not start per-row fetches"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(19)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(fetcher.calls(), 1);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    settle_until(|| fetcher.calls() == 2).await;
+
+    poller.abort();
+    ingest.abort();
 }

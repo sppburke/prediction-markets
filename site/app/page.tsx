@@ -4,12 +4,10 @@ import { PnlBarChart } from "@/components/PnlBarChart";
 import { WalletTabs } from "@/components/WalletTabs";
 import {
   fetchOpenFills,
-  fetchServiceRuntime,
   fetchWalletStats,
   fetchWatchedSet,
   NotConfiguredError,
 } from "@/lib/data";
-import { toNum } from "@/lib/format";
 
 // Server-rendered with ISR: the wallet_live_stats_mv read runs on the server and the result is
 // cached + shared across all viewers for up to `revalidate` seconds, instead of re-querying
@@ -31,18 +29,12 @@ export default async function OverviewPage() {
     return <StateNotice kind="empty" message="No wallets in wallet_live_stats yet." />;
   }
 
-  // Secondary: the watched-count. A failure here must not blank the page, so it falls
-  // back to "—".
-  let watched: number | null = null;
-  try {
-    const rt = await fetchServiceRuntime();
-    watched = rt ? toNum(rt.watchlist_size) : null;
-  } catch {
-    watched = null;
-  }
-
-  // Secondary (soft-fail): the watched set drives the Watched tab; open fills drive unrealized P&L.
-  const watchedSet = await fetchWatchedSet().catch(() => new Set<string>());
+  // The count and set come from the same token-guarded projection snapshot. Unavailable is not
+  // represented as an empty set: the UI keeps that state visibly distinct from valid empty.
+  const watchedProjection = await fetchWatchedSet();
+  const watched = watchedProjection.status === "available" ? watchedProjection.count : null;
+  const watchedSet =
+    watchedProjection.status === "available" ? [...watchedProjection.wallets] : null;
   const openFills = await fetchOpenFills().catch(() => []);
 
   return (
@@ -58,7 +50,7 @@ export default async function OverviewPage() {
         <PnlBarChart rows={rows} />
       </Panel>
       <Panel title="Wallets — historical vs watched">
-        <WalletTabs rows={rows} watchedSet={[...watchedSet]} openFills={openFills} />
+        <WalletTabs rows={rows} watchedSet={watchedSet} openFills={openFills} />
       </Panel>
     </div>
   );

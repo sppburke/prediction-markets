@@ -30,6 +30,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::decision_replay::{
+    AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
+};
+use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pending_evidence};
 use crate::supabase_reader::auth_token;
 use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 
@@ -38,6 +42,10 @@ use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 /// trade; #511: the frozen record retries via v2 and the boot frame-walk converges).
 #[derive(Debug, thiserror::Error)]
 pub enum SupabaseStateError {
+    #[error(
+        "authoritative resolution committed remotely but the local mirror failed for {market}: {error}"
+    )]
+    LocalMirrorUncertain { market: String, error: String },
     #[error("supabase transport: {0}")]
     Transport(#[source] reqwest::Error),
     /// Non-2xx response; the body carries the PL/pgSQL `RAISE` message when the RPC errored.
@@ -59,6 +67,11 @@ pub enum SupabaseStateError {
     PaperState(#[from] PaperStateError),
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("migration evidence: {0}")]
+    MigrationEvidence(String),
+    /// Boot frame reconciliation stopped below the verified log head.
+    #[error("authoritative boot frame walk incomplete at watermark {last_watermark}")]
+    IncompleteFrameWalk { last_watermark: i64 },
 }
 
 /// Requested page size for the boot `paper_positions` pull (the server may return
@@ -134,6 +147,17 @@ pub trait SupabaseStateTrait: Send + Sync {
         outcome_prices: &[Decimal],
         settled_at_unix: i64,
     ) -> impl Future<Output = Result<ResolutionV2Outcome, SupabaseStateError>> + Send;
+}
+
+/// Complete authoritative boot reads, split from runtime RPCs for deterministic failure injection.
+pub trait SupabaseBootTrait: SupabaseStateTrait {
+    fn fetch_boot_bankroll(
+        &self,
+    ) -> impl Future<Output = Result<Option<Decimal>, SupabaseStateError>> + Send;
+
+    fn fetch_boot_positions(
+        &self,
+    ) -> impl Future<Output = Result<Vec<PaperPositionRow>, SupabaseStateError>> + Send;
 }
 
 /// Production [`SupabaseStateTrait`]: PostgREST RPCs over reqwest, reusing the
@@ -361,6 +385,16 @@ impl SupabaseStateClient {
     }
 }
 
+impl SupabaseBootTrait for SupabaseStateClient {
+    async fn fetch_boot_bankroll(&self) -> Result<Option<Decimal>, SupabaseStateError> {
+        self.fetch_bankroll().await
+    }
+
+    async fn fetch_boot_positions(&self) -> Result<Vec<PaperPositionRow>, SupabaseStateError> {
+        self.fetch_positions().await
+    }
+}
+
 /// Raw `commit_fill_v2` jsonb response (fail-closed parse — every field validated).
 #[derive(Debug, Deserialize)]
 struct FillV2Resp {
@@ -533,6 +567,12 @@ struct PositionRow {
 pub enum AuthoritativeFillOutcome {
     Filled(Decimal),
     RefusedSettled(Decimal),
+    /// The authority committed but the local mirror could not converge after
+    /// in-process retries (#544 review): the caller must treat paper durability
+    /// as uncertain — fail readiness and stop producers; the boot frame-walk
+    /// converges from the durable frame on restart. Carries the authority
+    /// bankroll for the final status snapshot only.
+    LocalDurabilityUncertain(Decimal),
 }
 
 /// Authoritative fill commit (#397, reshaped by #511): `commit_fill_v2` FIRST (fail-closed
@@ -551,27 +591,52 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     seq: EventSeq,
     sup_row: &SupabaseFillRow,
     flip: Option<pe_paper_state::DispatchFlip<'_>>,
+    pending_decision: Option<&DecisionEvidenceAccumulator>,
 ) -> Result<AuthoritativeFillOutcome, SupabaseStateError> {
     // #510: snapshot the watermark BEFORE the external mutation — a getter failure fails
     // the fill closed here, never after the RPC has already debited Supabase.
     let wm_before = paper_state.last_supabase_applied_event_seq()?;
     let outcome = supabase.commit_fill_v2(sup_row).await?;
+    let pending = match &outcome {
+        FillV2Outcome::Applied { bankroll, row } => render_pending_evidence(
+            pending_decision,
+            AuthorityEvidence::commit_fill_v2("applied", *bankroll),
+            recorded_fill_terminal(&row.record, row.event_seq),
+        ),
+        FillV2Outcome::Existing { bankroll, row } => render_pending_evidence(
+            pending_decision,
+            AuthorityEvidence::commit_fill_v2("existing", *bankroll),
+            recorded_fill_terminal(&row.record, row.event_seq),
+        ),
+        FillV2Outcome::Settled { bankroll } => render_pending_evidence(
+            pending_decision,
+            AuthorityEvidence::commit_fill_v2("settled_refusal", *bankroll),
+            TerminalDispositionEvidence::settled_refusal(),
+        ),
+    }
+    .map_err(|error| {
+        SupabaseStateError::Corrupt(format!(
+            "encode decision_pending authority evidence: {error}"
+        ))
+    })?;
     // #508 round-4: the local disposition surfaces and retries IN-PROCESS (bounded); the
     // durable backstop is the boot frame-walk (the frozen watermark marks the frame pending).
     let mut local = Ok(());
     for attempt in 1u32..=3 {
         local = match &outcome {
             FillV2Outcome::Applied { bankroll, row }
-            | FillV2Outcome::Existing { bankroll, row } => paper_state.commit_fill_canonical(
-                Some(source_trade_id),
-                Some(leader),
-                &row.record,
-                row.event_seq,
-                seq,
-                *bankroll,
-                flip,
-            ),
-            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill(
+            | FillV2Outcome::Existing { bankroll, row } => paper_state
+                .commit_fill_canonical_pending(
+                    Some(source_trade_id),
+                    Some(leader),
+                    &row.record,
+                    row.event_seq,
+                    seq,
+                    *bankroll,
+                    flip,
+                    pending.as_ref().map(pending_terminal),
+                ),
+            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill_pending(
                 source_trade_id,
                 Some(leader),
                 seq,
@@ -579,6 +644,7 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
                     dispatch_id: f.dispatch_id,
                     paper_outcome: "no_fill:market_settled",
                 }),
+                pending.as_ref().map(pending_terminal),
             ),
         };
         match &local {
@@ -612,12 +678,23 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
                 );
             }
         }
-        Err(e) => warn!(
-            error = %e,
-            seq = seq.0,
-            "authoritative fill: authority committed but local disposition failed after \
-             in-process retries; watermark left frozen (boot frame-walk converges)"
-        ),
+        Err(e) => {
+            warn!(
+                error = %e,
+                seq = seq.0,
+                "authoritative fill: authority committed but local disposition failed after \
+                 in-process retries; watermark left frozen (boot frame-walk converges)"
+            );
+            // Remote truth advanced without local convergence: surface typed
+            // uncertainty instead of success (#544 review). In-memory financial
+            // state must not advance past durable local state.
+            let bankroll = match outcome {
+                FillV2Outcome::Applied { bankroll, .. }
+                | FillV2Outcome::Existing { bankroll, .. }
+                | FillV2Outcome::Settled { bankroll } => bankroll,
+            };
+            return Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll));
+        }
     }
     Ok(match outcome {
         FillV2Outcome::Applied { bankroll, .. } | FillV2Outcome::Existing { bankroll, .. } => {
@@ -652,9 +729,16 @@ pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
         warn!(
             error = %e,
             market = %market_id,
-            "authoritative resolution committed to Supabase but local SQLite mirror failed \
-             (heals on restart/retry)"
+            "authoritative resolution committed to Supabase but local SQLite mirror failed"
         );
+        // Typed error instead of silent success (#544 review): the market stays
+        // locally unsettled, the next tick re-drives the idempotent RPC (returns
+        // `existing`), and the mirror converges — the caller retries, it does
+        // not report a settled market it has not durably recorded.
+        return Err(SupabaseStateError::LocalMirrorUncertain {
+            market: market_id.0.0.clone(),
+            error: e.to_string(),
+        });
     }
     Ok(res.bankroll)
 }
@@ -736,10 +820,37 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
                 Ok(outcome) => {
                     resolved += 1;
                     let trade_id = sup.source_trade_id.clone().map(SourceTradeId);
+                    let pending_row = match trade_id.as_ref() {
+                        Some(id) => paper_state
+                            .open_decision_pending()?
+                            .into_iter()
+                            .find(|row| &row.source_trade_id == id),
+                        None => None,
+                    };
+                    let pending_decision = pending_row
+                        .as_ref()
+                        .map(DecisionEvidenceAccumulator::from_pending_checkpoint)
+                        .transpose()
+                        .map_err(|error| {
+                            SupabaseStateError::Corrupt(format!(
+                                "recover decision_pending checkpoint at seq {}: {error}",
+                                seq.0
+                            ))
+                        })?;
                     match outcome {
-                        FillV2Outcome::Applied { bankroll, row }
-                        | FillV2Outcome::Existing { bankroll, row } => paper_state
-                            .commit_fill_canonical(
+                        FillV2Outcome::Applied { bankroll, row } => {
+                            let pending = render_pending_evidence(
+                                pending_decision.as_ref(),
+                                AuthorityEvidence::commit_fill_v2("applied", bankroll),
+                                recorded_fill_terminal(&row.record, row.event_seq),
+                            )
+                            .map_err(|error| {
+                                SupabaseStateError::Corrupt(format!(
+                                    "render recovered decision evidence at seq {}: {error}",
+                                    seq.0
+                                ))
+                            })?;
+                            paper_state.commit_fill_canonical_pending(
                                 trade_id.as_ref(),
                                 None,
                                 &row.record,
@@ -747,9 +858,53 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
                                 seq,
                                 bankroll,
                                 None,
-                            ),
-                        FillV2Outcome::Settled { .. } => match trade_id.as_ref() {
-                            Some(id) => paper_state.commit_refused_fill(id, None, seq, None),
+                                pending.as_ref().map(pending_terminal),
+                            )
+                        }
+                        FillV2Outcome::Existing { bankroll, row } => {
+                            let pending = render_pending_evidence(
+                                pending_decision.as_ref(),
+                                AuthorityEvidence::commit_fill_v2("existing", bankroll),
+                                recorded_fill_terminal(&row.record, row.event_seq),
+                            )
+                            .map_err(|error| {
+                                SupabaseStateError::Corrupt(format!(
+                                    "render recovered decision evidence at seq {}: {error}",
+                                    seq.0
+                                ))
+                            })?;
+                            paper_state.commit_fill_canonical_pending(
+                                trade_id.as_ref(),
+                                None,
+                                &row.record,
+                                row.event_seq,
+                                seq,
+                                bankroll,
+                                None,
+                                pending.as_ref().map(pending_terminal),
+                            )
+                        }
+                        FillV2Outcome::Settled { bankroll } => match trade_id.as_ref() {
+                            Some(id) => {
+                                let pending = render_pending_evidence(
+                                    pending_decision.as_ref(),
+                                    AuthorityEvidence::commit_fill_v2("settled_refusal", bankroll),
+                                    TerminalDispositionEvidence::settled_refusal(),
+                                )
+                                .map_err(|error| {
+                                    SupabaseStateError::Corrupt(format!(
+                                        "render recovered refusal evidence at seq {}: {error}",
+                                        seq.0
+                                    ))
+                                })?;
+                                paper_state.commit_refused_fill_pending(
+                                    id,
+                                    None,
+                                    seq,
+                                    None,
+                                    pending.as_ref().map(pending_terminal),
+                                )
+                            }
                             // A `wf|` key always embeds the trade id; defensive.
                             None => Ok(()),
                         },
@@ -786,11 +941,26 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
 /// the RPC gate credits zero, the SQLite `settle_and_credit` mirror inserts+credits once),
 /// which also avoids a fragile jsonb→text round-trip. Fail-closed: a pull error aborts boot
 /// (refuse to run authoritative without the authority).
-pub async fn supabase_authoritative_boot(
-    client: &SupabaseStateClient,
+pub async fn supabase_authoritative_boot<S: SupabaseBootTrait + ?Sized>(
+    client: &S,
     paper_state: &PaperStateDb,
     event_log_path: &std::path::Path,
 ) -> Result<(), SupabaseStateError> {
+    supabase_authoritative_boot_observed(client, paper_state, event_log_path, |_, _| Ok(())).await
+}
+
+/// Migration form of [`supabase_authoritative_boot`]: the complete canonical
+/// snapshot is synchronously observed after validation and before SQLite apply.
+pub async fn supabase_authoritative_boot_observed<S, F>(
+    client: &S,
+    paper_state: &PaperStateDb,
+    event_log_path: &std::path::Path,
+    observe: F,
+) -> Result<(), SupabaseStateError>
+where
+    S: SupabaseBootTrait + ?Sized,
+    F: FnOnce(&Decimal, &[PaperPositionRow]) -> Result<(), SupabaseStateError>,
+{
     // 3. #511: resolve every event-log frame above the successor-gated watermark through
     //    `commit_fill_v2` (frames the runtime confirmed are below the watermark already;
     //    an ABSENT watermark — fresh DB or SQLite loss — walks from seq 0). This REPLACES
@@ -812,42 +982,25 @@ pub async fn supabase_authoritative_boot(
         "supabase authoritative boot: catch-up summary"
     );
 
-    // If catch-up halted before completing, Supabase is missing some debits (its bankroll is
-    // overstated), so the pull below must NOT overwrite the event-log-reconciled SQLite value.
-    // Keep the local state; the next boot retries catch-up. Not fatal — the local cache is
-    // self-consistent with the local fills, and the un-applied tail is durable in the event log.
+    // A partial walk leaves authority below the durable log head. Boot must fail so no producer
+    // can turn that uncertainty into seen/no-fill state (#544).
     if !fully_caught_up {
-        warn!(
-            "supabase authoritative boot: frame-walk halted before completing; skipping the \
-             bankroll/positions pull (Supabase incomplete). Retaining local SQLite state; the \
-             next boot completes catch-up."
-        );
-        return Ok(());
+        return Err(SupabaseStateError::IncompleteFrameWalk {
+            last_watermark: new_wm,
+        });
     }
 
-    // 4. Pull authoritative bankroll + positions Supabase → local (catch-up complete, so the
-    //    Supabase values are the authority).
-    match client.fetch_bankroll().await? {
-        Some(bankroll) => {
-            paper_state.set_bankroll(bankroll)?;
-            info!(bankroll = %bankroll, "supabase authoritative boot: pulled bankroll");
-        }
-        // Fail-closed: an authoritative boot with no `paper_bankroll` row cannot establish the
-        // authority. Refuse to boot rather than warn-and-trade with a stale local balance (an
-        // un-backfilled deploy: flag on without `--backfill-supabase`). Mirrors the existing
-        // "hard-fail if Supabase empty" boot precedent for the watchlist.
-        None => return Err(SupabaseStateError::Uninitialised("paper_bankroll")),
-    }
-    let positions = client.fetch_positions().await?;
+    // Fetch and validate the complete remote snapshot in memory before touching SQLite. The
+    // paper-state owner applies bankroll + delete-all + insert-all in one transaction.
+    let bankroll = client
+        .fetch_boot_bankroll()
+        .await?
+        .ok_or(SupabaseStateError::Uninitialised("paper_bankroll"))?;
+    let positions = client.fetch_boot_positions().await?;
     let n = positions.len();
-    for pos in positions {
-        paper_state.upsert_position(
-            &pos.market_id,
-            pos.outcome_id,
-            pos.long_contracts,
-            pos.short_contracts,
-        )?;
-    }
+    observe(&bankroll, &positions)?;
+    paper_state.replace_authoritative_state(bankroll, &positions)?;
+    info!(bankroll = %bankroll, "supabase authoritative boot: pulled bankroll");
     info!(
         positions = n,
         "supabase authoritative boot: pulled positions"
@@ -913,9 +1066,14 @@ mod tests {
         ))
     }
 
+    async fn bankroll_row() -> Json<Vec<serde_json::Value>> {
+        Json(vec![serde_json::json!({ "bankroll_str": "123.45" })])
+    }
+
     async fn serve(fixture: PositionsFixture) -> String {
         let app = Router::new()
             .route("/rest/v1/paper_positions", get(positions_page))
+            .route("/rest/v1/paper_bankroll", get(bankroll_row))
             .with_state(fixture);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1016,5 +1174,54 @@ mod tests {
         let rows = client(&base).fetch_positions().await.unwrap();
         assert_eq!(rows.len(), 1_001);
         assert_eq!(*fx.offsets.lock().unwrap(), vec![0, 1_000, 1_001]);
+    }
+
+    #[tokio::test]
+    async fn authoritative_boot_atomically_replaces_and_deletes_stale_positions() {
+        let fx = fixture(2, 1);
+        let base = serve(fx).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        db.set_bankroll(Decimal::ONE).unwrap();
+        db.upsert_position(
+            &MarketId(VenueMarketId("0xstale".to_owned())),
+            OutcomeId(0),
+            9,
+            0,
+        )
+        .unwrap();
+
+        supabase_authoritative_boot(&client(&base), &db, &dir.path().join("absent-paper.log"))
+            .await
+            .unwrap();
+
+        assert_eq!(db.bankroll().unwrap(), Some(Decimal::new(12_345, 2)));
+        let positions = db.paper_positions().unwrap();
+        assert_eq!(positions.len(), 2);
+        assert!(
+            positions
+                .iter()
+                .all(|row| row.market_id.to_string() != "0xstale")
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_boot_mid_page_failure_leaves_prior_local_state_untouched() {
+        let mut fx = fixture(5, usize::MAX);
+        fx.fail_at_offset = Some(2);
+        let base = serve(fx).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let stale = MarketId(VenueMarketId("0xstale".to_owned()));
+        db.set_bankroll(Decimal::ONE).unwrap();
+        db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+
+        let result =
+            supabase_authoritative_boot(&client(&base), &db, &dir.path().join("absent-paper.log"))
+                .await;
+
+        assert!(matches!(result, Err(SupabaseStateError::Status(503, _))));
+        assert_eq!(db.bankroll().unwrap(), Some(Decimal::ONE));
+        assert_eq!(db.paper_positions().unwrap()[0].market_id, stale);
     }
 }

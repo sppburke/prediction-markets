@@ -13,7 +13,7 @@ use pe_core_types::{
     AccountId, CollateralAmount, PolymarketConditionId, PolymarketTokenId, Price, RawHttpAttempt,
     ReceivedAt, ShareAmount, SourceId, SourceTimestamp,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Writer};
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
 use pe_venue_polymarket::{LadderPlan, PreparedPolymarketBuy};
@@ -570,8 +570,6 @@ pub enum LiveJournalError {
     UnexpectedEnvelope,
     #[error("live journal event sequence does not match its envelope")]
     SequenceMismatch,
-    #[error("live journal writer is unavailable after a durability failure")]
-    DurabilityFailed,
     #[error("live journal mutex is poisoned")]
     Poisoned,
 }
@@ -579,7 +577,6 @@ pub enum LiveJournalError {
 struct LiveJournalInner {
     writer: Writer,
     next_seq: u64,
-    durability_failed: bool,
 }
 
 /// Synchronized owner of the single ordinary-live journal stream.
@@ -613,12 +610,33 @@ impl LiveJournal {
         let next_seq =
             u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
         Ok(Self {
-            inner: Mutex::new(LiveJournalInner {
-                writer,
-                next_seq,
-                durability_failed: false,
-            }),
+            inner: Mutex::new(LiveJournalInner { writer, next_seq }),
         })
+    }
+
+    /// Native payload replay plus the shared physical scanner's exact tail binding (#544).
+    pub fn verified_tail(path: impl AsRef<Path>) -> Result<LogTailBinding, LiveJournalError> {
+        let events = replay_all(path.as_ref())?;
+        let binding = Reader::verified_tail(path.as_ref())?;
+        let expected =
+            u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
+        let actual = match binding.last_sequence {
+            None => 0,
+            Some(sequence) => sequence
+                .0
+                .checked_add(1)
+                .ok_or(LiveJournalError::SequenceMismatch)?,
+        };
+        if expected != actual {
+            return Err(LiveJournalError::SequenceMismatch);
+        }
+        Ok(binding)
+    }
+
+    /// Typed writer poison state for service readiness and producer shutdown.
+    pub fn poisoned(&self) -> Result<Option<PoisonReason>, LiveJournalError> {
+        let inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
+        Ok(inner.writer.poisoned().copied())
     }
 
     /// Append and fsync one event. The supplied timestamp is used for both payload and envelope.
@@ -629,9 +647,6 @@ impl LiveJournal {
         payload: LiveJournalPayload,
     ) -> Result<LiveJournalEvent, LiveJournalError> {
         let mut inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
-        if inner.durability_failed {
-            return Err(LiveJournalError::DurabilityFailed);
-        }
         let event = LiveJournalEvent {
             account_id,
             seq: inner.next_seq,
@@ -649,13 +664,9 @@ impl LiveJournal {
             payload,
         })?;
         if assigned.0 != event.seq {
-            inner.durability_failed = true;
             return Err(LiveJournalError::SequenceMismatch);
         }
-        if let Err(error) = inner.writer.sync() {
-            inner.durability_failed = true;
-            return Err(error.into());
-        }
+        inner.writer.sync()?;
         inner.next_seq = inner
             .next_seq
             .checked_add(1)
@@ -801,5 +812,68 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn native_verified_tail_reports_exact_physical_binding() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live_journal.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        journal
+            .append(
+                AccountId::new("first").unwrap(),
+                datetime!(2026-08-11 12:00 UTC),
+                LiveJournalPayload::OrderPreparationFailed(Box::new(
+                    LiveOrderPreparationFailedAudit {
+                        identity: identity("d0"),
+                        failure: LiveOrderPreparationFailure::Venue,
+                    },
+                )),
+            )
+            .unwrap();
+        drop(journal);
+
+        let binding = LiveJournal::verified_tail(&path).unwrap();
+        assert_eq!(binding.path, fs::canonicalize(&path).unwrap());
+        assert_eq!(binding.physical_tail, fs::metadata(&path).unwrap().len());
+        assert_eq!(binding.last_sequence.map(|sequence| sequence.0), Some(0));
+    }
+
+    #[test]
+    fn native_live_record_rejects_every_truncation_and_open_repairs_only_frame_tail() {
+        let dir = tempdir().unwrap();
+        let canonical = dir.path().join("canonical-live.log");
+        let journal = LiveJournal::open(&canonical).unwrap();
+        journal
+            .append(
+                AccountId::new("first").unwrap(),
+                datetime!(2026-08-11 12:00 UTC),
+                LiveJournalPayload::OrderPreparationFailed(Box::new(
+                    LiveOrderPreparationFailedAudit {
+                        identity: identity("d0"),
+                        failure: LiveOrderPreparationFailure::Venue,
+                    },
+                )),
+            )
+            .unwrap();
+        drop(journal);
+        let bytes = fs::read(&canonical).unwrap();
+
+        for cut in 1..bytes.len() {
+            let path = dir.path().join(format!("live-cut-{cut}.log"));
+            fs::write(&path, &bytes[..cut]).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            if cut < 5 {
+                assert!(LiveJournal::verified_tail(&path).is_err());
+                assert!(LiveJournal::open(&path).is_err());
+            } else if cut == 5 {
+                assert!(LiveJournal::verified_tail(&path).is_ok());
+                drop(LiveJournal::open(&path).unwrap());
+            } else {
+                assert!(LiveJournal::verified_tail(&path).is_err());
+                drop(LiveJournal::open(&path).unwrap());
+                assert_eq!(fs::read(&path).unwrap(), b"EDGE\x01");
+            }
+        }
     }
 }

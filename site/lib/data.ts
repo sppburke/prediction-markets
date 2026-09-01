@@ -49,15 +49,159 @@ export async function fetchWalletStat(wallet: string): Promise<WalletLiveStats |
   return (data as WalletLiveStats | null) ?? null;
 }
 
-/** Lowercase `wallet_hex` set pe-service is actively copying (#398 WS3 step 20). Soft-fails to an
- * empty set when the table is unreadable/empty (risk #10) so the Watched tab degrades gracefully to
- * `live_open_fills>0` rather than erroring. */
-export async function fetchWatchedSet(): Promise<Set<string>> {
+export type WatchedUnavailableReason =
+  | "not_configured"
+  | "read_error"
+  | "runtime_missing"
+  | "token_changed"
+  | "count_mismatch";
+
+export type WatchedSetResult =
+  | {
+      status: "available";
+      wallets: Set<string>;
+      count: number;
+      token: string;
+    }
+  | {
+      status: "unavailable";
+      reason: WatchedUnavailableReason;
+      message: string;
+    };
+
+type WatchlistRow = { wallet_hex: unknown };
+
+/** Validate the two-token read around one watchlist query (#544). Exported for deterministic
+ * unit proof; callers must never convert an unavailable result into an empty watchlist. */
+export function guardWatchedSnapshot(
+  before: ServiceRuntime,
+  rows: WatchlistRow[],
+  after: ServiceRuntime,
+): WatchedSetResult {
+  if (before.updated_at !== after.updated_at) {
+    return {
+      status: "unavailable",
+      reason: "token_changed",
+      message: "Watchlist changed while it was being read.",
+    };
+  }
+  const beforeCount = Number(before.watchlist_size);
+  const afterCount = Number(after.watchlist_size);
+  if (
+    !Number.isSafeInteger(beforeCount) ||
+    beforeCount < 0 ||
+    beforeCount !== afterCount ||
+    rows.length !== afterCount
+  ) {
+    return {
+      status: "unavailable",
+      reason: "count_mismatch",
+      message: "Watchlist row count does not match the service runtime snapshot.",
+    };
+  }
+  return {
+    status: "available",
+    wallets: new Set(rows.map((row) => String(row.wallet_hex).toLowerCase())),
+    count: afterCount,
+    token: after.updated_at,
+  };
+}
+
+type RuntimeRead = { data: ServiceRuntime | null; error: string | null };
+type WatchlistRead = { data: WatchlistRow[] | null; error: string | null };
+
+/** Execute runtime → rows → runtime with one retry when the tokens expose a concurrent replace. */
+export async function readConsistentWatchedSet(
+  readRuntime: () => Promise<RuntimeRead>,
+  readWatchlist: () => Promise<WatchlistRead>,
+): Promise<WatchedSetResult> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const before = await readRuntime();
+    if (before.error) {
+      return { status: "unavailable", reason: "read_error", message: before.error };
+    }
+    if (!before.data) {
+      return {
+        status: "unavailable",
+        reason: "runtime_missing",
+        message: "The service runtime row is missing.",
+      };
+    }
+
+    const watchlist = await readWatchlist();
+    if (watchlist.error || !watchlist.data) {
+      return {
+        status: "unavailable",
+        reason: "read_error",
+        message: watchlist.error ?? "The watchlist query returned no data.",
+      };
+    }
+
+    const after = await readRuntime();
+    if (after.error) {
+      return { status: "unavailable", reason: "read_error", message: after.error };
+    }
+    if (!after.data) {
+      return {
+        status: "unavailable",
+        reason: "runtime_missing",
+        message: "The service runtime row is missing.",
+      };
+    }
+
+    const guarded = guardWatchedSnapshot(before.data, watchlist.data, after.data);
+    if (guarded.status === "unavailable" && guarded.reason === "token_changed" && attempt === 0) {
+      continue;
+    }
+    return guarded;
+  }
+  return {
+    status: "unavailable",
+    reason: "token_changed",
+    message: "Watchlist changed during both read attempts.",
+  };
+}
+
+/** Lowercase `wallet_hex` set pe-service is actively copying. Reads the runtime token before and
+ * after the rows and retries one observed race. Read failures and inconsistent snapshots return a
+ * typed unavailable state, distinct from a valid empty projection (#544). */
+export async function fetchWatchedSet(): Promise<WatchedSetResult> {
   const sb = getSupabase();
-  if (!sb) return new Set();
-  const { data, error } = await sb.from("service_watchlist").select("wallet_hex");
-  if (error || !data) return new Set();
-  return new Set(data.map((r) => String(r.wallet_hex).toLowerCase()));
+  if (!sb) {
+    return {
+      status: "unavailable",
+      reason: "not_configured",
+      message: "Supabase is not configured.",
+    };
+  }
+  try {
+    return await readConsistentWatchedSet(
+      async () => {
+        const result = await sb
+          .from("service_runtime")
+          .select("watchlist_size, updated_at")
+          .eq("id", 1)
+          .maybeSingle();
+        return {
+          data: (result.data as ServiceRuntime | null) ?? null,
+          error: result.error?.message ?? null,
+        };
+      },
+      async () => {
+        const result = await sb.from("service_watchlist").select("wallet_hex");
+        return {
+          data: (result.data as WatchlistRow[] | null) ?? null,
+          error: result.error?.message ?? null,
+        };
+      },
+    );
+  } catch (error) {
+    return {
+      status: "unavailable",
+      reason: "read_error",
+      message: error instanceof Error ? error.message : "Watchlist read failed.",
+    };
+  }
 }
 
 /** Market ids that have resolved (have a `settled_markets` row) — used to split open vs settled

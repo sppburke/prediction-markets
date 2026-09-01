@@ -81,6 +81,16 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
+> **Data-API reconciliation contract re-verified live (2026-09-01, issue #544).**
+> `/activity` accepts one comma-separated `type` parameter: the production request
+> `TRADE,SPLIT,MERGE,REDEEM,CONVERSION` returned mixed position-changing activity in one response.
+> Its documented maximum offset is 5,000. `/positions` accepts `limit=500`, maximum offset
+> 10,000, and the deterministic `sizeThreshold=0&sortBy=TOKENS&sortDirection=ASC` request used by
+> the reconciliation reader. Explicit `redeemable=false` and `redeemable=true` walks are disjoint
+> partitions and must both complete; no omitted-filter inference substitutes for either partition.
+> Captured URLs, fetch times, byte lengths, and SHA-256 hashes are recorded in the issue-#544
+> fixture `MANIFEST.json`.
+
 > **Gamma `/markets?condition_ids=` + CLOB `/markets?closed=true` — UA blocklist & repeat-key batching (2026-06-20, issue #382 Phase-0 live probe `scripts/probe_gamma_ua.py`).** The `&closed=true` 403 is triggered by the literal `Python-urllib/*` default User-Agent (an anti-bot blocklist), **not** by a missing browser UA: both endpoints return **200** for a headerless request (a bare `reqwest::Client` = the shipped Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and **403 only** for `Python-urllib/3.11`. The shipped UA-less clients therefore do not 403, but this transport health did not prevent the 2026-06-24 through 2026-08-21 persisted-terminator cursor wedge from stopping repeat resolution ingestion. Repeat-key batching (`?condition_ids=A&condition_ids=B…&limit=500`) works for **both** the plain (open) and `&closed=true` Gamma variants — 50/50 and 100/100 returned, demux-by-`conditionId` clean, no cross-market leak; comma-separated joining returns 0 (repeat-key mandatory); observed batch cap ≥ 100 (kept at `gamma_batch_size`=50). This supersedes the stale `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" claim for the repeat-key form.
 
 | Link | Last checked | Re-verify by |
@@ -115,8 +125,8 @@
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-user-trade-activity | 2026-07-17 | 2026-09-15 |
-| https://clob.polymarket.com/markets?closed=true | 2026-08-21 | 2026-10-20 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-01 | 2026-10-31 |
+| https://clob.polymarket.com/markets?closed=true | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
 | https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-18 | 2026-09-16 |
@@ -124,12 +134,13 @@
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-01 | 2026-10-31 |
+| https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
-| https://clob.polymarket.com/markets/{condition_id} | 2026-08-22 | 2026-10-21 |
+| https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
-| https://clob.polymarket.com/prices-history?market={tokenId} | 2026-08-26 | 2026-10-25 |
-| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-08-26 | 2026-10-25 |
+| https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
+| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-09-01 | 2026-10-31 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
@@ -200,6 +211,12 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-09-01: Re-verified issue #544's user-activity, current-position, price-history, and CLOB
+  resolution contracts. Live captures confirmed the comma-separated multi-type activity request,
+  the fixed `limit=500` reconciliation page size, documented offset maxima (activity 5,000;
+  positions 10,000), deterministic position sort, and disjoint explicit redeemable partitions.
+  The fixture manifest records every captured URL, fetch timestamp, size, and SHA-256.
 
 - 2026-08-11: Re-verified the #508 ordinary-live Polymarket contracts and transports. Polygon 137
   lists `CtfCollateralAdapter` `0xAdA100Db00Ca00073811820692005400218FcE1f`,

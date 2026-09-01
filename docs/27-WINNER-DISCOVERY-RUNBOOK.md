@@ -106,14 +106,16 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
 - **Bounded inside the wrapper.** `--skip-discovery` skips both discovery and
   controlled activation. Backfill launched by the wrapper always defers global
   activation, so no wrapper override can silently activate an unbounded cohort.
-- **Infrastructure exclusions survive deletion.** `purge-infra` archives and
-  deletes live infra wallet data, then ordinary discovery refuses to lift its
-  durable `reason='infra'` tombstone. Exceptional reclassification requires the
-  explicit operator-only `clear-infra-exclusion --wallet <hex> --confirm` command;
-  it clears only that exclusion and does not recreate or activate the wallet.
-- **`CacheMutationLock`** is held only during the DB-write window inside
-  `winner-discovery` and released before `backfill` starts, so no lock
-  conflict with parallel `pe-bootstrap` invocations.
+- **Infrastructure exclusions do not require deletion.** Ordinary publication is
+  purge-free and applies durable `reason='infra'` tombstones at rank/export time.
+  Direct `purge-infra` is report-only while `PE_BOOTSTRAP_PURGE_ENABLED=false`.
+  Exceptional reclassification requires the explicit operator-only
+  `clear-infra-exclusion --wallet <hex> --confirm` command; it clears only that
+  exclusion and does not recreate or activate the wallet.
+- **`CacheMutationLock`** is a persistent-inode, kernel-held lock acquired before
+  every read-write wallet-cache open. Production coordination follows the sole
+  loop → one-shot run → cache order; true read-only probes use
+  `WalletCache::open_read_only`.
 - **Exit codes** follow the shared `pe-bootstrap` vocabulary (each command emits
   a subset): 0 = success, 1 = permanent failure, 2 = partial failure,
   75 = temporary failure (loop-supervised retry; emitted by `events` and

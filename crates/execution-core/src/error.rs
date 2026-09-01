@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Errors produced by the execution dispatcher and live executor.
 #[derive(Debug, Error)]
 pub enum ExecutionError {
+    #[error("paper event-log durability is uncertain after {reason}")]
+    PaperDurabilityUncertain { reason: pe_event_log::PoisonReason },
+
     #[error("paper execution failed: {0}")]
     Paper(#[from] pe_strategy_winner_follow::PaperExecutionError),
 

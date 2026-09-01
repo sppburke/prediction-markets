@@ -43,9 +43,9 @@ use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
 use pe_service::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 use pe_service::supabase_state::{
-    AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, ResolutionV2Outcome,
+    AuthoritativeFillOutcome, CanonicalFill, FillV2Outcome, ResolutionV2Outcome, SupabaseBootTrait,
     SupabaseStateError, SupabaseStateTrait, apply_resolution_authoritative,
-    commit_fill_authoritative, resolve_event_frames,
+    commit_fill_authoritative, resolve_event_frames, supabase_authoritative_boot,
 };
 use pe_strategy_winner_follow::PaperExecutor;
 use pe_venue_core::OrderIntent;
@@ -72,8 +72,8 @@ fn leader() -> LeaderPositionRow {
         wallet: WalletAddress::from_hex(wallet_hex()).unwrap(),
         market_id: market(),
         outcome_id: OutcomeId(0),
-        long_contracts: 0,
-        short_contracts: 0,
+        long_contracts: pe_core_types::ShareAmount::ZERO,
+        short_contracts: pe_core_types::ShareAmount::ZERO,
     }
 }
 
@@ -146,6 +146,7 @@ struct FakeSupabaseState {
     fail_commit_seq: Option<i64>,
     apply_then_error_seq: Option<i64>,
     fail_resolution: bool,
+    fail_boot_positions: bool,
 }
 
 impl FakeSupabaseState {
@@ -300,6 +301,37 @@ impl SupabaseStateTrait for FakeSupabaseState {
     }
 }
 
+impl SupabaseBootTrait for FakeSupabaseState {
+    async fn fetch_boot_bankroll(&self) -> Result<Option<Decimal>, SupabaseStateError> {
+        Ok(Some(self.bankroll()))
+    }
+
+    async fn fetch_boot_positions(
+        &self,
+    ) -> Result<Vec<pe_paper_state::PaperPositionRow>, SupabaseStateError> {
+        if self.fail_boot_positions {
+            return Err(SupabaseStateError::Corrupt(
+                "injected mid-page positions failure".to_owned(),
+            ));
+        }
+        self.positions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(
+                |((market_id, outcome_id), (long_contracts, short_contracts))| {
+                    Ok(pe_paper_state::PaperPositionRow {
+                        market_id: MarketId(VenueMarketId(market_id.clone())),
+                        outcome_id: OutcomeId(*outcome_id),
+                        long_contracts: *long_contracts,
+                        short_contracts: *short_contracts,
+                    })
+                },
+            )
+            .collect()
+    }
+}
+
 /// Append `wf|`-keyed fill frames to a fresh event log via the real `PaperExecutor`
 /// (dense seqs from 0), returning the log path. Frames only — no local commits.
 fn write_frames(dir: &TempDir, fills: &[(u64, Side, u64, Decimal)]) -> std::path::PathBuf {
@@ -339,6 +371,7 @@ async fn ac_wt_rpc_first_then_sqlite_mirror() {
         EventSeq(0),
         &sup_row,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -375,6 +408,7 @@ async fn ac_fail_closed_leaves_sqlite_untouched() {
         &record,
         EventSeq(0),
         &sup_row,
+        None,
         None,
     )
     .await;
@@ -447,6 +481,7 @@ async fn ac_walk_revisits_earlier_failed_frame_after_later_success() {
         EventSeq(0),
         &s0,
         None,
+        None,
     )
     .await;
     assert!(err.is_err());
@@ -459,6 +494,7 @@ async fn ac_walk_revisits_earlier_failed_frame_after_later_success() {
         &r1,
         EventSeq(1),
         &s1,
+        None,
         None,
     )
     .await
@@ -478,6 +514,89 @@ async fn ac_walk_revisits_earlier_failed_frame_after_later_success() {
     assert_eq!(db.fills_count().unwrap(), 2);
     assert_eq!(db.bankroll().unwrap(), Some(dec!(993.0)));
     println!("PASS: AC-WALK-GAP — earlier failed frame recovered after later success");
+}
+
+#[tokio::test]
+async fn ac_authoritative_boot_rejects_an_incomplete_frame_walk() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let log = write_frames(&dir, &[(0, Side::Buy, 10, dec!(0.40))]);
+    let failing = FakeSupabaseState {
+        fail_commit_seq: Some(0),
+        ..FakeSupabaseState::new(dec!(500))
+    };
+
+    let result = supabase_authoritative_boot(&failing, &db, &log).await;
+
+    assert!(matches!(
+        result,
+        Err(SupabaseStateError::IncompleteFrameWalk { last_watermark: -1 })
+    ));
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(1000)));
+    assert_eq!(db.fills_count().unwrap(), 0);
+    assert!(db.paper_positions().unwrap().is_empty());
+    println!("PASS: AC-BOOT-INCOMPLETE — incomplete frame walk aborts before authority pull");
+}
+
+#[tokio::test]
+async fn ac_authoritative_boot_rejects_a_physically_incomplete_final_frame() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let log = write_frames(&dir, &[(0, Side::Buy, 10, dec!(0.40))]);
+    let prior_len = std::fs::metadata(&log).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_len(prior_len - 1)
+        .unwrap();
+    let fake = FakeSupabaseState::new(dec!(500));
+
+    let result = supabase_authoritative_boot(&fake, &db, &log).await;
+
+    assert!(matches!(result, Err(SupabaseStateError::Corrupt(_))));
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(1000)));
+    assert_eq!(db.fills_count().unwrap(), 0);
+    assert!(db.paper_positions().unwrap().is_empty());
+    println!("PASS: AC-BOOT-PHYSICAL-TAIL — truncated final frame aborts before authority pull");
+}
+
+#[tokio::test]
+async fn ac_authoritative_boot_replaces_the_complete_local_position_set() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let stale = MarketId(VenueMarketId("0xstale".to_owned()));
+    db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+    let fake = FakeSupabaseState::new(dec!(123.45));
+    fake.positions
+        .lock()
+        .unwrap()
+        .insert(("0xfresh".to_owned(), 1), (7, 2));
+
+    supabase_authoritative_boot(&fake, &db, &dir.path().join("absent.log"))
+        .await
+        .unwrap();
+
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(123.45)));
+    let positions = db.paper_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].market_id.to_string(), "0xfresh");
+    println!("PASS: AC-BOOT-REPLACE — stale position deleted by one complete replacement");
+}
+
+#[tokio::test]
+async fn ac_authoritative_boot_page_failure_mutates_no_local_authority() {
+    let (dir, db) = db_with_bankroll(dec!(1000));
+    let stale = MarketId(VenueMarketId("0xstale".to_owned()));
+    db.upsert_position(&stale, OutcomeId(0), 9, 0).unwrap();
+    let failing = FakeSupabaseState {
+        fail_boot_positions: true,
+        ..FakeSupabaseState::new(dec!(123.45))
+    };
+
+    let result = supabase_authoritative_boot(&failing, &db, &dir.path().join("absent.log")).await;
+
+    assert!(matches!(result, Err(SupabaseStateError::Corrupt(_))));
+    assert_eq!(db.bankroll().unwrap(), Some(dec!(1000)));
+    assert_eq!(db.paper_positions().unwrap()[0].market_id, stale);
+    println!("PASS: AC-BOOT-PAGE-FAIL — pre-pull bankroll and positions remain intact");
 }
 
 /// #511: an AMBIGUOUS failure (applied server-side, error returned — the Jul-24 502
@@ -500,6 +619,7 @@ async fn ac_ambiguous_apply_converges_on_canonical_row() {
         EventSeq(0),
         &s0,
         None,
+        None,
     )
     .await;
     assert!(err.is_err(), "ambiguous failure surfaces as an error");
@@ -516,6 +636,7 @@ async fn ac_ambiguous_apply_converges_on_canonical_row() {
         &r0b,
         EventSeq(0),
         &s0b,
+        None,
         None,
     )
     .await
@@ -562,9 +683,19 @@ async fn ac_runtime_settled_refusal_writes_disposition() {
     let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
     let src = SourceTradeId("s0".to_string());
 
-    let ret = commit_fill_authoritative(&fake, &db, &src, &leader(), &r0, EventSeq(0), &s0, None)
-        .await
-        .unwrap();
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ret, AuthoritativeFillOutcome::RefusedSettled(dec!(1000)));
     assert!(db.is_seen(&src).unwrap());
     assert_eq!(db.fills_count().unwrap(), 0);
@@ -588,6 +719,7 @@ async fn ac_existing_key_wins_over_later_settlement() {
         EventSeq(0),
         &s0,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -602,6 +734,7 @@ async fn ac_existing_key_wins_over_later_settlement() {
         &r0,
         EventSeq(1),
         &s0,
+        None,
         None,
     )
     .await
@@ -709,6 +842,7 @@ async fn ac_parity_fake_matches_paper_state_over_fill_mix() {
             EventSeq(seq),
             &sup_row,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -751,6 +885,7 @@ async fn ac_dispatch_flip_rides_the_local_mirror_transaction() {
             dispatch_id: &record.idempotency_key,
             paper_outcome: "fill",
         }),
+        None,
     )
     .await
     .unwrap();

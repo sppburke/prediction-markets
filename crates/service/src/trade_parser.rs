@@ -9,7 +9,8 @@
 
 use pe_copy_signal_engine::{IncomingTrade, TradeProvenance};
 use pe_core_types::{
-    ContractQty, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
+    ContractQty, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
+    WalletAddress,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive as _;
@@ -216,16 +217,23 @@ fn convert_trade(
 
     let outcome_id = OutcomeId(raw.outcome_index.unwrap_or(0));
 
+    let exact_contracts =
+        ShareAmount::from_whole(contracts.0).map_err(|error| TradeParseError::InvalidSize {
+            value: raw.size.to_string(),
+            reason: error.to_string(),
+        })?;
+    let transaction_hash = raw.transaction_hash.to_ascii_lowercase();
     Ok(IncomingTrade {
         wallet,
         market_id: MarketId(VenueMarketId(raw.condition_id)),
         outcome_id,
         side,
         price,
-        contracts,
+        contracts: exact_contracts,
         observed_at,
         received_at,
-        source_trade_id: SourceTradeId(raw.transaction_hash),
+        source_trade_id: SourceTradeId(transaction_hash.clone()),
+        transaction_hash: Some(transaction_hash),
         provenance: TradeProvenance::RestPoll,
     })
 }
@@ -244,7 +252,7 @@ mod tests {
         let json = br#"[{"transactionHash":"0xabc","conditionId":"0xcond","side":"BUY","size":50,"price":0.65,"timestamp":1704067200,"outcomeIndex":0}]"#;
         let trades = parse_trades(json, dummy_wallet()).unwrap();
         assert_eq!(trades.len(), 1);
-        assert_eq!(trades[0].contracts.0, 50);
+        assert_eq!(trades[0].contracts.atomic(), 50_000_000);
         assert_eq!(trades[0].side, Side::Buy);
         assert_eq!(trades[0].market_id.0.0, "0xcond");
         assert_eq!(trades[0].source_trade_id.0, "0xabc");

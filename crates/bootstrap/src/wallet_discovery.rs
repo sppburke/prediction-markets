@@ -1,10 +1,8 @@
 //! Source-agnostic winner-discovery dispatch (issue #324).
 //!
 //! [`WalletDiscoverySource`] enumerates discovery sources.
-//! [`run_source_discovery`] acquires [`CacheMutationLock`] for the DB-mutation
-//! window, dispatches to the appropriate source, and returns aggregate counts.
-//! The lock is RAII-dropped before returning — callers may shell out to long
-//! subprocesses (e.g. backfill) without holding it.
+//! The binary acquires the cache mutation lock centrally before its read-write
+//! open (#544); discovery must not nest another acquisition.
 
 use std::time::Duration;
 
@@ -19,7 +17,6 @@ use crate::error::BootstrapError;
 use crate::leaderboard_discovery::{
     LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery_with_policy,
 };
-use crate::lock::CacheMutationLock;
 use crate::pile::ActivationPolicy;
 
 /// The supported wallet-discovery sources for `winner-discovery`.
@@ -36,8 +33,8 @@ pub struct SourceDiscoveryResult {
     pub activated: usize,
 }
 
-/// Run discovery for `source`, holding [`CacheMutationLock`] only for the
-/// DB-mutation window. The lock is released before this function returns.
+/// Run discovery for `source`. Production callers already hold the central
+/// cache mutation lock for the lifetime of `cache` (#544).
 pub async fn run_source_discovery(
     source: WalletDiscoverySource,
     config: &BootstrapConfig,
@@ -70,7 +67,6 @@ pub async fn run_source_discovery_with_policy(
                 ReqwestFetcher::new(client)
                     .with_min_interval_ms(config.leaderboard_request_interval_ms),
             );
-            let _lock = CacheMutationLock::acquire(&config.cache_path)?;
             let r: LeaderboardDiscoveryReport = run_leaderboard_discovery_with_policy(
                 &fetcher,
                 &config.leaderboard_categories,
@@ -108,11 +104,6 @@ pub async fn run_source_discovery_with_policy(
                 client,
                 config.datadash_request_interval_ms,
             );
-            let _lock = CacheMutationLock::acquire(&config.cache_path).map_err(|e| {
-                BootstrapError::Datadash {
-                    message: format!("lock: {e}"),
-                }
-            })?;
             let r: DatadashDiscoveryReport = run_datadash_discovery_with_policy(
                 &fetcher,
                 &config.datadash_exclude_ids,

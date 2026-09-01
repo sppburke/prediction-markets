@@ -33,6 +33,7 @@ PENDING_FILE="data/eval-results/rank_and_push.pending"
 CYCLE_FILE="data/eval-results/rank_and_push.cycle"
 LOOP_LOCK_FILE="data/eval-results/.rank_and_push_loop.lock"
 TRANSIENT_RETRY_DELAY_SECS=60
+SUCCESS_WAIT_SECS=60
 mkdir -p "$(dirname "$FLAG_FILE")"
 
 # Kernel-held singleton lock: stale process exits release it automatically. Open
@@ -44,15 +45,10 @@ if ! flock -n 9; then
   echo "FATAL: rank-and-push loop already running (PID ${holder:-unknown})" >&2
   exit 3
 fi
-: > "$LOOP_LOCK_FILE"
-printf '%s\n' "$$" >&9
+printf '%s\n' "$$" > "$LOOP_LOCK_FILE"
 
 ACTIVE_CHILD_PID=""
 TERM_GRACE_SECS=30
-
-cleanup() {
-  rm -f "$LOOP_LOCK_FILE"
-}
 
 terminate_active_group() {
   local exit_code="$1"
@@ -76,7 +72,6 @@ terminate_active_group() {
   exit "$exit_code"
 }
 
-trap cleanup EXIT
 trap 'terminate_active_group 143' TERM
 trap 'terminate_active_group 130' INT
 
@@ -100,6 +95,26 @@ read_flag() {
       return 2
       ;;
   esac
+}
+
+wait_with_flag() {
+  local reason="$1" delay_secs="$2"
+  for ((waited = 0; waited < delay_secs; waited++)); do
+    local flag_value
+    flag_value="$(read_flag)" || exit $?
+    case "$flag_value" in
+      missing)
+        echo "LOOP_STOP reason=flag_missing_during_${reason}"
+        exit 0
+        ;;
+      stop)
+        echo "LOOP_STOP reason=flag_stop_during_${reason}"
+        exit 0
+        ;;
+      run) ;;
+    esac
+    sleep 1
+  done
 }
 
 cycle=0
@@ -149,6 +164,13 @@ while true; do
   fi
 
   if [[ "$child_status" -eq 0 ]]; then
+    if [[ -e "$PENDING_FILE" || -L "$PENDING_FILE" \
+        || -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
+      echo "LOOP_RECOVERY_READY kind=$child_kind wait_bypassed=true"
+      continue
+    fi
+    echo "LOOP_SUCCESS kind=$child_kind retry_in=${SUCCESS_WAIT_SECS}s"
+    wait_with_flag "success" "$SUCCESS_WAIT_SECS"
     continue
   fi
   if [[ "$child_status" -ne 75 ]]; then
@@ -162,19 +184,5 @@ while true; do
     exit 1
   }
   echo "LOOP_TEMPFAIL kind=$child_kind status=75 retry_in=${TRANSIENT_RETRY_DELAY_SECS}s"
-  for ((waited = 0; waited < TRANSIENT_RETRY_DELAY_SECS; waited++)); do
-    flag_value="$(read_flag)" || exit $?
-    case "$flag_value" in
-      missing)
-        echo "LOOP_STOP reason=flag_missing_during_retry"
-        exit 0
-        ;;
-      stop)
-        echo "LOOP_STOP reason=flag_stop_during_retry"
-        exit 0
-        ;;
-      run) ;;
-    esac
-    sleep 1
-  done
+  wait_with_flag "retry" "$TRANSIENT_RETRY_DELAY_SECS"
 done

@@ -14,10 +14,10 @@
 //!   older than `purge_inactivity_secs`. Deleted with **no tombstone** — discovery
 //!   may re-find it.
 //!
-//! [`run_infra_purge`] is the separate pre-ranking path: it archives and removes
-//! every `is_infra = 1` wallet regardless of active state and writes a durable,
-//! non-liftable `infra` tombstone. Invocation is armed by default; only
-//! `--dry-run` is report-only.
+//! [`run_infra_purge`] is the direct infrastructure path: it archives and
+//! removes every `is_infra = 1` wallet regardless of active state and writes a
+//! durable, non-liftable `infra` tombstone. Like the ordinary purge, it is
+//! report-only unless `purge_enabled` is true and `--dry-run` is absent (#544).
 //!
 //! The guard keeps the rule-B set off every eligible (hence pushed-cohort) wallet:
 //! the pushed cohort ⊆ `latency_shift_rerank.py load_candidates` (`eligible &
@@ -41,21 +41,22 @@
 //! The recreate runs even on a mid-run delete/reclaim error
 //! (recreate-then-propagate). A `reclamation_pending` marker commits BEFORE the
 //! index drop and clears only after reclaim AND recreate succeed. Recovery is
-//! serviced only by the ordinary post-publication purge: a subthreshold/empty
-//! run recovers via reclaim + idempotent index creation with NO index drop
+//! serviced only by a direct ordinary purge: a subthreshold/empty run recovers
+//! via reclaim + idempotent index creation with NO index drop
 //! (schema-on-open already healed any absence), while an above-threshold run
-//! subsumes recovery in its normal bulk maintenance. `purge-infra`
-//! (pre-ranking, cycle-fatal) never services recovery. The lookup index
+//! subsumes recovery in its normal bulk maintenance. Direct `purge-infra` never
+//! services recovery. The lookup index
 //! `idx_trades_wallet_ts` and the PK are kept. Dry runs touch neither indexes
 //! nor the marker.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
 
 use crate::BootstrapConfig;
-use crate::cache::{PurgeReason, PurgeReport, PurgeRow, WalletCache};
+use crate::cache::{PurgeReason, PurgeReport, PurgeRow, ReclamationReport, WalletCache};
 use crate::error::BootstrapError;
 use crate::pile;
 
@@ -167,9 +168,8 @@ pub fn run_purge(
     Ok(report)
 }
 
-/// Delete every live infrastructure wallet and its wallet-keyed cache data.
-/// Unlike the ordinary loser/dead-weight purge, invocation is armed by default;
-/// only explicit `--dry-run` is report-only.
+/// Report or delete every live infrastructure wallet and its wallet-keyed cache
+/// data. The existing `purge_enabled` switch disarms both purge commands (#544).
 pub fn run_infra_purge(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -184,7 +184,7 @@ pub fn run_infra_purge(
             reason: PurgeReason::Infrastructure,
         })
         .collect();
-    let armed = !dry_run;
+    let armed = config.purge_enabled && !dry_run;
     let (report, bulk) = execute_purge_rows(config, cache, &rows, now_unix, armed, "purge-infra")?;
     tracing::info!(
         armed,
@@ -230,17 +230,11 @@ fn execute_purge_rows(
 
     // #538 fail-closed marker read: an error here aborts — a pending recovery
     // must never be silently skipped because the marker could not be read.
-    // Recovery is serviced ONLY at the ordinary post-publication purge ("purge"):
-    // purge-infra runs PRE-ranking and is fatal to the cycle, so a multi-hour
-    // recovery there would turn deferred maintenance into a ranking outage. An
+    // Recovery is serviced ONLY by the direct ordinary purge ("purge"):
+    // purge-infra must not silently turn an infrastructure-only command into
+    // unrelated multi-hour maintenance. An
     // above-threshold run needs no recovery arm — its normal bulk maintenance
     // drains the entire freelist (backlog included) and clears the marker.
-    let recovery_pending = if armed && label == "purge" {
-        cache.reclamation_pending()?
-    } else {
-        false
-    };
-
     let bulk =
         armed && u64::try_from(rows.len()).unwrap_or(u64::MAX) >= config.purge_bulk_min_wallets;
     let report = if bulk {
@@ -278,14 +272,7 @@ fn execute_purge_rows(
         report
     } else if armed {
         let report = cache.purge_wallets(rows, now_unix, false)?;
-        if recovery_pending {
-            // Recovery ≠ bulk (#538): indexes stay LIVE — no `DROP INDEX`
-            // (schema-on-open already healed any absence). Reclaim, then
-            // idempotent creation, then clear; a clear failure propagates and
-            // leaves recovery pending.
-            let reclamation = cache.reclaim_free_pages()?;
-            cache.create_trades_bulk_delete_indexes()?;
-            cache.clear_reclamation_pending()?;
+        if let Some(reclamation) = recover_pending_reclamation(cache)? {
             tracing::info!(
                 stage = label,
                 auto_vacuum_before = reclamation.auto_vacuum_before,
@@ -303,6 +290,54 @@ fn execute_purge_rows(
         cache.purge_wallets(rows, now_unix, true)?
     };
     Ok((report, bulk))
+}
+
+/// Complete only a previously marked reclamation recovery (#544).
+///
+/// This path cannot select, archive, tombstone, or delete wallets. It factors
+/// the ordinary purge's existing drop-free recovery sequence so activation can
+/// explicitly run `reclaim -> idempotent index create -> marker clear` without
+/// invoking either purge selector.
+pub fn recover_pending_reclamation(
+    cache: &mut WalletCache,
+) -> Result<Option<ReclamationReport>, BootstrapError> {
+    if !cache.reclamation_pending()? {
+        return Ok(None);
+    }
+    let reclamation = cache.reclaim_free_pages()?;
+    cache.create_trades_bulk_delete_indexes()?;
+    cache.clear_reclamation_pending()?;
+    Ok(Some(reclamation))
+}
+
+/// Append one outcome from an explicit purge command to its durable ledger.
+///
+/// Automatic purge stages no longer exist; this records only direct operator
+/// invocations and never changes the command's already-determined exit code.
+pub fn append_direct_purge_status(
+    eval_results_dir: &Path,
+    stage: &str,
+    exit_code: i32,
+) -> Result<(), BootstrapError> {
+    std::fs::create_dir_all(eval_results_dir)?;
+    let path = eval_results_dir.join("purge_status.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({
+            "ts_unix": OffsetDateTime::now_utc().unix_timestamp(),
+            "level": if exit_code == 0 { "info" } else { "warn" },
+            "message": "direct purge command exit",
+            "stage": stage,
+            "exit_code": exit_code,
+        }),
+    )?;
+    writeln!(file)?;
+    file.flush()?;
+    Ok(())
 }
 
 /// Resolve the decision CSV: explicit `purge_decision_csv` if set, else the

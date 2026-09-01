@@ -1,0 +1,21 @@
+{
+  "active": true,
+  "closed": true,
+  "condition_id": "0x0fbd0991b8cd88bebb6b48441c549d32a1eedb1e5ce47a5730829cec02c0e635",
+  "end_date_iso": "2023-01-14T00:00:00Z",
+  "is_50_50_outcome": true,
+  "tokens": [
+    {
+      "token_id": "1366352052302302650100212872577964890235822603265554843502820698768162038248",
+      "outcome": "Imavov",
+      "price": 0.5,
+      "winner": false
+    },
+    {
+      "token_id": "74363419021144293841871695416897740111219720976454426632393800957887739750033",
+      "outcome": "Gastelum",
+      "price": 0.5,
+      "winner": false
+    }
+  ]
+}

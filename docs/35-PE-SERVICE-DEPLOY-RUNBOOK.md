@@ -17,7 +17,7 @@ deploying it to the VPS with one restart and no stop-before-swap window.
 | binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
 | env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
-| build box | the VPS has no cargo — build on the dev box and `scp`. Dev box: `cargo build --release -p pe-service` at the target main SHA (rustc 1.95.0) |
+| build box | the VPS has no cargo — build on the dev box and `scp`. Release-like builds derive the full revision directly from the checked-out Git object and reject a dirty, unknown, or invalid checkout; no environment override is accepted. Dev/test builds use the explicit `dev-dirty` sentinel when needed. |
 | logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path`; `status.json` in the working directory |
 
 ## Topology (#546)
@@ -32,7 +32,10 @@ new ranking publication only.
 
 ## Procedure
 
-Every step is bound to sha256 identity (#514): **desired** = hash of the local release build;
+Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
+reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
+revision and the executable's BLAKE3 digest before staging. Continue to use sha256 for the existing
+desired/staged/installed/running byte comparison (#514): **desired** = hash of the local release build;
 **staged** = hash of `/tmp/pe-service.new.<desired-sha12>` on the VPS (hash-qualified so concurrent
 agents cannot clobber each other's staged binary, #516); **installed** = hash of the `ExecStart`
 binary; **running** = hash of `/proc/<MainPID>/exe`. A deploy holds the deploy lock from preflight
@@ -46,8 +49,21 @@ Since #546 the binary is replaced **while the old process keeps running** — Li
 open under it — and activated by **one** `systemctl restart`. Every step is resumable: the hash
 comparisons decide what remains; never guess from memory.
 
-1. **Build at the exact main SHA** being deployed (record the git SHA and the desired hash):
-   `git -C /home/sean/git/prediction-markets rev-parse HEAD && cargo build --release -p pe-service && sha256sum target/release/pe-service`
+1. **Build from a clean checkout at the exact reviewed SHA** and record both identities:
+
+   ```bash
+   revision=$(git -C /home/sean/git/prediction-markets rev-parse --verify 'HEAD^{commit}')
+   git -C /home/sean/git/prediction-markets status --porcelain=v1 --untracked-files=normal
+   cargo build --release -p pe-service
+   target/release/pe-service --version
+   artifact_blake3=$(b3sum target/release/pe-service | awk '{print $1}')
+   target/release/pe-service --verify-staged-identity "$revision" "$artifact_blake3"
+   sha256sum target/release/pe-service
+   ```
+
+   The status command must print nothing; `--version` and the verification output must name the
+   same full `revision`. A dirty release checkout fails during the build rather than emitting an
+   unchecked identity.
 2. **Ship** hash-qualified:
    `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
 3. **Preflight on the VPS** (read-only; lock first):
@@ -59,6 +75,9 @@ comparisons decide what remains; never guess from memory.
    systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory -p FragmentPath -p DropInPaths -p UnitFileState -p WantedBy -p Restart -p RestartUSec -p KillSignal
    pid=$(systemctl show pe-service -p MainPID --value)
    sha256sum target/release/pe-service "/proc/$pid/exe" /tmp/pe-service.new.<desired-sha12> .env smoke-test/service.toml
+   chmod 0755 /tmp/pe-service.new.<desired-sha12>
+   /tmp/pe-service.new.<desired-sha12> --version
+   /tmp/pe-service.new.<desired-sha12> --verify-staged-identity '<reviewed-40-hex>' '<staged-blake3>'
    stat -c '%d %n' target/release /tmp     # equal device ids ⇒ the rename below is atomic
    jq '.source_health, {bankroll,open_positions,fills_total,last_event_seq,watchlist_size}' status.json
    stat -c '%s %Y' smoke-test/source_events.log
@@ -66,7 +85,8 @@ comparisons decide what remains; never guess from memory.
 
    Expected contract: `enabled`, `active`, `UnitFileState=enabled`, `WantedBy=multi-user.target`,
    `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2`, staged = desired, installed = running.
-   If installed = running = desired already, the deploy is complete (a resumed run): go to step 6.
+   The staged `--version` revision and verified BLAKE3 must match step 1 in addition to the sha256
+   equality. If installed = running = desired already, the deploy is complete (a resumed run): go to step 6.
    If installed = desired but running is prior, go to step 5. Any unit-policy or ownership drift
    stops the deploy for a reviewed correction; only enablement drift may be repaired in place with
    `sudo systemctl enable pe-service` (no `--now`, no restart).
@@ -96,11 +116,16 @@ comparisons decide what remains; never guess from memory.
    systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory
    pid=$(systemctl show pe-service -p MainPID --value); sha256sum "/proc/$pid/exe" .env smoke-test/service.toml
    journalctl -u pe-service -n 100
-   jq '.source_health' status.json; curl -s localhost:8080/health/ready
+   target/release/pe-service --version
+   jq '{revision,applied_config_hash,tasks,runtime_config,watchlist_projection,source_health}' status.json
+   curl -s localhost:8080/health/ready
    ```
 
    A new `InvocationID`, PID, and start timestamp prove activation; `NRestarts` must not increase
-   afterwards (no restart loop); running hash = desired; `ExecStart`, `WorkingDirectory`, and the
+   afterwards (no restart loop); running hash = desired; embedded and `status.json.revision` equal
+   the reviewed revision; `status.json.applied_config_hash` equals
+   `runtime_config.applied_hash`; every critical task is running with no sticky failure; and
+   `ExecStart`, `WorkingDirectory`, and the
    `.env` / `service.toml` hashes equal step 3; clean boot (no config-parse error, watchlist seeded from
    `latest_ranking`, `service_config poll loop started`, no poll failures; since #542 an admitting
    swap or backfill is preceded by `hot-watchlist admission state prepared`).
@@ -126,8 +151,57 @@ comparisons decide what remains; never guess from memory.
    `consecutive_reconnects` and drop cadence: a churn pattern is the evidence for any keepalive
    follow-up (the first-party client sends `ping` every 5 s; `pe-service` does not).
 
-**Deployment one-time note (#530)**: delete the retired runtime row
-`delete from service_config where key='trade_poll_interval_secs';` (boot-owned only now).
+## #544 database, paper-boundary, and site activation lane
+
+Before staging the service, apply the additive projection function/schema and then the guarded
+configuration migration while version one still serves:
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f scripts/migrate_service_config_544.sql
+```
+
+The migration allows only the exact hot and retired key sets, deletes only the reviewed retired
+rows, and aborts before mutation while listing any unknown key. Reload/verify the PostgREST schema
+cache, prove `service_watchlist_replace_v1(timestamptz,jsonb)` is executable only by
+`service_role`, and prove the remaining `service_config` rows are the complete 17-key allowlist
+with only `kelly_fraction_override` permitted absent. In particular, the mandatory
+`price_impact_cap_bps` row must be present at the canonical seed and `per_trade_cap` must remain
+`unlimited`.
+
+The first v2 service activation resolves the configured source and paper event-log paths plus the
+derived `live_journal.log`, then captures immutable version-one bindings for each: canonical path,
+physical tail, last sequence, and last hash.
+It then resumes the machine-owned paper migration phase across restarts, reloads the complete
+Supabase bankroll/positions authority, runs the activity/position bracket, records final tails,
+and installs only the synchronized v2 main before producers start. Configure
+`PE_SUPABASE_AUTHORITATIVE=true` and point `PE_LEGACY_WALLET_HISTORY_PATH` at the captured legacy
+input. Do not add a history sidecar service or any periodic position-reseed step.
+
+Only before the first v2 append or active-state commit, preserve the failed side and restore the
+immutable v1 main with:
+
+```bash
+PE_PAPER_V1_BACKUP_PATH="$PAPER_V1_BACKUP" \
+PE_PAPER_FAILED_SIDE_PATH="$FAILED_PAPER_SIDE" \
+pe-service --rollback-paper-v1
+```
+
+After either boundary, rollback refuses; restart the same v2-compatible binary to resume the
+recorded roll-forward. A path/hash/phase/binary mismatch is a stop condition, not a reason to
+reseed or delete migration state.
+
+Activate the dashboard as its own `pe-site` lane. Build it from the reviewed commit with `npm ci`,
+`npm test`, and `npm run build`; record the commit and staged artifact hash, and stage the
+hash-qualified release path early if useful. Do not switch the unit's release path until the new
+service has completed one successful `service_watchlist_replace_v1` transaction and the returned
+token, count, and rows have been independently verified. Then activate that reviewed release,
+restart only `pe-site`, and verify `systemctl is-active pe-site` plus the signed-in Live page. The
+site must show a valid empty or nonempty watched set only when runtime-token → watchlist →
+runtime-token and count agree; induce no database writes during this read check. Site rollback
+restores the prior release path and restarts only `pe-site`; the additive RPC/schema remain
+installed. If service rollback to the legacy publisher is still permitted, roll the site back
+first—the token-guarded reader must never run against the legacy producer.
 
 ## #530 websocket rollback ordering
 

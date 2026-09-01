@@ -26,12 +26,31 @@ macro_rules! exact_amount {
         #[serde(transparent)]
         pub struct $name(u64);
 
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.to_decimal().fmt(formatter)
+            }
+        }
+
         impl $name {
             pub const ZERO: Self = Self(0);
 
             #[must_use]
             pub const fn from_atomic(atomic: u64) -> Self {
                 Self(atomic)
+            }
+
+            /// Construct an exact amount from a whole-unit legacy value.
+            ///
+            /// Version-two activity paths should use [`Self::from_decimal_exact`]
+            /// or [`Self::from_atomic`]. This checked helper exists for version-one
+            /// frames whose quantities were already projected to whole contracts
+            /// before the trustworthy activity boundary (#544).
+            pub fn from_whole(whole: u64) -> Result<Self, Error> {
+                whole
+                    .checked_mul(ATOMIC_SCALE)
+                    .map(Self)
+                    .ok_or(Error::OutOfRange { field: $field })
             }
 
             #[must_use]
@@ -43,7 +62,11 @@ macro_rules! exact_amount {
                 if value.is_sign_negative() {
                     return Err(Error::OutOfRange { field: $field });
                 }
-                let scaled = value * Decimal::from(ATOMIC_SCALE);
+                // checked_mul: a near-MAX Decimal (reachable from untrusted source
+                // payloads since #544's parser) must reject, never panic (#544 review).
+                let scaled = value
+                    .checked_mul(Decimal::from(ATOMIC_SCALE))
+                    .ok_or(Error::OutOfRange { field: $field })?;
                 if scaled.fract() != Decimal::ZERO {
                     return Err(Error::ScaleError {
                         max_dp: 6,

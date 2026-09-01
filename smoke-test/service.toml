@@ -19,10 +19,8 @@ mode                             = "paper"
 # market that resolves within [min, max] of now. The leader-price band was removed in
 # #339 — live sizing is re-based on the current market price instead. Hold-to-resolution
 # is enforced by the orchestrator's filled-positions set.
-wallet_market_history_path       = "smoke-test/wallet_market_history.json"
-# fail-open: a wallet whose history could not be fetched (first-run API failure) is
-# treated as new (copies allowed); the loader warns per absent wallet. Set true to block.
-entry_gate_fail_closed           = false
+# Version-two durable reconciled history is mandatory; missing/incomplete wallets are
+# excluded before membership publication (there is no runtime fail-open switch).
 max_resolution_horizon_secs      = 172800  # 48 h (run28 cutover)
 min_fill_price                   = "0.15"  # run28 entry-band floor (current price)
 watchlist_membership_mode        = "full_rerank"  # run28 cutover; knockout = legacy

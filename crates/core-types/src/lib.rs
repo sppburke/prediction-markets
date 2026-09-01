@@ -27,7 +27,8 @@ pub use http_evidence::{
 pub use identity::{AccountId, TraderId, VenueAccountId, WalletAddress};
 pub use ids::{
     EventSeq, MarketId, MarketOutcomeId, ModelId, OrderLocalId, OutcomeId, ResolverCardId,
-    SourceId, SourceTradeId, StrategyId, VenueId, VenueMarketId, VenueOrderId,
+    SourceId, SourceTradeId, SourceTradeIdentityVersion, StrategyId, VenueId, VenueMarketId,
+    VenueOrderId,
 };
 pub use polymarket::{
     PolymarketConditionId, PolymarketOrderId, PolymarketOrderType, PolymarketTokenId,

@@ -20,7 +20,6 @@
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run
 #                                                  ONCE (fetch_resolutions_and_schedules; the latter
 #                                                  is the --scheduled-only TTR clock)
-#   Step 0i purge   pe-bootstrap purge-infra       archive + delete infra wallet data before ranking
 #   Step 0a export  export_trades_parquet.py       trades+maps → Parquet for the DuckDB read-layer
 #                                                  (#375; auto/duck engines only; --skip-export bypass)
 #   Stage 1  rank    rank_72hr_buyandhold.py  --universe-from-trades  (every wallet w/ trade data)
@@ -31,14 +30,6 @@
 #   Stage 3  publish push_ranking_to_supabase.py records the exact request, then
 #                    atomically/idempotently publishes it through the Supabase RPC.
 #   Verify           that exact batch and contiguous rank set are latest_ranking.
-#   Stage 4  purge   pe-bootstrap purge (#385)  delete proven-loser & dead-weight wallets from
-#                    the local cache (DELETE is a no-op unless purge_enabled=true; always reports).
-#                    Non-fatal (the push already published); --skip-purge to bypass,
-#                    auto-skipped under --skip-backfill / --skip-rank (needs a fresh backfill+verdict).
-#   Stage 5  checkpoint  PRAGMA wal_checkpoint(TRUNCATE)  checkpoint committed WAL pages into the
-#                        cache and truncate the WAL so completed runs release their disk footprint.
-#                        Always attempted last (including re-push / skipped-purge runs) and non-fatal:
-#                        a concurrent SQLite connection may temporarily prevent truncation.
 #
 # Production defaults are baked in (override via flags): --universe-from-trades,
 # HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 48h, MinTRL 20 (the run28
@@ -74,8 +65,7 @@
 #   --engine E            ranker engine: auto (default) | duck | sqlite. auto uses the DuckDB
 #                         read-layer over a fresh Parquet snapshot (faster scan), else SQLite.
 #   --skip-export         reuse an existing Parquet snapshot (skip the Step-0a rewrite).
-#   --skip-purge          skip both pre-rank infra purge and Stage-4 ordinary purge (#385);
-#                         the final WAL checkpoint still runs.
+#   --skip-purge          accepted as a backward-compatible no-op; automatic purge is retired (#544).
 #   --keep-intermediates  retain qualifying_positions_72hr.csv (the >5 GB pass-1 intermediate) instead
 #                         of auto-pruning it after pass-2; useful for debugging the raw position set.
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
@@ -83,6 +73,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 INVOCATION_ARGC=$#
+
+command -v flock >/dev/null 2>&1 || {
+  echo "FATAL: required command is unavailable: flock" >&2
+  exit 2
+}
 
 # ── Defaults (override via flags) ────────────────────────────────────────────────────────
 DB="data/wallet_cache.db"
@@ -339,51 +334,34 @@ fi
 # Fail before the run lock, logical-cycle directory, or pointer when this
 # invocation will need the Rust cache mutator. A pure research re-push can still
 # omit the binary because every bootstrap stage is skipped.
-if [[ "$SKIP_DISCOVERY" == "0" || "$SKIP_BACKFILL" == "0" || "$SKIP_RANK" == "0" \
-      || ( "$SKIP_PURGE" == "0" && "$RESUME_PENDING" == "1" ) ]]; then
+if [[ "$SKIP_DISCOVERY" == "0" || "$SKIP_BACKFILL" == "0" || "$SKIP_RANK" == "0" ]]; then
   [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
     echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
     exit 2
   }
 fi
 
-# Both purge entry points (Step 0i purge-infra, Stage 4 ordinary purge) run the cache
-# mutator at idle block-I/O priority: the 2026-08-23 bulk purge saturated the cache disk
-# at normal priority and starved the control plane until a power cycle (#527). Resolve
-# the tool up front and fail closed before the run lock — a purge must never silently
-# run at normal priority, so no `ionice -t` and no fallback. The condition below is the
-# union of the two call sites' reachability (resume forces SKIP_RANK=1 but still runs
-# the ordinary post-publication purge).
-IONICE_BIN=""
-if [[ "$SKIP_PURGE" == "0" && ( "$SKIP_RANK" == "0" || "$RESUME_PENDING" == "1" ) ]]; then
-  IONICE_BIN="$(command -v ionice || true)"
-  [[ -n "$IONICE_BIN" && -x "$IONICE_BIN" ]] || {
-    echo "FATAL: ionice not found — purge stages require idle I/O priority (#527). Install util-linux or pass --skip-purge." >&2
-    exit 2
-  }
-fi
-
-# ── Single-run lock (PID-based) ──────────────────────────────────────────────────────────
-# A full run (≈496K wallets, 30–90 min) must never overlap the next cron tick. A live holder
-# aborts the new run; a stale lock from a crashed run (PID not alive) is reclaimed. The trap
-# is set only AFTER we own the lock, so a held-lock abort never deletes the other run's file.
+# ── Single-run kernel lock ────────────────────────────────────────────────────────────────
+# Keep one persistent inode so shell flock and Rust fs2 contenders coordinate on the same
+# kernel lock. The PID is diagnostic only and is written after acquisition (#544).
 LOCK_FILE="data/eval-results/.rank_and_push.lock"
 mkdir -p "$(dirname "$LOCK_FILE")"
-if [[ -e "$LOCK_FILE" ]]; then
-  LOCK_PID="$(cat "$LOCK_FILE" 2>/dev/null || true)"
-  if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
-    echo "FATAL: another rank_and_push.sh is already running (PID $LOCK_PID). Aborting." >&2
-    exit 3
-  fi
-  echo "WARN: reclaiming stale lock (PID ${LOCK_PID:-unknown} not alive)." >&2
+exec 8<>"$LOCK_FILE"
+if ! flock -n 8; then
+  LOCK_PID="$(tr -cd '0-9' < "$LOCK_FILE" 2>/dev/null || true)"
+  echo "FATAL: another rank_and_push.sh is already running (PID ${LOCK_PID:-unknown}). Aborting." >&2
+  exit 3
 fi
-echo "$$" > "$LOCK_FILE"
+printf '%s\n' "$$" > "$LOCK_FILE"
 CYCLE_TMP=""
+PIPELINE_VERSIONS_TMP=""
+CYCLE_CONFIG_TMP=""
+CURRENT_CYCLE_TMP=""
 cleanup_rank_and_push() {
-  rm -f "$LOCK_FILE"
-  if [[ -n "$CYCLE_TMP" ]]; then
-    rm -f "$CYCLE_TMP"
-  fi
+  [[ -z "$CYCLE_TMP" ]] || rm -f "$CYCLE_TMP"
+  [[ -z "$PIPELINE_VERSIONS_TMP" ]] || rm -f "$PIPELINE_VERSIONS_TMP"
+  [[ -z "$CYCLE_CONFIG_TMP" ]] || rm -f "$CYCLE_CONFIG_TMP"
+  [[ -z "$CURRENT_CYCLE_TMP" ]] || rm -f "$CURRENT_CYCLE_TMP"
 }
 trap cleanup_rank_and_push EXIT
 
@@ -424,10 +402,48 @@ validate_cycle_pointer() {
 if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
   if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
+    [[ -f "$OUT_DIR/cycle_manifest.json" && ! -L "$OUT_DIR/cycle_manifest.json" ]] || {
+      echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
+      exit 2
+    }
     echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
   else
+    PIPELINE_VERSIONS_TMP="data/eval-results/.pipeline_versions.$$.json"
+    CYCLE_CONFIG_TMP="data/eval-results/.cycle_configuration.$$.json"
+    CURRENT_CYCLE_TMP="data/eval-results/.cycle_manifest.$$.json"
+    "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_TMP"
+    "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
+      "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" "$FLOOR_TSTAT" \
+      "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" "$LATENCY_SHIFT_SECS" \
+      "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
+import json
+import sys
+
+keys = [
+    "half_life_days", "ttr_hours", "price_min", "price_max", "floor_tstat",
+    "min_trl", "min_avg_per_month", "min_active_months", "latency_shift_secs",
+    "fill_window_secs", "top_n",
+]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(dict(zip(keys, sys.argv[2:], strict=True)), handle, sort_keys=True)
+    handle.write("\n")
+PY
+    CYCLE_DAY_UTC="$(date -u +%Y-%m-%d)"
+    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
+      --db "$DB" --day-utc "$CYCLE_DAY_UTC" \
+      --versions-file "$PIPELINE_VERSIONS_TMP" \
+      --configuration-file "$CYCLE_CONFIG_TMP" --output "$CURRENT_CYCLE_TMP"
+    if "$PYTHON_BIN" scripts/rank_cycle_manifest.py unchanged \
+      --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
+      echo "RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"
+      exit 0
+    fi
     OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$OUT_DIR"
+    mv -f -- "$CURRENT_CYCLE_TMP" "$OUT_DIR/cycle_manifest.json"
+    CURRENT_CYCLE_TMP=""
+    cp -- "$PIPELINE_VERSIONS_TMP" "$OUT_DIR/pipeline_versions.json"
+    cp -- "$CYCLE_CONFIG_TMP" "$OUT_DIR/cycle_configuration.json"
     CYCLE_TMP="${CYCLE_FILE}.tmp.$$"
     printf '%s\n' "$OUT_DIR" > "$CYCLE_TMP"
     mv -f -- "$CYCLE_TMP" "$CYCLE_FILE"
@@ -456,6 +472,10 @@ POSITIONS_CSV="$OUT_DIR/qualifying_positions_72hr.csv"
 LATENCY_CSV="$OUT_DIR/latency_shift_ranked.csv"
 PUBLISH_REQUEST_FILE="$OUT_DIR/ranking_publish_request.json"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+PIPELINE_VERSIONS_FILE="$OUT_DIR/pipeline_versions.json"
+if [[ "$SKIP_RANK" == "0" && ! -f "$PIPELINE_VERSIONS_FILE" ]]; then
+  "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_FILE"
+fi
 
 # Universe source: explicit --universe <file>, else the production default --universe-from-trades
 # (every wallet with trade history; #370). The ranker enforces "exactly one of these", so pass
@@ -493,26 +513,11 @@ fi
 # the loop supervisor retries a 75 cycle, while 1 (permanent) stops the loop.
 # NEVER pass --strict: it turns a tolerable partial (2) into a fatal (1). backfill and
 # resolutions routinely return 2 at full scale, so swallowing 2 is load-bearing for cron.
-# #538: durable purge-stage record. journald died mid-incident on 2026-08-27 and
-# took the only failure signal with it; this JSONL line lands in the per-run
-# artifact dir on the data disk and records EVERY outcome (0/2/75/fatal). Append
-# failure warns and never alters the captured exit code or any stage policy.
-append_purge_status() {
-  local stage="$1" rc="$2" level="info"
-  [[ "$rc" -ne 0 ]] && level="warn"
-  printf '{"ts":"%s","level":"%s","message":"purge stage exit","stage":"%s","exit_code":%d}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$stage" "$rc" \
-    >> "$OUT_DIR/purge_status.jsonl" 2>/dev/null \
-    || echo "   [$stage] WARN: purge_status.jsonl append failed" >&2
-}
-
 run_refresh_stage() {
   local label="$1"; shift
   echo "   [$label] running: $*"
   local rc=0
   "$@" || rc=$?
-  # #538: record purge stages BEFORE case dispatch — the 75/fatal arms exit here.
-  [[ "$label" == "purge-infra" ]] && append_purge_status "$label" "$rc"
   case "$rc" in
     0) echo "   [$label] ok" ;;
     2) echo "   [$label] WARN exit 2 (partial); cache durable, continuing" >&2 ;;
@@ -574,24 +579,6 @@ refresh_data() {
 
 refresh_data
 
-# Infrastructure must be absent from the same cache snapshot the ranker reads.
-# This stage is armed by invocation, archive-before-delete, and fatal before any
-# export/rank/push. `--skip-purge` is the one explicit bypass for both purge kinds.
-if [[ "$SKIP_PURGE" == "1" ]]; then
-  echo "── Step 0i: infrastructure purge skipped (--skip-purge) ───────────────────────"
-elif [[ "$SKIP_RANK" == "1" ]]; then
-  echo "── Step 0i: infrastructure purge skipped (--skip-rank reuses an existing ranking) ──"
-else
-  [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
-    echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
-    exit 2
-  }
-  export PE_BOOTSTRAP_CACHE_PATH="$DB"
-  # Idle I/O priority (#527): ionice failure here is fatal via run_refresh_stage — the
-  # purge never falls back to normal priority.
-  run_refresh_stage "purge-infra" "$IONICE_BIN" -c3 "$PE_BOOTSTRAP_BIN" purge-infra "${BOOTSTRAP_CONFIG_ARGS[@]}"
-fi
-
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
 # Full atomic rewrite from the just-refreshed cache (so the snapshot is fresh for this run).
 # Skipped when ranking is skipped, export is skipped, or the engine is forced to sqlite. In
@@ -645,7 +632,8 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
     --min-active-months "$MIN_ACTIVE_MONTHS" \
-    --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA"
+    --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA" \
+    --pipeline-versions-file "$PIPELINE_VERSIONS_FILE"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"
 fi
@@ -717,85 +705,21 @@ if [[ "$push_rc" -ne 0 ]]; then
 fi
 echo "✓ Supabase exact batch published and verified. pe-service picks it up within one refresh interval."
 
-# ── Stage 4/5: purge proven-loser & dead-weight wallets from the local cache (issue #385) ──
-# Opt-in: the DELETE is a no-op unless purge_enabled=true in .env; the stage still emits a would-purge
-# report every run. Runs AFTER the push/verify so a purge failure can never block the (already-complete)
-# Supabase publish — hence non-fatal here. Skipped when --skip-purge, or when this run did not produce a
-# fresh backfill + verdict CSV (--skip-backfill / --skip-rank): purge relies on a fresh backfill (it
-# refuses an armed run on a stale cache) and the current run's RANKED_CSV verdict.
-if [[ "$SKIP_PURGE" == "1" ]]; then
-  echo "── Stage 4/5: purge skipped (--skip-purge) ───────────────────────────────────"
-elif [[ "$RESUME_PENDING" == "0" && ( "$SKIP_BACKFILL" == "1" || "$SKIP_RANK" == "1" ) ]]; then
-  echo "── Stage 4/5: purge skipped (needs a fresh backfill + verdict this run) ───────"
-else
-  echo "── Stage 4/5: purge proven-loser & dead-weight wallets (issue #385) ───────────"
-  prc=0
-  # Idle I/O priority (#527): an ionice failure surfaces as the stage's nonfatal WARN —
-  # the purge is skipped rather than ever running at normal priority.
-  PE_BOOTSTRAP_CACHE_PATH="$DB" PE_BOOTSTRAP_PURGE_DECISION_CSV="$RANKED_CSV" \
-    "$IONICE_BIN" -c3 "$PE_BOOTSTRAP_BIN" purge "${BOOTSTRAP_CONFIG_ARGS[@]}" || prc=$?
-  append_purge_status "purge" "$prc"
-  case "$prc" in
-    0) echo "   [purge] ok" ;;
-    *) echo "   [purge] WARN exit $prc — purge stage failed; Supabase publish already complete, continuing" >&2 ;;
-  esac
+if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
+  # The accepted watermark is captured only after the exact publication
+  # succeeds. A later same-day zero-argument invocation compares against this
+  # post-refresh state before discovery or any other cache mutation.
+  "$PE_BOOTSTRAP_BIN" pipeline-versions > "$OUT_DIR/pipeline_versions.json"
+  "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
+    --db "$DB" --day-utc "$(date -u +%Y-%m-%d)" \
+    --versions-file "$OUT_DIR/pipeline_versions.json" \
+    --configuration-file "$OUT_DIR/cycle_configuration.json" \
+    --output "$OUT_DIR/accepted_cycle_manifest.json"
 fi
-
-# ── Stage 5/5 (final): checkpoint + truncate the SQLite WAL ─────────────────────────────────
-# Bulk purge reclamation (conversion VACUUM or incremental_vacuum, #538) and the earlier refresh
-# stages can leave a large committed WAL after their
-# writer processes exit. Run TRUNCATE only after every DB-mutating stage has finished and while
-# this wrapper still owns the single-run PID lock. SQLite coordinates the checkpoint with any
-# other connections; a busy/error result is a WARN, never a reason to fail the already-complete
-# Supabase publish. URI mode=rw plus the file check prevents a wrong path from creating an empty DB.
-echo "── Stage 5/5: checkpoint + truncate SQLite WAL ──────────────────────────────"
-crc=0
-"$PYTHON_BIN" - "$DB" <<'PY' || crc=$?
-import sqlite3
-import sys
-from pathlib import Path
-
-db_path = Path(sys.argv[1])
-if not db_path.is_file():
-    print(f"checkpoint error: database is not a file: {db_path}", file=sys.stderr)
-    raise SystemExit(1)
-
-wal_path = Path(f"{db_path}-wal")
-before = wal_path.stat().st_size if wal_path.is_file() else 0
-
-try:
-    uri = db_path.resolve().as_uri() + "?mode=rw"
-    with sqlite3.connect(uri, uri=True) as connection:
-        result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-except sqlite3.Error as error:
-    print(f"checkpoint error: {error}", file=sys.stderr)
-    raise SystemExit(1) from error
-
-if result is None or len(result) != 3:
-    print(f"checkpoint error: unexpected SQLite result: {result!r}", file=sys.stderr)
-    raise SystemExit(1)
-
-busy, wal_pages, checkpointed_pages = result
-after = wal_path.stat().st_size if wal_path.is_file() else 0
-reclaimed = max(0, before - after)
-print(
-    "checkpoint result: "
-    f"busy={busy} wal_pages={wal_pages} checkpointed_pages={checkpointed_pages}"
-)
-print(f"checkpoint WAL bytes: before={before} after={after} reclaimed={reclaimed}")
-
-if busy != 0:
-    print("checkpoint error: SQLite reported a busy connection; WAL was not fully truncated", file=sys.stderr)
-    raise SystemExit(1)
-PY
-case "$crc" in
-  0) echo "   [checkpoint] ok" ;;
-  *) echo "   [checkpoint] WARN exit $crc — WAL checkpoint/truncate did not complete; retry next run" >&2 ;;
-esac
 
 # Compare-and-clear: never erase a different/newer recovery request. The request JSON
 # remains in the run directory as publication audit evidence; only the singleton pointer
-# is consumed after the same run's publish, purge, and checkpoint tail finishes.
+# is consumed after the same run's publish finishes.
 if [[ -e "$PENDING_FILE" || -L "$PENDING_FILE" ]]; then
   if [[ -f "$PENDING_FILE" && ! -L "$PENDING_FILE" ]]; then
     mapfile -t COMPLETED_PENDING_LINES < "$PENDING_FILE"
@@ -816,8 +740,8 @@ if [[ -e "$PENDING_FILE" || -L "$PENDING_FILE" ]]; then
   fi
 fi
 
-# Compare-and-clear the broader logical-cycle pointer only after publication and
-# the maintenance tail have completed. A changed/malformed pointer is evidence
+# Compare-and-clear the broader logical-cycle pointer only after publication has completed.
+# A changed/malformed pointer is evidence
 # for another operator action and must never be erased.
 if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
   if [[ -f "$CYCLE_FILE" && ! -L "$CYCLE_FILE" ]]; then
@@ -838,4 +762,4 @@ if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     echo "   [recovery] WARN unsafe cycle pointer; leaving it intact" >&2
   fi
 fi
-echo "✓ rank_and_push complete — Supabase published; final cache maintenance attempted."
+echo "✓ rank_and_push complete — Supabase published."

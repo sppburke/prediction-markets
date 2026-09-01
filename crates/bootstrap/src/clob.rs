@@ -9,9 +9,10 @@
 //! resolved and for all new markets ("primary-for-new").
 //!
 //! Pagination is sequential because each page returns the cursor for the
-//! next; `buffer_unordered` does not apply. Every completed invocation re-walks
-//! the full closed-market list. `source_cursor.clob_closed` retains only an
-//! interrupted walk's next-page cursor so a crash can resume within that walk.
+//! next; `buffer_unordered` does not apply. The legacy `source_cursor.clob_closed`
+//! remains a sealed v1 resume cursor. Version-two payout evidence owns an
+//! independent staging cursor and is installed only with a complete coverage
+//! manifest from page one through a terminal response (#544).
 //!
 //! **Approximation:** `resolved_at_unix` is set to the parsed `end_date_iso`
 //! because CLOB does not expose a block-timestamp resolution time. The retained
@@ -21,8 +22,10 @@
 use std::time::Duration;
 
 use pe_source_core::SourceError;
-use pe_source_polymarket_public::PageFetcher;
-use serde::Deserialize;
+use pe_source_polymarket_public::{
+    CLOB_END_CURSOR, ClobCoverageManifest, ClobCoveragePage, ClobMarket, ClobMarketsPage,
+    PageFetcher, is_clob_terminal_cursor, parse_clob_market, parse_clob_markets_page,
+};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 
@@ -42,7 +45,10 @@ pub const CLOB_CLOSED_CURSOR_KEY: &str = "clob_closed";
 /// next-page fetch will simply return an empty `data` array and the loop
 /// exits naturally (over-pagination is benign because every insert is
 /// `INSERT OR IGNORE`).
-const CLOB_END_CURSOR: &str = "LTE=";
+pub(crate) use pe_source_polymarket_public::{
+    ClobWinnerVerdict as WinnerVerdict, analyze_clob_winners as analyze_winners,
+    parse_clob_end_date as parse_iso_8601,
+};
 
 /// Page size requested from the CLOB `/markets` endpoint. The API caps
 /// `limit` at 1000.
@@ -79,12 +85,14 @@ const CLOB_RATE_LIMIT_MIN_WAIT_SECS: u64 = 1;
 /// written) and counted in `order_mismatches` — so a real divergence cannot
 /// silently misprice the downstream `true_clv` outcome→token join. Counts reflect
 /// only this run's newly-processed pages.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ClobReport {
     pub schedules: usize,
     pub resolutions: usize,
     pub tokens_mapped: usize,
     pub order_mismatches: usize,
+    /// Present only when this invocation installed a complete v2 payout walk.
+    pub coverage_manifest: Option<ClobCoverageManifest>,
 }
 
 /// Paginated client for the Polymarket CLOB `/markets` endpoint.
@@ -169,7 +177,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     ) -> Result<ClobMarket, BootstrapError> {
         let url = format!("{}/markets/{condition_id}", self.base_url);
         let bytes = self.fetch_page_with_retry(&url).await?;
-        serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Clob {
+        parse_clob_market(&bytes).map_err(|e| BootstrapError::Clob {
             message: format!("parse market {condition_id}: {e}"),
         })
     }
@@ -197,19 +205,56 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
         &self,
         cache: &mut WalletCache,
     ) -> Result<ClobReport, BootstrapError> {
-        let mut cursor: Option<String> = cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY);
-
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
+        let v2_only = cache.schema_version()? == crate::cache::CACHE_SCHEMA_VERSION_V2;
+        let legacy_cursor = if v2_only {
+            None
+        } else {
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY)
+        };
+        let legacy_resume = legacy_cursor
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != CLOB_END_CURSOR);
+        let mut payout_walk = cache.clob_payout_walk_state_v2()?;
+        if payout_walk.is_none() && !legacy_resume {
+            payout_walk = Some(cache.begin_or_resume_clob_payout_walk_v2(fetched_at)?);
+        }
+        let mut cursor = payout_walk
+            .as_ref()
+            .map(|state| state.next_cursor.clone())
+            .unwrap_or(legacy_cursor);
         let mut schedules = 0usize;
         let mut resolutions = 0usize;
         let mut tokens_mapped = 0usize;
         let mut order_mismatches = 0usize;
         let mut page_count = 0usize;
         let mut pending_winners = 0usize;
+        let mut coverage_manifest = None;
+
+        // A crash after the terminal page transaction but before installation
+        // resumes by validating and installing the already-durable page chain;
+        // it must not manufacture another network page after a terminal proof.
+        if let Some(state) = payout_walk.as_ref()
+            && state.next_page_ordinal > 0
+            && is_clob_terminal_cursor(state.next_cursor.as_deref())
+        {
+            let manifest = complete_payout_walk(cache, state.generation, fetched_at)?;
+            if !v2_only {
+                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+            }
+            return Ok(ClobReport {
+                schedules,
+                resolutions,
+                tokens_mapped,
+                order_mismatches,
+                coverage_manifest: Some(manifest),
+            });
+        }
 
         info!(
             base_url = self.base_url.as_str(),
             resume_from = cursor.as_deref().unwrap_or("<start>"),
+            payout_generation = payout_walk.as_ref().map(|state| state.generation),
             "clob: starting closed-market fetch"
         );
 
@@ -218,11 +263,31 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             let bytes = self.fetch_page_with_retry(&url).await?;
 
             let page: ClobMarketsPage =
-                serde_json::from_slice(&bytes).map_err(|e| BootstrapError::Clob {
+                parse_clob_markets_page(&bytes).map_err(|e| BootstrapError::Clob {
                     message: format!("parse page: {e}"),
                 })?;
             page_count += 1;
             let markets_in_page = page.data.len();
+            let coverage_page = payout_walk
+                .as_ref()
+                .map(|state| {
+                    ClobCoveragePage::from_response(
+                        state.next_page_ordinal,
+                        state.next_cursor.clone(),
+                        &bytes,
+                        &page,
+                    )
+                })
+                .transpose()
+                .map_err(|error| BootstrapError::Clob {
+                    message: format!("build payout coverage page: {error}"),
+                })?;
+            let payout_evidence = coverage_page.as_ref().map(|_| {
+                page.data
+                    .iter()
+                    .map(ClobMarket::resolution_evidence)
+                    .collect::<Vec<_>>()
+            });
 
             // `(token_id, condition_id, outcome_index)` rows for this page,
             // flushed in one transaction after the per-market loop (issue #429).
@@ -267,7 +332,8 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                         "clob: paginated record missing `closed` — resolution suppressed"
                     );
                 }
-                if market.closed == Some(true)
+                if !v2_only
+                    && market.closed == Some(true)
                     && let Some(resolved_at) = end_date_unix
                 {
                     match analyze_winners(&market.tokens).verdict {
@@ -363,6 +429,19 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 tokens_mapped += page_token_rows.len();
             }
 
+            if let (Some(state), Some(coverage_page), Some(payout_evidence)) = (
+                payout_walk.as_ref(),
+                coverage_page.as_ref(),
+                payout_evidence.as_deref(),
+            ) {
+                payout_walk = Some(cache.commit_clob_payout_page_v2(
+                    state.generation,
+                    coverage_page,
+                    payout_evidence,
+                    fetched_at,
+                )?);
+            }
+
             // Advance cursor. Treat empty/missing/terminator as end-of-pages.
             let next = page.next_cursor.as_deref().unwrap_or("");
             if next.is_empty() || next == CLOB_END_CURSOR {
@@ -375,10 +454,18 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                     pending_winners,
                     "clob: reached end of pages"
                 );
-                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+                if let Some(state) = payout_walk.as_ref() {
+                    coverage_manifest =
+                        Some(complete_payout_walk(cache, state.generation, fetched_at)?);
+                }
+                if !v2_only {
+                    cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+                }
                 break;
             }
-            cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, next)?;
+            if !v2_only {
+                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, next)?;
+            }
             cursor = Some(next.to_owned());
 
             if page_count.is_multiple_of(10) {
@@ -399,8 +486,24 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             resolutions,
             tokens_mapped,
             order_mismatches,
+            coverage_manifest,
         })
     }
+}
+
+fn complete_payout_walk(
+    cache: &mut WalletCache,
+    generation: u64,
+    completed_at_unix: i64,
+) -> Result<ClobCoverageManifest, BootstrapError> {
+    let pages = cache.clob_payout_coverage_pages_v2(generation)?;
+    let manifest = ClobCoverageManifest::complete(generation, pages).map_err(|error| {
+        BootstrapError::Clob {
+            message: format!("complete payout coverage manifest: {error}"),
+        }
+    })?;
+    cache.complete_clob_payout_walk_v2(&manifest, completed_at_unix)?;
+    Ok(manifest)
 }
 
 /// Exponential page-retry backoff: `CLOB_PAGE_RETRY_BASE_MS · 2^attempt`, capped
@@ -419,140 +522,19 @@ fn build_page_url(base_url: &str, cursor: Option<&str>) -> String {
     }
 }
 
-/// Winner classification for a market's `tokens[]` (issues #519/#523).
-///
-/// Verdict precedence — contradiction detection runs FIRST, so an invalid
-/// payload can never hide behind an absent flag:
-///
-/// - `Invalid` — two or more explicit `winner=true` legs, or a winner index
-///   beyond `u16` (contradictory payload; `[true, true, absent]` is `Invalid`,
-///   not `Pending`). The audit fails closed on this; the walk skips it.
-/// - `Pending` — no tokens, or any token with an absent `winner` flag (and no
-///   contradiction). NOTHING is recorded: a partial vector like `[true, absent]`
-///   must never resolve, because a wrongly recorded winner is permanent
-///   (`insert_resolution_with_source` upgrades only NULL winners). The market
-///   stays missing and the next walk / audit pass retries it.
-/// - `Resolved(idx)` — a COMPLETE flag vector with exactly one `winner=true`.
-/// - `Voided` — a COMPLETE flag vector with every leg `winner=false`: the
-///   venue settled with no winning leg. Recorded as a terminal NULL-winner row.
-///
-/// Index is taken positionally because CLOB returns tokens in YES/NO order
-/// for binary markets; multi-outcome markets follow the same convention.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum WinnerVerdict {
-    Resolved(u16),
-    Voided,
-    Pending,
-    Invalid,
-}
-
-/// Full winner analysis: the terminal verdict plus whether ANY explicit
-/// `winner=true` leg exists — the audit's open-market branch blocks on an
-/// explicit winner inside a `closed=false` response (issue #523), and token
-/// fields are private to this module, so this is the one shared analysis for
-/// both the paginated walk and the audit.
-pub(crate) struct WinnerAnalysis {
-    pub(crate) verdict: WinnerVerdict,
-    pub(crate) has_explicit_winner: bool,
-}
-
-pub(crate) fn analyze_winners(tokens: &[ClobToken]) -> WinnerAnalysis {
-    let winners: Vec<usize> = tokens
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.winner == Some(true))
-        .map(|(i, _)| i)
-        .collect();
-    let has_explicit_winner = !winners.is_empty();
-    let verdict = match winners.as_slice() {
-        [_, _, ..] => WinnerVerdict::Invalid,
-        [only] => match u16::try_from(*only) {
-            Err(_) => WinnerVerdict::Invalid,
-            Ok(idx) => {
-                if tokens.iter().any(|t| t.winner.is_none()) {
-                    WinnerVerdict::Pending
-                } else {
-                    WinnerVerdict::Resolved(idx)
-                }
-            }
-        },
-        [] => {
-            if tokens.is_empty() || tokens.iter().any(|t| t.winner.is_none()) {
-                WinnerVerdict::Pending
-            } else {
-                WinnerVerdict::Voided
-            }
-        }
-    };
-    WinnerAnalysis {
-        verdict,
-        has_explicit_winner,
-    }
-}
-
-/// Parse an ISO-8601 timestamp into a unix-seconds value, or return `None`
-/// for malformed/missing input.
-pub(crate) fn parse_iso_8601(s: &str) -> Option<i64> {
-    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-        .ok()
-        .map(|dt| dt.unix_timestamp())
-}
-
-// ── Serde DTOs ───────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct ClobMarketsPage {
-    #[serde(default)]
-    data: Vec<ClobMarket>,
-    #[serde(default)]
-    next_cursor: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ClobMarket {
-    #[serde(default)]
-    pub(crate) condition_id: Option<String>,
-    #[serde(default)]
-    pub(crate) end_date_iso: Option<String>,
-    /// Presence-preserving (issue #523): `None` means the field was absent from
-    /// the response — the audit fails closed on that, and the paginated walk
-    /// suppresses resolution insertion only. A defaulted `bool` would silently
-    /// collapse venue schema drift into `false`.
-    pub(crate) closed: Option<bool>,
-    /// Presence-preserving (issue #523): splits the audit's open-market classes
-    /// (`active=false` = delisted/inactive inventory). Absence classifies as
-    /// `open_unknown`, never as a specific class.
-    pub(crate) active: Option<bool>,
-    #[serde(default)]
-    pub(crate) tokens: Vec<ClobToken>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ClobToken {
-    /// ERC-1155 CTF positionId (decimal-string uint256) — the same id Gamma
-    /// returns in `clobTokenIds` and the on-chain `OrderFilled` logs carry.
-    /// Absent on ~5% of markets (issue #429 live probe); those tokens are skipped
-    /// for mapping but the market's resolution/schedule still insert.
-    #[serde(default)]
-    token_id: Option<String>,
-    /// Winner flag as CLOB serves it: `Some(true)` = resolved winner leg,
-    /// `Some(false)` = explicitly settled loser leg, `None` = flag absent
-    /// (winner not yet posted / draft payload). The tri-state matters (issue
-    /// #519 review): absent flags must classify as Pending, never Voided.
-    #[serde(default)]
-    winner: Option<bool>,
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use pe_source_polymarket_public::{ClobToken, ClobTokenPrice};
     use std::collections::HashMap;
 
     fn tok(winner: Option<bool>) -> ClobToken {
         ClobToken {
             winner,
             token_id: None,
+            outcome: None,
+            price: ClobTokenPrice::Missing,
         }
     }
 

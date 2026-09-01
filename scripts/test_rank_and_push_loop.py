@@ -44,6 +44,7 @@ class RankAndPushLoopScenario(unittest.TestCase):
             loop_copy.read_text()
             .replace("TERM_GRACE_SECS=30", "TERM_GRACE_SECS=1")
             .replace("TRANSIENT_RETRY_DELAY_SECS=60", "TRANSIENT_RETRY_DELAY_SECS=1")
+            .replace("SUCCESS_WAIT_SECS=60", "SUCCESS_WAIT_SECS=3")
         )
         loop_copy.chmod(0o755)
         (self.root / "scripts" / "rank_and_push.sh").write_text(
@@ -92,6 +93,20 @@ class RankAndPushLoopScenario(unittest.TestCase):
             "> data/eval-results/rank_and_push.pending\n"
             "    printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
             "    exit 75\n"
+            "    ;;\n"
+            "  stop_during_success_wait)\n"
+            "    (sleep 1; printf 'stop\\n' > data/eval-results/rank_and_push.loop) &\n"
+            "    ;;\n"
+            "  success_pointer)\n"
+            "    if [[ ! -e success_pointer_attempted ]]; then\n"
+            "      : > success_pointer_attempted\n"
+            "      mkdir -p data/eval-results/cron-test\n"
+            "      printf 'data/eval-results/cron-test\\n' "
+            "> data/eval-results/rank_and_push.cycle\n"
+            "    else\n"
+            "      rm -f data/eval-results/rank_and_push.cycle\n"
+            "      printf 'stop\\n' > data/eval-results/rank_and_push.loop\n"
+            "    fi\n"
             "    ;;\n"
             "  hold) sleep 300 & printf '%s\\n' \"$!\" > descendant.pid; wait ;;\n"
             "  resist) sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > descendant.pid; "
@@ -146,6 +161,25 @@ class RankAndPushLoopScenario(unittest.TestCase):
         self.assertEqual((self.root / "child_argc").read_text().strip(), "0")
         self.assertIn("RANK_AND_PUSH_RUN_DIR=data/eval-results/cron-test", ran.stdout)
         self.assertIn("LOOP_CYCLE_END cycle=1", ran.stdout)
+        self.assertIn("LOOP_SUCCESS kind=cycle retry_in=3s", ran.stdout)
+        self.assertIn("reason=flag_stop_during_success", ran.stdout)
+
+    def test_stop_during_success_wait_prevents_another_child(self):
+        self.flag.write_text("run\n")
+        stopped = self._run(mode="stop_during_success_wait")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual((self.root / "child_argc").read_text().splitlines(), ["0"])
+        self.assertIn("LOOP_SUCCESS kind=cycle retry_in=3s", stopped.stdout)
+        self.assertIn("reason=flag_stop_during_success", stopped.stdout)
+
+    def test_success_with_recovery_pointer_bypasses_only_success_wait(self):
+        self.flag.write_text("run\n")
+        recovered = self._run(mode="success_pointer")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual((self.root / "child_argc").read_text().splitlines(), ["0", "0"])
+        self.assertIn("LOOP_RECOVERY_READY kind=cycle wait_bypassed=true", recovered.stdout)
+        self.assertIn("LOOP_RESUME_START kind=cycle", recovered.stdout)
+        self.assertNotIn("LOOP_SUCCESS kind=cycle retry_in=3s", recovered.stdout)
 
     def test_child_failure_stops_without_retry(self):
         self.flag.write_text("run\n")
@@ -251,8 +285,8 @@ class RankAndPushLoopScenario(unittest.TestCase):
             _wait_dead(descendant_pid),
             "TERM-resistant descendant survived process-group KILL escalation",
         )
-        self.assertFalse(
-            (self.root / "data" / "eval-results" / ".rank_and_push_loop.lock").exists()
+        self.assertTrue(
+            (self.root / "data" / "eval-results" / ".rank_and_push_loop.lock").is_file()
         )
         with sqlite3.connect(self.root / "data" / "wallet_cache.db") as connection:
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")

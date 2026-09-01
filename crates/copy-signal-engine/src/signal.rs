@@ -1,7 +1,7 @@
 //! Output type assembled by the classifier.
 
 use pe_core_types::{
-    LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, Quantity, ReconstructionQuality,
+    LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, ReconstructionQuality, ShareAmount,
     Side, SourceTradeId, TraderId, VenueId,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,8 @@ pub struct LeaderSignal {
     pub action: LeaderAction,
     pub leader_side: Side,
     pub leader_price: Price,
-    pub leader_size: Quantity,
+    /// Exact six-decimal leader quantity (#544).
+    pub leader_size: ShareAmount,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]

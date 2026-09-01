@@ -96,10 +96,7 @@ impl OrganicCandidateSource {
             data_host: DATA_HOST.to_owned(),
             watchlist: None,
             entries: HashMap::new(),
-            entry_gate: CopyEntryGate::new(
-                CopyEntryGateConfig { fail_closed: true },
-                HashMap::new(),
-            ),
+            entry_gate: CopyEntryGate::new(CopyEntryGateConfig, HashMap::new()),
             seeded_wallets: HashSet::new(),
             ledger: PositionLedger::new(),
             cursors: HashMap::new(),
@@ -139,9 +136,12 @@ impl OrganicCandidateSource {
         {
             self.in_flight = None;
         }
+        if let Err(error) = self.ledger.ingest(&observation.trade) {
+            tracing::error!(%error, "organic canary ledger rejected acknowledged trade");
+            return;
+        }
         self.seen_trade_ids
             .insert(observation.trade.source_trade_id.0.clone());
-        self.ledger.ingest(&observation.trade);
         self.cursors
             .entry(observation.trade.wallet)
             .and_modify(|cursor| {
@@ -181,8 +181,12 @@ impl OrganicCandidateSource {
                 self.entry_gate
                     .merge_history(HashMap::from([(entry.wallet, history)]));
                 self.seeded_wallets.insert(entry.wallet);
-                self.ledger
-                    .overlay(HashMap::from([(entry.wallet, position)]));
+                // #544 Lane D integration: the separately stopped organic canary still
+                // needs the causal activity/positions bracket before it may be enabled.
+                // This isolated pre-publication seed is not used by the service ledger.
+                let mut snapshots = self.ledger.snapshots().clone();
+                snapshots.insert(entry.wallet, position);
+                self.ledger = PositionLedger::from_snapshots(snapshots);
             }
             if let Some(cursor) = cursors.get(&entry.wallet) {
                 self.cursors.entry(entry.wallet).or_insert(*cursor);

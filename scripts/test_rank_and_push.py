@@ -11,14 +11,14 @@ What it locks (the things that would silently break cron if wired wrong):
   - default universe source is `--universe-from-trades`, never `--universe ""` (the ranker
     hard-errors on neither/both);
   - Step 0 runs deferred discovery → controlled activation → deferred backfill → events →
-    resolutions → infrastructure purge, in that order (issue #383 removed
+    resolutions, in that order (issue #383 removed
     the redundant trailing `schedules` stage — fetch_resolutions_and_schedules already covers it);
   - PE_BOOTSTRAP_FETCH_RESOLUTIONS is unset for `backfill` (trades-only) and =1 for `resolutions`,
     so the CLOB→Gamma refresh runs exactly once, not twice (issue #383);
   - a pe-bootstrap stage exiting 2 (partial soft-fail) does NOT abort the run — backfill
     and resolutions return 2 routinely at full scale;
   - a stage exiting 1 (fatal) DOES abort, before ranking;
-  - the PID lock blocks a concurrent run and reclaims a stale one;
+  - the persistent kernel lock blocks a real concurrent holder and never removes its inode;
   - the skip flags bypass Step 0 / ranking for a pure re-push;
   - zero-arg invocation auto-creates a timestamped out-dir;
   - a clean cron/nohup PATH still selects the repository Python environment;
@@ -27,13 +27,14 @@ What it locks (the things that would silently break cron if wired wrong):
   - the production half-life default is threaded to both passes.
   - a durable logical-cycle pointer exists before activation and a zero-argument retry
     reuses its exact run directory / activation batch instead of admitting another cohort;
-  - the final WAL checkpoint runs after purge, truncates committed WAL bytes, and warns
-    without failing an already-published run when checkpointing is unavailable.
+  - successful publication performs no automatic purge, reclamation, index rebuild, or
+    WAL checkpoint (#544), including through the pure re-push path.
 
 Run: `python3 scripts/test_rank_and_push.py`
   or: `pytest scripts/test_rank_and_push.py -v`
 """
 import os
+import json
 import shutil
 import shlex
 import sqlite3
@@ -41,9 +42,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
@@ -54,36 +53,12 @@ WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
 EXPECTED_DEFAULT_HALF_LIFE = "30"
 
 
-class _SupabaseStub(BaseHTTPRequestHandler):
-    """Answers the wrapper's verify GET with a non-zero row count so verify passes."""
-
-    def do_GET(self):  # noqa: N802 (http.server API)
-        self.send_response(200)
-        self.send_header("Content-Range", "0-0/5")
-        self.end_headers()
-        self.wfile.write(b"[{}]")
-
-    def log_message(self, *_):  # silence per-request stderr noise
-        pass
-
-
 def _write_exec(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
 class RankAndPushScenario(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.server = HTTPServer(("127.0.0.1", 0), _SupabaseStub)
-        cls.port = cls.server.server_address[1]
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
@@ -98,19 +73,35 @@ class RankAndPushScenario(unittest.TestCase):
         self.repo_python = self.root / ".venv-analysis" / "bin" / "python3"
         self._write_python_shim(self.repo_python, self.python_log)
 
-        # The final checkpoint opens the existing cache with URI mode=rw so a typo can never
-        # create an empty database. Most scenarios only need a valid empty cache; the WAL
-        # reclamation scenario below turns this into a WAL-mode fixture.
-        sqlite3.connect(self.root / "data" / "wallet_cache.db").close()
+        # The wrapper passes this cache path to refresh and rank stubs.
+        with sqlite3.connect(self.root / "data" / "wallet_cache.db") as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 1;
+                CREATE TABLE trades (wallet_hex TEXT, timestamp_unix INTEGER);
+                CREATE TABLE market_resolutions (fetched_at_unix INTEGER);
+                CREATE TABLE source_cursor (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+                CREATE TABLE wallets (
+                    wallet_hex TEXT PRIMARY KEY, is_active INTEGER NOT NULL, is_infra INTEGER NOT NULL
+                );
+                CREATE VIEW active_tradeable_wallets AS
+                    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+                INSERT INTO trades VALUES ('0xabc', 1788192000);
+                INSERT INTO market_resolutions VALUES (1788192000);
+                INSERT INTO source_cursor VALUES ('clob_closed', '', 1788192000);
+                INSERT INTO wallets VALUES ('0xabc', 1, 0);
+                """
+            )
 
         # Copy the wrapper-under-test into the sandbox so its `cd "$(dirname "$0")/.."`
         # lands in <tmp>, where the stubs / .env / target/release live.
         self.wrapper = self.root / "scripts" / "rank_and_push.sh"
         shutil.copy(WRAPPER, self.wrapper)
+        shutil.copy(WRAPPER.parent / "rank_cycle_manifest.py", self.root / "scripts")
 
-        # .env → point the verify step at the localhost stub.
+        # The fake publisher below does not contact this syntactically valid endpoint.
         (self.root / ".env").write_text(
-            f"SUPABASE_URL=http://127.0.0.1:{self.port}\nSUPABASE_SECRET_KEY=test-secret\n"
+            "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
         )
 
         # Fake pe-bootstrap: log argv to ./pe_bootstrap.log (cwd is the repo root the wrapper
@@ -121,6 +112,10 @@ class RankAndPushScenario(unittest.TestCase):
         _write_exec(
             self.root / "target" / "release" / "pe-bootstrap",
             '#!/usr/bin/env bash\n'
+            'if [[ "$1" == "pipeline-versions" ]]; then\n'
+            '  printf \'%s\\n\' \'{"source":"polymarket-public-activity","activity_schema":2,"activity_parser":2,"clob_resolution_schema":2,"clob_resolution_parser":2,"cache_schema":2,"configuration":1}\'\n'
+            '  exit 0\n'
+            'fi\n'
             'echo "$*" >> pe_bootstrap.log\n'
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
@@ -144,8 +139,9 @@ class RankAndPushScenario(unittest.TestCase):
         _write_exec(
             self.root / "scripts" / "export_trades_parquet.py",
             "#!/usr/bin/env python3\n"
-            "import sys\n"
-            'open("export.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n',
+            "import os, sys\n"
+            'open("export.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+            'raise SystemExit(int(os.environ.get("STUB_EXIT_export", "0")))\n',
         )
         _write_exec(
             self.root / "scripts" / "rank_72hr_buyandhold.py",
@@ -153,6 +149,9 @@ class RankAndPushScenario(unittest.TestCase):
             "import os, sys\n"
             "a = sys.argv[1:]\n"
             'open("rank.log", "a").write(" ".join(a) + "\\n")\n'
+            'rc = int(os.environ.get("STUB_EXIT_rank", "0"))\n'
+            "if rc:\n"
+            "    sys.exit(rc)\n"
             'out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
             "os.makedirs(out, exist_ok=True)\n"
             'open(os.path.join(out, "ranked_72hr_buyandhold.csv"), "w").write("wallet\\n0xabc\\n")\n'
@@ -166,25 +165,29 @@ class RankAndPushScenario(unittest.TestCase):
             self.root / "scripts" / "latency_shift_rerank.py",
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
-            "a = sys.argv[1:]\n"
-            'open("rerank.log", "a").write(" ".join(a) + "\\n")\n'
-            'out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
-            "os.makedirs(out, exist_ok=True)\n"
-            'if "--emit-targets" in a:\n'
-            '    tpath = a[a.index("--emit-targets") + 1]\n'
-            '    open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
-            '    sys.exit(int(os.environ.get("STUB_EXIT_emit", "0")))\n'
-            'rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
-            "if rc:\n"
-            "    sys.exit(rc)  # the real coverage gate exits before writing any output\n"
-            'open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
-            'if not os.environ.get("STUB_NO_MANIFEST"):\n'
-            '    import hashlib, json\n'
-            '    ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
-            '    open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
-            '        {"oracle": "clob-minute-reference",\n'
-            '         "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
-            "sys.exit(0)\n",
+            "ORACLE_VERSION = 1\n"
+            "def main():\n"
+            "    a = sys.argv[1:]\n"
+            '    open("rerank.log", "a").write(" ".join(a) + "\\n")\n'
+            '    out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
+            "    os.makedirs(out, exist_ok=True)\n"
+            '    if "--emit-targets" in a:\n'
+            '        tpath = a[a.index("--emit-targets") + 1]\n'
+            '        open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
+            '        return int(os.environ.get("STUB_EXIT_emit", "0"))\n'
+            '    rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
+            "    if rc:\n"
+            "        return rc  # the real coverage gate exits before writing any output\n"
+            '    open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
+            '    if not os.environ.get("STUB_NO_MANIFEST"):\n'
+            '        import hashlib, json\n'
+            '        ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
+            '        open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
+            '            {"oracle": "clob-minute-reference",\n'
+            '             "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
+            "    return 0\n"
+            'if __name__ == "__main__":\n'
+            "    raise SystemExit(main())\n",
         )
         # Fake push: log argv, emulate durable request/pending writes, and optionally
         # return the requested status (including EX_TEMPFAIL=75).
@@ -364,13 +367,10 @@ class RankAndPushScenario(unittest.TestCase):
                 "backfill",
                 "events",
                 "resolutions",
-                "purge-infra",
-                # #536: the targeted reference fetch runs between the rank passes
-                # (stage 2b) — after purge-infra, before the post-publish purge.
+                # #536: the targeted reference fetch runs between the rank passes.
                 "prices-history",
-                "purge",
             ],
-            "Step-0 stages ran out of canonical order, or the final purge stage (#385) is missing",
+            "refresh/rank stages ran out of canonical purge-free order",
         )
         boot_lines = boot.splitlines()
         self.assertIn("--defer-activation", boot_lines[0])
@@ -540,6 +540,31 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNone(self._log("push.log"), "publication ran despite a fatal fetch")
         print("PASS: fatal reference fetch aborts before the full rerank and push")
 
+    def test_forced_export_failure_stops_before_rank_and_publish(self):
+        r = self._run("--engine", "duck", exit_env={"STUB_EXIT_export": "1"})
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIsNone(self._log("rank.log"))
+        self.assertIsNone(self._log("push.log"))
+
+    def test_pass1_failure_stops_before_rerank_and_publish(self):
+        r = self._run(exit_env={"STUB_EXIT_rank": "1"})
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIsNone(self._log("rerank.log"))
+        self.assertIsNone(self._log("push.log"))
+        self.assertTrue(
+            (self.root / "data/eval-results/rank_and_push.cycle").is_file()
+        )
+
+    def test_target_emission_failure_stops_before_fetch_and_publish(self):
+        r = self._run(exit_env={"STUB_EXIT_emit": "1"})
+        self.assertEqual(r.returncode, 1, r.stderr)
+        boot = (self._log("pe_bootstrap.log") or "").splitlines()
+        self.assertFalse(any(line.startswith("prices-history") for line in boot))
+        self.assertIsNone(self._log("push.log"))
+        self.assertTrue(
+            (self.root / "data/eval-results/rank_and_push.cycle").is_file()
+        )
+
     def test_fresh_run_without_manifest_fails_closed_before_push(self):
         # #536: a fresh rerank always writes the manifest before success, so exit 0
         # with no manifest is corruption -- never a silent config_hash = null publish.
@@ -548,85 +573,6 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("refusing provenance-less publish", r.stderr)
         self.assertIsNone(self._log("push.log"), "published without an oracle manifest")
         print("PASS: fresh run with missing manifest fails closed before publication")
-
-    def _purge_status_lines(self):
-        # #538: one JSONL line per purge invocation, in the per-run artifact dir.
-        import glob as _glob
-        import json as _json
-        lines = []
-        for path in _glob.glob(str(self.root / "data/eval-results/cron-*/purge_status.jsonl")):
-            with open(path) as fh:
-                lines += [_json.loads(l) for l in fh if l.strip()]
-        return lines
-
-    def test_purge_status_jsonl_records_every_outcome(self):
-        # #538: journald died mid-incident and took the only purge failure signal
-        # with it. Every purge invocation must land one durable JSONL record in
-        # the run dir — success AND failure, both entry points, without altering
-        # any existing exit policy.
-        r = self._run()
-        self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
-        recs = self._purge_status_lines()
-        self.assertEqual(
-            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
-            [("purge-infra", 0, "info"), ("purge", 0, "info")],
-            f"clean run records both purge stages: {recs}",
-        )
-        for x in recs:
-            self.assertIn("ts", x)
-            self.assertEqual(x["message"], "purge stage exit")
-        print("PASS: clean run appends purge-infra + purge status lines (exit 0)")
-
-    def test_purge_status_jsonl_on_infra_tempfail_and_fatal(self):
-        # Exit 75 aborts inside run_refresh_stage's case arm — the record must
-        # exist anyway (append happens before dispatch).
-        r = self._run(exit_env={"STUB_EXIT_purge_infra": "75"})
-        self.assertEqual(r.returncode, 75)
-        recs = self._purge_status_lines()
-        self.assertEqual(
-            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
-            [("purge-infra", 75, "warn")],
-            f"tempfail recorded before the abort: {recs}",
-        )
-        print("PASS: purge-infra exit 75 recorded despite the in-arm abort")
-
-    def test_purge_status_jsonl_on_infra_partial_and_fatal(self):
-        # Exit 2 (partial: WARN + continue) and exit 1 (fatal: in-arm abort) must
-        # both be durably recorded (#538 review: suppressing records on exactly
-        # these arms would otherwise pass).
-        r = self._run(exit_env={"STUB_EXIT_purge_infra": "2"})
-        self.assertEqual(r.returncode, 0, "infra exit 2 is WARN + continue")
-        recs = self._purge_status_lines()
-        self.assertEqual(
-            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
-            [("purge-infra", 2, "warn"), ("purge", 0, "info")],
-            f"partial infra recorded, run continued to the ordinary purge: {recs}",
-        )
-
-        self.setUp()  # fresh sandbox for the fatal case
-        r = self._run(exit_env={"STUB_EXIT_purge_infra": "1"})
-        self.assertNotEqual(r.returncode, 0)
-        recs = self._purge_status_lines()
-        self.assertEqual(
-            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
-            [("purge-infra", 1, "warn")],
-            f"fatal infra recorded before the in-arm abort: {recs}",
-        )
-        print("PASS: purge-infra exits 2 and 1 both leave durable status records")
-
-    def test_purge_status_jsonl_on_ordinary_purge_failure(self):
-        # The ordinary purge is non-fatal (post-publication); its failure must
-        # still be durably recorded and the run must still succeed.
-        r = self._run(exit_env={"STUB_EXIT_purge": "1"})
-        self.assertEqual(r.returncode, 0, "ordinary purge failure stays non-fatal")
-        recs = self._purge_status_lines()
-        self.assertEqual(
-            [(x["stage"], x["exit_code"], x["level"]) for x in recs],
-            [("purge-infra", 0, "info"), ("purge", 1, "warn")],
-            f"ordinary purge failure recorded: {recs}",
-        )
-        self.assertIn("[purge] WARN exit 1", r.stderr)
-        print("PASS: ordinary purge failure recorded as warn; run still exits 0")
 
     def test_backfill_fatal_exit1_aborts_before_ranking(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "1"})
@@ -654,12 +600,6 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertTrue(any(l.startswith("activate-next") for l in boot))
         self.assertFalse(any(l.startswith("backfill") for l in boot))
 
-    def test_infra_purge_fatal_aborts_before_export_and_ranking(self):
-        r = self._run(exit_env={"STUB_EXIT_purge_infra": "1"})
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIsNone(self._log("export.log"))
-        self.assertIsNone(self._log("rank.log"))
-
     def test_skip_discovery_skips_activation_and_still_defers_backfill(self):
         r = self._run("--skip-discovery")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -672,22 +612,43 @@ class RankAndPushScenario(unittest.TestCase):
 
     def test_concurrent_run_blocked_by_live_lock(self):
         lock = self.root / "data" / "eval-results" / ".rank_and_push.lock"
-        lock.write_text(str(os.getpid()))  # our own PID is alive → held lock
-        r = self._run()
-        self.assertEqual(r.returncode, 3, f"a live lock must block with exit 3\nstderr={r.stderr}")
-        self.assertIsNone(self._log("pe_bootstrap.log"), "ran Step 0 despite a held lock")
-        self.assertEqual(lock.read_text(), str(os.getpid()), "clobbered the holder's lockfile")
-        print("PASS: live lock → second run aborts (exit 3), holder's lock intact")
+        holder = subprocess.Popen(
+            [
+                "bash",
+                "-c",
+                'exec 9<>"$1"; flock -n 9; printf "%s\\n" "$$" > "$1"; '
+                "echo ready; read -r _",
+                "holder",
+                str(lock),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "ready")
+            inode = lock.stat().st_ino
+            live_pid = lock.read_text()
+            r = self._run()
+            self.assertEqual(
+                r.returncode,
+                3,
+                f"a live kernel lock must block with exit 3\nstderr={r.stderr}",
+            )
+            self.assertIsNone(self._log("pe_bootstrap.log"), "ran Step 0 despite a held lock")
+            self.assertEqual(lock.read_text(), live_pid, "clobbered the holder's PID")
+            self.assertEqual(lock.stat().st_ino, inode, "replaced the persistent lock inode")
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+            holder.stdin.close()
+            holder.stdout.close()
 
-    def test_stale_lock_is_reclaimed(self):
-        dead = subprocess.Popen(["sh", "-c", "exit 0"])
-        dead.wait()  # dead.pid now refers to a terminated process
-        lock = self.root / "data" / "eval-results" / ".rank_and_push.lock"
-        lock.write_text(str(dead.pid))
-        r = self._run()
-        self.assertEqual(r.returncode, 0, f"stale lock should be reclaimed\nstderr={r.stderr}")
-        self.assertIn("reclaiming stale lock", r.stderr)
-        print("PASS: stale lock (dead PID) → reclaimed, run proceeds")
+        released = self._run()
+        self.assertEqual(released.returncode, 0, released.stderr)
+        self.assertTrue(lock.is_file(), "completed run removed the persistent lock inode")
+        self.assertEqual(lock.stat().st_ino, inode, "post-kill acquisition replaced the inode")
+        print("PASS: real holder blocks; kill releases kernel lock without stale-file reclamation")
 
     def test_pure_repush_skips_step0_and_ranking(self):
         out = self.root / "data" / "eval-results" / "prior"
@@ -702,6 +663,27 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertNotIn("--manifest-file", push,
                          "legacy pre-cutover re-push must publish config_hash = null")
         print("PASS: --skip-discovery --skip-backfill --skip-rank → re-push only")
+
+    def test_unique_notes_repush_publishes_exactly_once_without_purge(self):
+        out = self.root / "data" / "eval-results" / "prior"
+        out.mkdir()
+        (out / "latency_shift_ranked.csv").write_text("wallet\n0xabc\n")
+        result = self._run(
+            "--skip-discovery",
+            "--skip-backfill",
+            "--skip-rank",
+            "--out-dir",
+            str(out),
+            "--notes",
+            "forge-544-unique-proof",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pushes = (self._log("push.log") or "").splitlines()
+        self.assertEqual(len(pushes), 1)
+        self.assertIn("--notes forge-544-unique-proof", pushes[0])
+        self.assertIsNone(self._log("pe_bootstrap.log"))
+        self.assertNotIn("purge", result.stdout + result.stderr)
+        print("PASS: unique-notes re-push publishes exactly once with no purge path")
 
     def test_transient_push_retains_request_and_resume_runs_only_tail(self):
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
@@ -732,10 +714,9 @@ class RankAndPushScenario(unittest.TestCase):
             "resume reran the expensive refresh",
         )
         self.assertEqual(
-            sum(line.startswith("purge") and not line.startswith("purge-infra")
-                for line in boot_after),
-            1,
-            "resume did not finish the original purge tail exactly once",
+            boot_after,
+            boot_before,
+            "publication resume invoked a cache-mutating maintenance stage",
         )
         self.assertEqual(len((self._log("rank.log") or "").splitlines()), 1)
         self.assertIn("--resume-request", (self._log("push.log") or "").splitlines()[-1])
@@ -744,7 +725,7 @@ class RankAndPushScenario(unittest.TestCase):
             (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
             "completed publication tail did not clear the logical-cycle pointer",
         )
-        print("PASS: transient push resume replays request + purge/checkpoint, no activation/rank")
+        print("PASS: transient push resume replays only the exact publication request")
 
     def test_zero_arg_transient_cycle_reuses_run_directory_and_activation_batch(self):
         first = self._run(exit_env={"STUB_EXIT_events": "75"})
@@ -789,7 +770,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("RANK_AND_PUSH_AUTO_RESUME_PENDING=", resumed.stdout)
         self.assertEqual(
             (self._log("pe_bootstrap.log") or "").splitlines(),
-            boot_before + ["purge"],
+            boot_before,
             "direct zero-argument recovery reran pre-publication stages",
         )
         self.assertIn("--resume-request", (self._log("push.log") or "").splitlines()[-1])
@@ -804,6 +785,80 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(
             (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists()
         )
+
+    def test_unchanged_daily_watermark_exits_before_refresh_or_publish(self):
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        boot_before = self._log("pe_bootstrap.log")
+        rank_before = self._log("rank.log")
+        push_before = self._log("push.log")
+        cron_before = sorted((self.root / "data/eval-results").glob("cron-*"))
+
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
+        self.assertEqual(self._log("pe_bootstrap.log"), boot_before)
+        self.assertEqual(self._log("rank.log"), rank_before)
+        self.assertEqual(self._log("push.log"), push_before)
+        self.assertEqual(sorted((self.root / "data/eval-results").glob("cron-*")), cron_before)
+        self.assertFalse(
+            (self.root / "data/eval-results/rank_and_push.cycle").exists(),
+            "watermark no-op invented a recovery pointer",
+        )
+
+    def test_v2_cycle_manifest_uses_only_completed_generations_and_stamps_versions(self):
+        db = self.root / "data" / "wallet_cache.db"
+        db.unlink()
+        with sqlite3.connect(db) as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 2;
+                CREATE TABLE wallets (
+                    wallet_hex TEXT PRIMARY KEY, is_active INTEGER NOT NULL,
+                    is_infra INTEGER NOT NULL
+                );
+                CREATE VIEW active_tradeable_wallets AS
+                    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+                CREATE TABLE activity_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, cursors_json TEXT,
+                    completed_at_unix INTEGER
+                );
+                CREATE TABLE activity_groups_v2 (
+                    wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
+                    coverage_generation INTEGER
+                );
+                CREATE TABLE clob_payout_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, terminal_kind TEXT,
+                    completed_at_unix INTEGER
+                );
+                CREATE TABLE clob_payout_evidence_v2 (
+                    coverage_generation INTEGER, fetched_at_unix INTEGER
+                );
+                INSERT INTO wallets VALUES ('0xabc', 1, 0);
+                INSERT INTO activity_coverage_manifests_v2 VALUES (1, '{"0xabc":10}', 20);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
+                INSERT INTO activity_groups_v2 VALUES ('0xignored', 99, 'TRADE', 2);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 98, 'REDEEM', 1);
+                INSERT INTO clob_payout_coverage_manifests_v2 VALUES (3, 'end_cursor', 30);
+                INSERT INTO clob_payout_evidence_v2 VALUES (3, 29);
+                INSERT INTO clob_payout_evidence_v2 VALUES (2, 97);
+                """
+            )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = next((self.root / "data/eval-results").glob("cron-*"))
+        manifest = json.loads((out / "accepted_cycle_manifest.json").read_text())
+        self.assertEqual(manifest["source_watermark"]["activity"]["generation"], 1)
+        self.assertEqual(manifest["source_watermark"]["activity"]["count"], 2)
+        self.assertEqual(manifest["source_watermark"]["activity"]["newest_source_unix"], 10)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["generation"], 3)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["count"], 1)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["newest_fetch_unix"], 29)
+        self.assertEqual(manifest["versions"]["activity_parser"], 2)
+        self.assertEqual(manifest["versions"]["clob_resolution_schema"], 2)
+        self.assertEqual(manifest["versions"]["ranker"], 1)
 
     def test_parameterized_research_run_never_owns_production_pending_pointer(self):
         result = self._run("--skip-purge")
@@ -932,71 +987,40 @@ class RankAndPushScenario(unittest.TestCase):
         )
         print("PASS: missing pe-bootstrap binary → fatal before any stage")
 
-    def test_purge_runs_after_push_with_decision_csv(self):
-        # Issue #385: the final purge stage runs after the push, last in pe_bootstrap.log,
-        # with PE_BOOTSTRAP_PURGE_DECISION_CSV pointing at this run's ranked CSV.
-        r = self._run()
-        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
-        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
-        self.assertEqual(subs[-1], "purge", f"purge was not the final pe-bootstrap stage: {subs}")
-        self.assertIsNotNone(self._log("push.log"), "push must run before purge")
-        # The purge invocation saw the run's RANKED_CSV via env (last non-empty line).
-        csvs = [ln for ln in (self._log("pe_bootstrap_purge_csv.log") or "").splitlines() if ln.strip()]
-        self.assertTrue(csvs, "purge never saw PE_BOOTSTRAP_PURGE_DECISION_CSV")
-        self.assertTrue(
-            csvs[-1].endswith("ranked_72hr_buyandhold.csv") and "cron-" in csvs[-1],
-            f"purge decision CSV not the cron run's ranked CSV: {csvs[-1]}",
+    def test_automatic_physical_maintenance_is_absent(self):
+        # Even failure-injected direct-command stubs must be unreachable from a
+        # production publication. The static assertions catch hidden branches.
+        r = self._run(
+            exit_env={"STUB_EXIT_purge": "91", "STUB_EXIT_purge_infra": "92"}
         )
-        print("PASS: purge runs last, after push, with the run's RANKED_CSV as the decision CSV")
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        subs = [
+            ln.split()[0]
+            for ln in (self._log("pe_bootstrap.log") or "").splitlines()
+            if ln.strip()
+        ]
+        self.assertNotIn("purge", subs)
+        self.assertNotIn("purge-infra", subs)
+        source = WRAPPER.read_text()
+        self.assertNotIn('"$PE_BOOTSTRAP_BIN" purge', source)
+        self.assertNotIn("wal_checkpoint", source)
+        self.assertNotIn("incremental_vacuum", source)
+        self.assertNotIn("VACUUM", source)
+        self.assertIsNotNone(self._log("push.log"), "purge-free path did not publish")
+        print("PASS: production publication performs no purge, reclamation, index rebuild, or checkpoint")
 
-    def test_checkpoint_runs_after_purge_and_truncates_wal(self):
-        db = self.root / "data" / "wallet_cache.db"
-        connection = sqlite3.connect(db)
-        try:
-            self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
-            connection.execute("PRAGMA wal_autocheckpoint=0")
-            connection.execute("CREATE TABLE checkpoint_fixture (value TEXT NOT NULL)")
-            connection.execute("INSERT INTO checkpoint_fixture VALUES ('committed')")
-            connection.commit()
-
-            wal = Path(f"{db}-wal")
-            self.assertTrue(wal.is_file() and wal.stat().st_size > 0, "fixture did not create a WAL")
-
-            r = self._run()
-            self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
-            self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0, "final checkpoint did not truncate WAL")
-            self.assertGreater(r.stdout.index("Stage 5/5"), r.stdout.index("Stage 4/5"))
-            self.assertIn("[checkpoint] ok", r.stdout)
-        finally:
-            connection.close()
-        print("PASS: final checkpoint runs after purge and truncates committed WAL bytes")
-
-    def test_skip_purge_bypasses_purge(self):
+    def test_skip_purge_remains_a_backward_compatible_noop(self):
         r = self._run("--skip-purge")
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
-        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
-        self.assertNotIn("purge", subs, "purge ran despite --skip-purge")
-        self.assertIsNotNone(self._log("push.log"), "push must still run with --skip-purge")
-        self.assertIn("[checkpoint] ok", r.stdout, "checkpoint must still run when purge is skipped")
-        print("PASS: --skip-purge bypasses the purge stage; push still runs")
-
-    def test_purge_failure_is_non_fatal(self):
-        # purge runs after the (already-complete) push, so a purge failure must not fail the run.
-        r = self._run(exit_env={"STUB_EXIT_purge": "1"})
-        self.assertEqual(r.returncode, 0, f"a failing purge aborted the run\nstderr={r.stderr}")
-        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
-        self.assertIn("purge", subs, "purge stage did not run")
-        self.assertIn("WARN", r.stderr)
-        print("PASS: purge exit 1 → WARN, run still succeeds (push already published)")
-
-    def test_checkpoint_failure_is_non_fatal(self):
-        (self.root / "data" / "wallet_cache.db").unlink()
-        r = self._run()
-        self.assertEqual(r.returncode, 0, f"checkpoint failure changed run status\nstderr={r.stderr}")
-        self.assertIn("database is not a file", r.stderr)
-        self.assertIn("[checkpoint] WARN", r.stderr)
-        self.assertIsNotNone(self._log("push.log"), "push must complete before checkpoint warning")
-        print("PASS: checkpoint failure → WARN, run still succeeds (push already published)")
+        subs = [
+            ln.split()[0]
+            for ln in (self._log("pe_bootstrap.log") or "").splitlines()
+            if ln.strip()
+        ]
+        self.assertNotIn("purge", subs)
+        self.assertNotIn("purge-infra", subs)
+        self.assertIsNotNone(self._log("push.log"), "legacy flag prevented publication")
+        print("PASS: --skip-purge remains accepted while automatic purge stays retired")
 
     def test_auto_prune_removes_positions_csv(self):
         # After pass-2 consumes it, the multi-GB qualifying_positions_72hr.csv is pruned; the ranked
@@ -1036,7 +1060,7 @@ class RankAndPushScenario(unittest.TestCase):
                         "--skip-rank must not prune a positions file it did not generate")
         print("PASS: --skip-rank leaves a reused positions file untouched")
 
-    # ── #527: both purge entry points run at idle I/O priority, fail closed ──────────
+    # ── #544: retired purge stages impose no ionice dependency ──────────────────────
     def _install_ionice_stub(self):
         """PATH-prepended ionice stub: logs argv to ./ionice.log, then either exits with
         STUB_IONICE_EXIT_<subcommand> (subcommand = first arg after the pe-bootstrap
@@ -1078,31 +1102,26 @@ class RankAndPushScenario(unittest.TestCase):
                     continue
         return {"PATH": str(bindir)}
 
-    def test_purge_stages_run_under_idle_ionice(self):
+    def test_publication_never_invokes_ionice(self):
         r = self._run(exit_env=self._install_ionice_stub())
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         self.assertEqual(
             (self._log("ionice.log") or "").splitlines(),
-            [
-                "-c3 target/release/pe-bootstrap purge-infra",
-                "-c3 target/release/pe-bootstrap purge",
-            ],
-            "exactly the two purge stages must run under ionice -c3, nothing else",
+            [],
+            "purge-free publication unexpectedly invoked ionice",
         )
         boot = (self._log("pe_bootstrap.log") or "").splitlines()
-        self.assertIn("purge-infra", boot)
-        self.assertIn("purge", boot)
-        print("PASS: both purge stages — and only they — run under ionice -c3")
+        self.assertNotIn("purge-infra", boot)
+        self.assertNotIn("purge", boot)
+        print("PASS: purge-free publication never invokes ionice")
 
-    def test_missing_ionice_fails_before_lock_when_purge_reachable(self):
+    def test_missing_ionice_allows_normal_publication(self):
         r = self._run(exit_env=self._path_without_ionice())
-        self.assertEqual(r.returncode, 2, f"missing ionice should exit 2\nstderr={r.stderr}")
-        self.assertIn("ionice not found", r.stderr)
-        self._assert_preflight_left_no_pipeline_state()
-        print("PASS: absent ionice fails closed before lock, output directory, or refresh")
+        self.assertEqual(r.returncode, 0, f"missing ionice blocked publication\nstderr={r.stderr}")
+        self.assertIsNotNone(self._log("push.log"))
+        print("PASS: ionice is no longer a publication dependency")
 
     def test_missing_ionice_ok_for_pure_repush(self):
-        # Purge is unreachable on the re-push shape, so the ionice preflight must not fire.
         out = self.root / "data" / "eval-results" / "prior"
         out.mkdir()
         (out / "latency_shift_ranked.csv").write_text("wallet\n0xabc\n")
@@ -1113,64 +1132,58 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         self.assertIsNone(self._log("ionice.log"), "re-push invoked ionice")
         self.assertIsNotNone(self._log("push.log"), "re-push did not push")
-        print("PASS: ionice is a conditional dependency — absent tool still allows a re-push")
+        print("PASS: absent ionice allows a purge-free re-push")
 
-    def test_infra_ionice_failure_is_fatal_before_ranking(self):
+    def test_ionice_failure_injection_cannot_reach_retired_infra_purge(self):
         env = self._install_ionice_stub()
         env["STUB_IONICE_EXIT_purge_infra"] = "9"
         r = self._run(exit_env=env)
-        self.assertEqual(r.returncode, 9, f"infra ionice failure must abort\nstderr={r.stderr}")
+        self.assertEqual(r.returncode, 0, f"retired infra purge was reached\nstderr={r.stderr}")
         boot = (self._log("pe_bootstrap.log") or "").splitlines()
         self.assertNotIn("purge-infra", boot, "infra purge ran directly despite ionice failure")
-        self.assertIsNone(self._log("rank.log"), "ranking ran after fatal infra-purge failure")
-        self.assertIsNone(self._log("push.log"), "publish ran after fatal infra-purge failure")
-        print("PASS: infra-purge ionice failure is fatal before ranking, no unprioritized fallback")
+        self.assertIsNotNone(self._log("rank.log"))
+        self.assertIsNotNone(self._log("push.log"))
+        print("PASS: retired infra-purge injection cannot affect publication")
 
-    def test_infra_purge_partial_exit2_continues_through_ionice(self):
-        # Child (not ionice) soft-fails with the pe-bootstrap partial code 2: the stage
-        # must WARN and the run must still rank and publish — ionice's exec preserves
-        # the child's exit code, and run_refresh_stage's 2-branch must keep owning it.
+    def test_infra_purge_exit_injection_is_unreachable(self):
         env = self._install_ionice_stub()
         env["STUB_EXIT_purge_infra"] = "2"
         r = self._run(exit_env=env)
         self.assertEqual(r.returncode, 0, f"partial infra purge must not abort\nstderr={r.stderr}")
-        self.assertIn("[purge-infra] WARN exit 2", r.stderr)
-        self.assertIsNotNone(self._log("rank.log"), "ranking did not run after partial infra purge")
-        self.assertIsNotNone(self._log("push.log"), "publish did not run after partial infra purge")
-        print("PASS: infra-purge partial (exit 2) still warns and continues under ionice")
+        self.assertNotIn("[purge-infra]", r.stderr)
+        self.assertIsNotNone(self._log("rank.log"))
+        self.assertIsNotNone(self._log("push.log"))
+        print("PASS: direct purge-infra exit injection is unreachable from publication")
 
-    def test_ordinary_ionice_failure_warns_after_publish(self):
+    def test_ordinary_purge_ionice_failure_injection_is_unreachable(self):
         env = self._install_ionice_stub()
         env["STUB_IONICE_EXIT_purge"] = "9"
         r = self._run(exit_env=env)
         self.assertEqual(r.returncode, 0, f"ordinary ionice failure must stay nonfatal\nstderr={r.stderr}")
-        self.assertIn("[purge] WARN exit 9", r.stderr)
+        self.assertNotIn("[purge]", r.stderr)
         self.assertIsNotNone(self._log("push.log"), "publish did not complete")
         boot = (self._log("pe_bootstrap.log") or "").splitlines()
-        self.assertIn("purge-infra", boot)
-        self.assertNotIn("purge", boot, "ordinary purge ran directly despite ionice failure")
-        print("PASS: ordinary-purge ionice failure warns after publish, no unprioritized fallback")
+        self.assertNotIn("purge-infra", boot)
+        self.assertNotIn("purge", boot)
+        print("PASS: direct purge exit injection is unreachable from publication")
 
-    def test_resume_pending_purge_tail_is_prioritized(self):
+    def test_resume_pending_has_no_ionice_maintenance_tail(self):
         env = self._install_ionice_stub()
         first = self._run(exit_env={**env, "STUB_PUSH_EXIT": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
         self.assertEqual(
             (self._log("ionice.log") or "").splitlines(),
-            ["-c3 target/release/pe-bootstrap purge-infra"],
-            "failed-push run should have prioritized only the infra purge",
+            [],
+            "failed-push run invoked retired physical maintenance",
         )
         resumed = self._run("--resume-pending", exit_env=env)
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(
             (self._log("ionice.log") or "").splitlines(),
-            [
-                "-c3 target/release/pe-bootstrap purge-infra",
-                "-c3 target/release/pe-bootstrap purge",
-            ],
-            "resume must prioritize exactly the one ordinary purge tail, no infra rerun",
+            [],
+            "resume invoked a retired physical-maintenance tail",
         )
-        print("PASS: publication resume runs its single ordinary-purge tail under ionice -c3")
+        print("PASS: publication resume has no purge/ionice maintenance tail")
 
     def test_wrapper_passes_bash_syntax_check(self):
         r = subprocess.run(["bash", "-n", str(WRAPPER)], capture_output=True, text=True)

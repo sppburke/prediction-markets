@@ -1,0 +1,30 @@
+[
+  {
+    "name": "positions_omitted_w0.json",
+    "url": "https://data-api.polymarket.com/positions?user=0xfd9b763674cb096cacec059fcfe60ae82aae09e8&sizeThreshold=0&limit=500&sortBy=TOKENS&sortDirection=ASC",
+    "fetched_at_unix": 1788266844,
+    "sha256": "3f4756b4120695b91d15e9d78068a97563ee29c2b9eeb5e13c47c6514b6ba2bc",
+    "bytes": 462060
+  },
+  {
+    "name": "positions_redeemable_false_w0.json",
+    "url": "https://data-api.polymarket.com/positions?user=0xfd9b763674cb096cacec059fcfe60ae82aae09e8&sizeThreshold=0&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable=false",
+    "fetched_at_unix": 1788266846,
+    "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "bytes": 2
+  },
+  {
+    "name": "positions_redeemable_true_w0.json",
+    "url": "https://data-api.polymarket.com/positions?user=0xfd9b763674cb096cacec059fcfe60ae82aae09e8&sizeThreshold=0&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable=true",
+    "fetched_at_unix": 1788266846,
+    "sha256": "3f4756b4120695b91d15e9d78068a97563ee29c2b9eeb5e13c47c6514b6ba2bc",
+    "bytes": 462060
+  },
+  {
+    "name": "positions_false_archived_w0.json",
+    "url": "https://data-api.polymarket.com/positions?user=0xfd9b763674cb096cacec059fcfe60ae82aae09e8&sizeThreshold=0&limit=500&sortBy=TOKENS&sortDirection=ASC&redeemable=false&includeArchived=true",
+    "fetched_at_unix": 1788266848,
+    "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "bytes": 2
+  }
+]

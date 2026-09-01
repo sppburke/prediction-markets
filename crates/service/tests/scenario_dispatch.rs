@@ -23,13 +23,15 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ProbabilityPpm, Quantity,
-    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId,
-    VenueId, VenueMarketId, WalletAddress,
+    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ProbabilityPpm, ReconstructionQuality,
+    Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId, VenueId, VenueMarketId,
+    WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed, PaperStateDb};
+use pe_paper_state::{
+    DispatchSeedRecord, DispatchTargetSeed, PaperStateDb, WalletHistoryStatusRecord,
+};
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
@@ -97,10 +99,11 @@ fn entry_trade(id: &str, market: &str, price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -114,7 +117,7 @@ fn signal_for(trade: &IncomingTrade) -> LeaderSignal {
         action: pe_core_types::LeaderAction::Entry,
         leader_side: trade.side,
         leader_price: trade.price,
-        leader_size: Quantity(trade.contracts),
+        leader_size: trade.contracts,
         observed_at: trade.observed_at,
         received_at: trade.received_at,
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
@@ -149,6 +152,14 @@ fn open_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
     let state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     state.init_bankroll(dec!(10000)).unwrap();
     state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    state
 }
 
 fn paper_log_fills(dir: &TempDir) -> Vec<PaperFill> {
@@ -169,11 +180,11 @@ fn base_snapshot() -> RuntimeConfig {
     let mut rc = RuntimeConfig::from_service_config(&ServiceConfig::default());
     rc.sizing_mode = SizingMode::Dollar { usd: dec!(100) };
     rc.per_trade_cap = PerTradeCap::Unlimited;
-    rc.price_impact_cap_bps = 0;
+    rc.price_impact_cap_bps = 100;
     rc.max_resolution_horizon_secs = 0;
     rc.min_resolution_horizon_secs = 0;
-    rc.max_fill_price = "0.90".to_string();
-    rc.min_fill_price = "0".to_string();
+    rc.max_fill_price = dec!(0.90);
+    rc.min_fill_price = Decimal::ZERO;
     rc.fill_mode = FillMode::LeaderHaircut;
     rc
 }
@@ -184,8 +195,13 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .iter()
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
+        response_blake3: String::new(),
         fetched_at_ms: 0,
     }
+}
+
+fn usable_books(market: &str) -> HashMap<String, OrderBook> {
+    HashMap::from([(format!("{market}-0"), book(&[(dec!(0.50), dec!(1000))]))])
 }
 
 fn account_row(
@@ -262,6 +278,7 @@ async fn run_trade(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: dec!(10000),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -272,12 +289,11 @@ async fn run_trade(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
-            entry_gate_config: CopyEntryGateConfig { fail_closed: false },
+            price_impact_cap_bps: 100,
+            entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(runtime)),
             live_accounts: accounts,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(dir),
         paper_state,
@@ -402,7 +418,7 @@ async fn scenario_dispatch_paper_fill_flips_ready_with_primary_first_targets() {
         entry_trade("fill-1", MARKET, dec!(0.50)),
         base_snapshot(),
         Some(standard_armed_accounts()),
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;
@@ -446,7 +462,7 @@ async fn scenario_dispatch_stale_accounts_snapshot_stages_nothing_paper_unchange
         trade,
         base_snapshot(),
         Some(LiveAccounts::new(snapshot)),
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;
@@ -462,7 +478,7 @@ async fn scenario_dispatch_stale_accounts_snapshot_stages_nothing_paper_unchange
     println!("PASS: a stale accounts snapshot stages nothing while paper proceeds");
 }
 
-/// PASS: a zero-contract paper evaluation stages the live aggregate, records a typed
+/// PASS: a valid Kelly configuration with net cost above p stages the live aggregate, records a typed
 /// `no_fill:paper_reject:*` outcome, preserves both targets, and records no paper fill.
 /// FAIL: no aggregate, an untyped/wrong outcome, target drift, or any fill.
 #[tokio::test]
@@ -472,14 +488,16 @@ async fn scenario_dispatch_paper_no_edge_flips_typed_no_fill_with_targets_intact
     let trade = entry_trade("no-edge-1", MARKET, dec!(0.50));
     let dispatch_id = dispatch_id_for(&trade);
     let mut runtime = base_snapshot();
-    runtime.sizing_mode = SizingMode::Contract { contracts: 0 };
+    runtime.sizing_mode = SizingMode::Kelly;
+    runtime.polymarket_fee_rate = Decimal::ONE;
+    runtime.slippage_rate = Decimal::ZERO;
     run_trade(
         &dir,
         state.clone(),
         trade,
         runtime,
         Some(standard_armed_accounts()),
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;
@@ -520,7 +538,7 @@ async fn scenario_dispatch_paper_held_flips_typed_no_fill_without_second_fill() 
         trade,
         base_snapshot(),
         Some(standard_armed_accounts()),
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;
@@ -597,7 +615,7 @@ async fn scenario_dispatch_unusable_shared_quote_suppresses_all_destinations_pre
     println!("PASS: unusable shared quote suppresses all destinations before staging");
 }
 
-/// PASS: gate-off CLOB best-ask basis 0.60 is at/above `max_fill_price=0.50`, so the shared band
+/// PASS: the mandatory CLOB ladder basis 0.60 is at/above `max_fill_price=0.50`, so the shared band
 /// rejects the BUY before staging and records neither a seed nor a fill.
 /// FAIL: any aggregate or fill is created.
 #[tokio::test]
@@ -607,7 +625,7 @@ async fn scenario_dispatch_shared_band_rejection_creates_no_aggregate() {
     let trade = entry_trade("band-reject-1", MARKET, dec!(0.50));
     let dispatch_id = dispatch_id_for(&trade);
     let mut runtime = base_snapshot();
-    runtime.max_fill_price = "0.50".to_string();
+    runtime.max_fill_price = dec!(0.50);
     runtime.fill_mode = FillMode::ClobBestAsk;
     let books = HashMap::from([(format!("{MARKET}-0"), book(&[(dec!(0.60), dec!(100))]))]);
     run_trade(
@@ -644,7 +662,7 @@ async fn scenario_dispatch_zero_live_targets_preserve_phase_a_baseline() {
         trade.clone(),
         base_snapshot(),
         None,
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;
@@ -654,7 +672,7 @@ async fn scenario_dispatch_zero_live_targets_preserve_phase_a_baseline() {
         trade,
         base_snapshot(),
         Some(all_unarmed_accounts()),
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;
@@ -811,7 +829,7 @@ async fn scenario_dispatch_ordering_and_v1_target_bound_are_frozen() {
         trade,
         base_snapshot(),
         Some(four_accounts),
-        HashMap::new(),
+        usable_books(MARKET),
         "0.50",
     )
     .await;

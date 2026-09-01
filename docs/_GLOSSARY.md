@@ -124,7 +124,8 @@ pub struct SourceId(pub String);
 pub struct StrategyId(pub String);
 pub struct ModelId(pub String);
 pub struct OrderLocalId(pub uuid::Uuid);
-pub struct SourceTradeId(pub String);
+pub struct SourceTradeId(pub String);        // v2: "g2:" + 64 lowercase BLAKE3 hex digits
+pub enum SourceTradeIdentityVersion { TransactionHashV1, ReconciledGroupV2 }
 pub struct EventSeq(pub u64);
 
 // Identities
@@ -135,6 +136,8 @@ pub struct VenueAccountId(pub String);
 // Quantities, prices, probabilities
 pub struct ContractQty(pub u64);
 pub struct Quantity(pub ContractQty);
+pub struct ShareAmount(u64);                 // exact 6-dp shares, stored as integer atomics
+pub struct CollateralAmount(u64);            // exact 6-dp collateral, stored as integer atomics
 pub struct KalshiPriceCents(pub u8);          // 0..=100
 pub struct PolymarketPriceDecimal(pub rust_decimal::Decimal); // 0.0..=1.0, 4dp
 pub struct Price(pub rust_decimal::Decimal);  // 0.0..=1.0
@@ -155,6 +158,14 @@ pub struct ReconstructionQuality(pub u8);     // 0..=100
 // Sides
 pub enum Side { Buy, Sell }                   // venue adapters map Yes/No → Side per outcome
 ```
+
+`SourceTradeId` is generation-aware (#544). Historical version-one frames retain their
+transaction-hash identity. A version-two normalized activity group is keyed by
+`g2:<lowercase BLAKE3>` over the canonical length-prefixed group components; its
+`transaction_hash` remains separate audit evidence and never participates in deduplication or
+causal ordering. Only the exact 67-byte lowercase `g2:` encoding is version two. `ShareAmount`
+and `CollateralAmount` preserve venue decimals exactly to six places as checked `u64` atomics;
+lossy fractional input, negative input, and overflow are rejected rather than rounded.
 
 ## Resolver-card sub-types
 
@@ -301,10 +312,9 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
 | `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for the public CLOB `/book` liquidity-capture fetch (issue #350 WS2). Deliberately shorter than `polymarket_request_timeout_secs` (10) — the fetch runs off the fill hot path, so a slow book degrades to a partial snapshot rather than blocking a trade. Reuses the existing `polymarket_clob_min_interval_ms` (200) gate. |
 | `absorbable_depth_bps` | 100 | Fixed `crates/service/src/snapshot_worker.rs` constant `ABSORBABLE_DEPTH_BPS` (no env override): ask-depth band for `absorbable_usd_100bps` (issue #350 WS2 PR-H). Σ price·size over ask levels priced within this many basis points of the best ask. 100 bps = 1 %; baked into the column name `absorbable_usd_100bps`, so it is a constant rather than an operator knob. |
-| `position_reseed_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic leader-ledger reseeds from the positions API. 0 disables periodic reseeds (startup seed still runs). |
-| `position_page_limit` | 500 | `ServiceConfig` field. Maximum positions to fetch per page when seeding the leader ledger. |
-| `position_size_threshold` | 1 | `ServiceConfig` field. Minimum position size (contracts) to include; positions below this are treated as dust. |
-| `position_max_pages` | 20 | **Module const** in `crates/service/src/position_seeder.rs` (not a TOML/env key). Completeness cap: pagination advances on the decoded response-row count (not the retained position count, which dust filtering and key deduplication can shrink), and a full final permitted page is an **error** — the wallet is omitted from the seed map rather than seeded with a truncated snapshot that would classify its next BUY as a first Entry (#542). |
+| `reconciliation_page_limit` | 500 | **Module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers. |
+| `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
+| `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
 
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 
@@ -342,11 +352,10 @@ Campaign financial limits and eligibility are canonical in
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror (`seen_trades`, `fills`, `positions`, `leader_positions`, `bankroll`, `poll_cursors`, `meta`) |
+| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe schema-v2 paper-state SQLite mirror. In addition to financial/replay tables, v2 durably owns reconciled activity groups and revisions, first-entry history/results/completeness, `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
 | `paper_fill_haircut_bps` | 500 | BUY-side paper fill haircut (fee + slippage), basis points. Recorded fill `= min(limit·(1 + bps/10_000), 0.999)`. Mirrors the sizing cost `c` in `evaluate` |
 | `paper_fill_slippage_bps` | 100 | SELL-side paper fill slippage (no taker fee), basis points. Recorded fill `= max(limit·(1 − bps/10_000), 0.001)`. Retained for generic executor/replay compatibility; production Winner-Follow rejects SELLs before fill-price resolution. |
-| `fill_mode` | `clob_best_ask` | Paper fill-price mode (#486). `clob_best_ask`: a paper BUY fills at the fresh copy-time CLOB best-ask (`orchestrator::resolve_fill_price`), and sizing + the fill-price band gate (D) key off it — a fresher, typically more conservative basis than the haircut. `leader_haircut`: the pre-#486 boot-frozen leader-price haircut (`paper_fill_haircut_bps`). Runtime-mutable via `service_config`; an unknown value warns and keeps the last-known-good. Non-paper modes always use the local haircut with no `/book` fetch (`FillSource::LeaderHaircut`). |
-| `clob_best_ask_fallback_haircut_bps` | 100 | Fallback BUY haircut (bps) when a `clob_best_ask` paper fill has no usable best-ask — empty / errored / timed-out `/book`, missing CLOB token, or a zero / zero-size ask. Recorded fill `= leader·(1 + bps/10_000)`, tagged `FillSource::Fallback`, position kept. The haircut demoted from primary to fallback (5%→1%, #486). |
+| `fill_mode` | `clob_best_ask` | Hot runtime paper fill-price mode (#486/#544). Every admitted BUY first requires the mandatory price-impact book plan. `clob_best_ask` uses that one usable ladder's exact VWAP as the paper fill basis; `leader_haircut` uses the boot-owned `paper_fill_haircut_bps` only after the book gate succeeds. There is no unusable-book haircut fallback. |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for the Polymarket Gamma API used by the paper-pnl resolution poller. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms` |
 | `gamma_resolution_poll_interval_secs` | 120 | Seconds between Gamma resolution poll rounds in the live service. 2-minute cadence (issue #343) keeps the settled-markets set and "just resolved" wins within ≤2 min of actual resolution; the poll is gated to markets with open unsettled positions and rate-limited (50 ms min-interval), so the frequency increase is bounded by the open-position set, not the full universe |
 | `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). **172_800 since the 2026-07-03 run28 cutover** — the copy-time twin of `ranker_ttr_hours` (48 h ≈ 72 h on paired weekly P&L, `docs/33` §5; was 259_200/72 h). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. NOTE: the live `service_config` row must be PATCHed at deploy (`on conflict do nothing` never updates an already-seeded row). |
@@ -354,19 +363,67 @@ Campaign financial limits and eligibility are canonical in
 
 ### Copy-entry gate (first-ever BUY entry; issues #290, #339)
 
-Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. SELLs are rejected before in-session history is recorded, fill pricing, sizing, or execution. The leader-price band was removed in #339 — live sizing is re-based on the current market price instead (see `max_fill_price` below and `docs/19-WINNER-FOLLOW-STRATEGY.md` "Copy-scope gates" for the full gate sequence and fail posture).
+Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. Version-two `wallet_market_history_v2`, `entry_gate_results`, and `wallet_history_status_v2` rows in paper-state are the sole runtime history owner; `CopyEntryGate` is rebuilt from them before producers. Missing or incomplete reconciled history blocks membership publication. The captured legacy history file is a one-time migration input selected by boot-owned `legacy_wallet_history_path`: its source hash and import result are durable, and later file edits are inert. It is not a runtime sidecar. SELLs remain non-consuming.
+
+Activity groups in one wallet/epoch bucket commit atomically against immutable pre-bucket gate
+state. A single first BUY consumes history even if a later copy gate rejects it; multiple
+same-market candidates in one second are all recorded as ambiguous. `decision_pending` bridges
+the durable ledger/gate/history commit to the later production-only continuation: `open` is
+closed only by a terminal disposition, and replay consumes the recorded transition without
+executing the continuation. A changed semantic revision, unprovable activity, invalid mapping,
+or ledger arithmetic failure creates a monotonic `wallet_fences` row. Fenced wallets are removed
+from effective membership/projection and cannot copy; there is no delete owner for a fence.
+
+### Hot runtime configuration (`service_config`, issue #544)
+
+The service accepts one complete snapshot containing exactly these 17 keys; every key is
+mandatory exactly once except `kelly_fraction_override`, which may be absent:
+
+`active_watchlist_size`, `mode`, `max_fill_price`, `min_fill_price`,
+`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `fill_mode`,
+`price_impact_cap_bps`, `flip_human_approved`,
+`kelly_fraction_above_default_human_approved`, `polymarket_fee_rate`,
+`kelly_fraction_override`, `per_trade_cap`, `slippage_rate`, `sizing_mode`,
+`sizing_dollar_usd`, and `sizing_contracts`.
+
+Missing, duplicate, unknown, malformed, or cross-field-inconsistent rows reject the whole
+proposal and retain the whole last-good snapshot. The one canonical applied identity is a BLAKE3
+hash of the values actually applied; a pending watchlist-capacity transition continues to hash
+the old applied capacity. Rejected raw rows and their typed error are status evidence, not a
+second revision.
+
+The guarded operator migration removes these database rows while preserving the corresponding
+restart-owned `ServiceConfig` TOML/environment contracts where they still exist:
+`bankroll_usd`, `bench_overfetch`, `demotion_cb_alpha`, `demotion_min_trades`,
+`demotion_pnl_window_secs`, `gamma_resolution_poll_interval_secs`,
+`inactivity_hard_cap_secs`, `inactivity_threshold_secs`, `log_retention_days`,
+`maintenance_interval_secs`, `paper_fill_haircut_bps`, `paper_fill_slippage_bps`,
+`status_interval_secs`, `supabase_refresh_interval_secs`, and
+`supabase_sink_reconcile_interval_secs`. It also deletes the retired keys
+`entry_gate_fail_closed`, `position_page_limit`, `position_reseed_interval_secs`,
+`position_size_threshold`, `wallet_market_history_path`,
+`clob_best_ask_fallback_haircut_bps`, and `trade_poll_interval_secs`. Any database key outside
+the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` before mutation.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `wallet_market_history_path` | `./wallet_market_history.json` | `ServiceConfig` field. Path to the JSON sidecar tracking each leader's previously-traded markets (loaded/merged/persisted at startup by `crate::wallet_history`). It is a conservative any-trade superset for the first-BUY gate: prior SELL-only activity can suppress a later BUY, but can never admit a SELL. |
-| `max_fill_price` | `0.85` | `ServiceConfig` field (decimal string). Skip a BUY copy whose **fill price** (leader price + paper haircut) is `>=` this (catastrophic payoff geometry near $1). `0` disables. Mirrors the issue-#142 backtest `max_signal_price` cap, which also gates the slippage-adjusted fill price (#484: the gate keys off the fill price, not the Gamma mid, so a mid that diverges from the fill can't slip a copy past the cap). A safety rail, not the old leader-price band; adjustable up to ~0.90–0.95 (issue #339). |
-| `min_fill_price` | `0.15` | `ServiceConfig` field (decimal string), **added at the 2026-07-03 run28 cutover**. Skip a BUY copy whose **fill price** (leader price + paper haircut) is `<` this — the run28 entry-band lower bound enforced at copy time so selection and deployment share the filter (the #468 lesson). The boundary value itself fills (strict `<` skip, mirroring the backtest `min_signal_price` floor). Gated on the fill price, not the Gamma mid (#484). `0` disables. Runtime-mutable via `service_config`; drift-guarded by `service_config_seed_matches_boot_defaults`. |
-| `entry_gate_fail_closed` | `false` | `ServiceConfig` field. Posture for a wallet absent from the history map (fetch failed, no stale sidecar): `false` fails open (copies allowed, treat as new), `true` fails closed (blocked). The loader warns per absent wallet either way. |
-| `history_max_pages` | 200 | **Module const** in `crates/service/src/wallet_history.rs` (not a TOML/env key). Safety backstop: per-wallet history pagination stops after this many 500-trade pages; a `warn!` is emitted if hit (older markets may be missed → possible false first-entry). |
+| `max_fill_price` | `0.85` | Hot decimal value. Skip a BUY copy whose resolved fill basis is `>=` this (catastrophic payoff geometry near $1). In `clob_best_ask` mode the basis is the mandatory ladder VWAP; `leader_haircut` uses the boot-owned haircut only after that ladder passes. `0` disables this band edge, not the mandatory book gate. Mirrors the issue-#142 backtest `max_signal_price` cap. |
+| `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
 
-The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval — filtered to `survives=is.true` since #518, so the published 200-row bench admits only the wallets the ranker's own eligibility gate passed, and a batch with no verdict admits nobody (fail-closed) — and refreshes the scores of the live working set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`) up to the runtime `active_watchlist_size` cap — the refresh is score-update-only (no add/evict); MEMBERSHIP follows `watchlist_membership_mode` — maintenance-tick knockout/backfill (`knockout`, issue #350 WS1) or wholesale per-batch replacement (`full_rerank`, the 2026-07-03 cutover production mode). Every post-boot addition — capacity grow, full-rerank swap, or knockout backfill — is first prepared through one shared serialized preparer (`crate::watchlist_admission`, #542): the wallet's prior-market history and current positions are loaded and applied by the orchestrator, acknowledged, and only then is membership published; a preparation failure publishes no additions (capacity and full-rerank retry unchanged; knockout applies its decided evictions without backfill). A full-rerank transition reads `ranking_entries` pinned to the batch identifier that triggered it, so the applied rows and the committed batch marker always name one batch. Supabase is the sole wallet source (issue #370): there is no leaderboard/seed fallback, so the service hard-fails at boot if `latest_ranking` is empty or unreachable. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged). After each refresh (and once at bootstrap) the service best-effort publishes its actual current live-set size to the `service_runtime` table so the analytics site can show "N watched"; `status.json` separately reports both the actual size and the last safely applied target. The publish needs `supabase_secret_key`; it is skipped when absent and never blocks the refresh.
+The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval — filtered to `survives=is.true` since #518, so the published 200-row bench admits only the wallets the ranker's own eligibility gate passed, and a batch with no verdict admits nobody (fail-closed) — and refreshes the scores of the live working set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`) up to the runtime `active_watchlist_size` cap. MEMBERSHIP follows `watchlist_membership_mode`: maintenance-tick knockout/backfill (`knockout`, issue #350 WS1) or wholesale per-batch replacement (`full_rerank`, the 2026-07-03 cutover production mode). Every post-boot addition — capacity grow, full-rerank swap, or knockout backfill — is first prepared through one shared serialized preparer (`crate::watchlist_admission`, #542): the wallet's prior-market history is complete and its current positions pass the five-step causal bracket before the orchestrator atomically records all requested validations and membership is published. A fenced or unavailable candidate publishes no additions; capacity and full-rerank retry unchanged, while knockout applies its decided evictions without backfill. A full-rerank transition reads `ranking_entries` pinned to the batch identifier that triggered it, so the applied rows and the committed batch marker always name one batch. Supabase is the sole wallet source (issue #370): there is no leaderboard/seed fallback, so the service hard-fails at boot if `latest_ranking` is empty or unreachable. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged).
+
+The refresh task is also the sole serialized public-projection worker (#544). Boot, a successful
+score/rank refresh, and every membership or durable-fence transition coalesce into one bounded
+dirty signal. The worker snapshots effective membership (live membership minus durable fences)
+and invokes service-role-only `service_watchlist_replace_v1(expected_token, entries)`. The RPC
+locks `service_runtime`, compare-and-swaps its `updated_at` token, validates unique lowercase
+wallet/rank/`leader_score_bps` rows, replaces the whole `service_watchlist`, updates the matching
+count, and returns the new token. A stale writer loses without exposing a partial set; projection
+failure records typed analytics degradation and retries without failing trading readiness. The
+site reads runtime token → watchlist → runtime token and accepts even an empty set only when
+both tokens and row count agree, retrying one token race before returning typed unavailable.
 
 | Key | Default | Meaning |
 |---|---:|---|
@@ -391,7 +448,7 @@ The local latency-shift ranker pushes append-only ranking batches to Supabase (`
 | `ranking_publish_retry_max_secs` | 30 | Maximum per-request transient retry delay for ranking publication. |
 | `rank_and_push_tempfail_exit` | 75 | Exit code used when a bounded retryable rank-cycle operation exhausts its in-process retries or the resolution audit is blocked (`blocked > 0 \|\| clipped > 0` — a market whose available venue truth could not be recorded, or a repair-cap clip; venue-side incompleteness such as lagged/extended/inactive/pending markets is counted and retried without blocking, issue #523). Emitters are Gamma `events` page exhaustion, CLOB closed-markets page exhaustion in the `resolutions` command (`Transient`/`RateLimited` exhausted after `clob_page_max_retries`, issue #534), a blocked resolution audit, and ranking publication. The production loop preserves and resumes the applicable durable logical-cycle or exact-publication pointer; permanent failures remain non-75 and stop the loop. |
 | `rank_and_push_loop_retry_secs` | 60 | Delay between loop-level retries of a durable logical cycle or pending ranking publication. The loop checks its run flag once per second during this delay so an operator stop remains prompt. |
-| `rank_and_push_cycle_pointer` | `data/eval-results/rank_and_push.cycle` | One-line repository-relative pointer to the active zero-argument production `cron-<UTC>` run directory. Written atomically after preflight/run-lock acquisition and directory creation but before discovery or activation mutates the cache. A retry reuses the same path and therefore the same deterministic activation batch; compare-and-cleared only after publication plus the purge/checkpoint tail. Parameterized research runs neither create nor consume it. |
+| `rank_and_push_cycle_pointer` | `data/eval-results/rank_and_push.cycle` | One-line repository-relative pointer to the active zero-argument production `cron-<UTC>` run directory. Written atomically after preflight/run-lock acquisition and directory creation but before discovery or activation mutates the cache. A retry reuses the same path and therefore the same deterministic activation batch; compare-and-cleared only after exact publication verification and accepted-watermark capture. Parameterized research runs neither create nor consume it. |
 | `ranking_batches_retention` | 1080 | `--keep-batches` in `scripts/push_ranking_to_supabase.py` (issue #411; raised 180 → 1080 at the 2026-07-03 run28 cutover). After a successful push, prune `ranking_batches` to the newest N rows (CASCADE drops their `ranking_entries`), bounding the append-only epoch history (~6 months at the 4h production cadence, 6 pushes/day; preserves the original ~`ranker_window_days` of replay depth the 180-at-daily default was sized for). `latest_ranking` reads only `max(batch_id)`, so pruning older batches never affects the live read path or the `wallet_live_stats_mv` matview. `0` disables the prune (history-preserving research re-push). Best-effort: a prune failure logs HTTP status+body and does **not** fail the push (bounded + self-heals next run). Drift-guarded by `scripts/test_push_ranking_filter.py`. |
 | `ranker_window_days` | 180 | `DEFAULT_WINDOW_DAYS` in `scripts/ranker_decay.py` (issue #366). Relative entry-date window: when `--win-end`/`--win-start` are omitted, the ranker (`scripts/rank_72hr_buyandhold.py`) scores `win_end = today UTC-midnight`, `win_start = win_end − this`. Replaces the old fixed calendar window (`2025-12-01 → 2026-06-01`); the relative default **does** take effect on the next production `scripts/rank_and_push.sh` (which leaves `WIN_START`/`WIN_END` empty). Override via `--win-start`/`--win-end` (Python) or `WIN_START`/`WIN_END` (shell). Drift-guarded by `scripts/test_ranker_decay.py`. |
 | `ranker_half_life_days` | 30 | `DEFAULT_HALF_LIFE_DAYS` in `scripts/ranker_decay.py` (issue #366). Exponential recency-decay half-life (days) for the edge/t-stat score in BOTH ranking passes (`rank_72hr_buyandhold.py`, `latency_shift_rerank.py`): a trade one half-life old weighs 0.5. `0` disables decay (flat weights = legacy behaviour, bitwise-identical). Both the standalone Python scripts and the production wrapper `scripts/rank_and_push.sh` default to **30** (issue #370 adopted 30-day decay after the half-life sweep, flipping the #366 flat wrapper default). Override with `--half-life-days N`; for the first full-universe run, stage with `--half-life-days 0` so a cohort shift is attributable to the wider universe vs decay. Eligibility/activity gates and `hit_rate` stay raw. Drift-guarded by `scripts/test_ranker_decay.py`. |
@@ -450,7 +507,7 @@ Surviving cache/cursor artifacts — legacy, **read-only** on the Dune path:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `wallet_cache_mutation_lock` | `<cache_path>.lock` | PID-based RAII lock file (`pe_bootstrap::lock::CacheMutationLock`). Acquired by cache-mutating discovery/backfill paths and the standalone `activate-next`, `purge`, `purge-infra`, and `clear-infra-exclusion` commands before opening the cache read/write; stale-PID reclaim handles a crashed prior holder. |
+| `wallet_cache_mutation_lock` | `<cache_path>.lock` | Persistent kernel-held `flock(2)`/`fs2` inode (`pe_bootstrap::lock::CacheMutationLock`) acquired centrally before every read-write `WalletCache::open`, including named and no-argument `all`; true readers use `open_read_only`. Acquisition opens without truncation, takes the exclusive nonblocking lock, then writes only the live holder's decimal PID. Process death releases the kernel lock but never removes the inode; PID text is diagnostic and is never reclaimed. Forge activation acquires persistent loop → one-shot run → cache locks in that sole order. |
 | `wallets.polymarket_contracts_seen` (column) | `i64`, default `0` | Legacy OR-merged V1/V2 CTF-exchange attribution bitmask. Its on-chain enumeration writer was removed in #326, so every wallet is now left `0`; the column persists for schema backward-compat. |
 | `wallet_enum_completed_contracts` / `wallet_enum_topic_hashes` / `wallet_enum_chunk_progress` (cursors) | `source_cursor` keys (`pe_bootstrap::migrate::CURSOR_WALLET_ENUM_*`) | Legacy on-chain enumeration progress. Still written once by the `wallet_set.json` → SQLite migration (`migrate::auto_migrate_legacy` → `save_enum_state`) as a migration-audit marker, but **no longer read** — the reader (`load_enum_state`) and the `enumerate` subcommand were removed in #335. |
 
@@ -490,7 +547,7 @@ a focused file for problems, and a bounded stream for detail — never an unboun
 
 | Artifact | Shape | Use |
 |---|---|---|
-| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — `updated_at, uptime_secs, mode, authoritative, bankroll, open_positions, fills_total, settled_total, last_event_seq, watchlist_size, watchlist_target_size, supabase_rpc_calls`, (`open_positions` counts genuinely OPEN positions — net-nonzero rows whose market has not settled; the positions table itself is cumulative and settlement never zeroes rows, #516) plus an additive optional `live` block with `pending_dispatch_seeds`, `ready_dispatch_seeds`, `fetched_at_unix` (unix time of the last successful accounts poll; `null` before one succeeds — a strictly advancing value across two snapshots proves the poll is decoding, #514), `stale` (`true` while the snapshot exceeds `live_accounts_stale_after_secs`; no new live work is staged while `true`), and per-account `account_id, is_primary, enabled, requested_live_mode, effective_live_mode, armed`. `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap (the compiled fallback until a Supabase value is applied). Read this first; no grep. |
+| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — includes the embedded source `revision`, top-level `applied_config_hash`, sticky named `tasks` with class/state/typed failure, `status_error`, the prior financial/source/live fields, optional `runtime_config` (applied hash plus separately typed rejected raw proposal), and optional `watchlist_projection` (`pending`/`applied` token, count, time plus `last_error`). `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap. Read this first; no grep. |
 | `<stem>.<date>.jsonl` (from `jsonl_log_path`) | full stream, rotated **daily**, keeps `log_retention_days` | full detail; grep one day's file |
 | `errors.<date>.jsonl` (same dir) | **WARN+ERROR only**, rotated daily | the clean "what broke" tape (no INFO chatter) |
 
@@ -499,6 +556,37 @@ a focused file for problems, and a bounded stream for detail — never an unboun
 | `status_path` | `./status.json` | `ServiceConfig` field. Path of the health snapshot. `PE_STATUS_PATH`. |
 | `status_interval_secs` | 30 | `ServiceConfig` field. Seconds between `status.json` writes; `0` disables. `PE_STATUS_INTERVAL_SECS`. |
 | `log_retention_days` | 7 | `ServiceConfig` field. Dated JSONL files kept per sink (full + errors); bounds disk. `PE_LOG_RETENTION_DAYS`. |
+
+### Durable log, migration, and supervisor boundaries (#544)
+
+`pe-event-log::Scanner` is the single physical verifier for source and paper logs. It reports the
+resolved path, physical verified-tail offset, last sequence, and last hash while checking file and
+frame boundaries, size, checksum, decompression, envelope decode, sequence, stored raw-payload
+hash, and BLAKE3 chain. Only a scanner-proven incomplete final frame may be truncated and
+synchronized under the exclusive writer lock; interior corruption and every other mismatch are
+fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
+`live_journal.log` uses its native verified replay for the same binding fields.
+
+Paper schema-v1-to-v2 migration is a machine-owned roll-forward state machine:
+`boundary_recorded → version_two_inputs_appending → side_state_built →
+activation_tails_recorded → installed`. The record binds canonical paths, physical tails,
+sequences, hashes, the immutable v1 main and backup, captured legacy-history input, exact side-main
+path, binary identity, and final activation tails. Restart resumes the recorded phase and exact
+side main; path, prefix, hash, identity, or phase drift fails closed. Pre-boundary v1 frames remain
+audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
+committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
+
+Ordinary production has one named supervisor over 16 retained owners. Activity ingest, public
+poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
+watchlist refresh/projection, maintenance, capacity/config workers, status writer, and HTTP server
+are critical: an unexpected typed error, early return, channel close, or join failure sticks in
+readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
+tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown
+orders producers → orchestrator drain → healthy sinks → HTTP → final status → tracing;
+synchronization-uncertain work remains unseen for restart recovery. Expected failures are typed.
+Production release profiles use `panic = "abort"`; a panic is recovered by systemd restart from
+durable state, never by unwinding through service owners. Transient market-end fetch failure is not
+cached and is retried on the next request.
 
 ### JSONL observability sidecar schema
 
@@ -561,7 +649,7 @@ tracing::info!(progress = n, total = total_pending, "wallet backfill progress");
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `active_watchlist_size` | 100 | **Cap** on how many ranker-surviving leaders `pe-service` follows — not the followed count. Since #518 every watchlist read is filtered to the ranker's `survives` verdict, so actual membership is the survivor count when that is smaller (23-36 against this cap in 2026-08), and drifts lower still between batches as evictions go unbackfilled. `status.json.watchlist_size` is the truth; this is `watchlist_target_size`. Supabase `service_config` is authoritative; this key intentionally has no TOML/env surface. Valid range: `1..=200`, matching the published ranking bench. The service loads it at boot and polls every 30 seconds. A missing row, fetch failure, malformed value, `0`, or value above `200` keeps the last-known-good target (never clamps or empties the live set). A grow preloads every newly admitted wallet's prior-market history and current positions into the single-owner orchestrator before one atomic membership swap; a shrink uses the same atomic swap. Any preparation failure leaves both membership and the applied target unchanged and retries independently on the capacity worker's next 30-second retry. Installing the supporting binary requires one normal `pe-service` restart; later valid edits hot-swap without a restart. The previous top-50 setting was a 2026-07-13 operator-directed paper experiment, not run28 evidence; 100 supersedes it as the operator default. |
+| `active_watchlist_size` | 100 | **Cap** on how many ranker-surviving leaders `pe-service` follows — not the followed count. Since #518 every watchlist read is filtered to the ranker's `survives` verdict, so actual membership is the survivor count when that is smaller (23-36 against this cap in 2026-08), and drifts lower still between batches as evictions go unbackfilled. `status.json.watchlist_size` is the truth; this is `watchlist_target_size`. Supabase `service_config` is authoritative; this key intentionally has no TOML/env surface. Valid range: `1..=200`, matching the published ranking bench. The service loads it at boot and polls every 30 seconds. A missing row, fetch failure, malformed value, `0`, or value above `200` keeps the last-known-good target (never clamps or empties the live set). A grow validates every newly admitted wallet's complete history and current positions through the #544 five-step causal bracket before one atomic validation/membership swap; a shrink uses the same atomic membership swap. Any preparation failure leaves both membership and the applied target unchanged and retries independently on the capacity worker's next 30-second retry. Installing the supporting binary requires one normal `pe-service` restart; later valid edits hot-swap without a restart. The previous top-50 setting was a 2026-07-13 operator-directed paper experiment, not run28 evidence; 100 supersedes it as the operator default. |
 | `incubator_watchlist_size` | 250 | Candidates under research |
 
 ### Ranker eligibility thresholds
@@ -703,11 +791,11 @@ This applies anywhere the docs say "matches", "close to", or "drift acceptable".
 | `bootstrap_pipeline_activation_batch_wallets` | 20,000 | Maximum inactive, non-infra, non-tombstoned wallets activated by one zero-argument `rank_and_push.sh` cycle. Discovery and backfill defer the legacy global rule inside this wrapper; `activate-next` owns the single deterministic, transactionally audited batch. If fewer remain it activates all and warns; if none remain it warns and skips. Hardcoded as `pe_bootstrap::pile::PIPELINE_ACTIVATION_BATCH_WALLETS`. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on `pe-bootstrap backfill`. `0` processes every wallet whose `last_polymarket_fetch_at` is NULL or older than 1 day. The loop's zero-argument cycles run with `0`; set a positive value only to bound an ad-hoc run. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
 | `bootstrap_backfill_staleness_secs` | 86_400 (1 day) | Per-wallet staleness window for `pe-bootstrap backfill` (issue #166). A wallet is eligible for re-fetch when `last_polymarket_fetch_at IS NULL OR < now - 86_400`. Hardcoded as `pe_bootstrap::pile::BACKFILL_STALENESS_SECS`; each loop cycle's backfill stage re-fetches wallets stale beyond this window. Reused by `pe-bootstrap purge` (#385) as the rule-B freshness gate. |
-| `bootstrap_purge_enabled` | `false` | Arms only the ordinary `pe-bootstrap purge` proven-loser/dead-weight DELETE (issue #385). Default `false` keeps that stage report-only. It does not govern `purge-infra`, which is armed whenever invoked and is report-only only with explicit `--dry-run`. Set `PE_BOOTSTRAP_PURGE_ENABLED=1` to arm the ordinary purge. |
+| `bootstrap_purge_enabled` | `false` | Explicitly arms either direct `pe-bootstrap purge` or direct `purge-infra`; with the default false, both commands are report-only even without `--dry-run` (#544). The production `rank_and_push.sh` never invokes either command. Set `PE_BOOTSTRAP_PURGE_ENABLED=true` only under separate operator authorization; there is no automatic deletion owner. |
 | `bootstrap_purge_inactivity_secs` | 1_209_600 (14 days) | Rule-B (dead-weight) dormancy threshold (issue #385): an `is_active=1`, not-eligible wallet refreshed this run is deleted (no tombstone) when its newest trade is older than this. A zero-trade wallet (`MAX(timestamp_unix) IS NULL`) is never matched. `PE_BOOTSTRAP_PURGE_INACTIVITY_SECS` overrides. |
 | `bootstrap_purge_loser_tstat_max` | -2.0 | Rule-A (proven-loser) net t-stat ceiling (issue #385): an eligible wallet is deleted **and tombstoned** when `tstat_net <= -2.0 AND mean_net < 0 AND n_eff >= bootstrap_purge_loser_neff_min`. The one `f64` bootstrap config (a t-stat is a statistic, outside the "no raw f64" money/price/probability rule). `PE_BOOTSTRAP_PURGE_LOSER_TSTAT_MAX` overrides. |
 | `bootstrap_purge_loser_neff_min` | 20 | Rule-A minimum effective sample size (`n_eff`, Kish) for a proven-loser verdict (issue #385) — guards against tombstoning on a tiny sample. `PE_BOOTSTRAP_PURGE_LOSER_NEFF_MIN` overrides. |
-| `bootstrap_purge_bulk_min_wallets` | 5_000 | Delete-set size (wallet count) at/above which an armed `pe-bootstrap purge` runs in **bulk mode** (issue #401): drop the two non-lookup `trades` indexes → delete → reclaim free pages → rebuild. Below it the armed purge runs **subthreshold** — indexes stay live, no reclamation — so cheap daily purges (hundreds of wallets) plateau the file while a rare backlog clear stays fast. Reclamation (#538) is `incremental_vacuum` on a converted db or the one-time conversion `VACUUM` on a legacy mode-0 db; a `reclamation_pending` marker (cache `meta` table) commits before the index drop; a later ORDINARY post-publication purge finding it set recovers — on a subthreshold/empty run via reclaim + idempotent index creation with no drop, while an above-threshold run subsumes recovery in its normal bulk maintenance (its reclamation drains the whole backlog). `purge-infra` (pre-ranking, cycle-fatal) never services recovery. `PE_BOOTSTRAP_PURGE_BULK_MIN_WALLETS` overrides. |
+| `bootstrap_purge_bulk_min_wallets` | 5_000 | Delete-set size at/above which a separately authorized armed direct purge uses bulk mode: marker → index drop → delete → reclaim → index rebuild. Normal publication never enters this path. A pre-existing `reclamation_pending` marker is handled only by the recovery-only `pe-bootstrap recover-reclamation` command after operator inspection; that command cannot select or delete wallets and recreates required indexes before clearing the marker. |
 | `bootstrap_purge_archive_enabled` | true | Archive-before-DELETE for the armed purge (item 3.7, 2026-07-01 decision record, issue #417): every doomed wallet's `trades`/`wallets`/`leaderboard_snapshots` rows + a both-rules `purge_manifest` census are copied into the sibling archive DB before any destructive step; an archive failure ABORTS the purge (fail-closed). Disable only on a disk-constrained box. `PE_BOOTSTRAP_PURGE_ARCHIVE_ENABLED`. |
 | `bootstrap_purge_archive_path` | "" (derived) | Archive DB path; empty derives `<cache_path stem>.purge-archive.db` beside the cache. `PE_BOOTSTRAP_PURGE_ARCHIVE_PATH`. |
 | `tombstone_override_sources` | `SRC_LEADERBOARD` (= 16) | The source bits whose re-discovery of a non-infrastructure tombstoned wallet *lifts* the tombstone and re-admits it (issue #385): Polymarket leaderboard (16) only. An `infra` tombstone is never lifted by ordinary discovery, including leaderboard discovery; only the explicit operator command `clear-infra-exclusion --wallet <hex> --confirm` may remove it. Datadash (128), 502-gap (64), trades (2), wallet-set-json (1), and the retired Radion bit (32) leave every tombstone intact. |
@@ -757,8 +845,8 @@ WHERE is_active = 0 AND is_infra = 0 AND (
 
 `is_active` and `is_infra` are sticky under repository-owned automatic rules
 (they never decay). Re-running `migrate` after edits to input data only adds
-source bits and infra flags; it never removes them. Infrastructure purge removes
-the live row but preserves a durable exclusion as described below.
+source bits and infra flags; it never removes them. Rank/export applies infrastructure,
+tombstone, wallet-fence, and current-eligibility filters without deleting history.
 
 The zero-argument rank-and-push pipeline is a controlled exception to the
 legacy unbounded activation call sites: `winner-discovery` and `backfill` run
@@ -769,10 +857,10 @@ is derived from that durable batch and can be regenerated with the same batch
 ID without consuming another batch. Direct standalone `winner-discovery` and
 `backfill` retain the legacy immediate activation behavior.
 
-`purge-infra` archives and deletes live wallet-keyed rows before ranking and
-writes a non-liftable `purged_wallets(reason='infra')` exclusion in the same
-delete transaction. This preserves the classification after the live `wallets`
-row is gone and prevents a later discovery cycle from re-admitting it.
+Direct `purge-infra` remains an operator-only maintenance command. It is report-only while
+`bootstrap_purge_enabled=false`; if separately armed, its historical archive/delete and
+non-liftable `purged_wallets(reason='infra')` semantics still apply. It is never a publication
+stage.
 
 #### Leaderboard snapshots (`leaderboard_snapshots` table)
 
@@ -810,11 +898,11 @@ CREATE TABLE leaderboard_snapshots (
 | `kelly_p_extra_per_missing_snapshot_default` | 5 | Pseudo-observations added per missing snapshot. See `kelly_p_min_snapshots_default` for the full formula. Both ops use saturating arithmetic. Set via `PE_BACKTEST_KELLY_P_EXTRA_PER_MISSING_SNAPSHOT`. |
 | `liquidity_take_fraction_default` | `0.05` | Fraction of cached Gamma `liquidity` USD the sizer may take per BUY. Applied as `max_contracts = floor(take_fraction × liquidity_usd / fill_price)` in `simulation.rs` after `evaluate()` returns. `0` disables the gate (silent passthrough). Worked example: at `liquidity_usd = $5,000`, `take_fraction = 0.05`, `fill_price = $0.50` → max contracts = `floor(5000 × 0.05 / 0.50) = 500`. Set via `PE_BACKTEST_LIQUIDITY_TAKE_FRACTION`. **Backtest staleness caveat:** stored value is depth-at-last-bootstrap-refresh (≈ now), applied uniformly across the entire historical sim window — markets that *grew* in depth get over-clamped, markets that *shrank* get under-clamped. |
 | `liquidity_min_required_usd_default` | 200 | Minimum Gamma `liquidity` USD required to apply the clamp. Below this floor, depth data is too noisy to act on — clamp is bypassed (passthrough with `tracing::warn!`). Tracked via report counter `liquidity_below_floor_bypasses`. Set via `PE_BACKTEST_LIQUIDITY_MIN_REQUIRED_USD`. |
-| `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. **#508:** the service PINS `ModeDefault` at boot regardless of TOML/env (compiled outage posture); the Supabase `per_trade_cap` KV row (seeded `mode_default`) is the sole path to another value, and production runs `unlimited` after the Phase-A cutover (per-trade bps caps retired — the impact cap is the sole policy size limit, `docs/19-`). |
+| `per_trade_cap_default` | `mode_default` | Default `PerTradeCap` variant for `WinnerFollowConfig` and backtest: resolves to 25 bps for LiveTiny, 100 bps for Promoted. Override with `PE_BACKTEST_PER_TRADE_CAP=bps:N` or `PE_BACKTEST_PER_TRADE_CAP=unlimited` in backtest. Ordinary service production requires the complete initial hot snapshot before producers; its reviewed `service_config.per_trade_cap` value is `unlimited`. |
 | `per_trade_cap_unlimited_resolved_bps` | 10 000 | Effective cap in basis points when `PerTradeCap::Unlimited` is selected. Full bankroll — Kelly fraction is the only size constraint. |
-| `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode` (#398 WS2; replaced `flat_usd_per_trade`). `kelly` = fractional-Kelly sizing. `dollar` (`sizing_dollar_usd`) sizes each BUY as `max(1, floor(usd / fill_price))` contracts (fill_price = leader price + paper haircut on the live copy path, so `contracts × fill == usd`; #484) — the former flat path, eliminating bankroll compounding; use when the Kelly `p` input is a per-leader constant with no per-trade signal (issue #161). `contract` (`sizing_contracts`) sizes exactly N contracts. The per-trade cap, risk gate, and price-impact book cap (`price_impact_cap_bps`) remain active in all modes. The deployed service's boot default is `dollar` / `sizing_dollar_usd = 25` (`smoke-test/service.toml`); an ordinary-live account with NULL `accounts.live_sizing_mode` falls back to this shared mode, otherwise `accounts.live_sizing_*` overrides it (#516). KV layer: three flat `service_config` keys `sizing_mode` / `sizing_dollar_usd` / `sizing_contracts`. |
-| `price_impact_cap_bps_default` | `0` (compiled) / `100` (production cutover) | The price-impact cap (`RuntimeConfig.price_impact_cap_bps`; #398 WS2, reworked #508 Phase A) — **the sole policy order-size limit** below the always-applying available-bankroll bound. When enabled, ONE CLOB `/book` fetch per admitted BUY feeds the band gate, the budget-based executable-ladder planner (`pe_venue_polymarket::plan_budget_buy`: max whole shares within this many bps of best ask satisfying the sizing budget), and — in `clob_best_ask` mode — the exact ladder-VWAP fill basis (`estimated_ladder_spend / shares`; FOK limit = worst accepted tick; `worst_case_debit = shares × limit`). **Fail-closed when enabled**: an unusable book (missing token / fetch error / timeout / stale beyond the shared 2 s ladder bound / corrupt / empty) skips the trade, as does an in-band ladder affording no whole share. Edits valid `1..=10_000` inclusive; `0` and out-of-range are rejected with last-known-good retained — the limit cannot be switched off by edit ("effectively off" = explicit `10_000`); gate-off exists only as the compiled boot default (the committed `'0'` seed is rejected at parse). Production posture after the #508 A3 cutover UPDATE: `100`. Admin-mutable via `service_config`. |
-| `clob_book_hot_path_timeout_secs` | `2` | Timeout for the orchestrator's hot-path CLOB `/book` fetches — the price-impact gate (#398 WS2) and the `clob_best_ask` best-ask fill basis (#486) both use `orchestrator::CLOB_BOOK_HOT_PATH_TIMEOUT_SECS`. Tighter than the snapshot worker's 5 s per-request timeout so a slow book fails open (no cap / haircut fallback) without stalling the trade. |
+| `sizing_mode_default` | `kelly` | Default for `WinnerFollowConfig.sizing_mode` (#398 WS2; replaced `flat_usd_per_trade`). `kelly` = fractional-Kelly sizing. `dollar` (`sizing_dollar_usd`) sizes each BUY as `max(1, floor(usd / resolved_fill_basis))` contracts; `contract` (`sizing_contracts`) sizes exactly N contracts. The per-trade cap, risk gate, and mandatory price-impact book cap remain active in all modes. The deployed service's reviewed hot snapshot uses `dollar` / `sizing_dollar_usd = 25`; an ordinary-live account with NULL `accounts.live_sizing_mode` falls back to this shared mode, otherwise `accounts.live_sizing_*` overrides it (#516). |
+| `price_impact_cap_bps_default` | `100` | Mandatory hot `RuntimeConfig.price_impact_cap_bps` and new-install seed (#544): **the sole policy order-size limit** below the always-applying available-bankroll bound. One CLOB `/book` fetch per admitted BUY feeds the shared band gate, budget-based executable-ladder planner, and — in paper `clob_best_ask` mode — exact ladder-VWAP fill basis. Missing, unusable, corrupt, empty, stale, or timed-out evidence fails closed before any destination stages. A successful read with no paper-affordable whole share anchors the shared band at best ask, permits any otherwise-admissible live staging, and then records a paper-only skip. Boot requires the row; edits accept only `1..=10_000`. Zero and out-of-range values reject the whole snapshot and retain the last-good one; there is no gate-off construction path. |
+| `clob_book_hot_path_timeout_secs` | `2` | Timeout for the orchestrator's single mandatory hot-path CLOB `/book` fetch. A timeout fails closed; no cap bypass or haircut fallback remains. |
 | `backtest_suppression_warn_threshold_pct` | 30 | Single warn threshold shared by every per-quarter BUY-signal suppression diagnostic (`expiry_filter_suppression_pct`, `high_price_suppression_pct`, …). Logged as a warning when any quarter exceeds it. Hardcoded as `SUPPRESSION_WARN_THRESHOLD` in `crates/backtest/src/simulation.rs`. |
 | `backtest_require_known_expiry_default` | `true` | Strict-mode flag for the `max_hours_to_expiry` filter. `true` (default after #137 Sub-PR 3, gated on PR #154 stage 6f raising trade-set schedule coverage to 99.64%) — when both schedule and resolution are absent for a market, the BUY signal fails closed (suppressed). `false` (rollback / legacy) — both-absent allows the trade through. The fallback chain (schedule → resolution → flag) was unified in PR #139; pre-#139 the NULL-schedule path short-circuited to allow regardless of resolution. Set via `PE_BACKTEST_REQUIRE_KNOWN_EXPIRY`. |
 | `backtest_max_positions_per_market_default` | `Some(1)` | Cap on concurrent open positions per `market_id` (issue #138). `None` disables the cap entirely. `Some(n)` blocks new BUY signals on any market that already has ≥ `n` open positions across every leader and outcome — leader A on outcome 0 and leader B on outcome 1 of the same binary market count against the same slot. Slot reopens when positions close via SELL or resolution sweep. `NonZeroU32` rejects `0` at deserialize-time so `PE_BACKTEST_MAX_POSITIONS_PER_MARKET=0` is an explicit error. Set via `PE_BACKTEST_MAX_POSITIONS_PER_MARKET`. |

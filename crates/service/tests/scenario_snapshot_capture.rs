@@ -66,6 +66,7 @@ fn books_for_222() -> HashMap<String, OrderBook> {
                     size: dec!(1000),
                 },
             ],
+            response_blake3: String::new(),
             fetched_at_ms: 0,
         },
     );

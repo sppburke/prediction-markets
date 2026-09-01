@@ -1,7 +1,14 @@
 use pe_bootstrap::{
-    BootstrapConfig, backfill, cache::WalletCache, config, coverage, error::BootstrapError, fetch,
-    fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge, run_schedule_backfill,
-    watchlist_phase, winner_discovery,
+    BootstrapConfig, backfill,
+    cache::WalletCache,
+    cache_migration::{
+        CacheActivationRequest, activate_cache_v2, finalize_cache_v2, migrate_cache_v2,
+        populate_activity_v2, rollback_cache_to_v1, verify_frozen_payload_v1,
+    },
+    config, coverage,
+    error::BootstrapError,
+    fetch, fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge,
+    reclamation_evidence, run_schedule_backfill, watchlist_phase, winner_discovery,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -46,10 +53,35 @@ async fn main() {
                 | "activate-next"
                 | "purge-infra"
                 | "clear-infra-exclusion"
+                | "recover-reclamation"
+                | "reclamation-evidence"
+                | "cache-migrate-v2"
+                | "cache-verify-frozen-v1"
+                | "cache-populate-activity-v2"
+                | "cache-populate-payout-v2"
+                | "cache-finalize-v2"
+                | "cache-activate"
+                | "cache-rollback-v1"
+                | "pipeline-versions"
         )
     );
 
     if let Some(sub) = first_arg.filter(|_| known_sub) {
+        if sub == "pipeline-versions" {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": "polymarket-public-activity",
+                    "activity_schema": pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                    "activity_parser": pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    "clob_resolution_schema": pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
+                    "clob_resolution_parser": pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
+                    "cache_schema": pe_bootstrap::cache::CACHE_SCHEMA_VERSION_V2,
+                    "configuration": 1,
+                })
+            );
+            std::process::exit(0);
+        }
         // Single-pass flag parser. Tracks the actual string slices consumed
         // as flag values so the TOML positional search doesn't mistake
         // `--dump-ledgers /path` for a config file path.
@@ -65,6 +97,16 @@ async fn main() {
         let mut audit_csv: Option<std::path::PathBuf> = None;
         let mut targets_csv: Option<std::path::PathBuf> = None;
         let mut wallet_arg: Option<&str> = None;
+        let mut db_arg: Option<std::path::PathBuf> = None;
+        let mut manifest_arg: Option<std::path::PathBuf> = None;
+        let mut frozen_payload_arg: Option<std::path::PathBuf> = None;
+        let mut stage_record_arg: Option<std::path::PathBuf> = None;
+        let mut fixed_db_arg: Option<std::path::PathBuf> = None;
+        let mut backup_arg: Option<std::path::PathBuf> = None;
+        let mut failed_backup_arg: Option<std::path::PathBuf> = None;
+        let mut expected_sha256_arg: Option<String> = None;
+        let mut fixed_end_arg: Option<i64> = None;
+        let mut generation_arg: Option<u64> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -118,6 +160,66 @@ async fn main() {
                 dump_ledgers_path = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--dump-ledgers=") {
                 dump_ledgers_path = Some(std::path::PathBuf::from(v));
+            } else if a == "--db" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                db_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--db=") {
+                db_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--manifest" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                manifest_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--manifest=") {
+                manifest_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--frozen-payload" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                frozen_payload_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--frozen-payload=") {
+                frozen_payload_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--stage-record" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                stage_record_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--stage-record=") {
+                stage_record_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--fixed-db" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                fixed_db_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--fixed-db=") {
+                fixed_db_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--backup" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                backup_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--backup=") {
+                backup_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--failed-backup" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                failed_backup_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--failed-backup=") {
+                failed_backup_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--expected-sha256" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                expected_sha256_arg = Some(rest[i].to_owned());
+            } else if let Some(v) = a.strip_prefix("--expected-sha256=") {
+                expected_sha256_arg = Some(v.to_owned());
+            } else if a == "--fixed-end" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                fixed_end_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--fixed-end=") {
+                fixed_end_arg = v.parse().ok();
+            } else if a == "--generation" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                generation_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--generation=") {
+                generation_arg = v.parse().ok();
             } else if a == "--stage" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -134,13 +236,177 @@ async fn main() {
             .rfind(|&&a| !a.starts_with("--") && !flag_values.contains(a))
             .map(|p| std::path::PathBuf::from(*p));
 
-        let bootstrap_config = match config::load(toml_arg.as_deref()) {
+        let mut bootstrap_config = match config::load(toml_arg.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: config error");
                 std::process::exit(1);
             }
         };
+        if let Some(path) = db_arg {
+            bootstrap_config.cache_path = path;
+        }
+
+        if matches!(
+            sub,
+            "cache-migrate-v2"
+                | "cache-verify-frozen-v1"
+                | "cache-populate-activity-v2"
+                | "cache-populate-payout-v2"
+                | "cache-finalize-v2"
+                | "cache-activate"
+                | "cache-rollback-v1"
+        ) {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let result = match sub {
+                "cache-migrate-v2" => manifest_arg
+                    .as_deref()
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-migrate-v2 requires --manifest".to_owned(),
+                    })
+                    .and_then(|manifest| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        migrate_cache_v2(&bootstrap_config.cache_path, manifest)
+                            .and_then(json_report)
+                    }),
+                "cache-verify-frozen-v1" => frozen_payload_arg
+                    .as_deref()
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-verify-frozen-v1 requires --frozen-payload".to_owned(),
+                    })
+                    .and_then(|reference| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        verify_frozen_payload_v1(&bootstrap_config.cache_path, reference, now)
+                            .and_then(json_report)
+                    }),
+                "cache-populate-activity-v2" => {
+                    async {
+                        let (fixed_end, generation) = fixed_end_arg.zip(generation_arg).ok_or_else(
+                            || BootstrapError::Invalid {
+                                message: "cache-populate-activity-v2 requires integer --fixed-end and --generation"
+                                    .to_owned(),
+                            },
+                        )?;
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        let fetcher = pe_source_polymarket_public::ReqwestFetcher::new(
+                            reqwest::Client::new(),
+                        );
+                        populate_activity_v2(
+                            &bootstrap_config.cache_path,
+                            &fetcher,
+                            &bootstrap_config.polymarket_base_url,
+                            fixed_end,
+                            generation,
+                            now,
+                        )
+                        .await
+                        .and_then(json_report)
+                    }
+                    .await
+                }
+                "cache-populate-payout-v2" => {
+                    async {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        let mut cache = WalletCache::open(&bootstrap_config.cache_path)?;
+                        pe_bootstrap::populate_clob_payout_v2(&bootstrap_config, &mut cache)
+                            .await
+                            .and_then(json_report)
+                    }
+                    .await
+                }
+                "cache-finalize-v2" => stage_record_arg
+                    .as_deref()
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-finalize-v2 requires --stage-record".to_owned(),
+                    })
+                    .and_then(|stage_record| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        finalize_cache_v2(&bootstrap_config.cache_path, stage_record, now)
+                            .and_then(json_report)
+                    }),
+                "cache-activate" => fixed_db_arg
+                    .zip(backup_arg)
+                    .zip(expected_sha256_arg)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message:
+                            "cache-activate requires --fixed-db, --backup, and --expected-sha256"
+                                .to_owned(),
+                    })
+                    .and_then(
+                        |((fixed_path, version_one_backup_path), expected_side_sha256)| {
+                            activate_cache_v2(&CacheActivationRequest {
+                                fixed_path,
+                                side_path: bootstrap_config.cache_path.clone(),
+                                version_one_backup_path,
+                                expected_side_sha256,
+                            })
+                            .and_then(json_report)
+                        },
+                    ),
+                "cache-rollback-v1" => fixed_db_arg
+                    .zip(backup_arg)
+                    .zip(failed_backup_arg)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message:
+                            "cache-rollback-v1 requires --fixed-db, --backup, and --failed-backup"
+                                .to_owned(),
+                    })
+                    .and_then(|((fixed, backup), failed)| {
+                        rollback_cache_to_v1(&fixed, &backup, &failed)
+                            .map(|()| serde_json::json!({"restored": fixed}))
+                    }),
+                _ => Err(BootstrapError::Internal),
+            };
+            match result {
+                Ok(report) => {
+                    println!("{report}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, command = sub, "cache migration command failed");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
+
+        // Reclamation evidence is read-only but deliberately excludes all
+        // cache writers while it captures the activation gate (#544).
+        if sub == "reclamation-evidence" {
+            let _cache_mutation_lock =
+                acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
+            let eval_results_dir =
+                reclamation_evidence::eval_results_dir_for_cache(&bootstrap_config.cache_path);
+            let exit = match reclamation_evidence::capture(
+                &bootstrap_config.cache_path,
+                &eval_results_dir,
+            ) {
+                Ok(report) => match serde_json::to_string(&report) {
+                    Ok(rendered) => {
+                        println!("{rendered}");
+                        if report.activation_ready { 0 } else { 2 }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "reclamation-evidence: encode failed");
+                        1
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "reclamation-evidence: fatal");
+                    1
+                }
+            };
+            std::process::exit(exit);
+        }
 
         // `coverage` (issue #208) is a read-only probe: open the cache
         // READ_ONLY, never CREATE/migrate it, and never take the
@@ -165,28 +431,10 @@ async fn main() {
             std::process::exit(exit);
         }
 
-        // Serialize standalone mutators before opening the shared cache RW.
-        // Discovery owns its narrower per-source lock internally; these commands
-        // have no nested acquisition and hold this guard for their full mutation.
-        let _cache_mutation_lock = if matches!(
-            sub,
-            "activate-next"
-                | "backfill"
-                | "purge"
-                | "purge-infra"
-                | "clear-infra-exclusion"
-                | "prices-history"
-        ) {
-            match pe_bootstrap::lock::CacheMutationLock::acquire(&bootstrap_config.cache_path) {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    tracing::error!(error = %e, subcommand = sub, "bootstrap: cache mutation lock failed");
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            None
-        };
+        // Every named command below opens WalletCache read-write (including
+        // `all`), so the one central guard must precede that open (#544).
+        // Genuine readers return above through `open_read_only`.
+        let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
         let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
             Ok(c) => c,
@@ -270,9 +518,13 @@ async fn main() {
                         tracing::error!(error = %e, "resolutions: failed to reset CLOB cursor");
                         std::process::exit(1);
                     }
+                    if let Err(e) = cache.reset_clob_payout_walk_v2() {
+                        tracing::error!(error = %e, "resolutions: failed to reset v2 CLOB payout walk");
+                        std::process::exit(1);
+                    }
                     tracing::info!(
-                        "resolutions: --reset-clob-cursor → deleted source_cursor.clob_closed; \
-                         CLOB will start from page 1"
+                        "resolutions: --reset-clob-cursor → deleted legacy cursor and incomplete \
+                         v2 payout staging; CLOB will start from page 1"
                     );
                 }
                 let all_ids = cache.all_market_ids();
@@ -604,6 +856,29 @@ async fn main() {
                 }
             },
 
+            "recover-reclamation" => match purge::recover_pending_reclamation(&mut cache) {
+                Ok(Some(report)) => {
+                    tracing::info!(
+                        auto_vacuum_before = report.auto_vacuum_before,
+                        path = ?report.path,
+                        freelist_before = report.freelist_before,
+                        freelist_after = report.freelist_after,
+                        page_count_before = report.page_count_before,
+                        page_count_after = report.page_count_after,
+                        "recover-reclamation: complete"
+                    );
+                    0
+                }
+                Ok(None) => {
+                    tracing::info!("recover-reclamation: no pending marker");
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "recover-reclamation: fatal");
+                    1
+                }
+            },
+
             "clear-infra-exclusion" => {
                 if !confirm {
                     tracing::error!("clear-infra-exclusion: --confirm is required");
@@ -644,6 +919,13 @@ async fn main() {
 
             _ => unreachable!("known_sub filter restricts to known subcommand names"),
         };
+        if matches!(sub, "purge" | "purge-infra") {
+            let eval_results_dir =
+                reclamation_evidence::eval_results_dir_for_cache(&bootstrap_config.cache_path);
+            if let Err(error) = purge::append_direct_purge_status(&eval_results_dir, sub, exit) {
+                tracing::warn!(error = %error, subcommand = sub, "purge status append failed");
+            }
+        }
         std::process::exit(exit);
     }
 
@@ -671,7 +953,9 @@ async fn main() {
         }
     };
 
-    // No-arg → run "all" with strict=false (soft-fail default).
+    // No-arg → run "all" with strict=false (soft-fail default). It follows the
+    // same central lock-before-open contract as the named `all` command (#544).
+    let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
     let mut cache = match WalletCache::open(&bootstrap_config.cache_path) {
         Ok(c) => c,
         Err(e) => {
@@ -681,6 +965,23 @@ async fn main() {
     };
     let exit = handle_all(&bootstrap_config, &mut cache, false).await;
     std::process::exit(exit);
+}
+
+fn acquire_cache_lock_or_exit(
+    cache_path: &std::path::Path,
+    subcommand: &str,
+) -> pe_bootstrap::lock::CacheMutationLock {
+    match pe_bootstrap::lock::CacheMutationLock::acquire(cache_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                subcommand,
+                "bootstrap: cache mutation lock failed"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Orchestrate all bootstrap phases in sequence.
@@ -867,6 +1168,10 @@ fn resolutions_error_exit_code(error: &BootstrapError) -> i32 {
         // #534) to tempfail 75 and every permanent error to 1.
         _ => error.exit_code(),
     }
+}
+
+fn json_report<T: serde::Serialize>(report: T) -> Result<serde_json::Value, BootstrapError> {
+    serde_json::to_value(report).map_err(BootstrapError::from)
 }
 
 #[cfg(test)]

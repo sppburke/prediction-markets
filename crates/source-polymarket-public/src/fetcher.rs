@@ -32,15 +32,19 @@ const UNOBSERVED_CONTEXT: HttpRequestContext = HttpRequestContext {
 /// Abstracts HTTP page fetching so production and test connectors share the same logic.
 ///
 /// `&self` (not `&mut self`) so a single fetcher can be shared across concurrent tasks;
-/// implementations must use interior mutability for any per-call state.
-#[allow(async_fn_in_trait)]
+/// implementations must use interior mutability for any per-call state. The
+/// returned future is `Send` so the same contract can back spawned source and
+/// admission workers.
 pub trait PageFetcher {
     /// Fetch a page from `url`. Returns raw response bytes.
     ///
     /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value.
     /// - Returns [`SourceError::Transient`] on 5xx or network errors (retried internally).
     /// - Returns [`SourceError::Fatal`] on 4xx (non-429) errors.
-    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError>;
+    fn fetch_page(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send;
 }
 
 // ── Production fetcher ────────────────────────────────────────────────────────

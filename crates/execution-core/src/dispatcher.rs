@@ -7,6 +7,7 @@
 //! `PaperExecutor` is imported from `pe-strategy-winner-follow` — not moved.
 
 use pe_core_types::{EventSeq, Price, SourceTimestamp};
+use pe_event_log::PoisonReason;
 use pe_strategy_winner_follow::{ExecutionMode, FillSource, PaperExecutor, PaperFill};
 use pe_venue_core::OrderIntent;
 
@@ -27,6 +28,11 @@ impl ExecutionDispatcher {
         Self { paper }
     }
 
+    /// Typed paper-log durability state for readiness and bounded producer shutdown (#544).
+    pub fn paper_poisoned(&self) -> Option<&PoisonReason> {
+        self.paper.poisoned()
+    }
+
     /// Route `intent` to paper or live executor based on `mode`.
     ///
     /// `observed_fill_price` carries the orchestrator-resolved paper fill basis (#486): `Some`
@@ -42,8 +48,13 @@ impl ExecutionDispatcher {
     ) -> Result<DispatchResult, ExecutionError> {
         match mode {
             ExecutionMode::Shadow | ExecutionMode::Paper => {
-                let (fill, seq) = self.paper.execute(intent, now, observed_fill_price)?;
-                Ok(DispatchResult::Paper { fill, seq })
+                match self.paper.execute(intent, now, observed_fill_price) {
+                    Ok((fill, seq)) => Ok(DispatchResult::Paper { fill, seq }),
+                    Err(error) => match self.paper.poisoned().copied() {
+                        Some(reason) => Err(ExecutionError::PaperDurabilityUncertain { reason }),
+                        None => Err(error.into()),
+                    },
+                }
             }
             ExecutionMode::LiveTiny | ExecutionMode::Promoted => Err(ExecutionError::Live(
                 "ordinary credentialed dispatch is retired; use the isolated inactive canary role"

@@ -8,11 +8,11 @@
 //!
 //! Durability contract (one state machine, review-settled): the caller appends
 //! (with `sync`) BEFORE delivering the trade for decisions. Any append/sync
-//! failure POISONS the sink — the `Writer` is discarded, because an append can
-//! fail after partial frame writes and `sync` does not revalidate the chain —
-//! and websocket delivery stays blocked (REST fallback + dedup carry the
-//! trades) until [`SourceEventSink::try_reopen`] succeeds: `Writer::open`
-//! re-verifies the header and chain tail, which is the required revalidation.
+//! durability uncertainty POISONS the writer instance. The sink discards that
+//! instance, and websocket delivery stays blocked (REST fallback + dedup carry
+//! the trades) until [`SourceEventSink::try_reopen`] succeeds: `Writer::open`
+//! repairs only a scanner-proven incomplete tail, re-verifies the complete
+//! prefix, and synchronizes it.
 
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,6 @@ use pe_event_log::{EnvelopeIn, LogError, Writer};
 pub struct SourceEventSink {
     path: PathBuf,
     writer: Option<Writer>,
-    poisoned: bool,
     /// Crate-private one-shot faults for the coordinator's module tests only
     /// (#546): fail the next append / the next reopen exactly once. Absent from
     /// production builds.
@@ -47,7 +46,6 @@ impl SourceEventSink {
         Ok(Self {
             path,
             writer: Some(writer),
-            poisoned: false,
             #[cfg(test)]
             fail_next_append: false,
             #[cfg(test)]
@@ -67,14 +65,13 @@ impl SourceEventSink {
         self.fail_next_reopen = true;
     }
 
-    /// Durably append one source event (append + sync). On any failure the
-    /// sink poisons: the writer is discarded and every subsequent append fails
-    /// until [`Self::try_reopen`] succeeds.
+    /// Durably append one source event (append + sync). Writer-reported
+    /// durability uncertainty discards that poisoned instance until
+    /// [`Self::try_reopen`] succeeds.
     pub fn append_durable(&mut self, envelope: EnvelopeIn) -> Result<EventSeq, LogError> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_append) {
             self.writer = None;
-            self.poisoned = true;
             return Err(LogError::Io(std::io::Error::other(
                 "injected append failure",
             )));
@@ -87,26 +84,26 @@ impl SourceEventSink {
         let result = writer
             .append(envelope)
             .and_then(|seq| writer.sync().map(|()| seq));
-        if result.is_err() {
-            // Partial frame bytes may be on disk; only a reopen's chain
-            // re-verification can prove the tail. Drop the writer (releases
-            // the advisory lock) and poison.
+        if writer.poisoned().is_some() {
+            // Partial frame bytes may be on disk. Drop the poisoned instance (releasing the
+            // lock); a new writer repairs only a proven incomplete EOF and resynchronizes.
             self.writer = None;
-            self.poisoned = true;
         }
         result
     }
 
     /// Whether the sink is poisoned (websocket delivery must stay blocked).
     pub fn poisoned(&self) -> bool {
-        self.poisoned
+        self.writer
+            .as_ref()
+            .is_none_or(|writer| writer.poisoned().is_some())
     }
 
     /// Attempt recovery: reopen the log, which re-verifies the file header and
     /// hash chain. Only a successful reopen clears poison. Called from the
     /// reconnect cycle so recovery needs no dedicated timer.
     pub fn try_reopen(&mut self) -> bool {
-        if !self.poisoned && self.writer.is_some() {
+        if !self.poisoned() {
             return true;
         }
         #[cfg(test)]
@@ -116,7 +113,6 @@ impl SourceEventSink {
         match Writer::open(&self.path) {
             Ok(writer) => {
                 self.writer = Some(writer);
-                self.poisoned = false;
                 true
             }
             Err(error) => {
@@ -172,7 +168,6 @@ mod tests {
         // Force poison by hand (the failure path itself is exercised through
         // the writer's own error tests; here we prove the sink contract).
         sink.writer = None;
-        sink.poisoned = true;
         assert!(sink.append_durable(envelope(b"{}")).is_err());
         assert!(sink.poisoned());
         assert!(

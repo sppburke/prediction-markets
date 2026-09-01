@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pe_core_types::{
-    EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
+    EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
+    WalletAddress,
 };
 use pe_paper_pnl::{PnlLedger, ResolutionStore};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
@@ -30,8 +31,8 @@ fn leader(market_id: MarketId, long: u64) -> LeaderPositionRow {
         wallet: wallet(),
         market_id,
         outcome_id: OutcomeId(0),
-        long_contracts: long,
-        short_contracts: 0,
+        long_contracts: ShareAmount::from_whole(long).unwrap(),
+        short_contracts: ShareAmount::ZERO,
     }
 }
 

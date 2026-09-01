@@ -51,15 +51,19 @@ use std::time::Duration;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReceivedAt, ReconstructionQuality, Side,
-    SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    BasisPoints, LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, ReceivedAt,
+    ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
+    VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::PaperStateDb;
-use pe_position_ledger::PositionLedger;
-use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer};
-use pe_service::clob_book::FixtureClobBookFetcher;
+use pe_paper_state::{
+    ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
+    LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
+};
+use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
+use pe_service::bucket_commit::DecisionContinuationV2;
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
 use pe_service::live_accounts::{
@@ -69,11 +73,12 @@ use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
+use pe_service::paper_recovery::build_leader_ledger;
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::trade_parser;
 use pe_source_polymarket_public::{
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SUBSCRIBE, ActivityWsError,
-    ActivityWsPeer, FixtureFetcher, parse_activity_frame,
+    ActivityWsPeer, FixtureFetcher, parse_activity_frame, parse_activity_trade_observation,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -155,10 +160,11 @@ fn trade_at(
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(dec!(0.50)),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at,
         received_at: OffsetDateTime::now_utc(),
         source_trade_id: SourceTradeId(source_trade_id.to_string()),
+        transaction_hash: None,
         provenance,
     }
 }
@@ -166,7 +172,7 @@ fn trade_at(
 /// One real-shape websocket activity payload (string numerics, as the feed sends them).
 fn payload(tx: &str, wallet: &str, market: &MarketId, observed_unix: i64) -> String {
     format!(
-        r#"{{"proxyWallet":"{wallet}","conditionId":"{market}","side":"BUY","size":"100","price":"0.50","timestamp":"{observed_unix}","transactionHash":"{tx}","outcomeIndex":"0"}}"#
+        r#"{{"proxyWallet":"{wallet}","conditionId":"{market}","asset":"123","side":"BUY","size":"100","price":"0.50","timestamp":"{observed_unix}","transactionHash":"{tx}","outcomeIndex":"0"}}"#
     )
 }
 
@@ -197,7 +203,7 @@ fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::Orchestr
 }
 
 fn disabled_entry_gate() -> CopyEntryGateConfig {
-    CopyEntryGateConfig { fail_closed: false }
+    CopyEntryGateConfig
 }
 
 fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetcher> {
@@ -205,8 +211,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     let mut fx = HashMap::new();
     for m in markets {
         let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
-        let body =
-            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        let body = format!(
+            r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{m}-0\",\"{m}-1\"]"}}]"#
+        );
         fx.insert(url, body.into_bytes());
     }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
@@ -230,7 +237,13 @@ fn leader_long(paper_state: &PaperStateDb, market_id: &MarketId) -> Option<u64> 
         .unwrap()
         .iter()
         .find(|r| r.wallet == leader_wallet() && r.market_id == *market_id)
-        .map(|r| r.long_contracts)
+        .map(|r| r.long_contracts.atomic())
+}
+
+fn whole_shares(value: u64) -> u64 {
+    pe_core_types::ShareAmount::from_whole(value)
+        .unwrap()
+        .atomic()
 }
 
 // ── Armed live accounts (mirrors scenario_dispatch.rs) ────────────────────────
@@ -301,13 +314,42 @@ fn build_orchestrator(
     health: SharedHealth,
     opts: OrchOpts,
 ) -> Orchestrator<FixtureFetcher, FixtureClobBookFetcher> {
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
     let mid_price_cache = mid_cache_for(&opts.markets, "0.50");
+    let books = opts
+        .markets
+        .iter()
+        .flat_map(|market| {
+            (0..=1).map(move |outcome| {
+                (
+                    format!("{market}-{outcome}"),
+                    OrderBook {
+                        asks: vec![BookLevel {
+                            price: dec!(0.50),
+                            size: dec!(10000),
+                        }],
+                        response_blake3: String::new(),
+                        fetched_at_ms: 0,
+                    },
+                )
+            })
+        })
+        .collect();
+    let leader_ledger = build_leader_ledger(&paper_state).unwrap();
     let mut orch = Orchestrator::new(
         trade_rx,
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         OrchestratorConfig {
             activity_ws_enabled: opts.ws_enabled,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -318,16 +360,15 @@ fn build_orchestrator(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode: pe_service::runtime_config::FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: opts.live_accounts,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
         make_dispatcher(dir),
         paper_state,
-        PositionLedger::new(),
+        leader_ledger,
         health,
         MarketEndCache::new(String::new()),
         mid_price_cache,
@@ -335,7 +376,7 @@ fn build_orchestrator(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     if let Some(hooks) = opts.hooks {
@@ -484,16 +525,51 @@ async fn start_pool_with(
     let dir = tempfile::tempdir().unwrap();
     let source_log = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log).unwrap();
+    let (source_log_handle, source_rx) = SourceLogHandle::channel(capacity);
+    let (trigger_tx, mut trigger_rx) = mpsc::channel(capacity);
     let (trade_tx, trade_rx) = mpsc::channel(capacity);
     let health = healthy_ws_health();
     let ingest = ActivityIngest::with_dialer(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         sink,
-        trade_tx,
+        source_rx,
+        trigger_tx,
         health.clone(),
         net.dialer(),
     );
-    let task = tokio::spawn(ingest.run());
+    let replay_path = source_log.clone();
+    // Compatibility projection for the retained #546 reader-pool scenarios:
+    // production emits only reconciliation triggers, while these tests still
+    // exercise the old orchestrator seam. Reparse the row only after the source
+    // log proves it durable; no production path uses this projection.
+    let task = tokio::spawn(async move {
+        let _source_log_handle = source_log_handle;
+        let ingest = ingest.run();
+        tokio::pin!(ingest);
+        loop {
+            tokio::select! {
+                () = trade_tx.closed() => return,
+                () = &mut ingest => return,
+                trigger = trigger_rx.recv() => {
+                    let Some(trigger) = trigger else { return; };
+                    let trade = Reader::replay(&replay_path)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find_map(|(_seq, envelope)| {
+                            let observation = parse_activity_trade_observation(&envelope.payload).ok()?;
+                            if observation.group_id.key() != &trigger.source_trade_id {
+                                return None;
+                            }
+                            trade_parser::parse_ws_trade(&envelope.payload, envelope.received_at.0).ok()
+                        })
+                        .expect("durable trigger has its raw source row");
+                    if trade_tx.send(trade).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
     settle().await;
     for slot in 0..3 {
         assert_eq!(net.dial_count(slot), 1, "all three slots dial immediately");
@@ -758,10 +834,13 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     assert_eq!(paper_fill_count(dir.path()), 1);
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(100),
+        Some(whole_shares(100)),
         "one leader delta"
     );
-    assert_eq!(leader_long(&paper_state, &market_b()), Some(100));
+    assert_eq!(
+        leader_long(&paper_state, &market_b()),
+        Some(whole_shares(100))
+    );
     assert!(
         hooks.age_clock.lock().unwrap().is_empty(),
         "four budget samples"
@@ -925,7 +1004,11 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
             state.is_seen(&id("0xthree")).unwrap(),
             "one committed seen row"
         );
-        assert_eq!(leader_long(state, &market()), Some(100), "one leader delta");
+        assert_eq!(
+            leader_long(state, &market()),
+            Some(whole_shares(100)),
+            "one leader delta"
+        );
         assert_eq!(
             state.fills_count().unwrap(),
             1,
@@ -972,8 +1055,14 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
     let mut replayed = Vec::new();
     for (i, (_seq, env)) in envelopes.iter().enumerate() {
         assert_eq!(env.source_id.0, ACTIVITY_WS_SOURCE_ID);
-        assert_eq!(env.schema_version, ACTIVITY_WS_SCHEMA_VERSION);
-        assert_eq!(env.parser_version, ACTIVITY_WS_PARSER_VERSION);
+        assert_eq!(
+            env.schema_version,
+            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            env.parser_version,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+        );
         assert_eq!(
             env.payload,
             row.as_bytes(),
@@ -1047,20 +1136,25 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
     let (pool, trade_rx) = start_pool(1).await;
     let mut server = pool.net.take_server(0);
     let stale_unix = now_unix() - 60;
-    let rows: Vec<String> = ["0xa", "0xb", "0xc", "0xd"]
+    let rows: Vec<String> = ["0xa", "0xb", "0xc", "0xd", "0xf", "0xg"]
         .iter()
         .map(|tx| payload(tx, LEADER, &market(), stale_unix))
         .collect();
     server.send_text(&activity_frame(&rows)).await.unwrap();
     assert!(
         settle_until(|| pool.reader(0).fan_in_blocked).await,
-        "the fourth row blocks on the full fan-in (b is held on the full trade channel, c waits in the fan-in)"
+        "the sixth row blocks after the test-only trigger projection adds two retained slots"
     );
     let before = pool.reader(0);
     assert!(before.connected && before.is_live(Instant::now()));
     assert_eq!(
         pool.source_log_ids(),
-        vec!["0xa".to_string(), "0xb".to_string()]
+        vec![
+            "0xa".to_string(),
+            "0xb".to_string(),
+            "0xc".to_string(),
+            "0xd".to_string(),
+        ]
     );
 
     // No second wire frame is read while blocked.
@@ -1103,7 +1197,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
         OrchOpts::ws(vec![market()]),
     );
     let (orch_task, shutdown) = spawn_orchestrator(orch);
-    let all = ["0xa", "0xb", "0xc", "0xd"];
+    let all = ["0xa", "0xb", "0xc", "0xd", "0xf", "0xg"];
     assert!(settle_until(|| all.iter().all(|t| paper_state.is_seen(&id(t)).unwrap())).await);
     assert_eq!(
         pool.source_log_ids(),
@@ -1123,7 +1217,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(400),
+        Some(whole_shares(600)),
         "leader bookkeeping kept"
     );
 
@@ -1132,7 +1226,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
     assert!(settle_until(|| !pool.reader(0).connected).await);
     assert!(!pool.reader(0).fan_in_blocked);
     assert!(server.recv_text().await.is_none());
-    assert_eq!(pool.reader(0).normalized_activity_rows_total, 4);
+    assert_eq!(pool.reader(0).normalized_activity_rows_total, 6);
     advance(Duration::from_secs(1)).await;
     assert_eq!(pool.net.dial_count(0), 2);
     shutdown.send(()).unwrap();
@@ -1239,7 +1333,7 @@ async fn r8_early_gate_applies_the_strict_budget_to_both_provenances() {
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(100),
+        Some(whole_shares(100)),
         "stale rows still mirror the leader"
     );
 }
@@ -1298,7 +1392,7 @@ async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back()
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(200),
+        Some(whole_shares(200)),
         "both rows mirror the leader"
     );
     assert_eq!(
@@ -1382,7 +1476,7 @@ async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back()
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(100),
+        Some(whole_shares(100)),
         "the rolled-back ingest was restored: only the new trade advanced the ledger"
     );
 }
@@ -1455,7 +1549,7 @@ async fn ws1_duplicate_ws_then_rest_yields_one_decision() {
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(100),
+        Some(whole_shares(100)),
         "leader ledger must ingest the duplicate exactly once"
     );
 }
@@ -1524,7 +1618,7 @@ async fn ws2_stale_rest_fallback_disposition_fresh_ws_fills() {
     // The stale trade still advanced the leader ledger (bookkeeping intact).
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(100),
+        Some(whole_shares(100)),
         "stale trade must still mirror the leader position"
     );
 }
@@ -1628,6 +1722,138 @@ async fn ws4_dual_unhealthy_holds_trade_until_recovery_then_admits_once() {
         "held trade fills exactly once after recovery"
     );
     assert!(paper_state.is_seen(&id).unwrap());
+}
+
+// ── #544 decision_pending: boot resumes without reapplying bucket state ──────
+
+#[tokio::test]
+async fn decision_pending_boot_resume_is_terminal_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
+    let source_epoch = 1_i64;
+    let semantic_revision = "revision-v2".to_owned();
+    let applied_configuration = pe_service::runtime_config::RuntimeConfig::from_service_config(
+        &pe_service::config::ServiceConfig::default(),
+    );
+    let frozen = DecisionContinuationV2 {
+        version: 2,
+        source_trade_id: source_trade_id.clone(),
+        semantic_revision: semantic_revision.clone(),
+        transaction_hash: "0xpending".to_owned(),
+        wallet: leader_wallet(),
+        source_epoch,
+        market_id: market(),
+        outcome_id: OutcomeId(0),
+        side: Side::Buy,
+        price: Price(dec!(0.50)),
+        share_amount: ShareAmount::from_whole(1).unwrap(),
+        provenance: TradeProvenance::ActivityWs,
+        pre_bucket_action: LeaderAction::Entry,
+        reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        action_confidence_ppm: ProbabilityPpm(1_000_000),
+        gate_result: "admitted".to_owned(),
+        frozen_basis: pe_service::bucket_commit::FrozenDecisionBasis {
+            win_rate_p: pe_core_types::Probability::ZERO,
+            bankroll: rust_decimal::Decimal::ZERO,
+        },
+        applied_configuration_hash: applied_configuration.canonical_hash(),
+        applied_configuration,
+        decision_inputs: serde_json::json!({"source_window":"complete"}),
+    };
+    paper_state
+        .commit_activity_bucket(&ActivityBucketCommit {
+            wallet: leader_wallet(),
+            source_epoch,
+            dispositions: vec![ActivityDispositionRecord {
+                source_trade_id: source_trade_id.clone(),
+                transaction_hash: "0xpending".to_owned(),
+                wallet: leader_wallet(),
+                source_epoch,
+                semantic_revision: semantic_revision.clone(),
+                activity_type: "TRADE".to_owned(),
+                disposition: "decision_pending".to_owned(),
+                proof_json: "{\"bucket_epoch\":1}".to_owned(),
+                no_copy: None,
+            }],
+            leader_positions: vec![LeaderPositionRow {
+                wallet: leader_wallet(),
+                market_id: market(),
+                outcome_id: OutcomeId(0),
+                long_contracts: ShareAmount::from_whole(1).unwrap(),
+                short_contracts: ShareAmount::ZERO,
+            }],
+            gate_results: vec![EntryGateResultRecord {
+                source_trade_id: source_trade_id.clone(),
+                wallet: leader_wallet(),
+                market_id: market(),
+                source_epoch,
+                result: "admitted".to_owned(),
+                history_consumed: true,
+            }],
+            history_effects: vec![MarketHistoryRecord {
+                wallet: leader_wallet(),
+                market_id: market(),
+                first_epoch: source_epoch,
+                source_trade_id: source_trade_id.clone(),
+            }],
+            history_status: Some(WalletHistoryStatusRecord {
+                wallet: leader_wallet(),
+                complete: true,
+                proof_json: "{\"fixed_end_walk\":\"complete\"}".to_owned(),
+                updated_at_unix: 2,
+            }),
+            pending: vec![DecisionPendingRecord {
+                source_trade_id: source_trade_id.clone(),
+                semantic_revision,
+                wallet: leader_wallet(),
+                source_epoch,
+                frozen_inputs_json: serde_json::to_string(&frozen).unwrap(),
+                updated_at_unix: 2,
+            }],
+            fence: None,
+            advance_cursor: true,
+        })
+        .unwrap();
+
+    let (_trade_tx, trade_rx) = mpsc::channel(1);
+    let mut first = build_orchestrator(
+        dir.path(),
+        paper_state.clone(),
+        trade_rx,
+        healthy_ws_health(),
+        OrchOpts::ws(vec![market()]),
+    );
+    first.resume_pending_before_producers().await.unwrap();
+    drop(first);
+
+    assert!(paper_state.open_decision_pending().unwrap().is_empty());
+    assert_eq!(leader_long(&paper_state, &market()), Some(1_000_000));
+    assert_eq!(paper_fill_count(dir.path()), 0);
+    assert_eq!(
+        paper_state.gate_history().unwrap()[&leader_wallet()].len(),
+        1
+    );
+    assert_eq!(
+        paper_state
+            .no_copy_disposition(&source_trade_id)
+            .unwrap()
+            .map(|(_, _, reason)| reason),
+        Some("stale_activity_ws_past_copy_budget".to_owned())
+    );
+
+    let (_trade_tx, trade_rx) = mpsc::channel(1);
+    let mut restarted = build_orchestrator(
+        dir.path(),
+        paper_state.clone(),
+        trade_rx,
+        healthy_ws_health(),
+        OrchOpts::ws(vec![market()]),
+    );
+    restarted.resume_pending_before_producers().await.unwrap();
+    assert_eq!(leader_long(&paper_state, &market()), Some(1_000_000));
+    assert_eq!(paper_state.decision_pending_history().unwrap().len(), 1);
+    assert_eq!(paper_fill_count(dir.path()), 0);
 }
 
 // ── WS5: source-log replay reconstructs identical trades ─────────────────────
