@@ -1,6 +1,7 @@
 //! Service health state, shared between the orchestrator and HTTP handlers.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::{Json, extract::State, http::StatusCode};
 use pe_source_core::SourceStatus;
@@ -9,6 +10,7 @@ use pe_source_polymarket_public::{
 };
 use serde::Serialize;
 use time::OffsetDateTime;
+use tokio::time::Instant;
 
 /// Maximum seconds between source events before the source is considered stale.
 ///
@@ -16,7 +18,9 @@ use time::OffsetDateTime;
 const FRESHNESS_WINDOW_SECS: i64 = 60;
 
 /// One activity-websocket reader slot (#546). Written by that reader's task only;
-/// read by readiness and `status.json`.
+/// read by readiness and `status.json`. Timestamps are monotonic instants — the
+/// same clock the reader's own drop deadline runs on — so liveness cannot flap
+/// on a wall-clock step; `status.json` reports them as elapsed ages.
 #[derive(Debug, Clone, Default)]
 pub struct ReaderHealth {
     /// Socket currently established and subscribed.
@@ -24,12 +28,13 @@ pub struct ReaderHealth {
     /// Blocked on the bounded fan-in channel with one retained watched row
     /// (downstream backpressure, not upstream silence).
     pub fan_in_blocked: bool,
-    /// Last text frame of ANY kind on this socket (wire health only).
-    pub last_wire_frame_at: Option<OffsetDateTime>,
+    /// Last frame of ANY kind on this socket, control frames included (wire
+    /// health only).
+    pub last_wire_frame_at: Option<Instant>,
     /// Last payload accepted by the production normalizer on the CURRENT
     /// connection; reset on every (re)connect, so a new socket is not live until
     /// it proves delivery. Liveness keys on THIS one.
-    pub last_normalized_activity_at: Option<OffsetDateTime>,
+    pub last_normalized_activity_at: Option<Instant>,
     /// Normalizer-accepted payloads across all of this slot's connections.
     pub normalized_activity_rows_total: u64,
     /// Completed reconnects since the last normalized row.
@@ -39,15 +44,14 @@ pub struct ReaderHealth {
 impl ReaderHealth {
     /// Live = connected AND a normalized activity row younger than the
     /// normalized-activity timeout. Acknowledgements, keepalives, and rejected
-    /// payloads never make a reader live.
-    pub fn is_live(&self, now: OffsetDateTime) -> bool {
-        let timeout = time::Duration::seconds(
-            i64::try_from(ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS).unwrap_or(i64::MAX),
-        );
+    /// payloads never make a reader live. A reader blocked on a full fan-in
+    /// keeps its socket but derives non-live here once its row ages out.
+    pub fn is_live(&self, now: Instant) -> bool {
+        let timeout = Duration::from_secs(ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS);
         self.connected
             && self
                 .last_normalized_activity_at
-                .is_some_and(|t| now - t < timeout)
+                .is_some_and(|t| now.saturating_duration_since(t) < timeout)
     }
 }
 
@@ -116,22 +120,23 @@ impl HealthState {
     }
 
     /// Readers currently live (#546). Only meaningful when enabled.
-    pub fn ws_live_reader_count(&self, now: OffsetDateTime) -> usize {
+    pub fn ws_live_reader_count(&self, now: Instant) -> usize {
         self.ws_readers.iter().filter(|r| r.is_live(now)).count()
     }
 
     /// Websocket source unavailable (#546): no live reader, or the shared sink
     /// is poisoned. One live reader is degraded but still available.
-    pub fn ws_unavailable(&self, now: OffsetDateTime) -> bool {
+    pub fn ws_unavailable(&self, now: Instant) -> bool {
         self.ws_sink_poisoned || self.ws_live_reader_count(now) == 0
     }
 
     /// Dual-unhealthy admission block (#530): with the websocket enabled, BOTH
     /// transports unhealthy means no new copy work may stage — queued inputs
     /// are held (not dropped) until a source recovers, and redelivery (held
-    /// cursor / firehose backstop) admits each trade exactly once.
-    pub fn copy_admission_blocked(&self, now: OffsetDateTime) -> bool {
-        self.activity_ws_enabled && self.ws_unavailable(now) && self.poll_unhealthy(now)
+    /// cursor / firehose backstop) admits each trade exactly once. Poll health
+    /// is wall-clock (`now`); reader liveness is monotonic (`now_mono`).
+    pub fn copy_admission_blocked(&self, now: OffsetDateTime, now_mono: Instant) -> bool {
+        self.activity_ws_enabled && self.ws_unavailable(now_mono) && self.poll_unhealthy(now)
     }
 }
 
@@ -176,8 +181,14 @@ pub async fn live() -> &'static str {
     "ok"
 }
 
-/// Readiness issues for the current state at `now` (pure; the handler wraps it).
-pub fn readiness_issues(h: &HealthState, now: OffsetDateTime) -> Vec<&'static str> {
+/// Readiness issues for the current state (pure; the handler wraps it). `now`
+/// is the wall clock for source freshness and poll health; `now_mono` is the
+/// monotonic clock for reader liveness.
+pub fn readiness_issues(
+    h: &HealthState,
+    now: OffsetDateTime,
+    now_mono: Instant,
+) -> Vec<&'static str> {
     let mut issues: Vec<&'static str> = Vec::new();
 
     // Skip polygon liveness checks when the WS source is intentionally disabled
@@ -212,12 +223,12 @@ pub fn readiness_issues(h: &HealthState, now: OffsetDateTime) -> Vec<&'static st
         if h.ws_sink_poisoned {
             issues.push("activity_ws_sink_poisoned");
         }
-        if h.ws_unavailable(now) {
+        if h.ws_unavailable(now_mono) {
             issues.push("activity_ws_unavailable");
-        } else if h.ws_live_reader_count(now) == 1 {
+        } else if h.ws_live_reader_count(now_mono) == 1 {
             issues.push("activity_ws_redundancy_degraded");
         }
-        if h.copy_admission_blocked(now) {
+        if h.copy_admission_blocked(now, now_mono) {
             issues.push("copy_admission_blocked");
         }
     }
@@ -227,12 +238,13 @@ pub fn readiness_issues(h: &HealthState, now: OffsetDateTime) -> Vec<&'static st
 
 pub async fn ready(State(health): State<SharedHealth>) -> (StatusCode, Json<ReadyResponse>) {
     let now = OffsetDateTime::now_utc();
+    let now_mono = Instant::now();
     // Acquire the lock, compute, then release immediately — no await across lock.
     let issues = {
         let h = health
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        readiness_issues(&h, now)
+        readiness_issues(&h, now, now_mono)
     };
 
     let ready = issues.is_empty();
@@ -278,6 +290,12 @@ mod tests {
         OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()
     }
 
+    /// A monotonic reference comfortably after process start, so readers may be
+    /// stamped in its past without underflow.
+    fn m0() -> Instant {
+        Instant::now() + Duration::from_secs(1_000)
+    }
+
     /// Enabled websocket posture with fresh polymarket + poll health, so only the
     /// reader/sink vectors decide the websocket issues.
     fn ws_base() -> HealthState {
@@ -297,7 +315,7 @@ mod tests {
         }
     }
 
-    fn live_reader(at: OffsetDateTime) -> ReaderHealth {
+    fn live_reader(at: Instant) -> ReaderHealth {
         ReaderHealth {
             connected: true,
             last_wire_frame_at: Some(at),
@@ -308,64 +326,68 @@ mod tests {
 
     #[test]
     fn reader_liveness_keys_on_normalized_rows_within_the_timeout() {
-        let mut r = live_reader(t0());
-        assert!(r.is_live(t0() + time::Duration::milliseconds(29_999)));
+        let m0 = m0();
+        let mut r = live_reader(m0);
+        assert!(r.is_live(m0 + Duration::from_millis(29_999)));
         assert!(
-            !r.is_live(t0() + time::Duration::seconds(30)),
+            !r.is_live(m0 + Duration::from_secs(30)),
             "30s without a normalized row is the non-live boundary"
         );
-        // Wire traffic alone (acks, keepalives) never makes a reader live.
+        // Wire traffic alone (acks, keepalives, control frames) never makes a reader live.
         r.last_normalized_activity_at = None;
-        r.last_wire_frame_at = Some(t0() + time::Duration::seconds(60));
-        assert!(!r.is_live(t0() + time::Duration::seconds(60)));
+        r.last_wire_frame_at = Some(m0 + Duration::from_secs(60));
+        assert!(!r.is_live(m0 + Duration::from_secs(60)));
         // A disconnected reader is never live, however fresh its last row was.
-        r.last_normalized_activity_at = Some(t0());
+        r.last_normalized_activity_at = Some(m0);
         r.connected = false;
-        assert!(!r.is_live(t0()));
+        assert!(!r.is_live(m0));
     }
 
     #[test]
     fn readiness_reports_actual_reader_redundancy() {
-        let now = t0();
+        let (now, m0) = (t0(), m0());
         let mut h = ws_base();
-        assert_eq!(readiness_issues(&h, now), vec!["activity_ws_unavailable"]);
-        h.ws_readers[1] = live_reader(now);
         assert_eq!(
-            readiness_issues(&h, now),
+            readiness_issues(&h, now, m0),
+            vec!["activity_ws_unavailable"]
+        );
+        h.ws_readers[1] = live_reader(m0);
+        assert_eq!(
+            readiness_issues(&h, now, m0),
             vec!["activity_ws_redundancy_degraded"]
         );
-        h.ws_readers[0] = live_reader(now);
-        assert!(readiness_issues(&h, now).is_empty());
-        h.ws_readers[2] = live_reader(now);
-        assert!(readiness_issues(&h, now).is_empty());
+        h.ws_readers[0] = live_reader(m0);
+        assert!(readiness_issues(&h, now, m0).is_empty());
+        h.ws_readers[2] = live_reader(m0);
+        assert!(readiness_issues(&h, now, m0).is_empty());
         // Sink poison is unavailable at EVERY reader count, and reported as both.
         h.ws_sink_poisoned = true;
         assert_eq!(
-            readiness_issues(&h, now),
+            readiness_issues(&h, now, m0),
             vec!["activity_ws_sink_poisoned", "activity_ws_unavailable"]
         );
     }
 
     #[test]
     fn polling_health_never_hides_reader_conditions() {
-        let now = t0();
+        let (now, m0) = (t0(), m0());
         let mut h = ws_base();
-        h.ws_readers[0] = live_reader(now);
+        h.ws_readers[0] = live_reader(m0);
         // Healthy polling: degraded redundancy is still reported.
         assert_eq!(
-            readiness_issues(&h, now),
+            readiness_issues(&h, now, m0),
             vec!["activity_ws_redundancy_degraded"]
         );
         // Unhealthy polling with one live reader: still only degraded (no block).
         h.poll_error_streak = POLL_UNHEALTHY_ERROR_STREAK;
         assert_eq!(
-            readiness_issues(&h, now),
+            readiness_issues(&h, now, m0),
             vec!["activity_ws_redundancy_degraded"]
         );
         // Unhealthy polling with zero live readers: unavailable AND blocked.
         h.ws_readers[0] = ReaderHealth::default();
         assert_eq!(
-            readiness_issues(&h, now),
+            readiness_issues(&h, now, m0),
             vec!["activity_ws_unavailable", "copy_admission_blocked"]
         );
     }
@@ -375,8 +397,8 @@ mod tests {
         let mut h = ws_base();
         h.activity_ws_enabled = false;
         h.poll_error_streak = POLL_UNHEALTHY_ERROR_STREAK;
-        assert!(readiness_issues(&h, t0()).is_empty());
-        assert!(!h.copy_admission_blocked(t0()));
+        assert!(readiness_issues(&h, t0(), m0()).is_empty());
+        assert!(!h.copy_admission_blocked(t0(), m0()));
     }
 
     #[test]
@@ -400,21 +422,22 @@ mod tests {
 
     #[test]
     fn dual_unhealthy_requires_both_sources_down() {
+        let m0 = m0();
         let mut h = ws_base();
         h.poll_last_round_at = None;
         h.poll_error_streak = POLL_UNHEALTHY_ERROR_STREAK;
         // No reader ever normalized a row => websocket unavailable.
-        assert!(h.copy_admission_blocked(t0()));
+        assert!(h.copy_admission_blocked(t0(), m0));
         // A healthy poll round clears the block.
         h.poll_error_streak = 0;
         h.poll_last_round_at = Some(t0());
-        assert!(!h.copy_admission_blocked(t0()));
+        assert!(!h.copy_admission_blocked(t0(), m0));
         // One live reader also clears it, whatever polling says.
         h.poll_error_streak = POLL_UNHEALTHY_ERROR_STREAK;
-        h.ws_readers[2] = live_reader(t0());
-        assert!(!h.copy_admission_blocked(t0()));
+        h.ws_readers[2] = live_reader(m0);
+        assert!(!h.copy_admission_blocked(t0(), m0));
         // ...but a poisoned sink fails the whole pool closed again.
         h.ws_sink_poisoned = true;
-        assert!(h.copy_admission_blocked(t0()));
+        assert!(h.copy_admission_blocked(t0(), m0));
     }
 }

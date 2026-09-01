@@ -13,7 +13,7 @@ deploying it to the VPS with one restart and no stop-before-swap window.
 | item | value |
 |---|---|
 | VPS | `82.22.32.225`, user `sean` (`ssh -i ~/.ssh/id_personal sean@82.22.32.225` — never root) |
-| unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Restart needs interactive sudo (`ssh -t … 'sudo systemctl restart pe-service'`); a coding agent cannot restart it non-interactively |
+| unit | systemd **system** unit `pe-service` (`/etc/systemd/system/pe-service.service` + drop-in `pe-service.service.d/age-identity.conf`); `WantedBy=multi-user.target`, `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2` (SIGINT — the binary's shutdown signal, so a restart drains buffered trades). Start/stop/restart need root: run [`scripts/vps_grant_pe_service_sudo.sh`](../scripts/vps_grant_pe_service_sudo.sh) once as root to grant the deploy user passwordless, command-scoped `systemctl` control of the pe-service units (verified with `sudo -n -l`); until then use `ssh -t … 'sudo systemctl restart pe-service'` |
 | binary path | `ExecStart` runs `/bin/bash -c 'set -a; source /home/sean/prediction-markets/.env; set +a; exec /home/sean/prediction-markets/target/release/pe-service smoke-test/service.toml'` with `WorkingDirectory=/home/sean/prediction-markets` (verified 2026-08-31) |
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
 | env | `.env` on the VPS (REST keys `PE_SUPABASE_URL`/`PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
@@ -86,8 +86,8 @@ comparisons decide what remains; never guess from memory.
 
 5. **Config deltas for this deploy** (see each PR's "Deployment impact": `.env` / TOML boot knobs,
    PATCH/INSERT of the live `service_config` rows the new binary reads — seed `on conflict do nothing`
-   never updates an existing row), then **one activation** (operator, interactive sudo):
-   `ssh -t … 'sudo systemctl restart pe-service'`. Immediately before it, re-read the installed and
+   never updates an existing row), then **one activation**:
+   `sudo systemctl restart pe-service` (passwordless after the grant script; otherwise `ssh -t …`). Immediately before it, re-read the installed and
    running hashes and `InvocationID`: if the running hash is already desired (the unit re-activated on
    its own after a crash), do not restart again.
 6. **Verify**:
@@ -110,16 +110,18 @@ comparisons decide what remains; never guess from memory.
    `copy_admission_blocked=false`, and at least two readers' `normalized_activity_rows_total`
    advancing between the publications; readiness must carry none of `activity_ws_unavailable`,
    `activity_ws_redundancy_degraded`, `activity_ws_sink_poisoned`, `copy_admission_blocked`; the
-   source log's size/mtime must advance (append-only file; no content inspection here). Then the
-   duplicate invariant on paper state — both queries must return nothing, whatever unrelated activity
-   happened meanwhile:
+   source log's size/mtime must advance (append-only file; no content inspection here). Repeat
+   reader copies cannot create duplicate rows by construction — `seen_trades`, `fills` (keyed by the
+   `wf|leader|source_trade_id|…` idempotency key), and `dispatch_seeds` (keyed by the dispatch id
+   derived from it) are all primary-keyed on the trade's own identity, and acceptance scenario R6
+   proves three copies produce one row each — so the post-deploy check is identifier-bound: for any
+   watched `source_trade_id` observed after activation, expect `seen=1`, `fills<=1`, `seeds<=1`, and
+   `no_copy<=1` with `fills+no_copy<=1`; otherwise record `not observed`.
 
    ```bash
-   sqlite3 -readonly paper_state.db "select source_trade_id, count(*) from fills group by 1 having count(*) > 1; select source_trade_id, count(*) from dispatch_seeds group by 1 having count(*) > 1;"
-   ```
-
-   For any watched `source_trade_id` observed after activation, tie its seen row, fill, seed, and
-   targets to that identifier; otherwise record `not observed`. If the second publication cannot
+   id=<source_trade_id>
+   sqlite3 -readonly -header paper_state.db "select (select count(*) from seen_trades where source_trade_id='$id') as seen, (select count(*) from fills where idempotency_key like 'wf|%|$id|%') as fills, (select count(*) from dispatch_seeds where source_trade_id='$id') as seeds, (select count(*) from no_copy_dispositions where source_trade_id='$id') as no_copy;"
+   ``` If the second publication cannot
    establish two live readers, roll back instead of waiting. Record the readers'
    `consecutive_reconnects` and drop cadence: a churn pattern is the evidence for any keepalive
    follow-up (the first-party client sends `ping` every 5 s; `pe-service` does not).

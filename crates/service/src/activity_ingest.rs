@@ -23,10 +23,13 @@
 //! Failure semantics:
 //! - full fan-in or trade channel → the sender blocks holding its one item
 //!   (`fan_in_blocked` in health) and reads no further wire frame, so
-//!   backpressure reaches the socket. Nothing is deliberately dropped while
-//!   both downstream receivers are open; a closed receiver is orderly shutdown.
-//!   Owner abort or process failure may discard in-memory pre-log work (the
-//!   declared whole-process boundary; polling and #544 own recovery).
+//!   backpressure reaches the socket; health derives the slot non-live once its
+//!   last row ages past the timeout, the socket is kept, and after the frame
+//!   drains the deadline check drops it before any further read. Nothing is
+//!   deliberately dropped while both downstream receivers are open; a closed
+//!   receiver is orderly shutdown. Owner abort or process failure may discard
+//!   in-memory pre-log work (the declared whole-process boundary; polling and
+//!   #544 own recovery).
 //! - source-log append/sync failure → the sink poisons and the coordinator
 //!   enters a bounded-backoff reopen/revalidate loop holding the current item,
 //!   blocking delivery from EVERY reader until it durably appends (#530 review
@@ -48,7 +51,7 @@ use pe_event_log::{ContentType, EnvelopeIn};
 use pe_source_polymarket_public::{
     ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS, ACTIVITY_WS_PARSER_VERSION,
     ACTIVITY_WS_READER_COUNT, ACTIVITY_WS_SCHEMA_VERSION, ActivityWsError, ActivityWsStream,
-    ReconnectBackoff, backoff_secs, parse_activity_frame,
+    ReconnectBackoff, WireFrame, backoff_secs, parse_activity_frame,
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -227,13 +230,14 @@ impl Reader {
             let frame = tokio::select! {
                 biased;
                 () = tokio::time::sleep_until(deadline) => None,
-                frame = stream.next_text() => Some(frame),
+                frame = stream.next_frame() => Some(frame),
             };
             // One deadline check per iteration, BEFORE any normalization could
             // refresh it: covers expiry while parked, a frame that became ready
             // at the same instant, and a fan-in block inside the previous frame
             // that outlived the deadline (the drop then precedes the next read).
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 warn!(
                     slot = self.slot,
                     timeout_secs = ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
@@ -243,7 +247,12 @@ impl Reader {
             }
             let text = match frame {
                 None => continue,
-                Some(Ok(Some(text))) => text,
+                Some(Ok(Some(WireFrame::Text(text)))) => text,
+                Some(Ok(Some(WireFrame::NonText))) => {
+                    // Ping/pong/binary: the transport is alive; nothing to normalize.
+                    self.set_health(|r| r.last_wire_frame_at = Some(now));
+                    continue;
+                }
                 Some(Ok(None)) => {
                     warn!(slot = self.slot, "activity ws closed by peer");
                     return Ok(());
@@ -253,19 +262,21 @@ impl Reader {
                     return Ok(());
                 }
             };
-            self.on_frame(&text, &mut deadline, backoff).await?;
+            self.on_frame(&text, now, &mut deadline, backoff).await?;
         }
     }
 
-    /// Parse one frame, normalize every payload once, refresh liveness on the
-    /// first accepted payload, and deliver the watched rows in order.
+    /// Parse one text frame received at `now`, normalize every payload once,
+    /// refresh liveness on the first accepted payload, and deliver the watched
+    /// rows in order.
     async fn on_frame(
         &mut self,
         text: &str,
+        now: Instant,
         deadline: &mut Instant,
         backoff: &mut ReconnectBackoff,
     ) -> Result<(), Shutdown> {
-        let now = OffsetDateTime::now_utc();
+        let received_at = OffsetDateTime::now_utc();
         self.set_health(|r| r.last_wire_frame_at = Some(now));
         let (payloads, missing) = match parse_activity_frame(text) {
             Ok(parsed) => parsed,
@@ -292,7 +303,7 @@ impl Reader {
             // REST path uses (the frame receipt is injected; replay passes the
             // envelope's recorded instant instead, #530 review F7) — then filter
             // on the normalized wallet and reuse that same value for delivery.
-            let trade = match trade_parser::parse_ws_trade(payload, now) {
+            let trade = match trade_parser::parse_ws_trade(payload, received_at) {
                 Ok(trade) => trade,
                 Err(error) => {
                     rejected += 1;
@@ -305,7 +316,7 @@ impl Reader {
                 // Parser acceptance — watched or not — is the liveness and
                 // backoff-progress signal; acknowledgements and rejected payloads
                 // never are (#546).
-                *deadline = Instant::now() + activity_timeout();
+                *deadline = now + activity_timeout();
                 backoff.on_normalized_row();
                 self.set_health(|r| {
                     r.last_normalized_activity_at = Some(now);
@@ -375,9 +386,17 @@ struct Coordinator {
 }
 
 impl Coordinator {
-    /// Run until every reader is gone or the trade channel closes.
+    /// Run until every reader is gone or the trade channel closes — the latter
+    /// is noticed immediately, not only at the next delivery.
     async fn run(mut self) {
-        while let Some(observation) = self.fan_in.recv().await {
+        loop {
+            let observation = tokio::select! {
+                () = self.trade_tx.closed() => return,
+                received = self.fan_in.recv() => match received {
+                    Some(observation) => observation,
+                    None => return,
+                },
+            };
             if self.append_with_recovery(&observation).await.is_err() {
                 return;
             }

@@ -715,7 +715,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            h.copy_admission_blocked(OffsetDateTime::now_utc())
+            h.copy_admission_blocked(OffsetDateTime::now_utc(), tokio::time::Instant::now())
         };
         if admission_blocked {
             warn!(
@@ -735,7 +735,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         .health
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    !h.copy_admission_blocked(OffsetDateTime::now_utc())
+                    !h.copy_admission_blocked(
+                        OffsetDateTime::now_utc(),
+                        tokio::time::Instant::now(),
+                    )
                 };
                 if unblocked {
                     break;

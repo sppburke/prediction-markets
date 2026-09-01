@@ -19,7 +19,7 @@ pub use activity_ws::{
     ACTIVITY_WS_BACKOFF_CAP_SECS, ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_READER_COUNT, ACTIVITY_WS_SCHEMA_VERSION,
     ACTIVITY_WS_SUBSCRIBE, ACTIVITY_WS_URL, ActivityWsError, ActivityWsStream, ReconnectBackoff,
-    backoff_secs, parse_activity_frame,
+    WireFrame, backoff_secs, parse_activity_frame,
 };
 pub use clob_prices_history::{
     CLOB_PRICES_HISTORY_FIDELITY_MINUTES, CLOB_PRICES_HISTORY_MIN_INTERVAL_MS, ClassifiedPage,

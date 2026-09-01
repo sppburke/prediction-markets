@@ -457,7 +457,7 @@ impl Pool {
         self.health
             .lock()
             .unwrap()
-            .ws_live_reader_count(OffsetDateTime::now_utc())
+            .ws_live_reader_count(Instant::now())
     }
 
     /// Source-log contents in order, as trade identifiers.
@@ -581,7 +581,7 @@ async fn r1_only_normalized_rows_refresh_liveness_drop_is_exact_and_backoff_foll
             "{input:?}: must not refresh normalized liveness"
         );
         assert_eq!(r.normalized_activity_rows_total, 0, "{input:?}");
-        assert!(!r.is_live(wall_now()), "{input:?}: never live");
+        assert!(!r.is_live(Instant::now()), "{input:?}: never live");
     }
 
     // 29.999 s after connect: still holding the socket.
@@ -611,10 +611,26 @@ async fn r1_only_normalized_rows_refresh_liveness_drop_is_exact_and_backoff_foll
         "a new connection is not live until its first normalized row"
     );
 
-    // Second silent cycle: 30 s, then a 2 s backoff.
+    // Second cycle: a parser-accepted frame becomes ready at the exact deadline
+    // instant — the deadline wins (no refresh, no read); then a 2 s backoff.
     let mut server = pool.net.take_server(0);
+    server
+        .send_text(&activity_frame(&[payload(
+            "0xtie",
+            STRANGER,
+            &market_b(),
+            1_704_067_200,
+        )]))
+        .await
+        .unwrap();
     advance(Duration::from_secs(30)).await;
     assert!(server.recv_text().await.is_none());
+    let r = pool.reader(0);
+    assert_eq!(
+        r.normalized_activity_rows_total, 0,
+        "a frame ready at the deadline cannot refresh liveness"
+    );
+    assert!(r.last_normalized_activity_at.is_none());
     advance(Duration::from_millis(1_999)).await;
     assert_eq!(pool.net.dial_count(0), 2);
     advance(Duration::from_millis(1)).await;
@@ -652,7 +668,7 @@ async fn r2_mixed_frame_delivers_watched_row_once_and_unwatched_rows_only_refres
         r.normalized_activity_rows_total, 2,
         "two payloads passed the normalizer, one was rejected"
     );
-    assert!(r.is_live(wall_now()));
+    assert!(r.is_live(Instant::now()));
     assert_eq!(pool.source_log_ids(), vec!["0xwatched".to_string()]);
 
     // The frame refreshed the deadline: 29 more silent seconds keep the socket.
@@ -687,12 +703,20 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     let (pool, trade_rx) = start_pool(64).await;
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
+    // Fixed admission clock: 0xsame copy 1 samples early+final (fills), copy 2 is
+    // seen (no sample), 0xother samples early+final. Rows are observed 1 s before.
+    let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
+    let hooks = Arc::new(ScenarioHooks::default());
+    hooks.age_clock.lock().unwrap().extend([t, t, t, t]);
     let orch = build_orchestrator(
         dir.path(),
         paper_state.clone(),
         trade_rx,
         pool.health.clone(),
-        OrchOpts::ws(vec![market(), market_b()]),
+        OrchOpts {
+            hooks: Some(Arc::clone(&hooks)),
+            ..OrchOpts::ws(vec![market(), market_b()])
+        },
     );
     let (orch_task, shutdown) = spawn_orchestrator(orch);
     let mut s0 = pool.net.take_server(0);
@@ -700,7 +724,8 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     let mut s2 = pool.net.take_server(2);
 
     advance(Duration::from_secs(1)).await;
-    let frame = activity_frame(&[payload("0xsame", LEADER, &market(), now_unix())]);
+    let observed_unix = t.unix_timestamp() - 1;
+    let frame = activity_frame(&[payload("0xsame", LEADER, &market(), observed_unix)]);
     s0.send_text(&frame).await.unwrap();
     s2.send_text(&frame).await.unwrap();
     assert!(
@@ -715,7 +740,7 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
         "0xother",
         LEADER,
         &market_b(),
-        now_unix(),
+        observed_unix,
     )]))
     .await
     .unwrap();
@@ -737,6 +762,10 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
         "one leader delta"
     );
     assert_eq!(leader_long(&paper_state, &market_b()), Some(100));
+    assert!(
+        hooks.age_clock.lock().unwrap().is_empty(),
+        "four budget samples"
+    );
 
     // Keep 0 and 2 alive past slot 1's deadline with parser-accepted unwatched rows.
     advance(Duration::from_secs(24)).await; // t = 25 s
@@ -767,7 +796,7 @@ async fn r4_one_silent_reader_cannot_interrupt_delivery_to_one_decision() {
     {
         let h = pool.health.lock().unwrap();
         assert!(
-            readiness_issues(&h, wall_now())
+            readiness_issues(&h, wall_now(), Instant::now())
                 .iter()
                 .all(|i| !i.starts_with("activity_ws")),
             "two live readers is healthy"
@@ -829,7 +858,7 @@ async fn r5_each_reader_has_independent_reconnect_backoff() {
     advance(Duration::from_secs(8)).await;
     assert_eq!(net.dial_times(1)[4], t0 + Duration::from_secs(15));
     let r1 = pool.reader(1);
-    assert!(r1.connected && !r1.is_live(wall_now()));
+    assert!(r1.connected && !r1.is_live(Instant::now()));
     assert_eq!(
         r1.consecutive_reconnects, 4,
         "reset only by a normalized row"
@@ -845,7 +874,7 @@ async fn r5_each_reader_has_independent_reconnect_backoff() {
     .unwrap();
     settle().await;
     assert_eq!(pool.reader(1).consecutive_reconnects, 0);
-    assert!(pool.reader(1).is_live(wall_now()));
+    assert!(pool.reader(1).is_live(Instant::now()));
     pool.task.abort();
 }
 
@@ -853,10 +882,14 @@ async fn r5_each_reader_has_independent_reconnect_backoff() {
 
 #[tokio::test(start_paused = true)]
 async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to_the_same() {
+    // Fixed admission clock for both runs: copy 1 samples early+final (fault),
+    // copy 2 samples early+final (fills), copy 3 is seen (no sample).
+    let t = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
     let hooks = Arc::new(ScenarioHooks::default());
     hooks
         .fail_next_stage_seed
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks.age_clock.lock().unwrap().extend([t, t, t, t]);
     let (pool, trade_rx) = start_pool(64).await;
     let dir = tempfile::tempdir().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("p.db")).unwrap());
@@ -873,7 +906,7 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
     );
     let (orch_task, shutdown) = spawn_orchestrator(orch);
 
-    let row = payload("0xthree", LEADER, &market(), now_unix());
+    let row = payload("0xthree", LEADER, &market(), t.unix_timestamp() - 1);
     let frame = activity_frame(std::slice::from_ref(&row));
     for slot in 0..3 {
         pool.net.take_server(slot).send_text(&frame).await.unwrap();
@@ -919,6 +952,10 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
         "the one-shot staging fault was consumed by the first copy"
     );
     assert_one_decision(&paper_state, dir.path());
+    assert!(
+        hooks.age_clock.lock().unwrap().is_empty(),
+        "four budget samples"
+    );
     shutdown.send(()).unwrap();
     orch_task.await.unwrap();
     pool.task.abort();
@@ -941,6 +978,16 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
             env.payload,
             row.as_bytes(),
             "envelope {i}: exact raw row bytes"
+        );
+        assert_eq!(env.content_type, ContentType::Json);
+        assert_eq!(
+            env.observed_at.0, reference.observed_at,
+            "envelope {i}: observed_at"
+        );
+        assert_eq!(
+            env.raw_payload_hash,
+            blake3::hash(row.as_bytes()),
+            "envelope {i}: raw payload hash"
         );
         let t = trade_parser::parse_ws_trade(&env.payload, env.received_at.0).unwrap();
         assert_eq!(
@@ -969,6 +1016,7 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
     hooks2
         .fail_next_stage_seed
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks2.age_clock.lock().unwrap().extend([t, t, t, t]);
     run_trades(
         dir2.path(),
         paper2.clone(),
@@ -988,6 +1036,7 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
         "replay consumed the fault exactly once"
     );
     assert_one_decision(&paper2, dir2.path());
+    assert!(hooks2.age_clock.lock().unwrap().is_empty());
 }
 
 // ── R7: saturation retains the frame, item, and socket; drains in order ──────
@@ -1008,7 +1057,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
         "the fourth row blocks on the full fan-in (b is held on the full trade channel, c waits in the fan-in)"
     );
     let before = pool.reader(0);
-    assert!(before.connected && before.is_live(wall_now()));
+    assert!(before.connected && before.is_live(Instant::now()));
     assert_eq!(
         pool.source_log_ids(),
         vec!["0xa".to_string(), "0xb".to_string()]
@@ -1036,7 +1085,10 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
         r.last_normalized_activity_at,
         before.last_normalized_activity_at
     );
-    assert!(!r.is_live(wall_now() + time::Duration::seconds(30)));
+    assert!(
+        !r.is_live(Instant::now()),
+        "derived non-live after 30 s on the reader's own clock"
+    );
     assert_eq!(pool.net.dial_count(0), 1, "no reconnect while blocked");
 
     // Release capacity: an orchestrator drains every retained row IN ORDER; each
@@ -1341,20 +1393,11 @@ async fn r9_stale_before_staging_commits_no_copy_and_a_commit_fault_rolls_back()
 async fn r10a_closed_trade_channel_ends_the_pool_orderly_without_redials() {
     let (pool, trade_rx) = start_pool(8).await;
     let mut servers: Vec<ActivityWsPeer> = (0..3).map(|s| pool.net.take_server(s)).collect();
+    // Closing the idle trade receiver alone ends the coordinator; the owner
+    // aborts every reader and returns — no frame is needed to notice it.
     drop(trade_rx);
-    servers[0]
-        .send_text(&activity_frame(&[payload(
-            "0xlast",
-            LEADER,
-            &market(),
-            now_unix(),
-        )]))
-        .await
-        .unwrap();
-    // The coordinator appends, finds the trade channel closed, and exits; the
-    // owner aborts every reader and returns.
     assert!(settle_until(|| pool.task.is_finished()).await);
-    assert_eq!(pool.source_log_ids(), vec!["0xlast".to_string()]);
+    assert!(pool.source_log_ids().is_empty());
     advance(Duration::from_secs(120)).await;
     for slot in 0..3 {
         assert_eq!(

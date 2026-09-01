@@ -39,9 +39,12 @@ pub const ACTIVITY_WS_PARSER_VERSION: u32 = 1;
 /// live readers after the measured connection-local silent failure.
 /// Canonical home: `docs/_GLOSSARY.md` (`activity_ws_reader_count`).
 pub const ACTIVITY_WS_READER_COUNT: usize = 3;
-/// A reader with no normalized activity row for this long is not live: it drops
-/// its socket and re-dials after its own backoff. Six times the largest
-/// activity gap measured on a healthy connection (4.775s, #546).
+/// A reader with no normalized activity row for this long is not live. While
+/// reading, it drops its socket at the deadline and re-dials after its own
+/// backoff; while blocked on a full fan-in send it keeps the socket and its
+/// retained row (health still derives it non-live) and drops only after that
+/// frame drains. Six times the largest activity gap measured on a healthy
+/// connection (4.775s, #546).
 /// Canonical home: `docs/_GLOSSARY.md` (`activity_ws_normalized_activity_timeout_secs`).
 pub const ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS: u64 = 30;
 /// Reconnect backoff doubles from 1s and is capped here.
@@ -221,20 +224,29 @@ impl ActivityWsStream {
         Ok(stream)
     }
 
-    /// Next text frame; `Ok(None)` means the socket closed. Ping/pong and
-    /// binary frames are skipped (tungstenite answers pings on read). Cancel
-    /// safe: partial-frame state lives in the stream, not in this future.
-    pub async fn next_text(&mut self) -> Result<Option<String>, ActivityWsError> {
-        loop {
-            match self.inner.next().await {
-                None => return Ok(None),
-                Some(Ok(Message::Text(text))) => return Ok(Some(text.to_string())),
-                Some(Ok(Message::Close(_))) => return Ok(None),
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(transport(e)),
-            }
+    /// Next frame; `Ok(None)` means the socket closed. Ping/pong and binary
+    /// frames surface as [`WireFrame::NonText`] (tungstenite answers pings on
+    /// read) so the reader can count them as transport liveness without ever
+    /// treating them as activity. Cancel safe: partial-frame state lives in the
+    /// stream, not in this future.
+    pub async fn next_frame(&mut self) -> Result<Option<WireFrame>, ActivityWsError> {
+        match self.inner.next().await {
+            None => Ok(None),
+            Some(Ok(Message::Text(text))) => Ok(Some(WireFrame::Text(text.to_string()))),
+            Some(Ok(Message::Close(_))) => Ok(None),
+            Some(Ok(_)) => Ok(Some(WireFrame::NonText)),
+            Some(Err(e)) => Err(transport(e)),
         }
     }
+}
+
+/// One frame received on the socket.
+#[derive(Debug)]
+pub enum WireFrame {
+    /// A text frame: the only kind that can carry activity payloads.
+    Text(String),
+    /// Ping, pong, or binary: proof the transport is alive, never activity.
+    NonText,
 }
 
 /// Scenario-only server half of an in-process activity socket pair. Tests use

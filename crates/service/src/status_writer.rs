@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use pe_paper_state::PaperStateDb;
 use serde::Serialize;
@@ -59,26 +61,36 @@ pub struct ReaderStatus {
 }
 
 impl SourceHealthStatus {
-    /// Project the shared health state at `now` (pure; unit-tested for the
-    /// aggregate derivations).
-    pub fn from_health(h: &HealthState, now: OffsetDateTime) -> Self {
+    /// Project the shared health state (pure; unit-tested for the aggregate
+    /// derivations). `now` is the wall clock for poll ages; `now_mono` is the
+    /// monotonic clock reader timestamps are stamped on.
+    pub fn from_health(h: &HealthState, now: OffsetDateTime, now_mono: Instant) -> Self {
         let age = |t: Option<OffsetDateTime>| t.map(|t| (now - t).whole_seconds());
+        let age_mono = |t: Option<Instant>| {
+            t.map(|t| {
+                i64::try_from(now_mono.saturating_duration_since(t).as_secs()).unwrap_or(i64::MAX)
+            })
+        };
         let readers = h.ws_readers.iter();
         Self {
             activity_ws_enabled: h.activity_ws_enabled,
             ws_connected: readers.clone().any(|r| r.connected),
-            ws_last_frame_age_secs: age(readers.clone().filter_map(|r| r.last_wire_frame_at).max()),
-            ws_last_valid_frame_age_secs: age(readers
-                .clone()
-                .filter_map(|r| r.last_normalized_activity_at)
-                .max()),
+            ws_last_frame_age_secs: age_mono(
+                readers.clone().filter_map(|r| r.last_wire_frame_at).max(),
+            ),
+            ws_last_valid_frame_age_secs: age_mono(
+                readers
+                    .clone()
+                    .filter_map(|r| r.last_normalized_activity_at)
+                    .max(),
+            ),
             ws_consecutive_reconnects: readers
                 .clone()
                 .map(|r| r.consecutive_reconnects)
                 .max()
                 .unwrap_or(0),
             ws_sink_poisoned: h.ws_sink_poisoned,
-            ws_live_reader_count: h.ws_live_reader_count(now),
+            ws_live_reader_count: h.ws_live_reader_count(now_mono),
             ws_readers: readers
                 .clone()
                 .enumerate()
@@ -86,15 +98,15 @@ impl SourceHealthStatus {
                     slot,
                     connected: r.connected,
                     fan_in_blocked: r.fan_in_blocked,
-                    last_wire_frame_age_secs: age(r.last_wire_frame_at),
-                    last_normalized_activity_age_secs: age(r.last_normalized_activity_at),
+                    last_wire_frame_age_secs: age_mono(r.last_wire_frame_at),
+                    last_normalized_activity_age_secs: age_mono(r.last_normalized_activity_at),
                     normalized_activity_rows_total: r.normalized_activity_rows_total,
                     consecutive_reconnects: r.consecutive_reconnects,
                 })
                 .collect(),
             poll_last_round_age_secs: age(h.poll_last_round_at),
             poll_error_streak: h.poll_error_streak,
-            copy_admission_blocked: h.copy_admission_blocked(now),
+            copy_admission_blocked: h.copy_admission_blocked(now, now_mono),
         }
     }
 }
@@ -257,8 +269,9 @@ pub async fn run_status_writer(
             .unwrap_or(0);
         let source_health = health.as_ref().and_then(|h| {
             let h = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            h.activity_ws_enabled
-                .then(|| SourceHealthStatus::from_health(&h, OffsetDateTime::now_utc()))
+            h.activity_ws_enabled.then(|| {
+                SourceHealthStatus::from_health(&h, OffsetDateTime::now_utc(), Instant::now())
+            })
         });
         let mut snap = build_snapshot(
             &paper_state,
@@ -292,27 +305,30 @@ mod tests {
     fn aggregate_fields_derive_from_the_reader_records() {
         let health = new_shared_health_with_ws(false, true, 90);
         let now = t0() + time::Duration::seconds(100);
+        // Monotonic reference comfortably after process start.
+        let m0 = Instant::now() + Duration::from_secs(1_000);
+        let now_mono = m0 + Duration::from_secs(100);
         {
             let mut h = health.lock().unwrap();
             h.ws_readers[0] = ReaderHealth {
                 connected: true,
                 fan_in_blocked: false,
-                last_wire_frame_at: Some(t0() + time::Duration::seconds(95)),
-                last_normalized_activity_at: Some(t0() + time::Duration::seconds(90)),
+                last_wire_frame_at: Some(m0 + Duration::from_secs(95)),
+                last_normalized_activity_at: Some(m0 + Duration::from_secs(90)),
                 normalized_activity_rows_total: 7,
                 consecutive_reconnects: 0,
             };
             h.ws_readers[2] = ReaderHealth {
                 connected: false,
                 fan_in_blocked: false,
-                last_wire_frame_at: Some(t0() + time::Duration::seconds(60)),
-                last_normalized_activity_at: Some(t0() + time::Duration::seconds(99)),
+                last_wire_frame_at: Some(m0 + Duration::from_secs(60)),
+                last_normalized_activity_at: Some(m0 + Duration::from_secs(99)),
                 normalized_activity_rows_total: 3,
                 consecutive_reconnects: 4,
             };
         }
         let h = health.lock().unwrap();
-        let s = SourceHealthStatus::from_health(&h, now);
+        let s = SourceHealthStatus::from_health(&h, now, now_mono);
         assert!(s.ws_connected, "any connected reader");
         assert_eq!(s.ws_last_frame_age_secs, Some(5), "newest wire frame");
         assert_eq!(
