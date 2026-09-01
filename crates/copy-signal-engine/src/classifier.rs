@@ -120,12 +120,14 @@ pub fn classify_leader_action(
 }
 
 /// `remaining / original ≤ near_close_remaining_pct / 100` using integer arithmetic.
+/// Cross-multiplies in `u128` so untrusted near-`u64::MAX` atomic quantities compare
+/// exactly instead of saturating into an Exit/Trim misclassification (#544 review).
 fn is_near_close(remaining: ShareAmount, original: ShareAmount, config: &SignalConfig) -> bool {
     if original == ShareAmount::ZERO {
         return true;
     }
-    let pct = u64::from(config.near_close_remaining_pct);
-    remaining.atomic().saturating_mul(100) <= original.atomic().saturating_mul(pct)
+    let pct = u128::from(config.near_close_remaining_pct);
+    u128::from(remaining.atomic()) * 100 <= u128::from(original.atomic()) * pct
 }
 
 fn is_on_active_watchlist(wallet: WalletAddress, watchlist: &Watchlist) -> bool {

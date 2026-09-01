@@ -38,6 +38,10 @@ use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 /// trade; #511: the frozen record retries via v2 and the boot frame-walk converges).
 #[derive(Debug, thiserror::Error)]
 pub enum SupabaseStateError {
+    #[error(
+        "authoritative resolution committed remotely but the local mirror failed for {market}: {error}"
+    )]
+    LocalMirrorUncertain { market: String, error: String },
     #[error("supabase transport: {0}")]
     Transport(#[source] reqwest::Error),
     /// Non-2xx response; the body carries the PL/pgSQL `RAISE` message when the RPC errored.
@@ -559,6 +563,12 @@ struct PositionRow {
 pub enum AuthoritativeFillOutcome {
     Filled(Decimal),
     RefusedSettled(Decimal),
+    /// The authority committed but the local mirror could not converge after
+    /// in-process retries (#544 review): the caller must treat paper durability
+    /// as uncertain — fail readiness and stop producers; the boot frame-walk
+    /// converges from the durable frame on restart. Carries the authority
+    /// bankroll for the final status snapshot only.
+    LocalDurabilityUncertain(Decimal),
 }
 
 /// Authoritative fill commit (#397, reshaped by #511): `commit_fill_v2` FIRST (fail-closed
@@ -638,12 +648,23 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
                 );
             }
         }
-        Err(e) => warn!(
-            error = %e,
-            seq = seq.0,
-            "authoritative fill: authority committed but local disposition failed after \
-             in-process retries; watermark left frozen (boot frame-walk converges)"
-        ),
+        Err(e) => {
+            warn!(
+                error = %e,
+                seq = seq.0,
+                "authoritative fill: authority committed but local disposition failed after \
+                 in-process retries; watermark left frozen (boot frame-walk converges)"
+            );
+            // Remote truth advanced without local convergence: surface typed
+            // uncertainty instead of success (#544 review). In-memory financial
+            // state must not advance past durable local state.
+            let bankroll = match outcome {
+                FillV2Outcome::Applied { bankroll, .. }
+                | FillV2Outcome::Existing { bankroll, .. }
+                | FillV2Outcome::Settled { bankroll } => bankroll,
+            };
+            return Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll));
+        }
     }
     Ok(match outcome {
         FillV2Outcome::Applied { bankroll, .. } | FillV2Outcome::Existing { bankroll, .. } => {
@@ -678,9 +699,16 @@ pub async fn apply_resolution_authoritative<S: SupabaseStateTrait + ?Sized>(
         warn!(
             error = %e,
             market = %market_id,
-            "authoritative resolution committed to Supabase but local SQLite mirror failed \
-             (heals on restart/retry)"
+            "authoritative resolution committed to Supabase but local SQLite mirror failed"
         );
+        // Typed error instead of silent success (#544 review): the market stays
+        // locally unsettled, the next tick re-drives the idempotent RPC (returns
+        // `existing`), and the mirror converges — the caller retries, it does
+        // not report a settled market it has not durably recorded.
+        return Err(SupabaseStateError::LocalMirrorUncertain {
+            market: market_id.0.0.clone(),
+            error: e.to_string(),
+        });
     }
     Ok(res.bankroll)
 }

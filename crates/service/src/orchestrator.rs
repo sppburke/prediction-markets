@@ -104,6 +104,10 @@ enum PaperCommitResult {
     Refused,
     /// No terminal outcome yet — frozen retry owns the trade (ticker + boot walk).
     Parked,
+    /// Remote authority committed but the local mirror failed (#544 review):
+    /// financial state is uncertain — the caller fails readiness and stops
+    /// producer intake; the durable frame + idempotent RPC reconverge at boot.
+    DurabilityUncertain,
 }
 
 /// Orchestrator configuration.
@@ -1965,6 +1969,28 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 self.filled_positions.insert(parked.filled_key.clone());
                 PaperCommitResult::Filled
             }
+            Ok(AuthoritativeFillOutcome::LocalDurabilityUncertain(bankroll)) => {
+                // Remote committed, local did not converge: financial state is
+                // uncertain. Do NOT advance in-memory bankroll/positions past
+                // durable local truth; fail readiness and stop producer intake —
+                // the durable frame + idempotent RPC reconverge at boot (#544).
+                error!(
+                    key = %parked.record.idempotency_key,
+                    market = %parked.record.market_id,
+                    authority_bankroll = %bankroll,
+                    "authoritative fill uncertain: remote committed, local mirror failed; stopping producers"
+                );
+                {
+                    let mut health = self
+                        .health
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    health.paper_durability_uncertain = true;
+                    health.refresh_event_log_writable();
+                }
+                self.intake_stopped = true;
+                PaperCommitResult::DurabilityUncertain
+            }
             Ok(AuthoritativeFillOutcome::RefusedSettled(bankroll)) => {
                 self.bankroll = bankroll;
                 info!(
@@ -1990,6 +2016,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             };
             match self.attempt_parked_commit(id.clone(), &parked).await {
                 PaperCommitResult::Parked => {
+                    self.parked.insert(id, parked);
+                }
+                // Uncertainty keeps the frozen obligation: boot reconverges it.
+                PaperCommitResult::DurabilityUncertain => {
                     self.parked.insert(id, parked);
                 }
                 PaperCommitResult::Filled | PaperCommitResult::Refused => {}

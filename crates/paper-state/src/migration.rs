@@ -477,11 +477,32 @@ impl MigrationMetadata {
     }
 
     /// Require the final activation census and its binary binding before tails
-    /// may be frozen or the side main installed.
+    /// may be frozen or the side main installed. Current-binary equality applies
+    /// ONLY during the original activation.
     pub fn activation_facts_hash(
         path: &Path,
         binary_identity: &str,
     ) -> Result<String, PaperStateError> {
+        let (stored_hash, stored_binary) = Self::read_activation_facts(path)?;
+        if stored_binary != binary_identity {
+            return Err(PaperStateError::Corrupt(
+                "paper migration activation facts binary mismatch".to_owned(),
+            ));
+        }
+        Ok(stored_hash)
+    }
+
+    /// Verify the stored activation census is internally consistent. The
+    /// recorded binary identity is an immutable HISTORICAL fact of the one-time
+    /// migration: a later compatible v2 build must boot without matching it, or
+    /// every corrected binary would restart-loop and defeat the roll-forward
+    /// lane (#544 review).
+    pub fn verify_activation_facts(path: &Path) -> Result<String, PaperStateError> {
+        let (stored_hash, _historical_binary) = Self::read_activation_facts(path)?;
+        Ok(stored_hash)
+    }
+
+    fn read_activation_facts(path: &Path) -> Result<(String, String), PaperStateError> {
         let connection = open_bootstrap(path)?;
         let (facts_json, stored_hash, stored_binary): (String, String, String) = connection
             .query_row(
@@ -496,12 +517,12 @@ impl MigrationMetadata {
                 ))
             })?;
         let actual = blake3::hash(facts_json.as_bytes()).to_hex().to_string();
-        if actual != stored_hash || stored_binary != binary_identity {
+        if actual != stored_hash {
             return Err(PaperStateError::Corrupt(
-                "paper migration activation facts hash/binary mismatch".to_owned(),
+                "paper migration activation facts hash mismatch".to_owned(),
             ));
         }
-        Ok(stored_hash)
+        Ok((stored_hash, stored_binary))
     }
 
     /// Atomically install only the finalized side main. The checkpointed v1

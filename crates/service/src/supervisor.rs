@@ -21,6 +21,11 @@ use tokio::task::{AbortHandle, Id, JoinSet};
 /// uses the same bound so its joins finish before an outer service-manager kill backstop.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(45);
 
+/// Hard bound on post-abort joins and the final join sweep. Aborted tasks
+/// normally finish in milliseconds; a task that cannot be joined within this
+/// bound is pinned in synchronous work and the process exits instead (#544).
+pub const POST_ABORT_JOIN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Production owner name. The spelling is the stable `status.json` contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -548,16 +553,39 @@ impl TaskSupervisor {
                 abort.abort();
             }
         }
+        // Tokio abort is observed only at a yield point: a task pinned in
+        // synchronous work never completes, so the post-abort join must carry
+        // its own hard bound or shutdown is unbounded (#544 review).
+        let bound = tokio::time::Instant::now() + POST_ABORT_JOIN_BOUND;
         while names.iter().any(|name| self.is_running(*name)) {
-            if self.observe_next().await.is_none() {
-                break;
+            match tokio::time::timeout_at(bound, self.observe_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    for name in names {
+                        if self.is_running(*name) {
+                            tracing::error!(task = %name, "post-abort join bound expired; task is pinned in non-yielding work");
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
 
-    /// Join every remaining owner. Used only after all phases have advanced.
-    pub async fn join_all(&mut self) {
-        while self.observe_next().await.is_some() {}
+    /// Join every remaining owner, hard-bounded: a non-yielding task cannot
+    /// hold the process open past the deadline (#544 review). Returns `false`
+    /// when the bound expired with owners still unjoined — the caller exits the
+    /// process rather than waiting forever (durable state recovers on restart).
+    pub async fn join_all_bounded(&mut self) -> bool {
+        let bound = tokio::time::Instant::now() + POST_ABORT_JOIN_BOUND;
+        loop {
+            match tokio::time::timeout_at(bound, self.observe_next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
     }
 }
 

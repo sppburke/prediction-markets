@@ -198,7 +198,7 @@ impl PaperMigrationBoot {
             let mut record = MigrationMetadata::read(&paths.fixed_main)
                 .context("read installed paper migration record")?
                 .context("v2 paper main omitted migration record")?;
-            MigrationMetadata::activation_facts_hash(&paths.fixed_main, &paths.binary_identity)
+            MigrationMetadata::verify_activation_facts(&paths.fixed_main)
                 .context("verify installed paper migration activation census")?;
             if record.phase == MigrationPhase::ActivationTailsRecorded {
                 let activation = record

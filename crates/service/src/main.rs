@@ -1135,7 +1135,12 @@ async fn main() -> Result<()> {
     task_status.mark_stopped(TaskName::JsonTracingFullAppender);
     task_status.mark_stopped(TaskName::JsonTracingErrorAppender);
     shutdown.advance(ShutdownPhase::Complete);
-    supervisor.join_all().await;
+    if !supervisor.join_all_bounded().await {
+        // A pinned non-yielding task cannot be joined; exiting is the bounded
+        // fallback — durable state recovers on the next start (#544 review).
+        error!("final join bound expired with unjoined owners; exiting");
+        shutdown_timed_out = true;
+    }
 
     info!("pe-service stopped");
     if shutdown_timed_out {
