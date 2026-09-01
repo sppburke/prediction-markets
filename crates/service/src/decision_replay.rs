@@ -483,14 +483,30 @@ pub fn replay_decision_pending(
             }
         }
     }
-    // Authority vocabulary (production emitters): commit_fill_v2 outcomes are
-    // applied|existing|settled_refusal; the legacy local protocol emits
-    // committed|settled_refusal; not_read carries a typed reason.
+    // Authority is validated as the exact (kind, outcome) pair the production
+    // emitters produce (#544 review round 5): commit_fill_v2 →
+    // applied|existing (fill) | settled_refusal (non-fill); the legacy
+    // paper_state_sqlite protocol → committed (fill) | settled_refusal
+    // (non-fill); not_read
+    // carries a typed reason and is always non-fill. Unknown kinds reject.
+    let authority_kind = post_boundary.body.authority.kind.as_str();
     let authority_outcome = post_boundary.body.authority.outcome.as_str();
-    let fill_consistent = matches!(authority_outcome, "applied" | "existing" | "committed");
-    let authority_contradicts =
-        (disposition == "fill" && !fill_consistent) || (disposition != "fill" && fill_consistent);
-    if authority_contradicts {
+    let is_fill = disposition == "fill";
+    let authority_valid = match authority_kind {
+        "commit_fill_v2" => match authority_outcome {
+            "applied" | "existing" => is_fill,
+            "settled_refusal" => !is_fill,
+            _ => false,
+        },
+        "paper_state_sqlite" => match authority_outcome {
+            "committed" => is_fill,
+            "settled_refusal" => !is_fill,
+            _ => false,
+        },
+        "not_read" => !is_fill,
+        _ => false,
+    };
+    if !authority_valid {
         return Err(ReplayDecisionError::AuthorityBinding);
     }
     Ok(ReplayedDecision {

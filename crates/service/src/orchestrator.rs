@@ -1586,10 +1586,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .as_ref()
             .map(|continuation| continuation.frozen_basis.win_rate_p)
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
-        let sizing_bankroll = pending
-            .as_ref()
-            .map(|continuation| continuation.frozen_basis.bankroll)
-            .unwrap_or(self.bankroll);
+        let sizing_bankroll = match pending.as_ref() {
+            Some(continuation) => continuation.frozen_basis.bankroll,
+            None => self.bankroll,
+        };
         let gate_evidence = match self.plan_impact_gate(&signal, sizing_bankroll).await {
             Ok(outcome) => outcome,
             Err(failure) => {
