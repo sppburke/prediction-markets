@@ -371,6 +371,7 @@ async fn ac_wt_rpc_first_then_sqlite_mirror() {
         EventSeq(0),
         &sup_row,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -407,6 +408,7 @@ async fn ac_fail_closed_leaves_sqlite_untouched() {
         &record,
         EventSeq(0),
         &sup_row,
+        None,
         None,
     )
     .await;
@@ -479,6 +481,7 @@ async fn ac_walk_revisits_earlier_failed_frame_after_later_success() {
         EventSeq(0),
         &s0,
         None,
+        None,
     )
     .await;
     assert!(err.is_err());
@@ -491,6 +494,7 @@ async fn ac_walk_revisits_earlier_failed_frame_after_later_success() {
         &r1,
         EventSeq(1),
         &s1,
+        None,
         None,
     )
     .await
@@ -615,6 +619,7 @@ async fn ac_ambiguous_apply_converges_on_canonical_row() {
         EventSeq(0),
         &s0,
         None,
+        None,
     )
     .await;
     assert!(err.is_err(), "ambiguous failure surfaces as an error");
@@ -631,6 +636,7 @@ async fn ac_ambiguous_apply_converges_on_canonical_row() {
         &r0b,
         EventSeq(0),
         &s0b,
+        None,
         None,
     )
     .await
@@ -677,9 +683,19 @@ async fn ac_runtime_settled_refusal_writes_disposition() {
     let (r0, s0) = fill_pair(&wf_key(0), Side::Buy, 10, dec!(0.40), 0);
     let src = SourceTradeId("s0".to_string());
 
-    let ret = commit_fill_authoritative(&fake, &db, &src, &leader(), &r0, EventSeq(0), &s0, None)
-        .await
-        .unwrap();
+    let ret = commit_fill_authoritative(
+        &fake,
+        &db,
+        &src,
+        &leader(),
+        &r0,
+        EventSeq(0),
+        &s0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(ret, AuthoritativeFillOutcome::RefusedSettled(dec!(1000)));
     assert!(db.is_seen(&src).unwrap());
     assert_eq!(db.fills_count().unwrap(), 0);
@@ -703,6 +719,7 @@ async fn ac_existing_key_wins_over_later_settlement() {
         EventSeq(0),
         &s0,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -717,6 +734,7 @@ async fn ac_existing_key_wins_over_later_settlement() {
         &r0,
         EventSeq(1),
         &s0,
+        None,
         None,
     )
     .await
@@ -824,6 +842,7 @@ async fn ac_parity_fake_matches_paper_state_over_fill_mix() {
             EventSeq(seq),
             &sup_row,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -866,6 +885,7 @@ async fn ac_dispatch_flip_rides_the_local_mirror_transaction() {
             dispatch_id: &record.idempotency_key,
             paper_outcome: "fill",
         }),
+        None,
     )
     .await
     .unwrap();

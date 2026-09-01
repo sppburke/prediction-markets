@@ -106,7 +106,8 @@ impl AppliedWatchlistCapacity {
 }
 
 /// Paper fill-price mode (#486).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum FillMode {
     #[default]
     ClobBestAsk,
@@ -141,7 +142,7 @@ pub struct ConfigRow {
 
 /// The exact 17-key hot snapshot. It deliberately contains no revision/hash field; the one
 /// canonical applied hash is process status derived from these actual values.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     pub active_watchlist_size: usize,
     pub mode: String,

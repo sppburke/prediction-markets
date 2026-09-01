@@ -30,6 +30,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::decision_replay::{
+    AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
+};
+use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pending_evidence};
 use crate::supabase_reader::auth_token;
 use crate::supabase_sink::{SupabaseFillRow, supabase_fill_from};
 
@@ -587,27 +591,52 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
     seq: EventSeq,
     sup_row: &SupabaseFillRow,
     flip: Option<pe_paper_state::DispatchFlip<'_>>,
+    pending_decision: Option<&DecisionEvidenceAccumulator>,
 ) -> Result<AuthoritativeFillOutcome, SupabaseStateError> {
     // #510: snapshot the watermark BEFORE the external mutation — a getter failure fails
     // the fill closed here, never after the RPC has already debited Supabase.
     let wm_before = paper_state.last_supabase_applied_event_seq()?;
     let outcome = supabase.commit_fill_v2(sup_row).await?;
+    let pending = match &outcome {
+        FillV2Outcome::Applied { bankroll, row } => render_pending_evidence(
+            pending_decision,
+            AuthorityEvidence::commit_fill_v2("applied", *bankroll),
+            recorded_fill_terminal(&row.record, row.event_seq),
+        ),
+        FillV2Outcome::Existing { bankroll, row } => render_pending_evidence(
+            pending_decision,
+            AuthorityEvidence::commit_fill_v2("existing", *bankroll),
+            recorded_fill_terminal(&row.record, row.event_seq),
+        ),
+        FillV2Outcome::Settled { bankroll } => render_pending_evidence(
+            pending_decision,
+            AuthorityEvidence::commit_fill_v2("settled_refusal", *bankroll),
+            TerminalDispositionEvidence::settled_refusal(),
+        ),
+    }
+    .map_err(|error| {
+        SupabaseStateError::Corrupt(format!(
+            "encode decision_pending authority evidence: {error}"
+        ))
+    })?;
     // #508 round-4: the local disposition surfaces and retries IN-PROCESS (bounded); the
     // durable backstop is the boot frame-walk (the frozen watermark marks the frame pending).
     let mut local = Ok(());
     for attempt in 1u32..=3 {
         local = match &outcome {
             FillV2Outcome::Applied { bankroll, row }
-            | FillV2Outcome::Existing { bankroll, row } => paper_state.commit_fill_canonical(
-                Some(source_trade_id),
-                Some(leader),
-                &row.record,
-                row.event_seq,
-                seq,
-                *bankroll,
-                flip,
-            ),
-            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill(
+            | FillV2Outcome::Existing { bankroll, row } => paper_state
+                .commit_fill_canonical_pending(
+                    Some(source_trade_id),
+                    Some(leader),
+                    &row.record,
+                    row.event_seq,
+                    seq,
+                    *bankroll,
+                    flip,
+                    pending.as_ref().map(pending_terminal),
+                ),
+            FillV2Outcome::Settled { .. } => paper_state.commit_refused_fill_pending(
                 source_trade_id,
                 Some(leader),
                 seq,
@@ -615,6 +644,7 @@ pub async fn commit_fill_authoritative<S: SupabaseStateTrait + ?Sized>(
                     dispatch_id: f.dispatch_id,
                     paper_outcome: "no_fill:market_settled",
                 }),
+                pending.as_ref().map(pending_terminal),
             ),
         };
         match &local {
@@ -790,10 +820,37 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
                 Ok(outcome) => {
                     resolved += 1;
                     let trade_id = sup.source_trade_id.clone().map(SourceTradeId);
+                    let pending_row = match trade_id.as_ref() {
+                        Some(id) => paper_state
+                            .open_decision_pending()?
+                            .into_iter()
+                            .find(|row| &row.source_trade_id == id),
+                        None => None,
+                    };
+                    let pending_decision = pending_row
+                        .as_ref()
+                        .map(DecisionEvidenceAccumulator::from_pending_checkpoint)
+                        .transpose()
+                        .map_err(|error| {
+                            SupabaseStateError::Corrupt(format!(
+                                "recover decision_pending checkpoint at seq {}: {error}",
+                                seq.0
+                            ))
+                        })?;
                     match outcome {
-                        FillV2Outcome::Applied { bankroll, row }
-                        | FillV2Outcome::Existing { bankroll, row } => paper_state
-                            .commit_fill_canonical(
+                        FillV2Outcome::Applied { bankroll, row } => {
+                            let pending = render_pending_evidence(
+                                pending_decision.as_ref(),
+                                AuthorityEvidence::commit_fill_v2("applied", bankroll),
+                                recorded_fill_terminal(&row.record, row.event_seq),
+                            )
+                            .map_err(|error| {
+                                SupabaseStateError::Corrupt(format!(
+                                    "render recovered decision evidence at seq {}: {error}",
+                                    seq.0
+                                ))
+                            })?;
+                            paper_state.commit_fill_canonical_pending(
                                 trade_id.as_ref(),
                                 None,
                                 &row.record,
@@ -801,9 +858,53 @@ pub async fn resolve_event_frames<S: SupabaseStateTrait + ?Sized>(
                                 seq,
                                 bankroll,
                                 None,
-                            ),
-                        FillV2Outcome::Settled { .. } => match trade_id.as_ref() {
-                            Some(id) => paper_state.commit_refused_fill(id, None, seq, None),
+                                pending.as_ref().map(pending_terminal),
+                            )
+                        }
+                        FillV2Outcome::Existing { bankroll, row } => {
+                            let pending = render_pending_evidence(
+                                pending_decision.as_ref(),
+                                AuthorityEvidence::commit_fill_v2("existing", bankroll),
+                                recorded_fill_terminal(&row.record, row.event_seq),
+                            )
+                            .map_err(|error| {
+                                SupabaseStateError::Corrupt(format!(
+                                    "render recovered decision evidence at seq {}: {error}",
+                                    seq.0
+                                ))
+                            })?;
+                            paper_state.commit_fill_canonical_pending(
+                                trade_id.as_ref(),
+                                None,
+                                &row.record,
+                                row.event_seq,
+                                seq,
+                                bankroll,
+                                None,
+                                pending.as_ref().map(pending_terminal),
+                            )
+                        }
+                        FillV2Outcome::Settled { bankroll } => match trade_id.as_ref() {
+                            Some(id) => {
+                                let pending = render_pending_evidence(
+                                    pending_decision.as_ref(),
+                                    AuthorityEvidence::commit_fill_v2("settled_refusal", bankroll),
+                                    TerminalDispositionEvidence::settled_refusal(),
+                                )
+                                .map_err(|error| {
+                                    SupabaseStateError::Corrupt(format!(
+                                        "render recovered refusal evidence at seq {}: {error}",
+                                        seq.0
+                                    ))
+                                })?;
+                                paper_state.commit_refused_fill_pending(
+                                    id,
+                                    None,
+                                    seq,
+                                    None,
+                                    pending.as_ref().map(pending_terminal),
+                                )
+                            }
                             // A `wf|` key always embeds the trade id; defensive.
                             None => Ok(()),
                         },

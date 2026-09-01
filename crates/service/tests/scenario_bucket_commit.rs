@@ -11,12 +11,14 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
     SourceTimestamp, VenueMarketId, WalletAddress,
 };
-use pe_paper_state::{
-    DecisionPendingState, NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord,
-};
+use pe_paper_state::{DecisionPendingState, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::{PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
     BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2,
+};
+use pe_service::decision_replay::{
+    AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
+    DecisionPostBoundaryEvidenceBody, TerminalDispositionEvidence, replay_decision_pending,
 };
 use pe_service::paper_recovery::build_leader_ledger;
 use pe_source_polymarket_public::{
@@ -127,7 +129,9 @@ fn combo_effect(activity_type: &str, transaction_hash: &str, epoch: i64) -> Acti
 
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
     BucketDecisionContext {
-        applied_configuration_hash: "config-v2".to_owned(),
+        applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
+            &pe_service::config::ServiceConfig::default(),
+        ),
         decision_inputs_json: "{\"source_window\":\"complete\"}".to_owned(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),
@@ -237,6 +241,11 @@ fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
     let frozen = DecisionContinuationV2::from_durable(&row).unwrap();
     assert_eq!(frozen.share_amount.atomic(), 4_000_000);
     assert_eq!(frozen.price.0, rust_decimal::Decimal::new(5, 1));
+    assert_eq!(
+        frozen.applied_configuration_hash,
+        frozen.applied_configuration.canonical_hash(),
+        "the pending boundary stores the real canonical hash of its full hot snapshot"
+    );
 }
 
 #[test]
@@ -393,24 +402,38 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
         let trade = frozen.incoming_trade().unwrap();
         assert_eq!(trade.source_trade_id, pending.source_trade_id);
         assert_eq!(trade.contracts, frozen.share_amount);
-        let leader = before
-            .iter()
-            .find(|row| {
-                row.wallet == trade.wallet
-                    && row.market_id == trade.market_id
-                    && row.outcome_id == trade.outcome_id
-            })
-            .unwrap();
+        let terminal = TerminalDispositionEvidence {
+            disposition: "no_copy:test_terminal".to_owned(),
+            reason: "test_terminal".to_owned(),
+            fill: None,
+            dispatch_id: None,
+        };
+        let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
+            version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
+            owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
+            source_trade_id: pending.source_trade_id.clone(),
+            applied_configuration_hash: frozen.applied_configuration_hash.clone(),
+            market_end: None,
+            market_price: None,
+            book: None,
+            clocks: vec![DecisionClockEvidence {
+                purpose: "terminal_transition".to_owned(),
+                unix_millis: 301_000,
+            }],
+            authority: AuthorityEvidence {
+                kind: "not_read".to_owned(),
+                outcome: "test_terminal".to_owned(),
+                bankroll: None,
+            },
+            terminal,
+        })
+        .unwrap();
         restarted
-            .commit_seen_no_copy(
+            .close_decision_pending(
                 &pending.source_trade_id,
-                leader,
-                &NoCopyDisposition {
-                    provenance: "reconciled_rest".to_owned(),
-                    age_secs: 1,
-                    reason: "test_terminal".to_owned(),
-                    recorded_at_unix: 301,
-                },
+                &serde_json::to_string(&evidence).unwrap(),
+                "no_copy:test_terminal",
+                301,
             )
             .unwrap();
     }
@@ -421,6 +444,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
         row.state == DecisionPendingState::Terminal
             && row.terminal_disposition.as_deref() == Some("no_copy:test_terminal")
             && row.post_commit_inputs_json.contains("source_log")
+            && replay_decision_pending(row).is_ok()
     }));
     assert_eq!(restarted.leader_positions().unwrap(), before);
 }

@@ -24,23 +24,33 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
-    BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
-    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    BasisPoints, LeaderAction, MarketId, OutcomeId, Price, ProbabilityPpm, ReceivedAt,
+    ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
+    VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{
+    ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
+    LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
+};
 use pe_position_ledger::PositionLedger;
+use pe_service::bucket_commit::{BucketDecisionContext, DecisionContinuationV2};
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
+use pe_service::decision_replay::replay_decision_pending;
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::runtime_config::{FillMode, LiveRuntimeConfig, RuntimeConfig};
-use pe_source_polymarket_public::FixtureFetcher;
+use pe_source_polymarket_public::{
+    ActivityAggregate, ActivityParseContext, ActivityTransport, FixtureFetcher,
+    parse_activity_response,
+};
 use pe_strategy_winner_follow::{
     ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
     WinnerFollowConfig, WinnerFollowStrategy,
@@ -50,7 +60,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 // ── Helpers (mirror scenario_execution_gates) ───────────────────────────────────
 
@@ -104,15 +114,138 @@ fn entry_trade(id: &str, hex: &str, price: Decimal) -> IncomingTrade {
 }
 
 fn mid_cache_for(hex: &str, price: &str) -> MidPriceCache<FixtureFetcher> {
+    mid_cache_for_markets(&[(hex, price)])
+}
+
+fn mid_cache_for_markets(markets: &[(&str, &str)]) -> MidPriceCache<FixtureFetcher> {
     const BASE: &str = "http://gamma.test";
     let mut fx = HashMap::new();
-    let url = format!("{BASE}/markets?condition_ids={hex}&limit=500");
-    // clobTokenIds (outcome i → "{hex}-{i}") lets the price-impact gate resolve the /book token.
-    let body = format!(
-        r#"[{{"conditionId":"{hex}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{hex}-0\",\"{hex}-1\"]"}}]"#
-    );
-    fx.insert(url, body.into_bytes());
+    for (hex, price) in markets {
+        let url = format!("{BASE}/markets?condition_ids={hex}&limit=500");
+        // clobTokenIds (outcome i → "{hex}-{i}") lets the price-impact gate resolve the
+        // exact `/book` request token.
+        let body = format!(
+            r#"[{{"conditionId":"{hex}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{hex}-0\",\"{hex}-1\"]"}}]"#
+        );
+        fx.insert(url, body.into_bytes());
+    }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
+}
+
+fn install_pending(
+    paper_state: &PaperStateDb,
+    market_id: MarketId,
+    applied_configuration: RuntimeConfig,
+) -> SourceTradeId {
+    let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
+    let semantic_revision = "frozen-config-a".to_owned();
+    let source_epoch = 1_700_000_000;
+    let continuation = DecisionContinuationV2 {
+        version: 2,
+        source_trade_id: source_trade_id.clone(),
+        semantic_revision: semantic_revision.clone(),
+        transaction_hash: "0xfrozen-a".to_owned(),
+        wallet: leader_wallet(),
+        source_epoch,
+        market_id: market_id.clone(),
+        outcome_id: OutcomeId(0),
+        side: Side::Buy,
+        price: Price(dec!(0.60)),
+        share_amount: ShareAmount::from_whole(100).unwrap(),
+        provenance: TradeProvenance::RestPoll,
+        pre_bucket_action: LeaderAction::Entry,
+        reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        action_confidence_ppm: ProbabilityPpm(1_000_000),
+        gate_result: "admitted".to_owned(),
+        applied_configuration_hash: applied_configuration.canonical_hash(),
+        applied_configuration,
+        decision_inputs: serde_json::json!({"fixed_end": source_epoch + 10, "pages": 1}),
+    };
+    paper_state
+        .commit_activity_bucket(&ActivityBucketCommit {
+            wallet: leader_wallet(),
+            source_epoch,
+            dispositions: vec![ActivityDispositionRecord {
+                source_trade_id: source_trade_id.clone(),
+                transaction_hash: continuation.transaction_hash.clone(),
+                wallet: leader_wallet(),
+                source_epoch,
+                semantic_revision: semantic_revision.clone(),
+                activity_type: "TRADE".to_owned(),
+                disposition: "decision_pending".to_owned(),
+                proof_json: serde_json::json!({"bucket_epoch": source_epoch}).to_string(),
+                no_copy: None,
+            }],
+            leader_positions: vec![LeaderPositionRow {
+                wallet: leader_wallet(),
+                market_id: market_id.clone(),
+                outcome_id: OutcomeId(0),
+                long_contracts: ShareAmount::from_whole(100).unwrap(),
+                short_contracts: ShareAmount::ZERO,
+            }],
+            gate_results: vec![EntryGateResultRecord {
+                source_trade_id: source_trade_id.clone(),
+                wallet: leader_wallet(),
+                market_id: market_id.clone(),
+                source_epoch,
+                result: "admitted".to_owned(),
+                history_consumed: true,
+            }],
+            history_effects: vec![MarketHistoryRecord {
+                wallet: leader_wallet(),
+                market_id,
+                first_epoch: source_epoch,
+                source_trade_id: source_trade_id.clone(),
+            }],
+            history_status: Some(WalletHistoryStatusRecord {
+                wallet: leader_wallet(),
+                complete: true,
+                proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+                updated_at_unix: source_epoch,
+            }),
+            pending: vec![DecisionPendingRecord {
+                source_trade_id: source_trade_id.clone(),
+                semantic_revision,
+                wallet: leader_wallet(),
+                source_epoch,
+                frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+                updated_at_unix: source_epoch,
+            }],
+            fence: None,
+            advance_cursor: true,
+        })
+        .unwrap();
+    source_trade_id
+}
+
+fn pending_aggregate(market_id: &str, source_epoch: i64) -> ActivityAggregate {
+    let body = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "timestamp": source_epoch,
+        "conditionId": market_id,
+        "type": "TRADE",
+        "size": "100.000000",
+        "usdcSize": "60.000000",
+        "transactionHash": "0xin-process-frozen-a",
+        "price": "0.600000",
+        "asset": "token-0",
+        "side": "BUY",
+        "outcomeIndex": 0,
+        "outcome": "Yes",
+        "isCombo": false,
+    }]))
+    .unwrap();
+    let observed = OffsetDateTime::from_unix_timestamp(source_epoch + 1).unwrap();
+    let context = ActivityParseContext {
+        source_id: SourceId("polymarket-data-api".to_owned()),
+        observed_at: SourceTimestamp(observed),
+        received_at: ReceivedAt(observed),
+        transport: ActivityTransport::Rest,
+    };
+    let window = parse_activity_response(&body, leader_wallet(), &context).unwrap();
+    let mut aggregates = window.aggregates().unwrap();
+    assert_eq!(aggregates.len(), 1);
+    aggregates.remove(0)
 }
 
 fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
@@ -255,6 +388,258 @@ async fn hot_snapshot_never_overwrites_running_bankroll() {
     println!("PASS: hot runtime snapshot has no bankroll writer ({bankroll})");
 }
 
+/// A boot continuation is evaluated under the complete snapshot frozen by its bucket commit,
+/// while the next new decision reads the current live snapshot. The terminal evidence replays
+/// to the exact durable bytes and binds back to configuration A's canonical hash.
+#[tokio::test]
+async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
+    const FROZEN_MARKET: &str = "0xfrozen-config-a";
+    const FRESH_MARKET: &str = "0xfresh-config-b";
+
+    let dir = TempDir::new().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+
+    let config_a = flat_snapshot(dec!(0.90));
+    let config_b = flat_snapshot(dec!(0.50));
+    let source_trade_id = install_pending(
+        &paper_state,
+        MarketId(VenueMarketId(FROZEN_MARKET.to_owned())),
+        config_a.clone(),
+    );
+
+    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
+    trade_tx
+        .send(entry_trade("fresh-config-b", FRESH_MARKET, dec!(0.60)))
+        .await
+        .unwrap();
+    drop(trade_tx);
+
+    let books = HashMap::from([
+        (
+            format!("{FROZEN_MARKET}-0"),
+            book(&[(dec!(0.60), dec!(1000))]),
+        ),
+        (
+            format!("{FRESH_MARKET}-0"),
+            book(&[(dec!(0.60), dec!(1000))]),
+        ),
+    ]);
+    let leader_ledger = pe_service::paper_recovery::build_leader_ledger(&paper_state).unwrap();
+    let orch = Orchestrator::new(
+        trade_rx,
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
+            bankroll: Decimal::from(10_000u32),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: dec!(0.50),
+            min_fill_price: Decimal::ZERO,
+            paper_fill_haircut_bps: 500,
+            paper_fill_slippage_bps: 100,
+            fill_mode: FillMode::LeaderHaircut,
+            price_impact_cap_bps: 100,
+            entry_gate_config: CopyEntryGateConfig,
+            runtime_config: Some(LiveRuntimeConfig::new(config_b.clone())),
+            live_accounts: None,
+        },
+        WinnerFollowStrategy::new(config_b.winner_follow_config()),
+        make_dispatcher(&dir),
+        paper_state.clone(),
+        leader_ledger,
+        new_shared_health(false),
+        MarketEndCache::new(String::new()),
+        mid_cache_for_markets(&[(FROZEN_MARKET, "0.60"), (FRESH_MARKET, "0.60")]),
+        mpsc::channel(1).1,
+        None,
+        None,
+        None,
+        Arc::new(FixtureClobBookFetcher::new(books)),
+    )
+    .unwrap();
+    orch.run(std::future::pending::<()>()).await;
+
+    assert_eq!(
+        paper_fill_count(&dir),
+        1,
+        "config A must fill the pending 0.60 trade; config B must reject the fresh one"
+    );
+    let positions = paper_state.paper_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].market_id.to_string(), FROZEN_MARKET);
+
+    let row = paper_state
+        .decision_pending_history()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source_trade_id == source_trade_id)
+        .unwrap();
+    let replayed = replay_decision_pending(&row).unwrap();
+    assert_eq!(
+        replayed.continuation.applied_configuration_hash,
+        config_a.canonical_hash()
+    );
+    assert_eq!(
+        replayed.post_boundary.body.applied_configuration_hash,
+        config_a.canonical_hash()
+    );
+    assert_eq!(
+        replayed.post_boundary.body.terminal.reason,
+        "paper_fill_committed"
+    );
+    assert_eq!(replayed.post_boundary.body.terminal.disposition, "fill");
+    let recorded_book = replayed.post_boundary.body.book.as_ref().unwrap();
+    assert_eq!(
+        recorded_book.request_token_id.as_deref(),
+        Some("0xfrozen-config-a-0")
+    );
+    assert_eq!(
+        recorded_book.response_blake3.as_deref().map(str::len),
+        Some(64)
+    );
+    assert_eq!(
+        replayed.post_boundary.body.authority.kind,
+        "paper_state_sqlite"
+    );
+    assert_eq!(
+        serde_json::to_string(&replayed.post_boundary).unwrap(),
+        row.post_commit_inputs_json
+    );
+    println!(
+        "PASS: pending decision uses frozen config A; fresh trade uses live config B; replay is byte-exact"
+    );
+}
+
+/// The crash-free control path loads the row it just committed before it continues the decision.
+/// Even if the live snapshot has already advanced to B, that continuation must reinstall A.
+#[tokio::test]
+async fn in_process_bucket_continuation_uses_its_frozen_config() {
+    const FROZEN_MARKET: &str = "0xin-process-frozen-a";
+    const FRESH_MARKET: &str = "0xin-process-fresh-b";
+    const SOURCE_EPOCH: i64 = 1_700_000_100;
+
+    let dir = TempDir::new().unwrap();
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    record_complete_history(&paper_state);
+
+    let config_a = flat_snapshot(dec!(0.50));
+    let config_b = flat_snapshot(dec!(0.90));
+    let live_config = LiveRuntimeConfig::new(config_b.clone());
+    let books = HashMap::from([
+        (
+            format!("{FROZEN_MARKET}-0"),
+            book(&[(dec!(0.60), dec!(1000))]),
+        ),
+        (
+            format!("{FRESH_MARKET}-0"),
+            book(&[(dec!(0.60), dec!(1000))]),
+        ),
+    ]);
+    let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
+    let (control_tx, control_rx) = mpsc::channel(4);
+    let orch = Orchestrator::new(
+        trade_rx,
+        LiveWatchlist::new(make_watchlist(leader_wallet())),
+        OrchestratorConfig {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
+            bankroll: Decimal::from(10_000u32),
+            mode: ExecutionMode::Paper,
+            signal_config: SignalConfig::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: dec!(0.90),
+            min_fill_price: Decimal::ZERO,
+            paper_fill_haircut_bps: 500,
+            paper_fill_slippage_bps: 100,
+            fill_mode: FillMode::LeaderHaircut,
+            price_impact_cap_bps: 100,
+            entry_gate_config: CopyEntryGateConfig,
+            runtime_config: Some(live_config),
+            live_accounts: None,
+        },
+        WinnerFollowStrategy::new(config_b.winner_follow_config()),
+        make_dispatcher(&dir),
+        paper_state.clone(),
+        PositionLedger::new(),
+        new_shared_health(false),
+        MarketEndCache::new(String::new()),
+        mid_cache_for_markets(&[(FROZEN_MARKET, "0.60"), (FRESH_MARKET, "0.60")]),
+        control_rx,
+        None,
+        None,
+        None,
+        Arc::new(FixtureClobBookFetcher::new(books)),
+    )
+    .unwrap();
+    let run = tokio::spawn(orch.run(std::future::pending::<()>()));
+
+    let (committed, acknowledgement) = oneshot::channel();
+    control_tx
+        .send(OrchestratorControl::CommitActivityBucket {
+            aggregates: vec![pending_aggregate(FROZEN_MARKET, SOURCE_EPOCH)],
+            context: Box::new(BucketDecisionContext {
+                applied_configuration: config_a.clone(),
+                decision_inputs_json: serde_json::json!({
+                    "fixed_end": SOURCE_EPOCH + 10,
+                    "pages": 1,
+                })
+                .to_string(),
+                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                signal_config: SignalConfig::default(),
+                copy_eligible: true,
+                recorded_at_unix: SOURCE_EPOCH + 2,
+                observation_provenance: HashMap::new(),
+                no_copy_dispositions: HashMap::new(),
+                history_status: None,
+            }),
+            committed,
+        })
+        .await
+        .unwrap();
+    let commit = acknowledgement.await.unwrap().unwrap();
+    assert_eq!(commit.pending.len(), 1);
+    let pending_id = commit.pending[0].clone();
+
+    trade_tx
+        .send(entry_trade("in-process-fresh-b", FRESH_MARKET, dec!(0.60)))
+        .await
+        .unwrap();
+    drop(trade_tx);
+    drop(control_tx);
+    run.await.unwrap();
+
+    assert_eq!(paper_fill_count(&dir), 1);
+    let positions = paper_state.paper_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].market_id.to_string(), FRESH_MARKET);
+    let row = paper_state
+        .decision_pending_history()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.source_trade_id == pending_id)
+        .unwrap();
+    let replayed = replay_decision_pending(&row).unwrap();
+    assert_eq!(
+        replayed.continuation.applied_configuration_hash,
+        config_a.canonical_hash()
+    );
+    assert_eq!(
+        replayed.post_boundary.body.terminal.reason,
+        "fill_price_at_or_above_max"
+    );
+    println!(
+        "PASS: crash-free bucket continuation uses frozen config A while the next fresh trade uses B"
+    );
+}
+
 // ── Price-impact gate (#398 WS2) — orchestrator /book end-to-end ──────────────────
 // Folded into this binary (not a separate test file) to avoid adding another heavy link target.
 
@@ -283,6 +668,7 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .iter()
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
+        response_blake3: String::new(),
         fetched_at_ms: 0,
     }
 }

@@ -335,6 +335,7 @@ fn build_orchestrator(
                             price: dec!(0.50),
                             size: dec!(10000),
                         }],
+                        response_blake3: String::new(),
                         fetched_at_ms: 0,
                     },
                 )
@@ -1732,6 +1733,9 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
     let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
     let source_epoch = 1_i64;
     let semantic_revision = "revision-v2".to_owned();
+    let applied_configuration = pe_service::runtime_config::RuntimeConfig::from_service_config(
+        &pe_service::config::ServiceConfig::default(),
+    );
     let frozen = DecisionContinuationV2 {
         version: 2,
         source_trade_id: source_trade_id.clone(),
@@ -1749,7 +1753,8 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
         gate_result: "admitted".to_owned(),
-        applied_configuration_hash: "config-v2".to_owned(),
+        applied_configuration_hash: applied_configuration.canonical_hash(),
+        applied_configuration,
         decision_inputs: serde_json::json!({"source_window":"complete"}),
     };
     paper_state

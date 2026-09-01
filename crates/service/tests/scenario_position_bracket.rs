@@ -172,7 +172,9 @@ fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommit
 
 fn context(epoch: i64) -> BucketDecisionContext {
     BucketDecisionContext {
-        applied_configuration_hash: "test".to_owned(),
+        applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
+            &pe_service::config::ServiceConfig::default(),
+        ),
         decision_inputs_json: "{}".to_owned(),
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         signal_config: Default::default(),

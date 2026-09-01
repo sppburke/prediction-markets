@@ -11,6 +11,7 @@ pub mod build_info;
 pub mod clob_book;
 pub mod config;
 pub mod config_poller;
+pub mod decision_replay;
 pub mod demotion_stat;
 pub mod dispatch_recovery;
 pub mod entry_gate;

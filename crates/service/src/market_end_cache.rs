@@ -43,6 +43,8 @@ struct GammaMarketRaw {
 pub struct MarketResolution {
     /// When the contract expires/resolves (Unix seconds), or `None` if unknown.
     pub resolution_unix: Option<i64>,
+    /// Exact Gamma field selected for the decision (`uma_end_date` or `end_date`).
+    pub source: Option<String>,
     /// UMA resolution status (`resolved`/`proposed`/…), for display.
     pub status: Option<String>,
 }
@@ -177,13 +179,16 @@ fn validated_resolution(market: &GammaMarketRaw) -> Option<MarketResolution> {
 /// Build a [`MarketResolution`] from a raw market: prefer the exact resolution
 /// (`umaEndDate`), fall back to the always-present scheduled close (`endDate`).
 fn extract(m: &GammaMarketRaw) -> MarketResolution {
-    let resolution_unix = m
-        .uma_end_date
-        .as_deref()
-        .and_then(parse_timestamp)
-        .or_else(|| m.end_date.as_deref().and_then(parse_timestamp));
+    let uma = m.uma_end_date.as_deref().and_then(parse_timestamp);
+    let end = m.end_date.as_deref().and_then(parse_timestamp);
+    let (resolution_unix, source) = match (uma, end) {
+        (Some(value), _) => (Some(value), Some("gamma.uma_end_date".to_owned())),
+        (None, Some(value)) => (Some(value), Some("gamma.end_date".to_owned())),
+        (None, None) => (None, None),
+    };
     MarketResolution {
         resolution_unix,
+        source,
         status: m.uma_resolution_status.clone(),
     }
 }
@@ -231,7 +236,9 @@ mod tests {
             uma_resolution_status: Some("proposed".into()),
         };
         // 2026-06-06T00:30:00Z (always-present scheduled close)
-        assert_eq!(extract(&m).resolution_unix, Some(1_780_705_800));
+        let resolution = extract(&m);
+        assert_eq!(resolution.resolution_unix, Some(1_780_705_800));
+        assert_eq!(resolution.source.as_deref(), Some("gamma.end_date"));
     }
 
     #[test]
@@ -267,6 +274,7 @@ mod tests {
                     None,
                     Some(MarketResolution {
                         resolution_unix: Some(1_780_705_800),
+                        source: Some("fixture".to_owned()),
                         status: Some("open".to_owned()),
                     }),
                 ]

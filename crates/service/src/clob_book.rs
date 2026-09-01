@@ -72,6 +72,9 @@ pub struct BookLevel {
 pub struct OrderBook {
     /// Ask levels `{price, size}` as returned by `/book`.
     pub asks: Vec<BookLevel>,
+    /// BLAKE3 identity of the exact `/book` response bytes. Fixture books that
+    /// were constructed as typed values use a deterministic canonical ask hash.
+    pub response_blake3: String,
     /// Client-side fetch completion time (Unix ms), stamped by the
     /// [`ClobBookFetcher`] implementations (#508 Phase A). The impact-gate
     /// planner refuses to price an order off a snapshot older than the shared
@@ -101,6 +104,7 @@ impl OrderBook {
         }
         Ok(Self {
             asks,
+            response_blake3: blake3::hash(bytes).to_hex().to_string(),
             fetched_at_ms: 0,
         })
     }
@@ -275,6 +279,17 @@ impl ClobBookFetcher for FixtureClobBookFetcher {
         if book.fetched_at_ms == 0 {
             book.fetched_at_ms = now_unix_ms();
         }
+        if book.response_blake3.is_empty() {
+            let canonical = serde_json::json!({
+                "asks": book.asks.iter().map(|level| serde_json::json!({
+                    "price": level.price.normalize().to_string(),
+                    "size": level.size.normalize().to_string(),
+                })).collect::<Vec<_>>(),
+            });
+            book.response_blake3 = blake3::hash(canonical.to_string().as_bytes())
+                .to_hex()
+                .to_string();
+        }
         Ok(book)
     }
 }
@@ -323,6 +338,11 @@ mod tests {
                     size: dec!(250.5)
                 },
             ]
+        );
+        assert_eq!(
+            book.response_blake3,
+            blake3::hash(REAL_SHAPE.as_bytes()).to_hex().to_string(),
+            "decision evidence identifies the exact response bytes"
         );
     }
 
@@ -379,6 +399,7 @@ mod tests {
                     price: dec!(0.6),
                     size: dec!(10),
                 }],
+                response_blake3: String::new(),
                 fetched_at_ms: 0,
             },
         );

@@ -33,6 +33,7 @@ async fn clob_book_fixture_roundtrip() {
                     size: dec!(250.5),
                 },
             ],
+            response_blake3: String::new(),
             fetched_at_ms: 0,
         },
     );

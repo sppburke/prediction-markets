@@ -191,6 +191,11 @@ async fn run_once(
         paper_state,
         health,
         SignalConfig::default(),
+        pe_service::runtime_config::LiveRuntimeConfig::new(
+            pe_service::runtime_config::RuntimeConfig::from_service_config(
+                &pe_service::config::ServiceConfig::default(),
+            ),
+        ),
         obligations,
     )
     .with_clock(Arc::new(move || now))
@@ -321,6 +326,11 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
             paper_state,
             health,
             SignalConfig::default(),
+            pe_service::runtime_config::LiveRuntimeConfig::new(
+                pe_service::runtime_config::RuntimeConfig::from_service_config(
+                    &pe_service::config::ServiceConfig::default(),
+                ),
+            ),
             ReconciliationObligations::default(),
         )
         .with_clock(Arc::new(move || now))

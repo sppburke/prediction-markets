@@ -250,6 +250,15 @@ pub enum DecisionPendingState {
     Terminal,
 }
 
+/// Caller-rendered versioned evidence attached to a terminal pending-decision
+/// transition. The paper-state crate owns atomicity; the service tier owns the
+/// external-input schema so dependency direction stays intact.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingTerminalEvidence<'a> {
+    pub post_commit_inputs_json: &'a str,
+    pub updated_at_unix: i64,
+}
+
 /// Monotonic durable wallet fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletFenceRecord {
@@ -553,6 +562,16 @@ impl PaperStateDb {
         leader: &LeaderPositionRow,
         flip: Option<DispatchFlip<'_>>,
     ) -> Result<(), PaperStateError> {
+        self.commit_seen_no_fill_with_flip_pending(source_trade_id, leader, flip, None)
+    }
+
+    pub fn commit_seen_no_fill_with_flip_pending(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        flip: Option<DispatchFlip<'_>>,
+        pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
@@ -560,7 +579,7 @@ impl PaperStateDb {
         if let Some(flip) = flip {
             tx_flip_dispatch_ready(&tx, flip)?;
         }
-        tx_terminalize_pending(&tx, source_trade_id, "no_fill")?;
+        tx_terminalize_pending(&tx, source_trade_id, "no_fill", pending)?;
         tx.commit()?;
         Ok(())
     }
@@ -575,6 +594,16 @@ impl PaperStateDb {
         leader: &LeaderPositionRow,
         disposition: &NoCopyDisposition,
     ) -> Result<(), PaperStateError> {
+        self.commit_seen_no_copy_with_pending(source_trade_id, leader, disposition, None)
+    }
+
+    pub fn commit_seen_no_copy_with_pending(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        disposition: &NoCopyDisposition,
+        pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
@@ -584,6 +613,7 @@ impl PaperStateDb {
             &tx,
             source_trade_id,
             &format!("no_copy:{}", disposition.reason),
+            pending,
         )?;
         tx.commit()?;
         Ok(())
@@ -1254,6 +1284,44 @@ impl PaperStateDb {
         Ok(open)
     }
 
+    /// Persist the complete post-boundary decision inputs before a paper-log or
+    /// external-authority side effect. Terminal rows are immutable and make a
+    /// repeated checkpoint a no-op; a missing row is an invariant conflict.
+    pub fn checkpoint_decision_pending(
+        &self,
+        source_trade_id: &SourceTradeId,
+        post_commit_inputs_json: &str,
+        updated_at_unix: i64,
+    ) -> Result<(), PaperStateError> {
+        serde_json::from_str::<serde_json::Value>(post_commit_inputs_json)?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM decision_pending WHERE source_trade_id = ?1",
+                params![source_trade_id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match state.as_deref() {
+            Some("open") => {
+                tx.execute(
+                    "UPDATE decision_pending SET post_commit_inputs_json = ?2, \
+                         updated_at_unix = ?3 WHERE source_trade_id = ?1 AND state = 'open'",
+                    params![source_trade_id.0, post_commit_inputs_json, updated_at_unix],
+                )?;
+            }
+            Some("terminal") => {}
+            _ => {
+                return Err(PaperStateError::DecisionPendingConflict(
+                    source_trade_id.0.clone(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record the post-commit inputs and terminal transition. A same-value retry
     /// is idempotent; a different terminal replay fails closed (#544 revision 3).
     pub fn close_decision_pending(
@@ -1458,6 +1526,28 @@ impl PaperStateDb {
         fill_seq: EventSeq,
         flip: Option<DispatchFlip<'_>>,
     ) -> Result<FillCommitOutcome, PaperStateError> {
+        self.commit_fill_with_flip_pending(
+            source_trade_id,
+            leader,
+            fill,
+            fill_seq,
+            flip,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_fill_with_flip_pending(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: &LeaderPositionRow,
+        fill: &FillRecord,
+        fill_seq: EventSeq,
+        flip: Option<DispatchFlip<'_>>,
+        fill_pending: Option<PendingTerminalEvidence<'_>>,
+        settled_pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<FillCommitOutcome, PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
@@ -1477,7 +1567,12 @@ impl PaperStateDb {
                 )?;
             }
             tx_set_last_applied_max(&tx, fill_seq)?;
-            tx_terminalize_pending(&tx, source_trade_id, "no_fill:market_settled")?;
+            tx_terminalize_pending(
+                &tx,
+                source_trade_id,
+                "no_fill:market_settled",
+                settled_pending,
+            )?;
             let bankroll = tx_read_bankroll(&tx)?;
             tx.commit()?;
             return Ok(FillCommitOutcome::RefusedSettled(bankroll));
@@ -1495,7 +1590,7 @@ impl PaperStateDb {
         if let Some(flip) = flip {
             tx_flip_dispatch_ready(&tx, flip)?;
         }
-        tx_terminalize_pending(&tx, source_trade_id, "fill")?;
+        tx_terminalize_pending(&tx, source_trade_id, "fill", fill_pending)?;
         tx.commit()?;
         Ok(FillCommitOutcome::Applied(bankroll))
     }
@@ -1513,6 +1608,17 @@ impl PaperStateDb {
         seq: EventSeq,
         flip: Option<DispatchFlip<'_>>,
     ) -> Result<(), PaperStateError> {
+        self.commit_refused_fill_pending(source_trade_id, leader, seq, flip, None)
+    }
+
+    pub fn commit_refused_fill_pending(
+        &self,
+        source_trade_id: &SourceTradeId,
+        leader: Option<&LeaderPositionRow>,
+        seq: EventSeq,
+        flip: Option<DispatchFlip<'_>>,
+        pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
@@ -1523,7 +1629,7 @@ impl PaperStateDb {
             tx_flip_dispatch_ready(&tx, flip)?;
         }
         tx_set_last_applied_max(&tx, seq)?;
-        tx_terminalize_pending(&tx, source_trade_id, "no_fill:market_settled")?;
+        tx_terminalize_pending(&tx, source_trade_id, "no_fill:market_settled", pending)?;
         tx.commit()?;
         Ok(())
     }
@@ -1546,6 +1652,30 @@ impl PaperStateDb {
         canonical_bankroll: Decimal,
         flip: Option<DispatchFlip<'_>>,
     ) -> Result<(), PaperStateError> {
+        self.commit_fill_canonical_pending(
+            source_trade_id,
+            leader,
+            fill,
+            canonical_seq,
+            current_seq,
+            canonical_bankroll,
+            flip,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_fill_canonical_pending(
+        &self,
+        source_trade_id: Option<&SourceTradeId>,
+        leader: Option<&LeaderPositionRow>,
+        fill: &FillRecord,
+        canonical_seq: EventSeq,
+        current_seq: EventSeq,
+        canonical_bankroll: Decimal,
+        flip: Option<DispatchFlip<'_>>,
+        pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         if let Some(id) = source_trade_id {
@@ -1564,7 +1694,7 @@ impl PaperStateDb {
         }
         tx_set_last_applied_max(&tx, current_seq)?;
         if let Some(id) = source_trade_id {
-            tx_terminalize_pending(&tx, id, "fill")?;
+            tx_terminalize_pending(&tx, id, "fill", pending)?;
         }
         tx.commit()?;
         Ok(())
@@ -1641,6 +1771,14 @@ impl PaperStateDb {
     /// `dispatch_id` is left untouched (redelivery reuses it and never recomputes targets
     /// from current configuration) and `false` is returned.
     pub fn stage_dispatch_seed(&self, seed: &DispatchSeedRecord) -> Result<bool, PaperStateError> {
+        self.stage_dispatch_seed_pending(seed, None)
+    }
+
+    pub fn stage_dispatch_seed_pending(
+        &self,
+        seed: &DispatchSeedRecord,
+        pending: Option<PendingTerminalEvidence<'_>>,
+    ) -> Result<bool, PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let inserted = tx.execute(
@@ -1679,6 +1817,7 @@ impl PaperStateDb {
             &tx,
             &SourceTradeId(seed.source_trade_id.clone()),
             "dispatch_staged",
+            pending,
         )?;
         tx.commit()?;
         Ok(inserted)
@@ -2752,20 +2891,47 @@ fn tx_record_no_copy_disposition(
 }
 
 /// Close a bucket-applied continuation in the caller's terminal transaction.
-/// Post-boundary evidence remains in its normal versioned source/paper owners;
-/// this row records that ownership without duplicating mutable payloads (#544).
 fn tx_terminalize_pending(
     tx: &Transaction<'_>,
     source_trade_id: &SourceTradeId,
     terminal_disposition: &str,
+    pending: Option<PendingTerminalEvidence<'_>>,
 ) -> Result<(), PaperStateError> {
+    let current: Option<(String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT state, post_commit_inputs_json, terminal_disposition \
+             FROM decision_pending WHERE source_trade_id = ?1",
+            params![source_trade_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((state, _durable_json, _durable_disposition)) = current else {
+        return Ok(());
+    };
+    if state == "terminal" {
+        // `dispatch_staged` is a legitimate first terminal boundary. The later paper
+        // outcome still commits through this transaction, but must not rewrite that
+        // already-durable terminal evidence. Explicit offline-close retries retain the
+        // stricter same-value check in `close_decision_pending`.
+        return Ok(());
+    }
+    let evidence = pending.ok_or_else(|| {
+        PaperStateError::Internal(format!(
+            "terminal transition for open decision_pending {} omitted post-boundary evidence",
+            source_trade_id.0
+        ))
+    })?;
+    serde_json::from_str::<serde_json::Value>(evidence.post_commit_inputs_json)?;
     tx.execute(
         "UPDATE decision_pending SET state = 'terminal', \
-             post_commit_inputs_json = \
-                 '{\"version\":2,\"owners\":[\"source_log\",\"paper_log\"]}', \
-             terminal_disposition = ?2 \
+             post_commit_inputs_json = ?2, terminal_disposition = ?3, updated_at_unix = ?4 \
          WHERE source_trade_id = ?1 AND state = 'open'",
-        params![source_trade_id.0, terminal_disposition],
+        params![
+            source_trade_id.0,
+            evidence.post_commit_inputs_json,
+            terminal_disposition,
+            evidence.updated_at_unix
+        ],
     )?;
     Ok(())
 }
@@ -3158,6 +3324,39 @@ mod tests {
                 expected: SCHEMA_VERSION
             })
         ));
+    }
+
+    #[test]
+    fn pending_checkpoint_is_durable_while_open_and_cannot_rewrite_terminal_evidence() {
+        let (_dir, db) = db();
+        let source_trade_id = SourceTradeId("g2:checkpoint".to_owned());
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO decision_pending \
+                     (source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+                      frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
+                      updated_at_unix) \
+                 VALUES (?1, 'revision', ?2, 1, '{}', '[]', 'open', NULL, 1)",
+                params![source_trade_id.0, wallet().to_string()],
+            )
+            .unwrap();
+        }
+
+        db.checkpoint_decision_pending(&source_trade_id, "{\"checkpoint\":1}", 2)
+            .unwrap();
+        let open = db.open_decision_pending().unwrap().remove(0);
+        assert_eq!(open.post_commit_inputs_json, "{\"checkpoint\":1}");
+        assert_eq!(open.updated_at_unix, 2);
+
+        db.close_decision_pending(&source_trade_id, "{\"terminal\":1}", "fill", 3)
+            .unwrap();
+        db.checkpoint_decision_pending(&source_trade_id, "{\"checkpoint\":2}", 4)
+            .unwrap();
+        let terminal = db.decision_pending_history().unwrap().remove(0);
+        assert_eq!(terminal.post_commit_inputs_json, "{\"terminal\":1}");
+        assert_eq!(terminal.terminal_disposition.as_deref(), Some("fill"));
+        assert_eq!(terminal.updated_at_unix, 3);
     }
 
     #[test]

@@ -284,6 +284,7 @@ mod tests {
                 .iter()
                 .map(|&(price, size)| BookLevel { price, size })
                 .collect(),
+            response_blake3: String::new(),
             fetched_at_ms: 0,
         }
     }

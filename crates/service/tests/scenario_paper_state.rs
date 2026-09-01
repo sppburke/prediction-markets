@@ -179,6 +179,7 @@ async fn run_trades(
                         price: dec!(0.50),
                         size: dec!(10000),
                     }],
+                    response_blake3: String::new(),
                     fetched_at_ms: 0,
                 },
             )

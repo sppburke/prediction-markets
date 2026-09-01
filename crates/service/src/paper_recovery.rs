@@ -10,11 +10,18 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use pe_copy_signal_engine::{PositionSnapshot, PositionState};
-use pe_core_types::MarketOutcomeId;
+use pe_core_types::{MarketOutcomeId, SourceTradeId};
 use pe_event_log::Reader;
-use pe_paper_state::{FillRecord, PaperStateDb};
+use pe_paper_state::{FillRecord, FillRow, PaperStateDb};
 use pe_position_ledger::PositionLedger;
 use pe_strategy_winner_follow::PaperFill;
+
+use crate::bucket_commit::DecisionContinuationV2;
+use crate::decision_replay::{
+    AuthorityEvidence, DecisionEvidenceAccumulator, TerminalDispositionEvidence,
+};
+use crate::orchestrator::{pending_terminal, recorded_fill_terminal, render_pending_evidence};
+use crate::supabase_sink::supabase_fill_from;
 
 /// Replay event-log fills whose SQLite commit was lost to a crash (those with
 /// `seq > last_applied_event_seq`) back into `paper-state`. Returns the count newly
@@ -40,6 +47,74 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
             contracts: fill.intent.contracts.0,
             fill_price: fill.simulated_fill_price,
         };
+        let source_trade_id = i64::try_from(seq.0)
+            .ok()
+            .and_then(|event_seq| {
+                supabase_fill_from(&FillRow {
+                    idempotency_key: record.idempotency_key.clone(),
+                    market_id: record.market_id.clone(),
+                    outcome_id: record.outcome_id,
+                    side: record.side,
+                    contracts: record.contracts,
+                    fill_price: record.fill_price,
+                    event_seq,
+                })
+            })
+            .and_then(|row| row.source_trade_id)
+            .map(SourceTradeId);
+        let pending_row = match source_trade_id.as_ref() {
+            Some(id) => paper_state
+                .open_decision_pending()
+                .context("load decision_pending for paper-log recovery")?
+                .into_iter()
+                .find(|row| &row.source_trade_id == id),
+            None => None,
+        };
+        if let (Some(source_trade_id), Some(pending_row)) =
+            (source_trade_id.as_ref(), pending_row.as_ref())
+        {
+            let continuation = DecisionContinuationV2::from_durable(pending_row)
+                .context("decode pending paper-log continuation")?;
+            let evidence = DecisionEvidenceAccumulator::from_pending_checkpoint(pending_row)
+                .context("decode pending paper-log evidence checkpoint")?;
+            let leader = paper_state
+                .leader_positions()
+                .context("load pending paper-log leader mirror")?
+                .into_iter()
+                .find(|leader| {
+                    leader.wallet == continuation.wallet
+                        && leader.market_id == continuation.market_id
+                        && leader.outcome_id == continuation.outcome_id
+                })
+                .context("pending paper-log continuation has no leader mirror")?;
+            let fill_pending = render_pending_evidence(
+                Some(&evidence),
+                AuthorityEvidence::local("recovered_from_paper_log"),
+                recorded_fill_terminal(&record, seq),
+            )
+            .context("render recovered paper-log fill evidence")?;
+            let settled_pending = render_pending_evidence(
+                Some(&evidence),
+                AuthorityEvidence::local("recovered_settled_refusal"),
+                TerminalDispositionEvidence::settled_refusal(),
+            )
+            .context("render recovered paper-log refusal evidence")?;
+            let outcome = paper_state
+                .commit_fill_with_flip_pending(
+                    source_trade_id,
+                    &leader,
+                    &record,
+                    seq,
+                    None,
+                    fill_pending.as_ref().map(pending_terminal),
+                    settled_pending.as_ref().map(pending_terminal),
+                )
+                .context("commit recovered pending paper-log fill")?;
+            if matches!(outcome, pe_paper_state::FillCommitOutcome::Applied(_)) {
+                applied += 1;
+            }
+            continue;
+        }
         if paper_state.reconcile_fill(&record, seq)? {
             applied += 1;
         }

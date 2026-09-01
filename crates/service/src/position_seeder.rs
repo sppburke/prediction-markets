@@ -487,7 +487,9 @@ fn bracket_context(
     let reconstruction_quality =
         ReconstructionQuality::new(100).map_err(|_| CausalPositionError::ReconstructionQuality)?;
     Ok(BucketDecisionContext {
-        applied_configuration_hash: "causal-position-bracket-v1".to_owned(),
+        applied_configuration: crate::runtime_config::RuntimeConfig::from_service_config(
+            &crate::config::ServiceConfig::default(),
+        ),
         decision_inputs_json: serde_json::to_string(&json!({
             "fixed_end": activity.fixed_end,
             "pages": activity.pages,

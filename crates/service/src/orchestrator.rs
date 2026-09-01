@@ -18,7 +18,9 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_execution_core::{DispatchResult, ExecutionDispatcher, ExecutionError};
-use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
+use pe_paper_state::{
+    FillRecord, FillRow, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence,
+};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
 use pe_source_core::SourceStatus;
@@ -36,6 +38,10 @@ use tracing::{error, info, warn};
 
 use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV2};
 use crate::clob_book::ClobBookFetcher;
+use crate::decision_replay::{
+    AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
+    MarketPriceEvidence, TerminalDispositionEvidence, ladder_plan_blake3, replay_decision_pending,
+};
 use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
@@ -73,6 +79,92 @@ enum GatePlan {
     NothingAffordable { best_ask: Price },
 }
 
+struct GatePlanEvidence {
+    gate: GatePlan,
+    book: BookEvidence,
+    checked_at_unix_ms: u64,
+}
+
+struct GatePlanFailure {
+    reason: &'static str,
+    book: Box<BookEvidence>,
+    checked_at_unix_ms: Option<u64>,
+}
+
+fn book_failure(
+    token_id: Option<&str>,
+    outcome: &str,
+    response_blake3: Option<&str>,
+    fetched_at_unix_ms: Option<u64>,
+    reason: &str,
+) -> BookEvidence {
+    BookEvidence {
+        request_token_id: token_id.map(str::to_owned),
+        outcome: outcome.to_owned(),
+        response_blake3: response_blake3.map(str::to_owned),
+        fetched_at_unix_ms,
+        best_ask: None,
+        vwap_basis: None,
+        ladder_plan_blake3: None,
+        reason: Some(reason.to_owned()),
+    }
+}
+
+fn unix_millis(instant: OffsetDateTime) -> i64 {
+    i64::try_from(instant.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
+fn record_clock(
+    evidence: &mut Option<DecisionEvidenceAccumulator>,
+    purpose: &str,
+    instant: OffsetDateTime,
+) {
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.record_clock(purpose, unix_millis(instant));
+    }
+}
+
+pub(crate) fn render_pending_evidence(
+    evidence: Option<&DecisionEvidenceAccumulator>,
+    authority: AuthorityEvidence,
+    terminal: TerminalDispositionEvidence,
+) -> Result<Option<(String, i64)>, serde_json::Error> {
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    let terminal_at = OffsetDateTime::now_utc();
+    let mut complete = evidence.clone();
+    complete.record_clock("terminal_transition", unix_millis(terminal_at));
+    let json = complete.render(authority, terminal)?;
+    Ok(Some((json, terminal_at.unix_timestamp())))
+}
+
+pub(crate) fn pending_terminal(value: &(String, i64)) -> PendingTerminalEvidence<'_> {
+    PendingTerminalEvidence {
+        post_commit_inputs_json: &value.0,
+        updated_at_unix: value.1,
+    }
+}
+
+pub(crate) fn recorded_fill_terminal(
+    record: &FillRecord,
+    seq: EventSeq,
+) -> TerminalDispositionEvidence {
+    let side = match record.side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    };
+    TerminalDispositionEvidence::fill(
+        record.idempotency_key.clone(),
+        record.market_id.to_string(),
+        record.outcome_id.0,
+        side,
+        record.contracts,
+        record.fill_price,
+        seq,
+    )
+}
+
 /// Captured pre-admission state for exact rollback (#511): the leader ledger's
 /// pre-trade `(long, short)` for the touched key, or `None` when the trade created it.
 struct RollbackCtx {
@@ -93,6 +185,7 @@ struct ParkedFill {
     sup_row: Option<SupabaseFillRow>,
     dispatch_id: Option<String>,
     filled_key: MarketOutcomeId,
+    decision_evidence: Option<DecisionEvidenceAccumulator>,
 }
 
 /// Terminal-vs-parked result of a paper fill commit (#511).
@@ -420,6 +513,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
+        for row in paper_state
+            .decision_pending_history()
+            .map_err(|error| anyhow::anyhow!("load decision continuation history: {error}"))?
+            .into_iter()
+            .filter(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
+        {
+            replay_decision_pending(&row).map_err(|error| {
+                anyhow::anyhow!("verify terminal pending {}: {error}", row.source_trade_id)
+            })?;
+        }
         let mut pending_boot = VecDeque::new();
         let mut pending_continuations = HashMap::new();
         for row in paper_state
@@ -661,9 +764,21 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// affording no whole share both produce no order. The planner budget follows the sizing
     /// mode: `Dollar` plans within its USD notional; `Contract` caps at the requested count
     /// within the available bankroll; `Kelly` plans the full in-band depth within bankroll.
-    async fn plan_impact_gate(&self, signal: &LeaderSignal) -> Result<GatePlan, &'static str> {
-        let cap_bps =
-            u64::try_from(self.price_impact_cap_bps).map_err(|_| "impact gate cap invalid")?;
+    async fn plan_impact_gate(
+        &self,
+        signal: &LeaderSignal,
+    ) -> Result<GatePlanEvidence, GatePlanFailure> {
+        let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
+            reason: "impact gate cap invalid",
+            book: Box::new(book_failure(
+                None,
+                "not_read",
+                None,
+                None,
+                "impact gate cap invalid",
+            )),
+            checked_at_unix_ms: None,
+        })?;
         let snaps = self
             .mid_price_cache
             .fetch_snapshots(std::slice::from_ref(&signal.market_id))
@@ -673,7 +788,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .get(usize::from(signal.outcome_id.0))
                 .cloned()
         }) else {
-            return Err("price-impact book unusable: missing CLOB token (fail closed)");
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: missing CLOB token (fail closed)",
+                book: Box::new(book_failure(
+                    None,
+                    "missing_token",
+                    None,
+                    None,
+                    "outcome had no CLOB token id",
+                )),
+                checked_at_unix_ms: None,
+            });
         };
         let book = match tokio::time::timeout(
             Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
@@ -683,20 +808,74 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         {
             Ok(Ok(book)) => book,
             Ok(Err(_)) => {
-                return Err("price-impact book unusable: /book fetch failed (fail closed)");
+                return Err(GatePlanFailure {
+                    reason: "price-impact book unusable: /book fetch failed (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "fetch_failed",
+                        None,
+                        None,
+                        "/book fetch failed",
+                    )),
+                    checked_at_unix_ms: None,
+                });
             }
             Err(_) => {
-                return Err("price-impact book unusable: /book fetch timed out (fail closed)");
+                return Err(GatePlanFailure {
+                    reason: "price-impact book unusable: /book fetch timed out (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "fetch_timed_out",
+                        None,
+                        None,
+                        "/book fetch timed out",
+                    )),
+                    checked_at_unix_ms: None,
+                });
             }
         };
         let Some(ladder) = book.ladder() else {
-            return Err("price-impact book unusable: corrupt ask levels (fail closed)");
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: corrupt ask levels (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "corrupt_ladder",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "ask levels could not form an exact ladder",
+                )),
+                checked_at_unix_ms: None,
+            });
         };
         let Some(best) = ladder.first().map(|l| l.price) else {
-            return Err("price-impact book unusable: empty ask book (fail closed)");
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: empty ask book (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "empty_ladder",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "ask ladder was empty",
+                )),
+                checked_at_unix_ms: None,
+            });
         };
-        if ladder_is_stale(crate::clob_book::now_unix_ms(), book.fetched_at_ms) {
-            return Err("price-impact book unusable: stale snapshot (fail closed)");
+        let checked_at_unix_ms = crate::clob_book::now_unix_ms();
+        if ladder_is_stale(checked_at_unix_ms, book.fetched_at_ms) {
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: stale snapshot (fail closed)",
+                book: Box::new(BookEvidence {
+                    request_token_id: Some(token_id),
+                    outcome: "stale".to_owned(),
+                    response_blake3: Some(book.response_blake3),
+                    fetched_at_unix_ms: Some(book.fetched_at_ms),
+                    best_ask: Some(best.0.normalize().to_string()),
+                    vwap_basis: None,
+                    ladder_plan_blake3: None,
+                    reason: Some("snapshot exceeded the ladder age bound".to_owned()),
+                }),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            });
         }
         // Inclusive band ceiling: best × (1 + cap/10_000), clamped into the Price domain —
         // the same edge semantic as the analytics `absorbable_usd_100bps` column.
@@ -704,35 +883,108 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             * (Decimal::from(10_000u32 + u32::try_from(cap_bps).unwrap_or(10_000))
                 / Decimal::from(10_000u32)))
         .min(Decimal::ONE);
-        let ceiling =
-            Price::new(ceiling_raw).map_err(|_| "price-impact band ceiling not constructible")?;
+        let ceiling = Price::new(ceiling_raw).map_err(|_| GatePlanFailure {
+            reason: "price-impact band ceiling not constructible",
+            book: Box::new(book_failure(
+                Some(&token_id),
+                "arithmetic_failure",
+                Some(&book.response_blake3),
+                Some(book.fetched_at_ms),
+                "price-impact band ceiling not constructible",
+            )),
+            checked_at_unix_ms: Some(checked_at_unix_ms),
+        })?;
         // Planner budget from the sizing mode; 6-dp truncation never overstates the budget.
         let to_budget = |d: Decimal| {
             CollateralAmount::from_decimal_exact(
                 d.max(Decimal::ZERO)
                     .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero),
             )
-            .map_err(|_| "impact budget not constructible")
+            .map_err(|_| GatePlanFailure {
+                reason: "impact budget not constructible",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "arithmetic_failure",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "impact budget not constructible",
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            })
         };
         let (budget, max_shares) = match self.strategy.config().sizing_mode {
             SizingMode::Dollar { usd } => (to_budget(usd)?, None),
             SizingMode::Contract { contracts } => (to_budget(self.bankroll)?, Some(contracts)),
             SizingMode::Kelly => (to_budget(self.bankroll)?, None),
         };
-        let max_price = Price::new(Decimal::ONE).map_err(|_| "price domain invariant broken")?;
+        let max_price = Price::new(Decimal::ONE).map_err(|_| GatePlanFailure {
+            reason: "price domain invariant broken",
+            book: Box::new(book_failure(
+                Some(&token_id),
+                "arithmetic_failure",
+                Some(&book.response_blake3),
+                Some(book.fetched_at_ms),
+                "price domain invariant broken",
+            )),
+            checked_at_unix_ms: Some(checked_at_unix_ms),
+        })?;
         match plan_budget_buy(&ladder, budget, max_shares, Price::ZERO, max_price, ceiling) {
-            Ok(plan) => Ok(GatePlan::Planned(plan)),
+            Ok(plan) => Ok(GatePlanEvidence {
+                book: BookEvidence {
+                    request_token_id: Some(token_id),
+                    outcome: "planned".to_owned(),
+                    response_blake3: Some(book.response_blake3),
+                    fetched_at_unix_ms: Some(book.fetched_at_ms),
+                    best_ask: Some(plan.best_ask.0.normalize().to_string()),
+                    vwap_basis: plan.vwap().map(|value| value.0.normalize().to_string()),
+                    ladder_plan_blake3: Some(ladder_plan_blake3(&plan)),
+                    reason: None,
+                },
+                gate: GatePlan::Planned(plan),
+                checked_at_unix_ms,
+            }),
             // Decision 10 taxonomy (#508): a SUCCESSFUL read whose in-band depth cannot
             // absorb the paper budget is a PAPER-ONLY decision — it must never suppress
             // otherwise-admissible live targets, so it is not a shared rejection. The
             // best ask from the successful read anchors the shared band gate.
-            Err(LadderError::NothingAffordable) => {
-                Ok(GatePlan::NothingAffordable { best_ask: best })
-            }
+            Err(LadderError::NothingAffordable) => Ok(GatePlanEvidence {
+                book: BookEvidence {
+                    request_token_id: Some(token_id),
+                    outcome: "nothing_affordable".to_owned(),
+                    response_blake3: Some(book.response_blake3),
+                    fetched_at_unix_ms: Some(book.fetched_at_ms),
+                    best_ask: Some(best.0.normalize().to_string()),
+                    vwap_basis: None,
+                    ladder_plan_blake3: None,
+                    reason: Some("budget afforded no whole share".to_owned()),
+                },
+                gate: GatePlan::NothingAffordable { best_ask: best },
+                checked_at_unix_ms,
+            }),
             Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
-                Err("price-impact ladder walk failed (fail closed)")
+                Err(GatePlanFailure {
+                    reason: "price-impact ladder walk failed (fail closed)",
+                    book: Box::new(book_failure(
+                        Some(&token_id),
+                        "ladder_rejected",
+                        Some(&book.response_blake3),
+                        Some(book.fetched_at_ms),
+                        "ladder walk did not satisfy the price band",
+                    )),
+                    checked_at_unix_ms: Some(checked_at_unix_ms),
+                })
             }
-            Err(LadderError::Amount) => Err("price-impact ladder arithmetic failed (fail closed)"),
+            Err(LadderError::Amount) => Err(GatePlanFailure {
+                reason: "price-impact ladder arithmetic failed (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "arithmetic_failure",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    "ladder arithmetic failed",
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            }),
         }
     }
 
@@ -742,7 +994,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// no target exists (no aggregate; the Phase-A baseline path). A staging failure is a
     /// hard skip signalled as `Err` — the caller abandons the trade without marking it
     /// seen, so a redelivery can retry the whole admission.
-    fn stage_dispatch_if_targeted(&self, signal: &LeaderSignal) -> Result<Option<String>, ()> {
+    fn stage_dispatch_if_targeted(
+        &self,
+        signal: &LeaderSignal,
+        evidence: &mut Option<DecisionEvidenceAccumulator>,
+    ) -> Result<Option<String>, ()> {
         let Some(live) = self.live_accounts.as_ref() else {
             return Ok(None);
         };
@@ -750,7 +1006,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // #514: no NEW live aggregates while blind — a stale/never-successful accounts
         // snapshot stages nothing. Paper execution proceeds unchanged; in-flight recovery
         // and redemption reconciliation do not gate on freshness.
-        if !snapshot.is_fresh(OffsetDateTime::now_utc().unix_timestamp()) {
+        let accounts_at = OffsetDateTime::now_utc();
+        record_clock(evidence, "live_accounts_freshness", accounts_at);
+        if !snapshot.is_fresh(accounts_at.unix_timestamp()) {
             warn!(
                 "live accounts snapshot is stale; dispatch staging paused (no new live aggregates)"
             );
@@ -782,11 +1040,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             "price_impact_cap_bps": self.price_impact_cap_bps,
             "mode": format!("{:?}", self.mode),
         });
+        let staged_at = OffsetDateTime::now_utc();
+        record_clock(evidence, "dispatch_seed_created", staged_at);
         let record = pe_paper_state::DispatchSeedRecord {
             dispatch_id: dispatch_id.clone(),
             signal_json: frozen.to_string(),
             source_trade_id: signal.source_trade_id.0.clone(),
-            created_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            created_at_unix: staged_at.unix_timestamp(),
             targets,
         };
         #[cfg(feature = "scenario")]
@@ -795,7 +1055,21 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
             return Err(());
         }
-        match self.paper_state.stage_dispatch_seed(&record) {
+        let pending = match render_pending_evidence(
+            evidence.as_ref(),
+            AuthorityEvidence::not_read("dispatch_staged_before_fill_authority"),
+            TerminalDispositionEvidence::dispatch_staged(dispatch_id.clone()),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, dispatch_id = %dispatch_id, "encode dispatch decision evidence failed");
+                return Err(());
+            }
+        };
+        match self
+            .paper_state
+            .stage_dispatch_seed_pending(&record, pending.as_ref().map(pending_terminal))
+        {
             Ok(_staged_or_reused) => Ok(Some(dispatch_id)),
             Err(e) => {
                 error!(
@@ -823,6 +1097,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             self.paper_fill_slippage_bps,
         )?;
         Ok((price, FillSource::LeaderHaircut))
+    }
+
+    fn apply_runtime_snapshot(&mut self, rc: &runtime_config::RuntimeConfig) {
+        self.strategy.set_config(rc.winner_follow_config());
+        if let Some(mode) = runtime_config::parse_execution_mode(&rc.mode) {
+            self.mode = mode;
+        }
+        self.max_fill_price = rc.max_fill_price;
+        self.min_fill_price = rc.min_fill_price;
+        self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
+        self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
+        self.price_impact_cap_bps = rc.price_impact_cap_bps;
+        self.fill_mode = rc.fill_mode;
     }
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
@@ -877,20 +1164,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             },
             None => None,
         };
-        // #398 WS1: rebuild the runtime-mutable knobs from the latest Supabase config snapshot,
-        // once per event, so an admin edit takes effect within one poll with no restart. Reads
-        // only — the running `self.bankroll` (owned by the fill-commit path, #397) is untouched.
-        if let Some(rc) = self.runtime_config.as_ref().map(|live| live.snapshot()) {
-            self.strategy.set_config(rc.winner_follow_config());
-            if let Some(m) = runtime_config::parse_execution_mode(&rc.mode) {
-                self.mode = m;
-            }
-            self.max_fill_price = rc.max_fill_price;
-            self.min_fill_price = rc.min_fill_price;
-            self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
-            self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
-            self.price_impact_cap_bps = rc.price_impact_cap_bps;
-            self.fill_mode = rc.fill_mode;
+        let mut decision_evidence = pending.as_ref().map(DecisionEvidenceAccumulator::new);
+        // New decisions use the current hot snapshot. A committed continuation instead
+        // reinstalls its complete frozen 17-key snapshot before any post-boundary read.
+        let applied_runtime = pending
+            .as_ref()
+            .map(|continuation| continuation.applied_configuration.clone())
+            .or_else(|| {
+                self.runtime_config
+                    .as_ref()
+                    .map(|live| live.snapshot().as_ref().clone())
+            });
+        if let Some(rc) = applied_runtime.as_ref() {
+            self.apply_runtime_snapshot(rc);
             // NOTE: paper_fill_haircut/slippage_bps are deliberately NOT refreshed here. The
             // `PaperExecutor` that records the fill bakes them in at boot with no runtime setter,
             // so refreshing only the sizing side would desync sizing from the recorded fill after
@@ -965,19 +1251,31 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         if self.bucket_engine.is_fenced(&trade.wallet) {
             if pending.is_some() {
                 let leader = self.leader_position_row(&trade);
+                let fenced_at = self.admission_now();
+                record_clock(
+                    &mut decision_evidence,
+                    "wallet_fence_terminal_check",
+                    fenced_at,
+                );
                 let disposition = pe_paper_state::NoCopyDisposition {
                     provenance: "reconciled_rest".to_owned(),
                     age_secs: 0,
                     reason: "wallet_fenced_before_dispatch".to_owned(),
-                    recorded_at_unix: self.admission_now().unix_timestamp(),
+                    recorded_at_unix: fenced_at.unix_timestamp(),
                 };
-                if let Err(error) = self.paper_state.commit_seen_no_copy(
-                    &trade.source_trade_id,
+                self.commit_no_copy_or_rollback(
+                    &trade,
                     &leader,
                     &disposition,
-                ) {
-                    error!(%error, trade = %trade.source_trade_id, "close fenced pending continuation failed");
-                }
+                    &RollbackCtx {
+                        wallet: trade.wallet,
+                        key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
+                        prev: None,
+                        enabled: false,
+                    },
+                    None,
+                    decision_evidence.as_ref(),
+                );
                 return;
             }
             let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
@@ -1013,6 +1311,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 },
                 &rollback,
                 None,
+                decision_evidence.as_ref(),
             );
             return;
         }
@@ -1078,7 +1377,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             // Preserve version-one admission ordering: its stale bookkeeping
             // disposition predates classification/gate and remains non-consuming.
             if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
-                self.commit_no_copy_or_rollback(&trade, &leader_row, &disposition, &rb, None);
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader_row,
+                    &disposition,
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                );
                 return;
             }
             let Some(signal) = classify_trade(
@@ -1089,8 +1395,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 VenueId::polymarket(),
                 &self.signal_config,
             ) else {
-                self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
-                    .await;
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "classification_rejected",
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                )
+                .await;
                 return;
             };
             if let Some(reason) = self.bucket_engine.entry_gate().admit(&signal) {
@@ -1100,8 +1414,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     leader_price = %signal.leader_price.0,
                     "signal did not produce order",
                 );
-                self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
-                    .await;
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "entry_gate_rejected",
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                )
+                .await;
                 return;
             }
             // Legacy v1 remains an in-memory projection; v2 history was already
@@ -1114,11 +1436,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
         // Staleness is intentionally post-pending: it is a continuation input and
         // cannot cause the ledger/gate/history portion to be reapplied on restart.
-        if pending.is_some()
-            && let Some(disposition) = self.stale_no_copy(&trade, self.admission_now())
-        {
-            self.commit_no_copy_or_rollback(&trade, &leader_row, &disposition, &rb, None);
-            return;
+        if pending.is_some() {
+            let stale_at = self.admission_now();
+            record_clock(&mut decision_evidence, "initial_staleness_gate", stale_at);
+            if let Some(disposition) = self.stale_no_copy(&trade, stale_at) {
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader_row,
+                    &disposition,
+                    &rb,
+                    None,
+                    decision_evidence.as_ref(),
+                );
+                return;
+            }
         }
 
         // Resolution-horizon gate (#290, #339): copy only markets whose resolution time
@@ -1128,11 +1459,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // we cannot confirm the horizon, so we do not enter. One lookup serves both
         // bounds.
         if self.max_resolution_horizon_secs > 0 || self.min_resolution_horizon_secs > 0 {
-            let resolution_unix = self
-                .market_end_cache
-                .resolution_unix(&signal.market_id)
-                .await;
-            let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+            let resolution = self.market_end_cache.resolution(&signal.market_id).await;
+            let resolution_unix = resolution.resolution_unix;
+            if let Some(evidence) = decision_evidence.as_mut() {
+                evidence.record_market_end(MarketEndEvidence {
+                    market_id: signal.market_id.to_string(),
+                    resolution_unix,
+                    source: resolution
+                        .source
+                        .unwrap_or_else(|| "gamma.unavailable".to_owned()),
+                });
+            }
+            let horizon_at = OffsetDateTime::now_utc();
+            record_clock(
+                &mut decision_evidence,
+                "resolution_horizon_gate",
+                horizon_at,
+            );
+            let now_unix = horizon_at.unix_timestamp();
             if let Some(reason) = check_resolution_horizon(
                 resolution_unix,
                 now_unix,
@@ -1149,9 +1493,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     &trade,
                     &leader_row,
                     None,
-                    "",
+                    reason,
                     &rb,
                     Some(&signal.market_id),
+                    decision_evidence.as_ref(),
                 )
                 .await;
                 return;
@@ -1175,8 +1520,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 .get(&signal.market_id)
                 .and_then(|prices| prices.get(usize::from(signal.outcome_id.0)).copied());
             match px.and_then(|d| Price::new(d).ok()) {
-                Some(p) => p,
+                Some(p) => {
+                    if let Some(evidence) = decision_evidence.as_mut() {
+                        evidence.record_market_price(MarketPriceEvidence {
+                            market_id: signal.market_id.to_string(),
+                            outcome_id: signal.outcome_id.0,
+                            mid_price: Some(p.0.normalize().to_string()),
+                            source: "gamma.outcome_prices".to_owned(),
+                        });
+                    }
+                    p
+                }
                 None => {
+                    if let Some(evidence) = decision_evidence.as_mut() {
+                        evidence.record_market_price(MarketPriceEvidence {
+                            market_id: signal.market_id.to_string(),
+                            outcome_id: signal.outcome_id.0,
+                            mid_price: None,
+                            source: "gamma.outcome_prices_unavailable".to_owned(),
+                        });
+                    }
                     info!(
                         reason = "current market price unavailable",
                         market = %signal.market_id,
@@ -1187,9 +1550,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         &trade,
                         &leader_row,
                         None,
-                        "",
+                        "current_market_price_unavailable",
                         &rb,
                         Some(&signal.market_id),
+                        decision_evidence.as_ref(),
                     )
                     .await;
                     return;
@@ -1202,13 +1566,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // `clob_best_ask` paper mode) the VWAP fill basis. An unusable book — missing token,
         // fetch error/timeout, corrupt/empty/stale — fails CLOSED (skip), as does an in-band
         // ladder that affords no whole share.
-        let gate = match self.plan_impact_gate(&signal).await {
+        let gate_evidence = match self.plan_impact_gate(&signal).await {
             Ok(outcome) => outcome,
-            Err(reason) => {
+            Err(failure) => {
+                if let Some(evidence) = decision_evidence.as_mut() {
+                    evidence.record_book(*failure.book);
+                    if let Some(checked_at) = failure.checked_at_unix_ms {
+                        evidence.record_clock(
+                            "book_staleness_check",
+                            i64::try_from(checked_at).unwrap_or(i64::MAX),
+                        );
+                    }
+                }
                 // Shared-gate rejection (#508 Decision 10): an UNUSABLE admission quote
                 // suppresses every destination, pre-staging — no aggregate.
                 info!(
-                    reason,
+                    reason = failure.reason,
                     market = %signal.market_id,
                     outcome = signal.outcome_id.0,
                     "signal did not produce order",
@@ -1217,14 +1590,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     &trade,
                     &leader_row,
                     None,
-                    "",
+                    failure.reason,
                     &rb,
                     Some(&signal.market_id),
+                    decision_evidence.as_ref(),
                 )
                 .await;
                 return;
             }
         };
+        if let Some(evidence) = decision_evidence.as_mut() {
+            evidence.record_book(gate_evidence.book.clone());
+            evidence.record_clock(
+                "book_staleness_check",
+                i64::try_from(gate_evidence.checked_at_unix_ms).unwrap_or(i64::MAX),
+            );
+        }
+        let gate = gate_evidence.gate;
         let gate_plan: Option<&LadderPlan> = match &gate {
             GatePlan::Planned(plan) => Some(plan),
             _ => None,
@@ -1269,6 +1651,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     "",
                     &rb,
                     Some(&signal.market_id),
+                    decision_evidence.as_ref(),
                 )
                 .await;
                 return;
@@ -1289,6 +1672,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         "",
                         &rb,
                         Some(&signal.market_id),
+                        decision_evidence.as_ref(),
                     )
                     .await;
                     return;
@@ -1311,8 +1695,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 max_fill_price = %self.max_fill_price,
                 "signal did not produce order",
             );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                "fill_price_at_or_above_max",
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
             return;
         }
 
@@ -1332,8 +1724,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 min_fill_price = %self.min_fill_price,
                 "signal did not produce order",
             );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, Some(&signal.market_id))
-                .await;
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                "fill_price_below_min",
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
             return;
         }
 
@@ -1345,18 +1745,25 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // admission hold) must not turn an observation that was fresh at the early gate
         // into a stale fill or dispatch. The recorded same-session entry is deliberately
         // kept: this leader did enter the market.
-        if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+        let dispatch_stale_at = self.admission_now();
+        record_clock(
+            &mut decision_evidence,
+            "pre_dispatch_staleness_gate",
+            dispatch_stale_at,
+        );
+        if let Some(disposition) = self.stale_no_copy(&trade, dispatch_stale_at) {
             self.commit_no_copy_or_rollback(
                 &trade,
                 &leader_row,
                 &disposition,
                 &rb,
                 Some(&signal.market_id),
+                decision_evidence.as_ref(),
             );
             return;
         }
 
-        let dispatch_id = match self.stage_dispatch_if_targeted(&signal) {
+        let dispatch_id = match self.stage_dispatch_if_targeted(&signal, &mut decision_evidence) {
             Ok(id) => id,
             Err(()) => {
                 // Staging failed: abandoned unseen. #511: exact in-memory rollback so
@@ -1384,6 +1791,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 "paper_held",
                 &rb,
                 Some(&signal.market_id),
+                decision_evidence.as_ref(),
             )
             .await;
             return;
@@ -1405,6 +1813,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 "impact_absorbs_zero",
                 &rb,
                 Some(&signal.market_id),
+                decision_evidence.as_ref(),
             )
             .await;
             return;
@@ -1442,11 +1851,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     &reason,
                     &rb,
                     Some(&signal.market_id),
+                    decision_evidence.as_ref(),
                 )
                 .await;
             }
             Ok(intent) => {
-                let now = SourceTimestamp(OffsetDateTime::now_utc());
+                let execution_at = OffsetDateTime::now_utc();
+                record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
+                if let Some(evidence) = decision_evidence.as_ref() {
+                    let checkpoint = match evidence.checkpoint_json() {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => {
+                            error!(%error, trade = %trade.source_trade_id,
+                                "encode pre-dispatch decision evidence failed; stopping producer intake");
+                            self.intake_stopped = true;
+                            return;
+                        }
+                    };
+                    if let Err(error) = self.paper_state.checkpoint_decision_pending(
+                        &trade.source_trade_id,
+                        &checkpoint,
+                        execution_at.unix_timestamp(),
+                    ) {
+                        error!(%error, trade = %trade.source_trade_id,
+                            "persist pre-dispatch decision evidence failed; stopping producer intake");
+                        self.intake_stopped = true;
+                        return;
+                    }
+                }
+                let now = SourceTimestamp(execution_at);
                 // Exact recorded basis (#508): when the ladder plan priced this BUY and the
                 // strategy sized BELOW the planned quantity (Kelly/Contract clamps), re-price
                 // the VWAP over the ladder prefix actually consumed by the final count, so
@@ -1490,6 +1923,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                             "paper_dispatch_error",
                             &rb,
                             Some(&signal.market_id),
+                            decision_evidence.as_ref(),
                         )
                         .await;
                     }
@@ -1508,6 +1942,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                                     &fill,
                                     seq,
                                     dispatch_id.as_deref(),
+                                    decision_evidence.as_ref(),
                                 )
                                 .await
                         {
@@ -1582,6 +2017,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         disposition: &pe_paper_state::NoCopyDisposition,
         rb: &RollbackCtx,
         unrecord_market: Option<&MarketId>,
+        evidence: Option<&DecisionEvidenceAccumulator>,
     ) {
         info!(
             trade = %trade.source_trade_id,
@@ -1598,10 +2034,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             self.rollback_admission(rb, unrecord_market);
             return;
         }
-        if let Err(e) =
-            self.paper_state
-                .commit_seen_no_copy(&trade.source_trade_id, leader, disposition)
-        {
+        let pending = match render_pending_evidence(
+            evidence,
+            AuthorityEvidence::not_read("terminal_before_fill_authority"),
+            TerminalDispositionEvidence::no_copy(&disposition.reason),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode no-copy decision evidence failed");
+                self.rollback_admission(rb, unrecord_market);
+                return;
+            }
+        };
+        if let Err(e) = self.paper_state.commit_seen_no_copy_with_pending(
+            &trade.source_trade_id,
+            leader,
+            disposition,
+            pending.as_ref().map(pending_terminal),
+        ) {
             error!(error = %e, trade = %trade.source_trade_id,
                 "no-copy disposition commit failed; rolling back admission");
             self.rollback_admission(rb, unrecord_market);
@@ -1636,6 +2086,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// Terminal no-fill that STAYS terminal only if the seen-commit lands (#511): on
     /// commit failure the trade is abandoned unseen, so the in-memory admission effects
     /// are rolled back — the held cursor redelivers into a fresh identical admission.
+    #[allow(clippy::too_many_arguments)]
     async fn no_fill_or_rollback(
         &mut self,
         trade: &IncomingTrade,
@@ -1644,9 +2095,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         no_fill_reason: &str,
         rb: &RollbackCtx,
         unrecord_market: Option<&MarketId>,
+        evidence: Option<&DecisionEvidenceAccumulator>,
     ) {
         if self
-            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason)
+            .commit_no_fill_flipping(trade, leader, dispatch_id, no_fill_reason, evidence)
             .await
         {
             return;
@@ -1684,17 +2136,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         leader: &LeaderPositionRow,
         dispatch_id: Option<&str>,
         no_fill_reason: &str,
+        evidence: Option<&DecisionEvidenceAccumulator>,
     ) -> bool {
+        let durable_reason = if no_fill_reason.is_empty() {
+            "no_order"
+        } else {
+            no_fill_reason
+        };
+        let pending = match render_pending_evidence(
+            evidence,
+            AuthorityEvidence::not_read("terminal_before_fill_authority"),
+            TerminalDispositionEvidence::no_fill(durable_reason),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode no-fill decision evidence failed");
+                return false;
+            }
+        };
         let outcome = format!("no_fill:{no_fill_reason}");
         let flip = dispatch_id.map(|id| pe_paper_state::DispatchFlip {
             dispatch_id: id,
             paper_outcome: &outcome,
         });
         for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self.paper_state.commit_seen_no_fill_with_flip(
+            match self.paper_state.commit_seen_no_fill_with_flip_pending(
                 &trade.source_trade_id,
                 leader,
                 flip,
+                pending.as_ref().map(pending_terminal),
             ) {
                 Ok(()) => return true,
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
@@ -1735,6 +2205,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         fill: &PaperFill,
         seq: EventSeq,
         dispatch_id: Option<&str>,
+        decision_evidence: Option<&DecisionEvidenceAccumulator>,
     ) -> PaperCommitResult {
         let record = FillRecord {
             idempotency_key: fill.intent.idempotency_key.clone(),
@@ -1776,6 +2247,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 sup_row: Some(sup_row),
                 dispatch_id: dispatch_id.map(str::to_owned),
                 filled_key,
+                decision_evidence: decision_evidence.cloned(),
             };
             // Bounded in-process attempts before parking (#508 round-4 posture).
             let mut result = PaperCommitResult::Parked;
@@ -1820,14 +2292,38 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             dispatch_id: id,
             paper_outcome: "fill",
         });
+        let fill_pending = match render_pending_evidence(
+            decision_evidence,
+            AuthorityEvidence::local("committed"),
+            recorded_fill_terminal(&record, seq),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode fill decision evidence failed");
+                return PaperCommitResult::Parked;
+            }
+        };
+        let settled_pending = match render_pending_evidence(
+            decision_evidence,
+            AuthorityEvidence::local("settled_refusal"),
+            TerminalDispositionEvidence::settled_refusal(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "encode refusal decision evidence failed");
+                return PaperCommitResult::Parked;
+            }
+        };
         let mut committed = None;
         for attempt in 1..=LOCAL_COMMIT_RETRIES {
-            match self.paper_state.commit_fill_with_flip(
+            match self.paper_state.commit_fill_with_flip_pending(
                 &trade.source_trade_id,
                 leader,
                 &record,
                 seq,
                 flip,
+                fill_pending.as_ref().map(pending_terminal),
+                settled_pending.as_ref().map(pending_terminal),
             ) {
                 Ok(outcome) => {
                     committed = Some(outcome);
@@ -1893,6 +2389,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                         sup_row: None,
                         dispatch_id: dispatch_id.map(str::to_owned),
                         filled_key,
+                        decision_evidence: decision_evidence.cloned(),
                     },
                 );
                 PaperCommitResult::Parked
@@ -1917,12 +2414,36 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     dispatch_id: id,
                     paper_outcome: "fill",
                 });
-            return match self.paper_state.commit_fill_with_flip(
+            let fill_pending = match render_pending_evidence(
+                parked.decision_evidence.as_ref(),
+                AuthorityEvidence::local("committed"),
+                recorded_fill_terminal(&parked.record, parked.seq),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    error!(%error, trade = %source_trade_id, "encode parked fill evidence failed");
+                    return PaperCommitResult::Parked;
+                }
+            };
+            let settled_pending = match render_pending_evidence(
+                parked.decision_evidence.as_ref(),
+                AuthorityEvidence::local("settled_refusal"),
+                TerminalDispositionEvidence::settled_refusal(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    error!(%error, trade = %source_trade_id, "encode parked refusal evidence failed");
+                    return PaperCommitResult::Parked;
+                }
+            };
+            return match self.paper_state.commit_fill_with_flip_pending(
                 &source_trade_id,
                 &parked.leader,
                 &parked.record,
                 parked.seq,
                 flip,
+                fill_pending.as_ref().map(pending_terminal),
+                settled_pending.as_ref().map(pending_terminal),
             ) {
                 Ok(pe_paper_state::FillCommitOutcome::Applied(b)) => {
                     self.bankroll = b;
@@ -1961,6 +2482,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             parked.seq,
             sup_row,
             flip,
+            parked.decision_evidence.as_ref(),
         )
         .await
         {

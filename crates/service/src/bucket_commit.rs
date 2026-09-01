@@ -25,11 +25,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
+use crate::runtime_config::RuntimeConfig;
 
 /// Decision inputs already read before the atomic bucket commit.
 #[derive(Debug, Clone)]
 pub struct BucketDecisionContext {
-    pub applied_configuration_hash: String,
+    pub applied_configuration: RuntimeConfig,
     pub decision_inputs_json: String,
     pub reconstruction_quality: ReconstructionQuality,
     pub signal_config: SignalConfig,
@@ -56,7 +57,7 @@ pub struct BucketCommitResult {
 /// Versioned, self-contained continuation frozen by the bucket transaction.
 /// Inputs read after this boundary are appended to paper/source logs and the
 /// terminal `decision_pending` transition; offline replay never executes it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionContinuationV2 {
     pub version: u16,
     pub source_trade_id: SourceTradeId,
@@ -75,6 +76,7 @@ pub struct DecisionContinuationV2 {
     pub action_confidence_ppm: ProbabilityPpm,
     pub gate_result: String,
     pub applied_configuration_hash: String,
+    pub applied_configuration: RuntimeConfig,
     pub decision_inputs: Value,
 }
 
@@ -103,6 +105,7 @@ impl DecisionContinuationV2 {
             || frozen.source_epoch != row.source_epoch
             || frozen.gate_result != "admitted"
             || frozen.pre_bucket_action != LeaderAction::Entry
+            || frozen.applied_configuration.canonical_hash() != frozen.applied_configuration_hash
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
@@ -505,7 +508,10 @@ impl BucketCommitEngine {
                                 u32::from(context.reconstruction_quality.get()) * 10_000,
                             ),
                             gate_result: "admitted".to_owned(),
-                            applied_configuration_hash: context.applied_configuration_hash.clone(),
+                            applied_configuration_hash: context
+                                .applied_configuration
+                                .canonical_hash(),
+                            applied_configuration: context.applied_configuration.clone(),
                             decision_inputs: decision_inputs.clone(),
                         };
                         pending.push(DecisionPendingRecord {

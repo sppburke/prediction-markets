@@ -592,6 +592,7 @@ async fn main() -> Result<()> {
     let poller_ws_enabled = cfg.polymarket_activity_ws_enabled;
     let poller_copy_latency_budget_secs = cfg.copy_latency_budget_secs;
     let poller_control_tx = control_tx.clone();
+    let poller_runtime_config = live_runtime_config.clone();
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -612,6 +613,7 @@ async fn main() -> Result<()> {
             poller_paper_state,
             poller_health,
             Default::default(),
+            poller_runtime_config,
             obligations,
         )
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))

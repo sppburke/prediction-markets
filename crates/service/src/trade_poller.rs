@@ -38,6 +38,7 @@ use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
+use crate::runtime_config::LiveRuntimeConfig;
 
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
@@ -247,6 +248,7 @@ pub struct TradePoller {
     paper_state: Arc<PaperStateDb>,
     health: SharedHealth,
     signal_config: SignalConfig,
+    runtime_config: LiveRuntimeConfig,
     obligations: ReconciliationObligations,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
@@ -273,6 +275,7 @@ impl TradePoller {
         paper_state: Arc<PaperStateDb>,
         health: SharedHealth,
         signal_config: SignalConfig,
+        runtime_config: LiveRuntimeConfig,
         obligations: ReconciliationObligations,
     ) -> Self {
         Self {
@@ -285,6 +288,7 @@ impl TradePoller {
             paper_state,
             health,
             signal_config,
+            runtime_config,
             obligations,
             now: Arc::new(OffsetDateTime::now_utc),
         }
@@ -522,7 +526,7 @@ impl TradePoller {
             }
         }
         Ok(BucketDecisionContext {
-            applied_configuration_hash: "activity-reconciliation-v2".to_owned(),
+            applied_configuration: self.runtime_config.snapshot().as_ref().clone(),
             decision_inputs_json: serde_json::to_string(&serde_json::json!({
                 "fixed_end": fixed_end,
                 "pages": pages,
