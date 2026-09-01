@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+const POSITION_CHANGING_ACTIVITY_TYPES: &str = "TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION";
+
 /// Sort dimension for the `/v1/leaderboard` endpoint (API `orderBy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -124,6 +126,19 @@ pub enum PolymarketEndpoint {
         start: Option<i64>,
         offset: u32,
     },
+    /// Fixed-end position-changing activity response, starting at offset zero (#544).
+    UserPositionActivity {
+        user: String,
+        end: i64,
+        start: Option<i64>,
+    },
+    /// Strict offset page over all five position-changing activity types (#544).
+    UserPositionActivityPage {
+        user: String,
+        end: i64,
+        start: Option<i64>,
+        offset: u32,
+    },
     /// Live open positions for a single wallet via `/positions`.
     ///
     /// `redeemable`: when `Some(false)`, restrict to live (unresolved) positions.
@@ -148,6 +163,9 @@ impl PolymarketEndpoint {
             Self::Leaderboard { .. } => "leaderboard",
             Self::UserTradeActivity { .. } | Self::UserTradeActivityPage { .. } => {
                 "user_trade_activity"
+            }
+            Self::UserPositionActivity { .. } | Self::UserPositionActivityPage { .. } => {
+                "user_position_activity"
             }
             Self::CurrentPositions { .. } => "current_positions",
             Self::ClosedPositions { .. } => "closed_positions",
@@ -188,6 +206,29 @@ impl PolymarketEndpoint {
             } => {
                 let mut url = format!(
                     "{base}/activity?user={user}&type=TRADE&limit=500&offset={offset}&sortDirection=DESC&end={end}"
+                );
+                if let Some(start) = start {
+                    url.push_str(&format!("&start={start}"));
+                }
+                url
+            }
+            Self::UserPositionActivity { user, end, start } => {
+                let mut url = format!(
+                    "{base}/activity?user={user}&type={POSITION_CHANGING_ACTIVITY_TYPES}&limit=500&offset=0&sortDirection=DESC&end={end}"
+                );
+                if let Some(start) = start {
+                    url.push_str(&format!("&start={start}"));
+                }
+                url
+            }
+            Self::UserPositionActivityPage {
+                user,
+                end,
+                start,
+                offset,
+            } => {
+                let mut url = format!(
+                    "{base}/activity?user={user}&type={POSITION_CHANGING_ACTIVITY_TYPES}&limit=500&offset={offset}&sortDirection=DESC&end={end}"
                 );
                 if let Some(start) = start {
                     url.push_str(&format!("&start={start}"));
@@ -337,6 +378,35 @@ mod tests {
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
             "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE&limit=500&offset=0&start=1700000000"
+        );
+    }
+
+    #[test]
+    fn user_position_activity_has_fixed_end_and_all_five_types() {
+        let ep = PolymarketEndpoint::UserPositionActivity {
+            user: "0xabc".into(),
+            end: 1_700_000_100,
+            start: Some(1_700_000_000),
+        };
+        assert_eq!(ep.key(), "user_position_activity");
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end=1700000100&start=1700000000"
+        );
+    }
+
+    #[test]
+    fn user_position_activity_page_keeps_offset_and_optional_start() {
+        let ep = PolymarketEndpoint::UserPositionActivityPage {
+            user: "0xabc".into(),
+            end: 1_700_000_100,
+            start: None,
+            offset: 500,
+        };
+        assert_eq!(ep.key(), "user_position_activity");
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/activity?user=0xabc&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=500&sortDirection=DESC&end=1700000100"
         );
     }
 }

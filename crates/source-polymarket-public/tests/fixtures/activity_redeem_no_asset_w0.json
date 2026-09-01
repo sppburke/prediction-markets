@@ -1,0 +1,25 @@
+[
+  {
+    "proxyWallet": "0xfd9b763674cb096cacec059fcfe60ae82aae09e8",
+    "timestamp": 1788264706,
+    "conditionId": "0x988ccae2919c67319d78b69d4b3de8c21618688bcbd7c904a31a7556022ff0b4",
+    "type": "REDEEM",
+    "size": 34.997271,
+    "usdcSize": 34.997271,
+    "transactionHash": "0xd8cfe192132ee0ba59931e76397dae3e5f40ffd58200398207986963b345d4b2",
+    "price": 0,
+    "asset": "",
+    "side": "",
+    "outcomeIndex": 0,
+    "title": "Ethereum Up or Down - September 1, 8:05AM-8:10AM ET",
+    "slug": "eth-updown-5m-1788264300",
+    "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/ETH+fullsize.jpg",
+    "eventSlug": "eth-updown-5m-1788264300",
+    "outcome": "Up",
+    "name": "Sylldra",
+    "pseudonym": "Decent-Lobotomy",
+    "bio": "",
+    "profileImage": "",
+    "profileImageOptimized": ""
+  }
+]

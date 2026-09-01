@@ -1,0 +1,26 @@
+[
+  {
+    "proxyWallet": "0xc0f89d4e30b3ab40ab1f1979ebdcf8a02c39ae2e",
+    "timestamp": 1787999941,
+    "conditionId": "0x03776ebda82a0174bd3b680fd88591cf340000000000000000000000000000",
+    "type": "TRADE",
+    "size": 1037.737418,
+    "usdcSize": 111,
+    "transactionHash": "0xf25f3fdfdbdd6447e0ea395872c1bf2bb85dfb8f483cba8d230fa114cc729c8f",
+    "price": 0.1023689983,
+    "asset": "1567957651696239091719206017971399055398155065552945278851377549748624949248",
+    "side": "BUY",
+    "outcomeIndex": 0,
+    "title": "Will Racing Club Montevideo vs. Albion FC end in a draw? AND Will Racing Club Montevideo vs. Albion FC end in a draw?",
+    "slug": "",
+    "icon": "",
+    "eventSlug": "",
+    "outcome": "",
+    "name": "lukibazdonauki754",
+    "pseudonym": "Potable-Scaffold",
+    "bio": "",
+    "profileImage": "",
+    "profileImageOptimized": "",
+    "isCombo": true
+  }
+]
