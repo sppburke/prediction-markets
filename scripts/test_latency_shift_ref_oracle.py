@@ -9,6 +9,7 @@ data — a fixture SQLite database and CSVs in a temporary directory.
 from __future__ import annotations
 
 import csv
+import json
 import sqlite3
 import subprocess
 import sys
@@ -88,6 +89,16 @@ class RefOracleScenario(unittest.TestCase):
             w.writerow(POSITIONS_HEADER)
             for ts in ENTRIES:
                 w.writerow([W1, "0xm", 0, ts, 3600, 0.5, 10, 1.0, 1.0, 0.96, RESOLVED_AT])
+        self.versions = self.root / "pipeline_versions.json"
+        self.versions.write_text(json.dumps({
+            "source": "polymarket-public-activity",
+            "activity_schema": 2,
+            "activity_parser": 2,
+            "clob_resolution_schema": 2,
+            "clob_resolution_parser": 2,
+            "cache_schema": 2,
+            "configuration": 1,
+        }))
 
     def tearDown(self):
         self.dir.cleanup()
@@ -118,7 +129,8 @@ class RefOracleScenario(unittest.TestCase):
              "--out-dir", str(out),
              "--latency-shift-secs", str(SHIFT), "--fill-window-secs", str(WINDOW),
              "--half-life-days", "0", "--min-trl", "0", "--min-active-months", "0",
-             "--min-avg-per-month", "0", "--floor-tstat", "2.0", *extra],
+             "--min-avg-per-month", "0", "--floor-tstat", "2.0",
+             "--pipeline-versions-file", str(self.versions), *extra],
             capture_output=True, text=True, timeout=120)
         return r, out
 
@@ -215,6 +227,13 @@ class RefOracleScenario(unittest.TestCase):
         # No stage-2a targets file in this run: the input key must be present and null.
         self.assertIn("oracle_targets_sha256", man["inputs"])
         self.assertIsNone(man["inputs"]["oracle_targets_sha256"])
+        self.assertEqual(man["versions"]["source"], "polymarket-public-activity")
+        self.assertEqual(man["versions"]["activity_parser"], 2)
+        self.assertEqual(man["versions"]["activity_schema"], 2)
+        self.assertEqual(man["versions"]["clob_resolution_parser"], 2)
+        self.assertEqual(man["versions"]["clob_resolution_schema"], 2)
+        self.assertEqual(man["versions"]["ranker"], 1)
+        self.assertEqual(man["versions"]["configuration"], 1)
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
 
     def test_nonpositive_fill_window_is_fatal(self):

@@ -354,10 +354,14 @@ if ! flock -n 8; then
 fi
 printf '%s\n' "$$" > "$LOCK_FILE"
 CYCLE_TMP=""
+PIPELINE_VERSIONS_TMP=""
+CYCLE_CONFIG_TMP=""
+CURRENT_CYCLE_TMP=""
 cleanup_rank_and_push() {
-  if [[ -n "$CYCLE_TMP" ]]; then
-    rm -f "$CYCLE_TMP"
-  fi
+  [[ -z "$CYCLE_TMP" ]] || rm -f "$CYCLE_TMP"
+  [[ -z "$PIPELINE_VERSIONS_TMP" ]] || rm -f "$PIPELINE_VERSIONS_TMP"
+  [[ -z "$CYCLE_CONFIG_TMP" ]] || rm -f "$CYCLE_CONFIG_TMP"
+  [[ -z "$CURRENT_CYCLE_TMP" ]] || rm -f "$CURRENT_CYCLE_TMP"
 }
 trap cleanup_rank_and_push EXIT
 
@@ -398,10 +402,48 @@ validate_cycle_pointer() {
 if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
   if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
+    [[ -f "$OUT_DIR/cycle_manifest.json" && ! -L "$OUT_DIR/cycle_manifest.json" ]] || {
+      echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
+      exit 2
+    }
     echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
   else
+    PIPELINE_VERSIONS_TMP="data/eval-results/.pipeline_versions.$$.json"
+    CYCLE_CONFIG_TMP="data/eval-results/.cycle_configuration.$$.json"
+    CURRENT_CYCLE_TMP="data/eval-results/.cycle_manifest.$$.json"
+    "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_TMP"
+    "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
+      "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" "$FLOOR_TSTAT" \
+      "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" "$LATENCY_SHIFT_SECS" \
+      "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
+import json
+import sys
+
+keys = [
+    "half_life_days", "ttr_hours", "price_min", "price_max", "floor_tstat",
+    "min_trl", "min_avg_per_month", "min_active_months", "latency_shift_secs",
+    "fill_window_secs", "top_n",
+]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(dict(zip(keys, sys.argv[2:], strict=True)), handle, sort_keys=True)
+    handle.write("\n")
+PY
+    CYCLE_DAY_UTC="$(date -u +%Y-%m-%d)"
+    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
+      --db "$DB" --day-utc "$CYCLE_DAY_UTC" \
+      --versions-file "$PIPELINE_VERSIONS_TMP" \
+      --configuration-file "$CYCLE_CONFIG_TMP" --output "$CURRENT_CYCLE_TMP"
+    if "$PYTHON_BIN" scripts/rank_cycle_manifest.py unchanged \
+      --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
+      echo "RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"
+      exit 0
+    fi
     OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$OUT_DIR"
+    mv -f -- "$CURRENT_CYCLE_TMP" "$OUT_DIR/cycle_manifest.json"
+    CURRENT_CYCLE_TMP=""
+    cp -- "$PIPELINE_VERSIONS_TMP" "$OUT_DIR/pipeline_versions.json"
+    cp -- "$CYCLE_CONFIG_TMP" "$OUT_DIR/cycle_configuration.json"
     CYCLE_TMP="${CYCLE_FILE}.tmp.$$"
     printf '%s\n' "$OUT_DIR" > "$CYCLE_TMP"
     mv -f -- "$CYCLE_TMP" "$CYCLE_FILE"
@@ -430,6 +472,10 @@ POSITIONS_CSV="$OUT_DIR/qualifying_positions_72hr.csv"
 LATENCY_CSV="$OUT_DIR/latency_shift_ranked.csv"
 PUBLISH_REQUEST_FILE="$OUT_DIR/ranking_publish_request.json"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+PIPELINE_VERSIONS_FILE="$OUT_DIR/pipeline_versions.json"
+if [[ "$SKIP_RANK" == "0" && ! -f "$PIPELINE_VERSIONS_FILE" ]]; then
+  "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_FILE"
+fi
 
 # Universe source: explicit --universe <file>, else the production default --universe-from-trades
 # (every wallet with trade history; #370). The ranker enforces "exactly one of these", so pass
@@ -586,7 +632,8 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
     --min-active-months "$MIN_ACTIVE_MONTHS" \
-    --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA"
+    --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA" \
+    --pipeline-versions-file "$PIPELINE_VERSIONS_FILE"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"
 fi
@@ -657,6 +704,18 @@ if [[ "$push_rc" -ne 0 ]]; then
   exit "$push_rc"
 fi
 echo "✓ Supabase exact batch published and verified. pe-service picks it up within one refresh interval."
+
+if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
+  # The accepted watermark is captured only after the exact publication
+  # succeeds. A later same-day zero-argument invocation compares against this
+  # post-refresh state before discovery or any other cache mutation.
+  "$PE_BOOTSTRAP_BIN" pipeline-versions > "$OUT_DIR/pipeline_versions.json"
+  "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
+    --db "$DB" --day-utc "$(date -u +%Y-%m-%d)" \
+    --versions-file "$OUT_DIR/pipeline_versions.json" \
+    --configuration-file "$OUT_DIR/cycle_configuration.json" \
+    --output "$OUT_DIR/accepted_cycle_manifest.json"
+fi
 
 # Compare-and-clear: never erase a different/newer recovery request. The request JSON
 # remains in the run directory as publication audit evidence; only the singleton pointer

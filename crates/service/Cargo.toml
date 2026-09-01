@@ -63,6 +63,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 base64.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Paused-clock scenario tests drive the reader timers with the production constants (#546).
 tokio = { workspace = true, features = ["test-util"] }
 rust_decimal_macros = { workspace = true }

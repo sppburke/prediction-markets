@@ -206,7 +206,12 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
         cache: &mut WalletCache,
     ) -> Result<ClobReport, BootstrapError> {
         let fetched_at = OffsetDateTime::now_utc().unix_timestamp();
-        let legacy_cursor = cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY);
+        let v2_only = cache.schema_version()? == crate::cache::CACHE_SCHEMA_VERSION_V2;
+        let legacy_cursor = if v2_only {
+            None
+        } else {
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY)
+        };
         let legacy_resume = legacy_cursor
             .as_deref()
             .is_some_and(|value| !value.is_empty() && value != CLOB_END_CURSOR);
@@ -234,7 +239,9 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             && is_clob_terminal_cursor(state.next_cursor.as_deref())
         {
             let manifest = complete_payout_walk(cache, state.generation, fetched_at)?;
-            cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+            if !v2_only {
+                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+            }
             return Ok(ClobReport {
                 schedules,
                 resolutions,
@@ -325,7 +332,8 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                         "clob: paginated record missing `closed` — resolution suppressed"
                     );
                 }
-                if market.closed == Some(true)
+                if !v2_only
+                    && market.closed == Some(true)
                     && let Some(resolved_at) = end_date_unix
                 {
                     match analyze_winners(&market.tokens).verdict {
@@ -450,10 +458,14 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                     coverage_manifest =
                         Some(complete_payout_walk(cache, state.generation, fetched_at)?);
                 }
-                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+                if !v2_only {
+                    cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, "")?;
+                }
                 break;
             }
-            cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, next)?;
+            if !v2_only {
+                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, next)?;
+            }
             cursor = Some(next.to_owned());
 
             if page_count.is_multiple_of(10) {

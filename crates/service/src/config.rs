@@ -111,6 +111,11 @@ pub struct ServiceConfig {
     #[serde(default = "default_paper_state_db_path")]
     pub paper_state_db_path: PathBuf,
 
+    /// One-time captured v1 wallet/market history input used only by the
+    /// schema-v2 migration path (#544).
+    #[serde(default = "default_legacy_wallet_history_path")]
+    pub legacy_wallet_history_path: PathBuf,
+
     /// BUY-side paper fill haircut (fee + slippage) in basis points.
     /// See `docs/_GLOSSARY.md`: `paper_fill_haircut_bps`.
     #[serde(default = "default_paper_fill_haircut_bps")]
@@ -436,6 +441,10 @@ fn default_paper_state_db_path() -> PathBuf {
     PathBuf::from("./paper_state.db")
 }
 
+fn default_legacy_wallet_history_path() -> PathBuf {
+    PathBuf::from("./wallet_market_history.json")
+}
+
 const fn default_paper_fill_haircut_bps() -> u32 {
     500
 }
@@ -495,6 +504,7 @@ impl Default for ServiceConfig {
             status_interval_secs: default_status_interval_secs(),
             log_retention_days: default_log_retention_days(),
             paper_state_db_path: default_paper_state_db_path(),
+            legacy_wallet_history_path: default_legacy_wallet_history_path(),
             paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
             paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
             fill_mode: default_fill_mode(),
@@ -575,6 +585,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "status_interval_secs",
         "log_retention_days",
         "paper_state_db_path",
+        "legacy_wallet_history_path",
         "paper_fill_haircut_bps",
         "paper_fill_slippage_bps",
         "fill_mode",
@@ -648,6 +659,10 @@ mod tests {
         assert_eq!(cfg.fill_mode, "clob_best_ask");
         assert_eq!(cfg.clob_best_ask_fallback_haircut_bps, 100);
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
+        assert_eq!(
+            cfg.legacy_wallet_history_path,
+            PathBuf::from("./wallet_market_history.json")
+        );
         assert_eq!(cfg.max_resolution_horizon_secs, 172_800);
         assert_eq!(cfg.min_resolution_horizon_secs, 60);
         assert_eq!(cfg.max_fill_price, "0.85");

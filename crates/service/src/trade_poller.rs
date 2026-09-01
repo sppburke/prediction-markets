@@ -101,6 +101,29 @@ impl ReconciliationObligations {
             .sum()
     }
 
+    /// Stable activation census persisted with the paper migration record.
+    #[must_use]
+    pub fn migration_evidence(&self) -> serde_json::Value {
+        let mut rows = self
+            .by_wallet
+            .iter()
+            .flat_map(|(wallet, epochs)| {
+                epochs.iter().flat_map(move |(epoch, groups)| {
+                    groups.values().map(move |obligation| {
+                        serde_json::json!({
+                            "wallet": wallet.to_string(),
+                            "source_epoch": epoch,
+                            "source_trade_id": obligation.group_id.0,
+                            "received_at_unix": obligation.received_at_unix,
+                        })
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.to_string());
+        serde_json::Value::Array(rows)
+    }
+
     fn wallets(&self) -> impl Iterator<Item = WalletAddress> + '_ {
         self.by_wallet.keys().copied()
     }

@@ -45,7 +45,8 @@ use pe_core_types::{
 
 pub use migration::{
     BoundaryField, BoundaryMismatch, DurableLogBindings, DurableLogName, MigrationMetadata,
-    MigrationPhase, MigrationRecord, verify_log_bindings, verify_side_main_path,
+    MigrationPhase, MigrationRecord, PaperMainSeal, PaperSideBuildReport, verify_log_bindings,
+    verify_side_main_path,
 };
 pub use schema::SCHEMA_VERSION;
 use schema::{
@@ -1115,6 +1116,30 @@ impl PaperStateDb {
         Ok(fences)
     }
 
+    /// Replace the pre-activation census while the side main is still the sole
+    /// write target. Canonical JSON and its BLAKE3 bind source bounds, cursors,
+    /// obligations, fences, wallet identities, and the binary identity (#544).
+    pub fn record_migration_activation_facts(
+        &self,
+        facts: &serde_json::Value,
+        binary_identity: &str,
+    ) -> Result<String, PaperStateError> {
+        let rendered = serde_json::to_string(facts)?;
+        let hash = blake3::hash(rendered.as_bytes()).to_hex().to_string();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO migration_activation_facts_v2
+                 (singleton, facts_json, facts_blake3, binary_identity)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 facts_json = excluded.facts_json,
+                 facts_blake3 = excluded.facts_blake3,
+                 binary_identity = excluded.binary_identity",
+            params![rendered, hash, binary_identity],
+        )?;
+        Ok(hash)
+    }
+
     pub fn is_wallet_fenced(&self, wallet: &WalletAddress) -> Result<bool, PaperStateError> {
         let conn = self.lock();
         let exists = conn
@@ -1338,6 +1363,12 @@ impl PaperStateDb {
                 .extend(entry.markets);
         }
 
+        let expected_entries = merged
+            .iter()
+            .flat_map(|(wallet, markets)| {
+                markets.iter().map(move |market| (*wallet, market.clone()))
+            })
+            .collect::<Vec<_>>();
         for (wallet, markets) in merged {
             for market in markets {
                 tx.execute(
@@ -1357,6 +1388,20 @@ impl PaperStateDb {
                     imported_at_unix,
                 ],
             )?;
+        }
+        for (wallet, market) in &expected_entries {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM wallet_market_history_v2 \
+                 WHERE wallet_hex = ?1 AND market_id = ?2 AND source_trade_id = ?3 \
+                       AND origin = 'legacy_seed_v1')",
+                params![wallet.to_string(), market.to_string(), source_trade_id],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(PaperStateError::InvalidLegacyHistory(format!(
+                    "import proof omitted {wallet}/{market}"
+                )));
+            }
         }
         tx.execute(
             "INSERT INTO legacy_history_imports \

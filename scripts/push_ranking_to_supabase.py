@@ -60,24 +60,47 @@ class TransientRetriesExhausted(Exception):
 
 
 def _newest_trade_unix(con: sqlite3.Connection) -> int | None:
-    """Global ``MAX(timestamp_unix)`` over the whole trade cache (the freshness probe).
-    Scans the covering index ``idx_trades_wallet_ts`` (~1 min on the production cache;
-    no index leads with ``timestamp_unix``, so a full index scan is unavoidable)."""
-    row = con.execute("SELECT MAX(timestamp_unix) FROM trades").fetchone()
+    """Global newest trade over the active cache generation (the freshness probe).
+
+    Schema v1 reads ``trades``. Schema v2 can read only normalized ``TRADE``
+    groups in its latest completed coverage generation; sealed v1 rows are not
+    part of this query surface (#544).
+    """
+    if _cache_schema(con) >= 2:
+        row = con.execute(
+            "SELECT MAX(source_time_unix) FROM activity_groups_v2 "
+            "WHERE activity_type = 'TRADE' AND coverage_generation = "
+            "(SELECT MAX(generation) FROM activity_coverage_manifests_v2)"
+        ).fetchone()
+    else:
+        row = con.execute("SELECT MAX(timestamp_unix) FROM trades").fetchone()
     return None if row is None or row[0] is None else int(row[0])
 
 
 def _newest_resolution_fetch(con: sqlite3.Connection) -> int | None:
-    """Global resolution-content heartbeat from ``market_resolutions``."""
-    row = con.execute("SELECT MAX(fetched_at_unix) FROM market_resolutions").fetchone()
+    """Global resolution-content heartbeat from the active cache generation."""
+    if _cache_schema(con) >= 2:
+        row = con.execute(
+            "SELECT completed_at_unix FROM clob_payout_coverage_manifests_v2 "
+            "ORDER BY generation DESC LIMIT 1"
+        ).fetchone()
+    else:
+        row = con.execute("SELECT MAX(fetched_at_unix) FROM market_resolutions").fetchone()
     return None if row is None or row[0] is None else int(row[0])
 
 
 def _clob_sweep_completed_at(con: sqlite3.Connection) -> tuple[str, int] | None:
     """Return the CLOB sweep cursor value and its last update time, if present."""
-    row = con.execute(
-        "SELECT value, updated_at FROM source_cursor WHERE key = 'clob_closed'"
-    ).fetchone()
+    if _cache_schema(con) >= 2:
+        row = con.execute(
+            "SELECT '', completed_at_unix FROM clob_payout_coverage_manifests_v2 "
+            "WHERE terminal_kind IN ('end_cursor','empty_cursor','missing_cursor') "
+            "ORDER BY generation DESC LIMIT 1"
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT value, updated_at FROM source_cursor WHERE key = 'clob_closed'"
+        ).fetchone()
     if row is None:
         return None
     return str(row[0]), int(row[1])
@@ -92,18 +115,33 @@ def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dic
     ~269M rows. Chunked to stay under SQLite's bound-parameter limit.
     """
     out: dict[str, int] = {}
+    schema = _cache_schema(con)
     chunk_size = 500
     for i in range(0, len(wallets_lower), chunk_size):
         chunk = wallets_lower[i : i + chunk_size]
         placeholders = ",".join("?" * len(chunk))
-        q = (
-            f"SELECT wallet_hex, MAX(timestamp_unix) FROM trades "
-            f"WHERE wallet_hex IN ({placeholders}) GROUP BY wallet_hex"
-        )
+        if schema >= 2:
+            q = (
+                "SELECT wallet_hex, MAX(source_time_unix) FROM activity_groups_v2 "
+                f"WHERE activity_type = 'TRADE' AND wallet_hex IN ({placeholders}) "
+                "AND coverage_generation = "
+                "(SELECT MAX(generation) FROM activity_coverage_manifests_v2) "
+                "GROUP BY wallet_hex"
+            )
+        else:
+            q = (
+                f"SELECT wallet_hex, MAX(timestamp_unix) FROM trades "
+                f"WHERE wallet_hex IN ({placeholders}) GROUP BY wallet_hex"
+            )
         for hexv, ts in con.execute(q, chunk):
             if ts is not None:
                 out[hexv.lower()] = int(ts)
     return out
+
+
+def _cache_schema(con: sqlite3.Connection) -> int:
+    row = con.execute("PRAGMA user_version").fetchone()
+    return 0 if row is None else int(row[0])
 
 
 def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, now):

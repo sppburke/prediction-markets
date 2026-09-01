@@ -59,6 +59,8 @@ pub enum SupabaseStateError {
     PaperState(#[from] PaperStateError),
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("migration evidence: {0}")]
+    MigrationEvidence(String),
     /// Boot frame reconciliation stopped below the verified log head.
     #[error("authoritative boot frame walk incomplete at watermark {last_watermark}")]
     IncompleteFrameWalk { last_watermark: i64 },
@@ -815,6 +817,21 @@ pub async fn supabase_authoritative_boot<S: SupabaseBootTrait + ?Sized>(
     paper_state: &PaperStateDb,
     event_log_path: &std::path::Path,
 ) -> Result<(), SupabaseStateError> {
+    supabase_authoritative_boot_observed(client, paper_state, event_log_path, |_, _| Ok(())).await
+}
+
+/// Migration form of [`supabase_authoritative_boot`]: the complete canonical
+/// snapshot is synchronously observed after validation and before SQLite apply.
+pub async fn supabase_authoritative_boot_observed<S, F>(
+    client: &S,
+    paper_state: &PaperStateDb,
+    event_log_path: &std::path::Path,
+    observe: F,
+) -> Result<(), SupabaseStateError>
+where
+    S: SupabaseBootTrait + ?Sized,
+    F: FnOnce(&Decimal, &[PaperPositionRow]) -> Result<(), SupabaseStateError>,
+{
     // 3. #511: resolve every event-log frame above the successor-gated watermark through
     //    `commit_fill_v2` (frames the runtime confirmed are below the watermark already;
     //    an ABSENT watermark — fresh DB or SQLite loss — walks from seq 0). This REPLACES
@@ -852,6 +869,7 @@ pub async fn supabase_authoritative_boot<S: SupabaseBootTrait + ?Sized>(
         .ok_or(SupabaseStateError::Uninitialised("paper_bankroll"))?;
     let positions = client.fetch_boot_positions().await?;
     let n = positions.len();
+    observe(&bankroll, &positions)?;
     paper_state.replace_authoritative_state(bankroll, &positions)?;
     info!(bankroll = %bankroll, "supabase authoritative boot: pulled bankroll");
     info!(

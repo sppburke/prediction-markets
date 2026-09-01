@@ -5,18 +5,24 @@
 //! accepted proof; it never overlays or reseeds the ledger.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{PositionSnapshot, PositionState, SignalConfig};
 use pe_core_types::{
-    MarketId, MarketOutcomeId, OutcomeId, ReconstructionQuality, ShareAmount, VenueMarketId,
-    WalletAddress,
+    MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
+    SourceTimestamp, VenueMarketId, WalletAddress,
 };
+use pe_event_log::{ContentType, EnvelopeIn};
 use pe_paper_state::{PaperStateDb, PositionValidationRecord};
 use pe_position_ledger::PositionLedger;
+use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    CompleteActivityRead, CompletePositionsRead, PositionClassification, ReconciliationFetcher,
-    fetch_complete_activity, fetch_complete_positions,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, CompleteActivityRead, CompletePositionsRead,
+    PositionClassification, ReconciliationFetcher, fetch_complete_activity,
+    fetch_complete_positions,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -25,6 +31,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
+use crate::source_event_sink::SourceEventSink;
+use crate::trade_poller::ACTIVITY_POLL_SOURCE_ID;
 
 #[cfg(feature = "scenario")]
 type BracketStepHook = Arc<dyn Fn(usize, &mut BucketCommitEngine) + Send + Sync>;
@@ -109,6 +117,26 @@ impl CausalPositionValidator {
             #[cfg(feature = "scenario")]
             step_hook: None,
         }
+    }
+
+    /// Boot-migration form: every fetched activity/positions page is appended
+    /// and synchronized through the normal source-log owner before parsing and
+    /// application to the side database (#544).
+    pub fn new_recording(
+        fetcher: Arc<dyn ReconciliationFetcher>,
+        base_url: impl Into<Arc<str>>,
+        source_log_generation: impl Into<Arc<str>>,
+        source_log_path: impl AsRef<Path>,
+    ) -> Result<Self, pe_event_log::LogError> {
+        let recording = DurableRecordingFetcher {
+            inner: fetcher,
+            sink: tokio::sync::Mutex::new(SourceEventSink::open(source_log_path)?),
+        };
+        Ok(Self::new(
+            Arc::new(recording),
+            base_url,
+            source_log_generation,
+        ))
     }
 
     /// Deterministic bracket clock for hermetic scenario tests.
@@ -414,6 +442,40 @@ impl CausalPositionValidator {
                 proof_json: serde_json::to_string(&proof)?,
                 recorded_at_unix: (self.now)(),
             },
+        })
+    }
+}
+
+struct DurableRecordingFetcher {
+    inner: Arc<dyn ReconciliationFetcher>,
+    sink: tokio::sync::Mutex<SourceEventSink>,
+}
+
+impl ReconciliationFetcher for DurableRecordingFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            let payload = self.inner.fetch(url).await?;
+            let received_at = time::OffsetDateTime::now_utc();
+            let envelope = EnvelopeIn {
+                source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                content_type: ContentType::Json,
+                payload: payload.clone(),
+            };
+            self.sink
+                .lock()
+                .await
+                .append_durable(envelope)
+                .map_err(|error| SourceError::Fatal {
+                    message: format!("source-log append failed: {error}"),
+                })?;
+            Ok(payload)
         })
     }
 }

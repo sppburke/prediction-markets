@@ -31,12 +31,27 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
 -- Input dedup: version two keys on reconciled `g2:` activity group identity.
--- Non-g2 historical keys remain immutable version-one transaction identities.
-CREATE TABLE IF NOT EXISTS seen_trades (
+-- The public view plus trigger is intentional. The v1 binary's exact
+-- `INSERT OR IGNORE INTO seen_trades (source_trade_id)` shape must fail even
+-- if its user_version check is bypassed; an omitted identity_version raises
+-- an explicit ABORT instead of being swallowed by OR IGNORE (#544).
+CREATE TABLE IF NOT EXISTS seen_trades_v2 (
     source_trade_id  TEXT PRIMARY KEY NOT NULL,
     identity_version INTEGER NOT NULL CHECK(identity_version IN (1, 2)),
     transaction_hash TEXT
 );
+CREATE VIEW IF NOT EXISTS seen_trades AS
+SELECT source_trade_id, identity_version, transaction_hash FROM seen_trades_v2;
+CREATE TRIGGER IF NOT EXISTS seen_trades_insert_v2
+INSTEAD OF INSERT ON seen_trades
+BEGIN
+    SELECT CASE WHEN NEW.identity_version IS NULL
+        THEN RAISE(ABORT, 'v2 seen_trades requires identity_version')
+    END;
+    INSERT OR IGNORE INTO seen_trades_v2
+        (source_trade_id, identity_version, transaction_hash)
+    VALUES (NEW.source_trade_id, NEW.identity_version, NEW.transaction_hash);
+END;
 
 -- #530/#546: durable typed record of an admitted trade that staged NO copy because
 -- it was older than the calibrated copy budget on either transport (websocket-
@@ -205,6 +220,15 @@ CREATE TABLE IF NOT EXISTS poll_cursors (
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY NOT NULL,
     value INTEGER NOT NULL
+);
+
+-- Hash-bound activation census captured after remote-authority reload and the
+-- causal activity/position bracket, before final tails and rename (#544).
+CREATE TABLE IF NOT EXISTS migration_activation_facts_v2 (
+    singleton       INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+    facts_json      TEXT    NOT NULL,
+    facts_blake3    TEXT    NOT NULL,
+    binary_identity TEXT    NOT NULL
 );
 
 -- Durable settled-markets set: the double-credit guard for resolution crediting

@@ -28,6 +28,7 @@ use pe_core_types::{
     WalletAddress,
 };
 use pe_source_polymarket_public::{
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
     ClobCoveragePage, ClobPayoutResolution, ClobResolutionEvidence,
 };
@@ -37,6 +38,11 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 
 use crate::error::BootstrapError;
+
+/// Legacy wallet-cache generation understood by the pre-#544 trade readers.
+pub const CACHE_SCHEMA_VERSION_V1: i64 = 1;
+/// Trustworthy activity/payout wallet-cache generation introduced by #544.
+pub const CACHE_SCHEMA_VERSION_V2: i64 = 2;
 
 /// Row tuple for [`WalletCache::upsert_wallets_bulk`].
 ///
@@ -743,6 +749,34 @@ pub struct StoredClobPayoutEvidenceV2 {
     pub origin: String,
 }
 
+/// Exact version-two activity aggregate stored in the cache (#544).
+///
+/// The API has no version-one variant: sealed transaction-hash rows are read
+/// only through the frozen-payload verifier in `cache_migration`, so a caller
+/// cannot accidentally mix a legacy trade into v2 ranking/state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredActivityAggregateV2 {
+    pub source_trade_id: SourceTradeId,
+    pub generation: u64,
+    pub semantic_revision: String,
+    pub components_json: String,
+    pub wallet_hex: String,
+    pub transaction_hash: String,
+    pub activity_type: String,
+    pub condition_id: Option<String>,
+    pub asset: Option<String>,
+    pub outcome_id: Option<u16>,
+    pub side: Option<Side>,
+    pub row_count: u64,
+    pub share_amount: Decimal,
+    pub price_weighted_share_amount: Decimal,
+    pub source_usdc_amount: Decimal,
+    pub source_time_unix: i64,
+    pub is_combo: bool,
+    pub schema_version: u32,
+    pub parser_version: u32,
+}
+
 impl WalletCache {
     /// Open or create the SQLite database at `path`. Runs schema migrations.
     pub fn open(path: &Path) -> Result<Self, BootstrapError> {
@@ -750,6 +784,23 @@ impl WalletCache {
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found == CACHE_SCHEMA_VERSION_V2 {
+            // A v2 cache deliberately has no legacy `trades`,
+            // `market_resolutions`, or `source_cursor` table. Running the v1
+            // CREATE-on-open batch would recreate generation-blind owners and
+            // defeat sealing, so v2 opens only the already-installed schema.
+            conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+            return Ok(Self { conn });
+        }
+        if found != 0 && found != CACHE_SCHEMA_VERSION_V1 {
+            return Err(BootstrapError::Cache {
+                message: format!(
+                    "wallet-cache schema version {found} is unsupported; expected {} or {}",
+                    CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2
+                ),
+            });
+        }
         // #538: request incremental auto-vacuum BEFORE any DDL. Three db states:
         // a FRESH db is created in incremental mode by this pragma alone; an
         // EXISTING mode-0 db is unaffected until a `VACUUM` on a connection
@@ -830,7 +881,203 @@ impl WalletCache {
             )?;
         }
 
+        if found == 0 {
+            conn.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION_V1)?;
+        }
+
         Ok(Self { conn })
+    }
+
+    /// Return the on-disk cache schema generation.
+    pub fn schema_version(&self) -> Result<i64, BootstrapError> {
+        self.conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(BootstrapError::from)
+    }
+
+    /// Store one exact reconciled v2 aggregate under its `g2:` identity.
+    ///
+    /// Consumers cannot observe the generation through the typed read until its
+    /// coverage manifest is installed. Legacy transaction-hash rows have no
+    /// path into this method.
+    pub fn insert_activity_aggregate_v2(
+        &mut self,
+        generation: u64,
+        aggregate: &ActivityAggregate,
+    ) -> Result<(), BootstrapError> {
+        self.require_v2_schema()?;
+        let source_trade_id = aggregate.group_id.key();
+        if !source_trade_id.0.starts_with("g2:") {
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "version-two activity identity must start with g2:, got {}",
+                    source_trade_id.0
+                ),
+            });
+        }
+        let components = aggregate.group_id.components();
+        let components_json = serde_json::to_string(components)?;
+        let side = components.side.map(|value| match value {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        });
+        let changed = self.conn.execute(
+            "INSERT INTO activity_groups_v2 \
+                 (source_trade_id, coverage_generation, semantic_revision, components_json, \
+                  wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id, \
+                  side, row_count, share_amount_str, price_weighted_share_amount_str, \
+                  source_usdc_amount_str, source_time_unix, is_combo, schema_version, \
+                  parser_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     ?15, ?16, ?17, ?18, ?19) \
+             ON CONFLICT(source_trade_id) DO UPDATE SET \
+                 coverage_generation = excluded.coverage_generation, \
+                 semantic_revision = excluded.semantic_revision, \
+                 components_json = excluded.components_json, \
+                 wallet_hex = excluded.wallet_hex, \
+                 transaction_hash = excluded.transaction_hash, \
+                 activity_type = excluded.activity_type, \
+                 condition_id = excluded.condition_id, \
+                 asset = excluded.asset, outcome_id = excluded.outcome_id, side = excluded.side, \
+                 row_count = excluded.row_count, share_amount_str = excluded.share_amount_str, \
+                 price_weighted_share_amount_str = excluded.price_weighted_share_amount_str, \
+                 source_usdc_amount_str = excluded.source_usdc_amount_str, \
+                 source_time_unix = excluded.source_time_unix, is_combo = excluded.is_combo, \
+                 schema_version = excluded.schema_version, parser_version = excluded.parser_version \
+             WHERE activity_groups_v2.semantic_revision = excluded.semantic_revision",
+            params![
+                source_trade_id.0,
+                to_i64_u64(generation, "activity coverage generation")?,
+                aggregate.semantic_revision.as_str(),
+                components_json,
+                components.wallet.to_string(),
+                components.transaction_hash,
+                components.activity_type.as_str(),
+                components.condition_id.as_ref().map(ToString::to_string),
+                components.asset.as_ref().map(ToString::to_string),
+                components.outcome.map(|value| i64::from(value.0)),
+                side,
+                to_i64_u64(aggregate.row_count, "activity row count")?,
+                aggregate.share_sum.to_decimal().to_string(),
+                aggregate.price_weighted_share_sum.0.to_string(),
+                aggregate.source_usdc_sum.to_decimal().to_string(),
+                aggregate.source_time.0.unix_timestamp(),
+                i64::from(aggregate.is_combo),
+                i64::from(ACTIVITY_SCHEMA_VERSION),
+                i64::from(ACTIVITY_PARSER_VERSION),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "activity group {} was replayed with a different semantic revision",
+                    source_trade_id.0
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Load only version-two activity aggregates. Sealed v1 rows are
+    /// structurally outside this query and therefore cannot seed a v2 consumer.
+    pub fn activity_aggregates_v2(&self) -> Result<Vec<StoredActivityAggregateV2>, BootstrapError> {
+        self.require_v2_schema()?;
+        let mut statement = self.conn.prepare(
+            "SELECT source_trade_id, coverage_generation, semantic_revision, components_json, \
+                    wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id, \
+                    side, row_count, share_amount_str, price_weighted_share_amount_str, \
+                    source_usdc_amount_str, source_time_unix, is_combo, schema_version, \
+                    parser_version \
+             FROM activity_groups_v2
+             WHERE coverage_generation = (
+                 SELECT MAX(generation) FROM activity_coverage_manifests_v2
+             )
+             ORDER BY source_time_unix, source_trade_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, i64>(18)?,
+            ))
+        })?;
+        let mut aggregates = Vec::new();
+        for row in rows {
+            let row = row?;
+            if !row.0.starts_with("g2:") {
+                return Err(BootstrapError::Cache {
+                    message: format!("non-g2 identity in activity_groups_v2: {}", row.0),
+                });
+            }
+            aggregates.push(StoredActivityAggregateV2 {
+                source_trade_id: SourceTradeId(row.0),
+                generation: to_u64_i64(row.1, "activity coverage generation")?,
+                semantic_revision: row.2,
+                components_json: row.3,
+                wallet_hex: row.4,
+                transaction_hash: row.5,
+                activity_type: row.6,
+                condition_id: row.7,
+                asset: row.8,
+                outcome_id: row.9.map(parse_u16_i64).transpose()?,
+                side: row
+                    .10
+                    .map(|value| match value.as_str() {
+                        "buy" => Ok(Side::Buy),
+                        "sell" => Ok(Side::Sell),
+                        _ => Err(BootstrapError::Cache {
+                            message: format!("invalid v2 activity side {value}"),
+                        }),
+                    })
+                    .transpose()?,
+                row_count: to_u64_i64(row.11, "activity row count")?,
+                share_amount: parse_decimal(&row.12, "activity share amount")?,
+                price_weighted_share_amount: parse_decimal(
+                    &row.13,
+                    "activity price-weighted share amount",
+                )?,
+                source_usdc_amount: parse_decimal(&row.14, "activity source USDC amount")?,
+                source_time_unix: row.15,
+                is_combo: row.16 != 0,
+                schema_version: u32::try_from(row.17).map_err(|_| BootstrapError::Cache {
+                    message: "invalid v2 activity schema version".to_owned(),
+                })?,
+                parser_version: u32::try_from(row.18).map_err(|_| BootstrapError::Cache {
+                    message: "invalid v2 activity parser version".to_owned(),
+                })?,
+            });
+        }
+        Ok(aggregates)
+    }
+
+    fn require_v2_schema(&self) -> Result<(), BootstrapError> {
+        let found = self.schema_version()?;
+        if found == CACHE_SCHEMA_VERSION_V2 {
+            Ok(())
+        } else {
+            Err(BootstrapError::Cache {
+                message: format!(
+                    "version-two cache API requires schema {}, found {found}",
+                    CACHE_SCHEMA_VERSION_V2
+                ),
+            })
+        }
     }
 
     /// Open the cache **read-only**, skipping schema creation and migrations.
@@ -4296,6 +4543,30 @@ impl WalletCache {
             .expect("test-only direct SQL must succeed");
         n != 0
     }
+}
+
+fn to_i64_u64(value: u64, field: &str) -> Result<i64, BootstrapError> {
+    i64::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("{field} exceeds SQLite integer range"),
+    })
+}
+
+fn to_u64_i64(value: i64, field: &str) -> Result<u64, BootstrapError> {
+    u64::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("{field} is negative"),
+    })
+}
+
+fn parse_u16_i64(value: i64) -> Result<u16, BootstrapError> {
+    u16::try_from(value).map_err(|_| BootstrapError::Cache {
+        message: format!("v2 activity outcome {value} is outside u16 range"),
+    })
+}
+
+fn parse_decimal(value: &str, field: &str) -> Result<Decimal, BootstrapError> {
+    Decimal::from_str(value).map_err(|error| BootstrapError::Cache {
+        message: format!("invalid {field} {value:?}: {error}"),
+    })
 }
 
 /// Resolved-market record loaded from the `market_resolutions` table.

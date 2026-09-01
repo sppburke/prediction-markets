@@ -63,6 +63,42 @@ def _make_cache(
     con.close()
 
 
+def _make_v2_cache(path: str) -> None:
+    """Build only the completed v2 surfaces read by the publication gate."""
+    con = sqlite3.connect(path)
+    con.executescript(
+        f"""
+        PRAGMA user_version = 2;
+        CREATE TABLE trades_v1_sealed (wallet_hex TEXT, timestamp_unix INTEGER);
+        CREATE TABLE market_resolutions_v1_sealed (fetched_at_unix INTEGER);
+        CREATE TABLE source_cursor_v1_sealed (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE activity_coverage_manifests_v2 (
+            generation INTEGER PRIMARY KEY, completed_at_unix INTEGER
+        );
+        CREATE TABLE activity_groups_v2 (
+            wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
+            coverage_generation INTEGER
+        );
+        CREATE TABLE clob_payout_coverage_manifests_v2 (
+            generation INTEGER PRIMARY KEY, terminal_kind TEXT, completed_at_unix INTEGER
+        );
+        INSERT INTO trades_v1_sealed VALUES ('0xsealed', {NOW});
+        INSERT INTO market_resolutions_v1_sealed VALUES ({NOW});
+        INSERT INTO source_cursor_v1_sealed VALUES ('clob_closed', '', {NOW});
+        INSERT INTO activity_coverage_manifests_v2 VALUES (1, {NOW - HOUR});
+        INSERT INTO activity_groups_v2 VALUES ('0xaaa', {NOW - HOUR}, 'TRADE', 1);
+        INSERT INTO activity_groups_v2 VALUES ('0xbbb', {NOW}, 'REDEEM', 1);
+        INSERT INTO activity_groups_v2 VALUES ('0xpartial', {NOW}, 'TRADE', 2);
+        INSERT INTO clob_payout_coverage_manifests_v2
+            VALUES (1, 'end_cursor', {NOW - HOUR});
+        """
+    )
+    con.commit()
+    con.close()
+
+
 class ActiveFilterTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -185,6 +221,25 @@ class ActiveFilterTest(unittest.TestCase):
         )
         self.assertEqual(kept, [{"wallet": "0xaaa"}])
         self.assertEqual(dropped, 0)
+
+    def test_v2_filter_reads_only_latest_completed_trade_and_payout_generations(self) -> None:
+        _make_v2_cache(self.db)
+        rows = [
+            {"wallet": "0xaaa"},
+            {"wallet": "0xbbb"},
+            {"wallet": "0xpartial"},
+            {"wallet": "0xsealed"},
+        ]
+
+        kept, dropped, last = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+
+        self.assertEqual(kept, [{"wallet": "0xaaa"}])
+        self.assertEqual(dropped, 3)
+        self.assertEqual(last, {"0xaaa": NOW - HOUR})
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(pr._newest_trade_unix(con), NOW - HOUR)
+            self.assertEqual(pr._newest_resolution_fetch(con), NOW - HOUR)
+            self.assertEqual(pr._clob_sweep_completed_at(con), ("", NOW - HOUR))
 
 
 class DefaultsDriftTest(unittest.TestCase):

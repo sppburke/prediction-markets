@@ -61,6 +61,45 @@ impl Scanner {
             }),
         }
     }
+
+    /// Verify a recorded prefix and the complete current suffix without
+    /// requiring the current log to end at the recorded migration boundary.
+    /// This is the roll-forward resume check for append-only logs (#544).
+    pub fn verify_prefix(binding: &LogTailBinding) -> Result<LogTailBinding, LogError> {
+        let current = Self::verify(&binding.path)?;
+        if current.physical_tail < binding.physical_tail {
+            return Err(LogError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "event log is shorter than the recorded migration boundary",
+            )));
+        }
+
+        let file = File::open(&binding.path)?;
+        let mut reader = BufReader::new(file);
+        verify_file_header(&binding.path, &mut reader)?;
+        let mut state = ScanState::after_header();
+        while state.physical_tail() < binding.physical_tail {
+            match read_verified_frame(&mut reader, &mut state)? {
+                ScanStep::Frame(_) => {}
+                ScanStep::Eof | ScanStep::Incomplete(_) => {
+                    return Err(LogError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "recorded migration boundary is not a complete frame boundary",
+                    )));
+                }
+            }
+        }
+        if state.physical_tail() != binding.physical_tail
+            || state.next_sequence.checked_sub(1).map(EventSeq) != binding.last_sequence
+            || state.previous_hash != binding.last_hash
+        {
+            return Err(LogError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "event log does not match the recorded migration boundary",
+            )));
+        }
+        Ok(current)
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -26,6 +26,37 @@ pub struct CacheMutationLock {
     _file: File,
 }
 
+/// Cutover guard holding the three persistent Forge locks in the only allowed
+/// order: loop → one-shot run → cache (#544).
+#[derive(Debug)]
+#[must_use = "all Forge activation locks release when the guard is dropped"]
+pub struct ForgeActivationLocks {
+    _loop_file: File,
+    _run_file: File,
+    _cache: CacheMutationLock,
+}
+
+impl ForgeActivationLocks {
+    /// Acquire every Forge mutation owner needed for fixed-path activation.
+    pub fn acquire(cache_path: &Path) -> Result<Self, BootstrapError> {
+        let parent = cache_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let eval_results = parent.join("eval-results");
+        let loop_path = eval_results.join(".rank_and_push_loop.lock");
+        let run_path = eval_results.join(".rank_and_push.lock");
+        let loop_file = acquire_named_lock(&loop_path, "ranking loop")?;
+        let run_file = acquire_named_lock(&run_path, "one-shot ranking run")?;
+        let cache = CacheMutationLock::acquire(cache_path)?;
+        Ok(Self {
+            _loop_file: loop_file,
+            _run_file: run_file,
+            _cache: cache,
+        })
+    }
+}
+
 impl CacheMutationLock {
     /// Path component appended to `cache_path` to produce the lock filename.
     const LOCK_FILE_SUFFIX: &'static str = ".lock";
@@ -97,6 +128,32 @@ fn read_holder_pid(file: &mut File) -> Option<String> {
     } else {
         Some(holder.to_owned())
     }
+}
+
+fn acquire_named_lock(path: &Path, owner: &str) -> Result<File, BootstrapError> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    if let Err(error) = file.try_lock_exclusive() {
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(BootstrapError::Io(error));
+        }
+        let holder = read_holder_pid(&mut file).unwrap_or_else(|| "unknown".to_owned());
+        return Err(BootstrapError::Invalid {
+            message: format!(
+                "{owner} lock {} held by PID {holder}; refusing cache activation",
+                path.display()
+            ),
+        });
+    }
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(file)
 }
 
 #[cfg(test)]

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Freeze and compare the purge-free Forge source watermark (#544)."""
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import tempfile
+from pathlib import Path
+
+from latency_shift_rerank import ORACLE_VERSION
+
+MANIFEST_VERSION = 1
+
+
+def _one(connection: sqlite3.Connection, query: str, args=()):
+    row = connection.execute(query, args).fetchone()
+    return None if row is None else row[0]
+
+
+def _wallet_universe(connection: sqlite3.Connection) -> dict:
+    wallets = [
+        str(row[0]).lower()
+        for row in connection.execute(
+            "SELECT wallet_hex FROM active_tradeable_wallets ORDER BY wallet_hex"
+        )
+    ]
+    rendered = "\n".join(wallets).encode()
+    return {
+        "active_tradeable_count": len(wallets),
+        "active_tradeable_sha256": hashlib.sha256(rendered).hexdigest(),
+    }
+
+
+def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -> dict:
+    versions = {**versions, "ranker": ORACLE_VERSION}
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        schema = int(_one(connection, "PRAGMA user_version") or 0)
+        universe = _wallet_universe(connection)
+        if schema >= 2:
+            activity_generation = _one(
+                connection,
+                "SELECT MAX(generation) FROM activity_coverage_manifests_v2",
+            )
+            payout_generation = _one(
+                connection,
+                "SELECT MAX(generation) FROM clob_payout_coverage_manifests_v2",
+            )
+            activity = {
+                "generation": activity_generation,
+                "count": _one(
+                    connection,
+                    "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?",
+                    (activity_generation,),
+                ),
+                "newest_source_unix": _one(
+                    connection,
+                    "SELECT MAX(source_time_unix) FROM activity_groups_v2 "
+                    "WHERE coverage_generation = ? AND activity_type = 'TRADE'",
+                    (activity_generation,),
+                ),
+                "cursor": _one(
+                    connection,
+                    "SELECT cursors_json FROM activity_coverage_manifests_v2 "
+                    "ORDER BY generation DESC LIMIT 1",
+                ),
+                "completed_at_unix": _one(
+                    connection,
+                    "SELECT completed_at_unix FROM activity_coverage_manifests_v2 "
+                    "ORDER BY generation DESC LIMIT 1",
+                ),
+            }
+            resolution = {
+                "generation": payout_generation,
+                "count": _one(
+                    connection,
+                    "SELECT COUNT(*) FROM clob_payout_evidence_v2 "
+                    "WHERE coverage_generation = ?",
+                    (payout_generation,),
+                ),
+                "newest_fetch_unix": _one(
+                    connection,
+                    "SELECT MAX(fetched_at_unix) FROM clob_payout_evidence_v2 "
+                    "WHERE coverage_generation = ?",
+                    (payout_generation,),
+                ),
+                "completed_at_unix": _one(
+                    connection,
+                    "SELECT completed_at_unix FROM clob_payout_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (payout_generation,),
+                ),
+                "terminal_kind": _one(
+                    connection,
+                    "SELECT terminal_kind FROM clob_payout_coverage_manifests_v2 "
+                    "WHERE generation = ?",
+                    (payout_generation,),
+                ),
+            }
+        else:
+            activity = {
+                "generation": 1,
+                "count": _one(connection, "SELECT COUNT(*) FROM trades"),
+                "newest_source_unix": _one(
+                    connection, "SELECT MAX(timestamp_unix) FROM trades"
+                ),
+                "cursor": None,
+            }
+            cursor = connection.execute(
+                "SELECT value, updated_at FROM source_cursor WHERE key = 'clob_closed'"
+            ).fetchone()
+            resolution = {
+                "generation": 1,
+                "count": _one(connection, "SELECT COUNT(*) FROM market_resolutions"),
+                "newest_fetch_unix": _one(
+                    connection, "SELECT MAX(fetched_at_unix) FROM market_resolutions"
+                ),
+                "cursor": None
+                if cursor is None
+                else {"value": str(cursor[0]), "updated_at": int(cursor[1])},
+            }
+        body = {
+            "version": MANIFEST_VERSION,
+            "day_utc": day_utc,
+            "cache_schema": schema,
+            "universe": universe,
+            "source_watermark": {"activity": activity, "resolution": resolution},
+            "versions": versions,
+            "configuration": configuration,
+        }
+        fingerprint_body = dict(body)
+        fingerprint_body.pop("day_utc")
+        body["fingerprint_sha256"] = hashlib.sha256(
+            json.dumps(fingerprint_body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return body
+    finally:
+        connection.close()
+
+
+def atomic_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def latest_accepted(root: Path, day_utc: str) -> dict | None:
+    for path in sorted(root.glob("cron-*/accepted_cycle_manifest.json"), reverse=True):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if value.get("version") == MANIFEST_VERSION and value.get("day_utc") == day_utc:
+            return value
+    return None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    capture = subparsers.add_parser("capture")
+    capture.add_argument("--db", required=True, type=Path)
+    capture.add_argument("--day-utc", required=True)
+    capture.add_argument("--versions-file", required=True, type=Path)
+    capture.add_argument("--configuration-file", required=True, type=Path)
+    capture.add_argument("--output", required=True, type=Path)
+    compare = subparsers.add_parser("unchanged")
+    compare.add_argument("--current", required=True, type=Path)
+    compare.add_argument("--root", required=True, type=Path)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.command == "capture":
+        versions = json.loads(args.versions_file.read_text(encoding="utf-8"))
+        configuration = json.loads(args.configuration_file.read_text(encoding="utf-8"))
+        atomic_write(args.output, snapshot(args.db, args.day_utc, versions, configuration))
+        return 0
+    current = json.loads(args.current.read_text(encoding="utf-8"))
+    accepted = latest_accepted(args.root, current["day_utc"])
+    if accepted is not None and accepted.get("fingerprint_sha256") == current.get(
+        "fingerprint_sha256"
+    ):
+        print(accepted["fingerprint_sha256"])
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

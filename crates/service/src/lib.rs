@@ -26,6 +26,7 @@ pub mod orchestrator;
 pub mod orchestrator_control;
 pub mod organic_canary;
 pub mod paper_api;
+pub mod paper_migration;
 pub mod paper_recovery;
 pub mod position_seeder;
 pub mod runtime_config;

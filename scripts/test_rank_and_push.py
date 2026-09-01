@@ -34,6 +34,7 @@ Run: `python3 scripts/test_rank_and_push.py`
   or: `pytest scripts/test_rank_and_push.py -v`
 """
 import os
+import json
 import shutil
 import shlex
 import sqlite3
@@ -73,12 +74,30 @@ class RankAndPushScenario(unittest.TestCase):
         self._write_python_shim(self.repo_python, self.python_log)
 
         # The wrapper passes this cache path to refresh and rank stubs.
-        sqlite3.connect(self.root / "data" / "wallet_cache.db").close()
+        with sqlite3.connect(self.root / "data" / "wallet_cache.db") as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 1;
+                CREATE TABLE trades (wallet_hex TEXT, timestamp_unix INTEGER);
+                CREATE TABLE market_resolutions (fetched_at_unix INTEGER);
+                CREATE TABLE source_cursor (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+                CREATE TABLE wallets (
+                    wallet_hex TEXT PRIMARY KEY, is_active INTEGER NOT NULL, is_infra INTEGER NOT NULL
+                );
+                CREATE VIEW active_tradeable_wallets AS
+                    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+                INSERT INTO trades VALUES ('0xabc', 1788192000);
+                INSERT INTO market_resolutions VALUES (1788192000);
+                INSERT INTO source_cursor VALUES ('clob_closed', '', 1788192000);
+                INSERT INTO wallets VALUES ('0xabc', 1, 0);
+                """
+            )
 
         # Copy the wrapper-under-test into the sandbox so its `cd "$(dirname "$0")/.."`
         # lands in <tmp>, where the stubs / .env / target/release live.
         self.wrapper = self.root / "scripts" / "rank_and_push.sh"
         shutil.copy(WRAPPER, self.wrapper)
+        shutil.copy(WRAPPER.parent / "rank_cycle_manifest.py", self.root / "scripts")
 
         # The fake publisher below does not contact this syntactically valid endpoint.
         (self.root / ".env").write_text(
@@ -93,6 +112,10 @@ class RankAndPushScenario(unittest.TestCase):
         _write_exec(
             self.root / "target" / "release" / "pe-bootstrap",
             '#!/usr/bin/env bash\n'
+            'if [[ "$1" == "pipeline-versions" ]]; then\n'
+            '  printf \'%s\\n\' \'{"source":"polymarket-public-activity","activity_schema":2,"activity_parser":2,"clob_resolution_schema":2,"clob_resolution_parser":2,"cache_schema":2,"configuration":1}\'\n'
+            '  exit 0\n'
+            'fi\n'
             'echo "$*" >> pe_bootstrap.log\n'
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
@@ -142,25 +165,29 @@ class RankAndPushScenario(unittest.TestCase):
             self.root / "scripts" / "latency_shift_rerank.py",
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
-            "a = sys.argv[1:]\n"
-            'open("rerank.log", "a").write(" ".join(a) + "\\n")\n'
-            'out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
-            "os.makedirs(out, exist_ok=True)\n"
-            'if "--emit-targets" in a:\n'
-            '    tpath = a[a.index("--emit-targets") + 1]\n'
-            '    open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
-            '    sys.exit(int(os.environ.get("STUB_EXIT_emit", "0")))\n'
-            'rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
-            "if rc:\n"
-            "    sys.exit(rc)  # the real coverage gate exits before writing any output\n"
-            'open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
-            'if not os.environ.get("STUB_NO_MANIFEST"):\n'
-            '    import hashlib, json\n'
-            '    ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
-            '    open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
-            '        {"oracle": "clob-minute-reference",\n'
-            '         "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
-            "sys.exit(0)\n",
+            "ORACLE_VERSION = 1\n"
+            "def main():\n"
+            "    a = sys.argv[1:]\n"
+            '    open("rerank.log", "a").write(" ".join(a) + "\\n")\n'
+            '    out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
+            "    os.makedirs(out, exist_ok=True)\n"
+            '    if "--emit-targets" in a:\n'
+            '        tpath = a[a.index("--emit-targets") + 1]\n'
+            '        open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
+            '        return int(os.environ.get("STUB_EXIT_emit", "0"))\n'
+            '    rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
+            "    if rc:\n"
+            "        return rc  # the real coverage gate exits before writing any output\n"
+            '    open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
+            '    if not os.environ.get("STUB_NO_MANIFEST"):\n'
+            '        import hashlib, json\n'
+            '        ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
+            '        open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
+            '            {"oracle": "clob-minute-reference",\n'
+            '             "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
+            "    return 0\n"
+            'if __name__ == "__main__":\n'
+            "    raise SystemExit(main())\n",
         )
         # Fake push: log argv, emulate durable request/pending writes, and optionally
         # return the requested status (including EX_TEMPFAIL=75).
@@ -758,6 +785,80 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(
             (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists()
         )
+
+    def test_unchanged_daily_watermark_exits_before_refresh_or_publish(self):
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        boot_before = self._log("pe_bootstrap.log")
+        rank_before = self._log("rank.log")
+        push_before = self._log("push.log")
+        cron_before = sorted((self.root / "data/eval-results").glob("cron-*"))
+
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
+        self.assertEqual(self._log("pe_bootstrap.log"), boot_before)
+        self.assertEqual(self._log("rank.log"), rank_before)
+        self.assertEqual(self._log("push.log"), push_before)
+        self.assertEqual(sorted((self.root / "data/eval-results").glob("cron-*")), cron_before)
+        self.assertFalse(
+            (self.root / "data/eval-results/rank_and_push.cycle").exists(),
+            "watermark no-op invented a recovery pointer",
+        )
+
+    def test_v2_cycle_manifest_uses_only_completed_generations_and_stamps_versions(self):
+        db = self.root / "data" / "wallet_cache.db"
+        db.unlink()
+        with sqlite3.connect(db) as connection:
+            connection.executescript(
+                """
+                PRAGMA user_version = 2;
+                CREATE TABLE wallets (
+                    wallet_hex TEXT PRIMARY KEY, is_active INTEGER NOT NULL,
+                    is_infra INTEGER NOT NULL
+                );
+                CREATE VIEW active_tradeable_wallets AS
+                    SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+                CREATE TABLE activity_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, cursors_json TEXT,
+                    completed_at_unix INTEGER
+                );
+                CREATE TABLE activity_groups_v2 (
+                    wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
+                    coverage_generation INTEGER
+                );
+                CREATE TABLE clob_payout_coverage_manifests_v2 (
+                    generation INTEGER PRIMARY KEY, terminal_kind TEXT,
+                    completed_at_unix INTEGER
+                );
+                CREATE TABLE clob_payout_evidence_v2 (
+                    coverage_generation INTEGER, fetched_at_unix INTEGER
+                );
+                INSERT INTO wallets VALUES ('0xabc', 1, 0);
+                INSERT INTO activity_coverage_manifests_v2 VALUES (1, '{"0xabc":10}', 20);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
+                INSERT INTO activity_groups_v2 VALUES ('0xignored', 99, 'TRADE', 2);
+                INSERT INTO activity_groups_v2 VALUES ('0xabc', 98, 'REDEEM', 1);
+                INSERT INTO clob_payout_coverage_manifests_v2 VALUES (3, 'end_cursor', 30);
+                INSERT INTO clob_payout_evidence_v2 VALUES (3, 29);
+                INSERT INTO clob_payout_evidence_v2 VALUES (2, 97);
+                """
+            )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = next((self.root / "data/eval-results").glob("cron-*"))
+        manifest = json.loads((out / "accepted_cycle_manifest.json").read_text())
+        self.assertEqual(manifest["source_watermark"]["activity"]["generation"], 1)
+        self.assertEqual(manifest["source_watermark"]["activity"]["count"], 2)
+        self.assertEqual(manifest["source_watermark"]["activity"]["newest_source_unix"], 10)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["generation"], 3)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["count"], 1)
+        self.assertEqual(manifest["source_watermark"]["resolution"]["newest_fetch_unix"], 29)
+        self.assertEqual(manifest["versions"]["activity_parser"], 2)
+        self.assertEqual(manifest["versions"]["clob_resolution_schema"], 2)
+        self.assertEqual(manifest["versions"]["ranker"], 1)
 
     def test_parameterized_research_run_never_owns_production_pending_pointer(self):
         result = self._run("--skip-purge")

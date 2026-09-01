@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,8 +13,10 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::PaperStateError;
+use crate::schema::{SCHEMA, SCHEMA_VERSION};
 
 const MIGRATION_RECORD_KEY: &str = "trustworthy_v2_migration_record";
+const VERSION_ONE_ORIGIN_HASH_KEY: &str = "trustworthy_v2_origin_v1_blake3";
 
 /// Stable owner name for one of the three append-only histories bound at cutover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,7 +164,80 @@ fn verify_one(
 /// normal [`crate::PaperStateDb::open`] and therefore do not reject a version-two side main.
 pub struct MigrationMetadata;
 
+/// Result of building a version-two side main from the final checkpointed v1
+/// generation. The immutable v1 hash is captured after checkpoint/truncate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperSideBuildReport {
+    pub version_one_main_hash: String,
+    pub side_main_hash: String,
+    pub sealed_seen_trade_count: u64,
+    pub sealed_leader_position_count: u64,
+    pub sealed_poll_cursor_count: u64,
+    pub resumed: bool,
+}
+
+/// Final synchronized identity of a side or installed paper main.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperMainSeal {
+    pub path: PathBuf,
+    pub hash: String,
+    pub schema_version: i64,
+}
+
 impl MigrationMetadata {
+    /// Inspect `PRAGMA user_version` without applying current-schema DDL.
+    pub fn schema_version(path: &Path) -> Result<i64, PaperStateError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(PaperStateError::from)
+    }
+
+    /// Checkpoint and validate the fixed version-one main, then return its
+    /// immutable BLAKE3 identity for deterministic side/backup names.
+    pub fn seal_version_one_main(path: &Path) -> Result<String, PaperStateError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        require_schema_version(&connection, 1)?;
+        checkpoint_truncate(&connection)?;
+        integrity_and_foreign_key_check(&connection)?;
+        connection.close().map_err(|(_, error)| error)?;
+        remove_checkpoint_sidecars(path)?;
+        sync_file(path)?;
+        hash_file(path)
+    }
+
+    /// Preserve the exact checkpointed v1 generation before migration metadata
+    /// or any version-two input can change the fixed main or its logs (#544).
+    pub fn preserve_version_one_main(
+        fixed_path: &Path,
+        backup_path: &Path,
+        expected_hash: &str,
+    ) -> Result<(), PaperStateError> {
+        require_same_device(fixed_path, backup_path)?;
+        if backup_path.exists() {
+            let actual = hash_file(backup_path)?;
+            if actual != expected_hash {
+                return Err(PaperStateError::Corrupt(format!(
+                    "immutable version-one backup hash mismatch: expected {expected_hash}, got {actual}"
+                )));
+            }
+        } else {
+            let actual = hash_file(fixed_path)?;
+            if actual != expected_hash {
+                return Err(PaperStateError::Corrupt(format!(
+                    "version-one main changed before preservation: expected {expected_hash}, got {actual}"
+                )));
+            }
+            copy_file_atomic(fixed_path, backup_path)?;
+        }
+        let backup = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        require_schema_version(&backup, 1)?;
+        integrity_and_foreign_key_check(&backup)?;
+        backup.close().map_err(|(_, error)| error)?;
+        sync_file(backup_path)
+    }
+
     /// Persist the first record exactly once in the fixed version-one main.
     pub fn record_once(path: &Path, record: &MigrationRecord) -> Result<(), PaperStateError> {
         if record.phase != MigrationPhase::BoundaryRecorded || record.activation_tails.is_some() {
@@ -311,12 +387,393 @@ impl MigrationMetadata {
         }
         Ok(fixed)
     }
+
+    /// Build the deterministic v2 side main from a checkpointed v1 main.
+    ///
+    /// Legacy input dedup, leader positions, and poll cursors are renamed to
+    /// `*_v1_sealed`. Fresh v2 tables are created from the canonical schema.
+    /// There is deliberately no union view: only a complete v2 source replay,
+    /// authority reload, and causal position bracket may populate active state.
+    pub fn build_side_main_v2(
+        fixed_v1_path: &Path,
+        side_v2_path: &Path,
+    ) -> Result<PaperSideBuildReport, PaperStateError> {
+        if side_v2_path.exists() {
+            let connection =
+                Connection::open_with_flags(side_v2_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            require_schema_version(&connection, SCHEMA_VERSION)?;
+            integrity_and_foreign_key_check(&connection)?;
+            let report = side_build_report(&connection, fixed_v1_path, side_v2_path, true)?;
+            connection.close().map_err(|(_, error)| error)?;
+            return Ok(report);
+        }
+
+        require_same_device(fixed_v1_path, side_v2_path)?;
+        let fixed = Connection::open_with_flags(fixed_v1_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        fixed.busy_timeout(Duration::from_secs(5))?;
+        require_schema_version(&fixed, 1)?;
+        checkpoint_truncate(&fixed)?;
+        integrity_and_foreign_key_check(&fixed)?;
+        fixed.close().map_err(|(_, error)| error)?;
+        let version_one_main_hash = hash_file(fixed_v1_path)?;
+        std::fs::copy(fixed_v1_path, side_v2_path)?;
+        sync_file(side_v2_path)?;
+
+        let mut side =
+            Connection::open_with_flags(side_v2_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        side.busy_timeout(Duration::from_secs(5))?;
+        require_schema_version(&side, 1)?;
+        side.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
+        let transaction =
+            side.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "ALTER TABLE seen_trades RENAME TO seen_trades_v1_sealed;
+             ALTER TABLE leader_positions RENAME TO leader_positions_v1_sealed;
+             ALTER TABLE poll_cursors RENAME TO poll_cursors_v1_sealed;",
+        )?;
+        // Connection-level durability pragmas cannot run inside a transaction.
+        // They were applied above; keep the schema replacement itself atomic.
+        let schema_ddl = SCHEMA
+            .strip_prefix("\nPRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\n\n")
+            .ok_or_else(|| {
+                PaperStateError::Internal(
+                    "paper-state schema no longer starts with the expected durability pragmas"
+                        .to_owned(),
+                )
+            })?;
+        transaction.execute_batch(schema_ddl)?;
+        transaction.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![VERSION_ONE_ORIGIN_HASH_KEY, version_one_main_hash],
+        )?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+        integrity_and_foreign_key_check(&side)?;
+        checkpoint_truncate(&side)?;
+        let report =
+            side_build_report_with_v1_hash(&side, side_v2_path, version_one_main_hash, false)?;
+        side.close().map_err(|(_, error)| error)?;
+        remove_checkpoint_sidecars(side_v2_path)?;
+        sync_file(side_v2_path)?;
+        Ok(report)
+    }
+
+    /// Checkpoint, close, integrity/version-check, hash, and synchronize a v2
+    /// main file before atomic installation.
+    pub fn finalize_side_main_v2(path: &Path) -> Result<PaperMainSeal, PaperStateError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        require_schema_version(&connection, SCHEMA_VERSION)?;
+        integrity_and_foreign_key_check(&connection)?;
+        checkpoint_truncate(&connection)?;
+        connection.close().map_err(|(_, error)| error)?;
+        remove_checkpoint_sidecars(path)?;
+        sync_file(path)?;
+        Ok(PaperMainSeal {
+            path: std::fs::canonicalize(path)?,
+            hash: hash_file(path)?,
+            schema_version: SCHEMA_VERSION,
+        })
+    }
+
+    /// Require the final activation census and its binary binding before tails
+    /// may be frozen or the side main installed.
+    pub fn activation_facts_hash(
+        path: &Path,
+        binary_identity: &str,
+    ) -> Result<String, PaperStateError> {
+        let connection = open_bootstrap(path)?;
+        let (facts_json, stored_hash, stored_binary): (String, String, String) = connection
+            .query_row(
+                "SELECT facts_json, facts_blake3, binary_identity
+                 FROM migration_activation_facts_v2 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| {
+                PaperStateError::Corrupt(format!(
+                    "paper migration activation facts are missing: {error}"
+                ))
+            })?;
+        let actual = blake3::hash(facts_json.as_bytes()).to_hex().to_string();
+        if actual != stored_hash || stored_binary != binary_identity {
+            return Err(PaperStateError::Corrupt(
+                "paper migration activation facts hash/binary mismatch".to_owned(),
+            ));
+        }
+        Ok(stored_hash)
+    }
+
+    /// Atomically install only the finalized side main. The checkpointed v1
+    /// main is moved to `version_one_backup_path`; WAL/SHM files are removed and
+    /// never installed or restored.
+    pub fn install_side_main_v2(
+        fixed_path: &Path,
+        side_path: &Path,
+        version_one_backup_path: &Path,
+        expected_side_hash: &str,
+    ) -> Result<PaperMainSeal, PaperStateError> {
+        require_same_device(fixed_path, side_path)?;
+        require_same_device(fixed_path, version_one_backup_path)?;
+        let side = Self::finalize_side_main_v2(side_path)?;
+        if side.hash != expected_side_hash {
+            return Err(PaperStateError::Corrupt(format!(
+                "side-main hash changed: expected {expected_side_hash}, got {}",
+                side.hash
+            )));
+        }
+        let side_connection = open_bootstrap(side_path)?;
+        let version_one_origin = version_one_origin_hash(&side_connection)?;
+        side_connection.close().map_err(|(_, error)| error)?;
+        if !version_one_backup_path.is_file() {
+            return Err(PaperStateError::Corrupt(format!(
+                "immutable version-one backup is missing: {}",
+                version_one_backup_path.display()
+            )));
+        }
+        let backup_hash = hash_file(version_one_backup_path)?;
+        if backup_hash != version_one_origin {
+            return Err(PaperStateError::Corrupt(format!(
+                "version-one backup does not match the v2 origin: expected {version_one_origin}, got {backup_hash}"
+            )));
+        }
+        let backup =
+            Connection::open_with_flags(version_one_backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        require_schema_version(&backup, 1)?;
+        integrity_and_foreign_key_check(&backup)?;
+        backup.close().map_err(|(_, error)| error)?;
+        let fixed = Connection::open_with_flags(fixed_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        fixed.busy_timeout(Duration::from_secs(5))?;
+        require_schema_version(&fixed, 1)?;
+        checkpoint_truncate(&fixed)?;
+        integrity_and_foreign_key_check(&fixed)?;
+        fixed.close().map_err(|(_, error)| error)?;
+        remove_checkpoint_sidecars(fixed_path)?;
+        std::fs::rename(side_path, fixed_path).map_err(map_rename_error)?;
+        sync_parent(fixed_path)?;
+
+        let installed = Self::finalize_side_main_v2(fixed_path)?;
+        if installed.hash != expected_side_hash {
+            return Err(PaperStateError::Corrupt(format!(
+                "installed paper main hash changed: expected {expected_side_hash}, got {}",
+                installed.hash
+            )));
+        }
+        Ok(installed)
+    }
+
+    /// Restore the immutable v1 main only while the phase proves no v2 append
+    /// or active-state commit occurred. Log boundaries must still match exactly.
+    pub fn rollback_pre_activation(
+        fixed_path: &Path,
+        version_one_backup_path: &Path,
+        failed_side_path: &Path,
+        current_logs: &DurableLogBindings,
+    ) -> Result<(), PaperStateError> {
+        let record = Self::read(fixed_path)?.ok_or(PaperStateError::MigrationRecordMissing)?;
+        if record.phase != MigrationPhase::BoundaryRecorded {
+            return Err(PaperStateError::MigrationPhaseTransition {
+                from: record.phase.to_string(),
+                to: "version_one_rollback (roll-forward required)".to_owned(),
+            });
+        }
+        verify_log_bindings(&record.version_one_boundary, current_logs)
+            .map_err(|error| PaperStateError::Corrupt(error.to_string()))?;
+        require_same_device(fixed_path, version_one_backup_path)?;
+        let version_one =
+            Connection::open_with_flags(version_one_backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        require_schema_version(&version_one, 1)?;
+        integrity_and_foreign_key_check(&version_one)?;
+        version_one.close().map_err(|(_, error)| error)?;
+        if failed_side_path.exists() {
+            let failed = Self::finalize_side_main_v2(failed_side_path)?;
+            let mut preserved = failed_side_path.as_os_str().to_owned();
+            preserved.push(format!(".failed.{}", failed.hash));
+            std::fs::rename(failed_side_path, PathBuf::from(preserved))
+                .map_err(map_rename_error)?;
+        }
+        remove_checkpoint_sidecars(fixed_path)?;
+        std::fs::rename(version_one_backup_path, fixed_path).map_err(map_rename_error)?;
+        remove_checkpoint_sidecars(fixed_path)?;
+        sync_file(fixed_path)
+    }
 }
 
 fn same_migration_identity(left: &MigrationRecord, right: &MigrationRecord) -> bool {
     left.version_one_boundary == right.version_one_boundary
         && left.side_main_path == right.side_main_path
         && left.input_hashes == right.input_hashes
+}
+
+fn side_build_report(
+    connection: &Connection,
+    fixed_v1_path: &Path,
+    side_v2_path: &Path,
+    resumed: bool,
+) -> Result<PaperSideBuildReport, PaperStateError> {
+    side_build_report_with_v1_hash(connection, side_v2_path, hash_file(fixed_v1_path)?, resumed)
+}
+
+fn side_build_report_with_v1_hash(
+    connection: &Connection,
+    side_v2_path: &Path,
+    version_one_main_hash: String,
+    resumed: bool,
+) -> Result<PaperSideBuildReport, PaperStateError> {
+    let stored_origin = version_one_origin_hash(connection)?;
+    if stored_origin != version_one_main_hash {
+        return Err(PaperStateError::Corrupt(format!(
+            "v2 side main origin hash mismatch: stored {stored_origin}, fixed {version_one_main_hash}"
+        )));
+    }
+    Ok(PaperSideBuildReport {
+        version_one_main_hash,
+        side_main_hash: hash_file(side_v2_path)?,
+        sealed_seen_trade_count: count_rows(connection, "seen_trades_v1_sealed")?,
+        sealed_leader_position_count: count_rows(connection, "leader_positions_v1_sealed")?,
+        sealed_poll_cursor_count: count_rows(connection, "poll_cursors_v1_sealed")?,
+        resumed,
+    })
+}
+
+fn version_one_origin_hash(connection: &Connection) -> Result<String, PaperStateError> {
+    connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![VERSION_ONE_ORIGIN_HASH_KEY],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            PaperStateError::Corrupt(format!(
+                "v2 side main omitted its version-one origin hash: {error}"
+            ))
+        })
+}
+
+fn count_rows(connection: &Connection, table: &str) -> Result<u64, PaperStateError> {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let count: i64 = connection.query_row(&sql, [], |row| row.get(0))?;
+    u64::try_from(count)
+        .map_err(|_| PaperStateError::Corrupt(format!("negative row count for {table}")))
+}
+
+fn require_schema_version(connection: &Connection, expected: i64) -> Result<(), PaperStateError> {
+    let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if found == expected {
+        Ok(())
+    } else {
+        Err(PaperStateError::SchemaVersionMismatch { found, expected })
+    }
+}
+
+fn integrity_and_foreign_key_check(connection: &Connection) -> Result<(), PaperStateError> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(PaperStateError::Corrupt(format!(
+            "SQLite integrity_check failed: {integrity}"
+        )));
+    }
+    let foreign_key_failure: Option<(String, i64)> = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    if let Some((table, rowid)) = foreign_key_failure {
+        return Err(PaperStateError::Corrupt(format!(
+            "SQLite foreign_key_check failed at {table} row {rowid}"
+        )));
+    }
+    Ok(())
+}
+
+fn checkpoint_truncate(connection: &Connection) -> Result<(), PaperStateError> {
+    let journal_mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || log != checkpointed {
+            return Err(PaperStateError::MigrationCheckpointIncomplete {
+                busy,
+                log,
+                checkpointed,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<String, PaperStateError> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn remove_checkpoint_sidecars(path: &Path) -> Result<(), PaperStateError> {
+    let wal = sqlite_sidecar(path, "-wal");
+    if wal.is_file() && std::fs::metadata(&wal)?.len() != 0 {
+        return Err(PaperStateError::Corrupt(format!(
+            "non-empty WAL remains after checkpoint: {}",
+            wal.display()
+        )));
+    }
+    for sidecar in [wal, sqlite_sidecar(path, "-shm")] {
+        match std::fs::remove_file(sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+#[cfg(unix)]
+fn require_same_device(left: &Path, right: &Path) -> Result<(), PaperStateError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let left_device = std::fs::metadata(left)?.dev();
+    let right_parent = right
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let right_device = std::fs::metadata(right_parent)?.dev();
+    if left_device == right_device {
+        Ok(())
+    } else {
+        Err(PaperStateError::Internal(format!(
+            "atomic rename refused across devices: {} is {left_device}, {} is {right_device}",
+            left.display(),
+            right.display()
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn require_same_device(_left: &Path, _right: &Path) -> Result<(), PaperStateError> {
+    Ok(())
+}
+
+fn map_rename_error(error: std::io::Error) -> PaperStateError {
+    if error.raw_os_error() == Some(18) {
+        PaperStateError::Internal("atomic rename refused across devices".to_owned())
+    } else {
+        PaperStateError::Synchronization(error)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -506,6 +963,21 @@ fn sync_parent(path: &Path) -> Result<(), PaperStateError> {
     };
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+fn copy_file_atomic(source: &Path, target: &Path) -> Result<(), PaperStateError> {
+    let mut pending = target.as_os_str().to_owned();
+    pending.push(".pending");
+    let pending = PathBuf::from(pending);
+    match std::fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::copy(source, &pending)?;
+    sync_file(&pending)?;
+    std::fs::rename(&pending, target).map_err(map_rename_error)?;
+    sync_parent(target)
 }
 
 #[cfg(test)]
@@ -825,5 +1297,72 @@ mod tests {
         assert_eq!(winners, 1, "exactly one writer must win: {ra:?} / {rb:?}");
         let stored = MigrationMetadata::read(&path).unwrap().unwrap();
         assert!(stored == a || stored == b);
+    }
+
+    #[test]
+    fn v1_fixture_builds_sealed_v2_and_old_insert_fails_structurally() {
+        const V1_SCHEMA: &str = include_str!("../tests/fixtures/paper_state_v1.sql");
+        const OLD_INSERT: &str = "INSERT OR IGNORE INTO seen_trades (source_trade_id) VALUES (?1)";
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = dir.path().join("paper_state.db");
+        let side = dir.path().join("paper_state.v2.fixture.db");
+        let connection = Connection::open(&fixed).unwrap();
+        connection.execute_batch(V1_SCHEMA).unwrap();
+        // The old binary opens version one and its exact mandatory insert works.
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        connection.execute(OLD_INSERT, params!["0xsecond"]).unwrap();
+        drop(connection);
+
+        let built = MigrationMetadata::build_side_main_v2(&fixed, &side).unwrap();
+        assert_eq!(built.sealed_seen_trade_count, 2);
+        assert_eq!(built.sealed_leader_position_count, 1);
+        assert_eq!(built.sealed_poll_cursor_count, 1);
+        assert!(!built.resumed);
+        assert!(
+            MigrationMetadata::build_side_main_v2(&fixed, &side)
+                .unwrap()
+                .resumed
+        );
+
+        let v2 = Connection::open(&side).unwrap();
+        assert_eq!(
+            v2.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The exact v1 fixture DDL cannot be applied to the v2 file because the
+        // mandatory `seen_trades` owner is now a view. A real old binary also
+        // refuses at its user_version check. Even if both checks were bypassed,
+        // its exact mandatory insert is rejected by the v2 trigger.
+        let ddl_error = v2.execute_batch(V1_SCHEMA);
+        assert!(matches!(
+            ddl_error,
+            Err(rusqlite::Error::SqlInputError { msg, .. })
+                if msg.contains("seen_trades already exists")
+        ));
+        let error = v2.execute(OLD_INSERT, params!["0xold-binary-write"]);
+        assert!(matches!(
+            error,
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("v2 seen_trades requires identity_version")
+        ));
+        let active_seen: i64 = v2
+            .query_row("SELECT COUNT(*) FROM seen_trades", [], |row| row.get(0))
+            .unwrap();
+        let sealed_seen: i64 = v2
+            .query_row("SELECT COUNT(*) FROM seen_trades_v1_sealed", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active_seen, 0);
+        assert_eq!(sealed_seen, 2);
+        drop(v2);
+        assert!(PaperStateDb::open(&side).is_ok());
     }
 }

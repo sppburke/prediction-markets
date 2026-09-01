@@ -10,11 +10,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use pe_core_types::SourceId;
-use pe_event_log::Writer;
+use pe_event_log::{Scanner, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveJournal};
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
+use pe_service::paper_migration::{
+    PaperMigrationBoot, PaperMigrationPaths, append_remote_authority_snapshot,
+    record_activation_facts, rollback_version_one, validate_initial_configuration,
+    validate_migration_authority,
+};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_service::position_seeder::CausalPositionValidator;
 use pe_source_polymarket_public::{ReconciliationFetcher, ReqwestFetcher};
@@ -49,6 +54,7 @@ use pe_service::supabase_refresh::{
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
     SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
+    supabase_authoritative_boot_observed,
 };
 use pe_service::trade_poller::{
     TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
@@ -72,6 +78,9 @@ async fn main() -> Result<()> {
     // (issue #397). Run once with the service stopped, before flipping the flag. Exits.
     if env::args().any(|a| a == "--backfill-supabase") {
         return run_backfill_supabase().await;
+    }
+    if env::args().any(|a| a == "--rollback-paper-v1") {
+        return run_rollback_paper_v1();
     }
 
     let cfg = load_config()?;
@@ -128,6 +137,8 @@ async fn main() -> Result<()> {
         &cfg,
         clob_creds_present,
     ));
+    validate_initial_configuration(&live_runtime_config.snapshot())
+        .context("validate #544 activation configuration")?;
 
     // Bootstrap the initial wallet set from Supabase `latest_ranking` — the sole wallet
     // source (#339, #370). The fetch also returns the last-trade side-map (#357): each
@@ -184,12 +195,31 @@ async fn main() -> Result<()> {
     let watchlist_writer_lock = Arc::new(tokio::sync::Mutex::new(()));
     let applied_watchlist_capacity = AppliedWatchlistCapacity::new(initial_watchlist_size);
 
-    // Crash-safe paper-state mirror. Open, initialise bankroll (idempotent), then
+    let paper_schema_version = MigrationMetadata::schema_version(&cfg.paper_state_db_path)
+        .context("inspect paper-state schema before migration boot")?;
+    validate_migration_authority(paper_schema_version, cfg.supabase_authoritative)
+        .context("validate paper migration authority mode")?;
+    let mut migration_boot = PaperMigrationBoot::prepare(
+        PaperMigrationPaths {
+            fixed_main: cfg.paper_state_db_path.clone(),
+            source_log: cfg.source_event_log_path.clone(),
+            paper_log: cfg.event_log_path.clone(),
+            live_journal: live_journal_path(&cfg.event_log_path),
+            legacy_history: cfg.legacy_wallet_history_path.clone(),
+            binary_identity: build_identity().to_owned(),
+        },
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .context("prepare or resume paper-state v2 migration")?;
+
+    // Crash-safe paper-state mirror. During the one-time migration every boot
+    // write targets the recorded side main until the bracket completes.
     // reconcile any event-log fills whose SQLite commit was lost to a crash, and
     // rehydrate the leader position ledger — all before the orchestrator runs.
-    let paper_state = Arc::new(
-        PaperStateDb::open(&cfg.paper_state_db_path)
-            .with_context(|| format!("open paper-state {}", cfg.paper_state_db_path.display()))?,
+    let mut paper_state = Arc::new(
+        PaperStateDb::open(&migration_boot.active_main).with_context(|| {
+            format!("open paper-state {}", migration_boot.active_main.display())
+        })?,
     );
     paper_state
         .init_bankroll(configured_bankroll)
@@ -230,9 +260,26 @@ async fn main() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
-        supabase_authoritative_boot(&client, &paper_state, &cfg.event_log_path)
+        if migration_boot.session.is_some() {
+            supabase_authoritative_boot_observed(
+                &client,
+                &paper_state,
+                &cfg.event_log_path,
+                |bankroll, positions| {
+                    append_remote_authority_snapshot(
+                        &cfg.source_event_log_path,
+                        bankroll,
+                        positions,
+                    )
+                },
+            )
             .await
-            .context("supabase authoritative boot (frame-walk then pull)")?;
+            .context("supabase authoritative migration boot (logged frame-walk then pull)")?;
+        } else {
+            supabase_authoritative_boot(&client, &paper_state, &cfg.event_log_path)
+                .await
+                .context("supabase authoritative boot (frame-walk then pull)")?;
+        }
         info!(
             "supabase authoritative mode active: paper-state writes through to Supabase (system of record)"
         );
@@ -282,34 +329,34 @@ async fn main() -> Result<()> {
     // Validate the initial evaluation universe before any producer can observe it.
     // The installed migration record names the immutable version-two source-log
     // generation to which every accepted bracket is bound.
-    let migration = MigrationMetadata::read(&cfg.paper_state_db_path)
-        .context("read installed migration metadata for position validation")?
-        .context("installed migration metadata missing for position validation")?;
-    anyhow::ensure!(
-        migration.phase == MigrationPhase::Installed,
-        "position validation requires installed migration metadata, found {}",
-        migration.phase
-    );
-    let activation = migration
-        .activation_tails
-        .as_ref()
-        .context("installed migration metadata omitted activation tails")?;
+    let source_binding = Scanner::verify(&cfg.source_event_log_path)
+        .context("verify source-log generation before position bracket")?;
     let source_log_generation = serde_json::to_string(&serde_json::json!({
-        "path": activation.source.path,
-        "physical_tail": activation.source.physical_tail,
-        "last_sequence": activation.source.last_sequence.map(|sequence| sequence.0),
-        "last_hash": activation.source.last_hash.to_hex().to_string(),
+        "path": source_binding.path,
+        "physical_tail": source_binding.physical_tail,
+        "last_sequence": source_binding.last_sequence.map(|sequence| sequence.0),
+        "last_hash": source_binding.last_hash.to_hex().to_string(),
     }))
     .context("encode source-log generation for position validation")?;
     // One fetcher owns the documented public-API rate gate for boot brackets
     // and runtime reconciliation (#544).
     let position_fetcher: Arc<dyn ReconciliationFetcher> =
         Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
-    let position_validator = CausalPositionValidator::new(
-        position_fetcher.clone(),
-        cfg.polymarket_base_url.clone(),
-        source_log_generation,
-    );
+    let boot_position_validator = if migration_boot.session.is_some() {
+        CausalPositionValidator::new_recording(
+            position_fetcher.clone(),
+            cfg.polymarket_base_url.clone(),
+            source_log_generation,
+            &cfg.source_event_log_path,
+        )
+        .context("open migration source-log recorder")?
+    } else {
+        CausalPositionValidator::new(
+            position_fetcher.clone(),
+            cfg.polymarket_base_url.clone(),
+            source_log_generation,
+        )
+    };
     let mut boot_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
         .context("load boot activity ledger owner")?;
     let boot_wallets = live_watchlist
@@ -318,11 +365,68 @@ async fn main() -> Result<()> {
         .iter()
         .map(|entry| entry.wallet)
         .collect::<Vec<_>>();
-    position_validator
+    boot_position_validator
         .validate_direct(&boot_wallets, &mut boot_engine, &paper_state)
         .await
         .context("causal current-position validation for boot universe")?;
     let leader_ledger = boot_engine.into_ledger();
+    drop(boot_position_validator);
+
+    if migration_boot.session.is_some() {
+        let activation_obligations =
+            rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
+                .context("capture migration reconciliation obligations")?;
+        record_activation_facts(
+            &paper_state,
+            &boot_wallets,
+            &activation_obligations,
+            build_identity(),
+        )?;
+    }
+
+    if let Some(session) = migration_boot.session.take() {
+        let state = Arc::try_unwrap(paper_state).map_err(|_| {
+            anyhow::anyhow!("paper migration retained a database handle at activation")
+        })?;
+        drop(state);
+        session
+            .finish()
+            .context("activate version-two paper main")?;
+        paper_state = Arc::new(PaperStateDb::open(&cfg.paper_state_db_path).with_context(
+            || {
+                format!(
+                    "reopen installed paper-state {}",
+                    cfg.paper_state_db_path.display()
+                )
+            },
+        )?);
+    }
+    let installed_migration = MigrationMetadata::read(&cfg.paper_state_db_path)
+        .context("read installed migration metadata after position validation")?
+        .context("installed migration metadata missing after position validation")?;
+    anyhow::ensure!(
+        installed_migration.phase == MigrationPhase::Installed,
+        "position validation requires installed migration metadata, found {}",
+        installed_migration.phase
+    );
+    let _activation = installed_migration
+        .activation_tails
+        .as_ref()
+        .context("installed migration metadata omitted activation tails")?;
+    let runtime_source_binding = Scanner::verify(&cfg.source_event_log_path)
+        .context("verify current source-log generation after paper activation")?;
+    let runtime_source_generation = serde_json::to_string(&serde_json::json!({
+        "path": runtime_source_binding.path,
+        "physical_tail": runtime_source_binding.physical_tail,
+        "last_sequence": runtime_source_binding.last_sequence.map(|sequence| sequence.0),
+        "last_hash": runtime_source_binding.last_hash.to_hex().to_string(),
+    }))
+    .context("encode installed source-log generation")?;
+    let position_validator = CausalPositionValidator::new(
+        position_fetcher.clone(),
+        cfg.polymarket_base_url.clone(),
+        runtime_source_generation,
+    );
 
     // Publish only the durable-authority-filtered initial watched count.
     if !cfg.supabase_url.is_empty() && !cfg.supabase_secret_key.is_empty() {
@@ -912,6 +1016,10 @@ fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
         .join("live_journal.log")
 }
 
+fn build_identity() -> &'static str {
+    env!("PE_BUILD_COMMIT")
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Wipe the paper-state DB (after backup) and replay all event-log fills from scratch.
@@ -977,6 +1085,30 @@ fn run_rebuild_state() -> Result<()> {
     println!("  bankroll:        {bankroll}");
     println!("  NOT rebuilt:     seen_trades, leader_positions, poll_cursors (not in event log)");
     std::process::exit(0);
+}
+
+fn run_rollback_paper_v1() -> Result<()> {
+    let cfg = load_config()?;
+    let version_one_backup = env::var_os("PE_PAPER_V1_BACKUP_PATH")
+        .map(PathBuf::from)
+        .context("--rollback-paper-v1 requires PE_PAPER_V1_BACKUP_PATH")?;
+    let failed_side = env::var_os("PE_PAPER_FAILED_SIDE_PATH")
+        .map(PathBuf::from)
+        .context("--rollback-paper-v1 requires PE_PAPER_FAILED_SIDE_PATH")?;
+    rollback_version_one(
+        &PaperMigrationPaths {
+            fixed_main: cfg.paper_state_db_path,
+            source_log: cfg.source_event_log_path,
+            paper_log: cfg.event_log_path.clone(),
+            live_journal: live_journal_path(&cfg.event_log_path),
+            legacy_history: cfg.legacy_wallet_history_path,
+            binary_identity: build_identity().to_owned(),
+        },
+        &version_one_backup,
+        &failed_side,
+    )?;
+    println!("paper-state version-one main restored; WAL/SHM sidecars were not restored");
+    Ok(())
 }
 
 /// One-time SQLite → Supabase backfill for the authoritative cutover (issue #397), then exit.

@@ -1,7 +1,14 @@
 use pe_bootstrap::{
-    BootstrapConfig, backfill, cache::WalletCache, config, coverage, error::BootstrapError, fetch,
-    fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge, reclamation_evidence,
-    run_schedule_backfill, watchlist_phase, winner_discovery,
+    BootstrapConfig, backfill,
+    cache::WalletCache,
+    cache_migration::{
+        CacheActivationRequest, activate_cache_v2, finalize_cache_v2, migrate_cache_v2,
+        populate_activity_v2, rollback_cache_to_v1, verify_frozen_payload_v1,
+    },
+    config, coverage,
+    error::BootstrapError,
+    fetch, fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge,
+    reclamation_evidence, run_schedule_backfill, watchlist_phase, winner_discovery,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -48,10 +55,33 @@ async fn main() {
                 | "clear-infra-exclusion"
                 | "recover-reclamation"
                 | "reclamation-evidence"
+                | "cache-migrate-v2"
+                | "cache-verify-frozen-v1"
+                | "cache-populate-activity-v2"
+                | "cache-populate-payout-v2"
+                | "cache-finalize-v2"
+                | "cache-activate"
+                | "cache-rollback-v1"
+                | "pipeline-versions"
         )
     );
 
     if let Some(sub) = first_arg.filter(|_| known_sub) {
+        if sub == "pipeline-versions" {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "source": "polymarket-public-activity",
+                    "activity_schema": pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                    "activity_parser": pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    "clob_resolution_schema": pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
+                    "clob_resolution_parser": pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
+                    "cache_schema": pe_bootstrap::cache::CACHE_SCHEMA_VERSION_V2,
+                    "configuration": 1,
+                })
+            );
+            std::process::exit(0);
+        }
         // Single-pass flag parser. Tracks the actual string slices consumed
         // as flag values so the TOML positional search doesn't mistake
         // `--dump-ledgers /path` for a config file path.
@@ -67,6 +97,16 @@ async fn main() {
         let mut audit_csv: Option<std::path::PathBuf> = None;
         let mut targets_csv: Option<std::path::PathBuf> = None;
         let mut wallet_arg: Option<&str> = None;
+        let mut db_arg: Option<std::path::PathBuf> = None;
+        let mut manifest_arg: Option<std::path::PathBuf> = None;
+        let mut frozen_payload_arg: Option<std::path::PathBuf> = None;
+        let mut stage_record_arg: Option<std::path::PathBuf> = None;
+        let mut fixed_db_arg: Option<std::path::PathBuf> = None;
+        let mut backup_arg: Option<std::path::PathBuf> = None;
+        let mut failed_backup_arg: Option<std::path::PathBuf> = None;
+        let mut expected_sha256_arg: Option<String> = None;
+        let mut fixed_end_arg: Option<i64> = None;
+        let mut generation_arg: Option<u64> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -120,6 +160,66 @@ async fn main() {
                 dump_ledgers_path = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--dump-ledgers=") {
                 dump_ledgers_path = Some(std::path::PathBuf::from(v));
+            } else if a == "--db" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                db_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--db=") {
+                db_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--manifest" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                manifest_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--manifest=") {
+                manifest_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--frozen-payload" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                frozen_payload_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--frozen-payload=") {
+                frozen_payload_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--stage-record" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                stage_record_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--stage-record=") {
+                stage_record_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--fixed-db" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                fixed_db_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--fixed-db=") {
+                fixed_db_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--backup" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                backup_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--backup=") {
+                backup_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--failed-backup" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                failed_backup_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--failed-backup=") {
+                failed_backup_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--expected-sha256" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                expected_sha256_arg = Some(rest[i].to_owned());
+            } else if let Some(v) = a.strip_prefix("--expected-sha256=") {
+                expected_sha256_arg = Some(v.to_owned());
+            } else if a == "--fixed-end" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                fixed_end_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--fixed-end=") {
+                fixed_end_arg = v.parse().ok();
+            } else if a == "--generation" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                generation_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--generation=") {
+                generation_arg = v.parse().ok();
             } else if a == "--stage" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -136,13 +236,148 @@ async fn main() {
             .rfind(|&&a| !a.starts_with("--") && !flag_values.contains(a))
             .map(|p| std::path::PathBuf::from(*p));
 
-        let bootstrap_config = match config::load(toml_arg.as_deref()) {
+        let mut bootstrap_config = match config::load(toml_arg.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: config error");
                 std::process::exit(1);
             }
         };
+        if let Some(path) = db_arg {
+            bootstrap_config.cache_path = path;
+        }
+
+        if matches!(
+            sub,
+            "cache-migrate-v2"
+                | "cache-verify-frozen-v1"
+                | "cache-populate-activity-v2"
+                | "cache-populate-payout-v2"
+                | "cache-finalize-v2"
+                | "cache-activate"
+                | "cache-rollback-v1"
+        ) {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let result = match sub {
+                "cache-migrate-v2" => manifest_arg
+                    .as_deref()
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-migrate-v2 requires --manifest".to_owned(),
+                    })
+                    .and_then(|manifest| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        migrate_cache_v2(&bootstrap_config.cache_path, manifest)
+                            .and_then(json_report)
+                    }),
+                "cache-verify-frozen-v1" => frozen_payload_arg
+                    .as_deref()
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-verify-frozen-v1 requires --frozen-payload".to_owned(),
+                    })
+                    .and_then(|reference| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        verify_frozen_payload_v1(&bootstrap_config.cache_path, reference, now)
+                            .and_then(json_report)
+                    }),
+                "cache-populate-activity-v2" => {
+                    async {
+                        let (fixed_end, generation) = fixed_end_arg.zip(generation_arg).ok_or_else(
+                            || BootstrapError::Invalid {
+                                message: "cache-populate-activity-v2 requires integer --fixed-end and --generation"
+                                    .to_owned(),
+                            },
+                        )?;
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        let fetcher = pe_source_polymarket_public::ReqwestFetcher::new(
+                            reqwest::Client::new(),
+                        );
+                        populate_activity_v2(
+                            &bootstrap_config.cache_path,
+                            &fetcher,
+                            &bootstrap_config.polymarket_base_url,
+                            fixed_end,
+                            generation,
+                            now,
+                        )
+                        .await
+                        .and_then(json_report)
+                    }
+                    .await
+                }
+                "cache-populate-payout-v2" => {
+                    async {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        let mut cache = WalletCache::open(&bootstrap_config.cache_path)?;
+                        pe_bootstrap::populate_clob_payout_v2(&bootstrap_config, &mut cache)
+                            .await
+                            .and_then(json_report)
+                    }
+                    .await
+                }
+                "cache-finalize-v2" => stage_record_arg
+                    .as_deref()
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: "cache-finalize-v2 requires --stage-record".to_owned(),
+                    })
+                    .and_then(|stage_record| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )?;
+                        finalize_cache_v2(&bootstrap_config.cache_path, stage_record, now)
+                            .and_then(json_report)
+                    }),
+                "cache-activate" => fixed_db_arg
+                    .zip(backup_arg)
+                    .zip(expected_sha256_arg)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message:
+                            "cache-activate requires --fixed-db, --backup, and --expected-sha256"
+                                .to_owned(),
+                    })
+                    .and_then(
+                        |((fixed_path, version_one_backup_path), expected_side_sha256)| {
+                            activate_cache_v2(&CacheActivationRequest {
+                                fixed_path,
+                                side_path: bootstrap_config.cache_path.clone(),
+                                version_one_backup_path,
+                                expected_side_sha256,
+                            })
+                            .and_then(json_report)
+                        },
+                    ),
+                "cache-rollback-v1" => fixed_db_arg
+                    .zip(backup_arg)
+                    .zip(failed_backup_arg)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message:
+                            "cache-rollback-v1 requires --fixed-db, --backup, and --failed-backup"
+                                .to_owned(),
+                    })
+                    .and_then(|((fixed, backup), failed)| {
+                        rollback_cache_to_v1(&fixed, &backup, &failed)
+                            .map(|()| serde_json::json!({"restored": fixed}))
+                    }),
+                _ => Err(BootstrapError::Internal),
+            };
+            match result {
+                Ok(report) => {
+                    println!("{report}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, command = sub, "cache migration command failed");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
 
         // Reclamation evidence is read-only but deliberately excludes all
         // cache writers while it captures the activation gate (#544).
@@ -933,6 +1168,10 @@ fn resolutions_error_exit_code(error: &BootstrapError) -> i32 {
         // #534) to tempfail 75 and every permanent error to 1.
         _ => error.exit_code(),
     }
+}
+
+fn json_report<T: serde::Serialize>(report: T) -> Result<serde_json::Value, BootstrapError> {
+    serde_json::to_value(report).map_err(BootstrapError::from)
 }
 
 #[cfg(test)]
