@@ -21,7 +21,10 @@ use tracing::warn;
 
 use crate::health::{HealthState, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
-use crate::runtime_config::AppliedWatchlistCapacity;
+use crate::runtime_config::{
+    AppliedWatchlistCapacity, LiveRuntimeConfig, RuntimeConfigStatus, RuntimeConfigStatusSnapshot,
+};
+use crate::supabase_refresh::{WatchlistProjectionStatus, WatchlistProjectionStatusSnapshot};
 
 /// #530/#546: split trade-source health for the observability surface. Ages
 /// are in seconds; `None` = never. Emitted ONLY when the websocket is enabled —
@@ -136,6 +139,13 @@ pub struct StatusSnapshot {
     /// Last successfully applied Supabase-configured cap. It can differ from `watchlist_size`
     /// when the ranking bench cannot fill every requested slot or maintenance is between fills.
     pub watchlist_target_size: usize,
+    /// One canonical hash of the complete configuration actually applied, plus any separately
+    /// typed rejected raw proposal (#544).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<RuntimeConfigStatusSnapshot>,
+    /// Pending/applied serialized watchlist projection and last typed analytics error (#544).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watchlist_projection: Option<WatchlistProjectionStatusSnapshot>,
     /// Cumulative authoritative RPC calls (`commit_fill` + `apply_resolution`) since boot;
     /// `0` when not in authoritative mode. Diff two snapshots for the Supabase write rate.
     pub supabase_rpc_calls: u64,
@@ -207,6 +217,8 @@ pub fn build_snapshot(
             .unwrap_or(0),
         watchlist_size,
         watchlist_target_size,
+        runtime_config: None,
+        watchlist_projection: None,
         supabase_rpc_calls,
         live: live_accounts.map(|snapshot| LiveStatusBlock {
             pending_dispatch_seeds: paper_state
@@ -253,7 +265,9 @@ pub async fn run_status_writer(
     paper_state: Arc<PaperStateDb>,
     watchlist: LiveWatchlist,
     applied_capacity: AppliedWatchlistCapacity,
-    mode: String,
+    runtime_config: LiveRuntimeConfig,
+    runtime_config_status: RuntimeConfigStatus,
+    projection_status: WatchlistProjectionStatus,
     authoritative: bool,
     supabase_rpc_calls: Option<Arc<AtomicU64>>,
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
@@ -273,9 +287,10 @@ pub async fn run_status_writer(
                 SourceHealthStatus::from_health(&h, OffsetDateTime::now_utc(), Instant::now())
             })
         });
+        let applied_config = runtime_config.snapshot();
         let mut snap = build_snapshot(
             &paper_state,
-            &mode,
+            &applied_config.mode,
             authoritative,
             started_at.elapsed().as_secs(),
             OffsetDateTime::now_utc().unix_timestamp(),
@@ -285,6 +300,8 @@ pub async fn run_status_writer(
             live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
         );
         snap.source_health = source_health;
+        snap.runtime_config = Some(runtime_config_status.snapshot().as_ref().clone());
+        snap.watchlist_projection = Some(projection_status.snapshot().as_ref().clone());
         if let Err(e) = write_snapshot(&path, &snap) {
             warn!(error = %e, path = %path.display(), "status writer: write failed");
         }

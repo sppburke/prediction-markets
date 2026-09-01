@@ -30,9 +30,8 @@ pub enum FillSource {
     /// price — both carry this same tag, so comparisons must qualify by the captured
     /// `fill_mode` and `price_impact_cap_bps`, never by this tag alone (#536 review).
     ClobBestAsk,
-    /// The `clob_best_ask_fallback_haircut_bps` fallback for a BUY with no usable ask (empty /
-    /// errored / timed-out book, missing CLOB token, or a degenerate best-ask). Production
-    /// Winner-Follow rejects SELLs before fill-price resolution.
+    /// Historical pre-#544 fallback tag retained only so recorded frames remain deserializable.
+    /// New production fills never construct this variant.
     Fallback,
     /// The boot-frozen leader-price haircut: paper `leader_haircut` mode, every non-paper mode,
     /// or the recompute a `None` override takes — and every pre-#486 frame.
@@ -111,8 +110,8 @@ impl PaperExecutor {
     /// resolved one, else the local side-split haircut.
     ///
     /// `observed_fill_price`: `Some((price, source))` records `price`/`source` verbatim — the
-    /// orchestrator's authoritative paper basis (best-ask or its fallback, #486), so the executor
-    /// is a pure recorder and the fill mode stays runtime-mutable with no executor setter. `None`
+    /// orchestrator's authoritative paper basis (the validated CLOB ladder basis, #544), so the
+    /// executor is a pure recorder and the fill mode stays runtime-mutable with no executor setter. `None`
     /// recomputes the haircut fill from `intent.limit_price` and tags it
     /// [`FillSource::LeaderHaircut`], byte-identical to the pre-#486 behaviour.
     ///

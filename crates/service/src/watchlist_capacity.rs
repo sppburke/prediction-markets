@@ -13,13 +13,12 @@ use std::sync::Arc;
 use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
 use tokio::sync::{Mutex, watch};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
-use crate::supabase_refresh::{HttpWatchlistPublisher, WatchlistSizePublisher};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use crate::watchlist_maintenance::{
     MembershipApplyError, apply_ranked_membership_locked, ranked_membership_change,
@@ -135,22 +134,6 @@ impl SupabaseWatchlistCapacity {
         )?;
         self.applied_capacity.store(request);
         drop(_writer);
-
-        // Telemetry is downstream of membership. Never roll back a successful atomic swap because
-        // the analytics upsert failed; detach the bounded HTTP call so it cannot delay the worker.
-        if !self.supabase_secret_key.is_empty() {
-            let publisher = HttpWatchlistPublisher::new(
-                self.client.clone(),
-                &self.supabase_url,
-                &self.supabase_anon_key,
-                &self.supabase_secret_key,
-            );
-            std::mem::drop(tokio::spawn(async move {
-                if let Err(error) = publisher.publish(actual).await {
-                    warn!(%error, "failed to publish resized watchlist count");
-                }
-            }));
-        }
 
         info!(
             target,

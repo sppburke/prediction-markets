@@ -37,20 +37,18 @@ use pe_service::config_poller::{
 };
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health_with_ws;
-use pe_service::live_watchlist::LiveWatchlist;
+use pe_service::live_watchlist::{LiveWatchlist, projection_dirty_channel};
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
-    AppliedWatchlistCapacity, FillMode, LiveRuntimeConfig, load_initial_runtime_config,
+    AppliedWatchlistCapacity, LiveRuntimeConfig, RuntimeConfigStatus, load_initial_runtime_config,
 };
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
-use pe_service::supabase_refresh::{
-    HttpWatchlistPublisher, WatchlistSizePublisher, run_supabase_refresh_loop,
-};
+use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
     SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
@@ -93,52 +91,45 @@ async fn main() -> Result<()> {
 
     let configured_bankroll = Decimal::from_str(&cfg.bankroll_usd)
         .with_context(|| format!("parse bankroll_usd '{}'", cfg.bankroll_usd))?;
-    let mode = parse_mode(&cfg.mode)?;
-
     // (#398 step 8) The boot-time Kelly approval guard was removed: its invariant now lives in
     // `runtime_config::parse_config` and is re-enforced on every poll (and at boot via
     // `load_initial_runtime_config`), so a runtime override change is governed too — not just the
-    // boot value. An above-ceiling override without the approval flag is cleared, not a hard-fail.
+    // boot value. An above-ceiling override without the approval flag rejects the whole proposal.
 
     // Copy-entry gate posture. The leader-price band was removed in #339 — live sizing
     // is re-based on the current market price instead (see the orchestrator copy path).
     let entry_gate_config = CopyEntryGateConfig;
 
-    // Parse the fill-price band eagerly so a malformed value fails fast before any I/O.
-    let max_fill_price = Decimal::from_str(&cfg.max_fill_price)
-        .with_context(|| format!("parse max_fill_price '{}'", cfg.max_fill_price))?;
-    let min_fill_price = Decimal::from_str(&cfg.min_fill_price)
-        .with_context(|| format!("parse min_fill_price '{}'", cfg.min_fill_price))?;
-
     // #398 WS1: Supabase `service_config` is authoritative for the non-secret runtime knobs.
-    // Fetch it once at boot (best-effort; fall back to env/compiled on any error) and seed the
-    // `LiveRuntimeConfig` ArcSwap that the config poller refreshes and the orchestrator reads per
-    // event. `clob_creds_present` gates live-mode transitions (paper stays paper without creds).
+    // Fetch and validate it once at boot inside the existing twenty-second request envelope.
+    // No listener or producer starts without one complete valid hot snapshot (#544).
     // The ordinary paper service has no credentialed construction path. Supabase therefore cannot
     // promote it into live execution; the isolated canary binary owns separate credentials/state.
     let clob_creds_present = false;
-    let initial_config_rows = if cfg.supabase_url.is_empty() {
-        Vec::new()
-    } else {
-        fetch_service_config(
-            &reqwest::Client::new(),
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "initial service_config fetch failed; using env/compiled defaults");
-            Vec::new()
-        })
-    };
-    let live_runtime_config = LiveRuntimeConfig::new(load_initial_runtime_config(
-        &initial_config_rows,
-        &cfg,
-        clob_creds_present,
-    ));
-    validate_initial_configuration(&live_runtime_config.snapshot())
-        .context("validate #544 activation configuration")?;
+    anyhow::ensure!(
+        !cfg.supabase_url.is_empty(),
+        "PE_SUPABASE_URL is required for the authoritative runtime snapshot"
+    );
+    let config_http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build bounded initial service-config HTTP client")?;
+    let initial_config_rows = fetch_service_config(
+        &config_http_client,
+        &cfg.supabase_url,
+        &cfg.supabase_anon_key,
+        &cfg.supabase_secret_key,
+    )
+    .await
+    .context("required initial service_config fetch")?;
+    let initial_runtime_config =
+        load_initial_runtime_config(&initial_config_rows, &cfg, clob_creds_present)
+            .context("validate required initial service_config snapshot")?;
+    let mode = parse_mode(&initial_runtime_config.mode)?;
+    let max_fill_price = initial_runtime_config.max_fill_price;
+    let min_fill_price = initial_runtime_config.min_fill_price;
+    let runtime_config_status = RuntimeConfigStatus::new(&initial_runtime_config);
+    let live_runtime_config = LiveRuntimeConfig::new(initial_runtime_config.clone());
 
     // Bootstrap the initial wallet set from Supabase `latest_ranking` — the sole wallet
     // source (#339, #370). The fetch also returns the last-trade side-map (#357): each
@@ -188,7 +179,10 @@ async fn main() -> Result<()> {
          (is rank_and_push populating it, and does the newest batch carry `survives` verdicts?)"
     );
 
-    let live_watchlist = LiveWatchlist::new(initial_watchlist);
+    let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
+    let live_watchlist =
+        LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
+    let projection_status = WatchlistProjectionStatus::default();
 
     // Shared writer mutex (#350 WS1 PR-D): serializes the score-update refresh loop and the
     // maintenance tick's evict+backfill on the live watchlist's ArcSwap (readers stay lock-free).
@@ -199,6 +193,13 @@ async fn main() -> Result<()> {
         .context("inspect paper-state schema before migration boot")?;
     validate_migration_authority(paper_schema_version, cfg.supabase_authoritative)
         .context("validate paper migration authority mode")?;
+    if paper_schema_version == 1 {
+        // #544 activation prerequisites apply only to the one-time v1->v2 boot:
+        // a later ordinary boot must accept any VALID applied snapshot (cap edits
+        // in 1..=10_000 are legitimate after activation).
+        validate_initial_configuration(&live_runtime_config.snapshot())
+            .context("validate #544 activation configuration before migration")?;
+    }
     let mut migration_boot = PaperMigrationBoot::prepare(
         PaperMigrationPaths {
             fixed_main: cfg.paper_state_db_path.clone(),
@@ -428,19 +429,7 @@ async fn main() -> Result<()> {
         runtime_source_generation,
     );
 
-    // Publish only the durable-authority-filtered initial watched count.
-    if !cfg.supabase_url.is_empty() && !cfg.supabase_secret_key.is_empty() {
-        let publisher = HttpWatchlistPublisher::new(
-            reqwest::Client::new(),
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-        );
-        let size = live_watchlist.snapshot().entries.len();
-        if let Err(e) = publisher.publish(size).await {
-            tracing::warn!(error = %e, "initial watchlist-size publish failed");
-        }
-    }
+    projection_dirty.mark();
     info!(bankroll = %bankroll, "paper-state opened");
 
     // Paper event-log writer (opened after reconciliation reads the existing log).
@@ -757,8 +746,8 @@ async fn main() -> Result<()> {
             bankroll,
             mode,
             signal_config: Default::default(),
-            max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
-            min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
+            max_resolution_horizon_secs: initial_runtime_config.max_resolution_horizon_secs,
+            min_resolution_horizon_secs: initial_runtime_config.min_resolution_horizon_secs,
             activity_ws_enabled: cfg.polymarket_activity_ws_enabled,
             copy_latency_budget_secs: cfg.copy_latency_budget_secs,
             watchlist_writer_lock: Some(watchlist_writer_lock.clone()),
@@ -766,16 +755,13 @@ async fn main() -> Result<()> {
             min_fill_price,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
             paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
-            // Boot value; production wires `runtime_config: Some(..)` so it is refreshed per event
-            // from the snapshot. An unknown env/TOML override defaults to `ClobBestAsk` (already
-            // warned when `from_service_config` built the runtime snapshot above).
-            fill_mode: FillMode::parse(&cfg.fill_mode).unwrap_or_default(),
-            clob_best_ask_fallback_haircut_bps: cfg.clob_best_ask_fallback_haircut_bps,
+            fill_mode: initial_runtime_config.fill_mode,
+            price_impact_cap_bps: initial_runtime_config.price_impact_cap_bps,
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
         },
-        WinnerFollowStrategy::new(cfg.strategy.clone()),
+        WinnerFollowStrategy::new(initial_runtime_config.winner_follow_config()),
         dispatcher,
         paper_state.clone(),
         leader_ledger,
@@ -813,20 +799,19 @@ async fn main() -> Result<()> {
 
     // Live-watchlist refresh task (#339): poll Supabase on the configured interval and refresh
     // the scores of the live set (score-update-only, #350 WS1). Spawned only when configured.
-    let supabase_task = if !cfg.supabase_url.is_empty() && cfg.supabase_refresh_interval_secs > 0 {
-        Some(tokio::spawn(run_supabase_refresh_loop(
-            live_watchlist.clone(),
-            reqwest::Client::new(),
-            cfg.supabase_url.clone(),
-            cfg.supabase_anon_key.clone(),
-            cfg.supabase_secret_key.clone(),
-            applied_watchlist_capacity.clone(),
-            cfg.supabase_refresh_interval_secs,
-            watchlist_writer_lock.clone(),
-        )))
-    } else {
-        None
-    };
+    let supabase_task = Some(tokio::spawn(run_supabase_refresh_loop(
+        live_watchlist.clone(),
+        paper_state.clone(),
+        reqwest::Client::new(),
+        cfg.supabase_url.clone(),
+        cfg.supabase_anon_key.clone(),
+        cfg.supabase_secret_key.clone(),
+        applied_watchlist_capacity.clone(),
+        cfg.supabase_refresh_interval_secs,
+        watchlist_writer_lock.clone(),
+        projection_dirty_rx,
+        projection_status.clone(),
+    )));
 
     // Watchlist maintenance tick (#350 WS1 PR-D): inactivity + underperformance knockout +
     // atomic backfill. Spawned only when Supabase is configured and the interval is non-zero.
@@ -905,6 +890,7 @@ async fn main() -> Result<()> {
             .context("build bounded service-config HTTP client")?;
         let poller = tokio::spawn(run_config_poll_loop(
             live_runtime_config.clone(),
+            runtime_config_status.clone(),
             SupabaseConfigFetcher::new(
                 config_http_client,
                 cfg.supabase_url.clone(),
@@ -930,7 +916,9 @@ async fn main() -> Result<()> {
             paper_state.clone(),
             live_watchlist.clone(),
             applied_watchlist_capacity.clone(),
-            cfg.mode.clone(),
+            live_runtime_config.clone(),
+            runtime_config_status.clone(),
+            projection_status.clone(),
             cfg.supabase_authoritative,
             supabase_rpc_calls,
             live_accounts.clone(),

@@ -22,6 +22,7 @@
 use pe_copy_signal_engine::TradeProvenance;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
@@ -127,8 +128,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
         // Single-id `OpenOnly` batch URL the shared GammaMarketsClient builds (#382 Phase 3b);
         // the orchestrator fetches one market per signal, so each is a batch-of-one.
         let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
-        let body =
-            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        let body = format!(
+            r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{m}-0\",\"{m}-1\"]"}}]"#
+        );
         fx.insert(url, body.into_bytes());
     }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
@@ -233,6 +235,16 @@ async fn run_gate_capped(
 
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, mid_price);
+    let ask = mid_price.parse::<Decimal>().unwrap();
+    let books = trades
+        .iter()
+        .map(|trade| {
+            (
+                format!("{}-{}", trade.market_id, trade.outcome_id.0),
+                book(&[(ask, dec!(10000))]),
+            )
+        })
+        .collect();
 
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
@@ -261,7 +273,7 @@ async fn run_gate_capped(
             // #486: pin the pre-feature haircut basis (no /book fetch) so these existing gate
             // scenarios stay on the ×1.05 fill; the best-ask path is exercised separately below.
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: gate_config,
             runtime_config: None,
             live_accounts: None,
@@ -277,7 +289,7 @@ async fn run_gate_capped(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
@@ -527,10 +539,9 @@ async fn max_cap_rejects_leader_whose_fill_exceeds_cap() {
 }
 
 // ── Best-ask fill basis (#486) ────────────────────────────────────────────────
-// A paper BUY in `clob_best_ask` mode fills at the fresh CLOB best-ask (sizing + band-gate key
-// off it); no usable ask falls back to `leader × (1 + fallback_haircut)`. The production
-// copy-entry gate rejects SELLs before this path; every non-paper mode takes the boot-frozen
-// haircut with no `/book` fetch.
+// A paper BUY in `clob_best_ask` mode fills from the mandatory fresh CLOB ladder evidence (sizing +
+// band-gate key off it); no usable ask fails closed. The production copy-entry gate rejects SELLs
+// before this path; every retired non-paper mode is rejected before `/book` or fill resolution.
 
 const BA_HEX: &str = "0xbestask";
 const BA_TOKEN: &str = "0xbestask-0"; // outcome 0's token (mid_cache_with_tokens emits "{hex}-{i}")
@@ -543,6 +554,18 @@ fn book(asks: &[(Decimal, Decimal)]) -> OrderBook {
             .map(|&(price, size)| BookLevel { price, size })
             .collect(),
         fetched_at_ms: 0,
+    }
+}
+
+struct CountingBookFetcher {
+    inner: FixtureClobBookFetcher,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ClobBookFetcher for CountingBookFetcher {
+    async fn fetch_book(&self, token_id: &str) -> Result<OrderBook, ClobBookError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_book(token_id).await
     }
 }
 
@@ -640,7 +663,7 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
             live_accounts: None,
@@ -674,7 +697,7 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
     // Dust level 0.50 @ size 0 must NOT set the basis; the usable best-ask is 0.55.
     let books = HashMap::from([(
         BA_TOKEN.to_string(),
-        book(&[(dec!(0.50), dec!(0)), (dec!(0.55), dec!(10))]),
+        book(&[(dec!(0.50), dec!(0)), (dec!(0.55), dec!(1000))]),
     )]);
     let (fills, first) = run_bestask(
         &dir,
@@ -697,12 +720,10 @@ async fn best_ask_buy_fills_at_ask_and_sizes_off_it() {
     println!("PASS: AC1/AC7(i) — best-ask BUY fills at 0.55 (181 ct, ClobBestAsk), replay-stable");
 }
 
-/// AC2: a paper BUY with no usable ask (empty book, or a `/book` fetch error) falls back to
-/// `leader × (1 + 1%)` and is tagged `Fallback`, keeping the position.
-/// PASS: both the empty-book and fetch-error cases record 0.505 (0.50 × 1.01), source Fallback.
+/// #544: a paper BUY with no usable ask (empty book or fetch error) fails closed before fill
+/// resolution. The retired `Fallback` tag remains decode-only for historical replay.
 #[tokio::test]
-async fn best_ask_fallback_on_no_usable_ask() {
-    // (b) empty ask book → fallback.
+async fn best_ask_unusable_book_fails_closed_without_fallback() {
     let dir_empty = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir_empty,
@@ -716,12 +737,9 @@ async fn best_ask_fallback_on_no_usable_ask() {
         )]))),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (_c, price, source) = first.expect("empty-book fill recorded");
-    assert_eq!(price, dec!(0.505), "empty book → leader × 1.01 fallback");
-    assert_eq!(source, FillSource::Fallback);
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
 
-    // (c) /book fetch error (token absent from the fixture map) → fallback.
     let dir_err = TempDir::new().unwrap();
     let (fills, first) = run_bestask(
         &dir_err,
@@ -732,11 +750,52 @@ async fn best_ask_fallback_on_no_usable_ask() {
         Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
     )
     .await;
-    assert_eq!(fills, 1);
-    let (_c, price, source) = first.expect("fetch-error fill recorded");
-    assert_eq!(price, dec!(0.505), "fetch error → leader × 1.01 fallback");
-    assert_eq!(source, FillSource::Fallback);
-    println!("PASS: AC2 — no usable ask (empty book / fetch error) → 0.505 fallback (Fallback)");
+    assert_eq!(fills, 0);
+    assert!(first.is_none());
+    println!("PASS: #544 — no usable ask fails closed; no fallback fill is constructed");
+}
+
+/// The mandatory 100 bps gate performs exactly one request, and unusable or stale evidence
+/// fails closed without a second fill-resolution fetch (#544).
+#[tokio::test]
+async fn mandatory_cap_uses_exactly_one_book_request_and_fails_closed() {
+    let error_calls = Arc::new(AtomicUsize::new(0));
+    let error_fetcher = Arc::new(CountingBookFetcher {
+        inner: FixtureClobBookFetcher::new(HashMap::new()),
+        calls: Arc::clone(&error_calls),
+    });
+    let error_dir = TempDir::new().unwrap();
+    let (error_fills, _) = run_bestask(
+        &error_dir,
+        FillMode::ClobBestAsk,
+        Side::Buy,
+        dec!(0.50),
+        Decimal::ZERO,
+        error_fetcher,
+    )
+    .await;
+    assert_eq!(error_fills, 0);
+    assert_eq!(error_calls.load(Ordering::SeqCst), 1);
+
+    let stale_calls = Arc::new(AtomicUsize::new(0));
+    let mut stale = book(&[(dec!(0.50), dec!(1000))]);
+    stale.fetched_at_ms = 1;
+    let stale_fetcher = Arc::new(CountingBookFetcher {
+        inner: FixtureClobBookFetcher::new(HashMap::from([(BA_TOKEN.to_owned(), stale)])),
+        calls: Arc::clone(&stale_calls),
+    });
+    let stale_dir = TempDir::new().unwrap();
+    let (stale_fills, _) = run_bestask(
+        &stale_dir,
+        FillMode::ClobBestAsk,
+        Side::Buy,
+        dec!(0.50),
+        Decimal::ZERO,
+        stale_fetcher,
+    )
+    .await;
+    assert_eq!(stale_fills, 0);
+    assert_eq!(stale_calls.load(Ordering::SeqCst), 1);
 }
 
 /// AC3: the band gate keys on the ASK. A leader BUY at 0.80 (below the 0.85 cap) whose best-ask
@@ -779,14 +838,14 @@ async fn sell_entry_is_rejected_before_best_ask_fetch() {
     println!("PASS: AC4 — SELL entry rejected before /book fetch, 0 fills");
 }
 
-/// AC5: `leader_haircut` mode ignores the `/book` entirely and records the boot-frozen 5% haircut
-/// fill, tagged `LeaderHaircut` — byte-identical to the pre-#486 behaviour (rollback).
+/// AC5: `leader_haircut` mode still uses the mandatory `/book` admission/cap evidence but records
+/// the boot-frozen 5% haircut fill, tagged `LeaderHaircut`.
 /// PASS: recorded price == 0.525 (0.50 × 1.05), contracts == 190, source LeaderHaircut.
 #[tokio::test]
 async fn leader_haircut_mode_records_haircut_fill() {
     let dir = TempDir::new().unwrap();
-    // A book is present but must be ignored in leader_haircut mode.
-    let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.55), dec!(100))]))]);
+    // Ample in-band depth keeps the mandatory gate non-binding for this fill-basis assertion.
+    let books = HashMap::from([(BA_TOKEN.to_string(), book(&[(dec!(0.50), dec!(1000))]))]);
     let (fills, first) = run_bestask(
         &dir,
         FillMode::LeaderHaircut,
@@ -857,7 +916,7 @@ async fn live_mode_never_fetches_book_ac6() {
             // clob_best_ask is set deliberately: the mode gate — not the fill mode — must suppress
             // the fetch in a live mode.
             fill_mode: FillMode::ClobBestAsk,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: band_config(false),
             runtime_config: None,
             live_accounts: None,

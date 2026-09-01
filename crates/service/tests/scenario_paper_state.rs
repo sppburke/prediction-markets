@@ -32,7 +32,7 @@ use pe_event_log::{Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
-use pe_service::clob_book::FixtureClobBookFetcher;
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -136,8 +136,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
         // Single-id `OpenOnly` batch URL the shared GammaMarketsClient builds (#382 Phase 3b);
         // the orchestrator fetches one market per signal, so each is a batch-of-one.
         let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
-        let body =
-            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        let body = format!(
+            r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{m}-0\",\"{m}-1\"]"}}]"#
+        );
         fx.insert(url, body.into_bytes());
     }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
@@ -168,6 +169,21 @@ async fn run_trades(
     // Quote every traded market at 0.50 so an admitted signal can fetch a current price.
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, "0.50");
+    let books = trades
+        .iter()
+        .map(|trade| {
+            (
+                format!("{}-{}", trade.market_id, trade.outcome_id.0),
+                OrderBook {
+                    asks: vec![BookLevel {
+                        price: dec!(0.50),
+                        size: dec!(10000),
+                    }],
+                    fetched_at_ms: 0,
+                },
+            )
+        })
+        .collect();
 
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(64);
     for t in trades {
@@ -194,7 +210,7 @@ async fn run_trades(
             // #486: pin the pre-feature haircut basis so this existing assertion stays byte-
             // identical (no /book fetch; leader × 1.05).
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
@@ -210,7 +226,7 @@ async fn run_trades(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;

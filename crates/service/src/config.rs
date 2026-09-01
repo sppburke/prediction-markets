@@ -133,13 +133,6 @@ pub struct ServiceConfig {
     #[serde(default = "default_fill_mode")]
     pub fill_mode: String,
 
-    /// Fallback BUY haircut (bps) applied to the leader price when a paper `clob_best_ask` fill
-    /// has no usable best-ask (empty / errored / timed-out book, missing CLOB token, or a
-    /// degenerate ask). Default: 100 (1%) — the haircut demoted from primary to fallback (#486).
-    /// See `docs/_GLOSSARY.md`: `clob_best_ask_fallback_haircut_bps`.
-    #[serde(default = "default_clob_best_ask_fallback_haircut_bps")]
-    pub clob_best_ask_fallback_haircut_bps: u32,
-
     // ── Gamma / resolution polling ───────────────────────────────────────────
     /// Gamma API base URL (no trailing slash). See `docs/_GLOSSARY.md`.
     #[serde(default = "default_gamma_base_url")]
@@ -457,10 +450,6 @@ fn default_fill_mode() -> String {
     "clob_best_ask".to_string() // #486: paper BUY fills at the fresh CLOB best-ask
 }
 
-const fn default_clob_best_ask_fallback_haircut_bps() -> u32 {
-    100 // 1% — the haircut demoted from primary to fallback (#486)
-}
-
 fn default_bankroll_usd() -> String {
     "10000".to_string()
 }
@@ -508,7 +497,6 @@ impl Default for ServiceConfig {
             paper_fill_haircut_bps: default_paper_fill_haircut_bps(),
             paper_fill_slippage_bps: default_paper_fill_slippage_bps(),
             fill_mode: default_fill_mode(),
-            clob_best_ask_fallback_haircut_bps: default_clob_best_ask_fallback_haircut_bps(),
             gamma_base_url: default_gamma_base_url(),
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
@@ -589,7 +577,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "paper_fill_haircut_bps",
         "paper_fill_slippage_bps",
         "fill_mode",
-        "clob_best_ask_fallback_haircut_bps",
         "gamma_base_url",
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
@@ -657,7 +644,6 @@ mod tests {
         assert_eq!(cfg.paper_fill_haircut_bps, 500);
         assert_eq!(cfg.paper_fill_slippage_bps, 100);
         assert_eq!(cfg.fill_mode, "clob_best_ask");
-        assert_eq!(cfg.clob_best_ask_fallback_haircut_bps, 100);
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
         assert_eq!(
             cfg.legacy_wallet_history_path,
@@ -752,151 +738,28 @@ mode = "shadow"
         map
     }
 
-    /// Seed keys that are NOT flat `ServiceConfig` scalars, so this test (which compares flat seed
-    /// values to flat boot fields) excludes them. The enum-shaped sizing/cap keys and
-    /// RuntimeConfig-only fields are validated against boot defaults in
-    /// `runtime_config::tests::seed_reconstructs_boot_strategy`.
-    const RUNTIME_ONLY_KEYS: [&str; 6] = [
-        "active_watchlist_size",
-        "sizing_mode",
-        "sizing_dollar_usd",
-        "sizing_contracts",
-        "price_impact_cap_bps",
-        "per_trade_cap",
-    ];
-
     #[test]
     fn service_config_seed_matches_boot_defaults() {
-        // #398 round-5 step-1 (Blocking): the committed service_config seed must equal the boot
-        // config defaults. WS1 polls this table with precedence KV > env > compiled, so a WRONG
-        // seeded value would silently win over env on the first poll and revert a risk-engine
-        // input to a bad value. A MISSING key is safe (it falls through to env/compiled), so this
-        // test pins every seeded flat-scalar key to its boot default and forbids unexpected keys
-        // (except the enum-shaped sizing keys — see SIZING_KEYS).
+        // #544: new installs seed exactly the mandatory hot snapshot. Restart-owned values retain
+        // their ServiceConfig TOML/env contracts but have no service_config rows.
         let manifest = env!("CARGO_MANIFEST_DIR");
         let sql = std::fs::read_to_string(format!("{manifest}/../../scripts/supabase_schema.sql"))
             .unwrap();
         let seed = parse_service_config_seed(&sql);
-        assert!(
-            !seed.is_empty(),
-            "no service_config seed rows parsed from schema"
-        );
-
-        let d = ServiceConfig::default();
-        let expected: Vec<(&str, String)> = vec![
-            ("mode", d.mode.clone()),
-            ("bankroll_usd", d.bankroll_usd.clone()),
-            ("max_fill_price", d.max_fill_price.clone()),
-            ("min_fill_price", d.min_fill_price.clone()),
-            (
-                "min_resolution_horizon_secs",
-                d.min_resolution_horizon_secs.to_string(),
-            ),
-            (
-                "max_resolution_horizon_secs",
-                d.max_resolution_horizon_secs.to_string(),
-            ),
-            (
-                "paper_fill_haircut_bps",
-                d.paper_fill_haircut_bps.to_string(),
-            ),
-            (
-                "paper_fill_slippage_bps",
-                d.paper_fill_slippage_bps.to_string(),
-            ),
-            ("fill_mode", d.fill_mode.clone()),
-            (
-                "clob_best_ask_fallback_haircut_bps",
-                d.clob_best_ask_fallback_haircut_bps.to_string(),
-            ),
-            ("status_interval_secs", d.status_interval_secs.to_string()),
-            ("log_retention_days", d.log_retention_days.to_string()),
-            (
-                "gamma_resolution_poll_interval_secs",
-                d.gamma_resolution_poll_interval_secs.to_string(),
-            ),
-            (
-                "supabase_refresh_interval_secs",
-                d.supabase_refresh_interval_secs.to_string(),
-            ),
-            (
-                "supabase_sink_reconcile_interval_secs",
-                d.supabase_sink_reconcile_interval_secs.to_string(),
-            ),
-            (
-                "maintenance_interval_secs",
-                d.maintenance_interval_secs.to_string(),
-            ),
-            (
-                "inactivity_threshold_secs",
-                d.inactivity_threshold_secs.to_string(),
-            ),
-            (
-                "inactivity_hard_cap_secs",
-                d.inactivity_hard_cap_secs.to_string(),
-            ),
-            ("bench_overfetch", d.bench_overfetch.to_string()),
-            ("demotion_min_trades", d.demotion_min_trades.to_string()),
-            ("demotion_cb_alpha", d.demotion_cb_alpha.clone()),
-            (
-                "demotion_pnl_window_secs",
-                d.demotion_pnl_window_secs.to_string(),
-            ),
-            (
-                "flip_human_approved",
-                d.strategy.flip_human_approved.to_string(),
-            ),
-            (
-                "kelly_fraction_above_default_human_approved",
-                d.strategy
-                    .kelly_fraction_above_default_human_approved
-                    .to_string(),
-            ),
-            (
-                "polymarket_fee_rate",
-                d.strategy.polymarket_fee_rate.to_string(),
-            ),
-            ("slippage_rate", d.strategy.slippage_rate.to_string()),
-        ];
-
-        for (k, v) in &expected {
-            assert!(
-                seed.contains_key(*k),
-                "service_config seed is missing key `{k}`"
-            );
-            assert_eq!(
-                seed.get(*k),
-                Some(v),
-                "service_config seed `{k}` must equal boot default"
-            );
-        }
-        // The three sizing keys must be present (validated for value elsewhere); all other seed
-        // keys must be in the flat boot-default set.
-        for k in RUNTIME_ONLY_KEYS {
-            assert!(
-                seed.contains_key(k),
-                "service_config seed is missing key `{k}`"
-            );
-        }
-        let expected_keys: std::collections::HashSet<&str> = expected
-            .iter()
-            .map(|(k, _)| *k)
-            .chain(RUNTIME_ONLY_KEYS)
-            // #544 Lane C retires these runtime inputs. The coordinated lane
-            // boundary leaves scripts/supabase_schema.sql to Lane I; tolerate
-            // those inert seed rows until their owning lane removes them.
-            .chain([
-                "entry_gate_fail_closed",
-                "position_page_limit",
-                "position_reseed_interval_secs",
-                "position_size_threshold",
-            ])
+        let expected: std::collections::BTreeSet<_> = crate::runtime_config::HOT_CONFIG_KEYS
+            .into_iter()
+            .filter(|key| *key != "kelly_fraction_override")
+            .map(str::to_owned)
             .collect();
-        for k in seed.keys() {
-            assert!(
-                expected_keys.contains(k.as_str()),
-                "service_config seed has unexpected key `{k}` not in the boot-default set"
-            );
-        }
+        assert_eq!(
+            seed.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            seed.get("price_impact_cap_bps").map(String::as_str),
+            Some("100")
+        );
     }
 }

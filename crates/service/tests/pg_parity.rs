@@ -155,6 +155,165 @@ async fn sql_bankroll(client: &Client) -> Decimal {
     dec(&row.get::<_, String>(0))
 }
 
+async fn sql_replace_watchlist(
+    client: &Client,
+    token: &str,
+    entries: &str,
+) -> Result<(String, i32), tokio_postgres::Error> {
+    client
+        .query_one(
+            "select new_token::text, count from service_watchlist_replace_v1(\
+             $1::text::timestamptz, $2::text::jsonb)",
+            &[&token, &entries],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+}
+
+async fn watchlist_runtime(client: &Client) -> (String, i32, i64) {
+    let row = client
+        .query_one(
+            "select updated_at::text, watchlist_size, \
+             (select count(*) from service_watchlist) from service_runtime where id = 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+async fn watchlist_rows(client: &Client) -> String {
+    client
+        .query_one(
+            "select coalesce(jsonb_agg(jsonb_build_object(\
+             'wallet_hex', wallet_hex, 'rank', rank, 'leader_score_bps', leader_score_bps) \
+             order by rank), '[]'::jsonb)::text from service_watchlist",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+async fn pg_watchlist_replace_parity_and_concurrency() {
+    let Ok(url) = std::env::var("PE_TEST_PG_URL") else {
+        eprintln!(
+            "SKIP: PE_TEST_PG_URL unset — watchlist RPC parity runs only in CI / against a local pg"
+        );
+        return;
+    };
+    let _guard = pg_lock(&url).await;
+    let client = connect(&url).await;
+    client
+        .batch_execute(
+            "delete from service_watchlist; \
+             update service_runtime set watchlist_size = 0, \
+             updated_at = '2026-09-01 00:00:00+00' where id = 1;",
+        )
+        .await
+        .unwrap();
+
+    let acl = client
+        .query_one(
+            "select \
+             has_function_privilege('service_role', \
+               'service_watchlist_replace_v1(timestamptz,jsonb)', 'execute'), \
+             has_function_privilege('anon', \
+               'service_watchlist_replace_v1(timestamptz,jsonb)', 'execute')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(acl.get::<_, bool>(0));
+    assert!(!acl.get::<_, bool>(1));
+
+    let initial = watchlist_runtime(&client).await.0;
+    let one = r#"[{"wallet_hex":"0x1111111111111111111111111111111111111111","rank":1,"leader_score_bps":100}]"#;
+    let two = r#"[{"wallet_hex":"0x2222222222222222222222222222222222222222","rank":1,"leader_score_bps":800},{"wallet_hex":"0x3333333333333333333333333333333333333333","rank":2,"leader_score_bps":700}]"#;
+    let (one_token, one_count) = sql_replace_watchlist(&client, &initial, one).await.unwrap();
+    assert_eq!(one_count, 1);
+
+    // A reader whose statement snapshot predates the replacement sees the complete old
+    // generation; a later statement sees the complete new generation, never a partial delete.
+    let old_reader = connect(&url).await;
+    old_reader
+        .batch_execute("begin isolation level repeatable read")
+        .await
+        .unwrap();
+    assert_eq!(watchlist_runtime(&old_reader).await.1, 1);
+    let old_generation = watchlist_rows(&old_reader).await;
+    assert!(old_generation.contains("0x1111111111111111111111111111111111111111"));
+    assert!(!old_generation.contains("0x2222222222222222222222222222222222222222"));
+    let writer = connect(&url).await;
+    let (two_token, two_count) = sql_replace_watchlist(&writer, &one_token, two)
+        .await
+        .unwrap();
+    assert_eq!(two_count, 2);
+    assert_eq!(watchlist_runtime(&old_reader).await.1, 1);
+    assert_eq!(watchlist_rows(&old_reader).await, old_generation);
+    old_reader.batch_execute("commit").await.unwrap();
+    assert_eq!(watchlist_runtime(&old_reader).await.1, 2);
+    let new_generation = watchlist_rows(&old_reader).await;
+    assert!(!new_generation.contains("0x1111111111111111111111111111111111111111"));
+    assert!(new_generation.contains("0x2222222222222222222222222222222222222222"));
+    assert!(new_generation.contains("0x3333333333333333333333333333333333333333"));
+
+    let stable_runtime = watchlist_runtime(&client).await;
+    let stable_rows = watchlist_rows(&client).await;
+    let stale = sql_replace_watchlist(&client, &one_token, one)
+        .await
+        .expect_err("stale token must lose");
+    assert_eq!(stale.as_db_error().unwrap().code().code(), "P5441");
+    assert_eq!(watchlist_runtime(&client).await, stable_runtime);
+    assert_eq!(watchlist_rows(&client).await, stable_rows);
+
+    let duplicate = r#"[{"wallet_hex":"0x2222222222222222222222222222222222222222","rank":1,"leader_score_bps":1},{"wallet_hex":"0x2222222222222222222222222222222222222222","rank":2,"leader_score_bps":2}]"#;
+    let malformed = sql_replace_watchlist(&client, &two_token, duplicate)
+        .await
+        .expect_err("duplicate wallets must reject before mutation");
+    assert_eq!(malformed.as_db_error().unwrap().code().code(), "P5442");
+    assert_eq!(watchlist_runtime(&client).await, stable_runtime);
+    assert_eq!(watchlist_rows(&client).await, stable_rows);
+
+    // Score-only changes persist through the canonical column. A legacy reader selecting only
+    // the pre-#544 columns remains valid after the additive migration.
+    let rescored = r#"[{"wallet_hex":"0x2222222222222222222222222222222222222222","rank":1,"leader_score_bps":999},{"wallet_hex":"0x3333333333333333333333333333333333333333","rank":2,"leader_score_bps":888}]"#;
+    let (score_token, score_count) = sql_replace_watchlist(&client, &two_token, rescored)
+        .await
+        .unwrap();
+    assert_eq!(score_count, 2);
+    let scores = client
+        .query(
+            "select wallet_hex, rank, updated_at, leader_score_bps \
+             from service_watchlist order by rank",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(scores.len(), 2);
+    assert_eq!(scores[0].get::<_, i32>(3), 999);
+    assert_eq!(scores[1].get::<_, i32>(3), 888);
+    let legacy_rows = client
+        .query(
+            "select wallet_hex, rank, updated_at from service_watchlist order by rank",
+            &[],
+        )
+        .await
+        .expect("legacy projection must remain readable without selecting the additive score");
+    assert_eq!(legacy_rows.len(), 2);
+
+    let (empty_token, empty_count) = sql_replace_watchlist(&client, &score_token, "[]")
+        .await
+        .unwrap();
+    assert_eq!(empty_count, 0);
+    assert!(watchlist_rows(&client).await.contains("[]"));
+    assert_eq!(watchlist_runtime(&client).await, (empty_token, 0, 0));
+    println!(
+        "PASS: PG-544 — atomic old/new visibility, stale/malformed zero-write loss, scores, legacy read, and valid empty"
+    );
+}
+
 #[tokio::test]
 async fn pg_parity_and_concurrency() {
     let Ok(url) = std::env::var("PE_TEST_PG_URL") else {

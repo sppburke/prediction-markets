@@ -63,7 +63,7 @@ use pe_paper_state::{
 };
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
 use pe_service::bucket_commit::DecisionContinuationV2;
-use pe_service::clob_book::FixtureClobBookFetcher;
+use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::entry_gate::CopyEntryGateConfig;
 use pe_service::health::{ReaderHealth, SharedHealth, new_shared_health_with_ws, readiness_issues};
 use pe_service::live_accounts::{
@@ -211,8 +211,9 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     let mut fx = HashMap::new();
     for m in markets {
         let url = format!("{BASE}/markets?condition_ids={m}&limit=500");
-        let body =
-            format!(r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]"}}]"#);
+        let body = format!(
+            r#"[{{"conditionId":"{m}","outcomePrices":"[\"{price}\",\"{price}\"]","clobTokenIds":"[\"{m}-0\",\"{m}-1\"]"}}]"#
+        );
         fx.insert(url, body.into_bytes());
     }
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
@@ -322,6 +323,24 @@ fn build_orchestrator(
         })
         .unwrap();
     let mid_price_cache = mid_cache_for(&opts.markets, "0.50");
+    let books = opts
+        .markets
+        .iter()
+        .flat_map(|market| {
+            (0..=1).map(move |outcome| {
+                (
+                    format!("{market}-{outcome}"),
+                    OrderBook {
+                        asks: vec![BookLevel {
+                            price: dec!(0.50),
+                            size: dec!(10000),
+                        }],
+                        fetched_at_ms: 0,
+                    },
+                )
+            })
+        })
+        .collect();
     let leader_ledger = build_leader_ledger(&paper_state).unwrap();
     let mut orch = Orchestrator::new(
         trade_rx,
@@ -340,7 +359,7 @@ fn build_orchestrator(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode: pe_service::runtime_config::FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: opts.live_accounts,
@@ -356,7 +375,7 @@ fn build_orchestrator(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     if let Some(hooks) = opts.hooks {

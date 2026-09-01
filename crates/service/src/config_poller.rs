@@ -14,7 +14,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::runtime_config::{
-    AppliedWatchlistCapacity, ConfigRow, LiveRuntimeConfig, WatchlistCapacityEpoch, parse_config,
+    AppliedWatchlistCapacity, ConfigRow, LiveRuntimeConfig, RuntimeConfigStatus,
+    WatchlistCapacityEpoch, parse_config,
 };
 use crate::supabase_reader::{SupabaseError, auth_token};
 
@@ -191,6 +192,7 @@ async fn fetch_with_timeout<F: ConfigFetcher>(
 /// A potentially long capacity transition is never awaited here.
 pub async fn poll_once<F: ConfigFetcher>(
     live: &LiveRuntimeConfig,
+    status: &RuntimeConfigStatus,
     fetcher: &F,
     capacity_requests: &CapacityRequestHandle,
     clob_creds_present: bool,
@@ -212,18 +214,22 @@ pub async fn poll_once<F: ConfigFetcher>(
         };
 
     let applied = live.snapshot();
-    // A valid-but-pending target is the last-known-good parsing base. Thus a later malformed or
-    // absent row cannot silently cancel work that has not completed yet.
-    let mut parse_base = applied.as_ref().clone();
-    parse_base.active_watchlist_size = capacity_requests.current().target;
-    let parsed = parse_config(&rows, &parse_base, clob_creds_present);
+    let parsed = match parse_config(&rows, &applied, clob_creds_present) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn!(%error, "service_config snapshot rejected; keeping whole last-good config");
+            status.record_rejected(&rows, error);
+            return;
+        }
+    };
     let requested_target = parsed.active_watchlist_size;
 
     // This task is the sole RuntimeConfig writer. Other valid edits take effect immediately;
     // active_watchlist_size continues to describe the last successfully applied membership cap.
     let mut immediately_applied = parsed;
     immediately_applied.active_watchlist_size = applied.active_watchlist_size;
-    live.store(immediately_applied);
+    live.store(immediately_applied.clone());
+    status.record_applied(&immediately_applied);
     let request = capacity_requests.request(requested_target).await;
     if request.target != applied.active_watchlist_size {
         info!(
@@ -308,8 +314,10 @@ pub async fn run_capacity_worker<A: WatchlistCapacityApplier>(
 /// Run the fixed-cadence config coordinator. The boot fetch has already happened, so the first
 /// periodic fetch is one full interval after startup. Capacity results are committed immediately
 /// between ticks without creating a second RuntimeConfig writer.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_config_poll_loop<F: ConfigFetcher>(
     live: LiveRuntimeConfig,
+    status: RuntimeConfigStatus,
     fetcher: F,
     capacity_requests: CapacityRequestHandle,
     applied_capacity: AppliedWatchlistCapacity,
@@ -326,7 +334,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                poll_once(&live, &fetcher, &capacity_requests, clob_creds_present).await;
+                poll_once(&live, &status, &fetcher, &capacity_requests, clob_creds_present).await;
             }
             result = capacity_results.recv(), if results_open => {
                 match result {
@@ -338,7 +346,8 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
                     {
                         let mut next = live.snapshot().as_ref().clone();
                         next.active_watchlist_size = result.request.target;
-                        live.store(next);
+                        live.store(next.clone());
+                        status.record_applied(&next);
                         info!(
                             target = result.request.target,
                             generation = result.request.generation,
@@ -363,6 +372,7 @@ pub async fn run_config_poll_loop<F: ConfigFetcher>(
 mod tests {
     use std::sync::Mutex as StdMutex;
 
+    use rust_decimal::Decimal;
     use tokio::sync::Notify;
 
     use super::*;
@@ -373,12 +383,49 @@ mod tests {
         RuntimeConfig::from_service_config(&ServiceConfig::default())
     }
 
-    fn cfg_row(key: &str, value: &str) -> ConfigRow {
+    fn cfg_row(key: &str, value: &str, value_type: &str) -> ConfigRow {
         ConfigRow {
             key: key.to_string(),
             value: value.to_string(),
-            value_type: "text".to_string(),
+            value_type: value_type.to_string(),
         }
+    }
+
+    fn complete_rows() -> Vec<ConfigRow> {
+        [
+            ("active_watchlist_size", "100", "integer"),
+            ("mode", "paper", "text"),
+            ("max_fill_price", "0.85", "decimal"),
+            ("min_fill_price", "0.15", "decimal"),
+            ("min_resolution_horizon_secs", "60", "integer"),
+            ("max_resolution_horizon_secs", "172800", "integer"),
+            ("fill_mode", "clob_best_ask", "text"),
+            ("price_impact_cap_bps", "100", "integer"),
+            ("flip_human_approved", "false", "bool"),
+            (
+                "kelly_fraction_above_default_human_approved",
+                "false",
+                "bool",
+            ),
+            ("polymarket_fee_rate", "0.04", "decimal"),
+            ("per_trade_cap", "unlimited", "text"),
+            ("slippage_rate", "0.01", "decimal"),
+            ("sizing_mode", "dollar", "text"),
+            ("sizing_dollar_usd", "25", "decimal"),
+            ("sizing_contracts", "1", "integer"),
+        ]
+        .into_iter()
+        .map(|(key, value, value_type)| cfg_row(key, value, value_type))
+        .collect()
+    }
+
+    fn rows_with(key: &str, value: &str) -> Vec<ConfigRow> {
+        let mut rows = complete_rows();
+        rows.iter_mut()
+            .find(|row| row.key == key)
+            .expect("complete row")
+            .value = value.to_owned();
+        rows
     }
 
     fn request_channel(
@@ -427,24 +474,27 @@ mod tests {
     #[tokio::test]
     async fn poll_once_applies_an_ordinary_edit() {
         let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
         let (requests, _rx) = request_channel(100);
         poll_once(
             &live,
-            &OkFetcher(vec![cfg_row("max_fill_price", "0.50")]),
+            &status,
+            &OkFetcher(rows_with("max_fill_price", "0.50")),
             &requests,
             false,
         )
         .await;
-        assert_eq!(live.snapshot().max_fill_price, "0.50");
+        assert_eq!(live.snapshot().max_fill_price, Decimal::new(50, 2));
         assert_eq!(requests.current().target, 100);
     }
 
     #[tokio::test]
     async fn poll_once_keeps_last_good_on_fetch_error() {
         let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
         let (requests, _rx) = request_channel(100);
-        let before = live.snapshot().max_fill_price.clone();
-        poll_once(&live, &ErrFetcher, &requests, false).await;
+        let before = live.snapshot().max_fill_price;
+        poll_once(&live, &status, &ErrFetcher, &requests, false).await;
         assert_eq!(live.snapshot().max_fill_price, before);
         assert_eq!(requests.current().target, 100);
     }
@@ -452,37 +502,47 @@ mod tests {
     #[tokio::test]
     async fn capacity_edit_is_queued_without_publishing_it_as_applied() {
         let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
         let (requests, _rx) = request_channel(100);
         poll_once(
             &live,
-            &OkFetcher(vec![
-                cfg_row("active_watchlist_size", "150"),
-                cfg_row("max_fill_price", "0.50"),
-            ]),
+            &status,
+            &OkFetcher({
+                let mut rows = rows_with("active_watchlist_size", "150");
+                rows.iter_mut()
+                    .find(|row| row.key == "max_fill_price")
+                    .expect("complete row")
+                    .value = "0.50".to_owned();
+                rows
+            }),
             &requests,
             false,
         )
         .await;
         let snapshot = live.snapshot();
         assert_eq!(snapshot.active_watchlist_size, 100);
-        assert_eq!(snapshot.max_fill_price, "0.50");
+        assert_eq!(snapshot.max_fill_price, Decimal::new(50, 2));
         assert_eq!(requests.current().target, 150);
+        assert_eq!(status.snapshot().applied_hash, snapshot.canonical_hash());
     }
 
     #[tokio::test]
     async fn malformed_followup_retains_the_valid_pending_target() {
         let live = LiveRuntimeConfig::new(boot());
+        let status = RuntimeConfigStatus::new(&live.snapshot());
         let (requests, _rx) = request_channel(100);
         poll_once(
             &live,
-            &OkFetcher(vec![cfg_row("active_watchlist_size", "150")]),
+            &status,
+            &OkFetcher(rows_with("active_watchlist_size", "150")),
             &requests,
             false,
         )
         .await;
         poll_once(
             &live,
-            &OkFetcher(vec![cfg_row("active_watchlist_size", "invalid")]),
+            &status,
+            &OkFetcher(rows_with("active_watchlist_size", "invalid")),
             &requests,
             false,
         )
@@ -601,6 +661,7 @@ mod tests {
         let (results_tx, results_rx) = mpsc::channel(2);
         let coordinator = tokio::spawn(run_config_poll_loop(
             live.clone(),
+            RuntimeConfigStatus::new(&live.snapshot()),
             OkFetcher(Vec::new()),
             requests.clone(),
             applied.clone(),

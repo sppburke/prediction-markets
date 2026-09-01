@@ -8,7 +8,7 @@
 //   Watched    = watched by pe-service OR has open fills (+ an Unrealized column)
 //   Historical = has any settled fill
 //   Bench      = not Watched and never settled
-// If the watchlist is empty (soft-fail), Watched degrades to "has open fills" only.
+// An unavailable watchlist remains visibly unavailable; it is never interpreted as empty.
 import { useEffect, useMemo, useState } from "react";
 
 import { formatUsd, toNum } from "@/lib/format";
@@ -24,13 +24,16 @@ export function WalletTabs({
   openFills,
 }: {
   rows: WalletLiveStats[];
-  watchedSet: string[];
+  watchedSet: string[] | null;
   openFills: PaperFill[];
 }) {
   const [tab, setTab] = useState<TabKey>("live");
   const [unrealized, setUnrealized] = useState<Map<string, number>>(new Map());
 
-  const watched = useMemo(() => new Set(watchedSet.map((w) => w.toLowerCase())), [watchedSet]);
+  const watched = useMemo(
+    () => (watchedSet === null ? null : new Set(watchedSet.map((w) => w.toLowerCase()))),
+    [watchedSet],
+  );
 
   useEffect(() => {
     const keys = [...new Set(openFills.map((f) => `${f.market_id}:${f.outcome_id}`))];
@@ -63,11 +66,15 @@ export function WalletTabs({
 
   const { live, historical, bench } = useMemo(() => {
     const isLive = (r: WalletLiveStats) =>
-      watched.has(r.wallet.toLowerCase()) || (toNum(r.live_open_fills) ?? 0) > 0;
+      watched !== null &&
+      (watched.has(r.wallet.toLowerCase()) || (toNum(r.live_open_fills) ?? 0) > 0);
     return {
       live: rows.filter(isLive),
       historical: rows.filter((r) => (toNum(r.live_settled_count) ?? 0) > 0),
-      bench: rows.filter((r) => !isLive(r) && (toNum(r.live_settled_count) ?? 0) === 0),
+      bench:
+        watched === null
+          ? []
+          : rows.filter((r) => !isLive(r) && (toNum(r.live_settled_count) ?? 0) === 0),
     };
   }, [rows, watched]);
 
@@ -77,9 +84,9 @@ export function WalletTabs({
   );
 
   const tabs: { key: TabKey; label: string; rows: WalletLiveStats[] }[] = [
-    { key: "live", label: `Watched (${live.length})`, rows: live },
+    { key: "live", label: watched === null ? "Watched (—)" : `Watched (${live.length})`, rows: live },
     { key: "historical", label: `Historical (${historical.length})`, rows: historical },
-    { key: "bench", label: `Bench (${bench.length})`, rows: bench },
+    { key: "bench", label: watched === null ? "Bench (—)" : `Bench (${bench.length})`, rows: bench },
   ];
   const active = tabs.find((t) => t.key === tab) ?? tabs[0];
 
@@ -110,7 +117,13 @@ export function WalletTabs({
           </button>
         ))}
       </div>
-      <WalletTable rows={active.rows} unrealized={tab === "live" ? unrealized : undefined} />
+      {(tab === "live" || tab === "bench") && watched === null ? (
+        <p className="rounded border border-border p-4 text-sm text-muted">
+          Watchlist projection unavailable. Retry after the service publishes a consistent snapshot.
+        </p>
+      ) : (
+        <WalletTable rows={active.rows} unrealized={tab === "live" ? unrealized : undefined} />
+      )}
     </div>
   );
 }

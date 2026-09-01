@@ -6,7 +6,6 @@
 //! best-ask fill basis (#486) and, when the price-impact gate is on, for the size cap (#398 WS2).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,9 +137,9 @@ pub struct OrchestratorConfig {
     /// with sizing/band-gates keyed off it) or `LeaderHaircut` (the pre-#486 boot-frozen haircut).
     /// Refreshed per event from the runtime-config snapshot when `runtime_config` is `Some`.
     pub fill_mode: FillMode,
-    /// Fallback BUY haircut (bps) applied to the leader price when a `clob_best_ask` fill has no
-    /// usable best-ask (#486). Refreshed per event alongside `fill_mode`.
-    pub clob_best_ask_fallback_haircut_bps: u32,
+    /// Mandatory price-impact ceiling in basis points (#544). Valid values are `1..=10_000`;
+    /// unusable book evidence fails closed before paper fill resolution.
+    pub price_impact_cap_bps: i32,
     /// Copy-entry gate config (first-entry/fail-closed posture). The per-wallet
     /// market history is supplied separately to [`Orchestrator::new`].
     pub entry_gate_config: CopyEntryGateConfig,
@@ -239,18 +238,14 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // rebuild at the top of `handle_trade` reads one snapshot. `None` in tests (boot config).
     runtime_config: Option<LiveRuntimeConfig>,
     // Live CLOB /book fetcher for the price-impact gate (#398 WS2). Shared `Arc` with the snapshot
-    // worker so the 5 rps rate gate is global. Consulted only when `price_impact_cap_bps != 0`.
+    // worker so the 5 rps rate gate is global. Consulted for every admitted signal.
     book_fetcher: Arc<B>,
-    // Price-impact gate cap in bps, rebuilt per event from the runtime-config snapshot. `0`
-    // disables the gate (fail-open; no `/book` fetch).
+    // Mandatory price-impact gate cap in bps, rebuilt per event from the runtime-config snapshot.
     price_impact_cap_bps: i32,
     // Paper fill-price mode (#486), rebuilt per event from the runtime-config snapshot. Gates
     // whether a paper BUY fetches the CLOB best-ask (`ClobBestAsk`) or uses the boot-frozen
     // haircut (`LeaderHaircut`).
     fill_mode: FillMode,
-    // Fallback BUY haircut (bps) for a `clob_best_ask` fill with no usable ask (#486), rebuilt
-    // per event alongside `fill_mode`.
-    clob_best_ask_fallback_haircut_bps: u32,
     // Live account contexts (#508): armed targets stage dispatch aggregates. `None` in
     // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
@@ -337,11 +332,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     {
                         let mut fenced = HashSet::new();
                         fenced.insert(result.wallet);
+                        // The attached bounded latest-only notifier marks the effective
+                        // projection dirty after this post-commit removal (#544).
                         self.live_watchlist.remove_fenced(&fenced);
-                        // #544 Phase 3 integration: the base service has no
-                        // membership/projection dirty sender to notify here. Its
-                        // owning projection lane must attach that coalescing sender
-                        // at this post-commit, post-removal boundary.
                     }
                     result
                 } else {
@@ -396,6 +389,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     ) -> Result<Self, anyhow::Error> {
         let min_quality = ReconstructionQuality::new(0)
             .map_err(|_| anyhow::anyhow!("internal: ReconstructionQuality::new(0) failed"))?;
+        if !(1..=10_000).contains(&config.price_impact_cap_bps) {
+            return Err(anyhow::anyhow!(
+                "price_impact_cap_bps must be in 1..=10_000"
+            ));
+        }
 
         // Seed the dedup set from any positions already in the DB (crash-restart safety).
         let filled_positions: HashSet<MarketOutcomeId> = paper_state
@@ -455,9 +453,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             supabase_state,
             runtime_config: config.runtime_config,
             book_fetcher,
-            price_impact_cap_bps: 0,
+            price_impact_cap_bps: config.price_impact_cap_bps,
             fill_mode: config.fill_mode,
-            clob_best_ask_fallback_haircut_bps: config.clob_best_ask_fallback_haircut_bps,
             live_accounts: config.live_accounts,
             intake_stopped: false,
             watchlist_writer_lock: config.watchlist_writer_lock,
@@ -745,93 +742,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         }
     }
 
-    /// Resolve the paper fill basis + its provenance for `signal` (#486).
-    ///
-    /// Paper mode with `fill_mode == ClobBestAsk` and a BUY fetches the fresh CLOB `/book` for the
-    /// signal's outcome token and returns the best-ask ([`FillSource::ClobBestAsk`]) when usable,
-    /// else the `clob_best_ask_fallback_haircut_bps` fallback ([`FillSource::Fallback`]). The
-    /// production copy-entry gate rejects SELLs before this method. Its defensive non-BUY branch
-    /// retains the generic executor's SELL haircut but is unreachable from Winner-Follow.
-    /// `LeaderHaircut` mode and every non-paper mode return the boot-frozen haircut price
-    /// ([`FillSource::LeaderHaircut`]), byte-identical to the pre-#486 basis. Only the paper-mode
-    /// result is threaded to the executor as `observed_fill_price`; other modes pass `None` and
-    /// the executor recomputes the identical haircut.
-    async fn resolve_fill_price(
+    /// Resolve the local paper fill basis for paths that do not use the mandatory CLOB plan.
+    /// A paper `clob_best_ask` BUY is rejected before this point unless the single impact-gate
+    /// request produced a usable ladder basis (#544).
+    fn resolve_fill_price(
         &self,
         signal: &LeaderSignal,
     ) -> Result<(Price, FillSource), PaperExecutionError> {
-        // Non-paper modes and the leader_haircut fill mode: the boot-frozen local haircut, no fetch.
-        if self.mode != ExecutionMode::Paper || self.fill_mode != FillMode::ClobBestAsk {
-            let price = PaperExecutor::fill_price(
-                signal.leader_side,
-                signal.leader_price,
-                self.paper_fill_haircut_bps,
-                self.paper_fill_slippage_bps,
-            )?;
-            return Ok((price, FillSource::LeaderHaircut));
-        }
-        // clob_best_ask paper mode. The best-ask is the BUY-side price the copy would cross, and
-        // the `/book` has no bids, so only a BUY fetches; a SELL falls through to the shared SELL
-        // haircut branch below.
-        if signal.leader_side == Side::Buy
-            && let Some(ask) = self.fetch_best_ask(signal).await
-        {
-            return Ok((ask, FillSource::ClobBestAsk));
-        }
-        // Fallback: leader_price × (1 + clob_best_ask_fallback_haircut_bps/10_000) on a BUY, or the
-        // shared SELL slippage branch. The SELL branch of `fill_price` ignores the haircut arg and
-        // applies only `slippage_bps`, so pass the boot-frozen `paper_fill_slippage_bps` to keep a
-        // SELL byte-identical to the pre-#486 fill; the haircut arg is dead there and drives a BUY.
         let price = PaperExecutor::fill_price(
             signal.leader_side,
             signal.leader_price,
-            self.clob_best_ask_fallback_haircut_bps,
+            self.paper_fill_haircut_bps,
             self.paper_fill_slippage_bps,
         )?;
-        Ok((price, FillSource::Fallback))
-    }
-
-    /// Fetch the fresh CLOB best-ask (positive price AND positive size) for `signal`'s outcome
-    /// token, or `None` on any non-usable outcome — missing CLOB token, `/book` fetch error or
-    /// timeout, empty book, a best-ask that fails `Price::new`, or a zero / zero-size level — so
-    /// the caller takes the fallback haircut (#486). The 2 s timeout mirrors the price-impact gate.
-    async fn fetch_best_ask(&self, signal: &LeaderSignal) -> Option<Price> {
-        // The outcome's CLOB token id (served from the mid cache, warm from the mid gate above).
-        let snaps = self
-            .mid_price_cache
-            .fetch_snapshots(std::slice::from_ref(&signal.market_id))
-            .await;
-        let token_id = snaps.get(&signal.market_id).and_then(|s| {
-            s.clob_token_ids
-                .get(usize::from(signal.outcome_id.0))
-                .cloned()
-        })?;
-        let book = match tokio::time::timeout(
-            Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
-            self.book_fetcher.fetch_book(&token_id),
-        )
-        .await
-        {
-            Ok(Ok(book)) => book,
-            Ok(Err(e)) => {
-                info!(error = %e, market = %signal.market_id, "best-ask /book fetch failed; using fallback haircut");
-                return None;
-            }
-            Err(_) => {
-                info!(market = %signal.market_id, "best-ask /book fetch timed out; using fallback haircut");
-                return None;
-            }
-        };
-        // `OrderBook::best_ask` ignores level size, so compute the min price among positive-size
-        // levels here: a zero-size dust level must not set the fill basis (and slip a copy past the
-        // band gate). A non-positive best-ask (unreachable at 0.01 ticks) is guarded defensively.
-        let best_ask = book
-            .asks
-            .iter()
-            .filter(|l| l.size > Decimal::ZERO && l.price > Decimal::ZERO)
-            .map(|l| l.price)
-            .min()?;
-        Price::new(best_ask).ok()
+        Ok((price, FillSource::LeaderHaircut))
     }
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
@@ -894,19 +818,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             if let Some(m) = runtime_config::parse_execution_mode(&rc.mode) {
                 self.mode = m;
             }
-            if let Ok(price) = Decimal::from_str(&rc.max_fill_price) {
-                self.max_fill_price = price;
-            }
-            if let Ok(price) = Decimal::from_str(&rc.min_fill_price) {
-                self.min_fill_price = price;
-            }
+            self.max_fill_price = rc.max_fill_price;
+            self.min_fill_price = rc.min_fill_price;
             self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
             self.price_impact_cap_bps = rc.price_impact_cap_bps;
-            // #486: fill mode + fallback haircut ARE runtime-mutable — the executor is a pure
-            // recorder of the orchestrator-resolved basis, so no boot-frozen executor knob desyncs.
             self.fill_mode = rc.fill_mode;
-            self.clob_best_ask_fallback_haircut_bps = rc.clob_best_ask_fallback_haircut_bps;
             // NOTE: paper_fill_haircut/slippage_bps are deliberately NOT refreshed here. The
             // `PaperExecutor` that records the fill bakes them in at boot with no runtime setter,
             // so refreshing only the sizing side would desync sizing from the recorded fill after
@@ -1213,49 +1130,44 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
         };
 
-        // Price-impact gate (#508 Phase A): when enabled (`price_impact_cap_bps ≥ 1`), ONE
-        // `/book` fetch produces the executable-ladder plan that feeds the band gate, the
-        // size cap, and (in `clob_best_ask` paper mode) the VWAP fill basis. An unusable
-        // book — missing token, fetch error/timeout, corrupt/empty/stale — fails CLOSED
-        // (skip; the #398 fail-open posture is retired), as does an in-band ladder that
-        // affords no whole share.
-        let gate: Option<GatePlan> = if self.price_impact_cap_bps > 0 {
-            match self.plan_impact_gate(&signal).await {
-                Ok(outcome) => Some(outcome),
-                Err(reason) => {
-                    // Shared-gate rejection (#508 Decision 10): an UNUSABLE admission
-                    // quote suppresses every destination, pre-staging — no aggregate.
-                    info!(
-                        reason,
-                        market = %signal.market_id,
-                        outcome = signal.outcome_id.0,
-                        "signal did not produce order",
-                    );
-                    self.no_fill_or_rollback(
-                        &trade,
-                        &leader_row,
-                        None,
-                        "",
-                        &rb,
-                        Some(&signal.market_id),
-                    )
-                    .await;
-                    return;
-                }
+        // Mandatory price-impact gate (#508 Phase A, #544): ONE `/book` fetch produces the
+        // executable-ladder plan that feeds the band gate, the size cap, and (in
+        // `clob_best_ask` paper mode) the VWAP fill basis. An unusable book — missing token,
+        // fetch error/timeout, corrupt/empty/stale — fails CLOSED (skip), as does an in-band
+        // ladder that affords no whole share.
+        let gate = match self.plan_impact_gate(&signal).await {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                // Shared-gate rejection (#508 Decision 10): an UNUSABLE admission quote
+                // suppresses every destination, pre-staging — no aggregate.
+                info!(
+                    reason,
+                    market = %signal.market_id,
+                    outcome = signal.outcome_id.0,
+                    "signal did not produce order",
+                );
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "",
+                    &rb,
+                    Some(&signal.market_id),
+                )
+                .await;
+                return;
             }
-        } else {
-            None
         };
         let gate_plan: Option<&LadderPlan> = match &gate {
-            Some(GatePlan::Planned(plan)) => Some(plan),
+            GatePlan::Planned(plan) => Some(plan),
             _ => None,
         };
 
         // Realistic fill basis (#339 revisited, #486, #508): the price the copy will ACTUALLY
-        // fill at. With the impact gate enabled in paper `clob_best_ask` mode, a BUY prices at
+        // fill at. With the mandatory impact gate in paper `clob_best_ask` mode, a BUY prices at
         // the planned ladder VWAP (`estimated_ladder_spend / shares` — multi-level exact, from
         // the same single `/book` fetch as the gate). Otherwise: in paper `clob_best_ask` mode
-        // a BUY resolves to the fresh CLOB best-ask (else the fallback haircut); other modes
+        // a BUY uses the same successful CLOB evidence; other modes
         // use the leader price adjusted by the boot-frozen paper haircut
         // (`PaperExecutor::fill_price`). Size and band-gate against THIS, so notional ==
         // `sizing_dollar_usd` and the gates check the price actually paid. In paper mode the
@@ -1269,7 +1181,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // Zero-absorb reads still anchor the SHARED band gate on the successful best ask
         // (#508 Decision 10 — the paper-only skip happens after staging, below).
         let zero_absorb_basis = match &gate {
-            Some(GatePlan::NothingAffordable { best_ask }) if clob_basis_applies => Some(*best_ask),
+            GatePlan::NothingAffordable { best_ask } if clob_basis_applies => Some(*best_ask),
             _ => None,
         };
         let (fill_basis, fill_source) = if let Some(vwap) = planned_vwap_basis {
@@ -1277,7 +1189,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         } else if let Some(best_ask) = zero_absorb_basis {
             (best_ask, FillSource::ClobBestAsk)
         } else {
-            match self.resolve_fill_price(&signal).await {
+            if clob_basis_applies {
+                info!(
+                    reason = "price-impact book supplied no usable fill basis (fail closed)",
+                    market = %signal.market_id,
+                    "signal did not produce order",
+                );
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "",
+                    &rb,
+                    Some(&signal.market_id),
+                )
+                .await;
+                return;
+            }
+            match self.resolve_fill_price(&signal) {
                 Ok(pair) => pair,
                 Err(_) => {
                     info!(
@@ -1395,7 +1324,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
 
         // Paper-only zero-absorb skip (#508 Decision 10): the successful admission quote
         // could not absorb one whole share of the paper budget.
-        if matches!(&gate, Some(GatePlan::NothingAffordable { .. })) {
+        if matches!(&gate, GatePlan::NothingAffordable { .. }) {
             info!(
                 reason = "impact band absorbs no whole share of the paper budget (paper-only)",
                 market = %signal.market_id,
@@ -1414,8 +1343,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return;
         }
 
-        // Size cap from the ladder plan (#508): the planned whole-share quantity IS the
-        // within-band, within-budget maximum. Gate off → `None` (no cap; no `/book` fetch).
+        // Size cap from the mandatory ladder plan (#508): the planned whole-share quantity IS the
+        // within-band, within-budget maximum. The no-affordable-shares arm returned above.
         let book_cap_contracts = gate_plan.map(|plan| plan.shares.atomic() / 1_000_000);
 
         let p = self.win_rate_p_for(&watchlist, &signal.leader);

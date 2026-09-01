@@ -506,8 +506,8 @@ async fn process_target(
             return Ok(PassControl::Continue);
         }
     };
-    let minimum_price = parse_band_price(&runtime.min_fill_price, Price::ZERO);
-    let maximum_price = parse_band_price(&runtime.max_fill_price, Price(Decimal::ONE));
+    let minimum_price = parse_band_price(runtime.min_fill_price, Price::ZERO);
+    let maximum_price = parse_band_price(runtime.max_fill_price, Price(Decimal::ONE));
     let (minimum_price, maximum_price) = match (minimum_price, maximum_price) {
         (Ok(minimum), Ok(maximum)) => (minimum, maximum),
         _ => {
@@ -625,8 +625,7 @@ fn unix_ms(now: OffsetDateTime) -> u64 {
     u64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
-fn parse_band_price(raw: &str, disabled: Price) -> Result<Price, ()> {
-    let value = Decimal::from_str(raw).map_err(|_| ())?;
+fn parse_band_price(value: Decimal, disabled: Price) -> Result<Price, ()> {
     if value == Decimal::ZERO {
         return Ok(disabled);
     }

@@ -132,13 +132,12 @@ fn paper_fill_count(dir: &TempDir) -> usize {
 /// A flat-fill snapshot ($100/trade) with the resolution-horizon gate disabled, so only the
 /// snapshot's `max_fill_price` decides fill-vs-skip. The boot strategy/gates are deliberately
 /// different where it matters, to prove the per-event rebuild reads the snapshot, not boot.
-fn flat_snapshot(max_fill_price: &str, bankroll_usd: &str) -> RuntimeConfig {
+fn flat_snapshot(max_fill_price: Decimal) -> RuntimeConfig {
     let mut rc = RuntimeConfig::from_service_config(&ServiceConfig::default());
     rc.sizing_mode = SizingMode::Dollar { usd: dec!(100) };
     rc.max_resolution_horizon_secs = 0;
     rc.min_resolution_horizon_secs = 0;
-    rc.max_fill_price = max_fill_price.to_string();
-    rc.bankroll_usd = bankroll_usd.to_string();
+    rc.max_fill_price = max_fill_price;
     // #486: pin the pre-feature haircut basis so these gate scenarios stay on the ×1.05 fill.
     rc.fill_mode = FillMode::LeaderHaircut;
     rc
@@ -181,7 +180,7 @@ async fn run_with(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
             entry_gate_config: CopyEntryGateConfig,
             runtime_config,
@@ -201,7 +200,10 @@ async fn run_with(
         None,
         None,
         None,
-        Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        Arc::new(FixtureClobBookFetcher::new(HashMap::from([(
+            format!("{HEX}-0"),
+            book(&[(dec!(0.60), dec!(1000))]),
+        )]))),
     )
     .unwrap();
     orch.run(std::future::pending::<()>()).await;
@@ -219,7 +221,7 @@ async fn run_with(
 #[tokio::test]
 async fn snapshot_gate_overrides_permissive_boot_gate() {
     let dir = TempDir::new().unwrap();
-    let live = LiveRuntimeConfig::new(flat_snapshot("0.50", "10000"));
+    let live = LiveRuntimeConfig::new(flat_snapshot(dec!(0.50)));
     let (fills, _) = run_with(&dir, Some(live), dec!(0.90), "0.60").await;
     assert_eq!(fills, 0);
     println!(
@@ -238,23 +240,19 @@ async fn boot_gate_used_when_no_runtime_config() {
     println!("PASS: no runtime config → boot max_fill_price governs (1 fill at 0.60 < boot 0.90)");
 }
 
-/// PASS: a config `bankroll_usd` baseline of "1" never becomes the running bankroll — after a
-///       $100-flat fill the running bankroll is debited from 10000 (not reset to the baseline),
-///       proving the config path has no writer to the running bankroll (no re-credit).
-/// FAIL: the running bankroll equals the "1" baseline (the config wrongly overwrote it).
+/// PASS: a hot runtime snapshot has no bankroll owner, so a $100-flat fill debits the durable
+///       running bankroll from 10000 without any runtime-config re-credit.
 #[tokio::test]
-async fn config_bankroll_baseline_never_becomes_running_bankroll() {
+async fn hot_snapshot_never_overwrites_running_bankroll() {
     let dir = TempDir::new().unwrap();
-    let live = LiveRuntimeConfig::new(flat_snapshot("0.90", "1"));
+    let live = LiveRuntimeConfig::new(flat_snapshot(dec!(0.90)));
     let (fills, bankroll) = run_with(&dir, Some(live), dec!(0.90), "0.60").await;
     assert_eq!(fills, 1, "the BUY should fill under the 0.90 cap");
     assert!(
-        bankroll != dec!(1) && bankroll < Decimal::from(10_000u32) && bankroll > Decimal::ZERO,
-        "running bankroll {bankroll} must be debited from 10000 by the fill, never reset to the baseline (1)"
+        bankroll < Decimal::from(10_000u32) && bankroll > Decimal::ZERO,
+        "running bankroll {bankroll} must be debited from 10000 by the fill"
     );
-    println!(
-        "PASS: config bankroll_usd baseline never re-credits the running bankroll ({bankroll})"
-    );
+    println!("PASS: hot runtime snapshot has no bankroll writer ({bankroll})");
 }
 
 // ── Price-impact gate (#398 WS2) — orchestrator /book end-to-end ──────────────────
@@ -272,7 +270,7 @@ fn gate_snapshot(cap_bps: i32) -> RuntimeConfig {
     rc.price_impact_cap_bps = cap_bps;
     rc.max_resolution_horizon_secs = 0;
     rc.min_resolution_horizon_secs = 0;
-    rc.max_fill_price = "0.90".to_string();
+    rc.max_fill_price = dec!(0.90);
     // #486: the price-impact scenarios assert the ×1.05 haircut basis (floor(100/(0.50×1.05))=190),
     // so pin leader_haircut — the best-ask basis would reprice the fallback to ×1.01.
     rc.fill_mode = FillMode::LeaderHaircut;
@@ -328,7 +326,7 @@ async fn run_gate_with(
             paper_fill_haircut_bps: 500,
             paper_fill_slippage_bps: 100,
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: rc.price_impact_cap_bps,
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(rc)),
             live_accounts: None,

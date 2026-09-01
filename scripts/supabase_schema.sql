@@ -301,40 +301,20 @@ create table if not exists service_config (
 insert into service_config (key, value, value_type, description) values
   ('active_watchlist_size',                 '100',    'integer', 'Maximum top-ranked wallets pe-service actively follows; hot-reloaded every 30 seconds (1..200)'),
   ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
-  ('bankroll_usd',                          '10000',  'decimal', 'Bookkeeping mirror of the boot PE_BANKROLL_USD paper baseline: parsed into the runtime snapshot but consumed by nothing. The BOOT value seeds a fresh book (docs/34) and is the /paper/pnl denominator; editing this row re-credits nothing and has no live effect'),
   ('max_fill_price',                        '0.85',   'decimal', 'Skip BUYs at or above this current price'),
   ('min_fill_price',                        '0.15',   'decimal', 'Skip BUYs below this current price (run28 band lower bound; 0 disables)'),
   ('min_resolution_horizon_secs',           '60',     'integer', 'Min time-to-resolution copy floor (seconds)'),
   ('max_resolution_horizon_secs',           '172800', 'integer', 'Max time-to-resolution, 48 h (run28 cutover; seconds)'),
-  ('entry_gate_fail_closed',                'false',  'bool',    'Block copies for wallets whose market history could not be fetched'),
-  ('position_reseed_interval_secs',         '300',    'integer', 'Held-position reseed interval (seconds)'),
-  ('position_page_limit',                   '500',    'integer', 'Position fetch page size'),
-  ('position_size_threshold',               '1',      'integer', 'Min contracts to treat a position as held'),
-  ('paper_fill_haircut_bps',                '500',    'integer', 'Paper-fill conservative haircut (bps)'),
-  ('paper_fill_slippage_bps',               '100',    'integer', 'Paper-fill slippage (bps)'),
   ('fill_mode',                             'clob_best_ask', 'text', 'Paper fill-price mode: clob_best_ask | leader_haircut (#486)'),
-  ('clob_best_ask_fallback_haircut_bps',    '100',    'integer', 'Fallback BUY haircut (bps) when a clob_best_ask fill has no usable best-ask (#486)'),
-  ('status_interval_secs',                   '30',     'integer', 'status.json snapshot interval (seconds); 0 disables'),
-  ('log_retention_days',                     '7',      'integer', 'Daily-rotated JSONL files kept per sink'),
-  ('gamma_resolution_poll_interval_secs',   '120',    'integer', 'Settled-market resolution poll interval (seconds)'),
-  ('supabase_refresh_interval_secs',        '300',    'integer', 'Watchlist refresh interval (seconds)'),
-  ('supabase_sink_reconcile_interval_secs', '300',    'integer', 'Analytics sink reconcile interval (seconds)'),
-  ('maintenance_interval_secs',             '600',    'integer', 'Watchlist maintenance tick interval (seconds)'),
-  ('inactivity_threshold_secs',             '259200', 'integer', 'Soft inactivity threshold, 72 h (seconds)'),
-  ('inactivity_hard_cap_secs',              '604800', 'integer', 'Hard inactivity cap, 7 d (seconds)'),
-  ('bench_overfetch',                       '10',     'integer', 'Bench overfetch count'),
-  ('demotion_min_trades',                   '10',     'integer', 'Min settled trades before the demotion test'),
-  ('demotion_cb_alpha',                     '0.10',   'decimal', 'Empirical-Bernstein demotion confidence alpha'),
-  ('demotion_pnl_window_secs',              '2592000', 'integer', 'Trailing window for the demotion dollar-P&L conjunct, 30 d (#473; seconds)'),
+  ('price_impact_cap_bps',                  '100',    'integer', 'Mandatory price-impact cap (bps of best ask), the sole policy size limit (#508); valid 1..=10000'),
   ('flip_human_approved',                   'false',  'bool',    'Approval flag: allow Flip trades (admin-editable, audit-logged)'),
   ('kelly_fraction_above_default_human_approved', 'false', 'bool', 'Approval flag: allow a Kelly fraction above the mode default'),
   ('polymarket_fee_rate',                   '0.04',   'decimal', 'Polymarket BUY taker fee rate for net cost c'),
+  ('per_trade_cap',                         'mode_default', 'text', 'Per-trade cap: mode_default | unlimited | bps:N (#508); the safe boot seed — production flips to unlimited via the predicated A4 UPDATE only'),
   ('slippage_rate',                         '0.01',   'decimal', 'Expected fill slippage rate added to c'),
   ('sizing_mode',                           'dollar', 'text',    'Shared PAPER sizing mode: kelly | dollar | contract (#398 WS2). Reaches ordinary-live only as the fallback when accounts.live_sizing_mode is NULL'),
   ('sizing_dollar_usd',                     '25',     'decimal', 'USD per PAPER trade when sizing_mode=dollar. Live accounts size from accounts.live_sizing_dollar_usd; this value reaches live only via the NULL live_sizing_mode fallback'),
-  ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)'),
-  ('price_impact_cap_bps',                  '0',      'integer', 'Price-impact cap (bps of best ask), the sole policy size limit (#508); edits valid 1..=10000 — the seeded 0 is rejected at parse so boot stays gate-off until the A3 cutover UPDATE'),
-  ('per_trade_cap',                         'mode_default', 'text', 'Per-trade cap: mode_default | unlimited | bps:N (#508); the safe boot seed — production flips to unlimited via the predicated A4 UPDATE only')
+  ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)')
   on conflict (key) do nothing;
 
 -- Operator watchlist (issue #398): the wallets pe-service copies, written by the service-role
@@ -345,6 +325,94 @@ create table if not exists service_watchlist (
   rank       integer,
   updated_at timestamptz not null default now()
 );
+-- Additive and old-reader-compatible: legacy readers selecting wallet_hex/rank are unchanged.
+alter table service_watchlist
+  add column if not exists leader_score_bps integer not null default 0;
+
+-- Sole serialized watchlist projection owner (#544). The service passes its last applied
+-- service_runtime.updated_at token; stale writers lose before any delete/insert occurs.
+create or replace function service_watchlist_replace_v1(
+  expected_token timestamptz,
+  entries        jsonb
+) returns table(new_token timestamptz, count integer)
+language plpgsql
+as $$
+declare
+  v_current_token timestamptz;
+  v_new_token     timestamptz;
+  v_expected      integer;
+  v_distinct_wallets integer;
+begin
+  if jsonb_typeof(entries) is distinct from 'array' then
+    raise exception using errcode = 'P5442',
+      message = 'service_watchlist_replace_v1_invalid_entries: entries must be an array';
+  end if;
+
+  v_expected := jsonb_array_length(entries);
+  if exists (
+    select 1
+      from jsonb_array_elements(entries) as item(value)
+     where jsonb_typeof(value) is distinct from 'object'
+        or not (value ?& array['wallet_hex', 'rank', 'leader_score_bps'])
+        or jsonb_typeof(value->'wallet_hex') is distinct from 'string'
+        or (value->>'wallet_hex') !~ '^0x[0-9a-f]{40}$'
+        or case
+             when jsonb_typeof(value->'rank') = 'number'
+              and (value->>'rank') ~ '^[1-9][0-9]*$'
+             then (value->>'rank')::numeric > 2147483647
+             else true
+           end
+        or case
+             when jsonb_typeof(value->'leader_score_bps') = 'number'
+              and (value->>'leader_score_bps') ~ '^-?[0-9]+$'
+             then (value->>'leader_score_bps')::numeric
+                    not between -2147483648 and 2147483647
+             else true
+           end
+  ) then
+    raise exception using errcode = 'P5442',
+      message = 'service_watchlist_replace_v1_invalid_entries: malformed entry';
+  end if;
+
+  select count(distinct value->>'wallet_hex')
+    into v_distinct_wallets
+    from jsonb_array_elements(entries) as item(value);
+  if v_distinct_wallets <> v_expected then
+    raise exception using errcode = 'P5442',
+      message = 'service_watchlist_replace_v1_invalid_entries: duplicate wallet_hex';
+  end if;
+  select updated_at into v_current_token
+    from service_runtime
+   where id = 1
+   for update;
+  if not found or v_current_token is distinct from expected_token then
+    raise exception using errcode = 'P5441',
+      message = 'service_watchlist_replace_v1_conflict';
+  end if;
+
+  delete from service_watchlist;
+  insert into service_watchlist (wallet_hex, rank, leader_score_bps, updated_at)
+  select value->>'wallet_hex',
+         (value->>'rank')::integer,
+         (value->>'leader_score_bps')::integer,
+         greatest(clock_timestamp(), v_current_token + interval '1 microsecond')
+    from jsonb_array_elements(entries) as item(value);
+
+  v_new_token := greatest(clock_timestamp(), v_current_token + interval '1 microsecond');
+  update service_runtime
+     set watchlist_size = v_expected,
+         updated_at = v_new_token
+   where id = 1;
+
+  return query select v_new_token, v_expected;
+end;
+$$;
+
+revoke all on function service_watchlist_replace_v1(timestamptz, jsonb)
+  from public, anon, authenticated;
+grant execute on function service_watchlist_replace_v1(timestamptz, jsonb)
+  to service_role;
+notify pgrst, 'reload schema';
 
 -- Per-wallet historical (ranker) vs live (paper) stats. `security_invoker = true` so the
 -- view executes with the *querying* role's privileges and the anon RLS below applies.

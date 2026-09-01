@@ -195,7 +195,7 @@ async fn scenario_e2e_clean_exit() {
             paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
@@ -268,7 +268,7 @@ async fn scenario_graceful_shutdown() {
             paper_fill_slippage_bps: 100,
             // #486: pin the pre-feature haircut basis so these e2e fills stay byte-identical.
             fill_mode: FillMode::LeaderHaircut,
-            clob_best_ask_fallback_haircut_bps: 100,
+            price_impact_cap_bps: 100,
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,

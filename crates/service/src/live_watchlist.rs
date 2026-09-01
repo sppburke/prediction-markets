@@ -19,6 +19,27 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use pe_core_types::WalletAddress;
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+use tokio::sync::watch;
+
+/// Bounded latest-only dirty signal for the sole Supabase watchlist projection worker (#544).
+/// Each mutation advances a process-local counter; a slow worker observes only the newest value.
+#[derive(Clone)]
+pub struct ProjectionDirty {
+    tx: watch::Sender<u64>,
+}
+
+impl ProjectionDirty {
+    pub fn mark(&self) {
+        self.tx.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
+pub fn projection_dirty_channel() -> (ProjectionDirty, watch::Receiver<u64>) {
+    let (tx, rx) = watch::channel(0);
+    (ProjectionDirty { tx }, rx)
+}
 
 /// Hot-swappable handle to the current [`Watchlist`].
 ///
@@ -29,6 +50,7 @@ use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 #[derive(Clone)]
 pub struct LiveWatchlist {
     inner: Arc<ArcSwap<Watchlist>>,
+    projection_dirty: Option<ProjectionDirty>,
 }
 
 impl LiveWatchlist {
@@ -36,6 +58,15 @@ impl LiveWatchlist {
     pub fn new(initial: Watchlist) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
+            projection_dirty: None,
+        }
+    }
+
+    /// Production constructor that attaches the sole bounded projection signal.
+    pub fn new_with_projection(initial: Watchlist, projection_dirty: ProjectionDirty) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(initial)),
+            projection_dirty: Some(projection_dirty),
         }
     }
 
@@ -88,6 +119,7 @@ impl LiveWatchlist {
             incubator_count: total - active_count,
         };
         self.inner.store(Arc::new(updated));
+        self.mark_projection_dirty();
         total
     }
 
@@ -170,6 +202,7 @@ impl LiveWatchlist {
             incubator_count: total - active_count,
         };
         self.inner.store(Arc::new(updated));
+        self.mark_projection_dirty();
         total
     }
 
@@ -197,7 +230,14 @@ impl LiveWatchlist {
             active_count,
             incubator_count: total.saturating_sub(active_count),
         }));
+        self.mark_projection_dirty();
         total
+    }
+
+    fn mark_projection_dirty(&self) {
+        if let Some(dirty) = &self.projection_dirty {
+            dirty.mark();
+        }
     }
 }
 
