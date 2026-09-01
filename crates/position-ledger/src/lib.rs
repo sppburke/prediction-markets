@@ -82,6 +82,13 @@ impl LedgerMutation {
             | ActivityType::TakerRebate
             | ActivityType::ReferralReward => LedgerEffect::RawOnly,
             _ if aggregate.is_combo => LedgerEffect::RawOnly,
+            // Zero-share position-changing rows are venue artifacts with an
+            // arithmetically zero effect — the live API emits zero-burn REDEEM
+            // legs for empty outcome sides (108 observed on one live wallet,
+            // #544 activation fix 2). Retained as raw evidence; never a
+            // mutation, VWAP division, or fence. `Unknown` stays fenced above
+            // regardless of size (its effect cannot be trusted as zero).
+            _ if aggregate.share_sum == ShareAmount::ZERO => LedgerEffect::RawOnly,
             _ => match &components.activity_type {
                 ActivityType::Trade => LedgerEffect::Trade {
                     market_id: market()?,
