@@ -101,8 +101,8 @@ fn seed_fills(specs: &[(u64, &str)]) -> (TempDir, PaperStateDb) {
             wallet: pe_core_types::WalletAddress::from_hex(wallet_hex()).unwrap(),
             market_id: market("0xmkt"),
             outcome_id: OutcomeId(0),
-            long_contracts: 0,
-            short_contracts: 0,
+            long_contracts: pe_core_types::ShareAmount::ZERO,
+            short_contracts: pe_core_types::ShareAmount::ZERO,
         };
         db.commit_fill(
             &SourceTradeId(format!("src{i}")),

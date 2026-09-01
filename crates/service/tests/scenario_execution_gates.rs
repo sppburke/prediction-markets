@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
+    BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
@@ -42,6 +42,7 @@ use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::runtime_config::FillMode;
+use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, FillSource, PaperExecutor, PaperFill, PerTradeCap, SizingMode,
@@ -92,10 +93,11 @@ fn entry_trade(id: &str, market_id: MarketId, price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -112,8 +114,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
 }
 
 /// First-entry gate with the given fail-closed posture (no band since #339).
-fn band_config(fail_closed: bool) -> CopyEntryGateConfig {
-    CopyEntryGateConfig { fail_closed }
+fn band_config(_fail_closed: bool) -> CopyEntryGateConfig {
+    CopyEntryGateConfig
 }
 
 /// Mid-price cache fixture quoting `price` for both outcomes of every market in `markets`,
@@ -212,6 +214,22 @@ async fn run_gate_capped(
 ) -> usize {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    if !history.is_empty() {
+        let wallets: Vec<_> = history
+            .iter()
+            .map(|(wallet, markets)| serde_json::json!({ "wallet": wallet, "markets": markets }))
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({ "wallets": wallets })).unwrap();
+        paper_state.import_legacy_wallet_history(&bytes, 1).unwrap();
+    }
+    paper_state
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"test\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
 
     let markets: Vec<MarketId> = trades.iter().map(|t| t.market_id.clone()).collect();
     let mid_price_cache = mid_cache_for(&markets, mid_price);
@@ -228,6 +246,7 @@ async fn run_gate_capped(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -247,7 +266,6 @@ async fn run_gate_capped(
             runtime_config: None,
             live_accounts: None,
         },
-        history,
         WinnerFollowStrategy::new(flat_fill_config()),
         make_dispatcher(dir),
         paper_state,
@@ -333,40 +351,36 @@ async fn sell_is_rejected_without_consuming_first_entry_history() {
     println!("PASS: SELL is rejected without consuming first-entry history; later BUY fills once");
 }
 
-// ── Fail-open / fail-closed posture ───────────────────────────────────────────
+// ── Durable history posture ──────────────────────────────────────────────────
 
-/// PASS: with the leader ABSENT from the history map and the gate fail-open, an
-///       in-band first entry is admitted (one fill).
-/// FAIL: zero fills (fail-open wrongly blocked an unknown wallet).
+/// A complete reconciled wallet with no prior markets admits its first entry.
 #[tokio::test]
-async fn fail_open_admits_absent_wallet() {
+async fn complete_history_admits_first_entry_without_prior_markets() {
     let dir = TempDir::new().unwrap();
     let fills = run_gate(
         &dir,
         band_config(false),
-        HashMap::new(), // leader absent → unknown history
-        vec![entry_trade("fail-open", market("0xnew"), dec!(0.60))],
+        HashMap::new(),
+        vec![entry_trade("complete-empty", market("0xnew"), dec!(0.60))],
     )
     .await;
     assert_eq!(fills, 1);
-    println!("PASS: fail-open admits an entry from a wallet absent from history (1 fill)");
+    println!("PASS: complete empty history admits the first entry (1 fill)");
 }
 
-/// PASS: with the leader ABSENT from the history map and the gate fail-closed, an
-///       in-band entry is blocked (zero fills).
-/// FAIL: any fill (fail-closed wrongly admitted an unknown wallet).
+/// Missing reconciled history blocks the membership preparation boundary before
+/// any orchestrator acknowledgement can be requested.
 #[tokio::test]
-async fn fail_closed_blocks_absent_wallet() {
+async fn incomplete_history_blocks_admission_preparation() {
     let dir = TempDir::new().unwrap();
-    let fills = run_gate(
-        &dir,
-        band_config(true),
-        HashMap::new(), // leader absent → unknown history
-        vec![entry_trade("fail-closed", market("0xnew"), dec!(0.60))],
-    )
-    .await;
-    assert_eq!(fills, 0);
-    println!("PASS: fail-closed blocks an entry from a wallet absent from history (0 fills)");
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    let (control_tx, _control_rx) = mpsc::channel(1);
+    let preparer = AdmissionPreparer::new(control_tx, paper_state);
+    assert!(matches!(
+        preparer.prepare(&[leader_wallet()]).await,
+        Err(AdmissionError::MissingHistory { missing: 1 })
+    ));
+    println!("PASS: incomplete durable history blocks admission preparation");
 }
 
 // ── Current-price cap scenarios (#339) ────────────────────────────────────────
@@ -571,10 +585,11 @@ fn bestask_trade(id: &str, side: Side, leader_price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side,
         price: Price(leader_price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -593,6 +608,14 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
 ) -> (usize, Option<(u64, Decimal, FillSource)>) {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    paper_state
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"test\":true}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
 
     let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
     tx.send(bestask_trade("ba-1", side, leader_price))
@@ -606,6 +629,7 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -621,7 +645,6 @@ async fn run_bestask<B: ClobBookFetcher + 'static>(
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
         make_dispatcher(dir),
         paper_state.clone(),
@@ -821,6 +844,7 @@ async fn live_mode_never_fetches_book_ac6() {
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::LiveTiny,
             signal_config: SignalConfig::default(),
@@ -838,7 +862,6 @@ async fn live_mode_never_fetches_book_ac6() {
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(flat_fill_config()),
         make_live_dispatcher(&dir),
         paper_state.clone(),

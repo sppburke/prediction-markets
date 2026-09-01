@@ -94,8 +94,8 @@ fn leader_row(w: pe_core_types::WalletAddress) -> pe_paper_state::LeaderPosition
         wallet: w,
         market_id: pe_core_types::MarketId(pe_core_types::VenueMarketId("0xmkt".into())),
         outcome_id: pe_core_types::OutcomeId(0),
-        long_contracts: 0,
-        short_contracts: 0,
+        long_contracts: pe_core_types::ShareAmount::ZERO,
+        short_contracts: pe_core_types::ShareAmount::ZERO,
     }
 }
 
@@ -164,7 +164,7 @@ async fn downtime_forward_sweep_reconstructs_real_last_trade() {
 
     // Once the trades are durably seen (the orchestrator's job), the next sweep advances
     // the delivery cursor to B — the #357 forward-sweep reconstruction completes.
-    for trade_id in ["0xAAA", "0xBBB"] {
+    for trade_id in ["0xaaa", "0xbbb"] {
         db.commit_seen_no_fill_with_flip(
             &pe_core_types::SourceTradeId(trade_id.to_string()),
             &leader_row(w),
@@ -201,7 +201,7 @@ async fn downtime_forward_sweep_reconstructs_real_last_trade() {
     got.sort();
     assert_eq!(
         got,
-        vec!["0xAAA".to_string(), "0xBBB".to_string()],
+        vec!["0xaaa".to_string(), "0xbbb".to_string()],
         "PASS: the forward sweep re-delivered both A and B (dedup is downstream)"
     );
     println!("PASS: downtime-forward-sweep-reconstructs-real-last-trade");

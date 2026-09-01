@@ -301,10 +301,8 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
 | `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for the public CLOB `/book` liquidity-capture fetch (issue #350 WS2). Deliberately shorter than `polymarket_request_timeout_secs` (10) — the fetch runs off the fill hot path, so a slow book degrades to a partial snapshot rather than blocking a trade. Reuses the existing `polymarket_clob_min_interval_ms` (200) gate. |
 | `absorbable_depth_bps` | 100 | Fixed `crates/service/src/snapshot_worker.rs` constant `ABSORBABLE_DEPTH_BPS` (no env override): ask-depth band for `absorbable_usd_100bps` (issue #350 WS2 PR-H). Σ price·size over ask levels priced within this many basis points of the best ask. 100 bps = 1 %; baked into the column name `absorbable_usd_100bps`, so it is a constant rather than an operator knob. |
-| `position_reseed_interval_secs` | 300 | `ServiceConfig` field. Seconds between periodic leader-ledger reseeds from the positions API. 0 disables periodic reseeds (startup seed still runs). |
-| `position_page_limit` | 500 | `ServiceConfig` field. Maximum positions to fetch per page when seeding the leader ledger. |
-| `position_size_threshold` | 1 | `ServiceConfig` field. Minimum position size (contracts) to include; positions below this are treated as dust. |
-| `position_max_pages` | 20 | **Module const** in `crates/service/src/position_seeder.rs` (not a TOML/env key). Completeness cap: pagination advances on the decoded response-row count (not the retained position count, which dust filtering and key deduplication can shrink), and a full final permitted page is an **error** — the wallet is omitted from the seed map rather than seeded with a truncated snapshot that would classify its next BUY as a first Entry (#542). |
+| `position_page_limit` | 500 | `ServiceConfig` field. Maximum positions to fetch per page for read-only reconciliation/admission evidence. The positions API never overwrites the ordered activity ledger (#544). |
+| `position_max_pages` | 20 | **Module const** in `crates/service/src/position_seeder.rs` (not a TOML/env key). Completeness cap for the retained strict positions parser: pagination advances on decoded response-row count, and a full final permitted page is an error. It is evidence for reconciliation/admission, never a ledger replacement (#544). |
 
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 
@@ -354,15 +352,12 @@ Campaign financial limits and eligibility are canonical in
 
 ### Copy-entry gate (first-ever BUY entry; issues #290, #339)
 
-Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. SELLs are rejected before in-session history is recorded, fill pricing, sizing, or execution. The leader-price band was removed in #339 — live sizing is re-based on the current market price instead (see `max_fill_price` below and `docs/19-WINNER-FOLLOW-STRATEGY.md` "Copy-scope gates" for the full gate sequence and fail posture).
+Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. Version-two activity and gate rows in paper-state are the sole runtime history owner; `CopyEntryGate` is rebuilt from those rows before producers. Missing or incomplete reconciled history blocks membership publication. A valid legacy `wallet_market_history.json` can be imported once as a versioned conservative seed; its source hash/result are durable and later sidecar edits are inert (#544). SELLs remain non-consuming.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `wallet_market_history_path` | `./wallet_market_history.json` | `ServiceConfig` field. Path to the JSON sidecar tracking each leader's previously-traded markets (loaded/merged/persisted at startup by `crate::wallet_history`). It is a conservative any-trade superset for the first-BUY gate: prior SELL-only activity can suppress a later BUY, but can never admit a SELL. |
 | `max_fill_price` | `0.85` | `ServiceConfig` field (decimal string). Skip a BUY copy whose **fill price** (leader price + paper haircut) is `>=` this (catastrophic payoff geometry near $1). `0` disables. Mirrors the issue-#142 backtest `max_signal_price` cap, which also gates the slippage-adjusted fill price (#484: the gate keys off the fill price, not the Gamma mid, so a mid that diverges from the fill can't slip a copy past the cap). A safety rail, not the old leader-price band; adjustable up to ~0.90–0.95 (issue #339). |
 | `min_fill_price` | `0.15` | `ServiceConfig` field (decimal string), **added at the 2026-07-03 run28 cutover**. Skip a BUY copy whose **fill price** (leader price + paper haircut) is `<` this — the run28 entry-band lower bound enforced at copy time so selection and deployment share the filter (the #468 lesson). The boundary value itself fills (strict `<` skip, mirroring the backtest `min_signal_price` floor). Gated on the fill price, not the Gamma mid (#484). `0` disables. Runtime-mutable via `service_config`; drift-guarded by `service_config_seed_matches_boot_defaults`. |
-| `entry_gate_fail_closed` | `false` | `ServiceConfig` field. Posture for a wallet absent from the history map (fetch failed, no stale sidecar): `false` fails open (copies allowed, treat as new), `true` fails closed (blocked). The loader warns per absent wallet either way. |
-| `history_max_pages` | 200 | **Module const** in `crates/service/src/wallet_history.rs` (not a TOML/env key). Safety backstop: per-wallet history pagination stops after this many 500-trade pages; a `warn!` is emitted if hit (older markets may be missed → possible false first-entry). |
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
 

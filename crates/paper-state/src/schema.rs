@@ -6,7 +6,7 @@
 
 /// Current on-disk schema version, written to `PRAGMA user_version` on create
 /// and checked on open. Bump when the table layout changes incompatibly.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// `meta` key under which the event-log reconciliation cursor is stored.
 pub(crate) const META_LAST_APPLIED_EVENT_SEQ: &str = "last_applied_event_seq";
@@ -30,10 +30,12 @@ pub(crate) const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
--- Input dedup: every watchlisted trade we have processed, keyed by the venue's
--- tx-hash trade id. Permanent (no TTL); see issue #282 Open risk #7.
+-- Input dedup: version two keys on reconciled `g2:` activity group identity.
+-- Non-g2 historical keys remain immutable version-one transaction identities.
 CREATE TABLE IF NOT EXISTS seen_trades (
-    source_trade_id TEXT PRIMARY KEY NOT NULL
+    source_trade_id  TEXT PRIMARY KEY NOT NULL,
+    identity_version INTEGER NOT NULL CHECK(identity_version IN (1, 2)),
+    transaction_hash TEXT
 );
 
 -- #530/#546: durable typed record of an admitted trade that staged NO copy because
@@ -43,7 +45,7 @@ CREATE TABLE IF NOT EXISTS seen_trades (
 -- and reason are retained for audit and replay.
 CREATE TABLE IF NOT EXISTS no_copy_dispositions (
     source_trade_id  TEXT    PRIMARY KEY NOT NULL,
-    provenance       TEXT    NOT NULL CHECK(provenance IN ('rest_poll', 'activity_ws')),
+    provenance       TEXT    NOT NULL,
     age_secs         INTEGER NOT NULL,
     reason           TEXT    NOT NULL,
     recorded_at_unix INTEGER NOT NULL
@@ -76,9 +78,94 @@ CREATE TABLE IF NOT EXISTS leader_positions (
     wallet_hex      TEXT    NOT NULL,
     market_id       TEXT    NOT NULL,
     outcome_id      INTEGER NOT NULL,
-    long_contracts  INTEGER NOT NULL,
-    short_contracts INTEGER NOT NULL,
+    long_amount_str  TEXT    NOT NULL,
+    short_amount_str TEXT    NOT NULL,
     PRIMARY KEY (wallet_hex, market_id, outcome_id)
+);
+
+-- Complete version-two activity-group disposition. `transaction_hash` is audit
+-- evidence only and never participates in dedup or causal ordering (#544).
+CREATE TABLE IF NOT EXISTS activity_groups (
+    source_trade_id   TEXT    PRIMARY KEY NOT NULL,
+    transaction_hash TEXT    NOT NULL,
+    wallet_hex        TEXT    NOT NULL,
+    source_epoch      INTEGER NOT NULL,
+    semantic_revision TEXT   NOT NULL,
+    activity_type     TEXT    NOT NULL,
+    disposition       TEXT    NOT NULL,
+    proof_json        TEXT    NOT NULL
+);
+
+-- Immutable semantic revisions observed for a group. The first row mirrors
+-- `activity_groups`; a later changed revision is retained here while fencing
+-- the wallet, without rewriting the originally applied semantics.
+CREATE TABLE IF NOT EXISTS activity_group_revisions (
+    source_trade_id   TEXT    NOT NULL,
+    semantic_revision TEXT   NOT NULL,
+    transaction_hash TEXT    NOT NULL,
+    disposition       TEXT    NOT NULL,
+    proof_json        TEXT    NOT NULL,
+    recorded_at_unix  INTEGER NOT NULL,
+    PRIMARY KEY (source_trade_id, semantic_revision)
+);
+
+-- Durable first-entry projection and per-group result. The history row is the
+-- sole runtime owner; in-memory CopyEntryGate is rebuilt from it.
+CREATE TABLE IF NOT EXISTS wallet_market_history_v2 (
+    wallet_hex       TEXT    NOT NULL,
+    market_id        TEXT    NOT NULL,
+    first_epoch      INTEGER NOT NULL,
+    source_trade_id  TEXT    NOT NULL,
+    origin           TEXT    NOT NULL CHECK(origin IN ('activity_v2', 'legacy_seed_v1')),
+    PRIMARY KEY (wallet_hex, market_id)
+);
+
+CREATE TABLE IF NOT EXISTS entry_gate_results (
+    source_trade_id TEXT    PRIMARY KEY NOT NULL,
+    wallet_hex      TEXT    NOT NULL,
+    market_id       TEXT    NOT NULL,
+    source_epoch    INTEGER NOT NULL,
+    result          TEXT    NOT NULL,
+    history_consumed INTEGER NOT NULL CHECK(history_consumed IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS wallet_history_status_v2 (
+    wallet_hex      TEXT    PRIMARY KEY NOT NULL,
+    complete        INTEGER NOT NULL CHECK(complete IN (0, 1)),
+    proof_json      TEXT    NOT NULL,
+    updated_at_unix INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS legacy_history_imports (
+    import_name      TEXT    PRIMARY KEY NOT NULL,
+    source_hash      TEXT    NOT NULL,
+    parsed_row_count INTEGER NOT NULL,
+    result           TEXT    NOT NULL,
+    imported_at_unix INTEGER NOT NULL
+);
+
+-- Open after ledger/gate/history apply and closed only by a later terminal
+-- production continuation. Replay consumes the recorded transition and never
+-- executes the continuation (#544 revision 3).
+CREATE TABLE IF NOT EXISTS decision_pending (
+    source_trade_id        TEXT    PRIMARY KEY NOT NULL,
+    semantic_revision     TEXT    NOT NULL,
+    wallet_hex            TEXT    NOT NULL,
+    source_epoch          INTEGER NOT NULL,
+    frozen_inputs_json    TEXT    NOT NULL,
+    post_commit_inputs_json TEXT  NOT NULL,
+    state                  TEXT    NOT NULL CHECK(state IN ('open', 'terminal')),
+    terminal_disposition   TEXT,
+    updated_at_unix        INTEGER NOT NULL
+);
+
+-- Monotonic per-wallet fence set. No DELETE owner exists.
+CREATE TABLE IF NOT EXISTS wallet_fences (
+    wallet_hex       TEXT    PRIMARY KEY NOT NULL,
+    source_trade_id  TEXT    NOT NULL,
+    cause            TEXT    NOT NULL,
+    proof_json       TEXT    NOT NULL,
+    fenced_at_unix   INTEGER NOT NULL
 );
 
 -- Single-row current bankroll (decimal stored as text for exactness).
@@ -112,7 +199,7 @@ CREATE TABLE IF NOT EXISTS meta (
 -- (issue #343 step 0). Mirrors paper-pnl's `SettledMarket`. `outcome_prices` is a
 -- caller-owned JSON-encoded vector of text decimals (this crate stores it verbatim);
 -- `credit_applied` follows the existing text-decimal convention. Additive table —
--- materialises on the live v1 DB via `IF NOT EXISTS` with SCHEMA_VERSION held at 1.
+-- materialises idempotently via `IF NOT EXISTS` on a database at the active schema version.
 CREATE TABLE IF NOT EXISTS settled_markets (
     market_id       TEXT    PRIMARY KEY NOT NULL,
     outcome_prices  TEXT    NOT NULL,
@@ -133,7 +220,7 @@ CREATE TABLE IF NOT EXISTS settled_markets (
 -- for an orphan key, it is NOT inert. The snapshot write is best-effort and must never
 -- fail on referential grounds, so the relationship is documentary (column unconstrained);
 -- `fills` is append-only so there is nothing to cascade regardless. Additive table —
--- materialises on the live DB via `IF NOT EXISTS` with SCHEMA_VERSION held at 1.
+-- materialises idempotently via `IF NOT EXISTS` on a database at the active schema version.
 CREATE TABLE IF NOT EXISTS fill_market_snapshots (
     idempotency_key       TEXT    PRIMARY KEY NOT NULL,
     liquidity             TEXT,
@@ -152,7 +239,7 @@ CREATE TABLE IF NOT EXISTS fill_market_snapshots (
 -- identity — redelivery reuses the staged seed and NEVER recomputes targets from current
 -- configuration. finalized_at_unix is set when every target is terminal (the retention
 -- anchor for `dispatch_seed_retention_days`, _GLOSSARY.md). Additive tables — materialise
--- on the live DB via `IF NOT EXISTS` with SCHEMA_VERSION held at 1.
+-- idempotently via `IF NOT EXISTS` on a database at the active schema version.
 CREATE TABLE IF NOT EXISTS dispatch_seeds (
     dispatch_id       TEXT    PRIMARY KEY NOT NULL,
     state             TEXT    NOT NULL CHECK(state IN ('pending_paper','ready')),

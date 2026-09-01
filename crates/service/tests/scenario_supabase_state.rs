@@ -72,8 +72,8 @@ fn leader() -> LeaderPositionRow {
         wallet: WalletAddress::from_hex(wallet_hex()).unwrap(),
         market_id: market(),
         outcome_id: OutcomeId(0),
-        long_contracts: 0,
-        short_contracts: 0,
+        long_contracts: pe_core_types::ShareAmount::ZERO,
+        short_contracts: pe_core_types::ShareAmount::ZERO,
     }
 }
 

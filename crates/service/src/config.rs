@@ -51,22 +51,10 @@ pub struct ServiceConfig {
     #[serde(default = "default_trade_poll_interval_secs")]
     pub trade_poll_interval_secs: u64,
 
-    /// Seconds between periodic leader-ledger reseeds from the positions API.
-    /// 0 disables periodic reseeds (startup seed still runs).
-    /// See `docs/_GLOSSARY.md`: `position_reseed_interval_secs`.
-    #[serde(default = "default_position_reseed_interval_secs")]
-    pub position_reseed_interval_secs: u64,
-
-    /// Maximum positions to fetch per page when seeding the leader ledger.
+    /// Maximum positions to fetch per page for the causal positions bracket.
     /// See `docs/_GLOSSARY.md`: `position_page_limit`.
     #[serde(default = "default_position_page_limit")]
     pub position_page_limit: u32,
-
-    /// Minimum position size (in contracts) to include in the leader ledger seed.
-    /// Positions smaller than this are treated as dust and dropped.
-    /// See `docs/_GLOSSARY.md`: `position_size_threshold`.
-    #[serde(default = "default_position_size_threshold")]
-    pub position_size_threshold: u32,
 
     // ── Logging / persistence ────────────────────────────────────────────────
     /// Path to the BLAKE3-chained binary event log.
@@ -178,17 +166,6 @@ pub struct ServiceConfig {
     pub min_resolution_horizon_secs: u64,
 
     // ── Copy-entry gate (first-ever-entry; issues #290, #339) ─────────────────
-    /// Path to the JSON sidecar tracking each leader's previously-entered markets,
-    /// used by the first-entry gate. See `docs/_GLOSSARY.md`: `wallet_market_history_path`.
-    #[serde(default = "default_wallet_market_history_path")]
-    pub wallet_market_history_path: PathBuf,
-
-    /// First-entry gate posture for wallets whose history could not be loaded:
-    /// `false` (default) fails open (copies allowed), `true` fails closed (blocked).
-    /// See `docs/_GLOSSARY.md`: `entry_gate_fail_closed`.
-    #[serde(default)]
-    pub entry_gate_fail_closed: bool,
-
     /// Maximum *current* market price at which a BUY copy will fill, as a decimal string.
     /// Mirrors the issue-#142 backtest `max_signal_price` cap so live sizing matches
     /// backtest: a BUY whose current price is `>=` this is skipped (catastrophic payoff
@@ -372,10 +349,6 @@ const fn default_max_resolution_horizon_secs() -> u64 {
     48 * 3600 // 172_800 s = 48 h (run28 production TTR ceiling, 2026-07-03 cutover)
 }
 
-fn default_wallet_market_history_path() -> PathBuf {
-    PathBuf::from("./wallet_market_history.json")
-}
-
 const fn default_min_resolution_horizon_secs() -> u64 {
     60 // docs/29: the 1-minute copy floor; sub-minute "breaks down"
 }
@@ -436,16 +409,8 @@ const fn default_demotion_pnl_window_secs() -> u64 {
     2_592_000 // 30 d
 }
 
-const fn default_position_reseed_interval_secs() -> u64 {
-    300
-}
-
 const fn default_position_page_limit() -> u32 {
     500
-}
-
-const fn default_position_size_threshold() -> u32 {
-    1
 }
 
 fn default_source_event_log_path() -> PathBuf {
@@ -533,9 +498,7 @@ impl Default for ServiceConfig {
             polymarket_base_url: default_polymarket_base_url(),
             polymarket_channel_capacity: default_channel_capacity(),
             trade_poll_interval_secs: default_trade_poll_interval_secs(),
-            position_reseed_interval_secs: default_position_reseed_interval_secs(),
             position_page_limit: default_position_page_limit(),
-            position_size_threshold: default_position_size_threshold(),
             event_log_path: default_event_log_path(),
             jsonl_log_path: default_jsonl_log_path(),
             status_path: default_status_path(),
@@ -550,8 +513,6 @@ impl Default for ServiceConfig {
             gamma_resolution_poll_interval_secs: default_gamma_resolution_poll_interval_secs(),
             max_resolution_horizon_secs: default_max_resolution_horizon_secs(),
             min_resolution_horizon_secs: default_min_resolution_horizon_secs(),
-            wallet_market_history_path: default_wallet_market_history_path(),
-            entry_gate_fail_closed: false,
             max_fill_price: default_max_fill_price(),
             min_fill_price: default_min_fill_price(),
             watchlist_membership_mode: default_watchlist_membership_mode(),
@@ -615,9 +576,7 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "polymarket_base_url",
         "polymarket_channel_capacity",
         "trade_poll_interval_secs",
-        "position_reseed_interval_secs",
         "position_page_limit",
-        "position_size_threshold",
         "event_log_path",
         "polymarket_activity_ws_enabled",
         "source_event_log_path",
@@ -635,8 +594,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "gamma_resolution_poll_interval_secs",
         "max_resolution_horizon_secs",
         "min_resolution_horizon_secs",
-        "wallet_market_history_path",
-        "entry_gate_fail_closed",
         "max_fill_price",
         "min_fill_price",
         "watchlist_membership_mode",
@@ -717,16 +674,9 @@ mod tests {
         assert_eq!(cfg.fill_mode, "clob_best_ask");
         assert_eq!(cfg.clob_best_ask_fallback_haircut_bps, 100);
         assert_eq!(cfg.paper_state_db_path, PathBuf::from("./paper_state.db"));
-        assert_eq!(cfg.position_reseed_interval_secs, 300);
         assert_eq!(cfg.position_page_limit, 500);
-        assert_eq!(cfg.position_size_threshold, 1);
         assert_eq!(cfg.max_resolution_horizon_secs, 172_800);
         assert_eq!(cfg.min_resolution_horizon_secs, 60);
-        assert_eq!(
-            cfg.wallet_market_history_path,
-            PathBuf::from("./wallet_market_history.json")
-        );
-        assert!(!cfg.entry_gate_fail_closed);
         assert_eq!(cfg.max_fill_price, "0.85");
         assert_eq!(cfg.min_fill_price, "0.15");
         assert_eq!(cfg.watchlist_membership_mode, "knockout");
@@ -858,19 +808,7 @@ mode = "shadow"
                 "max_resolution_horizon_secs",
                 d.max_resolution_horizon_secs.to_string(),
             ),
-            (
-                "entry_gate_fail_closed",
-                d.entry_gate_fail_closed.to_string(),
-            ),
-            (
-                "position_reseed_interval_secs",
-                d.position_reseed_interval_secs.to_string(),
-            ),
             ("position_page_limit", d.position_page_limit.to_string()),
-            (
-                "position_size_threshold",
-                d.position_size_threshold.to_string(),
-            ),
             (
                 "paper_fill_haircut_bps",
                 d.paper_fill_haircut_bps.to_string(),
@@ -957,6 +895,14 @@ mode = "shadow"
             .iter()
             .map(|(k, _)| *k)
             .chain(RUNTIME_ONLY_KEYS)
+            // #544 Lane C retires these runtime inputs. The coordinated lane
+            // boundary leaves scripts/supabase_schema.sql to Lane I; tolerate
+            // those inert seed rows until their owning lane removes them.
+            .chain([
+                "entry_gate_fail_closed",
+                "position_reseed_interval_secs",
+                "position_size_threshold",
+            ])
             .collect();
         for k in seed.keys() {
             assert!(

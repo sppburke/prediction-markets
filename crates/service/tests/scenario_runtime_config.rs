@@ -24,12 +24,12 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
+    BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
@@ -58,6 +58,17 @@ fn leader_wallet() -> WalletAddress {
     serde_json::from_str("\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"").unwrap()
 }
 
+fn record_complete_history(paper_state: &PaperStateDb) {
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+}
+
 fn make_watchlist(wallet: WalletAddress) -> Watchlist {
     Watchlist {
         entries: vec![WatchlistEntry {
@@ -83,10 +94,11 @@ fn entry_trade(id: &str, hex: &str, price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -143,6 +155,7 @@ async fn run_with(
     const HEX: &str = "0xnewmarket";
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    record_complete_history(&paper_state);
 
     let (trade_tx, trade_rx) = mpsc::channel::<IncomingTrade>(8);
     trade_tx
@@ -157,6 +170,7 @@ async fn run_with(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -169,11 +183,10 @@ async fn run_with(
             fill_mode: FillMode::LeaderHaircut,
             clob_best_ask_fallback_haircut_bps: 100,
             // Boot strategy is flat $100 too; the snapshot (when present) overrides it via rebuild.
-            entry_gate_config: CopyEntryGateConfig { fail_closed: false },
+            entry_gate_config: CopyEntryGateConfig,
             runtime_config,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig {
             sizing_mode: SizingMode::Dollar { usd: dec!(100) },
             ..WinnerFollowConfig::default()
@@ -244,25 +257,6 @@ async fn config_bankroll_baseline_never_becomes_running_bankroll() {
     );
 }
 
-/// PASS: a snapshot `entry_gate_fail_closed = true` blocks an entry from a wallet absent from the
-///       history map, even though the BOOT gate is fail-open — proving the per-event rebuild
-///       hot-reloads the entry-gate posture (not just strategy/mode/price knobs).
-/// FAIL: a fill (the snapshot's fail-closed posture was ignored; boot fail-open governed).
-#[tokio::test]
-async fn snapshot_entry_gate_fail_closed_blocks_absent_wallet() {
-    let dir = TempDir::new().unwrap();
-    let mut rc = flat_snapshot("0.90", "10000");
-    rc.entry_gate_fail_closed = true;
-    let live = LiveRuntimeConfig::new(rc);
-    // Boot gate is fail-open (run_with hardcodes fail_closed: false) and the history map is empty,
-    // so the leader is absent → without the rebuild this BUY would fill. The snapshot flips it.
-    let (fills, _) = run_with(&dir, Some(live), dec!(0.90), "0.60").await;
-    assert_eq!(fills, 0);
-    println!(
-        "PASS: per-event rebuild hot-reloads entry_gate_fail_closed=true (absent wallet blocked, 0 fills)"
-    );
-}
-
 // ── Price-impact gate (#398 WS2) — orchestrator /book end-to-end ──────────────────
 // Folded into this binary (not a separate test file) to avoid adding another heavy link target.
 
@@ -309,6 +303,7 @@ async fn run_gate_with(
 ) -> (usize, u64) {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
+    record_complete_history(&paper_state);
 
     let (tx, rx) = mpsc::channel::<IncomingTrade>(8);
     tx.send(entry_trade("pig-1", GATE_COND, dec!(0.50)))
@@ -322,6 +317,7 @@ async fn run_gate_with(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -333,11 +329,10 @@ async fn run_gate_with(
             paper_fill_slippage_bps: 100,
             fill_mode: FillMode::LeaderHaircut,
             clob_best_ask_fallback_haircut_bps: 100,
-            entry_gate_config: CopyEntryGateConfig { fail_closed: false },
+            entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(rc)),
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(dir),
         paper_state.clone(),

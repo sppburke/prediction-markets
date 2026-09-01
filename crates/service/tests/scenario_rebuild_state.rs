@@ -36,8 +36,8 @@ fn leader(long: u64) -> LeaderPositionRow {
         wallet: wallet(),
         market_id: market(),
         outcome_id: OutcomeId(0),
-        long_contracts: long,
-        short_contracts: 0,
+        long_contracts: pe_core_types::ShareAmount::from_whole(long).unwrap(),
+        short_contracts: pe_core_types::ShareAmount::ZERO,
     }
 }
 

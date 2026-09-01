@@ -35,7 +35,7 @@ use pe_core_types::{
 };
 use pe_event_log::Writer;
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::PaperStateDb;
+use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, snapshot::TradingMode};
 use pe_service::clob_book::FixtureClobBookFetcher;
@@ -93,10 +93,11 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(Decimal::from_str("0.65").unwrap()),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId("trade_a1".to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -110,7 +111,16 @@ fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
-    Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap())
+    let state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
+    state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet_a(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    state
 }
 
 fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::OrchestratorControl> {
@@ -120,7 +130,7 @@ fn dead_reseed_rx() -> mpsc::Receiver<pe_service::orchestrator_control::Orchestr
 /// Copy-entry gate disabled for lifecycle tests: fail-open (no band since #339).
 /// Paired with an empty history map so every first Entry is admitted.
 fn disabled_entry_gate() -> CopyEntryGateConfig {
-    CopyEntryGateConfig { fail_closed: false }
+    CopyEntryGateConfig
 }
 
 /// Mid-price cache with no fixtures: every fetch misses → the current-price gate
@@ -173,6 +183,7 @@ async fn scenario_e2e_clean_exit() {
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -189,7 +200,6 @@ async fn scenario_e2e_clean_exit() {
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(&dir),
         make_paper_state(&dir),
@@ -246,6 +256,7 @@ async fn scenario_graceful_shutdown() {
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: Decimal::from(10_000u32),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -262,7 +273,6 @@ async fn scenario_graceful_shutdown() {
             runtime_config: None,
             live_accounts: None,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(&dir),
         make_paper_state(&dir),

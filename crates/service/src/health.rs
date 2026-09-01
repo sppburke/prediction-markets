@@ -62,6 +62,8 @@ pub struct HealthState {
     pub polymarket_last_event_at: Option<OffsetDateTime>,
     pub polygon_last_event_at: Option<OffsetDateTime>,
     pub event_log_writable: bool,
+    /// Paper executor crossed an uncertain sync boundary and is permanently poisoned.
+    pub paper_durability_uncertain: bool,
     /// Whether the live Polygon WS source is configured. When `false` (empty
     /// `polygon_ws_url`, i.e. "etherscan-only mode"), the absence of polygon
     /// events is intentional and must not flag the source as stale/dead — that
@@ -157,6 +159,7 @@ pub fn new_shared_health_with_ws(
         polymarket_last_event_at: None,
         polygon_last_event_at: None,
         event_log_writable: true,
+        paper_durability_uncertain: false,
         polygon_enabled,
         activity_ws_enabled,
         ws_readers: Default::default(),
@@ -214,6 +217,9 @@ pub fn readiness_issues(
 
     if !h.event_log_writable {
         issues.push("event_log_not_writable");
+    }
+    if h.paper_durability_uncertain {
+        issues.push("paper_durability_uncertain");
     }
 
     // #530/#546: websocket-source issues (skip-when-disabled, like polygon above)
@@ -304,6 +310,7 @@ mod tests {
             polymarket_last_event_at: Some(t0()),
             polygon_last_event_at: None,
             event_log_writable: true,
+            paper_durability_uncertain: false,
             polygon_enabled: false,
             activity_ws_enabled: true,
             ws_readers: Default::default(),

@@ -159,10 +159,7 @@ pub struct RuntimeConfig {
     pub demotion_cb_alpha: String,
     pub min_resolution_horizon_secs: u64,
     pub max_resolution_horizon_secs: u64,
-    pub entry_gate_fail_closed: bool,
-    pub position_reseed_interval_secs: u64,
     pub position_page_limit: u32,
-    pub position_size_threshold: u32,
     pub paper_fill_haircut_bps: u32,
     pub paper_fill_slippage_bps: u32,
     /// Paper fill-price mode (#486): `ClobBestAsk` (best-ask BUY fill) or `LeaderHaircut`
@@ -209,10 +206,7 @@ impl RuntimeConfig {
             demotion_cb_alpha: cfg.demotion_cb_alpha.clone(),
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             max_resolution_horizon_secs: cfg.max_resolution_horizon_secs,
-            entry_gate_fail_closed: cfg.entry_gate_fail_closed,
-            position_reseed_interval_secs: cfg.position_reseed_interval_secs,
             position_page_limit: cfg.position_page_limit,
-            position_size_threshold: cfg.position_size_threshold,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
             paper_fill_slippage_bps: cfg.paper_fill_slippage_bps,
             fill_mode: FillMode::parse(&cfg.fill_mode).unwrap_or_else(|| {
@@ -330,22 +324,7 @@ pub fn parse_config(
         "max_resolution_horizon_secs",
         &mut out.max_resolution_horizon_secs,
     );
-    apply_parsed(
-        &map,
-        "entry_gate_fail_closed",
-        &mut out.entry_gate_fail_closed,
-    );
-    apply_parsed(
-        &map,
-        "position_reseed_interval_secs",
-        &mut out.position_reseed_interval_secs,
-    );
     apply_parsed(&map, "position_page_limit", &mut out.position_page_limit);
-    apply_parsed(
-        &map,
-        "position_size_threshold",
-        &mut out.position_size_threshold,
-    );
     apply_parsed(
         &map,
         "paper_fill_haircut_bps",

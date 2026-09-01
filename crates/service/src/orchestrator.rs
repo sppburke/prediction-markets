@@ -5,7 +5,7 @@
 //! cache (Gamma), and the CLOB `/book` fetcher — read on every paper `clob_best_ask` BUY for the
 //! best-ask fill basis (#486) and, when the price-impact gate is on, for the size cap (#398 WS2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use pe_core_types::{
     ReconstructionQuality, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
     WalletAddress,
 };
-use pe_execution_core::{DispatchResult, ExecutionDispatcher};
+use pe_execution_core::{DispatchResult, ExecutionDispatcher, ExecutionError};
 use pe_paper_state::{FillRecord, FillRow, LeaderPositionRow, PaperStateDb};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{RiskSnapshot, TradingMode};
@@ -32,11 +32,12 @@ use pe_trader_index::Watchlist;
 use pe_venue_polymarket::{AskLevel, LadderError, LadderPlan, ladder_is_stale, plan_budget_buy};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
+use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV2};
 use crate::clob_book::ClobBookFetcher;
-use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
+use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::market_end_cache::MarketEndCache;
@@ -78,7 +79,8 @@ enum GatePlan {
 struct RollbackCtx {
     wallet: WalletAddress,
     key: MarketOutcomeId,
-    prev: Option<(u64, u64)>,
+    prev: Option<(ShareAmount, ShareAmount)>,
+    enabled: bool,
 }
 
 /// A post-frame fill whose authority commit has not reached a terminal outcome (#511).
@@ -157,6 +159,10 @@ pub struct OrchestratorConfig {
     /// from either source older than this is admitted with a typed no-copy disposition — at
     /// the early gate and again immediately before dispatch staging.
     pub copy_latency_budget_secs: u64,
+    /// Shared structural membership-writer lock. Production supplies the same
+    /// lock used by refresh/maintenance so a newly durable fence is removed
+    /// from the published generation before the bucket acknowledgement (#544).
+    pub watchlist_writer_lock: Option<Arc<Mutex<()>>>,
 }
 
 /// Scenario-only deterministic seams (#546): fixed admission-clock instants consumed in
@@ -173,7 +179,7 @@ pub struct ScenarioHooks {
 
 pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     trade_rx: mpsc::Receiver<IncomingTrade>,
-    position_ledger: PositionLedger,
+    bucket_engine: BucketCommitEngine,
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
@@ -214,7 +220,6 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     parked: HashMap<SourceTradeId, ParkedFill>,
     // Copy-entry gate: admits only a leader's first-ever BUY entry into a market
     // (#290; price band removed in #339).
-    entry_gate: CopyEntryGate,
     // Sentinel quality (0) returned for any wallet not found in the watchlist.
     // Zero quality → LeaderAction::Unknown → classify_trade returns None, so no signal.
     min_quality: ReconstructionQuality,
@@ -249,31 +254,72 @@ pub struct Orchestrator<F: PageFetcher + Send + Sync, B: ClobBookFetcher> {
     // Live account contexts (#508): armed targets stage dispatch aggregates. `None` in
     // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
+    /// Set at the first uncertain paper sync boundary. Dropping the receiver
+    /// then backpressures/stops every producer; supervisor owns process exit.
+    intake_stopped: bool,
+    watchlist_writer_lock: Option<Arc<Mutex<()>>>,
+    /// Open production continuations loaded before producers. The durable row
+    /// remains the owner; this queue only preserves its causal boot order.
+    pending_boot: VecDeque<IncomingTrade>,
+    pending_continuations: HashMap<SourceTradeId, DecisionContinuationV2>,
 }
 
-fn apply_control_message(
-    entry_gate: &mut CopyEntryGate,
-    position_ledger: &mut PositionLedger,
-    message: OrchestratorControl,
-) {
-    match message {
-        OrchestratorControl::PositionReseed(map) => {
-            let wallets = map.len();
-            position_ledger.overlay(map);
-            info!(wallets, "leader ledger reseeded from live positions API");
-        }
-        OrchestratorControl::PrepareAdmissions {
-            history,
-            positions,
-            acknowledged,
-        } => {
-            let wallets = positions.len();
-            entry_gate.merge_history(history);
-            position_ledger.overlay(positions);
-            // The acknowledgement is intentionally last: membership remains unpublished until
-            // both single-owner ledgers contain the admission prerequisites.
-            let _ = acknowledged.send(());
-            info!(wallets, "hot-watchlist admission state prepared");
+impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
+    async fn apply_control_message(&mut self, message: OrchestratorControl) {
+        match message {
+            OrchestratorControl::PrepareAdmissions {
+                wallets,
+                acknowledged,
+            } => {
+                if wallets
+                    .iter()
+                    .all(|wallet| !self.bucket_engine.is_fenced(wallet))
+                {
+                    let _ = acknowledged.send(());
+                } else {
+                    warn!(
+                        wallets = wallets.len(),
+                        "admission invalidated by durable wallet fence"
+                    );
+                }
+            }
+            OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context,
+                committed,
+            } => {
+                let result = self.bucket_engine.commit(aggregates, &context);
+                if let Ok(result) = &result
+                    && result.newly_fenced.is_some()
+                {
+                    let mut fenced = HashSet::new();
+                    fenced.insert(result.wallet);
+                    if let Some(writer_lock) = &self.watchlist_writer_lock {
+                        let _writer_guard = writer_lock.lock().await;
+                        self.live_watchlist.remove_fenced(&fenced);
+                    } else {
+                        // Scenario/unit construction may omit the production writer lock;
+                        // those harnesses have no competing membership writer.
+                        self.live_watchlist.remove_fenced(&fenced);
+                    }
+                    // #544 Phase 3 integration: the base service has no membership/projection
+                    // dirty sender to notify here. Its owning projection lane must attach that
+                    // coalescing sender at this post-commit, post-removal boundary.
+                }
+                if let Ok(result) = &result {
+                    for source_trade_id in &result.pending {
+                        match self.load_pending_continuation(source_trade_id) {
+                            Ok(Some(trade)) => self.handle_trade(trade).await,
+                            Ok(None) => {}
+                            Err(error) => {
+                                error!(%error, trade = %source_trade_id, "load committed decision continuation failed");
+                            }
+                        }
+                    }
+                }
+                let result = result.map_err(|error| error.to_string());
+                let _ = committed.send(result);
+            }
         }
     }
 }
@@ -284,7 +330,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         trade_rx: mpsc::Receiver<IncomingTrade>,
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
-        history_map: HashMap<WalletAddress, HashSet<MarketId>>,
         strategy: WinnerFollowStrategy,
         dispatcher: ExecutionDispatcher,
         paper_state: Arc<PaperStateDb>,
@@ -310,9 +355,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             .map(|p| MarketOutcomeId::new(p.market_id, p.outcome_id))
             .collect();
 
+        let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
+            .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
+        let mut pending_boot = VecDeque::new();
+        let mut pending_continuations = HashMap::new();
+        for row in paper_state
+            .open_decision_pending()
+            .map_err(|error| anyhow::anyhow!("load open decision continuations: {error}"))?
+        {
+            let continuation = DecisionContinuationV2::from_durable(&row).map_err(|error| {
+                anyhow::anyhow!("decode pending {}: {error}", row.source_trade_id)
+            })?;
+            let trade = continuation.incoming_trade().map_err(|error| {
+                anyhow::anyhow!("rebuild pending {}: {error}", row.source_trade_id)
+            })?;
+            pending_continuations.insert(row.source_trade_id, continuation);
+            pending_boot.push_back(trade);
+        }
         Ok(Self {
             trade_rx,
-            position_ledger: leader_ledger,
+            bucket_engine,
             live_watchlist,
             signal_config: config.signal_config,
             strategy,
@@ -335,7 +397,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             paper_fill_slippage_bps: config.paper_fill_slippage_bps,
             filled_positions,
             parked: HashMap::new(),
-            entry_gate: CopyEntryGate::new(config.entry_gate_config, history_map),
             min_quality,
             control_rx,
             sink,
@@ -347,6 +408,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             fill_mode: config.fill_mode,
             clob_best_ask_fallback_haircut_bps: config.clob_best_ask_fallback_haircut_bps,
             live_accounts: config.live_accounts,
+            intake_stopped: false,
+            watchlist_writer_lock: config.watchlist_writer_lock,
+            pending_boot,
+            pending_continuations,
         })
     }
 
@@ -369,6 +434,29 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         OffsetDateTime::now_utc()
     }
 
+    fn load_pending_continuation(
+        &mut self,
+        source_trade_id: &SourceTradeId,
+    ) -> Result<Option<IncomingTrade>, anyhow::Error> {
+        let row = self
+            .paper_state
+            .open_decision_pending()
+            .map_err(|error| anyhow::anyhow!("read open continuations: {error}"))?
+            .into_iter()
+            .find(|row| &row.source_trade_id == source_trade_id);
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let continuation = DecisionContinuationV2::from_durable(&row)
+            .map_err(|error| anyhow::anyhow!("decode pending {source_trade_id}: {error}"))?;
+        let trade = continuation
+            .incoming_trade()
+            .map_err(|error| anyhow::anyhow!("rebuild pending {source_trade_id}: {error}"))?;
+        self.pending_continuations
+            .insert(source_trade_id.clone(), continuation);
+        Ok(Some(trade))
+    }
+
     #[cfg(feature = "scenario")]
     fn take_scenario_fault(
         &self,
@@ -384,8 +472,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     ///
     /// On shutdown, remaining trades already buffered in the channel are drained
     /// and processed before returning — no in-flight fills are lost.
+    pub async fn resume_pending_before_producers(&mut self) -> Result<(), anyhow::Error> {
+        // Production boot recovery runs before either producer receiver is polled.
+        // `handle_trade` detects the durable pending owner and skips ledger/gate/history.
+        while let Some(trade) = self.pending_boot.pop_front() {
+            self.handle_trade(trade).await;
+            if self.intake_stopped {
+                return Err(anyhow::anyhow!(
+                    "paper durability became uncertain while resuming decision_pending"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
+        if let Err(error) = self.resume_pending_before_producers().await {
+            error!(%error, "decision_pending boot recovery failed");
+            return;
+        }
         let mut trades_done = false;
         let mut control_done = false;
         // #511 frozen-retry ticker: drives parked post-frame fills to a terminal outcome.
@@ -410,17 +516,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 }
                 result = self.control_rx.recv(), if !control_done => {
                     match result {
-                        Some(message) => apply_control_message(
-                            &mut self.entry_gate,
-                            &mut self.position_ledger,
-                            message,
-                        ),
+                        Some(message) => self.apply_control_message(message).await,
                         None => control_done = true,
                     }
                 }
                 result = self.trade_rx.recv(), if !trades_done => {
                     match result {
-                        Some(trade) => self.handle_trade(trade).await,
+                        Some(trade) => {
+                            self.handle_trade(trade).await;
+                            if self.intake_stopped {
+                                trades_done = true;
+                            }
+                        },
                         None => trades_done = true,
                     }
                 }
@@ -677,6 +784,57 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     }
 
     async fn handle_trade(&mut self, trade: IncomingTrade) {
+        let source_trade_id = trade.source_trade_id.clone();
+        let pending_owned = self.pending_continuations.contains_key(&source_trade_id);
+        self.handle_trade_once(trade).await;
+        if pending_owned {
+            match self.paper_state.is_decision_pending_open(&source_trade_id) {
+                Ok(true) => {
+                    error!(trade = %source_trade_id, "decision_pending continuation remained open; stopping producer intake for boot recovery");
+                    self.intake_stopped = true;
+                }
+                Ok(false) => {
+                    self.pending_continuations.remove(&source_trade_id);
+                }
+                Err(error) => {
+                    error!(%error, trade = %source_trade_id, "verify decision_pending terminal transition failed");
+                    self.intake_stopped = true;
+                }
+            }
+        }
+    }
+
+    async fn handle_trade_once(&mut self, mut trade: IncomingTrade) {
+        let pending = match self
+            .pending_continuations
+            .get(&trade.source_trade_id)
+            .cloned()
+        {
+            Some(continuation) => match self
+                .paper_state
+                .is_decision_pending_open(&trade.source_trade_id)
+            {
+                Ok(true) => {
+                    match continuation.incoming_trade() {
+                        Ok(frozen_trade) => trade = frozen_trade,
+                        Err(error) => {
+                            error!(%error, trade = %trade.source_trade_id, "invalid durable continuation");
+                            return;
+                        }
+                    }
+                    Some(continuation)
+                }
+                Ok(false) => {
+                    self.pending_continuations.remove(&trade.source_trade_id);
+                    None
+                }
+                Err(error) => {
+                    error!(%error, trade = %trade.source_trade_id, "read pending continuation state failed");
+                    return;
+                }
+            },
+            None => None,
+        };
         // #398 WS1: rebuild the runtime-mutable knobs from the latest Supabase config snapshot,
         // once per event, so an admin edit takes effect within one poll with no restart. Reads
         // only — the running `self.bankroll` (owned by the fill-commit path, #397) is untouched.
@@ -693,7 +851,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             }
             self.max_resolution_horizon_secs = rc.max_resolution_horizon_secs;
             self.min_resolution_horizon_secs = rc.min_resolution_horizon_secs;
-            self.entry_gate.set_fail_closed(rc.entry_gate_fail_closed);
             self.price_impact_cap_bps = rc.price_impact_cap_bps;
             // #486: fill mode + fallback haircut ARE runtime-mutable — the executor is a pure
             // recorder of the orchestrator-resolved basis, so no boot-frozen executor knob desyncs.
@@ -710,7 +867,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // source unhealthy). A blocked trade is refused BEFORE any state write -
         // it stays unseen, so the held cursor / firehose backstop redelivers it
         // exactly once when a source recovers.
-        let admission_blocked = {
+        let admission_blocked = pending.is_none() && {
             let h = self
                 .health
                 .lock()
@@ -758,12 +915,71 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // ledger/cluster mutation. A trade already processed (RTDS then poll
         // backstop, or a re-poll) must not advance the leader ledger a second time.
         match self.paper_state.is_seen(&trade.source_trade_id) {
+            Ok(true) if pending.is_some() => {}
             Ok(true) => return,
             Ok(false) => {}
             Err(e) => {
                 error!(error = %e, "paper-state is_seen failed; skipping trade");
                 return;
             }
+        }
+
+        // A durable fence is an immediate decision boundary (#544). Legacy v1 deliveries
+        // still advance the exact ledger when their effect is known, but must not read the
+        // watchlist, classify, mutate the entry gate, fetch market/book evidence, fill, or seed.
+        if self.bucket_engine.is_fenced(&trade.wallet) {
+            if pending.is_some() {
+                let leader = self.leader_position_row(&trade);
+                let disposition = pe_paper_state::NoCopyDisposition {
+                    provenance: "reconciled_rest".to_owned(),
+                    age_secs: 0,
+                    reason: "wallet_fenced_before_dispatch".to_owned(),
+                    recorded_at_unix: self.admission_now().unix_timestamp(),
+                };
+                if let Err(error) = self.paper_state.commit_seen_no_copy(
+                    &trade.source_trade_id,
+                    &leader,
+                    &disposition,
+                ) {
+                    error!(%error, trade = %trade.source_trade_id, "close fenced pending continuation failed");
+                }
+                return;
+            }
+            let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+            let previous = self
+                .bucket_engine
+                .ledger()
+                .position(&trade.wallet)
+                .and_then(|snapshot| snapshot.positions.get(&key))
+                .map(|state| (state.long_contracts, state.short_contracts));
+            let rollback = RollbackCtx {
+                wallet: trade.wallet,
+                key,
+                prev: previous,
+                enabled: true,
+            };
+            if let Err(error) = self.bucket_engine.ledger_mut().ingest(&trade) {
+                error!(%error, trade = %trade.source_trade_id, "fenced-wallet ledger advance failed");
+                return;
+            }
+            let leader = self.leader_position_row(&trade);
+            let provenance = match trade.provenance {
+                TradeProvenance::RestPoll => "rest_poll",
+                TradeProvenance::ActivityWs => "activity_ws",
+            };
+            self.commit_no_copy_or_rollback(
+                &trade,
+                &leader,
+                &pe_paper_state::NoCopyDisposition {
+                    provenance: provenance.to_owned(),
+                    age_secs: 0,
+                    reason: "wallet_fenced".to_owned(),
+                    recorded_at_unix: self.admission_now().unix_timestamp(),
+                },
+                &rollback,
+                None,
+            );
+            return;
         }
 
         // One consistent watchlist snapshot for this event (ArcSwap hot path): every
@@ -780,80 +996,95 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
             return;
         }
 
-        // Capture pre-trade snapshot: classify_action uses pre-trade position to determine
-        // Entry/Add/Flip/Trim/Exit. Ingest must follow so the ledger advances after
-        // classification, not before.
-        let position = self.position_ledger.position(&trade.wallet).cloned();
-
-        // #511 exact-rollback capture: the pre-trade (long, short) for the touched key.
-        // An abandoned-unseen exit restores this so redelivery re-admits byte-identically
-        // (`ingest` has no trade-id memory and classification reads pre-trade state).
-        let rb = RollbackCtx {
-            wallet: trade.wallet,
-            key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
-            prev: position
-                .as_ref()
-                .and_then(|s| {
-                    s.positions.get(&MarketOutcomeId::new(
-                        trade.market_id.clone(),
-                        trade.outcome_id,
-                    ))
-                })
-                .map(|st| (st.long_contracts, st.short_contracts)),
+        let (rb, leader_row, signal) = if let Some(continuation) = pending.as_ref() {
+            let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+            (
+                RollbackCtx {
+                    wallet: trade.wallet,
+                    key,
+                    prev: None,
+                    enabled: false,
+                },
+                self.leader_position_row(&trade),
+                LeaderSignal {
+                    leader: TraderId(trade.wallet),
+                    venue: VenueId::polymarket(),
+                    market_id: trade.market_id.clone(),
+                    outcome_id: trade.outcome_id,
+                    action: continuation.pre_bucket_action,
+                    leader_side: trade.side,
+                    leader_price: trade.price,
+                    leader_size: trade.contracts,
+                    observed_at: trade.observed_at,
+                    received_at: trade.received_at,
+                    reconstruction_quality: continuation.reconstruction_quality,
+                    source_trade_id: trade.source_trade_id.clone(),
+                    action_confidence_ppm: continuation.action_confidence_ppm,
+                },
+            )
+        } else {
+            // Capture pre-trade state, then advance the legacy v1 ledger exactly once.
+            let position = self.bucket_engine.ledger().position(&trade.wallet).cloned();
+            let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
+            let rb = RollbackCtx {
+                wallet: trade.wallet,
+                key: key.clone(),
+                prev: position
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.positions.get(&key))
+                    .map(|state| (state.long_contracts, state.short_contracts)),
+                enabled: true,
+            };
+            if let Err(error) = self.bucket_engine.ledger_mut().ingest(&trade) {
+                error!(%error, trade = %trade.source_trade_id, "leader ledger rejected trade");
+                return;
+            }
+            let leader_row = self.leader_position_row(&trade);
+            // Preserve version-one admission ordering: its stale bookkeeping
+            // disposition predates classification/gate and remains non-consuming.
+            if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+                self.commit_no_copy_or_rollback(&trade, &leader_row, &disposition, &rb, None);
+                return;
+            }
+            let Some(signal) = classify_trade(
+                &trade,
+                position.as_ref(),
+                &watchlist,
+                quality,
+                VenueId::polymarket(),
+                &self.signal_config,
+            ) else {
+                self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
+                    .await;
+                return;
+            };
+            if let Some(reason) = self.bucket_engine.entry_gate().admit(&signal) {
+                info!(
+                    reason = %reason,
+                    market = %signal.market_id,
+                    leader_price = %signal.leader_price.0,
+                    "signal did not produce order",
+                );
+                self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
+                    .await;
+                return;
+            }
+            // Legacy v1 remains an in-memory projection; v2 history was already
+            // consumed atomically by the bucket transaction.
+            self.bucket_engine
+                .entry_gate_mut()
+                .record_entry(signal.leader.0, &signal.market_id);
+            (rb, leader_row, signal)
         };
 
-        // Advance position ledger after classification inputs are captured.
-        self.position_ledger.ingest(&trade);
-
-        // Snapshot the leader's post-ingest position for this (market, outcome) so it
-        // is mirrored into paper-state on every processed trade — fill or no fill.
-        let leader_row = self.leader_position_row(&trade);
-
-        // #530/#546 copy-budget rule (websocket-primary mode only): an observation from
-        // EITHER source older than the calibrated budget is admitted for bookkeeping but
-        // stages no copy (`stale_no_copy`). Checked here and again immediately before
-        // dispatch staging.
-        if let Some(disposition) = self.stale_no_copy(&trade, self.admission_now()) {
+        // Staleness is intentionally post-pending: it is a continuation input and
+        // cannot cause the ledger/gate/history portion to be reapplied on restart.
+        if pending.is_some()
+            && let Some(disposition) = self.stale_no_copy(&trade, self.admission_now())
+        {
             self.commit_no_copy_or_rollback(&trade, &leader_row, &disposition, &rb, None);
             return;
         }
-
-        let Some(signal) = classify_trade(
-            &trade,
-            position.as_ref(),
-            &watchlist,
-            quality,
-            VenueId::polymarket(),
-            &self.signal_config,
-        ) else {
-            // No signal: still mark seen + mirror the leader ledger (AC2).
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
-                .await;
-            return;
-        };
-
-        // NOTE (#508): the hold/already-filled gate historically ran HERE, before the
-        // first-BUY entry gate. It is now a PAPER-ONLY decision relocated after dispatch
-        // staging (below), so a paper-held position can never suppress live targets.
-        // `entry_gate.record_entry`'s pre-staging side effect is deliberately kept.
-
-        // Copy-entry gate: copy only a leader's first-ever BUY entry into a market
-        // (#290; price band removed in #339).
-        if let Some(reason) = self.entry_gate.admit(&signal) {
-            info!(
-                reason = %reason,
-                market = %signal.market_id,
-                leader_price = %signal.leader_price.0,
-                "signal did not produce order",
-            );
-            self.no_fill_or_rollback(&trade, &leader_row, None, "", &rb, None)
-                .await;
-            return;
-        }
-        // Record the admitted BUY entry so a same-session re-entry into this market is
-        // blocked even if a later gate or the strategy rejects this signal.
-        self.entry_gate
-            .record_entry(signal.leader.0, &signal.market_id);
 
         // Resolution-horizon gate (#290, #339): copy only markets whose resolution time
         // (umaEndDate, else the always-present endDate) is known AND sits within
@@ -1190,6 +1421,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     .execute(&intent, self.mode, now, observed_fill_price)
                     .await
                 {
+                    Err(ExecutionError::PaperDurabilityUncertain { reason }) => {
+                        error!(%reason, "paper durability uncertain; stopping producer intake");
+                        {
+                            let mut health = self
+                                .health
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            health.paper_durability_uncertain = true;
+                            health.event_log_writable = false;
+                        }
+                        self.rollback_admission(&rb, None);
+                        self.intake_stopped = true;
+                    }
                     Err(e) => {
                         error!(error = %e, "execution dispatcher failed");
                         self.no_fill_or_rollback(
@@ -1322,9 +1566,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// un-record the tentative same-session entry. Redelivery then re-runs a
     /// byte-identical admission.
     fn rollback_admission(&mut self, rb: &RollbackCtx, unrecord_market: Option<&MarketId>) {
-        self.position_ledger.restore(rb.wallet, &rb.key, rb.prev);
-        if let Some(market) = unrecord_market {
-            self.entry_gate.unrecord_entry(rb.wallet, market);
+        if !rb.enabled {
+            return;
+        }
+        self.bucket_engine
+            .ledger_mut()
+            .restore(rb.wallet, &rb.key, rb.prev);
+        if unrecord_market.is_some() {
+            match self.paper_state.gate_history() {
+                Ok(history) => {
+                    *self.bucket_engine.entry_gate_mut() =
+                        crate::entry_gate::CopyEntryGate::new(CopyEntryGateConfig, history);
+                }
+                Err(error) => {
+                    error!(%error, "rebuild durable entry-gate projection after rollback failed");
+                    self.intake_stopped = true;
+                }
+            }
         }
     }
 
@@ -1354,11 +1612,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     fn leader_position_row(&self, trade: &IncomingTrade) -> LeaderPositionRow {
         let key = MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id);
         let (long, short) = self
-            .position_ledger
+            .bucket_engine
+            .ledger()
             .position(&trade.wallet)
             .and_then(|snap| snap.positions.get(&key))
             .map(|st| (st.long_contracts, st.short_contracts))
-            .unwrap_or((0, 0));
+            .unwrap_or((ShareAmount::ZERO, ShareAmount::ZERO));
         LeaderPositionRow {
             wallet: trade.wallet,
             market_id: trade.market_id.clone(),
@@ -1812,22 +2071,7 @@ fn zeroed_risk_snapshot() -> RiskSnapshot {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
-    use pe_copy_signal_engine::{LeaderSignal, PositionSnapshot, PositionState};
-    use pe_core_types::{
-        ContractQty, LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ProbabilityPpm,
-        Quantity, ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
-        WalletAddress,
-    };
-    use pe_position_ledger::PositionLedger;
-    use rust_decimal_macros::dec;
-    use time::OffsetDateTime;
-    use tokio::sync::oneshot;
-
-    use super::{apply_control_message, check_resolution_horizon};
-    use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig, GateReject};
-    use crate::orchestrator_control::OrchestratorControl;
+    use super::check_resolution_horizon;
 
     const NOW: i64 = 1_700_000_000;
 
@@ -1892,66 +2136,5 @@ mod tests {
             check_resolution_horizon(Some(NOW + 1), NOW, 259_200, 0),
             None
         );
-    }
-
-    #[tokio::test]
-    async fn admission_control_acknowledges_only_after_both_ledgers_are_ready() {
-        let wallet = WalletAddress([9; 20]);
-        let market = MarketId(VenueMarketId("0xknown".to_string()));
-        let outcome = MarketOutcomeId::new(market.clone(), OutcomeId(0));
-        let mut gate =
-            CopyEntryGate::new(CopyEntryGateConfig { fail_closed: true }, HashMap::new());
-        let mut ledger = PositionLedger::new();
-        let (acknowledged, acknowledgement) = oneshot::channel();
-        apply_control_message(
-            &mut gate,
-            &mut ledger,
-            OrchestratorControl::PrepareAdmissions {
-                history: HashMap::from([(wallet, HashSet::from([market.clone()]))]),
-                positions: HashMap::from([(
-                    wallet,
-                    PositionSnapshot {
-                        wallet,
-                        positions: HashMap::from([(
-                            outcome,
-                            PositionState {
-                                long_contracts: 7,
-                                short_contracts: 0,
-                            },
-                        )]),
-                    },
-                )]),
-                acknowledged,
-            },
-        );
-        acknowledgement.await.unwrap();
-
-        assert_eq!(
-            ledger
-                .position(&wallet)
-                .unwrap()
-                .positions
-                .values()
-                .next()
-                .unwrap()
-                .long_contracts,
-            7
-        );
-        let signal = LeaderSignal {
-            leader: TraderId(wallet),
-            venue: VenueId::polymarket(),
-            market_id: market,
-            outcome_id: OutcomeId(0),
-            action: LeaderAction::Entry,
-            leader_side: Side::Buy,
-            leader_price: Price(dec!(0.50)),
-            leader_size: Quantity(ContractQty(1)),
-            observed_at: OffsetDateTime::UNIX_EPOCH,
-            received_at: OffsetDateTime::UNIX_EPOCH,
-            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
-            source_trade_id: SourceTradeId("control-test".to_string()),
-            action_confidence_ppm: ProbabilityPpm(1_000_000),
-        };
-        assert_eq!(gate.admit(&signal), Some(GateReject::NotFirstEntry));
     }
 }

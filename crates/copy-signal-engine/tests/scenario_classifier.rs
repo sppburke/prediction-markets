@@ -11,8 +11,8 @@ use pe_copy_signal_engine::{
 };
 use pe_core_types::{BasisPoints, SourceTimestamp};
 use pe_core_types::{
-    ContractQty, LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality,
-    Side, SourceTradeId, VenueId, VenueMarketId, WalletAddress,
+    LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality, Side,
+    SourceTradeId, VenueId, VenueMarketId, WalletAddress,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal_macros::dec;
@@ -79,10 +79,11 @@ fn incoming(w: WalletAddress, mkt: MarketId, side: Side, contracts: u64) -> Inco
         outcome_id: OutcomeId(0),
         side,
         price: price(dec!(0.50)),
-        contracts: ContractQty(contracts),
+        contracts: pe_core_types::ShareAmount::from_whole(contracts).unwrap(),
         observed_at: NOW,
         received_at: NOW,
         source_trade_id: trade_id(1),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -129,8 +130,8 @@ fn add_to_existing() {
     positions.insert(
         MarketOutcomeId::new(mkt.clone(), OutcomeId(0)),
         PositionState {
-            long_contracts: 200,
-            short_contracts: 0,
+            long_contracts: pe_core_types::ShareAmount::from_whole(200).unwrap(),
+            short_contracts: pe_core_types::ShareAmount::ZERO,
         },
     );
     let position = PositionSnapshot {
@@ -167,8 +168,8 @@ fn trim_partial_close() {
     positions.insert(
         MarketOutcomeId::new(mkt.clone(), OutcomeId(0)),
         PositionState {
-            long_contracts: 1_000,
-            short_contracts: 0,
+            long_contracts: pe_core_types::ShareAmount::from_whole(1_000).unwrap(),
+            short_contracts: pe_core_types::ShareAmount::ZERO,
         },
     );
     let position = PositionSnapshot {
@@ -205,8 +206,8 @@ fn exit_full_close() {
     positions.insert(
         MarketOutcomeId::new(mkt.clone(), OutcomeId(0)),
         PositionState {
-            long_contracts: 1_000,
-            short_contracts: 0,
+            long_contracts: pe_core_types::ShareAmount::from_whole(1_000).unwrap(),
+            short_contracts: pe_core_types::ShareAmount::ZERO,
         },
     );
     let position = PositionSnapshot {
@@ -243,8 +244,8 @@ fn flip_side_reversal() {
     positions.insert(
         MarketOutcomeId::new(mkt.clone(), OutcomeId(0)),
         PositionState {
-            long_contracts: 1_000,
-            short_contracts: 0,
+            long_contracts: pe_core_types::ShareAmount::from_whole(1_000).unwrap(),
+            short_contracts: pe_core_types::ShareAmount::ZERO,
         },
     );
     let position = PositionSnapshot {
@@ -337,8 +338,8 @@ fn add_low_confidence_suppressed() {
     positions.insert(
         MarketOutcomeId::new(mkt.clone(), OutcomeId(0)),
         PositionState {
-            long_contracts: 200,
-            short_contracts: 0,
+            long_contracts: pe_core_types::ShareAmount::from_whole(200).unwrap(),
+            short_contracts: pe_core_types::ShareAmount::ZERO,
         },
     );
     let position = PositionSnapshot {

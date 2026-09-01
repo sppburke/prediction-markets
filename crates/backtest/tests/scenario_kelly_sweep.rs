@@ -28,7 +28,7 @@ use pe_bootstrap::cache::{LeaderboardSnapshots, LiquidityIndex, ResolutionIndex,
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, ContractQty, KellyFraction, LeaderAction, MarketId, OutcomeId, Price, Probability,
-    ProbabilityPpm, Quantity, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
+    ProbabilityPpm, ShareAmount, Side, SourceTimestamp, SourceTradeId, TraderId, VenueId,
     VenueMarketId, WalletAddress,
 };
 use pe_risk_engine::{ConcentrationCaps, RiskSnapshot, TradingMode};
@@ -153,7 +153,7 @@ fn thin_edge_signal() -> LeaderSignal {
         action: LeaderAction::Entry,
         leader_side: Side::Buy,
         leader_price: Price::new(dec!(0.40)).unwrap(),
-        leader_size: Quantity(ContractQty(100)),
+        leader_size: ShareAmount::from_whole(100).unwrap(),
         observed_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
         received_at: OffsetDateTime::from_unix_timestamp(BASE_UNIX).unwrap(),
         reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),

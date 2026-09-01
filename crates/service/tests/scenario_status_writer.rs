@@ -38,8 +38,8 @@ fn seeded_db() -> (TempDir, PaperStateDb) {
         wallet: WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
         market_id: market(),
         outcome_id: OutcomeId(0),
-        long_contracts: 0,
-        short_contracts: 0,
+        long_contracts: pe_core_types::ShareAmount::ZERO,
+        short_contracts: pe_core_types::ShareAmount::ZERO,
     };
     let record = FillRecord {
         idempotency_key: "k1".to_string(),

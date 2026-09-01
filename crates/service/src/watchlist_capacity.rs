@@ -281,6 +281,16 @@ mod tests {
         let live = LiveWatchlist::new(watchlist(vec![entry(existing), entry(departing)]));
         let temp = TempDir::new().unwrap();
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        for wallet in [departing, newcomer] {
+            paper_state
+                .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                    wallet,
+                    complete: true,
+                    proof_json: "{\"test\":true}".to_owned(),
+                    updated_at_unix: 1,
+                })
+                .unwrap();
+        }
         let writer_lock = Arc::new(Mutex::new(()));
         let applied = AppliedWatchlistCapacity::new(2);
         let (requests, desired_rx) = capacity_request_channel(2, Arc::clone(&writer_lock));
@@ -297,14 +307,13 @@ mod tests {
                 let mut attempts = 0;
                 while let Some(command) = control_rx.recv().await {
                     let OrchestratorControl::PrepareAdmissions {
-                        positions,
+                        wallets,
                         acknowledged,
-                        ..
                     } = command
                     else {
-                        panic!("capacity transition sent a periodic reseed")
+                        panic!("capacity transition sent an activity bucket")
                     };
-                    let mut wallets: Vec<WalletAddress> = positions.keys().copied().collect();
+                    let mut wallets = wallets;
                     wallets.sort_unstable_by_key(|w| w.0);
                     prepared_sets
                         .lock()
@@ -320,14 +329,7 @@ mod tests {
             })
         };
 
-        let preparer = AdmissionPreparer::new(
-            control_tx,
-            reqwest::Client::new(),
-            base_url.clone(),
-            temp.path().join("history.json"),
-            500,
-            1,
-        );
+        let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper_state));
         let applier = SupabaseWatchlistCapacity::new(
             live.clone(),
             Arc::clone(&paper_state),
@@ -420,6 +422,14 @@ mod tests {
         let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
         let temp = TempDir::new().unwrap();
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper_state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: newcomer,
+                complete: true,
+                proof_json: "{\"test\":true}".to_owned(),
+                updated_at_unix: 1,
+            })
+            .unwrap();
         let writer_lock = Arc::new(Mutex::new(()));
         let applied = AppliedWatchlistCapacity::new(1);
         let (requests, desired_rx) = capacity_request_channel(1, Arc::clone(&writer_lock));
@@ -435,19 +445,17 @@ mod tests {
             let command = control_rx.recv().await.unwrap();
             match command {
                 OrchestratorControl::PrepareAdmissions {
-                    history,
-                    positions,
+                    wallets,
                     acknowledged,
                 } => {
                     assert_eq!(live_at_control.snapshot().entries.len(), 1);
-                    assert!(history.contains_key(&newcomer));
-                    assert!(positions.contains_key(&newcomer));
+                    assert_eq!(wallets, vec![newcomer]);
                     prepared_task.notify_one();
                     release_task.notified().await;
                     acknowledged.send(()).unwrap();
                 }
-                OrchestratorControl::PositionReseed(_) => {
-                    panic!("capacity transition sent a periodic reseed")
+                OrchestratorControl::CommitActivityBucket { .. } => {
+                    panic!("capacity transition sent an activity bucket")
                 }
             }
         });
@@ -456,14 +464,7 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        let preparer = AdmissionPreparer::new(
-            control_tx,
-            reqwest::Client::new(),
-            base_url.clone(),
-            temp.path().join("history.json"),
-            500,
-            1,
-        );
+        let preparer = AdmissionPreparer::new(control_tx, Arc::clone(&paper_state));
         let applier = SupabaseWatchlistCapacity::new(
             live.clone(),
             Arc::clone(&paper_state),

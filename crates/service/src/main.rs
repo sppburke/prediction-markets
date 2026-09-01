@@ -19,7 +19,7 @@ use pe_source_polymarket_public::ReqwestFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::info;
 
 use pe_paper_pnl::{GammaResolutionFetcher, PnlLedger, ResolutionStore};
@@ -35,7 +35,6 @@ use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
-use pe_service::position_seeder::{run_reseed_loop, seed_all};
 use pe_service::runtime_config::{
     AppliedWatchlistCapacity, FillMode, LiveRuntimeConfig, load_initial_runtime_config,
 };
@@ -50,7 +49,6 @@ use pe_service::supabase_state::{
     SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
 };
 use pe_service::trade_poller::{TradePoller, TradePollerConfig};
-use pe_service::wallet_history::WalletHistoryLoader;
 use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
@@ -91,9 +89,7 @@ async fn main() -> Result<()> {
 
     // Copy-entry gate posture. The leader-price band was removed in #339 — live sizing
     // is re-based on the current market price instead (see the orchestrator copy path).
-    let entry_gate_config = CopyEntryGateConfig {
-        fail_closed: cfg.entry_gate_fail_closed,
-    };
+    let entry_gate_config = CopyEntryGateConfig;
 
     // Parse the fill-price band eagerly so a malformed value fails fast before any I/O.
     let max_fill_price = Decimal::from_str(&cfg.max_fill_price)
@@ -184,32 +180,6 @@ async fn main() -> Result<()> {
     let watchlist_writer_lock = Arc::new(tokio::sync::Mutex::new(()));
     let applied_watchlist_capacity = AppliedWatchlistCapacity::new(initial_watchlist_size);
 
-    // Publish the initial watched-count so the analytics site reflects it within seconds of
-    // start (the refresh loop's first publish is one interval away). Best-effort; needs the
-    // service-role secret (anon is read-only under RLS).
-    if !cfg.supabase_url.is_empty() && !cfg.supabase_secret_key.is_empty() {
-        let publisher = HttpWatchlistPublisher::new(
-            reqwest::Client::new(),
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-        );
-        let size = live_watchlist.snapshot().entries.len();
-        if let Err(e) = publisher.publish(size).await {
-            tracing::warn!(error = %e, "initial watchlist-size publish failed");
-        }
-    }
-
-    // One-time snapshot driving the startup position seed and wallet-history backfill. Every
-    // runtime addition (capacity growth, full-rerank swap, knockout backfill) is separately
-    // prepared through the shared admission preparer before membership is published (#542).
-    let wallets: Vec<_> = live_watchlist
-        .snapshot()
-        .entries
-        .iter()
-        .map(|e| e.wallet)
-        .collect();
-
     // Crash-safe paper-state mirror. Open, initialise bankroll (idempotent), then
     // reconcile any event-log fills whose SQLite commit was lost to a crash, and
     // rehydrate the leader position ledger — all before the orchestrator runs.
@@ -277,8 +247,48 @@ async fn main() -> Result<()> {
         .bankroll()
         .context("read paper-state bankroll")?
         .unwrap_or(configured_bankroll);
-    let mut leader_ledger =
+    let leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
+
+    // The version-two activity/gate records are the sole membership authority (#544).
+    // Fenced wallets and wallets without proven-complete reconciled history are removed
+    // before any producer or maintenance reader can observe the boot generation.
+    let complete_history = paper_state
+        .complete_history_wallets()
+        .context("load complete durable wallet history set")?;
+    let mut unavailable: std::collections::HashSet<_> = paper_state
+        .wallet_fences()
+        .context("load durable wallet fences")?
+        .into_iter()
+        .map(|fence| fence.wallet)
+        .collect();
+    unavailable.extend(
+        live_watchlist
+            .snapshot()
+            .entries
+            .iter()
+            .filter(|entry| !complete_history.contains(&entry.wallet))
+            .map(|entry| entry.wallet),
+    );
+    live_watchlist.remove_fenced(&unavailable);
+    anyhow::ensure!(
+        !live_watchlist.snapshot().entries.is_empty(),
+        "no wallets eligible after durable fence/history filtering"
+    );
+
+    // Publish only the durable-authority-filtered initial watched count.
+    if !cfg.supabase_url.is_empty() && !cfg.supabase_secret_key.is_empty() {
+        let publisher = HttpWatchlistPublisher::new(
+            reqwest::Client::new(),
+            &cfg.supabase_url,
+            &cfg.supabase_anon_key,
+            &cfg.supabase_secret_key,
+        );
+        let size = live_watchlist.snapshot().entries.len();
+        if let Err(e) = publisher.publish(size).await {
+            tracing::warn!(error = %e, "initial watchlist-size publish failed");
+        }
+    }
     info!(bankroll = %bankroll, "paper-state opened");
 
     // Paper event-log writer (opened after reconciliation reads the existing log).
@@ -302,107 +312,25 @@ async fn main() -> Result<()> {
     // Bounded channel per _GLOSSARY.md defaults.
     let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
-    // Startup seed: fetch current positions from the API for each watchlisted wallet and overlay
-    // them onto the leader ledger, then seed each wallet's poll cursor from its real last-trade
-    // time (#357) so the inactivity clock and the poller's first forward sweep both start at the
-    // real last trade — reconstructing any trades that happened while the service was down rather
-    // than skipping them. Must run before `wallets` is moved into TradePoller::new so the borrow
-    // stays valid, and before the poller starts consuming cursors.
-    {
-        let seed_fetcher = ReqwestFetcher::new(reqwest::Client::new());
-        let snapshot_map = seed_all(
-            &wallets,
-            &cfg.polymarket_base_url,
-            cfg.position_page_limit,
-            cfg.position_size_threshold,
-            &seed_fetcher,
-        )
-        .await;
-        let seeded = snapshot_map.len();
-        leader_ledger.overlay(snapshot_map.clone());
-        // Seed each bootstrapped wallet's poll cursor from its real last-trade time (#357).
-        // #511: the DELIVERY cursor seeds insert-only (an existing — possibly held — cursor
-        // is a valid lower bound and must never be jumped); the ACTIVITY clock MAX-seeds,
-        // establishing the inactivity clock for new/older rows. A wallet absent
-        // from the side-map (a NULL `last_trade_unix` ranking column) keeps its persisted cursor;
-        // a never-seeded `None` cursor self-heals via the poller's first unbounded fetch and is
-        // never reset to `now` (no admission grace).
-        let mut cursor_seeded = 0usize;
-        for (wallet, last_trade_unix) in &bootstrap_last_trade {
-            if let Err(e) = paper_state.seed_cursor_if_absent(wallet, *last_trade_unix) {
-                tracing::warn!(wallet = %wallet, error = %e, "failed to seed startup cursor from last_trade_unix");
-            } else {
-                cursor_seeded += 1;
-            }
+    // Seed the delivery cursor without mutating the ordered activity ledger. The positions API
+    // is no longer an overwrite authority (#544).
+    let mut cursor_seeded = 0usize;
+    for (wallet, last_trade_unix) in &bootstrap_last_trade {
+        if let Err(e) = paper_state.seed_cursor_if_absent(wallet, *last_trade_unix) {
+            tracing::warn!(wallet = %wallet, error = %e, "failed to seed startup cursor from last_trade_unix");
+        } else {
+            cursor_seeded += 1;
         }
-        info!(
-            seeded,
-            cursor_seeded,
-            total = wallets.len(),
-            "startup position seed complete"
-        );
     }
+    info!(cursor_seeded, "startup delivery cursors seeded");
 
-    // Startup wallet-history backfill: each watchlisted wallet's complete set of
-    // previously-entered markets, so the copy-entry gate admits only first-ever
-    // entries. Borrows `wallets` (must run before it is moved into TradePoller).
-    let history_map = {
-        // Per-request timeout so a stalled Polymarket connection can't hang startup
-        // (the loader falls back to the cached sidecar for any wallet that times out).
-        let history_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .context("build wallet-history http client")?;
-        let history_fetcher = ReqwestFetcher::new(history_client);
-        let map = WalletHistoryLoader::load(
-            &wallets,
-            &cfg.polymarket_base_url,
-            &cfg.wallet_market_history_path,
-            &history_fetcher,
-        )
-        .await;
-        info!(
-            wallets_with_history = map.len(),
-            total = wallets.len(),
-            "wallet market-history backfill complete"
-        );
-        map
-    };
-
-    // Orchestrator control channel: periodic position reseeds plus seed-before-membership
-    // admission preparation for runtime watchlist growth. Capacity 2 keeps both bounded while
-    // allowing one of each class to queue.
+    // Bounded service-side activity-bucket/admission control channel (#544).
     let (control_tx, control_rx) = mpsc::channel(2);
+    let (producer_start_tx, producer_start_rx) = watch::channel(false);
 
-    // One preparer owns every post-boot admission load (#542). Capacity and maintenance share it,
-    // so their attempts are serialized and each publishes only wallets already installed in the
-    // copy-entry gate and the leader position ledger.
-    let admission_preparer = AdmissionPreparer::new(
-        control_tx.clone(),
-        reqwest::Client::new(),
-        cfg.polymarket_base_url.clone(),
-        cfg.wallet_market_history_path.clone(),
-        cfg.position_page_limit,
-        cfg.position_size_threshold,
-    );
-    let reseed_task = if cfg.position_reseed_interval_secs > 0 {
-        // Reads the CURRENT watchlist each round (not the boot list) so wallets admitted
-        // post-boot — backfill or full-re-rank swaps — get leader-ledger seeds too.
-        let reseed_watchlist = live_watchlist.clone();
-        let reseed_base_url = cfg.polymarket_base_url.clone();
-        let reseed_fetcher = ReqwestFetcher::new(reqwest::Client::new());
-        Some(tokio::spawn(run_reseed_loop(
-            reseed_watchlist,
-            reseed_base_url,
-            cfg.position_page_limit,
-            cfg.position_size_threshold,
-            cfg.position_reseed_interval_secs,
-            reseed_fetcher,
-            control_tx.clone(),
-        )))
-    } else {
-        None
-    };
+    // Runtime admissions prove durable history and recheck the fence under the shared
+    // watchlist-writer lock before publication. Lane D adds the causal positions bracket.
+    let admission_preparer = AdmissionPreparer::new(control_tx.clone(), paper_state.clone());
 
     // #530: websocket-primary ingest task (flag-gated). Owns the source event
     // log; a boot-time open failure fails boot — enabled mode must satisfy the
@@ -416,34 +344,51 @@ async fn main() -> Result<()> {
                     cfg.source_event_log_path.display()
                 )
             })?;
-        Some(tokio::spawn(
+        let mut start = producer_start_rx.clone();
+        let activity_watchlist = live_watchlist.clone();
+        let activity_trade_tx = trade_tx.clone();
+        let activity_health = health.clone();
+        Some(tokio::spawn(async move {
+            if start.wait_for(|started| *started).await.is_err() {
+                return;
+            }
             pe_service::activity_ingest::ActivityIngest::new(
-                live_watchlist.clone(),
+                activity_watchlist,
                 sink,
-                trade_tx.clone(),
-                health.clone(),
+                activity_trade_tx,
+                activity_health,
             )
-            .run(),
-        ))
+            .run()
+            .await;
+        }))
     } else {
         None
     };
 
     // Polymarket trade poller task. Reads the live wallet set per poll round (#339).
-    let trade_task = tokio::spawn(
+    let mut poller_start = producer_start_rx;
+    let poller_watchlist = live_watchlist.clone();
+    let poller_paper_state = paper_state.clone();
+    let poller_health = health.clone();
+    let poller_base_url = cfg.polymarket_base_url.clone();
+    let trade_task = tokio::spawn(async move {
+        if poller_start.wait_for(|started| *started).await.is_err() {
+            return;
+        }
         TradePoller::new(
             TradePollerConfig {
-                base_url: cfg.polymarket_base_url.clone(),
+                base_url: poller_base_url,
                 poll_interval_secs: cfg.trade_poll_interval_secs,
             },
-            live_watchlist.clone(),
+            poller_watchlist,
             ReqwestFetcher::new(reqwest::Client::new()),
             trade_tx,
-            paper_state.clone(),
-            health.clone(),
+            poller_paper_state,
+            poller_health,
         )
-        .run(),
-    );
+        .run()
+        .await;
+    });
 
     // Orchestrator.
     let market_end_cache = MarketEndCache::new(cfg.gamma_base_url.clone());
@@ -624,7 +569,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let orch = Orchestrator::new(
+    let mut orch = Orchestrator::new(
         trade_rx,
         live_watchlist.clone(),
         OrchestratorConfig {
@@ -635,6 +580,7 @@ async fn main() -> Result<()> {
             min_resolution_horizon_secs: cfg.min_resolution_horizon_secs,
             activity_ws_enabled: cfg.polymarket_activity_ws_enabled,
             copy_latency_budget_secs: cfg.copy_latency_budget_secs,
+            watchlist_writer_lock: Some(watchlist_writer_lock.clone()),
             max_fill_price,
             min_fill_price,
             paper_fill_haircut_bps: cfg.paper_fill_haircut_bps,
@@ -648,7 +594,6 @@ async fn main() -> Result<()> {
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
         },
-        history_map,
         WinnerFollowStrategy::new(cfg.strategy.clone()),
         dispatcher,
         paper_state.clone(),
@@ -663,6 +608,12 @@ async fn main() -> Result<()> {
         book_fetcher,
     )
     .context("build orchestrator")?;
+    orch.resume_pending_before_producers()
+        .await
+        .context("resume decision_pending before source producers")?;
+    producer_start_tx
+        .send(true)
+        .map_err(|_| anyhow::anyhow!("source producer start gate closed"))?;
 
     // Cumulative authoritative-RPC counter for status.json — grabbed before `supabase_state`
     // is moved into the resolution task below; `None` when not in authoritative mode.
@@ -850,9 +801,6 @@ async fn main() -> Result<()> {
     }
     http_task.abort();
     resolution_task.abort();
-    if let Some(t) = reseed_task {
-        t.abort();
-    }
     if let Some(t) = supabase_task {
         t.abort();
     }

@@ -23,13 +23,15 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, LeaderSignal, SignalConfig};
 use pe_core_types::{
-    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ProbabilityPpm, Quantity,
-    ReconstructionQuality, Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId,
-    VenueId, VenueMarketId, WalletAddress,
+    BasisPoints, ContractQty, MarketId, OutcomeId, Price, ProbabilityPpm, ReconstructionQuality,
+    Side, SourceId, SourceTimestamp, SourceTradeId, StrategyId, TraderId, VenueId, VenueMarketId,
+    WalletAddress,
 };
 use pe_event_log::{Reader, Writer};
 use pe_execution_core::ExecutionDispatcher;
-use pe_paper_state::{DispatchSeedRecord, DispatchTargetSeed, PaperStateDb};
+use pe_paper_state::{
+    DispatchSeedRecord, DispatchTargetSeed, PaperStateDb, WalletHistoryStatusRecord,
+};
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{BookLevel, FixtureClobBookFetcher, OrderBook};
 use pe_service::config::ServiceConfig;
@@ -97,10 +99,11 @@ fn entry_trade(id: &str, market: &str, price: Decimal) -> IncomingTrade {
         outcome_id: OutcomeId(0),
         side: Side::Buy,
         price: Price(price),
-        contracts: ContractQty(100),
+        contracts: pe_core_types::ShareAmount::from_whole(100).unwrap(),
         observed_at: ts,
         received_at: ts,
         source_trade_id: SourceTradeId(id.to_string()),
+        transaction_hash: None,
         provenance: TradeProvenance::RestPoll,
     }
 }
@@ -114,7 +117,7 @@ fn signal_for(trade: &IncomingTrade) -> LeaderSignal {
         action: pe_core_types::LeaderAction::Entry,
         leader_side: trade.side,
         leader_price: trade.price,
-        leader_size: Quantity(trade.contracts),
+        leader_size: trade.contracts,
         observed_at: trade.observed_at,
         received_at: trade.received_at,
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
@@ -148,6 +151,14 @@ fn make_dispatcher(dir: &TempDir) -> ExecutionDispatcher {
 fn open_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {
     let state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     state.init_bankroll(dec!(10000)).unwrap();
+    state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: leader_wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
     state
 }
 
@@ -262,6 +273,7 @@ async fn run_trade(
         OrchestratorConfig {
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
+            watchlist_writer_lock: None,
             bankroll: dec!(10000),
             mode: ExecutionMode::Paper,
             signal_config: SignalConfig::default(),
@@ -273,11 +285,10 @@ async fn run_trade(
             paper_fill_slippage_bps: 100,
             fill_mode: FillMode::LeaderHaircut,
             clob_best_ask_fallback_haircut_bps: 100,
-            entry_gate_config: CopyEntryGateConfig { fail_closed: false },
+            entry_gate_config: CopyEntryGateConfig,
             runtime_config: Some(LiveRuntimeConfig::new(runtime)),
             live_accounts: accounts,
         },
-        HashMap::new(),
         WinnerFollowStrategy::new(WinnerFollowConfig::default()),
         make_dispatcher(dir),
         paper_state,

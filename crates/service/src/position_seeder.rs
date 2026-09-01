@@ -1,24 +1,22 @@
-//! Startup and periodic re-seed of the leader [`PositionLedger`] from
-//! the Polymarket positions API.
+//! Strict Polymarket positions-API parsing for read-only reconciliation evidence.
 //!
 //! Parsing is isolated in [`parse_positions`]; the paginated HTTP fetch lives in
 //! the private [`fetch_positions_for_wallet`]; [`seed_all`] sequences wallets
-//! warn-and-continuing on per-wallet failures. [`run_reseed_loop`] is the
-//! background task wired into the orchestrator.
+//! warn-and-continuing on per-wallet failures. The service no longer runs a
+//! wholesale-replacement reseed loop (#544); Lane D may reuse this parser for
+//! causal before/after position brackets.
 
 use std::collections::HashMap;
 
 use pe_copy_signal_engine::{PositionSnapshot, PositionState};
-use pe_core_types::{MarketId, MarketOutcomeId, OutcomeId, VenueMarketId, WalletAddress};
+use pe_core_types::{
+    MarketId, MarketOutcomeId, OutcomeId, ShareAmount, VenueMarketId, WalletAddress,
+};
 use pe_source_polymarket_public::{PageFetcher, PolymarketEndpoint};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive as _;
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::mpsc;
 use tracing::warn;
-
-use crate::orchestrator_control::OrchestratorControl;
 
 /// Safety backstop: stop paginating after this many pages per wallet.
 /// A wallet whose response rows exceed `page_limit × POSITION_MAX_PAGES` cannot be snapshotted
@@ -45,13 +43,15 @@ pub enum PositionParseError {
     Json(#[from] serde_json::Error),
     #[error("position omitted outcomeIndex")]
     MissingOutcomeIndex,
+    #[error("position has invalid exact size {value}: {reason}")]
+    InvalidAmount { value: Decimal, reason: String },
 }
 
 // ── Parse ─────────────────────────────────────────────────────────────────────
 
 /// Parse a flat-array positions response into a [`PositionSnapshot`].
 ///
-/// Dust positions (floor to 0 contracts) are skipped. Holdings are always long
+/// Exact zero positions are skipped. Holdings are always long
 /// (`short_contracts = 0`), as the API returns only outcome tokens held.
 pub fn parse_positions(
     bytes: &[u8],
@@ -63,7 +63,7 @@ pub fn parse_positions(
 /// Parse a page and also report the number of rows the response actually carried.
 ///
 /// Pagination must advance on the decoded row count, never on the retained position count:
-/// dust rows are skipped and duplicate `(market, outcome)` keys collapse, so a full page can
+/// zero rows are skipped and duplicate `(market, outcome)` keys collapse, so a full page can
 /// retain fewer entries than `limit` and would otherwise be read as "history exhausted" (#542).
 fn parse_positions_counted(
     bytes: &[u8],
@@ -73,17 +73,22 @@ fn parse_positions_counted(
     let decoded_rows = raw.len();
     let mut positions = HashMap::new();
     for item in raw {
-        let qty: u64 = match item.size.floor().to_u64() {
-            Some(q) if q > 0 => q,
-            _ => continue,
-        };
+        let qty = ShareAmount::from_decimal_exact(item.size).map_err(|error| {
+            PositionParseError::InvalidAmount {
+                value: item.size,
+                reason: error.to_string(),
+            }
+        })?;
+        if qty == ShareAmount::ZERO {
+            continue;
+        }
         let market_id = MarketId(VenueMarketId(item.condition_id));
         let key = MarketOutcomeId::new(market_id, OutcomeId(item.outcome_index.unwrap_or(0)));
         positions.insert(
             key,
             PositionState {
                 long_contracts: qty,
-                short_contracts: 0,
+                short_contracts: ShareAmount::ZERO,
             },
         );
     }
@@ -193,39 +198,6 @@ pub async fn seed_all<F: PageFetcher>(
     out
 }
 
-// ── run_reseed_loop ───────────────────────────────────────────────────────────
-
-/// Periodically re-seed the orchestrator's leader ledger from the positions API.
-///
-/// Reads the CURRENT live watchlist each round (2026-07-03 cutover fix): the loop used to
-/// iterate the boot wallet list forever, so wallets admitted post-boot (backfill, and now
-/// every 4h full-re-rank swap) never received leader-ledger seeds and their Adds were
-/// misclassified as Entries. Never advances poll cursors — cursor advancement is
-/// startup-only. Exits when `tx` is closed (orchestrator shut down).
-pub async fn run_reseed_loop<F: PageFetcher + Send + 'static>(
-    live: crate::live_watchlist::LiveWatchlist,
-    base_url: String,
-    page_limit: u32,
-    size_threshold: u32,
-    interval_secs: u64,
-    fetcher: F,
-    tx: mpsc::Sender<OrchestratorControl>,
-) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-        let wallets: Vec<WalletAddress> =
-            live.snapshot().entries.iter().map(|e| e.wallet).collect();
-        let map = seed_all(&wallets, &base_url, page_limit, size_threshold, &fetcher).await;
-        if tx
-            .send(OrchestratorControl::PositionReseed(map))
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -248,27 +220,35 @@ mod tests {
         let snap = parse_positions(bytes, w).unwrap();
         let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(0));
         let state = snap.positions[&key];
-        assert_eq!(state.long_contracts, 150);
-        assert_eq!(state.short_contracts, 0);
+        assert_eq!(
+            state.long_contracts,
+            pe_core_types::ShareAmount::from_whole(150).unwrap()
+        );
+        assert_eq!(state.short_contracts, pe_core_types::ShareAmount::ZERO);
     }
 
     #[test]
-    fn parse_dust_skipped() {
+    fn parse_fractional_position_is_exact() {
         let w = wallet();
-        // size = 0.4 → floor = 0 → skipped
         let bytes = br#"[{"conditionId":"0xccc","outcomeIndex":0,"size":"0.4"}]"#;
         let snap = parse_positions(bytes, w).unwrap();
-        assert!(snap.positions.is_empty());
+        let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(0));
+        assert_eq!(
+            snap.positions[&key].long_contracts,
+            ShareAmount::from_decimal_exact(Decimal::new(4, 1)).unwrap()
+        );
     }
 
     #[test]
-    fn parse_fractional_size_floored() {
+    fn parse_fractional_size_is_not_floored() {
         let w = wallet();
-        // size = 75.8 → floor = 75
         let bytes = br#"[{"conditionId":"0xccc","outcomeIndex":1,"size":"75.8"}]"#;
         let snap = parse_positions(bytes, w).unwrap();
         let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xccc".into())), OutcomeId(1));
-        assert_eq!(snap.positions[&key].long_contracts, 75);
+        assert_eq!(
+            snap.positions[&key].long_contracts,
+            ShareAmount::from_decimal_exact(Decimal::new(758, 1)).unwrap()
+        );
     }
 
     #[test]
@@ -340,7 +320,10 @@ mod tests {
         let map = seed_all(&[w], "https://api.example.com", 500, 1, &fetcher).await;
         assert_eq!(map.len(), 1);
         let key = MarketOutcomeId::new(MarketId(VenueMarketId("0xaaa".into())), OutcomeId(0));
-        assert_eq!(map[&w].positions[&key].long_contracts, 100);
+        assert_eq!(
+            map[&w].positions[&key].long_contracts,
+            pe_core_types::ShareAmount::from_whole(100).unwrap()
+        );
     }
 
     /// Register `pages` full pages of one row each at `limit = 1`, condition IDs `0xcondNNNN`.
@@ -409,8 +392,8 @@ mod tests {
 
     #[tokio::test]
     async fn filtered_full_page_continues_pagination() {
-        // Page 0 is FULL (3 decoded rows) but retains 1 position: one dust row and two
-        // non-dust rows sharing a `(market, outcome)` key. Counting retained positions would
+        // Page 0 is FULL (3 decoded rows) but retains 2 positions: one fractional row and two
+        // rows sharing a `(market, outcome)` key. Counting retained positions would
         // read the page as short and lose page 1.
         let w = wallet();
         let base = "https://api.example.com";
@@ -442,8 +425,20 @@ mod tests {
             .unwrap();
         let real = MarketOutcomeId::new(MarketId(VenueMarketId("0xreal".into())), OutcomeId(1));
         let dup = MarketOutcomeId::new(MarketId(VenueMarketId("0xdup".into())), OutcomeId(0));
-        assert_eq!(snap.positions[&real].long_contracts, 42);
-        assert_eq!(snap.positions[&dup].long_contracts, 7);
-        assert_eq!(snap.positions.len(), 2);
+        assert_eq!(
+            snap.positions[&real].long_contracts,
+            pe_core_types::ShareAmount::from_whole(42).unwrap()
+        );
+        assert_eq!(
+            snap.positions[&dup].long_contracts,
+            pe_core_types::ShareAmount::from_whole(7).unwrap()
+        );
+        let fractional =
+            MarketOutcomeId::new(MarketId(VenueMarketId("0xdust".into())), OutcomeId(0));
+        assert_eq!(
+            snap.positions[&fractional].long_contracts,
+            ShareAmount::from_decimal_exact(Decimal::new(4, 1)).unwrap()
+        );
+        assert_eq!(snap.positions.len(), 3);
     }
 }

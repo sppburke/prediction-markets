@@ -269,6 +269,55 @@ impl FromStr for OrderLocalId {
 #[serde(transparent)]
 pub struct SourceTradeId(pub String);
 
+/// Identity generation carried by a [`SourceTradeId`] (#544).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceTradeIdentityVersion {
+    /// Version-one inputs retain their transaction-hash identity.
+    TransactionHashV1,
+    /// Version-two reconciled activity groups use `g2:` plus lowercase BLAKE3.
+    ReconciledGroupV2,
+}
+
+impl SourceTradeId {
+    /// Discriminate immutable v1 identity from a reconciled v2 group key.
+    ///
+    /// Only the fixed-width lowercase `g2:` encoding is version two. Every
+    /// other historical shape remains version one and therefore cannot be
+    /// mistaken for a reconciled activity group during replay (#544).
+    #[must_use]
+    pub fn identity_version(&self) -> SourceTradeIdentityVersion {
+        let bytes = self.0.as_bytes();
+        let is_v2 = bytes.len() == 67
+            && bytes.starts_with(b"g2:")
+            && bytes[3..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+        if is_v2 {
+            SourceTradeIdentityVersion::ReconciledGroupV2
+        } else {
+            SourceTradeIdentityVersion::TransactionHashV1
+        }
+    }
+
+    #[must_use]
+    pub fn is_reconciled_v2(&self) -> bool {
+        self.identity_version() == SourceTradeIdentityVersion::ReconciledGroupV2
+    }
+
+    /// Whether this is a canonical 32-byte `0x` transaction-hash identity.
+    ///
+    /// Historical fixtures may carry shorter opaque v1 keys, so
+    /// [`Self::identity_version`] preserves their generation. New generation-
+    /// specific readers use this stricter helper at their version-one boundary.
+    #[must_use]
+    pub fn is_canonical_transaction_hash_v1(&self) -> bool {
+        let bytes = self.0.as_bytes();
+        bytes.len() == 66
+            && bytes.starts_with(b"0x")
+            && bytes[2..].iter().all(u8::is_ascii_hexdigit)
+    }
+}
+
 impl fmt::Display for SourceTradeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -355,5 +404,34 @@ mod tests {
         assert!(OutcomeId::from_str("65536").is_err());
         assert!(OutcomeId::from_str("-1").is_err());
         assert!(OutcomeId::from_str("not-a-number").is_err());
+    }
+
+    #[test]
+    fn source_trade_identity_versions_never_mix() {
+        let v2 = SourceTradeId(format!("g2:{}", "a".repeat(64)));
+        assert_eq!(
+            v2.identity_version(),
+            SourceTradeIdentityVersion::ReconciledGroupV2
+        );
+        assert!(v2.is_reconciled_v2());
+        assert!(!v2.is_canonical_transaction_hash_v1());
+
+        let v1 = SourceTradeId(format!("0x{}", "b".repeat(64)));
+        assert_eq!(
+            v1.identity_version(),
+            SourceTradeIdentityVersion::TransactionHashV1
+        );
+        assert!(v1.is_canonical_transaction_hash_v1());
+
+        for malformed in [
+            format!("g2:{}", "A".repeat(64)),
+            format!("g2:{}", "a".repeat(63)),
+            format!("g2:{}z", "a".repeat(63)),
+        ] {
+            assert_eq!(
+                SourceTradeId(malformed).identity_version(),
+                SourceTradeIdentityVersion::TransactionHashV1
+            );
+        }
     }
 }

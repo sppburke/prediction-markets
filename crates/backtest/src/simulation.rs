@@ -15,7 +15,7 @@ use pe_bootstrap::cache::{
 use pe_copy_signal_engine::LeaderSignal;
 use pe_core_types::{
     BasisPoints, KellyFraction, LeaderAction, MarketId, OutcomeId, Probability, ProbabilityPpm,
-    Quantity, ReconstructionQuality, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
+    ReconstructionQuality, ShareAmount, Side, SourceTimestamp, TraderId, VenueId, WalletAddress,
 };
 use pe_risk_engine::clamp_contracts_to_liquidity;
 use pe_risk_engine::snapshot::TradingMode;
@@ -845,7 +845,7 @@ pub fn run_simulation_with(
                         continue;
                     };
 
-                    let signal = raw_trade_to_leader_signal(trade, quality);
+                    let signal = raw_trade_to_leader_signal(trade, quality)?;
 
                     let risk_snapshot = build_risk_snapshot(&RiskContext {
                         exposure: &exposure,
@@ -1266,8 +1266,16 @@ pub fn run_one_kelly_fraction(
 /// Build a `LeaderSignal` from a raw simulation trade for routing through evaluate().
 ///
 /// All backtest signals use the `Add` action (BUY entry).
-fn raw_trade_to_leader_signal(trade: &RawTrade, quality: ReconstructionQuality) -> LeaderSignal {
-    LeaderSignal {
+fn raw_trade_to_leader_signal(
+    trade: &RawTrade,
+    quality: ReconstructionQuality,
+) -> Result<LeaderSignal, BacktestError> {
+    let leader_size = ShareAmount::from_whole(trade.contracts.0).map_err(|error| {
+        BacktestError::Internal(format!(
+            "legacy whole-contract quantity cannot be represented exactly: {error}"
+        ))
+    })?;
+    Ok(LeaderSignal {
         leader: TraderId(trade.wallet),
         venue: VenueId::polymarket(),
         market_id: trade.market_id.clone(),
@@ -1275,13 +1283,13 @@ fn raw_trade_to_leader_signal(trade: &RawTrade, quality: ReconstructionQuality) 
         action: LeaderAction::Add,
         leader_side: trade.side,
         leader_price: trade.price,
-        leader_size: Quantity(trade.contracts),
+        leader_size,
         observed_at: trade.timestamp.0,
         received_at: trade.timestamp.0,
         reconstruction_quality: quality,
         source_trade_id: trade.source_trade_id.clone(),
         action_confidence_ppm: ProbabilityPpm(700_000),
-    }
+    })
 }
 
 /// Bayesian shrinkage estimate of leader win-rate probability with two additive priors.

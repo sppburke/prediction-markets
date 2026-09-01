@@ -500,7 +500,9 @@ mod tests {
         drop(PaperStateDb::open(&path).unwrap());
         drop(PaperStateDb::open(&record(dir.path()).side_main_path).unwrap());
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .pragma_update(None, "user_version", crate::SCHEMA_VERSION + 1)
+            .unwrap();
         drop(connection);
 
         let first = record(dir.path());
@@ -508,7 +510,7 @@ mod tests {
         assert_eq!(MigrationMetadata::read(&path).unwrap(), Some(first.clone()));
         assert!(matches!(
             PaperStateDb::open(&path),
-            Err(PaperStateError::SchemaVersionMismatch { found: 2, .. })
+            Err(PaperStateError::SchemaVersionMismatch { found: 3, .. })
         ));
         let mut different = first;
         different

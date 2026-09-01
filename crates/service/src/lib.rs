@@ -3,6 +3,7 @@
 //! Production code lives in `main.rs`.
 
 pub mod activity_ingest;
+pub mod bucket_commit;
 pub mod clob_book;
 pub mod config;
 pub mod config_poller;
@@ -38,7 +39,6 @@ pub mod supabase_sink;
 pub mod supabase_state;
 pub mod trade_parser;
 pub mod trade_poller;
-pub mod wallet_history;
 pub mod watchlist_admission;
 pub mod watchlist_capacity;
 pub mod watchlist_maintenance;

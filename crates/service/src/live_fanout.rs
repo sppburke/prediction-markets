@@ -2311,9 +2311,8 @@ mod tests {
 
     use pe_core_types::SourceTimestamp;
     use pe_core_types::{
-        ContractQty, LeaderAction, MarketId, OutcomeId, ProbabilityPpm, Quantity,
-        ReconstructionQuality, Side, SourceTradeId, TraderId, VenueId, VenueMarketId,
-        WalletAddress,
+        LeaderAction, MarketId, OutcomeId, ProbabilityPpm, ReconstructionQuality, Side,
+        SourceTradeId, TraderId, VenueId, VenueMarketId, WalletAddress,
     };
     use pe_execution_core::{
         LiveAccountReadFailure, LiveOrderRejectKind, LivePostClassification, LivePostParseError,
@@ -2631,7 +2630,7 @@ mod tests {
             action: LeaderAction::Entry,
             leader_side: Side::Buy,
             leader_price: Price(dec!(0.50)),
-            leader_size: Quantity(ContractQty(10)),
+            leader_size: pe_core_types::ShareAmount::from_whole(10).unwrap(),
             observed_at: OffsetDateTime::UNIX_EPOCH,
             received_at: OffsetDateTime::UNIX_EPOCH,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),

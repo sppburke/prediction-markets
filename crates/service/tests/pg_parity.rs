@@ -176,8 +176,8 @@ async fn pg_parity_and_concurrency() {
         wallet: WalletAddress::from_hex(LEADER_HEX).unwrap(),
         market_id: market.clone(),
         outcome_id: OutcomeId(0),
-        long_contracts: 0,
-        short_contracts: 0,
+        long_contracts: pe_core_types::ShareAmount::ZERO,
+        short_contracts: pe_core_types::ShareAmount::ZERO,
     };
     // buy, sell (trims long), buy — exercises both bankroll directions and net positioning.
     let fills = [

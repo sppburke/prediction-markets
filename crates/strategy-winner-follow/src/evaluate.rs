@@ -410,7 +410,7 @@ mod canary_tests {
     #![allow(clippy::unwrap_used)]
 
     use pe_core_types::{
-        OutcomeId, ProbabilityPpm, Quantity, ReconstructionQuality, SourceTradeId, TraderId,
+        OutcomeId, ProbabilityPpm, ReconstructionQuality, ShareAmount, SourceTradeId, TraderId,
         VenueId, VenueMarketId, WalletAddress,
     };
     use rust_decimal_macros::dec;
@@ -429,7 +429,7 @@ mod canary_tests {
             action: LeaderAction::Entry,
             leader_side: Side::Buy,
             leader_price: Price(dec!(0.50)),
-            leader_size: Quantity(ContractQty(10)),
+            leader_size: ShareAmount::from_whole(10).unwrap(),
             observed_at: OffsetDateTime::UNIX_EPOCH,
             received_at: OffsetDateTime::UNIX_EPOCH,
             reconstruction_quality: ReconstructionQuality::new(100).unwrap(),

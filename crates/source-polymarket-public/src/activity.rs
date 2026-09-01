@@ -765,6 +765,8 @@ pub struct ActivityAggregate {
     pub price_weighted_share_sum: PriceWeightedShareAmount,
     pub source_usdc_sum: CollateralAmount,
     pub source_time: SourceTimestamp,
+    /// Identical combo classification shared by every member row.
+    pub is_combo: bool,
     pub semantic_revision: ActivitySemanticRevision,
 }
 
@@ -783,6 +785,28 @@ impl ActivityAggregate {
         } else {
             ActivityRevisionComparison::Changed
         }
+    }
+
+    /// Exact volume-weighted trade price, derived from the complete aggregate.
+    /// `usdcSize` is deliberately not consulted because it is audit evidence,
+    /// not the ledger/classification price owner (#544).
+    pub fn volume_weighted_price(&self) -> Result<Price, ActivityAggregationError> {
+        if self.share_sum == ShareAmount::ZERO {
+            return Err(ActivityAggregationError::ZeroShareSum {
+                group_id: self.group_id.to_string(),
+            });
+        }
+        let value = self
+            .price_weighted_share_sum
+            .0
+            .checked_div(self.share_sum.to_decimal())
+            .ok_or_else(|| ActivityAggregationError::PriceWeightedSumOverflow {
+                group_id: self.group_id.to_string(),
+            })?;
+        Price::new(value).map_err(|_| ActivityAggregationError::InvalidWeightedPrice {
+            group_id: self.group_id.to_string(),
+            value,
+        })
     }
 }
 
@@ -803,12 +827,18 @@ pub enum ActivityAggregationError {
         expected: i64,
         actual: i64,
     },
+    #[error("activity group {group_id} mixes ordinary and combo rows")]
+    MixedComboState { group_id: String },
     #[error("activity group {group_id} has no members")]
     EmptyGroup { group_id: String },
     #[error("activity group {group_id} exact amount overflow")]
     AmountOverflow { group_id: String },
     #[error("activity group {group_id} exact price-weighted sum overflow")]
     PriceWeightedSumOverflow { group_id: String },
+    #[error("activity group {group_id} has zero aggregate share amount")]
+    ZeroShareSum { group_id: String },
+    #[error("activity group {group_id} has invalid volume-weighted price {value}")]
+    InvalidWeightedPrice { group_id: String, value: Decimal },
 }
 
 /// Group and aggregate one complete fixed-end response without deduplicating
@@ -839,6 +869,7 @@ fn aggregate_group(
         });
     };
     let expected = first.source_time.0.unix_timestamp();
+    let is_combo = first.is_combo;
     let mut share_sum = ShareAmount::ZERO;
     let mut source_usdc_sum = CollateralAmount::ZERO;
     let mut price_weighted_share_sum = Decimal::ZERO;
@@ -849,6 +880,11 @@ fn aggregate_group(
                 group_id: group_id.to_string(),
                 expected,
                 actual,
+            });
+        }
+        if member.is_combo != is_combo {
+            return Err(ActivityAggregationError::MixedComboState {
+                group_id: group_id.to_string(),
             });
         }
         share_sum = share_sum.checked_add(member.share_amount).map_err(|_| {
@@ -887,6 +923,7 @@ fn aggregate_group(
         price_weighted_share_sum: PriceWeightedShareAmount(price_weighted_share_sum),
         source_usdc_sum,
         source_time: first.source_time.clone(),
+        is_combo,
         semantic_revision,
     })
 }

@@ -172,6 +172,33 @@ impl LiveWatchlist {
         self.inner.store(Arc::new(updated));
         total
     }
+
+    /// Remove a monotonic durable-fence set without admitting replacements.
+    /// Caller holds the structural writer lock (#544).
+    pub fn remove_fenced(&self, fenced: &HashSet<WalletAddress>) -> usize {
+        if fenced.is_empty() {
+            return self.inner.load().entries.len();
+        }
+        let current = self.inner.load_full();
+        let entries: Vec<_> = current
+            .entries
+            .iter()
+            .filter(|entry| !fenced.contains(&entry.wallet))
+            .cloned()
+            .collect();
+        let active_count = entries
+            .iter()
+            .filter(|entry| entry.tier == WatchlistTier::Active)
+            .count();
+        let total = entries.len();
+        self.inner.store(Arc::new(Watchlist {
+            entries,
+            snapshot_at: current.snapshot_at.clone(),
+            active_count,
+            incubator_count: total.saturating_sub(active_count),
+        }));
+        total
+    }
 }
 
 #[cfg(test)]
