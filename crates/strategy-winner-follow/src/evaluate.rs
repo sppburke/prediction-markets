@@ -388,20 +388,32 @@ fn proposed_trade_bps(contracts: u64, price: Decimal, bankroll: Decimal) -> Basi
 ///
 /// Format: `wf|{leader}|{source_trade_id}|{market}|{outcome}|{side}|{bucket}`
 /// where `bucket = floor(observed_at_ms / 1_000) = observed_at.unix_timestamp()`.
-pub fn build_idempotency_key(signal: &LeaderSignal) -> String {
-    let side_str = match signal.leader_side {
+/// Canonical `wf|leader|source|market|outcome|side|bucket` key from raw parts —
+/// the single format owner shared with offline decision replay (#544), so the
+/// replay binding compares EXACT equality rather than substrings.
+pub fn build_idempotency_key_parts(
+    leader: &str,
+    source_trade_id: &str,
+    market: &str,
+    outcome: u16,
+    side: pe_core_types::Side,
+    observed_at_bucket: i64,
+) -> String {
+    let side_str = match side {
         pe_core_types::Side::Buy => "buy",
         pe_core_types::Side::Sell => "sell",
     };
-    let bucket = signal.observed_at.unix_timestamp();
-    format!(
-        "wf|{}|{}|{}|{}|{}|{}",
-        signal.leader,
-        signal.source_trade_id.0,
-        signal.market_id.0.0,
+    format!("wf|{leader}|{source_trade_id}|{market}|{outcome}|{side_str}|{observed_at_bucket}")
+}
+
+pub fn build_idempotency_key(signal: &LeaderSignal) -> String {
+    build_idempotency_key_parts(
+        &signal.leader.to_string(),
+        &signal.source_trade_id.0,
+        &signal.market_id.0.0,
         signal.outcome_id.0,
-        side_str,
-        bucket,
+        signal.leader_side,
+        signal.observed_at.unix_timestamp(),
     )
 }
 

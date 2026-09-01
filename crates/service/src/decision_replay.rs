@@ -436,36 +436,60 @@ pub fn replay_decision_pending(
     {
         return Err(ReplayDecisionError::TerminalMismatch);
     }
-    // Semantic binding (#544 review round 3): a self-consistent document that
-    // describes a DIFFERENT market/outcome/side than the frozen continuation —
-    // or an authority outcome that contradicts the terminal disposition — must
-    // fail, or a recomputed-hash forgery replays as valid.
-    if let Some(fill) = post_boundary.body.terminal.fill.as_ref() {
-        if fill.market_id != continuation.market_id.0.0
-            || fill.outcome_id != continuation.outcome_id.0
-            || !fill.side.eq_ignore_ascii_case(match continuation.side {
-                Side::Buy => "buy",
-                Side::Sell => "sell",
-            })
-        {
-            return Err(ReplayDecisionError::ContinuationBinding);
-        }
-        if !fill
-            .idempotency_key
-            .contains(continuation.market_id.0.0.as_str())
-            && !fill
-                .idempotency_key
-                .contains(continuation.source_trade_id.0.as_str())
-        {
-            return Err(ReplayDecisionError::ContinuationBinding);
-        }
+    // Semantic binding (#544 review rounds 3-4): a self-consistent document that
+    // describes a DIFFERENT market/outcome/side/identity than the frozen
+    // continuation — or an authority outcome contradicting the disposition —
+    // must fail, or a recomputed-hash forgery replays as valid.
+    let market = continuation.market_id.to_string();
+    if let Some(evidence) = post_boundary.body.market_end.as_ref()
+        && evidence.market_id != market
+    {
+        return Err(ReplayDecisionError::ContinuationBinding);
+    }
+    if let Some(evidence) = post_boundary.body.market_price.as_ref()
+        && (evidence.market_id != market || evidence.outcome_id != continuation.outcome_id.0)
+    {
+        return Err(ReplayDecisionError::ContinuationBinding);
     }
     let disposition = post_boundary.body.terminal.disposition.as_str();
+    match post_boundary.body.terminal.fill.as_ref() {
+        Some(fill) => {
+            if disposition != "fill" {
+                // Only a fill disposition may carry recorded fill evidence.
+                return Err(ReplayDecisionError::ContinuationBinding);
+            }
+            let expected_key = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                &pe_core_types::TraderId(continuation.wallet).to_string(),
+                &continuation.source_trade_id.0,
+                &continuation.market_id.0.0,
+                continuation.outcome_id.0,
+                continuation.side,
+                continuation.source_epoch,
+            );
+            if fill.market_id != continuation.market_id.0.0
+                || fill.outcome_id != continuation.outcome_id.0
+                || !fill.side.eq_ignore_ascii_case(match continuation.side {
+                    Side::Buy => "buy",
+                    Side::Sell => "sell",
+                })
+                || fill.idempotency_key != expected_key
+            {
+                return Err(ReplayDecisionError::ContinuationBinding);
+            }
+        }
+        None => {
+            if disposition == "fill" {
+                return Err(ReplayDecisionError::AuthorityBinding);
+            }
+        }
+    }
+    // Authority vocabulary (production emitters): commit_fill_v2 outcomes are
+    // applied|existing|settled_refusal; the legacy local protocol emits
+    // committed|settled_refusal; not_read carries a typed reason.
     let authority_outcome = post_boundary.body.authority.outcome.as_str();
-    let authority_contradicts = (disposition == "fill"
-        && matches!(authority_outcome, "refused_settled" | "error"))
-        || (disposition.starts_with("no_fill") && authority_outcome == "applied")
-        || (disposition == "fill" && post_boundary.body.terminal.fill.is_none());
+    let fill_consistent = matches!(authority_outcome, "applied" | "existing" | "committed");
+    let authority_contradicts =
+        (disposition == "fill" && !fill_consistent) || (disposition != "fill" && fill_consistent);
     if authority_contradicts {
         return Err(ReplayDecisionError::AuthorityBinding);
     }
@@ -595,9 +619,16 @@ mod tests {
             "fill",
             AuthorityEvidence::commit_fill_v2("applied", dec!(996)),
             TerminalDispositionEvidence::fill(
-                // Canonical wf| key shape: the semantic binding requires the
-                // market or source id inside the key, as production keys carry.
-                format!("wf|0xleader|g2:fill|0x{}|0|buy|1700000000", "2".repeat(40)),
+                // The semantic binding requires EXACT canonical key equality:
+                // derive it from the same parts owner production uses.
+                pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+                    &pe_core_types::TraderId(wallet()).to_string(),
+                    "g2:fill",
+                    &format!("0x{}", "2".repeat(40)),
+                    0,
+                    pe_core_types::Side::Buy,
+                    1_700_000_000,
+                ),
                 format!("0x{}", "2".repeat(40)),
                 0,
                 "buy",

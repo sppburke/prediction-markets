@@ -431,23 +431,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 // final membership recheck/publication so a wallet cannot become
                 // visible from a proof invalidated between those two operations.
                 let writer_lock = self.watchlist_writer_lock.clone();
-                // Freeze the mutable decision basis atomically with this commit
-                // (#544 review round 3): a later watchlist refresh or bankroll
-                // move cannot change what a resumed continuation decides.
-                let frozen_basis = {
-                    let watchlist = self.live_watchlist.snapshot();
-                    let leader = aggregates
-                        .first()
-                        .map(|aggregate| TraderId(aggregate.group_id.components().wallet));
-                    crate::bucket_commit::FrozenDecisionBasis {
-                        win_rate_p: leader
-                            .map(|leader| self.win_rate_p_for(&watchlist, &leader))
-                            .unwrap_or(Probability::ZERO),
-                        bankroll: self.bankroll,
-                    }
-                };
                 let result = if let Some(writer_lock) = writer_lock {
                     let _writer_guard = writer_lock.lock().await;
+                    // Freeze the mutable decision basis UNDER the writer lock
+                    // (#544 review round 3): capture is linearized against a
+                    // concurrent refresh, and later watchlist/bankroll moves
+                    // cannot change what a resumed continuation decides.
+                    let frozen_basis = self.freeze_decision_basis(&aggregates);
                     let result = self
                         .bucket_engine
                         .commit(aggregates, &context, frozen_basis);
@@ -463,7 +453,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     result
                 } else {
                     // Scenario/unit construction may omit the production writer lock;
-                    // those harnesses have no competing membership writer.
+                    // those harnesses have no competing membership writer to
+                    // linearize the basis capture against.
+                    let frozen_basis = self.freeze_decision_basis(&aggregates);
                     let result = self
                         .bucket_engine
                         .commit(aggregates, &context, frozen_basis);
@@ -786,6 +778,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
+        sizing_bankroll: Decimal,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
         let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
             reason: "impact gate cap invalid",
@@ -933,8 +926,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         };
         let (budget, max_shares) = match self.strategy.config().sizing_mode {
             SizingMode::Dollar { usd } => (to_budget(usd)?, None),
-            SizingMode::Contract { contracts } => (to_budget(self.bankroll)?, Some(contracts)),
-            SizingMode::Kelly => (to_budget(self.bankroll)?, None),
+            SizingMode::Contract { contracts } => (to_budget(sizing_bankroll)?, Some(contracts)),
+            SizingMode::Kelly => (to_budget(sizing_bankroll)?, None),
         };
         let max_price = Price::new(Decimal::ONE).map_err(|_| GatePlanFailure {
             reason: "price domain invariant broken",
@@ -1585,7 +1578,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // `clob_best_ask` paper mode) the VWAP fill basis. An unusable book — missing token,
         // fetch error/timeout, corrupt/empty/stale — fails CLOSED (skip), as does an in-band
         // ladder that affords no whole share.
-        let gate_evidence = match self.plan_impact_gate(&signal).await {
+        // A resumed continuation evaluates under its frozen basis; only a fresh
+        // decision reads the live watchlist and bankroll (#544 review round 3).
+        // Selected BEFORE the impact gate so ladder budget, VWAP, and strategy
+        // sizing all share one basis.
+        let p = pending
+            .as_ref()
+            .map(|continuation| continuation.frozen_basis.win_rate_p)
+            .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
+        let sizing_bankroll = pending
+            .as_ref()
+            .map(|continuation| continuation.frozen_basis.bankroll)
+            .unwrap_or(self.bankroll);
+        let gate_evidence = match self.plan_impact_gate(&signal, sizing_bankroll).await {
             Ok(outcome) => outcome,
             Err(failure) => {
                 if let Some(evidence) = decision_evidence.as_mut() {
@@ -1842,16 +1847,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         // within-band, within-budget maximum. The no-affordable-shares arm returned above.
         let book_cap_contracts = gate_plan.map(|plan| plan.shares.atomic() / 1_000_000);
 
-        // A resumed continuation evaluates under its frozen basis; only a fresh
-        // decision reads the live watchlist and bankroll (#544 review round 3).
-        let p = pending
-            .as_ref()
-            .map(|continuation| continuation.frozen_basis.win_rate_p)
-            .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
-        let sizing_bankroll = pending
-            .as_ref()
-            .map(|continuation| continuation.frozen_basis.bankroll)
-            .unwrap_or(self.bankroll);
         let snapshot = zeroed_risk_snapshot();
         // Sizing basis: pass the leader's price as the RAW `current_price` (Kelly cost `c`,
         // per-trade cap, exposure bps) and `fill_basis` as the dollar-sizing price, so the
@@ -2589,6 +2584,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     /// Empirical win-rate probability for a leader, sourced from the watchlist's
     /// `win_rate_bps` (wins / closed_trades × 10 000). Falls back to `Probability::ZERO`
     /// if the leader is not in the watchlist (signal will produce no edge → NoEdge error).
+    /// Capture the mutable decision basis for one bucket's leader (#544).
+    fn freeze_decision_basis(
+        &self,
+        aggregates: &[pe_source_polymarket_public::ActivityAggregate],
+    ) -> crate::bucket_commit::FrozenDecisionBasis {
+        let watchlist = self.live_watchlist.snapshot();
+        let leader = aggregates
+            .first()
+            .map(|aggregate| TraderId(aggregate.group_id.components().wallet));
+        crate::bucket_commit::FrozenDecisionBasis {
+            win_rate_p: leader
+                .map(|leader| self.win_rate_p_for(&watchlist, &leader))
+                .unwrap_or(Probability::ZERO),
+            bankroll: self.bankroll,
+        }
+    }
+
     fn win_rate_p_for(&self, watchlist: &Watchlist, leader: &TraderId) -> Probability {
         let bps = watchlist
             .entries
