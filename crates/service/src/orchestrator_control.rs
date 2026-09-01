@@ -47,7 +47,7 @@ pub enum OrchestratorControl {
     /// source routing closes obligations before sending this command.
     CommitActivityBucket {
         aggregates: Vec<ActivityAggregate>,
-        context: BucketDecisionContext,
+        context: Box<BucketDecisionContext>,
         committed: oneshot::Sender<Result<BucketCommitResult, String>>,
     },
 }

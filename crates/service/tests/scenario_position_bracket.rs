@@ -178,6 +178,8 @@ fn context(epoch: i64) -> BucketDecisionContext {
         signal_config: Default::default(),
         copy_eligible: false,
         recorded_at_unix: epoch,
+        observation_provenance: HashMap::new(),
+        no_copy_dispositions: HashMap::new(),
         history_status: None,
     }
 }

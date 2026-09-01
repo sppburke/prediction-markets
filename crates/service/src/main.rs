@@ -17,7 +17,7 @@ use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_service::position_seeder::CausalPositionValidator;
-use pe_source_polymarket_public::ReqwestFetcher;
+use pe_source_polymarket_public::{ReconciliationFetcher, ReqwestFetcher};
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
@@ -50,7 +50,9 @@ use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
     SupabaseStateClient, apply_resolution_authoritative, supabase_authoritative_boot,
 };
-use pe_service::trade_poller::{TradePoller, TradePollerConfig};
+use pe_service::trade_poller::{
+    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
+};
 use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
@@ -299,9 +301,12 @@ async fn main() -> Result<()> {
         "last_hash": activation.source.last_hash.to_hex().to_string(),
     }))
     .context("encode source-log generation for position validation")?;
-    let position_fetcher = Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    // One fetcher owns the documented public-API rate gate for boot brackets
+    // and runtime reconciliation (#544).
+    let position_fetcher: Arc<dyn ReconciliationFetcher> =
+        Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
     let position_validator = CausalPositionValidator::new(
-        position_fetcher,
+        position_fetcher.clone(),
         cfg.polymarket_base_url.clone(),
         source_log_generation,
     );
@@ -353,7 +358,7 @@ async fn main() -> Result<()> {
     );
 
     // Bounded channel per _GLOSSARY.md defaults.
-    let (trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
+    let (_trade_tx, trade_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
 
     // Seed the delivery cursor without mutating the ordered activity ledger. The positions API
     // is no longer an overwrite authority (#544).
@@ -379,38 +384,54 @@ async fn main() -> Result<()> {
         position_validator,
     );
 
-    // #530: websocket-primary ingest task (flag-gated). Owns the source event
-    // log; a boot-time open failure fails boot — enabled mode must satisfy the
-    // raw-evidence invariant. Disabled mode spawns nothing (poll-only,
-    // byte-identical to pre-#530 behavior — the rollback posture).
-    let activity_ingest_task = if cfg.polymarket_activity_ws_enabled {
-        let sink = pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
-            .with_context(|| {
-                format!(
-                    "open source event log {}",
-                    cfg.source_event_log_path.display()
-                )
-            })?;
-        let mut start = producer_start_rx.clone();
-        let activity_watchlist = live_watchlist.clone();
-        let activity_trade_tx = trade_tx.clone();
-        let activity_health = health.clone();
-        Some(tokio::spawn(async move {
-            if start.wait_for(|started| *started).await.is_err() {
-                return;
-            }
+    // Rebuild durable reader obligations before either source producer starts.
+    // The existing source log plus aggregate records are sufficient, so #544
+    // adds no second database or obligation table.
+    let obligations = rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
+        .context("rebuild durable activity reconciliation obligations")?;
+    info!(
+        obligations = obligations.len(),
+        "activity obligations rebuilt"
+    );
+
+    // One bounded single-writer coordinator owns both websocket rows and every
+    // fixed-end public page. Append acknowledgement precedes all triggers/apply.
+    let sink = pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+        .with_context(|| {
+            format!(
+                "open source event log {}",
+                cfg.source_event_log_path.display()
+            )
+        })?;
+    let (source_log, source_rx) =
+        pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
+    let (trigger_tx, trigger_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
+    let mut start = producer_start_rx.clone();
+    let activity_watchlist = live_watchlist.clone();
+    let activity_health = health.clone();
+    let activity_ws_enabled = cfg.polymarket_activity_ws_enabled;
+    let activity_ingest_task = tokio::spawn(async move {
+        if start.wait_for(|started| *started).await.is_err() {
+            return;
+        }
+        let ingest = if activity_ws_enabled {
             pe_service::activity_ingest::ActivityIngest::new(
                 activity_watchlist,
                 sink,
-                activity_trade_tx,
+                source_rx,
+                trigger_tx,
                 activity_health,
             )
-            .run()
-            .await;
-        }))
-    } else {
-        None
-    };
+        } else {
+            pe_service::activity_ingest::ActivityIngest::poll_only(
+                sink,
+                source_rx,
+                trigger_tx,
+                activity_health,
+            )
+        };
+        ingest.run().await;
+    });
 
     // Polymarket trade poller task. Reads the live wallet set per poll round (#339).
     let mut poller_start = producer_start_rx;
@@ -418,6 +439,9 @@ async fn main() -> Result<()> {
     let poller_paper_state = paper_state.clone();
     let poller_health = health.clone();
     let poller_base_url = cfg.polymarket_base_url.clone();
+    let poller_ws_enabled = cfg.polymarket_activity_ws_enabled;
+    let poller_copy_latency_budget_secs = cfg.copy_latency_budget_secs;
+    let poller_control_tx = control_tx.clone();
     let trade_task = tokio::spawn(async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
             return;
@@ -426,12 +450,18 @@ async fn main() -> Result<()> {
             TradePollerConfig {
                 base_url: poller_base_url,
                 poll_interval_secs: cfg.trade_poll_interval_secs,
+                activity_ws_enabled: poller_ws_enabled,
+                copy_latency_budget_secs: poller_copy_latency_budget_secs,
             },
             poller_watchlist,
-            ReqwestFetcher::new(reqwest::Client::new()),
-            trade_tx,
+            position_fetcher,
+            source_log,
+            trigger_rx,
+            poller_control_tx,
             poller_paper_state,
             poller_health,
+            Default::default(),
+            obligations,
         )
         .run()
         .await;
@@ -843,9 +873,7 @@ async fn main() -> Result<()> {
 
     info!("orchestrator stopped; cleaning up");
     trade_task.abort();
-    if let Some(t) = activity_ingest_task {
-        t.abort();
-    }
+    activity_ingest_task.abort();
     http_task.abort();
     resolution_task.abort();
     if let Some(t) = supabase_task {

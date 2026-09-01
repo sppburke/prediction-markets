@@ -4,7 +4,7 @@
 //! reaches paper-state in one transaction. Lexical `g2:` order is used only to
 //! make storage/replay output canonical; it never selects a causal winner.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, SignalConfig, TradeProvenance, classify_leader_action};
@@ -15,7 +15,7 @@ use pe_core_types::{
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, DecisionPendingRecord,
     DecisionPendingRow, EntryGateResultRecord, LeaderPositionRow, MarketHistoryRecord,
-    PaperStateDb, WalletFenceRecord, WalletHistoryStatusRecord,
+    NoCopyDisposition, PaperStateDb, WalletFenceRecord, WalletHistoryStatusRecord,
 };
 use pe_position_ledger::{
     LedgerEffect, LedgerError, LedgerMutation, PositionLedger, WalletFenceCause,
@@ -35,6 +35,10 @@ pub struct BucketDecisionContext {
     pub signal_config: SignalConfig,
     pub copy_eligible: bool,
     pub recorded_at_unix: i64,
+    /// Transport retained from the first durable observation of each group.
+    pub observation_provenance: HashMap<SourceTradeId, TradeProvenance>,
+    /// Typed early-gate dispositions supplied by reconciliation (#544).
+    pub no_copy_dispositions: HashMap<SourceTradeId, NoCopyDisposition>,
     /// Lane E supplies this only after a complete fixed-end history walk.
     pub history_status: Option<WalletHistoryStatusRecord>,
 }
@@ -65,6 +69,7 @@ pub struct DecisionContinuationV2 {
     pub side: Side,
     pub price: Price,
     pub share_amount: ShareAmount,
+    pub provenance: TradeProvenance,
     pub pre_bucket_action: LeaderAction,
     pub reconstruction_quality: ReconstructionQuality,
     pub action_confidence_ppm: ProbabilityPpm,
@@ -120,7 +125,7 @@ impl DecisionContinuationV2 {
             received_at: observed_at,
             source_trade_id: self.source_trade_id.clone(),
             transaction_hash: Some(self.transaction_hash.clone()),
-            provenance: TradeProvenance::RestPoll,
+            provenance: self.provenance,
         })
     }
 }
@@ -255,6 +260,7 @@ impl BucketCommitEngine {
         }
         let seen = durable.iter().filter(|state| state.is_some()).count();
         if seen == aggregates.len() {
+            self.paper_state.set_cursor(&wallet, source_epoch)?;
             return Ok(BucketCommitResult {
                 wallet,
                 source_epoch,
@@ -400,7 +406,11 @@ impl BucketCommitEngine {
                 received_at: mutation.source_time.0,
                 source_trade_id: mutation.source_trade_id.clone(),
                 transaction_hash: Some(mutation.transaction_hash.clone()),
-                provenance: TradeProvenance::RestPoll,
+                provenance: context
+                    .observation_provenance
+                    .get(&mutation.source_trade_id)
+                    .copied()
+                    .unwrap_or(TradeProvenance::RestPoll),
             };
             let action = classify_leader_action(
                 &trade,
@@ -445,7 +455,9 @@ impl BucketCommitEngine {
                         .get(&source_trade_id.0)
                         .cloned()
                         .unwrap_or_else(|| "not_an_entry".to_owned());
-                    if outcome == "admitted"
+                    if let Some(no_copy) = context.no_copy_dispositions.get(&source_trade_id) {
+                        no_copy.reason.clone()
+                    } else if outcome == "admitted"
                         && context.copy_eligible
                         && !trade_decisions.iter().any(|decision| {
                             decision.source_trade_id == source_trade_id
@@ -482,6 +494,11 @@ impl BucketCommitEngine {
                             side: *side,
                             price: *price,
                             share_amount: *amount,
+                            provenance: context
+                                .observation_provenance
+                                .get(&source_trade_id)
+                                .copied()
+                                .unwrap_or(TradeProvenance::RestPoll),
                             pre_bucket_action: decision.action,
                             reconstruction_quality: context.reconstruction_quality,
                             action_confidence_ppm: ProbabilityPpm(
@@ -520,6 +537,7 @@ impl BucketCommitEngine {
                 aggregate,
                 disposition,
                 json!({"bucket_epoch": source_epoch}),
+                context.no_copy_dispositions.get(&source_trade_id).cloned(),
             )?);
         }
 
@@ -673,7 +691,12 @@ impl BucketCommitEngine {
                 "wallet_fenced".to_owned()
             };
             dispositions.insert(aggregate.group_id.key().0.clone(), disposition.clone());
-            records.push(activity_record(aggregate, disposition, proof.clone())?);
+            records.push(activity_record(
+                aggregate,
+                disposition,
+                proof.clone(),
+                None,
+            )?);
         }
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
@@ -736,7 +759,12 @@ impl BucketCommitEngine {
             };
             dispositions.insert(aggregate.group_id.key().0.clone(), disposition.clone());
             if differs {
-                records.push(activity_record(aggregate, disposition, proof.clone())?);
+                records.push(activity_record(
+                    aggregate,
+                    disposition,
+                    proof.clone(),
+                    None,
+                )?);
             }
         }
         self.paper_state
@@ -804,6 +832,7 @@ impl BucketCommitEngine {
                     aggregate,
                     "wallet_fenced".to_owned(),
                     json!({"bucket_epoch": source_epoch, "ledger_effect_applied": applied}),
+                    None,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -851,6 +880,7 @@ fn activity_record(
     aggregate: &ActivityAggregate,
     disposition: String,
     proof: Value,
+    no_copy: Option<NoCopyDisposition>,
 ) -> Result<ActivityDispositionRecord, serde_json::Error> {
     let components = aggregate.group_id.components();
     Ok(ActivityDispositionRecord {
@@ -862,6 +892,7 @@ fn activity_record(
         activity_type: components.activity_type.as_str().to_owned(),
         disposition,
         proof_json: serde_json::to_string(&proof)?,
+        no_copy,
     })
 }
 

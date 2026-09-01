@@ -19,11 +19,11 @@ pub mod reconciliation;
 pub use activity::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityAggregationError,
     ActivityIdentityError, ActivityParseContext, ActivityParseError, ActivityRevisionComparison,
-    ActivitySemanticRevision, ActivityTransport, ActivityType, ActivityValidationError,
-    ActivityWindowInvalidation, NormalizedActivity, NormalizedActivityWindow,
-    PriceWeightedShareAmount, SourceActivityGroupComponents, SourceActivityGroupId,
-    aggregate_activity_rows, parse_activity_response, parse_activity_row,
-    project_legacy_contract_qty_v1,
+    ActivitySemanticRevision, ActivityTradeObservation, ActivityTransport, ActivityType,
+    ActivityValidationError, ActivityWindowInvalidation, NormalizedActivity,
+    NormalizedActivityWindow, PriceWeightedShareAmount, SourceActivityGroupComponents,
+    SourceActivityGroupId, aggregate_activity_rows, parse_activity_response, parse_activity_row,
+    parse_activity_trade_observation, project_legacy_contract_qty_v1,
 };
 #[cfg(feature = "scenario")]
 pub use activity_ws::ActivityWsPeer;

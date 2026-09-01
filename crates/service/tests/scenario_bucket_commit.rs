@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pe_core_types::{
@@ -132,6 +133,8 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
         signal_config: Default::default(),
         copy_eligible: true,
         recorded_at_unix: epoch + 20,
+        observation_provenance: HashMap::new(),
+        no_copy_dispositions: HashMap::new(),
         history_status: complete_history.then(|| WalletHistoryStatusRecord {
             wallet: wallet(),
             complete: true,

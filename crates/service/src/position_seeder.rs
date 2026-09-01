@@ -323,7 +323,7 @@ impl CausalPositionValidator {
             control_tx
                 .send(OrchestratorControl::CommitActivityBucket {
                     aggregates: bucket,
-                    context: bracket_context(activity, &self.source_log_generation)?,
+                    context: Box::new(bracket_context(activity, &self.source_log_generation)?),
                     committed,
                 })
                 .await
@@ -435,6 +435,8 @@ fn bracket_context(
         signal_config: SignalConfig::default(),
         copy_eligible: false,
         recorded_at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        observation_provenance: HashMap::new(),
+        no_copy_dispositions: HashMap::new(),
         history_status: None,
     })
 }

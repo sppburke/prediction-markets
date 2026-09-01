@@ -257,6 +257,19 @@ pub struct NormalizedActivity {
     pub transport: ActivityTransport,
 }
 
+/// Identity carried by one accepted `activity/trades` websocket observation.
+///
+/// The websocket payload is only a reconciliation trigger: it cannot supply a
+/// semantic aggregate or mutate the ledger. Its documented envelope fixes the
+/// activity type to `TRADE`, while the payload supplies the remaining version-two
+/// group components and exact source second (#544).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityTradeObservation {
+    pub wallet: WalletAddress,
+    pub group_id: SourceActivityGroupId,
+    pub source_time: SourceTimestamp,
+}
+
 impl NormalizedActivity {
     pub fn group_id(&self) -> Result<SourceActivityGroupId, ActivityIdentityError> {
         SourceActivityGroupId::derive(SourceActivityGroupComponents {
@@ -321,6 +334,10 @@ pub enum ActivityWindowInvalidation {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ActivityValidationError {
+    #[error("activity/trades payload has invalid activity type {value:?}")]
+    InvalidActivityType { value: String },
+    #[error("activity/trades payload identity could not be derived")]
+    Identity,
     #[error("activity row omitted {field}")]
     MissingField { field: &'static str },
     #[error("activity row has empty {field}")]
@@ -396,6 +413,34 @@ pub fn parse_activity_row(
             message: error.to_string(),
         })?;
     parse_row(raw_row.get(), requested_wallet, context, 0)
+}
+
+/// Parse one payload accepted under the `activity/trades` websocket envelope.
+///
+/// Unlike a complete REST row, the push payload does not carry `type` or
+/// `usdcSize`. Those fields are not invented: the envelope supplies only the
+/// `TRADE` domain, and the observation remains raw evidence plus a group trigger.
+/// Exact aggregate quantities and prices come exclusively from fixed-end REST
+/// reconciliation.
+pub fn parse_activity_trade_observation(
+    raw: &[u8],
+) -> Result<ActivityTradeObservation, ActivityParseError> {
+    let raw_row: Box<RawValue> =
+        serde_json::from_slice(raw).map_err(|error| ActivityParseError::Json {
+            message: error.to_string(),
+        })?;
+    let mut raw: RawActivity =
+        serde_json::from_str(raw_row.get()).map_err(|error| ActivityParseError::Json {
+            message: format!("row 0: {error}"),
+        })?;
+    let wallet = parse_wallet(raw.proxy_wallet.take(), None, 0)?;
+    let observation = normalize_trade_observation(raw, wallet).map_err(|source| {
+        ActivityParseError::InvalidRow {
+            row_index: 0,
+            source,
+        }
+    })?;
+    Ok(observation)
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,6 +673,79 @@ fn normalize_row(
         parser_version: ACTIVITY_PARSER_VERSION,
         schema_version: ACTIVITY_SCHEMA_VERSION,
         transport: context.transport,
+    })
+}
+
+fn normalize_trade_observation(
+    raw: RawActivity,
+    wallet: WalletAddress,
+) -> Result<ActivityTradeObservation, ActivityValidationError> {
+    if let Some(activity_type) = optional_nonempty(raw.activity_type)
+        && !activity_type.eq_ignore_ascii_case("TRADE")
+    {
+        return Err(ActivityValidationError::InvalidActivityType {
+            value: activity_type,
+        });
+    }
+    let transaction_hash =
+        required_string(raw.transaction_hash, "transactionHash")?.to_ascii_lowercase();
+    let condition_id = optional_nonempty(raw.condition_id)
+        .map(|value| PolymarketConditionId(value.to_ascii_lowercase()))
+        .ok_or(ActivityValidationError::MissingField {
+            field: "conditionId",
+        })?;
+    let asset = optional_nonempty(raw.asset)
+        .map(PolymarketTokenId)
+        .ok_or(ActivityValidationError::MissingField { field: "asset" })?;
+    let side =
+        parse_side(raw.side)?.ok_or(ActivityValidationError::MissingField { field: "side" })?;
+    let outcome_label_present = optional_nonempty(raw.outcome).is_some();
+    let outcome = parse_outcome(raw.outcome_index, outcome_label_present)?
+        .ok_or(ActivityValidationError::InvalidConditionOutcomeMapping)?;
+    let price_decimal = raw
+        .price
+        .ok_or(ActivityValidationError::MissingField { field: "price" })?
+        .0;
+    Price::new(price_decimal).map_err(|error| ActivityValidationError::InvalidPrice {
+        value: price_decimal,
+        reason: error.to_string(),
+    })?;
+    let share_decimal = raw
+        .size
+        .ok_or(ActivityValidationError::MissingField { field: "size" })?
+        .0;
+    let share_amount = ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
+        ActivityValidationError::InvalidShareAmount {
+            value: share_decimal,
+            reason: error.to_string(),
+        }
+    })?;
+    if share_amount == ShareAmount::ZERO {
+        return Err(ActivityValidationError::ZeroShareAmount);
+    }
+    let source_epoch = raw
+        .timestamp
+        .ok_or(ActivityValidationError::MissingField { field: "timestamp" })?
+        .parse()?;
+    let source_epoch = normalize_epoch_seconds(source_epoch);
+    let source_time = SourceTimestamp(
+        time::OffsetDateTime::from_unix_timestamp(source_epoch)
+            .map_err(|_| ActivityValidationError::InvalidTimestamp(source_epoch))?,
+    );
+    let group_id = SourceActivityGroupId::derive(SourceActivityGroupComponents {
+        activity_type: ActivityType::Trade,
+        wallet,
+        transaction_hash,
+        condition_id: Some(condition_id),
+        asset: Some(asset),
+        outcome: Some(outcome),
+        side: Some(side),
+    })
+    .map_err(|_| ActivityValidationError::Identity)?;
+    Ok(ActivityTradeObservation {
+        wallet,
+        group_id,
+        source_time,
     })
 }
 
@@ -1219,5 +1337,22 @@ mod tests {
         // Decimal::MAX * ATOMIC_SCALE overflowed with a panicking multiply before
         // the checked_mul fix (#544 review).
         assert!(ShareAmount::from_decimal_exact(Decimal::MAX).is_err());
+    }
+
+    #[test]
+    fn websocket_observation_derives_rest_group_without_inventing_missing_fields() {
+        let raw = br#"{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"0xABC","outcomeIndex":"0"}"#;
+        let observation = parse_activity_trade_observation(raw).unwrap();
+        assert_eq!(observation.wallet, wallet());
+        assert_eq!(observation.source_time.0.unix_timestamp(), 1_704_067_200);
+        assert_eq!(observation.group_id.components(), &components());
+    }
+
+    #[test]
+    fn websocket_observation_rejects_non_trade_and_missing_asset() {
+        let non_trade = br#"{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"SPLIT","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"0xabc","outcomeIndex":"0"}"#;
+        assert!(parse_activity_trade_observation(non_trade).is_err());
+        let missing_asset = br#"{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conditionId":"0xcondition","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"0xabc","outcomeIndex":"0"}"#;
+        assert!(parse_activity_trade_observation(missing_asset).is_err());
     }
 }

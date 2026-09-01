@@ -132,7 +132,7 @@ pub enum PaperStateError {
 /// One leader's net position in a `(market, outcome)`, mirroring the in-memory
 /// `PositionState`. The service tier groups these into `PositionSnapshot`s.
 /// Typed no-copy disposition for a stale observation from either transport (#530/#546).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoCopyDisposition {
     /// `"rest_poll"` or `"activity_ws"` (schema CHECK-enforced).
     pub provenance: String,
@@ -164,6 +164,8 @@ pub struct ActivityDispositionRecord {
     pub activity_type: String,
     pub disposition: String,
     pub proof_json: String,
+    /// Exact typed admission disposition when this group is ledger-only.
+    pub no_copy: Option<NoCopyDisposition>,
 }
 
 /// Initially applied durable semantics for one reconciled group.
@@ -734,19 +736,21 @@ impl PaperStateDb {
                 )?;
             }
             tx_mark_seen(&tx, &record.source_trade_id, Some(&record.transaction_hash))?;
-            if record.disposition != "applied"
+            if let Some(disposition) = &record.no_copy {
+                tx_record_no_copy_disposition(&tx, &record.source_trade_id, disposition)?;
+            } else if record.disposition != "applied"
                 && record.disposition != "decision_pending"
                 && record.disposition != "raw_only"
             {
-                tx.execute(
-                    "INSERT OR IGNORE INTO no_copy_dispositions \
-                         (source_trade_id, provenance, age_secs, reason, recorded_at_unix) \
-                     VALUES (?1, 'reconciled_rest', 0, ?2, ?3)",
-                    params![
-                        record.source_trade_id.0,
-                        record.disposition,
-                        record.source_epoch
-                    ],
+                tx_record_no_copy_disposition(
+                    &tx,
+                    &record.source_trade_id,
+                    &NoCopyDisposition {
+                        provenance: "reconciled_rest".to_owned(),
+                        age_secs: 0,
+                        reason: record.disposition.clone(),
+                        recorded_at_unix: record.source_epoch,
+                    },
                 )?;
             }
         }

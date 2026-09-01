@@ -4,24 +4,23 @@
 //! Each reader owns one live-data socket and one persistent reconnect backoff.
 //! It parses every frame's activity payloads, normalizes EACH payload exactly
 //! once through the same parser as the REST path
-//! (`trade_parser::parse_ws_trade`), and only then filters on the normalized
+//! (`parse_activity_trade_observation`), and only then filters on the normalized
 //! wallet against one watchlist snapshot per frame. A parser-accepted row —
 //! watched or not — is the ONLY evidence a reader is alive: the 2026-08-31
 //! experiments (#546) showed a connection can stay open and acknowledged while
 //! delivering nothing, so 30 s without one drops the socket and the reader
 //! re-dials after its own backoff while the other readers keep delivering.
 //!
-//! Watched rows travel `(slot, exact raw bytes, normalized trade)` over ONE
-//! bounded fan-in channel (capacity = the trade channel's) to the coordinator,
+//! Watched rows travel `(slot, exact raw bytes, normalized trigger)` over ONE
+//! bounded fan-in channel (capacity = the trigger channel's) to the coordinator,
 //! which keeps the pre-#546 order: durable source-log append+sync, then the
-//! orchestrator's bounded trade channel. Reader copies of one trade are not
-//! coalesced — each is raw evidence — and the orchestrator's durable
-//! `seen_trades` check suppresses repeat financial effects after the first
-//! successful commit; a first copy rolled back before commit stays unseen so
-//! the next copy retries.
+//! bounded reconciliation-trigger channel. Public polling pages enter that
+//! same coordinator through a second bounded input and wait for the same durable
+//! acknowledgement. Reader copies are never coalesced before recording; the
+//! reconciliation owner coalesces their durable obligations per wallet.
 //!
 //! Failure semantics:
-//! - full fan-in or trade channel → the sender blocks holding its one item
+//! - full fan-in or trigger channel → the sender blocks holding its one item
 //!   (`fan_in_blocked` in health) and reads no further wire frame, so
 //!   backpressure reaches the socket; health derives the slot non-live once its
 //!   last row ages past the timeout, the socket is kept, and after the frame
@@ -33,7 +32,7 @@
 //! - source-log append/sync failure → the sink poisons and the coordinator
 //!   enters a bounded-backoff reopen/revalidate loop holding the current item,
 //!   blocking delivery from EVERY reader until it durably appends (#530 review
-//!   F4/F1: the trade is retained, never assumed onto REST).
+//!   F4/F1: the observation is retained, never assumed onto REST).
 //! - payload rejected by the normalizer → counted and warned once per frame;
 //!   the REST path parses the same shape with the same converter, so the
 //!   poller either delivers it or freezes the wallet cursor on it (#511).
@@ -45,16 +44,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use pe_copy_signal_engine::IncomingTrade;
-use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+use pe_copy_signal_engine::TradeProvenance;
+use pe_core_types::{
+    EventSeq, ReceivedAt, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
+};
 use pe_event_log::{ContentType, EnvelopeIn};
 use pe_source_polymarket_public::{
-    ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS, ACTIVITY_WS_PARSER_VERSION,
-    ACTIVITY_WS_READER_COUNT, ACTIVITY_WS_SCHEMA_VERSION, ActivityWsError, ActivityWsStream,
-    ReconnectBackoff, WireFrame, backoff_secs, parse_activity_frame,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ACTIVITY_WS_NORMALIZED_ACTIVITY_TIMEOUT_SECS,
+    ACTIVITY_WS_READER_COUNT, ActivityWsError, ActivityWsStream, ReconnectBackoff, WireFrame,
+    backoff_secs, parse_activity_frame, parse_activity_trade_observation,
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -62,10 +64,61 @@ use tracing::{info, warn};
 use crate::health::{HealthState, ReaderHealth, SharedHealth};
 use crate::live_watchlist::LiveWatchlist;
 use crate::source_event_sink::SourceEventSink;
-use crate::trade_parser;
 
 /// Source id stamped on every websocket envelope in the source event log.
 pub const ACTIVITY_WS_SOURCE_ID: &str = "polymarket-activity-ws";
+
+/// A durable raw observation that requires complete fixed-end reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationTrigger {
+    pub wallet: WalletAddress,
+    pub source_time: OffsetDateTime,
+    pub source_trade_id: SourceTradeId,
+    pub provenance: TradeProvenance,
+    pub received_at: OffsetDateTime,
+}
+
+/// Bounded producer handle for non-websocket source pages. The coordinator
+/// acknowledges only after append and synchronization complete (#544).
+#[derive(Clone)]
+pub struct SourceLogHandle {
+    tx: mpsc::Sender<SourceLogRequest>,
+}
+
+struct SourceLogRequest {
+    envelope: EnvelopeIn,
+    appended: oneshot::Sender<EventSeq>,
+}
+
+pub struct SourceLogReceiver {
+    rx: mpsc::Receiver<SourceLogRequest>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceLogHandleError {
+    #[error("source-log coordinator closed")]
+    Closed,
+}
+
+impl SourceLogHandle {
+    /// Build the bounded external input owned by [`ActivityIngest`].
+    pub fn channel(capacity: usize) -> (Self, SourceLogReceiver) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, SourceLogReceiver { rx })
+    }
+
+    /// Record one source page and wait for its durable append acknowledgement.
+    pub async fn append(&self, envelope: EnvelopeIn) -> Result<EventSeq, SourceLogHandleError> {
+        let (appended, acknowledgement) = oneshot::channel();
+        self.tx
+            .send(SourceLogRequest { envelope, appended })
+            .await
+            .map_err(|_| SourceLogHandleError::Closed)?;
+        acknowledgement
+            .await
+            .map_err(|_| SourceLogHandleError::Closed)
+    }
+}
 
 /// Opens one subscribed socket for reader `slot`. Production dials the fixed
 /// endpoint; scenario builds may inject in-process peers.
@@ -81,17 +134,22 @@ fn activity_timeout() -> Duration {
 struct Observation {
     slot: usize,
     payload: Vec<u8>,
-    trade: IncomingTrade,
+    trigger: ReconciliationTrigger,
 }
 
 /// A downstream receiver closed: the service is shutting down.
 struct Shutdown;
 
 pub struct ActivityIngest {
-    live_watchlist: LiveWatchlist,
+    reader: Option<ReaderConfig>,
     sink: SourceEventSink,
-    trade_tx: mpsc::Sender<IncomingTrade>,
+    source_rx: SourceLogReceiver,
+    trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
+}
+
+struct ReaderConfig {
+    live_watchlist: LiveWatchlist,
     dialer: Dialer,
 }
 
@@ -99,15 +157,35 @@ impl ActivityIngest {
     pub fn new(
         live_watchlist: LiveWatchlist,
         sink: SourceEventSink,
-        trade_tx: mpsc::Sender<IncomingTrade>,
+        source_rx: SourceLogReceiver,
+        trigger_tx: mpsc::Sender<ReconciliationTrigger>,
         health: SharedHealth,
     ) -> Self {
         Self {
-            live_watchlist,
+            reader: Some(ReaderConfig {
+                live_watchlist,
+                dialer: Arc::new(|_slot| Box::pin(ActivityWsStream::connect_and_subscribe())),
+            }),
             sink,
-            trade_tx,
+            source_rx,
+            trigger_tx,
             health,
-            dialer: Arc::new(|_slot| Box::pin(ActivityWsStream::connect_and_subscribe())),
+        }
+    }
+
+    /// Source-log coordinator without websocket readers (poll-only rollback posture).
+    pub fn poll_only(
+        sink: SourceEventSink,
+        source_rx: SourceLogReceiver,
+        trigger_tx: mpsc::Sender<ReconciliationTrigger>,
+        health: SharedHealth,
+    ) -> Self {
+        Self {
+            reader: None,
+            sink,
+            source_rx,
+            trigger_tx,
+            health,
         }
     }
 
@@ -117,47 +195,59 @@ impl ActivityIngest {
     pub fn with_dialer(
         live_watchlist: LiveWatchlist,
         sink: SourceEventSink,
-        trade_tx: mpsc::Sender<IncomingTrade>,
+        source_rx: SourceLogReceiver,
+        trigger_tx: mpsc::Sender<ReconciliationTrigger>,
         health: SharedHealth,
         dialer: Dialer,
     ) -> Self {
         Self {
-            live_watchlist,
+            reader: Some(ReaderConfig {
+                live_watchlist,
+                dialer,
+            }),
             sink,
-            trade_tx,
+            source_rx,
+            trigger_tx,
             health,
-            dialer,
         }
     }
 
-    /// Run until the trade channel closes (service shutdown).
+    /// Run until the trigger channel closes (service shutdown).
     ///
     /// Owns every reader and the coordinator in one `JoinSet`: the first child
     /// to finish (a closed downstream channel) ends the pool — the rest are
     /// aborted and drained. Dropping this future (external abort) drops the
     /// set, which aborts its children without joining them.
     pub async fn run(self) {
-        let (fan_in_tx, fan_in_rx) = mpsc::channel(self.trade_tx.max_capacity());
+        let (fan_in_tx, fan_in_rx) = mpsc::channel(self.trigger_tx.max_capacity());
         let mut tasks = JoinSet::new();
-        for slot in 0..ACTIVITY_WS_READER_COUNT {
-            tasks.spawn(
-                Reader {
-                    slot,
-                    dialer: self.dialer.clone(),
-                    live_watchlist: self.live_watchlist.clone(),
-                    health: self.health.clone(),
-                    fan_in: fan_in_tx.clone(),
-                }
-                .run(),
-            );
-        }
+        let fan_in_guard = if let Some(reader) = self.reader {
+            for slot in 0..ACTIVITY_WS_READER_COUNT {
+                tasks.spawn(
+                    Reader {
+                        slot,
+                        dialer: reader.dialer.clone(),
+                        live_watchlist: reader.live_watchlist.clone(),
+                        health: self.health.clone(),
+                        fan_in: fan_in_tx.clone(),
+                    }
+                    .run(),
+                );
+            }
+            None
+        } else {
+            // Keep the unused fan-in open so poll-only mode is owned solely by
+            // the external source channel.
+            Some(fan_in_tx.clone())
+        };
         drop(fan_in_tx);
         tasks.spawn(
             Coordinator {
                 sink: self.sink,
-                trade_tx: self.trade_tx,
+                trigger_tx: self.trigger_tx,
                 health: self.health,
                 fan_in: fan_in_rx,
+                source_rx: self.source_rx.rx,
             }
             .run(),
         );
@@ -166,6 +256,7 @@ impl ActivityIngest {
             tasks.abort_all();
             while tasks.join_next().await.is_some() {}
         }
+        drop(fan_in_guard);
     }
 }
 
@@ -303,8 +394,8 @@ impl Reader {
             // REST path uses (the frame receipt is injected; replay passes the
             // envelope's recorded instant instead, #530 review F7) — then filter
             // on the normalized wallet and reuse that same value for delivery.
-            let trade = match trade_parser::parse_ws_trade(payload, received_at) {
-                Ok(trade) => trade,
+            let activity = match parse_activity_trade_observation(payload) {
+                Ok(activity) => activity,
                 Err(error) => {
                     rejected += 1;
                     last_rejection = Some(error.to_string());
@@ -323,13 +414,19 @@ impl Reader {
                     r.consecutive_reconnects = 0;
                 });
             }
-            if !watched.contains(&trade.wallet) {
+            if !watched.contains(&activity.wallet) {
                 continue;
             }
             self.deliver(Observation {
                 slot: self.slot,
                 payload: payload.to_vec(),
-                trade,
+                trigger: ReconciliationTrigger {
+                    wallet: activity.wallet,
+                    source_time: activity.source_time.0,
+                    source_trade_id: activity.group_id.key().clone(),
+                    provenance: TradeProvenance::ActivityWs,
+                    received_at,
+                },
             })
             .await?;
         }
@@ -377,34 +474,74 @@ impl Reader {
 
 // ── Coordinator ──────────────────────────────────────────────────────────────
 
-/// Single owner of the source event log and the orchestrator's trade sender.
+/// Single owner of the source event log and reconciliation-trigger sender.
 struct Coordinator {
     sink: SourceEventSink,
-    trade_tx: mpsc::Sender<IncomingTrade>,
+    trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
     fan_in: mpsc::Receiver<Observation>,
+    source_rx: mpsc::Receiver<SourceLogRequest>,
 }
 
 impl Coordinator {
-    /// Run until every reader is gone or the trade channel closes — the latter
+    /// Run until every producer is gone or the trigger channel closes — the latter
     /// is noticed immediately, not only at the next delivery.
     async fn run(mut self) {
         loop {
-            let observation = tokio::select! {
-                biased;
-                () = self.trade_tx.closed() => return,
-                received = self.fan_in.recv() => match received {
-                    Some(observation) => observation,
-                    None => return,
-                },
-            };
-            if self.append_with_recovery(&observation).await.is_err() {
-                return;
+            enum Input {
+                Reader(Observation),
+                Source(SourceLogRequest),
             }
-            // Bounded channel: a full queue blocks here → the fan-in fills →
-            // the readers block on their sockets; a watched trade is never dropped.
-            if self.trade_tx.send(observation.trade).await.is_err() {
-                return;
+            let input = tokio::select! {
+                biased;
+                () = self.trigger_tx.closed() => return,
+                input = async {
+                    tokio::select! {
+                        received = self.fan_in.recv() => received.map(Input::Reader),
+                        received = self.source_rx.recv() => received.map(Input::Source),
+                    }
+                } => match input {
+                    Some(input) => input,
+                    None => return,
+                }
+            };
+            match input {
+                Input::Reader(observation) => {
+                    let envelope = EnvelopeIn {
+                        source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_string()),
+                        schema_version: ACTIVITY_SCHEMA_VERSION,
+                        parser_version: ACTIVITY_PARSER_VERSION,
+                        observed_at: SourceTimestamp(observation.trigger.source_time),
+                        received_at: ReceivedAt(observation.trigger.received_at),
+                        content_type: ContentType::Json,
+                        payload: observation.payload.clone(),
+                    };
+                    let label = observation.trigger.source_trade_id.clone();
+                    let slot = Some(observation.slot);
+                    if self
+                        .append_with_recovery(envelope, &label, slot)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Bounded channel: a full queue blocks here → the fan-in fills →
+                    // readers block on their sockets. Trigger delivery always follows sync.
+                    if self.trigger_tx.send(observation.trigger).await.is_err() {
+                        return;
+                    }
+                }
+                Input::Source(request) => {
+                    let label = SourceTradeId("poll-page".to_owned());
+                    let seq = match self
+                        .append_with_recovery(request.envelope, &label, None)
+                        .await
+                    {
+                        Ok(seq) => seq,
+                        Err(Shutdown) => return,
+                    };
+                    let _ = request.appended.send(seq);
+                }
             }
         }
     }
@@ -412,29 +549,24 @@ impl Coordinator {
     /// Durably append one watched payload, entering the poison-recovery loop on
     /// failure: bounded-backoff reopen + full revalidation, retrying THIS
     /// payload until it lands (#530 review F4/F1 — delivery from every reader
-    /// blocks while poisoned; the trade is retained, not assumed onto REST).
-    async fn append_with_recovery(&mut self, observation: &Observation) -> Result<(), Shutdown> {
-        let trade = &observation.trade;
-        let envelope = || EnvelopeIn {
-            source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_string()),
-            schema_version: ACTIVITY_WS_SCHEMA_VERSION,
-            parser_version: ACTIVITY_WS_PARSER_VERSION,
-            observed_at: SourceTimestamp(trade.observed_at),
-            received_at: ReceivedAt(trade.received_at),
-            content_type: ContentType::Json,
-            payload: observation.payload.clone(),
-        };
-        match self.sink.append_durable(envelope()) {
-            Ok(_) => return Ok(()),
+    /// blocks while poisoned; the observation is retained, not assumed onto REST).
+    async fn append_with_recovery(
+        &mut self,
+        envelope: EnvelopeIn,
+        label: &SourceTradeId,
+        slot: Option<usize>,
+    ) -> Result<EventSeq, Shutdown> {
+        match self.sink.append_durable(duplicate_envelope(&envelope)) {
+            Ok(seq) => return Ok(seq),
             Err(error) => {
                 self.set_health(|h| h.ws_sink_poisoned = true);
-                warn!(error = %error, slot = observation.slot, trade = %trade.source_trade_id,
+                warn!(error = %error, ?slot, trade = %label,
                     "source log append failed; sink poisoned — holding delivery and retrying reopen");
             }
         }
         let mut attempt: u32 = 0;
         loop {
-            if self.trade_tx.is_closed() {
+            if self.trigger_tx.is_closed() {
                 return Err(Shutdown);
             }
             tokio::time::sleep(Duration::from_secs(backoff_secs(attempt))).await;
@@ -442,12 +574,12 @@ impl Coordinator {
             if !self.sink.try_reopen() {
                 continue;
             }
-            match self.sink.append_durable(envelope()) {
-                Ok(_) => {
+            match self.sink.append_durable(duplicate_envelope(&envelope)) {
+                Ok(seq) => {
                     self.set_health(|h| h.ws_sink_poisoned = false);
-                    info!(trade = %trade.source_trade_id,
+                    info!(trade = %label,
                         "source log recovered; held payload appended durably");
-                    return Ok(());
+                    return Ok(seq);
                 }
                 Err(error) => {
                     warn!(error = %error, "source log re-poisoned immediately after reopen");
@@ -465,6 +597,18 @@ impl Coordinator {
     }
 }
 
+fn duplicate_envelope(envelope: &EnvelopeIn) -> EnvelopeIn {
+    EnvelopeIn {
+        source_id: envelope.source_id.clone(),
+        schema_version: envelope.schema_version,
+        parser_version: envelope.parser_version,
+        observed_at: envelope.observed_at.clone(),
+        received_at: envelope.received_at.clone(),
+        content_type: envelope.content_type.clone(),
+        payload: envelope.payload.clone(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -476,15 +620,21 @@ mod tests {
 
     fn observation(tx: &str) -> Observation {
         let payload = format!(
-            r#"{{"proxyWallet":"{WALLET}","conditionId":"0xc1","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"{tx}","outcomeIndex":"0"}}"#
+            r#"{{"proxyWallet":"{WALLET}","conditionId":"0xc1","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"{tx}","outcomeIndex":"0"}}"#
         )
         .into_bytes();
         let received = OffsetDateTime::from_unix_timestamp(1_704_070_000).unwrap();
-        let trade = trade_parser::parse_ws_trade(&payload, received).unwrap();
+        let activity = parse_activity_trade_observation(&payload).unwrap();
         Observation {
             slot: 0,
             payload,
-            trade,
+            trigger: ReconciliationTrigger {
+                wallet: activity.wallet,
+                source_time: activity.source_time.0,
+                source_trade_id: activity.group_id.key().clone(),
+                provenance: TradeProvenance::ActivityWs,
+                received_at: received,
+            },
         }
     }
 
@@ -505,14 +655,16 @@ mod tests {
         sink.fail_next_append();
         sink.fail_next_reopen();
         let (fan_in_tx, fan_in_rx) = mpsc::channel(8);
-        let (trade_tx, mut trade_rx) = mpsc::channel(8);
+        let (trigger_tx, mut trigger_rx) = mpsc::channel(8);
+        let (_source_log, source_rx) = SourceLogHandle::channel(8);
         let health = new_shared_health_with_ws(false, true, 90);
         let task = tokio::spawn(
             Coordinator {
                 sink,
-                trade_tx,
+                trigger_tx,
                 health: health.clone(),
                 fan_in: fan_in_rx,
+                source_rx: source_rx.rx,
             }
             .run(),
         );
@@ -524,7 +676,7 @@ mod tests {
             "first append poisons"
         );
         assert!(
-            trade_rx.try_recv().is_err(),
+            trigger_rx.try_recv().is_err(),
             "delivery blocked while poisoned"
         );
 
@@ -532,15 +684,16 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         assert!(health.lock().unwrap().ws_sink_poisoned);
-        assert!(trade_rx.try_recv().is_err());
+        assert!(trigger_rx.try_recv().is_err());
 
         // Attempt 1 (2s backoff): reopen revalidates, the HELD item lands first,
         // then the queued one, in order.
         tokio::time::advance(Duration::from_secs(2)).await;
         settle().await;
         assert!(!health.lock().unwrap().ws_sink_poisoned);
-        assert_eq!(trade_rx.recv().await.unwrap().source_trade_id.0, "0xa");
-        assert_eq!(trade_rx.recv().await.unwrap().source_trade_id.0, "0xb");
+        let first = trigger_rx.recv().await.unwrap().source_trade_id;
+        let second = trigger_rx.recv().await.unwrap().source_trade_id;
+        assert_ne!(first, second);
 
         drop(fan_in_tx);
         task.await.unwrap();
@@ -548,10 +701,12 @@ mod tests {
             .unwrap()
             .map(|item| {
                 let (_seq, env) = item.unwrap();
-                trade_parser::parse_ws_trade(&env.payload, env.received_at.0)
+                parse_activity_trade_observation(&env.payload)
                     .unwrap()
-                    .source_trade_id
-                    .0
+                    .group_id
+                    .components()
+                    .transaction_hash
+                    .clone()
             })
             .collect();
         assert_eq!(ids, vec!["0xa".to_string(), "0xb".to_string()]);
@@ -565,41 +720,45 @@ mod tests {
         let path = dir.path().join("source.log");
         let sink = SourceEventSink::open(&path).unwrap();
         let (fan_in_tx, fan_in_rx) = mpsc::channel(8);
-        let (trade_tx, trade_rx) = mpsc::channel(8);
+        let (trigger_tx, trigger_rx) = mpsc::channel(8);
+        let (_source_log, source_rx) = SourceLogHandle::channel(8);
         fan_in_tx.send(observation("0xa")).await.unwrap();
-        drop(trade_rx);
+        drop(trigger_rx);
         Coordinator {
             sink,
-            trade_tx,
+            trigger_tx,
             health: new_shared_health_with_ws(false, true, 90),
             fan_in: fan_in_rx,
+            source_rx: source_rx.rx,
         }
         .run()
         .await;
         assert_eq!(LogReader::replay(&path).unwrap().count(), 0);
     }
 
-    /// A closed trade channel ends the coordinator (orderly), even mid-recovery.
+    /// A closed trigger channel ends the coordinator (orderly), even mid-recovery.
     #[tokio::test(start_paused = true)]
     async fn coordinator_exits_when_trade_channel_closes_during_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let mut sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();
         sink.fail_next_append();
         let (fan_in_tx, fan_in_rx) = mpsc::channel(8);
-        let (trade_tx, trade_rx) = mpsc::channel(8);
+        let (trigger_tx, trigger_rx) = mpsc::channel(8);
+        let (_source_log, source_rx) = SourceLogHandle::channel(8);
         let health = new_shared_health_with_ws(false, true, 90);
         let task = tokio::spawn(
             Coordinator {
                 sink,
-                trade_tx,
+                trigger_tx,
                 health,
                 fan_in: fan_in_rx,
+                source_rx: source_rx.rx,
             }
             .run(),
         );
         fan_in_tx.send(observation("0xa")).await.unwrap();
         settle().await;
-        drop(trade_rx);
+        drop(trigger_rx);
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

@@ -61,7 +61,7 @@ use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, DecisionPendingRecord, EntryGateResultRecord,
     LeaderPositionRow, MarketHistoryRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
-use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer};
+use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, Dialer, SourceLogHandle};
 use pe_service::bucket_commit::DecisionContinuationV2;
 use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::entry_gate::CopyEntryGateConfig;
@@ -78,7 +78,7 @@ use pe_service::source_event_sink::SourceEventSink;
 use pe_service::trade_parser;
 use pe_source_polymarket_public::{
     ACTIVITY_WS_PARSER_VERSION, ACTIVITY_WS_SCHEMA_VERSION, ACTIVITY_WS_SUBSCRIBE, ActivityWsError,
-    ActivityWsPeer, FixtureFetcher, parse_activity_frame,
+    ActivityWsPeer, FixtureFetcher, parse_activity_frame, parse_activity_trade_observation,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, PaperExecutor, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -172,7 +172,7 @@ fn trade_at(
 /// One real-shape websocket activity payload (string numerics, as the feed sends them).
 fn payload(tx: &str, wallet: &str, market: &MarketId, observed_unix: i64) -> String {
     format!(
-        r#"{{"proxyWallet":"{wallet}","conditionId":"{market}","side":"BUY","size":"100","price":"0.50","timestamp":"{observed_unix}","transactionHash":"{tx}","outcomeIndex":"0"}}"#
+        r#"{{"proxyWallet":"{wallet}","conditionId":"{market}","asset":"123","side":"BUY","size":"100","price":"0.50","timestamp":"{observed_unix}","transactionHash":"{tx}","outcomeIndex":"0"}}"#
     )
 }
 
@@ -505,16 +505,51 @@ async fn start_pool_with(
     let dir = tempfile::tempdir().unwrap();
     let source_log = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log).unwrap();
+    let (source_log_handle, source_rx) = SourceLogHandle::channel(capacity);
+    let (trigger_tx, mut trigger_rx) = mpsc::channel(capacity);
     let (trade_tx, trade_rx) = mpsc::channel(capacity);
     let health = healthy_ws_health();
     let ingest = ActivityIngest::with_dialer(
         LiveWatchlist::new(make_watchlist(leader_wallet())),
         sink,
-        trade_tx,
+        source_rx,
+        trigger_tx,
         health.clone(),
         net.dialer(),
     );
-    let task = tokio::spawn(ingest.run());
+    let replay_path = source_log.clone();
+    // Compatibility projection for the retained #546 reader-pool scenarios:
+    // production emits only reconciliation triggers, while these tests still
+    // exercise the old orchestrator seam. Reparse the row only after the source
+    // log proves it durable; no production path uses this projection.
+    let task = tokio::spawn(async move {
+        let _source_log_handle = source_log_handle;
+        let ingest = ingest.run();
+        tokio::pin!(ingest);
+        loop {
+            tokio::select! {
+                () = trade_tx.closed() => return,
+                () = &mut ingest => return,
+                trigger = trigger_rx.recv() => {
+                    let Some(trigger) = trigger else { return; };
+                    let trade = Reader::replay(&replay_path)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find_map(|(_seq, envelope)| {
+                            let observation = parse_activity_trade_observation(&envelope.payload).ok()?;
+                            if observation.group_id.key() != &trigger.source_trade_id {
+                                return None;
+                            }
+                            trade_parser::parse_ws_trade(&envelope.payload, envelope.received_at.0).ok()
+                        })
+                        .expect("durable trigger has its raw source row");
+                    if trade_tx.send(trade).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
     settle().await;
     for slot in 0..3 {
         assert_eq!(net.dial_count(slot), 1, "all three slots dial immediately");
@@ -1000,8 +1035,14 @@ async fn r6_three_reader_copies_yield_one_decision_and_the_source_log_replays_to
     let mut replayed = Vec::new();
     for (i, (_seq, env)) in envelopes.iter().enumerate() {
         assert_eq!(env.source_id.0, ACTIVITY_WS_SOURCE_ID);
-        assert_eq!(env.schema_version, ACTIVITY_WS_SCHEMA_VERSION);
-        assert_eq!(env.parser_version, ACTIVITY_WS_PARSER_VERSION);
+        assert_eq!(
+            env.schema_version,
+            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            env.parser_version,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+        );
         assert_eq!(
             env.payload,
             row.as_bytes(),
@@ -1075,20 +1116,25 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
     let (pool, trade_rx) = start_pool(1).await;
     let mut server = pool.net.take_server(0);
     let stale_unix = now_unix() - 60;
-    let rows: Vec<String> = ["0xa", "0xb", "0xc", "0xd"]
+    let rows: Vec<String> = ["0xa", "0xb", "0xc", "0xd", "0xf", "0xg"]
         .iter()
         .map(|tx| payload(tx, LEADER, &market(), stale_unix))
         .collect();
     server.send_text(&activity_frame(&rows)).await.unwrap();
     assert!(
         settle_until(|| pool.reader(0).fan_in_blocked).await,
-        "the fourth row blocks on the full fan-in (b is held on the full trade channel, c waits in the fan-in)"
+        "the sixth row blocks after the test-only trigger projection adds two retained slots"
     );
     let before = pool.reader(0);
     assert!(before.connected && before.is_live(Instant::now()));
     assert_eq!(
         pool.source_log_ids(),
-        vec!["0xa".to_string(), "0xb".to_string()]
+        vec![
+            "0xa".to_string(),
+            "0xb".to_string(),
+            "0xc".to_string(),
+            "0xd".to_string(),
+        ]
     );
 
     // No second wire frame is read while blocked.
@@ -1131,7 +1177,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
         OrchOpts::ws(vec![market()]),
     );
     let (orch_task, shutdown) = spawn_orchestrator(orch);
-    let all = ["0xa", "0xb", "0xc", "0xd"];
+    let all = ["0xa", "0xb", "0xc", "0xd", "0xf", "0xg"];
     assert!(settle_until(|| all.iter().all(|t| paper_state.is_seen(&id(t)).unwrap())).await);
     assert_eq!(
         pool.source_log_ids(),
@@ -1151,7 +1197,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
     );
     assert_eq!(
         leader_long(&paper_state, &market()),
-        Some(whole_shares(400)),
+        Some(whole_shares(600)),
         "leader bookkeeping kept"
     );
 
@@ -1160,7 +1206,7 @@ async fn r7_full_fan_in_retains_frame_and_socket_then_drains_in_order_and_drops(
     assert!(settle_until(|| !pool.reader(0).connected).await);
     assert!(!pool.reader(0).fan_in_blocked);
     assert!(server.recv_text().await.is_none());
-    assert_eq!(pool.reader(0).normalized_activity_rows_total, 4);
+    assert_eq!(pool.reader(0).normalized_activity_rows_total, 6);
     advance(Duration::from_secs(1)).await;
     assert_eq!(pool.net.dial_count(0), 2);
     shutdown.send(()).unwrap();
@@ -1679,6 +1725,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
         side: Side::Buy,
         price: Price(dec!(0.50)),
         share_amount: ShareAmount::from_whole(1).unwrap(),
+        provenance: TradeProvenance::ActivityWs,
         pre_bucket_action: LeaderAction::Entry,
         reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
         action_confidence_ppm: ProbabilityPpm(1_000_000),
@@ -1699,6 +1746,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
                 activity_type: "TRADE".to_owned(),
                 disposition: "decision_pending".to_owned(),
                 proof_json: "{\"bucket_epoch\":1}".to_owned(),
+                no_copy: None,
             }],
             leader_positions: vec![LeaderPositionRow {
                 wallet: leader_wallet(),
@@ -1763,7 +1811,7 @@ async fn decision_pending_boot_resume_is_terminal_exactly_once() {
             .no_copy_disposition(&source_trade_id)
             .unwrap()
             .map(|(_, _, reason)| reason),
-        Some("stale_fallback_past_copy_budget".to_owned())
+        Some("stale_activity_ws_past_copy_budget".to_owned())
     );
 
     let (_trade_tx, trade_rx) = mpsc::channel(1);
