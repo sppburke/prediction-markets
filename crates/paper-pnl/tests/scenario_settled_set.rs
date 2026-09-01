@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use pe_core_types::{
-    ShareAmount,
-    EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
+    EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId, VenueMarketId,
+    WalletAddress,
 };
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};

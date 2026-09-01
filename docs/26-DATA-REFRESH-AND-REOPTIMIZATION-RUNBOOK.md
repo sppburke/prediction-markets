@@ -33,10 +33,11 @@ cargo build --release -p pe-bootstrap
   volume, point `SQLITE_TMPDIR` at a writable directory on the CACHE volume, e.g.
   `SQLITE_TMPDIR=/mnt/storage/tmp` in `.env` (the wrapper exports its whole `.env` to
   every stage). Proven necessary on 2026-08-27: forge's root SD card remounted
-  read-only mid-purge, and because the default temp dir lived there, the bulk purge's
-  `VACUUM` and its index rebuild both failed while the deletes (which write only to the
-  cache volume) succeeded — leaving 38.5 GiB of unreclaimed free pages, an absent
-  `trades` index, and a subsequent cycle that silently paid a multi-hour rebuild.
+  read-only during a historical operator-authorized purge. Because the default temp dir
+  lived there, that bulk purge's `VACUUM` and index rebuild both failed while the deletes
+  (which write only to the cache volume) succeeded — leaving 38.5 GiB of unreclaimed free
+  pages, an absent `trades` index, and a subsequent cycle that silently paid a multi-hour
+  rebuild.
   Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
   path is demonstrably writable.
 - **Market resolutions (no RPC).** The resolution pipeline is CLOB → Gamma:
@@ -199,8 +200,8 @@ In order it runs: **Step 0** data refresh — `winner-discovery
 --defer-activation` (leaderboard + datadash ingest) → one transactionally
 audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`) →
 `backfill --defer-activation` (trades only) → `events` → `resolutions` →
-**Step 0i** archive and delete every infra wallet's live wallet-keyed data
-before the ranker snapshot (and write a durable, non-liftable infra exclusion).
+The production wrapper performs no infrastructure or ordinary purge; rank/export applies
+infrastructure, tombstone, wallet-fence, and current-eligibility filters without deleting history.
 `resolutions` performs a full CLOB closed-market re-walk, backfills missing
 schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full
@@ -219,13 +220,9 @@ latest reference sample at-or-before `entry+Δ` (adds `hit_rate`, writes the
 per-position `oracle_outcomes.csv` and the versioned `oracle_manifest.json` whose
 canonical hash the push stores as `ranking_batches.config_hash`); **Stage 3** record
 the exact publication request, atomically publish it through the idempotent
-`publish_ranking_batch` RPC, and verify that exact batch is `latest_ranking`; **Stage 4**
-purge proven-loser
-and dead-weight wallets when armed; **Stage 5** run
-`PRAGMA wal_checkpoint(TRUNCATE)` against the local cache so committed WAL pages are
-checkpointed and the WAL file releases its disk footprint. The checkpoint is always
-attempted last, including re-pushes and runs that skip purge. A busy/error result warns
-without failing the already-complete Supabase publish; the next run retries it.
+`publish_ranking_batch` RPC, verify that exact batch is `latest_ranking`, and capture the
+accepted cycle manifest used by the next unchanged-watermark check. No post-publication deletion,
+reclamation, index rebuild, or checkpoint stage exists (#544).
 
 
 **Oracle rollback (#536):** reverting the ranker code alone does NOT restore the
@@ -238,26 +235,13 @@ epoch), then verify a strictly larger `batch_id` is `latest_ranking` and service
 membership converged. The additive `ranker_price_*` tables are inert thereafter.
 
 
-> **Purge I/O priority (#527).** Both purge entry points — Step 0i `purge-infra` and the
-> Stage 4 ordinary `purge` — run the cache mutator under `ionice -c3` (idle block-I/O
-> class): the 2026-08-23 bulk purge saturated the cache disk at normal priority and
-> starved SSH until a power cycle. The dependency fails closed: when a run can reach a
-> purge site and `ionice` is not on `PATH`, the wrapper exits 2 before the run lock,
-> cycle directory, or any cache state; an `ionice` execution failure is fatal at the
-> infra site and a post-publication warning at the ordinary site — a purge never falls
-> back to normal priority. Trade-off: under competing I/O an idle-class purge can take
-> longer or stall entirely, which is preferred over starving the control plane. Ordinary
-> purge cannot delay an already-completed publication (it runs after the push), but
-> Step 0i `purge-infra` remains a prerequisite for ranking and may lengthen or stall
-> the cycle. Ordinary
-> purge stays disarmed (`PE_BOOTSTRAP_PURGE_ENABLED=false`) until #527 Phase 2 witnesses
-> one real bulk-mode run complete under idle priority with control-plane probes intact —
-> the gate is an organically produced disabled report whose delete set reaches the
-> canonical `purge_bulk_min_wallets`; wiring-only subthreshold runs do not qualify.
-> Rollback: atomically write the loop flag to `stop` (natural run-down — a unit stop
-> needs the owner's explicit authorization for the active process), keep ordinary purge
-> false, and keep the priority wrapper; if the wrapper itself must be reverted, leave the
-> loop stopped, because `purge-infra` is armed on every invocation.
+> **Purge-free publication (#544).** `rank_and_push.sh` never invokes `purge` or
+> `purge-infra`; `--skip-purge` remains only as a backward-compatible no-op. Both direct
+> commands obey `PE_BOOTSTRAP_PURGE_ENABLED=false` as report-only. Keep that value false.
+> Any future delete requires separate operator authorization and is not part of a ranking
+> cycle. A pre-existing `meta.reclamation_pending` obligation is recovered only through the
+> recovery-only `pe-bootstrap recover-reclamation` path after the evidence gate below; that
+> command cannot select or delete wallets.
 
 Production defaults are baked in (override via flags): `--universe-from-trades`,
 `HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
@@ -294,8 +278,90 @@ resolve deterministically via `(timestamp_unix, source_trade_id)`).
   launched through this wrapper still defers global activation;
   `--skip-discovery` also skips `activate-next`, so it activates no new wallet.
 - `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push.
-- `--skip-purge` — skip wallet deletion; the final WAL checkpoint still runs.
+- `--skip-purge` — backward-compatible no-op; automatic wallet deletion is retired.
 - Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
+
+### Forge lock and reclamation-evidence contract (#544)
+
+The three production lock inodes are persistent and kernel-held:
+
+1. `data/eval-results/.rank_and_push_loop.lock`;
+2. `data/eval-results/.rank_and_push.lock`;
+3. `data/wallet_cache.db.lock`.
+
+Acquire them only in loop → one-shot run → cache order. Shell uses `flock`; Rust uses
+`fs2` on the same inodes. Every owner opens without truncation, acquires exclusively and
+nonblocking, then writes its decimal PID. Contention changes neither inode nor PID contents;
+process exit releases ownership, including after a kill, without stale-file reclamation. Every
+read-write `pe-bootstrap` entry acquires the cache lock before opening SQLite; true readers use
+the read-only open path. Pre-#544 PID-file artifacts do not coordinate safely with this scheme:
+before activation, stop and prove the absence of every legacy loop, one-shot, and bootstrap
+process, then prohibit those artifacts from invocation.
+
+Before cache activation, hold all three locks and capture the gate:
+
+```bash
+pe-bootstrap reclamation-evidence --db data/wallet_cache.db \
+  > "$CACHE_ACTIVATION_RECLAMATION_EVIDENCE"
+```
+
+Inspect the newest `purge_status.jsonl` records, `meta.reclamation_pending`, freelist pages,
+required trades-index inventory, and resolved `SQLITE_TMPDIR` path/device/free space. Activation
+requires the marker absent, all required indexes present, and the path/device unchanged from the
+preliminary capture. If and only if the marker is pending and the operator separately authorizes
+recovery, run `pe-bootstrap recover-reclamation --db data/wallet_cache.db`, then capture and
+inspect the evidence again. Missing index, changed path/device, insufficient space, or recovery
+failure stops before checkpoint or rename.
+
+### Version-two cache generation and fixed-path activation (#544)
+
+Build and resume the side cache by its hash-bound manifest and explicit `--db` path. Version one
+is sealed into `*_v1_sealed` audit tables; version-two consumers read only complete normalized
+activity and CLOB-payout generations, and no API unions the generations.
+
+```bash
+pe-bootstrap cache-migrate-v2 \
+  --db "$CACHE_V2_SIDE" --manifest "$CACHE_BUILD_MANIFEST"
+
+pe-bootstrap cache-populate-activity-v2 \
+  --db "$CACHE_V2_SIDE" --fixed-end "$FIXED_END_UNIX" --generation 1
+
+pe-bootstrap cache-populate-payout-v2 --db "$CACHE_V2_SIDE"
+
+pe-bootstrap cache-verify-frozen-v1 \
+  --db "$CACHE_V2_SIDE" --frozen-payload "$FROZEN_PAYLOAD_REFERENCE"
+
+pe-bootstrap cache-finalize-v2 \
+  --db "$CACHE_V2_SIDE" --stage-record "$CACHE_STAGE_RECORD"
+
+pe-bootstrap cache-activate \
+  --db "$CACHE_V2_SIDE" \
+  --fixed-db data/wallet_cache.db \
+  --backup "$CACHE_V1_BACKUP" \
+  --expected-sha256 "$CACHE_V2_SHA256"
+```
+
+Each command is idempotent only for the same recorded evidence. Activity coverage is published
+only after every fixed-end wallet walk completes; payout coverage requires a complete terminal
+CLOB walk; the frozen-payload verification must reproduce the last accepted active-wallet and
+freshness/cursor facts with zero cross-generation identity matches. Finalization verifies both
+coverage generations, integrity, checkpoint/truncate, the exact main-file hash, and parent sync.
+Activation itself acquires all three Forge locks in canonical order and rechecks reclamation
+evidence before the atomic fixed-path rename.
+
+Pre-activation rollback preserves the failed v2 main for audit and restores the immutable v1
+main only:
+
+```bash
+pe-bootstrap cache-rollback-v1 \
+  --fixed-db data/wallet_cache.db \
+  --backup "$CACHE_V1_BACKUP" \
+  --failed-backup "$FAILED_CACHE_V2_BACKUP"
+```
+
+After activation, normal ranking/export still names the legacy `trades` table and is not a v2
+ranking consumer. Keep the production loop stopped. The only verified v2 publication path in
+this cycle is a unique-notes pure re-push of the last accepted payload; it must remain purge-free.
 
 ### Continuous Forge supervisor
 
@@ -352,9 +418,15 @@ Status and logs: `systemctl --user is-active pe-rank-loop` and
 supervisor deliberately for diagnosis (`Restart=no`); restart with
 `systemctl --user start pe-rank-loop` after resolving it.
 
+After any successful child with neither recovery pointer, the supervisor waits 60 seconds through
+the shared flag-aware wait helper before starting another cycle. A stop or missing flag exits
+during that wait. A retained recovery pointer bypasses only this success wait; transient exit 75
+keeps its separate 60-second flag-aware backoff.
+
 After an immediate stop, verify no loop, wrapper, bootstrap, or ranking Python
-descendant remains; neither `.rank_and_push.lock` nor the cache mutation lock is
-held; and SQLite opens/read-checks cleanly.
+descendant remains; the persistent `.rank_and_push_loop.lock`, `.rank_and_push.lock`, and
+`wallet_cache.db.lock` inodes may remain, but no process may hold them; and SQLite
+opens/read-checks cleanly. Do not unlink any lock inode or interpret old PID text as ownership.
 
 Each zero-argument one-shot creates its run directory, then atomically writes
 `data/eval-results/rank_and_push.cycle` after dependency preflight and run-lock
@@ -371,9 +443,8 @@ loop waits 60 seconds while
 checking the run flag once per second, then:
 
 - If `rank_and_push.pending` exists, it takes precedence. Recovery replays the
-  same content-addressed Supabase request and completes only that run's
-  purge/checkpoint tail; it does not rediscover, activate, backfill, export, or
-  rank.
+  same content-addressed Supabase request and verifies publication; it does not rediscover,
+  activate, backfill, export, rank, delete, reclaim, or checkpoint.
 - Otherwise, if `rank_and_push.cycle` exists, the loop invokes the normal
   zero-argument command. The one-shot reuses the pointed run directory and
   deterministic activation batch, so retrying discovery, activation, backfill,
@@ -442,9 +513,11 @@ inside one PostgreSQL transaction, so a failed request exposes neither a partial
 epoch nor a duplicate epoch. If code rollback is required, stop the loop and
 restore the prior checkout; the additive schema can remain in place.
 
-The final checkpoint remains inside that lock and starts only after every pipeline DB
-writer has exited. It checkpoints committed data rather than deleting rows; its storage
-effect is to truncate the separate `wallet_cache.db-wal` file.
+Before allocating a new production run, the wrapper captures the current daily source watermark,
+pipeline versions, and configuration. If they exactly match a prior accepted cycle, it prints
+`RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1` and exits successfully before discovery, refresh,
+export, rank, or publication. An existing publication pointer takes precedence over the cycle
+pointer, and either pointer takes precedence over this new-cycle check.
 
 `pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
@@ -494,8 +567,8 @@ directory and preserves the cycle's deterministic activation identity. During
 an incomplete production publication,
 `data/eval-results/rank_and_push.pending` contains one repository-relative path
 to that request and takes recovery precedence over the broader cycle pointer.
-Both are compare-and-cleared only after publication verification and the same
-run's purge/checkpoint tail. Retire superseded artifacts to
+Both are compare-and-cleared only after exact publication verification and accepted-watermark
+capture. Retire superseded artifacts to
 `data/archive/`; never delete eval outputs — they are the audit trail for what
 was published to `latest_ranking` and when.
 
