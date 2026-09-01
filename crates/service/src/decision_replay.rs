@@ -499,8 +499,8 @@ pub fn replay_decision_pending(
             _ => false,
         },
         "paper_state_sqlite" => match authority_outcome {
-            "committed" => is_fill,
-            "settled_refusal" => !is_fill,
+            "committed" | "recovered_from_paper_log" => is_fill,
+            "settled_refusal" | "recovered_settled_refusal" => !is_fill,
             _ => false,
         },
         "not_read" => !is_fill,
