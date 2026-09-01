@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use pe_core_types::{
+    ShareAmount,
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_paper_pnl::ResolutionStore;
@@ -37,8 +38,8 @@ fn enter(db: &Arc<PaperStateDb>, mkt: &MarketId, key: &str, contracts: u64, pric
             wallet: wallet(),
             market_id: mkt.clone(),
             outcome_id: OutcomeId(0),
-            long_contracts: contracts,
-            short_contracts: 0,
+            long_contracts: ShareAmount::from_whole(contracts).unwrap(),
+            short_contracts: ShareAmount::ZERO,
         },
         &FillRecord {
             idempotency_key: key.to_string(),
