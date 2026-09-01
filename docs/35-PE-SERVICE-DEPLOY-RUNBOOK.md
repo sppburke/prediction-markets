@@ -37,7 +37,8 @@ Every step is bound to sha256 identity (#514): **desired** = hash of the local r
 agents cannot clobber each other's staged binary, #516); **installed** = hash of the `ExecStart`
 binary; **running** = hash of `/proc/<MainPID>/exe`. A deploy holds the deploy lock from preflight
 through verify-or-rollback — acquire it as the FIRST VPS action and keep the descriptor open for the
-whole run: `exec 9>/home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }`.
+whole run: `exec 9</home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }`
+(a read-only descriptor: the lock file is root-owned mode 0644, so `9>` fails for `sean`; `flock` needs no write access).
 The lock serializes concurrent deploy agents on the VPS; backfill/reset (dev-box `psql` paths) are
 excluded instead by their own runbook precondition that the service is STOPPED while they run (docs/34).
 
@@ -52,7 +53,7 @@ comparisons decide what remains; never guess from memory.
 3. **Preflight on the VPS** (read-only; lock first):
 
    ```bash
-   exec 9>/home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }
+   exec 9</home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }
    cd /home/sean/prediction-markets
    systemctl is-enabled pe-service; systemctl is-active pe-service
    systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory -p FragmentPath -p DropInPaths -p UnitFileState -p WantedBy -p Restart -p RestartUSec -p KillSignal
