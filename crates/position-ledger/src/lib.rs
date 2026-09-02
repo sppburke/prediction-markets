@@ -23,6 +23,14 @@ pub struct LedgerMutation {
     pub effect: LedgerEffect,
 }
 
+/// Venue-metadata proof that rebinds a stamped activity identity (#555).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityCorrection {
+    pub stamped: MarketOutcomeId,
+    pub verified: MarketOutcomeId,
+    pub evidence_hash: String,
+}
+
 /// Supported ledger effects. Non-mutating rows are retained so a complete
 /// bucket can prove every group reached a durable disposition (#544).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +59,12 @@ pub enum LedgerEffect {
     Conversion,
     RawOnly,
     UnknownEffect,
+    /// An effect whose identity was rebound after aggregation while retaining
+    /// the source-stamped identity as replay evidence.
+    Corrected {
+        effect: Box<LedgerEffect>,
+        correction: IdentityCorrection,
+    },
 }
 
 /// Typed failures while decoding a persisted versioned [`LedgerEffect`] document.
@@ -62,7 +76,8 @@ pub enum LedgerEffectDocumentError {
     Malformed { message: String },
 }
 
-const LEDGER_EFFECT_DOCUMENT_VERSION: u64 = 1;
+const LEDGER_EFFECT_DOCUMENT_VERSION_V1: u64 = 1;
+const LEDGER_EFFECT_DOCUMENT_VERSION_V2: u64 = 2;
 
 /// Versioned persisted form of a [`LedgerEffect`] (issue #555): the exact
 /// normalized mutation stored beside each activity-group disposition so a
@@ -72,6 +87,8 @@ const LEDGER_EFFECT_DOCUMENT_VERSION: u64 = 1;
 struct LedgerEffectDocument {
     version: u64,
     effect: LedgerEffectDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correction: Option<IdentityCorrection>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -140,6 +157,7 @@ impl From<&LedgerEffect> for LedgerEffectDto {
             LedgerEffect::Conversion => Self::Conversion,
             LedgerEffect::RawOnly => Self::RawOnly,
             LedgerEffect::UnknownEffect => Self::UnknownEffect,
+            LedgerEffect::Corrected { effect, .. } => Self::from(effect.as_ref()),
         }
     }
 }
@@ -186,15 +204,107 @@ impl From<LedgerEffectDto> for LedgerEffect {
 }
 
 impl LedgerEffect {
+    /// Return correction evidence parsed from or destined for a version-two
+    /// effect document.
+    #[must_use]
+    pub const fn correction(&self) -> Option<&IdentityCorrection> {
+        match self {
+            Self::Corrected { correction, .. } => Some(correction),
+            Self::Trade { .. }
+            | Self::Split { .. }
+            | Self::Merge { .. }
+            | Self::Redeem { .. }
+            | Self::RequiresAnchor
+            | Self::Conversion
+            | Self::RawOnly
+            | Self::UnknownEffect => None,
+        }
+    }
+
+    /// Return the authoritative effect to use for classification and replay.
+    /// A corrected effect already contains the verified market/outcome.
+    #[must_use]
+    pub fn effective(&self) -> &Self {
+        match self {
+            Self::Corrected { effect, .. } => effect.effective(),
+            Self::Trade { .. }
+            | Self::Split { .. }
+            | Self::Merge { .. }
+            | Self::Redeem { .. }
+            | Self::RequiresAnchor
+            | Self::Conversion
+            | Self::RawOnly
+            | Self::UnknownEffect => self,
+        }
+    }
+
+    fn identity(&self) -> Option<MarketOutcomeId> {
+        match self.effective() {
+            Self::Trade {
+                market_id,
+                outcome_id,
+                ..
+            }
+            | Self::Redeem {
+                market_id,
+                outcome_id,
+                ..
+            } => Some(MarketOutcomeId::new(market_id.clone(), *outcome_id)),
+            Self::Split { .. }
+            | Self::Merge { .. }
+            | Self::RequiresAnchor
+            | Self::Conversion
+            | Self::RawOnly
+            | Self::UnknownEffect => None,
+            Self::Corrected { .. } => None,
+        }
+    }
+
+    fn into_effective(self) -> Self {
+        match self {
+            Self::Corrected { effect, .. } => effect.into_effective(),
+            effect => effect,
+        }
+    }
+
+    fn with_identity(self, verified: &MarketOutcomeId) -> Self {
+        match self {
+            Self::Trade {
+                side,
+                amount,
+                price,
+                ..
+            } => Self::Trade {
+                market_id: verified.market().clone(),
+                outcome_id: verified.outcome(),
+                side,
+                amount,
+                price,
+            },
+            Self::Redeem { amount, .. } => Self::Redeem {
+                market_id: verified.market().clone(),
+                outcome_id: verified.outcome(),
+                amount,
+            },
+            effect => effect,
+        }
+    }
+
     /// Canonical JSON document persisted with an activity-group disposition.
     /// Field order is the declaration order above, so the encoding is
     /// deterministic for equal effects.
     pub fn to_document(&self) -> Result<String, LedgerEffectDocumentError> {
         // Encoding through `Value` sorts object keys, so equal effects always
         // produce byte-identical documents.
+        let correction = self.correction().cloned();
         let value = serde_json::to_value(LedgerEffectDocument {
-            version: LEDGER_EFFECT_DOCUMENT_VERSION,
-            effect: self.into(),
+            version: if correction.is_some() {
+                LEDGER_EFFECT_DOCUMENT_VERSION_V2
+            } else {
+                LEDGER_EFFECT_DOCUMENT_VERSION_V1
+            },
+            effect: self.effective().into(),
+            correction,
         })
         .map_err(malformed)?;
         serde_json::to_string(&value).map_err(malformed)
@@ -206,12 +316,41 @@ impl LedgerEffect {
         let value: serde_json::Value = serde_json::from_str(document).map_err(malformed)?;
         let decoded: LedgerEffectDocument =
             serde_json::from_value(value.clone()).map_err(malformed)?;
-        if decoded.version != LEDGER_EFFECT_DOCUMENT_VERSION {
-            return Err(LedgerEffectDocumentError::UnknownVersion {
-                version: decoded.version,
-            });
-        }
-        let effect: Self = decoded.effect.into();
+        let effect = match (decoded.version, decoded.correction) {
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, None) => decoded.effect.into(),
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V1, Some(_)) => {
+                return Err(LedgerEffectDocumentError::Malformed {
+                    message: "version 1 ledger effect document contains a correction".to_owned(),
+                });
+            }
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, Some(correction)) => {
+                let effect: Self = decoded.effect.into();
+                if correction.stamped == correction.verified {
+                    return Err(LedgerEffectDocumentError::Malformed {
+                        message: "ledger identity correction does not change identity".to_owned(),
+                    });
+                }
+                if effect.identity().as_ref() != Some(&correction.verified) {
+                    return Err(LedgerEffectDocumentError::Malformed {
+                        message: "corrected effect identity does not match verified identity"
+                            .to_owned(),
+                    });
+                }
+                Self::Corrected {
+                    effect: Box::new(effect),
+                    correction,
+                }
+            }
+            (LEDGER_EFFECT_DOCUMENT_VERSION_V2, None) => {
+                return Err(LedgerEffectDocumentError::Malformed {
+                    message: "version 2 ledger effect document is missing its correction"
+                        .to_owned(),
+                });
+            }
+            (version, _) => {
+                return Err(LedgerEffectDocumentError::UnknownVersion { version });
+            }
+        };
         // Exact decoding: the input must be the canonical encoding of what it
         // decoded to, which rejects extra fields on any variant.
         if serde_json::to_string(&value).map_err(malformed)? != effect.to_document()? {
@@ -321,9 +460,41 @@ impl LedgerMutation {
         })
     }
 
+    /// Rebind a single-outcome trade or redemption to venue-verified identity.
+    /// The reconciled source-group key and all other mutation evidence remain
+    /// unchanged. Effects without a single market/outcome identity are left
+    /// unchanged.
+    #[must_use]
+    pub fn with_verified_identity(
+        mut self,
+        verified: MarketOutcomeId,
+        evidence_hash: String,
+    ) -> Self {
+        let Some(current) = self.effect.identity() else {
+            return self;
+        };
+        if current == verified {
+            return self;
+        }
+        let stamped = self
+            .effect
+            .correction()
+            .map_or_else(|| current.clone(), |correction| correction.stamped.clone());
+        let effect = self.effect.into_effective().with_identity(&verified);
+        self.effect = LedgerEffect::Corrected {
+            effect: Box::new(effect),
+            correction: IdentityCorrection {
+                stamped,
+                verified,
+                evidence_hash,
+            },
+        };
+        self
+    }
+
     #[must_use]
     pub fn touched_keys(&self) -> Vec<MarketOutcomeId> {
-        match &self.effect {
+        match self.effect.effective() {
             LedgerEffect::Trade {
                 market_id,
                 outcome_id,
@@ -342,6 +513,7 @@ impl LedgerMutation {
             | LedgerEffect::Conversion
             | LedgerEffect::RawOnly
             | LedgerEffect::UnknownEffect => Vec::new(),
+            LedgerEffect::Corrected { .. } => Vec::new(),
         }
     }
 }
@@ -468,7 +640,7 @@ impl PositionLedger {
     }
 
     fn apply_in_place(&mut self, mutation: &LedgerMutation) -> Result<(), LedgerError> {
-        match &mutation.effect {
+        match mutation.effect.effective() {
             LedgerEffect::Trade {
                 market_id,
                 outcome_id,
@@ -506,6 +678,7 @@ impl PositionLedger {
             LedgerEffect::UnknownEffect => Err(LedgerError::UnknownEffect {
                 source_trade_id: mutation.source_trade_id.clone(),
             }),
+            LedgerEffect::Corrected { .. } => Ok(()),
         }
     }
 
@@ -1174,12 +1347,95 @@ mod tests {
     }
 
     #[test]
+    fn uncorrected_v1_document_bytes_remain_frozen() {
+        let effect = LedgerEffect::Trade {
+            market_id: market(),
+            outcome_id: OutcomeId(7),
+            side: Side::Buy,
+            amount: ShareAmount::from_atomic(1_234_567),
+            price: Price(dec!(0.5000)),
+        };
+
+        assert_eq!(
+            effect.to_document().unwrap(),
+            r#"{"effect":{"amount":1234567,"kind":"trade","market":"0xmarket1","outcome":7,"price":"0.5000","side":"Buy"},"version":1}"#
+        );
+    }
+
+    #[test]
+    fn corrected_mutation_round_trips_v2_and_applies_only_to_verified_identity() {
+        let original =
+            LedgerMutation::from_activity(&activity_aggregate("TRADE", "1.250000", Some(0), false))
+                .unwrap();
+        let source_trade_id = original.source_trade_id.clone();
+        let stamped = MarketOutcomeId::new(market(), OutcomeId(0));
+        let verified = MarketOutcomeId::new(
+            MarketId(VenueMarketId("0xverified-market".to_owned())),
+            OutcomeId(1),
+        );
+        let expected_correction = IdentityCorrection {
+            stamped: stamped.clone(),
+            verified: verified.clone(),
+            evidence_hash: "metadata-page-hash".to_owned(),
+        };
+        let corrected = original
+            .with_verified_identity(verified.clone(), expected_correction.evidence_hash.clone());
+
+        assert_eq!(corrected.source_trade_id, source_trade_id);
+        assert_eq!(corrected.effect.correction(), Some(&expected_correction));
+        assert_eq!(corrected.touched_keys(), vec![verified.clone()]);
+
+        let document = corrected.effect.to_document().unwrap();
+        let value: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["effect"]["market"], "0xverified-market");
+        assert_eq!(value["effect"]["outcome"], 1);
+        assert_eq!(value["correction"]["stamped"]["market"], "0xmarket1");
+        assert_eq!(value["correction"]["stamped"]["outcome"], 0);
+        assert_eq!(
+            value["correction"]["verified"]["market"],
+            "0xverified-market"
+        );
+        assert_eq!(value["correction"]["verified"]["outcome"], 1);
+
+        let replayed_effect = LedgerEffect::from_document(&document).unwrap();
+        assert_eq!(replayed_effect, corrected.effect);
+        assert_eq!(replayed_effect.correction(), Some(&expected_correction));
+
+        let mut replayed = corrected.clone();
+        replayed.effect = replayed_effect;
+        let mut ledger = PositionLedger::new();
+        ledger.apply(&replayed).unwrap();
+        let snapshot = ledger.position(&replayed.wallet).unwrap();
+        assert!(!snapshot.positions.contains_key(&stamped));
+        assert_eq!(
+            snapshot.positions[&verified].long_contracts,
+            ShareAmount::from_atomic(1_250_000)
+        );
+    }
+
+    #[test]
+    fn equal_verified_identity_is_the_identity_function() {
+        let mutation =
+            LedgerMutation::from_activity(&activity_aggregate("TRADE", "1.250000", Some(0), false))
+                .unwrap();
+        let verified = MarketOutcomeId::new(market(), OutcomeId(0));
+
+        assert_eq!(
+            mutation
+                .clone()
+                .with_verified_identity(verified, "unused-evidence".to_owned()),
+            mutation
+        );
+    }
+
+    #[test]
     fn effect_document_unknown_version_is_typed() {
-        let document = json!({"effect": {"kind": "raw_only"}, "version": 2});
+        let document = json!({"effect": {"kind": "raw_only"}, "version": 3});
         let error = LedgerEffect::from_document(&document.to_string()).unwrap_err();
         assert_eq!(
             error,
-            LedgerEffectDocumentError::UnknownVersion { version: 2 }
+            LedgerEffectDocumentError::UnknownVersion { version: 3 }
         );
     }
 
@@ -1190,6 +1446,21 @@ mod tests {
             r#"{"effect":{"kind":"trade"},"version":1}"#,
             r#"{"effect":{"kind":"raw_only","market":"extra"},"version":1}"#,
             r#"{"effect":{"kind":"raw_only"},"version":"1"}"#,
+        ] {
+            assert!(matches!(
+                LedgerEffect::from_document(document),
+                Err(LedgerEffectDocumentError::Malformed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn effect_document_malformed_corrections_are_typed() {
+        for document in [
+            r#"{"effect":{"amount":1,"kind":"trade","market":"0xverified","outcome":1,"price":"0.5","side":"Buy"},"version":2}"#,
+            r#"{"correction":{"evidence_hash":7,"stamped":{"market":"0xstamped","outcome":0},"verified":{"market":"0xverified","outcome":1}},"effect":{"amount":1,"kind":"trade","market":"0xverified","outcome":1,"price":"0.5","side":"Buy"},"version":2}"#,
+            r#"{"correction":{"evidence_hash":"hash","stamped":{"market":"0xverified","outcome":1},"verified":{"market":"0xverified","outcome":1}},"effect":{"amount":1,"kind":"trade","market":"0xverified","outcome":1,"price":"0.5","side":"Buy"},"version":2}"#,
+            r#"{"correction":{"evidence_hash":"hash","stamped":{"market":"0xstamped","outcome":0},"verified":{"market":"0xverified","outcome":1}},"effect":{"amount":1,"kind":"trade","market":"0xother","outcome":1,"price":"0.5","side":"Buy"},"version":2}"#,
         ] {
             assert!(matches!(
                 LedgerEffect::from_document(document),
