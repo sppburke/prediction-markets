@@ -6,9 +6,7 @@
 //! those mutable ledgers while an acknowledgement gives the shared admission preparer
 //! ([`crate::watchlist_admission`]) a strict seed-before-membership ordering.
 
-use std::collections::BTreeMap;
-
-use pe_core_types::{ShareAmount, WalletAddress};
+use pe_core_types::WalletAddress;
 use pe_source_polymarket_public::ActivityAggregate;
 use tokio::sync::oneshot;
 
@@ -20,8 +18,6 @@ use crate::position_seeder::AnchorInstall;
 pub struct AdmissionLedgerCapture {
     pub wallet: WalletAddress,
     pub hash: String,
-    pub positive_ordinary_balances: BTreeMap<(String, u16), ShareAmount>,
-    pub has_positive_short: bool,
     pub cursor: Option<i64>,
     pub anchor_seq: Option<i64>,
     pub coverage_generation: i64,
@@ -39,7 +35,7 @@ pub enum OrchestratorControl {
     /// after rechecking the captured ledger and coverage generation.
     InstallAnchors {
         installs: Vec<AnchorInstall>,
-        acknowledged: oneshot::Sender<Result<(), String>>,
+        acknowledged: oneshot::Sender<Result<(), crate::bucket_commit::AnchorInstallError>>,
     },
     /// Capture one exact ledger generation between bracket steps.
     CaptureAdmissionLedger {

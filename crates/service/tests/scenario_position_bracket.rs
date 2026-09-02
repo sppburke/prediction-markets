@@ -4,9 +4,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use pe_copy_signal_engine::PositionState;
 use pe_core_types::{
-    MarketId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId, SourceTimestamp,
-    VenueMarketId, WalletAddress,
+    MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
+    SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
@@ -259,9 +260,7 @@ fn spawn_control_actor(
                     installs,
                     acknowledged,
                 } => {
-                    let result = engine
-                        .install_anchors(&installs)
-                        .map_err(|error| error.to_string());
+                    let result = engine.install_anchors(&installs);
                     let _ = acknowledged.send(result);
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
@@ -284,6 +283,42 @@ fn spawn_control_actor(
             }
         }
     })
+}
+
+#[test]
+fn canonical_capture_hash_matches_sorted_anchored_balances() {
+    let wallet = wallet(0x10);
+    let (_dir, paper, _engine) = fresh(&[wallet]);
+    paper.set_cursor(&wallet, 42).unwrap();
+    let mut ledger = PositionLedger::new();
+    ledger.replace_wallet_snapshot(
+        wallet,
+        HashMap::from([
+            (
+                MarketOutcomeId::new(MarketId(VenueMarketId(condition(2))), OutcomeId(1)),
+                PositionState {
+                    long_contracts: ShareAmount::ZERO,
+                    short_contracts: ShareAmount::from_atomic(2_500_000),
+                },
+            ),
+            (
+                MarketOutcomeId::new(MarketId(VenueMarketId(condition(1))), OutcomeId(0)),
+                PositionState {
+                    long_contracts: ShareAmount::from_atomic(1_000_000),
+                    short_contracts: ShareAmount::ZERO,
+                },
+            ),
+        ]),
+    );
+
+    let capture = ledger_capture(&ledger, &paper, wallet).unwrap();
+    assert_eq!(
+        capture.hash,
+        "c08a170362315f92f6ee39615f7db11e308c4a7db8f2b1b044813fe8a67113c4"
+    );
+    assert_eq!(capture.cursor, Some(42));
+    assert_eq!(capture.anchor_seq, None);
+    assert_eq!(capture.coverage_generation, 0);
 }
 
 #[tokio::test]
@@ -347,11 +382,16 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
             CausalPositionError::LedgerRevision { .. } | CausalPositionError::AnchorInstall(_)
         ));
         assert_eq!(
-            ledger_capture(engine.ledger(), &paper, wallet)
-                .unwrap()
-                .positive_ordinary_balances
-                .get(&(condition(9), 0))
-                .copied(),
+            engine
+                .ledger()
+                .position(&wallet)
+                .and_then(|snapshot| {
+                    snapshot.positions.get(&MarketOutcomeId::new(
+                        MarketId(VenueMarketId(condition(9))),
+                        OutcomeId(0),
+                    ))
+                })
+                .map(|state| state.long_contracts),
             Some(ShareAmount::from_atomic(1_000_000)),
             "the intervening poller BUY must survive the rejected anchor"
         );
@@ -359,6 +399,37 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
         assert!(paper.position_validation(&wallet).unwrap().is_none());
         assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     }
+}
+
+#[tokio::test]
+async fn zero_redeem_after_positions_b_defers_and_preserves_reanchor_flag() {
+    let wallet = wallet(0x2f);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let mut redeem = activity(wallet, 9, "0", "0xreanchor-between-captures", 20);
+    redeem["type"] = json!("REDEEM");
+    redeem["usdcSize"] = json!("0");
+    redeem["price"] = json!("0");
+    redeem["side"] = json!("");
+    let mutation = aggregate(redeem, wallet);
+    let hook = Arc::new(move |step: usize, engine: &mut BucketCommitEngine| {
+        if step == 4 {
+            engine
+                .commit(vec![mutation.clone()], &context(20), zero_basis())
+                .unwrap();
+        }
+    });
+
+    let accepted = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+        .with_step_hook(hook)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert!(accepted.is_empty());
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -718,9 +789,7 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                     installs,
                     acknowledged,
                 } => {
-                    let result = engine
-                        .install_anchors(&installs)
-                        .map_err(|error| error.to_string());
+                    let result = engine.install_anchors(&installs);
                     let _ = acknowledged.send(result);
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
@@ -763,9 +832,9 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
 }
 
 #[test]
-fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
+fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regressed_cutoff() {
     let wallet = wallet(0x66);
-    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
     paper.set_cursor(&wallet, 10).unwrap();
     let before = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     let balance = (
@@ -773,7 +842,7 @@ fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
         OutcomeId(0),
         ShareAmount::from_atomic(3_000_000),
     );
-    let mut install = AnchorInstall {
+    let install = AnchorInstall {
         wallet,
         balances: vec![balance.clone()],
         cutoff: 10,
@@ -781,7 +850,7 @@ fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
             positions_proof_hash: "positions".to_owned(),
             activity_bounds_json: "[]".to_owned(),
             source_log_generation: "scenario".to_owned(),
-            document: "{".to_owned(),
+            document: "{}".to_owned(),
             recorded_at_unix: 100,
         },
         expected: AnchorExpectation {
@@ -792,7 +861,18 @@ fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
         },
     };
 
-    assert!(engine.install_anchors(&[install.clone()]).is_err());
+    let trigger = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    trigger
+        .execute_batch(
+            "CREATE TRIGGER fail_anchor_validation
+             BEFORE INSERT ON position_validations
+             BEGIN SELECT RAISE(FAIL, 'injected anchor transaction failure'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.install_anchors(std::slice::from_ref(&install)),
+        Err(pe_service::bucket_commit::AnchorInstallError::Durability(_))
+    ));
     assert_eq!(
         ledger_capture(engine.ledger(), &paper, wallet)
             .unwrap()
@@ -803,14 +883,22 @@ fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
     assert!(paper.leader_positions().unwrap().is_empty());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 
-    install.proof.document = "{}".to_owned();
+    trigger
+        .execute_batch("DROP TRIGGER fail_anchor_validation;")
+        .unwrap();
     engine.install_anchors(&[install]).unwrap();
     let installed = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     assert_eq!(
-        installed
-            .positive_ordinary_balances
-            .get(&(condition(1), 0))
-            .copied(),
+        engine
+            .ledger()
+            .position(&wallet)
+            .and_then(|snapshot| {
+                snapshot.positions.get(&MarketOutcomeId::new(
+                    MarketId(VenueMarketId(condition(1))),
+                    OutcomeId(0),
+                ))
+            })
+            .map(|state| state.long_contracts),
         Some(balance.2)
     );
     let durable_before_regression = (
@@ -856,6 +944,65 @@ fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
         ),
         durable_before_regression
     );
+}
+
+#[test]
+fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
+    let cursor_wallet = wallet(0x6d);
+    let (_dir, paper, mut engine) = fresh(&[cursor_wallet]);
+    paper.set_cursor(&cursor_wallet, 10).unwrap();
+    let captured = ledger_capture(engine.ledger(), &paper, cursor_wallet).unwrap();
+    let candidate = AnchorInstall {
+        wallet: cursor_wallet,
+        balances: Vec::new(),
+        cutoff: 20,
+        proof: AnchorProof {
+            positions_proof_hash: "cursor".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 20,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: captured.hash,
+            cursor: captured.cursor,
+            anchor_seq: captured.anchor_seq,
+            coverage_generation: captured.coverage_generation,
+        },
+    };
+    paper.set_cursor(&cursor_wallet, 11).unwrap();
+    assert!(matches!(
+        engine.install_anchors(&[candidate]),
+        Err(pe_service::bucket_commit::AnchorInstallError::CursorChanged { .. })
+    ));
+
+    let wallet = wallet(0x6e);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 10);
+    let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let candidate = AnchorInstall {
+        wallet,
+        balances: Vec::new(),
+        cutoff: 10,
+        proof: AnchorProof {
+            positions_proof_hash: "anchor-sequence".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 11,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: captured.hash,
+            cursor: captured.cursor,
+            anchor_seq: captured.anchor_seq,
+            coverage_generation: captured.coverage_generation,
+        },
+    };
+    install_empty_anchor(&mut engine, &paper, wallet, 10);
+    assert!(matches!(
+        engine.install_anchors(&[candidate]),
+        Err(pe_service::bucket_commit::AnchorInstallError::AnchorSeqChanged { .. })
+    ));
 }
 
 #[test]
@@ -1049,6 +1196,47 @@ async fn parse_and_fatal_fetch_errors_remain_boot_fatal() {
         assert!(!paper.is_wallet_fenced(&wallet).unwrap());
         assert!(paper.position_anchors(&wallet).unwrap().is_empty());
     }
+}
+
+#[test]
+fn source_log_open_error_fails_recording_validator_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = CausalPositionValidator::new_recording(
+        Arc::new(QueueFetcher::new(HashMap::new())),
+        BASE,
+        "source-generation-test",
+        dir.path(),
+    );
+    assert!(matches!(result, Err(pe_event_log::LogError::Io(_))));
+}
+
+#[tokio::test]
+async fn paper_state_transaction_error_remains_boot_fatal_without_swapping() {
+    let wallet = wallet(0x73);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let before = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let trigger = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    trigger
+        .execute_batch(
+            "CREATE TRIGGER fail_activity_group
+             BEFORE INSERT ON activity_groups
+             BEGIN SELECT RAISE(FAIL, 'injected activity transaction failure'); END;",
+        )
+        .unwrap();
+
+    let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CausalPositionError::BucketCommit { .. }));
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash,
+        before.hash
+    );
+    assert_eq!(paper.cursor(&wallet).unwrap(), None);
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
 }
 
 #[tokio::test]

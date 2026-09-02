@@ -179,6 +179,11 @@ pub enum WalletLedgerReplayError {
     },
     #[error("activity group {source_trade_id} revision changed during replay")]
     RevisionMismatch { source_trade_id: SourceTradeId },
+    #[error("activity group {source_trade_id} has unknown disposition {disposition}")]
+    UnknownDisposition {
+        source_trade_id: SourceTradeId,
+        disposition: String,
+    },
     #[error("activity group {source_trade_id} has invalid source epoch {source_epoch}")]
     InvalidSourceEpoch {
         source_trade_id: SourceTradeId,
@@ -290,7 +295,7 @@ fn apply_replayed_group(
             source,
         }
     })?;
-    if !applied_disposition(&group.disposition) {
+    if !applied_disposition(&group.source_trade_id, &group.disposition)? {
         return Ok(());
     }
     let source_time =
@@ -330,10 +335,14 @@ fn verify_replayed_group_revision(
     Ok(())
 }
 
-fn applied_disposition(disposition: &str) -> bool {
-    matches!(
+fn applied_disposition(
+    source_trade_id: &SourceTradeId,
+    disposition: &str,
+) -> Result<bool, WalletLedgerReplayError> {
+    let applied = matches!(
         disposition,
         "applied"
+            | "wallet_fenced_applied"
             | "decision_pending"
             | "not_copy_eligible"
             | "not_an_entry"
@@ -344,7 +353,31 @@ fn applied_disposition(disposition: &str) -> bool {
             | "order_dependent_equal_second_action"
             | "stale_fallback_past_copy_budget"
             | "stale_activity_ws_past_copy_budget"
-    )
+    );
+    let not_applied = matches!(
+        disposition,
+        "raw_only"
+            | "reanchor_required_redemption"
+            | "anchor_covered"
+            | "anchor_covered_late"
+            | "wallet_fenced"
+            | "revised_applied_aggregate"
+            | "late_group_after_bucket_commit"
+            | "invalid_mapping"
+            | "position_underflow"
+            | "position_overflow"
+            | "conversion_unknown_conditions"
+            | "unknown_activity_effect"
+            | "order_dependent_equal_second"
+    );
+    if applied || not_applied {
+        Ok(applied)
+    } else {
+        Err(WalletLedgerReplayError::UnknownDisposition {
+            source_trade_id: source_trade_id.clone(),
+            disposition: disposition.to_owned(),
+        })
+    }
 }
 
 #[cfg(test)]

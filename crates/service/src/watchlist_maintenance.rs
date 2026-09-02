@@ -1212,22 +1212,31 @@ mod tests {
                             // prepared wallet gains a current causal position validation,
                             // or the publication recheck would (correctly) reject it. The
                             // bracket itself is proven in scenario_position_bracket.rs.
-                            let validations: Vec<pe_paper_state::PositionValidationRecord> =
-                                wallets
-                                    .iter()
-                                    .map(|wallet| pe_paper_state::PositionValidationRecord {
-                                        wallet: *wallet,
-                                        ledger_hash: "test-ledger".to_owned(),
-                                        positions_proof_hash: "test-proof".to_owned(),
-                                        activity_bounds_json: "{}".to_owned(),
-                                        source_log_generation: "test-gen".to_owned(),
-                                        proof_json: "{}".to_owned(),
-                                        recorded_at_unix: 0,
-                                    })
-                                    .collect();
                             fake_paper_state
-                                .record_position_validations(&validations)
+                                .seed_cursors_if_absent(
+                                    &wallets
+                                        .iter()
+                                        .copied()
+                                        .map(|wallet| (wallet, NOW - 60))
+                                        .collect::<Vec<_>>(),
+                                )
                                 .unwrap();
+                            let installs: Vec<pe_paper_state::AnchorInstallRecord> = wallets
+                                .iter()
+                                .map(|wallet| pe_paper_state::AnchorInstallRecord {
+                                    wallet: *wallet,
+                                    balances: Vec::new(),
+                                    activity_cutoff_unix: NOW - 60,
+                                    anchored_at_unix: NOW - 60,
+                                    ledger_hash_after: "test-ledger".to_owned(),
+                                    positions_proof_hash: "test-proof".to_owned(),
+                                    activity_bounds_json: "{}".to_owned(),
+                                    source_log_generation: "test-gen".to_owned(),
+                                    proof_json: "{}".to_owned(),
+                                    recorded_at_unix: NOW - 60,
+                                })
+                                .collect();
+                            fake_paper_state.install_anchors(&installs).unwrap();
                             control_log
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)

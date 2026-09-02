@@ -328,6 +328,13 @@ pub struct WalletFenceRecord {
     pub fenced_at_unix: i64,
 }
 
+/// Re-anchor state transition committed with its triggering activity group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReanchorRecord {
+    pub source_trade_id: SourceTradeId,
+    pub reason: String,
+}
+
 /// Complete atomic wallet-second commit assembled by the service bucket engine.
 #[derive(Debug, Clone)]
 pub struct ActivityBucketCommit {
@@ -340,6 +347,7 @@ pub struct ActivityBucketCommit {
     pub history_status: Option<WalletHistoryStatusRecord>,
     pub pending: Vec<DecisionPendingRecord>,
     pub fence: Option<WalletFenceRecord>,
+    pub reanchor: Option<ReanchorRecord>,
     pub advance_cursor: bool,
 }
 
@@ -768,6 +776,7 @@ impl PaperStateDb {
             .optional()?
             .is_some();
         let mut invalidates_position_validation = false;
+        let mut inserts_reanchor_trigger = false;
 
         for record in &bucket.dispositions {
             let existing: Option<(String, String, String, String, i64, String, String)> = tx
@@ -817,6 +826,10 @@ impl PaperStateDb {
                 invalidates_position_validation |= retained_revision;
             } else {
                 invalidates_position_validation = true;
+                inserts_reanchor_trigger |= bucket
+                    .reanchor
+                    .as_ref()
+                    .is_some_and(|reanchor| reanchor.source_trade_id == record.source_trade_id);
                 tx.execute(
                     "INSERT INTO activity_groups \
                          (source_trade_id, transaction_hash, wallet_hex, source_epoch, \
@@ -891,6 +904,24 @@ impl PaperStateDb {
                     },
                 )?;
             }
+        }
+
+        if inserts_reanchor_trigger {
+            let reanchor = bucket.reanchor.as_ref().ok_or_else(|| {
+                PaperStateError::Internal("missing activity re-anchor marker".to_owned())
+            })?;
+            let updated = tx.execute(
+                "UPDATE poll_cursors SET reanchor_required = 1, \
+                     coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1",
+                params![bucket.wallet.to_string()],
+            )?;
+            if updated != 1 {
+                return Err(PaperStateError::Internal(format!(
+                    "reanchor mark for {} ({}) requires an existing wallet cursor for {}",
+                    reanchor.source_trade_id, reanchor.reason, bucket.wallet
+                )));
+            }
+            invalidates_position_validation = true;
         }
 
         for leader in &bucket.leader_positions {
@@ -1159,23 +1190,6 @@ impl PaperStateDb {
         Ok(promoted)
     }
 
-    /// Install one all-or-nothing set of accepted causal position brackets.
-    pub fn record_position_validations(
-        &self,
-        validations: &[PositionValidationRecord],
-    ) -> Result<(), PaperStateError> {
-        for validation in validations {
-            validate_position_validation(validation)?;
-        }
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        for validation in validations {
-            tx_upsert_position_validation(&tx, validation)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Install one all-or-nothing batch of venue-authoritative position anchors.
     pub fn install_anchors(&self, installs: &[AnchorInstallRecord]) -> Result<(), PaperStateError> {
         self.install_anchors_inner(installs, false)
@@ -1401,45 +1415,28 @@ impl PaperStateDb {
         })
     }
 
-    /// Mark a wallet for a fresh anchor and invalidate its accepted bracket.
-    pub fn mark_reanchor_required(
+    /// Age in seconds of the oldest live wallet's latest anchor, or `None` when
+    /// no live wallet has an anchor.
+    pub fn oldest_anchor_age(
         &self,
-        wallet: &WalletAddress,
-        source_trade_id: &SourceTradeId,
-        reason: &str,
-    ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let updated = tx.execute(
-            "UPDATE poll_cursors SET reanchor_required = 1, \
-                 coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1",
-            params![wallet.to_string()],
-        )?;
-        if updated != 1 {
-            return Err(PaperStateError::Internal(format!(
-                "reanchor mark for {source_trade_id} ({reason}) requires an existing wallet cursor for {wallet}"
-            )));
-        }
-        tx.execute(
-            "DELETE FROM position_validations WHERE wallet_hex = ?1",
-            params![wallet.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Age in seconds of the oldest wallet's latest anchor, or `None` before any anchor.
-    pub fn oldest_anchor_age(&self, now_unix: i64) -> Result<Option<i64>, PaperStateError> {
+        wallets: &[WalletAddress],
+        now_unix: i64,
+    ) -> Result<Option<i64>, PaperStateError> {
         let conn = self.lock();
-        let anchored_at_unix: Option<i64> = conn.query_row(
-            "SELECT MIN(anchor.anchored_at_unix) FROM position_anchors AS anchor \
-             WHERE anchor.anchor_seq = ( \
-                 SELECT MAX(candidate.anchor_seq) FROM position_anchors AS candidate \
-                 WHERE candidate.wallet_hex = anchor.wallet_hex \
-             )",
-            [],
-            |row| row.get(0),
+        let mut statement = conn.prepare(
+            "SELECT anchored_at_unix FROM position_anchors WHERE wallet_hex = ?1 \
+             ORDER BY anchor_seq DESC LIMIT 1",
         )?;
+        let mut anchored_at_unix = None;
+        for wallet in wallets {
+            let latest = statement
+                .query_row(params![wallet.to_string()], |row| row.get::<_, i64>(0))
+                .optional()?;
+            if let Some(latest) = latest {
+                anchored_at_unix =
+                    Some(anchored_at_unix.map_or(latest, |oldest: i64| oldest.min(latest)));
+            }
+        }
         Ok(anchored_at_unix.map(|anchored| now_unix.saturating_sub(anchored).max(0)))
     }
 
@@ -3134,14 +3131,6 @@ impl PaperStateDb {
 
 // ── Transaction-scoped helpers ──────────────────────────────────────────────
 
-fn validate_position_validation(
-    validation: &PositionValidationRecord,
-) -> Result<(), PaperStateError> {
-    serde_json::from_str::<serde_json::Value>(&validation.activity_bounds_json)?;
-    serde_json::from_str::<serde_json::Value>(&validation.proof_json)?;
-    Ok(())
-}
-
 fn tx_upsert_position_validation(
     tx: &Transaction<'_>,
     validation: &PositionValidationRecord,
@@ -3230,6 +3219,11 @@ fn validate_activity_bucket(bucket: &ActivityBucketCommit) -> Result<(), PaperSt
             return Err(PaperStateError::ActivityBucketMismatch);
         }
         serde_json::from_str::<serde_json::Value>(&fence.proof_json)?;
+    }
+    if let Some(reanchor) = &bucket.reanchor
+        && !group_ids.contains(&reanchor.source_trade_id.0)
+    {
+        return Err(PaperStateError::ActivityBucketMismatch);
     }
     Ok(())
 }
@@ -3770,6 +3764,7 @@ mod tests {
             history_status: None,
             pending: Vec::new(),
             fence: None,
+            reanchor: None,
             advance_cursor: false,
         })
         .unwrap();
@@ -3859,7 +3854,7 @@ mod tests {
                     anchored_at_unix: None,
                 }
             );
-            assert_eq!(db.oldest_anchor_age(100).unwrap(), None);
+            assert_eq!(db.oldest_anchor_age(&[wallet()], 100).unwrap(), None);
             drop(db);
 
             let conn = Connection::open(&path).unwrap();
@@ -3951,7 +3946,10 @@ mod tests {
                 anchored_at_unix: Some(200),
             }
         );
-        assert_eq!(db.oldest_anchor_age(250).unwrap(), Some(50));
+        assert_eq!(
+            db.oldest_anchor_age(&[first, second], 250).unwrap(),
+            Some(50)
+        );
         assert_eq!(db.cursor(&first).unwrap(), Some(10));
         assert_eq!(db.activity(&first).unwrap(), Some(10));
 
@@ -3982,7 +3980,7 @@ mod tests {
         assert_eq!(db.cursor(&first).unwrap(), Some(10));
         assert_eq!(db.activity(&first).unwrap(), Some(10));
         assert_eq!(
-            db.oldest_anchor_age(350).unwrap(),
+            db.oldest_anchor_age(&[first, second], 350).unwrap(),
             Some(130),
             "age uses each wallet's latest anchor"
         );
@@ -4140,8 +4138,8 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_mark_invalidates_validation_and_next_install_clears_flag() {
-        let (_dir, db) = db();
+    fn reanchor_group_failure_rolls_back_and_retry_repairs_coverage_atomically() {
+        let (dir, db) = db();
         let wallet = wallet();
         db.seed_cursor_if_absent(&wallet, 10).unwrap();
         db.install_anchors(&[anchor_install(
@@ -4154,8 +4152,53 @@ mod tests {
         .unwrap();
         assert!(db.position_validation(&wallet).unwrap().is_some());
 
-        db.mark_reanchor_required(&wallet, &group_id('d'), "anchor_covered_late")
+        let bucket = ActivityBucketCommit {
+            wallet,
+            source_epoch: 101,
+            dispositions: vec![ActivityDispositionRecord {
+                source_trade_id: group_id('d'),
+                transaction_hash: "transaction-d".to_owned(),
+                wallet,
+                source_epoch: 101,
+                semantic_revision: "revision-d".to_owned(),
+                activity_type: "TRADE".to_owned(),
+                disposition: "anchor_covered_late".to_owned(),
+                proof_json: "{}".to_owned(),
+                no_copy: None,
+            }],
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: None,
+            pending: Vec::new(),
+            fence: None,
+            reanchor: Some(ReanchorRecord {
+                source_trade_id: group_id('d'),
+                reason: "anchor_covered_late".to_owned(),
+            }),
+            advance_cursor: true,
+        };
+        let trigger = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        trigger
+            .execute_batch(
+                "CREATE TRIGGER fail_reanchor_update
+                 BEFORE UPDATE OF reanchor_required ON poll_cursors
+                 BEGIN SELECT RAISE(FAIL, 'injected reanchor failure'); END;",
+            )
             .unwrap();
+        assert!(matches!(
+            db.commit_activity_bucket(&bucket),
+            Err(PaperStateError::Sqlite(_))
+        ));
+        assert!(db.activity_group_state(&group_id('d')).unwrap().is_none());
+        assert_eq!(db.wallet_coverage(&wallet).unwrap().coverage_generation, 0);
+        assert!(!db.wallet_coverage(&wallet).unwrap().reanchor_required);
+        assert!(db.position_validation(&wallet).unwrap().is_some());
+
+        trigger
+            .execute_batch("DROP TRIGGER fail_reanchor_update;")
+            .unwrap();
+        db.commit_activity_bucket(&bucket).unwrap();
         assert_eq!(
             db.wallet_coverage(&wallet).unwrap(),
             WalletCoverage {
@@ -4167,6 +4210,9 @@ mod tests {
             }
         );
         assert!(db.position_validation(&wallet).unwrap().is_none());
+
+        db.commit_activity_bucket(&bucket).unwrap();
+        assert_eq!(db.wallet_coverage(&wallet).unwrap().coverage_generation, 1);
 
         db.install_anchors(&[anchor_install(
             wallet,

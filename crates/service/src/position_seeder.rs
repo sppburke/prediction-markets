@@ -475,6 +475,14 @@ impl CausalPositionValidator {
         if ledgers[0].hash != ledgers[1].hash || ledgers[1].hash != ledgers[2].hash {
             return Err(CausalPositionError::LedgerRevision { wallet });
         }
+        let coverage_matches = |left: &AdmissionLedgerCapture, right: &AdmissionLedgerCapture| {
+            left.cursor == right.cursor
+                && left.anchor_seq == right.anchor_seq
+                && left.coverage_generation == right.coverage_generation
+        };
+        if !coverage_matches(ledgers[0], ledgers[1]) || !coverage_matches(ledgers[1], ledgers[2]) {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
         let balances = ordinary_position_balances(first_positions)?;
 
         let activity_bounds = activities
@@ -646,24 +654,16 @@ pub fn ledger_capture(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"prediction-edge/admission-ledger/v1\0");
     hash_part(&mut hasher, wallet.to_string().as_bytes())?;
-    let mut positive_ordinary_balances = BTreeMap::new();
-    let mut has_positive_short = false;
     for ((condition_id, outcome), (long, short)) in all {
         hash_part(&mut hasher, condition_id.as_bytes())?;
         hash_part(&mut hasher, &outcome.to_be_bytes())?;
         hash_part(&mut hasher, &long.atomic().to_be_bytes())?;
         hash_part(&mut hasher, &short.atomic().to_be_bytes())?;
-        if long > ShareAmount::ZERO {
-            positive_ordinary_balances.insert((condition_id, outcome), long);
-        }
-        has_positive_short |= short > ShareAmount::ZERO;
     }
     let coverage = paper_state.wallet_coverage(&wallet)?;
     Ok(AdmissionLedgerCapture {
         wallet,
         hash: hasher.finalize().to_hex().to_string(),
-        positive_ordinary_balances,
-        has_positive_short,
         cursor: paper_state.cursor(&wallet)?,
         anchor_seq: coverage.anchor_seq,
         coverage_generation: coverage.coverage_generation,
@@ -773,4 +773,42 @@ pub fn parse_positions_strict(
         );
     }
     Ok(PositionSnapshot { wallet, positions })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    struct EmptyFetcher;
+
+    impl ReconciliationFetcher for EmptyFetcher {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async { Ok(b"[]".to_vec()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn recorder_append_failure_is_wrapped_as_a_fatal_source_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();
+        sink.fail_next_append();
+        let fetcher = DurableRecordingFetcher {
+            inner: Arc::new(EmptyFetcher),
+            sink: tokio::sync::Mutex::new(sink),
+        };
+
+        let error = fetcher
+            .fetch("https://api.example.com/activity")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SourceError::Fatal { message }
+                if message.contains("source-log append failed: I/O error: injected append failure")
+        ));
+    }
 }

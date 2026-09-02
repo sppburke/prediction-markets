@@ -6,13 +6,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pe_copy_signal_engine::SignalConfig;
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
-use pe_service::bucket_commit::{BucketCommitEngine, FrozenDecisionBasis};
+use pe_service::bucket_commit::{AnchorInstallError, BucketCommitEngine, FrozenDecisionBasis};
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::orchestrator_control::OrchestratorControl;
@@ -220,10 +221,20 @@ fn poller_harness(
     wallets: &[WalletAddress],
     bracket_responses: HashMap<String, Vec<Vec<u8>>>,
     rounds: usize,
-    corrupt_install: bool,
+    fail_install_transaction: bool,
     installed: Arc<Mutex<Vec<(WalletAddress, usize)>>>,
     shutdown: Option<oneshot::Sender<()>>,
 ) -> PollerHarness {
+    if fail_install_transaction {
+        rusqlite::Connection::open(dir.path().join("paper.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_anchor_validation
+                 BEFORE INSERT ON position_validations
+                 BEGIN SELECT RAISE(FAIL, 'injected anchor transaction failure'); END;",
+            )
+            .unwrap();
+    }
     let source_log_path = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(8);
@@ -270,19 +281,14 @@ fn poller_harness(
                     );
                 }
                 OrchestratorControl::InstallAnchors {
-                    mut installs,
+                    installs,
                     acknowledged,
                 } => {
-                    if corrupt_install && let Some(install) = installs.first_mut() {
-                        install.proof.document = "{".to_owned();
-                    }
                     let wallets = installs
                         .iter()
                         .map(|install| install.wallet)
                         .collect::<Vec<_>>();
-                    let result = engine
-                        .install_anchors(&installs)
-                        .map_err(|error| error.to_string());
+                    let result = engine.install_anchors(&installs);
                     if result.is_ok() {
                         let calls = actor_poll_fetcher.calls.load(Ordering::SeqCst);
                         actor_installed
@@ -328,7 +334,7 @@ fn poller_harness(
             &pe_service::config::ServiceConfig::default(),
         )),
         ReconciliationObligations::default(),
-        Some(Arc::clone(&preparer)),
+        Some(preparer.as_ref().clone()),
     )
     .with_clock(Arc::new(|| {
         OffsetDateTime::from_unix_timestamp(NOW).unwrap()
@@ -349,6 +355,63 @@ async fn finish_harness(
     drop(preparer);
     ingest.await.unwrap();
     actor.await.unwrap();
+}
+
+async fn refresh_outcome_for_install_rejection(
+    rejection: AnchorInstallError,
+) -> AnchorRefreshOutcome {
+    let wallet = wallet(0x5a);
+    let (_dir, paper) = paper(&[wallet]);
+    let (control_tx, mut control_rx) = mpsc::channel(4);
+    let actor_paper = Arc::clone(&paper);
+    let actor = tokio::spawn(async move {
+        let mut engine =
+            BucketCommitEngine::load(Arc::clone(&actor_paper), PositionLedger::new()).unwrap();
+        let mut rejection = Some(rejection);
+        while let Some(command) = control_rx.recv().await {
+            match command {
+                OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
+                    let _ = acknowledged.send(());
+                }
+                OrchestratorControl::CommitActivityBucket {
+                    aggregates,
+                    context,
+                    committed,
+                } => {
+                    let _ = committed.send(
+                        engine
+                            .commit(
+                                aggregates,
+                                &context,
+                                FrozenDecisionBasis {
+                                    win_rate_p: pe_core_types::Probability::ZERO,
+                                    bankroll: rust_decimal::Decimal::ZERO,
+                                },
+                            )
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let _ = captured.send(
+                        ledger_capture(engine.ledger(), &actor_paper, wallet)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::InstallAnchors { acknowledged, .. } => {
+                    let _ = acknowledged.send(Err(rejection.take().unwrap()));
+                }
+            }
+        }
+    });
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        paper,
+        validator(stable_bracket_responses(&[wallet])),
+    );
+    let outcome = preparer.prepare_if_due(wallet, NOW, 3_600).await.unwrap();
+    drop(preparer);
+    actor.await.unwrap();
+    outcome
 }
 
 #[tokio::test]
@@ -418,6 +481,66 @@ async fn mutex_recheck_skips_a_fresh_anchor_without_a_validator() {
 }
 
 #[tokio::test]
+async fn contended_mutex_rereads_fresh_anchor_before_refreshing() {
+    let blocker = wallet(0x34);
+    let target = wallet(0x35);
+    let (_dir, paper) = paper(&[blocker, target]);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let (received_tx, received_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let Some(OrchestratorControl::PrepareAdmissions { acknowledged, .. }) =
+            control_rx.recv().await
+        else {
+            return;
+        };
+        let _ = received_tx.send(());
+        let _ = release_rx.await;
+        let _ = acknowledged.send(());
+    });
+    let preparer = Arc::new(AdmissionPreparer::new(control_tx, Arc::clone(&paper)));
+    let first = {
+        let preparer = Arc::clone(&preparer);
+        tokio::spawn(async move { preparer.prepare(&[blocker]).await })
+    };
+    received_rx.await.unwrap();
+    let mut second = {
+        let preparer = Arc::clone(&preparer);
+        tokio::spawn(async move { preparer.prepare_if_due(target, NOW, 3_600).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut second)
+            .await
+            .is_err()
+    );
+
+    paper.set_cursor(&target, 10).unwrap();
+    paper
+        .install_anchors(&[AnchorInstallRecord {
+            wallet: target,
+            balances: Vec::new(),
+            activity_cutoff_unix: 10,
+            anchored_at_unix: NOW,
+            ledger_hash_after: "unused".to_owned(),
+            positions_proof_hash: "positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: NOW,
+        }])
+        .unwrap();
+    release_tx.send(()).unwrap();
+
+    first.await.unwrap().unwrap();
+    assert_eq!(
+        second.await.unwrap().unwrap(),
+        AnchorRefreshOutcome::Skipped
+    );
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
 async fn deferred_refresh_continues_the_poller() {
     let wallet = wallet(0x44);
     let (dir, paper) = paper(&[wallet]);
@@ -464,7 +587,30 @@ async fn deferred_refresh_continues_the_poller() {
 }
 
 #[tokio::test]
-async fn durable_install_error_terminates_the_poller_without_swapping() {
+async fn every_install_rejection_defers_refresh() {
+    let wallet = wallet(0x5a);
+    let rejections = [
+        AnchorInstallError::CoverageGenerationChanged { wallet },
+        AnchorInstallError::CursorChanged { wallet },
+        AnchorInstallError::LedgerHashChanged { wallet },
+        AnchorInstallError::AnchorSeqChanged { wallet },
+        AnchorInstallError::Fenced { wallet },
+        AnchorInstallError::CutoffRegression {
+            wallet,
+            stored: 10,
+            candidate: 9,
+        },
+    ];
+    for rejection in rejections {
+        assert_eq!(
+            refresh_outcome_for_install_rejection(rejection).await,
+            AnchorRefreshOutcome::Deferred
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_transaction_failure_terminates_the_poller_without_swapping() {
     let wallet = wallet(0x55);
     let (dir, paper) = paper(&[wallet]);
     let installed = Arc::new(Mutex::new(Vec::new()));

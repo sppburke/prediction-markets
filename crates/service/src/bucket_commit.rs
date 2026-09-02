@@ -17,7 +17,7 @@ use pe_core_types::{
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, AnchorInstallRecord,
     DecisionPendingRecord, DecisionPendingRow, EntryGateResultRecord, LeaderPositionRow,
-    MarketHistoryRecord, NoCopyDisposition, PaperStateDb, WalletFenceRecord,
+    MarketHistoryRecord, NoCopyDisposition, PaperStateDb, ReanchorRecord, WalletFenceRecord,
     WalletHistoryStatusRecord,
 };
 use pe_position_ledger::{
@@ -174,11 +174,11 @@ pub enum AnchorInstallError {
     #[error("wallet {wallet} is durably fenced")]
     Fenced { wallet: WalletAddress },
     #[error("wallet {wallet} ledger changed before anchor install")]
-    LedgerChanged { wallet: WalletAddress },
+    LedgerHashChanged { wallet: WalletAddress },
     #[error("wallet {wallet} cursor changed before anchor install")]
     CursorChanged { wallet: WalletAddress },
     #[error("wallet {wallet} anchor sequence changed before anchor install")]
-    AnchorSequenceChanged { wallet: WalletAddress },
+    AnchorSeqChanged { wallet: WalletAddress },
     #[error("wallet {wallet} coverage generation changed before anchor install")]
     CoverageGenerationChanged { wallet: WalletAddress },
     #[error("wallet {wallet} anchor cutoff regressed from {stored} to {candidate}")]
@@ -187,13 +187,14 @@ pub enum AnchorInstallError {
         stored: i64,
         candidate: i64,
     },
-    #[error("anchor ledger proof for {wallet}: {message}")]
-    LedgerProof {
-        wallet: WalletAddress,
-        message: String,
-    },
-    #[error("paper-state: {0}")]
-    PaperState(#[from] pe_paper_state::PaperStateError),
+    #[error("anchor install durability failure: {0}")]
+    Durability(String),
+}
+
+impl From<pe_paper_state::PaperStateError> for AnchorInstallError {
+    fn from(error: pe_paper_state::PaperStateError) -> Self {
+        Self::Durability(format!("paper-state: {error}"))
+    }
 }
 
 /// Single runtime owner for the exact leader ledger, durable gate projection,
@@ -270,10 +271,10 @@ impl BucketCommitEngine {
         let mut wallets = HashSet::new();
         for install in installs {
             if !wallets.insert(install.wallet) {
-                return Err(AnchorInstallError::LedgerProof {
-                    wallet: install.wallet,
-                    message: "duplicate wallet in anchor batch".to_owned(),
-                });
+                return Err(AnchorInstallError::Durability(format!(
+                    "anchor ledger proof for {}: duplicate wallet in anchor batch",
+                    install.wallet
+                )));
             }
             if self.is_fenced(&install.wallet) {
                 return Err(AnchorInstallError::Fenced {
@@ -281,13 +282,15 @@ impl BucketCommitEngine {
                 });
             }
             let capture = ledger_capture(&self.ledger, &self.paper_state, install.wallet).map_err(
-                |error| AnchorInstallError::LedgerProof {
-                    wallet: install.wallet,
-                    message: error.to_string(),
+                |error| {
+                    AnchorInstallError::Durability(format!(
+                        "anchor ledger proof for {}: {error}",
+                        install.wallet
+                    ))
                 },
             )?;
             if capture.hash != install.expected.ledger_hash {
-                return Err(AnchorInstallError::LedgerChanged {
+                return Err(AnchorInstallError::LedgerHashChanged {
                     wallet: install.wallet,
                 });
             }
@@ -297,7 +300,7 @@ impl BucketCommitEngine {
                 });
             }
             if capture.anchor_seq != install.expected.anchor_seq {
-                return Err(AnchorInstallError::AnchorSequenceChanged {
+                return Err(AnchorInstallError::AnchorSeqChanged {
                     wallet: install.wallet,
                 });
             }
@@ -334,22 +337,19 @@ impl BucketCommitEngine {
                     )
                     .is_some()
                 {
-                    return Err(AnchorInstallError::LedgerProof {
-                        wallet: install.wallet,
-                        message: format!(
-                            "duplicate anchored balance for {market_id} outcome {}",
-                            outcome_id.0
-                        ),
-                    });
+                    return Err(AnchorInstallError::Durability(format!(
+                        "anchor ledger proof for {}: duplicate anchored balance for {market_id} outcome {}",
+                        install.wallet, outcome_id.0
+                    )));
                 }
             }
             candidate.replace_wallet_snapshot(install.wallet, positions);
             let post =
                 ledger_capture(&candidate, &self.paper_state, install.wallet).map_err(|error| {
-                    AnchorInstallError::LedgerProof {
-                        wallet: install.wallet,
-                        message: error.to_string(),
-                    }
+                    AnchorInstallError::Durability(format!(
+                        "anchor ledger proof for {}: {error}",
+                        install.wallet
+                    ))
                 })?;
             records.push(AnchorInstallRecord {
                 wallet: install.wallet,
@@ -735,17 +735,16 @@ impl BucketCommitEngine {
             history_status: context.history_status.clone(),
             pending: pending.clone(),
             fence: None,
+            reanchor: reanchor_trigger
+                .clone()
+                .map(|source_trade_id| ReanchorRecord {
+                    source_trade_id,
+                    reason: "reanchor_required_redemption".to_owned(),
+                }),
             advance_cursor: true,
         };
         self.paper_state.commit_activity_bucket(&bucket)?;
         self.ledger = candidate;
-        if let Some(trigger) = reanchor_trigger {
-            self.paper_state.mark_reanchor_required(
-                &wallet,
-                &trigger,
-                "reanchor_required_redemption",
-            )?;
-        }
         self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
         Ok(BucketCommitResult {
             wallet,
@@ -811,13 +810,13 @@ impl BucketCommitEngine {
                 history_status: context.history_status.clone(),
                 pending: Vec::new(),
                 fence: None,
+                reanchor: late.then(|| ReanchorRecord {
+                    source_trade_id: trigger,
+                    reason: disposition.to_owned(),
+                }),
                 advance_cursor: true,
             })?;
         self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
-        if late {
-            self.paper_state
-                .mark_reanchor_required(&wallet, &trigger, disposition)?;
-        }
         Ok(BucketCommitResult {
             wallet,
             source_epoch,
@@ -1019,6 +1018,7 @@ impl BucketCommitEngine {
                     proof_json: serde_json::to_string(&proof)?,
                     fenced_at_unix: context.recorded_at_unix,
                 }),
+                reanchor: None,
                 advance_cursor: true,
             })?;
         self.fences.insert(wallet);
@@ -1089,6 +1089,7 @@ impl BucketCommitEngine {
                     proof_json,
                     fenced_at_unix: context.recorded_at_unix,
                 }),
+                reanchor: None,
                 advance_cursor: true,
             })?;
         if !already_fenced {
@@ -1130,16 +1131,17 @@ impl BucketCommitEngine {
             .iter()
             .zip(mutations)
             .map(|(aggregate, mutation)| {
-                dispositions.insert(
-                    aggregate.group_id.key().0.clone(),
-                    "wallet_fenced".to_owned(),
-                );
-                activity_record(
-                    aggregate,
-                    "wallet_fenced".to_owned(),
-                    &mutation.effect,
-                    None,
-                )
+                let disposition = if applied
+                    && !matches!(
+                        mutation.effect,
+                        LedgerEffect::Conversion | LedgerEffect::UnknownEffect
+                    ) {
+                    "wallet_fenced_applied"
+                } else {
+                    "wallet_fenced"
+                };
+                dispositions.insert(aggregate.group_id.key().0.clone(), disposition.to_owned());
+                activity_record(aggregate, disposition.to_owned(), &mutation.effect, None)
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.paper_state
@@ -1157,6 +1159,7 @@ impl BucketCommitEngine {
                 history_status: context.history_status.clone(),
                 pending: Vec::new(),
                 fence: None,
+                reanchor: None,
                 advance_cursor: true,
             })?;
         if applied {

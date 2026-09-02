@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
-use pe_paper_state::{PaperStateDb, PositionValidationRecord, WalletHistoryStatusRecord};
+use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::runtime_config::{
@@ -143,21 +143,24 @@ fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
         })
         .unwrap();
     }
-    db.record_position_validations(
-        &(u8::MIN..=u8::MAX)
-            .map(|n| PositionValidationRecord {
-                wallet: wallet(n),
-                ledger_hash: format!("ledger-{n}"),
-                positions_proof_hash: format!("positions-{n}"),
-                activity_bounds_json: "[]".to_owned(),
-                source_log_generation: "scenario".to_owned(),
-                proof_json: "{\"scenario\":true}".to_owned(),
-                recorded_at_unix: 1,
-            })
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
     (dir, db)
+}
+
+fn install_anchor(db: &PaperStateDb, wallet: WalletAddress, cursor: i64) {
+    db.set_cursor(&wallet, cursor).unwrap();
+    db.install_anchors(&[AnchorInstallRecord {
+        wallet,
+        balances: Vec::new(),
+        activity_cutoff_unix: cursor,
+        anchored_at_unix: cursor,
+        ledger_hash_after: format!("ledger-{wallet}"),
+        positions_proof_hash: format!("positions-{wallet}"),
+        activity_bounds_json: "[]".to_owned(),
+        source_log_generation: "scenario".to_owned(),
+        proof_json: "{\"scenario\":true}".to_owned(),
+        recorded_at_unix: cursor,
+    }])
+    .unwrap();
 }
 
 // ── proven-winner-spared-under-72h ──────────────────────────────────────────────
@@ -350,15 +353,16 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
     // A backfill candidate that passed the `gte.{now-72h}` freshness filter: its real last trade
-    // is recent (idle ~1000s). The maintenance tick seeds its cursor from that real last-trade
-    // time (carried in the candidate side-map), NOT from `now` — there is no admission clock (#357).
+    // is recent (idle ~1000s). The anchor fixture represents completed admission preparation;
+    // structural publication must preserve that causal cursor rather than jump it to `now`.
     let fresh = wallet(2);
     let fresh_last_trade = NOW - 1_000;
     assert_eq!(
         db.cursor(&fresh).unwrap(),
         None,
-        "no cursor before admission (a brand-new wallet)"
+        "no cursor before admission preparation (a brand-new wallet)"
     );
+    install_anchor(&db, fresh, fresh_last_trade);
 
     let candidates = vec![entry(fresh, 150)];
     let mut candidate_last_trade = HashMap::new();
@@ -378,11 +382,11 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
     .unwrap();
     assert_eq!(size, 2, "backfilled into the live set");
 
-    // Cursor seeded from the REAL last trade, not `now` (#357 reverses the admission clock).
+    // Structural publication preserves the prepared causal cursor rather than replacing it.
     assert_eq!(
         db.cursor(&fresh).unwrap(),
         Some(fresh_last_trade),
-        "cursor seeded from real last_trade_unix at admission, inside the writer-locked section"
+        "prepared cursor remains the real last_trade_unix through publication"
     );
 
     // idle = now − real_last_trade = 1000s < 72h → kept (it just traded).
@@ -409,10 +413,11 @@ async fn stale_seeded_wallet_no_admission_grace() {
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
     // A wallet admitted with a real last trade already 72h old (e.g. a stale bootstrap admission
-    // that slipped the candidate freshness filter). #357 seeds the cursor from that real time, so
+    // that slipped the candidate freshness filter). Its prepared anchor retains that real time, so
     // there is NO admission grace: it is eviction-eligible on the very next tick.
     let stale = wallet(2);
     let stale_last_trade = NOW - H72;
+    install_anchor(&db, stale, stale_last_trade);
     let candidates = vec![entry(stale, 150)];
     let mut candidate_last_trade = HashMap::new();
     candidate_last_trade.insert(stale, stale_last_trade);
@@ -492,6 +497,9 @@ async fn writer_mutex_serializes_refresh_and_replace() {
         let candidate_last_trade: HashMap<WalletAddress, i64> = (101..=105u8)
             .map(|n| (wallet(n), NOW - 100 - i64::from(n)))
             .collect();
+        for (wallet, cursor) in &candidate_last_trade {
+            install_anchor(&db_m, *wallet, *cursor);
+        }
         apply_evictions_and_backfill(
             &live_m,
             &db_m,
@@ -552,6 +560,7 @@ async fn full_rerank_swap_wholesale() {
     let d_last_trade = NOW - 5_000;
     incoming_last_trade.insert(d, d_last_trade);
     incoming_last_trade.insert(b, NOW - 9_000);
+    install_anchor(&db, d, d_last_trade);
     let (applied, epoch) = capacity(25);
 
     let (total, dropped) = apply_full_rerank_swap(
@@ -645,6 +654,9 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
     let side: HashMap<WalletAddress, i64> = (1..=100u8)
         .map(|n| (wallet(n), NOW - i64::from(n)))
         .collect();
+    for n in 51..=100u8 {
+        install_anchor(&db, wallet(n), NOW - i64::from(n));
+    }
     let (grow_capacity, grow_epoch) = capacity(100);
     let (grown, dropped) = apply_full_rerank_swap(
         &live,
@@ -730,7 +742,7 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
 }
 
 // ── cursor-prerequisite-fail-closed ───────────────────────────────────
-/// PASS: a missing last-trade cursor rejects an admission before ArcSwap publication.
+/// PASS: a missing last-trade side-map rejects an anchored admission before ArcSwap publication.
 #[tokio::test]
 async fn missing_admission_cursor_leaves_membership_unchanged() {
     let original = wallet(1);
@@ -740,6 +752,7 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
     let lock = Mutex::new(());
     let (applied, epoch) = capacity(1);
     let incoming = vec![entry(newcomer, 200)];
+    install_anchor(&db, newcomer, 0);
 
     let error = apply_full_rerank_swap(
         &live,
@@ -760,7 +773,7 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
         .map(|entry| entry.wallet)
         .collect();
     assert_eq!(members, HashSet::from([original]));
-    assert_eq!(db.cursor(&newcomer).unwrap(), None);
+    assert_eq!(db.cursor(&newcomer).unwrap(), Some(0));
     println!("PASS: cursor prerequisite fails closed before membership publication");
 }
 

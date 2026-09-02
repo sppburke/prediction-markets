@@ -10,6 +10,7 @@ use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use crate::bucket_commit::AnchorInstallError;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::position_seeder::{
     AnchorInstall, CausalPositionError, CausalPositionValidator, is_deferred_causal_position_error,
@@ -32,6 +33,8 @@ pub enum AdmissionError {
     #[error("causal current-position validation unavailable: {0}")]
     PositionValidation(#[source] CausalPositionError),
     #[error("orchestrator rejected the accepted position brackets: {0}")]
+    ValidationRejected(AnchorInstallError),
+    #[error("accepted position bracket durability failed: {0}")]
     ValidationInstall(String),
     #[error("paper-state admission read failed: {0}")]
     PaperState(#[from] pe_paper_state::PaperStateError),
@@ -138,8 +141,11 @@ impl AdmissionPreparer {
             }
             Err(error) => return Err(AdmissionError::PositionValidation(error)),
         };
-        self.install_anchors(installs).await?;
-        Ok(AnchorRefreshOutcome::Anchored)
+        match self.install_anchors(installs).await {
+            Ok(()) => Ok(AnchorRefreshOutcome::Anchored),
+            Err(AdmissionError::ValidationRejected(_)) => Ok(AnchorRefreshOutcome::Deferred),
+            Err(error) => Err(error),
+        }
     }
 
     fn check_prerequisites(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
@@ -214,6 +220,9 @@ impl AdmissionPreparer {
         .await
         .map_err(|_| AdmissionError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS))?
         .map_err(|_| AdmissionError::AcknowledgementClosed)?
-        .map_err(AdmissionError::ValidationInstall)
+        .map_err(|error| match error {
+            AnchorInstallError::Durability(message) => AdmissionError::ValidationInstall(message),
+            rejection => AdmissionError::ValidationRejected(rejection),
+        })
     }
 }

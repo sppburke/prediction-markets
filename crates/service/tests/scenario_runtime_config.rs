@@ -219,6 +219,7 @@ fn install_pending(
                 updated_at_unix: source_epoch,
             }],
             fence: None,
+            reanchor: None,
             advance_cursor: true,
         })
         .unwrap();

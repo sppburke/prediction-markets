@@ -31,6 +31,7 @@ use time::OffsetDateTime;
 const WALLET_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MARKET_A: &str = "0xcondition-a";
 const MARKET_B: &str = "0xcondition-b";
+const MARKET_C: &str = "0xcondition-c";
 
 fn wallet() -> WalletAddress {
     WalletAddress::from_hex(WALLET_HEX).unwrap()
@@ -302,6 +303,15 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
     assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+
+    let copy = position_row("TRADE", "0xlate-copy", MARKET_C, 0, "BUY", "1", "0.5", 101);
+    let copy_id = copy.group_id.key().clone();
+    let result = engine
+        .commit(vec![copy], &context(101, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&copy_id.0], "not_copy_eligible");
+    assert!(result.pending.is_empty());
+    assert!(paper.open_decision_pending().unwrap().is_empty());
 }
 
 #[test]
@@ -625,7 +635,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
         later
             .dispositions
             .values()
-            .all(|value| value == "wallet_fenced")
+            .all(|value| value == "wallet_fenced_applied")
     );
     assert_eq!(state(&engine, MARKET_B, 0).atomic(), 1);
 

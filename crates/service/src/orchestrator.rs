@@ -389,10 +389,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                 installs,
                 acknowledged,
             } => {
-                let result = self
-                    .bucket_engine
-                    .install_anchors(&installs)
-                    .map_err(|error| error.to_string());
+                let result = self.bucket_engine.install_anchors(&installs);
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {

@@ -20,6 +20,7 @@ use crate::runtime_config::{
 };
 use crate::supabase_refresh::{WatchlistProjectionStatus, WatchlistProjectionStatusSnapshot};
 use crate::supervisor::{TaskStateSnapshot, TaskStatus};
+use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -193,6 +194,7 @@ struct FinancialValues {
 
 fn read_financial_values(
     paper_state: &PaperStateDb,
+    live_wallets: &[WalletAddress],
     now_unix: i64,
 ) -> Result<FinancialValues, pe_paper_state::PaperStateError> {
     Ok(FinancialValues {
@@ -201,7 +203,7 @@ fn read_financial_values(
         fills_total: paper_state.fills_count()?,
         settled_total: paper_state.settled_count()?,
         oldest_anchor_age_secs: paper_state
-            .oldest_anchor_age(now_unix)?
+            .oldest_anchor_age(live_wallets, now_unix)?
             .and_then(|age| u64::try_from(age).ok()),
         last_event_seq: paper_state.last_applied_event_seq()?.0,
     })
@@ -244,6 +246,7 @@ pub fn build_snapshot(
     uptime_secs: u64,
     now_unix: i64,
     watchlist_size: usize,
+    live_wallets: &[WalletAddress],
     watchlist_target_size: usize,
     supabase_rpc_calls: u64,
     live_accounts: Option<&crate::live_accounts::LiveAccountsSnapshot>,
@@ -268,7 +271,7 @@ pub fn build_snapshot(
         fills_total: paper_state.fills_count().unwrap_or(0),
         settled_total: paper_state.settled_count().unwrap_or(0),
         oldest_anchor_age_secs: paper_state
-            .oldest_anchor_age(now_unix)
+            .oldest_anchor_age(live_wallets, now_unix)
             .ok()
             .flatten()
             .and_then(|age| u64::try_from(age).ok()),
@@ -362,7 +365,13 @@ pub async fn run_status_writer(
         });
         let applied_config = runtime_config.snapshot();
         let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-        let status_error = match read_financial_values(&paper_state, now_unix) {
+        let watchlist_snapshot = watchlist.snapshot();
+        let live_wallets = watchlist_snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<Vec<_>>();
+        let status_error = match read_financial_values(&paper_state, &live_wallets, now_unix) {
             Ok(values) => {
                 last_good_financials = Some(values);
                 None
@@ -378,7 +387,8 @@ pub async fn run_status_writer(
             authoritative,
             started_at.elapsed().as_secs(),
             now_unix,
-            watchlist.snapshot().entries.len(),
+            watchlist_snapshot.entries.len(),
+            &live_wallets,
             applied_capacity.load().target,
             calls,
             live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
@@ -497,7 +507,18 @@ mod tests {
     fn disabled_mode_omits_source_health_entirely() {
         let dir = tempfile::tempdir().unwrap();
         let paper_state = PaperStateDb::open(&dir.path().join("p.db")).unwrap();
-        let snap = build_snapshot(&paper_state, "paper", false, 1, 1_000_000, 0, 0, 0, None);
+        let snap = build_snapshot(
+            &paper_state,
+            "paper",
+            false,
+            1,
+            1_000_000,
+            0,
+            &[],
+            0,
+            0,
+            None,
+        );
         assert!(snap.source_health.is_none());
         let json = serde_json::to_value(&snap).unwrap();
         assert!(

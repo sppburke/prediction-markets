@@ -11,7 +11,7 @@ use pe_core_types::{
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, PaperStateDb, WalletHistoryStatusRecord,
 };
-use pe_position_ledger::PositionLedger;
+use pe_position_ledger::{LedgerEffect, PositionLedger};
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::paper_recovery::{
     WalletLedgerReplayError, build_leader_ledger, replay_wallet_ledger,
@@ -55,6 +55,45 @@ fn aggregate(
         "side": side,
         "outcomeIndex": outcome,
         "outcome": if outcome == 0 { "Yes" } else { "No" },
+        "isCombo": false,
+    }]);
+    parse_activity_response(
+        &serde_json::to_vec(&rows).unwrap(),
+        wallet(),
+        &ActivityParseContext {
+            source_id: SourceId("scenario".to_owned()),
+            observed_at: SourceTimestamp(observed),
+            received_at: ReceivedAt(observed),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap()
+    .remove(0)
+}
+
+fn non_trade_aggregate(
+    activity_type: &str,
+    transaction_hash: &str,
+    market_id: &str,
+    size: &str,
+    epoch: i64,
+) -> ActivityAggregate {
+    let observed = OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+    let rows = json!([{
+        "proxyWallet": WALLET,
+        "timestamp": epoch,
+        "conditionId": market_id,
+        "type": activity_type,
+        "size": size,
+        "usdcSize": "0",
+        "transactionHash": transaction_hash,
+        "price": "0",
+        "asset": "",
+        "side": "",
+        "outcomeIndex": 999,
+        "outcome": "",
         "isCombo": false,
     }]);
     parse_activity_response(
@@ -201,6 +240,133 @@ fn two_anchors_and_ordered_effect_documents_replay_to_the_restart_mirror() {
     );
 }
 
+#[test]
+fn successful_post_fence_bucket_replays_the_applied_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    paper.set_cursor(&wallet(), 0).unwrap();
+    let mut engine = BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+    install(&mut engine, &paper, 100, Vec::new());
+    engine
+        .commit(
+            vec![non_trade_aggregate(
+                "CONVERSION",
+                "0xfence-success",
+                "market-a",
+                "1",
+                110,
+            )],
+            &context(110),
+            zero_basis(),
+        )
+        .unwrap();
+    let buy = aggregate("0xpost-fence-buy", "market-a", 0, "BUY", "2", 120);
+    let buy_id = buy.group_id.key().clone();
+    let result = engine
+        .commit(vec![buy], &context(120), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&buy_id.0], "wallet_fenced_applied");
+
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    let mirrored = build_leader_ledger(&paper).unwrap();
+    assert_eq!(
+        ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+        ledger_capture(&mirrored, &paper, wallet()).unwrap().hash
+    );
+}
+
+#[test]
+fn failed_post_fence_bucket_replays_without_the_rejected_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    paper.set_cursor(&wallet(), 0).unwrap();
+    let mut engine = BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+    install(&mut engine, &paper, 100, Vec::new());
+    engine
+        .commit(
+            vec![non_trade_aggregate(
+                "CONVERSION",
+                "0xfence-failed",
+                "market-a",
+                "1",
+                110,
+            )],
+            &context(110),
+            zero_basis(),
+        )
+        .unwrap();
+    let merge = non_trade_aggregate("MERGE", "0xpost-fence-merge", "market-a", "1", 120);
+    let merge_id = merge.group_id.key().clone();
+    let result = engine
+        .commit(vec![merge], &context(120), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&merge_id.0], "wallet_fenced");
+
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    let mirrored = build_leader_ledger(&paper).unwrap();
+    assert_eq!(
+        ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+        ledger_capture(&mirrored, &paper, wallet()).unwrap().hash
+    );
+}
+
+#[test]
+fn equal_cutoff_is_covered_and_legacy_prefix_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    paper.set_cursor(&wallet(), 0).unwrap();
+    let legacy = aggregate("0xlegacy", "market-legacy", 0, "BUY", "1", 90);
+    paper
+        .commit_activity_bucket(&ActivityBucketCommit {
+            wallet: wallet(),
+            source_epoch: 90,
+            dispositions: vec![ActivityDispositionRecord {
+                source_trade_id: legacy.group_id.key().clone(),
+                transaction_hash: legacy.group_id.components().transaction_hash.clone(),
+                wallet: wallet(),
+                source_epoch: 90,
+                semantic_revision: legacy.semantic_revision.as_str().to_owned(),
+                activity_type: "TRADE".to_owned(),
+                disposition: "legacy_v0".to_owned(),
+                proof_json: "{}".to_owned(),
+                no_copy: None,
+            }],
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: None,
+            pending: Vec::new(),
+            fence: None,
+            reanchor: None,
+            advance_cursor: true,
+        })
+        .unwrap();
+    let mut engine = BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+    install(
+        &mut engine,
+        &paper,
+        100,
+        vec![(
+            market("market-a"),
+            OutcomeId(0),
+            ShareAmount::from_atomic(5_000_000),
+        )],
+    );
+    let equal = aggregate("0xequal", "market-a", 0, "BUY", "3", 100);
+    let equal_id = equal.group_id.key().clone();
+    let result = engine
+        .commit(vec![equal], &context(100), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&equal_id.0], "anchor_covered_late");
+
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    let mirrored = build_leader_ledger(&paper).unwrap();
+    assert_eq!(
+        ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+        ledger_capture(&mirrored, &paper, wallet()).unwrap().hash
+    );
+}
+
 fn replay_with_document(document: &str) -> WalletLedgerReplayError {
     let dir = tempfile::tempdir().unwrap();
     let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
@@ -229,6 +395,7 @@ fn replay_with_document(document: &str) -> WalletLedgerReplayError {
             history_status: None,
             pending: Vec::new(),
             fence: None,
+            reanchor: None,
             advance_cursor: true,
         })
         .unwrap();
@@ -250,5 +417,49 @@ fn missing_and_unknown_effect_documents_are_typed_replay_failures() {
             source: pe_position_ledger::LedgerEffectDocumentError::UnknownVersion { version: 2 },
             ..
         }
+    ));
+}
+
+#[test]
+fn unknown_disposition_version_is_a_typed_replay_failure() {
+    let replay = {
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        paper.set_cursor(&wallet(), 0).unwrap();
+        let mut engine =
+            BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
+        install(&mut engine, &paper, 100, Vec::new());
+        let group = aggregate("0xunknown-disposition", "market-a", 0, "BUY", "1", 110);
+        paper
+            .commit_activity_bucket(&ActivityBucketCommit {
+                wallet: wallet(),
+                source_epoch: 110,
+                dispositions: vec![ActivityDispositionRecord {
+                    source_trade_id: group.group_id.key().clone(),
+                    transaction_hash: group.group_id.components().transaction_hash.clone(),
+                    wallet: wallet(),
+                    source_epoch: 110,
+                    semantic_revision: group.semantic_revision.as_str().to_owned(),
+                    activity_type: "TRADE".to_owned(),
+                    disposition: "wallet_fenced_v2".to_owned(),
+                    proof_json: LedgerEffect::RawOnly.to_document().unwrap(),
+                    no_copy: None,
+                }],
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: Vec::new(),
+                fence: None,
+                reanchor: None,
+                advance_cursor: true,
+            })
+            .unwrap();
+        replay_wallet_ledger(&paper, wallet())
+    };
+    assert!(matches!(
+        replay,
+        Err(WalletLedgerReplayError::UnknownDisposition { disposition, .. })
+            if disposition == "wallet_fenced_v2"
     ));
 }

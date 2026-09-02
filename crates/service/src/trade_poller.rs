@@ -253,7 +253,7 @@ pub struct TradePoller {
     signal_config: SignalConfig,
     runtime_config: LiveRuntimeConfig,
     obligations: ReconciliationObligations,
-    admission_preparer: Option<Arc<AdmissionPreparer>>,
+    admission_preparer: Option<AdmissionPreparer>,
     refresh_cursor: usize,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
@@ -284,7 +284,7 @@ impl TradePoller {
         signal_config: SignalConfig,
         runtime_config: LiveRuntimeConfig,
         obligations: ReconciliationObligations,
-        admission_preparer: Option<Arc<AdmissionPreparer>>,
+        admission_preparer: Option<AdmissionPreparer>,
     ) -> Self {
         Self {
             config,
