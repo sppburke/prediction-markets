@@ -292,11 +292,11 @@ async fn changed_activity_revision_fences_and_installs_nothing() {
             vec![b"[]".to_vec()],
         ),
     ]);
-    let error = validator(responses)
+    let accepted = validator(responses)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect_err("a changed applied revision must fence");
-    assert!(matches!(error, CausalPositionError::Fenced { .. }));
+        .expect("a deterministic durable fence is quarantined, not boot-fatal");
+    assert!(accepted.is_empty());
     assert!(paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 }
@@ -682,4 +682,33 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
     assert!(paper.position_validation_current(&wallet).unwrap());
     drop(preparer);
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
+    // Live shape from the #544 activation rehearsal: one wallet's visible
+    // activity cannot reconstruct its holdings (position_underflow), the
+    // commit fences it durably, and the boot bracket must continue with the
+    // remaining universe instead of aborting the one-shot activation.
+    let fenced_wallet = wallet(0x71);
+    let healthy = wallet(0x72);
+    let (_dir, paper, mut engine) = fresh(&[fenced_wallet, healthy]);
+    let mut responses = stable_responses(&[(healthy, 2, "1.000000")]);
+    let mut underflow_redeem = activity(fenced_wallet, 1, "2.000000", "0xunderflow", 10);
+    underflow_redeem["type"] = json!("REDEEM");
+    responses.insert(
+        activity_url(fenced_wallet),
+        vec![serde_json::to_vec(&vec![underflow_redeem]).unwrap()],
+    );
+
+    let accepted = validator(responses)
+        .validate_direct(&[fenced_wallet, healthy], &mut engine, &paper)
+        .await
+        .expect("a per-wallet fence must not abort the boot bracket");
+
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].validation.wallet, healthy);
+    assert!(paper.is_wallet_fenced(&fenced_wallet).unwrap());
+    assert!(paper.position_validation(&fenced_wallet).unwrap().is_none());
+    assert!(paper.position_validation(&healthy).unwrap().is_some());
 }

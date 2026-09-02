@@ -179,7 +179,26 @@ impl CausalPositionValidator {
     ) -> Result<Vec<AdmissionAcceptance>, CausalPositionError> {
         let mut accepted = Vec::with_capacity(wallets.len());
         for wallet in wallets {
-            accepted.push(self.validate_one_direct(*wallet, engine).await?);
+            match self.validate_one_direct(*wallet, engine).await {
+                Ok(acceptance) => accepted.push(acceptance),
+                // A newly durable fence is deterministic per-wallet quarantine:
+                // the commit already recorded it, and the pre-bracket durable
+                // fence filter would exclude the wallet on the next boot from
+                // the same historical activity — so aborting here can never
+                // converge (observed live in the #544 activation rehearsal).
+                // Skipping is exactly restart-then-filter without the restart;
+                // the wallet stays history-incomplete and is filtered after
+                // the bracket. Every retryable outcome (revision, mismatch,
+                // intervening activity) and every infrastructure error still
+                // rejects the attempted generation as reviewed.
+                Err(CausalPositionError::Fenced { wallet }) => {
+                    tracing::warn!(
+                        wallet = %wallet,
+                        "boot bracket: wallet durably fenced; excluded from the boot universe"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         let records = accepted
             .iter()
