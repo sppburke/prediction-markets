@@ -181,20 +181,34 @@ impl CausalPositionValidator {
         for wallet in wallets {
             match self.validate_one_direct(*wallet, engine).await {
                 Ok(acceptance) => accepted.push(acceptance),
-                // A newly durable fence is deterministic per-wallet quarantine:
-                // the commit already recorded it, and the pre-bracket durable
-                // fence filter would exclude the wallet on the next boot from
-                // the same historical activity — so aborting here can never
-                // converge (observed live in the #544 activation rehearsal).
-                // Skipping is exactly restart-then-filter without the restart;
-                // the wallet stays history-incomplete and is filtered after
-                // the bracket. Every retryable outcome (revision, mismatch,
-                // intervening activity) and every infrastructure error still
-                // rejects the attempted generation as reviewed.
+                // The boot bracket is one-shot: it has no retry loop of its
+                // own, so a per-wallet outcome must never abort activation.
+                // A newly durable fence is deterministic quarantine (the
+                // commit already recorded it; the next boot's pre-bracket
+                // filter would exclude the wallet anyway). A retryable
+                // outcome — stable ledger/positions mismatch, positions
+                // revised between reads, activity intervening mid-bracket —
+                // leaves the wallet unvalidated: it stays history-incomplete,
+                // is filtered after the bracket, and re-enters only through
+                // the serialized runtime admission preparer, which owns the
+                // retries (both observed live in the #544 activation
+                // rehearsals as activation deadlocks). Infrastructure errors
+                // and a post-loop ledger revision still fail the boot.
                 Err(CausalPositionError::Fenced { wallet }) => {
                     tracing::warn!(
                         wallet = %wallet,
                         "boot bracket: wallet durably fenced; excluded from the boot universe"
+                    );
+                }
+                Err(
+                    error @ (CausalPositionError::StableMismatch { wallet }
+                    | CausalPositionError::PositionRevision { wallet }
+                    | CausalPositionError::InterveningActivity { wallet }),
+                ) => {
+                    tracing::warn!(
+                        wallet = %wallet,
+                        outcome = %error,
+                        "boot bracket: wallet left unvalidated for runtime admission"
                     );
                 }
                 Err(error) => return Err(error),
