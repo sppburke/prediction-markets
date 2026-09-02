@@ -81,7 +81,7 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
-> **Data-API reconciliation contract re-verified live (2026-09-01, issue #544).**
+> **Data-API reconciliation contract re-verified live (2026-09-02, issues #544/#555).**
 > `/activity` accepts one comma-separated `type` parameter: the production request
 > `TRADE,SPLIT,MERGE,REDEEM,CONVERSION` returned mixed position-changing activity in one response.
 > Its documented maximum offset is 5,000. `/positions` accepts `limit=500`, maximum offset
@@ -99,10 +99,16 @@
 > and empty `asset` — 191 of 299,175 rows across 17 of 79 live watchlist wallets, every one
 > winner-priced (`usdcSize == size`). Combo ("A AND B") redemptions use the same sentinel with a
 > zero-padded composite condition id. Batch redemption transactions carry sibling REDEEM legs for
-> other markets, so the sentinel row is the complete record for its condition. Combo rows stay
-> raw-only; ordinary sentinel redemptions parse with no outcome and the position ledger burns the
-> single funded outcome exactly or fails closed
-> (`LedgerEffect::RedeemUnattributed`, `crates/position-ledger`).
+> other markets, so the sentinel row is the complete record for its condition. Zero-size REDEEM legs
+> and `outcomeIndex: 999` sentinel rows do not identify the burn scope: the venue's redemption call
+> accepts arbitrary index sets, and the public feed carries no calldata. Combo rows stay raw-only;
+> ordinary rows with unknowable burn scope require a positions re-anchor rather than any inferred
+> ledger effect. **On multi-outcome markets, one asset id can appear with two different
+> `outcomeIndex` values:** for wallet `0x180e62e6…` and condition `0xd21e5817…`, four rows carry
+> index 1 and three carry index 0. Activity `outcomeIndex` is therefore not a reliable identity on
+> those markets, and the bracket defers such wallets. The `/positions` endpoint, walked through both
+> `redeemable` partitions with `sizeThreshold=0&includeArchived=true`, reports the wallet's true
+> current balances and is the authority for absolute balances at an anchor (issue #555).
 
 > **Gamma `/markets?condition_ids=` + CLOB `/markets?closed=true` — UA blocklist & repeat-key batching (2026-06-20, issue #382 Phase-0 live probe `scripts/probe_gamma_ua.py`).** The `&closed=true` 403 is triggered by the literal `Python-urllib/*` default User-Agent (an anti-bot blocklist), **not** by a missing browser UA: both endpoints return **200** for a headerless request (a bare `reqwest::Client` = the shipped Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and **403 only** for `Python-urllib/3.11`. The shipped UA-less clients therefore do not 403, but this transport health did not prevent the 2026-06-24 through 2026-08-21 persisted-terminator cursor wedge from stopping repeat resolution ingestion. Repeat-key batching (`?condition_ids=A&condition_ids=B…&limit=500`) works for **both** the plain (open) and `&closed=true` Gamma variants — 50/50 and 100/100 returned, demux-by-`conditionId` clean, no cross-market leak; comma-separated joining returns 0 (repeat-key mandatory); observed batch cap ≥ 100 (kept at `gamma_batch_size`=50). This supersedes the stale `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" claim for the repeat-key form.
 
@@ -138,7 +144,7 @@
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-01 | 2026-10-31 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-02 | 2026-11-01 |
 | https://clob.polymarket.com/markets?closed=true | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
@@ -147,7 +153,7 @@
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-01 | 2026-10-31 |
+| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |

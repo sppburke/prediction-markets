@@ -506,8 +506,6 @@ pub enum PositionReadError {
     },
     #[error("position asset {asset} has no complete activity mapping")]
     MissingActivityMapping { asset: String },
-    #[error("activity asset {asset} has an invalid condition/outcome mapping")]
-    InvalidActivityMapping { asset: String },
     #[error("activity asset {asset} has conflicting mappings")]
     ConflictingActivityMapping { asset: String },
     #[error("activity condition {condition_id} outcome {outcome} maps to multiple assets")]
