@@ -425,8 +425,12 @@ struct ResolutionV2Resp {
 }
 
 /// Parse a decimal-string money field: fail closed on malformed or negative (#511).
+/// Postgres renders `numeric` arithmetic at its full accumulated scale, so a stored
+/// bankroll such as `3729.7323088775297327030000000060` carries more significant
+/// digits than `Decimal` holds; like the boot pull path, precision beyond the 28th
+/// significant digit is rounded (1e-24 USD), while malformed text still fails.
 fn money(raw: &str, what: &'static str) -> Result<Decimal, SupabaseStateError> {
-    let d = Decimal::from_str_exact(raw)
+    let d = Decimal::from_str(raw)
         .map_err(|e| SupabaseStateError::Corrupt(format!("{what}: {raw:?}: {e}")))?;
     if d < Decimal::ZERO {
         return Err(SupabaseStateError::Corrupt(format!(
@@ -1093,6 +1097,16 @@ mod tests {
 
     fn client(base: &str) -> SupabaseStateClient {
         SupabaseStateClient::new(reqwest::Client::new(), base, "anon", "")
+    }
+
+    #[test]
+    fn money_rounds_postgres_scale_noise_and_still_fails_closed() {
+        // Live `paper_bankroll.bankroll_str` on 2026-09-02 (32 significant digits).
+        let live = "3729.7323088775297327030000000060";
+        let parsed = super::money(live, "bankroll").expect("over-precise numeric text parses");
+        assert_eq!(parsed.to_string(), "3729.7323088775297327030000000");
+        assert!(super::money("3729.73x", "bankroll").is_err());
+        assert!(super::money("-1", "bankroll").is_err());
     }
 
     #[tokio::test]

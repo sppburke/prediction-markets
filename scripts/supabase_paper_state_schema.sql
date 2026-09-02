@@ -117,12 +117,12 @@ begin
     v_notional := p_fill_price::numeric * p_contracts;
     if p_side = 'buy' then
       update paper_bankroll
-         set bankroll_str = greatest(bankroll_str::numeric - v_notional, 0)::text,
+         set bankroll_str = round(greatest(bankroll_str::numeric - v_notional, 0), 18)::text,
              updated_at   = now()
        where id = 0;
     else
       update paper_bankroll
-         set bankroll_str = (bankroll_str::numeric + v_notional)::text,
+         set bankroll_str = round(bankroll_str::numeric + v_notional, 18)::text,
              updated_at   = now()
        where id = 0;
     end if;
@@ -160,7 +160,7 @@ begin
 
   if v_inserted > 0 then
     update paper_bankroll
-       set bankroll_str = (bankroll_str::numeric + p_credit::numeric)::text,
+       set bankroll_str = round(bankroll_str::numeric + p_credit::numeric, 18)::text,
            updated_at   = now()
      where id = 0;
   end if;
