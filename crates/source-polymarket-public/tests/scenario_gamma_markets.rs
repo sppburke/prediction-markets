@@ -248,10 +248,13 @@ async fn token_lookup_rejects_more_than_one_request_batch() {
         .await;
     assert!(matches!(
         result,
-        Err(GammaMarketsError::TooManyTokenIds {
-            tokens: 3,
-            limit: 2
-        })
+        Err(error) if matches!(
+            error.source,
+            GammaMarketsError::TooManyTokenIds {
+                tokens: 3,
+                limit: 2
+            }
+        ) && error.page.is_none()
     ));
 }
 
@@ -262,6 +265,34 @@ async fn token_lookup_rejects_comma_joined_input() {
         .await;
     assert!(matches!(
         result,
-        Err(GammaMarketsError::InvalidTokenId { token }) if token == "A,B"
+        Err(error) if matches!(
+            &error.source,
+            GammaMarketsError::InvalidTokenId { token } if token == "A,B"
+        ) && error.page.is_none()
     ));
+}
+
+#[tokio::test]
+async fn malformed_token_lookup_returns_parse_error_with_raw_page_evidence() {
+    for raw in [b"not-json".to_vec(), br#"{"not":"an array"}"#.to_vec()] {
+        let mut responses = HashMap::new();
+        responses.insert(token_batch_url(&["A"], false), raw.clone());
+
+        let error = client(responses, 50)
+            .fetch_markets_by_token_ids(&ids(&["A"]), MarketFilter::OpenOnly)
+            .await
+            .err()
+            .expect("malformed response must fail");
+
+        assert!(matches!(error.source, GammaMarketsError::Parse(_)));
+        let (evidence, recorded) = error.page.expect("successful transport retains its page");
+        assert_eq!(recorded, raw);
+        assert_eq!(
+            evidence.raw_page_hash,
+            blake3::hash(&recorded).to_hex().to_string()
+        );
+        assert_eq!(evidence.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+        assert_eq!(evidence.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+        assert_eq!(evidence.parser_version, GAMMA_MARKETS_PARSER_VERSION);
+    }
 }

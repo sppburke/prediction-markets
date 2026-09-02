@@ -194,7 +194,7 @@ impl AssetIdentityResolver {
         sequences: &mut HashMap<String, u64>,
     ) -> Result<(), SourceError> {
         for chunk in tokens.chunks(self.gamma_batch_size) {
-            let fetched = self
+            let fetched = match self
                 .client
                 .fetch_markets_by_token_ids(
                     &chunk
@@ -204,7 +204,15 @@ impl AssetIdentityResolver {
                     filter,
                 )
                 .await
-                .map_err(map_gamma_error)?;
+            {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    if let Some(page) = &error.page {
+                        self.record_page(page).await?;
+                    }
+                    return Err(map_gamma_error(error.source));
+                }
+            };
             if let Some(page) = fetched.page {
                 let sequence = self.record_page(&page).await?;
                 sequences
@@ -577,6 +585,34 @@ mod tests {
             let resolved = resolver.resolve([token.clone()]).await.unwrap();
             assert!(!resolved.verified.contains_key(&token));
             assert!(resolved.unverified.contains_key(&token));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_successful_pages_are_recorded_before_parse_error_and_not_cached() {
+        for raw in [b"not-json".as_slice(), br#"{"not":"an array"}"#] {
+            let fetcher = Arc::new(GammaFixture::new(raw, b"[]"));
+            let (_dir, path, sink, resolver) = boot_resolver(fetcher);
+            let token = PolymarketTokenId("token-a".to_owned());
+
+            assert!(matches!(
+                resolver.resolve([token]).await,
+                Err(SourceError::Fatal { message })
+                    if message.starts_with("gamma metadata parse failed:")
+            ));
+            assert!(resolver.cache.read().await.is_empty());
+
+            drop(resolver);
+            drop(sink);
+            let entries = Reader::replay(&path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].1.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+            assert_eq!(entries[0].1.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+            assert_eq!(entries[0].1.parser_version, GAMMA_MARKETS_PARSER_VERSION);
+            assert_eq!(entries[0].1.payload, raw);
         }
     }
 

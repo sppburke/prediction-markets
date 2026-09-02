@@ -132,6 +132,14 @@ pub struct GammaMarketsWithPages {
     pub page: Option<(MetadataPageEvidence, Vec<u8>)>,
 }
 
+/// A token-targeted Gamma failure and any transport-successful page received before it failed.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct GammaTokenMarketsError {
+    pub source: GammaMarketsError,
+    pub page: Option<(MetadataPageEvidence, Vec<u8>)>,
+}
+
 /// One token identity proven by a recorded Gamma market page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTokenIdentity {
@@ -301,15 +309,18 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
     /// # Errors
     /// Returns [`GammaMarketsError::InvalidTokenId`] when one input contains a comma, because comma
     /// joining is not a valid Gamma token lookup. Fetch and parse failures have the same meanings as
-    /// [`Self::fetch_markets`].
+    /// [`Self::fetch_markets`]; a transport-successful page accompanies a parse failure.
     pub async fn fetch_markets_by_token_ids(
         &self,
         token_ids: &[String],
         filter: MarketFilter,
-    ) -> Result<GammaMarketsWithPages, GammaMarketsError> {
+    ) -> Result<GammaMarketsWithPages, GammaTokenMarketsError> {
         if let Some(token) = token_ids.iter().find(|token| token.contains(',')) {
-            return Err(GammaMarketsError::InvalidTokenId {
-                token: token.clone(),
+            return Err(GammaTokenMarketsError {
+                source: GammaMarketsError::InvalidTokenId {
+                    token: token.clone(),
+                },
+                page: None,
             });
         }
 
@@ -320,9 +331,12 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             .filter(|token| seen.insert(token))
             .collect::<Vec<_>>();
         if unique.len() > self.batch_size {
-            return Err(GammaMarketsError::TooManyTokenIds {
-                tokens: unique.len(),
-                limit: self.batch_size,
+            return Err(GammaTokenMarketsError {
+                source: GammaMarketsError::TooManyTokenIds {
+                    tokens: unique.len(),
+                    limit: self.batch_size,
+                },
+                page: None,
             });
         }
         if unique.is_empty() {
@@ -354,11 +368,23 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                     page: None,
                 });
             }
-            Err(error) => return Err(GammaMarketsError::Fetch(error.to_string())),
+            Err(error) => {
+                return Err(GammaTokenMarketsError {
+                    source: GammaMarketsError::Fetch(error.to_string()),
+                    page: None,
+                });
+            }
         };
-        let decoded: Vec<GammaMarketRaw> = serde_json::from_slice(&raw)
-            .map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
-        let evidence = metadata_page_evidence(&url, &raw, received_at)?;
+        let evidence = metadata_page_evidence(&url, &raw, received_at);
+        let decoded: Vec<GammaMarketRaw> = match serde_json::from_slice(&raw) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return Err(GammaTokenMarketsError {
+                    source: GammaMarketsError::Parse(error.to_string()),
+                    page: Some((evidence, raw)),
+                });
+            }
+        };
         let markets = decoded
             .into_iter()
             .map(gamma_market)
@@ -418,12 +444,11 @@ fn metadata_page_evidence(
     request_url: &str,
     raw: &[u8],
     received_at: ReceivedAt,
-) -> Result<MetadataPageEvidence, GammaMarketsError> {
-    let value: serde_json::Value =
-        serde_json::from_slice(raw).map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
-    let canonical =
-        serde_json::to_vec(&value).map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
-    Ok(MetadataPageEvidence {
+) -> MetadataPageEvidence {
+    let canonical = serde_json::from_slice::<serde_json::Value>(raw)
+        .and_then(|value| serde_json::to_vec(&value))
+        .unwrap_or_else(|_| raw.to_vec());
+    MetadataPageEvidence {
         request_url: request_url.to_owned(),
         raw_page_hash: blake3::hash(raw).to_hex().to_string(),
         canonical_page_hash: blake3::hash(&canonical).to_hex().to_string(),
@@ -431,7 +456,7 @@ fn metadata_page_evidence(
         source_id: SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
         schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
         parser_version: GAMMA_MARKETS_PARSER_VERSION,
-    })
+    }
 }
 
 /// Verify the venue-defined condition/outcome identity for every requested token that appeared in
@@ -739,8 +764,7 @@ mod tests {
             "https://g/markets?clob_token_ids=T&limit=500",
             &raw,
             received_at,
-        )
-        .unwrap();
+        );
         vec![(evidence, raw)]
     }
 
@@ -839,8 +863,7 @@ mod tests {
                 "https://g/markets?clob_token_ids=B&limit=500",
                 &raw,
                 received_at,
-            )
-            .unwrap(),
+            ),
             raw,
         ));
 

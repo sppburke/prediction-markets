@@ -55,8 +55,8 @@ pub use fetcher::{FixtureFetcher, HttpRequestContext, PageFetcher, ReqwestFetche
 pub use gamma_markets::{
     GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, GammaMarket, GammaMarkets, GammaMarketsClient, GammaMarketsError,
-    GammaMarketsWithPages, MarketFilter, MetadataIdentityError, MetadataPageEvidence,
-    VerifiedTokenIdentity, parse_outcome_prices,
+    GammaMarketsWithPages, GammaTokenMarketsError, MarketFilter, MetadataIdentityError,
+    MetadataPageEvidence, VerifiedTokenIdentity, parse_outcome_prices,
 };
 pub use live_admission::{
     LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveFeeEvidence, LiveMarketError,

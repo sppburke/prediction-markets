@@ -16,7 +16,7 @@ use pe_position_ledger::PositionLedger;
 use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::orchestrator_control::OrchestratorControl;
-use pe_service::paper_recovery::build_leader_ledger;
+use pe_service::paper_recovery::{build_leader_ledger, replay_wallet_ledger};
 use pe_service::position_seeder::{
     AnchorExpectation, AnchorInstall, AnchorProof, CausalPositionError, CausalPositionValidator,
     is_deferred_causal_position_error, ledger_capture,
@@ -1165,85 +1165,143 @@ async fn concurrent_brackets_record_both_orders_install_once_and_attribute_disti
 }
 
 #[tokio::test]
-async fn concurrent_shared_asset_bracket_reuses_recorded_cache_provenance() {
+async fn concurrent_shared_corrected_asset_replays_identically_in_both_completion_orders() {
     let first = wallet(0x79);
     let second = wallet(0x7a);
-    let preferred_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
-    let other_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
-    let preferred_completion = Arc::new(tokio::sync::Semaphore::new(0));
-    let fetcher = Arc::new(OrderedBracketFetcher {
-        inner: QueueFetcher::new(stable_responses(&[
-            (first, 1, "1.000000"),
-            (second, 1, "2.000000"),
-        ])),
-        wallets: [first, second],
-        preferred: first,
-        activity_calls: Mutex::new(HashMap::new()),
-        first_activity: tokio::sync::Barrier::new(2),
-        preferred_first_commit: Arc::clone(&preferred_first_commit),
-        other_first_commit: Arc::clone(&other_first_commit),
-        preferred_completion: Arc::clone(&preferred_completion),
-    });
-    let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
-    let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
-    let step_hook = Arc::new(
-        move |wallet: WalletAddress, step: usize, _engine: &mut BucketCommitEngine| {
-            if step == 1 {
-                if wallet == first {
-                    preferred_first_commit.add_permits(1);
-                } else {
-                    other_first_commit.add_permits(1);
+    let gamma = serde_json::to_vec(&vec![json!({
+        "conditionId": condition(9),
+        "clobTokenIds": ["other-outcome", asset(1)]
+    })])
+    .unwrap();
+    let mut completion_orders = Vec::new();
+    let mut replayed_balances = Vec::new();
+    for preferred in [first, second] {
+        let preferred_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
+        let other_first_commit = Arc::new(tokio::sync::Semaphore::new(0));
+        let preferred_completion = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetcher = Arc::new(OrderedBracketFetcher {
+            inner: QueueFetcher::with_gamma(
+                stable_responses(&[(first, 1, "1.000000"), (second, 1, "2.000000")]),
+                Some(gamma.clone()),
+            ),
+            wallets: [first, second],
+            preferred,
+            activity_calls: Mutex::new(HashMap::new()),
+            first_activity: tokio::sync::Barrier::new(2),
+            preferred_first_commit: Arc::clone(&preferred_first_commit),
+            other_first_commit: Arc::clone(&other_first_commit),
+            preferred_completion: Arc::clone(&preferred_completion),
+        });
+        let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
+        let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let observed_completion_order = Arc::clone(&completion_order);
+        let step_hook = Arc::new(
+            move |wallet: WalletAddress, step: usize, _engine: &mut BucketCommitEngine| {
+                if step == 1 {
+                    if wallet == preferred {
+                        preferred_first_commit.add_permits(1);
+                    } else {
+                        other_first_commit.add_permits(1);
+                    }
                 }
-            }
-            if wallet == first && step == 5 {
-                preferred_completion.add_permits(1);
-            }
-        },
-    );
-    let validator = validator.with_step_hook(step_hook);
-    let (_paper_dir, paper, mut engine) = fresh(&[first, second]);
+                if step == 5 {
+                    observed_completion_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(wallet);
+                    if wallet == preferred {
+                        preferred_completion.add_permits(1);
+                    }
+                }
+            },
+        );
+        let validator = validator.with_step_hook(step_hook);
+        let (_paper_dir, paper, mut engine) = fresh(&[first, second]);
 
-    let accepted = validator
-        .validate_direct(&[first, second], &mut engine, &paper)
-        .await
-        .unwrap();
-
-    let metadata = accepted
-        .iter()
-        .map(|install| {
-            serde_json::from_str::<Value>(&install.proof.document).unwrap()["metadata_reads"]
-                .clone()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(metadata[0], metadata[1]);
-    assert_eq!(
-        fetcher
-            .inner
-            .urls()
-            .iter()
-            .filter(|url| url.contains("/markets?clob_token_ids="))
-            .count(),
-        1
-    );
-
-    drop(validator);
-    let provenance = &metadata[0][0];
-    let sequence = provenance["source_log_sequence"].as_u64().unwrap();
-    let canonical_hash = provenance["canonical_page_hash"].as_str().unwrap();
-    let metadata_entry = Reader::replay(&source_path)
-        .unwrap()
-        .map(|entry| entry.unwrap())
-        .find(|(event_sequence, envelope)| {
-            event_sequence.0 == sequence && envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID
-        })
-        .expect("both proofs reference the one appended Gamma page");
-    let canonical_payload =
-        serde_json::to_vec(&serde_json::from_slice::<Value>(&metadata_entry.1.payload).unwrap())
+        let accepted = validator
+            .validate_direct(&[first, second], &mut engine, &paper)
+            .await
             .unwrap();
+        assert_eq!(accepted.len(), 2);
+        completion_orders.push(
+            completion_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+
+        let metadata = accepted
+            .iter()
+            .map(|install| {
+                serde_json::from_str::<Value>(&install.proof.document).unwrap()["metadata_reads"]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metadata[0], metadata[1]);
+        assert_eq!(metadata[0][0]["asset"], asset(1));
+        assert_eq!(
+            fetcher
+                .inner
+                .urls()
+                .iter()
+                .filter(|url| url.contains("/markets?clob_token_ids="))
+                .count(),
+            1
+        );
+
+        let verified_key =
+            MarketOutcomeId::new(MarketId(VenueMarketId(condition(9))), OutcomeId(1));
+        let stamped_key = MarketOutcomeId::new(MarketId(VenueMarketId(condition(1))), OutcomeId(0));
+        let mut balances = Vec::new();
+        for (wallet, amount) in [(first, 1_000_000), (second, 2_000_000)] {
+            let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+            assert_eq!(groups.len(), 1);
+            let document = serde_json::from_str::<Value>(&groups[0].proof_json).unwrap();
+            assert_eq!(document["version"], 2);
+            assert_eq!(document["correction"]["stamped"]["market"], condition(1));
+            assert_eq!(document["correction"]["stamped"]["outcome"], 0);
+            assert_eq!(document["correction"]["verified"]["market"], condition(9));
+            assert_eq!(document["correction"]["verified"]["outcome"], 1);
+            assert_eq!(document["effect"]["market"], condition(9));
+            assert_eq!(document["effect"]["outcome"], 1);
+
+            let replayed = replay_wallet_ledger(&paper, wallet).unwrap();
+            let snapshot = replayed.position(&wallet).unwrap();
+            assert!(!snapshot.positions.contains_key(&stamped_key));
+            let position = snapshot.positions.get(&verified_key).unwrap();
+            assert_eq!(position.long_contracts.atomic(), amount);
+            assert_eq!(position.short_contracts, ShareAmount::ZERO);
+            balances.push(position.long_contracts.atomic());
+        }
+        replayed_balances.push(balances);
+
+        drop(validator);
+        let provenance = &metadata[0][0];
+        let sequence = provenance["source_log_sequence"].as_u64().unwrap();
+        let canonical_hash = provenance["canonical_page_hash"].as_str().unwrap();
+        let metadata_entry = Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|(event_sequence, envelope)| {
+                event_sequence.0 == sequence && envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID
+            })
+            .expect("both proofs reference the one appended Gamma page");
+        let canonical_payload = serde_json::to_vec(
+            &serde_json::from_slice::<Value>(&metadata_entry.1.payload).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            blake3::hash(&canonical_payload).to_hex().as_str(),
+            canonical_hash
+        );
+    }
     assert_eq!(
-        blake3::hash(&canonical_payload).to_hex().as_str(),
-        canonical_hash
+        completion_orders,
+        vec![vec![first, second], vec![second, first]]
     );
+    assert_eq!(replayed_balances[0], replayed_balances[1]);
+    assert_eq!(replayed_balances[0], vec![1_000_000, 2_000_000]);
 }
 
 #[tokio::test]
@@ -1910,7 +1968,7 @@ async fn metadata_unresolved_activity_asset_defers_with_typed_reason() {
 }
 
 #[tokio::test]
-async fn conflicting_stamped_identities_without_metadata_defer_as_mapping_conflict() {
+async fn conflicting_stamped_identities_without_metadata_defer_as_metadata_unresolved() {
     let wallet = wallet(0x75);
     let (_dir, paper, engine) = fresh(&[wallet]);
     let first = activity(wallet, 1, "1.000000", "0xstamped-zero", 10);
@@ -1931,12 +1989,17 @@ async fn conflicting_stamped_identities_without_metadata_defer_as_mapping_confli
     );
 
     let error = preparer.prepare(&[wallet]).await.unwrap_err();
+    assert!(error.to_string().contains(&format!(
+        "activity asset {} is unresolved by venue metadata: token absent from open and closed Gamma metadata",
+        crate::asset(1)
+    )));
     assert!(matches!(
         error,
         AdmissionError::PositionValidation(CausalPositionError::Positions {
-            source: PositionReadError::ConflictingActivityMapping { asset },
+            source: PositionReadError::MetadataUnresolved { asset, reason },
             ..
         }) if asset == crate::asset(1)
+            && reason == "token absent from open and closed Gamma metadata"
     ));
     drop(preparer);
     actor.await.unwrap();

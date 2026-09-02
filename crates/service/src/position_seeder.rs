@@ -602,25 +602,18 @@ impl CausalPositionValidator {
                 .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         }
         for asset in &tokens {
-            if !mapping
-                .identity(asset)
-                .is_some_and(|identity| identity.verified)
-            {
-                let source = if mapping.classification(asset).is_none() {
-                    PositionReadError::MixedActivityClassification {
-                        asset: asset.0.clone(),
-                    }
-                } else if mapping.unresolved().contains_key(asset) {
-                    PositionReadError::ConflictingActivityMapping {
-                        asset: asset.0.clone(),
-                    }
-                } else {
-                    PositionReadError::MetadataUnresolved {
-                        asset: asset.0.clone(),
-                        reason: resolved.unverified.get(asset).cloned().unwrap_or_else(|| {
-                            "token absent from open and closed Gamma metadata".to_owned()
-                        }),
-                    }
+            if mapping.classification(asset).is_none() {
+                let source = PositionReadError::MixedActivityClassification {
+                    asset: asset.0.clone(),
+                };
+                return Err(CausalPositionError::Positions { wallet, source });
+            }
+            if !resolved.verified.contains_key(asset) {
+                let source = PositionReadError::MetadataUnresolved {
+                    asset: asset.0.clone(),
+                    reason: resolved.unverified.get(asset).cloned().unwrap_or_else(|| {
+                        "token absent from open and closed Gamma metadata".to_owned()
+                    }),
                 };
                 return Err(CausalPositionError::Positions { wallet, source });
             }
