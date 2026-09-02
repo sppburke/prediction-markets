@@ -25,10 +25,11 @@ float_arithmetic = "deny"
 pe-core-types        = { path = "../core-types",        version = "0.1.0" }
 pe-copy-signal-engine = { path = "../copy-signal-engine", version = "0.1.0" }
 pe-source-polymarket-public = { path = "../source-polymarket-public", version = "0.1.0" }
+serde     = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 rust_decimal        = { workspace = true }
 rust_decimal_macros = { workspace = true }
-serde_json          = { workspace = true }
 time                = { workspace = true }

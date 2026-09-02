@@ -3,6 +3,7 @@
 //! [`PositionLedger`] is a stateful in-memory accumulator; it has no I/O and produces
 //! deterministic output given the same ordered input stream.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use pe_copy_signal_engine::{IncomingTrade, PositionSnapshot, PositionState};
@@ -46,18 +47,186 @@ pub enum LedgerEffect {
         outcome_id: OutcomeId,
         amount: ShareAmount,
     },
-    /// A redemption whose outcome leg the venue did not stamp (live
-    /// `outcomeIndex` 999 sentinel with no label; 191 of 299,175 live rows
-    /// across 17 of 79 watchlist wallets, 2026-09-01, #544 fix 5). The burn
-    /// resolves against the reconstructed ledger: exactly one funded outcome
-    /// applies exactly; zero or two funded outcomes fail closed.
-    RedeemUnattributed {
-        market_id: MarketId,
-        amount: ShareAmount,
-    },
+    RequiresAnchor,
     Conversion,
     RawOnly,
     UnknownEffect,
+}
+
+/// Typed failures while decoding a persisted versioned [`LedgerEffect`] document.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LedgerEffectDocumentError {
+    #[error("unsupported ledger effect document version {version}")]
+    UnknownVersion { version: u64 },
+    #[error("malformed ledger effect document: {message}")]
+    Malformed { message: String },
+}
+
+const LEDGER_EFFECT_DOCUMENT_VERSION: u64 = 1;
+
+/// Versioned persisted form of a [`LedgerEffect`] (issue #555): the exact
+/// normalized mutation stored beside each activity-group disposition so a
+/// wallet ledger replays from anchors plus groups with zero network.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerEffectDocument {
+    version: u64,
+    effect: LedgerEffectDto,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum LedgerEffectDto {
+    Trade {
+        market: MarketId,
+        outcome: OutcomeId,
+        side: Side,
+        price: Price,
+        amount: ShareAmount,
+    },
+    Split {
+        market: MarketId,
+        amount: ShareAmount,
+    },
+    Merge {
+        market: MarketId,
+        amount: ShareAmount,
+    },
+    Redeem {
+        market: MarketId,
+        outcome: OutcomeId,
+        amount: ShareAmount,
+    },
+    RequiresAnchor,
+    Conversion,
+    RawOnly,
+    UnknownEffect,
+}
+
+impl From<&LedgerEffect> for LedgerEffectDto {
+    fn from(effect: &LedgerEffect) -> Self {
+        match effect {
+            LedgerEffect::Trade {
+                market_id,
+                outcome_id,
+                side,
+                amount,
+                price,
+            } => Self::Trade {
+                market: market_id.clone(),
+                outcome: *outcome_id,
+                side: *side,
+                price: *price,
+                amount: *amount,
+            },
+            LedgerEffect::Split { market_id, amount } => Self::Split {
+                market: market_id.clone(),
+                amount: *amount,
+            },
+            LedgerEffect::Merge { market_id, amount } => Self::Merge {
+                market: market_id.clone(),
+                amount: *amount,
+            },
+            LedgerEffect::Redeem {
+                market_id,
+                outcome_id,
+                amount,
+            } => Self::Redeem {
+                market: market_id.clone(),
+                outcome: *outcome_id,
+                amount: *amount,
+            },
+            LedgerEffect::RequiresAnchor => Self::RequiresAnchor,
+            LedgerEffect::Conversion => Self::Conversion,
+            LedgerEffect::RawOnly => Self::RawOnly,
+            LedgerEffect::UnknownEffect => Self::UnknownEffect,
+        }
+    }
+}
+
+impl From<LedgerEffectDto> for LedgerEffect {
+    fn from(dto: LedgerEffectDto) -> Self {
+        match dto {
+            LedgerEffectDto::Trade {
+                market,
+                outcome,
+                side,
+                price,
+                amount,
+            } => Self::Trade {
+                market_id: market,
+                outcome_id: outcome,
+                side,
+                amount,
+                price,
+            },
+            LedgerEffectDto::Split { market, amount } => Self::Split {
+                market_id: market,
+                amount,
+            },
+            LedgerEffectDto::Merge { market, amount } => Self::Merge {
+                market_id: market,
+                amount,
+            },
+            LedgerEffectDto::Redeem {
+                market,
+                outcome,
+                amount,
+            } => Self::Redeem {
+                market_id: market,
+                outcome_id: outcome,
+                amount,
+            },
+            LedgerEffectDto::RequiresAnchor => Self::RequiresAnchor,
+            LedgerEffectDto::Conversion => Self::Conversion,
+            LedgerEffectDto::RawOnly => Self::RawOnly,
+            LedgerEffectDto::UnknownEffect => Self::UnknownEffect,
+        }
+    }
+}
+
+impl LedgerEffect {
+    /// Canonical JSON document persisted with an activity-group disposition.
+    /// Field order is the declaration order above, so the encoding is
+    /// deterministic for equal effects.
+    pub fn to_document(&self) -> Result<String, LedgerEffectDocumentError> {
+        // Encoding through `Value` sorts object keys, so equal effects always
+        // produce byte-identical documents.
+        let value = serde_json::to_value(LedgerEffectDocument {
+            version: LEDGER_EFFECT_DOCUMENT_VERSION,
+            effect: self.into(),
+        })
+        .map_err(malformed)?;
+        serde_json::to_string(&value).map_err(malformed)
+    }
+
+    /// Decode a versioned effect document; unknown versions and any missing,
+    /// extra, or malformed field are typed failures.
+    pub fn from_document(document: &str) -> Result<Self, LedgerEffectDocumentError> {
+        let value: serde_json::Value = serde_json::from_str(document).map_err(malformed)?;
+        let decoded: LedgerEffectDocument =
+            serde_json::from_value(value.clone()).map_err(malformed)?;
+        if decoded.version != LEDGER_EFFECT_DOCUMENT_VERSION {
+            return Err(LedgerEffectDocumentError::UnknownVersion {
+                version: decoded.version,
+            });
+        }
+        let effect: Self = decoded.effect.into();
+        // Exact decoding: the input must be the canonical encoding of what it
+        // decoded to, which rejects extra fields on any variant.
+        if serde_json::to_string(&value).map_err(malformed)? != effect.to_document()? {
+            return Err(LedgerEffectDocumentError::Malformed {
+                message: "document is not the canonical encoding of its effect".to_owned(),
+            });
+        }
+        Ok(effect)
+    }
+}
+
+fn malformed(error: impl std::fmt::Display) -> LedgerEffectDocumentError {
+    LedgerEffectDocumentError::Malformed {
+        message: error.to_string(),
+    }
 }
 
 impl LedgerMutation {
@@ -91,12 +260,12 @@ impl LedgerMutation {
             | ActivityType::TakerRebate
             | ActivityType::ReferralReward => LedgerEffect::RawOnly,
             _ if aggregate.is_combo => LedgerEffect::RawOnly,
-            // Zero-share position-changing rows are venue artifacts with an
-            // arithmetically zero effect — the live API emits zero-burn REDEEM
-            // legs for empty outcome sides (108 observed on one live wallet,
-            // #544 activation fix 2). Retained as raw evidence; never a
-            // mutation, VWAP division, or fence. `Unknown` stays fenced above
-            // regardless of size (its effect cannot be trusted as zero).
+            ActivityType::Redeem if aggregate.share_sum == ShareAmount::ZERO => {
+                LedgerEffect::RequiresAnchor
+            }
+            // Other zero-share position-changing rows are arithmetically zero.
+            // `Unknown` stays fenced above regardless of size because its effect
+            // cannot be trusted as zero.
             _ if aggregate.share_sum == ShareAmount::ZERO => LedgerEffect::RawOnly,
             _ => match &components.activity_type {
                 ActivityType::Trade => LedgerEffect::Trade {
@@ -130,10 +299,7 @@ impl LedgerMutation {
                         outcome_id,
                         amount: aggregate.share_sum,
                     },
-                    None => LedgerEffect::RedeemUnattributed {
-                        market_id: market()?,
-                        amount: aggregate.share_sum,
-                    },
+                    None => LedgerEffect::RequiresAnchor,
                 },
                 ActivityType::Conversion
                 | ActivityType::Unknown(_)
@@ -168,15 +334,14 @@ impl LedgerMutation {
                 outcome_id,
                 ..
             } => vec![MarketOutcomeId::new(market_id.clone(), *outcome_id)],
-            LedgerEffect::Split { market_id, .. }
-            | LedgerEffect::Merge { market_id, .. }
-            | LedgerEffect::RedeemUnattributed { market_id, .. } => vec![
+            LedgerEffect::Split { market_id, .. } | LedgerEffect::Merge { market_id, .. } => vec![
                 MarketOutcomeId::new(market_id.clone(), OutcomeId(0)),
                 MarketOutcomeId::new(market_id.clone(), OutcomeId(1)),
             ],
-            LedgerEffect::Conversion | LedgerEffect::RawOnly | LedgerEffect::UnknownEffect => {
-                Vec::new()
-            }
+            LedgerEffect::RequiresAnchor
+            | LedgerEffect::Conversion
+            | LedgerEffect::RawOnly
+            | LedgerEffect::UnknownEffect => Vec::new(),
         }
     }
 }
@@ -192,7 +357,6 @@ pub enum WalletFenceCause {
     Conversion,
     UnknownEffect,
     OrderDependentEqualSecond,
-    AmbiguousRedeem,
 }
 
 impl WalletFenceCause {
@@ -207,7 +371,6 @@ impl WalletFenceCause {
             Self::Conversion => "conversion_unknown_conditions",
             Self::UnknownEffect => "unknown_activity_effect",
             Self::OrderDependentEqualSecond => "order_dependent_equal_second",
-            Self::AmbiguousRedeem => "unattributed_redeem_ambiguous",
         }
     }
 }
@@ -224,10 +387,6 @@ pub enum LedgerError {
     Conversion { source_trade_id: SourceTradeId },
     #[error("activity group {source_trade_id} has an unknown position effect")]
     UnknownEffect { source_trade_id: SourceTradeId },
-    #[error(
-        "activity group {source_trade_id} is an outcome-unattributed redemption funding more than one outcome"
-    )]
-    AmbiguousRedeem { source_trade_id: SourceTradeId },
 }
 
 impl LedgerError {
@@ -239,7 +398,6 @@ impl LedgerError {
             Self::Overflow { .. } => WalletFenceCause::Overflow,
             Self::Conversion { .. } => WalletFenceCause::Conversion,
             Self::UnknownEffect { .. } => WalletFenceCause::UnknownEffect,
-            Self::AmbiguousRedeem { .. } => WalletFenceCause::AmbiguousRedeem,
         }
     }
 }
@@ -341,36 +499,10 @@ impl PositionLedger {
                 outcome_id,
                 amount,
             } => self.checked_remove(mutation, market_id, *outcome_id, *amount),
-            LedgerEffect::RedeemUnattributed { market_id, amount } => {
-                let mut funded = Vec::new();
-                for outcome in [OutcomeId(0), OutcomeId(1)] {
-                    let long = self
-                        .position(&mutation.wallet)
-                        .and_then(|snapshot| {
-                            snapshot
-                                .positions
-                                .get(&MarketOutcomeId::new(market_id.clone(), outcome))
-                        })
-                        .map(|state| state.long_contracts)
-                        .unwrap_or_default();
-                    if long.atomic() >= amount.atomic() {
-                        funded.push(outcome);
-                    }
-                }
-                match funded.as_slice() {
-                    [outcome] => self.checked_remove(mutation, market_id, *outcome, *amount),
-                    [] => Err(LedgerError::Underflow {
-                        source_trade_id: mutation.source_trade_id.clone(),
-                    }),
-                    _ => Err(LedgerError::AmbiguousRedeem {
-                        source_trade_id: mutation.source_trade_id.clone(),
-                    }),
-                }
-            }
             LedgerEffect::Conversion => Err(LedgerError::Conversion {
                 source_trade_id: mutation.source_trade_id.clone(),
             }),
-            LedgerEffect::RawOnly => Ok(()),
+            LedgerEffect::RequiresAnchor | LedgerEffect::RawOnly => Ok(()),
             LedgerEffect::UnknownEffect => Err(LedgerError::UnknownEffect {
                 source_trade_id: mutation.source_trade_id.clone(),
             }),
@@ -464,6 +596,16 @@ impl PositionLedger {
         }
     }
 
+    /// Replace one wallet's complete authoritative position snapshot.
+    pub fn replace_wallet_snapshot(
+        &mut self,
+        wallet: WalletAddress,
+        positions: HashMap<MarketOutcomeId, PositionState>,
+    ) {
+        let candidate = PositionSnapshot { wallet, positions };
+        self.snapshots.insert(wallet, candidate);
+    }
+
     /// Return the current position snapshot for a wallet, or `None` if the wallet
     /// has never been observed.
     pub fn position(&self, wallet: &WalletAddress) -> Option<&PositionSnapshot> {
@@ -545,8 +687,12 @@ mod tests {
     use std::collections::HashMap;
 
     use pe_copy_signal_engine::TradeProvenance;
-    use pe_core_types::{OutcomeId, Price, SourceTradeId};
+    use pe_core_types::{OutcomeId, Price, ReceivedAt, SourceId, SourceTradeId};
+    use pe_source_polymarket_public::{
+        ActivityParseContext, ActivityTransport, parse_activity_response,
+    };
     use rust_decimal_macros::dec;
+    use serde_json::{Value, json};
     use time::OffsetDateTime;
 
     use super::*;
@@ -575,6 +721,48 @@ mod tests {
             transaction_hash: None,
             provenance: TradeProvenance::RestPoll,
         }
+    }
+
+    fn activity_aggregate(
+        activity_type: &str,
+        size: &str,
+        outcome: Option<u16>,
+        is_combo: bool,
+    ) -> ActivityAggregate {
+        let outcome_label = outcome.map(|value| if value == 0 { "Yes" } else { "No" });
+        let row = json!({
+            "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 1_788_000_000_i64,
+            "conditionId": "0xmarket1",
+            "type": activity_type,
+            "size": size,
+            "usdcSize": "0.000000",
+            "transactionHash": format!("0x{activity_type}-{size}"),
+            "price": "0.5",
+            "asset": "asset-0",
+            "side": "BUY",
+            "outcomeIndex": outcome.unwrap_or(999),
+            "outcome": outcome_label.unwrap_or(""),
+            "isCombo": is_combo,
+        });
+        let context = ActivityParseContext {
+            source_id: SourceId("polymarket-data-api".to_owned()),
+            observed_at: SourceTimestamp(
+                OffsetDateTime::from_unix_timestamp(1_788_000_010).unwrap(),
+            ),
+            received_at: ReceivedAt(OffsetDateTime::from_unix_timestamp(1_788_000_011).unwrap()),
+            transport: ActivityTransport::Rest,
+        };
+        let raw = serde_json::to_vec(&[row]).unwrap();
+        let window = parse_activity_response(
+            &raw,
+            wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            &context,
+        )
+        .unwrap();
+        let mut aggregates = window.aggregates().unwrap();
+        assert_eq!(aggregates.len(), 1);
+        aggregates.remove(0)
     }
 
     #[test]
@@ -701,68 +889,313 @@ mod tests {
         )]))
     }
 
-    fn unattributed_redeem(w: WalletAddress, amount: u64) -> LedgerMutation {
-        LedgerMutation {
-            source_trade_id: SourceTradeId("g2:unattributed".to_owned()),
-            transaction_hash: "0xtest".to_owned(),
-            wallet: w,
-            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
-            effect: LedgerEffect::RedeemUnattributed {
-                market_id: market(),
-                amount: ShareAmount::from_atomic(amount),
-            },
-        }
+    #[test]
+    fn unexpressible_redeems_require_an_anchor() {
+        let zero = LedgerMutation::from_activity(&activity_aggregate(
+            "REDEEM",
+            "0.000000",
+            Some(0),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(zero.effect, LedgerEffect::RequiresAnchor);
+
+        let outcome_less =
+            LedgerMutation::from_activity(&activity_aggregate("REDEEM", "1.250000", None, false))
+                .unwrap();
+        assert_eq!(outcome_less.effect, LedgerEffect::RequiresAnchor);
     }
 
     #[test]
-    fn unattributed_redeem_burns_the_single_funded_outcome_exactly() {
+    fn stamped_non_zero_redeem_keeps_exact_arithmetic_and_underflow() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let mut ledger = ledger_with_longs(w, 500, 20);
-        ledger.apply(&unattributed_redeem(w, 100)).unwrap();
-        let snap = ledger.position(&w).unwrap();
-        let funded = MarketOutcomeId::new(market(), OutcomeId(0));
-        let other = MarketOutcomeId::new(market(), OutcomeId(1));
+        let mutation = LedgerMutation::from_activity(&activity_aggregate(
+            "REDEEM",
+            "0.000100",
+            Some(0),
+            false,
+        ))
+        .unwrap();
         assert_eq!(
-            snap.positions[&funded].long_contracts,
+            mutation.effect,
+            LedgerEffect::Redeem {
+                market_id: market(),
+                outcome_id: OutcomeId(0),
+                amount: ShareAmount::from_atomic(100),
+            }
+        );
+
+        let mut ledger = ledger_with_longs(w, 500, 20);
+        ledger.apply(&mutation).unwrap();
+        let snapshot = ledger.position(&w).unwrap();
+        assert_eq!(
+            snapshot.positions[&MarketOutcomeId::new(market(), OutcomeId(0))].long_contracts,
             ShareAmount::from_atomic(400)
         );
         assert_eq!(
-            snap.positions[&other].long_contracts,
+            snapshot.positions[&MarketOutcomeId::new(market(), OutcomeId(1))].long_contracts,
             ShareAmount::from_atomic(20)
         );
-    }
 
-    #[test]
-    fn unattributed_redeem_with_no_funded_outcome_underflows() {
-        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let mut ledger = ledger_with_longs(w, 50, 20);
+        let mut underfunded = ledger_with_longs(w, 50, 20);
         assert!(matches!(
-            ledger.apply(&unattributed_redeem(w, 100)),
+            underfunded.apply(&mutation),
             Err(LedgerError::Underflow { .. })
         ));
         assert_eq!(
-            ledger.position(&w).unwrap().positions[&MarketOutcomeId::new(market(), OutcomeId(0))]
+            underfunded.position(&w).unwrap().positions
+                [&MarketOutcomeId::new(market(), OutcomeId(0))]
                 .long_contracts,
             ShareAmount::from_atomic(50)
         );
     }
 
     #[test]
-    fn unattributed_redeem_funding_both_outcomes_fails_closed() {
+    fn zero_non_redeem_effects_and_combo_redeem_stay_raw_only() {
+        for activity_type in ["TRADE", "SPLIT", "MERGE"] {
+            let mutation = LedgerMutation::from_activity(&activity_aggregate(
+                activity_type,
+                "0.000000",
+                Some(0),
+                false,
+            ))
+            .unwrap();
+            assert_eq!(mutation.effect, LedgerEffect::RawOnly);
+        }
+
+        let combo =
+            LedgerMutation::from_activity(&activity_aggregate("REDEEM", "1.000000", None, true))
+                .unwrap();
+        assert_eq!(combo.effect, LedgerEffect::RawOnly);
+
+        let conversion = LedgerMutation::from_activity(&activity_aggregate(
+            "CONVERSION",
+            "0.000000",
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(conversion.effect, LedgerEffect::Conversion);
+
+        let unknown =
+            LedgerMutation::from_activity(&activity_aggregate("NEW_TYPE", "0.000000", None, false))
+                .unwrap();
+        assert_eq!(unknown.effect, LedgerEffect::UnknownEffect);
+    }
+
+    #[test]
+    fn requires_anchor_is_non_mutating_and_touches_no_keys() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let mut ledger = ledger_with_longs(w, 500, 500);
-        let error = ledger.apply(&unattributed_redeem(w, 100)).unwrap_err();
-        assert!(matches!(error, LedgerError::AmbiguousRedeem { .. }));
+        let mut ledger = ledger_with_longs(w, 500, 20);
+        let before = ledger.clone();
+        let mutation = LedgerMutation {
+            source_trade_id: SourceTradeId("g2:requires-anchor".to_owned()),
+            transaction_hash: "0xtest".to_owned(),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::RequiresAnchor,
+        };
+
+        ledger.apply(&mutation).unwrap();
+        assert!(mutation.touched_keys().is_empty());
+        assert_eq!(ledger.snapshots(), before.snapshots());
+    }
+
+    fn sorted_position_rows(
+        positions: &HashMap<MarketOutcomeId, PositionState>,
+    ) -> Vec<(String, u16, u64, u64)> {
+        let mut rows = positions
+            .iter()
+            .map(|(key, state)| {
+                (
+                    key.market().to_string(),
+                    key.outcome().0,
+                    state.long_contracts.atomic(),
+                    state.short_contracts.atomic(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn replace_wallet_snapshot_removes_absent_keys_and_preserves_other_wallets() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let other = wallet("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let mut ledger = ledger_with_longs(w, 500, 20);
+        let other_trade = trade(other, Side::Buy, 3, 1_000);
+        ledger.ingest(&other_trade).unwrap();
+        let other_before = ledger.position(&other).cloned();
+
+        let retained = MarketOutcomeId::new(market(), OutcomeId(1));
+        let added = MarketOutcomeId::new(
+            MarketId(VenueMarketId("0xmarket2".to_owned())),
+            OutcomeId(0),
+        );
+        let replacement = HashMap::from([
+            (
+                retained.clone(),
+                PositionState {
+                    long_contracts: ShareAmount::from_atomic(42),
+                    short_contracts: ShareAmount::from_atomic(3),
+                },
+            ),
+            (
+                added.clone(),
+                PositionState {
+                    long_contracts: ShareAmount::from_atomic(7),
+                    short_contracts: ShareAmount::ZERO,
+                },
+            ),
+        ]);
+        ledger.replace_wallet_snapshot(w, replacement);
+
+        let snapshot = ledger.position(&w).unwrap();
+        assert_eq!(snapshot.positions.len(), 2);
+        assert!(
+            !snapshot
+                .positions
+                .contains_key(&MarketOutcomeId::new(market(), OutcomeId(0)))
+        );
         assert_eq!(
-            error.fence_cause().as_str(),
-            "unattributed_redeem_ambiguous"
+            snapshot.positions[&retained].long_contracts,
+            ShareAmount::from_atomic(42)
+        );
+        assert!(snapshot.positions.contains_key(&added));
+        assert_eq!(ledger.position(&other), other_before.as_ref());
+    }
+
+    #[test]
+    fn replacing_the_same_wallet_snapshot_twice_equals_once_for_generated_inputs() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for mask in 0_u16..16 {
+            let mut anchored = HashMap::new();
+            for ordinal in 0_u16..4 {
+                if mask & (1 << ordinal) != 0 {
+                    anchored.insert(
+                        MarketOutcomeId::new(
+                            MarketId(VenueMarketId(format!("0xmarket-{ordinal}"))),
+                            OutcomeId(ordinal % 2),
+                        ),
+                        PositionState {
+                            long_contracts: ShareAmount::from_atomic(u64::from(ordinal) + 1),
+                            short_contracts: ShareAmount::from_atomic(u64::from(mask)),
+                        },
+                    );
+                }
+            }
+            let mut expected = anchored
+                .iter()
+                .map(|(key, state)| {
+                    (
+                        key.market().to_string(),
+                        key.outcome().0,
+                        state.long_contracts.atomic(),
+                        state.short_contracts.atomic(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            let mut once = PositionLedger::new();
+            once.replace_wallet_snapshot(w, anchored.clone());
+            let mut twice = once.clone();
+            twice.replace_wallet_snapshot(w, anchored.clone());
+
+            assert_eq!(once.snapshots(), twice.snapshots());
+            assert_eq!(
+                sorted_position_rows(&once.position(&w).unwrap().positions),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn effect_documents_round_trip_every_variant_in_canonical_json() {
+        let effects = [
+            LedgerEffect::Trade {
+                market_id: market(),
+                outcome_id: OutcomeId(7),
+                side: Side::Buy,
+                amount: ShareAmount::from_atomic(1_234_567),
+                price: Price(dec!(0.5000)),
+            },
+            LedgerEffect::Split {
+                market_id: market(),
+                amount: ShareAmount::from_atomic(2_000_001),
+            },
+            LedgerEffect::Merge {
+                market_id: market(),
+                amount: ShareAmount::from_atomic(3_000_002),
+            },
+            LedgerEffect::Redeem {
+                market_id: market(),
+                outcome_id: OutcomeId(1),
+                amount: ShareAmount::from_atomic(4_000_003),
+            },
+            LedgerEffect::RequiresAnchor,
+            LedgerEffect::RawOnly,
+            LedgerEffect::Conversion,
+            LedgerEffect::UnknownEffect,
+        ];
+
+        for effect in effects {
+            let document = effect.to_document().unwrap();
+            let value: Value = serde_json::from_str(&document).unwrap();
+            assert_eq!(serde_json::to_string(&value).unwrap(), document);
+            assert_eq!(LedgerEffect::from_document(&document).unwrap(), effect);
+        }
+
+        let document = LedgerEffect::Trade {
+            market_id: market(),
+            outcome_id: OutcomeId(7),
+            side: Side::Buy,
+            amount: ShareAmount::from_atomic(1_234_567),
+            price: Price(dec!(0.5000)),
+        }
+        .to_document()
+        .unwrap();
+        let value: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["effect"]["kind"], "trade");
+        assert_eq!(value["effect"]["outcome"], 7);
+        assert_eq!(value["effect"]["side"], "Buy");
+        assert!(value["effect"]["amount"].is_string() || value["effect"]["amount"].is_number());
+        assert_eq!(
+            LedgerEffect::from_document(&document).unwrap(),
+            LedgerEffect::Trade {
+                market_id: market(),
+                outcome_id: OutcomeId(7),
+                side: Side::Buy,
+                amount: ShareAmount::from_atomic(1_234_567),
+                price: Price(dec!(0.5000)),
+            }
         );
     }
 
     #[test]
-    fn unattributed_redeem_touches_both_outcome_keys() {
-        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(unattributed_redeem(w, 1).touched_keys().len(), 2);
+    fn effect_document_unknown_version_is_typed() {
+        let document = json!({"effect": {"kind": "raw_only"}, "version": 2});
+        let error = LedgerEffect::from_document(&document.to_string()).unwrap_err();
+        assert_eq!(
+            error,
+            LedgerEffectDocumentError::UnknownVersion { version: 2 }
+        );
+    }
+
+    #[test]
+    fn effect_document_malformed_inputs_are_typed() {
+        for document in [
+            "not-json",
+            r#"{"effect":{"kind":"trade"},"version":1}"#,
+            r#"{"effect":{"kind":"raw_only","market":"extra"},"version":1}"#,
+            r#"{"effect":{"kind":"raw_only"},"version":"1"}"#,
+        ] {
+            assert!(matches!(
+                LedgerEffect::from_document(document),
+                Err(LedgerEffectDocumentError::Malformed { .. })
+            ));
+        }
     }
 }
 #[cfg(test)]
