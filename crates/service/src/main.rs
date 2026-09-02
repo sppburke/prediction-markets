@@ -419,19 +419,26 @@ async fn main() -> Result<()> {
         .map(|entry| entry.wallet)
         .collect();
     live_watchlist.remove_fenced(&history_incomplete);
+    // Live at boot means accepted by this boot's bracket. Fenced and deferred
+    // wallets re-enter only through the runtime admission preparer; on a
+    // resumed side main an earlier bracket's promoted history would otherwise
+    // keep a now-deferred wallet live.
+    let anchored_wallets: Vec<_> = anchored.iter().map(|install| install.wallet).collect();
+    let not_accepted: std::collections::HashSet<_> = boot_wallets
+        .iter()
+        .filter(|wallet| !anchored_wallets.contains(wallet))
+        .copied()
+        .collect();
+    live_watchlist.remove_fenced(&not_accepted);
     anyhow::ensure!(
         !live_watchlist.snapshot().entries.is_empty(),
-        "no wallets eligible after durable fence/history filtering"
+        "no wallets eligible after durable fence/history/acceptance filtering"
     );
 
     if migration_boot.session.is_some() {
         let activation_obligations =
             rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
                 .context("capture migration reconciliation obligations")?;
-        // Fenced and deferred wallets carry no validation row and leave the
-        // boot universe (see `validate_direct`); the census describes the
-        // accepted set.
-        let anchored_wallets: Vec<_> = anchored.iter().map(|install| install.wallet).collect();
         record_activation_facts(
             &paper_state,
             &anchored_wallets,

@@ -86,10 +86,11 @@ pub fn validate_migration_authority(
 }
 
 /// Capture the state census of the wallets the migration bracket accepted,
-/// immediately after the bracket. Fenced and deferred wallets have no
-/// validation row and are not part of the census. The side-main file hash
-/// later binds this row together with the canonical cursor/fence/validation
-/// tables it describes.
+/// immediately after the bracket; that set is the boot universe. Fenced and
+/// deferred wallets are not part of the census, and only the accepted set is
+/// guaranteed a current validation row. The side-main file hash later binds
+/// this row together with the canonical cursor/fence/validation tables it
+/// describes.
 pub fn record_activation_facts(
     paper_state: &PaperStateDb,
     wallets: &[WalletAddress],
