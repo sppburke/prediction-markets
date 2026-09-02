@@ -279,6 +279,12 @@ impl ReqwestFetcher {
                             && attempt < self.max_retries
                         {
                             attempt += 1;
+                            tracing::warn!(
+                                path = %path,
+                                retry_after_secs,
+                                attempt,
+                                "rate limited by the venue; retrying after the requested wait"
+                            );
                             tokio::time::sleep(Duration::from_secs(u64::from(
                                 retry_after_secs.max(1),
                             )))
@@ -545,23 +551,17 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
+        // A 5xx retry with zero backoff isolates the gate: the only wait between
+        // the two attempts is the 300 ms rate slot.
         let app = axum::Router::new().route(
             "/paced",
             axum::routing::get(move || {
                 let counter = counter.clone();
                 async move {
                     if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                        (
-                            axum::http::StatusCode::TOO_MANY_REQUESTS,
-                            [("retry-after", "0")],
-                            "{}".to_owned(),
-                        )
+                        (axum::http::StatusCode::BAD_GATEWAY, "{}".to_owned())
                     } else {
-                        (
-                            axum::http::StatusCode::OK,
-                            [("retry-after", "0")],
-                            "[]".to_owned(),
-                        )
+                        (axum::http::StatusCode::OK, "[]".to_owned())
                     }
                 }
             }),
@@ -571,15 +571,13 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let fetcher = ReqwestFetcher::new(reqwest::Client::new())
             .with_max_retries(1)
-            .with_min_interval_ms(300)
-            .with_rate_limit_retry_max_secs(1);
+            .with_initial_backoff_ms(0)
+            .with_min_interval_ms(300);
         let started = std::time::Instant::now();
         fetcher
             .fetch_page(&format!("http://{address}/paced"))
             .await
             .unwrap();
-        // Two attempts through a 300 ms gate cannot complete inside 300 ms; the
-        // `Retry-After: 0` sleep itself is one second, so assert the gate bound only.
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
