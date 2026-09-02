@@ -308,8 +308,9 @@ impl CausalPositionValidator {
         let first_mapping = first_activity
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
-        let first_positions = self.positions(wallet, &first_mapping).await?;
         let first_activity = ActivityEvidence::from(first_activity);
+        let first_positions = self.positions(wallet, &first_mapping).await?;
+        drop(first_mapping);
 
         let second_activity = self.activity(wallet).await?;
         if self
@@ -322,8 +323,9 @@ impl CausalPositionValidator {
         let second_mapping = second_activity
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
-        let second_positions = self.positions(wallet, &second_mapping).await?;
         let second_activity = ActivityEvidence::from(second_activity);
+        let second_positions = self.positions(wallet, &second_mapping).await?;
+        drop(second_mapping);
 
         let final_activity = self.activity(wallet).await?;
         if self
@@ -362,8 +364,9 @@ impl CausalPositionValidator {
         let first_mapping = first_activity
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
-        let first_positions = self.positions(wallet, &first_mapping).await?;
         let first_activity = ActivityEvidence::from(first_activity);
+        let first_positions = self.positions(wallet, &first_mapping).await?;
+        drop(first_mapping);
         self.run_step_hook(2, engine);
 
         let second_activity = self.activity(wallet).await?;
@@ -381,8 +384,9 @@ impl CausalPositionValidator {
         let second_mapping = second_activity
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
-        let second_positions = self.positions(wallet, &second_mapping).await?;
         let second_activity = ActivityEvidence::from(second_activity);
+        let second_positions = self.positions(wallet, &second_mapping).await?;
+        drop(second_mapping);
         self.run_step_hook(4, engine);
 
         let final_activity = self.activity(wallet).await?;
