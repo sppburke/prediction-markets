@@ -12,7 +12,7 @@ use pe_core_types::{
     SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_paper_state::{DecisionPendingState, PaperStateDb, WalletHistoryStatusRecord};
-use pe_position_ledger::{PositionLedger, WalletFenceCause};
+use pe_position_ledger::{LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
     BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2,
 };
@@ -21,6 +21,7 @@ use pe_service::decision_replay::{
     DecisionPostBoundaryEvidenceBody, TerminalDispositionEvidence, replay_decision_pending,
 };
 use pe_service::paper_recovery::build_leader_ledger;
+use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
 use pe_source_polymarket_public::{
     ActivityAggregate, ActivityParseContext, ActivityTransport, parse_activity_response,
 };
@@ -174,9 +175,138 @@ fn fresh() -> (tempfile::TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
     (dir, paper, engine)
 }
 
+fn fresh_anchored() -> (tempfile::TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
+    let (dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(&mut engine, &paper, 0, Vec::new(), 0);
+    (dir, paper, engine)
+}
+
+fn install_anchor(
+    engine: &mut BucketCommitEngine,
+    paper: &PaperStateDb,
+    cutoff: i64,
+    balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
+    recorded_at_unix: i64,
+) {
+    let captured = ledger_capture(engine.ledger(), paper, wallet()).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet: wallet(),
+            balances,
+            cutoff,
+            proof: AnchorProof {
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+}
+
+#[test]
+fn pre_anchor_groups_are_covered_without_arithmetic_or_copy_side_effects() {
+    let (_dir, paper, mut engine) = fresh();
+    let redeem = position_row("REDEEM", "0xcovered1", MARKET_A, 0, "", "7", "0", 100);
+    let sell = position_row("TRADE", "0xcovered2", MARKET_B, 0, "SELL", "4", "0.5", 100);
+    let buy = position_row("TRADE", "0xcovered3", MARKET_A, 0, "BUY", "2", "0.5", 100);
+    let result = engine
+        .commit(vec![redeem, sell, buy], &context(100, true), zero_basis())
+        .unwrap();
+
+    assert!(
+        result
+            .dispositions
+            .values()
+            .all(|disposition| disposition == "anchor_covered")
+    );
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_A, 1), ShareAmount::ZERO);
+    assert!(result.pending.is_empty());
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert!(paper.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    let history = paper.gate_history().unwrap();
+    assert!(history[&wallet()].contains(&MarketId(VenueMarketId(MARKET_A.to_owned()))));
+    assert!(
+        !history[&wallet()].contains(&MarketId(VenueMarketId(MARKET_B.to_owned()))),
+        "covered SELLs do not consume ever-traded history"
+    );
+    for group in paper.activity_groups_after(&wallet(), -1).unwrap() {
+        LedgerEffect::from_document(&group.proof_json).unwrap();
+    }
+}
+
+#[test]
+fn covered_late_precedes_partial_and_late_equal_second_fences() {
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(&mut engine, &paper, 100, Vec::new(), 101);
+
+    let first = position_row("TRADE", "0xlate1", MARKET_A, 0, "BUY", "1", "0.5", 100);
+    let first_id = first.group_id.key().clone();
+    let result = engine
+        .commit(vec![first.clone()], &context(100, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&first_id.0], "anchor_covered_late");
+    assert_eq!(
+        paper
+            .wallet_coverage(&wallet())
+            .unwrap()
+            .coverage_generation,
+        1
+    );
+    assert!(paper.position_validation(&wallet()).unwrap().is_none());
+    assert!(result.pending.is_empty());
+
+    install_anchor(&mut engine, &paper, 100, Vec::new(), 102);
+    let partial = position_row("TRADE", "0xlate2", MARKET_B, 0, "BUY", "2", "0.5", 100);
+    let partial_id = partial.group_id.key().clone();
+    let result = engine
+        .commit(vec![first, partial], &context(100, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&partial_id.0], "anchor_covered_late");
+    assert_eq!(
+        paper
+            .wallet_coverage(&wallet())
+            .unwrap()
+            .coverage_generation,
+        2
+    );
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+
+    install_anchor(&mut engine, &paper, 100, Vec::new(), 103);
+    let late = position_row("TRADE", "0xlate3", MARKET_B, 1, "BUY", "3", "0.5", 100);
+    let late_id = late.group_id.key().clone();
+    let result = engine
+        .commit(vec![late], &context(100, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&late_id.0], "anchor_covered_late");
+    assert_eq!(
+        paper
+            .wallet_coverage(&wallet())
+            .unwrap()
+            .coverage_generation,
+        3
+    );
+    assert!(paper.position_validation(&wallet()).unwrap().is_none());
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+}
+
 #[test]
 fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     engine
         .commit(
             vec![pair_effect(
@@ -214,7 +344,7 @@ fn split_merge_redeem_preserve_exact_fractional_balances_atomically() {
 
 #[test]
 fn trade_aggregate_uses_exact_size_weighted_price_and_not_usdc_audit() {
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let trade = aggregate_rows(vec![
         json!({
             "timestamp": 150,
@@ -271,7 +401,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
         Vec<pe_paper_state::LeaderPositionRow>,
         std::collections::HashMap<WalletAddress, std::collections::HashSet<MarketId>>,
     ) {
-        let (_dir, paper, mut engine) = fresh();
+        let (_dir, paper, mut engine) = fresh_anchored();
         let first = position_row("TRADE", "0x11", MARKET_A, 0, "BUY", first_size, "0.21", 200);
         let second = position_row(
             "TRADE",
@@ -313,7 +443,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
     let right = run("2.875000", "1.125000", true);
     assert_eq!(left, right, "g2 order/economics cannot select a winner");
 
-    let (dir, paper, mut engine) = fresh();
+    let (dir, paper, mut engine) = fresh_anchored();
     let groups = vec![
         position_row("TRADE", "0x31", MARKET_A, 0, "BUY", "1", "0.4", 210),
         position_row("TRADE", "0x32", MARKET_A, 0, "BUY", "2", "0.6", 210),
@@ -344,7 +474,7 @@ fn tied_same_market_entries_are_symmetric_and_consume_history_once() {
 #[test]
 fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
     fn opposite(reverse: bool) -> (Vec<pe_paper_state::LeaderPositionRow>, Value, Value) {
-        let (_dir, paper, mut engine) = fresh();
+        let (_dir, paper, mut engine) = fresh_anchored();
         let mut no_copy = context(250, true);
         no_copy.copy_eligible = false;
         let buy = position_row("TRADE", "0x35", MARKET_A, 0, "BUY", "2", "0.4", 250);
@@ -366,7 +496,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
     assert_eq!(opposite(false), opposite(true));
 
     fn split_merge(reverse: bool) -> (Vec<pe_paper_state::LeaderPositionRow>, Value) {
-        let (_dir, paper, mut engine) = fresh();
+        let (_dir, paper, mut engine) = fresh_anchored();
         engine
             .commit(
                 vec![pair_effect("SPLIT", "0x37", MARKET_A, "2", 251)],
@@ -397,7 +527,7 @@ fn shuffled_opposite_side_and_split_merge_buckets_are_byte_identical() {
 
 #[test]
 fn different_markets_create_independent_pending_deliveries_and_restart_does_not_reapply() {
-    let (dir, paper, mut engine) = fresh();
+    let (dir, paper, mut engine) = fresh_anchored();
     let result = engine
         .commit(
             vec![
@@ -472,7 +602,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
 
 #[test]
 fn conversion_and_underflow_fence_without_partial_ledger_apply() {
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let conversion = pair_effect("CONVERSION", "0x51", MARKET_A, "1", 400);
     let trade = position_row("TRADE", "0x52", MARKET_B, 0, "BUY", "7", "0.5", 400);
     let result = engine
@@ -499,7 +629,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
     );
     assert_eq!(state(&engine, MARKET_B, 0).atomic(), 1);
 
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let result = engine
         .commit(
             vec![pair_effect("MERGE", "0x61", MARKET_A, "0.000001", 500)],
@@ -508,10 +638,11 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
         )
         .unwrap();
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::Underflow));
-    assert!(engine.ledger().position(&wallet()).is_none());
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_A, 1), ShareAmount::ZERO);
     assert!(paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let result = engine
         .commit(
             vec![combo_effect("FUTURE_POSITION_EFFECT", "0x62", 501)],
@@ -522,7 +653,7 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
     assert_eq!(result.newly_fenced, Some(WalletFenceCause::UnknownEffect));
     assert!(paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let result = engine
         .commit(
             vec![combo_effect("CONVERSION", "0x63", 502)],
@@ -535,11 +666,8 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 }
 
 #[test]
-fn unattributed_redeem_sharing_its_equal_second_market_fences_order_dependent() {
-    // An outcome-unattributed redemption (live outcomeIndex 999 sentinel,
-    // #544 fix 5) resolves its leg from ledger state, so any other operation
-    // on the same market in the same second is order-dependent.
-    let (_dir, paper, mut engine) = fresh();
+fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
+    let (_dir, paper, mut engine) = fresh_anchored();
     engine
         .commit(
             vec![position_row(
@@ -562,54 +690,49 @@ fn unattributed_redeem_sharing_its_equal_second_market_fences_order_dependent() 
         "outcomeIndex": 999,
         "outcome": "",
     }));
+    let sentinel_id = sentinel.group_id.key().clone();
     let sell = position_row("TRADE", "0x72", MARKET_A, 0, "SELL", "1", "0.5", 560);
     let result = engine
         .commit(vec![sentinel, sell], &context(560, true), zero_basis())
         .unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     assert_eq!(
-        result.newly_fenced,
-        Some(WalletFenceCause::OrderDependentEqualSecond)
+        result.dispositions[&sentinel_id.0],
+        "reanchor_required_redemption"
     );
-    assert!(paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
 
-    // Alone in its second, the same redemption burns the single funded leg.
-    let (_dir, paper, mut engine) = fresh();
-    engine
-        .commit(
-            vec![position_row(
-                "TRADE", "0x73", MARKET_A, 0, "BUY", "5", "0.5", 561,
-            )],
-            &context(561, true),
-            zero_basis(),
-        )
-        .unwrap();
-    let sentinel = aggregate(json!({
-        "timestamp": 562,
+    let zero = aggregate(json!({
+        "timestamp": 561,
         "conditionId": MARKET_A,
         "type": "REDEEM",
-        "size": "2",
-        "usdcSize": "2",
-        "transactionHash": "0x74",
+        "size": "0",
+        "usdcSize": "0",
+        "transactionHash": "0x73",
         "price": "0",
-        "asset": "",
+        "asset": "asset-0",
         "side": "",
-        "outcomeIndex": 999,
-        "outcome": "",
+        "outcomeIndex": 0,
+        "outcome": "Yes",
     }));
+    let zero_id = zero.group_id.key().clone();
     let result = engine
-        .commit(vec![sentinel], &context(562, true), zero_basis())
+        .commit(vec![zero], &context(561, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
     assert_eq!(
-        state(&engine, MARKET_A, 0),
-        ShareAmount::from_decimal_exact(rust_decimal::Decimal::from(3)).unwrap()
+        result.dispositions[&zero_id.0],
+        "reanchor_required_redemption"
     );
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
 }
 
 #[test]
 fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let split = pair_effect("SPLIT", "0x65", MARKET_A, "1", 550);
     let sell = position_row("TRADE", "0x66", MARKET_A, 0, "SELL", "2", "0.5", 550);
     let result = engine
@@ -623,7 +746,7 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
     assert_eq!(state(&engine, MARKET_A, 1), ShareAmount::ZERO);
     assert!(paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let mut no_copy = context(551, true);
     no_copy.copy_eligible = false;
     let disjoint = vec![
@@ -640,7 +763,7 @@ fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
 
 #[test]
 fn changed_or_late_equal_second_groups_fence_without_reapplying_prior_state() {
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let mut no_copy = context(600, true);
     no_copy.copy_eligible = false;
     let original = position_row("TRADE", "0x71", MARKET_A, 0, "BUY", "1.250000", "0.4", 600);
@@ -662,7 +785,7 @@ fn changed_or_late_equal_second_groups_fence_without_reapplying_prior_state() {
     assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_250_000);
     assert!(paper.is_wallet_fenced(&wallet()).unwrap());
 
-    let (_dir, paper, mut engine) = fresh();
+    let (_dir, paper, mut engine) = fresh_anchored();
     let first = position_row("TRADE", "0x81", MARKET_A, 0, "BUY", "2", "0.4", 700);
     engine.commit(vec![first], &no_copy, zero_basis()).unwrap();
     let late = position_row("TRADE", "0x82", MARKET_B, 0, "BUY", "5", "0.6", 700);

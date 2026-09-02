@@ -39,9 +39,12 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::runtime_config::LiveRuntimeConfig;
+use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome};
 
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
+/// Best-effort cadence for refreshing venue-authoritative position anchors.
+pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
 
 /// Configuration for the existing per-wallet polling cadence.
 #[derive(Debug, Clone)]
@@ -250,6 +253,8 @@ pub struct TradePoller {
     signal_config: SignalConfig,
     runtime_config: LiveRuntimeConfig,
     obligations: ReconciliationObligations,
+    admission_preparer: Option<Arc<AdmissionPreparer>>,
+    refresh_cursor: usize,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
@@ -261,6 +266,8 @@ pub enum TradePollerOwnerError {
     TriggerChannelClosed,
     #[error("trade poll interval is zero")]
     ZeroPollInterval,
+    #[error("position anchor refresh failed: {0}")]
+    AnchorRefresh(String),
 }
 
 impl TradePoller {
@@ -277,6 +284,7 @@ impl TradePoller {
         signal_config: SignalConfig,
         runtime_config: LiveRuntimeConfig,
         obligations: ReconciliationObligations,
+        admission_preparer: Option<Arc<AdmissionPreparer>>,
     ) -> Self {
         Self {
             config,
@@ -290,6 +298,8 @@ impl TradePoller {
             signal_config,
             runtime_config,
             obligations,
+            admission_preparer,
+            refresh_cursor: 0,
             now: Arc::new(OffsetDateTime::now_utc),
         }
     }
@@ -351,8 +361,11 @@ impl TradePoller {
 
     async fn poll_round(&mut self) -> Result<(), TradePollerOwnerError> {
         let snapshot = self.live_watchlist.snapshot();
-        let mut wallets: Vec<WalletAddress> =
+        let mut live_wallets: Vec<WalletAddress> =
             snapshot.entries.iter().map(|entry| entry.wallet).collect();
+        live_wallets.sort_by_key(ToString::to_string);
+        live_wallets.dedup();
+        let mut wallets = live_wallets.clone();
         wallets.extend(self.obligations.wallets());
         wallets.sort_by_key(ToString::to_string);
         wallets.dedup();
@@ -387,6 +400,49 @@ impl TradePoller {
             } else {
                 health.poll_error_streak = health.poll_error_streak.saturating_add(1);
             }
+        }
+        self.refresh_one_wallet(&live_wallets).await?;
+        Ok(())
+    }
+
+    async fn refresh_one_wallet(
+        &mut self,
+        wallets: &[WalletAddress],
+    ) -> Result<(), TradePollerOwnerError> {
+        let Some(preparer) = self.admission_preparer.as_ref() else {
+            return Ok(());
+        };
+        if wallets.is_empty() {
+            self.refresh_cursor = 0;
+            return Ok(());
+        }
+        let now_unix = (self.now)().unix_timestamp();
+        let refresh_secs = i64::try_from(ANCHOR_REFRESH_SECS).unwrap_or(i64::MAX);
+        for offset in 0..wallets.len() {
+            let index = self.refresh_cursor.saturating_add(offset) % wallets.len();
+            let wallet = wallets[index];
+            let coverage = self
+                .paper_state
+                .wallet_coverage(&wallet)
+                .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?;
+            let due = coverage.reanchor_required
+                || coverage
+                    .anchored_at_unix
+                    .is_none_or(|anchored| now_unix.saturating_sub(anchored) > refresh_secs);
+            if !due {
+                continue;
+            }
+            self.refresh_cursor = index.saturating_add(1) % wallets.len();
+            match preparer
+                .prepare_if_due(wallet, now_unix, ANCHOR_REFRESH_SECS)
+                .await
+                .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?
+            {
+                AnchorRefreshOutcome::Anchored
+                | AnchorRefreshOutcome::Skipped
+                | AnchorRefreshOutcome::Deferred => {}
+            }
+            break;
         }
         Ok(())
     }

@@ -4,18 +4,24 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use pe_core_types::{ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress};
+use pe_core_types::{
+    MarketId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId, SourceTimestamp,
+    VenueMarketId, WalletAddress,
+};
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::build_leader_ledger;
-use pe_service::position_seeder::{CausalPositionError, CausalPositionValidator, ledger_capture};
-use pe_service::watchlist_admission::AdmissionPreparer;
+use pe_service::position_seeder::{
+    AnchorExpectation, AnchorInstall, AnchorProof, CausalPositionError, CausalPositionValidator,
+    is_deferred_causal_position_error, ledger_capture,
+};
+use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityTransport, PageFetcher, PolymarketEndpoint, PositionPartition,
-    aggregate_activity_rows, parse_activity_response,
+    ActivityParseContext, ActivityReadError, ActivityTransport, PageFetcher, PolymarketEndpoint,
+    PositionPartition, PositionReadError, aggregate_activity_rows, parse_activity_response,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -170,6 +176,36 @@ fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommit
     (dir, paper, engine)
 }
 
+fn install_empty_anchor(
+    engine: &mut BucketCommitEngine,
+    paper: &PaperStateDb,
+    wallet: WalletAddress,
+    cutoff: i64,
+) {
+    paper.set_cursor(&wallet, cutoff).unwrap();
+    let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet,
+            balances: Vec::new(),
+            cutoff,
+            proof: AnchorProof {
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: cutoff,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+}
+
 fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
     pe_service::bucket_commit::FrozenDecisionBasis {
         win_rate_p: pe_core_types::Probability::ZERO,
@@ -208,6 +244,48 @@ fn aggregate(row: Value, wallet: WalletAddress) -> pe_source_polymarket_public::
     aggregate_activity_rows(&parsed.rows).unwrap().remove(0)
 }
 
+fn spawn_control_actor(
+    mut control_rx: mpsc::Receiver<OrchestratorControl>,
+    mut engine: BucketCommitEngine,
+    paper: Arc<PaperStateDb>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(message) = control_rx.recv().await {
+            match message {
+                OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
+                    let _ = acknowledged.send(());
+                }
+                OrchestratorControl::InstallAnchors {
+                    installs,
+                    acknowledged,
+                } => {
+                    let result = engine
+                        .install_anchors(&installs)
+                        .map_err(|error| error.to_string());
+                    let _ = acknowledged.send(result);
+                }
+                OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let _ = captured.send(
+                        ledger_capture(engine.ledger(), &paper, wallet)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::CommitActivityBucket {
+                    aggregates,
+                    context,
+                    committed,
+                } => {
+                    let _ = committed.send(
+                        engine
+                            .commit(aggregates, &context, zero_basis())
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+            }
+        }
+    })
+}
+
 #[tokio::test]
 async fn stable_complete_bracket_installs_and_restart_is_identical() {
     let wallet = wallet(0x11);
@@ -217,7 +295,10 @@ async fn stable_complete_bracket_installs_and_restart_is_identical() {
         .await
         .unwrap();
     let durable = paper.position_validation(&wallet).unwrap().unwrap();
-    assert_eq!(durable.ledger_hash, first[0].validation.ledger_hash);
+    assert_eq!(
+        durable.positions_proof_hash,
+        first[0].proof.positions_proof_hash
+    );
     assert_eq!(durable.source_log_generation, "source-generation-test");
 
     let restarted_ledger = build_leader_ledger(&paper).unwrap();
@@ -226,21 +307,19 @@ async fn stable_complete_bracket_installs_and_restart_is_identical() {
         .validate_direct(&[wallet], &mut restarted, &paper)
         .await
         .unwrap();
+    assert_eq!(first[0].balances, second[0].balances);
     assert_eq!(
-        first[0].validation.ledger_hash,
-        second[0].validation.ledger_hash
-    );
-    assert_eq!(
-        first[0].validation.positions_proof_hash,
-        second[0].validation.positions_proof_hash
+        first[0].proof.positions_proof_hash,
+        second[0].proof.positions_proof_hash
     );
 }
 
 #[tokio::test]
 async fn mutation_between_each_bracket_step_installs_nothing() {
-    for target_step in 1..=4 {
+    for target_step in 1..=5 {
         let wallet = wallet(u8::try_from(0x20 + target_step).unwrap());
         let (_dir, paper, mut engine) = fresh(&[wallet]);
+        install_empty_anchor(&mut engine, &paper, wallet, 0);
         let mutation = aggregate(
             activity(
                 wallet,
@@ -258,17 +337,25 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
                     .unwrap();
             }
         });
-        match validator(stable_responses(&[(wallet, 1, "1.000000")]))
+        let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
             .with_step_hook(hook)
             .validate_direct(&[wallet], &mut engine, &paper)
             .await
-        {
-            // A mismatch surfaced inside the bracket defers the wallet at
-            // boot (retryable, nothing installed); a ledger revision caught
-            // by the post-loop recheck still rejects the attempted generation.
-            Ok(accepted) => assert!(accepted.is_empty(), "a deferred wallet installs nothing"),
-            Err(error) => assert!(matches!(error, CausalPositionError::LedgerRevision { .. })),
-        }
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CausalPositionError::LedgerRevision { .. } | CausalPositionError::AnchorInstall(_)
+        ));
+        assert_eq!(
+            ledger_capture(engine.ledger(), &paper, wallet)
+                .unwrap()
+                .positive_ordinary_balances
+                .get(&(condition(9), 0))
+                .copied(),
+            Some(ShareAmount::from_atomic(1_000_000)),
+            "the intervening poller BUY must survive the rejected anchor"
+        );
+        assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
         assert!(paper.position_validation(&wallet).unwrap().is_none());
         assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     }
@@ -304,24 +391,25 @@ async fn changed_activity_revision_fences_and_installs_nothing() {
 }
 
 #[tokio::test]
-async fn stable_unexplained_mismatch_retries_without_fencing() {
+async fn stable_positions_replace_the_activity_balance_without_fencing() {
     let wallet = wallet(0x41);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     let accepted = validator(stable_responses(&[(wallet, 1, "2.000000")]))
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("a stable unexplained mismatch defers the wallet at boot, never fatally");
-    assert!(accepted.is_empty());
+        .expect("stable positions are the authoritative anchor");
+    assert_eq!(accepted.len(), 1);
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+    assert_eq!(accepted[0].balances[0].2.atomic(), 2_000_000);
 
     let second = validator(stable_responses(&[(wallet, 1, "2.000000")]))
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("a never-converging mismatch stays deferred on retry");
-    assert!(second.is_empty());
+        .expect("the authoritative balance re-installs idempotently");
+    assert_eq!(second.len(), 1);
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -447,11 +535,7 @@ async fn later_activity_atomically_invalidates_an_accepted_proof() {
 }
 
 #[tokio::test]
-async fn boot_bracket_defers_the_mismatched_wallet_and_accepts_the_rest() {
-    // Live shape from the #544 activation rehearsals: one wallet's positions
-    // stably disagree with its reconstructed ledger. The one-shot boot has no
-    // retry loop, so that wallet is deferred to runtime admission (no fence,
-    // nothing installed) while the healthy wallet is accepted.
+async fn boot_bracket_installs_each_stable_authoritative_balance() {
     let first = wallet(0x51);
     let second = wallet(0x52);
     let (_dir, paper, mut engine) = fresh(&[first, second]);
@@ -461,11 +545,11 @@ async fn boot_bracket_defers_the_mismatched_wallet_and_accepts_the_rest() {
     ]))
     .validate_direct(&[first, second], &mut engine, &paper)
     .await
-    .expect("a retryable wallet outcome must not abort the boot bracket");
-    assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].validation.wallet, first);
+    .expect("stable authoritative positions install for the whole boot batch");
+    assert_eq!(accepted.len(), 2);
+    assert_eq!(accepted[0].wallet, first);
     assert!(paper.position_validation(&first).unwrap().is_some());
-    assert!(paper.position_validation(&second).unwrap().is_none());
+    assert!(paper.position_validation(&second).unwrap().is_some());
     assert!(!paper.is_wallet_fenced(&second).unwrap());
 }
 
@@ -488,12 +572,13 @@ async fn positions_before_activity_retry_then_converge_without_fence() {
             vec![b"[]".to_vec()],
         ),
     ]);
-    assert!(matches!(
+    assert!(
         validator(unavailable)
             .validate_direct(&[wallet], &mut engine, &paper)
-            .await,
-        Err(CausalPositionError::Positions { .. })
-    ));
+            .await
+            .expect("missing activity mapping is a deferred boot outcome")
+            .is_empty()
+    );
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
 
     validator(stable_responses(&[(wallet, 1, "1.000000")]))
@@ -629,31 +714,19 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
                 }
-                OrchestratorControl::PrepareValidatedAdmissions {
-                    validations,
+                OrchestratorControl::InstallAnchors {
+                    installs,
                     acknowledged,
                 } => {
-                    let result = validations
-                        .iter()
-                        .try_for_each(|validation| {
-                            let capture = ledger_capture(engine.ledger(), validation.wallet)
-                                .map_err(|error| error.to_string())?;
-                            if capture.hash == validation.ledger_hash {
-                                Ok(())
-                            } else {
-                                Err("ledger changed".to_owned())
-                            }
-                        })
-                        .and_then(|()| {
-                            actor_paper
-                                .record_position_validations(&validations)
-                                .map_err(|error| error.to_string())
-                        });
+                    let result = engine
+                        .install_anchors(&installs)
+                        .map_err(|error| error.to_string());
                     let _ = acknowledged.send(result);
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(
-                        ledger_capture(engine.ledger(), wallet).map_err(|error| error.to_string()),
+                        ledger_capture(engine.ledger(), &actor_paper, wallet)
+                            .map_err(|error| error.to_string()),
                     );
                 }
                 OrchestratorControl::CommitActivityBucket {
@@ -689,6 +762,331 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
     actor.await.unwrap();
 }
 
+#[test]
+fn anchor_install_is_durable_before_swap_and_rejects_a_regressed_cutoff() {
+    let wallet = wallet(0x66);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    paper.set_cursor(&wallet, 10).unwrap();
+    let before = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let balance = (
+        MarketId(VenueMarketId(condition(1))),
+        OutcomeId(0),
+        ShareAmount::from_atomic(3_000_000),
+    );
+    let mut install = AnchorInstall {
+        wallet,
+        balances: vec![balance.clone()],
+        cutoff: 10,
+        proof: AnchorProof {
+            positions_proof_hash: "positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{".to_owned(),
+            recorded_at_unix: 100,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: before.hash.clone(),
+            cursor: before.cursor,
+            anchor_seq: before.anchor_seq,
+            coverage_generation: before.coverage_generation,
+        },
+    };
+
+    assert!(engine.install_anchors(&[install.clone()]).is_err());
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash,
+        before.hash
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    assert!(paper.leader_positions().unwrap().is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+
+    install.proof.document = "{}".to_owned();
+    engine.install_anchors(&[install]).unwrap();
+    let installed = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    assert_eq!(
+        installed
+            .positive_ordinary_balances
+            .get(&(condition(1), 0))
+            .copied(),
+        Some(balance.2)
+    );
+    let durable_before_regression = (
+        paper.position_anchors(&wallet).unwrap(),
+        paper.leader_positions().unwrap(),
+        paper.position_validation(&wallet).unwrap(),
+        paper.wallet_coverage(&wallet).unwrap(),
+    );
+    let regressed = AnchorInstall {
+        wallet,
+        balances: Vec::new(),
+        cutoff: 9,
+        proof: AnchorProof {
+            positions_proof_hash: "regressed".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 101,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: installed.hash.clone(),
+            cursor: installed.cursor,
+            anchor_seq: installed.anchor_seq,
+            coverage_generation: installed.coverage_generation,
+        },
+    };
+    assert!(matches!(
+        engine.install_anchors(&[regressed]),
+        Err(pe_service::bucket_commit::AnchorInstallError::CutoffRegression { .. })
+    ));
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash,
+        installed.hash
+    );
+    assert_eq!(
+        (
+            paper.position_anchors(&wallet).unwrap(),
+            paper.leader_positions().unwrap(),
+            paper.position_validation(&wallet).unwrap(),
+            paper.wallet_coverage(&wallet).unwrap(),
+        ),
+        durable_before_regression
+    );
+}
+
+#[test]
+fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
+    let wallet = wallet(0x67);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 100);
+    let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    let candidate = AnchorInstall {
+        wallet,
+        balances: Vec::new(),
+        cutoff: 100,
+        proof: AnchorProof {
+            positions_proof_hash: "candidate".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            document: "{}".to_owned(),
+            recorded_at_unix: 101,
+        },
+        expected: AnchorExpectation {
+            ledger_hash: captured.hash.clone(),
+            cursor: captured.cursor,
+            anchor_seq: captured.anchor_seq,
+            coverage_generation: captured.coverage_generation,
+        },
+    };
+    engine
+        .commit(
+            vec![aggregate(
+                activity(wallet, 2, "1.000000", "0xcovered-late", 90),
+                wallet,
+            )],
+            &context(101),
+            zero_basis(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        engine.install_anchors(&[candidate]),
+        Err(pe_service::bucket_commit::AnchorInstallError::CoverageGenerationChanged { .. })
+    ));
+    let after = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+    assert_eq!(after.hash, captured.hash);
+    assert_eq!(after.cursor, captured.cursor);
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+}
+
+#[test]
+fn deferred_position_predicate_is_exact() {
+    let wallet = wallet(0x68);
+    let retryable = vec![
+        CausalPositionError::PositionRevision { wallet },
+        CausalPositionError::InterveningActivity { wallet },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::SaturatedTerminalSecond {
+                end: 100,
+                offset: 3_000,
+            },
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Fetch {
+                url: "activity".to_owned(),
+                source: SourceError::Transient {
+                    message: "retry".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Fetch {
+                url: "activity".to_owned(),
+                source: SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::Fetch {
+                url: "positions".to_owned(),
+                source: SourceError::Transient {
+                    message: "retry".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::Fetch {
+                url: "positions".to_owned(),
+                source: SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::MissingActivityMapping {
+                asset: "missing".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::ConflictingActivityMapping {
+                asset: "activity-conflict".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::ConflictingOutcomeMapping {
+                condition_id: "condition".to_owned(),
+                outcome: 0,
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::PositionMappingConflict {
+                asset: "position-conflict".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::DuplicateAsset {
+                asset: "duplicate".to_owned(),
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::SaturatedTerminalPage {
+                partition: PositionPartition::NotRedeemable,
+                offset: 3_000,
+            },
+        },
+    ];
+    assert!(retryable.iter().all(is_deferred_causal_position_error));
+
+    let fatal = [
+        CausalPositionError::Activity {
+            wallet,
+            source: ActivityReadError::Fetch {
+                url: "activity".to_owned(),
+                source: SourceError::Fatal {
+                    message: "fatal".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::Fetch {
+                url: "positions".to_owned(),
+                source: SourceError::Fatal {
+                    message: "fatal".to_owned(),
+                },
+            },
+        },
+        CausalPositionError::LedgerRevision { wallet },
+    ];
+    assert!(
+        fatal
+            .iter()
+            .all(|error| !is_deferred_causal_position_error(error))
+    );
+}
+
+#[tokio::test]
+async fn parse_and_fatal_fetch_errors_remain_boot_fatal() {
+    for (suffix, payload) in [(0x69, Some(b"{".to_vec())), (0x6a, None)] {
+        let wallet = wallet(suffix);
+        let (_dir, paper, mut engine) = fresh(&[wallet]);
+        let responses = payload.map_or_else(HashMap::new, |payload| {
+            HashMap::from([(activity_url(wallet), vec![payload])])
+        });
+        let error = validator(responses)
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CausalPositionError::Activity {
+                source: ActivityReadError::Parse(_)
+                    | ActivityReadError::Fetch {
+                        source: SourceError::Fatal { .. },
+                        ..
+                    },
+                ..
+            }
+        ));
+        assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn multi_wallet_prepare_preserves_typed_deferral_and_installs_none() {
+    let healthy = wallet(0x6b);
+    let deferred = wallet(0x6c);
+    let (_dir, paper, engine) = fresh(&[healthy, deferred]);
+    let mut responses = stable_responses(&[(healthy, 1, "1.000000")]);
+    responses.insert(
+        activity_url(deferred),
+        vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::NotRedeemable),
+        vec![serde_json::to_vec(&vec![position(deferred, 2, "1")]).unwrap()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::Redeemable),
+        vec![b"[]".to_vec()],
+    );
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer =
+        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+    let error = preparer.prepare(&[healthy, deferred]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionError::PositionValidation(CausalPositionError::Positions {
+            source: PositionReadError::MissingActivityMapping { .. },
+            ..
+        })
+    ));
+    assert!(paper.position_anchors(&healthy).unwrap().is_empty());
+    assert!(paper.position_anchors(&deferred).unwrap().is_empty());
+    drop(preparer);
+    actor.await.unwrap();
+}
+
 #[tokio::test]
 async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     // Live shape from the #544 activation rehearsal: one wallet's visible
@@ -698,6 +1096,8 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     let fenced_wallet = wallet(0x71);
     let healthy = wallet(0x72);
     let (_dir, paper, mut engine) = fresh(&[fenced_wallet, healthy]);
+    install_empty_anchor(&mut engine, &paper, fenced_wallet, 0);
+    install_empty_anchor(&mut engine, &paper, healthy, 0);
     let mut responses = stable_responses(&[(healthy, 2, "1.000000")]);
     let mut underflow_redeem = activity(fenced_wallet, 1, "2.000000", "0xunderflow", 10);
     underflow_redeem["type"] = json!("REDEEM");
@@ -712,7 +1112,7 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
         .expect("a per-wallet fence must not abort the boot bracket");
 
     assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].validation.wallet, healthy);
+    assert_eq!(accepted[0].wallet, healthy);
     assert!(paper.is_wallet_fenced(&fenced_wallet).unwrap());
     assert!(paper.position_validation(&fenced_wallet).unwrap().is_none());
     assert!(paper.position_validation(&healthy).unwrap().is_some());

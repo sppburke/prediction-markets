@@ -385,40 +385,23 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
                     );
                 }
             }
-            OrchestratorControl::PrepareValidatedAdmissions {
-                validations,
+            OrchestratorControl::InstallAnchors {
+                installs,
                 acknowledged,
             } => {
-                let result = validations
-                    .iter()
-                    .try_for_each(|validation| {
-                        if self.bucket_engine.is_fenced(&validation.wallet) {
-                            return Err(format!("wallet {} is fenced", validation.wallet));
-                        }
-                        let capture = crate::position_seeder::ledger_capture(
-                            self.bucket_engine.ledger(),
-                            validation.wallet,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        if capture.hash != validation.ledger_hash {
-                            return Err(format!(
-                                "wallet {} ledger changed before admission install",
-                                validation.wallet
-                            ));
-                        }
-                        Ok(())
-                    })
-                    .and_then(|()| {
-                        self.paper_state
-                            .record_position_validations(&validations)
-                            .map_err(|error| error.to_string())
-                    });
+                let result = self
+                    .bucket_engine
+                    .install_anchors(&installs)
+                    .map_err(|error| error.to_string());
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
-                let result =
-                    crate::position_seeder::ledger_capture(self.bucket_engine.ledger(), wallet)
-                        .map_err(|error| error.to_string());
+                let result = crate::position_seeder::ledger_capture(
+                    self.bucket_engine.ledger(),
+                    &self.paper_state,
+                    wallet,
+                )
+                .map_err(|error| error.to_string());
                 let _ = captured.send(result);
             }
             OrchestratorControl::CommitActivityBucket {

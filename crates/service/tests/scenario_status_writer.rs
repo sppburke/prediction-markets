@@ -19,7 +19,7 @@ use std::str::FromStr as _;
 use pe_core_types::{
     EventSeq, MarketId, OutcomeId, Price, Side, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb};
+use pe_paper_state::{AnchorInstallRecord, FillRecord, LeaderPositionRow, PaperStateDb};
 use pe_service::status_writer::{build_snapshot, write_snapshot};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -206,4 +206,31 @@ fn ac_uninitialised_bankroll_is_none() {
     assert_eq!(snap.open_positions, 0);
     assert_eq!(snap.settled_total, 0);
     println!("PASS: uninitialised bankroll → null; zero counts");
+}
+
+#[test]
+fn anchor_age_is_none_before_install_and_tracks_the_oldest_latest_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    let now = 1_700_000_000;
+    let before = build_snapshot(&db, "paper", true, 0, now, 0, 100, 0, None);
+    assert_eq!(before.oldest_anchor_age_secs, None);
+
+    let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    db.set_cursor(&wallet, 10).unwrap();
+    db.install_anchors(&[AnchorInstallRecord {
+        wallet,
+        balances: Vec::new(),
+        activity_cutoff_unix: 10,
+        anchored_at_unix: now - 75,
+        ledger_hash_after: "empty".to_owned(),
+        positions_proof_hash: "positions".to_owned(),
+        activity_bounds_json: "[]".to_owned(),
+        source_log_generation: "scenario".to_owned(),
+        proof_json: "{}".to_owned(),
+        recorded_at_unix: now - 75,
+    }])
+    .unwrap();
+    let after = build_snapshot(&db, "paper", true, 0, now, 0, 100, 0, None);
+    assert_eq!(after.oldest_anchor_age_secs, Some(75));
 }

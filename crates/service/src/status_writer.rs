@@ -140,6 +140,8 @@ pub struct StatusSnapshot {
     pub open_positions: usize,
     pub fills_total: usize,
     pub settled_total: usize,
+    /// Age of the oldest wallet's latest anchor, or `None` before any anchor.
+    pub oldest_anchor_age_secs: Option<u64>,
     /// Highest event-log seq mirrored into SQLite.
     pub last_event_seq: u64,
     /// Live watchlist size (wallets currently copied).
@@ -185,17 +187,22 @@ struct FinancialValues {
     open_positions: usize,
     fills_total: usize,
     settled_total: usize,
+    oldest_anchor_age_secs: Option<u64>,
     last_event_seq: u64,
 }
 
 fn read_financial_values(
     paper_state: &PaperStateDb,
+    now_unix: i64,
 ) -> Result<FinancialValues, pe_paper_state::PaperStateError> {
     Ok(FinancialValues {
         bankroll: paper_state.bankroll()?.map(|value| value.to_string()),
         open_positions: paper_state.positions_count()?,
         fills_total: paper_state.fills_count()?,
         settled_total: paper_state.settled_count()?,
+        oldest_anchor_age_secs: paper_state
+            .oldest_anchor_age(now_unix)?
+            .and_then(|age| u64::try_from(age).ok()),
         last_event_seq: paper_state.last_applied_event_seq()?.0,
     })
 }
@@ -260,6 +267,11 @@ pub fn build_snapshot(
         open_positions: paper_state.positions_count().unwrap_or(0),
         fills_total: paper_state.fills_count().unwrap_or(0),
         settled_total: paper_state.settled_count().unwrap_or(0),
+        oldest_anchor_age_secs: paper_state
+            .oldest_anchor_age(now_unix)
+            .ok()
+            .flatten()
+            .and_then(|age| u64::try_from(age).ok()),
         last_event_seq: paper_state
             .last_applied_event_seq()
             .map(|s| s.0)
@@ -349,7 +361,8 @@ pub async fn run_status_writer(
             })
         });
         let applied_config = runtime_config.snapshot();
-        let status_error = match read_financial_values(&paper_state) {
+        let now_unix = OffsetDateTime::now_utc().unix_timestamp();
+        let status_error = match read_financial_values(&paper_state, now_unix) {
             Ok(values) => {
                 last_good_financials = Some(values);
                 None
@@ -364,7 +377,7 @@ pub async fn run_status_writer(
             &applied_config.mode,
             authoritative,
             started_at.elapsed().as_secs(),
-            OffsetDateTime::now_utc().unix_timestamp(),
+            now_unix,
             watchlist.snapshot().entries.len(),
             applied_capacity.load().target,
             calls,
@@ -382,6 +395,7 @@ pub async fn run_status_writer(
             snap.open_positions = values.open_positions;
             snap.fills_total = values.fills_total;
             snap.settled_total = values.settled_total;
+            snap.oldest_anchor_age_secs = values.oldest_anchor_age_secs;
             snap.last_event_seq = values.last_event_seq;
         }
         write_snapshot(&path, &snap).map_err(|source| StatusWriterError::Write {

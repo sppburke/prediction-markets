@@ -11,7 +11,9 @@ use pe_paper_state::PaperStateDb;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::orchestrator_control::OrchestratorControl;
-use crate::position_seeder::CausalPositionValidator;
+use crate::position_seeder::{
+    AnchorInstall, CausalPositionError, CausalPositionValidator, is_deferred_causal_position_error,
+};
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
 
@@ -28,9 +30,20 @@ pub enum AdmissionError {
     #[error("orchestrator admission preparation exceeded {0} seconds")]
     AcknowledgementTimeout(u64),
     #[error("causal current-position validation unavailable: {0}")]
-    PositionValidation(String),
+    PositionValidation(#[source] CausalPositionError),
     #[error("orchestrator rejected the accepted position brackets: {0}")]
     ValidationInstall(String),
+    #[error("paper-state admission read failed: {0}")]
+    PaperState(#[from] pe_paper_state::PaperStateError),
+    #[error("anchor refresh requires a causal position validator")]
+    PositionValidatorUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorRefreshOutcome {
+    Anchored,
+    Skipped,
+    Deferred,
 }
 
 /// Shared serialized admission coordinator. Its durable checks are repeated by
@@ -88,21 +101,57 @@ impl AdmissionPreparer {
         let preparer = &self.inner;
         let _attempt = preparer.attempt.lock().await;
 
+        self.check_prerequisites(additions)?;
+        self.prepare_locked(additions).await
+    }
+
+    /// Re-anchor one due wallet under the shared bracket mutex.
+    pub async fn prepare_if_due(
+        &self,
+        wallet: WalletAddress,
+        now_unix: i64,
+        refresh_secs: u64,
+    ) -> Result<AnchorRefreshOutcome, AdmissionError> {
+        let preparer = &self.inner;
+        let _attempt = preparer.attempt.lock().await;
+        let coverage = preparer.paper_state.wallet_coverage(&wallet)?;
+        let refresh_secs = i64::try_from(refresh_secs).unwrap_or(i64::MAX);
+        let due = coverage.reanchor_required
+            || coverage
+                .anchored_at_unix
+                .is_none_or(|anchored| now_unix.saturating_sub(anchored) > refresh_secs);
+        if !due {
+            return Ok(AnchorRefreshOutcome::Skipped);
+        }
+        self.check_prerequisites(&[wallet])?;
+        let validator = preparer
+            .validator
+            .as_ref()
+            .ok_or(AdmissionError::PositionValidatorUnavailable)?;
+        let installs = match validator
+            .validate_via_control(&[wallet], &preparer.control_tx)
+            .await
+        {
+            Ok(installs) => installs,
+            Err(error) if is_deferred_causal_position_error(&error) => {
+                return Ok(AnchorRefreshOutcome::Deferred);
+            }
+            Err(error) => return Err(AdmissionError::PositionValidation(error)),
+        };
+        self.install_anchors(installs).await?;
+        Ok(AnchorRefreshOutcome::Anchored)
+    }
+
+    fn check_prerequisites(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
+        let preparer = &self.inner;
+
         let mut fenced = 0usize;
         let mut missing = 0usize;
         for wallet in additions {
-            if preparer
-                .paper_state
-                .is_wallet_fenced(wallet)
-                .unwrap_or(true)
-            {
+            if preparer.paper_state.is_wallet_fenced(wallet)? {
                 fenced = fenced.saturating_add(1);
             }
-            if !preparer
-                .paper_state
-                .wallet_history_complete(wallet)
-                .unwrap_or(false)
-            {
+            if !preparer.paper_state.wallet_history_complete(wallet)? {
                 missing = missing.saturating_add(1);
             }
         }
@@ -112,55 +161,31 @@ impl AdmissionPreparer {
         if missing > 0 {
             return Err(AdmissionError::MissingHistory { missing });
         }
+        Ok(())
+    }
 
-        let command = if let Some(validator) = &preparer.validator {
-            let accepted = validator
+    async fn prepare_locked(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {
+        let preparer = &self.inner;
+        if let Some(validator) = &preparer.validator {
+            let installs = validator
                 .validate_via_control(additions, &preparer.control_tx)
                 .await
-                .map_err(|error| AdmissionError::PositionValidation(error.to_string()))?;
-            let validations = accepted
-                .into_iter()
-                .map(|acceptance| acceptance.validation)
-                .collect();
-            let (acknowledged, acknowledgement) = oneshot::channel();
-            preparer
-                .control_tx
-                .send(OrchestratorControl::PrepareValidatedAdmissions {
-                    validations,
-                    acknowledged,
-                })
-                .await
-                .map_err(|_| AdmissionError::ControlClosed)?;
-            return tokio::time::timeout(
-                Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
-                acknowledgement,
-            )
-            .await
-            .map_err(|_| {
-                AdmissionError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS)
-            })?
-            .map_err(|_| AdmissionError::AcknowledgementClosed)?
-            .map_err(AdmissionError::ValidationInstall);
-        } else {
-            let (acknowledged, acknowledgement) = oneshot::channel();
-            (
-                OrchestratorControl::PrepareAdmissions {
-                    wallets: additions.to_vec(),
-                    acknowledged,
-                },
-                acknowledgement,
-            )
-        };
+                .map_err(AdmissionError::PositionValidation)?;
+            return self.install_anchors(installs).await;
+        }
+        let (acknowledged, acknowledgement) = oneshot::channel();
         tokio::time::timeout(
             Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
             async {
                 preparer
                     .control_tx
-                    .send(command.0)
+                    .send(OrchestratorControl::PrepareAdmissions {
+                        wallets: additions.to_vec(),
+                        acknowledged,
+                    })
                     .await
                     .map_err(|_| AdmissionError::ControlClosed)?;
-                command
-                    .1
+                acknowledgement
                     .await
                     .map_err(|_| AdmissionError::AcknowledgementClosed)
             },
@@ -170,5 +195,25 @@ impl AdmissionPreparer {
             AdmissionError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS)
         })??;
         Ok(())
+    }
+
+    async fn install_anchors(&self, installs: Vec<AnchorInstall>) -> Result<(), AdmissionError> {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        self.inner
+            .control_tx
+            .send(OrchestratorControl::InstallAnchors {
+                installs,
+                acknowledged,
+            })
+            .await
+            .map_err(|_| AdmissionError::ControlClosed)?;
+        tokio::time::timeout(
+            Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
+            acknowledgement,
+        )
+        .await
+        .map_err(|_| AdmissionError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS))?
+        .map_err(|_| AdmissionError::AcknowledgementClosed)?
+        .map_err(AdmissionError::ValidationInstall)
     }
 }

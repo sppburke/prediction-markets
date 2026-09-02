@@ -1,8 +1,7 @@
 //! Causal current-position validation for watchlist admission (#544).
 //!
-//! The ordered activity ledger remains the sole position owner. This module
-//! performs the five-step activity/positions bracket and installs only an
-//! accepted proof; it never overlays or reseeds the ledger.
+//! Venue positions own absolute balances at each proved anchor; ordered
+//! activity owns exact causal effects after that anchor.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -16,20 +15,20 @@ use pe_core_types::{
     SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
-use pe_paper_state::{PaperStateDb, PositionValidationRecord};
+use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, CompleteActivityRead, CompletePositionsRead,
-    PositionClassification, ReconciliationFetcher, fetch_complete_activity,
-    fetch_complete_positions,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityReadError, CompleteActivityRead,
+    CompletePositionsRead, PositionClassification, PositionReadError, ReconciliationFetcher,
+    fetch_complete_activity, fetch_complete_positions,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
+use crate::bucket_commit::{AnchorInstallError, BucketCommitEngine, BucketDecisionContext};
 use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
 use crate::source_event_sink::SourceEventSink;
 use crate::trade_poller::ACTIVITY_POLL_SOURCE_ID;
@@ -37,10 +36,31 @@ use crate::trade_poller::ACTIVITY_POLL_SOURCE_ID;
 #[cfg(feature = "scenario")]
 type BracketStepHook = Arc<dyn Fn(usize, &mut BucketCommitEngine) + Send + Sync>;
 
-/// An accepted proof waiting for the orchestrator's final ledger-hash recheck.
+/// A venue-authoritative balance snapshot waiting for the single-owner install.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmissionAcceptance {
-    pub validation: PositionValidationRecord,
+pub struct AnchorInstall {
+    pub wallet: WalletAddress,
+    pub balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
+    pub cutoff: i64,
+    pub proof: AnchorProof,
+    pub expected: AnchorExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorProof {
+    pub positions_proof_hash: String,
+    pub activity_bounds_json: String,
+    pub source_log_generation: String,
+    pub document: String,
+    pub recorded_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorExpectation {
+    pub ledger_hash: String,
+    pub cursor: Option<i64>,
+    pub anchor_seq: Option<i64>,
+    pub coverage_generation: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,8 +96,6 @@ pub enum CausalPositionError {
         previous: i64,
         next: i64,
     },
-    #[error("stable current positions do not match the activity ledger for {wallet}")]
-    StableMismatch { wallet: WalletAddress },
     #[error("orchestrator control channel closed during position validation")]
     ControlClosed,
     #[error("orchestrator dropped a position-validation acknowledgement")]
@@ -88,8 +106,44 @@ pub enum CausalPositionError {
     ProofComponentTooLong,
     #[error("paper-state position proof install failed: {0}")]
     PaperState(#[from] pe_paper_state::PaperStateError),
+    #[error("position anchor install failed: {0}")]
+    AnchorInstall(#[from] AnchorInstallError),
     #[error("reconstruction quality invariant failed")]
     ReconstructionQuality,
+}
+
+/// Exact per-wallet source outcomes that retry without fencing or failing boot.
+#[must_use]
+pub fn is_deferred_causal_position_error(error: &CausalPositionError) -> bool {
+    match error {
+        CausalPositionError::PositionRevision { .. }
+        | CausalPositionError::InterveningActivity { .. } => true,
+        CausalPositionError::Activity {
+            source: ActivityReadError::SaturatedTerminalSecond { .. },
+            ..
+        } => true,
+        CausalPositionError::Activity {
+            source: ActivityReadError::Fetch { source, .. },
+            ..
+        }
+        | CausalPositionError::Positions {
+            source: PositionReadError::Fetch { source, .. },
+            ..
+        } => matches!(
+            source,
+            SourceError::Transient { .. } | SourceError::RateLimited { .. }
+        ),
+        CausalPositionError::Positions { source, .. } => matches!(
+            source,
+            PositionReadError::MissingActivityMapping { .. }
+                | PositionReadError::ConflictingActivityMapping { .. }
+                | PositionReadError::ConflictingOutcomeMapping { .. }
+                | PositionReadError::PositionMappingConflict { .. }
+                | PositionReadError::DuplicateAsset { .. }
+                | PositionReadError::SaturatedTerminalPage { .. }
+        ),
+        _ => false,
+    }
 }
 
 /// Shared real/fake-source bracket implementation.
@@ -161,7 +215,7 @@ impl CausalPositionValidator {
         &self,
         wallets: &[WalletAddress],
         control_tx: &mpsc::Sender<OrchestratorControl>,
-    ) -> Result<Vec<AdmissionAcceptance>, CausalPositionError> {
+    ) -> Result<Vec<AnchorInstall>, CausalPositionError> {
         let mut accepted = Vec::with_capacity(wallets.len());
         for wallet in wallets {
             accepted.push(self.validate_one_control(*wallet, control_tx).await?);
@@ -176,18 +230,18 @@ impl CausalPositionValidator {
         wallets: &[WalletAddress],
         engine: &mut BucketCommitEngine,
         paper_state: &PaperStateDb,
-    ) -> Result<Vec<AdmissionAcceptance>, CausalPositionError> {
+    ) -> Result<Vec<AnchorInstall>, CausalPositionError> {
         let mut accepted = Vec::with_capacity(wallets.len());
         for wallet in wallets {
-            match self.validate_one_direct(*wallet, engine).await {
+            match self.validate_one_direct(*wallet, engine, paper_state).await {
                 Ok(acceptance) => accepted.push(acceptance),
                 // The boot bracket is one-shot: it has no retry loop of its
                 // own, so a per-wallet outcome must never abort activation.
                 // A newly durable fence is deterministic quarantine (the
                 // commit already recorded it; the next boot's pre-bracket
                 // filter would exclude the wallet anyway). A retryable
-                // outcome — stable ledger/positions mismatch, positions
-                // revised between reads, activity intervening mid-bracket —
+                // outcome — positions revised between reads, activity
+                // intervening mid-bracket, or an incomplete source read —
                 // leaves the wallet unvalidated: it stays history-incomplete,
                 // is filtered after the bracket, and re-enters only through
                 // the serialized runtime admission preparer, which owns the
@@ -200,11 +254,7 @@ impl CausalPositionValidator {
                         "boot bracket: wallet durably fenced; excluded from the boot universe"
                     );
                 }
-                Err(
-                    error @ (CausalPositionError::StableMismatch { wallet }
-                    | CausalPositionError::PositionRevision { wallet }
-                    | CausalPositionError::InterveningActivity { wallet }),
-                ) => {
+                Err(error) if is_deferred_causal_position_error(&error) => {
                     tracing::warn!(
                         wallet = %wallet,
                         outcome = %error,
@@ -214,24 +264,12 @@ impl CausalPositionValidator {
                 Err(error) => return Err(error),
             }
         }
-        let records = accepted
-            .iter()
-            .map(|acceptance| acceptance.validation.clone())
-            .collect::<Vec<_>>();
-        for record in &records {
-            let current = ledger_capture(engine.ledger(), record.wallet)?;
-            if current.hash != record.ledger_hash || engine.is_fenced(&record.wallet) {
-                return Err(CausalPositionError::LedgerRevision {
-                    wallet: record.wallet,
-                });
-            }
-        }
-        paper_state.record_position_validations(&records)?;
+        engine.install_anchors(&accepted)?;
         // The accepted bracket IS the plan's history-validating reconciliation:
         // promote each wallet's SEEDED (conservative) history row to complete.
         // Unseeded wallets stay incomplete and are filtered fail-closed (#544
         // activation fix — without this the first v2 boot can never publish).
-        let wallets: Vec<WalletAddress> = records.iter().map(|record| record.wallet).collect();
+        let wallets: Vec<WalletAddress> = accepted.iter().map(|install| install.wallet).collect();
         paper_state.mark_seeded_history_validated(
             &wallets,
             "{\"source\":\"causal_position_bracket_v2\"}",
@@ -244,7 +282,7 @@ impl CausalPositionValidator {
         &self,
         wallet: WalletAddress,
         control_tx: &mpsc::Sender<OrchestratorControl>,
-    ) -> Result<AdmissionAcceptance, CausalPositionError> {
+    ) -> Result<AnchorInstall, CausalPositionError> {
         let first_activity = self.activity(wallet).await?;
         self.commit_control(wallet, &first_activity, control_tx, false)
             .await?;
@@ -288,7 +326,8 @@ impl CausalPositionValidator {
         &self,
         wallet: WalletAddress,
         engine: &mut BucketCommitEngine,
-    ) -> Result<AdmissionAcceptance, CausalPositionError> {
+        paper_state: &PaperStateDb,
+    ) -> Result<AnchorInstall, CausalPositionError> {
         let first_activity = self.activity(wallet).await?;
         commit_direct(
             wallet,
@@ -297,7 +336,7 @@ impl CausalPositionValidator {
             false,
             &self.source_log_generation,
         )?;
-        let first_ledger = ledger_capture(engine.ledger(), wallet)?;
+        let first_ledger = ledger_capture(engine.ledger(), paper_state, wallet)?;
         self.run_step_hook(1, engine);
         let first_mapping = first_activity
             .asset_mapping()
@@ -315,7 +354,7 @@ impl CausalPositionValidator {
         )? {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
-        let second_ledger = ledger_capture(engine.ledger(), wallet)?;
+        let second_ledger = ledger_capture(engine.ledger(), paper_state, wallet)?;
         self.run_step_hook(3, engine);
         let second_mapping = second_activity
             .asset_mapping()
@@ -333,14 +372,16 @@ impl CausalPositionValidator {
         )? {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
-        let final_ledger = ledger_capture(engine.ledger(), wallet)?;
-        self.finish(
+        let final_ledger = ledger_capture(engine.ledger(), paper_state, wallet)?;
+        let install = self.finish(
             wallet,
             [&first_activity, &second_activity, &final_activity],
             [&first_ledger, &second_ledger, &final_ledger],
             &first_positions,
             &second_positions,
-        )
+        )?;
+        self.run_step_hook(5, engine);
+        Ok(install)
     }
 
     #[cfg(feature = "scenario")]
@@ -418,7 +459,7 @@ impl CausalPositionValidator {
         ledgers: [&AdmissionLedgerCapture; 3],
         first_positions: &CompletePositionsRead,
         second_positions: &CompletePositionsRead,
-    ) -> Result<AdmissionAcceptance, CausalPositionError> {
+    ) -> Result<AnchorInstall, CausalPositionError> {
         for pair in activities.windows(2) {
             if pair[1].fixed_end < pair[0].fixed_end {
                 return Err(CausalPositionError::NonMonotonicActivityBounds {
@@ -434,56 +475,59 @@ impl CausalPositionValidator {
         if ledgers[0].hash != ledgers[1].hash || ledgers[1].hash != ledgers[2].hash {
             return Err(CausalPositionError::LedgerRevision { wallet });
         }
-        let position_balances = ordinary_position_balances(first_positions)?;
-        if position_balances != ledgers[2].positive_ordinary_balances
-            || ledgers[2].has_positive_short
-        {
-            return Err(CausalPositionError::StableMismatch { wallet });
-        }
+        let balances = ordinary_position_balances(first_positions)?;
 
         let activity_bounds = activities
             .iter()
             .map(|activity| {
-                activity
-                    .pages
-                    .iter()
-                    .map(|page| {
-                        json!({
-                            "request_url": page.request_url,
-                            "bounds": page.bounds,
-                            "offset": page.offset,
-                            "row_count": page.row_count,
-                            "canonical_page_hash": page.canonical_page_hash,
-                            "raw_page_hash": page.raw_page_hash,
-                            "received_at": page.received_at,
-                            "schema_version": page.schema_version,
-                            "parser_version": page.parser_version,
-                        })
-                    })
-                    .collect::<Vec<_>>()
+                json!({
+                    "fixed_end": activity.fixed_end,
+                    "pages": activity.pages,
+                    "observations": activity.rows.iter().map(|row| json!({
+                        "source_id": row.source_id,
+                        "observed_at": row.observed_at,
+                        "received_at": row.received_at,
+                        "schema_version": row.schema_version,
+                        "parser_version": row.parser_version,
+                    })).collect::<Vec<_>>(),
+                })
             })
             .collect::<Vec<_>>();
         let proof = json!({
             "version": 1,
             "wallet": wallet,
+            "source_id": ACTIVITY_POLL_SOURCE_ID,
             "positions_semantic_hash": first_positions.semantic_hash(),
-            "ledger_hash": ledgers[2].hash,
+            "expected_ledger_hash": ledgers[2].hash,
             "source_log_generation": self.source_log_generation,
             "activity_walks": activity_bounds,
-            "positions_pages": [
-                first_positions.pages,
-                second_positions.pages,
+            "positions_reads": [
+                {
+                    "semantic_hash": first_positions.semantic_hash(),
+                    "pages": first_positions.pages,
+                },
+                {
+                    "semantic_hash": second_positions.semantic_hash(),
+                    "pages": second_positions.pages,
+                },
             ],
         });
-        Ok(AdmissionAcceptance {
-            validation: PositionValidationRecord {
-                wallet,
-                ledger_hash: ledgers[2].hash.clone(),
+        Ok(AnchorInstall {
+            wallet,
+            balances,
+            cutoff: activities[1].fixed_end,
+            proof: AnchorProof {
                 positions_proof_hash: first_positions.semantic_hash().to_owned(),
                 activity_bounds_json: serde_json::to_string(&activity_bounds)?,
                 source_log_generation: self.source_log_generation.to_string(),
-                proof_json: serde_json::to_string(&proof)?,
+                document: serde_json::to_string(&proof)?,
                 recorded_at_unix: (self.now)(),
+            },
+            expected: AnchorExpectation {
+                ledger_hash: ledgers[2].hash.clone(),
+                cursor: ledgers[2].cursor,
+                anchor_seq: ledgers[2].anchor_seq,
+                coverage_generation: ledgers[2].coverage_generation,
             },
         })
     }
@@ -587,6 +631,7 @@ fn commit_direct(
 /// Canonical exact ledger proof for one wallet.
 pub fn ledger_capture(
     ledger: &PositionLedger,
+    paper_state: &PaperStateDb,
     wallet: WalletAddress,
 ) -> Result<AdmissionLedgerCapture, CausalPositionError> {
     let mut all = BTreeMap::<(String, u16), (ShareAmount, ShareAmount)>::new();
@@ -613,17 +658,21 @@ pub fn ledger_capture(
         }
         has_positive_short |= short > ShareAmount::ZERO;
     }
+    let coverage = paper_state.wallet_coverage(&wallet)?;
     Ok(AdmissionLedgerCapture {
         wallet,
         hash: hasher.finalize().to_hex().to_string(),
         positive_ordinary_balances,
         has_positive_short,
+        cursor: paper_state.cursor(&wallet)?,
+        anchor_seq: coverage.anchor_seq,
+        coverage_generation: coverage.coverage_generation,
     })
 }
 
 fn ordinary_position_balances(
     read: &CompletePositionsRead,
-) -> Result<BTreeMap<(String, u16), ShareAmount>, CausalPositionError> {
+) -> Result<Vec<(MarketId, OutcomeId, ShareAmount)>, CausalPositionError> {
     let mut balances = BTreeMap::new();
     for position in &read.positions {
         if position.classification == PositionClassification::Combo
@@ -639,7 +688,16 @@ fn ordinary_position_balances(
             });
         }
     }
-    Ok(balances)
+    Ok(balances
+        .into_iter()
+        .map(|((condition_id, outcome), amount)| {
+            (
+                MarketId(VenueMarketId(condition_id)),
+                OutcomeId(outcome),
+                amount,
+            )
+        })
+        .collect())
 }
 
 fn hash_part(hasher: &mut blake3::Hasher, value: &[u8]) -> Result<(), CausalPositionError> {

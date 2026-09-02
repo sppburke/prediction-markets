@@ -465,7 +465,7 @@ mod tests {
                 OrchestratorControl::CommitActivityBucket { .. } => {
                     panic!("capacity transition sent an activity bucket")
                 }
-                OrchestratorControl::PrepareValidatedAdmissions { .. }
+                OrchestratorControl::InstallAnchors { .. }
                 | OrchestratorControl::CaptureAdmissionLedger { .. } => {
                     panic!("legacy admission test sent a causal-bracket command")
                 }

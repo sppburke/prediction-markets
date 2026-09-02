@@ -14,7 +14,7 @@ use pe_core_types::{
     BasisPoints, ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
-use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, SourceLogHandle};
 use pe_service::bucket_commit::BucketCommitEngine;
@@ -204,6 +204,7 @@ async fn run_once(
             ),
         ),
         obligations,
+        None,
     )
     .with_clock(Arc::new(move || now))
     .run()
@@ -229,6 +230,22 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     let now = OffsetDateTime::from_unix_timestamp(epoch + 3).unwrap();
     paper_state
         .set_cursor(&wallet(), epoch.saturating_add(20))
+        .unwrap();
+    // A wallet with no anchor covers everything (#555): anchor an empty
+    // ledger below the scenario epoch so the bucket is post-cutoff.
+    paper_state
+        .install_anchors(&[AnchorInstallRecord {
+            wallet: wallet(),
+            balances: Vec::new(),
+            activity_cutoff_unix: epoch - 1,
+            anchored_at_unix: epoch,
+            ledger_hash_after: "empty".to_owned(),
+            positions_proof_hash: "positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: epoch,
+        }])
         .unwrap();
     for _reader in 0..3 {
         append_ws(&source_log, ws_payload(epoch), epoch);
@@ -339,6 +356,7 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
                 ),
             ),
             ReconciliationObligations::default(),
+            None,
         )
         .with_clock(Arc::new(move || now))
         .run(),

@@ -534,6 +534,23 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
     record_complete_history(&paper_state);
+    // A wallet with no anchor covers everything (#555): anchor an empty
+    // ledger below the scenario epoch so the buckets are post-cutoff.
+    paper_state.set_cursor(&leader_wallet(), 0).unwrap();
+    paper_state
+        .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            wallet: leader_wallet(),
+            balances: Vec::new(),
+            activity_cutoff_unix: SOURCE_EPOCH - 1,
+            anchored_at_unix: SOURCE_EPOCH,
+            ledger_hash_after: "empty".to_owned(),
+            positions_proof_hash: "positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: SOURCE_EPOCH,
+        }])
+        .unwrap();
 
     let config_a = flat_snapshot(dec!(0.50));
     let config_b = flat_snapshot(dec!(0.90));

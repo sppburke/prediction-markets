@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 
 use pe_core_types::{ShareAmount, WalletAddress};
-use pe_paper_state::PositionValidationRecord;
 use pe_source_polymarket_public::ActivityAggregate;
 use tokio::sync::oneshot;
 
 use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+use crate::position_seeder::AnchorInstall;
 
 /// Exact single-owner ledger capture used by the causal bracket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub struct AdmissionLedgerCapture {
     pub hash: String,
     pub positive_ordinary_balances: BTreeMap<(String, u16), ShareAmount>,
     pub has_positive_short: bool,
+    pub cursor: Option<i64>,
+    pub anchor_seq: Option<i64>,
+    pub coverage_generation: i64,
 }
 
 /// A control-plane update consumed ahead of trade events by the orchestrator's biased select.
@@ -32,10 +35,10 @@ pub enum OrchestratorControl {
         wallets: Vec<WalletAddress>,
         acknowledged: oneshot::Sender<()>,
     },
-    /// Install an all-or-nothing set of accepted causal brackets after
-    /// rechecking each final ledger hash against the single runtime owner.
-    PrepareValidatedAdmissions {
-        validations: Vec<PositionValidationRecord>,
+    /// Install an all-or-nothing set of venue-authoritative position anchors
+    /// after rechecking the captured ledger and coverage generation.
+    InstallAnchors {
+        installs: Vec<AnchorInstall>,
         acknowledged: oneshot::Sender<Result<(), String>>,
     },
     /// Capture one exact ledger generation between bracket steps.
