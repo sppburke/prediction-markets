@@ -1,7 +1,7 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::PositionState;
@@ -9,8 +9,10 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
     SourceTimestamp, VenueMarketId, WalletAddress,
 };
+use pe_event_log::Reader;
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
+use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::build_leader_ledger;
@@ -18,11 +20,13 @@ use pe_service::position_seeder::{
     AnchorExpectation, AnchorInstall, AnchorProof, CausalPositionError, CausalPositionValidator,
     is_deferred_causal_position_error, ledger_capture,
 };
+use pe_service::source_event_sink::SourceEventSink;
 use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityReadError, ActivityTransport, PageFetcher, PolymarketEndpoint,
-    PositionPartition, PositionReadError, aggregate_activity_rows, parse_activity_response,
+    ActivityParseContext, ActivityReadError, ActivityTransport, GAMMA_BATCH_SIZE,
+    GAMMA_MARKETS_SOURCE_ID, PageFetcher, PolymarketEndpoint, PositionPartition, PositionReadError,
+    ReconciliationFetcher, aggregate_activity_rows, parse_activity_response,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -34,10 +38,19 @@ const END: i64 = 100;
 
 struct QueueFetcher {
     responses: Mutex<HashMap<String, VecDeque<Vec<u8>>>>,
+    urls: Mutex<Vec<String>>,
+    gamma_response: Option<Vec<u8>>,
 }
 
 impl QueueFetcher {
     fn new(responses: HashMap<String, Vec<Vec<u8>>>) -> Self {
+        Self::with_gamma(responses, None)
+    }
+
+    fn with_gamma(
+        responses: HashMap<String, Vec<Vec<u8>>>,
+        gamma_response: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             responses: Mutex::new(
                 responses
@@ -45,12 +58,50 @@ impl QueueFetcher {
                     .map(|(url, responses)| (url, responses.into()))
                     .collect(),
             ),
+            urls: Mutex::new(Vec::new()),
+            gamma_response,
         }
+    }
+
+    fn urls(&self) -> Vec<String> {
+        self.urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
 impl PageFetcher for QueueFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(url.to_owned());
+        if url.contains("/markets?clob_token_ids=") {
+            if let Some(response) = &self.gamma_response {
+                return Ok(response.clone());
+            }
+            let markets = url
+                .split('?')
+                .nth(1)
+                .into_iter()
+                .flat_map(|query| query.split('&'))
+                .filter_map(|part| part.strip_prefix("clob_token_ids="))
+                .filter_map(|token| {
+                    let byte = token.strip_prefix("asset-")?;
+                    u8::from_str_radix(byte, 16).ok().map(|byte| {
+                        json!({
+                            "conditionId": condition(byte),
+                            "clobTokenIds": [token],
+                            "closed": url.contains("closed=true")
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            return serde_json::to_vec(&markets).map_err(|error| SourceError::Fatal {
+                message: error.to_string(),
+            });
+        }
         self.responses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -59,6 +110,62 @@ impl PageFetcher for QueueFetcher {
             .ok_or_else(|| SourceError::Fatal {
                 message: format!("no queued fixture for {url}"),
             })
+    }
+}
+
+struct GatedFetcher {
+    inner: QueueFetcher,
+    wallets: Vec<WalletAddress>,
+    first_activity: Mutex<HashSet<WalletAddress>>,
+    barrier: tokio::sync::Barrier,
+    yields: HashMap<WalletAddress, usize>,
+}
+
+impl GatedFetcher {
+    fn new(
+        responses: HashMap<String, Vec<Vec<u8>>>,
+        wallets: Vec<WalletAddress>,
+        yields: HashMap<WalletAddress, usize>,
+        gamma_response: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            inner: QueueFetcher::with_gamma(responses, gamma_response),
+            barrier: tokio::sync::Barrier::new(wallets.len()),
+            wallets,
+            first_activity: Mutex::new(HashSet::new()),
+            yields,
+        }
+    }
+
+    fn urls(&self) -> Vec<String> {
+        self.inner.urls()
+    }
+}
+
+impl PageFetcher for GatedFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        let wallet = self
+            .wallets
+            .iter()
+            .copied()
+            .find(|wallet| url.contains(&wallet.to_string()));
+        let gate = wallet.is_some_and(|wallet| {
+            url.contains("/activity?")
+                && self
+                    .first_activity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(wallet)
+        });
+        if gate {
+            self.barrier.wait().await;
+            if let Some(wallet) = wallet {
+                for _ in 0..self.yields.get(&wallet).copied().unwrap_or_default() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        self.inner.fetch_page(url).await
     }
 }
 
@@ -151,13 +258,69 @@ fn stable_responses(specs: &[(WalletAddress, u8, &str)]) -> HashMap<String, Vec<
     responses
 }
 
+fn stable_responses_for_attempts(
+    specs: &[(WalletAddress, u8, &str)],
+    attempts: usize,
+) -> HashMap<String, Vec<Vec<u8>>> {
+    let mut responses = stable_responses(specs);
+    for pages in responses.values_mut() {
+        let original = pages.clone();
+        for _ in 1..attempts {
+            pages.extend(original.clone());
+        }
+    }
+    responses
+}
+
 fn validator(responses: HashMap<String, Vec<Vec<u8>>>) -> CausalPositionValidator {
-    CausalPositionValidator::new(
-        Arc::new(QueueFetcher::new(responses)),
+    validator_from_fetcher(Arc::new(QueueFetcher::new(responses)))
+}
+
+fn validator_from_fetcher(fetcher: Arc<QueueFetcher>) -> CausalPositionValidator {
+    let fetcher: Arc<dyn ReconciliationFetcher> = fetcher;
+    validator_from_reconciliation(fetcher)
+}
+
+fn validator_from_reconciliation(
+    fetcher: Arc<dyn ReconciliationFetcher>,
+) -> CausalPositionValidator {
+    let dir = tempfile::tempdir().unwrap();
+    let source_log = Arc::new(tokio::sync::Mutex::new(
+        SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+    ));
+    let asset_identity = Arc::new(AssetIdentityResolver::new(
+        Arc::clone(&fetcher),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log,
+    ));
+    CausalPositionValidator::new(fetcher, BASE, "source-generation-test", asset_identity)
+        .with_clock(Arc::new(|| END))
+}
+
+fn recording_validator(
+    fetcher: Arc<dyn ReconciliationFetcher>,
+) -> (TempDir, std::path::PathBuf, CausalPositionValidator) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.log");
+    let sink = Arc::new(tokio::sync::Mutex::new(
+        SourceEventSink::open(&path).unwrap(),
+    ));
+    let asset_identity = Arc::new(AssetIdentityResolver::new(
+        Arc::clone(&fetcher),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        Arc::clone(&sink),
+    ));
+    let validator = CausalPositionValidator::new_recording(
+        fetcher,
         BASE,
         "source-generation-test",
+        sink,
+        asset_identity,
     )
-    .with_clock(Arc::new(|| END))
+    .with_clock(Arc::new(|| END));
+    (dir, path, validator)
 }
 
 fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
@@ -225,6 +388,8 @@ fn context(epoch: i64) -> BucketDecisionContext {
         recorded_at_unix: epoch,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
+        identity_overrides: HashMap::new(),
+        identity_unresolved: Default::default(),
         history_status: None,
     }
 }
@@ -350,6 +515,379 @@ async fn stable_complete_bracket_installs_and_restart_is_identical() {
 }
 
 #[tokio::test]
+async fn corrected_bracket_records_metadata_reuses_provenance_and_keeps_full_reads() {
+    let wallet = wallet(0x12);
+    let (_paper_dir, paper, mut engine) = fresh(&[wallet]);
+    let gamma = serde_json::to_vec(&vec![json!({
+        "conditionId": condition(9),
+        "clobTokenIds": ["other-outcome", asset(1)]
+    })])
+    .unwrap();
+    let fetcher = Arc::new(QueueFetcher::with_gamma(
+        stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2),
+        Some(gamma),
+    ));
+    let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
+    let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
+
+    let first = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    let second = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        first[0].balances,
+        vec![(
+            MarketId(VenueMarketId(condition(9))),
+            OutcomeId(1),
+            ShareAmount::from_atomic(1_000_000),
+        )]
+    );
+    let first_proof: Value = serde_json::from_str(&first[0].proof.document).unwrap();
+    let second_proof: Value = serde_json::from_str(&second[0].proof.document).unwrap();
+    assert_eq!(
+        first_proof["metadata_reads"],
+        second_proof["metadata_reads"]
+    );
+    let metadata_reads = first_proof["metadata_reads"].as_array().unwrap();
+    assert_eq!(metadata_reads.len(), 1);
+    let sequence = metadata_reads[0]["source_log_sequence"].as_u64().unwrap();
+    let canonical_hash = metadata_reads[0]["canonical_page_hash"].as_str().unwrap();
+
+    let urls = fetcher.urls();
+    let activity_urls = urls
+        .iter()
+        .filter(|url| url.contains("/activity?"))
+        .collect::<Vec<_>>();
+    assert_eq!(activity_urls.len(), 6);
+    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert_eq!(
+        urls.iter()
+            .filter(|url| url.contains("/markets?clob_token_ids="))
+            .count(),
+        1,
+        "the anchored bracket reuses the process cache"
+    );
+    assert_eq!(first[0].cutoff, END);
+    assert_eq!(second[0].cutoff, END);
+
+    let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+    assert_eq!(groups.len(), 1);
+    let effect = pe_position_ledger::LedgerEffect::from_document(&groups[0].proof_json).unwrap();
+    assert!(effect.correction().is_some());
+    assert_eq!(
+        serde_json::from_str::<Value>(&groups[0].proof_json).unwrap()["version"],
+        2
+    );
+
+    drop(validator);
+    let metadata_entries = Reader::replay(&source_path)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|(_, envelope)| envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID)
+        .collect::<Vec<_>>();
+    assert_eq!(metadata_entries.len(), 1);
+    assert_eq!(metadata_entries[0].0.0, sequence);
+    let canonical_payload = serde_json::to_vec(
+        &serde_json::from_slice::<Value>(&metadata_entries[0].1.payload).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        blake3::hash(&canonical_payload).to_hex().as_str(),
+        canonical_hash
+    );
+}
+
+#[tokio::test]
+async fn verified_anchor_replaces_a_preexisting_wrong_identity_ledger_row() {
+    let wallet = wallet(0x18);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let raw = activity(wallet, 1, "1.000000", "0xbase1", 10);
+    engine
+        .commit(vec![aggregate(raw, wallet)], &context(10), zero_basis())
+        .unwrap();
+    assert_eq!(
+        engine
+            .ledger()
+            .position(&wallet)
+            .and_then(|snapshot| {
+                snapshot.positions.get(&MarketOutcomeId::new(
+                    MarketId(VenueMarketId(condition(1))),
+                    OutcomeId(0),
+                ))
+            })
+            .map(|position| position.long_contracts.atomic()),
+        Some(1_000_000)
+    );
+
+    let gamma = serde_json::to_vec(&vec![json!({
+        "conditionId": condition(9),
+        "clobTokenIds": ["other-outcome", asset(1)]
+    })])
+    .unwrap();
+    let fetcher = Arc::new(QueueFetcher::with_gamma(
+        stable_responses(&[(wallet, 1, "1.000000")]),
+        Some(gamma),
+    ));
+    let validator = validator_from_fetcher(fetcher);
+    let accepted = validator
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+
+    assert_eq!(accepted.len(), 1);
+    let snapshot = engine.ledger().position(&wallet).unwrap();
+    assert!(!snapshot.positions.contains_key(&MarketOutcomeId::new(
+        MarketId(VenueMarketId(condition(1))),
+        OutcomeId(0),
+    )));
+    assert_eq!(
+        snapshot.positions
+            [&MarketOutcomeId::new(MarketId(VenueMarketId(condition(9))), OutcomeId(1),)]
+            .long_contracts
+            .atomic(),
+        1_000_000
+    );
+
+    let replayed = build_leader_ledger(&paper).unwrap();
+    let replayed = replayed.position(&wallet).unwrap();
+    assert!(!replayed.positions.contains_key(&MarketOutcomeId::new(
+        MarketId(VenueMarketId(condition(1))),
+        OutcomeId(0),
+    )));
+    assert_eq!(
+        replayed.positions
+            [&MarketOutcomeId::new(MarketId(VenueMarketId(condition(9))), OutcomeId(1),)]
+            .long_contracts
+            .atomic(),
+        1_000_000
+    );
+}
+
+#[tokio::test]
+async fn assets_first_seen_in_second_or_final_activity_read_are_resolved_before_commit() {
+    for (suffix, appearance) in [(0x19, 2_usize), (0x1a, 3_usize)] {
+        let wallet = wallet(suffix);
+        let (_dir, paper, mut engine) = fresh(&[wallet]);
+        let first_row = activity(wallet, 1, "1.000000", "0xfirst-asset", 10);
+        let second_row = activity(wallet, 2, "2.000000", "0xlater-asset", 20);
+        let second_group = aggregate(second_row.clone(), wallet).group_id.key().clone();
+        let first_activity = serde_json::to_vec(&vec![first_row.clone()]).unwrap();
+        let both_activity = serde_json::to_vec(&vec![second_row, first_row]).unwrap();
+        let activity_pages = if appearance == 2 {
+            vec![
+                first_activity,
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity,
+            ]
+        } else {
+            vec![
+                first_activity.clone(),
+                first_activity,
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity.clone(),
+                both_activity,
+            ]
+        };
+        let first_positions = serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap();
+        let both_positions =
+            serde_json::to_vec(&vec![position(wallet, 1, "1"), position(wallet, 2, "2")]).unwrap();
+        let position_reads = if appearance == 2 { 3 } else { 4 };
+        let mut not_redeemable = vec![first_positions; appearance - 1];
+        not_redeemable.extend((0..2).map(|_| both_positions.clone()));
+        assert_eq!(not_redeemable.len(), position_reads);
+        let responses = HashMap::from([
+            (activity_url(wallet), activity_pages),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                not_redeemable,
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                (0..position_reads).map(|_| b"[]".to_vec()).collect(),
+            ),
+        ]);
+        let gamma = serde_json::to_vec(&vec![
+            json!({"conditionId":condition(1),"clobTokenIds":[asset(1)]}),
+            json!({
+                "conditionId":condition(9),
+                "clobTokenIds":["other-outcome",asset(2)]
+            }),
+        ])
+        .unwrap();
+        let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(gamma)));
+
+        let accepted = validator_from_fetcher(fetcher)
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert!(accepted[0].balances.contains(&(
+            MarketId(VenueMarketId(condition(9))),
+            OutcomeId(1),
+            ShareAmount::from_atomic(2_000_000),
+        )));
+        let corrected = paper
+            .activity_groups_after(&wallet, -1)
+            .unwrap()
+            .into_iter()
+            .find(|group| group.source_trade_id == second_group)
+            .expect("later asset is committed during the read where it first appears");
+        assert_eq!(
+            serde_json::from_str::<Value>(&corrected.proof_json).unwrap()["version"],
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_shared_asset_brackets_have_durable_provenance_in_either_completion_order() {
+    let first = wallet(0x13);
+    let second = wallet(0x14);
+    let mut outcomes = Vec::new();
+    for yields in [
+        HashMap::from([(first, 0), (second, 8)]),
+        HashMap::from([(first, 8), (second, 0)]),
+    ] {
+        let (_paper_dir, paper, mut engine) = fresh(&[first, second]);
+        let gamma = serde_json::to_vec(&vec![json!({
+            "conditionId": condition(9),
+            "clobTokenIds": ["other-outcome", asset(1)]
+        })])
+        .unwrap();
+        let fetcher = Arc::new(GatedFetcher::new(
+            stable_responses(&[(first, 1, "1.000000"), (second, 1, "2.000000")]),
+            vec![first, second],
+            yields,
+            Some(gamma),
+        ));
+        let fetcher_trait: Arc<dyn ReconciliationFetcher> = fetcher.clone();
+        let (_source_dir, source_path, validator) = recording_validator(fetcher_trait);
+
+        let accepted = validator
+            .validate_direct(&[first, second], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+        let metadata = accepted
+            .iter()
+            .map(|install| {
+                serde_json::from_str::<Value>(&install.proof.document).unwrap()["metadata_reads"]
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metadata[0], metadata[1]);
+        let provenance = metadata[0].as_array().unwrap();
+        assert_eq!(provenance.len(), 1);
+        let sequence = provenance[0]["source_log_sequence"].as_u64().unwrap();
+        let canonical_hash = provenance[0]["canonical_page_hash"].as_str().unwrap();
+        assert_eq!(
+            fetcher
+                .urls()
+                .iter()
+                .filter(|url| url.contains("/markets?clob_token_ids="))
+                .count(),
+            1
+        );
+
+        drop(validator);
+        let metadata_entry = Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|(event_sequence, envelope)| {
+                event_sequence.0 == sequence && envelope.source_id.0 == GAMMA_MARKETS_SOURCE_ID
+            })
+            .expect("both proofs reference an appended Gamma page");
+        let canonical_payload = serde_json::to_vec(
+            &serde_json::from_slice::<Value>(&metadata_entry.1.payload).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            blake3::hash(&canonical_payload).to_hex().as_str(),
+            canonical_hash
+        );
+
+        let replayed = build_leader_ledger(&paper).unwrap();
+        let replayed_engine = BucketCommitEngine::load(Arc::clone(&paper), replayed).unwrap();
+        outcomes.push(
+            [first, second]
+                .into_iter()
+                .map(|wallet| {
+                    replayed_engine
+                        .ledger()
+                        .position(&wallet)
+                        .and_then(|snapshot| {
+                            snapshot.positions.get(&MarketOutcomeId::new(
+                                MarketId(VenueMarketId(condition(9))),
+                                OutcomeId(1),
+                            ))
+                        })
+                        .map(|position| position.long_contracts.atomic())
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[0], vec![Some(1_000_000), Some(2_000_000)]);
+}
+
+#[tokio::test]
+async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
+    let fenced = wallet(0x15);
+    let deferred = wallet(0x16);
+    let healthy = wallet(0x17);
+    let (_dir, paper, mut engine) = fresh(&[fenced, deferred, healthy]);
+    install_empty_anchor(&mut engine, &paper, fenced, 0);
+    let mut responses = stable_responses(&[(healthy, 3, "4.000000")]);
+    let mut underflow = activity(fenced, 1, "2.000000", "0xconcurrent-underflow", 10);
+    underflow["type"] = json!("REDEEM");
+    responses.insert(
+        activity_url(fenced),
+        vec![serde_json::to_vec(&vec![underflow]).unwrap()],
+    );
+    responses.insert(
+        activity_url(deferred),
+        vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::NotRedeemable),
+        vec![serde_json::to_vec(&vec![position(deferred, 2, "1")]).unwrap()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::Redeemable),
+        vec![b"[]".to_vec()],
+    );
+    let fetcher = Arc::new(GatedFetcher::new(
+        responses,
+        vec![fenced, deferred, healthy],
+        HashMap::from([(fenced, 4), (deferred, 2), (healthy, 0)]),
+        None,
+    ));
+    let fetcher: Arc<dyn ReconciliationFetcher> = fetcher;
+    let validator = validator_from_reconciliation(fetcher);
+
+    let accepted = validator
+        .validate_direct(&[fenced, deferred, healthy], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].wallet, healthy);
+    assert!(paper.is_wallet_fenced(&fenced).unwrap());
+    assert!(paper.position_validation(&fenced).unwrap().is_none());
+    assert!(paper.position_validation(&deferred).unwrap().is_none());
+    assert!(paper.position_validation(&healthy).unwrap().is_some());
+}
+
+#[tokio::test]
 async fn mutation_between_each_bracket_step_installs_nothing() {
     for target_step in 1..=5 {
         let wallet = wallet(u8::try_from(0x20 + target_step).unwrap());
@@ -402,7 +940,7 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
 }
 
 #[tokio::test]
-async fn zero_redeem_after_positions_b_defers_and_preserves_reanchor_flag() {
+async fn intervening_once_retries_then_accepts_and_clears_reanchor() {
     let wallet = wallet(0x2f);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 0);
@@ -420,16 +958,16 @@ async fn zero_redeem_after_positions_b_defers_and_preserves_reanchor_flag() {
         }
     });
 
-    let accepted = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+    let accepted = validator(stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2))
         .with_step_hook(hook)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
         .unwrap();
 
-    assert!(accepted.is_empty());
-    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
-    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 2);
+    assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -494,6 +1032,137 @@ async fn changed_position_revision_retries_without_fencing() {
     let responses = HashMap::from([
         (
             activity_url(wallet),
+            vec![
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity,
+            ],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![first, second.clone(), second.clone(), second],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+            ],
+        ),
+    ]);
+    let accepted = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .expect("the one bounded retry accepts stable position semantics");
+    assert_eq!(accepted.len(), 1);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn position_revision_twice_defers_after_one_retry() {
+    let wallet = wallet(0x45);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let activity =
+        serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xbase", 10)]).unwrap();
+    let positions = ["1", "2", "3", "4"]
+        .into_iter()
+        .map(|amount| serde_json::to_vec(&vec![position(wallet, 1, amount)]).unwrap())
+        .collect::<Vec<_>>();
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity.clone(),
+                activity,
+            ],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            positions,
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+                b"[]".to_vec(),
+            ],
+        ),
+    ]);
+
+    let accepted = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert!(accepted.is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn intervening_twice_defers_after_one_retry() {
+    let wallet = wallet(0x46);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let mutations = [("0xintervening-first", 20), ("0xintervening-second", 21)]
+        .into_iter()
+        .map(|(transaction_hash, epoch)| {
+            let mut redeem = activity(wallet, 9, "0", transaction_hash, epoch);
+            redeem["type"] = json!("REDEEM");
+            redeem["usdcSize"] = json!("0");
+            redeem["price"] = json!("0");
+            redeem["side"] = json!("");
+            aggregate(redeem, wallet)
+        })
+        .collect::<VecDeque<_>>();
+    let mutations = Arc::new(Mutex::new(mutations));
+    let hook = Arc::new(move |step: usize, engine: &mut BucketCommitEngine| {
+        if step == 4
+            && let Some(mutation) = mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+        {
+            let epoch = mutation.source_time.0.unix_timestamp();
+            engine
+                .commit(vec![mutation], &context(epoch), zero_basis())
+                .unwrap();
+        }
+    });
+
+    let accepted = validator(stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2))
+        .with_step_hook(hook)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert!(accepted.is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn durable_fence_between_attempts_stops_the_retry() {
+    let wallet = wallet(0x47);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let activity =
+        serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xbase", 10)]).unwrap();
+    let first = serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap();
+    let second = serde_json::to_vec(&vec![position(wallet, 1, "2")]).unwrap();
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
             vec![activity.clone(), activity.clone(), activity],
         ),
         (
@@ -505,12 +1174,33 @@ async fn changed_position_revision_retries_without_fencing() {
             vec![b"[]".to_vec(), b"[]".to_vec()],
         ),
     ]);
+    let database_path = dir.path().join("paper.db");
+    let inserted = Arc::new(Mutex::new(false));
+    let hook = Arc::new(move |step: usize, _engine: &mut BucketCommitEngine| {
+        let mut inserted = inserted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if step == 4 && !*inserted {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO wallet_fences
+                     (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix)
+                     VALUES (?1, 'g2:test-fence', 'test_fence', '{}', 100)",
+                    [wallet.to_string()],
+                )
+                .unwrap();
+            *inserted = true;
+        }
+    });
+
     let accepted = validator(responses)
+        .with_step_hook(hook)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("changed position semantics defer the wallet for a later retry");
+        .unwrap();
     assert!(accepted.is_empty());
-    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 }
 
@@ -562,12 +1252,7 @@ async fn backwards_activity_fixed_end_retries_without_installing() {
         ),
     ]);
     let clock = Arc::new(Mutex::new(VecDeque::from([100_i64, 99, 101])));
-    let validator = CausalPositionValidator::new(
-        Arc::new(QueueFetcher::new(responses)),
-        BASE,
-        "source-generation-test",
-    )
-    .with_clock(Arc::new(move || {
+    let validator = validator(responses).with_clock(Arc::new(move || {
         clock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -740,6 +1425,36 @@ async fn combo_identity_comes_from_activity_and_is_excluded_from_ordinary_compar
         .await
         .expect("negativeRisk must not turn an activity-proven combo into ordinary inventory");
     assert!(paper.position_validation_current(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn mixed_activity_combo_classification_defers_with_named_asset() {
+    let wallet = wallet(0x60);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let ordinary = activity(wallet, 1, "1.000000", "0xmixed-ordinary", 10);
+    let mut combo = activity(wallet, 1, "1.000000", "0xmixed-combo", 11);
+    combo["isCombo"] = json!(true);
+    let activity = serde_json::to_vec(&vec![ordinary, combo]).unwrap();
+    let responses = HashMap::from([(
+        activity_url(wallet),
+        vec![activity.clone(), activity.clone(), activity],
+    )]);
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer =
+        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+
+    let error = preparer.prepare(&[wallet]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AdmissionError::PositionValidation(CausalPositionError::Positions {
+            source: PositionReadError::ConflictingActivityMapping { asset },
+            ..
+        }) if asset == crate::asset(1)
+    ));
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    drop(preparer);
+    actor.await.unwrap();
 }
 
 #[tokio::test]
@@ -1199,14 +1914,9 @@ async fn parse_and_fatal_fetch_errors_remain_boot_fatal() {
 }
 
 #[test]
-fn source_log_open_error_fails_recording_validator_construction() {
+fn source_log_open_error_is_fatal_before_recording_validator_construction() {
     let dir = tempfile::tempdir().unwrap();
-    let result = CausalPositionValidator::new_recording(
-        Arc::new(QueueFetcher::new(HashMap::new())),
-        BASE,
-        "source-generation-test",
-        dir.path(),
-    );
+    let result = SourceEventSink::open(dir.path());
     assert!(matches!(result, Err(pe_event_log::LogError::Io(_))));
 }
 

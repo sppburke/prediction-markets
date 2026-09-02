@@ -124,6 +124,8 @@ fn context(epoch: i64) -> BucketDecisionContext {
         recorded_at_unix: epoch,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
+        identity_overrides: HashMap::new(),
+        identity_unresolved: Default::default(),
         history_status: Some(WalletHistoryStatusRecord {
             wallet: wallet(),
             complete: true,
@@ -410,11 +412,11 @@ fn missing_and_unknown_effect_documents_are_typed_replay_failures() {
         replay_with_document("{}"),
         WalletLedgerReplayError::EffectDocument { .. }
     ));
-    let unknown = replay_with_document(r#"{"effect":{"kind":"raw_only"},"version":2}"#);
+    let unknown = replay_with_document(r#"{"effect":{"kind":"raw_only"},"version":3}"#);
     assert!(matches!(
         unknown,
         WalletLedgerReplayError::EffectDocument {
-            source: pe_position_ledger::LedgerEffectDocumentError::UnknownVersion { version: 2 },
+            source: pe_position_ledger::LedgerEffectDocumentError::UnknownVersion { version: 3 },
             ..
         }
     ));

@@ -623,6 +623,8 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
                 recorded_at_unix: SOURCE_EPOCH + 2,
                 observation_provenance: HashMap::new(),
                 no_copy_dispositions: HashMap::new(),
+                identity_overrides: HashMap::new(),
+                identity_unresolved: Default::default(),
                 history_status: None,
             }),
             committed,

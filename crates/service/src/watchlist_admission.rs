@@ -132,7 +132,7 @@ impl AdmissionPreparer {
             .as_ref()
             .ok_or(AdmissionError::PositionValidatorUnavailable)?;
         let installs = match validator
-            .validate_via_control(&[wallet], &preparer.control_tx)
+            .validate_via_control(&[wallet], &preparer.control_tx, &preparer.paper_state)
             .await
         {
             Ok(installs) => installs,
@@ -174,7 +174,7 @@ impl AdmissionPreparer {
         let preparer = &self.inner;
         if let Some(validator) = &preparer.validator {
             let installs = validator
-                .validate_via_control(additions, &preparer.control_tx)
+                .validate_via_control(additions, &preparer.control_tx, &preparer.paper_state)
                 .await
                 .map_err(AdmissionError::PositionValidation)?;
             return self.install_anchors(installs).await;

@@ -13,6 +13,7 @@ use pe_core_types::SourceId;
 use pe_event_log::{Scanner, Writer};
 use pe_execution_core::{ExecutionDispatcher, LiveJournal};
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
+use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_migration::{
@@ -22,7 +23,7 @@ use pe_service::paper_migration::{
 };
 use pe_service::paper_recovery::{build_leader_ledger, reconcile_paper_state};
 use pe_service::position_seeder::CausalPositionValidator;
-use pe_source_polymarket_public::{ReconciliationFetcher, ReqwestFetcher};
+use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReconciliationFetcher, ReqwestFetcher};
 use pe_strategy_winner_follow::{ExecutionMode, PaperExecutor, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use rust_decimal::Decimal;
@@ -378,19 +379,30 @@ async fn main() -> Result<()> {
         ReqwestFetcher::new(reqwest::Client::new())
             .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS),
     );
+    let boot_source_log = Arc::new(tokio::sync::Mutex::new(
+        pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+            .context("open boot source-log recorder")?,
+    ));
+    let asset_identity = Arc::new(AssetIdentityResolver::new(
+        position_fetcher.clone(),
+        cfg.gamma_base_url.clone(),
+        GAMMA_BATCH_SIZE,
+        Arc::clone(&boot_source_log),
+    ));
     let boot_position_validator = if migration_boot.session.is_some() {
         CausalPositionValidator::new_recording(
             position_fetcher.clone(),
             cfg.polymarket_base_url.clone(),
             source_log_generation,
-            &cfg.source_event_log_path,
+            Arc::clone(&boot_source_log),
+            Arc::clone(&asset_identity),
         )
-        .context("open migration source-log recorder")?
     } else {
         CausalPositionValidator::new(
             position_fetcher.clone(),
             cfg.polymarket_base_url.clone(),
             source_log_generation,
+            Arc::clone(&asset_identity),
         )
     };
     let mut boot_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
@@ -407,6 +419,10 @@ async fn main() -> Result<()> {
         .context("causal current-position validation for boot universe")?;
     let leader_ledger = boot_engine.into_ledger();
     drop(boot_position_validator);
+    let (source_log, source_rx) =
+        pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
+    asset_identity.activate_runtime(source_log.clone()).await;
+    drop(boot_source_log);
 
     let complete_history = paper_state
         .complete_history_wallets()
@@ -489,6 +505,7 @@ async fn main() -> Result<()> {
         position_fetcher.clone(),
         cfg.polymarket_base_url.clone(),
         runtime_source_generation,
+        Arc::clone(&asset_identity),
     );
 
     projection_dirty.mark();
@@ -570,8 +587,6 @@ async fn main() -> Result<()> {
                 cfg.source_event_log_path.display()
             )
         })?;
-    let (source_log, source_rx) =
-        pe_service::activity_ingest::SourceLogHandle::channel(cfg.polymarket_channel_capacity);
     let (trigger_tx, trigger_rx) = mpsc::channel(cfg.polymarket_channel_capacity);
     let mut start = producer_start_rx.clone();
     let activity_watchlist = live_watchlist.clone();
@@ -616,6 +631,7 @@ async fn main() -> Result<()> {
     let poller_control_tx = control_tx.clone();
     let poller_runtime_config = live_runtime_config.clone();
     let poller_admission_preparer = admission_preparer.clone();
+    let poller_asset_identity = Arc::clone(&asset_identity);
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -630,6 +646,7 @@ async fn main() -> Result<()> {
             },
             poller_watchlist,
             position_fetcher,
+            poller_asset_identity,
             source_log,
             trigger_rx,
             poller_control_tx,

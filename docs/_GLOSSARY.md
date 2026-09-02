@@ -317,6 +317,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
 | `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
 | `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; an owner-selected operational default, not a calibrated value. |
+| `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host; every bracket still reads the wallet's full history three times. |
 
 ### Isolated Polymarket V2 canary (`pe-service-live-canary`)
 

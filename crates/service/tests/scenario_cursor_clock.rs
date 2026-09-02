@@ -17,6 +17,7 @@ use pe_event_log::{ContentType, EnvelopeIn, Reader, Writer};
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ActivityIngest, SourceLogHandle};
+use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -28,8 +29,8 @@ use pe_service::trade_poller::{
 };
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ReconciliationFetcher,
-    parse_activity_trade_observation,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, GAMMA_BATCH_SIZE, GAMMA_MARKETS_SOURCE_ID,
+    ReconciliationFetcher, parse_activity_trade_observation,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use time::OffsetDateTime;
@@ -72,6 +73,23 @@ impl ReconciliationFetcher for QueueFetcher {
                 })
         })
     }
+}
+
+struct GammaFetcher {
+    payload: Vec<u8>,
+}
+
+impl ReconciliationFetcher for GammaFetcher {
+    fn fetch<'a>(
+        &'a self,
+        _url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async { Ok(self.payload.clone()) })
+    }
+}
+
+fn verified_gamma_payload() -> Vec<u8> {
+    br#"[{"conditionId":"0xverified-condition","clobTokenIds":["123"]}]"#.to_vec()
 }
 
 async fn settle_until(mut predicate: impl FnMut() -> bool) {
@@ -141,10 +159,19 @@ async fn run_once(
     paper_state: Arc<PaperStateDb>,
     obligations: ReconciliationObligations,
     response: Vec<u8>,
+    gamma_response: Vec<u8>,
     now: OffsetDateTime,
 ) {
     let sink = SourceEventSink::open(source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(4);
+    let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
+        Arc::new(GammaFetcher {
+            payload: gamma_response,
+        }),
+        BASE_URL.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log.clone(),
+    ));
     let (trigger_tx, trigger_rx) = mpsc::channel(4);
     let health = new_shared_health_with_ws(false, true, 90);
     let ingest =
@@ -192,6 +219,7 @@ async fn run_once(
         },
         LiveWatchlist::new(watchlist()),
         Arc::new(QueueFetcher::new([response])),
+        asset_identity,
         source_log,
         trigger_rx,
         control_tx,
@@ -258,6 +286,7 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
         paper_state.clone(),
         obligations,
         b"[]".to_vec(),
+        verified_gamma_payload(),
         now,
     )
     .await;
@@ -274,6 +303,7 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
         paper_state.clone(),
         after_restart,
         rest_payload(epoch),
+        verified_gamma_payload(),
         now,
     )
     .await;
@@ -284,6 +314,8 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     );
     let positions = paper_state.leader_positions().unwrap();
     assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].market_id.to_string(), "0xverified-condition");
+    assert_eq!(positions[0].outcome_id.0, 0);
     assert_eq!(positions[0].long_contracts.atomic(), 5_000_000);
     let group_id = parse_activity_trade_observation(&ws_payload(epoch))
         .unwrap()
@@ -297,6 +329,22 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     assert_eq!(provenance, "activity_ws");
     assert!(age > 2);
     assert_eq!(reason, "stale_activity_ws_past_copy_budget");
+    let durable_group = paper_state
+        .activity_groups_after(&wallet(), epoch.saturating_sub(1))
+        .unwrap()
+        .into_iter()
+        .find(|group| group.source_trade_id == group_id)
+        .expect("the raw websocket group id is the durable corrected group");
+    let effect =
+        pe_position_ledger::LedgerEffect::from_document(&durable_group.proof_json).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&durable_group.proof_json).unwrap()["version"],
+        2
+    );
+    assert_eq!(
+        effect.correction().unwrap().verified.market().to_string(),
+        "0xverified-condition"
+    );
 
     let sources: Vec<String> = Reader::replay(&source_log)
         .unwrap()
@@ -319,6 +367,80 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     );
 }
 
+#[tokio::test]
+async fn first_seen_unverified_poller_group_is_raw_only_and_reanchors() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_log = dir.path().join("source.log");
+    let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    paper_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{\"scenario\":\"complete\"}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    let epoch = 1_900_000_100;
+    paper_state.set_cursor(&wallet(), epoch - 1).unwrap();
+    paper_state
+        .install_anchors(&[AnchorInstallRecord {
+            wallet: wallet(),
+            balances: Vec::new(),
+            activity_cutoff_unix: epoch - 1,
+            anchored_at_unix: epoch - 1,
+            ledger_hash_after: "empty".to_owned(),
+            positions_proof_hash: "positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: epoch - 1,
+        }])
+        .unwrap();
+    let now = OffsetDateTime::from_unix_timestamp(epoch + 3).unwrap();
+
+    run_once(
+        &source_log,
+        Arc::clone(&paper_state),
+        ReconciliationObligations::default(),
+        rest_payload(epoch),
+        b"[]".to_vec(),
+        now,
+    )
+    .await;
+
+    let group_id = parse_activity_trade_observation(&ws_payload(epoch))
+        .unwrap()
+        .group_id
+        .key()
+        .clone();
+    assert_eq!(
+        paper_state
+            .activity_group_state(&group_id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        "raw_only"
+    );
+    assert_eq!(
+        paper_state.no_copy_disposition(&group_id).unwrap(),
+        Some(("rest_poll".to_owned(), 3, "identity_unresolved".to_owned()))
+    );
+    assert!(
+        paper_state
+            .wallet_coverage(&wallet())
+            .unwrap()
+            .reanchor_required
+    );
+    assert!(paper_state.leader_positions().unwrap().is_empty());
+    assert!(paper_state.open_decision_pending().unwrap().is_empty());
+    let gamma_pages = Reader::replay(&source_log)
+        .unwrap()
+        .map(|entry| entry.unwrap().1.source_id.0)
+        .filter(|source_id| source_id == GAMMA_MARKETS_SOURCE_ID)
+        .count();
+    assert_eq!(gamma_pages, 2, "open and closed misses are both recorded");
+}
+
 #[tokio::test(start_paused = true)]
 async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let dir = tempfile::tempdir().unwrap();
@@ -326,6 +448,14 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
     let sink = SourceEventSink::open(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(4);
+    let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
+        Arc::new(GammaFetcher {
+            payload: verified_gamma_payload(),
+        }),
+        BASE_URL.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log.clone(),
+    ));
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let trigger_inject = trigger_tx.clone();
     let health = new_shared_health_with_ws(false, true, 90);
@@ -344,6 +474,7 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
             },
             LiveWatchlist::new(watchlist()),
             fetcher.clone(),
+            asset_identity,
             source_log,
             trigger_rx,
             control_tx,

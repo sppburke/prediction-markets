@@ -11,10 +11,12 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, OutcomeId, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId,
     SourceTimestamp, VenueMarketId, WalletAddress,
 };
-use pe_paper_state::{DecisionPendingState, PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{
+    DecisionPendingState, NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord,
+};
 use pe_position_ledger::{LedgerEffect, PositionLedger, WalletFenceCause};
 use pe_service::bucket_commit::{
-    BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2,
+    BucketCommitEngine, BucketDecisionContext, DecisionContinuationV2, IdentityOverride,
 };
 use pe_service::decision_replay::{
     AuthorityEvidence, DecisionClockEvidence, DecisionPostBoundaryEvidence,
@@ -147,6 +149,8 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
         recorded_at_unix: epoch + 20,
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
+        identity_overrides: HashMap::new(),
+        identity_unresolved: Default::default(),
         history_status: complete_history.then(|| WalletHistoryStatusRecord {
             wallet: wallet(),
             complete: true,
@@ -167,6 +171,13 @@ fn state(engine: &BucketCommitEngine, market: &str, outcome: u16) -> ShareAmount
         .and_then(|snapshot| snapshot.positions.get(&key))
         .map(|position| position.long_contracts)
         .unwrap_or(ShareAmount::ZERO)
+}
+
+fn market_outcome(market: &str, outcome: u16) -> MarketOutcomeId {
+    MarketOutcomeId::new(
+        MarketId(VenueMarketId(market.to_owned())),
+        OutcomeId(outcome),
+    )
 }
 
 fn fresh() -> (tempfile::TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
@@ -312,6 +323,304 @@ fn covered_late_precedes_partial_and_late_equal_second_fences() {
     assert_eq!(result.dispositions[&copy_id.0], "not_copy_eligible");
     assert!(result.pending.is_empty());
     assert!(paper.open_decision_pending().unwrap().is_empty());
+}
+
+#[test]
+fn verified_identity_override_commits_v2_and_replays_with_v1() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let legacy = position_row("TRADE", "0xidentity-v1", MARKET_A, 0, "BUY", "2", "0.4", 90);
+    engine
+        .commit(vec![legacy], &context(90, true), zero_basis())
+        .unwrap();
+
+    let corrected = position_row("TRADE", "0xidentity-v2", MARKET_A, 0, "BUY", "3", "0.6", 91);
+    let corrected_id = corrected.group_id.key().clone();
+    let mut corrected_context = context(91, true);
+    corrected_context.identity_overrides.insert(
+        corrected_id.clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 1),
+            evidence_hash: "gamma-page-hash".to_owned(),
+        },
+    );
+    let result = engine
+        .commit(vec![corrected.clone()], &corrected_context, zero_basis())
+        .unwrap();
+
+    assert_eq!(result.dispositions[&corrected_id.0], "decision_pending");
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 2_000_000);
+    assert_eq!(state(&engine, MARKET_B, 1).atomic(), 3_000_000);
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let legacy_document = groups
+        .iter()
+        .find(|group| group.source_trade_id != corrected_id)
+        .unwrap();
+    let corrected_document = groups
+        .iter()
+        .find(|group| group.source_trade_id == corrected_id)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&legacy_document.proof_json).unwrap()["version"],
+        1
+    );
+    let parsed = LedgerEffect::from_document(&corrected_document.proof_json).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&corrected_document.proof_json).unwrap()["version"],
+        2
+    );
+    let correction = parsed.correction().unwrap();
+    assert_eq!(correction.stamped, market_outcome(MARKET_A, 0));
+    assert_eq!(correction.verified, market_outcome(MARKET_B, 1));
+    assert_eq!(correction.evidence_hash, "gamma-page-hash");
+
+    let retry = engine
+        .commit(vec![corrected], &corrected_context, zero_basis())
+        .unwrap();
+    assert!(retry.already_committed);
+    assert_eq!(state(&engine, MARKET_B, 1).atomic(), 3_000_000);
+
+    drop(engine);
+    drop(paper);
+    let restarted = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let replayed = build_leader_ledger(&restarted).unwrap();
+    let restarted_engine = BucketCommitEngine::load(restarted, replayed).unwrap();
+    assert_eq!(state(&restarted_engine, MARKET_A, 0).atomic(), 2_000_000);
+    assert_eq!(state(&restarted_engine, MARKET_B, 1).atomic(), 3_000_000);
+}
+
+#[test]
+fn unverified_identity_is_raw_only_reanchors_and_replays() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let unverified = position_row(
+        "TRADE",
+        "0xidentity-unverified",
+        MARKET_A,
+        0,
+        "BUY",
+        "7",
+        "0.5",
+        92,
+    );
+    let source_trade_id = unverified.group_id.key().clone();
+    let mut unresolved_context = context(92, true);
+    unresolved_context
+        .identity_unresolved
+        .insert(source_trade_id.clone());
+    unresolved_context.no_copy_dispositions.insert(
+        source_trade_id.clone(),
+        NoCopyDisposition {
+            provenance: "rest_poll".to_owned(),
+            age_secs: 0,
+            reason: "identity_unresolved".to_owned(),
+            recorded_at_unix: 112,
+        },
+    );
+
+    let result = engine
+        .commit(vec![unverified], &unresolved_context, zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&source_trade_id.0], "raw_only");
+    assert!(result.pending.is_empty());
+    assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+    assert_eq!(
+        paper.no_copy_disposition(&source_trade_id).unwrap(),
+        Some(("rest_poll".to_owned(), 0, "identity_unresolved".to_owned()))
+    );
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert!(
+        paper
+            .gate_history()
+            .unwrap()
+            .get(&wallet())
+            .is_none_or(std::collections::HashSet::is_empty)
+    );
+    assert!(matches!(
+        LedgerEffect::from_document(
+            &paper.activity_groups_after(&wallet(), 0).unwrap()[0].proof_json
+        ),
+        Ok(LedgerEffect::RawOnly)
+    ));
+
+    drop(engine);
+    drop(paper);
+    let restarted = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let replayed = build_leader_ledger(&restarted).unwrap();
+    let restarted_engine = BucketCommitEngine::load(restarted, replayed).unwrap();
+    assert_eq!(state(&restarted_engine, MARKET_A, 0), ShareAmount::ZERO);
+}
+
+#[test]
+fn covered_identity_resolution_uses_verified_history_and_keeps_unverified_raw_only() {
+    let (_dir, paper, mut engine) = fresh();
+    paper.set_cursor(&wallet(), 0).unwrap();
+    install_anchor(&mut engine, &paper, 100, Vec::new(), 101);
+    let corrected = position_row(
+        "TRADE",
+        "0xcovered-corrected",
+        MARKET_A,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        100,
+    );
+    let unverified = position_row(
+        "TRADE",
+        "0xcovered-unverified",
+        MARKET_C,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        100,
+    );
+    let corrected_id = corrected.group_id.key().clone();
+    let unverified_id = unverified.group_id.key().clone();
+    let mut resolved_context = context(100, true);
+    resolved_context.identity_overrides.insert(
+        corrected_id.clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 1),
+            evidence_hash: "covered-gamma-page".to_owned(),
+        },
+    );
+    resolved_context
+        .identity_unresolved
+        .insert(unverified_id.clone());
+    resolved_context.no_copy_dispositions.insert(
+        unverified_id.clone(),
+        NoCopyDisposition {
+            provenance: "rest_poll".to_owned(),
+            age_secs: 0,
+            reason: "identity_unresolved".to_owned(),
+            recorded_at_unix: 120,
+        },
+    );
+
+    let result = engine
+        .commit(vec![corrected, unverified], &resolved_context, zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&corrected_id.0], "anchor_covered_late");
+    assert_eq!(result.dispositions[&unverified_id.0], "raw_only");
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let history = paper.gate_history().unwrap();
+    assert!(history[&wallet()].contains(&MarketId(VenueMarketId(MARKET_B.to_owned()))));
+    assert!(!history[&wallet()].contains(&MarketId(VenueMarketId(MARKET_A.to_owned()))));
+    assert!(!history[&wallet()].contains(&MarketId(VenueMarketId(MARKET_C.to_owned()))));
+}
+
+#[test]
+fn mixed_corrected_unverified_bucket_rolls_back_every_surface_then_retries() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let corrected = position_row(
+        "TRADE",
+        "0xatomic-corrected",
+        MARKET_A,
+        0,
+        "BUY",
+        "3",
+        "0.5",
+        93,
+    );
+    let unverified = position_row(
+        "TRADE",
+        "0xatomic-unverified",
+        MARKET_C,
+        0,
+        "BUY",
+        "4",
+        "0.5",
+        93,
+    );
+    let corrected_id = corrected.group_id.key().clone();
+    let unverified_id = unverified.group_id.key().clone();
+    let mut mixed_context = context(93, true);
+    mixed_context.identity_overrides.insert(
+        corrected_id.clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 1),
+            evidence_hash: "atomic-gamma-page".to_owned(),
+        },
+    );
+    mixed_context
+        .identity_unresolved
+        .insert(unverified_id.clone());
+    mixed_context.no_copy_dispositions.insert(
+        unverified_id.clone(),
+        NoCopyDisposition {
+            provenance: "rest_poll".to_owned(),
+            age_secs: 0,
+            reason: "identity_unresolved".to_owned(),
+            recorded_at_unix: 113,
+        },
+    );
+
+    let database_path = dir.path().join("paper.db");
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_identity_history BEFORE INSERT ON wallet_market_history_v2 \
+             BEGIN SELECT RAISE(FAIL, 'injected identity bucket failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(
+        engine
+            .commit(
+                vec![corrected.clone(), unverified.clone()],
+                &mixed_context,
+                zero_basis(),
+            )
+            .is_err()
+    );
+    assert!(paper.activity_group_state(&corrected_id).unwrap().is_none());
+    assert!(
+        paper
+            .activity_group_state(&unverified_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(paper.no_copy_disposition(&corrected_id).unwrap().is_none());
+    assert!(paper.no_copy_disposition(&unverified_id).unwrap().is_none());
+    assert!(paper.leader_positions().unwrap().is_empty());
+    assert!(paper.open_decision_pending().unwrap().is_empty());
+    assert!(
+        paper
+            .gate_history()
+            .unwrap()
+            .get(&wallet())
+            .is_none_or(std::collections::HashSet::is_empty)
+    );
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert_eq!(state(&engine, MARKET_B, 1), ShareAmount::ZERO);
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    let revision_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM activity_group_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revision_count, 0);
+    connection
+        .execute_batch("DROP TRIGGER fail_identity_history;")
+        .unwrap();
+    drop(connection);
+
+    let result = engine
+        .commit(vec![corrected, unverified], &mixed_context, zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&unverified_id.0], "raw_only");
+    assert_eq!(state(&engine, MARKET_B, 1).atomic(), 3_000_000);
+    assert_eq!(state(&engine, MARKET_C, 0), ShareAmount::ZERO);
+    assert!(paper.activity_group_state(&corrected_id).unwrap().is_some());
+    assert!(
+        paper
+            .activity_group_state(&unverified_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
 }
 
 #[test]

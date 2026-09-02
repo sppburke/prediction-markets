@@ -13,6 +13,7 @@ use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletA
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
+use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{AnchorInstallError, BucketCommitEngine, FrozenDecisionBasis};
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
@@ -26,7 +27,7 @@ use pe_service::trade_poller::{
 use pe_service::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    PageFetcher, PolymarketEndpoint, PositionPartition, ReconciliationFetcher,
+    GAMMA_BATCH_SIZE, PageFetcher, PolymarketEndpoint, PositionPartition, ReconciliationFetcher,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use serde_json::json;
@@ -87,6 +88,24 @@ impl MapFetcher {
 
 impl PageFetcher for MapFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if url.contains("/markets?clob_token_ids=") {
+            let markets = url
+                .split('?')
+                .nth(1)
+                .into_iter()
+                .flat_map(|query| query.split('&'))
+                .filter_map(|part| part.strip_prefix("clob_token_ids="))
+                .filter_map(|token| {
+                    token.strip_prefix("asset-").map(|index| {
+                        json!({
+                            "conditionId": format!("condition-{index}"),
+                            "clobTokenIds": [token]
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(serde_json::to_vec(&markets).unwrap());
+        }
         self.responses
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -203,8 +222,18 @@ fn paper(wallets: &[WalletAddress]) -> (tempfile::TempDir, Arc<PaperStateDb>) {
 }
 
 fn validator(responses: HashMap<String, Vec<Vec<u8>>>) -> CausalPositionValidator {
-    CausalPositionValidator::new(Arc::new(MapFetcher::new(responses)), BASE, "scenario")
-        .with_clock(Arc::new(|| NOW))
+    let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(MapFetcher::new(responses));
+    let dir = tempfile::tempdir().unwrap();
+    let source_log = Arc::new(tokio::sync::Mutex::new(
+        SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+    ));
+    let resolver = Arc::new(AssetIdentityResolver::new(
+        Arc::clone(&fetcher),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log,
+    ));
+    CausalPositionValidator::new(fetcher, BASE, "scenario", resolver).with_clock(Arc::new(|| NOW))
 }
 
 struct PollerHarness {
@@ -238,6 +267,12 @@ fn poller_harness(
     let source_log_path = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(8);
+    let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
+        Arc::new(MapFetcher::new(HashMap::new())),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        source_log.clone(),
+    ));
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let health = new_shared_health_with_ws(false, true, 90);
     let ingest =
@@ -324,6 +359,7 @@ fn poller_harness(
         },
         live_watchlist(wallets),
         poll_fetcher,
+        asset_identity,
         source_log,
         trigger_rx,
         control_tx,

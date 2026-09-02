@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use pe_copy_signal_engine::{SignalConfig, TradeProvenance};
 use pe_core_types::{
-    ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
+    MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
+    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn, Reader};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
@@ -34,7 +35,8 @@ use tracing::warn;
 use crate::activity_ingest::{
     ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger, SourceLogHandle, SourceLogHandleError,
 };
-use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+use crate::asset_identity::AssetIdentityResolver;
+use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext, IdentityOverride};
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
@@ -59,6 +61,12 @@ pub struct TradePollerConfig {
 struct Obligation {
     group_id: SourceTradeId,
     received_at_unix: i64,
+}
+
+#[derive(Default)]
+struct BucketIdentities {
+    overrides: HashMap<SourceTradeId, IdentityOverride>,
+    unresolved: HashSet<SourceTradeId>,
 }
 
 /// Coalesced durable websocket work rebuilt from source evidence on restart.
@@ -220,6 +228,8 @@ pub fn rebuild_reconciliation_obligations(
 enum ReconciliationError {
     #[error("activity reconciliation: {0}")]
     Activity(#[from] ActivityReadError),
+    #[error("asset identity resolution: {0}")]
+    Identity(SourceError),
     #[error("source-log coordinator closed")]
     SourceLogClosed,
     #[error("paper-state: {0}")]
@@ -237,6 +247,10 @@ enum ReconciliationError {
 impl ReconciliationError {
     fn retryable(&self) -> bool {
         matches!(self, Self::Activity(_))
+            || matches!(
+                self,
+                Self::Identity(SourceError::Transient { .. } | SourceError::RateLimited { .. })
+            )
     }
 }
 
@@ -245,6 +259,7 @@ pub struct TradePoller {
     config: TradePollerConfig,
     live_watchlist: LiveWatchlist,
     fetcher: Arc<dyn ReconciliationFetcher>,
+    asset_identity: Arc<AssetIdentityResolver>,
     source_log: SourceLogHandle,
     trigger_rx: mpsc::Receiver<ReconciliationTrigger>,
     control_tx: mpsc::Sender<OrchestratorControl>,
@@ -276,6 +291,7 @@ impl TradePoller {
         config: TradePollerConfig,
         live_watchlist: LiveWatchlist,
         fetcher: Arc<dyn ReconciliationFetcher>,
+        asset_identity: Arc<AssetIdentityResolver>,
         source_log: SourceLogHandle,
         trigger_rx: mpsc::Receiver<ReconciliationTrigger>,
         control_tx: mpsc::Sender<OrchestratorControl>,
@@ -290,6 +306,7 @@ impl TradePoller {
             config,
             live_watchlist,
             fetcher,
+            asset_identity,
             source_log,
             trigger_rx,
             control_tx,
@@ -523,6 +540,7 @@ impl TradePoller {
             {
                 break;
             }
+            let identities = self.resolve_bucket(&bucket).await?;
             let context = self.context(
                 wallet,
                 source_epoch,
@@ -531,6 +549,7 @@ impl TradePoller {
                 copy_eligible,
                 &activity.pages,
                 &bucket,
+                identities,
             )?;
             let result = self.commit_bucket(bucket, context).await?;
             for group in bucket_ids {
@@ -557,6 +576,7 @@ impl TradePoller {
         copy_eligible: bool,
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         bucket: &[ActivityAggregate],
+        identities: BucketIdentities,
     ) -> Result<BucketDecisionContext, ReconciliationError> {
         let now = (self.now)();
         let mut observation_provenance = HashMap::new();
@@ -581,6 +601,21 @@ impl TradePoller {
                 no_copy_dispositions.insert(group, disposition);
             }
         }
+        for group in &identities.unresolved {
+            let provenance = observation_provenance
+                .get(group)
+                .copied()
+                .unwrap_or(TradeProvenance::RestPoll);
+            let source_time = bucket
+                .iter()
+                .find(|aggregate| aggregate.group_id.key() == group)
+                .map(|aggregate| aggregate.source_time.0)
+                .unwrap_or(now);
+            no_copy_dispositions.insert(
+                group.clone(),
+                identity_unresolved_disposition(provenance, source_time, now),
+            );
+        }
         Ok(BucketDecisionContext {
             applied_configuration: self.runtime_config.snapshot().as_ref().clone(),
             decision_inputs_json: serde_json::to_string(&serde_json::json!({
@@ -593,8 +628,52 @@ impl TradePoller {
             recorded_at_unix: now.unix_timestamp(),
             observation_provenance,
             no_copy_dispositions,
+            identity_overrides: identities.overrides,
+            identity_unresolved: identities.unresolved,
             history_status: None,
         })
+    }
+
+    async fn resolve_bucket(
+        &self,
+        bucket: &[ActivityAggregate],
+    ) -> Result<BucketIdentities, ReconciliationError> {
+        let tokens = bucket
+            .iter()
+            .filter_map(|aggregate| aggregate.group_id.components().asset.clone())
+            .collect::<HashSet<PolymarketTokenId>>();
+        let resolved = self
+            .asset_identity
+            .resolve(tokens)
+            .await
+            .map_err(ReconciliationError::Identity)?;
+        let mut identities = BucketIdentities::default();
+        for aggregate in bucket {
+            let components = aggregate.group_id.components();
+            let Some(asset) = &components.asset else {
+                continue;
+            };
+            let group = aggregate.group_id.key().clone();
+            let Some(verified) = resolved.verified.get(asset) else {
+                identities.unresolved.insert(group);
+                continue;
+            };
+            let differs = components.condition_id.as_ref() != Some(&verified.condition_id)
+                || components.outcome != Some(verified.outcome);
+            if differs {
+                identities.overrides.insert(
+                    group,
+                    IdentityOverride {
+                        verified: MarketOutcomeId::new(
+                            MarketId(VenueMarketId(verified.condition_id.0.clone())),
+                            verified.outcome,
+                        ),
+                        evidence_hash: verified.evidence_hash.clone(),
+                    },
+                );
+            }
+        }
+        Ok(identities)
     }
 
     async fn commit_bucket(
@@ -651,6 +730,23 @@ fn stale_disposition(
         reason: reason.to_owned(),
         recorded_at_unix: now.unix_timestamp(),
     })
+}
+
+fn identity_unresolved_disposition(
+    provenance: TradeProvenance,
+    source_time: OffsetDateTime,
+    now: OffsetDateTime,
+) -> NoCopyDisposition {
+    NoCopyDisposition {
+        provenance: match provenance {
+            TradeProvenance::RestPoll => "rest_poll",
+            TradeProvenance::ActivityWs => "activity_ws",
+        }
+        .to_owned(),
+        age_secs: (now - source_time).whole_seconds(),
+        reason: "identity_unresolved".to_owned(),
+        recorded_at_unix: now.unix_timestamp(),
+    }
 }
 
 struct RecordingFetcher {
