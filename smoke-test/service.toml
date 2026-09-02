@@ -21,6 +21,9 @@ mode                             = "paper"
 # is enforced by the orchestrator's filled-positions set.
 # Version-two durable reconciled history is mandatory; missing/incomplete wallets are
 # excluded before membership publication (there is no runtime fail-open switch).
+# One-time version-two migration input (see `_GLOSSARY.md`, entry gate): the captured
+# legacy history file the previous service wrote at this path. Inert after the import.
+legacy_wallet_history_path       = "smoke-test/wallet_market_history.json"
 max_resolution_horizon_secs      = 172800  # 48 h (run28 cutover)
 min_fill_price                   = "0.15"  # run28 entry-band floor (current price)
 watchlist_membership_mode        = "full_rerank"  # run28 cutover; knockout = legacy
