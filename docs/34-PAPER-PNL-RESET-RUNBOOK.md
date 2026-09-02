@@ -47,7 +47,7 @@ emptied `paper_fills` the RPC treats them as new — the exposure is a few
 boundary-second trades at most, and the first-entry gate blocks most.
 The captured legacy history file is deliberately **kept** for a schema-v1 migration rehearsal.
 It is a one-time, hash-bound migration input selected by `PE_LEGACY_WALLET_HISTORY_PATH`, not a
-runtime sidecar; after import, edits are inert.
+runtime sidecar; once the migration reaches phase `installed`, edits are inert.
 
 ## Sequence
 
