@@ -419,10 +419,10 @@ async fn main() -> Result<()> {
         .map(|entry| entry.wallet)
         .collect();
     live_watchlist.remove_fenced(&history_incomplete);
-    // Live at boot means accepted by this boot's bracket. Fenced and deferred
-    // wallets re-enter only through the runtime admission preparer; on a
-    // resumed side main an earlier bracket's promoted history would otherwise
-    // keep a now-deferred wallet live.
+    // Live at boot means accepted by this boot's bracket. Deferred wallets
+    // re-enter only through the runtime admission preparer; fenced wallets stay
+    // excluded. On a resumed side main an earlier bracket's promoted history
+    // would otherwise keep a now-deferred wallet live.
     let anchored_wallets: Vec<_> = anchored.iter().map(|install| install.wallet).collect();
     let not_accepted: std::collections::HashSet<_> = boot_wallets
         .iter()
