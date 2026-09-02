@@ -157,6 +157,24 @@ pub struct CausalPositionValidator {
     step_hook: Option<BracketStepHook>,
 }
 
+/// What the anchor proof keeps from a complete activity read once its rows have
+/// been committed: the fixed end and the page evidence. The rows themselves are
+/// already recorded per group, and holding three full histories per wallet was
+/// the boot's memory peak (#555 activation).
+struct ActivityEvidence {
+    fixed_end: i64,
+    pages: Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+}
+
+impl From<CompleteActivityRead> for ActivityEvidence {
+    fn from(read: CompleteActivityRead) -> Self {
+        Self {
+            fixed_end: read.fixed_end,
+            pages: read.pages,
+        }
+    }
+}
+
 impl CausalPositionValidator {
     pub fn new(
         fetcher: Arc<dyn ReconciliationFetcher>,
@@ -291,6 +309,7 @@ impl CausalPositionValidator {
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         let first_positions = self.positions(wallet, &first_mapping).await?;
+        let first_activity = ActivityEvidence::from(first_activity);
 
         let second_activity = self.activity(wallet).await?;
         if self
@@ -304,6 +323,7 @@ impl CausalPositionValidator {
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         let second_positions = self.positions(wallet, &second_mapping).await?;
+        let second_activity = ActivityEvidence::from(second_activity);
 
         let final_activity = self.activity(wallet).await?;
         if self
@@ -313,6 +333,7 @@ impl CausalPositionValidator {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
         let final_ledger = capture_control(wallet, control_tx).await?;
+        let final_activity = ActivityEvidence::from(final_activity);
         self.finish(
             wallet,
             [&first_activity, &second_activity, &final_activity],
@@ -342,6 +363,7 @@ impl CausalPositionValidator {
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         let first_positions = self.positions(wallet, &first_mapping).await?;
+        let first_activity = ActivityEvidence::from(first_activity);
         self.run_step_hook(2, engine);
 
         let second_activity = self.activity(wallet).await?;
@@ -360,6 +382,7 @@ impl CausalPositionValidator {
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         let second_positions = self.positions(wallet, &second_mapping).await?;
+        let second_activity = ActivityEvidence::from(second_activity);
         self.run_step_hook(4, engine);
 
         let final_activity = self.activity(wallet).await?;
@@ -373,6 +396,7 @@ impl CausalPositionValidator {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
         let final_ledger = ledger_capture(engine.ledger(), paper_state, wallet)?;
+        let final_activity = ActivityEvidence::from(final_activity);
         let install = self.finish(
             wallet,
             [&first_activity, &second_activity, &final_activity],
@@ -455,7 +479,7 @@ impl CausalPositionValidator {
     fn finish(
         &self,
         wallet: WalletAddress,
-        activities: [&CompleteActivityRead; 3],
+        activities: [&ActivityEvidence; 3],
         ledgers: [&AdmissionLedgerCapture; 3],
         first_positions: &CompletePositionsRead,
         second_positions: &CompletePositionsRead,
@@ -491,13 +515,6 @@ impl CausalPositionValidator {
                 json!({
                     "fixed_end": activity.fixed_end,
                     "pages": activity.pages,
-                    "observations": activity.rows.iter().map(|row| json!({
-                        "source_id": row.source_id,
-                        "observed_at": row.observed_at,
-                        "received_at": row.received_at,
-                        "schema_version": row.schema_version,
-                        "parser_version": row.parser_version,
-                    })).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();
