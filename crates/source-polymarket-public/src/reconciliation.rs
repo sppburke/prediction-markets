@@ -539,11 +539,19 @@ impl ActivityAssetMapping {
         asset: &PolymarketTokenId,
         verified: &VerifiedTokenIdentity,
     ) -> Result<(), PositionReadError> {
-        let classification = self.classification(asset).ok_or_else(|| {
-            PositionReadError::MissingActivityMapping {
-                asset: asset.0.clone(),
+        let classification = match self.classification_by_asset.get(asset) {
+            Some(Some(classification)) => *classification,
+            Some(None) => {
+                return Err(PositionReadError::MixedActivityClassification {
+                    asset: asset.0.clone(),
+                });
             }
-        })?;
+            None => {
+                return Err(PositionReadError::MissingActivityMapping {
+                    asset: asset.0.clone(),
+                });
+            }
+        };
         self.by_asset.insert(
             asset.clone(),
             ActivityAssetIdentity {
@@ -621,6 +629,10 @@ pub enum PositionReadError {
     MissingActivityMapping { asset: String },
     #[error("activity asset {asset} has conflicting mappings")]
     ConflictingActivityMapping { asset: String },
+    #[error("activity asset {asset} has mixed ordinary/combo classifications")]
+    MixedActivityClassification { asset: String },
+    #[error("activity asset {asset} is unresolved by venue metadata: {reason}")]
+    MetadataUnresolved { asset: String, reason: String },
     #[error("activity condition {condition_id} outcome {outcome} maps to multiple assets")]
     ConflictingOutcomeMapping { condition_id: String, outcome: u16 },
     #[error("position asset {asset} conflicts with its activity condition/outcome mapping")]

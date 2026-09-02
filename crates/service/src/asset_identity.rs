@@ -5,7 +5,7 @@
 //! immutable provenance across cache hits.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use pe_core_types::{PolymarketTokenId, SourceTimestamp};
 use pe_event_log::{ContentType, EnvelopeIn};
@@ -43,22 +43,19 @@ enum IdentityRecorder {
     Runtime(SourceLogHandle),
 }
 
-/// One call's verified/unverified results and only the fresh pages fetched by
-/// that call. `provenance` includes cache hits as well as fresh identities.
+/// One call's verified/unverified results. `provenance` includes cache hits as
+/// well as fresh identities.
 pub struct ResolvedIdentities {
     pub verified: BTreeMap<PolymarketTokenId, VerifiedTokenIdentity>,
     pub unverified: BTreeMap<PolymarketTokenId, String>,
-    pub pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
     pub provenance: BTreeMap<PolymarketTokenId, IdentityProvenance>,
 }
 
 pub struct AssetIdentityResolver {
     client: GammaMarketsClient<ReconciliationPageFetcher>,
+    gamma_batch_size: usize,
     cache: RwLock<HashMap<PolymarketTokenId, CachedIdentity>>,
     recorder: RwLock<IdentityRecorder>,
-    /// Per-token single-flight locks let unrelated brackets resolve in
-    /// parallel while a shared miss becomes one recorded fetch plus cache hits.
-    resolve_locks: std::sync::Mutex<HashMap<PolymarketTokenId, Weak<Mutex<()>>>>,
 }
 
 impl AssetIdentityResolver {
@@ -98,12 +95,13 @@ impl AssetIdentityResolver {
         gamma_batch_size: usize,
         recorder: IdentityRecorder,
     ) -> Self {
+        let gamma_batch_size = gamma_batch_size.max(1);
         Self {
             client: GammaMarketsClient::new(gamma_base_url, ReconciliationPageFetcher(fetcher))
                 .with_batch_size(gamma_batch_size),
+            gamma_batch_size,
             cache: RwLock::new(HashMap::new()),
             recorder: RwLock::new(recorder),
-            resolve_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -119,7 +117,7 @@ impl AssetIdentityResolver {
     ) -> Result<ResolvedIdentities, SourceError> {
         let requested = tokens.into_iter().collect::<BTreeSet<_>>();
         let mut resolved = self.cached(&requested).await;
-        let mut misses = requested
+        let misses = requested
             .iter()
             .filter(|token| !resolved.verified.contains_key(*token))
             .cloned()
@@ -128,87 +126,41 @@ impl AssetIdentityResolver {
             return Ok(resolved);
         }
 
-        let locks = self.token_locks(&misses);
-        let mut _guards = Vec::with_capacity(locks.len());
-        for lock in locks {
-            _guards.push(lock.lock_owned().await);
-        }
-        resolved = self.cached(&requested).await;
-        misses = requested
-            .iter()
-            .filter(|token| !resolved.verified.contains_key(*token))
-            .cloned()
-            .collect();
-        if misses.is_empty() {
-            return Ok(resolved);
-        }
-
-        let mut fresh = Vec::new();
+        let mut pages = Vec::new();
+        let mut sequences = HashMap::new();
         let mut newly_verified = BTreeMap::new();
-        let open = self
-            .client
-            .fetch_markets_by_token_ids(
-                &misses
-                    .iter()
-                    .map(|token| token.0.clone())
-                    .collect::<Vec<_>>(),
-                MarketFilter::OpenOnly,
-            )
-            .await
-            .map_err(map_gamma_error)?;
-        let open_sequences = self.record_pages(&open.raw_pages).await?;
-        fresh.extend(open.raw_pages.clone());
-        if !open.markets.unfetched.is_empty() {
-            return Err(SourceError::Fatal {
-                message: format!(
-                    "gamma token lookup rejected: {}",
-                    open.markets.unfetched.join(",")
-                ),
-            });
-        }
-        let open_identities = verify_token_identities(&misses, &open);
+        self.fetch_and_record_chunks(
+            &misses,
+            MarketFilter::OpenOnly,
+            "gamma token lookup rejected",
+            &mut pages,
+            &mut sequences,
+        )
+        .await?;
+        let open_identities = verify_token_identities(&misses, &pages);
         let leftovers = misses
             .iter()
             .filter(|token| !open_identities.contains_key(*token))
             .cloned()
             .collect::<Vec<_>>();
+
+        if !leftovers.is_empty() {
+            self.fetch_and_record_chunks(
+                &leftovers,
+                MarketFilter::ClosedOnly,
+                "gamma closed-token lookup rejected",
+                &mut pages,
+                &mut sequences,
+            )
+            .await?;
+        }
+
         collect_verified(
-            open_identities,
-            &open_sequences,
+            verify_token_identities(&misses, &pages),
+            &sequences,
             &mut newly_verified,
             &mut resolved.unverified,
         );
-
-        if !leftovers.is_empty() {
-            let closed = self
-                .client
-                .fetch_markets_by_token_ids(
-                    &leftovers
-                        .iter()
-                        .map(|token| token.0.clone())
-                        .collect::<Vec<_>>(),
-                    MarketFilter::ClosedOnly,
-                )
-                .await
-                .map_err(map_gamma_error)?;
-            let closed_sequences = self.record_pages(&closed.raw_pages).await?;
-            fresh.extend(closed.raw_pages.clone());
-            if !closed.markets.unfetched.is_empty() {
-                return Err(SourceError::Fatal {
-                    message: format!(
-                        "gamma closed-token lookup rejected: {}",
-                        closed.markets.unfetched.join(",")
-                    ),
-                });
-            }
-            let closed_identities = verify_token_identities(&leftovers, &closed);
-            collect_verified(
-                closed_identities,
-                &closed_sequences,
-                &mut newly_verified,
-                &mut resolved.unverified,
-            );
-        }
 
         for token in misses {
             if !newly_verified.contains_key(&token) && !resolved.unverified.contains_key(&token) {
@@ -230,28 +182,46 @@ impl AssetIdentityResolver {
                 .insert(token.clone(), cached.identity.clone());
             resolved.provenance.insert(token, cached.provenance);
         }
-        resolved.pages = fresh;
         Ok(resolved)
     }
 
-    fn token_locks(&self, tokens: &[PolymarketTokenId]) -> Vec<Arc<Mutex<()>>> {
-        let mut by_token = self
-            .resolve_locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        by_token.retain(|_, lock| lock.strong_count() > 0);
-        tokens
-            .iter()
-            .map(|token| {
-                if let Some(lock) = by_token.get(token).and_then(Weak::upgrade) {
-                    lock
-                } else {
-                    let lock = Arc::new(Mutex::new(()));
-                    by_token.insert(token.clone(), Arc::downgrade(&lock));
-                    lock
-                }
-            })
-            .collect()
+    async fn fetch_and_record_chunks(
+        &self,
+        tokens: &[PolymarketTokenId],
+        filter: MarketFilter,
+        rejected_message: &str,
+        pages: &mut Vec<(MetadataPageEvidence, Vec<u8>)>,
+        sequences: &mut HashMap<String, u64>,
+    ) -> Result<(), SourceError> {
+        for chunk in tokens.chunks(self.gamma_batch_size) {
+            let fetched = self
+                .client
+                .fetch_markets_by_token_ids(
+                    &chunk
+                        .iter()
+                        .map(|token| token.0.clone())
+                        .collect::<Vec<_>>(),
+                    filter,
+                )
+                .await
+                .map_err(map_gamma_error)?;
+            if let Some(page) = fetched.page {
+                let sequence = self.record_page(&page).await?;
+                sequences
+                    .entry(page.0.canonical_page_hash.clone())
+                    .or_insert(sequence);
+                pages.push(page);
+            }
+            if !fetched.markets.unfetched.is_empty() {
+                return Err(SourceError::Fatal {
+                    message: format!(
+                        "{rejected_message}: {}",
+                        fetched.markets.unfetched.join(",")
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn cached(&self, requested: &BTreeSet<PolymarketTokenId>) -> ResolvedIdentities {
@@ -267,28 +237,27 @@ impl AssetIdentityResolver {
         ResolvedIdentities {
             verified,
             unverified: BTreeMap::new(),
-            pages: Vec::new(),
             provenance,
         }
     }
 
-    async fn record_pages(
+    async fn record_page(
         &self,
-        pages: &[(MetadataPageEvidence, Vec<u8>)],
-    ) -> Result<HashMap<String, u64>, SourceError> {
+        page: &(MetadataPageEvidence, Vec<u8>),
+    ) -> Result<u64, SourceError> {
         let recorder = self.recorder.read().await.clone();
-        let mut sequences = HashMap::new();
-        for (evidence, payload) in pages {
-            let envelope = EnvelopeIn {
-                source_id: evidence.source_id.clone(),
-                schema_version: evidence.schema_version,
-                parser_version: evidence.parser_version,
-                observed_at: SourceTimestamp(evidence.received_at.0),
-                received_at: evidence.received_at.clone(),
-                content_type: ContentType::Json,
-                payload: payload.clone(),
-            };
-            let sequence = match &recorder {
+        let (evidence, payload) = page;
+        let envelope = EnvelopeIn {
+            source_id: evidence.source_id.clone(),
+            schema_version: evidence.schema_version,
+            parser_version: evidence.parser_version,
+            observed_at: SourceTimestamp(evidence.received_at.0),
+            received_at: evidence.received_at.clone(),
+            content_type: ContentType::Json,
+            payload: payload.clone(),
+        };
+        let sequence =
+            match &recorder {
                 IdentityRecorder::Boot(sink) => sink
                     .lock()
                     .await
@@ -303,11 +272,7 @@ impl AssetIdentityResolver {
                         message: "source-log coordinator closed".to_owned(),
                     })?,
             };
-            sequences
-                .entry(evidence.canonical_page_hash.clone())
-                .or_insert(sequence.0);
-        }
-        Ok(sequences)
+        Ok(sequence.0)
     }
 }
 
@@ -372,6 +337,11 @@ fn map_gamma_error(error: GammaMarketsError) -> SourceError {
         GammaMarketsError::InvalidTokenId { token } => SourceError::Fatal {
             message: format!("gamma metadata token invalid: {token}"),
         },
+        GammaMarketsError::TooManyTokenIds { tokens, limit } => SourceError::Fatal {
+            message: format!(
+                "gamma metadata token batch has {tokens} ids, above per-request limit {limit}"
+            ),
+        },
     }
 }
 
@@ -399,29 +369,24 @@ mod tests {
         closed: Vec<u8>,
     }
 
-    struct ParallelGammaFixture {
-        barrier: tokio::sync::Barrier,
+    struct MixedChunkFixture {
         calls: AtomicUsize,
     }
 
-    impl ReconciliationFetcher for ParallelGammaFixture {
+    impl ReconciliationFetcher for MixedChunkFixture {
         fn fetch<'a>(
             &'a self,
             url: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                self.barrier.wait().await;
-                let token = if url.contains("token-a") {
-                    "token-a"
+                if url.contains("clob_token_ids=token-b") {
+                    Err(SourceError::Transient {
+                        message: "injected second chunk failure".to_owned(),
+                    })
                 } else {
-                    "token-b"
-                };
-                Ok(serde_json::to_vec(&vec![serde_json::json!({
-                    "conditionId": format!("condition-{token}"),
-                    "clobTokenIds": [token]
-                })])
-                .unwrap())
+                    Ok(br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#.to_vec())
+                }
             })
         }
     }
@@ -480,7 +445,6 @@ mod tests {
 
         let first = resolver.resolve([token.clone()]).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(first.pages.len(), 1);
         assert_eq!(first.verified[&token].condition_id.0, "condition-a");
         assert_eq!(first.verified[&token].outcome.0, 1);
         assert_eq!(first.provenance[&token].source_log_sequence, 0);
@@ -491,7 +455,6 @@ mod tests {
 
         let second = resolver.resolve([token.clone()]).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
-        assert!(second.pages.is_empty());
         assert_eq!(second.provenance, first.provenance);
 
         drop(resolver);
@@ -509,56 +472,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_resolves_share_one_fresh_page_and_recorded_provenance() {
-        let fetcher = Arc::new(GammaFixture::new(
-            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
-            b"[]",
-        ));
-        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
-        let resolver = Arc::new(resolver);
-        let token = PolymarketTokenId("token-a".to_owned());
-        let (left, right) = tokio::join!(
-            resolver.resolve([token.clone()]),
-            resolver.resolve([token.clone()])
-        );
-        let left = left.unwrap();
-        let right = right.unwrap();
-
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(left.provenance, right.provenance);
-        assert_eq!(
-            usize::from(left.pages.is_empty()) + usize::from(right.pages.is_empty()),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn unrelated_token_misses_resolve_concurrently() {
-        let fetcher = Arc::new(ParallelGammaFixture {
-            barrier: tokio::sync::Barrier::new(2),
-            calls: AtomicUsize::new(0),
-        });
-        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
-        let resolver = Arc::new(resolver);
-        let token_a = PolymarketTokenId("token-a".to_owned());
-        let token_b = PolymarketTokenId("token-b".to_owned());
-        let (left, right) = tokio::join!(
-            resolver.resolve([token_a.clone()]),
-            resolver.resolve([token_b.clone()])
-        );
-
-        assert_eq!(
-            left.unwrap().verified[&token_a].condition_id.0,
-            "condition-token-a"
-        );
-        assert_eq!(
-            right.unwrap().verified[&token_b].condition_id.0,
-            "condition-token-b"
-        );
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
     async fn closed_lookup_records_both_pages_and_uses_the_proving_page() {
         let fetcher = Arc::new(GammaFixture::new(
             b"[]",
@@ -569,11 +482,71 @@ mod tests {
 
         let resolved = resolver.resolve([token.clone()]).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(resolved.pages.len(), 2);
         assert_eq!(resolved.provenance[&token].source_log_sequence, 1);
         let urls = fetcher.urls.lock().unwrap();
         assert!(!urls[0].contains("closed=true"));
         assert!(urls[1].contains("closed=true"));
+    }
+
+    #[tokio::test]
+    async fn chunk_boundary_coalesces_one_market_and_verifies_both_tokens() {
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a","token-b"]}]"#,
+            b"[]",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap()));
+        let resolver =
+            AssetIdentityResolver::new(fetcher.clone(), BASE.to_owned(), 1, Arc::clone(&sink));
+        let token_a = PolymarketTokenId("token-a".to_owned());
+        let token_b = PolymarketTokenId("token-b".to_owned());
+
+        let resolved = resolver
+            .resolve([token_a.clone(), token_b.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resolved.verified[&token_a].condition_id.0, "condition-a");
+        assert_eq!(resolved.verified[&token_a].outcome.0, 0);
+        assert_eq!(resolved.verified[&token_b].condition_id.0, "condition-a");
+        assert_eq!(resolved.verified[&token_b].outcome.0, 1);
+        assert_eq!(resolved.provenance[&token_a].source_log_sequence, 0);
+        assert_eq!(resolved.provenance[&token_b].source_log_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_chunk_is_recorded_before_later_transient_and_no_identity_is_cached() {
+        let fetcher = Arc::new(MixedChunkFixture {
+            calls: AtomicUsize::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap()));
+        let resolver =
+            AssetIdentityResolver::new(fetcher.clone(), BASE.to_owned(), 1, Arc::clone(&sink));
+        let token_a = PolymarketTokenId("token-a".to_owned());
+        let token_b = PolymarketTokenId("token-b".to_owned());
+
+        assert!(matches!(
+            resolver.resolve([token_a.clone(), token_b]).await,
+            Err(SourceError::Transient { message })
+                if message.contains("injected second chunk failure")
+        ));
+        let entries_after_failure = Reader::replay(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries_after_failure.len(), 1);
+
+        let resolved = resolver.resolve([token_a.clone()]).await.unwrap();
+        assert_eq!(resolved.verified[&token_a].condition_id.0, "condition-a");
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            3,
+            "the failed multi-chunk lookup must not cache its successful sibling"
+        );
     }
 
     #[tokio::test]

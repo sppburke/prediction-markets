@@ -451,6 +451,66 @@ fn unverified_identity_is_raw_only_reanchors_and_replays() {
 }
 
 #[test]
+fn unresolved_member_after_partial_durable_bucket_is_raw_only_without_fence() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let committed = position_row(
+        "TRADE",
+        "0xpartial-committed",
+        MARKET_A,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        92,
+    );
+    let committed_id = committed.group_id.key().clone();
+    engine
+        .commit(vec![committed.clone()], &context(92, true), zero_basis())
+        .unwrap();
+
+    let unresolved = position_row(
+        "TRADE",
+        "0xpartial-unresolved",
+        MARKET_B,
+        0,
+        "BUY",
+        "2",
+        "0.5",
+        92,
+    );
+    let unresolved_id = unresolved.group_id.key().clone();
+    let mut mixed_context = context(92, true);
+    mixed_context
+        .identity_unresolved
+        .insert(unresolved_id.clone());
+    mixed_context.no_copy_dispositions.insert(
+        unresolved_id.clone(),
+        NoCopyDisposition {
+            provenance: "rest_poll".to_owned(),
+            age_secs: 0,
+            reason: "identity_unresolved".to_owned(),
+            recorded_at_unix: 112,
+        },
+    );
+
+    let result = engine
+        .commit(vec![committed, unresolved], &mixed_context, zero_basis())
+        .unwrap();
+
+    assert_eq!(result.dispositions[&committed_id.0], "already_committed");
+    assert_eq!(result.dispositions[&unresolved_id.0], "raw_only");
+    assert_eq!(result.newly_fenced, None);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert_eq!(
+        paper.no_copy_disposition(&unresolved_id).unwrap(),
+        Some(("rest_poll".to_owned(), 0, "identity_unresolved".to_owned()))
+    );
+    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_000_000);
+    assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
+}
+
+#[test]
 fn covered_identity_resolution_uses_verified_history_and_keeps_unverified_raw_only() {
     let (_dir, paper, mut engine) = fresh();
     paper.set_cursor(&wallet(), 0).unwrap();

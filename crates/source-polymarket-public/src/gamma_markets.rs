@@ -124,14 +124,12 @@ pub struct MetadataPageEvidence {
     pub source_id: SourceId,
     pub schema_version: u32,
     pub parser_version: u32,
-    pub market_count: u32,
 }
 
-/// A token-targeted Gamma result and the exact pages that produced it.
+/// A token-targeted Gamma result and the exact page that produced it.
 pub struct GammaMarketsWithPages {
     pub markets: GammaMarkets,
-    pub pages: Vec<MetadataPageEvidence>,
-    pub raw_pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
+    pub page: Option<(MetadataPageEvidence, Vec<u8>)>,
 }
 
 /// One token identity proven by a recorded Gamma market page.
@@ -176,6 +174,9 @@ pub enum GammaMarketsError {
     /// A token id contains a comma and would change the repeat-key request semantics.
     #[error("gamma token id must use one repeat-key value, got {token:?}")]
     InvalidTokenId { token: String },
+    /// The token lookup method owns exactly one request. Its caller owns chunking.
+    #[error("gamma token lookup has {tokens} ids, above the per-request limit {limit}")]
+    TooManyTokenIds { tokens: usize, limit: usize },
 }
 
 /// Batched Gamma `/markets` client. Generic over [`PageFetcher`] so production uses
@@ -293,9 +294,9 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         })
     }
 
-    /// Fetch markets by repeat-key `clob_token_ids`, retaining the raw page and call-scoped
-    /// evidence for every successful request. Input order is preserved through deduplication and
-    /// chunking; completed requests are restored to chunk order before evidence is returned.
+    /// Fetch one page of markets by repeat-key `clob_token_ids`, retaining the raw page and
+    /// call-scoped evidence for the successful request. Input order is preserved through
+    /// deduplication. The caller owns chunking across requests.
     ///
     /// # Errors
     /// Returns [`GammaMarketsError::InvalidTokenId`] when one input contains a comma, because comma
@@ -318,62 +319,57 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             .map(String::as_str)
             .filter(|token| seen.insert(token))
             .collect::<Vec<_>>();
-        let chunks = unique
-            .chunks(self.batch_size)
-            .map(|chunk| chunk.iter().map(|token| (*token).to_owned()).collect())
-            .collect::<Vec<Vec<String>>>();
-
-        let base = self.base_url.as_str();
-        let fetcher = &self.fetcher;
-        let closed = filter.closed_param();
-        let limit = self.limit;
-        let mut stream = stream::iter(chunks.into_iter().enumerate())
-            .map(|(chunk_index, chunk)| async move {
-                let url = build_token_batch_url(base, &chunk, closed, limit);
-                let result = fetcher.fetch_page(&url).await;
-                let received_at = ReceivedAt::now_utc();
-                (chunk_index, chunk, url, received_at, result)
-            })
-            .buffer_unordered(self.concurrency);
-
-        let mut responses = Vec::new();
-        while let Some(response) = stream.next().await {
-            responses.push(response);
+        if unique.len() > self.batch_size {
+            return Err(GammaMarketsError::TooManyTokenIds {
+                tokens: unique.len(),
+                limit: self.batch_size,
+            });
         }
-        responses.sort_by_key(|(chunk_index, _, _, _, _)| *chunk_index);
+        if unique.is_empty() {
+            return Ok(GammaMarketsWithPages {
+                markets: GammaMarkets {
+                    markets: HashMap::new(),
+                    unfetched: Vec::new(),
+                },
+                page: None,
+            });
+        }
 
-        let mut markets = HashMap::new();
-        let mut unfetched = Vec::new();
-        let mut pages = Vec::new();
-        let mut raw_pages = Vec::new();
-        for (_, chunk, url, received_at, result) in responses {
-            let raw = match result {
-                Ok(raw) => raw,
-                Err(SourceError::Fatal { message }) => {
-                    tracing::warn!(chunk_len = chunk.len(), error = %message, "gamma_markets: token batch fatal, marking chunk unfetched");
-                    unfetched.extend(chunk);
-                    continue;
-                }
-                Err(error) => return Err(GammaMarketsError::Fetch(error.to_string())),
-            };
-            let decoded: Vec<GammaMarketRaw> = serde_json::from_slice(&raw)
-                .map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
-            let market_count = u32::try_from(decoded.len()).map_err(|_| {
-                GammaMarketsError::Parse("gamma market count exceeds u32".to_owned())
-            })?;
-            let evidence = metadata_page_evidence(&url, &raw, received_at, market_count)?;
-            for market in decoded {
-                let market = gamma_market(market);
-                markets.insert(market.condition_id.clone(), market);
+        let chunk = unique
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect::<Vec<_>>();
+        let url = build_token_batch_url(&self.base_url, &chunk, filter.closed_param(), self.limit);
+        let result = self.fetcher.fetch_page(&url).await;
+        let received_at = ReceivedAt::now_utc();
+        let raw = match result {
+            Ok(raw) => raw,
+            Err(SourceError::Fatal { message }) => {
+                tracing::warn!(chunk_len = chunk.len(), error = %message, "gamma_markets: token batch fatal, marking chunk unfetched");
+                return Ok(GammaMarketsWithPages {
+                    markets: GammaMarkets {
+                        markets: HashMap::new(),
+                        unfetched: chunk,
+                    },
+                    page: None,
+                });
             }
-            pages.push(evidence.clone());
-            raw_pages.push((evidence, raw));
-        }
-
+            Err(error) => return Err(GammaMarketsError::Fetch(error.to_string())),
+        };
+        let decoded: Vec<GammaMarketRaw> = serde_json::from_slice(&raw)
+            .map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
+        let evidence = metadata_page_evidence(&url, &raw, received_at)?;
+        let markets = decoded
+            .into_iter()
+            .map(gamma_market)
+            .map(|market| (market.condition_id.clone(), market))
+            .collect();
         Ok(GammaMarketsWithPages {
-            markets: GammaMarkets { markets, unfetched },
-            pages,
-            raw_pages,
+            markets: GammaMarkets {
+                markets,
+                unfetched: Vec::new(),
+            },
+            page: Some((evidence, raw)),
         })
     }
 }
@@ -422,7 +418,6 @@ fn metadata_page_evidence(
     request_url: &str,
     raw: &[u8],
     received_at: ReceivedAt,
-    market_count: u32,
 ) -> Result<MetadataPageEvidence, GammaMarketsError> {
     let value: serde_json::Value =
         serde_json::from_slice(raw).map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
@@ -436,7 +431,6 @@ fn metadata_page_evidence(
         source_id: SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
         schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
         parser_version: GAMMA_MARKETS_PARSER_VERSION,
-        market_count,
     })
 }
 
@@ -445,18 +439,21 @@ fn metadata_page_evidence(
 #[must_use]
 pub fn verify_token_identities(
     requested: &[PolymarketTokenId],
-    fetched: &GammaMarketsWithPages,
+    pages: &[(MetadataPageEvidence, Vec<u8>)],
 ) -> BTreeMap<PolymarketTokenId, Result<VerifiedTokenIdentity, MetadataIdentityError>> {
     let mut page_markets = Vec::new();
-    for (evidence, raw) in &fetched.raw_pages {
+    let mut seen_markets = HashSet::new();
+    for (evidence, raw) in pages {
         let Ok(decoded) = serde_json::from_slice::<Vec<GammaMarketRaw>>(raw) else {
             continue;
         };
-        page_markets.extend(
-            decoded
-                .into_iter()
-                .map(|market| (gamma_market(market), evidence.canonical_page_hash.clone())),
-        );
+        for market in decoded {
+            let market = gamma_market(market);
+            let key = (market.condition_id.clone(), market.clob_token_ids.clone());
+            if seen_markets.insert(key) {
+                page_markets.push((market, evidence.canonical_page_hash.clone()));
+            }
+        }
     }
 
     let mut verified = BTreeMap::new();
@@ -736,29 +733,15 @@ mod tests {
         PolymarketTokenId(id.to_owned())
     }
 
-    fn fetched_page(raw: Vec<u8>) -> GammaMarketsWithPages {
-        let decoded: Vec<GammaMarketRaw> = serde_json::from_slice(&raw).unwrap();
+    fn fetched_page(raw: Vec<u8>) -> Vec<(MetadataPageEvidence, Vec<u8>)> {
         let received_at = ReceivedAt(OffsetDateTime::from_unix_timestamp(100).unwrap());
         let evidence = metadata_page_evidence(
             "https://g/markets?clob_token_ids=T&limit=500",
             &raw,
             received_at,
-            u32::try_from(decoded.len()).unwrap(),
         )
         .unwrap();
-        let markets = decoded
-            .into_iter()
-            .map(gamma_market)
-            .map(|market| (market.condition_id.clone(), market))
-            .collect();
-        GammaMarketsWithPages {
-            markets: GammaMarkets {
-                markets,
-                unfetched: Vec::new(),
-            },
-            pages: vec![evidence.clone()],
-            raw_pages: vec![(evidence, raw)],
-        }
+        vec![(evidence, raw)]
     }
 
     #[test]
@@ -824,7 +807,7 @@ mod tests {
             Some(&Ok(VerifiedTokenIdentity {
                 condition_id: PolymarketConditionId("0xcondition".to_owned()),
                 outcome: OutcomeId(1),
-                evidence_hash: fetched.pages[0].canonical_page_hash.clone(),
+                evidence_hash: fetched[0].0.canonical_page_hash.clone(),
             }))
         );
         assert!(!result.contains_key(&token("missing")));
@@ -843,6 +826,30 @@ mod tests {
                 markets: 2,
             })
         );
+    }
+
+    #[test]
+    fn verify_token_identities_coalesces_identical_markets_across_pages() {
+        let raw = br#"[{"conditionId":"condition","clobTokenIds":["A","B"]}]"#.to_vec();
+        let mut pages = fetched_page(raw.clone());
+        let first_hash = pages[0].0.canonical_page_hash.clone();
+        let received_at = ReceivedAt(OffsetDateTime::from_unix_timestamp(101).unwrap());
+        pages.push((
+            metadata_page_evidence(
+                "https://g/markets?clob_token_ids=B&limit=500",
+                &raw,
+                received_at,
+            )
+            .unwrap(),
+            raw,
+        ));
+
+        let result = verify_token_identities(&[token("A"), token("B")], &pages);
+        for token in [token("A"), token("B")] {
+            let identity = result[&token].as_ref().unwrap();
+            assert_eq!(identity.condition_id.0, "condition");
+            assert_eq!(identity.evidence_hash, first_hash);
+        }
     }
 
     #[test]

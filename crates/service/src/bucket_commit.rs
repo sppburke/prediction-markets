@@ -424,7 +424,11 @@ impl BucketCommitEngine {
             })
             .map(|(aggregate, _)| aggregate.group_id.key().clone())
             .collect();
-        if let Some(trigger) = changed.first() {
+        if let Some(trigger) = changed
+            .iter()
+            .find(|trigger| !context.identity_unresolved.contains(*trigger))
+            .or_else(|| changed.first())
+        {
             return self.commit_changed_bucket_fence(
                 &aggregates,
                 &durable,
@@ -461,11 +465,37 @@ impl BucketCommitEngine {
                 context,
             );
         }
+        let unseen = aggregates
+            .iter()
+            .zip(&durable)
+            .filter(|(_, state)| state.is_none())
+            .map(|(aggregate, _)| aggregate.group_id.key())
+            .collect::<Vec<_>>();
+        if !unseen.is_empty()
+            && unseen
+                .iter()
+                .all(|source_trade_id| context.identity_unresolved.contains(*source_trade_id))
+        {
+            return self.commit_covered_bucket(
+                &aggregates,
+                &durable,
+                &recordable_mutations,
+                wallet,
+                source_epoch,
+                true,
+                context,
+            );
+        }
         if seen != 0 {
             let trigger = aggregates
                 .iter()
                 .zip(&durable)
-                .find(|(_, state)| state.is_none())
+                .find(|(aggregate, state)| {
+                    state.is_none()
+                        && !context
+                            .identity_unresolved
+                            .contains(aggregate.group_id.key())
+                })
                 .map(|(aggregate, _)| aggregate.group_id.key().clone())
                 .ok_or(BucketCommitError::PartialDurableBucket)?;
             return self.commit_changed_bucket_fence(
@@ -483,7 +513,12 @@ impl BucketCommitEngine {
             .is_some_and(|last_epoch| last_epoch >= source_epoch)
         {
             let trigger = aggregates
-                .first()
+                .iter()
+                .find(|aggregate| {
+                    !context
+                        .identity_unresolved
+                        .contains(aggregate.group_id.key())
+                })
                 .map(|aggregate| aggregate.group_id.key().clone())
                 .ok_or(BucketCommitError::Empty)?;
             return self.commit_changed_bucket_fence(
@@ -567,7 +602,12 @@ impl BucketCommitEngine {
         });
         if !order_independent_validity(&self.ledger, wallet, &mutations) {
             let trigger = mutations
-                .first()
+                .iter()
+                .find(|mutation| {
+                    !context
+                        .identity_unresolved
+                        .contains(&mutation.source_trade_id)
+                })
                 .map(|mutation| mutation.source_trade_id.clone())
                 .ok_or(BucketCommitError::Empty)?;
             return self.commit_fence(
@@ -1052,8 +1092,15 @@ impl BucketCommitEngine {
         let proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::with_capacity(aggregates.len());
+        let mut unresolved_trigger = None;
         for aggregate in aggregates {
-            let disposition = if aggregate.group_id.key() == &trigger {
+            let unresolved = context
+                .identity_unresolved
+                .contains(aggregate.group_id.key());
+            let disposition = if unresolved {
+                unresolved_trigger.get_or_insert_with(|| aggregate.group_id.key().clone());
+                "raw_only".to_owned()
+            } else if aggregate.group_id.key() == &trigger {
                 cause.as_str().to_owned()
             } else {
                 "wallet_fenced".to_owned()
@@ -1064,7 +1111,14 @@ impl BucketCommitEngine {
                 aggregate,
                 disposition,
                 &mutation.effect,
-                None,
+                unresolved
+                    .then(|| {
+                        context
+                            .no_copy_dispositions
+                            .get(aggregate.group_id.key())
+                            .cloned()
+                    })
+                    .flatten(),
             )?);
         }
         self.paper_state
@@ -1084,7 +1138,10 @@ impl BucketCommitEngine {
                     proof_json: serde_json::to_string(&proof)?,
                     fenced_at_unix: context.recorded_at_unix,
                 }),
-                reanchor: None,
+                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                    source_trade_id,
+                    reason: "identity_unresolved".to_owned(),
+                }),
                 advance_cursor: true,
             })?;
         self.fences.insert(wallet);
@@ -1113,13 +1170,20 @@ impl BucketCommitEngine {
         let proof_json = serde_json::to_string(&proof)?;
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::new();
+        let mut unresolved_trigger = None;
         for (aggregate, state) in aggregates.iter().zip(durable) {
             let differs = state.as_ref().is_none_or(|state| {
                 state.semantic_revision != aggregate.semantic_revision.as_str()
                     || state.transaction_hash != aggregate.group_id.components().transaction_hash
             });
+            let unresolved = context
+                .identity_unresolved
+                .contains(aggregate.group_id.key());
             let disposition = if differs {
-                if aggregate.group_id.key() == &trigger && !already_fenced {
+                if unresolved {
+                    unresolved_trigger.get_or_insert_with(|| aggregate.group_id.key().clone());
+                    "raw_only".to_owned()
+                } else if aggregate.group_id.key() == &trigger && !already_fenced {
                     cause.as_str().to_owned()
                 } else {
                     "wallet_fenced".to_owned()
@@ -1134,7 +1198,14 @@ impl BucketCommitEngine {
                     aggregate,
                     disposition,
                     &mutation.effect,
-                    None,
+                    unresolved
+                        .then(|| {
+                            context
+                                .no_copy_dispositions
+                                .get(aggregate.group_id.key())
+                                .cloned()
+                        })
+                        .flatten(),
                 )?);
             }
         }
@@ -1155,7 +1226,10 @@ impl BucketCommitEngine {
                     proof_json,
                     fenced_at_unix: context.recorded_at_unix,
                 }),
-                reanchor: None,
+                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                    source_trade_id,
+                    reason: "identity_unresolved".to_owned(),
+                }),
                 advance_cursor: true,
             })?;
         if !already_fenced {
@@ -1193,6 +1267,12 @@ impl BucketCommitEngine {
         let applied = order_independent_validity(&self.ledger, wallet, &known)
             && candidate.apply_all_or_none(&known).is_ok();
         let mut dispositions = BTreeMap::new();
+        let unresolved_trigger = mutations.iter().find_map(|mutation| {
+            context
+                .identity_unresolved
+                .contains(&mutation.source_trade_id)
+                .then(|| mutation.source_trade_id.clone())
+        });
         let records = aggregates
             .iter()
             .zip(mutations)
@@ -1239,7 +1319,10 @@ impl BucketCommitEngine {
                 history_status: context.history_status.clone(),
                 pending: Vec::new(),
                 fence: None,
-                reanchor: None,
+                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                    source_trade_id,
+                    reason: "identity_unresolved".to_owned(),
+                }),
                 advance_cursor: true,
             })?;
         if applied {

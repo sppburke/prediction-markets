@@ -212,42 +212,47 @@ async fn closed_filter_uses_closed_true_url() {
 }
 
 #[tokio::test]
-async fn token_lookup_deduplicates_batches_and_returns_ordered_raw_evidence() {
+async fn token_lookup_deduplicates_one_request_and_returns_raw_evidence() {
     let first_raw = br#"[
       {"conditionId":"condition-a","clobTokenIds":["A","B"]}
     ]"#
     .to_vec();
-    let second_raw = br#"[{"clobTokenIds":["C","D"],"conditionId":"condition-c"}]"#.to_vec();
     let mut responses = HashMap::new();
     responses.insert(token_batch_url(&["A", "B"], true), first_raw.clone());
-    responses.insert(token_batch_url(&["C"], true), second_raw.clone());
 
     let out = client(responses, 2)
-        .fetch_markets_by_token_ids(&ids(&["A", "A", "B", "C"]), MarketFilter::ClosedOnly)
+        .fetch_markets_by_token_ids(&ids(&["A", "A", "B"]), MarketFilter::ClosedOnly)
         .await
         .unwrap();
 
-    assert_eq!(out.markets.markets.len(), 2);
-    assert_eq!(out.pages.len(), 2);
-    assert_eq!(out.raw_pages.len(), 2);
-    assert_eq!(out.pages[0].request_url, token_batch_url(&["A", "B"], true));
-    assert_eq!(out.pages[1].request_url, token_batch_url(&["C"], true));
-    assert_eq!(out.raw_pages[0].1, first_raw);
-    assert_eq!(out.raw_pages[1].1, second_raw);
-    for (page, (raw_page_evidence, raw)) in out.pages.iter().zip(&out.raw_pages) {
-        let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
-        let canonical = serde_json::to_vec(&value).unwrap();
-        assert_eq!(page, raw_page_evidence);
-        assert_eq!(page.raw_page_hash, blake3::hash(raw).to_hex().to_string());
-        assert_eq!(
-            page.canonical_page_hash,
-            blake3::hash(&canonical).to_hex().to_string()
-        );
-        assert_eq!(page.source_id, SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()));
-        assert_eq!(page.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
-        assert_eq!(page.parser_version, GAMMA_MARKETS_PARSER_VERSION);
-        assert_eq!(page.market_count, 1);
-    }
+    assert_eq!(out.markets.markets.len(), 1);
+    let (page, raw) = out.page.unwrap();
+    assert_eq!(page.request_url, token_batch_url(&["A", "B"], true));
+    assert_eq!(raw, first_raw);
+    let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let canonical = serde_json::to_vec(&value).unwrap();
+    assert_eq!(page.raw_page_hash, blake3::hash(&raw).to_hex().to_string());
+    assert_eq!(
+        page.canonical_page_hash,
+        blake3::hash(&canonical).to_hex().to_string()
+    );
+    assert_eq!(page.source_id, SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()));
+    assert_eq!(page.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+    assert_eq!(page.parser_version, GAMMA_MARKETS_PARSER_VERSION);
+}
+
+#[tokio::test]
+async fn token_lookup_rejects_more_than_one_request_batch() {
+    let result = client(HashMap::new(), 2)
+        .fetch_markets_by_token_ids(&ids(&["A", "B", "C"]), MarketFilter::OpenOnly)
+        .await;
+    assert!(matches!(
+        result,
+        Err(GammaMarketsError::TooManyTokenIds {
+            tokens: 3,
+            limit: 2
+        })
+    ));
 }
 
 #[tokio::test]

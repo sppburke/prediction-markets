@@ -462,7 +462,7 @@ fn mixed_activity_classification_stays_unresolved_and_cannot_apply_metadata() {
                 evidence_hash: "hash".to_owned(),
             }
         ),
-        Err(PositionReadError::MissingActivityMapping { .. })
+        Err(PositionReadError::MixedActivityClassification { .. })
     ));
 
     let mut position_only = ActivityAssetMapping::from_rows(&[]);

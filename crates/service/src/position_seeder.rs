@@ -36,7 +36,10 @@ use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
 use crate::trade_poller::ACTIVITY_POLL_SOURCE_ID;
 
 #[cfg(feature = "scenario")]
-type BracketStepHook = Arc<dyn Fn(usize, &mut BucketCommitEngine) + Send + Sync>;
+type BracketStepHook = Arc<dyn Fn(WalletAddress, usize, &mut BucketCommitEngine) + Send + Sync>;
+
+#[cfg(feature = "scenario")]
+type AnchorInstallHook = Arc<dyn Fn(&[AnchorInstall]) + Send + Sync>;
 
 pub const BRACKET_CONCURRENCY: usize = 4;
 
@@ -147,6 +150,8 @@ pub fn is_deferred_causal_position_error(error: &CausalPositionError) -> bool {
             source,
             PositionReadError::MissingActivityMapping { .. }
                 | PositionReadError::ConflictingActivityMapping { .. }
+                | PositionReadError::MixedActivityClassification { .. }
+                | PositionReadError::MetadataUnresolved { .. }
                 | PositionReadError::ConflictingOutcomeMapping { .. }
                 | PositionReadError::PositionMappingConflict { .. }
                 | PositionReadError::DuplicateAsset { .. }
@@ -166,6 +171,8 @@ pub struct CausalPositionValidator {
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     #[cfg(feature = "scenario")]
     step_hook: Option<BracketStepHook>,
+    #[cfg(feature = "scenario")]
+    install_hook: Option<AnchorInstallHook>,
 }
 
 /// What the anchor proof keeps from a complete activity read once its rows have
@@ -207,6 +214,8 @@ impl CausalPositionValidator {
             now: Arc::new(|| time::OffsetDateTime::now_utc().unix_timestamp()),
             #[cfg(feature = "scenario")]
             step_hook: None,
+            #[cfg(feature = "scenario")]
+            install_hook: None,
         }
     }
 
@@ -245,6 +254,14 @@ impl CausalPositionValidator {
     #[must_use]
     pub fn with_step_hook(mut self, hook: BracketStepHook) -> Self {
         self.step_hook = Some(hook);
+        self
+    }
+
+    /// Observe the one direct-install batch in deterministic scenario tests.
+    #[cfg(feature = "scenario")]
+    #[must_use]
+    pub fn with_install_hook(mut self, hook: AnchorInstallHook) -> Self {
+        self.install_hook = Some(hook);
         self
     }
 
@@ -330,6 +347,10 @@ impl CausalPositionValidator {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        #[cfg(feature = "scenario")]
+        if let Some(hook) = &self.install_hook {
+            hook(&accepted);
         }
         engine.lock().await.install_anchors(&accepted)?;
         // The accepted bracket IS the plan's history-validating reconciliation:
@@ -465,14 +486,16 @@ impl CausalPositionValidator {
                 &self.source_log_generation,
             )?;
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
-            self.run_step_hook(1, &mut engine);
+            #[cfg(feature = "scenario")]
+            self.run_step_hook(wallet, 1, &mut engine);
             captured
         };
         let first_positions = self.positions(wallet, &first_prepared.mapping).await?;
         let first_activity = ActivityEvidence::from(first_activity);
+        #[cfg(feature = "scenario")]
         {
             let mut engine = engine.lock().await;
-            self.run_step_hook(2, &mut engine);
+            self.run_step_hook(wallet, 2, &mut engine);
         }
 
         let second_activity = self.activity(wallet).await?;
@@ -491,14 +514,16 @@ impl CausalPositionValidator {
                 return Err(CausalPositionError::InterveningActivity { wallet });
             }
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
-            self.run_step_hook(3, &mut engine);
+            #[cfg(feature = "scenario")]
+            self.run_step_hook(wallet, 3, &mut engine);
             captured
         };
         let second_positions = self.positions(wallet, &second_prepared.mapping).await?;
         let second_activity = ActivityEvidence::from(second_activity);
+        #[cfg(feature = "scenario")]
         {
             let mut engine = engine.lock().await;
-            self.run_step_hook(4, &mut engine);
+            self.run_step_hook(wallet, 4, &mut engine);
         }
 
         let final_activity = self.activity(wallet).await?;
@@ -527,22 +552,20 @@ impl CausalPositionValidator {
             &second_positions,
             metadata_reads.into_values().collect(),
         )?;
+        #[cfg(feature = "scenario")]
         {
             let mut engine = engine.lock().await;
-            self.run_step_hook(5, &mut engine);
+            self.run_step_hook(wallet, 5, &mut engine);
         }
         Ok(install)
     }
 
     #[cfg(feature = "scenario")]
-    fn run_step_hook(&self, step: usize, engine: &mut BucketCommitEngine) {
+    fn run_step_hook(&self, wallet: WalletAddress, step: usize, engine: &mut BucketCommitEngine) {
         if let Some(hook) = &self.step_hook {
-            hook(step, engine);
+            hook(wallet, step, engine);
         }
     }
-
-    #[cfg(not(feature = "scenario"))]
-    fn run_step_hook(&self, _step: usize, _engine: &mut BucketCommitEngine) {}
 
     async fn activity(
         &self,
@@ -574,22 +597,32 @@ impl CausalPositionValidator {
             .await
             .map_err(|source| CausalPositionError::Identity { wallet, source })?;
         for (asset, identity) in &resolved.verified {
-            // Missing unanimous activity classification deliberately leaves
-            // the asset unresolved and is translated below into today's
-            // named activity-mapping deferral.
-            let _ = mapping.apply_verified(asset, identity);
+            mapping
+                .apply_verified(asset, identity)
+                .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         }
         for asset in &tokens {
             if !mapping
                 .identity(asset)
                 .is_some_and(|identity| identity.verified)
             {
-                return Err(CausalPositionError::Positions {
-                    wallet,
-                    source: PositionReadError::ConflictingActivityMapping {
+                let source = if mapping.classification(asset).is_none() {
+                    PositionReadError::MixedActivityClassification {
                         asset: asset.0.clone(),
-                    },
-                });
+                    }
+                } else if mapping.unresolved().contains_key(asset) {
+                    PositionReadError::ConflictingActivityMapping {
+                        asset: asset.0.clone(),
+                    }
+                } else {
+                    PositionReadError::MetadataUnresolved {
+                        asset: asset.0.clone(),
+                        reason: resolved.unverified.get(asset).cloned().unwrap_or_else(|| {
+                            "token absent from open and closed Gamma metadata".to_owned()
+                        }),
+                    }
+                };
+                return Err(CausalPositionError::Positions { wallet, source });
             }
             if !resolved.provenance.contains_key(asset) {
                 return Err(CausalPositionError::Identity {
