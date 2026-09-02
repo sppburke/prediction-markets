@@ -291,13 +291,22 @@ impl NormalizedActivity {
 
     #[must_use]
     pub fn requires_wallet_fence(&self) -> bool {
-        self.activity_type.requires_wallet_fence()
+        // A zero-share CONVERSION has an arithmetically zero effect and does
+        // not fence; an Unknown type fences regardless of size — its semantics
+        // cannot be trusted to make "zero" meaningful (#544 activation fix 2).
+        match &self.activity_type {
+            ActivityType::Conversion => self.share_amount != ShareAmount::ZERO,
+            other => other.requires_wallet_fence(),
+        }
     }
 
-    /// Ordinary lookup/ranking may see only non-combo, supported mutations.
+    /// Ordinary lookup/ranking may see only non-combo, supported mutations
+    /// with a nonzero effect — zero-share rows are venue artifacts retained as
+    /// raw evidence only (#544 activation fix 2).
     #[must_use]
     pub fn is_ordinary_position_change(&self) -> bool {
-        self.activity_type.is_position_changing()
+        self.share_amount != ShareAmount::ZERO
+            && self.activity_type.is_position_changing()
             && !self.activity_type.requires_wallet_fence()
             && !self.is_combo
     }
@@ -350,8 +359,6 @@ pub enum ActivityValidationError {
     InvalidShareAmount { value: Decimal, reason: String },
     #[error("activity row has invalid collateral amount {value}: {reason}")]
     InvalidCollateralAmount { value: Decimal, reason: String },
-    #[error("position-changing activity has zero share amount")]
-    ZeroShareAmount,
     #[error("activity row has invalid condition/outcome mapping")]
     InvalidConditionOutcomeMapping,
     #[error("activity timestamp {0} is outside the supported range")]
@@ -714,15 +721,13 @@ fn normalize_trade_observation(
         .size
         .ok_or(ActivityValidationError::MissingField { field: "size" })?
         .0;
-    let share_amount = ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
+    // Exactness is still validated; zero is allowed (raw-only, #544 fix 2).
+    let _share_amount = ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
         ActivityValidationError::InvalidShareAmount {
             value: share_decimal,
             reason: error.to_string(),
         }
     })?;
-    if share_amount == ShareAmount::ZERO {
-        return Err(ActivityValidationError::ZeroShareAmount);
-    }
     let source_epoch = raw
         .timestamp
         .ok_or(ActivityValidationError::MissingField { field: "timestamp" })?
@@ -805,8 +810,11 @@ fn validate_type_specific(
     side: Option<Side>,
     share_amount: ShareAmount,
 ) -> Result<(), ActivityValidationError> {
-    if activity_type.is_position_changing() && share_amount == ShareAmount::ZERO {
-        return Err(ActivityValidationError::ZeroShareAmount);
+    // A zero-share position-changing row has an arithmetically zero effect and
+    // is retained raw-only (#544 fix 2): effect-field validation (mapping,
+    // side, asset) applies only to rows that can mutate a position.
+    if share_amount == ShareAmount::ZERO {
+        return Ok(());
     }
     match activity_type {
         ActivityType::Trade => {
@@ -1354,5 +1362,54 @@ mod tests {
         assert!(parse_activity_trade_observation(non_trade).is_err());
         let missing_asset = br#"{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conditionId":"0xcondition","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"0xabc","outcomeIndex":"0"}"#;
         assert!(parse_activity_trade_observation(missing_asset).is_err());
+    }
+
+    #[test]
+    fn zero_share_position_changing_rows_are_raw_only_not_errors() {
+        // Live capture 2026-09-01 (wallet 0xfd9b76…, 108 such rows): zero-burn
+        // REDEEM legs for empty outcome sides. Zero effect ⇒ raw-only (#544).
+        let row = r#"{"proxyWallet":"0xfd9b763674cb096cacec059fcfe60ae82aae09e8","timestamp":1783529873,"conditionId":"0x945561381b820840a1876a9bbacc5e702c50a91ac40936870988d00159d281d6","type":"REDEEM","size":0,"usdcSize":0,"transactionHash":"0x83e3a30760ec2c4cc7a59a44cd54c64f486e8da924427ee7c46c2eb240ac26af","price":0,"asset":"","side":"","outcomeIndex":0}"#;
+        let context = ActivityParseContext {
+            source_id: SourceId("polymarket-activity-test".to_owned()),
+            observed_at: SourceTimestamp(
+                time::OffsetDateTime::from_unix_timestamp(1_783_529_873).unwrap(),
+            ),
+            received_at: ReceivedAt(
+                time::OffsetDateTime::from_unix_timestamp(1_783_529_874).unwrap(),
+            ),
+            transport: ActivityTransport::Rest,
+        };
+        let parsed = parse_activity_row(
+            row.as_bytes(),
+            Some(WalletAddress::from_hex("0xfd9b763674cb096cacec059fcfe60ae82aae09e8").unwrap()),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(parsed.share_amount, ShareAmount::ZERO);
+        assert!(!parsed.is_ordinary_position_change());
+        assert!(!parsed.requires_wallet_fence());
+
+        // Zero CONVERSION: no fence; zero-effect raw retention.
+        let conv = row.replace("\"type\":\"REDEEM\"", "\"type\":\"CONVERSION\"");
+        let parsed = parse_activity_row(
+            conv.as_bytes(),
+            Some(WalletAddress::from_hex("0xfd9b763674cb096cacec059fcfe60ae82aae09e8").unwrap()),
+            &context,
+        )
+        .unwrap();
+        assert!(!parsed.requires_wallet_fence());
+
+        // Negative stays a hard error.
+        let neg = row.replace("\"size\":0", "\"size\":-1");
+        assert!(
+            parse_activity_row(
+                neg.as_bytes(),
+                Some(
+                    WalletAddress::from_hex("0xfd9b763674cb096cacec059fcfe60ae82aae09e8").unwrap()
+                ),
+                &context,
+            )
+            .is_err()
+        );
     }
 }
