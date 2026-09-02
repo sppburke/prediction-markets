@@ -195,6 +195,19 @@ CREATE TABLE IF NOT EXISTS position_validations (
     recorded_at_unix       INTEGER NOT NULL
 );
 
+-- Append-only venue-authoritative balance anchors. Activity groups after each
+-- cutoff replay forward from the canonical sorted balance document.
+CREATE TABLE IF NOT EXISTS position_anchors (
+    wallet_hex          TEXT    NOT NULL,
+    anchor_seq          INTEGER NOT NULL,
+    anchored_at_unix    INTEGER NOT NULL,
+    activity_cutoff_unix INTEGER NOT NULL,
+    balances_json       TEXT    NOT NULL,
+    ledger_hash_after   TEXT    NOT NULL,
+    proof_json           TEXT    NOT NULL,
+    PRIMARY KEY (wallet_hex, anchor_seq)
+);
+
 -- Single-row current bankroll (decimal stored as text for exactness).
 CREATE TABLE IF NOT EXISTS bankroll (
     id           INTEGER PRIMARY KEY CHECK(id = 0),
@@ -212,7 +225,11 @@ CREATE TABLE IF NOT EXISTS poll_cursors (
     -- is the newest trade timestamp ever observed (MAX-only) and feeds the inactivity
     -- knockout so holding a delivery cursor cannot fake idleness. NULL = unmigrated /
     -- never observed; consumers fall back to `last_ts_unix`.
-    last_activity_unix INTEGER
+    last_activity_unix INTEGER,
+    -- NULL means no anchor, so activity is treated as covered through +infinity.
+    activity_cutoff_unix INTEGER,
+    coverage_generation INTEGER NOT NULL DEFAULT 0,
+    reanchor_required INTEGER NOT NULL DEFAULT 0
 );
 
 -- Key/value metadata. Existing cursors are INTEGER; #544's migration-bootstrap record is

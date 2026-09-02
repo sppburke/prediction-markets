@@ -119,6 +119,15 @@ pub enum PaperStateError {
     /// A previously stored group was presented with different durable semantics.
     #[error("paper-state activity revision conflict for {0}")]
     ActivityRevisionConflict(String),
+    /// A candidate anchor would regress the wallet's already-installed activity cutoff.
+    #[error(
+        "paper-state anchor cutoff regression for {wallet}: stored {stored_cutoff_unix}, candidate {candidate_cutoff_unix}"
+    )]
+    AnchorCutoffRegression {
+        wallet: WalletAddress,
+        stored_cutoff_unix: i64,
+        candidate_cutoff_unix: i64,
+    },
     /// A bucket mixed wallets or epoch seconds and therefore cannot be atomic.
     #[error("paper-state activity bucket identity mismatch")]
     ActivityBucketMismatch,
@@ -164,6 +173,8 @@ pub struct ActivityDispositionRecord {
     pub semantic_revision: String,
     pub activity_type: String,
     pub disposition: String,
+    /// Caller-owned canonical JSON. Versioned effect documents are stored here
+    /// unchanged so replay can select and verify the recorded effect schema.
     pub proof_json: String,
     /// Exact typed admission disposition when this group is ledger-only.
     pub no_copy: Option<NoCopyDisposition>,
@@ -217,6 +228,54 @@ pub struct PositionValidationRecord {
     pub source_log_generation: String,
     pub proof_json: String,
     pub recorded_at_unix: i64,
+}
+
+/// One venue-authoritative balance snapshot to install atomically with its
+/// accepted activity/positions bracket and wallet coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorInstallRecord {
+    pub wallet: WalletAddress,
+    pub balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
+    pub activity_cutoff_unix: i64,
+    pub anchored_at_unix: i64,
+    pub ledger_hash_after: String,
+    pub positions_proof_hash: String,
+    pub activity_bounds_json: String,
+    pub source_log_generation: String,
+    pub proof_json: String,
+    pub recorded_at_unix: i64,
+}
+
+/// Durable coverage state for one wallet's latest installed anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoverage {
+    pub activity_cutoff_unix: Option<i64>,
+    pub coverage_generation: i64,
+    pub reanchor_required: bool,
+    pub anchor_seq: Option<i64>,
+    pub anchored_at_unix: Option<i64>,
+}
+
+/// One append-only venue-authoritative position anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionAnchorRow {
+    pub wallet: WalletAddress,
+    pub anchor_seq: i64,
+    pub anchored_at_unix: i64,
+    pub activity_cutoff_unix: i64,
+    pub balances_json: String,
+    pub ledger_hash_after: String,
+    pub proof_json: String,
+}
+
+/// One replayable activity group after an anchor cutoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityGroupRow {
+    pub source_trade_id: SourceTradeId,
+    pub source_epoch: i64,
+    pub semantic_revision: String,
+    pub disposition: String,
+    pub proof_json: String,
 }
 
 /// Frozen continuation created in the same transaction as an admitted entry.
@@ -458,19 +517,32 @@ impl PaperStateDb {
         if found == 0 {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        // #511 additive migration: split the activity clock from the delivery cursor.
-        // Guarded ALTER (idempotent across reopens); CREATE IF NOT EXISTS above cannot
-        // add a column to a pre-existing table.
-        let has_activity: bool = conn
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('poll_cursors') WHERE name = 'last_activity_unix'",
-            )?
-            .exists([])?;
-        if !has_activity {
-            conn.execute(
+        // Additive guarded migrations: CREATE IF NOT EXISTS above cannot add columns
+        // to the existing wallet cursor owner. Each ALTER is idempotent across reopens.
+        for (column, alter) in [
+            (
+                "last_activity_unix",
                 "ALTER TABLE poll_cursors ADD COLUMN last_activity_unix INTEGER",
-                [],
-            )?;
+            ),
+            (
+                "activity_cutoff_unix",
+                "ALTER TABLE poll_cursors ADD COLUMN activity_cutoff_unix INTEGER",
+            ),
+            (
+                "coverage_generation",
+                "ALTER TABLE poll_cursors ADD COLUMN coverage_generation INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "reanchor_required",
+                "ALTER TABLE poll_cursors ADD COLUMN reanchor_required INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            let has_column: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('poll_cursors') WHERE name = ?1")?
+                .exists(params![column])?;
+            if !has_column {
+                conn.execute(alter, [])?;
+            }
         }
 
         Ok(Self {
@@ -536,6 +608,41 @@ impl PaperStateDb {
             |row| row.get(0),
         )
         .map_err(PaperStateError::from)
+    }
+
+    /// Replayable activity groups strictly after `cutoff_unix`, in causal order.
+    pub fn activity_groups_after(
+        &self,
+        wallet: &WalletAddress,
+        cutoff_unix: i64,
+    ) -> Result<Vec<ActivityGroupRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json \
+             FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 \
+             ORDER BY source_epoch, source_trade_id",
+        )?;
+        let rows = statement.query_map(params![wallet.to_string(), cutoff_unix], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (source_trade_id, source_epoch, semantic_revision, disposition, proof_json) = row?;
+            groups.push(ActivityGroupRow {
+                source_trade_id: SourceTradeId(source_trade_id),
+                source_epoch,
+                semantic_revision,
+                disposition,
+                proof_json,
+            });
+        }
+        Ok(groups)
     }
 
     // ── Write shapes ─────────────────────────────────────────────────────────
@@ -1058,34 +1165,148 @@ impl PaperStateDb {
         validations: &[PositionValidationRecord],
     ) -> Result<(), PaperStateError> {
         for validation in validations {
-            serde_json::from_str::<serde_json::Value>(&validation.activity_bounds_json)?;
-            serde_json::from_str::<serde_json::Value>(&validation.proof_json)?;
+            validate_position_validation(validation)?;
         }
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         for validation in validations {
+            tx_upsert_position_validation(&tx, validation)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Install one all-or-nothing batch of venue-authoritative position anchors.
+    pub fn install_anchors(&self, installs: &[AnchorInstallRecord]) -> Result<(), PaperStateError> {
+        self.install_anchors_inner(installs, false)
+    }
+
+    fn install_anchors_inner(
+        &self,
+        installs: &[AnchorInstallRecord],
+        fail_before_commit: bool,
+    ) -> Result<(), PaperStateError> {
+        let mut prepared = Vec::with_capacity(installs.len());
+        for install in installs {
+            serde_json::from_str::<serde_json::Value>(&install.activity_bounds_json)?;
+            serde_json::from_str::<serde_json::Value>(&install.proof_json)?;
+            let mut balances = install
+                .balances
+                .iter()
+                .map(|(market_id, outcome_id, long)| (market_id.to_string(), outcome_id.0, *long))
+                .collect::<Vec<_>>();
+            balances
+                .sort_by(|left, right| (left.0.as_str(), left.1).cmp(&(right.0.as_str(), right.1)));
+            for duplicate in balances.windows(2) {
+                if duplicate[0].0 == duplicate[1].0 && duplicate[0].1 == duplicate[1].1 {
+                    return Err(PaperStateError::DuplicateAuthoritativePosition {
+                        market_id: duplicate[0].0.clone(),
+                        outcome_id: duplicate[0].1,
+                    });
+                }
+            }
+            let balances_json = serde_json::to_string(&balances)?;
+            prepared.push((install, balances, balances_json));
+        }
+
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for (install, balances, balances_json) in prepared {
+            let wallet_hex = install.wallet.to_string();
+            let stored_cutoff: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT activity_cutoff_unix FROM poll_cursors WHERE wallet_hex = ?1",
+                    params![wallet_hex],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let stored_cutoff = stored_cutoff.ok_or_else(|| {
+                PaperStateError::Internal(format!(
+                    "anchor install requires an existing wallet cursor for {}",
+                    install.wallet
+                ))
+            })?;
+            if let Some(stored_cutoff_unix) = stored_cutoff
+                && stored_cutoff_unix > install.activity_cutoff_unix
+            {
+                return Err(PaperStateError::AnchorCutoffRegression {
+                    wallet: install.wallet,
+                    stored_cutoff_unix,
+                    candidate_cutoff_unix: install.activity_cutoff_unix,
+                });
+            }
+
+            let previous_anchor_seq: Option<i64> = tx.query_row(
+                "SELECT MAX(anchor_seq) FROM position_anchors WHERE wallet_hex = ?1",
+                params![wallet_hex],
+                |row| row.get(0),
+            )?;
+            let anchor_seq = match previous_anchor_seq {
+                Some(previous) => previous.checked_add(1).ok_or_else(|| {
+                    PaperStateError::Internal(format!(
+                        "anchor sequence overflow for {}",
+                        install.wallet
+                    ))
+                })?,
+                None => 0,
+            };
             tx.execute(
-                "INSERT INTO position_validations \
-                     (wallet_hex, ledger_hash, positions_proof_hash, activity_bounds_json, \
-                      source_log_generation, proof_json, recorded_at_unix) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT(wallet_hex) DO UPDATE SET \
-                     ledger_hash = excluded.ledger_hash, \
-                     positions_proof_hash = excluded.positions_proof_hash, \
-                     activity_bounds_json = excluded.activity_bounds_json, \
-                     source_log_generation = excluded.source_log_generation, \
-                     proof_json = excluded.proof_json, \
-                     recorded_at_unix = excluded.recorded_at_unix",
+                "INSERT INTO position_anchors \
+                     (wallet_hex, anchor_seq, anchored_at_unix, activity_cutoff_unix, \
+                      balances_json, ledger_hash_after, proof_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    validation.wallet.to_string(),
-                    validation.ledger_hash,
-                    validation.positions_proof_hash,
-                    validation.activity_bounds_json,
-                    validation.source_log_generation,
-                    validation.proof_json,
-                    validation.recorded_at_unix,
+                    wallet_hex,
+                    anchor_seq,
+                    install.anchored_at_unix,
+                    install.activity_cutoff_unix,
+                    balances_json,
+                    install.ledger_hash_after,
+                    install.proof_json,
                 ],
             )?;
+
+            tx.execute(
+                "DELETE FROM leader_positions WHERE wallet_hex = ?1",
+                params![wallet_hex],
+            )?;
+            {
+                let mut statement = tx.prepare(
+                    "INSERT INTO leader_positions \
+                         (wallet_hex, market_id, outcome_id, long_amount_str, short_amount_str) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for (market_id, outcome_id, long) in balances {
+                    statement.execute(params![
+                        wallet_hex,
+                        market_id,
+                        i64::from(outcome_id),
+                        long.to_decimal().to_string(),
+                        ShareAmount::ZERO.to_decimal().to_string(),
+                    ])?;
+                }
+            }
+
+            let validation = PositionValidationRecord {
+                wallet: install.wallet,
+                ledger_hash: install.ledger_hash_after.clone(),
+                positions_proof_hash: install.positions_proof_hash.clone(),
+                activity_bounds_json: install.activity_bounds_json.clone(),
+                source_log_generation: install.source_log_generation.clone(),
+                proof_json: install.proof_json.clone(),
+                recorded_at_unix: install.recorded_at_unix,
+            };
+            tx_upsert_position_validation(&tx, &validation)?;
+            tx.execute(
+                "UPDATE poll_cursors SET activity_cutoff_unix = ?2, reanchor_required = 0 \
+                 WHERE wallet_hex = ?1",
+                params![wallet_hex, install.activity_cutoff_unix],
+            )?;
+        }
+        if fail_before_commit {
+            return Err(PaperStateError::Internal(
+                "injected anchor install failure before commit".to_owned(),
+            ));
         }
         tx.commit()?;
         Ok(())
@@ -1124,6 +1345,131 @@ impl PaperStateDb {
         wallet: &WalletAddress,
     ) -> Result<bool, PaperStateError> {
         Ok(self.position_validation(wallet)?.is_some())
+    }
+
+    /// Read the latest installed anchor and coverage state for one wallet.
+    pub fn wallet_coverage(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<WalletCoverage, PaperStateError> {
+        type RawCoverageRow = (Option<i64>, i64, i64, Option<i64>, Option<i64>);
+
+        let conn = self.lock();
+        let row: Option<RawCoverageRow> = conn
+            .query_row(
+                "SELECT activity_cutoff_unix, coverage_generation, reanchor_required, \
+                        (SELECT MAX(anchor_seq) FROM position_anchors \
+                         WHERE wallet_hex = poll_cursors.wallet_hex), \
+                        (SELECT anchored_at_unix FROM position_anchors \
+                         WHERE wallet_hex = poll_cursors.wallet_hex \
+                         ORDER BY anchor_seq DESC LIMIT 1) \
+                 FROM poll_cursors WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            activity_cutoff_unix,
+            coverage_generation,
+            reanchor_required,
+            anchor_seq,
+            anchored_at_unix,
+        )) = row
+        else {
+            return Ok(WalletCoverage {
+                activity_cutoff_unix: None,
+                coverage_generation: 0,
+                reanchor_required: false,
+                anchor_seq: None,
+                anchored_at_unix: None,
+            });
+        };
+        Ok(WalletCoverage {
+            activity_cutoff_unix,
+            coverage_generation,
+            reanchor_required: parse_bool_flag(reanchor_required, "reanchor_required")?,
+            anchor_seq,
+            anchored_at_unix,
+        })
+    }
+
+    /// Mark a wallet for a fresh anchor and invalidate its accepted bracket.
+    pub fn mark_reanchor_required(
+        &self,
+        wallet: &WalletAddress,
+        source_trade_id: &SourceTradeId,
+        reason: &str,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE poll_cursors SET reanchor_required = 1, \
+                 coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1",
+            params![wallet.to_string()],
+        )?;
+        if updated != 1 {
+            return Err(PaperStateError::Internal(format!(
+                "reanchor mark for {source_trade_id} ({reason}) requires an existing wallet cursor for {wallet}"
+            )));
+        }
+        tx.execute(
+            "DELETE FROM position_validations WHERE wallet_hex = ?1",
+            params![wallet.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Age in seconds of the oldest wallet's latest anchor, or `None` before any anchor.
+    pub fn oldest_anchor_age(&self, now_unix: i64) -> Result<Option<i64>, PaperStateError> {
+        let conn = self.lock();
+        let anchored_at_unix: Option<i64> = conn.query_row(
+            "SELECT MIN(anchor.anchored_at_unix) FROM position_anchors AS anchor \
+             WHERE anchor.anchor_seq = ( \
+                 SELECT MAX(candidate.anchor_seq) FROM position_anchors AS candidate \
+                 WHERE candidate.wallet_hex = anchor.wallet_hex \
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(anchored_at_unix.map(|anchored| now_unix.saturating_sub(anchored).max(0)))
+    }
+
+    /// All position anchors for one wallet in append order.
+    pub fn position_anchors(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Vec<PositionAnchorRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT anchor_seq, anchored_at_unix, activity_cutoff_unix, balances_json, \
+                    ledger_hash_after, proof_json FROM position_anchors \
+             WHERE wallet_hex = ?1 ORDER BY anchor_seq",
+        )?;
+        let rows = statement.query_map(params![wallet.to_string()], |row| {
+            Ok(PositionAnchorRow {
+                wallet: *wallet,
+                anchor_seq: row.get(0)?,
+                anchored_at_unix: row.get(1)?,
+                activity_cutoff_unix: row.get(2)?,
+                balances_json: row.get(3)?,
+                ledger_hash_after: row.get(4)?,
+                proof_json: row.get(5)?,
+            })
+        })?;
+        let mut anchors = Vec::new();
+        for row in rows {
+            anchors.push(row?);
+        }
+        Ok(anchors)
     }
 
     /// Complete-history wallet set used to initialize the bucket gate owner.
@@ -2788,6 +3134,43 @@ impl PaperStateDb {
 
 // ── Transaction-scoped helpers ──────────────────────────────────────────────
 
+fn validate_position_validation(
+    validation: &PositionValidationRecord,
+) -> Result<(), PaperStateError> {
+    serde_json::from_str::<serde_json::Value>(&validation.activity_bounds_json)?;
+    serde_json::from_str::<serde_json::Value>(&validation.proof_json)?;
+    Ok(())
+}
+
+fn tx_upsert_position_validation(
+    tx: &Transaction<'_>,
+    validation: &PositionValidationRecord,
+) -> Result<(), PaperStateError> {
+    tx.execute(
+        "INSERT INTO position_validations \
+             (wallet_hex, ledger_hash, positions_proof_hash, activity_bounds_json, \
+              source_log_generation, proof_json, recorded_at_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(wallet_hex) DO UPDATE SET \
+             ledger_hash = excluded.ledger_hash, \
+             positions_proof_hash = excluded.positions_proof_hash, \
+             activity_bounds_json = excluded.activity_bounds_json, \
+             source_log_generation = excluded.source_log_generation, \
+             proof_json = excluded.proof_json, \
+             recorded_at_unix = excluded.recorded_at_unix",
+        params![
+            validation.wallet.to_string(),
+            validation.ledger_hash,
+            validation.positions_proof_hash,
+            validation.activity_bounds_json,
+            validation.source_log_generation,
+            validation.proof_json,
+            validation.recorded_at_unix,
+        ],
+    )?;
+    Ok(())
+}
+
 fn validate_activity_bucket(bucket: &ActivityBucketCommit) -> Result<(), PaperStateError> {
     let mut group_ids = BTreeSet::new();
     for record in &bucket.dispositions {
@@ -3254,6 +3637,16 @@ fn parse_u16(v: i64) -> Result<u16, PaperStateError> {
     u16::try_from(v).map_err(|_| PaperStateError::Corrupt(format!("outcome_id {v} out of range")))
 }
 
+fn parse_bool_flag(value: i64, field: &str) -> Result<bool, PaperStateError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(PaperStateError::Corrupt(format!(
+            "bad {field} flag {other}"
+        ))),
+    }
+}
+
 fn parse_decimal(s: &str) -> Result<Decimal, PaperStateError> {
     Decimal::from_str(s).map_err(|_| PaperStateError::Corrupt(format!("bad decimal {s:?}")))
 }
@@ -3296,6 +3689,90 @@ mod tests {
 
     fn market() -> MarketId {
         MarketId(VenueMarketId("0xmarket1".to_string()))
+    }
+
+    fn other_wallet() -> WalletAddress {
+        WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap()
+    }
+
+    fn named_market(name: &str) -> MarketId {
+        MarketId(VenueMarketId(name.to_owned()))
+    }
+
+    fn anchor_install(
+        wallet: WalletAddress,
+        balances: Vec<(MarketId, OutcomeId, ShareAmount)>,
+        activity_cutoff_unix: i64,
+        anchored_at_unix: i64,
+        ledger_hash_after: &str,
+    ) -> AnchorInstallRecord {
+        AnchorInstallRecord {
+            wallet,
+            balances,
+            activity_cutoff_unix,
+            anchored_at_unix,
+            ledger_hash_after: ledger_hash_after.to_owned(),
+            positions_proof_hash: format!("positions-{ledger_hash_after}"),
+            activity_bounds_json: format!("{{\"cutoff\":{activity_cutoff_unix}}}"),
+            source_log_generation: format!("generation-{ledger_hash_after}"),
+            proof_json: format!("{{\"anchor\":\"{ledger_hash_after}\"}}"),
+            recorded_at_unix: anchored_at_unix,
+        }
+    }
+
+    fn leader_projection(db: &PaperStateDb) -> Vec<(String, String, u16, u64, u64)> {
+        let mut rows = db
+            .leader_positions()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.wallet.to_string(),
+                    row.market_id.to_string(),
+                    row.outcome_id.0,
+                    row.long_contracts.atomic(),
+                    row.short_contracts.atomic(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    fn group_id(suffix: char) -> SourceTradeId {
+        SourceTradeId(format!("g2:{}", suffix.to_string().repeat(64)))
+    }
+
+    fn record_activity_group(
+        db: &PaperStateDb,
+        wallet: WalletAddress,
+        source_epoch: i64,
+        suffix: char,
+        proof_json: &str,
+    ) {
+        db.commit_activity_bucket(&ActivityBucketCommit {
+            wallet,
+            source_epoch,
+            dispositions: vec![ActivityDispositionRecord {
+                source_trade_id: group_id(suffix),
+                transaction_hash: format!("transaction-{suffix}"),
+                wallet,
+                source_epoch,
+                semantic_revision: format!("revision-{suffix}"),
+                activity_type: "TRADE".to_owned(),
+                disposition: "applied".to_owned(),
+                proof_json: proof_json.to_owned(),
+                no_copy: None,
+            }],
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: None,
+            pending: Vec::new(),
+            fence: None,
+            advance_cursor: false,
+        })
+        .unwrap();
     }
 
     fn leader(long: u64, short: u64) -> LeaderPositionRow {
@@ -3349,6 +3826,387 @@ mod tests {
                 expected: SCHEMA_VERSION
             })
         ));
+    }
+
+    #[test]
+    fn pre_anchor_schema_reopens_with_guarded_columns_and_table_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper_state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 2;
+                 CREATE TABLE poll_cursors (
+                     wallet_hex TEXT PRIMARY KEY NOT NULL,
+                     last_ts_unix INTEGER NOT NULL,
+                     last_activity_unix INTEGER
+                 );
+                 INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)
+                 VALUES ('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 42, 43);",
+            )
+            .unwrap();
+        }
+
+        for reopen in 0..2 {
+            let db = PaperStateDb::open(&path).unwrap();
+            assert_eq!(
+                db.wallet_coverage(&wallet()).unwrap(),
+                WalletCoverage {
+                    activity_cutoff_unix: None,
+                    coverage_generation: 0,
+                    reanchor_required: false,
+                    anchor_seq: None,
+                    anchored_at_unix: None,
+                }
+            );
+            assert_eq!(db.oldest_anchor_age(100).unwrap(), None);
+            drop(db);
+
+            let conn = Connection::open(&path).unwrap();
+            let added_columns: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('poll_cursors')
+                     WHERE name IN ('activity_cutoff_unix', 'coverage_generation',
+                                    'reanchor_required')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(added_columns, 3, "reopen {reopen}");
+            let anchor_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'position_anchors'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(anchor_tables, 1, "reopen {reopen}");
+        }
+    }
+
+    #[test]
+    fn install_anchors_batch_replaces_mirror_validation_and_coverage() {
+        let (_dir, db) = db();
+        let first = wallet();
+        let second = other_wallet();
+        db.seed_cursors_if_absent(&[(first, 10), (second, 20)])
+            .unwrap();
+        let market_a = named_market("0xanchor-a");
+        let market_b = named_market("0xanchor-b");
+        let market_c = named_market("0xanchor-c");
+        let first_install = anchor_install(
+            first,
+            vec![
+                (market_b.clone(), OutcomeId(1), ShareAmount::from_atomic(8)),
+                (market_a.clone(), OutcomeId(0), ShareAmount::from_atomic(7)),
+            ],
+            100,
+            200,
+            "ledger-first",
+        );
+        let second_install = anchor_install(
+            second,
+            vec![(market_c.clone(), OutcomeId(2), ShareAmount::from_atomic(9))],
+            110,
+            220,
+            "ledger-second",
+        );
+        db.install_anchors(&[first_install.clone(), second_install.clone()])
+            .unwrap();
+
+        let first_anchors = db.position_anchors(&first).unwrap();
+        assert_eq!(first_anchors.len(), 1);
+        assert_eq!(first_anchors[0].anchor_seq, 0);
+        assert_eq!(first_anchors[0].ledger_hash_after, "ledger-first");
+        let canonical_balances: Vec<(String, u16, ShareAmount)> =
+            serde_json::from_str(&first_anchors[0].balances_json).unwrap();
+        assert_eq!(
+            canonical_balances,
+            vec![
+                ("0xanchor-a".to_owned(), 0, ShareAmount::from_atomic(7)),
+                ("0xanchor-b".to_owned(), 1, ShareAmount::from_atomic(8)),
+            ]
+        );
+        assert_eq!(db.position_anchors(&second).unwrap()[0].anchor_seq, 0);
+        assert_eq!(
+            db.position_validation(&first).unwrap().unwrap(),
+            PositionValidationRecord {
+                wallet: first,
+                ledger_hash: first_install.ledger_hash_after.clone(),
+                positions_proof_hash: first_install.positions_proof_hash.clone(),
+                activity_bounds_json: first_install.activity_bounds_json.clone(),
+                source_log_generation: first_install.source_log_generation.clone(),
+                proof_json: first_install.proof_json.clone(),
+                recorded_at_unix: first_install.recorded_at_unix,
+            }
+        );
+        assert_eq!(
+            db.wallet_coverage(&first).unwrap(),
+            WalletCoverage {
+                activity_cutoff_unix: Some(100),
+                coverage_generation: 0,
+                reanchor_required: false,
+                anchor_seq: Some(0),
+                anchored_at_unix: Some(200),
+            }
+        );
+        assert_eq!(db.oldest_anchor_age(250).unwrap(), Some(50));
+        assert_eq!(db.cursor(&first).unwrap(), Some(10));
+        assert_eq!(db.activity(&first).unwrap(), Some(10));
+
+        db.install_anchors(&[anchor_install(
+            first,
+            vec![(market_b.clone(), OutcomeId(1), ShareAmount::from_atomic(12))],
+            120,
+            300,
+            "ledger-first-next",
+        )])
+        .unwrap();
+        let first_anchors = db.position_anchors(&first).unwrap();
+        assert_eq!(
+            first_anchors
+                .iter()
+                .map(|anchor| anchor.anchor_seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            leader_projection(&db)
+                .into_iter()
+                .filter(|row| row.0 == first.to_string())
+                .collect::<Vec<_>>(),
+            vec![(first.to_string(), market_b.to_string(), 1, 12, 0,)],
+            "balances absent from the new anchor are deleted"
+        );
+        assert_eq!(db.cursor(&first).unwrap(), Some(10));
+        assert_eq!(db.activity(&first).unwrap(), Some(10));
+        assert_eq!(
+            db.oldest_anchor_age(350).unwrap(),
+            Some(130),
+            "age uses each wallet's latest anchor"
+        );
+    }
+
+    #[test]
+    fn injected_anchor_failure_before_commit_rolls_back_all_four_surfaces() {
+        let (_dir, db) = db();
+        let first = wallet();
+        let second = other_wallet();
+        db.seed_cursors_if_absent(&[(first, 10), (second, 20)])
+            .unwrap();
+        db.install_anchors(&[
+            anchor_install(
+                first,
+                vec![(market(), OutcomeId(0), ShareAmount::from_atomic(1))],
+                100,
+                200,
+                "baseline-first",
+            ),
+            anchor_install(
+                second,
+                vec![(
+                    named_market("0xbaseline-second"),
+                    OutcomeId(1),
+                    ShareAmount::from_atomic(2),
+                )],
+                100,
+                210,
+                "baseline-second",
+            ),
+        ])
+        .unwrap();
+        let before_anchors = (
+            db.position_anchors(&first).unwrap(),
+            db.position_anchors(&second).unwrap(),
+        );
+        let before_mirror = leader_projection(&db);
+        let before_validations = (
+            db.position_validation(&first).unwrap(),
+            db.position_validation(&second).unwrap(),
+        );
+        let before_coverage = (
+            db.wallet_coverage(&first).unwrap(),
+            db.wallet_coverage(&second).unwrap(),
+        );
+
+        let result = db.install_anchors_inner(
+            &[
+                anchor_install(
+                    first,
+                    vec![(
+                        named_market("0xfailing-first"),
+                        OutcomeId(0),
+                        ShareAmount::from_atomic(3),
+                    )],
+                    120,
+                    300,
+                    "failing-first",
+                ),
+                anchor_install(
+                    second,
+                    vec![(
+                        named_market("0xfailing-second"),
+                        OutcomeId(1),
+                        ShareAmount::from_atomic(4),
+                    )],
+                    120,
+                    310,
+                    "failing-second",
+                ),
+            ],
+            true,
+        );
+        assert!(matches!(result, Err(PaperStateError::Internal(_))));
+        assert_eq!(
+            (
+                db.position_anchors(&first).unwrap(),
+                db.position_anchors(&second).unwrap(),
+            ),
+            before_anchors
+        );
+        assert_eq!(leader_projection(&db), before_mirror);
+        assert_eq!(
+            (
+                db.position_validation(&first).unwrap(),
+                db.position_validation(&second).unwrap(),
+            ),
+            before_validations
+        );
+        assert_eq!(
+            (
+                db.wallet_coverage(&first).unwrap(),
+                db.wallet_coverage(&second).unwrap(),
+            ),
+            before_coverage
+        );
+    }
+
+    #[test]
+    fn cutoff_regression_rolls_back_the_whole_anchor_batch() {
+        let (_dir, db) = db();
+        let first = wallet();
+        let second = other_wallet();
+        db.seed_cursors_if_absent(&[(first, 10), (second, 20)])
+            .unwrap();
+        db.install_anchors(&[
+            anchor_install(first, Vec::new(), 100, 200, "baseline-first"),
+            anchor_install(second, Vec::new(), 100, 210, "baseline-second"),
+        ])
+        .unwrap();
+        let before_first = db.position_anchors(&first).unwrap();
+        let before_second = db.position_anchors(&second).unwrap();
+        let before_validations = (
+            db.position_validation(&first).unwrap(),
+            db.position_validation(&second).unwrap(),
+        );
+
+        let result = db.install_anchors(&[
+            anchor_install(
+                first,
+                vec![(market(), OutcomeId(0), ShareAmount::from_atomic(5))],
+                120,
+                300,
+                "candidate-first",
+            ),
+            anchor_install(second, Vec::new(), 99, 310, "candidate-second"),
+        ]);
+        assert!(matches!(
+            result,
+            Err(PaperStateError::AnchorCutoffRegression {
+                wallet: regressed,
+                stored_cutoff_unix: 100,
+                candidate_cutoff_unix: 99,
+            }) if regressed == second
+        ));
+        assert_eq!(db.position_anchors(&first).unwrap(), before_first);
+        assert_eq!(db.position_anchors(&second).unwrap(), before_second);
+        assert_eq!(
+            (
+                db.position_validation(&first).unwrap(),
+                db.position_validation(&second).unwrap(),
+            ),
+            before_validations
+        );
+        assert!(leader_projection(&db).is_empty());
+        assert_eq!(
+            db.wallet_coverage(&first).unwrap().activity_cutoff_unix,
+            Some(100)
+        );
+        assert_eq!(
+            db.wallet_coverage(&second).unwrap().activity_cutoff_unix,
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn reanchor_mark_invalidates_validation_and_next_install_clears_flag() {
+        let (_dir, db) = db();
+        let wallet = wallet();
+        db.seed_cursor_if_absent(&wallet, 10).unwrap();
+        db.install_anchors(&[anchor_install(
+            wallet,
+            vec![(market(), OutcomeId(0), ShareAmount::from_atomic(1))],
+            100,
+            200,
+            "baseline",
+        )])
+        .unwrap();
+        assert!(db.position_validation(&wallet).unwrap().is_some());
+
+        db.mark_reanchor_required(&wallet, &group_id('d'), "anchor_covered_late")
+            .unwrap();
+        assert_eq!(
+            db.wallet_coverage(&wallet).unwrap(),
+            WalletCoverage {
+                activity_cutoff_unix: Some(100),
+                coverage_generation: 1,
+                reanchor_required: true,
+                anchor_seq: Some(0),
+                anchored_at_unix: Some(200),
+            }
+        );
+        assert!(db.position_validation(&wallet).unwrap().is_none());
+
+        db.install_anchors(&[anchor_install(
+            wallet,
+            vec![(market(), OutcomeId(0), ShareAmount::from_atomic(2))],
+            120,
+            300,
+            "refreshed",
+        )])
+        .unwrap();
+        let coverage = db.wallet_coverage(&wallet).unwrap();
+        assert_eq!(coverage.coverage_generation, 1);
+        assert!(!coverage.reanchor_required);
+        assert_eq!(coverage.anchor_seq, Some(1));
+        assert!(db.position_validation(&wallet).unwrap().is_some());
+    }
+
+    #[test]
+    fn activity_groups_after_is_cutoff_exclusive_and_causally_ordered() {
+        let (_dir, db) = db();
+        let wallet = wallet();
+        let proof_b = "{\"version\":1,\"effect\":{\"Trade\":{\"amount\":\"2\"}}}";
+        let proof_a = "{\"version\":1,\"effect\":{\"Trade\":{\"amount\":\"1\"}}}";
+        record_activity_group(&db, wallet, 101, 'b', proof_b);
+        record_activity_group(
+            &db,
+            wallet,
+            100,
+            'c',
+            "{\"version\":1,\"effect\":\"RawOnly\"}",
+        );
+        record_activity_group(&db, wallet, 101, 'a', proof_a);
+
+        let groups = db.activity_groups_after(&wallet, 100).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].source_trade_id, group_id('a'));
+        assert_eq!(groups[1].source_trade_id, group_id('b'));
+        assert!(groups.iter().all(|group| group.source_epoch == 101));
+        assert_eq!(groups[0].proof_json, proof_a);
+        assert_eq!(groups[1].proof_json, proof_b);
+        assert!(db.activity_groups_after(&wallet, 101).unwrap().is_empty());
     }
 
     #[test]
