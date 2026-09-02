@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
         .iter()
         .map(|entry| entry.wallet)
         .collect::<Vec<_>>();
-    boot_position_validator
+    let anchored = boot_position_validator
         .validate_direct(&boot_wallets, &mut boot_engine, &paper_state)
         .await
         .context("causal current-position validation for boot universe")?;
@@ -428,9 +428,13 @@ async fn main() -> Result<()> {
         let activation_obligations =
             rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
                 .context("capture migration reconciliation obligations")?;
+        // Fenced and deferred wallets carry no validation row and leave the
+        // boot universe (see `validate_direct`); the census describes the
+        // accepted set.
+        let anchored_wallets: Vec<_> = anchored.iter().map(|install| install.wallet).collect();
         record_activation_facts(
             &paper_state,
-            &boot_wallets,
+            &anchored_wallets,
             &activation_obligations,
             build_identity(),
         )?;
