@@ -113,7 +113,9 @@ fn activity_url(start: Option<i64>, end: i64, offset: u32) -> String {
     PolymarketEndpoint::UserPositionActivityPage {
         user: WALLET.to_owned(),
         end,
-        start,
+        // The live API `start` is inclusive; the fetcher puts the exclusive
+        // window bound on the wire as `start + 1`.
+        start: start.map(|value| value + 1),
         offset,
     }
     .url(BASE)
@@ -674,4 +676,116 @@ async fn still_full_one_second_activity_window_is_typed_incomplete() {
             offset: ACTIVITY_MAX_OFFSET,
         }
     ));
+}
+
+/// Serves the live `/activity` contract from one row store: `start` and `end`
+/// are both INCLUSIVE seconds, rows come back newest-first, and each page
+/// holds at most 500 rows at the requested offset (2026-09-01 live evidence,
+/// docs/15). The map-keyed fixtures above cannot express inclusivity; this
+/// fake reproduces the saturated-split live failure found in the #544
+/// activation rehearsal.
+struct InclusiveActivityApi {
+    rows: Vec<Value>,
+}
+
+impl InclusiveActivityApi {
+    fn new(mut rows: Vec<Value>) -> Self {
+        rows.sort_by(|left, right| {
+            let ts = |row: &Value| row["timestamp"].as_i64().expect("timestamp");
+            let tx = |row: &Value| row["transactionHash"].as_str().expect("tx").to_owned();
+            ts(right)
+                .cmp(&ts(left))
+                .then_with(|| tx(left).cmp(&tx(right)))
+        });
+        Self { rows }
+    }
+}
+
+impl pe_source_polymarket_public::PageFetcher for InclusiveActivityApi {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+        let query = url.split_once('?').map(|(_, q)| q).unwrap_or_default();
+        let mut start = None;
+        let mut end = None;
+        let mut offset = 0_usize;
+        for pair in query.split('&') {
+            match pair.split_once('=') {
+                Some(("start", value)) => start = Some(value.parse::<i64>().expect("start")),
+                Some(("end", value)) => end = Some(value.parse::<i64>().expect("end")),
+                Some(("offset", value)) => offset = value.parse::<usize>().expect("offset"),
+                _ => {}
+            }
+        }
+        let end = end.expect("end is always requested");
+        let window = self
+            .rows
+            .iter()
+            .filter(|row| {
+                let ts = row["timestamp"].as_i64().expect("timestamp");
+                ts <= end && start.is_none_or(|start| ts >= start)
+            })
+            .collect::<Vec<_>>();
+        let page = window
+            .into_iter()
+            .skip(offset)
+            .take(500)
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&page).map_err(|error| pe_source_core::SourceError::Fatal {
+            message: error.to_string(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn saturated_split_against_the_inclusive_live_api_returns_each_row_exactly_once() {
+    // 5,499 rows share one second: enough to saturate the parent window at
+    // the maximum offset, while the split-off one-second window still
+    // completes. Pre-fix, the post-split upper window re-received the
+    // boundary-second rows (inclusive `start`) and failed RowOutsideBounds.
+    let mut rows = vec![activity_row(
+        10,
+        "0xold".to_owned(),
+        "asset-old".to_owned(),
+        0,
+    )];
+    for index in 0..5_499_u32 {
+        rows.push(activity_row(
+            50,
+            format!("0xsat{index:04}"),
+            format!("asset-sat-{index}"),
+            0,
+        ));
+    }
+    rows.push(activity_row(
+        51,
+        "0xafter0".to_owned(),
+        "asset-after-0".to_owned(),
+        0,
+    ));
+    rows.push(activity_row(
+        51,
+        "0xafter1".to_owned(),
+        "asset-after-1".to_owned(),
+        0,
+    ));
+
+    let read = fetch_complete_activity(&InclusiveActivityApi::new(rows), BASE, wallet(), None, 100)
+        .await
+        .expect("the split walk completes against the inclusive live contract");
+
+    assert_eq!(read.rows.len(), 5_502);
+    let identities = read
+        .rows
+        .iter()
+        .map(|row| row.group_id().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(identities.len(), 5_502, "each row appears exactly once");
+    let timestamps = read
+        .rows
+        .iter()
+        .map(|row| row.source_time.0.unix_timestamp())
+        .collect::<Vec<_>>();
+    assert!(timestamps.is_sorted());
+    assert_eq!(timestamps.iter().filter(|ts| **ts == 10).count(), 1);
+    assert_eq!(timestamps.iter().filter(|ts| **ts == 50).count(), 5_499);
+    assert_eq!(timestamps.iter().filter(|ts| **ts == 51).count(), 2);
 }

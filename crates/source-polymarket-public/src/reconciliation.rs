@@ -282,10 +282,13 @@ async fn fetch_activity_segment(
                 limit: RECONCILIATION_PAGE_LIMIT,
             });
         }
+        // The live API `start` parameter is inclusive (a row at exactly the
+        // requested second is returned; verified live 2026-09-01, docs/15), so
+        // the exclusive lower window bound goes on the wire as `start + 1`.
         let url = PolymarketEndpoint::UserPositionActivityPage {
             user: requested_wallet.to_string(),
             end: bounds.end,
-            start: bounds.start,
+            start: bounds.start.map(|start| start.saturating_add(1)),
             offset,
         }
         .url(base_url);

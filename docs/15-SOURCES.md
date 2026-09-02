@@ -89,7 +89,11 @@
 > the reconciliation reader. Explicit `redeemable=false` and `redeemable=true` walks are disjoint
 > partitions and must both complete; no omitted-filter inference substitutes for either partition.
 > Captured URLs, fetch times, byte lengths, and SHA-256 hashes are recorded in the issue-#544
-> fixture `MANIFEST.json`.
+> fixture `MANIFEST.json`. **`/activity` `start` is INCLUSIVE (2026-09-01, #544 activation
+> rehearsal):** a request with `start=S` returns rows whose `timestamp` equals `S`, proven live
+> when a saturated-window split re-received boundary-second rows. The reconciliation reader keeps
+> its exclusive `(start, end]` window contract internally and puts `start + 1` on the wire
+> (`crates/source-polymarket-public/src/reconciliation.rs`); `end` remains inclusive as observed.
 
 > **Gamma `/markets?condition_ids=` + CLOB `/markets?closed=true` — UA blocklist & repeat-key batching (2026-06-20, issue #382 Phase-0 live probe `scripts/probe_gamma_ua.py`).** The `&closed=true` 403 is triggered by the literal `Python-urllib/*` default User-Agent (an anti-bot blocklist), **not** by a missing browser UA: both endpoints return **200** for a headerless request (a bare `reqwest::Client` = the shipped Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and **403 only** for `Python-urllib/3.11`. The shipped UA-less clients therefore do not 403, but this transport health did not prevent the 2026-06-24 through 2026-08-21 persisted-terminator cursor wedge from stopping repeat resolution ingestion. Repeat-key batching (`?condition_ids=A&condition_ids=B…&limit=500`) works for **both** the plain (open) and `&closed=true` Gamma variants — 50/50 and 100/100 returned, demux-by-`conditionId` clean, no cross-market leak; comma-separated joining returns 0 (repeat-key mandatory); observed batch cap ≥ 100 (kept at `gamma_batch_size`=50). This supersedes the stale `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" claim for the repeat-key form.
 
