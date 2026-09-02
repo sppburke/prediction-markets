@@ -14,6 +14,8 @@ use time::OffsetDateTime;
 // Defaults — canonical values live in `docs/_GLOSSARY.md` "Polymarket public source" section.
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRIES: u32 = 3;
+/// Longest `Retry-After` honored in-line on HTTP 429; longer waits are returned to the caller.
+const RATE_LIMIT_RETRY_MAX_SECS: u32 = 5;
 /// Enforces ≤ 20 req/s per the Polymarket Data API documented limit (200 req/10s on `/trades`).
 const MIN_INTERVAL_MS: u64 = 50;
 
@@ -38,7 +40,8 @@ const UNOBSERVED_CONTEXT: HttpRequestContext = HttpRequestContext {
 pub trait PageFetcher {
     /// Fetch a page from `url`. Returns raw response bytes.
     ///
-    /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value.
+    /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value once
+    ///   short waits have been retried within the budget.
     /// - Returns [`SourceError::Transient`] on 5xx or network errors (retried internally).
     /// - Returns [`SourceError::Fatal`] on 4xx (non-429) errors.
     fn fetch_page(
@@ -59,7 +62,8 @@ pub trait PageFetcher {
 ///   shared via `Mutex<Option<Instant>>` so concurrent callers all observe the
 ///   serial gate (see `last_request_at` and the gate logic in `fetch_page`).
 ///   Override via [`Self::with_min_interval_ms`] for APIs with different rate limits.
-/// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried).
+/// - HTTP 429 with `Retry-After` ≤ [`RATE_LIMIT_RETRY_MAX_SECS`] → retried after that wait
+///   inside the same retry budget; otherwise [`SourceError::RateLimited`] is returned.
 /// - HTTP 4xx (non-429) → [`SourceError::Fatal`].
 pub struct ReqwestFetcher {
     client: reqwest::Client,
@@ -258,6 +262,21 @@ impl ReqwestFetcher {
                             .as_deref()
                             .and_then(|value| value.parse::<u32>().ok())
                             .unwrap_or(30);
+                        // A short `Retry-After` is honored inside the retry budget: the
+                        // venue answers a page burst with `Retry-After: 1` (observed
+                        // 2026-09-02 during the #555 boot bracket), and returning it
+                        // uncontested deferred whole wallets. Longer waits stay the
+                        // caller's decision.
+                        if retry_after_secs <= RATE_LIMIT_RETRY_MAX_SECS
+                            && attempt < self.max_retries
+                        {
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_secs(u64::from(
+                                retry_after_secs.max(1),
+                            )))
+                            .await;
+                            continue;
+                        }
                         return Err(SourceError::RateLimited { retry_after_secs });
                     }
                     if is_retryable_status(status) {
@@ -390,6 +409,72 @@ impl PageFetcher for FixtureFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn short_retry_after_is_honored_inside_the_retry_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/burst",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "1")],
+                            "{}".to_owned(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [("retry-after", "0")],
+                            "[1]".to_owned(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_max_retries(1);
+        let body = fetcher
+            .fetch_page(&format!("http://{address}/burst"))
+            .await
+            .unwrap();
+        assert_eq!(body, b"[1]");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_is_returned_to_the_caller_without_waiting() {
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "60")],
+                    "{}",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new()).with_max_retries(3);
+        let started = std::time::Instant::now();
+        let result = fetcher.fetch_page(&format!("http://{address}/slow")).await;
+        assert!(matches!(
+            result,
+            Err(SourceError::RateLimited {
+                retry_after_secs: 60
+            })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[tokio::test]
     async fn observed_response_retains_retry_headers() {
