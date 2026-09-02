@@ -657,6 +657,7 @@ fn normalize_row(
         outcome_label_present,
         side,
         share_amount,
+        raw.is_combo.unwrap_or(false),
     )?;
 
     Ok(NormalizedActivity {
@@ -801,6 +802,7 @@ fn parse_outcome(
     Ok(Some(OutcomeId(value)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_type_specific(
     activity_type: &ActivityType,
     condition_id: Option<&PolymarketConditionId>,
@@ -809,11 +811,19 @@ fn validate_type_specific(
     outcome_label_present: bool,
     side: Option<Side>,
     share_amount: ShareAmount,
+    is_combo: bool,
 ) -> Result<(), ActivityValidationError> {
     // A zero-share position-changing row has an arithmetically zero effect and
     // is retained raw-only (#544 fix 2): effect-field validation (mapping,
     // side, asset) applies only to rows that can mutate a position.
     if share_amount == ShareAmount::ZERO {
+        return Ok(());
+    }
+    // A combo row cannot mutate the per-outcome ledger — aggregation keeps its
+    // combo classification and effect derivation keeps it raw-only — so the
+    // same rule applies. Live capture 2026-09-01 (#544 fix 5): combo REDEEMs
+    // carry the 999 outcome sentinel with no label and no side.
+    if is_combo {
         return Ok(());
     }
     match activity_type {
@@ -1411,5 +1421,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn combo_redeem_with_outcome_sentinel_is_raw_only_not_an_error() {
+        // Live capture 2026-09-01 (wallet 0xc0f89d…, tx 0x26d6a353…): a combo
+        // ("A AND B") redemption carries outcomeIndex 999 with an empty
+        // outcome label, an empty side, and a zero-padded composite condition
+        // id. A combo row cannot mutate the per-outcome ledger, so it is
+        // retained raw-only instead of failing the page (#544 fix 5).
+        let row = r#"{"proxyWallet":"0xc0f89d4e30b3ab40ab1f1979ebdcf8a02c39ae2e","timestamp":1788267565,"conditionId":"0x03b3a79f3835495dcd640b7b083a15aff70000000000000000000000000000","type":"REDEEM","size":61.365568,"usdcSize":61.365568,"transactionHash":"0x26d6a3534b70404ec37034669852f22ccbfea587a381cc745088011779e53ac1","price":0,"asset":"1674361054535973225327180188452138060703688165104420239139655208134273662976","side":"","outcomeIndex":999,"outcome":"","isCombo":true}"#;
+        let context = ActivityParseContext {
+            source_id: SourceId("polymarket-activity-test".to_owned()),
+            observed_at: SourceTimestamp(
+                time::OffsetDateTime::from_unix_timestamp(1_788_267_565).unwrap(),
+            ),
+            received_at: ReceivedAt(
+                time::OffsetDateTime::from_unix_timestamp(1_788_267_566).unwrap(),
+            ),
+            transport: ActivityTransport::Rest,
+        };
+        let wallet = WalletAddress::from_hex("0xc0f89d4e30b3ab40ab1f1979ebdcf8a02c39ae2e").unwrap();
+        let parsed = parse_activity_row(row.as_bytes(), Some(wallet), &context).unwrap();
+        assert!(parsed.is_combo);
+        assert_eq!(parsed.outcome, None);
+        assert_ne!(parsed.share_amount, ShareAmount::ZERO);
+        assert!(!parsed.is_ordinary_position_change());
+        assert!(!parsed.requires_wallet_fence());
+
+        // The same sentinel on an ordinary (non-combo) redemption stays a
+        // hard error: only structurally raw-only rows skip effect validation.
+        let ordinary = row.replace("\"isCombo\":true", "\"isCombo\":false");
+        assert!(parse_activity_row(ordinary.as_bytes(), Some(wallet), &context).is_err());
     }
 }
