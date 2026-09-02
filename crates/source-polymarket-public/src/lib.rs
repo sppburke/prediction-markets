@@ -53,8 +53,10 @@ pub use endpoint::{
 };
 pub use fetcher::{FixtureFetcher, HttpRequestContext, PageFetcher, ReqwestFetcher};
 pub use gamma_markets::{
-    GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GammaMarket, GammaMarkets, GammaMarketsClient,
-    GammaMarketsError, MarketFilter, parse_outcome_prices,
+    GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarket, GammaMarkets, GammaMarketsClient, GammaMarketsError,
+    GammaMarketsWithPages, MarketFilter, MetadataIdentityError, MetadataPageEvidence,
+    VerifiedTokenIdentity, parse_outcome_prices,
 };
 pub use live_admission::{
     LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveFeeEvidence, LiveMarketError,
@@ -65,6 +67,6 @@ pub use reconciliation::{
     ActivityRequestBounds, CanonicalPosition, CompleteActivityRead, CompletePositionsRead,
     POSITION_PROOF_VERSION, POSITIONS_MAX_OFFSET, PositionClassification, PositionReadError,
     RECONCILIATION_PAGE_LIMIT, ReconciliationFetcher, ReconciliationPageEvidence,
-    fetch_complete_activity, fetch_complete_positions,
+    ReconciliationPageFetcher, fetch_complete_activity, fetch_complete_positions,
 };
 pub mod canary;

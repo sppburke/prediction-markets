@@ -4,9 +4,10 @@
 //! claim either public endpoint is final, so callers must use the causal
 //! activity/positions bracket before accepting a leader position proof.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use pe_core_types::{
     OutcomeId, PolymarketConditionId, PolymarketTokenId, ReceivedAt, ShareAmount, SourceId,
@@ -24,6 +25,7 @@ use crate::activity::{
 };
 use crate::endpoint::{PolymarketEndpoint, PositionPartition};
 use crate::fetcher::PageFetcher;
+use crate::gamma_markets::VerifiedTokenIdentity;
 
 /// Fixed public-API page size for both reconciliation readers.
 pub const RECONCILIATION_PAGE_LIMIT: u32 = 500;
@@ -51,6 +53,15 @@ where
         url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(self.fetch_page(url))
+    }
+}
+
+/// Adapter that lets a service-owned recording fetcher drive a [`PageFetcher`] client.
+pub struct ReconciliationPageFetcher(pub Arc<dyn ReconciliationFetcher>);
+
+impl PageFetcher for ReconciliationPageFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.0.fetch(url).await
     }
 }
 
@@ -102,7 +113,7 @@ impl CompleteActivityRead {
 
     /// Derive the complete asset mapping used by the positions parser.
     pub fn asset_mapping(&self) -> Result<ActivityAssetMapping, PositionReadError> {
-        ActivityAssetMapping::from_rows(&self.rows)
+        Ok(ActivityAssetMapping::from_rows(&self.rows))
     }
 }
 
@@ -377,29 +388,48 @@ pub enum PositionClassification {
     Combo,
 }
 
-/// One activity-proven asset identity.
+/// One mapped asset identity plus its activity-proven ordinary/combo classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityAssetIdentity {
     pub condition_id: PolymarketConditionId,
     pub outcome: OutcomeId,
     pub classification: PositionClassification,
+    /// `true` when venue metadata, rather than an activity stamp, established the identity.
+    pub verified: bool,
 }
 
-/// Complete bidirectional mapping from activity token IDs to condition/outcome.
+/// Complete and unresolved activity mappings, replaceable by verified venue metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityAssetMapping {
     by_asset: HashMap<PolymarketTokenId, ActivityAssetIdentity>,
-    by_outcome: HashMap<(PolymarketConditionId, OutcomeId), PolymarketTokenId>,
+    unresolved: BTreeMap<PolymarketTokenId, Vec<ActivityAssetIdentity>>,
+    classification_by_asset: HashMap<PolymarketTokenId, Option<PositionClassification>>,
 }
 
 impl ActivityAssetMapping {
-    pub fn from_rows(rows: &[NormalizedActivity]) -> Result<Self, PositionReadError> {
-        let mut by_asset = HashMap::new();
-        let mut by_outcome = HashMap::new();
+    #[must_use]
+    pub fn from_rows(rows: &[NormalizedActivity]) -> Self {
+        let mut candidates = BTreeMap::<PolymarketTokenId, Vec<ActivityAssetIdentity>>::new();
+        let mut classification_by_asset =
+            HashMap::<PolymarketTokenId, Option<PositionClassification>>::new();
         for row in rows {
             let Some(asset) = row.asset.clone() else {
                 continue;
             };
+            let classification = if row.is_combo {
+                PositionClassification::Combo
+            } else {
+                PositionClassification::Ordinary
+            };
+            classification_by_asset
+                .entry(asset.clone())
+                .and_modify(|current| {
+                    if current.is_some_and(|current| current != classification) {
+                        *current = None;
+                    }
+                })
+                .or_insert(Some(classification));
+            let identities = candidates.entry(asset).or_default();
             let (Some(condition_id), Some(outcome)) = (row.condition_id.clone(), row.outcome)
             else {
                 // SPLIT/MERGE rows may legitimately omit an outcome even when
@@ -408,40 +438,123 @@ impl ActivityAssetMapping {
                 continue;
             };
             let identity = ActivityAssetIdentity {
-                condition_id: condition_id.clone(),
+                condition_id,
                 outcome,
-                classification: if row.is_combo {
-                    PositionClassification::Combo
-                } else {
-                    PositionClassification::Ordinary
-                },
+                classification,
+                verified: false,
             };
-            if let Some(existing) = by_asset.get(&asset)
-                && existing != &identity
-            {
-                return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
+            if !identities.contains(&identity) {
+                identities.push(identity);
             }
-            let outcome_key = (condition_id, outcome);
-            if let Some(existing_asset) = by_outcome.get(&outcome_key)
-                && existing_asset != &asset
-            {
-                return Err(PositionReadError::ConflictingOutcomeMapping {
-                    condition_id: outcome_key.0.0,
-                    outcome: outcome.0,
-                });
-            }
-            by_outcome.insert(outcome_key, asset.clone());
-            by_asset.insert(asset, identity);
         }
-        Ok(Self {
+        for identities in candidates.values_mut() {
+            identities.sort_by(|left, right| {
+                left.condition_id
+                    .0
+                    .cmp(&right.condition_id.0)
+                    .then_with(|| left.outcome.0.cmp(&right.outcome.0))
+                    .then_with(|| {
+                        let rank = |classification| match classification {
+                            PositionClassification::Ordinary => 0_u8,
+                            PositionClassification::Combo => 1_u8,
+                        };
+                        rank(left.classification).cmp(&rank(right.classification))
+                    })
+            });
+        }
+
+        let mut assets_by_outcome =
+            HashMap::<(PolymarketConditionId, OutcomeId), BTreeSet<PolymarketTokenId>>::new();
+        for (asset, identities) in &candidates {
+            for identity in identities {
+                assets_by_outcome
+                    .entry((identity.condition_id.clone(), identity.outcome))
+                    .or_default()
+                    .insert(asset.clone());
+            }
+        }
+        let outcome_conflicts = assets_by_outcome
+            .into_values()
+            .filter(|assets| assets.len() > 1)
+            .flatten()
+            .collect::<HashSet<_>>();
+
+        let mut by_asset = HashMap::new();
+        let mut unresolved = BTreeMap::new();
+        for (asset, identities) in candidates {
+            let classification_is_unanimous = classification_by_asset
+                .get(&asset)
+                .is_some_and(Option::is_some);
+            if identities.len() == 1
+                && classification_is_unanimous
+                && !outcome_conflicts.contains(&asset)
+            {
+                if let Some(identity) = identities.into_iter().next() {
+                    by_asset.insert(asset, identity);
+                }
+            } else {
+                unresolved.insert(asset, identities);
+            }
+        }
+
+        Self {
             by_asset,
-            by_outcome,
-        })
+            unresolved,
+            classification_by_asset,
+        }
     }
 
     #[must_use]
     pub fn identity(&self, asset: &PolymarketTokenId) -> Option<&ActivityAssetIdentity> {
         self.by_asset.get(asset)
+    }
+
+    /// Every activity-backed token, whether its stamped identity is consistent or unresolved.
+    pub fn tokens(&self) -> impl Iterator<Item = &PolymarketTokenId> {
+        let mut tokens = self
+            .by_asset
+            .keys()
+            .chain(self.unresolved.keys())
+            .collect::<Vec<_>>();
+        tokens.sort_unstable();
+        tokens.into_iter()
+    }
+
+    /// Assets whose activity rows did not establish one unambiguous identity and classification.
+    #[must_use]
+    pub fn unresolved(&self) -> &BTreeMap<PolymarketTokenId, Vec<ActivityAssetIdentity>> {
+        &self.unresolved
+    }
+
+    /// Return the unanimous activity classification for `asset`.
+    #[must_use]
+    pub fn classification(&self, asset: &PolymarketTokenId) -> Option<PositionClassification> {
+        self.classification_by_asset.get(asset).copied().flatten()
+    }
+
+    /// Replace an activity-stamped identity with one proven by venue metadata while preserving the
+    /// activity-only ordinary/combo classification.
+    pub fn apply_verified(
+        &mut self,
+        asset: &PolymarketTokenId,
+        verified: &VerifiedTokenIdentity,
+    ) -> Result<(), PositionReadError> {
+        let classification = self.classification(asset).ok_or_else(|| {
+            PositionReadError::MissingActivityMapping {
+                asset: asset.0.clone(),
+            }
+        })?;
+        self.by_asset.insert(
+            asset.clone(),
+            ActivityAssetIdentity {
+                condition_id: verified.condition_id.clone(),
+                outcome: verified.outcome,
+                classification,
+                verified: true,
+            },
+        );
+        self.unresolved.remove(asset);
+        Ok(())
     }
 }
 
@@ -635,9 +748,16 @@ pub async fn fetch_complete_positions(
                         asset: asset.0.clone(),
                     }
                 })?;
-                if identity.condition_id != condition_id || identity.outcome != outcome {
+                if !identity.verified
+                    && (identity.condition_id != condition_id || identity.outcome != outcome)
+                {
                     return Err(PositionReadError::PositionMappingConflict { asset: asset.0 });
                 }
+                let (condition_id, outcome) = if identity.verified {
+                    (identity.condition_id.clone(), identity.outcome)
+                } else {
+                    (condition_id, outcome)
+                };
                 let size = ShareAmount::from_decimal_exact(decoded.size.0).map_err(|error| {
                     PositionReadError::InvalidAmount {
                         row_index,

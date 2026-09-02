@@ -19,12 +19,13 @@
 //! The client is **pure fetch + parse + demux**. Cache writes, TTL, skip-sets, and
 //! resolution/`yes_won` logic stay at each call site.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
+use pe_core_types::{OutcomeId, PolymarketConditionId, PolymarketTokenId, ReceivedAt, SourceId};
 use pe_source_core::SourceError;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::fetcher::PageFetcher;
 
@@ -38,6 +39,12 @@ pub const GAMMA_CONCURRENCY: usize = 10;
 /// correctness requirement — the probe showed a UA-less request returns 200; only `Python-urllib/*`
 /// 403s. Setting it guards against a future bot-flagged default.
 pub const GAMMA_BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) prediction-edge/1.0";
+/// Stable source identity for recorded Gamma `/markets` metadata pages.
+pub const GAMMA_MARKETS_SOURCE_ID: &str = "polymarket.gamma.markets";
+/// Wire schema version for recorded Gamma `/markets` metadata pages.
+pub const GAMMA_MARKETS_SCHEMA_VERSION: u32 = 1;
+/// Parser version for recorded Gamma `/markets` metadata pages.
+pub const GAMMA_MARKETS_PARSER_VERSION: u32 = 1;
 
 /// Which slice of the market universe a [`GammaMarketsClient::fetch_markets`] call targets.
 ///
@@ -107,6 +114,47 @@ pub struct GammaMarkets {
     pub unfetched: Vec<String>,
 }
 
+/// Call-scoped evidence for one successful Gamma `/markets` page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataPageEvidence {
+    pub request_url: String,
+    pub raw_page_hash: String,
+    pub canonical_page_hash: String,
+    pub received_at: ReceivedAt,
+    pub source_id: SourceId,
+    pub schema_version: u32,
+    pub parser_version: u32,
+    pub market_count: u32,
+}
+
+/// A token-targeted Gamma result and the exact pages that produced it.
+pub struct GammaMarketsWithPages {
+    pub markets: GammaMarkets,
+    pub pages: Vec<MetadataPageEvidence>,
+    pub raw_pages: Vec<(MetadataPageEvidence, Vec<u8>)>,
+}
+
+/// One token identity proven by a recorded Gamma market page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTokenIdentity {
+    pub condition_id: PolymarketConditionId,
+    pub outcome: OutcomeId,
+    pub evidence_hash: String,
+}
+
+/// Strict token-identity validation failures in Gamma market metadata.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetadataIdentityError {
+    #[error("token {token} is listed by {markets} markets")]
+    MarketCardinality { token: String, markets: usize },
+    #[error("market {condition_id} has empty or duplicate token ids")]
+    EmptyOrDuplicateTokens { condition_id: String },
+    #[error("market {condition_id} outcome {outcome} identifies multiple tokens")]
+    DuplicateIdentity { condition_id: String, outcome: u16 },
+    #[error("market {condition_id} token index {index} exceeds u16")]
+    IndexOverflow { condition_id: String, index: usize },
+}
+
 /// Errors from [`GammaMarketsClient::fetch_markets`].
 ///
 /// A per-chunk HTTP `4xx` (`SourceError::Fatal`) is **not** an error: those ids are reported in
@@ -125,6 +173,9 @@ pub enum GammaMarketsError {
     /// gross corruption of the whole array.
     #[error("gamma batch parse: {0}")]
     Parse(String),
+    /// A token id contains a comma and would change the repeat-key request semantics.
+    #[error("gamma token id must use one repeat-key value, got {token:?}")]
+    InvalidTokenId { token: String },
 }
 
 /// Batched Gamma `/markets` client. Generic over [`PageFetcher`] so production uses
@@ -241,6 +292,90 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             unfetched,
         })
     }
+
+    /// Fetch markets by repeat-key `clob_token_ids`, retaining the raw page and call-scoped
+    /// evidence for every successful request. Input order is preserved through deduplication and
+    /// chunking; completed requests are restored to chunk order before evidence is returned.
+    ///
+    /// # Errors
+    /// Returns [`GammaMarketsError::InvalidTokenId`] when one input contains a comma, because comma
+    /// joining is not a valid Gamma token lookup. Fetch and parse failures have the same meanings as
+    /// [`Self::fetch_markets`].
+    pub async fn fetch_markets_by_token_ids(
+        &self,
+        token_ids: &[String],
+        filter: MarketFilter,
+    ) -> Result<GammaMarketsWithPages, GammaMarketsError> {
+        if let Some(token) = token_ids.iter().find(|token| token.contains(',')) {
+            return Err(GammaMarketsError::InvalidTokenId {
+                token: token.clone(),
+            });
+        }
+
+        let mut seen: HashSet<&str> = HashSet::with_capacity(token_ids.len());
+        let unique = token_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|token| seen.insert(token))
+            .collect::<Vec<_>>();
+        let chunks = unique
+            .chunks(self.batch_size)
+            .map(|chunk| chunk.iter().map(|token| (*token).to_owned()).collect())
+            .collect::<Vec<Vec<String>>>();
+
+        let base = self.base_url.as_str();
+        let fetcher = &self.fetcher;
+        let closed = filter.closed_param();
+        let limit = self.limit;
+        let mut stream = stream::iter(chunks.into_iter().enumerate())
+            .map(|(chunk_index, chunk)| async move {
+                let url = build_token_batch_url(base, &chunk, closed, limit);
+                let result = fetcher.fetch_page(&url).await;
+                let received_at = ReceivedAt::now_utc();
+                (chunk_index, chunk, url, received_at, result)
+            })
+            .buffer_unordered(self.concurrency);
+
+        let mut responses = Vec::new();
+        while let Some(response) = stream.next().await {
+            responses.push(response);
+        }
+        responses.sort_by_key(|(chunk_index, _, _, _, _)| *chunk_index);
+
+        let mut markets = HashMap::new();
+        let mut unfetched = Vec::new();
+        let mut pages = Vec::new();
+        let mut raw_pages = Vec::new();
+        for (_, chunk, url, received_at, result) in responses {
+            let raw = match result {
+                Ok(raw) => raw,
+                Err(SourceError::Fatal { message }) => {
+                    tracing::warn!(chunk_len = chunk.len(), error = %message, "gamma_markets: token batch fatal, marking chunk unfetched");
+                    unfetched.extend(chunk);
+                    continue;
+                }
+                Err(error) => return Err(GammaMarketsError::Fetch(error.to_string())),
+            };
+            let decoded: Vec<GammaMarketRaw> = serde_json::from_slice(&raw)
+                .map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
+            let market_count = u32::try_from(decoded.len()).map_err(|_| {
+                GammaMarketsError::Parse("gamma market count exceeds u32".to_owned())
+            })?;
+            let evidence = metadata_page_evidence(&url, &raw, received_at, market_count)?;
+            for market in decoded {
+                let market = gamma_market(market);
+                markets.insert(market.condition_id.clone(), market);
+            }
+            pages.push(evidence.clone());
+            raw_pages.push((evidence, raw));
+        }
+
+        Ok(GammaMarketsWithPages {
+            markets: GammaMarkets { markets, unfetched },
+            pages,
+            raw_pages,
+        })
+    }
 }
 
 /// Build the repeat-key batch URL: `{base}/markets?condition_ids=A&condition_ids=B[&closed=true]&limit=N`.
@@ -262,6 +397,161 @@ pub(crate) fn build_batch_url(base: &str, ids: &[String], closed: &str, limit: u
     url.push_str("&limit=");
     url.push_str(&limit.to_string());
     url
+}
+
+/// Build a repeat-key token lookup URL. Unlike the older condition lookup, the validated token
+/// endpoint form places `limit` before the optional `closed` filter.
+fn build_token_batch_url(base: &str, token_ids: &[String], closed: &str, limit: u32) -> String {
+    let mut url = String::with_capacity(base.len() + token_ids.len() * 80 + closed.len() + 16);
+    url.push_str(base);
+    url.push_str("/markets?");
+    for (index, token) in token_ids.iter().enumerate() {
+        if index > 0 {
+            url.push('&');
+        }
+        url.push_str("clob_token_ids=");
+        url.push_str(token);
+    }
+    url.push_str("&limit=");
+    url.push_str(&limit.to_string());
+    url.push_str(closed);
+    url
+}
+
+fn metadata_page_evidence(
+    request_url: &str,
+    raw: &[u8],
+    received_at: ReceivedAt,
+    market_count: u32,
+) -> Result<MetadataPageEvidence, GammaMarketsError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
+    let canonical =
+        serde_json::to_vec(&value).map_err(|error| GammaMarketsError::Parse(error.to_string()))?;
+    Ok(MetadataPageEvidence {
+        request_url: request_url.to_owned(),
+        raw_page_hash: blake3::hash(raw).to_hex().to_string(),
+        canonical_page_hash: blake3::hash(&canonical).to_hex().to_string(),
+        received_at,
+        source_id: SourceId(GAMMA_MARKETS_SOURCE_ID.to_owned()),
+        schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
+        parser_version: GAMMA_MARKETS_PARSER_VERSION,
+        market_count,
+    })
+}
+
+/// Verify the venue-defined condition/outcome identity for every requested token that appeared in
+/// the fetched, recorded pages. Tokens absent from every page remain absent from the result.
+#[must_use]
+pub fn verify_token_identities(
+    requested: &[PolymarketTokenId],
+    fetched: &GammaMarketsWithPages,
+) -> BTreeMap<PolymarketTokenId, Result<VerifiedTokenIdentity, MetadataIdentityError>> {
+    let mut page_markets = Vec::new();
+    for (evidence, raw) in &fetched.raw_pages {
+        let Ok(decoded) = serde_json::from_slice::<Vec<GammaMarketRaw>>(raw) else {
+            continue;
+        };
+        page_markets.extend(
+            decoded
+                .into_iter()
+                .map(|market| (gamma_market(market), evidence.canonical_page_hash.clone())),
+        );
+    }
+
+    let mut verified = BTreeMap::new();
+    for token in requested {
+        if verified.contains_key(token) {
+            continue;
+        }
+        let matching = page_markets
+            .iter()
+            .filter(|(market, _)| market.clob_token_ids.iter().any(|id| id == &token.0))
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        if matching.len() != 1 {
+            verified.insert(
+                token.clone(),
+                Err(MetadataIdentityError::MarketCardinality {
+                    token: token.0.clone(),
+                    markets: matching.len(),
+                }),
+            );
+            continue;
+        }
+
+        let (market, evidence_hash) = matching[0];
+        let unique_tokens = market.clob_token_ids.iter().collect::<HashSet<_>>();
+        if market.clob_token_ids.is_empty()
+            || market
+                .clob_token_ids
+                .iter()
+                .any(|token| token.trim().is_empty())
+            || unique_tokens.len() != market.clob_token_ids.len()
+        {
+            verified.insert(
+                token.clone(),
+                Err(MetadataIdentityError::EmptyOrDuplicateTokens {
+                    condition_id: market.condition_id.clone(),
+                }),
+            );
+            continue;
+        }
+        let Some(index) = market.clob_token_ids.iter().position(|id| id == &token.0) else {
+            continue;
+        };
+        let Ok(outcome) = u16::try_from(index) else {
+            verified.insert(
+                token.clone(),
+                Err(MetadataIdentityError::IndexOverflow {
+                    condition_id: market.condition_id.clone(),
+                    index,
+                }),
+            );
+            continue;
+        };
+        verified.insert(
+            token.clone(),
+            Ok(VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId(market.condition_id.clone()),
+                outcome: OutcomeId(outcome),
+                evidence_hash: evidence_hash.clone(),
+            }),
+        );
+    }
+
+    let mut tokens_by_identity = HashMap::<(String, u16), HashSet<String>>::new();
+    for (market, _) in &page_markets {
+        for (index, token) in market.clob_token_ids.iter().enumerate() {
+            if let Ok(outcome) = u16::try_from(index) {
+                tokens_by_identity
+                    .entry((market.condition_id.clone(), outcome))
+                    .or_default()
+                    .insert(token.clone());
+            }
+        }
+    }
+    let duplicate_identities = tokens_by_identity
+        .into_iter()
+        .filter_map(|(identity, tokens)| (tokens.len() > 1).then_some(identity))
+        .collect::<HashSet<_>>();
+    for identity in verified.values_mut() {
+        let duplicate = match identity {
+            Ok(identity) => duplicate_identities
+                .contains(&(identity.condition_id.0.clone(), identity.outcome.0))
+                .then(|| (identity.condition_id.0.clone(), identity.outcome.0)),
+            Err(_) => None,
+        };
+        if let Some((condition_id, outcome)) = duplicate {
+            *identity = Err(MetadataIdentityError::DuplicateIdentity {
+                condition_id,
+                outcome,
+            });
+        }
+    }
+    verified
 }
 
 /// Parse a Gamma RFC 3339 timestamp (e.g. `"2024-11-04T00:00:00Z"`) to unix seconds. `None` on any
@@ -308,6 +598,25 @@ struct GammaMarketRaw {
     /// yields an empty vec (issue #382 Phase 3b).
     #[serde(default, deserialize_with = "deserialize_clob_token_ids")]
     clob_token_ids: Vec<String>,
+}
+
+fn gamma_market(market: GammaMarketRaw) -> GammaMarket {
+    let end_date_unix = market.end_date.as_deref().and_then(parse_rfc3339_unix);
+    let created_at_unix = market.created_at.as_deref().and_then(parse_rfc3339_unix);
+    let outcome_prices = market
+        .outcome_prices
+        .as_deref()
+        .and_then(parse_outcome_prices);
+    GammaMarket {
+        condition_id: market.condition_id,
+        end_date_unix,
+        created_at_unix,
+        liquidity: market.liquidity,
+        closed: market.closed,
+        outcome_prices,
+        volume: market.volume,
+        clob_token_ids: market.clob_token_ids,
+    }
 }
 
 /// Deserialize a JSON value (number or string) into `Option<Decimal>`.
@@ -414,9 +723,42 @@ pub fn parse_outcome_prices(prices_str: &str) -> Option<Vec<Decimal>> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::fetcher::FixtureFetcher;
+    use crate::reconciliation::ReconciliationPageFetcher;
+    use std::sync::Arc;
+    use time::OffsetDateTime;
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn token(id: &str) -> PolymarketTokenId {
+        PolymarketTokenId(id.to_owned())
+    }
+
+    fn fetched_page(raw: Vec<u8>) -> GammaMarketsWithPages {
+        let decoded: Vec<GammaMarketRaw> = serde_json::from_slice(&raw).unwrap();
+        let received_at = ReceivedAt(OffsetDateTime::from_unix_timestamp(100).unwrap());
+        let evidence = metadata_page_evidence(
+            "https://g/markets?clob_token_ids=T&limit=500",
+            &raw,
+            received_at,
+            u32::try_from(decoded.len()).unwrap(),
+        )
+        .unwrap();
+        let markets = decoded
+            .into_iter()
+            .map(gamma_market)
+            .map(|market| (market.condition_id.clone(), market))
+            .collect();
+        GammaMarketsWithPages {
+            markets: GammaMarkets {
+                markets,
+                unfetched: Vec::new(),
+            },
+            pages: vec![evidence.clone()],
+            raw_pages: vec![(evidence, raw)],
+        }
     }
 
     #[test]
@@ -446,6 +788,125 @@ mod tests {
         assert_eq!(
             url,
             "https://g/markets?condition_ids=0xC&condition_ids=0xA&condition_ids=0xB&limit=500"
+        );
+    }
+
+    #[test]
+    fn build_token_batch_url_uses_repeat_keys_and_validated_parameter_order() {
+        assert_eq!(
+            build_token_batch_url("https://g", &ids(&["A", "B"]), "", 500),
+            "https://g/markets?clob_token_ids=A&clob_token_ids=B&limit=500"
+        );
+        assert_eq!(
+            build_token_batch_url("https://g", &ids(&["A"]), "&closed=true", 500),
+            "https://g/markets?clob_token_ids=A&limit=500&closed=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_page_fetcher_delegates_to_reconciliation_fetch() {
+        let url = "https://g/page";
+        let expected = b"page".to_vec();
+        let fetcher = ReconciliationPageFetcher(Arc::new(FixtureFetcher::new(HashMap::from([(
+            url.to_owned(),
+            expected.clone(),
+        )]))));
+        assert_eq!(fetcher.fetch_page(url).await.unwrap(), expected);
+    }
+
+    #[test]
+    fn verify_token_identities_accepts_one_strict_market_and_omits_absent_token() {
+        let fetched =
+            fetched_page(br#"[{"conditionId":"0xcondition","clobTokenIds":["A","B"]}]"#.to_vec());
+        let result = verify_token_identities(&[token("B"), token("missing")], &fetched);
+        assert_eq!(
+            result.get(&token("B")),
+            Some(&Ok(VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId("0xcondition".to_owned()),
+                outcome: OutcomeId(1),
+                evidence_hash: fetched.pages[0].canonical_page_hash.clone(),
+            }))
+        );
+        assert!(!result.contains_key(&token("missing")));
+    }
+
+    #[test]
+    fn verify_token_identities_rejects_market_cardinality() {
+        let fetched = fetched_page(
+            br#"[{"conditionId":"one","clobTokenIds":["T"]},{"conditionId":"two","clobTokenIds":["T"]}]"#
+                .to_vec(),
+        );
+        assert_eq!(
+            verify_token_identities(&[token("T")], &fetched)[&token("T")],
+            Err(MetadataIdentityError::MarketCardinality {
+                token: "T".to_owned(),
+                markets: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn verify_token_identities_rejects_duplicate_market_tokens() {
+        let fetched =
+            fetched_page(br#"[{"conditionId":"condition","clobTokenIds":["T","T"]}]"#.to_vec());
+        assert_eq!(
+            verify_token_identities(&[token("T")], &fetched)[&token("T")],
+            Err(MetadataIdentityError::EmptyOrDuplicateTokens {
+                condition_id: "condition".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn verify_token_identities_rejects_blank_market_tokens() {
+        let fetched =
+            fetched_page(br#"[{"conditionId":"condition","clobTokenIds":["T",""]}]"#.to_vec());
+        assert_eq!(
+            verify_token_identities(&[token("T")], &fetched)[&token("T")],
+            Err(MetadataIdentityError::EmptyOrDuplicateTokens {
+                condition_id: "condition".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn verify_token_identities_rejects_duplicate_condition_outcome_identity() {
+        let fetched = fetched_page(
+            br#"[{"conditionId":"condition","clobTokenIds":["A"]},{"conditionId":"condition","clobTokenIds":["B"]}]"#
+                .to_vec(),
+        );
+        let result = verify_token_identities(&[token("A"), token("B")], &fetched);
+        let expected = Err(MetadataIdentityError::DuplicateIdentity {
+            condition_id: "condition".to_owned(),
+            outcome: 0,
+        });
+        assert_eq!(result[&token("A")], expected);
+        assert_eq!(result[&token("B")], expected);
+    }
+
+    #[test]
+    fn verify_token_identities_rejects_outcome_index_overflow() {
+        let tokens = (0..=usize::from(u16::MAX) + 1)
+            .map(|index| {
+                if index == usize::from(u16::MAX) + 1 {
+                    "overflow".to_owned()
+                } else {
+                    format!("token-{index}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let raw = serde_json::to_vec(&serde_json::json!([{
+            "conditionId": "condition",
+            "clobTokenIds": tokens,
+        }]))
+        .unwrap();
+        let fetched = fetched_page(raw);
+        assert_eq!(
+            verify_token_identities(&[token("overflow")], &fetched)[&token("overflow")],
+            Err(MetadataIdentityError::IndexOverflow {
+                condition_id: "condition".to_owned(),
+                index: usize::from(u16::MAX) + 1,
+            })
         );
     }
 
