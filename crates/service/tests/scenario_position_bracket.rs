@@ -258,15 +258,17 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
                     .unwrap();
             }
         });
-        let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+        match validator(stable_responses(&[(wallet, 1, "1.000000")]))
             .with_step_hook(hook)
             .validate_direct(&[wallet], &mut engine, &paper)
             .await
-            .expect_err("every intervening mutation must reject the bracket");
-        assert!(matches!(
-            error,
-            CausalPositionError::LedgerRevision { .. } | CausalPositionError::StableMismatch { .. }
-        ));
+        {
+            // A mismatch surfaced inside the bracket defers the wallet at
+            // boot (retryable, nothing installed); a ledger revision caught
+            // by the post-loop recheck still rejects the attempted generation.
+            Ok(accepted) => assert!(accepted.is_empty(), "a deferred wallet installs nothing"),
+            Err(error) => assert!(matches!(error, CausalPositionError::LedgerRevision { .. })),
+        }
         assert!(paper.position_validation(&wallet).unwrap().is_none());
         assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     }
@@ -305,19 +307,19 @@ async fn changed_activity_revision_fences_and_installs_nothing() {
 async fn stable_unexplained_mismatch_retries_without_fencing() {
     let wallet = wallet(0x41);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
-    let error = validator(stable_responses(&[(wallet, 1, "2.000000")]))
+    let accepted = validator(stable_responses(&[(wallet, 1, "2.000000")]))
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect_err("a stable unexplained mismatch stays unavailable");
-    assert!(matches!(error, CausalPositionError::StableMismatch { .. }));
+        .expect("a stable unexplained mismatch defers the wallet at boot, never fatally");
+    assert!(accepted.is_empty());
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 
     let second = validator(stable_responses(&[(wallet, 1, "2.000000")]))
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect_err("a never-converging mismatch remains unavailable on retry");
-    assert!(matches!(second, CausalPositionError::StableMismatch { .. }));
+        .expect("a never-converging mismatch stays deferred on retry");
+    assert!(second.is_empty());
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 }
@@ -344,14 +346,11 @@ async fn changed_position_revision_retries_without_fencing() {
             vec![b"[]".to_vec(), b"[]".to_vec()],
         ),
     ]);
-    let error = validator(responses)
+    let accepted = validator(responses)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect_err("changed position semantics must retry");
-    assert!(matches!(
-        error,
-        CausalPositionError::PositionRevision { .. }
-    ));
+        .expect("changed position semantics defer the wallet for a later retry");
+    assert!(accepted.is_empty());
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
 }
@@ -448,20 +447,26 @@ async fn later_activity_atomically_invalidates_an_accepted_proof() {
 }
 
 #[tokio::test]
-async fn multi_wallet_attempt_installs_no_partial_acceptance() {
+async fn boot_bracket_defers_the_mismatched_wallet_and_accepts_the_rest() {
+    // Live shape from the #544 activation rehearsals: one wallet's positions
+    // stably disagree with its reconstructed ledger. The one-shot boot has no
+    // retry loop, so that wallet is deferred to runtime admission (no fence,
+    // nothing installed) while the healthy wallet is accepted.
     let first = wallet(0x51);
     let second = wallet(0x52);
     let (_dir, paper, mut engine) = fresh(&[first, second]);
-    let error = validator(stable_responses(&[
+    let accepted = validator(stable_responses(&[
         (first, 1, "1.000000"),
         (second, 2, "9.000000"),
     ]))
     .validate_direct(&[first, second], &mut engine, &paper)
     .await
-    .expect_err("one unavailable wallet rejects the attempted generation");
-    assert!(matches!(error, CausalPositionError::StableMismatch { .. }));
-    assert!(paper.position_validation(&first).unwrap().is_none());
+    .expect("a retryable wallet outcome must not abort the boot bracket");
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].validation.wallet, first);
+    assert!(paper.position_validation(&first).unwrap().is_some());
     assert!(paper.position_validation(&second).unwrap().is_none());
+    assert!(!paper.is_wallet_fenced(&second).unwrap());
 }
 
 #[tokio::test]
