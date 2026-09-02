@@ -66,6 +66,10 @@ use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
 
+/// Longest HTTP 429 `Retry-After` the reconciliation fetcher waits out in-line (issue #555;
+/// `docs/_GLOSSARY.md`): the venue answers a boot-bracket page burst with `Retry-After: 1`.
+const RECONCILIATION_RATE_LIMIT_RETRY_SECS: u32 = 1;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -370,8 +374,10 @@ async fn main() -> Result<()> {
     .context("encode source-log generation for position validation")?;
     // One fetcher owns the documented public-API rate gate for boot brackets
     // and runtime reconciliation (#544).
-    let position_fetcher: Arc<dyn ReconciliationFetcher> =
-        Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    let position_fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(
+        ReqwestFetcher::new(reqwest::Client::new())
+            .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS),
+    );
     let boot_position_validator = if migration_boot.session.is_some() {
         CausalPositionValidator::new_recording(
             position_fetcher.clone(),

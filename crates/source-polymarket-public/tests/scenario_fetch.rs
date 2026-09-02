@@ -111,7 +111,8 @@ async fn scenario_retry_on_5xx() {
 
 // ── Scenario 3: rate_limited_429 ─────────────────────────────────────────────
 //
-// PASS: fetch_page returns RateLimited { retry_after_secs: 5 }; no retry.
+// PASS: fetch_page returns RateLimited { retry_after_secs: 5 } after exactly one request;
+//       a fetcher that has not opted in never retries a 429 (issue #555).
 // FAIL: any other error variant or Ok.
 
 #[tokio::test]

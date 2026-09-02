@@ -62,7 +62,7 @@ Production budgets are conservative; they reduce automatically on 429/5xx. The "
 
 | Venue / surface | Documented limit | Production budget | Burst |
 |---|---|---|---|
-| Polymarket Data API | 200 req/10s on `/activity`, 100 req/s general (Cloudflare-queued, no 429) | ≤ 20 req/s sustained on `/activity` | n/a — bursts queued, not rejected |
+| Polymarket Data API | 200 req/10s on `/activity`, 100 req/s general | ≤ 20 req/s sustained on `/activity` | page bursts DO return HTTP 429 with `Retry-After: 1` (observed 2026-09-02, #555); the reconciliation fetcher alone waits out `Retry-After` ≤ `reconciliation_rate_limit_retry_secs` (1 s) inside its retry budget |
 | Polymarket Gamma API | verify | ≤ 2 req/s sustained | 10-req burst |
 | Polymarket CLOB REST | verify | ≤ 5 req/s sustained | 10-req burst |
 | Polymarket WebSocket | per-account socket cap | ≤ 4 concurrent sockets | n/a |
@@ -300,6 +300,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_base_url` | `https://data-api.polymarket.com` | Base URL for all five public REST endpoints |
 | `polymarket_request_timeout_secs` | 10 | Per-request HTTP timeout before the request is abandoned |
 | `polymarket_max_retries` | 3 | Retries on network errors and 5xx (4 total attempts: initial + 3 retries) |
+| `reconciliation_rate_limit_retry_secs` | 1 | **Module const** `RECONCILIATION_RATE_LIMIT_RETRY_SECS` in `service` (not a TOML/env key). HTTP 429 `Retry-After` at or below this is waited out inside `polymarket_max_retries` by the Data-API reconciliation fetcher only; every other fetcher returns 429 to its caller unretried |
 | `polymarket_channel_capacity` | 256 | Bounded mpsc channel capacity between trade poller and orchestrator |
 | `trade_poll_interval_secs` | 30 | Seconds between Polymarket trade poll rounds (one round = all watchlisted wallets, fetched sequentially — revisit time = round duration + this sleep). BOOT-OWNED (TOML/env only; the former runtime-config surface was inert and removed in #530). With the activity websocket enabled the poll is the always-on correctness backstop, not the latency path |
 | `polymarket_activity_ws_enabled` | false | #530: websocket-primary trade observation via the officially listed real-time data endpoint whose activity subscription and payload are published by the first-party client, without published completeness, uptime, ordering, continuity, or resume guarantees (`docs/15` entry + re-check policy). #546 runs `activity_ws_reader_count` independent readers per process. Boot-owned; false = poll-only, byte-identical to pre-#530 (the rollback posture). Never disable while a Δ=2 batch is latest — reverse-order rollback: restore a Δ=20 batch first |
