@@ -46,6 +46,15 @@ pub enum LedgerEffect {
         outcome_id: OutcomeId,
         amount: ShareAmount,
     },
+    /// A redemption whose outcome leg the venue did not stamp (live
+    /// `outcomeIndex` 999 sentinel with no label; 191 of 299,175 live rows
+    /// across 17 of 79 watchlist wallets, 2026-09-01, #544 fix 5). The burn
+    /// resolves against the reconstructed ledger: exactly one funded outcome
+    /// applies exactly; zero or two funded outcomes fail closed.
+    RedeemUnattributed {
+        market_id: MarketId,
+        amount: ShareAmount,
+    },
     Conversion,
     RawOnly,
     UnknownEffect,
@@ -115,14 +124,16 @@ impl LedgerMutation {
                     market_id: market()?,
                     amount: aggregate.share_sum,
                 },
-                ActivityType::Redeem => LedgerEffect::Redeem {
-                    market_id: market()?,
-                    outcome_id: components
-                        .outcome
-                        .ok_or_else(|| LedgerError::InvalidMapping {
-                            source_trade_id: source_trade_id.clone(),
-                        })?,
-                    amount: aggregate.share_sum,
+                ActivityType::Redeem => match components.outcome {
+                    Some(outcome_id) => LedgerEffect::Redeem {
+                        market_id: market()?,
+                        outcome_id,
+                        amount: aggregate.share_sum,
+                    },
+                    None => LedgerEffect::RedeemUnattributed {
+                        market_id: market()?,
+                        amount: aggregate.share_sum,
+                    },
                 },
                 ActivityType::Conversion
                 | ActivityType::Unknown(_)
@@ -157,7 +168,9 @@ impl LedgerMutation {
                 outcome_id,
                 ..
             } => vec![MarketOutcomeId::new(market_id.clone(), *outcome_id)],
-            LedgerEffect::Split { market_id, .. } | LedgerEffect::Merge { market_id, .. } => vec![
+            LedgerEffect::Split { market_id, .. }
+            | LedgerEffect::Merge { market_id, .. }
+            | LedgerEffect::RedeemUnattributed { market_id, .. } => vec![
                 MarketOutcomeId::new(market_id.clone(), OutcomeId(0)),
                 MarketOutcomeId::new(market_id.clone(), OutcomeId(1)),
             ],
@@ -179,6 +192,7 @@ pub enum WalletFenceCause {
     Conversion,
     UnknownEffect,
     OrderDependentEqualSecond,
+    AmbiguousRedeem,
 }
 
 impl WalletFenceCause {
@@ -193,6 +207,7 @@ impl WalletFenceCause {
             Self::Conversion => "conversion_unknown_conditions",
             Self::UnknownEffect => "unknown_activity_effect",
             Self::OrderDependentEqualSecond => "order_dependent_equal_second",
+            Self::AmbiguousRedeem => "unattributed_redeem_ambiguous",
         }
     }
 }
@@ -209,6 +224,10 @@ pub enum LedgerError {
     Conversion { source_trade_id: SourceTradeId },
     #[error("activity group {source_trade_id} has an unknown position effect")]
     UnknownEffect { source_trade_id: SourceTradeId },
+    #[error(
+        "activity group {source_trade_id} is an outcome-unattributed redemption funding more than one outcome"
+    )]
+    AmbiguousRedeem { source_trade_id: SourceTradeId },
 }
 
 impl LedgerError {
@@ -220,6 +239,7 @@ impl LedgerError {
             Self::Overflow { .. } => WalletFenceCause::Overflow,
             Self::Conversion { .. } => WalletFenceCause::Conversion,
             Self::UnknownEffect { .. } => WalletFenceCause::UnknownEffect,
+            Self::AmbiguousRedeem { .. } => WalletFenceCause::AmbiguousRedeem,
         }
     }
 }
@@ -321,6 +341,32 @@ impl PositionLedger {
                 outcome_id,
                 amount,
             } => self.checked_remove(mutation, market_id, *outcome_id, *amount),
+            LedgerEffect::RedeemUnattributed { market_id, amount } => {
+                let mut funded = Vec::new();
+                for outcome in [OutcomeId(0), OutcomeId(1)] {
+                    let long = self
+                        .position(&mutation.wallet)
+                        .and_then(|snapshot| {
+                            snapshot
+                                .positions
+                                .get(&MarketOutcomeId::new(market_id.clone(), outcome))
+                        })
+                        .map(|state| state.long_contracts)
+                        .unwrap_or_default();
+                    if long.atomic() >= amount.atomic() {
+                        funded.push(outcome);
+                    }
+                }
+                match funded.as_slice() {
+                    [outcome] => self.checked_remove(mutation, market_id, *outcome, *amount),
+                    [] => Err(LedgerError::Underflow {
+                        source_trade_id: mutation.source_trade_id.clone(),
+                    }),
+                    _ => Err(LedgerError::AmbiguousRedeem {
+                        source_trade_id: mutation.source_trade_id.clone(),
+                    }),
+                }
+            }
             LedgerEffect::Conversion => Err(LedgerError::Conversion {
                 source_trade_id: mutation.source_trade_id.clone(),
             }),
@@ -633,6 +679,90 @@ mod tests {
             ledger.position(&w).unwrap().positions[&first].long_contracts,
             original_first
         );
+    }
+
+    fn ledger_with_longs(w: WalletAddress, long0: u64, long1: u64) -> PositionLedger {
+        let mut positions = HashMap::new();
+        for (outcome, long) in [(OutcomeId(0), long0), (OutcomeId(1), long1)] {
+            positions.insert(
+                MarketOutcomeId::new(market(), outcome),
+                PositionState {
+                    long_contracts: ShareAmount::from_atomic(long),
+                    short_contracts: ShareAmount::ZERO,
+                },
+            );
+        }
+        PositionLedger::from_snapshots(HashMap::from([(
+            w,
+            PositionSnapshot {
+                wallet: w,
+                positions,
+            },
+        )]))
+    }
+
+    fn unattributed_redeem(w: WalletAddress, amount: u64) -> LedgerMutation {
+        LedgerMutation {
+            source_trade_id: SourceTradeId("g2:unattributed".to_owned()),
+            transaction_hash: "0xtest".to_owned(),
+            wallet: w,
+            source_time: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            effect: LedgerEffect::RedeemUnattributed {
+                market_id: market(),
+                amount: ShareAmount::from_atomic(amount),
+            },
+        }
+    }
+
+    #[test]
+    fn unattributed_redeem_burns_the_single_funded_outcome_exactly() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut ledger = ledger_with_longs(w, 500, 20);
+        ledger.apply(&unattributed_redeem(w, 100)).unwrap();
+        let snap = ledger.position(&w).unwrap();
+        let funded = MarketOutcomeId::new(market(), OutcomeId(0));
+        let other = MarketOutcomeId::new(market(), OutcomeId(1));
+        assert_eq!(
+            snap.positions[&funded].long_contracts,
+            ShareAmount::from_atomic(400)
+        );
+        assert_eq!(
+            snap.positions[&other].long_contracts,
+            ShareAmount::from_atomic(20)
+        );
+    }
+
+    #[test]
+    fn unattributed_redeem_with_no_funded_outcome_underflows() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut ledger = ledger_with_longs(w, 50, 20);
+        assert!(matches!(
+            ledger.apply(&unattributed_redeem(w, 100)),
+            Err(LedgerError::Underflow { .. })
+        ));
+        assert_eq!(
+            ledger.position(&w).unwrap().positions[&MarketOutcomeId::new(market(), OutcomeId(0))]
+                .long_contracts,
+            ShareAmount::from_atomic(50)
+        );
+    }
+
+    #[test]
+    fn unattributed_redeem_funding_both_outcomes_fails_closed() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut ledger = ledger_with_longs(w, 500, 500);
+        let error = ledger.apply(&unattributed_redeem(w, 100)).unwrap_err();
+        assert!(matches!(error, LedgerError::AmbiguousRedeem { .. }));
+        assert_eq!(
+            error.fence_cause().as_str(),
+            "unattributed_redeem_ambiguous"
+        );
+    }
+
+    #[test]
+    fn unattributed_redeem_touches_both_outcome_keys() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(unattributed_redeem(w, 1).touched_keys().len(), 2);
     }
 }
 #[cfg(test)]

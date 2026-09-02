@@ -923,7 +923,8 @@ fn mutation_error_id(error: &LedgerError) -> SourceTradeId {
         | LedgerError::Underflow { source_trade_id }
         | LedgerError::Overflow { source_trade_id }
         | LedgerError::Conversion { source_trade_id }
-        | LedgerError::UnknownEffect { source_trade_id } => source_trade_id.clone(),
+        | LedgerError::UnknownEffect { source_trade_id }
+        | LedgerError::AmbiguousRedeem { source_trade_id } => source_trade_id.clone(),
     }
 }
 
@@ -980,6 +981,11 @@ fn order_independent_validity(
         return true;
     }
     let mut totals: BTreeMap<String, (MarketOutcomeId, OperationTotals)> = BTreeMap::new();
+    // An outcome-unattributed redemption resolves its leg from ledger state,
+    // so any other same-second operation on its market (or a second such
+    // redemption) is order-dependent and fails closed (#544 fix 5).
+    let mut unattributed_market_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for mutation in mutations {
         match &mutation.effect {
             LedgerEffect::Trade {
@@ -1041,8 +1047,22 @@ fn order_independent_validity(
                 };
                 entry.1.remove = sum;
             }
+            LedgerEffect::RedeemUnattributed { market_id, .. } => {
+                for outcome in [pe_core_types::OutcomeId(0), pe_core_types::OutcomeId(1)] {
+                    let key = encode_key(&MarketOutcomeId::new(market_id.clone(), outcome));
+                    if !unattributed_market_keys.insert(key) {
+                        return false;
+                    }
+                }
+            }
             LedgerEffect::Conversion | LedgerEffect::RawOnly | LedgerEffect::UnknownEffect => {}
         }
+    }
+    if unattributed_market_keys
+        .iter()
+        .any(|key| totals.contains_key(key))
+    {
+        return false;
     }
     for (_, (key, totals)) in totals {
         let state = ledger

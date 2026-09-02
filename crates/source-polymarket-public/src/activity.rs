@@ -851,7 +851,16 @@ fn validate_type_specific(
             }
         }
         ActivityType::Redeem => {
-            if condition_id.is_none() || outcome.is_none() || !outcome_label_present {
+            if condition_id.is_none() {
+                return Err(ActivityValidationError::MissingField {
+                    field: "conditionId",
+                });
+            }
+            // The outcome may be absent: the live venue omits it on some
+            // redemptions (`outcomeIndex` 999 sentinel with no label); the
+            // ledger resolves the burn from funded balances or fails closed
+            // (#544 fix 5). A stamped outcome still requires its label.
+            if outcome.is_some() && !outcome_label_present {
                 return Err(ActivityValidationError::InvalidConditionOutcomeMapping);
             }
         }
@@ -1449,9 +1458,41 @@ mod tests {
         assert!(!parsed.is_ordinary_position_change());
         assert!(!parsed.requires_wallet_fence());
 
-        // The same sentinel on an ordinary (non-combo) redemption stays a
-        // hard error: only structurally raw-only rows skip effect validation.
+        // The same sentinel also appears on ordinary redemptions (191 of
+        // 299,175 live rows, 17 of 79 watchlist wallets): they parse with no
+        // outcome and the ledger resolves the burn from funded balances.
         let ordinary = row.replace("\"isCombo\":true", "\"isCombo\":false");
-        assert!(parse_activity_row(ordinary.as_bytes(), Some(wallet), &context).is_err());
+        let parsed = parse_activity_row(ordinary.as_bytes(), Some(wallet), &context).unwrap();
+        assert!(!parsed.is_combo);
+        assert_eq!(parsed.outcome, None);
+    }
+
+    #[test]
+    fn ordinary_redeem_with_outcome_sentinel_parses_without_an_outcome() {
+        // Live capture 2026-09-01 (wallet 0xe8ca3f…, tx 0xb66608c7…): an
+        // ordinary binary-market redemption whose outcome the venue did not
+        // stamp — outcomeIndex 999, empty label, empty side, empty asset,
+        // winner-priced payout (usdcSize == size). 191 such rows across 17 of
+        // 79 live watchlist wallets (#544 fix 5).
+        let row = r#"{"proxyWallet":"0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb","timestamp":1784121881,"conditionId":"0x39e04bf6b09df29f9846fcf08aeb1cb364b498c0eaa2526e17cb8ca82fdc0a5b","type":"REDEEM","size":192.1,"usdcSize":192.1,"transactionHash":"0xb66608c7462c05cda63304cc28a36ade79618cd02038f325ef0736568607bf5c","price":0,"asset":"","side":"","outcomeIndex":999,"outcome":""}"#;
+        let context = ActivityParseContext {
+            source_id: SourceId("polymarket-activity-test".to_owned()),
+            observed_at: SourceTimestamp(
+                time::OffsetDateTime::from_unix_timestamp(1_784_121_881).unwrap(),
+            ),
+            received_at: ReceivedAt(
+                time::OffsetDateTime::from_unix_timestamp(1_784_121_882).unwrap(),
+            ),
+            transport: ActivityTransport::Rest,
+        };
+        let wallet = WalletAddress::from_hex("0xe8ca3f758c93f44f3ec210542ab78afb7c0bcccb").unwrap();
+        let parsed = parse_activity_row(row.as_bytes(), Some(wallet), &context).unwrap();
+        assert_eq!(parsed.outcome, None);
+        assert_ne!(parsed.share_amount, ShareAmount::ZERO);
+        assert!(!parsed.requires_wallet_fence());
+
+        // A stamped outcome with a missing label remains a hard error.
+        let stamped = row.replace("\"outcomeIndex\":999", "\"outcomeIndex\":1");
+        assert!(parse_activity_row(stamped.as_bytes(), Some(wallet), &context).is_err());
     }
 }
