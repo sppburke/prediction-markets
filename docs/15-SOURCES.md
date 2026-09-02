@@ -94,6 +94,15 @@
 > when a saturated-window split re-received boundary-second rows. The reconciliation reader keeps
 > its exclusive `(start, end]` window contract internally and puts `start + 1` on the wire
 > (`crates/source-polymarket-public/src/reconciliation.rs`); `end` remains inclusive as observed.
+> **`/activity` REDEEM rows may omit the outcome (2026-09-01, #544 activation rehearsal + 79-wallet
+> sweep):** some redemptions carry `outcomeIndex: 999` with an empty `outcome` label, empty `side`,
+> and empty `asset` — 191 of 299,175 rows across 17 of 79 live watchlist wallets, every one
+> winner-priced (`usdcSize == size`). Combo ("A AND B") redemptions use the same sentinel with a
+> zero-padded composite condition id. Batch redemption transactions carry sibling REDEEM legs for
+> other markets, so the sentinel row is the complete record for its condition. Combo rows stay
+> raw-only; ordinary sentinel redemptions parse with no outcome and the position ledger burns the
+> single funded outcome exactly or fails closed
+> (`LedgerEffect::RedeemUnattributed`, `crates/position-ledger`).
 
 > **Gamma `/markets?condition_ids=` + CLOB `/markets?closed=true` — UA blocklist & repeat-key batching (2026-06-20, issue #382 Phase-0 live probe `scripts/probe_gamma_ua.py`).** The `&closed=true` 403 is triggered by the literal `Python-urllib/*` default User-Agent (an anti-bot blocklist), **not** by a missing browser UA: both endpoints return **200** for a headerless request (a bare `reqwest::Client` = the shipped Rust clients), an empty UA, a product UA (`prediction-edge/1.0`), and a browser UA — and **403 only** for `Python-urllib/3.11`. The shipped UA-less clients therefore do not 403, but this transport health did not prevent the 2026-06-24 through 2026-08-21 persisted-terminator cursor wedge from stopping repeat resolution ingestion. Repeat-key batching (`?condition_ids=A&condition_ids=B…&limit=500`) works for **both** the plain (open) and `&closed=true` Gamma variants — 50/50 and 100/100 returned, demux-by-`conditionId` clean, no cross-market leak; comma-separated joining returns 0 (repeat-key mandatory); observed batch cap ≥ 100 (kept at `gamma_batch_size`=50). This supersedes the stale `crates/bootstrap/src/gamma.rs:5-6` "batching fails silently" claim for the repeat-key form.
 

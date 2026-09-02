@@ -244,21 +244,38 @@ fn trade_and_redeem_reject_missing_required_effect_fields() {
         );
     }
 
-    for (field, value) in [("conditionId", json!("")), ("outcome", json!(""))] {
-        let mut redeem = base_row("REDEEM");
-        redeem[field] = value;
-        assert!(matches!(
-            parse_activity_response(
-                &response(&[redeem]),
-                wallet(WALLET),
-                &context(ActivityTransport::Rest, 1_788_000_010, 1_788_000_011)
-            ),
-            Err(ActivityParseError::InvalidRow {
-                source: ActivityValidationError::InvalidConditionOutcomeMapping,
-                ..
-            })
-        ));
-    }
+    let mut redeem = base_row("REDEEM");
+    redeem["conditionId"] = json!("");
+    assert!(matches!(
+        parse_activity_response(
+            &response(&[redeem]),
+            wallet(WALLET),
+            &context(ActivityTransport::Rest, 1_788_000_010, 1_788_000_011)
+        ),
+        Err(ActivityParseError::InvalidRow {
+            source: ActivityValidationError::MissingField {
+                field: "conditionId"
+            },
+            ..
+        })
+    ));
+
+    // A stamped outcome index with an empty label stays inconsistent; only
+    // the venue's unattributed sentinel (999 + no label) parses without an
+    // outcome (#544 fix 5).
+    let mut redeem = base_row("REDEEM");
+    redeem["outcome"] = json!("");
+    assert!(matches!(
+        parse_activity_response(
+            &response(&[redeem]),
+            wallet(WALLET),
+            &context(ActivityTransport::Rest, 1_788_000_010, 1_788_000_011)
+        ),
+        Err(ActivityParseError::InvalidRow {
+            source: ActivityValidationError::InvalidConditionOutcomeMapping,
+            ..
+        })
+    ));
 }
 
 #[test]

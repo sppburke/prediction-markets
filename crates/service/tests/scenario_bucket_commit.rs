@@ -535,6 +535,79 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 }
 
 #[test]
+fn unattributed_redeem_sharing_its_equal_second_market_fences_order_dependent() {
+    // An outcome-unattributed redemption (live outcomeIndex 999 sentinel,
+    // #544 fix 5) resolves its leg from ledger state, so any other operation
+    // on the same market in the same second is order-dependent.
+    let (_dir, paper, mut engine) = fresh();
+    engine
+        .commit(
+            vec![position_row(
+                "TRADE", "0x70", MARKET_A, 0, "BUY", "5", "0.5", 559,
+            )],
+            &context(559, true),
+            zero_basis(),
+        )
+        .unwrap();
+    let sentinel = aggregate(json!({
+        "timestamp": 560,
+        "conditionId": MARKET_A,
+        "type": "REDEEM",
+        "size": "2",
+        "usdcSize": "2",
+        "transactionHash": "0x71",
+        "price": "0",
+        "asset": "",
+        "side": "",
+        "outcomeIndex": 999,
+        "outcome": "",
+    }));
+    let sell = position_row("TRADE", "0x72", MARKET_A, 0, "SELL", "1", "0.5", 560);
+    let result = engine
+        .commit(vec![sentinel, sell], &context(560, true), zero_basis())
+        .unwrap();
+    assert_eq!(
+        result.newly_fenced,
+        Some(WalletFenceCause::OrderDependentEqualSecond)
+    );
+    assert!(paper.is_wallet_fenced(&wallet()).unwrap());
+
+    // Alone in its second, the same redemption burns the single funded leg.
+    let (_dir, paper, mut engine) = fresh();
+    engine
+        .commit(
+            vec![position_row(
+                "TRADE", "0x73", MARKET_A, 0, "BUY", "5", "0.5", 561,
+            )],
+            &context(561, true),
+            zero_basis(),
+        )
+        .unwrap();
+    let sentinel = aggregate(json!({
+        "timestamp": 562,
+        "conditionId": MARKET_A,
+        "type": "REDEEM",
+        "size": "2",
+        "usdcSize": "2",
+        "transactionHash": "0x74",
+        "price": "0",
+        "asset": "",
+        "side": "",
+        "outcomeIndex": 999,
+        "outcome": "",
+    }));
+    let result = engine
+        .commit(vec![sentinel], &context(562, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.newly_fenced, None);
+    assert_eq!(
+        state(&engine, MARKET_A, 0),
+        ShareAmount::from_decimal_exact(rust_decimal::Decimal::from(3)).unwrap()
+    );
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+}
+
+#[test]
 fn equal_second_validity_is_order_independent_or_the_whole_bucket_fences() {
     let (_dir, paper, mut engine) = fresh();
     let split = pair_effect("SPLIT", "0x65", MARKET_A, "1", 550);
